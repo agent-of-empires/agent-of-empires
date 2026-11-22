@@ -5,6 +5,7 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 
 import { fetchSandboxImageStatus, type SandboxImageStatus } from "../../../lib/api";
 import {
+  IDLE_RECHECK_MS,
   IMAGE_RECHECK_MS,
   RUNNING_RECHECK_MS,
   sandboxImageStatusLabel,
@@ -63,7 +64,7 @@ describe("useSandboxImageRowStatus", () => {
     expect(result.current?.label).toBe("Update status unknown");
   });
 
-  it("re-checks every 2 s while the image downloads, and stops once it ends or the dialog closes", async () => {
+  it("re-checks every 2 s while the image downloads, slows once it ends, and stops when the dialog closes", async () => {
     const running = status({ state: "current", pull: { state: "running", layers_done: 1, layers_known: 7 } });
     fetchStatus.mockResolvedValue(running);
     const { result, unmount } = renderHook(() => useSandboxImageRowStatus("sb:1", true));
@@ -82,8 +83,22 @@ describe("useSandboxImageRowStatus", () => {
     await settle();
     const calls = fetchStatus.mock.calls.length;
     close();
-    await act(async () => vi.advanceTimersByTime(RUNNING_RECHECK_MS * 3));
+    await act(async () => vi.advanceTimersByTime(IDLE_RECHECK_MS * 3));
     expect(fetchStatus).toHaveBeenCalledTimes(calls);
+  });
+
+  it("shows a pull that starts after an idle answer, without reopening the dialog", async () => {
+    const { result } = renderHook(() => useSandboxImageRowStatus("sb:1", true));
+    await settle();
+    expect(result.current?.reply).toMatchObject({ pull: { state: "idle" } });
+    fetchStatus.mockResolvedValue(status({ state: "current", pull: { state: "running" } }));
+    await act(async () => vi.advanceTimersByTime(IDLE_RECHECK_MS - 1));
+    expect(fetchStatus).toHaveBeenCalledTimes(1);
+    await act(async () => vi.advanceTimersByTime(1));
+    expect(fetchStatus.mock.calls.slice(1)).toEqual([["sb:1", { fresh: false }]]);
+    expect(result.current?.reply).toMatchObject({ pull: { state: "running" } });
+    await act(async () => vi.advanceTimersByTime(RUNNING_RECHECK_MS));
+    expect(fetchStatus, "a running pull isn't followed at 2 s").toHaveBeenCalledTimes(3);
   });
 
   it.each([

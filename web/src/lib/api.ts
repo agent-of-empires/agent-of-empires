@@ -1729,13 +1729,16 @@ export function pullSandboxImage(): Promise<{ ok: boolean; message?: string }> {
   return okWithMessage("/api/sandbox/image-pull", { method: "POST" });
 }
 
-/** Cancels the default image's pull for every client; `pull` is the state it ended in. */
-export async function cancelSandboxImagePull(): Promise<{ ok: boolean; pull?: SandboxImagePull; message?: string }> {
-  const reply = await send("/api/sandbox/image-pull/cancel", { method: "POST" }).catch(() => null);
+/** Cancels `image`'s pull for every client; `pull` is the state it ended in, only when the reply is
+ *  about that image. */
+export async function cancelSandboxImagePull(
+  image: string,
+): Promise<{ ok: boolean; pull?: SandboxImagePull; message?: string }> {
+  const reply = await send("/api/sandbox/image-pull/cancel", jsonInit("POST", { image })).catch(() => null);
   if (!reply) return { ok: false };
   if (!reply.ok) return { ok: false, message: stringField(reply.payload, "message") };
-  const pull = (reply.payload as { pull?: SandboxImagePull } | null)?.pull;
-  return pull ? { ok: true, pull } : { ok: true };
+  const payload = reply.payload as { image?: string; pull?: SandboxImagePull } | null;
+  return payload?.pull && payload.image === image ? { ok: true, pull: payload.pull } : { ok: true };
 }
 
 export function dismissSandboxImage(digest: string): Promise<boolean> {

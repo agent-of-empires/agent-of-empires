@@ -190,6 +190,9 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
       replyPendingSince.current = null;
       createPullSince.current = null;
       setRefusal(null);
+      // A Cancel still out now answers an older attempt, which can't reset its button.
+      setCancelling(false);
+      setCancelRefused(null);
       pollNow.current();
     });
     const offStarted = onSandboxImagePullStarted(() => {
@@ -248,11 +251,12 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
     pollNow.current();
   }, []);
 
-  const cancel = useCallback(() => {
+  // `image` is the one on the banner, so a default changed since can't cancel a different pull.
+  const cancel = useCallback((image: string) => {
     const mine = attempt.current;
     setCancelling(true);
     setCancelRefused(null);
-    void cancelSandboxImagePull().then((reply) => {
+    void cancelSandboxImagePull(image).then((reply) => {
       // A newer update owns the banner now.
       if (mine !== attempt.current) return;
       setCancelling(false);
@@ -307,7 +311,8 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
     const { pull } = status;
     if (pull.state === "running") {
       const progress = pullProgress(pull);
-      const onCancel = status.pull_blocked ? undefined : cancel;
+      const image = status.image;
+      const onCancel = status.pull_blocked ? undefined : () => cancel(image);
       return {
         view: hidden ? null : { kind: "updating", progress, onCancel, cancelling, cancelRefused, onHide: hide },
         running: { progress, hidden, onShow: show },

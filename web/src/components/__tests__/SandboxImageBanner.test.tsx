@@ -12,14 +12,15 @@ import { SandboxImageBanner } from "../SandboxImageBanner";
 const fetchSandboxImageStatus = vi.fn();
 const pullSandboxImage = vi.fn((): Promise<{ ok: boolean; message?: string }> => Promise.resolve({ ok: true }));
 const dismissSandboxImage = vi.fn(() => Promise.resolve(true));
-const cancelSandboxImagePull = vi.fn((): Promise<{ ok: boolean; pull?: SandboxImagePull; message?: string }> =>
-  Promise.resolve({ ok: true, pull: { state: "cancelled" } }),
+const cancelSandboxImagePull = vi.fn(
+  (_image: string): Promise<{ ok: boolean; pull?: SandboxImagePull; message?: string }> =>
+    Promise.resolve({ ok: true, pull: { state: "cancelled" } }),
 );
 vi.mock("../../lib/api", () => ({
   fetchSandboxImageStatus: () => fetchSandboxImageStatus(),
   pullSandboxImage: () => pullSandboxImage(),
   dismissSandboxImage: (digest: string) => dismissSandboxImage(digest),
-  cancelSandboxImagePull: () => cancelSandboxImagePull(),
+  cancelSandboxImagePull: (image: string) => cancelSandboxImagePull(image),
 }));
 const writeClipboard = vi.fn(() => Promise.resolve(true));
 vi.mock("../../lib/clipboard", () => ({ writeClipboard: (text: string) => writeClipboard(text) }));
@@ -692,6 +693,35 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
     fetchSandboxImageStatus.mockResolvedValue(running());
     await pollAfter(30_000);
     expect(banner()?.textContent).toBe(DOWNLOADING);
+  });
+
+  it("cancels the image on the banner, not whatever the default is by then", async () => {
+    await mount({ ...running(), image: "ghcr.io/example/other:1" });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(cancelSandboxImagePull).toHaveBeenCalledWith("ghcr.io/example/other:1");
+  });
+
+  it("frees Cancel when a create's pull supersedes the attempt it was sent for", async () => {
+    let answer!: (r: { ok: boolean; pull?: SandboxImagePull }) => void;
+    cancelSandboxImagePull.mockReturnValueOnce(new Promise((r) => (answer = r)));
+    await mount(running());
+    const cancelButton = () => screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement;
+    fireEvent.click(cancelButton());
+    expect(cancelButton().disabled).toBe(true);
+    act(() => notifySandboxImagePulled());
+    await pollAfter(0);
+    // The pull ends, and the next one is started elsewhere while the old Cancel reply is still out.
+    fetchSandboxImageStatus.mockResolvedValue(status({ state: "current", pull: { state: "done" } }));
+    await pollAfter(2000);
+    fetchSandboxImageStatus.mockResolvedValue(running());
+    await pollAfter(30_000);
+    expect(banner()?.textContent).toBe(DOWNLOADING);
+    expect(cancelButton().disabled, "the superseded Cancel kept the button off").toBe(false);
+    fetchSandboxImageStatus.mockReturnValueOnce(new Promise(() => {}));
+    await act(async () => answer({ ok: true, pull: { state: "cancelled" } }));
+    expect(banner()?.textContent, "the old reply ended the new pull").toBe(DOWNLOADING);
+    fireEvent.click(cancelButton());
+    expect(cancelSandboxImagePull).toHaveBeenCalledTimes(2);
   });
 
   it("ignores a Cancel reply that arrives after a newer update started", async () => {

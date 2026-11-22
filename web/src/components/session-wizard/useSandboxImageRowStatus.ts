@@ -5,6 +5,8 @@ import { fetchSandboxImageStatus, type SandboxImageStatus } from "../../lib/api"
 export const IMAGE_RECHECK_MS = 500;
 // While the image downloads, so the dialog follows it and offers its checkbox again once it ends.
 export const RUNNING_RECHECK_MS = 2000;
+// Otherwise, so a pull that starts while the dialog is open shows.
+export const IDLE_RECHECK_MS = 10_000;
 
 /** What the Sandbox row says before the image, from a status, a refusal (`{ error }`) or null offline. */
 export function sandboxImageStatusLabel(reply: SandboxImageReply): string {
@@ -25,8 +27,8 @@ export type SandboxImageReply = SandboxImageStatus | { error: string } | null;
 
 /** The status label and reply for `image` (empty: the default image), or null until it is answered.
  *  Only the first check runs at once; an edited image is re-checked once typing stops, even while that
- *  first check is pending, and every 2 s while it downloads, through failed checks. The first answered
- *  check skips the Daemon's cache. */
+ *  first check is pending, every 2 s while it downloads, through failed checks, and every 10 s
+ *  otherwise. The first answered check skips the Daemon's cache. */
 export function useSandboxImageRowStatus(
   image: string,
   enabled: boolean,
@@ -51,7 +53,7 @@ export function useSandboxImageRowStatus(
       }
       pulling = conclusive && reply.pull.state === "running";
       setAnswer({ image, label: sandboxImageStatusLabel(reply), reply });
-      if (pulling) timer = setTimeout(check, RUNNING_RECHECK_MS);
+      timer = setTimeout(check, pulling ? RUNNING_RECHECK_MS : IDLE_RECHECK_MS);
     };
     if (started.current) timer = setTimeout(check, IMAGE_RECHECK_MS);
     else void check();
