@@ -732,14 +732,18 @@ body. `POST /api/sessions` applies the same gate to
 
 Both take an optional body: none for the global default image, or JSON
 `{"image": "<configured image>"}` sent as `application/json`. Any other body,
-including `{}`, gets `400 invalid_body`.
+including `{}`, gets `400 invalid_body`. A JSON body naming an image that isn't
+configured gets `400 unknown_image`.
 
 ### GET /api/sandbox/image-status
 
 `?image=<ref>&fresh=true`, both optional. Reports whether the registry has a
 newer image, and the state of the image's pull. Registry answers are cached for
 15 minutes per image and runtime; `fresh=true` waits for a check that starts
-after the request. A finished pull drops the cached answer.
+after the request. The cached answer is dropped when a pull started by
+`image-pull` ends, or when a create's `pull_latest_image` pull succeeds. Other
+pulls, such as a missing image pulled when a session starts, leave it until it
+expires.
 
 ```json
 {
@@ -780,8 +784,10 @@ after the request. A finished pull drops the cached answer.
 - `cancelled`: ended by `image-pull/cancel`.
 - `failed`, with `reason` (`timeout`, `network`, `disk_space`, `auth` or
   `other`), `message` (the wording both clients show) and `error` (the
-  runtime's output). Only Docker's errors are classified; other runtimes read
-  `other`.
+  runtime's output). Every runtime's failure is classified: `timeout` when the
+  10-minute limit kills the pull, otherwise a match on the runtime's output. The
+  phrases matched come from Docker's output, so another runtime's failure can
+  read `other` where Docker's would be named.
 
 A finished state stays until the image's next pull starts.
 
