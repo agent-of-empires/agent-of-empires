@@ -9,8 +9,18 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-/// PID 1 is `sleep`, which ignores SIGTERM, so waiting out the grace only delays SIGKILL.
-pub(crate) const STOP_NOW_ARGS: [&str; 3] = ["stop", "-t", "0"];
+/// Format printing a container's image ENTRYPOINT as JSON.
+pub(crate) const ENTRYPOINT_FORMAT: &str = "{{json .Config.Entrypoint}}";
+
+/// Stop args for a container whose ENTRYPOINT printed as `entrypoint`. With
+/// none, PID 1 is the appended `sleep`, which ignores SIGTERM, so waiting out
+/// the grace only delays SIGKILL. Any other PID 1 keeps the runtime's grace.
+pub(crate) fn stop_args(entrypoint: Option<&str>) -> &'static [&'static str] {
+    match entrypoint {
+        Some("null" | "[]" | "\"\"") => &["stop", "-t", "0"],
+        _ => &["stop"],
+    }
+}
 
 /// `docker pull` has no timeout of its own; this only fires on a wedged pull.
 const PULL_TIMEOUT: Duration = Duration::from_secs(600);
@@ -798,8 +808,15 @@ impl RuntimeBase {
 
     pub fn stop_container(&self, name: &str) -> Result<()> {
         tracing::info!(target: "containers.runtime", runtime = %self.name, %name, "stopping container");
+        let mut inspect = self.command();
+        inspect.args(["inspect", "--format", ENTRYPOINT_FORMAT, name]);
+        let entrypoint = self
+            .probe_output(&mut inspect)
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
         let mut cmd = self.command();
-        cmd.args(STOP_NOW_ARGS).arg(name);
+        cmd.args(stop_args(entrypoint.as_deref())).arg(name);
         let output = self.probe_output(&mut cmd)?;
 
         if !output.status.success() {
@@ -977,6 +994,19 @@ mod tests {
             Err(DockerError::PermissionDenied) => "permission_denied".into(),
             Err(DockerError::InspectFailed(stderr)) => format!("inspect_failed:{stderr}"),
             Err(other) => format!("other:{other}"),
+        }
+    }
+
+    #[test]
+    fn stop_skips_the_grace_only_without_an_entrypoint() {
+        for (entrypoint, expected) in [
+            (Some("null"), &["stop", "-t", "0"][..]),
+            (Some("[]"), &["stop", "-t", "0"][..]),
+            (Some("\"\""), &["stop", "-t", "0"][..]),
+            (Some("[\"/entry.sh\"]"), &["stop"][..]),
+            (None, &["stop"][..]),
+        ] {
+            assert_eq!(stop_args(entrypoint), expected, "{entrypoint:?}");
         }
     }
 

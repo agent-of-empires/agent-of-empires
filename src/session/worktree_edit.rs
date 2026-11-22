@@ -576,7 +576,11 @@ mod tests {
             let log = std::fs::read_to_string(&calls).unwrap_or_default();
             assert_eq!(
                 log.trim(),
-                if called { "stop -t 0 c1" } else { "" },
+                if called {
+                    "inspect --format {{json .Config.Entrypoint}} c1\nstop c1"
+                } else {
+                    ""
+                },
                 "{label}"
             );
         }
