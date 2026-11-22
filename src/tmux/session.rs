@@ -330,20 +330,25 @@ fn capture_output(success: bool, stdout: &[u8]) -> Option<String> {
     success.then(|| String::from_utf8_lossy(stdout).into_owned())
 }
 
-/// Capture `pane_id` only while it still belongs to `session_name`: one tmux call prints the
-/// pane's owner, then the capture. A moved or renumbered pane id yields `None`.
+/// Capture `pane_id` only while `session_name` still lists it: one tmux call prints an ownership
+/// marker, then the capture. Membership comes from the session's own pane list, not the bare id,
+/// which resolves through whichever session sharing a linked window was active last.
 fn capture_pane_in_session(
     pane_id: &str,
     session_name: &str,
     lines: usize,
 ) -> std::io::Result<Option<String>> {
+    const OWNS: &str = "aoe-owns";
     let output = crate::tmux::tmux_command()
         .args([
-            "display-message",
-            "-p",
+            "list-panes",
+            "-s",
             "-t",
-            pane_id,
-            "#{session_name}",
+            &format!("={session_name}:"),
+            "-f",
+            &format!("#{{==:#{{pane_id}},{pane_id}}}"),
+            "-F",
+            OWNS,
             ";",
             "capture-pane",
             "-t",
@@ -358,9 +363,9 @@ fn capture_pane_in_session(
         return Ok(None);
     };
     Ok(text
-        .split_once('\n')
-        .filter(|(owner, _)| *owner == session_name)
-        .map(|(_, screen)| screen.to_owned()))
+        .strip_prefix(OWNS)
+        .and_then(|rest| rest.strip_prefix('\n'))
+        .map(str::to_owned))
 }
 
 impl Session {

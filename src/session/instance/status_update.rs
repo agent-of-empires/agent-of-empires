@@ -1427,6 +1427,33 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         assert!(count > 1, "the foreign pane id is rejected, then resolved");
         assert!(session.capture_pane_at(&moved, 20).is_none());
 
+        // A window linked into a session tmux prefers still belongs to this one.
+        let linked = tmux::Session::generate_name("aoe_test_5788_cap", "pane id linked");
+        let _linked_guard = spawn_pane(&linked, "sleep 300");
+        let own = tmux::first_pane_id(&name).expect("own pane id");
+        let linked_in = crate::tmux::tmux_command()
+            .args([
+                "link-window",
+                "-s",
+                &format!("={name}:^"),
+                "-t",
+                &format!("={linked}:"),
+            ])
+            .output()
+            .expect("link-window");
+        assert!(linked_in.status.success(), "{linked_in:?}");
+        let preferred = crate::tmux::tmux_command()
+            .args(["display-message", "-p", "-t", &own, "#{session_name}"])
+            .output()
+            .expect("display-message");
+        assert_eq!(
+            String::from_utf8_lossy(&preferred.stdout).trim_end(),
+            linked,
+            "the bare id must resolve through the other session"
+        );
+        let out = session.capture_pane_at(&own, 20).expect("owned pane");
+        assert!(out.contains("pane-id-marker"), "{out:?}");
+
         // The previous VT channel still holds the moved pane: it is rejected, not re-selected.
         #[cfg(unix)]
         {
