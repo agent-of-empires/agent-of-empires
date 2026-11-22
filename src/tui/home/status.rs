@@ -588,7 +588,10 @@ impl HomeView {
             instance.notify_on_waiting = row.notify_on_waiting;
             instance.notify_on_idle = row.notify_on_idle;
             instance.notify_on_error = row.notify_on_error;
-            instance.last_error.clone_from(&row.last_error);
+            match row.last_error.as_deref() {
+                Some(error) => instance.last_error.set(error),
+                None => instance.last_error.clear(),
+            }
             instance.pane_dead_observed = row.pane_dead_observed;
             if let Some(status) = Status::from_api_str(&row.status) {
                 instance.status = status;
@@ -942,13 +945,16 @@ impl HomeView {
             return false;
         };
         let mut changed = instance.status != status
-            || instance.last_error != row.last_error
+            || instance.last_error.as_deref() != row.last_error.as_deref()
             || instance.pane_dead_observed != row.pane_dead_observed;
         if instance.status != status {
             crate::sound::play_for_transition(instance.status, status, &self.sound_config);
         }
         instance.status = status;
-        instance.last_error.clone_from(&row.last_error);
+        match row.last_error.as_deref() {
+            Some(error) => instance.last_error.set(error),
+            None => instance.last_error.clear(),
+        }
         instance.pane_dead_observed = row.pane_dead_observed;
         if row.view != crate::session::View::Structured
             || row.archived_at.is_some()

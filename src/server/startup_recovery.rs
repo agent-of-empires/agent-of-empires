@@ -859,7 +859,7 @@ mod tests {
                         View::Terminal
                     };
                     candidate.status = Status::Running;
-                    candidate.last_error = Some("previous diagnostic".into());
+                    candidate.last_error.set("previous diagnostic");
                     let mut shelved = candidate.clone();
                     shelve(&mut shelved);
                     test_support::seed_instances_on_disk_for_test("test", vec![shelved.clone()]);

@@ -90,7 +90,7 @@ impl Instance {
                 // Only a plain Idle is ever held, so there is no error explanation to keep or
                 // derive.
                 self.status = pending;
-                self.last_error = None;
+                self.last_error.clear();
             }
         }
         if let Some(prev) = baseline {
@@ -127,7 +127,7 @@ impl Instance {
     /// (a session converted to, or restarted in, the structured view).
     pub(crate) fn clear_stale_tmux_error(&mut self) {
         if reports_tmux_session_gone(self.last_error.as_deref()) {
-            self.last_error = None;
+            self.last_error.clear();
         }
     }
 
@@ -135,7 +135,7 @@ impl Instance {
     fn latch_tmux_error(&mut self, message: &str) {
         self.status = Status::Error;
         if self.last_error.is_none() {
-            self.last_error = Some(message.to_string());
+            self.last_error.set(message.to_string());
         }
         self.last_error_check = Some(std::time::Instant::now());
     }
@@ -148,7 +148,8 @@ impl Instance {
         }
         if self.last_error.is_none() {
             let pane_content = session.capture_pane(20).unwrap_or_default();
-            self.last_error = Some(summarize_error_from_pane(&pane_content));
+            self.last_error
+                .set(summarize_error_from_pane(&pane_content));
         }
     }
 
@@ -176,10 +177,11 @@ impl Instance {
         }
         let diagnostic = self
             .last_error
-            .take()
+            .as_deref()
             .filter(|error| {
-                error != TMUX_SESSION_GONE_ERROR && error != TMUX_SERVER_UNREACHABLE_ERROR
+                *error != TMUX_SESSION_GONE_ERROR && *error != TMUX_SERVER_UNREACHABLE_ERROR
             })
+            .map(str::to_owned)
             .or(seen);
         let ended = match (lead, diagnostic.as_deref()) {
             (Some(lead), Some(diagnostic)) => {
@@ -188,7 +190,7 @@ impl Instance {
             (Some(lead), None) => lead.to_string(),
             (None, diagnostic) => ended_sentence(diagnostic),
         };
-        self.last_error = Some(format!(
+        self.last_error.set(format!(
             "{ended} Terminal view can't start this Session again: {remedy}"
         ));
     }
@@ -347,12 +349,12 @@ impl Instance {
                 if is_dead {
                     self.explain_error_from_pane(&session, true);
                 } else if self.last_error.is_none() {
-                    self.last_error = Some(summarize_error_from_pane(
+                    self.last_error.set(summarize_error_from_pane(
                         &session.capture_pane(20).unwrap_or_default(),
                     ));
                 }
             } else {
-                self.last_error = None;
+                self.last_error.clear();
             }
             return;
         }
@@ -416,7 +418,7 @@ impl Instance {
                 if hook.status == Status::Error {
                     self.explain_error_from_pane(&session, false);
                 } else {
-                    self.last_error = None;
+                    self.last_error.clear();
                 }
                 return;
             }
@@ -477,10 +479,11 @@ impl Instance {
 
         if self.status == Status::Error {
             if self.last_error.is_none() {
-                self.last_error = Some(summarize_error_from_pane(&pane_content));
+                self.last_error
+                    .set(summarize_error_from_pane(&pane_content));
             }
         } else {
-            self.last_error = None;
+            self.last_error.clear();
         }
     }
 
@@ -677,12 +680,12 @@ impl Instance {
                     self.name_refused_restart(None, diagnostic.clone());
                 }
                 if self.last_error.is_none() {
-                    self.last_error = Some(
+                    self.last_error.set(
                         diagnostic.unwrap_or_else(|| summarize_error_from_pane(&pane_content)),
                     );
                 }
             } else {
-                self.last_error = None;
+                self.last_error.clear();
             }
         }
         self.detection.activity = activity;
@@ -830,11 +833,14 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.archive();
         inst.update_status_with_metadata(None, None);
-        assert_eq!((inst.status, inst.last_error.clone()), (Status::Idle, None));
+        assert_eq!(
+            (inst.status, inst.last_error.as_deref()),
+            (Status::Idle, None)
+        );
 
         // A genuine failure survives archive and unarchive.
         inst.status = Status::Error;
-        inst.last_error = Some("agent crashed".to_string());
+        inst.last_error.set("agent crashed".to_string());
         inst.update_status_with_metadata(None, None);
         assert_eq!(inst.status, Status::Error);
         inst.unarchive();
@@ -970,7 +976,9 @@ mod tests {
         for (label, reachable, status, error, ever, streak, want_status, want_error) in cases {
             let mut inst = Instance::new("existence", "/tmp/existence");
             inst.status = status;
-            inst.last_error = error.map(str::to_string);
+            if let Some(error) = error {
+                inst.last_error.set(error);
+            }
             inst.ever_confirmed_present = ever;
             inst.unknown_since = streak.map(|age| Instant::now() - age);
             let guard = crate::tmux::SessionCacheGuard::capture();
@@ -1331,7 +1339,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         inst.source_profile = PROFILE.to_string();
         inst.tool = "settl".to_string();
         inst.status = Status::Running;
-        inst.last_error = None;
+        inst.last_error.clear();
         write_hook_status(&inst.id, "error");
 
         let name = tmux::Session::generate_name(&inst.id, &inst.title);
@@ -1349,7 +1357,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
 
         // A standing explanation is the better one: it came from whatever
         // first diagnosed the failure.
-        inst.last_error = Some("agent crashed".to_string());
+        inst.last_error.set("agent crashed".to_string());
         inst.last_error_check = None;
         inst.update_status_with_metadata_inner(Some(&metadata), None);
         crate::hooks::cleanup_hook_status_dir(&inst.id);
@@ -1422,7 +1430,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
                 crate::tmux::SessionExistence::Unknown,
             ));
             latched.clear_stale_tmux_error();
-            assert_eq!(latched.last_error, None);
+            assert_eq!(latched.last_error.as_deref(), None);
         }
 
         // No tmux server, as after the last pane ended, past the window that waits for one.
@@ -1457,7 +1465,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
                 assert_eq!(inst.last_error.as_deref(), Some(ended.as_str()));
             } else {
                 assert_ne!(inst.status, Status::Error);
-                assert_eq!(inst.last_error, None);
+                assert_eq!(inst.last_error.as_deref(), None);
             }
         }
 
@@ -1467,7 +1475,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         {
             let mut inst = conflicting();
             inst.status = Status::Error;
-            inst.last_error = Some(live.into());
+            inst.last_error.set(live);
             let _cache = force_session_absent();
             inst.update_status_with_metadata_inner(None, None);
             let gone = refused(&inst, &format!("{TMUX_SESSION_GONE_LEAD} {live}."));
@@ -1488,7 +1496,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         {
             let mut inst = conflicting();
             inst.status = Status::Error;
-            inst.last_error = Some(live.into());
+            inst.last_error.set(live);
             write_hook_status(&inst.id, "running");
             let name = tmux::Session::generate_name(&inst.id, &inst.title);
             let guard = crate::tmux::SessionCacheGuard::capture();
@@ -1790,7 +1798,8 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
                 Some(message),
                 "footer_rows={footer_rows}, caption={caption:?}"
             );
-            inst.last_error = Some("Earlier failure remains latched".to_owned());
+            inst.last_error
+                .set("Earlier failure remains latched".to_owned());
             inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
             assert_eq!(
                 inst.last_error.as_deref(),
@@ -1834,7 +1843,8 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             inst.tool = "omp".to_owned();
             inst.source_profile = format!("omp-error-cleared-{}", inst.id);
             inst.status = Status::Error;
-            inst.last_error = Some("Earlier provider request denied".to_owned());
+            inst.last_error
+                .set("Earlier provider request denied".to_owned());
             let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
             let _guard = spawn_pane(
                 &session_name,
@@ -1849,7 +1859,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
 
             assert_eq!(inst.status, expected, "{current}");
-            assert_eq!(inst.last_error, None, "{current}");
+            assert_eq!(inst.last_error.as_deref(), None, "{current}");
         }
     }
 
@@ -1900,8 +1910,11 @@ HISTORY_READY",
             Status::Error,
         ] {
             inst.status = status;
-            inst.last_error =
-                (status == Status::Error).then(|| "Provider denied request".to_owned());
+            if status == Status::Error {
+                inst.last_error.set("Provider denied request");
+            } else {
+                inst.last_error.clear();
+            }
             let diagnostic = inst.last_error.clone();
             for _ in 0..2 {
                 poll(&mut inst, &metadata);
@@ -1910,7 +1923,7 @@ HISTORY_READY",
             }
         }
         inst.status = Status::Running;
-        inst.last_error = None;
+        inst.last_error.clear();
         metadata.pane_current_command = Some("bash".to_owned());
         poll(&mut inst, &metadata);
         poll(&mut inst, &metadata);
@@ -1919,7 +1932,7 @@ HISTORY_READY",
             Status::Idle,
             "history cannot retain Running after ownership loss"
         );
-        inst.last_error = None;
+        inst.last_error.clear();
         metadata.pane_start_command_is_protected = true;
         inst.status = Status::Waiting;
         poll(&mut inst, &metadata);

@@ -54,6 +54,7 @@ pub(crate) use hooks::HostHookApprovalRequired;
 pub(crate) use status_update::CAPTURE_FAILED_RULE;
 mod identity_sidecar;
 mod kill;
+mod last_error;
 mod launch_command;
 mod prime_capture;
 
@@ -91,6 +92,7 @@ pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservati
 
 #[cfg(test)]
 pub(crate) use identity_sidecar::FAIL_PI_PATH_WRITES;
+pub use last_error::LastError;
 pub use polling::PollerStart;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome, SessionGone};
 pub use resume::ManagedResumeCause;
@@ -1036,7 +1038,7 @@ pub struct Instance {
     pub(crate) pi_session_path: Option<String>,
 
     #[serde(skip)]
-    pub last_error: Option<String>,
+    pub last_error: LastError,
     #[serde(skip)]
     pub(crate) capture_poller: capture_slot::CapturePollerSlot,
     /// Session IDs invalidated at a fresh-generation boundary. Persisting this

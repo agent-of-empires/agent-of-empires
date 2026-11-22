@@ -248,7 +248,7 @@ async fn commit_structured_view(
             slot.status = Status::Idle;
             slot.idle_dormant_since = None;
             slot.idle_entered_at = None;
-            slot.last_error = None;
+            slot.last_error.clear();
             slot.lifecycle_generation = generation;
             slot.acp_load_session_capable = None;
             Ok(slot.lifecycle_generation)
@@ -1813,7 +1813,7 @@ fn drive_terminal_handoff(
                             // replaced, never on disk.
                             current.terminal_handoff = None;
                             current.status = Status::Error;
-                            current.last_error = Some(command_selector_ended(&cleanup_id));
+                            current.last_error.set(command_selector_ended(&cleanup_id));
                             if let Err(error) = native.adopt_runtime_fields(&current) {
                                 tracing::warn!(target: "acp.switch", session = %cleanup_id, %error, "ended handoff's remedy not published");
                             }

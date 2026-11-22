@@ -7305,7 +7305,7 @@ async fn failed_delete_notifies_plugins_of_the_error() {
                     .find(|row| row.id == "sess-delete-error")
                     .unwrap();
                 row.status = Status::Error;
-                row.last_error = Some("boom".into());
+                row.last_error.set("boom");
                 Ok(())
             })
             .unwrap();
