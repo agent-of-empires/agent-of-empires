@@ -1,5 +1,5 @@
 import { useEffect, useSyncExternalStore } from "react";
-import { isIOS, isSecureOrigin, isStandalone } from "../lib/platform";
+import { isIOS, isSecureOrigin, isStandalone, supportsPush } from "../lib/platform";
 import {
   classifyPushHealth,
   hasFreshGoneFailure,
@@ -24,9 +24,6 @@ export type PushState =
     }
   | { kind: "disabled-by-server" }
   | { kind: "error"; message: string };
-
-const supportsPush = (): boolean =>
-  typeof window !== "undefined" && "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
 
 const iosTab = () => isIOS() && !isStandalone();
 

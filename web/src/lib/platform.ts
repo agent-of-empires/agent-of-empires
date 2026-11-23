@@ -1,7 +1,10 @@
 // Shared side-effect-free platform probes.
 
-/** Misses iPadOS in desktop mode, which reports a Mac userAgent; callers only need iPhone. */
-export const isIOS = (): boolean => typeof navigator !== "undefined" && /iPad|iPhone|iPod/.test(navigator.userAgent);
+/** iPhone, iPod or iPad, including iPadOS in desktop mode: a Mac userAgent with touch points, which a real Mac lacks. */
+export const isIOS = (): boolean =>
+  typeof navigator !== "undefined" &&
+  (/iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1));
 
 export const isStandalone = (): boolean => {
   if (typeof window === "undefined") return false;
@@ -22,21 +25,22 @@ export const isSecureOrigin = (): boolean => {
   return host === "localhost" || host === "127.0.0.1" || host === "[::1]";
 };
 
-export type InstallHint = "ios" | "android" | "other";
+export const supportsPush = (): boolean =>
+  typeof window !== "undefined" && "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
 
-/** iPadOS in desktop mode reports a Mac userAgent; a real Mac has no touch points. */
-const isIPadDesktopMode = (): boolean =>
-  typeof navigator !== "undefined" && /Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1;
+/** `ios` installs to the Home Screen, `push` turns notifications on in this tab, `other` installs from the browser's menu. */
+export type InstallHint = "ios" | "push" | "other";
 
 /**
- * Which install steps a phone or tablet browser tab needs; null for an installed app, a desktop,
- * or an insecure origin. iOS and Android are known from the userAgent, whatever the pointer (an
- * iPad with a trackpad, an Android device with a mouse). Anything else needs touch hardware.
+ * What a phone or tablet browser tab needs for notifications; null for an installed app, a desktop,
+ * or an insecure origin. iOS comes first because its Safari exposes push only to Home Screen apps.
+ * Android is a touch device whatever its pointer; anything else needs touch points and no fine
+ * pointer. Whether the tab can push is feature-detected, not read from the userAgent.
  */
 export function installHint(): InstallHint | null {
   if (isStandalone() || !isSecureOrigin()) return null;
-  if (isIOS() || isIPadDesktopMode()) return "ios";
-  if (/Android/.test(navigator.userAgent)) return "android";
-  if (hasFinePointer()) return null;
-  return navigator.maxTouchPoints > 0 ? "other" : null;
+  if (isIOS()) return "ios";
+  const touchDevice = /Android/.test(navigator.userAgent) || (!hasFinePointer() && navigator.maxTouchPoints > 0);
+  if (!touchDevice) return null;
+  return supportsPush() ? "push" : "other";
 }

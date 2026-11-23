@@ -41,10 +41,40 @@ export interface TourStep {
   installHint?: true;
 }
 
-export const INSTALL_HINTS: Record<InstallHint, string> = {
-  ios: "For notifications, add this page to your Home Screen (Share › Add to Home Screen), open it from there, sign in, and turn them on.",
-  android: "For notifications, install this app (browser menu › Install app), open it, sign in, and turn them on.",
-  other: "For notifications, install this app from your browser's menu, open it, sign in, and turn them on.",
+/** One platform's notification steps, shared by the install banner, Settings › Notifications and the tour. */
+export interface InstallSteps {
+  /** The banner's text after "Get notifications on this device." For `push`, Settings › Notifications is its link. */
+  banner: { path?: string; text: string };
+  /** The steps Settings › Notifications lists; `push` has none, since its Enable button is the step. */
+  settings: readonly string[];
+  /** The tour's last-step line. */
+  tour: string;
+}
+
+export const INSTALL_STEPS: Record<InstallHint, InstallSteps> = {
+  ios: {
+    banner: { path: "Share › Add to Home Screen", text: "Open AoE, sign in, and turn them on in Settings." },
+    settings: [
+      "Tap Share › Add to Home Screen.",
+      "Open AoE from your Home Screen and sign in.",
+      "Come back here and tap Enable notifications.",
+    ],
+    tour: "For notifications, tap Share › Add to Home Screen, open AoE, sign in, and turn them on in Settings.",
+  },
+  push: {
+    banner: { text: "Turn them on in Settings › Notifications." },
+    settings: [],
+    tour: "For notifications, turn them on in Settings › Notifications.",
+  },
+  other: {
+    banner: { text: "Install AoE from your browser's menu. Open AoE, sign in, and turn them on in Settings." },
+    settings: [
+      "Install AoE from your browser's menu.",
+      "Open AoE and sign in.",
+      "Come back here and tap Enable notifications.",
+    ],
+    tour: "For notifications, install AoE from your browser's menu, open it, sign in, and turn them on in Settings.",
+  },
 };
 
 /** Skips inert retained views, whose hidden anchors would otherwise match first and end the tour. */

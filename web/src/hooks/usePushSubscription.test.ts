@@ -144,6 +144,7 @@ afterEach(() => {
   for (const [key, descriptor] of Object.entries(originalDescriptors)) {
     if (descriptor) Object.defineProperty(navigator, key, descriptor);
   }
+  delete (navigator as { maxTouchPoints?: number }).maxTouchPoints;
 });
 
 async function mountAndSettle() {
@@ -174,6 +175,17 @@ describe("usePushSubscription initial refresh", () => {
       () => {
         removePushManager();
         setUserAgent(IOS_UA);
+      },
+      unsupported("ios-not-standalone"),
+    ],
+    [
+      "an iPad Safari tab in desktop mode",
+      () => {
+        removePushManager();
+        setUserAgent(
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.0 Safari/605.1.15",
+        );
+        Object.defineProperty(navigator, "maxTouchPoints", { configurable: true, value: 5 });
       },
       unsupported("ios-not-standalone"),
     ],

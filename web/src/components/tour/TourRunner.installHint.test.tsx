@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import TourRunner from "./TourRunner";
-import { INSTALL_HINTS, TOUR_STEPS } from "../../lib/tourSteps";
+import { INSTALL_STEPS, TOUR_STEPS } from "../../lib/tourSteps";
 import type { InstallHint } from "../../lib/platform";
 
 const platform = vi.hoisted(() => ({ hint: null as InstallHint | null }));
@@ -33,16 +33,16 @@ afterEach(() => {
 const stepText = (id: string) => document.querySelector(`[data-step="${id}"]`)?.textContent ?? "";
 
 describe("TourRunner install hint", () => {
-  it.each(["ios", "android", "other"] as const)("adds the %s line to the last step only", (hint) => {
+  it.each(["ios", "push", "other"] as const)("adds the %s line to the last step only", (hint) => {
     platform.hint = hint;
     render(<TourRunner run steps={[...TOUR_STEPS]} onFinish={() => {}} />);
-    expect(screen.getAllByText(INSTALL_HINTS[hint])).toHaveLength(1);
-    expect(stepText("topbar-more")).toContain(INSTALL_HINTS[hint]);
+    expect(screen.getAllByText(INSTALL_STEPS[hint].tour)).toHaveLength(1);
+    expect(stepText("topbar-more")).toContain(INSTALL_STEPS[hint].tour);
   });
 
   it("shows no install line where the platform needs none", () => {
     render(<TourRunner run steps={[...TOUR_STEPS]} onFinish={() => {}} />);
-    for (const text of Object.values(INSTALL_HINTS)) expect(screen.queryByText(text)).toBeNull();
+    for (const { tour: text } of Object.values(INSTALL_STEPS)) expect(screen.queryByText(text)).toBeNull();
     expect(stepText("topbar-more")).toBe(TOUR_STEPS.find((s) => s.id === "topbar-more")?.body);
   });
 });

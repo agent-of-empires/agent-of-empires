@@ -1112,6 +1112,27 @@
       "notes": "Deferred-operation tests cover an enable that settles after every consumer unmounted and remounted, and refresh registration POSTs (one or two overlapping) that must not land after disable."
     },
     {
+      "id": "notifications.install-banner",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/live/install-banner.spec.ts",
+        "tests/tour-install-hint.spec.ts",
+        "src/components/__tests__/InstallBanner.test.tsx",
+        "src/components/__tests__/BannerStack.test.tsx",
+        "src/components/__tests__/NotificationSettings.test.tsx",
+        "src/lib/__tests__/platform.test.ts"
+      ],
+      "components": [
+        "web/src/components/InstallBanner.tsx",
+        "web/src/components/BannerStack.tsx",
+        "web/src/components/NotificationSettings.tsx",
+        "web/src/lib/platform.ts",
+        "web/src/lib/tourSteps.ts"
+      ],
+      "notes": "#4595: a phone or tablet browser tab gets iOS Home Screen steps (any iPad, including desktop mode), a Settings › Notifications link where the tab can push (feature-detected), or the generic install line. It hides once installed, when push is on, denied or off on the server, while Disconnected or the tour runs, and for good after ×; Settings › Notifications shows each platform's own step. Live: an iPhone with the tour seen and never opened, and × across a reload."
+    },
+    {
       "id": "notifications.push-health-banner",
       "kind": "vitest",
       "risk": "medium",
@@ -5760,7 +5781,7 @@
         "web/src/components/SettingsView.tsx",
         "web/src/components/settings/SettingsIntro.tsx"
       ],
-      "notes": "#4595: the last step adds iOS, Android or generic install and notifications steps only in a phone or tablet browser tab over a secure origin. Any iPad gets the iOS steps, with a trackpad or in desktop mode; installed apps, desktops and plain HTTP get none."
+      "notes": "#4595: the last step adds the iOS Home Screen steps, a turn-them-on-in-Settings line where the tab can push, or the generic install line, only in a phone or tablet browser tab over a secure origin. Any iPad gets the iOS steps, with a trackpad or in desktop mode; installed apps, desktops and plain HTTP get none."
     },
     {
       "id": "onboarding.settings-tab-intros",

@@ -2,7 +2,7 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { ACTIONS, Joyride, EVENTS, STATUS, type EventData, type Step } from "react-joyride";
 import { installHint } from "../../lib/platform";
-import { INSTALL_HINTS, type TourShortcutHint, type TourStep, tourSelector } from "../../lib/tourSteps";
+import { INSTALL_STEPS, type TourShortcutHint, type TourStep, tourSelector } from "../../lib/tourSteps";
 import { SHORTCUTS_BY_ID, formatTourShortcut } from "../../lib/shortcuts";
 import { TOUR_RUNNER_OPTIONS, TOUR_RUNNER_STYLES } from "./tourRunnerStyles";
 
@@ -60,7 +60,7 @@ function toJoyrideStep(step: TourStep, installLine: string | undefined): Step {
 export default function TourRunner({ run, steps, onFinish }: TourRunnerProps) {
   const joyrideSteps = useMemo(() => {
     const platformHint = installHint();
-    const installLine = platformHint ? INSTALL_HINTS[platformHint] : undefined;
+    const installLine = platformHint ? INSTALL_STEPS[platformHint].tour : undefined;
     return steps.map((step) => toJoyrideStep(step, installLine));
   }, [steps]);
   const [stepIndex, setStepIndex] = useState(0);
