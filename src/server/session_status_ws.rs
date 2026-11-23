@@ -58,7 +58,9 @@ impl Dwells {
     }
 
     fn on_change(&mut self, change: &StatusChange, now: Instant) {
-        self.track(&change.instance_id, change.new, now);
+        if !(change.new == Status::Error && change.rearms_error()) {
+            self.track(&change.instance_id, change.new, now);
+        }
     }
 
     /// A dwell for every session already in a cueing status, so a new connection still cues a
@@ -267,6 +269,38 @@ mod tests {
         );
         assert!(dwells.take_due(t0 + Duration::from_secs(60)).is_empty());
         assert_eq!(dwells.next_due(), None);
+    }
+
+    /// #5921: push's Error to Error re-arm moves nothing, so the sound dwell keeps its time and
+    /// a cued Error doesn't replay. A Retry's rollback, Error to Starting to Error, does move the
+    /// status, and cues once.
+    #[test]
+    fn a_rollback_cues_once_and_a_push_only_rearm_replays_nothing() {
+        use Status::{Error, Starting};
+        let step = |old, new, restores_prior| StatusChange {
+            old,
+            restores_prior,
+            ..change("a", new)
+        };
+        let t0 = Instant::now();
+        let later = |secs| t0 + Duration::from_secs(secs);
+        let mut dwells = Dwells::default();
+        dwells.on_change(&change("a", Error), t0);
+        let pending = dwells.next_due();
+        assert!(pending.is_some(), "an Error cues");
+        dwells.on_change(&step(Error, Error, false), later(1));
+        assert_eq!(
+            dwells.next_due(),
+            pending,
+            "a re-arm keeps a pending cue's time"
+        );
+        let mut cues = vec![dwells.take_due(later(60)).len()];
+        dwells.on_change(&step(Error, Starting, false), later(61));
+        dwells.on_change(&step(Starting, Error, true), later(62));
+        cues.push(dwells.take_due(later(120)).len());
+        dwells.on_change(&step(Error, Error, false), later(121));
+        cues.push(dwells.take_due(later(180)).len());
+        assert_eq!(cues, [1, 1, 0], "the first Error, the rollback, the re-arm");
     }
 
     fn cursor(revision: u64) -> RuntimeCursor {
