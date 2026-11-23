@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
-use super::home::update_bar::{DrawnBar, UpdateBar};
+use super::home::update_bar::{DrawnBar, PullLine, UpdateBar};
 use super::home::{bindings, HomeView, TerminalMode};
 use super::image_pull::{
     self, Applied, ImageOffer, PullAnswer, PullReport, PullRequest, PullSource, PullWatch,
@@ -80,6 +80,7 @@ type PullRunner =
 
 const CANCEL_PULL_PROMPT: &str =
     "Press y to cancel the download. To keep going, press any other key.";
+const CANCEL_UNSENT: &str = "Nothing was cancelled: the Daemon didn't answer the download's start.";
 
 /// The cancel prompt's confirming key: not Ctrl+E, so holding Ctrl+E can't confirm it.
 const CONFIRM_CANCEL_PULL: KeyCode = KeyCode::Char('y');
@@ -94,6 +95,12 @@ fn run_pull_request(
         let _ = tx.send(answer);
     });
     rx
+}
+
+/// What the banner polls need redrawn this loop.
+struct BannerRedraw {
+    clear: bool,
+    repaint: bool,
 }
 
 pub struct App {
@@ -126,7 +133,7 @@ pub struct App {
     pull_image: String,
     /// The update the watched pull installs, recorded when it starts.
     pull_digest: Option<String>,
-    /// A Cancel asked for while the Start is in flight; sent once the Start answers.
+    /// A Cancel asked for while the Start is in flight; sent once the Start's answer shows the pull.
     cancel_after_start: bool,
     /// The update a pull this TUI watched just installed, so a stale offer of it stays away.
     pulled_image_digest: Option<String>,
@@ -1328,11 +1335,12 @@ impl App {
                 refresh_needed = true;
             }
             needs_full_refresh |= self.poll_tool_detection();
-            // Every banner poll must run.
-            if self.poll_update_check() | self.poll_update_status() | self.poll_pull() {
+            let banners = self.poll_banners();
+            if banners.clear {
                 self.needs_redraw = true;
                 needs_full_refresh = true;
             }
+            needs_full_refresh |= banners.repaint;
 
             self.home.request_plugin_ui_refresh();
 
@@ -1769,12 +1777,30 @@ impl App {
         true
     }
 
+    /// Runs every banner poll. A pull's progress changes each second, so it takes the diffed
+    /// repaint: a full clear would flash the screen.
+    fn poll_banners(&mut self) -> BannerRedraw {
+        BannerRedraw {
+            clear: self.poll_update_check() | self.poll_update_status(),
+            repaint: self.poll_pull(),
+        }
+    }
+
     fn start_pull(&mut self, image: String) {
+        self.pull_digest = self.offered_digest(&image);
         self.pull_image = image.clone();
-        self.pull_digest = self.image_update.as_ref().map(|u| u.remote_digest.clone());
         self.cancel_after_start = false;
         self.pull.start();
         self.request_pull(PullRequest::Start, image);
+    }
+
+    /// The digest on offer for `image`: another image's offer says nothing about this pull.
+    /// An offer names the image the Daemon resolved, the default's included.
+    fn offered_digest(&self, image: &str) -> Option<String> {
+        self.image_update
+            .as_ref()
+            .filter(|update| update.image == image)
+            .map(|update| update.remote_digest.clone())
     }
 
     /// A poll waits for the request in flight, and so does a cancel behind a start, which the
@@ -1819,14 +1845,18 @@ impl App {
                 PullReport::Unavailable.into()
             }
         };
-        let changed = match self.pull.apply(request, report) {
+        let applied = self.pull.apply(request, report);
+        // A Start the Daemon didn't answer may never have reached it, so a running pull it then
+        // polls may be another client's, which a cancel would stop.
+        let start_unanswered = request == PullRequest::Start && applied == Applied::Recheck;
+        let changed = match applied {
             Applied::Unchanged => false,
             Applied::Changed => true,
             Applied::Updated => {
                 let installed = self
                     .pull_digest
                     .take()
-                    .or_else(|| self.image_update.as_ref().map(|u| u.remote_digest.clone()));
+                    .or_else(|| self.offered_digest(&self.pull_image));
                 if self.image_update.as_ref().map(|u| &u.remote_digest) == installed.as_ref() {
                     self.image_update = None;
                 }
@@ -1846,11 +1876,11 @@ impl App {
         if self.pull.running() {
             // A pull seen running elsewhere installs the update on offer now, and is of the
             // image this poll reported on.
-            if self.pull_digest.is_none() {
-                self.pull_digest = self.image_update.as_ref().map(|u| u.remote_digest.clone());
-            }
             if self.pull_image.is_empty() {
                 self.pull_image = image.unwrap_or_default();
+            }
+            if self.pull_digest.is_none() {
+                self.pull_digest = self.offered_digest(&self.pull_image);
             }
         } else if !self.pull.holds_line() {
             self.pull_image.clear();
@@ -1860,7 +1890,11 @@ impl App {
             && std::mem::take(&mut self.cancel_after_start)
             && self.pull.running()
         {
-            self.request_pull(PullRequest::Cancel, self.pull_image.clone());
+            if start_unanswered {
+                self.set_status(CANCEL_UNSENT);
+            } else {
+                self.request_pull(PullRequest::Cancel, self.pull_image.clone());
+            }
         }
         offered || changed
     }
@@ -2329,7 +2363,8 @@ impl App {
             self.request_pull(PullRequest::Cancel, self.pull_image.clone());
             return Ok(());
         }
-        self.pull.other_key();
+        self.pull
+            .other_key(self.drawn_bar == Some(DrawnBar::Pull(PullLine::Done)));
         self.clear_cancel_pull_prompt();
         match (key.code, key.modifiers) {
             // Ctrl+C belongs to the agent in live-send.
@@ -3552,7 +3587,6 @@ pub enum Action {
 mod tests {
     use super::*;
     use crate::containers::image_pull::PullState;
-    use crate::tui::home::update_bar::PullLine;
 
     fn key_app() -> (App, Terminal<TuiBackend>) {
         let app = App::new(
@@ -3665,6 +3699,7 @@ mod tests {
         app.dismissed_image_digest = None;
 
         answer_pull(&mut app, PullRequest::Poll, offered(&image_update()));
+        app.pull_image = image_update().image;
         app.pull.start();
         answer_pull(
             &mut app,
@@ -3686,6 +3721,7 @@ mod tests {
         let (mut app, mut terminal) = key_app();
         app.update_info = Some(app_update());
         app.image_update = Some(image_update());
+        app.pull_image = image_update().image;
         app.pull.start();
         let dismissed = || AppStateConfig::load().unwrap().dismissed_update_version;
 
@@ -3772,8 +3808,8 @@ mod tests {
     }
 
     /// A cancel while the Start is in flight waits for it, then goes out, of the image the pull
-    /// started with although the default has since changed; a Start the Daemon didn't answer
-    /// polls again at once rather than dropping the watch.
+    /// started with although the default has since changed. A Start the Daemon didn't answer
+    /// polls again at once rather than dropping the watch, and sends no cancel.
     #[tokio::test]
     #[serial_test::serial]
     async fn a_cancel_behind_a_start_waits_for_it_and_names_the_watched_image() {
@@ -3823,8 +3859,27 @@ mod tests {
         app.pull_rx = None;
         app.start_pull(IMAGE.into());
         app.next_pull_poll = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        app.handle_key(ctrl_e, &mut terminal).await.unwrap();
+        app.handle_key(confirm, &mut terminal).await.unwrap();
         answer_sent(&mut app, &sent, 0, PullReport::Unavailable);
         assert!(app.pull.running(), "an unanswered Start dropped the watch");
+        assert!(
+            sent_requests(&sent).is_empty(),
+            "a cancel went out behind a Start the Daemon may never have had"
+        );
+        assert_eq!(
+            app.update_status.as_ref().map(|s| s.text.as_str()),
+            Some(CANCEL_UNSENT)
+        );
+        answer_pull(
+            &mut app,
+            PullRequest::Poll,
+            PullReport::State(PullState::Running(Default::default())),
+        );
+        assert!(
+            sent_requests(&sent).is_empty(),
+            "a poll's pull, maybe another client's, was cancelled"
+        );
         let now = std::time::Instant::now();
         assert!(
             app.next_pull_poll <= now,
@@ -3879,6 +3934,130 @@ mod tests {
         answer_pull(&mut app, PullRequest::Poll, poll(PullState::Done, &newer));
         assert_eq!(app.image_update, Some(newer));
         assert_eq!(app.pulled_image_digest, Some(image_update().remote_digest));
+    }
+
+    /// A pull's progress repaints the screen without the full clear an app update gets, which
+    /// would flash it every second while the image downloads.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pull_progress_repaints_without_a_full_clear() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let (mut app, _terminal) = key_app();
+        let sent = hold_pull_requests(&mut app);
+        app.start_pull(image_update().image);
+        let (_, _, tx) = sent.lock().unwrap().remove(0);
+        let progress = crate::containers::pull_progress::ProgressSnapshot {
+            layers_done: Some(1),
+            layers_known: Some(7),
+            ..Default::default()
+        };
+        let _ = tx.send(PullReport::State(PullState::Running(progress)).into());
+        let banners = app.poll_banners();
+        assert!(banners.repaint, "a progress change wasn't redrawn");
+        assert!(!banners.clear, "a progress change cleared the screen");
+    }
+
+    /// A pull is tied to an offer's digest only when the offer is for the pulled image, so
+    /// pulling A never takes off or suppresses B's offer: at the confirm, at Done, and for a
+    /// pull first seen running elsewhere.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_pull_records_only_its_own_images_digest() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let a = image_update();
+        let b = ImageUpdate {
+            image: "ghcr.io/example/other:latest".into(),
+            remote_digest: "sha256:bbb".into(),
+        };
+        let running = || PullReport::State(PullState::Running(Default::default()));
+        let done = || PullReport::State(PullState::Done);
+        for case in ["confirm", "done", "running elsewhere"] {
+            let (mut app, mut terminal) = key_app();
+            let sent = hold_pull_requests(&mut app);
+            match case {
+                // The offer moves to B between opening A's confirm and pressing `y`.
+                "confirm" => {
+                    app.image_update = Some(a.clone());
+                    app.home.prompt_pull_sandbox_image(a.image.clone());
+                    app.image_update = Some(b.clone());
+                    let yes = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+                    app.handle_key(yes, &mut terminal).await.unwrap();
+                    assert_eq!(
+                        sent_requests(&sent),
+                        [(PullRequest::Start, a.image.clone())]
+                    );
+                    answer_sent(&mut app, &sent, 0, running());
+                }
+                // Nothing on offer at the start; B arrives before Done.
+                "done" => {
+                    app.start_pull(a.image.clone());
+                    answer_sent(&mut app, &sent, 0, running());
+                    app.image_update = Some(b.clone());
+                }
+                // A pull of A first seen on a poll while B is on offer.
+                _ => {
+                    app.image_update = Some(b.clone());
+                    answer_pull(
+                        &mut app,
+                        PullRequest::Poll,
+                        PullAnswer {
+                            report: running(),
+                            offer: None,
+                            image: Some(a.image.clone()),
+                        },
+                    );
+                    assert!(app.pull.running(), "{case}: the pull isn't shown");
+                }
+            }
+            answer_pull(&mut app, PullRequest::Poll, done());
+            assert_eq!(app.pull.line(), Some(&PullLine::Done), "{case}");
+            assert_eq!(
+                app.image_update,
+                Some(b.clone()),
+                "{case}: A's pull took off B"
+            );
+            assert_ne!(
+                app.pulled_image_digest,
+                Some(b.remote_digest.clone()),
+                "{case}: B's offer is suppressed"
+            );
+        }
+    }
+
+    /// A key acknowledges Done only once a frame drew it: behind a status, it waits.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_key_acknowledges_done_only_once_it_was_drawn() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let (mut app, mut terminal) = key_app();
+        let _sent = hold_pull_requests(&mut app);
+        app.start_pull(image_update().image);
+        answer_pull(
+            &mut app,
+            PullRequest::Poll,
+            PullReport::State(PullState::Running(Default::default())),
+        );
+        answer_pull(
+            &mut app,
+            PullRequest::Poll,
+            PullReport::State(PullState::Done),
+        );
+        app.update_status = Some(UpdateStatus::persistent("updating aoe…".into()));
+        draw(&mut app);
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        app.handle_key(down, &mut terminal).await.unwrap();
+        assert_eq!(
+            app.pull.line(),
+            Some(&PullLine::Done),
+            "a key cleared a Done the status hid"
+        );
+        app.update_status = None;
+        draw(&mut app);
+        app.handle_key(down, &mut terminal).await.unwrap();
+        assert_eq!(app.pull.line(), None, "a drawn Done outlived the next key");
     }
 
     /// The Daemon's state is read with this TUI's update checks off and no sandbox in use: the

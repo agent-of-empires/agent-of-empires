@@ -4475,9 +4475,11 @@ impl HomeView {
             } else {
                 ""
             };
+            let badge = self.hidden_pull_badge(theme);
             // Spaces between chip, title and chord. The title gets what is left after
-            // the fixed pieces, reserved last so the exit chord never falls off.
-            let fixed_width = unicode_width::UnicodeWidthStr::width(chip)
+            // the fixed pieces, reserved last so the exit chord and the pull badge never fall off.
+            let fixed_width = badge.as_ref().map_or(0, |badge| 2 + badge.width())
+                + unicode_width::UnicodeWidthStr::width(chip)
                 + 1 // single space after the chip
                 + 2 // double space before the chord
                 + unicode_width::UnicodeWidthStr::width(flash)
@@ -4516,7 +4518,7 @@ impl HomeView {
                     Style::default().fg(theme.dimmed).italic(),
                 ));
             }
-            if let Some(badge) = self.hidden_pull_badge(theme) {
+            if let Some(badge) = badge {
                 spans.push(Span::raw("  "));
                 spans.push(badge);
             }

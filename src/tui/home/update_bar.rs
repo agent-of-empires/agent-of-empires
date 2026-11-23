@@ -155,11 +155,7 @@ impl PullLine {
                 &format!("  [{update}] try again  [{hide}] dismiss"),
                 width,
             ),
-            Self::Gated { command } => shorten(
-                &format!(" Sandbox image pulls are off here. Run: {command}"),
-                &format!("  [{hide}] dismiss"),
-                width,
-            ),
+            Self::Gated { command } => gated(command, &format!("  [{hide}] dismiss"), width),
         }
     }
 }
@@ -186,21 +182,48 @@ fn meter(done: u32, known: u32) -> String {
     "▰".repeat(filled) + &"▱".repeat(CELLS as usize - filled)
 }
 
+/// The manual command is the line's only remedy, so it stays whole while it fits: the
+/// prefix shortens first, then the dismiss hint goes (its key still works).
+fn gated(command: &str, keys: &str, width: usize) -> String {
+    let long = format!(" Sandbox image pulls are off here. Run: {command}");
+    let short = format!(" Pulls are off. Run: {command}");
+    for (message, keys) in [(&long, keys), (&short, keys), (&short, "")] {
+        if message.width() + keys.width() <= width {
+            return format!("{message}{keys}");
+        }
+    }
+    cut(&short, width)
+}
+
 /// `message` then `keys`, cutting the message short with an ellipsis so the keys still fit.
 fn shorten(message: &str, keys: &str, width: usize) -> String {
     if message.width() + keys.width() <= width {
         return format!("{message}{keys}");
     }
-    let mut room = width.saturating_sub(keys.width() + 1);
+    if keys.width() + 1 > width {
+        // Not even the keys fit, so the line is cut as a whole.
+        return cut(&format!("{message}{keys}"), width);
+    }
+    format!("{}{keys}", cut(message, width - keys.width()))
+}
+
+/// `text` within `width` columns, ending in an ellipsis when cut.
+fn cut(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_string();
+    }
+    let Some(mut room) = width.checked_sub(1) else {
+        return String::new();
+    };
     let mut kept = String::new();
-    for c in message.chars() {
+    for c in text.chars() {
         let Some(left) = room.checked_sub(c.width().unwrap_or(0)) else {
             break;
         };
         room = left;
         kept.push(c);
     }
-    format!("{kept}…{keys}")
+    kept + "…"
 }
 
 #[cfg(test)]
@@ -275,6 +298,9 @@ mod tests {
         let unpacking = snapshot(Some(PullPhase::Unpacking), Some(7), Some(7));
         let gated = PullLine::Gated {
             command: "docker pull ghcr.io/example/sandbox:latest".into(),
+        };
+        let default_gated = PullLine::Gated {
+            command: "docker pull ghcr.io/agent-of-empires/aoe-sandbox:1.19.0".into(),
         };
         for strict in [false, true] {
             let label = |id| bindings::label(id, strict);
@@ -358,6 +384,25 @@ mod tests {
                     vec!["Sandbox image pulls are off here. Run: docker pull ghcr.io/example/sandbox:latest", dismiss.as_str()],
                     vec![],
                 ),
+                // The default image's command stays whole: the prefix shortens, then the hint goes.
+                (
+                    default_gated.clone(),
+                    100,
+                    vec![" Pulls are off. Run: docker pull ghcr.io/agent-of-empires/aoe-sandbox:1.19.0", dismiss.as_str()],
+                    vec!["…"],
+                ),
+                (
+                    default_gated.clone(),
+                    80,
+                    vec![" Pulls are off. Run: docker pull ghcr.io/agent-of-empires/aoe-sandbox:1.19.0"],
+                    vec!["…", dismiss.as_str()],
+                ),
+                // Only a command wider than the row is cut.
+                (default_gated.clone(), 40, vec![" Pulls are off. Run: docker pull", "…"], vec![]),
+                // Narrower than the keys: the whole line is cut to the width.
+                (PullLine::Cancelled, 12, vec!["…"], vec![update.as_str()]),
+                (PullLine::Running(downloading), 3, vec!["…"], vec![]),
+                (PullLine::Cancelled, 0, vec![], vec!["…"]),
             ];
             for (line, width, shows, drops) in cases {
                 let text = line.text(width, strict, "⠹");

@@ -12,6 +12,8 @@ use crate::tui::home::update_bar::PullLine;
 
 const START_UNANSWERED: &str =
     "Couldn't start the sandbox image download: the Daemon didn't answer.";
+const CANCEL_GATED: &str =
+    "Couldn't cancel the sandbox image download: image pulls are off on the Daemon.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PullRequest {
@@ -261,15 +263,21 @@ impl PullWatch {
             PullReport::State(PullState::Failed { reason, .. }) => {
                 self.end(Some(PullLine::Failed(reason)))
             }
+            // A refused cancel leaves the download running, and hidden if it was.
+            PullReport::Gated { .. } if request == PullRequest::Cancel => {
+                return Applied::Unanswered(CANCEL_GATED);
+            }
             PullReport::Gated { command } => self.end(Some(PullLine::Gated { command })),
             PullReport::UnknownImage => {
-                if !self.running() || request == PullRequest::Poll {
+                if !self.running() {
                     return Applied::Unchanged;
                 }
                 self.end(None);
-                return Applied::Unanswered(
-                    "The Daemon no longer has this sandbox image configured, so nothing changed.",
-                );
+                return Applied::Unanswered(if request == PullRequest::Poll {
+                    "The Daemon no longer has this sandbox image configured, so its download isn't shown."
+                } else {
+                    "The Daemon no longer has this sandbox image configured, so nothing changed."
+                });
             }
             PullReport::Unavailable => match request {
                 PullRequest::Poll => {}
@@ -327,11 +335,11 @@ impl PullWatch {
         })
     }
 
-    /// Any key but Ctrl+E or the confirming key ends a cancel prompt, and a Done line clears so the key acts as
-    /// usual. Returns whether the line changed.
-    pub(crate) fn other_key(&mut self) -> bool {
+    /// Any key but Ctrl+E or the confirming key ends a cancel prompt, and clears a Done line the
+    /// last frame `done_drawn`, so the key acts as usual. Returns whether the line changed.
+    pub(crate) fn other_key(&mut self, done_drawn: bool) -> bool {
         self.cancel_armed = None;
-        if self.line == Some(PullLine::Done) {
+        if done_drawn && self.line == Some(PullLine::Done) {
             self.set_line(None);
             return true;
         }
@@ -522,6 +530,26 @@ mod tests {
                 ),
             ),
             (
+                "a running pull's image no longer configured",
+                true,
+                vec![(Poll, running(2)), (Poll, PullReport::UnknownImage)],
+                None,
+                Applied::Unanswered(
+                    "The Daemon no longer has this sandbox image configured, so its download isn't shown.",
+                ),
+            ),
+            (
+                "a refused cancel",
+                true,
+                vec![(Poll, running(2)), (Cancel, gated())],
+                shown(PullLine::Running(ProgressSnapshot {
+                    layers_done: Some(2),
+                    layers_known: Some(7),
+                    ..ProgressSnapshot::default()
+                })),
+                Applied::Unanswered(CANCEL_GATED),
+            ),
+            (
                 "no answer to a cancel",
                 true,
                 vec![(Cancel, PullReport::Unavailable)],
@@ -561,6 +589,15 @@ mod tests {
         assert_eq!(watch.hidden_progress().and_then(|p| p.layers_done), Some(4));
         watch.apply(PullRequest::Poll, running(5));
         assert_eq!(watch.line(), None, "a new reading unhid the pull");
+        let gated = PullReport::Gated {
+            command: "docker pull img".into(),
+        };
+        assert_eq!(
+            watch.apply(PullRequest::Cancel, gated),
+            Applied::Unanswered(CANCEL_GATED)
+        );
+        assert_eq!(watch.line(), None, "a refused cancel unhid the pull");
+        assert!(watch.running(), "a refused cancel ended the watch");
 
         watch.apply(PullRequest::Poll, failed());
         let outcome = watch
@@ -604,11 +641,18 @@ mod tests {
             );
         }
         watch.arm_cancel(at);
-        assert!(!watch.other_key(), "a running pull's line changed on a key");
+        assert!(
+            !watch.other_key(true),
+            "a running pull's line changed on a key"
+        );
         assert!(!watch.confirm_cancel(at), "another key left the prompt");
 
         watch.apply(PullRequest::Poll, PullReport::State(PullState::Done));
-        assert!(watch.other_key());
+        assert!(
+            !watch.other_key(false),
+            "a key cleared a Done that wasn't drawn"
+        );
+        assert!(watch.other_key(true));
         assert_eq!(watch.line(), None);
     }
 

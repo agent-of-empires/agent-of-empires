@@ -2123,16 +2123,19 @@ fn a_hidden_pull_shows_its_progress_on_every_key_line() {
     use ratatui::Terminal;
 
     let theme = load_theme("empire");
-    // (case, shortcut bar shown, in Live send)
-    for (case, bar, live) in [
-        ("shortcut bar", true, false),
-        ("Live send", true, true),
-        ("bar hidden", false, false),
+    // (case, shortcut bar shown, in Live send, Live send title)
+    for (case, bar, live, title) in [
+        ("shortcut bar", true, false, ""),
+        ("Live send", true, true, "live send"),
+        // A title wide enough to fill the row still leaves the badge its room.
+        ("Live send, long title", true, true, &*"long ".repeat(30)),
+        ("bar hidden", false, false, ""),
     ] {
         let mut env = create_test_env_empty();
         env.view.show_shortcut_bar = bar;
         if live {
             env.view.enter_live_send_for_test();
+            env.view.live_send.as_mut().unwrap().title = title.into();
         }
         env.view.hidden_pull = Some(ProgressSnapshot {
             layers_done: Some(3),
