@@ -19,6 +19,7 @@ import type { FileRef } from "../lib/fileRef";
 import type { ServerAbout } from "../lib/api";
 import { autoResumeSettingsHref } from "../lib/autoResumeSettingsHref";
 import { lazyView } from "../lib/lazyView";
+import { CloseOnEscape } from "./diff/comments/CloseOnEscape";
 
 const BackgroundAgentsPanel = lazyView(
   () => import("./acp/BackgroundAgentsPanel").then((m) => m.BackgroundAgentsPanel),
@@ -27,7 +28,7 @@ const BackgroundAgentsPanel = lazyView(
 const DiffFileViewer = lazyView(() => import("./diff/DiffFileViewer").then((m) => m.DiffFileViewer), null);
 const SendCommentsDialog = lazyView(
   () => import("./diff/comments/SendCommentsDialog").then((m) => m.SendCommentsDialog),
-  null,
+  (p) => <CloseOnEscape onClose={p.onClose} />,
 );
 const StructuredView = lazyView(() => import("./acp/StructuredView").then((m) => m.StructuredView), null);
 

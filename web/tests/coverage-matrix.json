@@ -3147,6 +3147,7 @@
       "specs": ["tests/diff-comments.spec.ts"],
       "components": [
         "web/src/components/diff/comments/SendCommentsDialog.tsx",
+        "web/src/components/diff/comments/CloseOnEscape.tsx",
         "web/src/components/diff/comments/CommentsBanner.tsx",
         "web/src/components/diff/comments/CommentForm.tsx",
         "web/src/components/diff/comments/CommentCard.tsx"

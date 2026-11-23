@@ -14,13 +14,16 @@ const loadFailed = (
   </div>
 );
 
-/** Code-split a view: renders `fallback` until `load` resolves, then the component with the same props. */
-export function lazyView<P extends object>(load: () => Promise<ComponentType<P>>, fallback: ReactNode) {
+/** Code-split a view: renders `fallback` (given the view's props if a function) until `load` resolves, then the component with the same props. */
+export function lazyView<P extends object>(
+  load: () => Promise<ComponentType<P>>,
+  fallback: ReactNode | ((props: P) => ReactNode),
+) {
   const Lazy = lazy(() => load().then((component) => ({ default: component })));
   return function LazyView(props: P) {
     return (
       <ErrorBoundary fallback={loadFailed}>
-        <Suspense fallback={fallback}>
+        <Suspense fallback={typeof fallback === "function" ? fallback(props) : fallback}>
           <Lazy {...(props as P & JSX.IntrinsicAttributes)} />
         </Suspense>
       </ErrorBoundary>

@@ -21,6 +21,7 @@ import { Navigate, useLocation, useMatch, useNavigate, useSearchParams } from "r
 import { IDLE_DECAY_WINDOW_MS } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
 import { lazyView } from "./lib/lazyView";
+import { CloseOnEscape } from "./components/diff/comments/CloseOnEscape";
 import { useSessions } from "./hooks/useSessions";
 import { useAttentionCounts } from "./hooks/useAttentionCounts";
 import { useStatusSounds } from "./hooks/useStatusSounds";
@@ -176,7 +177,10 @@ const SettingsView = lazyView(
   <LazyFallback label="Loading settings…" />,
 );
 const loadSendCommentsDialog = () => import("./components/diff/comments/SendCommentsDialog");
-const SendCommentsDialog = lazyView(() => loadSendCommentsDialog().then((m) => m.SendCommentsDialog), null);
+const SendCommentsDialog = lazyView(
+  () => loadSendCommentsDialog().then((m) => m.SendCommentsDialog),
+  (p) => <CloseOnEscape onClose={p.onClose} />,
+);
 const loadCommandPalette = () => import("./components/command-palette/CommandPalette");
 const LazyCommandPalette = lazyView(() => loadCommandPalette().then((m) => m.CommandPalette), null);
 // Mounted only while open; the chunk is prefetched 2 s after mount.
