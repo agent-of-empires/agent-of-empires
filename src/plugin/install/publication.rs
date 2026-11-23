@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use crate::session::AnchoredDir;
 
-use super::{remove_owned_tree_checked, PriorMetadata};
+use super::{publication_error, remove_owned_tree_checked, PriorMetadata};
 
 pub(super) const MARKER: &str = ".plugin-publication-active";
 const MAX_RECORD: usize = 4096;
@@ -145,6 +145,21 @@ fn directory_at(parent: &AnchoredDir, leaf: &Path) -> Result<Option<Identity>> {
     Ok(Some(identity))
 }
 
+fn verify_rename_destination(
+    parent: &AnchoredDir,
+    leaf: &Path,
+    expected: Option<Identity>,
+) -> Result<()> {
+    let actual = directory_at(parent, leaf).map_err(publication_error)?;
+    if actual.is_none() || actual != expected {
+        return Err(publication_error(anyhow::anyhow!(
+            "publication rename destination {} has an unexpected identity",
+            parent.path().join(leaf).display()
+        )));
+    }
+    Ok(())
+}
+
 fn app_for(final_dir: &Path) -> Result<AnchoredDir> {
     let app = final_dir
         .parent()
@@ -161,6 +176,12 @@ impl Journal {
         update: bool,
     ) -> Result<Self> {
         let app = app_for(final_dir)?;
+        let marker = Path::new(MARKER);
+        if app.entry_stat(marker).map_err(publication_error)?.is_some() {
+            return Err(publication_error(anyhow::anyhow!(
+                "publication evidence already exists"
+            )));
+        }
         let plugins = app.child(Path::new("plugins"))?;
         crate::process::prove_same_mount(app.descriptor(), plugins.descriptor())?;
         let container = tree.parent().context("missing publication container")?;
@@ -194,14 +215,19 @@ impl Journal {
             plugins.entry_stat(&record.backup())?.is_none(),
             "publication backup already exists"
         );
+        let bytes = record.encode()?;
         anchored.sync()?;
         plugins.sync()?;
-        let mut file = app
-            .create_new_regular(Path::new(MARKER))?
-            .context("publication evidence already exists")?;
-        file.write_all(&record.encode()?)?;
-        file.sync_all()?;
-        app.sync()?;
+        // From exclusive creation onward, an error cannot prove that no journal exists.
+        (|| -> Result<()> {
+            let mut file = app
+                .create_new_regular(marker)?
+                .context("publication evidence already exists")?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            app.sync()
+        })()
+        .map_err(publication_error)?;
         Ok(record)
     }
 
@@ -262,13 +288,15 @@ impl Journal {
 
     fn restore(&self, plugins: &AnchoredDir) -> Result<()> {
         let backup = self.backup();
+        let target = Path::new(&self.id);
         ensure!(
             self.old_tree.is_some() && directory_at(plugins, &backup)? == self.old_tree,
             "publication backup changed before restoration"
         );
         plugins
-            .rename_child_exclusive(&backup, plugins, Path::new(&self.id))
-            .context("restoring the owned plugin backup")
+            .rename_child_exclusive(&backup, plugins, target)
+            .context("restoring the owned plugin backup")?;
+        verify_rename_destination(plugins, target, self.old_tree)
     }
 
     pub(super) fn has_prior_tree(&self) -> bool {
@@ -278,11 +306,13 @@ impl Journal {
     pub(super) fn displace(&self, final_dir: &Path) -> Result<()> {
         let plugins = self.plugins(&app_for(final_dir)?)?;
         let target = Path::new(&self.id);
+        let backup = self.backup();
         ensure!(
             self.old_tree.is_some() && directory_at(&plugins, target)? == self.old_tree,
             "installed tree changed before backup"
         );
-        plugins.rename_child_exclusive(target, &plugins, &self.backup())
+        plugins.rename_child_exclusive(target, &plugins, &backup)?;
+        verify_rename_destination(&plugins, &backup, self.old_tree)
     }
 
     pub(super) fn place(&self, final_dir: &Path) -> Result<()> {
@@ -295,7 +325,9 @@ impl Journal {
             directory_at(&container, tree)? == Some(self.new_tree),
             "staged publication tree changed"
         );
-        container.rename_child_exclusive(tree, &plugins, Path::new(&self.id))
+        let target = Path::new(&self.id);
+        container.rename_child_exclusive(tree, &plugins, target)?;
+        verify_rename_destination(&plugins, target, Some(self.new_tree))
     }
 
     fn open_container(&self, plugins: &AnchoredDir) -> Result<Option<AnchoredDir>> {

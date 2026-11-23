@@ -2232,10 +2232,9 @@ fn with_publication_copy<T>(
         let tree = directory.join("tree");
         fetched.copy_for_publication(&tree)?;
         if let Some((prior, update)) = transaction {
-            journal = Some(
-                publication::Journal::prepare(final_dir, &tree, prior, update)
-                    .map_err(publication_error)?,
-            );
+            journal = Some(publication::Journal::prepare(
+                final_dir, &tree, prior, update,
+            )?);
         }
         publish(&tree, journal.as_mut())
     });
@@ -2478,7 +2477,7 @@ fn replace_and_build(
 ) -> Result<()> {
     let backup_dir = final_dir.with_file_name(format!("{plugin_id}.bak"));
 
-    if backup_dir.exists() {
+    if !fetched.journals_publication() && backup_dir.exists() {
         return Err(super::execution::RecoveryRequired(format!(
             "ambiguous prior update backup {}; manual recovery required",
             backup_dir.display()
@@ -2659,6 +2658,64 @@ mod tests {
     const PUBLICATION_SOURCE: &str = "gh:acme/journal";
 
     #[tokio::test]
+    #[serial]
+    async fn publication_preparation_refusal_cleans_unjournaled_copy() {
+        let _home = isolate_app_dir();
+        let app = crate::session::get_app_dir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("aoe-plugin.toml"),
+            "id = \"acme.journal\"\nname = \"Journal\"\nversion = \"2.0.0\"\napi_version = 2\n",
+        )
+        .unwrap();
+        let operation = begin_operation().unwrap();
+        let fetched = fetch::fetch(
+            &PluginSource::Local(source.path().to_owned()),
+            Some(operation.clone()),
+        )
+        .await
+        .unwrap();
+        let plugins = super::super::plugins_dir().unwrap();
+        let final_dir = plugins.join(PUBLICATION_ID);
+        let backup = plugins.join(format!("{PUBLICATION_ID}.bak"));
+        std::fs::create_dir(&backup).unwrap();
+        std::fs::write(backup.join("payload"), b"prior").unwrap();
+        let prior = PriorMetadata::capture(PUBLICATION_ID).unwrap();
+        // Exercise the journal transaction without depending on a Git clone.
+        let result: Result<()> =
+            with_publication_copy(&fetched, &final_dir, Some((&prior, true)), |_, _| {
+                panic!("a backup obstruction must prevent publication")
+            });
+        assert!(!super::super::execution::needs_recovery(&result));
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "publication backup already exists"
+        );
+        let marker = app.join(publication::MARKER);
+        assert!(!marker.exists());
+        assert!(!final_dir.exists());
+        assert_eq!(std::fs::read(backup.join("payload")).unwrap(), b"prior");
+        assert!(std::fs::read_dir(&plugins).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".publish-")
+        }));
+        assert!(check_recovery_evidence().is_ok());
+
+        std::fs::write(&marker, b"existing evidence").unwrap();
+        let result: Result<()> =
+            with_publication_copy(&fetched, &final_dir, Some((&prior, true)), |_, _| {
+                panic!("existing evidence must prevent publication")
+            });
+        assert!(super::super::execution::needs_recovery(&result));
+        assert_eq!(std::fs::read(&marker).unwrap(), b"existing evidence");
+        assert!(check_recovery_evidence().is_err());
+        fetched.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
     #[ignore = "subprocess fixture for publication crash recovery"]
     async fn publication_crash_child() {
         use std::os::unix::net::UnixStream;
@@ -2734,12 +2791,49 @@ mod tests {
         task.await.unwrap();
     }
 
+    #[tokio::test]
+    #[ignore = "subprocess fixture for writable daemon startup"]
+    async fn publication_restart_child() {
+        let Some(home) = std::env::var_os("AOE_PUBLICATION_CRASH_HOME") else {
+            return;
+        };
+        let _home = crate::session::test_support::isolate_app_dir_at(Path::new(&home));
+        let transaction = crate::daemon::lifecycle::Transaction::try_acquire().unwrap();
+        let _lifetime = transaction.lifetime().unwrap();
+        crate::server::start_server(
+            crate::server::ServerConfig {
+                profile: "",
+                host: "127.0.0.1",
+                port: 0,
+                core_only: true,
+                read_acquisition: false,
+                auth_mode: crate::cli::serve::AuthMode::None,
+                read_only: false,
+                remote: false,
+                tunnel_name: None,
+                tunnel_url: None,
+                no_tailscale: true,
+                funnel_port: 443,
+                is_daemon: true,
+                passphrase: None,
+                behind_proxy: false,
+                allow_plaintext_remote: false,
+                open_browser: false,
+                extra_allowed_hosts: Vec::new(),
+                extra_allowed_origins: Vec::new(),
+            },
+            transaction,
+        )
+        .await
+        .unwrap();
+    }
+
     #[test]
     #[serial]
     fn default_remote_publication_reconciles_after_crash() {
         use crate::git::test_support::run_git;
         use std::io::Read as _;
-        use std::os::unix::net::UnixListener;
+        use std::os::unix::net::{UnixDatagram, UnixListener};
         use std::time::{Duration, Instant};
 
         struct Daemon(std::process::Child);
@@ -2794,6 +2888,15 @@ mod tests {
                     .env("AOE_PUBLICATION_CRASH_PHASE", phase)
                     .env("AOE_PUBLICATION_CRASH_REPO", &repo)
                     .env("AOE_PUBLICATION_CRASH_CONTROL", &socket)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_TEMPLATE_DIR", "")
+                    .env_remove("GIT_CONFIG")
+                    .env_remove("GIT_CONFIG_COUNT")
+                    .env_remove("GIT_CONFIG_PARAMETERS")
+                    .env_remove("GIT_ALLOW_PROTOCOL")
+                    .env_remove("GIT_PROTOCOL_FROM_USER")
                     .spawn()
                     .unwrap(),
             );
@@ -2812,6 +2915,7 @@ mod tests {
                     Err(error) => panic!("{case}: {error}"),
                 }
             };
+            control.set_nonblocking(false).unwrap();
             control
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
@@ -2844,10 +2948,9 @@ mod tests {
                 evidence.push(b'\n');
                 std::fs::write(&marker, &evidence).unwrap();
             }
-            let recovery = recover_stale_publication();
             if matches!(case, "update-partial" | "replaced-tree" | "changed-birth") {
                 assert!(
-                    recovery.is_err(),
+                    recover_stale_publication().is_err(),
                     "{case}: ambiguous state must stay fenced"
                 );
                 assert_eq!(std::fs::read(&marker).unwrap(), evidence);
@@ -2873,7 +2976,47 @@ mod tests {
                 continue;
             }
 
-            recovery.unwrap();
+            let notify_path = home.join("notify");
+            let notify = UnixDatagram::bind(&notify_path).unwrap();
+            notify
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let mut restarted = Daemon(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "plugin::install::tests::publication_restart_child",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("AOE_PUBLICATION_CRASH_HOME", &home)
+                    .env("NOTIFY_SOCKET", &notify_path)
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut message = [0; 256];
+            loop {
+                match notify.recv(&mut message) {
+                    Ok(len) if message[..len].starts_with(b"READY=1\n") => break,
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(error) => panic!("{case}: receiving daemon readiness: {error}"),
+                }
+                assert!(
+                    restarted.0.try_wait().unwrap().is_none(),
+                    "{case}: restarted daemon exited before readiness"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "{case}: daemon startup timed out"
+                );
+            }
+            // Check durable state before any plugin operation can recover it.
             assert!(!marker.exists());
             assert!(!backup.exists());
             assert!(std::fs::read_dir(&plugins).unwrap().all(|entry| {
@@ -2883,8 +3026,6 @@ mod tests {
                     .to_string_lossy()
                     .starts_with(".publish-")
             }));
-            assert!(check_recovery_evidence().is_ok());
-            assert!(begin_operation().is_ok());
             let metadata = PriorMetadata::capture(PUBLICATION_ID).unwrap();
             match case {
                 "install-ready" => {
@@ -2910,6 +3051,9 @@ mod tests {
                     assert_eq!(config.grant.is_some(), case == "install-committed");
                 }
             }
+            drop(restarted);
+            assert!(check_recovery_evidence().is_ok());
+            assert!(begin_operation().is_ok());
         }
     }
 
