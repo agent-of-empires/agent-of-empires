@@ -1469,7 +1469,7 @@ mod tests {
             branch: "work".into(),
             main_repo_path: alias.to_string_lossy().into_owned(),
             managed_by_aoe: false,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: None,
         });
         let owner = PurgeOwner::record(&storage, &row, PurgeCapture::new(&row)?)?;

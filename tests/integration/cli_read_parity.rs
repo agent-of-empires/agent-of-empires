@@ -455,15 +455,21 @@ fn row(
     instance.status = status;
     instance.group_path = group_path.to_string();
     instance.agent_session_id = Some(format!("{id}-agent"));
-    instance.created_at = "2026-01-02T03:04:05.123456789Z"
-        .parse()
-        .expect("created_at");
+    instance.created_at =
+        agent_of_empires::time::Timestamp::parse_rfc3339("2026-01-02T03:04:05.123456789Z")
+            .expect("created_at");
     // Short fractions exercise AutoSi timestamp normalization on both transports.
     if archived {
-        instance.archived_at = Some("2026-02-03T04:05:06.25Z".parse().expect("archived_at"));
+        instance.archived_at = Some(
+            agent_of_empires::time::Timestamp::parse_rfc3339("2026-02-03T04:05:06.25Z")
+                .expect("archived_at"),
+        );
     }
     if trashed {
-        instance.trashed_at = Some("2026-03-04T05:06:07.5Z".parse().expect("trashed_at"));
+        instance.trashed_at = Some(
+            agent_of_empires::time::Timestamp::parse_rfc3339("2026-03-04T05:06:07.5Z")
+                .expect("trashed_at"),
+        );
     }
     serde_json::to_value(&instance).expect("row serializes")
 }

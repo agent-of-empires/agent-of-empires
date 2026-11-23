@@ -164,7 +164,7 @@ async fn readonly_trash_restore_bulk_purge_and_force_remove_leave_persisted_owne
     row.lifecycle_reservation = Some(LifecycleReservation {
         op: LifecycleOperation::Purge,
         generation: 9,
-        at: chrono::Utc::now(),
+        at: crate::time::Timestamp::now(),
     });
     seed_profile("test", std::slice::from_ref(&row));
     let state = native_state(&["test"]).await;

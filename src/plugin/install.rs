@@ -1043,7 +1043,7 @@ async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcom
                 Some(CapabilityGrant {
                     manifest_hash: prepared.manifest_hash.clone(),
                     capabilities: prepared.capabilities.clone(),
-                    granted_at: chrono::Utc::now(),
+                    granted_at: crate::time::Timestamp::now(),
                 })
             } else {
                 None
@@ -1052,7 +1052,7 @@ async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcom
             Some(CapabilityGrant {
                 manifest_hash: prepared.manifest_hash.clone(),
                 capabilities: vec![],
-                granted_at: chrono::Utc::now(),
+                granted_at: crate::time::Timestamp::now(),
             })
         } else {
             prepared.prior_grant.clone().map(|g| CapabilityGrant {
@@ -1222,7 +1222,7 @@ pub async fn apply_update(
     let grant = Some(CapabilityGrant {
         manifest_hash: prepared.manifest_hash.clone(),
         capabilities: prepared.capabilities.clone(),
-        granted_at: chrono::Utc::now(),
+        granted_at: crate::time::Timestamp::now(),
     });
     let node_env = apply_node_env(&prepared.fetched.manifest).await;
     tokio::task::spawn_blocking(move || {
@@ -1315,7 +1315,7 @@ pub fn approve_installed(id: &str, expected_manifest_hash: &str) -> Result<()> {
         entry.grant = Some(CapabilityGrant {
             manifest_hash: consent.manifest_hash.clone(),
             capabilities: consent.capabilities.clone(),
-            granted_at: chrono::Utc::now(),
+            granted_at: crate::time::Timestamp::now(),
         });
         Ok(())
     })??;
@@ -1892,7 +1892,7 @@ fn persist_install(
         entry.grant = Some(CapabilityGrant {
             manifest_hash: manifest_hash.to_string(),
             capabilities: capabilities.to_vec(),
-            granted_at: chrono::Utc::now(),
+            granted_at: crate::time::Timestamp::now(),
         });
     })
 }
@@ -2346,7 +2346,7 @@ mod tests {
         let grant = CapabilityGrant {
             manifest_hash: approved.manifest_hash.clone(),
             capabilities: approved.capabilities.clone(),
-            granted_at: chrono::Utc::now(),
+            granted_at: crate::time::Timestamp::now(),
         };
         finish_update(approved, Some(grant), begin_operation().unwrap(), provision)
             .await

@@ -647,11 +647,11 @@ mod retained_tests {
             branch: "retained-paths".into(),
             main_repo_path: main.to_string_lossy().into_owned(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: None,
         });
         let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
-        let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
+        let at = crate::time::Timestamp::from_unix_secs(100).unwrap();
         state
             .acp_event_store
             .record(
@@ -850,7 +850,7 @@ mod retained_tests {
         let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
         let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
         let mut model = crate::acp::transcript::TranscriptModel::new();
-        let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
+        let at = crate::time::Timestamp::from_unix_secs(100).unwrap();
         model.apply_event(
             1,
             &Event::ToolCallStarted {
@@ -982,7 +982,7 @@ mod retained_tests {
                 let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
                 let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
                 let mut model = crate::acp::transcript::TranscriptModel::new();
-                let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
+                let at = crate::time::Timestamp::from_unix_secs(100).unwrap();
                 model.apply_event(
                     1,
                     &Event::ToolCallStarted {
@@ -1176,7 +1176,7 @@ mod retained_tests {
                         is_error: failed,
                         content: final_text.into(),
                         output: blocks.clone(),
-                        completed_at: chrono::Utc::now(),
+                        completed_at: crate::time::Timestamp::now(),
                         async_subagent: false,
                     },
                 );
@@ -1306,7 +1306,7 @@ mod retained_tests {
                                 kind: "execute".into(),
                                 args_preview: "{}".into(),
                                 prompt: None,
-                                started_at: chrono::Utc::now(),
+                                started_at: crate::time::Timestamp::now(),
                                 parent_tool_call_id: None,
                                 memory_recall: None,
                                 diffs: Vec::new(),
@@ -1399,7 +1399,7 @@ mod retained_tests {
                             kind: "execute".into(),
                             args_preview: "{}".into(),
                             prompt: None,
-                            started_at: chrono::Utc::now(),
+                            started_at: crate::time::Timestamp::now(),
                             parent_tool_call_id: None,
                             memory_recall: None,
                             diffs: Vec::new(),
@@ -1790,7 +1790,7 @@ mod retained_tests {
         );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let mut inst = crate::session::Instance::new("retained", "/tmp");
-        inst.trashed_at = Some(chrono::Utc::now());
+        inst.trashed_at = Some(crate::time::Timestamp::now());
         for id in ["obsolete", "refresh"] {
             inst.id = id.into();
             let mut obsolete = RetainedView::new(Some(endpoint.clone()), &inst);

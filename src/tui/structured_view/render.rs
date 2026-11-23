@@ -4385,7 +4385,7 @@ mod tests {
                 kind: "other".into(),
                 args_preview: String::new(),
                 prompt: None,
-                started_at: chrono::Utc::now(),
+                started_at: crate::time::Timestamp::now(),
                 parent_tool_call_id: parent.map(Into::into),
                 memory_recall: None,
                 diffs: Vec::new(),
@@ -4538,7 +4538,7 @@ mod tests {
             path: path.into(),
             old_text: old.map(Into::into),
             new_text: Some(new.into()),
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
         };
         row.diffs = vec![
             diff("src/one.rs", Some("let a = 1;"), "let a = 2;"),
@@ -4853,6 +4853,7 @@ mod tests {
                 attachments: Vec::new(),
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
             Event::AgentMessageChunk {
                 text: "What should we build?".into(),
@@ -4894,6 +4895,7 @@ mod tests {
                 attachments: Vec::new(),
                 synthesized: false,
                 origin_plugin: Some("cron".into()),
+                origin: crate::daemon::PromptOrigin::Unknown,
             }]));
         let rows = render_rows(&state, 80, 20, true);
         assert!(

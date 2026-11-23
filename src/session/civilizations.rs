@@ -87,7 +87,7 @@ fn to_roman(n: u32) -> String {
 
 pub fn generate_random_title(existing_titles: &[&str]) -> String {
     generate_random_title_filtered(existing_titles, |_| false).unwrap_or_else(|| {
-        let timestamp = chrono::Utc::now().timestamp();
+        let timestamp = crate::time::Timestamp::now().as_unix_secs();
         for n in timestamp.. {
             let candidate = format!("Session {}", n);
             if !existing_titles.contains(&candidate.as_str()) {
@@ -125,7 +125,7 @@ where
         }
     }
 
-    let timestamp = chrono::Utc::now().timestamp();
+    let timestamp = crate::time::Timestamp::now().as_unix_secs();
     for n in timestamp..timestamp + 1000 {
         let candidate = format!("{} {}", base, n);
         if !existing_titles.contains(&candidate.as_str()) && !is_unavailable(&candidate) {

@@ -55,9 +55,9 @@ pub(crate) struct StructuredSessionSpec {
     /// Plugin create-idempotency record to persist with the instance,
     /// stamped alongside `created_by_plugin`.
     pub plugin_create_idempotency: Option<crate::session::PluginCreateIdempotency>,
-    /// Initial prompt to persist with the instance and deliver once the ACP
-    /// worker is live, stamped by `SessionService::create_structured_session`.
-    pub pending_initial_turn: Option<String>,
+    /// Initial prompt and its origin, persisted with the instance and delivered once
+    /// the ACP worker is live. Stamped by `SessionService::create_structured_session`.
+    pub pending_initial_turn: Option<(String, crate::daemon::PromptOrigin)>,
     /// The session this one is a sub-session of, already checked by the caller.
     pub parent_session_id: Option<String>,
     /// Explicit ACP approval-mode id to persist on the instance; the
@@ -373,14 +373,15 @@ pub(crate) async fn spawn_structured_session(
         instance.created_by_plugin = created_by_plugin;
         instance.plugin_create_idempotency = plugin_create_idempotency;
         instance.pending_initial_turn =
-            pending_initial_turn.map(|text| crate::session::PendingInitialTurn {
+            pending_initial_turn.map(|(text, origin)| crate::session::PendingInitialTurn {
                 text,
                 attachments: Vec::new(),
                 synthesized: false,
                 error: None,
- error_code: None,
- id: crate::session::PendingInitialTurn::fresh_id(),
-});
+                error_code: None,
+                id: crate::session::PendingInitialTurn::fresh_id(),
+                origin,
+            });
         instance.acp_mode_id = acp_mode_id;
         instance.callback_url = callback_url;
         instance.idempotency_key = idempotency_key;
@@ -441,7 +442,7 @@ pub(crate) async fn spawn_structured_session(
             let _title = crate::session::acquire_session_title_lock(&instance.id)?;
             let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&instance.id)?;
             let generation = instance.try_acquire_lifecycle_reservation(
-                LifecycleOperation::Launch, Instance::LIFECYCLE_RESERVATION_TTL, chrono::Utc::now(),
+                LifecycleOperation::Launch, Instance::LIFECYCLE_RESERVATION_TTL, crate::time::Timestamp::now(),
             )?;
             instance.status = Status::Creating;
             store.update(|rows, groups| {
@@ -1851,7 +1852,7 @@ mod tests {
                         .try_acquire_lifecycle_reservation(
                             LifecycleOperation::Capture,
                             Instance::LIFECYCLE_RESERVATION_TTL,
-                            chrono::Utc::now(),
+                            crate::time::Timestamp::now(),
                         )
                         .map_err(anyhow::Error::from)
                 });
@@ -2068,6 +2069,7 @@ mod tests {
                     Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
                     None,
                     None,
+                    axum::http::HeaderMap::new(),
                     Ok(Json(body)),
                 )
                 .await
@@ -2135,6 +2137,7 @@ mod tests {
                     Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
                     None,
                     None,
+                    axum::http::HeaderMap::new(),
                     Ok(Json(body)),
                 )
                 .await
@@ -2595,6 +2598,7 @@ mod tests {
             Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
             None,
             None,
+            axum::http::HeaderMap::new(),
             Ok(Json(body)),
         )
         .await
@@ -2783,6 +2787,7 @@ mod tests {
             Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
             None,
             None,
+            axum::http::HeaderMap::new(),
             Ok(Json(body)),
         )
         .await

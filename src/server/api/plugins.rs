@@ -518,6 +518,8 @@ pub struct PluginActionBody {
 pub async fn invoke_plugin_action(
     State(state): State<std::sync::Arc<AppState>>,
     Path(id): Path<String>,
+    // Option: an unstamped request is stamped `token`, the least trusted origin.
+    principal: Option<axum::Extension<Principal>>,
     body: Result<Json<PluginActionBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if state.read_only {
@@ -555,6 +557,16 @@ pub async fn invoke_plugin_action(
             serde_json::Value::Null => params = json!({ "session_id": sid }),
             _ => {}
         }
+    } else if let serde_json::Value::Object(map) = &mut params {
+        map.remove("session_id");
+    }
+    tracing::debug!(target: "plugin.host", plugin = %id, method = %body.method, principal = ?principal.as_ref().map(|p| &p.0), "forwarding plugin action");
+    if !stamp_origin(&mut params, principal.as_ref().map(|p| &p.0)) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_params",
+            "Plugin action params must be a JSON object",
+        );
     }
     if host.notify_worker(&id, &body.method, params).await {
         (
@@ -677,6 +689,25 @@ fn active_plugin_declares(plugin_id: &str, capability: &str) -> bool {
                 .iter()
                 .any(|cap| cap.as_str() == capability)
         })
+}
+
+/// Sets `params.origin` from the caller's principal, replacing any client value.
+/// `dashboard` is a signed-in browser login; `socket` the daemon's Unix socket;
+/// `token` any other caller. Returns false when `params` cannot carry the field.
+fn stamp_origin(params: &mut serde_json::Value, principal: Option<&Principal>) -> bool {
+    let origin = match principal {
+        Some(Principal::Device) => "dashboard",
+        Some(Principal::LocalPeer { .. }) => "socket",
+        Some(Principal::TokenHolder) | None => "token",
+    };
+    if params.is_null() {
+        *params = json!({});
+    }
+    let Some(map) = params.as_object_mut() else {
+        return false;
+    };
+    map.insert("origin".into(), origin.into());
+    true
 }
 
 fn strip_composer_snapshot_without_capability(plugin_id: &str, params: &mut serde_json::Value) {
@@ -934,7 +965,7 @@ impl PluginJobRegistry {
                 kind,
                 target,
                 status: PluginJobStatus::Running,
-                started_at: chrono::Utc::now().timestamp(),
+                started_at: crate::time::Timestamp::now().as_unix_secs(),
                 finished_at: None,
             },
             log_path: log_path.clone(),
@@ -949,7 +980,7 @@ impl PluginJobRegistry {
         if let Some(tracked) = self.jobs.lock().unwrap().get_mut(id) {
             let duration_ms = tracked.started.elapsed().as_millis();
             let job = &mut tracked.job;
-            job.finished_at = Some(chrono::Utc::now().timestamp());
+            job.finished_at = Some(crate::time::Timestamp::now().as_unix_secs());
             job.status = match result {
                 Ok(()) => {
                     tracing::info!(target: "plugin.install", job_id = %id, kind = ?job.kind, target = %job.target, duration_ms, "plugin job finished");
@@ -971,7 +1002,7 @@ impl PluginJobRegistry {
 
     /// Drop finished jobs older than the TTL and remove their log files.
     fn prune(&self) {
-        let cutoff = chrono::Utc::now().timestamp() - FINISHED_JOB_TTL_SECS;
+        let cutoff = crate::time::Timestamp::now().as_unix_secs() - FINISHED_JOB_TTL_SECS;
         self.jobs.lock().unwrap().retain(|_, job| {
             let stale = job.job.finished_at.is_some_and(|t| t < cutoff);
             if stale {
@@ -2136,6 +2167,23 @@ while not (p/'finish').exists():
         }
     }
 
+    #[test]
+    fn stamp_origin_overwrites_client_value_per_principal() {
+        for (principal, expected) in [
+            (Some(Principal::Device), "dashboard"),
+            (Some(Principal::LocalPeer { uid: 1000 }), "socket"),
+            (Some(Principal::TokenHolder), "token"),
+            (None, "token"),
+        ] {
+            for mut params in [json!({ "origin": "dashboard", "k": 1 }), json!(null)] {
+                assert!(stamp_origin(&mut params, principal.as_ref()));
+                assert_eq!(params["origin"], expected, "{principal:?}");
+            }
+        }
+        let mut params = json!([1]);
+        assert!(!stamp_origin(&mut params, None));
+    }
+
     #[tokio::test]
     async fn only_the_plugin_page_relaxes_the_global_frame_policy() {
         use tower::ServiceExt;
@@ -2335,7 +2383,7 @@ id = "voice"
                         grant: Some(CapabilityGrant {
                             manifest_hash: PluginManifest::hash_bytes(manifest.as_bytes()),
                             capabilities: Vec::new(),
-                            granted_at: chrono::Utc::now(),
+                            granted_at: crate::time::Timestamp::now(),
                         }),
                         ..PluginConfig::default()
                     },
@@ -2613,7 +2661,7 @@ id = "voice"
                 grant: Some(CapabilityGrant {
                     manifest_hash: reader_hash,
                     capabilities: reader_caps.iter().map(|cap| cap.to_string()).collect(),
-                    granted_at: chrono::Utc::now(),
+                    granted_at: crate::time::Timestamp::now(),
                 }),
                 ..PluginConfig::default()
             },
@@ -2624,7 +2672,7 @@ id = "voice"
                 grant: Some(CapabilityGrant {
                     manifest_hash: plain_hash,
                     capabilities: plain_caps.iter().map(|cap| cap.to_string()).collect(),
-                    granted_at: chrono::Utc::now(),
+                    granted_at: crate::time::Timestamp::now(),
                 }),
                 ..PluginConfig::default()
             },
@@ -2667,7 +2715,7 @@ id = "voice"
                     grant: Some(CapabilityGrant {
                         manifest_hash: hash,
                         capabilities: caps.iter().map(|cap| cap.to_string()).collect(),
-                        granted_at: chrono::Utc::now(),
+                        granted_at: crate::time::Timestamp::now(),
                     }),
                     ..PluginConfig::default()
                 },

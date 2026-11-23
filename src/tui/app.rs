@@ -3968,7 +3968,7 @@ mod tests {
         .unwrap();
         app.home.show_changelog(Some("1.18.0".into()));
         let cache = serde_json::json!({
-            "checked_at": chrono::Utc::now(),
+            "checked_at": crate::time::Timestamp::now(),
             "latest_version": "1.19.0",
             "releases": [{"version": "1.19.0", "body": "### Performance\n- Faster startup", "published_at": null}]
         });

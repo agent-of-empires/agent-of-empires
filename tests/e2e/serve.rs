@@ -651,7 +651,7 @@ async fn daemon_group_move_preserves_live_terminal_and_restarts_in_target_profil
 async fn native_creation_hooks_preserve_borrowed_scratch_resources() {
     use agent_of_empires::daemon::{
         ApiErrorCode, CreateSessionBody, CreationTrustRequest, DaemonClient, DaemonClientError,
-        RUNTIME_EPOCH_HEADER,
+        PromptOrigin, RUNTIME_EPOCH_HEADER,
     };
     require_tmux!();
     if std::process::Command::new("curl")
@@ -729,7 +729,7 @@ async fn native_creation_hooks_preserve_borrowed_scratch_resources() {
         }))
         .unwrap();
         let owner = sdk
-            .create_session(&owner_body, &epoch)
+            .create_session(&owner_body, &epoch, PromptOrigin::Unknown)
             .await
             .unwrap()
             .outcome;
@@ -826,10 +826,12 @@ if grep -Fq 'hooks_hash = "{hash}"' {trust:?}; then printf approved > {trust_see
                 mcp.replace("secret-before-review", "secret-after-review"),
             )
             .unwrap();
-            assert!(matches!(sdk.create_session(&borrower_body, &epoch).await,
+            assert!(
+                matches!(sdk.create_session(&borrower_body, &epoch, PromptOrigin::Unknown).await,
                 Err(DaemonClientError::Status { code: Some(ApiErrorCode::CreationTrustChanged), body, .. })
                     if !["secret-before-review", "secret-after-review", "secret-header"]
-                        .iter().any(|secret| body.contains(secret))));
+                        .iter().any(|secret| body.contains(secret)))
+            );
             assert!(!app.join("trusted_repos.toml").exists());
             let repo = git2::Repository::open(&source).unwrap();
             assert!(repo
@@ -861,14 +863,18 @@ if grep -Fq 'hooks_hash = "{hash}"' {trust:?}; then printf approved > {trust_see
                 sdk.cancel_creation(&pending.id, &epoch).await.unwrap();
                 std::fs::write(&release, "continue").unwrap();
             };
-            let (result, ()) = tokio::join!(sdk.create_session(&borrower_body, &epoch), cancel);
+            let (result, ()) = tokio::join!(
+                sdk.create_session(&borrower_body, &epoch, PromptOrigin::Unknown),
+                cancel
+            );
             assert!(
                 matches!(&result, Err(DaemonClientError::Status { status, code: Some(ApiErrorCode::CreationCancelled), .. }) if *status == reqwest::StatusCode::CONFLICT),
                 "{result:?}"
             );
             result
         } else {
-            sdk.create_session(&borrower_body, &epoch).await
+            sdk.create_session(&borrower_body, &epoch, PromptOrigin::Unknown)
+                .await
         };
         if matches!(
             stage,
@@ -924,7 +930,8 @@ if grep -Fq 'hooks_hash = "{hash}"' {trust:?}; then printf approved > {trust_see
 #[parallel]
 async fn cancelled_creation_is_gone_from_the_first_read_after_the_failure() {
     use agent_of_empires::daemon::{
-        ApiErrorCode, CreateSessionBody, DaemonClient, DaemonClientError, RuntimeSnapshot,
+        ApiErrorCode, CreateSessionBody, DaemonClient, DaemonClientError, PromptOrigin,
+        RuntimeSnapshot,
     };
     require_tmux!();
     let mut h = TuiTestHarness::new_in_tmp("cancelled_creation_publish");
@@ -967,7 +974,7 @@ async fn cancelled_creation_is_gone_from_the_first_read_after_the_failure() {
     }))
     .unwrap();
     let owner = sdk
-        .create_session(&owner_body, &epoch)
+        .create_session(&owner_body, &epoch, PromptOrigin::Unknown)
         .await
         .unwrap()
         .outcome;
@@ -1009,7 +1016,10 @@ async fn cancelled_creation_is_gone_from_the_first_read_after_the_failure() {
         sdk.cancel_creation(&pending.id, &epoch).await.unwrap();
         std::fs::write(&release, "continue").unwrap();
     };
-    let (result, ()) = tokio::join!(sdk.create_session(&body, &epoch), cancel);
+    let (result, ()) = tokio::join!(
+        sdk.create_session(&body, &epoch, PromptOrigin::Unknown),
+        cancel
+    );
     assert!(
         matches!(
             &result,
@@ -1648,7 +1658,7 @@ async fn daemon_trash_restore_purge_preserves_collisions_and_allows_retry() {
         branch: "feature/restore".into(),
         main_repo_path: repo.to_string_lossy().into_owned(),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        created_at: agent_of_empires::time::Timestamp::now(),
         base_branch: None,
     });
     let id = row.id.clone();
@@ -1827,9 +1837,10 @@ async fn daemon_trash_restore_purge_preserves_collisions_and_allows_retry() {
                 delete_worktree: true,
                 expected_trash: true,
                 expected_trashed_at: Some(
-                    chrono::DateTime::parse_from_rfc3339(row.trashed_at.as_ref().unwrap())
-                        .unwrap()
-                        .with_timezone(&chrono::Utc),
+                    agent_of_empires::time::Timestamp::parse_rfc3339(
+                        row.trashed_at.as_ref().unwrap(),
+                    )
+                    .unwrap(),
                 ),
                 expected_generation: Some(row.lifecycle_generation),
                 expected_trash_lifecycle_id: row.trash_lifecycle_id.clone(),
@@ -1882,9 +1893,10 @@ async fn daemon_trash_restore_purge_preserves_collisions_and_allows_retry() {
                 force_failed: true,
                 expected_trash: true,
                 expected_trashed_at: Some(
-                    chrono::DateTime::parse_from_rfc3339(retained.trashed_at.as_ref().unwrap())
-                        .unwrap()
-                        .with_timezone(&chrono::Utc),
+                    agent_of_empires::time::Timestamp::parse_rfc3339(
+                        retained.trashed_at.as_ref().unwrap(),
+                    )
+                    .unwrap(),
                 ),
                 expected_generation: Some(retained.lifecycle_generation),
                 expected_trash_lifecycle_id: retained.trash_lifecycle_id.clone(),
@@ -2022,7 +2034,7 @@ async fn daemon_terminal_commands_apply_dimensions_archive_and_abandon_policy() 
         branch: "feature/native-terminal".into(),
         main_repo_path: repo.to_string_lossy().into_owned(),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        created_at: agent_of_empires::time::Timestamp::now(),
         base_branch: None,
     });
     let id = row.id.clone();

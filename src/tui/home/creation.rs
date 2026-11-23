@@ -108,7 +108,7 @@ impl HomeView {
                 branch,
                 main_repo_path: data.path.clone(),
                 managed_by_aoe: false,
-                created_at: chrono::Utc::now(),
+                created_at: crate::time::Timestamp::now(),
                 base_branch: data.base_branch.clone(),
             });
         }
