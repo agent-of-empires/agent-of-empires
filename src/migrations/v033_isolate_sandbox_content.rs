@@ -2705,7 +2705,7 @@ mod tests {
             "branch": "main",
             "workspace_dir": project.to_string_lossy(),
             "repos": [],
-            "created_at": chrono::Utc::now().to_rfc3339(),
+            "created_at": crate::time::Timestamp::now().to_rfc3339(),
             "cleanup_on_delete": true,
         });
         let registry = app.join("sessions.json");

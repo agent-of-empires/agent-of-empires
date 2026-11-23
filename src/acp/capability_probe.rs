@@ -107,7 +107,7 @@ async fn drain_first_snapshot(client: &mut AcpClient, agent: &str) -> bool {
                 continue;
             }
             let agent = agent.to_string();
-            let now = chrono::Utc::now().to_rfc3339();
+            let now = crate::time::Timestamp::now().to_rfc3339();
             let _ = tokio::task::spawn_blocking(move || {
                 crate::acp::option_catalog::record(&agent, &options, now)
             })

@@ -1611,7 +1611,7 @@ async fn daemon_trash_restore_purge_preserves_collisions_and_allows_retry() {
         branch: "feature/restore".into(),
         main_repo_path: repo.to_string_lossy().into_owned(),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        created_at: agent_of_empires::time::Timestamp::now(),
         base_branch: None,
     });
     let id = row.id.clone();
@@ -1790,9 +1790,10 @@ async fn daemon_trash_restore_purge_preserves_collisions_and_allows_retry() {
                 delete_worktree: true,
                 expected_trash: true,
                 expected_trashed_at: Some(
-                    chrono::DateTime::parse_from_rfc3339(row.trashed_at.as_ref().unwrap())
-                        .unwrap()
-                        .with_timezone(&chrono::Utc),
+                    agent_of_empires::time::Timestamp::parse_rfc3339(
+                        row.trashed_at.as_ref().unwrap(),
+                    )
+                    .unwrap(),
                 ),
                 expected_generation: Some(row.lifecycle_generation),
                 expected_trash_lifecycle_id: row.trash_lifecycle_id.clone(),
@@ -1845,9 +1846,10 @@ async fn daemon_trash_restore_purge_preserves_collisions_and_allows_retry() {
                 force_failed: true,
                 expected_trash: true,
                 expected_trashed_at: Some(
-                    chrono::DateTime::parse_from_rfc3339(retained.trashed_at.as_ref().unwrap())
-                        .unwrap()
-                        .with_timezone(&chrono::Utc),
+                    agent_of_empires::time::Timestamp::parse_rfc3339(
+                        retained.trashed_at.as_ref().unwrap(),
+                    )
+                    .unwrap(),
                 ),
                 expected_generation: Some(retained.lifecycle_generation),
                 expected_trash_lifecycle_id: retained.trash_lifecycle_id.clone(),
@@ -1985,7 +1987,7 @@ async fn daemon_terminal_commands_apply_dimensions_archive_and_abandon_policy() 
         branch: "feature/native-terminal".into(),
         main_repo_path: repo.to_string_lossy().into_owned(),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        created_at: agent_of_empires::time::Timestamp::now(),
         base_branch: None,
     });
     let id = row.id.clone();

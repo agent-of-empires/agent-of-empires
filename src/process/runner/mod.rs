@@ -668,7 +668,8 @@ fn append_log_line(path: &Path, line: &str) {
     else {
         return;
     };
-    let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
+    let ts =
+        crate::time::Timestamp::now().to_rfc3339_opts(crate::time::SecondsFormat::Millis, true);
     let _ = writeln!(f, "[{ts}] {line}");
 }
 

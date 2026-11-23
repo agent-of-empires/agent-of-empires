@@ -41,7 +41,7 @@ pub(super) fn between_prompt_signal_update(
     };
     if let Some(LifecycleSignal::WakeupPending { at }) = wakeup {
         return Some(BetweenPromptUpdate {
-            wake_at: at.timestamp_millis().max(prev_wake_at),
+            wake_at: at.as_millis().max(prev_wake_at),
             ..tracked(false)
         });
     }
@@ -441,7 +441,7 @@ mod tests {
                 wake_at,
             })
         };
-        let at = chrono::DateTime::from_timestamp_millis(600_000).unwrap();
+        let at = crate::time::Timestamp::from_millis(600_000).unwrap();
         let wake = LifecycleSignal::WakeupPending { at };
         let cases = [
             (

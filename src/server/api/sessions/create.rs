@@ -217,7 +217,7 @@ pub(super) async fn resolve_canonical_fork_seed(
                 super::lifecycle::lifecycle_rejection(state, &error)
                     .unwrap_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())
             })?;
-        if source.has_fresh_lifecycle_reservation(chrono::Utc::now()) {
+        if source.has_fresh_lifecycle_reservation(crate::time::Timestamp::now()) {
             return Err((
                 StatusCode::CONFLICT,
                 crate::daemon::ApiErrorCode::LifecycleLocked.header(),
@@ -244,7 +244,7 @@ pub(super) async fn resolve_canonical_fork_seed(
         .iter()
         .find(|row| row.id == source_id)
         .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
-    if source.has_fresh_lifecycle_reservation(chrono::Utc::now()) {
+    if source.has_fresh_lifecycle_reservation(crate::time::Timestamp::now()) {
         return Err((
             StatusCode::CONFLICT,
             crate::daemon::ApiErrorCode::LifecycleLocked.header(),

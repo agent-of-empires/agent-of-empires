@@ -689,7 +689,7 @@ pub struct DeleteSessionBody {
     pub cleanup_intent: Option<crate::session::deletion::CleanupIntent>,
     /// Consent is bound to the trash lifecycle selected by the client.
     #[serde(default)]
-    pub expected_trashed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub expected_trashed_at: Option<crate::time::Timestamp>,
     #[serde(default)]
     pub expected_trash_lifecycle_id: Option<String>,
     #[serde(default)]

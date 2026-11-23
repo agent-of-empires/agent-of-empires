@@ -1533,7 +1533,7 @@ mod tests {
                 .try_acquire_lifecycle_reservation(
                     LifecycleOperation::Stop,
                     Instance::LIFECYCLE_RESERVATION_TTL,
-                    chrono::Utc::now(),
+                    crate::time::Timestamp::now(),
                 )
                 .unwrap();
             crate::server::test_support::seed_instances_on_disk_for_test(
@@ -1589,7 +1589,7 @@ mod tests {
                             let generation = row.try_acquire_lifecycle_reservation(
                                 LifecycleOperation::Stop,
                                 Instance::LIFECYCLE_RESERVATION_TTL,
-                                chrono::Utc::now(),
+                                crate::time::Timestamp::now(),
                             )?;
                             row.status = Status::Stopped;
                             row.mark_idle_dormant();

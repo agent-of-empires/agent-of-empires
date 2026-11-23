@@ -1786,7 +1786,7 @@ mod tests {
                 prompt: "do a thing".into(),
                 model: "claude".into(),
                 output_file: "/tmp/nonexistent-4029.jsonl".into(),
-                started_at: chrono::Utc::now(),
+                started_at: crate::time::Timestamp::now(),
                 workflow: None,
             },
         );
@@ -1807,7 +1807,7 @@ mod tests {
                     model: None,
                     background: true,
                 },
-                at: chrono::Utc::now(),
+                at: crate::time::Timestamp::now(),
             },
         );
         let sup = Supervisor::new(sink);

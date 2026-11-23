@@ -13,10 +13,10 @@ use std::time::Duration;
 #[cfg(test)]
 use tokio::net::UnixStream;
 
+use crate::time::Timestamp;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
-use chrono::{DateTime, Utc};
 #[cfg(test)]
 use futures_util::SinkExt;
 use futures_util::StreamExt;
@@ -156,7 +156,11 @@ async fn run_read(
             alias_only_instances: Vec::new(),
             health: cache.health.clone(),
         };
-        (rows, metadata, runtime.pinned_now.unwrap_or_else(Utc::now))
+        (
+            rows,
+            metadata,
+            runtime.pinned_now.unwrap_or_else(Timestamp::now),
+        )
     };
     // A cancelled blocking sample retains admission until its worker exits.
     let sampled = tokio::task::spawn_blocking(move || {
@@ -249,7 +253,7 @@ pub struct RecordingPins {
     pub prebind_instance_id: String,
     pub runtime_instance_id: String,
     /// The instant the observed freshness is stamped with.
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: Timestamp,
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -315,7 +319,7 @@ struct RuntimeState {
     /// The blocking worker owns sample exclusion, even if its caller is cancelled.
     flight: Mutex<()>,
     /// Recordings may pin time; production uses the wall clock.
-    pinned_now: Option<DateTime<Utc>>,
+    pinned_now: Option<Timestamp>,
 }
 
 impl RuntimeState {
@@ -341,7 +345,7 @@ static RUNTIME: LazyLock<RuntimeState> = LazyLock::new(RuntimeState::new);
 /// Keep the latched cursor nonzero so unavailable freshness is not a malformed snapshot.
 const LATCHED_CURSOR: u64 = u64::MAX;
 
-fn publish_freshness(runtime: &RuntimeState, observed_at: DateTime<Utc>) -> (StatusFreshness, u64) {
+fn publish_freshness(runtime: &RuntimeState, observed_at: Timestamp) -> (StatusFreshness, u64) {
     let mut sampler = runtime
         .sampler
         .lock()
@@ -389,7 +393,7 @@ fn build_snapshot(
     runtime: &RuntimeState,
     mut sessions: Vec<SessionRead>,
     owner: Owner,
-    observed_at: DateTime<Utc>,
+    observed_at: Timestamp,
     cache: &super::reload::RuntimeReadCache,
 ) -> Sampled {
     // `local_owner` mirrors the declared owner so the two can never disagree.
@@ -1089,13 +1093,13 @@ mod tests {
             branch: "feature\u{202e}review".into(),
             main_repo_path: "/repo/".into(),
             managed_by_aoe: true,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             base_branch: Some("base\u{2066}review".into()),
         });
         session.workspace_info = Some(WorkspaceInfo {
             branch: "feature".into(),
             workspace_dir: "/repo/.aoe/workspace".into(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             cleanup_on_delete: true,
             repos: vec![repository],
         });
@@ -1110,7 +1114,7 @@ mod tests {
                 &RuntimeState::new(),
                 rows.clone(),
                 owner,
-                Utc::now(),
+                Timestamp::now(),
                 &crate::server::reload::RuntimeReadCache::accepted_inventory(),
             );
             for (schema, bytes) in [
@@ -1131,7 +1135,7 @@ mod tests {
         instance.workspace_info = Some(WorkspaceInfo {
             branch: "main".into(),
             workspace_dir: "/srv/repo/.aoe/workspace".into(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             cleanup_on_delete: true,
             repos: vec![repo("beta", "/srv/beta"), repo("alpha", "/srv/alpha")],
         });
@@ -1195,7 +1199,7 @@ mod tests {
             &RuntimeState::new(),
             rows,
             Owner::remote(),
-            Utc::now(),
+            Timestamp::now(),
             &cache,
         );
         let hello = parse_hello(&hello_frame(&sampled)).unwrap();
@@ -1321,7 +1325,7 @@ mod tests {
                     bad.workspace_info = Some(WorkspaceInfo {
                         branch: "main".into(),
                         workspace_dir: "/workspace".into(),
-                        created_at: Utc::now(),
+                        created_at: Timestamp::now(),
                         cleanup_on_delete: true,
                         repos: if case == "workspace-duplicate" {
                             vec![repository.clone(), repository]
@@ -1337,7 +1341,7 @@ mod tests {
                         branch: "main".into(),
                         main_repo_path: "relative/repo".into(),
                         managed_by_aoe: true,
-                        created_at: Utc::now(),
+                        created_at: Timestamp::now(),
                         base_branch: None,
                     });
                 }
@@ -1372,7 +1376,7 @@ mod tests {
                 &RuntimeState::new(),
                 instances.map(SessionRead::from_instance).collect(),
                 Owner::remote(),
-                Utc::now(),
+                Timestamp::now(),
                 &crate::server::reload::RuntimeReadCache::accepted_inventory(),
             );
             let hello = parse_hello(&hello_frame(&sampled)).unwrap();
@@ -2087,7 +2091,7 @@ mod tests {
             &RuntimeState::new(),
             instances.iter().map(SessionRead::from_instance).collect(),
             Owner::remote(),
-            Utc::now(),
+            Timestamp::now(),
             &crate::server::reload::RuntimeReadCache::accepted_inventory(),
         );
 
@@ -2167,7 +2171,7 @@ mod tests {
             &RuntimeState::new(),
             Vec::new(),
             Owner::remote(),
-            Utc::now(),
+            Timestamp::now(),
             &crate::server::reload::RuntimeReadCache::accepted_inventory(),
         );
 
@@ -2222,7 +2226,7 @@ mod tests {
                 .map(SessionRead::from_instance)
                 .collect(),
             Owner::remote(),
-            Utc::now(),
+            Timestamp::now(),
             &crate::server::reload::RuntimeReadCache::accepted_inventory(),
         );
         assert_eq!(sampled.data.default_profile, None);
@@ -2304,7 +2308,7 @@ mod tests {
             &RuntimeState::new(),
             instances.iter().map(SessionRead::from_instance).collect(),
             Owner::remote(),
-            Utc::now(),
+            Timestamp::now(),
             &crate::server::reload::RuntimeReadCache::accepted_inventory(),
         );
 
@@ -2330,7 +2334,7 @@ mod tests {
                 .map(SessionRead::from_instance)
                 .collect(),
             Owner::remote(),
-            Utc::now(),
+            Timestamp::now(),
             &crate::server::reload::RuntimeReadCache::accepted_inventory(),
         );
         let value: serde_json::Value = serde_json::to_value(&sampled.hello).expect("hello encodes");
@@ -2348,7 +2352,7 @@ mod tests {
         let observed_at = freshness["observed_at"].as_str().expect("timestamp");
         assert!(observed_at.ends_with('Z'));
         assert!(
-            chrono::DateTime::parse_from_rfc3339(observed_at).is_ok(),
+            crate::time::Timestamp::parse_rfc3339(observed_at).is_ok(),
             "{observed_at}"
         );
     }
@@ -2364,14 +2368,14 @@ mod tests {
             &runtime,
             Vec::new(),
             Owner::remote(),
-            Utc::now(),
+            Timestamp::now(),
             &crate::server::reload::RuntimeReadCache::accepted_inventory(),
         );
         let second = build_snapshot(
             &runtime,
             Vec::new(),
             Owner::remote(),
-            Utc::now(),
+            Timestamp::now(),
             &crate::server::reload::RuntimeReadCache::accepted_inventory(),
         );
 
@@ -2393,7 +2397,7 @@ mod tests {
             &runtime,
             Vec::new(),
             Owner::remote(),
-            Utc::now(),
+            Timestamp::now(),
             &crate::server::reload::RuntimeReadCache::accepted_inventory(),
         );
 
@@ -2419,7 +2423,7 @@ mod tests {
             "and the renderer reads it as the freshness it cannot report"
         );
 
-        let (again, cursor) = publish_freshness(&runtime, Utc::now());
+        let (again, cursor) = publish_freshness(&runtime, Timestamp::now());
         assert!(matches!(again, StatusFreshness::Unavailable { .. }));
         assert_eq!(cursor, LATCHED_CURSOR);
     }
@@ -2483,7 +2487,7 @@ mod tests {
                 &RuntimeState::new(),
                 instances.iter().map(SessionRead::from_instance).collect(),
                 Owner::remote(),
-                Utc::now(),
+                Timestamp::now(),
                 &crate::server::reload::RuntimeReadCache::accepted_inventory(),
             );
             let snapshot = parse_snapshot(&snapshot_frame(&sampled)).unwrap();
@@ -2596,13 +2600,16 @@ mod tests {
     fn a_fractional_timestamp_survives_the_wire_intact() {
         let _home = TempHome::new();
         let mut inst = named("fractional", "main");
-        inst.created_at = "2026-01-02T03:04:05.123456789Z".parse().expect("timestamp");
-        inst.pinned_at = Some("2026-01-02T03:04:06.5Z".parse().expect("timestamp"));
+        inst.created_at = crate::time::Timestamp::parse_rfc3339("2026-01-02T03:04:05.123456789Z")
+            .expect("timestamp");
+        inst.pinned_at = Some(
+            crate::time::Timestamp::parse_rfc3339("2026-01-02T03:04:06.5Z").expect("timestamp"),
+        );
         let sampled = build_snapshot(
             &RuntimeState::new(),
             [inst].iter().map(SessionRead::from_instance).collect(),
             Owner::remote(),
-            Utc::now(),
+            Timestamp::now(),
             &crate::server::reload::RuntimeReadCache::accepted_inventory(),
         );
 
@@ -2610,7 +2617,7 @@ mod tests {
         assert_eq!(row.created_at, "2026-01-02T03:04:05.123456789Z");
         // `AutoSi` writes the smallest of 0, 3, 6 or 9 digits that keeps the
         // instant, so `.5` comes back as `.500`: the same spelling the local
-        // `DateTime<Utc>` serializer produces.
+        // `Timestamp` serializer produces.
         assert_eq!(row.pinned_at.as_deref(), Some("2026-01-02T03:04:06.500Z"));
 
         // And the client's own validator accepts the spelling it is handed.
@@ -2631,7 +2638,8 @@ mod tests {
                     runtime_epoch: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
                     prebind_instance_id: "bbbbbbbb-cccc-dddd-eeee-ffffffffffff".into(),
                     runtime_instance_id: "cccccccc-dddd-eeee-ffff-000000000000".into(),
-                    observed_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                    observed_at: crate::time::Timestamp::parse_rfc3339("2026-01-01T00:00:00Z")
+                        .unwrap(),
                 },
             );
             let snapshot = parse_snapshot(&frames.snapshot).unwrap();

@@ -166,7 +166,7 @@ impl Instance {
             !matches!(self.status, Status::Creating | Status::Deleting),
             LifecycleReservationError::Superseded
         );
-        if self.has_fresh_lifecycle_reservation(Utc::now()) {
+        if self.has_fresh_lifecycle_reservation(Timestamp::now()) {
             return Err(LifecycleReservationError::Busy(
                 self.lifecycle_reservation
                     .as_ref()

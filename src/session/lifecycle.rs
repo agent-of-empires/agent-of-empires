@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use serde_json::Value;
 
 use super::Instance;
@@ -87,7 +87,7 @@ pub struct LifecycleChange {
     pub session_id: String,
     pub effective_profile: String,
     pub kind: LifecycleKind,
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
     /// The session as of this change; `None` for a deleted session.
     pub summary: Option<Value>,
 }
@@ -97,7 +97,7 @@ fn change(row: &LifecycleRow, kind: LifecycleKind) -> LifecycleChange {
         session_id: row.id.clone(),
         effective_profile: row.profile.clone(),
         kind,
-        at: Utc::now(),
+        at: Timestamp::now(),
         summary: (kind != LifecycleKind::Deleted).then(|| row.summary.clone()),
     }
 }
@@ -675,7 +675,7 @@ mod tests {
             branch: "feature/x".to_string(),
             main_repo_path: "/work/main".to_string(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: None,
         });
         let row = LifecycleRow::of(&inst, "p");

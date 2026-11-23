@@ -519,7 +519,7 @@ mod tests {
         AcpSessionId, AgentName, AuthStatusKind, Event, Plan, PlanStep, ThinkingSignal, ToolCall,
     };
     use crate::acp::transcript::{TranscriptModel, TranscriptRowKind};
-    use chrono::Utc;
+    use crate::time::Timestamp;
 
     fn tool(id: &str, name: &str) -> ToolCall {
         ToolCall {
@@ -528,7 +528,7 @@ mod tests {
             name: name.into(),
             kind: "execute".into(),
             args_preview: "ls".into(),
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             parent_tool_call_id: None,
             memory_recall: None,
             diffs: Vec::new(),
@@ -600,7 +600,7 @@ mod tests {
             options: Vec::new(),
             choice: false,
             plan: None,
-            requested_at: Utc::now(),
+            requested_at: Timestamp::now(),
             resolved: None,
         }
     }
@@ -628,7 +628,7 @@ mod tests {
                 load_session: None,
             },
             Event::CancelRequested {
-                escalates_at: Utc::now(),
+                escalates_at: Timestamp::now(),
             },
             Event::ModesAvailable {
                 current_mode_id: "plan".into(),
@@ -674,7 +674,7 @@ mod tests {
             description: None,
             tool_call_id: None,
             questions: Vec::new(),
-            requested_at: Utc::now(),
+            requested_at: Timestamp::now(),
             resolved: None,
         }];
 
@@ -712,7 +712,7 @@ mod tests {
             (
                 "thinking",
                 Some(ThinkingSignal {
-                    started_at: Utc::now(),
+                    started_at: Timestamp::now(),
                 }),
                 false,
                 Some("thinking…"),
@@ -721,7 +721,7 @@ mod tests {
             (
                 "compacting outranks thinking",
                 Some(ThinkingSignal {
-                    started_at: Utc::now(),
+                    started_at: Timestamp::now(),
                 }),
                 true,
                 Some("compacting…"),
@@ -807,7 +807,7 @@ mod tests {
             prompt: "do the thing".into(),
             model: "claude-opus-4-8".into(),
             output_file: "/tmp/a1.output".into(),
-            started_at: chrono::Utc::now(),
+            started_at: crate::time::Timestamp::now(),
             workflow: None,
         }]);
         assert!(!state.turn_active, "fixture invariant: no main turn opened");
@@ -829,7 +829,7 @@ mod tests {
             prompt: "do the thing".into(),
             model: "claude-opus-4-8".into(),
             output_file: "/tmp/a1.output".into(),
-            started_at: chrono::Utc::now(),
+            started_at: crate::time::Timestamp::now(),
             workflow: None,
         }]);
         t.apply_reduced_state(1, launched, &[]);

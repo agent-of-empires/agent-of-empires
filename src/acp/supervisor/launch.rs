@@ -3316,7 +3316,7 @@ time.sleep(60)
                 name: "Bash".into(),
                 kind: "execute".into(),
                 args_preview: r#"{"command":"pwd"}"#.into(),
-                started_at: chrono::Utc::now(),
+                started_at: crate::time::Timestamp::now(),
                 parent_tool_call_id: None,
                 memory_recall: None,
                 diffs: Vec::new(),
@@ -3325,7 +3325,7 @@ time.sleep(60)
             options: Vec::new(),
             choice: false,
             plan: None,
-            requested_at: chrono::Utc::now(),
+            requested_at: crate::time::Timestamp::now(),
             resolved: None,
         };
         sink.publish(
@@ -3415,7 +3415,7 @@ time.sleep(60)
                 prompt: "do a thing".into(),
                 model: "claude".into(),
                 output_file: "/tmp/nonexistent.jsonl".into(),
-                started_at: chrono::Utc::now(),
+                started_at: crate::time::Timestamp::now(),
                 workflow: None,
             },
         );
@@ -3429,7 +3429,7 @@ time.sleep(60)
                 tools: Vec::new(),
                 last_tool: None,
                 last_text: None,
-                at: chrono::Utc::now(),
+                at: crate::time::Timestamp::now(),
             },
         );
         let launcher: super::super::Launcher = Arc::new(move |config: SpawnConfig, session_id| {
@@ -3608,7 +3608,7 @@ time.sleep(60)
                 prompt: "do a thing".into(),
                 model: "claude".into(),
                 output_file: output_file.into(),
-                started_at: chrono::Utc::now(),
+                started_at: crate::time::Timestamp::now(),
                 workflow: None,
             },
         );
@@ -3622,7 +3622,7 @@ time.sleep(60)
                 tools: Vec::new(),
                 last_tool: None,
                 last_text: None,
-                at: chrono::Utc::now(),
+                at: crate::time::Timestamp::now(),
             },
         );
         if let Some(task_id) = open_task {

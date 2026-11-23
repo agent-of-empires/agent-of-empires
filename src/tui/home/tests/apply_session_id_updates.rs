@@ -70,7 +70,7 @@ fn settings_repo_scope_saves_where_a_workspace_runtime_reads() {
         inst.workspace_info = Some(crate::session::WorkspaceInfo {
             branch: "feat".into(),
             workspace_dir,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             cleanup_on_delete: false,
             repos: vec![crate::session::WorkspaceRepo {
                 name: "repo".into(),

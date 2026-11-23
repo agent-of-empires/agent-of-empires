@@ -53,7 +53,7 @@ pub(super) fn is_compact_failure(text: &str) -> bool {
 fn cleared_plan() -> Event {
     Event::PlanUpdated {
         plan: Plan {
-            plan_id: format!("plan-{}", chrono::Utc::now().timestamp_millis()),
+            plan_id: format!("plan-{}", crate::time::Timestamp::now().as_millis()),
             version: 1,
             steps: Vec::new(),
         },
@@ -310,7 +310,7 @@ fn notice_severity_str(severity: &NoticeSeverity) -> &str {
 /// TodoWrite arrives as a checklist plan; a synthetic TodoWrite card pair
 /// records each update in the transcript. A legacy plan has no id, so one is minted.
 fn checklist_events(entries: Vec<PlanEntry>, plan_id: Option<String>) -> Vec<Event> {
-    let ts_ms = chrono::Utc::now().timestamp_millis();
+    let ts_ms = crate::time::Timestamp::now().as_millis();
     let seq = SYNTHETIC_TOOL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let plan_id = plan_id.unwrap_or_else(|| format!("plan-{ts_ms}-{seq}"));
     let tool_id = format!("todo-{ts_ms}-{seq}");
@@ -334,7 +334,7 @@ fn checklist_events(entries: Vec<PlanEntry>, plan_id: Option<String>) -> Vec<Eve
             status: map_plan_status(e.status),
         })
         .collect();
-    let now = chrono::Utc::now();
+    let now = crate::time::Timestamp::now();
     vec![
         Event::ToolCallStarted {
             tool_call: ToolCall {
@@ -449,7 +449,7 @@ pub(super) fn map_update_to_events(
                 kind: tool_kind_str(&tc.kind),
                 args_preview: args_preview.clone(),
                 prompt: tc.raw_input.as_ref().and_then(full_prompt),
-                started_at: chrono::Utc::now(),
+                started_at: crate::time::Timestamp::now(),
                 parent_tool_call_id,
                 memory_recall,
                 diffs,
@@ -466,7 +466,7 @@ pub(super) fn map_update_to_events(
                     is_error: matches!(tc.status, ToolCallStatus::Failed),
                     content: extract_tool_content_text(&tc.content),
                     output: extract_tool_output_blocks(&tc.content),
-                    completed_at: chrono::Utc::now(),
+                    completed_at: crate::time::Timestamp::now(),
                     async_subagent: tc.status == ToolCallStatus::Completed
                         && matches!(
                             detect_off_protocol_work_completed(&tc.content),
@@ -552,7 +552,7 @@ pub(super) fn map_update_to_events(
                     title: new_title,
                     args_preview: new_args_preview,
                     prompt: new_prompt,
-                    started_at: in_progress.then(chrono::Utc::now),
+                    started_at: in_progress.then(crate::time::Timestamp::now),
                     diffs: new_diffs,
                 });
             }
@@ -568,7 +568,7 @@ pub(super) fn map_update_to_events(
                     is_error,
                     content: content_text,
                     output: output_blocks,
-                    completed_at: chrono::Utc::now(),
+                    completed_at: crate::time::Timestamp::now(),
                     async_subagent,
                 });
             } else if !content_text.is_empty() {
@@ -1546,7 +1546,7 @@ mod tests {
         for armed in [
             Event::MonitorArmed { description: None },
             Event::WakeupScheduled {
-                at: chrono::Utc::now(),
+                at: crate::time::Timestamp::now(),
                 reason: None,
             },
         ] {
@@ -1887,7 +1887,7 @@ mod tests {
         else {
             panic!("expected WakeupScheduled, got {events:?}");
         };
-        assert!((590..=610).contains(&(*at - chrono::Utc::now()).num_seconds()));
+        assert!((590..=610).contains(&(*at - crate::time::Timestamp::now()).whole_seconds()));
         assert_eq!(
             reason.as_deref(),
             Some("Test 10-minute wake-up card countdown")

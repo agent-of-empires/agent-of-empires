@@ -108,9 +108,9 @@ pub(super) const UNKNOWN_ERROR_WINDOW_CONFIRMED_PRESENT: std::time::Duration =
 pub(crate) struct PassiveStatusPatch {
     pub status: Status,
     pub lifecycle_generation: u64,
-    pub idle_entered_at: Option<DateTime<Utc>>,
+    pub idle_entered_at: Option<Timestamp>,
     /// Stays `None` for a never-touched row; idle-reap and freshness sort rely on it.
-    pub last_accessed_at: Option<DateTime<Utc>>,
+    pub last_accessed_at: Option<Timestamp>,
 }
 
 impl PassiveStatusPatch {

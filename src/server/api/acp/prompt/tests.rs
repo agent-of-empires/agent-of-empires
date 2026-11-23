@@ -106,7 +106,7 @@ fn park_on_armed_rate_limit(state: &AppState, id: &str) {
             &Event::RateLimit {
                 info: crate::acp::state::RateLimitInfo {
                     status: "limited".into(),
-                    resets_at: Some(chrono::Utc::now() + chrono::Duration::days(3)),
+                    resets_at: Some(crate::time::Timestamp::now() + crate::time::Duration::days(3)),
                     kind: "usage".into(),
                 },
             },
@@ -149,7 +149,7 @@ async fn failing_start_state(
             Err::<crate::acp::acp_client::AcpClient, _>(if rate_limited {
                 AcpError::RateLimited(Box::new(crate::acp::state::RateLimitInfo {
                     status: "limited".into(),
-                    resets_at: Some(chrono::Utc::now() + chrono::Duration::days(3)),
+                    resets_at: Some(crate::time::Timestamp::now() + crate::time::Duration::days(3)),
                     kind: "usage".into(),
                 }))
             } else {
@@ -850,8 +850,8 @@ async fn diff_comments_refuse_to_open_a_turn_another_submission_started() {
 /// which is what makes B queue rather than dispatch.
 fn seed_elapsed_rate_limit_park(state: &AppState, id: &str, busy: bool) {
     let store = &state.acp_event_store;
-    let long_ago = chrono::Utc::now() - chrono::Duration::hours(1);
-    let at = long_ago.timestamp_millis();
+    let long_ago = crate::time::Timestamp::now() - crate::time::Duration::hours(1);
+    let at = long_ago.as_millis();
     let mut events = vec![
         Event::UserPromptSent {
             merged_prompt_ids: Vec::new(),
@@ -1042,9 +1042,10 @@ fn prompt_persist_tiers() {
     // clear Ignore.
     let mut disk = crate::session::Instance::new("s", "/tmp/x");
     disk.view = crate::session::View::Structured;
-    disk.last_accessed_at = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
-    disk.archived_at = Some(chrono::Utc::now() - chrono::Duration::seconds(30));
-    disk.ignored_at = Some(chrono::Utc::now());
+    disk.last_accessed_at =
+        Some(crate::time::Timestamp::now() - crate::time::Duration::seconds(60));
+    disk.archived_at = Some(crate::time::Timestamp::now() - crate::time::Duration::seconds(30));
+    disk.ignored_at = Some(crate::time::Timestamp::now());
     crate::server::session_service::apply_prompt_persist_to_disk(&mut disk, false);
     assert!(disk.archived_at.is_some());
     assert!(disk.ignored_at.is_none());
@@ -1053,8 +1054,8 @@ fn prompt_persist_tiers() {
     // A wake persist lifts a sunk row.
     let mut disk = crate::session::Instance::new("s", "/tmp/x");
     disk.view = crate::session::View::Structured;
-    disk.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::minutes(10));
-    disk.ignored_at = Some(chrono::Utc::now());
+    disk.snoozed_until = Some(crate::time::Timestamp::now() + crate::time::Duration::minutes(10));
+    disk.ignored_at = Some(crate::time::Timestamp::now());
     crate::server::session_service::apply_prompt_persist_to_disk(&mut disk, true);
     assert!(disk.snoozed_until.is_none());
     assert!(disk.ignored_at.is_none());
