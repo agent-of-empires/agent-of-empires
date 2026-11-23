@@ -14342,6 +14342,7 @@ async fn restart_of_a_shelved_sandbox_session_runs_no_before_start_hook() -> any
 #[serial_test::serial]
 async fn restart_admission_decides_on_the_incoming_tool() -> anyhow::Result<()> {
     let home = crate::session::test_support::isolate_app_dir();
+    let (_runtime, _calls) = crate::session::test_support::probing_container_runtime(home.path());
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })?;
@@ -14466,6 +14467,7 @@ fn restart_admission_keeps_the_conversation_of_an_account_swap() {
 #[serial_test::serial]
 async fn restart_admission_decides_an_account_swap_on_the_incoming_account() -> anyhow::Result<()> {
     let home = crate::session::test_support::isolate_app_dir();
+    let (_runtime, _calls) = crate::session::test_support::probing_container_runtime(home.path());
     let _registry = crate::session::install_aliases("default", &[("claude-2", "claude")]);
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
