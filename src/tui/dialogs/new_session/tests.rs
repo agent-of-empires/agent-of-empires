@@ -1982,6 +1982,45 @@ fn terminal_fork_hides_structured_despite_structured_default() {
     assert!(!dialog.structured_enabled);
 }
 
+/// A structured fork's child must run the ACP `session/fork` handshake, so the
+/// dialog opens it structured under a terminal default and keeps it there.
+#[test]
+fn structured_fork_stays_structured_despite_terminal_default() {
+    let mut dialog = single_tool_dialog();
+    dialog.structured_default = false;
+    dialog.set_structured_capable(true);
+    dialog.apply_structured_default();
+    assert!(!dialog.structured_enabled);
+    dialog.set_fork_from(crate::session::ForkSeed::Structured {
+        parent_acp_session_id: "acp-parent".into(),
+    });
+    assert!(dialog.structured_enabled);
+    dialog.set_structured(false);
+    assert!(dialog.structured_enabled, "the toggle cannot turn it off");
+    let data = submitted(dialog.build_submit_result());
+    assert!(data.structured);
+    assert!(matches!(
+        data.fork_seed,
+        Some(crate::session::ForkSeed::Structured { .. })
+    ));
+}
+
+/// A structured fork whose agent cannot run structured here is refused, not sent
+/// as a terminal session carrying an ACP parent id.
+#[test]
+fn structured_fork_without_a_structured_capable_agent_is_refused() {
+    let mut dialog = single_tool_dialog();
+    dialog.set_structured_capable(false);
+    dialog.set_fork_from(crate::session::ForkSeed::Structured {
+        parent_acp_session_id: "acp-parent".into(),
+    });
+    assert!(!dialog.validate_structured());
+    assert!(dialog
+        .error_message
+        .as_deref()
+        .is_some_and(|m| m.contains("structured view")));
+}
+
 #[test]
 fn only_a_title_the_user_typed_is_marked_typed() {
     let mut dialog = single_tool_dialog();
