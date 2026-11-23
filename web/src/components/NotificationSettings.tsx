@@ -58,8 +58,8 @@ export function NotificationSettings() {
         )}
       </div>
 
-      {/* The steps the install banner's × promises stay here. A tab that can push has its Enable button. */}
-      {state.kind === "unsupported" && (hint === "ios" || hint === "other") && <InstallHelp hint={hint} />}
+      {/* The install banner's × promises these steps here, so the platform decides them, not the push state. */}
+      {(hint === "ios" || hint === "other") && <InstallHelp hint={hint} />}
     </section>
   );
 }

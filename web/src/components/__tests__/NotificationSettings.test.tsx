@@ -124,6 +124,13 @@ describe("NotificationSettings", () => {
       steps: INSTALL_STEPS.ios.settings,
       enable: false,
     },
+    {
+      name: "an iPhone tab that exposes push lists the Home Screen steps and offers Enable",
+      hint: "ios",
+      state: { kind: "off" },
+      steps: INSTALL_STEPS.ios.settings,
+      enable: true,
+    },
     { name: "a tab that can push offers Enable", hint: "push", state: { kind: "off" }, steps: [], enable: true },
     {
       name: "a touch browser without push lists the install steps",
