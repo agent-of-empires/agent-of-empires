@@ -738,7 +738,7 @@ An `href` renders as a link only when it is an `http(s)` URL or a path starting 
 
 #### Pane actions
 
-Clicking an `action` block, or a `row` carrying a `method`, POSTs to `/api/plugins/{id}/action` with `{ method, params, session_id }`. `params` is the block's own `params` object, forwarded as given apart from the host-owned `session_id` and `origin`, so one method can serve every row in a list:
+Clicking an `action` block, or a `row` carrying a `method`, POSTs to `/api/plugins/{id}/action` with `{ method, params, session_id }`. `params` is the block's own `params` object, forwarded as given apart from the host-owned `session_id` and `origin`. The host also removes `composer` unless the plugin declares the composer-read capability. One method can serve every row in a list:
 
 ```json
 { "kind": "row", "label": "warn when daemon is stale", "prefix": "#3231",
