@@ -69,7 +69,7 @@ Each row shows the server name, transport, its winning provenance (`agent-native
 
 `aoe mcp list` prints the same merged set, plus conflicts and servers kept after removal.
 
-Resolve conflicts and kept servers in the dashboard's **MCP servers** settings tab (hidden in [CityHall client mode](web-dashboard.md#cityhall-client-mode)):
+Resolve conflicts and kept servers in the dashboard's **MCP servers** settings tab; in [CityHall client mode](web-dashboard.md#cityhall-client-mode) the tab is read-only, listing conflicts and kept servers without the resolve, keep and drop actions:
 
 - **Conflicts.** AoE remembers the last definition it saw in an agent's native config. If that file changes on disk, the changed server is flagged and you pick a side. Keeping AoE's version stores it in the global `mcp.json`, which outranks the native layer; choosing the native version accepts the new definition. AoE never writes back to an agent-native config.
 - **Kept after removal.** A server that disappears from a native config is kept in view with a warning, so you can **keep** it (promoting it into the global `mcp.json`) or **drop** it.
