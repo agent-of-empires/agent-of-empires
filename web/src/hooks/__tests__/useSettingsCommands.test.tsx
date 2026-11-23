@@ -46,6 +46,7 @@ const SCHEMA: SettingsFieldDescriptor[] = [
   field("acp", "replay", { kind: "select", options: [] }, { policy: "allow" }),
   field("session", "secret", { kind: "toggle" }, { policy: "local_only", reason: "x" }),
   field("telemetry", "enabled", { kind: "toggle" }, { policy: "allow" }, false),
+  field("web", "auto_open_diff_pane", { kind: "toggle" }, { policy: "allow" }, false),
 ];
 
 beforeEach(() => {
@@ -64,7 +65,7 @@ async function render(overrides: Partial<Parameters<typeof useSettingsCommands>[
   const hook = renderHook((args: Parameters<typeof useSettingsCommands>[0]) => useSettingsCommands(args), {
     initialProps: { open: true, readOnly: false, onOpenSettingsTab, ...overrides },
   });
-  await waitFor(() => expect(hook.result.current.length).toBe(5));
+  await waitFor(() => expect(hook.result.current.length).toBe(6));
   const action = (id: string) => hook.result.current.find((a) => a.id === id);
   await waitFor(() =>
     expect(action("setting:worktree.auto_cleanup")?.subtitle).toBe(
@@ -159,6 +160,8 @@ describe("useSettingsCommands", () => {
     const { onOpenSettingsTab, action } = await render({ readOnly: true });
     action("setting:session.live_send")?.perform();
     expect(onOpenSettingsTab).toHaveBeenCalledWith("session");
+    action("setting:web.auto_open_diff_pane")?.perform();
+    expect(onOpenSettingsTab).toHaveBeenCalledWith("panels");
     expect(updateSettings).not.toHaveBeenCalled();
   });
 });

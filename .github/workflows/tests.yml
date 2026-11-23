@@ -72,16 +72,19 @@ jobs:
         if: matrix.leg == 'core-rest'
         with:
           tool: cargo-nextest
-      - name: Install tmux
+      - name: Install runtime test prerequisites
         run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Install isolated namespace test prerequisites
+        if: matrix.leg == 'core-rest' || matrix.leg == 'web-e2e'
+        run: sudo apt-get install -y bubblewrap iproute2 apparmor
       # RunsOn appends `. /etc/environment` to /etc/profile, so every login shell
       # resets PATH and aoe's login-shell launches lose the e2e stub dirs.
       - name: Keep inherited PATH in login shells
         run: sudo sed -i '/runs-on\/env/d' /etc/profile
-      - name: Install confined Local test prerequisites
-        if: matrix.leg == 'web-e2e'
+      - name: Enable isolated namespace tests
+        if: matrix.leg == 'core-rest' || matrix.leg == 'web-e2e'
         run: |
-          sudo apt-get install -y bubblewrap iproute2 apparmor
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           # The packaged profile denies capabilities to bwrap children, including ip.
           # Replace it only in memory on this disposable runner; keep network isolation.
           sudo apparmor_parser -r -K <<'PROFILE'
@@ -173,6 +176,9 @@ jobs:
         run: |
           echo "TMPDIR=${TMPDIR:-unset}"
           cargo nextest run --no-fail-fast
+      - name: Exercise bounded plugin staging
+        if: matrix.leg == 'core-rest'
+        run: cargo nextest run --run-ignored only --no-tests=fail -E 'test(staging_volume_) | test(startup_reclaims)'
       - name: Require scoped cancellation coverage
         if: matrix.leg == 'core-rest'
         env:

@@ -128,7 +128,7 @@ async fn retained_admitted_copy_reports_completion_after_presentation_invalidati
     let initial_scene = tokio::time::timeout(Duration::from_secs(12), async {
         loop {
             ticker.tick().await;
-            app.reconcile_structured_preview().await;
+            app.reconcile_structured_preview();
             drain_terminal(&mut master, &mut bytes);
             app.draw(&mut terminal).unwrap();
             if app.home.presentation_ready
@@ -227,7 +227,7 @@ async fn retained_admitted_copy_reports_completion_after_presentation_invalidati
         loop {
             ticker.reset();
             ticker.tick().await;
-            app.reconcile_structured_preview().await;
+            app.reconcile_structured_preview();
             match observed.try_recv() {
                 Ok(()) => break,
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
@@ -254,7 +254,7 @@ async fn retained_admitted_copy_reports_completion_after_presentation_invalidati
         loop {
             ticker.reset();
             ticker.tick().await;
-            app.reconcile_structured_preview().await;
+            app.reconcile_structured_preview();
             drain_terminal(&mut master, &mut bytes);
             app.draw(&mut terminal).unwrap();
             drain_terminal(&mut master, &mut bytes);
@@ -297,7 +297,7 @@ async fn retained_admitted_copy_reports_completion_after_presentation_invalidati
         loop {
             ticker.reset();
             ticker.tick().await;
-            app.reconcile_structured_preview().await;
+            app.reconcile_structured_preview();
             drain_terminal(&mut master, &mut bytes);
             app.draw(&mut terminal).unwrap();
             drain_terminal(&mut master, &mut bytes);
