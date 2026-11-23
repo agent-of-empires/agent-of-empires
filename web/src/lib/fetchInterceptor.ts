@@ -39,7 +39,7 @@ export function isLoginAttemptPath(path: string): boolean {
   );
 }
 
-/** GETs whose every caller shows its own error, so a toast would only repeat it. */
+/** GETs whose failure Home, /suggestions and the plugin views show inline; the sidebar group just hides. */
 const SELF_REPORTED = new Set(["/api/suggestions", "/api/plugins/discover"]);
 
 const ACP_PROMPT_PATH = /^\/api\/sessions\/[^/]+\/acp\/prompt$/;

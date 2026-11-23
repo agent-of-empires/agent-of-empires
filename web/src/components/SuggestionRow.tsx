@@ -378,7 +378,8 @@ export function UndoBar({
   title: string;
   disabled: boolean;
   onUndo: () => void;
-  onStop?: () => void;
+  /** Resolves true once the kind is off. */
+  onStop?: () => Promise<boolean>;
   stopLabel?: string;
 }) {
   const [stopped, setStopped] = useState(false);
@@ -402,10 +403,7 @@ export function UndoBar({
               <span aria-hidden="true">·</span>
               <button
                 type="button"
-                onClick={() => {
-                  onStop();
-                  setStopped(true);
-                }}
+                onClick={() => void onStop().then(setStopped)}
                 disabled={disabled}
                 className="flex-none cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
               >

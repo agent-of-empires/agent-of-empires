@@ -143,6 +143,13 @@ describe("SidebarSuggestions", () => {
     await waitFor(() => expect(dismissSuggestion).toHaveBeenCalledWith("github", "i1", true));
   });
 
+  it("a stale row has no \u25be menu, as on Home", async () => {
+    fetchSuggestions.mockResolvedValue(snap([mk(1, { stale: true }), mk(2)], true));
+    renderIt();
+    fireEvent.click(await screen.findByTestId("sidebar-suggested-toggle"));
+    expect(screen.getAllByRole("button", { name: "Start options" })).toHaveLength(1);
+  });
+
   it("a repo with no Project opens Start in\u2026 from the row", async () => {
     fetchSuggestionProjects.mockResolvedValue([{ name: "aoe", path: "/work/aoe" }]);
     fetchSuggestions.mockResolvedValue(snap([mk(1, { mapping_key: "acme/web" })], true));

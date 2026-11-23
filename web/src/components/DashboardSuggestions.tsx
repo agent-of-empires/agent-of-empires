@@ -164,6 +164,8 @@ export function DashboardSuggestions({
       <SuggestionHooksReview ctrl={ctrl} />
       {undo && (
         <UndoBar
+          // A new dismissal gets a fresh bar, not the last one's Stop state.
+          key={suggestionKey(undo)}
           title={undo.title}
           disabled={busy !== null || readOnly || offline}
           onUndo={() => void dismiss(undo, false)}

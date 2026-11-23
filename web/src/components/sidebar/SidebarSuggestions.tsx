@@ -209,7 +209,7 @@ function SuggestedRows({
                 {body}
               </button>
             )}
-            {!compact && (
+            {!compact && !item.stale && (
               <StartMenu
                 {...startMenuFor(item, snapshot, {
                   startWithChanges: (it) => void ctrl.startWithChanges(it),

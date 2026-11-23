@@ -198,6 +198,38 @@ describe("DashboardSuggestions", () => {
     expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
   });
 
+  it("a failed Stop keeps the undo bar, and a new dismiss starts a fresh bar", async () => {
+    const withKind = (items: SuggestionItem[]): SuggestionsSnapshot => ({
+      items,
+      prefs: PREFS,
+      providers: [
+        {
+          id: "github",
+          name: "GitHub",
+          status: "ok",
+          enabled: true,
+          sources: [{ criterion: "assigned", label: "Assigned issues", description: "", enabled: true, variables: [] }],
+        },
+      ],
+    });
+    fetchSuggestions.mockResolvedValue(withKind([mk(1), mk(2)]));
+    dismissSuggestion.mockResolvedValue(ok);
+    updateSuggestionSource.mockResolvedValue({ ok: false, error: "nope" });
+    renderIt();
+    fireEvent.click((await screen.findAllByRole("button", { name: "Dismiss" }))[0]!);
+    fireEvent.click(await screen.findByRole("button", { name: "Stop suggesting assigned issues" }));
+    await waitFor(() => expect(updateSuggestionSource).toHaveBeenCalled());
+    await act(async () => {});
+    expect(screen.queryByText(/^Stopped suggesting/)).toBeNull();
+    expect(screen.getByRole("button", { name: "Undo" })).toBeTruthy();
+
+    updateSuggestionSource.mockResolvedValue(ok);
+    fireEvent.click(screen.getByRole("button", { name: "Stop suggesting assigned issues" }));
+    await screen.findByText(/^Stopped suggesting/);
+    fireEvent.click(screen.getAllByRole("button", { name: "Dismiss" })[1]!);
+    expect(await screen.findByRole("button", { name: "Undo" })).toBeTruthy();
+  });
+
   it("expires the undo bar after 10s", async () => {
     fetchSuggestions.mockResolvedValueOnce(snap([mk(1)])).mockResolvedValue(snap([mk(1, { dismissed: true })]));
     dismissSuggestion.mockResolvedValue(ok);
