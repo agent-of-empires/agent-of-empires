@@ -182,7 +182,7 @@ const loadSendCommentsDialog = () => import("./components/diff/comments/SendComm
 const SendCommentsDialog = lazyView(() => loadSendCommentsDialog().then((m) => m.SendCommentsDialog), null);
 const loadCommandPalette = () => import("./components/command-palette/CommandPalette");
 const LazyCommandPalette = lazyView(() => loadCommandPalette().then((m) => m.CommandPalette), null);
-// Mounted only while open; the chunk itself is prefetched on idle.
+// Mounted only while open; the chunk is prefetched 2 s after mount.
 function CommandPalette(props: ComponentProps<typeof LazyCommandPalette>) {
   return props.open ? <LazyCommandPalette {...props} /> : null;
 }
@@ -918,7 +918,7 @@ function AppContent({
   // unit-tested directly.
   const tips = useTips();
   const [showPalette, setShowPalette] = useState(false);
-  // Warm the palette chunk once the app is idle so the first shortcut press opens it at once.
+  // Warm the palette chunk 2 s after mount so the first shortcut press opens it at once.
   useEffect(() => {
     const id = window.setTimeout(() => void loadCommandPalette(), 2000);
     return () => window.clearTimeout(id);
