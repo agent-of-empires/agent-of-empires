@@ -410,6 +410,7 @@ fn recover_staging(root_path: &Path) -> Result<()> {
         };
         if let Some(proof) = &evidence.removal {
             if let Some(mount) = &mount {
+                mount.require_owned_directory()?;
                 anyhow::ensure!(
                     mount.created() == Some(proof.mount_created),
                     "plugin staging mount birth changed"
@@ -2931,6 +2932,29 @@ mod tests {
             }
         }
         if may_remove && phase == "prepared" {
+            use std::os::unix::fs::PermissionsExt;
+
+            let permissions = std::fs::metadata(&mount).unwrap().permissions();
+            std::fs::set_permissions(
+                &mount,
+                std::fs::Permissions::from_mode(permissions.mode() | 0o022),
+            )
+            .unwrap();
+            let error = recover_staging(&root).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "anchored directory is not owned or permits shared writes"
+            );
+            assert!(mount.is_dir(), "shared-writable mount must survive");
+            assert_eq!(
+                anchored
+                    .read_regular(Path::new(STAGING_MARKER), 1024 * 1024)
+                    .unwrap()
+                    .unwrap(),
+                original
+            );
+            std::fs::set_permissions(&mount, permissions).unwrap();
+
             crate::session::anchored_fs::FAIL_SYNC_ONCE.set(Some(stage.clone()));
             assert!(recover_stale_staging().is_err());
             assert!(
