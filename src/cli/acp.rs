@@ -1028,6 +1028,7 @@ async fn restart(session: &str) -> Result<()> {
     let Some(record) = worker_registry::load(session)? else {
         // A cleanly stopped worker has no registry entry; start it like the dashboard's Retry.
         let client = HttpClient::new(require_daemon().await?)?;
+        println!("Starting agent worker for {session}...");
         client.spawn_acp(session).await.map_err(map_http)?;
         println!("Started agent worker for {session}.");
         return Ok(());

@@ -23,8 +23,9 @@ use crate::plugin::ui_state::UiSnapshot;
 
 /// The daemon revives, waits for readiness and delivers before it answers a terminal send.
 const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-/// The daemon prepares the sandbox, runs hooks and handshakes before it answers a spawn.
-const SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// A spawn answers only after sandbox prep, hooks (which have no deadline) and the handshake,
+/// so the client waits like the dashboard Retry and the user aborts with Ctrl-C.
+const SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 const PLUGIN_PREVIEW_TIMEOUT: std::time::Duration =
     crate::plugin::EXECUTION_BUDGET.saturating_add(std::time::Duration::from_secs(10 * 60));
 
@@ -585,22 +586,19 @@ impl HttpClient {
         Ok(())
     }
 
-    fn spawn_request(&self, session_id: &str) -> Result<reqwest::RequestBuilder, HttpError> {
+    /// `POST /api/sessions/{id}/acp/spawn`: start the worker, resuming the stored conversation.
+    pub async fn spawn_acp(&self, session_id: &str) -> Result<(), HttpError> {
         let url = format!(
             "{}/api/sessions/{}/acp/spawn",
             self.endpoint.base_url,
             path_segment(session_id)?
         );
-        Ok(self
+        let request = self
             .http
             .post(&url)
             .json(&serde_json::json!({}))
-            .timeout(SPAWN_TIMEOUT))
-    }
-
-    /// `POST /api/sessions/{id}/acp/spawn`: start the worker, resuming the stored conversation.
-    pub async fn spawn_acp(&self, session_id: &str) -> Result<(), HttpError> {
-        let res = self.execute(self.spawn_request(session_id)?).await?;
+            .timeout(SPAWN_TIMEOUT);
+        let res = self.execute(request).await?;
         check_status(res, session_id)?;
         Ok(())
     }
@@ -1612,12 +1610,20 @@ mod tests {
         let _ = server.await;
     }
 
-    #[test]
-    fn spawn_request_outlasts_the_default_transport_timeout() {
-        let client = HttpClient::new(endpoint("http://127.0.0.1:1", Some("t"))).unwrap();
-        let request = client.spawn_request("abc").unwrap().build().unwrap();
-        // The daemon transport default is 15s.
-        assert!(*request.timeout().unwrap() > Duration::from_secs(15));
+    #[tokio::test]
+    async fn spawn_acp_waits_past_the_default_transport_timeout() {
+        use axum::{routing::post, Router};
+        let app = Router::new().route(
+            "/api/sessions/{id}/acp/spawn",
+            post(|| async { tokio::time::sleep(Duration::from_secs(16)).await }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HttpClient::new(endpoint(&base, Some("spawn-token"))).unwrap();
+        client.spawn_acp("abc").await.unwrap();
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
