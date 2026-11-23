@@ -476,6 +476,7 @@ async fn user_prompt_to_a_stop_fenced_session_wakes_it() {
     let response = acp_prompt(
         State(Arc::clone(&state)),
         Path(id.clone()),
+        axum::http::HeaderMap::new(),
         prompt_req("wake up"),
     )
     .await
@@ -509,6 +510,7 @@ async fn no_revive_prompt_to_a_stop_fenced_session_stays_fenced() {
     let response = acp_prompt(
         State(Arc::clone(&state)),
         Path(id.clone()),
+        axum::http::HeaderMap::new(),
         no_revive_prompt_req("automated"),
     )
     .await
