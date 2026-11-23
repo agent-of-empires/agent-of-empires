@@ -2598,13 +2598,12 @@ impl App {
         // land on text the composer still holds, so the rest waits for the next
         // mount. Every segment stays in `unsent` while that is set.
         let mut stopped = false;
-        let failure = {
+        {
             let view = self
                 .home
                 .structured_preview
                 .as_mut()
                 .expect("checked above");
-            let mut failure = None;
             // A refused send is back in the composer and had its own Enter, so
             // it becomes the next segment: pasting the one after it onto that
             // text would submit both as one prompt. Text the reader edited since
@@ -2616,24 +2615,21 @@ impl App {
                 }
             }
             let held = view.take_held_text();
-            if !held.is_empty() {
-                draft = format!("{held}{draft}");
+            if !held.trim().is_empty() {
+                // Verbatim, so a leading indent or a trailing space survives,
+                // but the two were typed into different composers: a newline
+                // keeps them from being spliced into one word.
+                draft = if draft.is_empty() {
+                    held
+                } else {
+                    format!("{held}\n{draft}")
+                };
             }
             // Each segment was frozen when its Enter fell, so replaying them in
             // order submits exactly what the user had typed before each Enter.
             while let Some(segment) = unsent.first().cloned() {
                 let accepted = view.accepted_submits();
-                view.paste_text_with_file_load(&segment).await;
-                if let Err(e) = view
-                    .handle_event(Event::Key(KeyEvent::new(
-                        KeyCode::Enter,
-                        KeyModifiers::NONE,
-                    )))
-                    .await
-                {
-                    failure = Some(e);
-                    break;
-                }
+                view.submit_replayed_segment(&segment).await;
                 if view.accepted_submits() == accepted {
                     // The daemon kept nothing and the view put the segment back
                     // in its composer, either refused or held by the submit
@@ -2646,11 +2642,10 @@ impl App {
                 }
                 unsent.remove(0);
             }
-            if failure.is_none() && !stopped && !draft.is_empty() {
+            if !stopped && !draft.is_empty() {
                 view.paste_text_with_file_load(&draft).await;
             }
-            failure
-        };
+        }
         if stopped {
             // Every segment keeps its own Enter for the next mount, so the
             // buffer holds them all rather than a row switch dropping the one
@@ -2659,17 +2654,6 @@ impl App {
                 session_id.to_owned(),
                 PendingStructuredInput::from_parts(unsent, draft),
             );
-            return;
-        }
-        if let Some(e) = failure {
-            // Nothing that never reached the composer is dropped: the rest waits
-            // for the next mount of this row.
-            self.home.pending_paste_for_structured_view.insert(
-                session_id.to_owned(),
-                PendingStructuredInput::from_parts(unsent, draft),
-            );
-            self.close_embedded_structured();
-            self.update_status = Some(UpdateStatus::transient(format!("structured view: {e}")));
         }
     }
 
@@ -4099,8 +4083,8 @@ mod tests {
                 .get(&id)
                 .map(PendingStructuredInput::text)
                 .as_deref(),
-            Some("send this not this"),
-            "the later text waits for the next mount of this row"
+            Some("send this\n not this"),
+            "the later text waits for the next mount of this row, whitespace intact"
         );
     }
 
@@ -4149,7 +4133,7 @@ mod tests {
                 .get(&id)
                 .map(PendingStructuredInput::text)
                 .as_deref(),
-            Some("firstsecond"),
+            Some("first\nsecond"),
             "each segment waits for the next mount with its own Enter"
         );
 
@@ -4174,7 +4158,7 @@ mod tests {
                 .get(&id)
                 .map(PendingStructuredInput::text)
                 .as_deref(),
-            Some("firstsecond"),
+            Some("first\nsecond"),
             "both segments still wait, each on its own Enter"
         );
     }
@@ -4276,7 +4260,7 @@ mod tests {
                 .get(&id)
                 .map(PendingStructuredInput::text)
                 .as_deref(),
-            Some("éa界"),
+            Some("éa\n界"),
             "the frozen segment and the multibyte draft both survive for the next mount, got {:?}",
             view.composer_text()
         );
@@ -4389,8 +4373,82 @@ mod tests {
                 .get(&id)
                 .map(PendingStructuredInput::text)
                 .as_deref(),
-            Some("frozenalso do X"),
-            "the reader's text is kept as the draft after the segment, not merged into it"
+            Some("frozen\nalso do X"),
+            "the reader's text is kept as the draft after the segment, on its own line"
+        );
+    }
+
+    /// The held text is parked as the reader typed it: trimming would drop
+    /// their leading indent and fuse it to the draft that follows.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn parked_reader_text_keeps_its_whitespace() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        app.home.structured_preview = Some(EmbeddedView::for_test(&id));
+        app.home.pending_paste_for_structured_view.insert(
+            id.clone(),
+            PendingStructuredInput::from_parts(vec![], "  indented".into()),
+        );
+        app.home
+            .structured_preview
+            .as_mut()
+            .expect("mounted")
+            .paste_text_with_file_load("  held line\n")
+            .await;
+
+        app.drain_pending_paste_for_structured_view(&id).await;
+
+        assert_eq!(
+            app.home
+                .structured_preview
+                .as_ref()
+                .expect("mounted")
+                .composer_text(),
+            "  held line\n\n  indented",
+            "both sides keep their whitespace and the draft stays after the held text"
+        );
+    }
+
+    /// A pasted segment can open the composer's slash picker. The replay must
+    /// submit it anyway: an Enter that accepts a completion leaves the segment
+    /// in the buffer, so reopening would strand it and everything behind it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_segment_that_opens_a_picker_is_submitted_not_completed() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        app.open_structured_view(&id).await.unwrap();
+        app.route_pasted_text("/compact").await;
+        assert!(app.hold_key_for_pending_structured_view(&KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        app.route_pasted_text("then explain").await;
+
+        let mut view = EmbeddedView::for_test(&id);
+        view.offer_commands_for_test(&["compact", "clear"]);
+        view.accept_submits_for_test(1);
+        assert!(tx.send(Ok(view)).is_ok());
+        assert!(app.poll_structured_mount());
+        app.drain_structured_paste().await;
+
+        let view = app
+            .home
+            .structured_preview
+            .as_ref()
+            .expect("the mount is on screen");
+        assert_eq!(
+            view.submitted_prompts(),
+            ["/compact".to_string()],
+            "the frozen segment goes out as typed, not as an accepted completion"
+        );
+        assert_eq!(
+            view.composer_text(),
+            "then explain",
+            "the input behind it is still in the composer, not stranded behind a picker"
         );
     }
 
@@ -4494,8 +4552,8 @@ mod tests {
         );
         assert_eq!(
             view.composer_text(),
-            "refused! typed later",
-            "the edit stays in the composer with the text typed after its Enter"
+            "refused!\n typed later",
+            "the edit stays in the composer, unchanged, with the text typed after its Enter"
         );
         assert!(!app.home.pending_paste_for_structured_view.contains_key(&id));
     }

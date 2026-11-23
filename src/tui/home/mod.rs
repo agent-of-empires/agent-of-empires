@@ -264,10 +264,17 @@ impl PendingStructuredInput {
         Self { completed, draft }
     }
 
+    /// Every buffered prompt, one per line, the way the replay types them into
+    /// the composer.
     #[cfg(test)]
     pub(super) fn text(&self) -> String {
-        let mut text = self.completed.concat();
-        text.push_str(&self.draft);
+        let mut text = self.completed.join("\n");
+        if !self.draft.is_empty() {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&self.draft);
+        }
         text
     }
 }

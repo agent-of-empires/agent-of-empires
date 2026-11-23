@@ -453,6 +453,21 @@ impl EmbeddedView {
         self.state.toast.as_ref().map(|toast| toast.text.as_str())
     }
 
+    /// Offer these slash commands to the composer, so a pasted `/` query opens
+    /// the picker the replay has to get past.
+    #[cfg(test)]
+    pub(crate) fn offer_commands_for_test(&mut self, names: &[&str]) {
+        self.state.transcript.available_commands = names
+            .iter()
+            .map(|name| crate::acp::state::AvailableCommand {
+                name: (*name).to_string(),
+                description: String::new(),
+                accepts_input: false,
+                input_hint: None,
+            })
+            .collect();
+    }
+
     /// Prompts the daemon took from this view. The paste drain advances its
     /// replay only when this grows, so a rejected prompt is not counted as sent.
     pub(crate) fn accepted_submits(&self) -> u64 {
@@ -494,11 +509,26 @@ impl EmbeddedView {
         }
     }
 
-    /// Drain the composer into the caller's buffer. The replay parks text the
-    /// composer already holds, so it lands on an empty composer and a blocked
-    /// send takes only the segment it pasted.
+    /// Drain the composer into the caller's buffer, whitespace intact. The
+    /// replay parks text the composer already holds, so it lands on an empty
+    /// composer and a blocked send takes only the segment it pasted.
     pub(crate) fn take_held_text(&mut self) -> String {
-        self.state.take_composer_text()
+        self.state.take_composer_raw()
+    }
+
+    /// Submit one frozen replay segment as its own prompt. A paste can open the
+    /// `/` or `@` completion pickers, whose Enter accepts the completion instead
+    /// of sending, so the segment goes through the composer's submit path
+    /// directly and the picker never sees the key.
+    pub(crate) async fn submit_replayed_segment(&mut self, segment: &str) {
+        self.paste_text_with_file_load(segment).await;
+        let text = self.state.take_composer_text();
+        // The submit lock holds the segment as a draft, matching a live Enter.
+        if self.state.in_flight {
+            self.state.set_composer_text(&text);
+            return;
+        }
+        super::send_prompt_now(&mut self.state, &mut self.toast_deadline, &text).await;
     }
 
     /// Take back whatever the view left in its composer after an Enter it did not

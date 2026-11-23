@@ -522,7 +522,13 @@ impl StructuredViewState {
     /// Drain the composer's current text and clear it so the user can
     /// start the next prompt.
     pub fn take_composer_text(&mut self) -> String {
-        let text = self.composer.lines().join("\n").trim().to_string();
+        self.take_composer_raw().trim().to_string()
+    }
+
+    /// `take_composer_text` without the trim, for a caller parking the text
+    /// rather than sending it: the surrounding whitespace is the reader's.
+    pub fn take_composer_raw(&mut self) -> String {
+        let text = self.composer.lines().join("\n");
         // Replace with a fresh textarea so cursor + selection state
         // also reset; ratatui-textarea has no public "clear" today.
         self.composer = new_composer_textarea();
