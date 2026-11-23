@@ -14638,10 +14638,12 @@ async fn restart_of_a_shelved_sandbox_session_runs_no_before_start_hook() -> any
 /// A restart that changes the tool is admitted on the launch it makes, not on the row it
 /// leaves: the hook runs for the incoming tool, and a restart into a tool without a sandbox
 /// login is not held by the outgoing tool's login.
+#[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial]
 async fn restart_admission_decides_on_the_incoming_tool() -> anyhow::Result<()> {
     let home = crate::session::test_support::isolate_app_dir();
+    let (_runtime, _calls) = crate::session::test_support::probing_container_runtime(home.path());
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })?;
@@ -14762,10 +14764,12 @@ fn restart_admission_keeps_the_conversation_of_an_account_swap() {
 
 /// The restart into another account of the same agent is admitted on that launch: hook-only
 /// authentication admits it, a hook without any refuses it, as the restart itself decides.
+#[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial]
 async fn restart_admission_decides_an_account_swap_on_the_incoming_account() -> anyhow::Result<()> {
     let home = crate::session::test_support::isolate_app_dir();
+    let (_runtime, _calls) = crate::session::test_support::probing_container_runtime(home.path());
     let _registry = crate::session::install_aliases("default", &[("claude-2", "claude")]);
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
