@@ -46,6 +46,8 @@ export interface SessionActionHandlers {
   onArchiveToggle: (ws: Workspace, archived: boolean) => void;
   onSnooze: (ws: Workspace, minutes: number | null) => void;
   onUnreadToggle: (ws: Workspace, markUnread: boolean) => void;
+  onIgnoreToggle: (sessionId: string, ignored: boolean) => void;
+  onReclaimOwnership: (sessionId: string) => void;
 }
 
 export type SessionMenuState = { x: number; y: number; scope: RowContextScope };
@@ -263,6 +265,13 @@ function buildRowActions(
     recreateContainer: afterTarget("recreateContainer", setRecreating),
     pin: () => props.onPinToggle(workspace, !model.effectivePinned),
     archive: after(() => props.onArchiveToggle(workspace, !model.effectiveArchived)),
+    ignore: (sessionId: string) => {
+      closeMenu();
+      const session = workspace.sessions.find((s) => s.id === sessionId);
+      if (!session) return;
+      props.onIgnoreToggle(sessionId, session.ignored_at == null);
+    },
+    reclaimOwnership: afterTarget("reclaimOwnership", (s) => props.onReclaimOwnership(s.id)),
     openSnooze: after(() => setModal("snooze")),
     unsnooze: after(() => {
       setModal(null);

@@ -90,6 +90,9 @@ type Undo = Box<dyn FnOnce(&mut crate::session::Instance) + Send>;
 struct MirroredFields {
     /// The mutation cleared `pending_initial_turn`, so the disk row must drop it in the same write.
     pending_turn_cleared: bool,
+    /// `(lifecycle_generation, text, error, error_code)` of a failed pending turn; applied
+    /// only to a disk row of the same launch and turn.
+    pending_turn_failure: Option<(u64, String, String, Option<String>)>,
     queued_prompts: Vec<crate::daemon::QueuedPromptEntry>,
     queued_prompt_next_seq: u64,
     idle_dormant_since: Option<chrono::DateTime<chrono::Utc>>,
@@ -290,6 +293,9 @@ pub struct SessionService {
     /// fast path and the reconciler tick cannot queue duplicate drains.
     /// Sync mutex: critical sections are tiny and never span an `await`.
     pending_drains: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// `(session id, PendingInitialTurn::key)` of consumed initial turns whose clear never
+    /// reached disk; a reload that restores the row must not type them again.
+    unpersisted_clears: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
     /// Per-session persist locks for `mutate_instance_persisted`, held across
     /// snapshot AND disk write so the two cannot be reordered. Distinct from
     /// the other two: the drains hold `prompt_locks` across `send_turn` and
@@ -423,6 +429,10 @@ pub(crate) enum PromptTouch {
     RevivalRefused,
     /// The session is archived or trashed; refused before any mutation.
     Blocked(crate::session::StartBlocked),
+    /// The caller refuses ignored rows and this one is ignored; refused before
+    /// any mutation. Checked under the per-session lock, so an ignore that
+    /// committed after the caller's own read still wins.
+    Ignored,
     WorkerNotReady,
 }
 
@@ -502,6 +512,7 @@ impl SessionService {
             sandbox_login: Arc::default(),
             create_in_flight: std::sync::Mutex::new(HashMap::new()),
             pending_drains: std::sync::Mutex::new(std::collections::HashSet::new()),
+            unpersisted_clears: std::sync::Mutex::new(std::collections::HashSet::new()),
             persist_locks: RwLock::new(HashMap::new()),
             reload_gate: Arc::new(RwLock::new(())),
             prompt_locks: RwLock::new(HashMap::new()),
@@ -852,6 +863,28 @@ impl SessionService {
     /// (#4081 review: a client-side liveness check before this call would
     /// race a concurrent archive, snooze, or wake).
     pub(crate) async fn touch_and_wake_on_prompt(&self, id: &str, no_revive: bool) -> PromptTouch {
+        self.touch_and_wake_on_prompt_with(id, no_revive, false)
+            .await
+    }
+
+    /// Like [`Self::touch_and_wake_on_prompt`], but refuses an ignored row under
+    /// the instance lock. MCP sends use this so a concurrent ignore is never
+    /// cleared by the send.
+    pub(crate) async fn touch_and_wake_on_prompt_refusing_ignored(
+        &self,
+        id: &str,
+        no_revive: bool,
+    ) -> PromptTouch {
+        self.touch_and_wake_on_prompt_with(id, no_revive, true)
+            .await
+    }
+
+    async fn touch_and_wake_on_prompt_with(
+        &self,
+        id: &str,
+        no_revive: bool,
+        refuse_if_ignored: bool,
+    ) -> PromptTouch {
         let Ok(state) = self.native_state() else {
             return PromptTouch::WorkerNotReady;
         };
@@ -859,13 +892,20 @@ impl SessionService {
         let service = state.session_service.clone();
         let id = id.to_owned();
         work.run("server.prompt_touch", async move {
-            service.touch_and_wake_on_prompt_inner(&id, no_revive).await
+            service
+                .touch_and_wake_on_prompt_inner(&id, no_revive, refuse_if_ignored)
+                .await
         })
         .await
         .unwrap_or(PromptTouch::WorkerNotReady)
     }
 
-    async fn touch_and_wake_on_prompt_inner(&self, id: &str, no_revive: bool) -> PromptTouch {
+    async fn touch_and_wake_on_prompt_inner(
+        &self,
+        id: &str,
+        no_revive: bool,
+        refuse_if_ignored: bool,
+    ) -> PromptTouch {
         let Ok(state) = self.native_state() else {
             return PromptTouch::WorkerNotReady;
         };
@@ -909,6 +949,9 @@ impl SessionService {
                         .into_iter()
                         .find(|row| row.id == worker_id)
                         .ok_or(crate::session::SessionGone)?;
+                    if refuse_if_ignored && row.is_ignored() {
+                        return Ok(Err(PromptTouch::Ignored));
+                    }
                     if let Some(outcome) = prompt_touch_rejection(
                         &row,
                         generation,
@@ -976,6 +1019,10 @@ impl SessionService {
             let committed = store.update(|rows, _| {
                 let row = rows.iter_mut().find(|row| row.id == worker_id)
                     .ok_or(crate::session::SessionGone)?;
+                if refuse_if_ignored && row.is_ignored() {
+                    refused = Some(PromptTouch::Ignored);
+                    anyhow::bail!(crate::session::LifecycleReservationError::Superseded);
+                }
                 if let Some(outcome) = prompt_touch_rejection(
                     row, generation, &title, provider.as_deref(), view, no_revive,
                 ) {
@@ -1014,6 +1061,75 @@ impl SessionService {
                 PromptTouch::WorkerNotReady
             }
         }
+    }
+
+    /// Whether the canonical row is ignored. A delivery that must not clear Ignore reads the
+    /// store rather than the watcher's snapshot, which lags a write from the CLI or another
+    /// request.
+    pub(crate) async fn is_ignored_on_disk(&self, id: &str) -> anyhow::Result<bool> {
+        let state = self.native_state()?;
+        let profile = self
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id)
+            .map(|row| row.source_profile.clone())
+            .ok_or(crate::session::SessionGone)?;
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            use crate::session::SessionStore;
+            let native = super::session_store::NativeSessionStore::open(state, &profile, None)?;
+            Ok(native
+                .load()?
+                .iter()
+                .any(|row| row.id == id && row.is_ignored()))
+        })
+        .await?
+    }
+
+    /// Input reached an open pane, which is user input like `send`: an ignored row does not
+    /// stay hidden under the operator's own keystrokes. Only the marker and recency change,
+    /// and only while the canonical row is still ignored and startable, so the write happens
+    /// once rather than per keystroke.
+    pub(crate) async fn touch_after_direct_input(&self, id: &str) -> anyhow::Result<()> {
+        // The snapshot lags a peer's commit, so an already-ignored row is the only case
+        // that needs no store read here; anything else asks the canonical store.
+        if !self
+            .instances
+            .read()
+            .await
+            .iter()
+            .any(|row| row.id == id && row.is_ignored())
+            && !self.is_ignored_on_disk(id).await?
+        {
+            return Ok(());
+        }
+        let state = self.native_state()?;
+        let profile = self
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id)
+            .map(|row| row.source_profile.clone())
+            .ok_or(crate::session::SessionGone)?;
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            use crate::session::SessionStore;
+            let native = super::session_store::NativeSessionStore::open(state, &profile, None)?;
+            let store: &dyn SessionStore = &native;
+            store.update(|rows, _| {
+                if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
+                    if row.is_ignored() {
+                        row.touch_after_input();
+                    }
+                }
+                Ok(())
+            })?;
+            Ok(())
+        })
+        .await?
     }
 
     /// Deliver a turn to a structured session: resume a dead/dormant worker
@@ -1295,6 +1411,248 @@ impl SessionService {
         }
     }
 
+    fn claim_pending_drain(self: &Arc<Self>, id: &str) -> Option<PendingDrainGuard> {
+        let mut drains = self
+            .pending_drains
+            .lock()
+            .expect("pending_drains mutex poisoned");
+        drains.insert(id.to_string()).then(|| PendingDrainGuard {
+            service: Arc::clone(self),
+            id: id.to_string(),
+        })
+    }
+
+    /// Type a terminal session's `pending_initial_turn` once its agent is
+    /// running and ready, then clear it.
+    ///
+    /// Only the `pending_drains` claim is held while waiting, so lifecycle and
+    /// send operations on the session are not blocked. The submission and
+    /// instance guards cover re-validation, typing and clearing, which makes
+    /// the create-path and reconciler drains mutually exclusive. A failure
+    /// types nothing and marks the in-memory turn `error`, persisted when the
+    /// disk write succeeds; if it does not, only memory is errored and a
+    /// daemon restart retries the turn from disk. An errored turn is never
+    /// retried; the user's next terminal send discards it.
+    pub(crate) async fn drain_terminal_initial_turn(self: &Arc<Self>, id: &str) {
+        self.drain_terminal_initial_turn_within(id, TERMINAL_INITIAL_TURN_READY_BUDGET)
+            .await;
+    }
+
+    async fn drain_terminal_initial_turn_within(
+        self: &Arc<Self>,
+        id: &str,
+        ready_budget: std::time::Duration,
+    ) {
+        while self
+            .drain_terminal_initial_turn_once(id, ready_budget)
+            .await
+        {}
+    }
+
+    /// One drain attempt; `true` when the launch was replaced during a failed
+    /// wait and the new launch's turn needs its own attempt, now the claim is
+    /// free. A launch replaced during a successful wait returns `false`: the
+    /// reconciler's next pass picks up the new launch.
+    async fn drain_terminal_initial_turn_once(
+        self: &Arc<Self>,
+        id: &str,
+        ready_budget: std::time::Duration,
+    ) -> bool {
+        let Some(_claim) = self.claim_pending_drain(id) else {
+            return false;
+        };
+        let Some((instance, text)) = self.undelivered_terminal_turn(id).await else {
+            return false;
+        };
+        let probe = instance.clone();
+        let ready =
+            tokio::task::spawn_blocking(move || wait_for_terminal_agent(&probe, ready_budget))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result);
+        if let Err(error) = ready {
+            return match self.undelivered_terminal_turn(id).await {
+                Some((current, current_text))
+                    if same_terminal_turn(&current, &current_text, &instance, &text) =>
+                {
+                    self.report_undelivered_turn(&instance, &text, &error).await;
+                    false
+                }
+                Some(_) => true,
+                None => false,
+            };
+        }
+
+        // Namespace first, as a manual send takes it: a rename that finished
+        // during the wait is seen by the refresh below, and none starts until
+        // delivery and bookkeeping are done.
+        let _namespace = match self.native_state() {
+            Ok(state) => Some(state.profile_namespace.clone().read_owned().await),
+            Err(_) => None,
+        };
+        let Some(_submission) = self.prompt_submission_for_session(id).await else {
+            return false;
+        };
+        let lock = self.instance_lock(id).await;
+        let _guard = lock.lock().await;
+        // The wait released every guard; type only into the same turn of the
+        // same launch.
+        let Some((current, current_text)) = self.undelivered_terminal_turn(id).await else {
+            return false;
+        };
+        if current.lifecycle_reservation.is_some()
+            || !same_terminal_turn(&current, &current_text, &instance, &text)
+        {
+            return false;
+        }
+        let typed = text.clone();
+        let mut target = current.clone();
+        let probed = (current.lifecycle_generation, current.title.clone());
+        let native_state = self.native_state().ok();
+        let delivered = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            // The cached row can predate an archive, trash or relaunch another
+            // process wrote to disk. The lifecycle locks and a reload decide
+            // ownership, and stay held until the text is typed.
+            let mut _held = None;
+            if let Some(state) = native_state {
+                let native = crate::server::session_store::NativeSessionStore::open(
+                    state,
+                    &target.source_profile,
+                    None,
+                )?;
+                match target.acquire_auxiliary_locks_in(&native) {
+                    Ok(locks) => _held = Some(locks),
+                    Err(error) => {
+                        tracing::debug!(
+                            target: "acp.supervisor",
+                            session = %target.id,
+                            "terminal initial turn held back: {error:#}"
+                        );
+                        return Ok(false);
+                    }
+                }
+                if (target.lifecycle_generation, &target.title) != (probed.0, &probed.1)
+                    || target.is_snoozed()
+                    || !target
+                        .pending_initial_turn
+                        .as_ref()
+                        .is_some_and(|turn| turn.error.is_none() && turn.text == typed)
+                {
+                    return Ok(false);
+                }
+            }
+            let pane = crate::server::api::sessions::ready_agent_pane_for_automatic_input(&target)?
+                .ok_or_else(|| anyhow::anyhow!("the agent is no longer running"))?;
+            // The waits ran before these guards; what is on screen now decides.
+            // Check, capture and type address the pane the process check saw.
+            let tmux = target.tmux_session()?;
+            if !pane_accepts_automatic_input(&target, &tmux, &pane)? {
+                return Ok(false);
+            }
+            tmux.send_keys_to_pane(&pane, &typed, target.send_keys_enter_delay())?;
+            Ok(true)
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result);
+        match delivered {
+            Ok(true) => self.clear_pending_initial_turn(id).await,
+            Ok(false) => {}
+            Err(error) => self.report_undelivered_turn(&current, &text, &error).await,
+        }
+        false
+    }
+
+    /// The row and text of a terminal session's pending turn that has not
+    /// failed, once its launch is finalized.
+    async fn undelivered_terminal_turn(&self, id: &str) -> Option<(Instance, String)> {
+        let instances = self.instances.read().await;
+        instances
+            .iter()
+            .find(|i| {
+                i.id == id
+                    && !i.is_structured()
+                    && i.launch_is_finalized()
+                    && i.terminal_handoff.is_none()
+                    && !i.is_archived()
+                    && !i.is_snoozed()
+                    && !i.is_trashed()
+            })
+            .and_then(|i| {
+                let turn = i.pending_initial_turn.as_ref()?;
+                (turn.is_creation_prompt() && self.turn_is_deliverable(id, turn))
+                    .then(|| (i.clone(), turn.text.clone()))
+            })
+    }
+
+    /// A pending turn that failed, or whose delivery was consumed but could not be
+    /// cleared on disk, must not be delivered again by either view's drain.
+    pub(crate) fn turn_is_deliverable(
+        &self,
+        id: &str,
+        turn: &crate::session::PendingInitialTurn,
+    ) -> bool {
+        turn.error.is_none()
+            && !self
+                .unpersisted_clears
+                .lock()
+                .expect("unpersisted_clears mutex poisoned")
+                .contains(&(id.to_string(), turn.key()))
+    }
+
+    async fn report_undelivered_turn(
+        self: &Arc<Self>,
+        waited: &Instance,
+        text: &str,
+        error: &anyhow::Error,
+    ) {
+        tracing::warn!(
+            target: "tmux.command",
+            session = %waited.id,
+            error = %error,
+            "initial prompt not delivered"
+        );
+        let code = error
+            .downcast_ref::<TerminalPromptBlocker>()
+            .map(|blocker| blocker.code());
+        self.fail_pending_initial_turn(waited, text, error.to_string(), code)
+            .await;
+    }
+
+    /// Mark the turn undelivered, in memory and on disk, only while the row is
+    /// still the launch and turn that was waited on.
+    async fn fail_pending_initial_turn(
+        self: &Arc<Self>,
+        waited: &Instance,
+        text: &str,
+        reason: String,
+        code: Option<&'static str>,
+    ) {
+        let (waited, text) = (waited.clone(), text.to_string());
+        let outcome = self
+            .mutate_instance_persisted_with(&waited.id.clone(), false, move |inst| {
+                let same = inst.lifecycle_generation == waited.lifecycle_generation
+                    && inst.title == waited.title
+                    && inst.tool == waited.tool;
+                if let Some(turn) = inst
+                    .pending_initial_turn
+                    .as_mut()
+                    .filter(|turn| same && turn.text == text)
+                {
+                    turn.error = Some(reason);
+                    turn.error_code = code.map(str::to_string);
+                }
+                ((), None)
+            })
+            .await;
+        if matches!(outcome, Some(((), false))) {
+            tracing::warn!(
+                target: "tmux.command",
+                "failed to persist initial prompt error; a daemon restart retries the prompt"
+            );
+        }
+    }
+
     /// Deliver a session's persisted `pending_initial_turn`, then clear it.
     ///
     /// Single drain owner: callers (the create fast path and the reconciler
@@ -1308,18 +1666,8 @@ impl SessionService {
     /// disk clear re-delivers after restart, which is the documented
     /// at-least-once contract.
     pub(crate) async fn drain_pending_initial_turn(self: &Arc<Self>, id: &str) {
-        {
-            let mut drains = self
-                .pending_drains
-                .lock()
-                .expect("pending_drains mutex poisoned");
-            if !drains.insert(id.to_string()) {
-                return;
-            }
-        }
-        let _claim = PendingDrainGuard {
-            service: Arc::clone(self),
-            id: id.to_string(),
+        let Some(_claim) = self.claim_pending_drain(id) else {
+            return;
         };
         // Non-vivifying.
         let Some(_submission) = self.prompt_submission_for_session(id).await else {
@@ -1331,24 +1679,27 @@ impl SessionService {
                 .iter()
                 .find(|i| i.id == id && i.launch_is_finalized() && i.terminal_handoff.is_none())
                 .and_then(|i| {
-                    i.pending_initial_turn.clone().map(|turn| {
-                        // Reconstruct the creator principal so plugin-created
-                        // pending turns keep plugin attribution and the plugin
-                        // mode-assertion path; user-created ones stay User.
-                        let caller = match &i.created_by_plugin {
-                            Some(plugin_id) => SessionCaller::Plugin {
-                                plugin_id: plugin_id.clone(),
-                            },
-                            None => SessionCaller::User,
-                        };
-                        (
-                            turn.text,
-                            turn.attachments,
-                            turn.synthesized,
-                            i.source_profile.clone(),
-                            caller,
-                        )
-                    })
+                    i.pending_initial_turn
+                        .clone()
+                        .filter(|turn| self.turn_is_deliverable(id, turn))
+                        .map(|turn| {
+                            // Reconstruct the creator principal so plugin-created
+                            // pending turns keep plugin attribution and the plugin
+                            // mode-assertion path; user-created ones stay User.
+                            let caller = match &i.created_by_plugin {
+                                Some(plugin_id) => SessionCaller::Plugin {
+                                    plugin_id: plugin_id.clone(),
+                                },
+                                None => SessionCaller::User,
+                            };
+                            (
+                                turn.text,
+                                turn.attachments,
+                                turn.synthesized,
+                                i.source_profile.clone(),
+                                caller,
+                            )
+                        })
                 })
         }) else {
             return;
@@ -1457,6 +1808,9 @@ impl SessionService {
             text,
             attachments,
             synthesized: true,
+            error: None,
+            error_code: None,
+            id: crate::session::PendingInitialTurn::fresh_id(),
         };
         let profile = {
             let mut instances = self.instances.write().await;
@@ -1504,45 +1858,39 @@ impl SessionService {
     /// rate-limit resume continuation, so the stale continuation must not
     /// replay after the newer message (#3028). No-op when nothing is queued.
     pub(crate) async fn clear_pending_initial_turn(self: &Arc<Self>, id: &str) {
-        let profile = {
-            let mut instances = self.instances.write().await;
-            match instances.iter_mut().find(|i| i.id == id) {
-                Some(inst) if inst.pending_initial_turn.is_some() => {
-                    inst.pending_initial_turn = None;
-                    self.invalidate_disk_snapshots();
-                    inst.source_profile.clone()
-                }
-                _ => return,
-            }
+        let Some(turn_key) = self
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|i| i.id == id)
+            .and_then(|i| i.pending_initial_turn.as_ref().map(|turn| turn.key()))
+        else {
+            return;
         };
-        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
-            Ok(storage) => {
-                let id_persist = id.to_string();
-                let persisted = tokio::task::spawn_blocking(move || {
-                    storage.update(|instances, _groups| {
-                        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
-                            inst.pending_initial_turn = None;
-                        }
-                        Ok(())
-                    })
+        for attempt in 0..CLEAR_PERSIST_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            let outcome = self
+                .mutate_instance_persisted_with(id, true, |inst| {
+                    inst.pending_initial_turn = None;
+                    ((), None)
                 })
                 .await;
-                if !matches!(persisted, Ok(Ok(()))) {
-                    tracing::warn!(
-                        target: "acp.supervisor",
-                        session = %id,
-                        "failed to persist pending-turn clear; the drain re-checks liveness before delivery"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    "failed to open storage to clear pending turn: {e}"
-                );
+            if !matches!(outcome, Some(((), false))) {
+                return;
             }
         }
+        tracing::warn!(
+            target: "acp.supervisor",
+            session = %id,
+            "failed to persist pending-turn clear; the turn stays suppressed until a daemon restart"
+        );
+        self.unpersisted_clears
+            .lock()
+            .expect("unpersisted_clears mutex poisoned")
+            .insert((id.to_string(), turn_key));
     }
 
     /// Invalidate earlier disk snapshots under instances.write() or reload_gate.
@@ -1633,6 +1981,15 @@ impl SessionService {
                 undo,
                 MirroredFields {
                     pending_turn_cleared: clear_pending_turn_on_disk,
+                    pending_turn_failure: inst.pending_initial_turn.as_ref().and_then(|turn| {
+                        let error = turn.error.clone()?;
+                        Some((
+                            inst.lifecycle_generation,
+                            turn.text.clone(),
+                            error,
+                            turn.error_code.clone(),
+                        ))
+                    }),
                     queued_prompts: inst.queued_prompts.clone(),
                     queued_prompt_next_seq: inst.queued_prompt_next_seq,
                     idle_dormant_since: inst.idle_dormant_since,
@@ -1653,6 +2010,19 @@ impl SessionService {
                         if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
                             if mirrored.pending_turn_cleared {
                                 inst.pending_initial_turn = None;
+                            }
+                            if let Some((generation, text, error, code)) = mirrored.pending_turn_failure
+                            {
+                                if inst.lifecycle_generation == generation {
+                                    if let Some(turn) = inst
+                                        .pending_initial_turn
+                                        .as_mut()
+                                        .filter(|turn| turn.text == text)
+                                    {
+                                        turn.error = Some(error);
+                                        turn.error_code = code;
+                                    }
+                                }
                             }
                             inst.queued_prompts = mirrored.queued_prompts;
                             inst.queued_prompt_next_seq = mirrored.queued_prompt_next_seq;
@@ -2009,6 +2379,12 @@ impl SessionService {
                     let _ = reduced.apply_event(seq, event);
                     last_seq = seq;
                 }
+                tracing::debug!(
+                    target: "acp.control_fold",
+                    session = %sid,
+                    last_seq,
+                    "hydrated a cold control fold from the log"
+                );
                 (reduced, last_seq)
             })
         })
@@ -2022,26 +2398,73 @@ impl SessionService {
         })
     }
 
-    /// The sidebar status right after `seq`, rebuilt from the durable log. For
-    /// a frame published while the control cache was cold, so no status rode
-    /// with it; exact for whatever the journal's retention still holds.
+    /// The sidebar status projected at `seq`, for a frame published while the
+    /// control cache was cold or behind, so no status rode with it.
+    ///
+    /// A frame at the fold's last seq answers from the fold. A frame ahead of it
+    /// folds only the events through its seq. A cold session hydrates through
+    /// [`Self::fold_control_state`] first. A frame behind the fold is projected
+    /// at its own seq from the log to preserve transitions such as running to idle.
     pub(crate) async fn sidebar_status_at(
         &self,
         id: &str,
         seq: u64,
     ) -> Option<crate::session::Status> {
         use crate::acp::state::{AcpSessionId, AcpState, AgentName};
+        let fold = self.fold_control_state(id).await;
+        if fold.last_seq == seq {
+            tracing::debug!(
+                target: "acp.sidebar_projection",
+                session = %id,
+                since = seq,
+                seq,
+                folded = 0,
+                "projected sidebar status from the cached fold"
+            );
+            return Some(fold.sidebar_status());
+        }
         let store = Arc::clone(&self.acp_event_store);
         let sid = id.to_string();
+        let since = fold.last_seq;
+        let behind = fold.last_seq > seq;
         tokio::task::spawn_blocking(move || {
-            let mut state =
-                AcpState::new(AcpSessionId(sid.clone()), AgentName(String::new()), None);
-            let mut folded = false;
-            for (at, event) in store.replay_before(&sid, seq.saturating_add(1)) {
-                let _ = state.apply_event(at, event);
-                folded = true;
+            if behind {
+                let mut state =
+                    AcpState::new(AcpSessionId(sid.clone()), AgentName(String::new()), None);
+                let mut folded = 0usize;
+                let mut found_event = false;
+                for (at, event) in store.replay_before(&sid, seq.saturating_add(1)) {
+                    found_event = true;
+                    if state.apply_event(at, event).is_ok() {
+                        folded += 1;
+                    }
+                }
+                tracing::debug!(
+                    target: "acp.sidebar_projection",
+                    session = %sid,
+                    since = 0,
+                    seq,
+                    folded,
+                    "projected sidebar status from the event log"
+                );
+                return found_event.then(|| state.sidebar_status());
             }
-            folded.then(|| state.sidebar_status())
+            let mut state = fold;
+            let mut folded = 0usize;
+            for (at, event) in store.replay_through(&sid, since, seq) {
+                if state.apply_event(at, event).is_ok() {
+                    folded += 1;
+                }
+            }
+            tracing::debug!(
+                target: "acp.sidebar_projection",
+                session = %sid,
+                since,
+                seq,
+                folded,
+                "projected sidebar status from the cached fold"
+            );
+            Some(state.sidebar_status())
         })
         .await
         .ok()
@@ -2588,6 +3011,142 @@ impl SessionService {
     }
 }
 
+const TERMINAL_INITIAL_TURN_READY_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A one-time Claude Code dialog that holds the input box back. The prompt is
+/// never typed into it, and neither screen is ever accepted on the user's behalf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalPromptBlocker {
+    FolderNotTrusted,
+    BypassNotAccepted,
+}
+
+impl TerminalPromptBlocker {
+    /// Recognizes the dialogs from the plain-text screen of a Claude Code pane.
+    pub(crate) fn detect(tool: &str, screen: &str) -> Option<Self> {
+        if tool != "claude" {
+            return None;
+        }
+        let screen = screen.to_lowercase();
+        if screen.contains("yes, i trust this folder") {
+            Some(Self::FolderNotTrusted)
+        } else if screen.contains("yes, i accept") && screen.contains("bypass permissions mode") {
+            Some(Self::BypassNotAccepted)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::FolderNotTrusted => "agent_folder_not_trusted",
+            Self::BypassNotAccepted => "agent_bypass_not_accepted",
+        }
+    }
+}
+
+impl std::fmt::Display for TerminalPromptBlocker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FolderNotTrusted => f.write_str(
+                "Claude Code is asking whether to trust this folder, so the prompt was not typed. \
+                 Turn on `pre_trust_agent_folders` (Settings, Agents, \"Skip the Agent's trust this \
+                 folder prompt\", or `[session] pre_trust_agent_folders = true` in config.toml) to \
+                 start new sessions trusted, or open the session once and trust the folder.",
+            ),
+            Self::BypassNotAccepted => f.write_str(
+                "Claude Code is asking you to accept Bypass Permissions mode, so the prompt was not \
+                 typed. Open the session once and accept it.",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TerminalPromptBlocker {}
+
+/// Whether the visible screen, not its scrollback, shows the agent's input box. A first-run dialog
+/// is an error carrying its [`TerminalPromptBlocker`]; any other screen without
+/// a ready marker, such as a stale one that has since scrolled away, is `false`.
+fn pane_accepts_automatic_input(
+    instance: &Instance,
+    tmux: &crate::tmux::Session,
+    pane: &str,
+) -> anyhow::Result<bool> {
+    let screen = crate::tmux::utils::strip_ansi(&tmux.try_capture_pane_in(pane, 0)?);
+    if let Some(blocker) = TerminalPromptBlocker::detect(&instance.tool, &screen) {
+        return Err(blocker.into());
+    }
+    let screen = screen.to_lowercase();
+    Ok(crate::agents::ready_markers(&instance.tool)
+        .iter()
+        .any(|marker| screen.contains(marker)))
+}
+
+/// Blocks until the terminal session's agent process is up (alive pane, not a
+/// bare shell) and its ready marker is showing. An agent without a ready marker
+/// is refused: stable output alone cannot tell a prompt from a dialog.
+fn wait_for_terminal_agent(instance: &Instance, budget: std::time::Duration) -> anyhow::Result<()> {
+    // A shell or custom command has no agent readiness signal; typing the
+    // prompt there would run it as a command.
+    anyhow::ensure!(
+        !instance.expects_shell() && !instance.has_command_override(),
+        "initial prompts are only typed into a known agent"
+    );
+    let markers = crate::agents::ready_markers(&instance.tool);
+    anyhow::ensure!(
+        !markers.is_empty(),
+        "this agent has no ready marker, so the prompt is not typed"
+    );
+    let deadline = std::time::Instant::now() + budget;
+    // A probe error is "not ready yet" while the pane is still starting; the
+    // last one is reported only when the budget runs out.
+    loop {
+        let probe = crate::server::api::sessions::ready_agent_session_for_automatic_input(instance);
+        if matches!(probe, Ok(Some(_))) {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(match probe {
+                Err(error) => error.context(format!(
+                    "the agent was not running within {}s",
+                    budget.as_secs()
+                )),
+                Ok(_) => anyhow::anyhow!("the agent was not running within {}s", budget.as_secs()),
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let ready = instance
+        .tmux_session()?
+        .wait_until_ready_unless(remaining, markers, |screen| {
+            TerminalPromptBlocker::detect(&instance.tool, screen)
+        })
+        .map_err(anyhow::Error::from)?;
+    anyhow::ensure!(
+        ready,
+        "the agent was not ready within {}s",
+        budget.as_secs()
+    );
+    Ok(())
+}
+
+/// Whether `current` is the same turn of the same launch as `waited`.
+fn same_terminal_turn(
+    current: &Instance,
+    current_text: &str,
+    waited: &Instance,
+    waited_text: &str,
+) -> bool {
+    current.lifecycle_generation == waited.lifecycle_generation
+        && current.title == waited.title
+        && current.tool == waited.tool
+        && current_text == waited_text
+}
+
+/// Disk writes tried before a consumed turn is only suppressed in memory.
+const CLEAR_PERSIST_ATTEMPTS: u32 = 3;
+
 /// Releases a session's `pending_drains` claim on every exit path of
 /// [`SessionService::drain_pending_initial_turn`], including panics.
 struct PendingDrainGuard {
@@ -2674,6 +3233,21 @@ struct CreationEntry {
 #[derive(Debug, thiserror::Error)]
 #[error("Session creation cancelled")]
 pub(crate) struct CreationCancelled;
+
+impl CreationCancelled {
+    /// A create's setup that fails once `cancel` fired reads as cancelled, whatever the setup
+    /// reported: a cancelled shared pull, say, or the create's own cancel ending its wait.
+    pub(crate) fn or_error(
+        cancel: &tokio_util::sync::CancellationToken,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        if cancel.is_cancelled() {
+            Self.into()
+        } else {
+            error
+        }
+    }
+}
 
 pub(super) struct CreationGuard {
     service: Arc<SessionService>,
@@ -2954,6 +3528,7 @@ fn prompt_touch_rejection(
 
 /// Apply an accepted prompt gesture to the authoritative row before native commit.
 /// A wake lifts snooze/dormancy; other prompts advance recency monotonically.
+/// Both paths clear Ignore, since the user engaged with the row.
 ///
 /// Advancing `last_accessed_at` on disk is the signal `merge_user_action_diff`
 /// (`session/instance/merge.rs`) keys on to clear a park, which is right for a
@@ -2964,6 +3539,7 @@ pub(crate) fn apply_prompt_persist_to_disk(disk: &mut crate::session::Instance, 
     } else {
         let now = chrono::Utc::now();
         disk.last_accessed_at = disk.last_accessed_at.max(Some(now));
+        disk.ignored_at = None;
     }
 }
 
@@ -2980,6 +3556,16 @@ mod tests {
             payload_hash: payload_hash.to_string(),
         });
         inst
+    }
+
+    #[test]
+    fn initial_prompt_is_never_typed_into_a_shell_or_custom_command() {
+        for command in ["bash", "my-wrapper --flag"] {
+            let mut inst = Instance::new("t", "/tmp/aoe-shell-prompt");
+            inst.command = command.to_string();
+            let err = wait_for_terminal_agent(&inst, std::time::Duration::ZERO).unwrap_err();
+            assert!(err.to_string().contains("known agent"), "{command}: {err}");
+        }
     }
 
     fn test_spec() -> StructuredSessionSpec {
@@ -3482,6 +4068,51 @@ mod tests {
             "drain must release its claim on the no-op paths"
         );
     }
+    /// A failed or consumed turn is not deliverable by either view's drain, so a
+    /// terminal-to-structured switch cannot replay it.
+    #[tokio::test]
+    async fn a_failed_or_consumed_turn_is_not_deliverable_after_a_view_switch() {
+        let mut inst = Instance::new("switched", "/tmp/aoe-switch-project");
+        inst.id = "sess-switch".to_string();
+        inst.view = crate::session::View::Structured;
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+        let turn = |text: &str, error: Option<&str>| crate::session::PendingInitialTurn {
+            text: text.to_string(),
+            attachments: Vec::new(),
+            synthesized: false,
+            error: error.map(str::to_string),
+            error_code: None,
+            id: String::new(),
+        };
+
+        assert!(service.turn_is_deliverable("sess-switch", &turn("fresh", None)));
+        assert!(!service.turn_is_deliverable("sess-switch", &turn("failed", Some("not running"))));
+
+        service
+            .unpersisted_clears
+            .lock()
+            .unwrap()
+            .insert(("sess-switch".to_string(), turn("typed", None).key()));
+        assert!(!service.turn_is_deliverable("sess-switch", &turn("typed", None)));
+        assert!(service.turn_is_deliverable("sess-switch", &turn("other", None)));
+        assert!(service.turn_is_deliverable("sess-other", &turn("typed", None)));
+
+        // A later turn with the same text has its own identity.
+        let mut later = turn("typed", None);
+        later.id = crate::session::PendingInitialTurn::fresh_id();
+        let mut failed = turn("typed", None);
+        failed.id = "consumed".into();
+        service
+            .unpersisted_clears
+            .lock()
+            .unwrap()
+            .insert(("sess-switch".to_string(), failed.key()));
+        assert!(!service.turn_is_deliverable("sess-switch", &failed));
+        assert!(service.turn_is_deliverable("sess-switch", &later));
+    }
+
     /// Declare `bridge` as a custom ACP agent that resets with `alias`.
     fn declare_custom_reset(alias: &str) {
         let config = crate::session::get_app_dir().unwrap().join("config.toml");
@@ -4388,6 +5019,1063 @@ mod tests {
         assert!(service.queued_prompts_snapshot("sess-mut").await.is_empty());
     }
 
+    fn terminal_turn_instance(id: &str, title: &str, text: &str) -> Instance {
+        let mut inst = Instance::new(title, "/tmp/aoe-term-drain");
+        inst.id = id.to_string();
+        inst.tool = "opencode".into();
+        inst.view = crate::session::View::Terminal;
+        inst.status = crate::session::Status::Idle;
+        inst.pending_initial_turn = Some(crate::session::PendingInitialTurn {
+            text: text.to_string(),
+            attachments: Vec::new(),
+            synthesized: false,
+            error: None,
+            error_code: None,
+            id: String::new(),
+        });
+        inst
+    }
+
+    /// Starts the pane `inst` resolves to, running `script`; the guard kills it.
+    fn start_terminal_pane(
+        inst: &Instance,
+        script: &str,
+        remain_on_exit: bool,
+    ) -> crate::tmux::test_helpers::TmuxTestSession {
+        let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let mut args: Vec<String> = [
+            "new-session",
+            "-d",
+            "-s",
+            &name,
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "sh",
+            "-c",
+            script,
+        ]
+        .map(String::from)
+        .into();
+        crate::tmux::utils::append_pane_base_index_args(&mut args, &name);
+        if remain_on_exit {
+            crate::tmux::utils::append_remain_on_exit_args(&mut args, &name);
+        }
+        let status = crate::tmux::tmux_command()
+            .args(args)
+            .status()
+            .expect("tmux new-session");
+        assert!(status.success());
+        crate::tmux::refresh_session_cache();
+        crate::tmux::test_helpers::TmuxTestSession::from_name(name)
+    }
+
+    const READY_AGENT_SCRIPT: &str = "echo 'ask anything'; exec cat";
+
+    async fn pending_turn(
+        service: &SessionService,
+        id: &str,
+    ) -> Option<crate::session::PendingInitialTurn> {
+        service
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|i| i.id == id)
+            .and_then(|i| i.pending_initial_turn.clone())
+    }
+
+    fn pane_text(pane: &crate::tmux::test_helpers::TmuxTestSession) -> String {
+        crate::tmux::Session::from_name(pane.name())
+            .capture_pane(20)
+            .expect("capture pane")
+    }
+
+    /// Claude Code 2.1.326 first-run folder-trust dialog, as `capture-pane -p -e` returns it.
+    const TRUST_DIALOG_CAPTURE: &str = concat!(
+        "\x1b[39m \x1b[1m\x1b[38;5;220mAccessing\x1b[0m \x1b[1m\x1b[38;5;220mworkspace:\x1b[0m\n",
+        " \x1b[1m/private/tmp/aoe-cap/untrusted3\x1b[0m\n",
+        " Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source\n",
+        " project, or work from your team). If not, take a moment to review what's in this folder first.\n",
+        " Claude Code'll be able to read, edit, and execute files here.\n",
+        " \x1b[38;5;246m\x1b]8;id=zaxmda;https://code.claude.com/docs/en/security\x1b\\Security guide\x1b[39m\x1b]8;;\x1b\\\n",
+        " \x1b[38;5;153m\u{276f}\x1b[39m \x1b[38;5;153mNo,\x1b[39m \x1b[38;5;153mexit\x1b[39m\n",
+        "   Yes, I trust this folder\n",
+        " \x1b[38;5;246mEnter\x1b[39m \x1b[38;5;246mto\x1b[39m \x1b[38;5;246mconfirm\x1b[39m \x1b[38;5;246m\u{b7}\x1b[39m \x1b[38;5;246mEsc\x1b[39m \x1b[38;5;246mto\x1b[39m \x1b[38;5;246mcancel\x1b[39m\n",
+    );
+
+    /// Claude Code 2.1.326 Bypass Permissions acceptance screen, as `capture-pane -p -e` returns it.
+    const BYPASS_DIALOG_CAPTURE: &str = concat!(
+        "\x1b[39m  \x1b[1m\x1b[38;5;211mWARNING:\x1b[0m \x1b[1m\x1b[38;5;211mClaude\x1b[0m \x1b[1m\x1b[38;5;211mCode\x1b[0m \x1b[1m\x1b[38;5;211mrunning\x1b[0m \x1b[1m\x1b[38;5;211min\x1b[0m \x1b[1m\x1b[38;5;211mBypass\x1b[0m \x1b[1m\x1b[38;5;211mPermissions\x1b[0m \x1b[1m\x1b[38;5;211mmode\x1b[0m\n",
+        "  In Bypass Permissions mode, Claude Code will not ask for your approval before running potentially dangerous\n",
+        "  commands.\n",
+        "  This mode should only be used in a sandboxed container/VM that has restricted internet access and can easily be\n",
+        "  restored if damaged.\n",
+        "  By proceeding, you accept all responsibility for actions taken while running in Bypass Permissions mode.\n",
+        "  \x1b]8;id=zaxmda;https://code.claude.com/docs/en/security\x1b\\https://code.claude.com/docs/en/security\x1b]8;;\x1b\\\n",
+        "  \x1b[38;5;153m\u{276f}\x1b[39m \x1b[38;5;153mNo,\x1b[39m \x1b[38;5;153mexit\x1b[39m\n",
+        "    Yes, I accept\n",
+        "  \x1b[3m\x1b[38;5;246mEnter\x1b[0m \x1b[3m\x1b[38;5;246mto\x1b[0m \x1b[3m\x1b[38;5;246mconfirm\x1b[0m \x1b[3m\x1b[38;5;246m\u{b7}\x1b[0m \x1b[3m\x1b[38;5;246mEsc\x1b[0m \x1b[3m\x1b[38;5;246mto\x1b[0m \x1b[3m\x1b[38;5;246mcancel\x1b[0m\n",
+    );
+
+    #[test]
+    fn claude_dialogs_are_recognized_from_real_colored_captures() {
+        let plain = |capture: &str| crate::tmux::utils::strip_ansi(capture);
+        assert_eq!(
+            TerminalPromptBlocker::detect("claude", &plain(TRUST_DIALOG_CAPTURE)),
+            Some(TerminalPromptBlocker::FolderNotTrusted)
+        );
+        assert_eq!(
+            TerminalPromptBlocker::detect("claude", &plain(BYPASS_DIALOG_CAPTURE)),
+            Some(TerminalPromptBlocker::BypassNotAccepted)
+        );
+        assert_eq!(
+            TerminalPromptBlocker::detect("opencode", &plain(TRUST_DIALOG_CAPTURE)),
+            None
+        );
+        assert_eq!(
+            TerminalPromptBlocker::detect(
+                "claude",
+                "❯ Try \"fix typecheck errors\"\n  ⏵⏵ auto mode on (shift+tab to cycle)"
+            ),
+            None
+        );
+    }
+
+    /// Either dialog stops the wait within seconds, types nothing, and records a
+    /// machine-readable code beside the message.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_initial_turn_stops_at_once_on_a_claude_dialog() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let fixtures = tempfile::tempdir().unwrap();
+        for (case, capture, code, hint) in [
+            (
+                "trust",
+                TRUST_DIALOG_CAPTURE,
+                "agent_folder_not_trusted",
+                "pre_trust_agent_folders",
+            ),
+            (
+                "bypass",
+                BYPASS_DIALOG_CAPTURE,
+                "agent_bypass_not_accepted",
+                "accept it",
+            ),
+        ] {
+            let id = format!("sess-dialog-{case}");
+            let mut inst =
+                terminal_turn_instance(&id, &format!("term-dialog-{case}"), "must-not-type");
+            inst.tool = "claude".into();
+            let file = fixtures.path().join(case);
+            std::fs::write(&file, capture).unwrap();
+            let pane =
+                start_terminal_pane(&inst, &format!("cat '{}'; exec cat", file.display()), false);
+            let service = crate::server::test_support::build_test_app_state(vec![inst])
+                .session_service
+                .clone();
+
+            let started = std::time::Instant::now();
+            service
+                .drain_terminal_initial_turn_within(&id, std::time::Duration::from_secs(40))
+                .await;
+
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(15),
+                "{case}"
+            );
+            assert!(!pane_text(&pane).contains("must-not-type"), "{case}");
+            let turn = pending_turn(&service, &id).await.expect("turn is kept");
+            assert_eq!(turn.error_code.as_deref(), Some(code), "{case}");
+            assert!(turn.error.is_some_and(|e| e.contains(hint)), "{case}");
+        }
+    }
+
+    /// The screen is read again under the final guards: a ready marker that has
+    /// since gone, or a dialog that has since appeared, receives no input.
+    #[test]
+    #[serial_test::serial]
+    fn the_final_send_rechecks_the_visible_pane() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let (trust, go) = (dir.path().join("trust"), dir.path().join("go"));
+        std::fs::write(&trust, TRUST_DIALOG_CAPTURE).unwrap();
+        let mut inst = terminal_turn_instance("sess-final", "term-final", "unused");
+        inst.tool = "claude".into();
+        let pane = start_terminal_pane(
+            &inst,
+            &format!(
+                "echo 'bypass permissions on (shift+tab to cycle)'; \
+                 until [ -f '{go}' ]; do sleep 0.05; done; clear; cat '{trust}'; \
+                 sleep 1; clear; echo loading; exec cat",
+                go = go.display(),
+                trust = trust.display()
+            ),
+            false,
+        );
+        let wait_for = |want: &dyn Fn(&str) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !want(&pane_text(&pane)) {
+                assert!(std::time::Instant::now() < deadline, "{}", pane_text(&pane));
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
+
+        let tmux = crate::tmux::Session::from_name(pane.name());
+        let pane_id = tmux
+            .live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())
+            .unwrap();
+        let accepts = || pane_accepts_automatic_input(&inst, &tmux, &pane_id);
+
+        wait_for(&|screen| screen.contains("shift+tab to cycle"));
+        assert!(accepts().unwrap());
+
+        std::fs::write(&go, b"").unwrap();
+        wait_for(&|screen| screen.contains("Yes, I trust this folder"));
+        let error = accepts().unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<TerminalPromptBlocker>(),
+            Some(&TerminalPromptBlocker::FolderNotTrusted)
+        );
+
+        wait_for(&|screen| screen.contains("loading"));
+        assert!(!accepts().unwrap());
+    }
+
+    /// Capture and send address the pane that was checked. When it is gone, a
+    /// surviving pane of the session receives nothing.
+    #[test]
+    #[serial_test::serial]
+    fn the_final_send_never_retargets_another_pane() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let inst = terminal_turn_instance("sess-pane", "term-pane", "unused");
+        let pane = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
+        let tmux = crate::tmux::Session::from_name(pane.name());
+        let pane_id = crate::server::api::sessions::ready_agent_pane_for_automatic_input(&inst)
+            .unwrap()
+            .expect("agent pane");
+        let tmux_ok = |args: &[&str]| {
+            let out = crate::tmux::tmux_command().args(args).output().unwrap();
+            assert!(out.status.success(), "{args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let survivor = tmux_ok(&[
+            "split-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            &pane_id,
+            "exec cat",
+        ]);
+        tmux.send_keys_to_pane(&pane_id, "reaches-checked-pane", 0)
+            .unwrap();
+
+        tmux_ok(&["kill-pane", "-t", &pane_id]);
+        assert!(tmux.try_capture_pane_in(&pane_id, 0).is_err());
+        assert!(tmux
+            .send_keys_to_pane(&pane_id, "must-not-land", 0)
+            .is_err());
+        let screen = tmux_ok(&["capture-pane", "-p", "-t", &survivor]);
+        assert!(!screen.contains("must-not-land"), "{screen}");
+    }
+
+    /// A rate-limit continuation is ACP-only: the terminal drain skips it and
+    /// anything carrying attachments, which it cannot send.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_drain_takes_only_creation_prompts() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let attachment = crate::daemon::PromptAttachmentRef {
+            id: "a1".into(),
+            kind: crate::daemon::PromptAttachmentKind::Resource,
+            mime_type: "text/plain".into(),
+            name: None,
+            size: 1,
+        };
+        for (synthesized, attachments, taken) in [
+            (false, Vec::new(), true),
+            (true, Vec::new(), false),
+            (false, vec![attachment.clone()], false),
+            (true, vec![attachment], false),
+        ] {
+            let mut inst = terminal_turn_instance("sess-kind", "term-kind", "continue");
+            let turn = inst.pending_initial_turn.as_mut().unwrap();
+            turn.synthesized = synthesized;
+            turn.attachments = attachments;
+            let service = crate::server::test_support::build_test_app_state(vec![inst])
+                .session_service
+                .clone();
+            assert_eq!(
+                service
+                    .undelivered_terminal_turn("sess-kind")
+                    .await
+                    .is_some(),
+                taken,
+                "synthesized={synthesized}"
+            );
+        }
+    }
+
+    /// A Claude session is typed into once its input box shows the mode line,
+    /// not while it is still starting.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_initial_turn_is_typed_into_claude_once_its_input_box_is_up() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = terminal_turn_instance("sess-claude", "term-claude", "claude-first-turn");
+        inst.tool = "claude".into();
+        let pane = start_terminal_pane(
+            &inst,
+            "echo 'Starting Claude Code...'; sleep 1.5; clear; \
+             echo '  bypass permissions on (shift+tab to cycle)'; exec cat",
+            false,
+        );
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+
+        service
+            .drain_terminal_initial_turn_within("sess-claude", std::time::Duration::from_secs(10))
+            .await;
+
+        let screen = pane_text(&pane);
+        assert_eq!(screen.matches("claude-first-turn").count(), 2, "{screen}");
+        assert!(pending_turn(&service, "sess-claude").await.is_none());
+    }
+
+    /// A ready agent is typed once even when the create-path and reconciler
+    /// drains race, and the turn is cleared in memory and on disk.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_initial_turn_is_typed_once_when_the_agent_is_ready() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let inst = terminal_turn_instance("sess-term-ready", "term-ready", "run-the-nightly-task");
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![inst.clone()],
+        );
+        let profile = inst.source_profile.clone();
+        let pane = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+
+        let budget = std::time::Duration::from_secs(10);
+        tokio::join!(
+            service.drain_terminal_initial_turn_within("sess-term-ready", budget),
+            service.drain_terminal_initial_turn_within("sess-term-ready", budget),
+        );
+
+        // `cat` echoes each typed line once as input and once as output.
+        let typed = pane_text(&pane).matches("run-the-nightly-task").count();
+        assert_eq!(
+            typed,
+            2,
+            "typed more or less than once:\n{}",
+            pane_text(&pane)
+        );
+        assert!(pending_turn(&service, "sess-term-ready").await.is_none());
+        let on_disk = crate::session::Storage::new_unwatched(&profile)
+            .unwrap()
+            .load()
+            .unwrap();
+        assert!(on_disk[0].pending_initial_turn.is_none());
+    }
+
+    /// Stable output is not readiness: a bare shell or a dead pane is never
+    /// typed into, the reason is recorded, and later drains do not retry.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_initial_turn_is_not_typed_into_a_shell_or_dead_pane() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        for (case, script, remain_on_exit) in [
+            (
+                "shell",
+                "echo 'login banner, nothing is running here'; exec sh",
+                false,
+            ),
+            ("dead", "echo 'the agent exited with an error banner'", true),
+            ("missing", "", false),
+        ] {
+            let id = format!("sess-term-{case}");
+            let inst = terminal_turn_instance(&id, &format!("term-{case}"), "must-not-be-typed");
+            let pane =
+                (!script.is_empty()).then(|| start_terminal_pane(&inst, script, remain_on_exit));
+            let service = crate::server::test_support::build_test_app_state(vec![inst.clone()])
+                .session_service
+                .clone();
+
+            let budget = std::time::Duration::from_millis(600);
+            service
+                .drain_terminal_initial_turn_within(&id, budget)
+                .await;
+
+            let turn = pending_turn(&service, &id)
+                .await
+                .expect("the undelivered turn is kept");
+            assert_eq!(turn.text, "must-not-be-typed", "{case}");
+            assert!(
+                turn.error.is_some_and(|e| e.contains("not running")),
+                "{case}"
+            );
+            if let Some(pane) = &pane {
+                assert!(!pane_text(pane).contains("must-not-be-typed"), "{case}");
+            }
+
+            // The agent comes up afterwards; an errored turn is still not retried.
+            drop(pane);
+            let ready = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
+            service
+                .drain_terminal_initial_turn_within(&id, budget)
+                .await;
+            assert!(!pane_text(&ready).contains("must-not-be-typed"), "{case}");
+            assert!(
+                pending_turn(&service, &id)
+                    .await
+                    .is_some_and(|t| t.error.is_some()),
+                "{case}"
+            );
+        }
+    }
+
+    /// An agent that exited to a live shell leaves its hook status file
+    /// behind; that must not make the pane look ready for typed input.
+    #[tokio::test]
+    #[serial_test::serial(hook_base)]
+    async fn terminal_initial_turn_is_not_typed_into_a_shell_with_a_stale_hook_status() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let (_hooks, _, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let inst = terminal_turn_instance("sess-term-stale", "term-stale", "must-not-be-typed");
+        let dir = crate::hooks::ensure_instance_dir_path(&inst.id).expect("hook dir");
+        std::fs::write(dir.join("status"), "idle").unwrap();
+        let pane = start_terminal_pane(&inst, "echo 'agent exited'; exec sh", false);
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+
+        service
+            .drain_terminal_initial_turn_within(
+                "sess-term-stale",
+                std::time::Duration::from_millis(600),
+            )
+            .await;
+
+        assert!(!pane_text(&pane).contains("must-not-be-typed"));
+        assert!(pending_turn(&service, "sess-term-stale")
+            .await
+            .is_some_and(|t| t.error.is_some()));
+        crate::hooks::cleanup_hook_status_dir("sess-term-stale");
+    }
+
+    /// A session archived, snoozed or relaunched while the drain waits for the
+    /// agent is not typed into, and the stale wait records no error on it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_initial_turn_revalidates_the_row_after_the_readiness_wait() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        type Change = fn(&mut Instance);
+        let changes: [(&str, Change); 3] = [
+            ("archived", |i| i.archive()),
+            ("snoozed", |i| i.snooze(60)),
+            ("relaunched", |i| i.lifecycle_generation += 1),
+        ];
+        for (case, change) in changes {
+            let id = format!("sess-term-wait-{case}");
+            let inst =
+                terminal_turn_instance(&id, &format!("term-wait-{case}"), "must-not-be-typed");
+            let service = crate::server::test_support::build_test_app_state(vec![inst.clone()])
+                .session_service
+                .clone();
+            let budget = std::time::Duration::from_secs(10);
+            // The mutation lands while the drain polls for the missing pane; the
+            // pane comes up after it, so the wait succeeds against a changed row.
+            let (retry, pane) = tokio::join!(
+                service.drain_terminal_initial_turn_once(&id, budget),
+                async {
+                    change(
+                        service
+                            .instances
+                            .write()
+                            .await
+                            .iter_mut()
+                            .find(|i| i.id == id)
+                            .expect("row"),
+                    );
+                    start_terminal_pane(&inst, READY_AGENT_SCRIPT, false)
+                },
+            );
+            assert!(!retry, "{case}");
+            assert!(!pane_text(&pane).contains("must-not-be-typed"), "{case}");
+            let turn = pending_turn(&service, &id).await.expect("turn is kept");
+            assert!(turn.error.is_none(), "{case}");
+        }
+    }
+
+    /// A failed wait for a launch that was replaced meanwhile is not recorded
+    /// on the replacement; the new launch gets its own attempt.
+    #[tokio::test]
+    async fn a_failed_wait_does_not_poison_a_replacement_launch() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let inst = terminal_turn_instance("sess-term-replaced", "term-replaced", "later");
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+        let (retry, ()) = tokio::join!(
+            service.drain_terminal_initial_turn_once(
+                "sess-term-replaced",
+                std::time::Duration::from_millis(300),
+            ),
+            async {
+                service
+                    .instances
+                    .write()
+                    .await
+                    .iter_mut()
+                    .find(|i| i.id == "sess-term-replaced")
+                    .expect("row")
+                    .lifecycle_generation += 1;
+            },
+        );
+        assert!(retry);
+        let turn = pending_turn(&service, "sess-term-replaced")
+            .await
+            .expect("turn is kept");
+        assert!(turn.error.is_none());
+    }
+
+    fn disk_turn(profile: &str, id: &str) -> Option<crate::session::PendingInitialTurn> {
+        let (rows, _groups) = crate::session::Storage::new_unwatched(profile)
+            .expect("storage")
+            .load_with_groups()
+            .expect("load");
+        rows.into_iter()
+            .find(|i| i.id == id)
+            .and_then(|i| i.pending_initial_turn)
+    }
+
+    /// A consumed turn whose clear cannot reach disk is not typed again after
+    /// a reload restores the row.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_consumed_turn_is_not_retyped_after_a_failed_clear_write_and_reload() {
+        use std::os::unix::fs::PermissionsExt;
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let inst = terminal_turn_instance("sess-clear-fail", "term-clear-fail", "typed-once");
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![inst.clone()],
+        );
+        let pane = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
+        let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+        let service = state.session_service.clone();
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        let profile_dir = crate::session::get_profile_dir(&inst.source_profile).unwrap();
+        let writable = std::fs::metadata(&profile_dir).unwrap().permissions();
+        std::fs::set_permissions(&profile_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        service.clear_pending_initial_turn("sess-clear-fail").await;
+        std::fs::set_permissions(&profile_dir, writable).unwrap();
+
+        assert!(pending_turn(&service, "sess-clear-fail").await.is_none());
+        assert!(disk_turn(&inst.source_profile, "sess-clear-fail").is_some());
+        // The reload restores the row with its turn from the stale disk copy.
+        service.instances.write().await[0].pending_initial_turn =
+            disk_turn(&inst.source_profile, "sess-clear-fail");
+        service
+            .drain_terminal_initial_turn_within(
+                "sess-clear-fail",
+                std::time::Duration::from_secs(3),
+            )
+            .await;
+        assert!(!pane_text(&pane).contains("typed-once"));
+    }
+
+    /// An agent with no ready marker cannot tell a prompt from a dialog, so
+    /// nothing is typed into its stable pane and the failure is recorded.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_initial_turn_is_refused_for_an_agent_without_a_ready_marker() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = terminal_turn_instance("sess-no-marker", "term-no-marker", "must-not-type");
+        inst.tool = "gemini".into();
+        assert!(crate::agents::ready_markers("gemini").is_empty());
+        let pane = start_terminal_pane(
+            &inst,
+            "echo 'Do you trust this folder? (y/n) [stable dialog]'; exec cat",
+            false,
+        );
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+
+        service
+            .drain_terminal_initial_turn_within("sess-no-marker", std::time::Duration::from_secs(5))
+            .await;
+
+        assert!(!pane_text(&pane).contains("must-not-type"));
+        let turn = pending_turn(&service, "sess-no-marker")
+            .await
+            .expect("turn is kept");
+        assert!(turn.error.is_some_and(|e| e.contains("no ready marker")));
+    }
+
+    /// A launch replaced after the wait was inspected, but before the error
+    /// is applied, keeps its turn clean in memory and on disk.
+    #[tokio::test]
+    async fn a_failure_is_fenced_to_the_waited_launch() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let waited = terminal_turn_instance("sess-fence", "term-fence", "same");
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &waited.source_profile,
+            vec![waited.clone()],
+        );
+        let service = crate::server::test_support::build_test_app_state(vec![waited.clone()])
+            .session_service
+            .clone();
+        service.instances.write().await[0].lifecycle_generation += 1;
+
+        service
+            .fail_pending_initial_turn(&waited, "same", "stale failure".to_string(), None)
+            .await;
+
+        assert!(pending_turn(&service, "sess-fence")
+            .await
+            .unwrap()
+            .error
+            .is_none());
+        assert!(disk_turn(&waited.source_profile, "sess-fence")
+            .unwrap()
+            .error
+            .is_none());
+    }
+
+    /// The failure write holds the reload gate through persistence, so a
+    /// reload cannot sample the old disk row and overwrite the error.
+    #[tokio::test]
+    async fn a_failure_write_excludes_reload_until_persisted() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let waited = terminal_turn_instance("sess-gate", "term-gate", "turn");
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &waited.source_profile,
+            vec![waited.clone()],
+        );
+        let service = crate::server::test_support::build_test_app_state(vec![waited.clone()])
+            .session_service
+            .clone();
+
+        let reload = service.disk_reload_guard().await;
+        let mut failing = Box::pin(service.fail_pending_initial_turn(
+            &waited,
+            "turn",
+            "wait failed".to_string(),
+            None,
+        ));
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut failing).await;
+        assert!(blocked.is_err(), "the write must wait for the reload");
+        assert!(pending_turn(&service, "sess-gate")
+            .await
+            .unwrap()
+            .error
+            .is_none());
+
+        drop(reload);
+        failing.await;
+        let error = Some("wait failed".to_string());
+        assert_eq!(
+            pending_turn(&service, "sess-gate").await.unwrap().error,
+            error
+        );
+        assert_eq!(
+            disk_turn(&waited.source_profile, "sess-gate")
+                .unwrap()
+                .error,
+            error
+        );
+    }
+
+    /// Clearing a delivered turn holds the reload gate through persistence,
+    /// so a reload cannot restore it from the still-pending disk row.
+    #[tokio::test]
+    async fn a_pending_turn_clear_excludes_reload_until_persisted() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let inst = terminal_turn_instance("sess-clear-gate", "term-clear-gate", "turn");
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![inst.clone()],
+        );
+        let service = crate::server::test_support::build_test_app_state(vec![inst.clone()])
+            .session_service
+            .clone();
+
+        let reload = service.disk_reload_guard().await;
+        let mut clearing = Box::pin(service.clear_pending_initial_turn("sess-clear-gate"));
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut clearing).await;
+        assert!(blocked.is_err(), "the clear must wait for the reload");
+        assert!(pending_turn(&service, "sess-clear-gate").await.is_some());
+
+        drop(reload);
+        clearing.await;
+        assert!(pending_turn(&service, "sess-clear-gate").await.is_none());
+        assert!(disk_turn(&inst.source_profile, "sess-clear-gate").is_none());
+    }
+
+    /// A user message supersedes an undelivered initial turn: the drain that
+    /// was waiting never types it after the message.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_terminal_send_supersedes_the_pending_initial_turn() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let inst = terminal_turn_instance("sess-term-super", "term-super", "initial-turn-A");
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![inst.clone()],
+        );
+        let pane = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let service = state.session_service.clone();
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        let sent = crate::server::api::sessions::send_terminal_message(
+            &service,
+            "sess-term-super",
+            "user-message-B".to_string(),
+            false,
+            false,
+        )
+        .await;
+        assert!(sent.is_ok());
+        service
+            .drain_terminal_initial_turn_within(
+                "sess-term-super",
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+
+        let text = pane_text(&pane);
+        assert!(text.contains("user-message-B"), "{text}");
+        assert!(!text.contains("initial-turn-A"), "{text}");
+        assert!(pending_turn(&service, "sess-term-super").await.is_none());
+    }
+
+    /// The supersession clear queues blocking work of its own, so a send must
+    /// not hold the only blocking slot while it waits for that clear.
+    #[test]
+    #[serial_test::serial]
+    fn a_terminal_send_clears_the_pending_turn_with_one_blocking_slot() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let _app_dir = crate::session::test_support::isolate_app_dir();
+            let inst = terminal_turn_instance("sess-one-slot", "one-slot", "initial-turn-A");
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                &inst.source_profile,
+                vec![inst.clone()],
+            );
+            let _pane = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            let service = state.session_service.clone();
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+            let sent = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                crate::server::api::sessions::send_terminal_message(
+                    &service,
+                    "sess-one-slot",
+                    "user-message-B".to_string(),
+                    false,
+                    false,
+                ),
+            )
+            .await
+            .expect("the send finished instead of waiting on the blocking pool");
+            assert!(sent.is_ok());
+            assert!(pending_turn(&service, "sess-one-slot").await.is_none());
+        });
+    }
+
+    /// A send dropped after tmux accepted the text still finishes under the
+    /// profile namespace, so a profile rename cannot move the profile first.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_cancelled_terminal_send_keeps_the_profile_namespace_until_it_finishes() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let inst = terminal_turn_instance("sess-cancel-ns", "cancel-ns", "initial-turn-A");
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![inst.clone()],
+        );
+        let pane = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let service = state.session_service.clone();
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        // The clear after the typed text waits on this gate.
+        let gate = service.disk_reload_guard().await;
+        let sender = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                crate::server::api::sessions::send_terminal_message(
+                    &service,
+                    "sess-cancel-ns",
+                    "user-message-B".to_string(),
+                    false,
+                    false,
+                )
+                .await
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !pane_text(&pane).contains("user-message-B") {
+            assert!(std::time::Instant::now() < deadline, "{}", pane_text(&pane));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        sender.abort();
+        let _ = sender.await;
+
+        assert!(
+            state.profile_namespace.try_write().is_err(),
+            "the detached send released the profile namespace"
+        );
+        drop(gate);
+        while state.profile_namespace.try_write().is_err() {
+            assert!(std::time::Instant::now() < deadline, "send never finished");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(pending_turn(&service, "sess-cancel-ns").await.is_none());
+    }
+
+    /// The automatic drain holds the profile namespace through delivery and the
+    /// clear, so a profile rename cannot move the profile under it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_terminal_drain_holds_the_profile_namespace_through_delivery() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let inst = terminal_turn_instance("sess-drain-ns", "drain-ns", "run-the-nightly-task");
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![inst.clone()],
+        );
+        let pane = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let service = state.session_service.clone();
+
+        // The clear after the typed text waits on this gate.
+        let gate = service.disk_reload_guard().await;
+        let drain = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .drain_terminal_initial_turn_within(
+                        "sess-drain-ns",
+                        std::time::Duration::from_secs(10),
+                    )
+                    .await
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !pane_text(&pane).contains("run-the-nightly-task") {
+            assert!(std::time::Instant::now() < deadline, "{}", pane_text(&pane));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        assert!(
+            state.profile_namespace.try_write().is_err(),
+            "the drain released the profile namespace before its bookkeeping"
+        );
+        drop(gate);
+        drain.await.unwrap();
+        assert!(pending_turn(&service, "sess-drain-ns").await.is_none());
+        assert!(state.profile_namespace.try_write().is_ok());
+    }
+
+    /// An archived or snoozed session is set aside: its pending turn is
+    /// neither typed nor marked failed.
+    #[tokio::test]
+    async fn terminal_initial_turn_skips_archived_and_snoozed_sessions() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut archived = terminal_turn_instance("sess-term-arch", "term-arch", "later");
+        archived.archive();
+        let mut snoozed = terminal_turn_instance("sess-term-snz", "term-snz", "later");
+        snoozed.snooze(60);
+        for inst in [archived, snoozed] {
+            let id = inst.id.clone();
+            let service = crate::server::test_support::build_test_app_state(vec![inst])
+                .session_service
+                .clone();
+            service
+                .drain_terminal_initial_turn_within(&id, std::time::Duration::from_millis(200))
+                .await;
+            let turn = pending_turn(&service, &id).await.expect("turn is kept");
+            assert!(turn.error.is_none(), "{id}");
+        }
+    }
+
+    /// An archive another process wrote to disk (`aoe archive --no-kill` keeps
+    /// the pane) is honored although the cached row is still active, and the
+    /// turn is delivered once the session is unarchived.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_initial_turn_honors_a_disk_only_archive() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let inst = terminal_turn_instance("sess-disk-arch", "disk-arch", "after-unarchive");
+        let mut archived = inst.clone();
+        archived.archive();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![archived],
+        );
+        let pane = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
+        let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+        let service = state.session_service.clone();
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        service
+            .drain_terminal_initial_turn_within("sess-disk-arch", std::time::Duration::from_secs(3))
+            .await;
+        assert!(!pane_text(&pane).contains("after-unarchive"));
+        let turn = pending_turn(&service, "sess-disk-arch")
+            .await
+            .expect("turn is kept");
+        assert!(turn.error.is_none());
+
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![inst.clone()],
+        );
+        service
+            .drain_terminal_initial_turn_within("sess-disk-arch", std::time::Duration::from_secs(3))
+            .await;
+        assert!(pane_text(&pane).contains("after-unarchive"));
+    }
+
+    /// A trashed session receives nothing and records no delivery error, so
+    /// restoring it delivers the turn.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_initial_turn_waits_out_trash_and_is_delivered_after_restore() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut trashed = terminal_turn_instance("sess-trash", "term-trash", "after-restore");
+        trashed.trash();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &trashed.source_profile,
+            vec![trashed.clone()],
+        );
+        let pane = start_terminal_pane(&trashed, READY_AGENT_SCRIPT, false);
+        let state = crate::server::test_support::build_test_app_state(vec![trashed.clone()]);
+        let service = state.session_service.clone();
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        service
+            .drain_terminal_initial_turn_within("sess-trash", std::time::Duration::from_secs(3))
+            .await;
+        assert!(!pane_text(&pane).contains("after-restore"));
+        let turn = pending_turn(&service, "sess-trash")
+            .await
+            .expect("turn is kept");
+        assert!(turn.error.is_none());
+
+        let mut restored = trashed.clone();
+        restored.untrash();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &restored.source_profile,
+            vec![restored.clone()],
+        );
+        service.instances.write().await[0] = restored;
+        service
+            .drain_terminal_initial_turn_within("sess-trash", std::time::Duration::from_secs(3))
+            .await;
+        assert!(pane_text(&pane).contains("after-restore"));
+    }
+
+    /// A relaunch another process wrote to disk after the launch was probed
+    /// (the cached row still holds the old generation) is not typed into.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_initial_turn_is_not_typed_after_a_disk_only_relaunch() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let inst = terminal_turn_instance("sess-relaunch", "term-relaunch", "old-launch-text");
+        let mut relaunched = inst.clone();
+        relaunched.lifecycle_generation += 1;
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![relaunched],
+        );
+        let pane = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
+        let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+        let service = state.session_service.clone();
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        service
+            .drain_terminal_initial_turn_within("sess-relaunch", std::time::Duration::from_secs(3))
+            .await;
+
+        assert!(!pane_text(&pane).contains("old-launch-text"));
+        let turn = pending_turn(&service, "sess-relaunch")
+            .await
+            .expect("turn is kept");
+        assert!(turn.error.is_none());
+    }
+
     /// #3687: a background drain spawned from a pre-deletion snapshot must not
     /// re-create the deleted session's `prompt_locks` entry.
     ///
@@ -4410,6 +6098,9 @@ mod tests {
                 text: "hello".to_string(),
                 attachments: Vec::new(),
                 synthesized: false,
+                error: None,
+                error_code: None,
+                id: String::new(),
             });
             inst
         }
@@ -4875,6 +6566,9 @@ mod tests {
             text: "resume".into(),
             attachments: vec![],
             synthesized: true,
+            error: None,
+            error_code: None,
+            id: crate::session::PendingInitialTurn::fresh_id(),
         };
         type Mutate = fn(Arc<SessionService>) -> futures_util::future::BoxFuture<'static, ()>;
         type Check = fn(&Instance) -> bool;
@@ -4955,6 +6649,108 @@ mod tests {
             .await;
 
             assert!(check(&state.instances.read().await[0]), "{name}");
+        }
+    }
+
+    /// A peer write is what counts: the canonical check sees an ignore the watcher has not
+    /// delivered to the in-memory snapshot yet.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_peer_ignore_is_visible_to_the_canonical_check() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut managed = Instance::new("peer-ignored", "/tmp/aoe-peer-ignored");
+        managed.id = "peer-ignored".into();
+        managed.source_profile = "default".into();
+        managed.parent_session_id = Some("manager".into());
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![managed.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![managed.clone()]);
+        let service = state.session_service.clone();
+        assert!(!service.is_ignored_on_disk("peer-ignored").await.unwrap());
+
+        let mut ignored = managed;
+        ignored.ignore();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![ignored]);
+        assert!(service.is_ignored_on_disk("peer-ignored").await.unwrap());
+        assert!(
+            !state.instances.read().await[0].is_ignored(),
+            "the snapshot was never refreshed, so the check above read the store"
+        );
+    }
+
+    /// Input accepted while the snapshot still shows the row unignored clears a peer's
+    /// Ignore: the snapshot lags the commit, so the store decides.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn direct_input_clears_an_ignore_the_snapshot_has_not_seen() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut managed = Instance::new("peer-typed", "/tmp/aoe-peer-typed");
+        managed.id = "peer-typed".into();
+        managed.source_profile = "default".into();
+        managed.parent_session_id = Some("manager".into());
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![managed.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![managed.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let service = state.session_service.clone();
+
+        // A peer commits the ignore; this daemon's snapshot still shows the row live.
+        let mut ignored = managed;
+        ignored.ignore();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![ignored]);
+        assert!(!state.instances.read().await[0].is_ignored());
+
+        service
+            .touch_after_direct_input("peer-typed")
+            .await
+            .unwrap();
+
+        assert!(
+            !service.is_ignored_on_disk("peer-typed").await.unwrap(),
+            "accepted input must clear the canonical marker"
+        );
+    }
+
+    /// Typing in an open pane is user input, so it clears Ignore on a row that can still
+    /// start; an archived row keeps the marker that its archive outranks.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn direct_input_clears_ignore_only_on_a_startable_row() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let cases = [("live", false, false), ("sunk", true, true)];
+        for (id, archived, still_ignored) in cases {
+            let mut row = Instance::new(id, "/tmp/aoe-direct-input");
+            row.id = id.into();
+            row.source_profile = "default".into();
+            row.parent_session_id = Some("manager".into());
+            if archived {
+                row.archive();
+            }
+            row.ignore();
+            let stored = crate::session::Storage::new_unwatched("default").unwrap();
+            stored
+                .update(|rows, _| {
+                    rows.retain(|row| row.id != id);
+                    rows.push(row.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let state = crate::server::test_support::build_test_app_state(vec![row]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            state
+                .session_service
+                .touch_after_direct_input(id)
+                .await
+                .unwrap();
+
+            let rows = stored.load().unwrap();
+            let written = rows.iter().find(|row| row.id == id).unwrap();
+            assert_eq!(written.is_ignored(), still_ignored, "{id}");
+            assert!(written.last_accessed_at.is_some(), "{id}");
         }
     }
 
@@ -5092,6 +6888,7 @@ mod tests {
         for reason in [
             "archived",
             "trashed",
+            "ignored",
             "no_revive",
             "unfinished",
             "superseded",
@@ -5104,6 +6901,7 @@ mod tests {
             match reason {
                 "archived" => persisted.archive(),
                 "trashed" => persisted.trash(),
+                "ignored" => persisted.ignore(),
                 "unfinished" => persisted.status = crate::session::Status::Creating,
                 "superseded" => persisted.lifecycle_generation += 1,
                 _ => {}
@@ -5120,10 +6918,17 @@ mod tests {
             let memory_before = serde_json::to_value(&visible).unwrap();
             let disk_before = std::fs::read(storage.sessions_path()).unwrap();
             let mut status_rx = state.status_tx.subscribe();
-            let outcome = state
-                .session_service
-                .touch_and_wake_on_prompt(&visible.id, reason == "no_revive")
-                .await;
+            let outcome = if reason == "ignored" {
+                state
+                    .session_service
+                    .touch_and_wake_on_prompt_refusing_ignored(&visible.id, false)
+                    .await
+            } else {
+                state
+                    .session_service
+                    .touch_and_wake_on_prompt(&visible.id, reason == "no_revive")
+                    .await
+            };
             match reason {
                 "archived" => assert!(matches!(
                     outcome,
@@ -5133,6 +6938,7 @@ mod tests {
                     outcome,
                     PromptTouch::Blocked(crate::session::StartBlocked::Trashed)
                 )),
+                "ignored" => assert!(matches!(outcome, PromptTouch::Ignored)),
                 "no_revive" => assert!(matches!(outcome, PromptTouch::RevivalRefused)),
                 _ => assert!(matches!(outcome, PromptTouch::WorkerNotReady)),
             }
@@ -5209,9 +7015,12 @@ mod tests {
         inst.id = "sess-supersede".to_string();
         inst.view = crate::session::View::Structured;
         inst.pending_initial_turn = Some(crate::session::PendingInitialTurn {
+            error: None,
+            error_code: None,
             text: "continuation".to_string(),
             attachments: Vec::new(),
             synthesized: true,
+            id: crate::session::PendingInitialTurn::fresh_id(),
         });
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
         let service = state.session_service.clone();
@@ -5265,9 +7074,12 @@ mod tests {
         inst.id = "sess-disk-only".to_string();
         inst.view = crate::session::View::Structured;
         inst.pending_initial_turn = Some(crate::session::PendingInitialTurn {
+            error: None,
+            error_code: None,
             text: "continuation".to_string(),
             attachments: Vec::new(),
             synthesized: true,
+            id: crate::session::PendingInitialTurn::fresh_id(),
         });
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
         let profile = state.instances.read().await[0].source_profile.clone();
@@ -5305,9 +7117,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let seeded = crate::session::PendingInitialTurn {
+            error: None,
+            error_code: None,
             text: "continuation".to_string(),
             attachments: Vec::new(),
             synthesized: true,
+            id: crate::session::PendingInitialTurn::fresh_id(),
         };
         let mut inst = Instance::new("queue", "/tmp/aoe-queue-project");
         inst.id = "sess-undo".to_string();
@@ -5355,9 +7170,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let seeded = crate::session::PendingInitialTurn {
+            error: None,
+            error_code: None,
             text: "continuation".to_string(),
             attachments: Vec::new(),
             synthesized: true,
+            id: crate::session::PendingInitialTurn::fresh_id(),
         };
         let mut inst = Instance::new("queue", "/tmp/aoe-queue-project");
         inst.id = "sess-cancel".to_string();
@@ -5824,5 +7642,50 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("{case}: the resume reached the container runtime"));
         }
+    }
+
+    #[tokio::test]
+    async fn sidebar_status_at_folds_only_the_tail_and_replays_behind_frames() {
+        use crate::acp::state::test_support::{prompt, stopped};
+        use crate::session::Status;
+
+        let id = "sidebar-tail";
+        let mut inst = Instance::new("sidebar-tail", "/tmp/aoe-sidebar-tail");
+        inst.id = id.to_string();
+        inst.view = crate::session::View::Structured;
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let at = chrono::Utc::now().timestamp_millis();
+        let store = &state.acp_event_store;
+        let service = &state.session_service;
+        let first = prompt("go");
+        let second = stopped("end_turn");
+        store.record_at(id, 1, &first, at).unwrap();
+        store.record_at(id, 2, &second, at).unwrap();
+
+        let fold = service.fold_control_state(id).await;
+        assert_eq!(fold.last_seq, 2);
+
+        let running = prompt("again");
+        store.record_at(id, 3, &running, at).unwrap();
+        let ahead = service.sidebar_status_at(id, 3).await;
+        assert_eq!(ahead, Some(Status::Running));
+
+        // Advance the live fold beyond seq 3. A late frame at seq 3 still
+        // projects the running transition at that sequence, not the later idle
+        // level held by the fold.
+        let ended = stopped("end_turn");
+        store.record_at(id, 4, &ended, at).unwrap();
+        assert_eq!(
+            state.acp_control_cache.apply_if_cached(id, 3, &running),
+            Some(Status::Running)
+        );
+        assert_eq!(
+            state.acp_control_cache.apply_if_cached(id, 4, &ended),
+            Some(Status::Idle)
+        );
+        let behind = service.sidebar_status_at(id, 3).await;
+        assert_eq!(behind, Some(Status::Running));
+        let folded = service.sidebar_status_at(id, 4).await;
+        assert_eq!(folded, Some(Status::Idle));
     }
 }

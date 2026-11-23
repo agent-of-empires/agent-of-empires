@@ -128,6 +128,15 @@ const launch = async () => {
 };
 const payload = (call = 0) => createSession.mock.calls[call]![0];
 
+describe("SessionWizard dialog semantics", () => {
+  it("is a modal dialog named by its heading", async () => {
+    renderWizard();
+    const dialog = screen.getByRole("dialog", { name: "New session" });
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    await screen.findByRole("switch", { name: "Yolo mode" });
+  });
+});
+
 describe("SessionWizard native import late defaults", () => {
   it.each([true, false])(
     "keeps a native import on the host after the original registry settles (success %s)",

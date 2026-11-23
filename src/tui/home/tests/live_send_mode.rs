@@ -737,16 +737,35 @@ fn warm_predicates_stay_cold_without_a_live_pane() {
     assert!(!env.view.agent_pane_is_warm(&id));
 
     // Non-live statuses are cold regardless of pane state.
+    let cache = crate::tmux::SessionCacheGuard::capture();
+    let inst = env.view.get_instance(&id).unwrap().clone();
+    let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+    cache.force_present(&[tmux_name.as_str()]);
     for status in [
         crate::session::Status::Stopped,
         crate::session::Status::Starting,
         crate::session::Status::Error,
-        crate::session::Status::Unknown,
     ] {
         env.view.set_instance_status(&id, status);
         assert!(
             !env.view.agent_pane_is_warm(&id),
             "status {status:?} must not count as warm"
+        );
+    }
+
+    // An unclassified status with the pane actually up is warm: that is the
+    // steady state of an agent whose status adapter has not classified its
+    // screen, and live send attaches those rows.
+    for status in [
+        crate::session::Status::Unknown,
+        crate::session::Status::Idle,
+        crate::session::Status::Waiting,
+        crate::session::Status::Running,
+    ] {
+        env.view.set_instance_status(&id, status);
+        assert!(
+            env.view.agent_pane_is_warm(&id),
+            "status {status:?} with a live pane must count as warm"
         );
     }
 

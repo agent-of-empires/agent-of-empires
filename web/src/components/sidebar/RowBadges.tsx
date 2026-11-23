@@ -131,7 +131,7 @@ function QueuedChip({ sessions, counts, total }: { sessions: SessionResponse[]; 
 /** Badges after the row label; hidden in the compact rail. */
 export function RowTrailingBadges({ workspace, model }: { workspace: Workspace; model: RowModel }) {
   const { firstSession: first, effectiveArchived, effectiveSnoozedUntil } = model;
-  const rowTag = computeSessionRowTag(workspace, useSessionRowTagMode());
+  const rowTag = computeSessionRowTag(workspace, useSessionRowTagMode(), model.label);
   const baseBranch = first?.base_branch ?? null;
   const sessionIds = useMemo(() => workspace.sessions.map((s) => s.id), [workspace.sessions]);
   const hasDraft = useHasDraftForSessions(sessionIds);

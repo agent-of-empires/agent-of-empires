@@ -1655,8 +1655,8 @@ export interface UpdateStatus {
   update_command?: string;
 }
 
-export function fetchUpdateStatus(): Promise<UpdateStatus | null> {
-  return fetchJson<UpdateStatus>("/api/system/update-status");
+export function fetchUpdateStatus(init?: RequestInit): Promise<UpdateStatus | null> {
+  return fetchJson<UpdateStatus>("/api/system/update-status", init);
 }
 
 /** Persist that the update banner was dismissed for `version`, server-side, so
@@ -3177,6 +3177,24 @@ export async function startSession(id: string): Promise<StartSessionResult> {
 export async function setSessionSnooze(id: string, minutes: number | null): Promise<SessionResponse | null> {
   try {
     return await sessionUpdate(id, "snooze", jsonInit("PATCH", { minutes }));
+  } catch {
+    return null;
+  }
+}
+
+/** Ignore or unignore a session managed by another session. The row stays present and live. */
+export async function setSessionIgnored(id: string, ignored: boolean): Promise<SessionResponse | null> {
+  try {
+    return await sessionUpdate(id, "ignored", jsonInit("PATCH", { ignored }));
+  } catch {
+    return null;
+  }
+}
+
+/** Take ownership back from a managing session: clears its manager link and ignore marker. */
+export async function reclaimSessionOwnership(id: string): Promise<SessionResponse | null> {
+  try {
+    return await sessionUpdate(id, "reclaim-ownership", jsonInit("POST", { reclaim: true }));
   } catch {
     return null;
   }

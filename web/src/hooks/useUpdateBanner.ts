@@ -5,6 +5,8 @@ import { onServerDownChange } from "../lib/connectionState";
 
 // Re-poll cadence for `/api/system/update-status`.
 const POLL_MINUTES = 60;
+// A request that never settles would leave the newest poll without a next one scheduled.
+const REQUEST_TIMEOUT_MS = 15_000;
 
 /** The update status to offer, or `null` when nothing should show. */
 export function useUpdateBanner(): { status: UpdateStatus; dismiss: () => void } | null {
@@ -22,7 +24,7 @@ export function useUpdateBanner(): { status: UpdateStatus; dismiss: () => void }
     // its answer and schedules the next one, so a slow older reply can't restore a stale offer.
     const poll = async () => {
       const seq = ++latest;
-      const s = await fetchUpdateStatus();
+      const s = await fetchUpdateStatus({ signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
       if (cancelled || seq !== latest) return;
       if (s) setStatus(s);
       if (timer) clearTimeout(timer);

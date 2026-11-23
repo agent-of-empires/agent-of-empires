@@ -829,6 +829,12 @@ impl Session {
             .ok_or_else(|| anyhow::anyhow!("could not capture tmux session '{}'", self.name))
     }
 
+    /// [`Self::try_capture_pane`] of exactly `pane`, a `#{pane_id}`, never a re-resolved one.
+    pub fn try_capture_pane_in(&self, pane: &str, lines: usize) -> Result<String> {
+        self.capture_target(pane, lines)?
+            .ok_or_else(|| anyhow::anyhow!("could not capture tmux pane '{pane}'"))
+    }
+
     /// `None` when the session is gone or `capture-pane` failed; `Err` when tmux could not run.
     fn capture(&self, lines: usize) -> Result<Option<String>> {
         if !self.exists() {
@@ -836,11 +842,15 @@ impl Session {
         }
         let target =
             self.live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
+        self.capture_target(&target, lines)
+    }
+
+    fn capture_target(&self, target: &str, lines: usize) -> Result<Option<String>> {
         let output = crate::tmux::tmux_command()
             .args([
                 "capture-pane",
                 "-t",
-                &target,
+                target,
                 "-p",
                 "-e",
                 "-S",
@@ -850,33 +860,52 @@ impl Session {
         Ok(capture_output(output.status.success(), &output.stdout))
     }
 
-    /// Wait for a known marker, or for two stable captures when no marker exists.
+    /// Wait for any known marker, or for two stable captures when no marker exists.
     /// The polling budget bounds readiness checks, not each native subprocess.
-    pub fn wait_until_ready(&self, max_wait: std::time::Duration, ready_marker: Option<&str>) {
+    /// Returns false when the budget ran out first.
+    pub fn wait_until_ready(&self, max_wait: std::time::Duration, ready_markers: &[&str]) -> bool {
+        self.wait_until_ready_unless(max_wait, ready_markers, |_| None::<()>)
+            .unwrap_or(false)
+    }
+
+    /// [`Self::wait_until_ready`] that also stops at once with `Err` when
+    /// `blocked` recognizes the plain-text screen as a dialog.
+    pub fn wait_until_ready_unless<B>(
+        &self,
+        max_wait: std::time::Duration,
+        ready_markers: &[&str],
+        blocked: impl Fn(&str) -> Option<B>,
+    ) -> Result<bool, B> {
         let poll_interval = std::time::Duration::from_millis(200);
         let deadline = std::time::Instant::now() + max_wait;
-        let ready_marker = ready_marker.map(str::to_lowercase);
+        let ready_markers: Vec<String> = ready_markers.iter().map(|m| m.to_lowercase()).collect();
         let mut last: Option<String> = None;
         while std::time::Instant::now() < deadline {
             std::thread::sleep(poll_interval);
-            let Ok(now) = self.capture_pane(5) else {
+            let Ok(now) = self.capture_pane(0) else {
                 continue;
             };
             #[cfg(test)]
             tests::observe_ready_capture(&now);
-            if let Some(marker) = ready_marker.as_deref() {
-                if now.to_lowercase().contains(marker) {
-                    return;
+            let screen = crate::tmux::utils::strip_ansi(&now);
+            if let Some(blocker) = blocked(&screen) {
+                return Err(blocker);
+            }
+            if !ready_markers.is_empty() {
+                let screen = screen.to_lowercase();
+                if ready_markers.iter().any(|m| screen.contains(m)) {
+                    return Ok(true);
                 }
                 continue;
             }
             if now.trim().len() > 20 {
                 if last.as_deref() == Some(now.as_str()) {
-                    return;
+                    return Ok(true);
                 }
                 last = Some(now);
             }
         }
+        Ok(false)
     }
 
     /// Capture the whole first window, panes composited, for the passive
@@ -1276,7 +1305,7 @@ impl Session {
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> Result<String> {
         #[cfg(unix)]
-        if let Some(id) = crate::tmux::vt::channel_pane_id(&self.name) {
+        if let Some(id) = crate::tmux::vt::channel_pane_id(&self.name, deadline) {
             return Ok(id);
         }
         super::utils::first_pane_id_with_deadline(&self.name, deadline)
@@ -1361,9 +1390,13 @@ impl Session {
     pub fn send_raw_bytes(&self, bytes: &[u8]) -> Result<()> {
         let target =
             self.live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
+        Self::send_raw_bytes_to(&target, bytes)
+    }
+
+    fn send_raw_bytes_to(target: &str, bytes: &[u8]) -> Result<()> {
         for batch in raw_byte_batches(bytes) {
             let output = crate::tmux::tmux_command()
-                .args(["send-keys", "-t", &target, "-H"])
+                .args(["send-keys", "-t", target, "-H"])
                 .args(&batch)
                 .output()?;
             if !output.status.success() {
@@ -1430,6 +1463,19 @@ impl Session {
 
         let target =
             self.live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
+        Self::send_keys_to(&target, text, enter_delay_ms)
+    }
+
+    /// [`Self::send_keys_with_delay`] to exactly `pane`, a `#{pane_id}`: text and Enter
+    /// reach the pane that was checked, or fail if it is gone.
+    pub fn send_keys_to_pane(&self, pane: &str, text: &str, enter_delay_ms: u64) -> Result<()> {
+        if !self.exists() {
+            bail!("Session does not exist: {}", self.name);
+        }
+        Self::send_keys_to(pane, text, enter_delay_ms)
+    }
+
+    fn send_keys_to(target: &str, text: &str, enter_delay_ms: u64) -> Result<()> {
         let delivery = submit_text(text);
         tracing::debug!(target: "tmux.command",
             "send_keys_with_delay: bytes={} lines={} paste={} target={}",
@@ -1440,15 +1486,15 @@ impl Session {
         );
 
         match delivery {
-            SubmitText::Paste(text) => Self::send_via_paste_buffer(&target, text)?,
+            SubmitText::Paste(text) => Self::send_via_paste_buffer(target, text)?,
             SubmitText::Literal(payload) => {
                 let (head, semis) = peel_trailing_semicolons(&payload);
                 if !head.is_empty() {
                     // `--` so lines starting with `-` are not read as tmux flags.
-                    Self::tmux_send(&target, &["-l", "--", head])?;
+                    Self::tmux_send(target, &["-l", "--", head])?;
                 }
                 if semis > 0 {
-                    self.send_raw_bytes(&vec![b';'; semis])?;
+                    Self::send_raw_bytes_to(target, &vec![b';'; semis])?;
                 }
             }
         }
@@ -1458,7 +1504,7 @@ impl Session {
         }
 
         // Enter to submit
-        Self::tmux_send(&target, &["Enter"])?;
+        Self::tmux_send(target, &["Enter"])?;
 
         Ok(())
     }
@@ -3095,7 +3141,7 @@ mod tests {
                         resume: resume_rx,
                     });
                     Session::from_name(name)
-                        .wait_until_ready(std::time::Duration::from_secs(60), Some("ask anything"));
+                        .wait_until_ready(std::time::Duration::from_secs(60), &["ask anything"]);
                 });
                 let _release_on_unwind = ReleaseOnDrop(&release);
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -5173,6 +5219,8 @@ mod tests {
             .expect("set pane title")
             .success());
         let pid = pane_field(&pane, "#{pane_pid}");
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        let server_pid = pane_field(&pane, "#{pid}");
         let cases = [
             (
                 "pane PID",
@@ -5183,6 +5231,24 @@ mod tests {
                 "pane title",
                 crate::tmux::utils::pane_title(&session_name),
                 title,
+            ),
+            (
+                "server PID",
+                crate::tmux::vt::server_pid(&pane, &deadline),
+                server_pid.as_str(),
+            ),
+            (
+                "session pane membership",
+                Some(
+                    crate::tmux::vt::session_holds_pane(
+                        &session_name,
+                        &server_pid,
+                        &pane,
+                        &deadline,
+                    )
+                    .to_string(),
+                ),
+                "true",
             ),
         ];
         for (query, read, expected) in cases {

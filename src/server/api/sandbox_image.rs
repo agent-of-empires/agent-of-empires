@@ -104,10 +104,9 @@ impl StatusCache {
 }
 
 static STATUS: LazyLock<Mutex<StatusCache>> = LazyLock::new(Mutex::default);
-/// The key's dashboard waiter, by the id its cleanup checks. One per running pull, so repeated
-/// POSTs don't each hold a blocking thread for the whole pull.
+/// The flight each key's dashboard waiter waits on. One per running pull, so repeated POSTs
+/// don't each hold a blocking thread for the whole pull.
 static DASHBOARD_WAITERS: LazyLock<Mutex<HashMap<ImageKey, u64>>> = LazyLock::new(Mutex::default);
-static NEXT_DASHBOARD_WAITER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// One registry check per image and runtime at a time, so callers arriving together share it.
 static CHECK_TURNS: LazyLock<Mutex<HashMap<ImageKey, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(Mutex::default);
@@ -405,6 +404,24 @@ fn requested_image(
     }
 }
 
+/// The image a pull or cancel request names, once the dashboard may pull it.
+async fn pull_request(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> Result<(Configured, String), Response> {
+    if let Some(resp) = read_only_block(state).or_else(|| cityhall_block(state)) {
+        return Err(resp);
+    }
+    let configured = configured().await?;
+    if pull_blocked(state, &configured).is_some() {
+        return Err(pull_disabled());
+    }
+    let requested = requested_image(headers, body)?;
+    let image = resolve_image(&configured, requested.as_deref())?;
+    Ok((configured, image))
+}
+
 /// `POST /api/sandbox/image-pull`: starts at most one pull per image and returns at once;
 /// `image-status` reports its progress. The pull keeps its 600 s runtime timeout.
 pub async fn sandbox_image_pull(
@@ -412,32 +429,20 @@ pub async fn sandbox_image_pull(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    if let Some(resp) = read_only_block(&state).or_else(|| cityhall_block(&state)) {
-        return resp;
-    }
-    let configured = match configured().await {
-        Ok(configured) => configured,
-        Err(resp) => return resp,
-    };
-    if pull_blocked(&state, &configured).is_some() {
-        return pull_disabled();
-    }
-    let requested = match requested_image(&headers, &body) {
-        Ok(requested) => requested,
-        Err(resp) => return resp,
-    };
-    let image = match resolve_image(&configured, requested.as_deref()) {
-        Ok(image) => image,
+    let (configured, image) = match pull_request(&state, &headers, &body).await {
+        Ok(request) => request,
         Err(resp) => return resp,
     };
     let key = configured.key(image.clone());
     let runtime = ContainerRuntime::from(configured.runtime);
     let mut waiters = DASHBOARD_WAITERS.lock().unwrap_or_else(|e| e.into_inner());
-    // Joined under the map's lock, so two POSTs can't both add a waiter to one pull.
-    if !(waiters.contains_key(&key) && runtime.pull_state(&image) == PullState::Running) {
+    // Joined under the map's lock, so two POSTs can't both add a waiter to one pull. Matched by
+    // flight, so an entry left by a cancelled pull doesn't stand in for the next one.
+    let running = runtime.running_pull_id(&image);
+    if running.is_none() || waiters.get(&key) != running.as_ref() {
         // Registered now, so the next status read already sees it running.
         let waiter = runtime.join_pull(&image);
-        let id = NEXT_DASHBOARD_WAITER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = waiter.flight_id();
         waiters.insert(key.clone(), id);
         tokio::task::spawn_blocking(move || {
             // A pull the dashboard asked for is never cancelled by a create that joined it.
@@ -455,9 +460,35 @@ pub async fn sandbox_image_pull(
     drop(waiters);
     (
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "image": image, "pull": PullState::Running })),
+        Json(serde_json::json!({ "image": image, "pull": PullState::Running(Default::default()) })),
     )
         .into_response()
+}
+
+/// How long a Cancel waits for the killed pull to end; the kill itself takes at most 250 ms.
+const CANCEL_BACKSTOP: Duration = Duration::from_secs(5);
+
+/// `POST /api/sandbox/image-pull/cancel`, with the same body as image-pull: cancels the
+/// image's running pull for every waiter and answers with the state it ended in. With no pull
+/// running it answers the current state, so a repeat is harmless.
+pub async fn sandbox_image_cancel(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let (configured, image) = match pull_request(&state, &headers, &body).await {
+        Ok(request) => request,
+        Err(resp) => return resp,
+    };
+    let runtime = ContainerRuntime::from(configured.runtime);
+    let cancelled = tokio::task::spawn_blocking({
+        let image = image.clone();
+        move || runtime.cancel_pull(&image, CANCEL_BACKSTOP)
+    })
+    .await;
+    let pull =
+        cancelled.unwrap_or_else(|_| ContainerRuntime::from(configured.runtime).pull_state(&image));
+    Json(serde_json::json!({ "image": image, "pull": pull })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -844,6 +875,215 @@ mod tests {
             status_generation_for_test(&runtime, IMAGE),
             before + 1,
             "the status is invalidated once, when the pull ends"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_dashboard_entry_left_by_a_cancelled_pull_does_not_stop_a_post_joining_the_next() {
+        use crate::containers::image_pull;
+        const IMAGE: &str = "aoe-test/post-after-cancel:latest";
+        let _app = crate::session::test_support::isolate_app_dir();
+        crate::session::update_config(|c| {
+            c.sandbox.allow_image_pull = true;
+            c.sandbox.default_image = IMAGE.into();
+        })
+        .unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let runtime = ContainerRuntime::from(ContainerRuntimeName::default());
+        let pull_key = image_pull::PullKey {
+            runtime: runtime.display_name(),
+            image: IMAGE.into(),
+        };
+        let key = runtime_key(&runtime, IMAGE);
+        let post = || {
+            sandbox_image_pull(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::new(),
+            )
+        };
+
+        let first = image_pull::join_with(pull_key.clone(), |pull| {
+            while !pull.kill.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(crate::containers::error::DockerError::Cancelled(
+                "pull".into(),
+            ))
+        });
+        assert_eq!(json(post().await).await.0, StatusCode::ACCEPTED);
+        let stale = DASHBOARD_WAITERS.lock().unwrap_or_else(|e| e.into_inner())[&key];
+        assert_eq!(
+            image_pull::cancel(&pull_key, Duration::from_secs(10)),
+            PullState::Cancelled
+        );
+        drop(first);
+        // Once the cancelled pull's dashboard task has cleaned up, put its entry back: the
+        // window where a POST arrives before that cleanup.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while DASHBOARD_WAITERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&key)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dashboard task never ended"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        DASHBOARD_WAITERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), stale);
+
+        let (open, gate) = std::sync::mpsc::channel::<()>();
+        let create = image_pull::join_with(pull_key.clone(), move |_| {
+            let _ = gate.recv();
+            Ok(())
+        });
+        assert_eq!(json(post().await).await.0, StatusCode::ACCEPTED);
+        assert_eq!(
+            image_pull::waiters_for_test(&pull_key),
+            2,
+            "the create and a dashboard waiter on the new pull"
+        );
+        open.send(()).unwrap();
+        create
+            .wait(&tokio_util::sync::CancellationToken::new())
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancel_is_gated_like_a_pull_and_answers_the_state_the_pull_ended_in() {
+        use crate::containers::image_pull;
+        use crate::containers::pull_progress::LayerUpdate;
+        const IMAGE: &str = "aoe-test/cancel-endpoint:latest";
+        let _app = crate::session::test_support::isolate_app_dir();
+        crate::session::update_config(|c| {
+            c.updates.update_check_mode = crate::session::config::UpdateCheckMode::Off;
+            c.sandbox.allow_image_pull = true;
+            c.sandbox.default_image = IMAGE.into();
+        })
+        .unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let cancel = |state: Arc<AppState>| {
+            sandbox_image_cancel(
+                State(state),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::new(),
+            )
+        };
+        let pull_of = |body: serde_json::Value| body["pull"].clone();
+        let status = || {
+            let state = state.clone();
+            async move {
+                let resp = sandbox_image_status(
+                    State(state),
+                    Query(ImageStatusQuery {
+                        image: None,
+                        fresh: false,
+                    }),
+                )
+                .await;
+                json(resp).await.1["pull"].clone()
+            }
+        };
+
+        for (state, error) in [
+            (
+                crate::server::test_support::build_test_app_state_configured(Vec::new(), |s| {
+                    s.read_only = true
+                }),
+                "read_only",
+            ),
+            (
+                crate::server::test_support::build_test_app_state_configured(Vec::new(), |s| {
+                    s.cityhall_mode = true
+                }),
+                "cityhall_mode",
+            ),
+        ] {
+            let (code, body) = json(cancel(state).await).await;
+            assert_eq!(
+                (code, body["error"].as_str()),
+                (StatusCode::FORBIDDEN, Some(error))
+            );
+        }
+
+        let (code, body) = json(cancel(state.clone()).await).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["image"], IMAGE);
+        assert_eq!(
+            pull_of(body),
+            serde_json::json!({"state": "idle"}),
+            "nothing to cancel"
+        );
+
+        let runtime = ContainerRuntime::from(ContainerRuntimeName::default());
+        let pull_key = image_pull::PullKey {
+            runtime: runtime.display_name(),
+            image: IMAGE.into(),
+        };
+        let (report, reported) = std::sync::mpsc::channel::<()>();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let running = image_pull::join_with(pull_key.clone(), move |pull| {
+            let _ = gate.recv();
+            for (id, done) in [("a", false), ("b", false), ("a", true)] {
+                pull.report(LayerUpdate {
+                    id: id.into(),
+                    done,
+                });
+            }
+            let _ = report.send(());
+            while !pull.kill.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(crate::containers::error::DockerError::Cancelled(
+                "pull".into(),
+            ))
+        });
+        assert_eq!(
+            status().await,
+            serde_json::json!({"state": "running"}),
+            "no counts before a line parses"
+        );
+        release.send(()).unwrap();
+        reported
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the pull reports");
+        assert_eq!(
+            status().await,
+            serde_json::json!({
+                "state": "running",
+                "phase": "downloading",
+                "layers_done": 1,
+                "layers_known": 2,
+            })
+        );
+
+        let (code, body) = json(cancel(state.clone()).await).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(pull_of(body), serde_json::json!({"state": "cancelled"}));
+        assert!(matches!(
+            running.wait(&tokio_util::sync::CancellationToken::new()),
+            Err(crate::containers::error::DockerError::PullCancelled(_))
+        ));
+        assert_eq!(status().await, serde_json::json!({"state": "cancelled"}));
+        let (code, body) = json(cancel(state.clone()).await).await;
+        assert_eq!(
+            (code, pull_of(body)),
+            (StatusCode::OK, serde_json::json!({"state": "cancelled"})),
+            "a repeat answers the same"
+        );
+
+        crate::session::update_config(|c| c.sandbox.allow_image_pull = false).unwrap();
+        let (code, body) = json(cancel(state.clone()).await).await;
+        assert_eq!(
+            (code, body["error"].as_str()),
+            (StatusCode::FORBIDDEN, Some("pull_disabled"))
         );
     }
 

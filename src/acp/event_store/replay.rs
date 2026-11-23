@@ -39,6 +39,26 @@ impl EventStore {
         self.replay_page(session_id, since, None).events
     }
 
+    /// Events with `since < seq <= through`, oldest first.
+    pub(crate) fn replay_through(
+        &self,
+        session_id: &str,
+        since: u64,
+        through: u64,
+    ) -> Vec<(u64, Event)> {
+        let rows = events::scan(
+            &self.reader(),
+            &self.schema,
+            session_id,
+            SeqBound::AfterThrough(since, through),
+            Order::Asc,
+            None,
+        );
+        #[cfg(test)]
+        tests::BOUNDED_ROWS.with(|count| count.set(rows.len()));
+        decode_rows(session_id, rows, None).0
+    }
+
     /// Up to `limit` events with `seq > since`, oldest first.
     pub fn replay_page(&self, session_id: &str, since: u64, limit: Option<usize>) -> ReplayPage {
         let page = self.page(session_id, SeqBound::After(since), Order::Asc, limit);
@@ -405,6 +425,31 @@ mod tests {
         /// Runs once between a page's bounds queries and its row scan.
         pub(super) static AFTER_BOUNDS: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
             const { std::cell::Cell::new(None) };
+        pub(super) static BOUNDED_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn bounded_replay_reads_only_rows_in_the_requested_range() {
+        let (_tmp, store) = open_store(0);
+        record_from(
+            &store,
+            "bounded",
+            1,
+            (1..=1002).map(|_| Event::ThinkingStarted),
+        );
+        store.record("other", 3, &Event::ThinkingEnded).unwrap();
+        for (since, through, expected) in [
+            (2, 3, vec![3]),
+            (2, 4, vec![3, 4]),
+            (3, 3, vec![]),
+            (4, 3, vec![]),
+            (1000, u64::MAX, vec![1001, 1002]),
+            (u64::MAX, u64::MAX, vec![]),
+        ] {
+            let replay = store.replay_through("bounded", since, through);
+            assert_eq!(seqs(&replay), expected);
+            BOUNDED_ROWS.with(|count| assert_eq!(count.get(), expected.len()));
+        }
     }
 
     #[test]

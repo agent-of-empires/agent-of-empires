@@ -976,7 +976,7 @@ pub(crate) async fn start_server(
                     );
                 } else {
                     println!(
-                        "Open the localhost URL in a browser. Other devices get 426 until you front aoe with HTTPS, or pass --dangerously-allow-plaintext-remote."
+                        "Open the localhost URL in a browser. Other devices are refused until you front aoe with HTTPS, or pass --dangerously-allow-plaintext-remote."
                     );
                 }
             }

@@ -445,22 +445,11 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             }
             (Some(policy), _) => match frame.sidebar_status {
                 Some(projected) => Some((policy, projected)),
-                None => {
-                    // Hydrates once; frames published after it carry a status.
-                    let fold = state
-                        .session_service
-                        .fold_control_state(&frame.session_id)
-                        .await;
-                    if fold.last_seq == frame.seq {
-                        Some(fold.sidebar_status())
-                    } else {
-                        state
-                            .session_service
-                            .sidebar_status_at(&frame.session_id, frame.seq)
-                            .await
-                    }
-                    .map(|projected| (policy, projected))
-                }
+                None => state
+                    .session_service
+                    .sidebar_status_at(&frame.session_id, frame.seq)
+                    .await
+                    .map(|projected| (policy, projected)),
             },
             (None, _) => None,
         };

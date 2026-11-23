@@ -175,9 +175,12 @@ async fn wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker(
     let id = "sess-3172".to_string();
     let state = structured_state(&id, false).await;
     let seeded = crate::session::PendingInitialTurn {
+        error: None,
+        error_code: None,
         text: "queued before the park".to_string(),
         attachments: Vec::new(),
         synthesized: true,
+        id: String::new(),
     };
     state.instances.write().await[0].pending_initial_turn = Some(seeded.clone());
     seed_native_row(&state).await;
@@ -252,9 +255,12 @@ async fn a_rejected_enqueue_keeps_the_pending_turn_and_an_accepted_one_clears_it
         .expect("seed a running turn");
     state.acp_supervisor.hydrate_seqs([(id.clone(), 1)]);
     let seeded = crate::session::PendingInitialTurn {
+        error: None,
+        error_code: None,
         text: "queued before the park".to_string(),
         attachments: Vec::new(),
         synthesized: true,
+        id: String::new(),
     };
     state.instances.write().await[0].pending_initial_turn = Some(seeded.clone());
     seed_native_row(&state).await;
@@ -439,6 +445,9 @@ async fn no_revive_refuses_a_stopped_or_dormant_worker_without_side_effects() {
                 text: "queued before the park".to_string(),
                 attachments: Vec::new(),
                 synthesized: true,
+                error: None,
+                error_code: None,
+                id: String::new(),
             });
         }
         seed_native_row(&state).await;
@@ -583,6 +592,9 @@ async fn no_revive_refuses_a_prompt_on_a_rate_limit_park() {
                 text: "queued before the park".to_string(),
                 attachments: Vec::new(),
                 synthesized: true,
+                error: None,
+                error_code: None,
+                id: String::new(),
             });
         seed_native_row(&state).await;
 
@@ -642,6 +654,9 @@ async fn no_revive_refuses_a_workerless_rate_limit_park_with_a_stale_turn() {
             text: "queued before the park".to_string(),
             attachments: Vec::new(),
             synthesized: true,
+            error: None,
+            error_code: None,
+            id: String::new(),
         });
     seed_native_row(&state).await;
 
@@ -1023,20 +1038,26 @@ async fn a_manual_prompt_cannot_overtake_a_continuation_install() {
 #[test]
 fn prompt_persist_tiers() {
     // The recency-only tier does not clear a peer's archive by itself.
+    // Neither tier clears a peer's archive, but both are direct engagement and
+    // clear Ignore.
     let mut disk = crate::session::Instance::new("s", "/tmp/x");
     disk.view = crate::session::View::Structured;
     disk.last_accessed_at = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
     disk.archived_at = Some(chrono::Utc::now() - chrono::Duration::seconds(30));
+    disk.ignored_at = Some(chrono::Utc::now());
     crate::server::session_service::apply_prompt_persist_to_disk(&mut disk, false);
     assert!(disk.archived_at.is_some());
+    assert!(disk.ignored_at.is_none());
     assert!(disk.last_accessed_at > disk.archived_at);
 
     // A wake persist lifts a sunk row.
     let mut disk = crate::session::Instance::new("s", "/tmp/x");
     disk.view = crate::session::View::Structured;
     disk.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::minutes(10));
+    disk.ignored_at = Some(chrono::Utc::now());
     crate::server::session_service::apply_prompt_persist_to_disk(&mut disk, true);
     assert!(disk.snoozed_until.is_none());
+    assert!(disk.ignored_at.is_none());
     assert!(disk.last_accessed_at.is_some());
 }
 
@@ -1622,6 +1643,9 @@ async fn sandbox_login_queue_keeps_http_prompt() {
         text: "run the nightly task".to_string(),
         attachments: Vec::new(),
         synthesized: false,
+        error: None,
+        error_code: None,
+        id: String::new(),
     });
     crate::session::test_support::sandbox_needing_login(app_dir.path(), &mut inst);
     let state = crate::server::test_support::build_native_test_app_state(vec![inst]).await;

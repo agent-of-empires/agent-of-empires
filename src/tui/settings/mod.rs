@@ -1345,6 +1345,59 @@ pub(super) mod test_util {
 }
 
 #[cfg(test)]
+mod loaded_value_tests {
+    use super::*;
+    use crate::session::Storage;
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    /// A breakpoint hand-written below the renderer's floor still loads and
+    /// saves: the renderer raises it to 50, so the schema accepts it instead of
+    /// blocking the save of every field on the tab.
+    #[test]
+    #[serial]
+    fn a_narrow_breakpoint_below_the_floor_does_not_block_an_unrelated_save() {
+        let temp = TempDir::new().unwrap();
+        let home = crate::session::test_support::isolate_home(temp.path());
+        let _ = Storage::new_unwatched("test").unwrap();
+        update_config(|config| config.session.narrow_breakpoint = 40).unwrap();
+
+        let mut view = SettingsView::new("test", None).unwrap();
+        view.scope = SettingsScope::Global;
+        view.rebuild_categories_for_scope();
+        view.selected_category = view
+            .categories
+            .iter()
+            .position(|row| row.as_tab() == Some(SettingsCategory::Session))
+            .expect("the Session tab is visible for the global scope");
+        view.rebuild_fields();
+        assert!(
+            view.fields
+                .iter()
+                .any(|field| field.label == "Narrow layout below this width"),
+            "the Session tab carries the breakpoint field"
+        );
+
+        // An unrelated edit on the same tab, as the reported flow had it.
+        view.global_config.session.snooze_duration_minutes = 17;
+        view.recompute_dirty();
+        view.save().unwrap();
+
+        assert_eq!(
+            view.error_message, None,
+            "a loaded 40 must not block the save"
+        );
+        let on_disk = Config::load().unwrap();
+        assert_eq!(on_disk.session.snooze_duration_minutes, 17);
+        assert_eq!(
+            on_disk.session.narrow_breakpoint, 40,
+            "the value the user wrote is kept as written"
+        );
+        drop(home);
+    }
+}
+
+#[cfg(test)]
 mod dirty_tracking_tests {
     use super::*;
     use crate::session::Storage;

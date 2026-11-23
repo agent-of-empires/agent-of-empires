@@ -115,6 +115,167 @@ pub async fn update_session_favorite(
     crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
 }
 
+/// 409 for ignore refusing a sunk row. The codes stay the ones clients already
+/// switch on; the message names ignore instead of a start.
+fn ignore_blocked_response(blocked: crate::session::StartBlocked) -> axum::response::Response {
+    use crate::daemon::ApiErrorCode;
+    let (code, message) = match blocked {
+        crate::session::StartBlocked::Archived => (
+            ApiErrorCode::SessionArchived,
+            "An archived session cannot be ignored; unarchive it first",
+        ),
+        crate::session::StartBlocked::Trashed => (
+            ApiErrorCode::SessionTrashed,
+            "A session in trash cannot be ignored; restore it first",
+        ),
+    };
+    crate::server::api::api_error_with_code_header(code, message)
+}
+
+/// Ignore or unignore a session managed by another session. The row stays
+/// live and present; archive, snooze, and trash are untouched. Ignoring
+/// requires a manager and refuses an archived or trashed session because
+/// those states outrank it.
+pub async fn update_session_ignored(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateIgnoredBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return crate::server::api::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+
+    let namespace = state.profile_namespace.read().await;
+    let lock = state.instance_lock(&id).await;
+    let guard = lock.lock().await;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
+    }
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
+            return crate::server::api::session_not_found();
+        };
+        instance.source_profile.clone()
+    };
+    let ignored = body.ignored;
+    let persist_id = id.clone();
+    let committed = commit_profile_update_with_refusal(
+        &state,
+        profile,
+        "ignore update",
+        move |instances| {
+            let Some(instance) = instances
+                .iter_mut()
+                .find(|instance| instance.id == persist_id)
+            else {
+                return Err(crate::server::api::session_not_found());
+            };
+            if ignored {
+                // Archive and trash outrank ignore; ignoring a sunk row would persist a
+                // state the rest of the dashboard reads as archived or trashed.
+                if instance.is_trashed() {
+                    return Err(ignore_blocked_response(
+                        crate::session::StartBlocked::Trashed,
+                    ));
+                }
+                if instance.is_archived() {
+                    return Err(ignore_blocked_response(
+                        crate::session::StartBlocked::Archived,
+                    ));
+                }
+                // Only a managed row can be ignored; otherwise the marker would outlive
+                // the manager link that gives it meaning.
+                if instance.parent_session_id.is_none() {
+                    return Err(crate::server::api::api_error(
+                        axum::http::StatusCode::BAD_REQUEST,
+                        "session_not_managed",
+                        "Only a session managed by another session can be ignored",
+                    ));
+                }
+                instance.ignore();
+            } else {
+                instance.unignore();
+            }
+            Ok(())
+        },
+        None,
+    )
+    .await;
+    if let Err(response) = committed {
+        return response;
+    }
+    tracing::info!(target: "session.sync", session = %id, field = "ignored", value = ignored, "session updated");
+    drop(guard);
+    drop(namespace);
+    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
+}
+
+/// Take ownership of a managed session: clear its manager link and ignore
+/// marker while preserving the row, conversation, worktree, and every
+/// unrelated triage timestamp.
+pub async fn reclaim_session_ownership(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<ReclaimOwnershipBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return crate::server::api::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    if !body.reclaim {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "reclaim must be true",
+        );
+    }
+
+    let namespace = state.profile_namespace.read().await;
+    let lock = state.instance_lock(&id).await;
+    let guard = lock.lock().await;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
+    }
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
+            return crate::server::api::session_not_found();
+        };
+        instance.source_profile.clone()
+    };
+    let persist_id = id.clone();
+    let committed = commit_profile_update(
+        &state,
+        profile,
+        "reclaim ownership",
+        move |instances| {
+            if let Some(instance) = instances
+                .iter_mut()
+                .find(|instance| instance.id == persist_id)
+            {
+                instance.reclaim_ownership();
+            }
+        },
+        None,
+    )
+    .await;
+    if let Err(response) = committed {
+        return response;
+    }
+    tracing::info!(target: "session.sync", session = %id, field = "ownership", value = "reclaimed", "session updated");
+    drop(guard);
+    drop(namespace);
+    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
+}
+
 pub async fn update_session_color(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1101,6 +1262,7 @@ pub async fn restore_session(
 /// title from the first prompt, even over one already chosen. Waits for the
 /// rename: `200` once the title is saved, `409` when nothing could be applied,
 /// `502` with the agent's reason on failure, `504` past the rename deadline.
+/// A terminal session's rename runs detached, so it answers `202` with the row.
 pub async fn force_smart_rename(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1189,13 +1351,7 @@ pub async fn force_smart_rename(
                 true,
             ),
         );
-        return match state.runtime.publish(&state).await {
-            Ok(snapshot) => crate::server::runtime::mutation_response(
-                &snapshot.value.cursor,
-                StatusCode::ACCEPTED,
-            ),
-            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
+        return crate::server::runtime::accepted_session_mutation_response(&state, &id).await;
     }
 
     let Some((first_user_prompt, agent_prose)) = state
