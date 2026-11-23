@@ -989,7 +989,7 @@ fn claim_handoff_in(
         row.lifecycle_reservation = Some(LifecycleReservation {
             op: LifecycleOperation::Launch,
             generation,
-            at: chrono::Utc::now(),
+            at: crate::time::Timestamp::now(),
         });
         row.terminal_handoff
             .as_mut()
@@ -1084,7 +1084,7 @@ fn reserve_handoff_in(
         let generation = row.try_acquire_lifecycle_reservation(
             LifecycleOperation::Launch,
             Instance::LIFECYCLE_RESERVATION_TTL,
-            chrono::Utc::now(),
+            crate::time::Timestamp::now(),
         )?;
         let unborn_fence = unborn_producer.map(|(producer_epoch, producer_id)| {
             crate::session::TerminalHandoffUnbornFence {
@@ -3511,9 +3511,10 @@ mod tests {
                 storage.update(|rows, _| {
                     let current = rows.iter_mut().find(|row| row.id == source.id).unwrap();
                     assert_eq!(handoff_key(current)?, live_key);
-                    current.lifecycle_reservation.as_mut().unwrap().at = chrono::Utc::now()
-                        - Instance::LIFECYCLE_RESERVATION_TTL
-                        - chrono::Duration::seconds(1);
+                    current.lifecycle_reservation.as_mut().unwrap().at =
+                        crate::time::Timestamp::now()
+                            - Instance::LIFECYCLE_RESERVATION_TTL
+                            - crate::time::Duration::seconds(1);
                     Ok(())
                 })?;
                 // The blocked real host hook proves the live driver, not the marker age.
@@ -4961,7 +4962,7 @@ mod tests {
         // An archived row starts no pane, so its selector never reaches a launch.
         let mut archived = selecting("own selector, archived", None);
         archived.agent_session_id = Some("sid-archived".into());
-        archived.archived_at = Some(chrono::Utc::now());
+        archived.archived_at = Some(crate::time::Timestamp::now());
         let rows = vec![
             archived.clone(),
             unbound.clone(),

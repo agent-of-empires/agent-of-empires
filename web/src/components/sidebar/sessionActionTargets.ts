@@ -6,6 +6,8 @@ export type SessionAction =
   | "stop"
   | "start"
   | "restartUpdate"
+  | "ignore"
+  | "reclaimOwnership"
   | "recreateContainer"
   | "fork"
   | "switchAgent"
@@ -40,6 +42,11 @@ export const recreateContainerTitle = (s: SessionResponse) =>
 
 const ELIGIBLE: Record<SessionAction, (s: SessionResponse, archived: boolean) => boolean> = {
   stop: (s) => !["Stopped", "Deleting", "Creating"].includes(s.status),
+  // Ignore is for a managed row that is not already sunk or deleted; an ignored row keeps the
+  // action so it can be unignored. Reclaim may clear a leftover manager link even when the row
+  // is no longer ignored.
+  ignore: (s) => !s.trashed_at && !s.archived_at && (s.parent_session_id != null || s.ignored_at != null),
+  reclaimOwnership: (s) => !s.trashed_at && (s.parent_session_id != null || s.ignored_at != null),
   // Archived and trashed sessions must be unarchived or restored before they start (#4116).
   start: (s, archived) => s.status === "Stopped" && !archived && !s.trashed_at,
   restartUpdate: (s) => !!s.update_restart,
@@ -69,6 +76,8 @@ export function resolveActionTargets(sessions: SessionResponse[], optimistic: Ro
     stop: targets("stop"),
     start: targets("start"),
     restartUpdate: targets("restartUpdate"),
+    ignore: targets("ignore"),
+    reclaimOwnership: targets("reclaimOwnership"),
     recreateContainer: targets("recreateContainer"),
     fork: targets("fork"),
     switchAgent: targets("switchAgent"),

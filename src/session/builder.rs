@@ -8,8 +8,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::time::Timestamp;
 use anyhow::{bail, Result};
-use chrono::Utc;
 
 use super::path_identity::CleanupProtection;
 use crate::containers;
@@ -68,7 +68,7 @@ pub struct InstanceParams {
     /// repository's detected default branch. See #948.
     pub base_branch: Option<String>,
     pub sandbox: bool,
-    /// The sandbox image to use. Required when sandbox is true.
+    /// The sandbox image to use; blank resolves to the configured default.
     pub sandbox_image: String,
     pub yolo_mode: bool,
     /// Additional environment entries for the container.
@@ -114,7 +114,7 @@ pub struct BuildResult {
     /// Workspace worktrees created during build (for cleanup)
     pub created_workspace_worktrees: Vec<CreatedWorktree>,
     /// Non-fatal warnings from worktree/workspace creation. Callers should
-    /// surface these to the user (post-checkout hook failures etc.).
+    /// surface these to the user (stale fetches etc.).
     pub warnings: Vec<String>,
 }
 
@@ -216,8 +216,8 @@ pub struct WorkspaceResult {
     pub workspace_info: WorkspaceInfo,
     pub created_worktrees: Vec<CreatedWorktree>,
     pub workspace_path: PathBuf,
-    /// Non-fatal warnings from worktree creation (e.g. post-checkout hook
-    /// failures where the worktree itself was created successfully).
+    /// Non-fatal warnings from worktree creation (e.g. stale fetches
+    /// where the worktree itself was created successfully).
     pub warnings: Vec<String>,
 }
 
@@ -548,7 +548,7 @@ impl WorkspacePlan {
                     base_branch_override: None,
                 })
                 .collect(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             cleanup_on_delete: false,
         }
     }
@@ -979,7 +979,7 @@ pub(crate) fn plan_instance(
                         branch: branch.clone(),
                         main_repo_path: main_repo_path.to_string_lossy().to_string(),
                         managed_by_aoe: false,
-                        created_at: Utc::now(),
+                        created_at: Timestamp::now(),
                         base_branch: None,
                     });
                 } else {
@@ -1006,7 +1006,7 @@ pub(crate) fn plan_instance(
                         branch: branch.clone(),
                         main_repo_path: main_repo_path.to_string_lossy().to_string(),
                         managed_by_aoe: false,
-                        created_at: Utc::now(),
+                        created_at: Timestamp::now(),
                         base_branch: None,
                     });
                 }
@@ -1051,7 +1051,7 @@ pub(crate) fn plan_instance(
                     branch: branch.clone(),
                     main_repo_path: main_repo_path.to_string_lossy().to_string(),
                     managed_by_aoe: false,
-                    created_at: Utc::now(),
+                    created_at: Timestamp::now(),
                     base_branch: base,
                 });
             }
@@ -1129,7 +1129,7 @@ pub(crate) fn plan_instance(
         instance.sandbox_info = Some(SandboxInfo {
             enabled: true,
             container_id: None,
-            image: params.sandbox_image.clone(),
+            image: config.sandbox.resolve_image(Some(&params.sandbox_image)),
             container_name: containers::DockerContainer::generate_name(&instance.id),
             extra_env: if params.extra_env.is_empty() {
                 None
@@ -2410,7 +2410,7 @@ mod tests {
             }
         }
 
-        let timestamp = chrono::Utc::now().timestamp();
+        let timestamp = crate::time::Timestamp::now().as_unix_secs();
         for civ in civilizations::CIVILIZATIONS {
             for n in timestamp - 60..timestamp + 1060 {
                 taken.insert(branch_name_from_title(&format!("{} {}", civ, n)));

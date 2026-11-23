@@ -97,7 +97,7 @@ impl Instance {
             if prev != self.status {
                 self.log_status_transition(prev);
                 // last_accessed_at is deliberately NOT restamped here.
-                let now = Utc::now();
+                let now = Timestamp::now();
                 self.idle_entered_at = if self.status == Status::Idle {
                     Some(now)
                 } else {
@@ -293,7 +293,7 @@ impl Instance {
 
         // A peer process is launching this row and has not created its pane yet; the owner's
         // commit or failure write decides the outcome.
-        if self.has_fresh_launch_reservation(Utc::now()) {
+        if self.has_fresh_launch_reservation(Timestamp::now()) {
             self.status = Status::Starting;
             return;
         }
@@ -718,7 +718,7 @@ impl Instance {
         }
 
         // Stamped before the capture, never after.
-        let captured_at = Utc::now().timestamp();
+        let captured_at = Timestamp::now().as_unix_secs();
         let pane_content = session
             .capture_pane(policy.scope.lines())
             .unwrap_or_default();
@@ -894,7 +894,7 @@ mod tests {
         let entries: [(&str, Settle); 2] = [
             ("archive", |inst| inst.archive()),
             ("archived poll", |inst| {
-                inst.archived_at = Some(Utc::now());
+                inst.archived_at = Some(Timestamp::now());
                 inst.update_status_with_metadata(None, None);
             }),
         ];
@@ -1100,7 +1100,7 @@ mod tests {
     #[serial_test::serial]
     fn reserved_launch_without_a_pane_reads_starting() {
         let _cache = force_session_absent();
-        let now = Utc::now();
+        let now = Timestamp::now();
         for (op, at, want) in [
             (LifecycleOperation::Launch, now, Status::Starting),
             (
@@ -1151,7 +1151,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn status_poll_bookkeeping_never_restamps_user_touch() {
-        let stale = Some(Utc::now() - chrono::Duration::hours(2));
+        let stale = Some(Timestamp::now() - crate::time::Duration::hours(2));
         let _cache = force_session_absent();
         // (baseline, disk status, expected idle_entered_at after the Error detection)
         for (baseline, status, idle_after) in [
@@ -1186,7 +1186,7 @@ mod tests {
         inst.archive();
         inst.live_status_baseline = Some(Status::Idle);
         inst.status = Status::Unknown;
-        let user_touch = Some(Utc::now() - chrono::Duration::hours(2));
+        let user_touch = Some(Timestamp::now() - crate::time::Duration::hours(2));
         inst.last_accessed_at = user_touch;
 
         inst.update_status_with_metadata(None, None);
@@ -1985,7 +1985,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         )
         .expect("write viewer");
         let mut mismatches = Vec::new();
-        let before = chrono::Utc::now().timestamp() - 100;
+        let before = crate::time::Timestamp::now().as_unix_secs() - 100;
         let remedies: [(&str, fn(&mut Instance)); 2] = [
             ("flag removed", |inst| inst.command = "claude".into()),
             ("AoE's id cleared", |inst| {

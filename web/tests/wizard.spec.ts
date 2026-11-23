@@ -127,6 +127,76 @@ test.describe("essentials", () => {
   });
 });
 
+test.describe("modal focus", () => {
+  test("Tab and Shift+Tab stay inside the wizard, and closing returns focus to the opener", async ({ page }) => {
+    await startWizard(page, { project: false });
+    const opener = page
+      .locator('[data-testid="sidebar-group-header"]')
+      .first()
+      .getByRole("button", { name: /New session in /i });
+    await opener.click();
+    const w = wizard(page);
+    await expect(w.getByPlaceholder("Auto-generated if empty")).toBeFocused();
+    const insideWizard = () => page.evaluate(() => !!document.activeElement?.closest('[data-testid="session-wizard"]'));
+
+    // Focus left behind the overlay enters the wizard on Tab.
+    await opener.focus();
+    await page.keyboard.press("Tab");
+    expect(await insideWizard()).toBe(true);
+
+    const close = w.getByRole("button", { name: "Close" });
+    await close.focus();
+    await page.keyboard.press("Shift+Tab");
+    await expect(close).not.toBeFocused();
+    expect(await insideWizard()).toBe(true);
+    await page.keyboard.press("Tab");
+    await expect(close).toBeFocused();
+
+    for (let i = 0; i < 40; i++) {
+      await page.keyboard.press("Tab");
+      expect(await insideWizard()).toBe(true);
+    }
+    for (let i = 0; i < 40; i++) {
+      await page.keyboard.press("Shift+Tab");
+      expect(await insideWizard()).toBe(true);
+    }
+
+    await close.focus();
+    await page.keyboard.press("Enter");
+    await expect(w).toHaveCount(0);
+    await expect(opener).toBeFocused();
+  });
+
+  test("Tab stays inside a hooks trust confirm opened over the wizard", async ({ page }) => {
+    let refused = false;
+    await startWizard(page, {
+      onCreate: async (_body, route) => {
+        if (refused) return undefined;
+        refused = true;
+        await route.fulfill({
+          status: 403,
+          json: {
+            error: "hooks_need_trust",
+            message: "trust",
+            on_create: ["make setup"],
+            on_launch: [],
+            on_destroy: [],
+          },
+        });
+        return true;
+      },
+    });
+    await launch(page);
+    await expect(page.getByTestId("hooks-trust-dialog")).toBeVisible();
+    const insideConfirm = () =>
+      page.evaluate(() => !!document.activeElement?.closest('[data-testid="hooks-trust-dialog"]'));
+    for (const key of ["Tab", "Tab", "Tab", "Shift+Tab", "Shift+Tab", "Shift+Tab"]) {
+      await page.keyboard.press(key);
+      expect(await insideConfirm()).toBe(true);
+    }
+  });
+});
+
 test.describe("panels focus their first field", () => {
   test("Worktree focuses the branch name, Sandbox the image, Agent the selected agent", async ({ page }) => {
     await startWizard(page, {
@@ -178,6 +248,14 @@ test.describe("create progress", () => {
 
 test.describe("mobile", () => {
   test.use({ hasTouch: true, isMobile: true, viewport: { width: 390, height: 844 } });
+
+  test("opening starts focus inside the wizard, on Close, without a field", async ({ page }) => {
+    await mockWizardApis(page);
+    await page.goto("/");
+    await expect(page.getByTestId("sidebar-session-row").first()).toBeVisible();
+    await openWizard(page);
+    await expect(wizard(page).getByRole("button", { name: "Close" })).toBeFocused();
+  });
 
   test("the wizard is a bottom sheet sized to its rows, with Launch right under them", async ({ page }) => {
     await mockWizardApis(page);
@@ -721,8 +799,8 @@ test.describe("Sandbox row", () => {
         const row = wizard(page).getByTestId("wizard-sandbox-row");
         const status = row.getByTestId("sandbox-image-status");
         await expect(status).toContainText(label);
-        // The banner polls the default image too; the wizard asks for its own, fresh.
-        expect(asked).toContain(`?${new URLSearchParams({ image, fresh: "true" })}`);
+        // The banner polls the default image too; the wizard asks for its own, fresh, for its profile.
+        expect(asked).toContain(`?${new URLSearchParams({ image, profile: "default", fresh: "true" })}`);
         const fit = await status.evaluate((el) => {
           // SwitchRow's summary truncates, so its box clips whatever overflows it.
           let clip = el.parentElement;

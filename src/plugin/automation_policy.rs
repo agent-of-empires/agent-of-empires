@@ -145,7 +145,7 @@ impl AutomationPolicy {
         limit: u64,
     ) -> Result<(), DispatchError> {
         let topic = format!("{operation}/{plugin_id}");
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = crate::time::Timestamp::now().as_millis();
         let ledger = self.ledger.lock().expect("ledger mutex poisoned");
         let used = events::count_since(
             &ledger.conn,
@@ -180,7 +180,7 @@ impl AutomationPolicy {
 
     pub(crate) fn audit(&self, plugin_id: &str, record: serde_json::Value) {
         let topic = format!("decision/{plugin_id}");
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = crate::time::Timestamp::now().as_millis();
         let ledger = self.ledger.lock().expect("ledger mutex poisoned");
         let seq = events::highest_seq(&ledger.conn, &ledger.schema, &topic) + 1;
         if let Err(e) = events::insert_event(

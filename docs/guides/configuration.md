@@ -6,7 +6,7 @@ Settings resolve in layers, each overriding the one before it, field by field:
 2. **Profile**: `~/.agent-of-empires/profiles/<name>/config.toml`
 3. **Repo**: `.agent-of-empires/config.toml` in the project root
 
-Unset fields inherit from the layer above. List fields replace rather than extend. Everything below is also editable from the TUI settings screen (`s`) and, unless noted, from the web dashboard.
+Unset fields inherit from the layer above. List fields replace rather than extend. Most settings below are also editable from the TUI settings screen (`s`) and, unless noted, from the web dashboard. `[tools.*]` is file-only.
 
 Over the web API, `GET /api/settings` returns the settings as they apply to the profile the server serves (or `?profile=<name>`): the profile's overrides over the global config. `PATCH /api/settings` saves each field to the layer it belongs in, that profile for fields it can override and the global config for the rest, so a save always lands where the read looks. Add `?layer=machine` to either to read or write the global config alone.
 
@@ -58,14 +58,15 @@ Updates use a locked read-modify-write operation, preserving concurrent changes.
 
 ```toml
 [theme]
-name = "default"          # see the picker or `aoe theme list`
+name = "zinc"             # see the picker or `aoe theme list`
 color_mode = "truecolor"  # truecolor | palette (TUI only)
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `name` | `"default"` | Theme for the TUI and web dashboard. Builtins: `default`, `empire`, `phosphor`, `tokyo-night-storm`, `catppuccin-latte`, `dracula`, `rose-pine`, `deep-ocean`. Custom TOML themes appear in the picker. Empty means `default`. |
+| `name` | `""` | Theme for the TUI and web dashboard. Builtins: `zinc`, `empire`, `phosphor`, `tokyo-night-storm`, `catppuccin-latte`, `dracula`, `rose-pine`, `deep-ocean`. Custom TOML themes appear in the picker. Empty means `zinc`. |
 | `color_mode` | `"truecolor"` | TUI only. `palette` downsamples to xterm-256 for transports that mangle 24-bit RGB (e.g. some `mosh` setups). The web dashboard always renders truecolor. |
+| `idle_decay_minutes` | `0` | TUI only. Minutes a freshly idle session keeps its highlight and breathing icon, and counts for the `w` jump. 0 turns it off. |
 
 Custom themes are TOML files in `<app_dir>/themes/`, listed in the picker under their filename stem. Run `aoe theme dir` for the active directory; see [File Locations](#file-locations) for Linux and macOS resolution.
 
@@ -90,6 +91,7 @@ auto_stop_idle_secs = 0   # 0 disables; e.g. 7200 = stop after 2h idle
 row_tag = "branch"        # none | auto | profile | sandbox | branch
 sidebar_position = "left" # left | right; TUI session list
 narrow_layout = "stacked" # stacked | one_pane | big_preview; see below
+narrow_breakpoint = 80    # columns; narrower terminals use narrow_layout
 ```
 
 After your 31st session creation, a one-time tip explains how to hide the shortcut bar.
@@ -108,16 +110,17 @@ You can browse tips from **Ctrl+K > Show tips** even with the bar hidden.
 | `row_tag` | `"branch"` | Controls the compact metadata shown next to each TUI session title: `none` shows nothing; `auto` shows the profile code only in all-profiles view; `profile` always shows the profile code; `sandbox` shows `sb` on sandboxed sessions; `branch` shows a compact worktree or workspace branch tag. |
 | `show_activity_age` | `true` | Show the age column at the right edge of each TUI session row: time since the agent stopped on `Idle` rows, time since last access on `Unknown` rows, and remaining snooze time under the Attention sort. |
 | `show_structured_badge` | `true` | Show the `[structured]` badge on Structured view rows in the TUI session list. Hiding it returns the width to the title and plugin row badges; the row still opens the Structured view. TUI only; the web session list never shows the badge. |
-| `sidebar_position` | `"left"` | Places the TUI session list on the left or right. Below 80 columns the layout follows `narrow_layout` instead. Global only. |
-| `narrow_layout` | `"stacked"` | How the TUI lays out the session list and preview once the terminal is too narrow for them side by side (below 80 columns). `stacked` puts the list above the preview; `one_pane` shows only one pane at a time, the list normally and the preview while it is the pane being worked in (live mode relaying keys, an interactive structured transcript, a retained trashed transcript, or System Health), then Esc or Ctrl+Q returns to the list; `big_preview` keeps the stack but squeezes the list to its minimum while the preview is that active pane, giving the preview most of the height. Global only, under Settings > Global > Session. |
+| `sidebar_position` | `"left"` | Places the TUI session list on the left or right. Narrower than `narrow_breakpoint` columns the layout follows `narrow_layout` instead. Global only. |
+| `narrow_layout` | `"stacked"` | How the TUI lays out the session list and preview once the terminal is too narrow for them side by side (narrower than `narrow_breakpoint`). `stacked` puts the list above the preview; `one_pane` shows only one pane at a time, the list normally and the preview while it is the pane being worked in (live mode relaying keys, an interactive structured transcript, a retained trashed transcript, or System Health), then Esc or Ctrl+Q returns to the list; `big_preview` keeps the stack but squeezes the list to its minimum while the preview is that active pane, giving the preview most of the height. Global only, under Settings > Global > Session. |
+| `narrow_breakpoint` | `80` | TUI window width in columns below which the list and preview stop sitting side by side and the layout follows `narrow_layout`. The preview compares its own pane width against the same value, not the window width, to choose its compact title over its info header, so a narrow preview beside the list shows the compact title while the layout is still side by side. Range `0` to `1000`; values under `50` act as `50`, the narrowest side-by-side split that still leaves the preview's 40-column floor beside a 10-column list, so a hand-edited value below it still saves. A value greater than your terminal width always uses the narrow layout, which still splits the height by `narrow_layout`. Global only, under Settings > Global > Session. |
 | `split_terminal_height_percent` | `50` | Paired-terminal share of split preview height. Range `1` to `99`. Global only; see [Live mode](live-mode.md). |
 | `split_terminal_min_width` | `100` | Minimum whole-window width in columns for the paired-terminal split. Range `0` to `1000`. Global only. |
 | `split_terminal_min_height` | `30` | Minimum whole-window height in rows for the paired-terminal split. Range `0` to `1000`. Global only. |
 | `show_shortcut_bar` | `true` | Show the TUI's bottom shortcut row, including the LIVE banner. Global only, under Settings > Global > Interaction. Hiding it gives that row to the main view and suppresses the repeated Ctrl+C reminder in Live mode without changing interrupt forwarding. Shortcuts, `?` help, dialog controls, the leader menu, and other temporary notifications still work. |
 | `preview_link_prefixes` | `[]` | Link targets beyond http and https that a click in the preview may open, as case-insensitive `scheme://authority/` prefixes, for example `["vscode://file/"]` to open file links in VS Code. Entries not in that form, including a missing `/` after the authority, are ignored, and `file:`, `javascript:`, `data:` and `vbscript:` never open. Unlisted targets are neither opened nor passed to the terminal; a new entry applies to links printed after it. Global only and not editable from the web dashboard; under Settings > Global > Interaction (advanced). |
 | `tie_workdir_to_name` | `true` | Keep a managed worktree session's directory named after its title. See [Worktrees](worktrees.md#naming). |
-| `yolo_mode_default` | `false` | Enable YOLO mode by default for new sessions (skip permission prompts). Works with or without sandbox. In tmux mode this passes `--dangerously-skip-permissions` to the agent CLI; in structured view it maps to ACP `bypassPermissions` (see [Structured view: Permission modes and YOLO](../structured-view/controls.md#permission-modes-and-yolo) for the adapter caveat). |
-| `pre_trust_agent_folders` | `false` | Pre-trust host worktrees in Claude Code, Codex and Gemini config. Config-dir overrides are honored; `agent_config_dir` wins. The record outlives the session. Trust activates the repo's `.claude/settings.json`, including hooks and permission rules, so enable it only for directories you would trust by hand. MCP servers still ask separately and permission mode is unchanged. Sandboxed sessions pre-trust their staged config. |
+| `yolo_mode_default` | `false` | Enable YOLO mode by default for new sessions (skip permission prompts). Works with or without sandbox. In terminal view this passes the agent's own flag (for example `--dangerously-skip-permissions` for Claude Code, `--yolo` for Cursor) to the agent CLI; in structured view it maps to ACP `bypassPermissions` (see [Structured view: Permission modes and YOLO](../structured-view/controls.md#permission-modes-and-yolo) for the adapter caveat). |
+| `pre_trust_agent_folders` | `false` | Pre-trust host worktrees in Claude Code, Codex and Gemini config. Config-dir overrides are honored; `agent_config_dir` wins. The record outlives the session. Trust activates the repo's `.claude/settings.json`, including hooks and permission rules, so enable it only for directories you would trust by hand. MCP servers still ask separately and permission mode is unchanged. Sandboxed sessions pre-trust their staged config. Without it, a new folder opens Claude Code's trust dialog and a session's initial prompt is not typed: the session records `initial_prompt_error_code` `agent_folder_not_trusted` (see [API](../api.md)). Claude's one-time Bypass Permissions screen on the first yolo start is never pre-accepted; it records `agent_bypass_not_accepted`. |
 | `agent_status_hooks` | `true` | Install status-detection hooks into the agent's config file; see [Agent hook approval](#agent-hook-approval) for the approval that gates the write and [Adding a New Agent](../development/adding-agents.md#hook-format-reference) for the per-agent file and payload. Config-dir overrides are honored. When disabled, status detection reads the pane alone, but any authoritative identity hooks declared for native resume remain installed. A hook write is evidence rather than the last word: pane state and terminal title are weighed against it by declared priority. |
 | `opencode_preassign_session_id` | `false` | Pre-assign OpenCode's native session id before a new host launch. AoE starts a short-lived `opencode serve`, creates the session through `POST /api/session`, then launches `opencode --session <id>`. This avoids guessing from OpenCode's shared SQLite store, at the cost of about two seconds per new session. When disabled or unavailable, automatic capture stays off; an explicitly pinned exact id still resumes. Sandboxed OpenCode automatic capture is unsupported. |
 | `smart_rename` | `true` | Auto-rename a default-named session after its first completed turn. Structured sessions use their first-turn transcript; terminal sessions use the pane after a Running-to-Idle transition. A manually named session is never overwritten. Only the title changes, not the worktree directory. Sandboxed sessions run the one-shot inside their own running container; unsupported agents, command overrides, or a different sandbox rename agent prevent naming. A failed or timed-out call leaves the generated name. Daemon-owned naming jobs finish before daemon shutdown releases ownership. |
@@ -414,14 +417,16 @@ auto_cleanup = true                                   # prompt to remove the wor
 
 See [Git Worktrees](worktrees.md) for the remaining keys and path templates.
 
-## Sandbox (Docker)
+<a id="sandbox-docker"></a>
+
+## Sandbox
 
 `[sandbox]` configures container sandboxing:
 
 ```toml
 [sandbox]
 enabled_by_default = false                                    # auto-enable sandbox for new sessions
-default_image = "ghcr.io/agent-of-empires/aoe-sandbox:latest" # container image
+# default_image unset: the aoe-sandbox image tagged with your AoE version
 environment = ["GH_TOKEN=$AOE_GH_TOKEN"]                      # env vars forwarded into the container
 ```
 

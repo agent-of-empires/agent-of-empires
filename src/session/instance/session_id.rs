@@ -444,7 +444,7 @@ impl Instance {
                     .try_acquire_lifecycle_reservation(
                         LifecycleOperation::Capture,
                         Self::LIFECYCLE_RESERVATION_TTL,
-                        Utc::now(),
+                        Timestamp::now(),
                     )
                     .map_err(|error| anyhow::anyhow!("capture blocked: {error}"))
             })?;
@@ -1792,7 +1792,7 @@ work-opencode = "opencode"
         let mut creating = base.clone();
         creating.status = Status::Creating;
         let mut archived = base.clone();
-        archived.archived_at = Some(Utc::now());
+        archived.archived_at = Some(Timestamp::now());
 
         for (reason, instance) in [
             ("stored identity", with_id),

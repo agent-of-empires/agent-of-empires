@@ -491,7 +491,7 @@ async fn report_connection_error(
     let message = format!("ACP connection failed: {e}");
     let rate_limit = classify_rate_limit_from_message(
         &message,
-        captured_rate_limit_reset(&shared.rate_limit_rejections, chrono::Utc::now()),
+        captured_rate_limit_reset(&shared.rate_limit_rejections, crate::time::Timestamp::now()),
     );
     if let Some(tx) = ready_tx.lock().await.take() {
         // A handshake-time limit fails the spawn as rate-limited so the

@@ -70,15 +70,15 @@ pub use sessions::{
     create_session_progress, delete_session, delete_workspace, empty_trash,
     ensure_container_terminal, ensure_session, ensure_terminal, ensure_tool, force_smart_rename,
     get_recent_projects, kill_terminal, list_sessions, paste_image, preview_volume_ignores_globs,
-    read_output, recreate_container, rename_session, restart_for_update, restart_session,
-    restore_session, review_creation_trust, save_session_file, search_sessions, send_message,
-    serve_session_artifact, session_account_targets, session_diff_file, session_diff_file_raw,
-    session_diff_files, session_file, session_file_raw, set_worktree_name, start_session,
-    stop_auxiliary, stop_session, summarize_session, touch_session_access, trash_session,
-    update_session_archive, update_session_color, update_session_diff_base,
-    update_session_favorite, update_session_group, update_session_notifications,
-    update_session_pin, update_session_snooze, update_session_unread, update_workspace_ordering,
-    OutputQuery, SendMessageRequest,
+    read_output, reclaim_session_ownership, recreate_container, rename_session, restart_for_update,
+    restart_session, restore_session, review_creation_trust, save_session_file, search_sessions,
+    send_message, serve_session_artifact, session_account_targets, session_diff_file,
+    session_diff_file_raw, session_diff_files, session_file, session_file_raw, set_worktree_name,
+    start_session, stop_auxiliary, stop_session, summarize_session, touch_session_access,
+    trash_session, update_session_archive, update_session_color, update_session_diff_base,
+    update_session_favorite, update_session_group, update_session_ignored,
+    update_session_notifications, update_session_pin, update_session_snooze, update_session_unread,
+    update_workspace_ordering, OutputQuery, SendMessageRequest,
 };
 pub(crate) use sessions::{
     lifecycle_rejection, persist_session_update, purge_expired_trash, reconcile_trashed_worktrees,
@@ -100,8 +100,9 @@ pub use system::{
     update_profile_settings, update_settings, update_theme,
 };
 pub use telemetry::{
-    get_telemetry_status, post_telemetry_seen, post_telemetry_structured_interaction,
-    reset_telemetry_id, set_telemetry_consent, TelemetryMutation,
+    get_telemetry_status, post_telemetry_feature_use, post_telemetry_seen,
+    post_telemetry_structured_interaction, reset_telemetry_id, set_telemetry_consent,
+    TelemetryMutation,
 };
 
 /// A clone of the live instance with this id.
@@ -235,6 +236,16 @@ pub(crate) fn before_start_hook_failed_response(
         StatusCode::BAD_GATEWAY,
         "before_start_hook_failed",
         err.to_string(),
+    )
+}
+
+/// The origin a client claims with the prompt-origin header. Only the dashboard, TUI and
+/// CLI values are accepted; anything else, and any body field, is `Unknown`.
+pub(crate) fn prompt_origin(headers: &axum::http::HeaderMap) -> crate::daemon::PromptOrigin {
+    crate::daemon::PromptOrigin::from_header_value(
+        headers
+            .get(crate::daemon::PromptOrigin::HEADER)
+            .and_then(|v| v.to_str().ok()),
     )
 }
 
@@ -574,8 +585,10 @@ mod tests {
                 "update_session_archive",
                 "update_session_color",
                 "update_session_favorite",
+                "update_session_ignored",
                 "update_session_pin",
                 "update_session_snooze",
+                "reclaim_session_ownership",
                 "update_session_unread",
             ],
         ),
@@ -685,6 +698,7 @@ mod tests {
             "telemetry.rs",
             include_str!("telemetry.rs"),
             &[
+                "post_telemetry_feature_use",
                 "post_telemetry_seen",
                 "post_telemetry_structured_interaction",
                 "reset_telemetry_id",

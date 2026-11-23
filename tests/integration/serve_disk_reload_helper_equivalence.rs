@@ -20,7 +20,7 @@ use agent_of_empires::server::test_support::{
     reload_disk_only_for_test, reload_tmux_applied_for_test,
 };
 use agent_of_empires::session::{DetectionState, Instance, Status};
-use chrono::TimeZone;
+use agent_of_empires::time::Timestamp;
 
 #[tokio::test]
 #[serial_test::parallel]
@@ -30,14 +30,14 @@ async fn reload_state_instances_from_disk_disk_only_preserves_prior_status() {
     prior.status = Status::Running;
     prior.last_error_check = Some(probe);
     prior.last_error.set("boom".to_string());
-    prior.last_accessed_at = Some(chrono::Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap());
+    prior.last_accessed_at = Some(Timestamp::parse_rfc3339("2024-06-01T00:00:00Z").unwrap());
     let prior_id = prior.id.clone();
     let state = build_test_app_state(vec![prior]);
 
     let mut fresh = Instance::new("seed", "/tmp/seed");
     fresh.id = prior_id.clone();
     fresh.status = Status::Idle;
-    fresh.last_accessed_at = Some(chrono::Utc.with_ymd_and_hms(2024, 5, 1, 0, 0, 0).unwrap());
+    fresh.last_accessed_at = Some(Timestamp::parse_rfc3339("2024-05-01T00:00:00Z").unwrap());
 
     reload_disk_only_for_test(&state, vec![fresh], Vec::new()).await;
 
@@ -61,11 +61,10 @@ async fn reload_state_instances_from_disk_disk_only_preserves_prior_status() {
         "healthy merged status drops the stale last_error (#1271)"
     );
     assert_eq!(
-        row.last_accessed_at.unwrap().timestamp(),
-        chrono::Utc
-            .with_ymd_and_hms(2024, 6, 1, 0, 0, 0)
+        row.last_accessed_at.unwrap().as_unix_secs(),
+        Timestamp::parse_rfc3339("2024-06-01T00:00:00Z")
             .unwrap()
-            .timestamp(),
+            .as_unix_secs(),
         "monotonic-max last_accessed_at",
     );
 }
@@ -78,14 +77,14 @@ async fn reload_state_instances_from_disk_tmux_applied_takes_fresh_status() {
     prior.status = Status::Idle;
     prior.last_error_check = Some(probe);
     prior.last_error.set("prev".to_string());
-    prior.last_accessed_at = Some(chrono::Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap());
+    prior.last_accessed_at = Some(Timestamp::parse_rfc3339("2024-06-01T00:00:00Z").unwrap());
     let prior_id = prior.id.clone();
     let state = build_test_app_state(vec![prior]);
 
     let mut fresh = Instance::new("seed", "/tmp/seed");
     fresh.id = prior_id.clone();
     fresh.status = Status::Running;
-    fresh.last_accessed_at = Some(chrono::Utc.with_ymd_and_hms(2024, 5, 1, 0, 0, 0).unwrap());
+    fresh.last_accessed_at = Some(Timestamp::parse_rfc3339("2024-05-01T00:00:00Z").unwrap());
 
     reload_tmux_applied_for_test(&state, vec![fresh], Vec::new()).await;
 
@@ -108,11 +107,10 @@ async fn reload_state_instances_from_disk_tmux_applied_takes_fresh_status() {
         "healthy merged status drops the stale last_error (#1271)"
     );
     assert_eq!(
-        row.last_accessed_at.unwrap().timestamp(),
-        chrono::Utc
-            .with_ymd_and_hms(2024, 6, 1, 0, 0, 0)
+        row.last_accessed_at.unwrap().as_unix_secs(),
+        Timestamp::parse_rfc3339("2024-06-01T00:00:00Z")
             .unwrap()
-            .timestamp(),
+            .as_unix_secs(),
         "monotonic-max last_accessed_at",
     );
 }

@@ -107,8 +107,8 @@ pub use instance::{
     ManagedResumeCause, PaneObservation, PanePresence, PendingInitialTurn, PluginCreateIdempotency,
     PollerStart, SandboxInfo, SandboxLoginRequired, SandboxLoginUnsupported, SessionBucket,
     SessionGone, StartBlocked, StartOutcome, Status, TerminalInfo, TmuxServerIdentity, View,
-    WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SERVER_UNREACHABLE_ERROR,
-    TMUX_SESSION_GONE_ERROR,
+    WorkspaceInfo, WorkspaceRepo, WorktreeInfo, MAX_INITIAL_PROMPT_BYTES, SESSION_COLORS,
+    TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR,
 };
 pub(crate) use instance::{reports_tmux_session_gone, resolved_agent_for, UNBOUND_STORE_HINT};
 pub(crate) use instance::{

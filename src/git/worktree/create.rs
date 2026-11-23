@@ -47,13 +47,19 @@ impl GitWorktree {
     /// `git fetch <remote> <branch>` with stdin nulled (no passphrase prompts)
     /// and a 10 second bound.
     fn fetch_branch(&self, remote: &str, branch: &str) -> FetchOutcome {
-        let mut cmd = std::process::Command::new("git");
-        cmd.args(["fetch", remote, branch])
-            .current_dir(&self.repo_path)
-            .stdin(std::process::Stdio::null());
         let timeout = std::time::Duration::from_secs(10);
         let start = Instant::now();
-        match crate::process::run_with_timeout(&mut cmd, timeout) {
+        let result = match crate::git::command::hardened_git_within(Some(start + timeout)) {
+            Some(mut cmd) => {
+                cmd.args(["fetch", remote, branch])
+                    .current_dir(&self.repo_path)
+                    .stdin(std::process::Stdio::null());
+                let remaining = timeout.saturating_sub(start.elapsed());
+                crate::process::run_with_timeout(&mut cmd, remaining)
+            }
+            None => Ok(None),
+        };
+        match result {
             Ok(Some(output)) if output.status.success() => {
                 tracing::info!(target: "git.worktree", "git fetch {remote}/{branch} ok in {:?}", start.elapsed());
                 FetchOutcome::Ok
@@ -88,8 +94,16 @@ impl GitWorktree {
         }
     }
 
-    /// Fetches `branch` and records a non-`Ok` outcome as a warning.
+    /// Fetches `branch` and records a non-`Ok` outcome as a warning. A repo
+    /// without `remote` has nothing to fetch, so that is not a warning.
     fn fetch_with_warning(&self, warnings: &mut Vec<String>, remote: &str, branch: &str) {
+        let has_remote = open_repo_at(&self.repo_path).map_or(true, |repo| {
+            !matches!(repo.find_remote(remote), Err(e) if e.code() == git2::ErrorCode::NotFound)
+        });
+        if !has_remote {
+            tracing::info!(target: "git.worktree", "git fetch skipped: no remote {remote}");
+            return;
+        }
         let detail = match self.fetch_branch(remote, branch) {
             FetchOutcome::Ok => return,
             FetchOutcome::Failed(msg) | FetchOutcome::Skipped(msg) => msg,
@@ -105,7 +119,7 @@ impl GitWorktree {
     ///
     /// With `create_branch`, the branch starts at `base_branch` (else the
     /// detected default), resolved remote-first then local. Returns non-fatal
-    /// warnings (stale fetches, a failed post-checkout hook, a failed lock)
+    /// warnings (stale fetches, a failed checkout step, a failed lock)
     /// for the caller to show.
     pub fn create_worktree(
         &self,
@@ -301,8 +315,9 @@ impl GitWorktree {
         }
     }
 
-    /// `git worktree add`. A post-checkout hook can fail after the checkout
-    /// exists; that worktree is usable, so the failure becomes a warning.
+    /// `git worktree add`. Repo hooks never run: a sandbox could have written
+    /// them. A failure after the checkout exists leaves a usable worktree, so
+    /// it becomes a warning.
     fn add_worktree(&self, branch: &str, path: &Path, warnings: &mut Vec<String>) -> Result<()> {
         let t = Instant::now();
         let output = crate::git::command::run_git(
@@ -323,7 +338,7 @@ impl GitWorktree {
             let combined = sanitize_remote_credentials(&combined);
             if path.exists() && path.join(".git").exists() {
                 let warning = format!(
-                    "post-checkout hook failed for {} (worktree created, hook output below):\n{}",
+                    "git worktree add failed for {} (worktree created, output below):\n{}",
                     path.display(),
                     combined.trim()
                 );
@@ -567,12 +582,32 @@ pub(super) mod tests {
 
     #[test]
     fn fetch_branch_reports_outcome() {
-        let (no_remote, _repo) = init_repo();
+        let (no_remote, repo) = init_repo();
         let git_wt = GitWorktree::new(no_remote.path().to_path_buf()).unwrap();
         assert!(matches!(
             git_wt.fetch_branch("origin", "main"),
             FetchOutcome::Failed(_)
         ));
+        // A missing remote is skipped quietly; an unreachable one still warns.
+        let mut warnings = Vec::new();
+        git_wt.fetch_with_warning(&mut warnings, "origin", "main");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let gone = no_remote.path().join("gone");
+        repo.remote("origin", gone.to_str().unwrap()).unwrap();
+        git_wt.fetch_with_warning(&mut warnings, "origin", "main");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        // A configured remote that fails to load is not a missing one.
+        repo.config()
+            .unwrap()
+            .set_str(
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/main",
+            )
+            .unwrap();
+        let lookup = repo.find_remote("origin").map(|_| ()).unwrap_err();
+        assert_ne!(lookup.code(), git2::ErrorCode::NotFound, "{lookup}");
+        git_wt.fetch_with_warning(&mut warnings, "origin", "main");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
 
         let (_dirs, local, _, _) = fork_upstream_layout("main");
         let git_wt = GitWorktree::new(local).unwrap();
@@ -679,7 +714,7 @@ pub(super) mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn create_worktree_turns_fetch_and_hook_failures_into_warnings() {
+    fn create_worktree_turns_fetch_failures_into_warnings_and_skips_repo_hooks() {
         use std::os::unix::fs::PermissionsExt;
         const CHILD: &str = "AOE_WORKTREE_HOOK_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -689,7 +724,7 @@ pub(super) mod tests {
                 .args([
                     "--exact",
                     &format!(
-                        "{module}::create_worktree_turns_fetch_and_hook_failures_into_warnings"
+                        "{module}::create_worktree_turns_fetch_failures_into_warnings_and_skips_repo_hooks"
                     ),
                     "--nocapture",
                     "--test-threads=1",
@@ -718,16 +753,13 @@ pub(super) mod tests {
             &["remote", "add", "origin", bogus.to_str().unwrap()],
         );
         let hook = dir.path().join(".git/hooks/post-checkout");
+        let marker = dir.path().join("hook-ran");
         repo.config()
             .unwrap()
             .set_str("core.hooksPath", hook.parent().unwrap().to_str().unwrap())
             .unwrap();
         std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
-        std::fs::write(
-            &hook,
-            "#!/bin/sh\necho 'simulated hook failure' >&2\nexit 1\n",
-        )
-        .unwrap();
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let wt_parent = TempDir::new().unwrap();
@@ -738,12 +770,8 @@ pub(super) mod tests {
             .unwrap()
             .join("\n");
         assert!(wt_path.join(".git").exists());
-        for fragment in [
-            "git fetch",
-            "failed for",
-            "post-checkout hook failed",
-            "simulated hook failure",
-        ] {
+        assert!(!marker.exists(), "a repo hook ran on the host");
+        for fragment in ["git fetch", "failed for"] {
             assert!(
                 warnings.contains(fragment),
                 "missing {fragment:?}: {warnings}"

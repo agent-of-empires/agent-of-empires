@@ -16,10 +16,10 @@ use crate::daemon::{AttachProjectBody, RenameSessionBody, SetWorktreeNameBody};
 use crate::daemon::{
     CleanupDefaults, ContextResumeAvailability, ContextResumeIndeterminateReason,
     ContextResumeUnavailableReason, CreateSessionBody, DeleteSessionBody, ListSessionsQuery,
-    PendingApproval, PlanSummary, PurgeOutcome, SessionResponse, TrashSessionBody, Tristate,
-    UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody, UpdateFavoriteBody, UpdateGroupBody,
-    UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
-    WorkspaceRepoSummary,
+    PendingApproval, PlanSummary, PurgeOutcome, ReclaimOwnershipBody, SessionResponse,
+    TrashSessionBody, Tristate, UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody,
+    UpdateFavoriteBody, UpdateGroupBody, UpdateIgnoredBody, UpdateNotificationsBody, UpdatePinBody,
+    UpdateSnoozeBody, UpdateUnreadBody, WorkspaceRepoSummary,
 };
 
 use crate::git::error::GitError;

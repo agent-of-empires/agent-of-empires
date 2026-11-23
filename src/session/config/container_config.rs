@@ -64,6 +64,9 @@ struct AgentConfigMount {
 }
 
 /// The sole source-copy registry. Unknown root files never gain copy authority.
+/// MCP servers reach sandboxed agents only through ACP forwarding, so Claude's host
+/// `.claude.json` is never copied. Other agents' MCP-bearing config files below are
+/// still copied verbatim, a known gap.
 const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
     AgentConfigMount {
         tool_name: "claude",
@@ -2655,6 +2658,95 @@ pub(crate) fn preview_glob_volume_ignores(
         .collect())
 }
 
+/// Read-only overlays for the git metadata host git follows and executes
+/// from: `config`, `hooks`, `config.worktree` (read once
+/// `extensions.worktreeConfig` is set) and, for a linked worktree, its `.git`
+/// file plus the admin dir's `commondir` and `gitdir` pointers. A sandbox that
+/// could write any of them would execute code outside the container, or
+/// redirect host git to metadata it controls.
+///
+/// Candidates are every mounted path plus `repo_paths` (the project path and
+/// the repos and worktrees a mount covers without a root of their own). Each path is mapped
+/// through the mount containing it. Missing `hooks` and `config.worktree` are
+/// created, otherwise the sandbox could create them; failing to is an error.
+fn git_exec_surface_overlays(
+    project_volumes: &[VolumeMount],
+    repo_paths: &[PathBuf],
+) -> Result<Vec<VolumeMount>> {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let mut overlays: Vec<VolumeMount> = Vec::new();
+    let candidates = project_volumes
+        .iter()
+        .map(|v| PathBuf::from(&v.host_path))
+        .chain(repo_paths.iter().cloned());
+    for candidate in candidates {
+        let Ok(repo) = git2::Repository::open(&candidate) else {
+            continue;
+        };
+        let common = canon(repo.commondir());
+        let admin = canon(repo.path());
+        let mut protect = vec![
+            (common.join("config"), false),
+            (common.join("hooks"), true),
+            (common.join("config.worktree"), false),
+        ];
+        if admin != common {
+            protect.push((admin.join("config.worktree"), false));
+            protect.push((admin.join("commondir"), false));
+            protect.push((admin.join("gitdir"), false));
+        }
+        // A `.git` file can redirect host git to a gitdir the sandbox controls,
+        // also when that gitdir is the common dir (bare-backed root, submodule).
+        let dot_git = canon(repo.workdir().unwrap_or(&candidate)).join(".git");
+        if dot_git.is_file() {
+            protect.push((dot_git, false));
+        }
+        for (path, is_dir) in protect {
+            // Decide coverage first: a git dir no mount covers gets no overlay,
+            // so it must not be touched either.
+            let Some((volume, root)) = project_volumes
+                .iter()
+                .map(|v| (v, canon(Path::new(&v.host_path))))
+                .filter(|(_, root)| path.starts_with(root))
+                .max_by_key(|(_, root)| root.as_os_str().len())
+            else {
+                continue;
+            };
+            if is_dir {
+                std::fs::create_dir_all(&path)
+                    .with_context(|| format!("creating {}", path.display()))?;
+            } else if path.file_name().is_some_and(|n| n == "config.worktree") {
+                // Create-new: an existing file, or one a host git just wrote, is kept.
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => {
+                        return Err(e).with_context(|| format!("creating {}", path.display()))
+                    }
+                }
+            } else if !path.exists() {
+                continue;
+            }
+            let container_path = Path::new(&volume.container_path)
+                .join(path.strip_prefix(&root).unwrap_or(Path::new("")))
+                .to_string_lossy()
+                .to_string();
+            if !overlays.iter().any(|o| o.container_path == container_path) {
+                overlays.push(VolumeMount {
+                    host_path: path.to_string_lossy().to_string(),
+                    container_path,
+                    read_only: true,
+                });
+            }
+        }
+    }
+    Ok(overlays)
+}
+
 /// `(host_path, container_path)` pairs for the project mounts, the roots glob
 /// `volume_ignores` are expanded against.
 fn glob_roots(project_volumes: &[VolumeMount]) -> Vec<(String, String)> {
@@ -2855,6 +2947,19 @@ pub(crate) fn build_container_config(
     let glob_roots = glob_roots(&project_volumes);
 
     let mut volumes = project_volumes;
+    let git_candidates: Vec<PathBuf> = match workspace_info {
+        Some(ws) => ws
+            .repos
+            .iter()
+            .flat_map(|r| [&r.main_repo_path, &r.worktree_path])
+            .map(PathBuf::from)
+            .collect(),
+        None => vec![project_path.to_path_buf()],
+    };
+    // A runtime that mounts read-only volumes read-write would get no-op overlays.
+    if crate::containers::get_container_runtime().supports_read_only_volumes() {
+        volumes.extend(git_exec_surface_overlays(&volumes, &git_candidates)?);
+    }
 
     let sandbox_config = launch_config.sandbox();
 
@@ -3844,6 +3949,134 @@ mod tests {
     }
 
     #[test]
+    fn git_exec_surface_overlays_only_touch_covered_git_dirs() {
+        let (_dir, main) = setup_regular_repo();
+        let worktree = main.with_file_name(format!(
+            "{}-wt",
+            main.file_name().unwrap().to_string_lossy()
+        ));
+        let status = std::process::Command::new("git")
+            .args(["worktree", "add", "-b", "wt", worktree.to_str().unwrap()])
+            .current_dir(&main)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::remove_dir_all(main.join(".git/hooks")).ok();
+        let admin = std::fs::read_dir(main.join(".git/worktrees"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+
+        // Only the worktree is mounted: its main repo's `.git` has no overlay,
+        // so nothing may be created there.
+        let volumes = vec![VolumeMount {
+            host_path: worktree.to_string_lossy().to_string(),
+            container_path: "/workspace/wt".into(),
+            read_only: false,
+        }];
+        git_exec_surface_overlays(&volumes, std::slice::from_ref(&worktree)).unwrap();
+        assert!(!main.join(".git/hooks").exists());
+        assert!(!main.join(".git/config.worktree").exists());
+        assert!(!admin.join("config.worktree").exists());
+
+        // A covered `config.worktree` that already exists keeps its content.
+        let volumes = vec![VolumeMount {
+            host_path: main.to_string_lossy().to_string(),
+            container_path: "/workspace/main".into(),
+            read_only: false,
+        }];
+        std::fs::write(main.join(".git/config.worktree"), "[core]\n").unwrap();
+        git_exec_surface_overlays(&volumes, &[]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(main.join(".git/config.worktree")).unwrap(),
+            "[core]\n"
+        );
+    }
+
+    #[test]
+    fn git_exec_surface_overlays_cover_config_pointers_and_worktree_config() {
+        let overlays_of = |volumes: &[VolumeMount], repos: &[PathBuf]| {
+            let overlays = git_exec_surface_overlays(volumes, repos).unwrap();
+            assert!(overlays.iter().all(|o| o.read_only));
+            let mut got: Vec<String> = overlays.into_iter().map(|o| o.container_path).collect();
+            got.sort();
+            got
+        };
+        let expect = |base: &str, names: &[&str]| {
+            let mut v: Vec<String> = names.iter().map(|n| format!("{base}/{n}")).collect();
+            v.sort();
+            v
+        };
+        let main_files = ["config", "config.worktree", "hooks"];
+
+        // Plain repo; missing hooks and config.worktree are created to be overlaid.
+        let (_dir, repo_path) = setup_regular_repo();
+        std::fs::remove_dir_all(repo_path.join(".git/hooks")).ok();
+        let (volumes, _) = compute_volume_paths(&repo_path, repo_path.to_str().unwrap()).unwrap();
+        let name = repo_path.file_name().unwrap().to_string_lossy();
+        assert_eq!(
+            overlays_of(&volumes, &[]),
+            expect(&format!("/workspace/{name}/.git"), &main_files)
+        );
+        assert!(repo_path.join(".git/hooks").is_dir());
+        assert!(repo_path.join(".git/config.worktree").is_file());
+
+        // Bare layout: the worktree's `.git` is a writable pointer file, so the
+        // file, the admin dir's pointers and its config.worktree are overlaid.
+        let (_bare_dir, bare_root, worktree) = setup_bare_repo_with_worktree();
+        if worktree.exists() {
+            let (volumes, _) = compute_volume_paths(&worktree, worktree.to_str().unwrap()).unwrap();
+            let repo = git2::Repository::open(&worktree).unwrap();
+            let root = bare_root.canonicalize().unwrap();
+            let rel = |p: &Path| {
+                p.canonicalize()
+                    .unwrap()
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_owned()
+            };
+            let (common, admin) = (rel(repo.commondir()), rel(repo.path()));
+            let wt = rel(&worktree);
+            let base = format!(
+                "/workspace/{}",
+                bare_root.file_name().unwrap().to_string_lossy()
+            );
+            let mut want = expect(&format!("{base}/{}", common.display()), &main_files);
+            want.extend(expect(
+                &format!("{base}/{}", admin.display()),
+                &["config.worktree", "commondir", "gitdir"],
+            ));
+            want.push(format!("{base}/{}/.git", wt.display()));
+            want.push(format!("{base}/.git"));
+            want.sort();
+            assert_eq!(overlays_of(&volumes, std::slice::from_ref(&worktree)), want);
+
+            // The bare-backed root's own `.git` pointer is protected too.
+            let mut root_want = expect(&format!("{base}/{}", common.display()), &main_files);
+            root_want.push(format!("{base}/.git"));
+            root_want.sort();
+            assert_eq!(overlays_of(&volumes, &[]), root_want);
+        }
+
+        // A repo a workspace mount covers without a volume of its own.
+        let ws = TempDir::new().unwrap();
+        let nested = ws.path().join("main-repo");
+        git2::Repository::init(&nested).unwrap();
+        let volumes = vec![VolumeMount {
+            host_path: ws.path().to_string_lossy().to_string(),
+            container_path: "/workspace/ws".into(),
+            read_only: false,
+        }];
+        assert!(overlays_of(&volumes, &[]).is_empty());
+        assert_eq!(
+            overlays_of(&volumes, &[nested]),
+            expect("/workspace/ws/main-repo/.git", &main_files)
+        );
+    }
+
+    #[test]
     fn test_compute_volume_paths_non_git_directory() {
         let dir = TempDir::new().unwrap();
         let project_path_str = dir.path().to_str().unwrap();
@@ -4340,6 +4573,57 @@ mod tests {
         sync_fixture(&host, &sandbox, &["settings.json"], &[], &[], &[]).unwrap();
         assert!(!sandbox.join("auth.json").exists());
         assert!(sandbox.join("settings.json").exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_store_never_carries_host_mcp_definitions() {
+        const SECRET: &str = "s3cr3t-guard-value";
+        let (_hook_guard, _, _application) = BaseGuard::ready();
+        let dir = TempDir::new().unwrap();
+        let host = dir.path().join(".claude");
+        fs::create_dir_all(&host).unwrap();
+        fs::write(host.join("settings.json"), r#"{"theme":"dark"}"#).unwrap();
+        fs::write(host.join(".credentials.json"), r#"{"claudeAiOauth":{}}"#).unwrap();
+        fs::write(
+            dir.path().join(".claude.json"),
+            serde_json::json!({
+                "hasCompletedOnboarding": false,
+                "mcpServers": {
+                    "stdio": {"command": "srv", "env": {"TOKEN": SECRET}},
+                    "http": {"type": "http", "url": "https://x.invalid",
+                             "headers": {"Authorization": SECRET}}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mount = claude_mount_without_keychain();
+        let sandbox = prepare_owned_fixture(
+            &mount,
+            dir.path(),
+            Some("guardinstance"),
+            CredentialFold::Freshest,
+            &crate::session::config::SessionConfig::default(),
+            dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(sandbox.join(".claude.json")).unwrap(),
+            r#"{"hasCompletedOnboarding":true}"#
+        );
+        assert!(sandbox.join("settings.json").exists());
+        let mut pending = vec![sandbox.clone()];
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                pending.extend(fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+            } else if let Ok(content) = fs::read_to_string(&path) {
+                assert!(!content.contains("mcpServers"), "{}", path.display());
+                assert!(!content.contains(SECRET), "{}", path.display());
+            }
+        }
     }
 
     #[test]
@@ -5007,7 +5291,7 @@ mod tests {
                 base_branch: None,
                 base_branch_override: None,
             }],
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             cleanup_on_delete: true,
         };
 

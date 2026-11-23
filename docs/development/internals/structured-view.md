@@ -218,11 +218,13 @@ A respawn reuses the stored launch, which can't rebuild a sandbox container. Dur
 changing the selected agent. It first validates the stored session and requested
 agent, then fences new launches, cancels or stops the current worker, waits for
 the worker to become absent, and starts a replacement with explicit resume
-authority. A concurrent restart returns `409 restart_in_progress`; if the old
-worker cannot settle before the bounded shutdown wait, the endpoint returns a
-`503` settlement error and leaves the replacement admission to a retry. A
-separate `409 worker_not_stopped` response is used when the worker is still
-present after a successful shutdown wait. The restart request is runtime-owned,
+authority. A concurrent restart returns `409 restart_in_progress`. If permanent
+deletion fences the session before the restart claim or replacement admission,
+the endpoint returns `409 purge_in_progress`. If the old worker cannot settle
+before the bounded shutdown wait, the endpoint returns a `503` settlement error
+and leaves replacement admission to a retry. A separate `409 worker_not_stopped`
+response is used when the worker is still present after a successful shutdown
+wait. The restart request is runtime-owned,
 so disconnecting the HTTP client does not leave the session half-restarted.
 
 ## Agent switching
@@ -246,6 +248,10 @@ Profiles are conservative: an unverified tool surface is omitted rather than gue
 - `terminal/*`: commands run in aoe's process, in the worktree, or inside the sandbox container via `docker exec`.
 - Approval nonces are server-generated and single-use, so a compromised agent cannot synthesize one. `AOE_TOKEN` is not forwarded to the agent subprocess.
 - **Sandboxed sessions** wrap the agent argv in `docker exec` while the daemon stays on the host, and `fs/*` paths are translated from container to host before the inside-roots check. Translation covers the workspace mounts only, so config, credential, and `extra_volumes` mounts are rejected. The image must bundle the ACP adapters, or the handshake exits with status 127.
+
+## Prompt origin
+
+`UserPromptSent.origin` records where a prompt entered AoE: `dashboard`, `tui`, `cli`, `mcp`, `plugin`, `aoe` (daemon-generated turns) or `unknown`. HTTP clients self-identify with the `X-Aoe-Prompt-Origin` header and the daemon accepts only `dashboard`, `tui` and `cli` from it, never from a body. It is provenance, not proof that a human was present, and `unknown` (missing, forged or pre-origin data) must be treated as untrusted.
 
 ## Global tuning (`[acp]`)
 

@@ -41,14 +41,14 @@ pub use wire::{
     DeleteProfileQuery, DeleteSessionBody, EmptyTrashBody, EmptyTrashOutcome, EnsureToolBody,
     GroupLocation, GroupSessionFailure, GroupSessionFailureCode, GroupSessionOutcome,
     ListSessionsQuery, MoveDirection, MoveGroupBody, PendingApproval, PlanSummary,
-    PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome, QueuedPromptEntry, RenameOutcome,
-    RenameProfileBody, RenameSessionBody, ReorderBody, ReorderOutcome, RepoBaseInput,
-    RestartOutcome, RestartSessionBody, RestoreOutcome, SessionResponse, SessionsEnvelope,
-    SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody, TerminalSize, TerminalTarget,
-    TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome, TrashSessionBody, Tristate,
-    UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody, UpdateFavoriteBody, UpdateGroupBody,
-    UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
-    WorkspaceRepoSummary, WorktreeEditOutcome,
+    PromptAttachmentKind, PromptAttachmentRef, PromptOrigin, PurgeOutcome, QueuedPromptEntry,
+    ReclaimOwnershipBody, RenameOutcome, RenameProfileBody, RenameSessionBody, ReorderBody,
+    ReorderOutcome, RepoBaseInput, RestartOutcome, RestartSessionBody, RestoreOutcome,
+    SessionResponse, SessionsEnvelope, SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody,
+    TerminalSize, TerminalTarget, TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome,
+    TrashSessionBody, Tristate, UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody,
+    UpdateFavoriteBody, UpdateGroupBody, UpdateIgnoredBody, UpdateNotificationsBody, UpdatePinBody,
+    UpdateSnoozeBody, UpdateUnreadBody, WorkspaceRepoSummary, WorktreeEditOutcome,
 };
 pub use wire::{
     ApplyUpdateBody, InstallPreviewBody, PluginJob, PluginJobAccepted, PluginJobKind, PluginJobLog,
@@ -57,8 +57,9 @@ pub use wire::{
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Sandbox copies, image pulls and launch hooks can take minutes.
-const LIFECYCLE_TIMEOUT: Duration =
-    Duration::from_secs(crate::session::Instance::SANDBOX_PREPARATION_WINDOW.num_seconds() as u64);
+const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(
+    crate::session::Instance::SANDBOX_PREPARATION_WINDOW.whole_seconds() as u64,
+);
 /// A destroy hook may run for minutes per row, so the bulk purge outlives `DEFAULT_TIMEOUT`.
 const EMPTY_TRASH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
@@ -267,6 +268,14 @@ fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &
             "Resume failed; the conversation is preserved for explicit retry".into()
         }
         Some(ApiErrorCode::StartFailed) => "Session start failed".into(),
+        // The body names the path or branch when this client may read it.
+        Some(ApiErrorCode::WorkingDirMissing) if body.is_empty() => {
+            "A project or repository path does not exist where the Daemon runs".into()
+        }
+        Some(ApiErrorCode::BranchNotFound) if body.is_empty() => {
+            "The worktree branch was not found".into()
+        }
+        Some(ApiErrorCode::WorkingDirMissing | ApiErrorCode::BranchNotFound) => body.into(),
         Some(ApiErrorCode::PurgeFailed) => "Session purge failed".into(),
         Some(ApiErrorCode::AccountSwapUnavailable) => "Account swap refused, nothing changed. The target must be another account (a tool with its own `agent_config_dir`) of the same agent, the session needs a recorded Claude conversation and a launch that can carry it, and a terminal session needs `auto_resume_on_restart` on for the target profile".into(),
         Some(ApiErrorCode::LifecycleLocked) => {
@@ -302,6 +311,7 @@ fn public_creation_failure(body: &str, local_owner: bool) -> String {
             | "sandbox_image_pull_failed"
             | "sandbox_image_update_failed"
             | "working_dir_missing"
+            | "branch_not_found"
             | "create_outcome_unknown"
             | "creation_cancelled"
             | "creation_trust_changed"
@@ -501,15 +511,17 @@ impl DaemonClient {
         &self,
         body: &CreateSessionBody,
         epoch: &str,
+        origin: PromptOrigin,
     ) -> Result<MutationReceipt<SessionResponse>, DaemonClientError> {
-        self.request_mutation_with_outcome(
-            self.http
-                .post(self.sessions_url.clone())
-                .timeout(Duration::from_secs(30 * 60))
-                .json(body),
-            epoch,
-        )
-        .await
+        let mut request = self
+            .http
+            .post(self.sessions_url.clone())
+            .timeout(Duration::from_secs(30 * 60))
+            .json(body);
+        if let Some(origin) = origin.as_header_value() {
+            request = request.header(PromptOrigin::HEADER, origin);
+        }
+        self.request_mutation_with_outcome(request, epoch).await
     }
 
     /// Request deferred cancellation; the returned cursor confirms the daemon
@@ -1512,7 +1524,10 @@ mod tests {
                 "path": "/tmp", "tool": "claude", "cli": {},
             }))
             .unwrap();
-            let error = client.create_session(&body, "epoch").await.unwrap_err();
+            let error = client
+                .create_session(&body, "epoch", PromptOrigin::Unknown)
+                .await
+                .unwrap_err();
             assert!(matches!(
                 &error,
                 DaemonClientError::Status {
@@ -1551,8 +1566,8 @@ mod tests {
                 "running_hooks",
             ),
             (
-                r#"{"error":"sandbox_image_update_failed","message":"Couldn't pull the latest Sandbox image img:1.","stage":"pulling_image","reference":"creation-ref"}"#,
-                "Couldn't pull the latest Sandbox image img:1.",
+                r#"{"error":"sandbox_image_update_failed","message":"Couldn't download the sandbox image: not enough disk space.","stage":"pulling_image","reference":"creation-ref"}"#,
+                "Couldn't download the sandbox image: not enough disk space.",
                 "pulling_image",
             ),
         ] {

@@ -174,6 +174,26 @@ fn sidebar_divider_drag_ends_when_the_divider_disappears() {
     }
 }
 
+/// The configured breakpoint moves the boundary: a viewport exactly at it stays side by
+/// side, and one column below it stacks.
+#[test]
+#[serial]
+fn narrow_breakpoint_moves_the_stacked_boundary() {
+    let mut env = create_test_env_with_sessions(3);
+    env.view.narrow_breakpoint = 60;
+    env.view.list_width = 20;
+
+    render(&mut env.view, 60);
+    assert!(env.view.divider_col.is_some(), "60 is at the breakpoint");
+    assert_eq!(env.view.divider_row, None, "60 is at the breakpoint");
+    assert_ne!(env.view.preview_outer_area, Rect::default());
+
+    render(&mut env.view, 59);
+    assert_eq!(env.view.divider_col, None, "59 is below the breakpoint");
+    assert_ne!(env.view.divider_row, None, "59 is below the breakpoint");
+    assert_ne!(env.view.list_area, Rect::default());
+}
+
 /// `one_pane` gives the list the whole narrow screen instead of stacking a preview under
 /// it, and the list closes all four borders since no preview owns the bottom seam.
 #[test]

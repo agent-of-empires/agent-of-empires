@@ -115,7 +115,7 @@ impl Shared {
         for subagent in expired {
             self.emit(Event::SubagentUpdated {
                 subagent,
-                at: chrono::Utc::now(),
+                at: crate::time::Timestamp::now(),
             })
             .await;
         }
@@ -163,7 +163,7 @@ impl Shared {
         };
         self.emit(Event::SubagentUpdated {
             subagent: record,
-            at: chrono::Utc::now(),
+            at: crate::time::Timestamp::now(),
         })
         .await;
     }
@@ -310,7 +310,7 @@ impl Shared {
                 kind: "think".into(),
                 args_preview: preview_args(&args),
                 prompt: None,
-                started_at: chrono::Utc::now(),
+                started_at: crate::time::Timestamp::now(),
                 parent_tool_call_id: outer,
                 memory_recall: None,
                 diffs: Vec::new(),
@@ -368,7 +368,7 @@ impl Shared {
                 text: reply.clone(),
             }],
             content: reply,
-            completed_at: chrono::Utc::now(),
+            completed_at: crate::time::Timestamp::now(),
             async_subagent: false,
         })
         .await;

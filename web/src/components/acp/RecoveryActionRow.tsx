@@ -64,18 +64,15 @@ export function RecoveryActionRow({
   );
 }
 
-/** A command to run by hand, with a copy button. `scroll` keeps it on one line
- *  and scrolls it sideways instead of wrapping. */
+/** A command to run by hand, wrapped so all of it reads before it runs, with a copy button. */
 export function CommandBlock({
   command,
   note = null,
   testId,
-  scroll = false,
 }: {
   command: string;
   note?: string | null;
   testId: string;
-  scroll?: boolean;
 }) {
   const [copied, setCopied] = useState(false);
   return (
@@ -83,16 +80,14 @@ export function CommandBlock({
       <div className="mt-1 flex items-start gap-2 rounded-md border border-surface-700 bg-surface-950 p-2">
         <code
           data-testid={testId}
-          className={`min-w-0 flex-1 font-mono text-[12px] text-text-primary ${
-            scroll ? "overflow-x-auto whitespace-pre" : "whitespace-pre-wrap break-all"
-          }`}
+          className="min-w-0 flex-1 whitespace-pre-wrap break-all font-mono text-[12px] text-text-primary"
         >
           {command}
         </code>
         <button
           type="button"
           onClick={() => void writeClipboard(command).then(setCopied)}
-          className="shrink-0 rounded-md px-2 text-[11px] text-text-subtle hover:text-text-primary"
+          className="shrink-0 rounded-md border border-surface-700 bg-surface-800 px-2 py-0.5 text-[11px] font-medium text-text-primary transition-colors hover:bg-surface-700"
         >
           {copied ? "Copied" : "Copy"}
         </button>

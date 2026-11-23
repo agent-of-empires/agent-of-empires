@@ -6,6 +6,16 @@ use super::*;
 #[error("{0}")]
 struct PurgeCleanupFailed(String);
 
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+enum PurgeCheckpoint {
+    CaptureRetirement,
+    CleanupComplete,
+}
+
+#[cfg(test)]
+type PurgeObserver<'a> = Option<&'a (dyn Fn(PurgeCheckpoint) + Sync)>;
+
 /// Callers retain namespace, submission and instance exclusion through cleanup.
 pub(crate) async fn purge_session_artifacts(
     state: &Arc<AppState>,
@@ -24,6 +34,8 @@ pub(crate) async fn purge_session_artifacts(
         recent_entry,
         additional_protection,
         selection,
+        #[cfg(test)]
+        None,
     )
     .await?;
     if let PurgeOutcome::Deleted { cleanup_errors, .. } = &outcome {
@@ -32,6 +44,7 @@ pub(crate) async fn purge_session_artifacts(
     Ok(outcome)
 }
 
+#[cfg_attr(test, allow(clippy::too_many_arguments))]
 async fn purge_session_artifacts_inner(
     state: &Arc<AppState>,
     id: &str,
@@ -40,6 +53,7 @@ async fn purge_session_artifacts_inner(
     recent_entry: Option<crate::session::RecentProjectEntry>,
     additional_protection: Option<crate::session::path_identity::CleanupProtection>,
     selection: Option<crate::session::deletion::PurgeSelection>,
+    #[cfg(test)] observe: PurgeObserver<'_>,
 ) -> anyhow::Result<PurgeOutcome> {
     use crate::session::deletion::{DeletionDisposition, PurgeTransaction};
     if state.cityhall_mode && !instance.is_structured() {
@@ -110,11 +124,20 @@ async fn purge_session_artifacts_inner(
             cleanup_errors,
         });
     }
-    // Freeze the original worker before reservation, so a refused registry read cannot strand Purge.
-    let retirement = if instance.is_structured() {
-        Some(state.acp_supervisor.capture_retirement(id)?)
+    // A later admission must not replace the construction frozen for this purge.
+    let (_retirement_admission, retirement) = if instance.is_structured() {
+        let capture_retirement = || {
+            #[cfg(test)]
+            if let Some(observe) = observe {
+                observe(PurgeCheckpoint::CaptureRetirement);
+            }
+            state.acp_supervisor.capture_retirement(id)
+        };
+        let admission = state.acp_supervisor.fence_spawn_admission(id);
+        let retirement = capture_retirement()?;
+        (Some(admission), Some(retirement))
     } else {
-        None
+        (None, None)
     };
     let request = crate::session::deletion::DeletionRequest {
         session_id: id.to_owned(),
@@ -258,6 +281,10 @@ async fn purge_session_artifacts_inner(
         if let Err(error) = crate::session::record_recent_project(entry) {
             tracing::warn!(target: "http.api.sessions", %error, "recording recent project after delete failed");
         }
+    }
+    #[cfg(test)]
+    if let Some(observe) = observe {
+        observe(PurgeCheckpoint::CleanupComplete);
     }
     Ok(PurgeOutcome::Deleted {
         messages,
@@ -628,7 +655,7 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
         .runtime
         .purge_namespace_lease(&state.profile_namespace)
         .await;
-    let now = chrono::Utc::now();
+    let now = crate::time::Timestamp::now();
     let candidates: Vec<String> = state
         .instances
         .read()
@@ -1093,7 +1120,7 @@ pub async fn abandon_purge(
                     .as_ref()
                     .filter(|reservation| {
                         reservation.op != LifecycleOperation::Purge
-                            && row.has_fresh_lifecycle_reservation(chrono::Utc::now())
+                            && row.has_fresh_lifecycle_reservation(crate::time::Timestamp::now())
                     })
                     .map(|reservation| reservation.op);
                 return Err(holder
@@ -1173,7 +1200,7 @@ pub struct DeleteWorkspaceBody {
 
 #[derive(Clone, Deserialize)]
 pub struct TrashPurgeConsent {
-    pub expected_trashed_at: chrono::DateTime<chrono::Utc>,
+    pub expected_trashed_at: crate::time::Timestamp,
     pub expected_trash_lifecycle_id: String,
     pub expected_generation: u64,
 }
@@ -1562,5 +1589,65 @@ pub async fn delete_workspace(
                 "Workspace deletion task failed",
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acp::supervisor::SupervisorError;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn structured_purge_fences_spawn_from_retirement_capture_through_cleanup(
+    ) -> anyhow::Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let app_dir = crate::session::get_app_dir()?;
+        crate::session::purge_owners::initialize(&app_dir)?;
+        crate::tmux::tool_retirement::initialize(&app_dir)?;
+        let project = tempfile::tempdir()?;
+        let mut row = Instance::new("purge admission", project.path().to_str().unwrap());
+        row.view = crate::session::View::Structured;
+        row.source_profile = "default".into();
+        let id = row.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        let checkpoints = std::sync::Mutex::new(Vec::new());
+        let observe = |checkpoint| {
+            assert!(
+                matches!(
+                    state.acp_supervisor.begin_spawn_request(&id),
+                    Err(SupervisorError::PurgeInProgress(session_id)) if session_id == id
+                ),
+                "spawn admission must be fenced at {checkpoint:?}"
+            );
+            checkpoints.lock().unwrap().push(checkpoint);
+        };
+        let outcome = purge_session_artifacts_inner(
+            &state,
+            &id,
+            row,
+            &DeleteSessionBody::default(),
+            None,
+            None,
+            None,
+            Some(&observe),
+        )
+        .await?;
+        assert!(matches!(
+            outcome,
+            PurgeOutcome::Deleted { cleanup_errors, .. } if cleanup_errors.is_empty()
+        ));
+        assert_eq!(
+            checkpoints.into_inner().unwrap(),
+            [
+                PurgeCheckpoint::CaptureRetirement,
+                PurgeCheckpoint::CleanupComplete
+            ]
+        );
+        assert!(state.acp_supervisor.begin_spawn_request(&id).is_ok());
+        Ok(())
     }
 }

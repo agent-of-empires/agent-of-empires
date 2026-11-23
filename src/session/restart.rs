@@ -230,7 +230,7 @@ mod tests {
                 instance.lifecycle_reservation = Some(LifecycleReservation {
                     op: LifecycleOperation::Launch,
                     generation: 1,
-                    at: chrono::Utc::now(),
+                    at: crate::time::Timestamp::now(),
                 });
             }
             storage

@@ -55,9 +55,9 @@ pub(crate) struct StructuredSessionSpec {
     /// Plugin create-idempotency record to persist with the instance,
     /// stamped alongside `created_by_plugin`.
     pub plugin_create_idempotency: Option<crate::session::PluginCreateIdempotency>,
-    /// Initial prompt to persist with the instance and deliver once the ACP
-    /// worker is live, stamped by `SessionService::create_structured_session`.
-    pub pending_initial_turn: Option<String>,
+    /// Initial prompt and its origin, persisted with the instance and delivered once
+    /// the ACP worker is live. Stamped by `SessionService::create_structured_session`.
+    pub pending_initial_turn: Option<(String, crate::daemon::PromptOrigin)>,
     /// The session this one is a sub-session of, already checked by the caller.
     pub parent_session_id: Option<String>,
     /// Explicit ACP approval-mode id to persist on the instance; the
@@ -108,13 +108,20 @@ impl std::error::Error for SessionBuildPanicked {}
 /// A create's requested pull of the latest Sandbox image failed; `detail` is the
 /// runtime's sanitized stderr.
 #[derive(Debug, thiserror::Error)]
-#[error("Couldn't pull the latest Sandbox image {image}: {}", if *.cancelled { CANCELLED_UPDATE } else { .detail.as_str() })]
+#[error("Couldn't pull the latest Sandbox image {image}: {}", match .failure { UpdateFailure::Cancelled => CANCELLED_UPDATE, UpdateFailure::Pull(_) => .detail.as_str() })]
 pub(crate) struct ImageUpdateFailed {
     pub image: String,
     /// The runtime's output; local owners only.
     pub detail: String,
-    /// The shared pull was cancelled for everyone, which every caller may be told.
-    pub cancelled: bool,
+    pub failure: UpdateFailure,
+}
+
+/// Why a create's pull of the latest image failed; every caller may be told either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpdateFailure {
+    Pull(crate::containers::image_pull::PullFailureReason),
+    /// The shared pull was cancelled for everyone.
+    Cancelled,
 }
 
 pub(crate) const CANCELLED_UPDATE: &str = "the update was cancelled";
@@ -155,16 +162,21 @@ fn create_pull_error(error: crate::containers::error::DockerError) -> anyhow::Er
     use crate::containers::error::DockerError;
     match error {
         DockerError::Cancelled(_) => crate::server::session_service::CreationCancelled.into(),
-        DockerError::ImagePullFailed { image, detail, .. } => ImageUpdateFailed {
+        DockerError::ImagePullFailed {
             image,
             detail,
-            cancelled: false,
+            reason,
+            ..
+        } => ImageUpdateFailed {
+            image,
+            detail,
+            failure: UpdateFailure::Pull(reason),
         }
         .into(),
         DockerError::PullCancelled(image) => ImageUpdateFailed {
             image,
             detail: String::new(),
-            cancelled: true,
+            failure: UpdateFailure::Cancelled,
         }
         .into(),
         other => other.into(),
@@ -241,14 +253,8 @@ pub(crate) async fn spawn_structured_session(
             cli,
         } = spec;
 
-        let sandbox_image = sandbox_image.unwrap_or_else(|| {
-            if config.sandbox.default_image.is_empty() {
-                "ubuntu:latest".to_string()
-            } else {
-                config.sandbox.default_image.clone()
-            }
-        });
-
+        // Blank resolves against the profile-merged config in the builder.
+        let sandbox_image = sandbox_image.unwrap_or_default();
 
         let extra_repo_paths: Vec<String> = extra_repo_paths
             .into_iter()
@@ -367,10 +373,14 @@ pub(crate) async fn spawn_structured_session(
         instance.created_by_plugin = created_by_plugin;
         instance.plugin_create_idempotency = plugin_create_idempotency;
         instance.pending_initial_turn =
-            pending_initial_turn.map(|text| crate::session::PendingInitialTurn {
+            pending_initial_turn.map(|(text, origin)| crate::session::PendingInitialTurn {
                 text,
                 attachments: Vec::new(),
                 synthesized: false,
+                error: None,
+                error_code: None,
+                id: crate::session::PendingInitialTurn::fresh_id(),
+                origin,
             });
         instance.acp_mode_id = acp_mode_id;
         instance.callback_url = callback_url;
@@ -432,7 +442,7 @@ pub(crate) async fn spawn_structured_session(
             let _title = crate::session::acquire_session_title_lock(&instance.id)?;
             let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&instance.id)?;
             let generation = instance.try_acquire_lifecycle_reservation(
-                LifecycleOperation::Launch, Instance::LIFECYCLE_RESERVATION_TTL, chrono::Utc::now(),
+                LifecycleOperation::Launch, Instance::LIFECYCLE_RESERVATION_TTL, crate::time::Timestamp::now(),
             )?;
             instance.status = Status::Creating;
             store.update(|rows, groups| {
@@ -905,6 +915,7 @@ pub(crate) async fn spawn_structured_session(
                     instance.command.clone(),
                     instance.import_pending == Some(true),
                     instance.fork_pending.clone(),
+                    instance.workspace_info.clone(),
                 ))
             } else {
                 None
@@ -912,9 +923,7 @@ pub(crate) async fn spawn_structured_session(
             let response_instance = instance.clone();
 
             // Count the create for the opt-in telemetry trend counter.
-            service
-                .telemetry_session_creates
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::telemetry::consent::bump(&service.telemetry_session_creates);
 
             if let Some((
                 id,
@@ -932,6 +941,7 @@ pub(crate) async fn spawn_structured_session(
                 command,
                 seed_history_replay,
                 fork_from,
+                workspace_info,
             )) = acp_spawn_target
             {
                 let reservation = acp_reservation.expect("spawn target owns its ACP lease");
@@ -1062,6 +1072,7 @@ pub(crate) async fn spawn_structured_session(
                                     sandbox_continuation:
                                         crate::acp::supervisor::SandboxContinuation::Persisted,
                                     sandbox_info,
+                                    workspace_info,
                                     source_profile: source_profile_for_spawn,
                                     yolo_mode,
                                     acp_mode_id,
@@ -1094,6 +1105,14 @@ pub(crate) async fn spawn_structured_session(
                         Err(error) => tracing::warn!(target: "acp.supervisor", session = %id,
                             "created session completion failed: {error}"),
                     }
+                });
+            } else if !response_instance.is_structured()
+                && response_instance.pending_initial_turn.is_some()
+            {
+                let id = response_instance.id.clone();
+                let service_for_drain = service.clone();
+                service.work.spawn("tmux.initial_turn", async move {
+                    service_for_drain.drain_terminal_initial_turn(&id).await;
                 });
             }
 
@@ -1235,7 +1254,7 @@ mod tests {
             .downcast_ref::<ImageUpdateFailed>()
             .expect("the create fails instead of reading as cancelled");
         assert_eq!(failed.image, "img");
-        assert!(failed.cancelled);
+        assert_eq!(failed.failure, UpdateFailure::Cancelled);
     }
 
     #[test]
@@ -1623,7 +1642,7 @@ mod tests {
                 "failed pull",
                 Some("echo created"),
                 false,
-                Some("echo 'manifest unknown' >&2; exit 1"),
+                Some("echo 'write /var/lib/docker/tmp: no space left on device' >&2; exit 1"),
             ),
             ("cancelled pull", Some("echo created"), false, Some("block")),
             // Exits 0 inside the cancel's grace, so the pull itself reports success.
@@ -1812,7 +1831,7 @@ mod tests {
                         .try_acquire_lifecycle_reservation(
                             LifecycleOperation::Capture,
                             Instance::LIFECYCLE_RESERVATION_TTL,
-                            chrono::Utc::now(),
+                            crate::time::Timestamp::now(),
                         )
                         .map_err(anyhow::Error::from)
                 });
@@ -1922,9 +1941,20 @@ mod tests {
                         let failed = error
                             .downcast_ref::<ImageUpdateFailed>()
                             .expect("typed pull failure");
+                        // A classified reason, not the `Other` a dropped one would read as.
                         assert_eq!(
-                            (failed.image.as_str(), failed.detail.as_str()),
-                            ("test-image", "manifest unknown")
+                            (
+                                failed.image.as_str(),
+                                failed.detail.as_str(),
+                                failed.failure
+                            ),
+                            (
+                                "test-image",
+                                "write /var/lib/docker/tmp: no space left on device",
+                                UpdateFailure::Pull(
+                                    crate::containers::image_pull::PullFailureReason::DiskSpace
+                                )
+                            )
                         );
                     }
                     "pull finishes as it is cancelled" => {
@@ -2018,6 +2048,7 @@ mod tests {
                     Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
                     None,
                     None,
+                    axum::http::HeaderMap::new(),
                     Ok(Json(body)),
                 )
                 .await
@@ -2085,6 +2116,7 @@ mod tests {
                     Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
                     None,
                     None,
+                    axum::http::HeaderMap::new(),
                     Ok(Json(body)),
                 )
                 .await
@@ -2189,6 +2221,7 @@ mod tests {
             Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
             None,
             None,
+            axum::http::HeaderMap::new(),
             Ok(Json(body)),
         )
         .await
@@ -2322,5 +2355,106 @@ mod tests {
                 "the admission runs before any runtime call for the session"
             );
         }
+    }
+
+    /// The detached spawn after a create re-resolves MCP servers from the session's workspace,
+    /// so a multi-repo create must hand the new workspace layout to the supervisor.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_spawn_carries_the_new_workspace() {
+        use crate::server::test_support as support;
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        use axum::Json;
+
+        fn init_repo(path: &std::path::Path) {
+            std::fs::create_dir_all(path).unwrap();
+            for args in [
+                &["init", "-q"][..],
+                &["config", "user.email", "test@example.com"],
+                &["config", "user.name", "Test"],
+                &["commit", "-q", "--allow-empty", "-m", "init"],
+            ] {
+                let out = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(path)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "git {args:?}: {out:?}");
+            }
+        }
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .expect("acknowledge the agent hook paths");
+        let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+        let repos = tempfile::tempdir().unwrap();
+        let (alpha, beta) = (repos.path().join("alpha"), repos.path().join("beta"));
+        init_repo(&alpha);
+        init_repo(&beta);
+        support::seed_instances_on_disk_for_test("test", Vec::new());
+        let (launcher, seen) = support::workspace_capturing_launcher();
+        let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+        support::refresh_canonical_metadata_for_test(&state).await;
+        let body = serde_json::from_value(serde_json::json!({
+            "title": "created-workspace", "path": alpha, "tool": "claude",
+            "view": "structured", "profile": "test",
+            "extra_repo_paths": [beta],
+            "worktree_enabled": true, "worktree_branch": "feat/ws", "create_new_branch": true,
+        }))
+        .unwrap();
+        let response = crate::server::api::sessions::create_session(
+            State(state.clone()),
+            Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+            None,
+            None,
+            axum::http::HeaderMap::new(),
+            Ok(Json(body)),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let created = support::load_instances_from_disk_for_test("test")
+            .into_iter()
+            .find(|inst| inst.title == "created-workspace")
+            .expect("create persisted its row");
+        assert_eq!(
+            created.workspace_info.as_ref().map(|w| w.repos.len()),
+            Some(2),
+            "the create built a two-repo workspace"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while seen.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the post-create spawn reaches the launcher");
+        // The launcher records before it fails; the creation guard drops only after
+        // the detached task has finished its storage and publication work.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while state.session_service.has_profile_creation("test") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the detached create settles before the app dir goes away");
+        support::assert_carries_workspace(
+            seen.lock().unwrap()[0].as_ref(),
+            &created,
+            "session_spawn acp_spawn_target",
+        );
     }
 }
