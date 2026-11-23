@@ -19,6 +19,7 @@ export function GroupCombobox({
   testId,
   disabled,
   openOnFocus = true,
+  dropUp,
 }: {
   id: string;
   value: string;
@@ -30,6 +31,8 @@ export function GroupCombobox({
   disabled?: boolean;
   /** False keeps the list closed on focus, e.g. for a programmatic refocus. */
   openOnFocus?: boolean;
+  /** Always open upward, e.g. where the list would cover the controls below. */
+  dropUp?: boolean;
 }) {
   const listId = useId();
   const inputRef = useRef<HTMLInputElement>(null);
@@ -53,9 +56,9 @@ export function GroupCombobox({
     const bottom = viewport ? Math.min(area.bottom, viewport.offsetTop + viewport.height) : area.bottom;
     const below = bottom - field.bottom - 8;
     const above = field.top - top - 8;
-    const up = below < Math.min(LIST_MAX, above);
+    const up = dropUp || below < Math.min(LIST_MAX, above);
     setPlacement({ up, maxHeight: Math.max(0, Math.min(LIST_MAX, up ? above : below)) });
-  }, []);
+  }, [dropUp]);
 
   // Before paint, so the list never shows a frame at its default size.
   useLayoutEffect(() => {

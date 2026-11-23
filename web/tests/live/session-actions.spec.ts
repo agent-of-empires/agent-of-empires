@@ -93,8 +93,6 @@ test.describe("group edit (#1726)", () => {
     const input = modal.locator("[data-testid='session-group-modal-input']");
     await expect(input).toHaveValue(prefilled);
     await input.fill(value);
-    // Blur closes the combobox list, which could cover Save.
-    await modal.locator("#session-group-modal-prompt").click();
     await modal.locator("[data-testid='session-group-modal-save']").click();
     const patchRes = await patch;
     expect(patchRes.ok(), `group save should succeed, got ${patchRes.status()}`).toBe(true);
