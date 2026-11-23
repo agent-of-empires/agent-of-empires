@@ -32,14 +32,14 @@ impl<S: BroadcastSink> Supervisor<S> {
     ) -> bool {
         let counter = super::session_seq(&self.next_seqs, session_id);
         let persisted = super::sink::blocking_io(|| {
-            let mut last = super::lock_recover(&counter);
+            let mut last = super::lock_recover(&counter.next);
             if *last != expected_seq {
                 return None;
             }
-            *last = last.saturating_add(1);
+            let seq = counter.allocate(&mut last);
             Some(self.sink.queue_persisted(
                 session_id,
-                *last,
+                seq,
                 &Event::Stopped {
                     reason: reason.to_string(),
                 },
@@ -987,7 +987,10 @@ inherits-claude = "claude"
     impl BroadcastSink for LockProbeSink {
         fn publish(&self, session_id: &str, seq: u64, _event: &Event) {
             let counter = super::super::session_seq(self.seqs.get().unwrap(), session_id);
-            let held = matches!(counter.try_lock(), Err(std::sync::TryLockError::WouldBlock));
+            let held = matches!(
+                counter.next.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
             self.held.lock().unwrap().push((seq, held));
         }
     }
