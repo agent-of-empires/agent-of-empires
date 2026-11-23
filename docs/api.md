@@ -560,7 +560,9 @@ profile's `sandbox.default_image`. Any other `sandbox_image` is refused with
 These refusals come before anything is provisioned. While the pull runs, the
 create-progress `stage` is `pulling_image`. A failed pull ends the creation with
 `400 sandbox_image_update_failed`, and the session and its resources are rolled
-back. Only the local owner sees the runtime's output in its message; a replay
+back. Its message says why the pull failed, as the dashboard's sandbox image
+banner does.
+Only the local owner sees the runtime's output in its message; a replay
 of the cached failure does not include it. CityHall creations ignore the field.
 
 With CLI intent, `extra_args` uses shell-style word grouping and each decoded
@@ -597,6 +599,11 @@ granting trust or provisioning a session. It returns merged and repository-only
 hooks, MCP summaries with environment/header names but not their values,
 `hooks_need_trust`, `mcp_need_trust`, and a `fingerprint`. Unknown profiles are
 rejected without creating them; read-only and CityHall modes refuse this route.
+
+A project path that is not a directory on the Daemon host returns `400` with
+`aoe-error-code: working_dir_missing`, from this review and from creation.
+Checking out a worktree branch that exists neither locally nor on a remote fails
+creation with `400` and `aoe-error-code: branch_not_found`.
 
 For an interactive generated worktree title, the review may also receive
 `generated_worktree_branch` and `create_new_branch`. It returns `suggested_title`
@@ -668,6 +675,26 @@ with `400 create_failed` and the safe message “Import source is already owned 
 an AoE session”. Frozen cleanup ownership covers all tools' current and parked
 ACP IDs, even after an ordinary purge removes the visible row. Unrelated failures
 remain sanitized rather than exposing their internal causes.
+
+**Initial prompt**
+
+`initial_prompt` is sent to the agent as its first turn, never before the
+agent is ready. Structured sessions deliver it once the worker is live and
+retry until it lands. A terminal session running an agent with a ready marker
+waits up to 60 seconds for that marker, then types it. A shell, a
+command-override session or an agent without a ready marker is refused
+immediately and surfaces `initial_prompt_error`. On timeout nothing is typed;
+a send error can leave partial input in the pane. Either way the session row
+carries `initial_prompt_error`. Claude Code's first-run folder-trust dialog and
+its one-time Bypass Permissions screen stop the wait within about a second;
+nothing is typed and neither screen is ever accepted for the user. The row
+then also carries `initial_prompt_error_code`: `agent_folder_not_trusted`
+(turn on `session.pre_trust_agent_folders`, or trust the folder once) or
+`agent_bypass_not_accepted` (open the session once and accept it). The code is
+absent for every other failure, which has only the message. A failed terminal prompt is not retried, unless
+persisting the error fails: the error then lives only in memory and a daemon
+restart retries the prompt. A consumed turn whose clear cannot be persisted is suppressed until a daemon restart, which can retype it. A crash between delivery and bookkeeping can
+deliver it twice. A blank or over-64 KiB (65536 bytes) value returns `400`.
 
 **Worktree fields**
 

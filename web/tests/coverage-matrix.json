@@ -1014,7 +1014,7 @@
         "web/src/components/settings/FormFields.tsx",
         "web/src/components/settings/SchemaSection.tsx"
       ],
-      "notes": "The Updates tab shows the Daemon port (`serve.port`) under a Daemon heading; editing it saves `{ serve: { port } }` through the normal settings path. Global only; a new value applies after a stop and start. The same block renders the Funnel port select (`serve.funnel_port`) from the schema with no web code of its own. Folder-ignore entries (`sandbox.volume_ignores`) are checked client-side from the schema's `volume_ignore_list` rule: an absolute path, a `:` or a `..` segment is rejected inline and not saved, while a relative entry such as node_modules saves as `{ sandbox: { volume_ignores } }`."
+      "notes": "The Updates tab shows the Daemon port (`serve.port`) under a Daemon heading; editing it saves `{ serve: { port } }` through the normal settings path. Global only; a new value applies after a stop and start. The same block renders the Funnel port select (`serve.funnel_port`) from the schema with no web code of its own. Folder-ignore entries (`sandbox.volume_ignores`) are checked client-side from the schema's `volume_ignore_list` rule: an absolute path, a `:` or a `..` segment is rejected inline and not saved, while a relative entry such as node_modules saves as `{ sandbox: { volume_ignores } }`. Port mappings (`sandbox.port_mappings`) reject a port above 65535 on either side inline and keep the draft, while `65535:65535` saves as `{ sandbox: { port_mappings } }`."
     },
     {
       "id": "settings.global-migration-and-persistence",
@@ -1046,6 +1046,18 @@
       "risk": "medium",
       "specs": ["src/components/__tests__/SettingsView.session.test.tsx"],
       "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/FormFields.tsx"]
+    },
+    {
+      "id": "settings.narrow-breakpoint",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/settings/__tests__/SchemaFieldPatches.test.tsx"],
+      "components": [
+        "web/src/components/settings/SchemaSection.tsx",
+        "web/src/components/settings/FormFields.tsx",
+        "src/session/config/mod.rs"
+      ],
+      "notes": "The breakpoint is a number control in the Terminal UI group with the 0 to 1000 range the TUI accepts, patching { session: { narrow_breakpoint } } sparsely like its neighbours, so a config holding a value below the 50-column floor still saves."
     },
     {
       "id": "settings.advanced-fold-persistence",
@@ -1406,6 +1418,27 @@
       "components": []
     },
     {
+      "id": "modal.focus-trap",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/hooks/__tests__/useFocusTrap.test.tsx",
+        "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx",
+        "tests/wizard.spec.ts"
+      ],
+      "components": [
+        "web/src/components/AboutModal.tsx",
+        "web/src/components/ContextMenu.tsx",
+        "web/src/components/TerminalComposeSheet.tsx",
+        "web/src/components/acp/BackgroundShells.tsx",
+        "web/src/components/acp/PlanModal.tsx",
+        "web/src/components/acp/SwitchAccountModal.tsx",
+        "web/src/components/session-wizard/ConfirmCreateDialog.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx"
+      ],
+      "notes": "Every modal keeps Tab and Shift+Tab inside it through useFocusTrap: Tab wraps at either end, Tab from focus behind every modal enters the last one opened, a modal opened inside it keeps the key (a hooks trust confirm over the wizard holds Tab), and an inert or inactive trap does nothing. PlanModal, the shell dialog and the session wizard return focus to the opener on close."
+    },
+    {
       "id": "wizard",
       "kind": "mocked-playwright",
       "risk": "high",
@@ -1442,7 +1475,7 @@
         "web/src/components/Toasts.tsx",
         "web/src/hooks/app/useWizardReopen.ts"
       ],
-      "notes": "The View row is a Structured view | Terminal view radio group: arrow keys move the selection, Structured view is disabled with the reason for an agent that can't run it, and with \"ACP adapter not installed\" when the /api/agents row for the selected Profile and project (path, or scratch) has acp_create_ready false, Sandbox is off and there is no command override, so a project whose repository hook installs the adapter stays Structured; a list fetched for another project leaves Structured available until the new project's answer arrives, except for an agent that only the repository's agent_detect_as makes ACP-capable, and the create's acp_adapter_missing refusal shows its message in the error box; acp_create_ready true counts as ACP-capable unless acp_allowed is false; at 375px the summary wraps under the label and segments, and Launch without Sandbox with no host adapter focuses Terminal view in view without sending. The Yolo mode row says what each value does and is locked on for an Agent whose /api/agents?profile= row for the selected Profile has always_yolo (Terminal view) or acp_always_yolo (Structured view), so a custom agent with its own adapter and an always-Yolo base locks only in Terminal view; the create sends the user's value and the server forces it; until /api/agents answers for that Profile (retried on failure) the row promises neither value and Launch waits, and a list loaded for another Profile is not used; a 404 profile_not_found is not retried and the footer asks for another Profile, with the Profile row shown even when only one is left; the unavailable Sandbox names the configured Container runtime from /api/docker/status. A refused create shows a box with its title, failed step, one recovery action per code and its reference, outlines the row it blames, and takes focus; Retry re-reads /api/docker/status, and every relaunch, Launch without Sandbox included, uses a new idempotency key. A failed on_create hook also offers Create without setup, which resends that once with skip_on_create under a new key, and closes the wizard on a 201. A background refusal toasts with Reopen, which stays until used or dismissed, stays in view when the toasts overflow the column, and restores the form as sent and the box, with the hook output the create printed after the wizard closed; while another wizard is open, Reopen asks to close it first and the toast stays. A backgrounded create polls its progress only until it settles. An adopted create toasts plainly. A reopened wizard sends its own form, never another wizard's unresolved create, shows an agent-list error beside the box, and applies only the newest runtime check."
+      "notes": "The View row is a Structured view | Terminal view radio group: arrow keys move the selection, Structured view is disabled with the reason for an agent that can't run it, and with \"ACP adapter not installed\" when the /api/agents row for the selected Profile and project (path, or scratch) has acp_create_ready false, Sandbox is off and there is no command override, so a project whose repository hook installs the adapter stays Structured; a list fetched for another project leaves Structured available until the new project's answer arrives, except for an agent that only the repository's agent_detect_as makes ACP-capable, and the create's acp_adapter_missing refusal shows its message in the error box; acp_create_ready true counts as ACP-capable unless acp_allowed is false; at 375px the summary wraps under the label and segments, and Launch without Sandbox with no host adapter focuses Terminal view in view without sending. The Yolo mode row says what each value does and is locked on for an Agent whose /api/agents?profile= row for the selected Profile has always_yolo (Terminal view) or acp_always_yolo (Structured view), so a custom agent with its own adapter and an always-Yolo base locks only in Terminal view; the create sends the user's value and the server forces it; until /api/agents answers for that Profile (retried on failure) the row promises neither value and Launch waits, and a list loaded for another Profile is not used; a 404 profile_not_found is not retried and the footer asks for another Profile, with the Profile row shown even when only one is left; the unavailable Sandbox names the configured Container runtime from /api/docker/status. A refused create shows a box with its title, failed step, one recovery action per code and its reference, outlines the row it blames, and takes focus; Retry re-reads /api/docker/status, and every relaunch, Launch without Sandbox included, uses a new idempotency key. A failed on_create hook also offers Create without setup, which resends that once with skip_on_create under a new key, and closes the wizard on a 201. A background refusal toasts with Reopen, which stays until used or dismissed, stays in view when the toasts overflow the column, and restores the form as sent and the box, with the hook output the create printed after the wizard closed; while another wizard is open, Reopen asks to close it first and the toast stays. A backgrounded create polls its progress only until it settles. An adopted create toasts plainly. A reopened wizard sends its own form, never another wizard's unresolved create, shows an agent-list error beside the box, and applies only the newest runtime check. The wizard is a modal dialog named by its heading; Tab and Shift+Tab wrap inside it, Tab from focus left behind it enters it, closing returns focus to the opener, and a touch device starts focus on Close."
     },
     {
       "id": "wizard.structured-view-exposure",
@@ -2538,7 +2571,12 @@
         "src/components/__tests__/SettingsView.session.test.tsx",
         "src/lib/sessionRowTag.test.ts"
       ],
-      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/SettingsView.tsx"]
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/sidebar/RowBadges.tsx"
+      ],
+      "notes": "A single-repo branch tag that only repeats the row label is dropped."
     },
     {
       "id": "sidebar.sort-pure",
@@ -3276,10 +3314,13 @@
         "src/components/settings/__tests__/StructuredViewDisplaySettings.test.tsx",
         "src/components/acp/__tests__/StructuredViewRoot.test.tsx",
         "src/components/acp/Markdown.test.tsx",
+        "src/hooks/__tests__/useHistoryWindow.test.tsx",
         "tests/acp-structured-view.spec.ts"
       ],
       "components": [
         "web/src/components/settings/StructuredViewDisplaySettings.tsx",
+        "web/src/hooks/useHistoryWindow.ts",
+        "web/src/lib/structuredHistoryWindow.ts",
         "web/src/components/settings/FontSizeControl.tsx",
         "web/src/components/TerminalSettings.tsx",
         "web/src/lib/fontSizeRange.ts",
@@ -3359,7 +3400,8 @@
         "web/src/hooks/useConnectionBanner.ts",
         "web/src/hooks/useUpdateBanner.ts",
         "web/src/components/SandboxImageBanner.tsx"
-      ]
+      ],
+      "notes": "#5932: a hung update-status poll is aborted after 15s, the offer stays visible and the next hourly poll runs; pinned in UpdateBanner.test.tsx."
     },
     {
       "id": "connectivity.sandbox-image-banner",

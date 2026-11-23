@@ -736,7 +736,7 @@ pub static BINDINGS: &[Binding] = &[
         context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Other,
-            desc: "Search",
+            desc: "Search (then n for next match)",
         }),
         palette: None,
     },
@@ -991,9 +991,8 @@ pub static BINDINGS: &[Binding] = &[
         }),
     },
     // Pin toggle shares `p` (Shift+P in strict) with Projects but fires only on a project
-    // header, so it must precede the Projects binding. The help desc names that gate
-    // ("group header only") because the `?` overlay has no notion of context and lists both
-    // `p` rows unconditionally, which is what made the shared key look ambiguous in #3133.
+    // header, so it must precede the Projects binding. The `?` overlay lists both rows
+    // unconditionally, so each desc names its context (#3133).
     Binding {
         id: ActionId::ToggleProjectPin,
         non_strict: &[k('p')],
@@ -1001,7 +1000,7 @@ pub static BINDINGS: &[Binding] = &[
         context: Context::ProjectGroupSelected,
         help: Some(HelpMeta {
             section: HelpSection::Actions,
-            desc: "Pin/unpin project (group header only)",
+            desc: "Pin/unpin project (on a project header)",
         }),
         palette: None,
     },
@@ -1014,7 +1013,7 @@ pub static BINDINGS: &[Binding] = &[
         context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Other,
-            desc: "Projects",
+            desc: "Projects (except on a project header)",
         }),
         palette: Some(PaletteMeta {
             title: "Manage projects",
@@ -1667,13 +1666,14 @@ mod tests {
     /// The `?` overlay renders one row per help-listed binding and never
     /// consults `Context`, so two bindings sharing a chord show the same key
     /// twice (#3133: `p` for the pin toggle and `p` for the projects dialog).
-    /// The convention that keeps that readable is that the guarded one states
-    /// when it applies. Enforced here rather than by asserting a desc string,
-    /// so it also catches a future guarded binding added onto a shared chord.
+    /// Every row on a shared chord states when it applies.
     #[test]
     fn shared_help_chords_document_their_guard() {
-        // A qualifier the desc can use to say when the guarded action fires.
-        let qualifies = |d: &str| ["only", "when ", "selected"].iter().any(|q| d.contains(q));
+        let qualifies = |d: &str| {
+            ["only", "when ", "selected", "on a ", "except"]
+                .iter()
+                .any(|q| d.contains(q))
+        };
         for strict in [false, true] {
             let rows: Vec<(String, Context, &str)> = BINDINGS
                 .iter()
@@ -1685,7 +1685,7 @@ mod tests {
                 .collect();
             for (l, context, desc) in &rows {
                 let shared = rows.iter().filter(|(other, ..)| other == l).count() > 1;
-                if shared && *context != Context::Always {
+                if shared {
                     assert!(
                         qualifies(desc),
                         "strict={strict}: {l:?} is shared, so the {context:?} row \

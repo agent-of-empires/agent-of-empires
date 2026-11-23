@@ -486,7 +486,12 @@ pub async fn review_creation_trust(
             anyhow::ensure!(!profile.is_empty(), "Missing profile");
             let profile = crate::session::resolve_existing_profile(&profile)?;
             let path = std::path::Path::new(&body.path);
-            anyhow::ensure!(body.scratch || path.is_dir(), "Project path does not exist");
+            if !body.scratch && !path.is_dir() {
+                return Err(crate::session::builder::BuildRefusal::WorkingDirMissing(
+                    body.path.clone(),
+                )
+                .into());
+            }
             let base = crate::session::resolve_config(&profile)?.hooks;
             let trust = read_creation_trust(path, body.scratch)?;
             let fingerprint = creation_trust_fingerprint(&base, &trust);
@@ -546,6 +551,15 @@ pub async fn review_creation_trust(
         Ok(Ok(review)) => Json(review).into_response(),
         Ok(Err(error)) => {
             tracing::warn!(target: "http.api.sessions", error = %error, "Creation trust review refused");
+            if matches!(
+                error.downcast_ref(),
+                Some(crate::session::builder::BuildRefusal::WorkingDirMissing(_))
+            ) {
+                return crate::server::api::text_error_with_code_header(
+                    crate::daemon::ApiErrorCode::WorkingDirMissing,
+                    error.to_string(),
+                );
+            }
             (StatusCode::BAD_REQUEST, error.to_string()).into_response()
         }
         Err(error) => {
@@ -873,6 +887,29 @@ pub(crate) async fn create_session_with(
         }
     }
 
+    if body
+        .initial_prompt
+        .as_deref()
+        .is_some_and(|prompt| prompt.trim().is_empty())
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "initial_prompt must not be blank",
+        );
+    }
+    if body
+        .initial_prompt
+        .as_deref()
+        .is_some_and(|prompt| prompt.len() > crate::session::MAX_INITIAL_PROMPT_BYTES)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "initial_prompt exceeds 64 KiB",
+        );
+    }
+
     // Idempotency first: a known key is answered from its result, replayed failure or
     // restart fence before any validation that reads mutable state (profiles, agents,
     // projects), which could otherwise turn a retry of an unknown outcome into a verdict.
@@ -942,6 +979,17 @@ pub(crate) async fn create_session_with(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
                 "Internal server error",
+            );
+        }
+        Err(error)
+            if matches!(
+                error.downcast_ref(),
+                Some(crate::session::builder::BuildRefusal::WorkingDirMissing(_))
+            ) =>
+        {
+            return crate::server::api::api_error_with_code_header(
+                crate::daemon::ApiErrorCode::WorkingDirMissing,
+                error.to_string(),
             );
         }
         Err(error) => {
@@ -1425,6 +1473,7 @@ pub(crate) async fn create_session_with(
         );
     }
 
+    let initial_turn = initial_turn.or(body.initial_prompt.take());
     let profile = body.profile.unwrap_or(default_profile);
     // `body.profile` is the caller's authority when it names one; otherwise
     // the served profile resolved above, which is also what the validation
@@ -1606,12 +1655,14 @@ pub(crate) async fn create_session_with(
     }
 }
 
-fn create_failure_response(
+pub(super) fn create_failure_response(
     failure: crate::server::create_progress::CreateFailure,
 ) -> axum::response::Response {
     let code = [
         crate::daemon::ApiErrorCode::AgentHooksNotApproved,
         crate::daemon::ApiErrorCode::CreateOutcomeUnknown,
+        crate::daemon::ApiErrorCode::WorkingDirMissing,
+        crate::daemon::ApiErrorCode::BranchNotFound,
     ]
     .into_iter()
     .find(|code| failure.code == code.as_str());
@@ -1663,7 +1714,9 @@ fn lost_shared_pull(e: &anyhow::Error) -> bool {
     create_cause(e).0.chain().any(|cause| {
         cause
             .downcast_ref::<crate::server::session_spawn::ImageUpdateFailed>()
-            .is_some_and(|failed| failed.cancelled)
+            .is_some_and(|failed| {
+                failed.failure == crate::server::session_spawn::UpdateFailure::Cancelled
+            })
             || matches!(
                 cause.downcast_ref::<DockerError>(),
                 Some(DockerError::PullCancelled(_))
@@ -1887,14 +1940,14 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, S
         if let Some(failed) =
             cause.downcast_ref::<crate::server::session_spawn::ImageUpdateFailed>()
         {
-            let message = if failed.cancelled {
-                format!(
+            // The banner's wording for the same pull failure; the runtime's output is added for local owners.
+            let message = match failed.failure {
+                crate::server::session_spawn::UpdateFailure::Cancelled => format!(
                     "Couldn't pull the latest Sandbox image {}: {}.",
                     failed.image,
                     crate::server::session_spawn::CANCELLED_UPDATE
-                )
-            } else {
-                format!("Couldn't pull the latest Sandbox image {}.", failed.image)
+                ),
+                crate::server::session_spawn::UpdateFailure::Pull(reason) => reason.user_text(),
             };
             return ("sandbox_image_update_failed", message);
         }
@@ -1925,9 +1978,9 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, S
     }
     if let Some(git_err) = e.chain().find_map(|c| c.downcast_ref::<GitError>()) {
         match git_err {
+            GitError::BranchNotFound(_) => return ("branch_not_found", git_err.to_string()),
             GitError::WorktreeAlreadyExists(_)
             | GitError::BranchAlreadyCheckedOut(_)
-            | GitError::BranchNotFound(_)
             | GitError::InvalidTemplate(_)
             | GitError::NotAGitRepo => return ("create_failed", git_err.to_string()),
             // Raw command output / libgit2 / IO: not safe to expose.

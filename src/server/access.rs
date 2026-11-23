@@ -535,6 +535,7 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("POST", "/api/sessions/{id}/acp/switch-provider"),
     // Global settings / ops / shared workspace ordering.
     ("PATCH", "/api/settings"),
+    ("PUT", "/api/profiles/{name}/acp-defaults/{agent}/model"),
     ("PATCH", "/api/log-level"),
     ("PUT", "/api/workspace-ordering"),
 ];

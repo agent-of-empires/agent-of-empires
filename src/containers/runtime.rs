@@ -66,6 +66,11 @@ impl ContainerRuntime {
         self.base.name
     }
 
+    /// False when `read_only` volumes are mounted read-write instead.
+    pub fn supports_read_only_volumes(&self) -> bool {
+        self.base.supports_read_only_volumes
+    }
+
     pub fn is_available(&self) -> bool {
         self.base.is_available()
     }

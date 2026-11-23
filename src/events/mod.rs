@@ -56,6 +56,7 @@ impl Schema {
 pub enum SeqBound {
     After(u64),
     Before(u64),
+    AfterThrough(u64, u64),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -360,29 +361,23 @@ pub fn scan(
     limit: Option<usize>,
 ) -> Vec<(u64, String)> {
     // Clamp before the cast so a `u64::MAX` cursor does not wrap negative.
-    let (op, value) = match bound {
-        SeqBound::After(v) => (">", v),
-        SeqBound::Before(v) if v > i64::MAX as u64 => ("<=", v),
-        SeqBound::Before(v) => ("<", v),
+    let (predicate, mut values) = match bound {
+        SeqBound::After(v) => ("seq > ?", vec![v]),
+        SeqBound::Before(v) if v > i64::MAX as u64 => ("seq <= ?", vec![v]),
+        SeqBound::Before(v) => ("seq < ?", vec![v]),
+        SeqBound::AfterThrough(after, through) => ("seq > ? AND seq <= ?", vec![after, through]),
     };
-    let value_i64 = i64::try_from(value).unwrap_or(i64::MAX);
     let order_sql = match order {
         Order::Asc => "ASC",
         Order::Desc => "DESC",
     };
     let events = schema.events_table();
-    let sql = match limit {
-        Some(_) => format!(
-            "SELECT seq, event_json FROM {events}
-             WHERE session_id = ?1 AND seq {op} ?2
-             ORDER BY seq {order_sql} LIMIT ?3"
-        ),
-        None => format!(
-            "SELECT seq, event_json FROM {events}
-             WHERE session_id = ?1 AND seq {op} ?2
-             ORDER BY seq {order_sql}"
-        ),
-    };
+    let limit_sql = if limit.is_some() { " LIMIT ?" } else { "" };
+    let sql = format!(
+        "SELECT seq, event_json FROM {events}
+         WHERE session_id = ? AND {predicate}
+         ORDER BY seq {order_sql}{limit_sql}"
+    );
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(e) => {
@@ -395,10 +390,15 @@ pub fn scan(
         let json: String = row.get(1)?;
         Ok((seq as u64, json))
     };
-    let rows = match limit {
-        Some(n) => stmt.query_map(params![topic, value_i64, n as i64], map_row),
-        None => stmt.query_map(params![topic, value_i64], map_row),
-    };
+    if let Some(n) = limit {
+        values.push(n as u64);
+    }
+    let args = std::iter::once(Value::Text(topic.to_string())).chain(
+        values
+            .into_iter()
+            .map(|v| Value::Integer(i64::try_from(v).unwrap_or(i64::MAX))),
+    );
+    let rows = stmt.query_map(params_from_iter(args), map_row);
     let rows = match rows {
         Ok(r) => r,
         Err(e) => {
