@@ -66,8 +66,8 @@ fn test_row_tag_modes_in_all_profiles_view() {
         (
             worktree_instance("feature/foo"),
             RowTagMode::Branch,
-            &["[foo         ]"],
-            &[],
+            &["feature/foo"],
+            &["[foo"],
         ),
         (
             worktree_instance("my-session"),

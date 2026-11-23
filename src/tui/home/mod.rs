@@ -425,6 +425,7 @@ pub struct HomeView {
     pub(super) sidebar_position: crate::session::config::SidebarPosition,
 
     pub(super) narrow_layout: crate::session::config::NarrowLayout,
+    pub(super) narrow_breakpoint: u16,
     pub(super) passive_pane_synced: std::collections::HashMap<String, PassiveSynced>,
     pub(super) passive_pane_declined:
         std::collections::HashMap<String, ((u16, u16), std::time::Instant)>,

@@ -119,12 +119,15 @@ impl<S: BroadcastSink> Supervisor<S> {
         // Hold the worker gate while claiming the matching durable stop token.
         let _workers = self.workers.lock().await;
         let request_state = lock_recover(&self.spawn_requests);
-        if (request_state.stop_fences.contains_key(session_id) && restart.is_none())
-            || cancellation
-                .as_ref()
-                .is_some_and(CancellationToken::is_cancelled)
+        if cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
         {
             return Err(SupervisorError::SpawnCancelled(session_id.to_string()));
+        }
+        let admission_error = request_state.admission_error(session_id, restart.is_some());
+        if let Some(error) = admission_error {
+            return Err(error);
         }
         drop(request_state);
         let restart_requests = lock_recover(&self.restart_requests);
@@ -174,13 +177,17 @@ impl<S: BroadcastSink> Supervisor<S> {
         // A stop may have installed its fence while durable admission was
         // being prepared. Abandon this exact Lease before any launch work.
         let request_state = lock_recover(&self.spawn_requests);
-        if (request_state.stop_fences.contains_key(session_id) && restart.is_none())
-            || cancellation
-                .as_ref()
-                .is_some_and(CancellationToken::is_cancelled)
+        let admission_error = if cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
         {
+            Some(SupervisorError::SpawnCancelled(session_id.to_string()))
+        } else {
+            request_state.admission_error(session_id, restart.is_some())
+        };
+        if let Some(error) = admission_error {
             table.abandon(&lease);
-            return Err(SupervisorError::SpawnCancelled(session_id.to_string()));
+            return Err(error);
         }
         drop(request_state);
         if kind != ResumeKind::Attach {
@@ -524,6 +531,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             McpPaths {
                 cwd: req.cwd.clone(),
                 config_path: req.config_path.clone(),
+                sandboxed: req.sandbox_info.is_some(),
             },
             host_environment.clone(),
             claude_config_dir,
@@ -1421,9 +1429,11 @@ pub(super) fn discovery_key<'a>(sandboxed: bool, agent: &'a str, native: &'a str
 }
 
 /// `cwd` keys the native per-project lookup; project-local servers load from `config_path`.
+/// `sandboxed` sessions never receive daemon or loopback servers.
 pub(super) struct McpPaths {
     pub(super) cwd: PathBuf,
     pub(super) config_path: PathBuf,
+    pub(super) sandboxed: bool,
 }
 
 pub(super) async fn resolve_mcp_servers(
@@ -1435,50 +1445,38 @@ pub(super) async fn resolve_mcp_servers(
     native_config_override: Option<PathBuf>,
     failure: &'static str,
 ) -> Vec<agent_client_protocol::v1::schema::McpServer> {
+    use crate::session::mcp::mcp_model::summarize;
+
     let agent_key = agent_key.to_string();
-    let session = session_id.to_string();
-    tokio::task::spawn_blocking(move || {
+    let env = session_env.clone();
+    let sandboxed = paths.sandboxed;
+    let resolved = tokio::task::spawn_blocking(move || {
         resolve_mcp_layers(
             &agent_key,
-            &session,
             profile.as_deref(),
-            &paths.cwd,
-            &paths.config_path,
+            &paths,
             &session_env,
             native_config_override.as_deref(),
         )
     })
-    .await
-    .unwrap_or_else(|e| {
-        warn!(
-            target: "acp.mcp",
-            session = %session_id,
-            error = %e,
-            "{failure}; forwarding no servers"
-        );
-        Vec::new()
-    })
-}
-
-fn resolve_mcp_layers(
-    agent_key: &str,
-    session_id: &str,
-    profile: Option<&str>,
-    cwd: &std::path::Path,
-    config_path: &std::path::Path,
-    session_env: &[(String, String)],
-    native_config_override: Option<&std::path::Path>,
-) -> Vec<agent_client_protocol::v1::schema::McpServer> {
-    use crate::session::mcp::mcp_model::{resolve_effective, summarize};
-
-    let merged = resolve_effective(
-        agent_key,
-        profile,
-        cwd,
-        config_path,
-        session_env,
-        native_config_override,
-    );
+    .await;
+    let mut merged = match resolved {
+        Ok(merged) => merged,
+        Err(e) => {
+            warn!(
+                target: "acp.mcp",
+                session = %session_id,
+                error = %e,
+                "{failure}; forwarding no servers"
+            );
+            return Vec::new();
+        }
+    };
+    // Read the accepted tokens after the definitions so they cover every token those hold.
+    if sandboxed {
+        let daemon = crate::acp::mcp_config::DaemonIdentity::current().await;
+        merged = crate::acp::mcp_config::drop_daemon_servers(merged, &daemon);
+    }
     if !merged.is_empty() {
         info!(
             target: "acp.mcp",
@@ -1488,7 +1486,24 @@ fn resolve_mcp_layers(
             "forwarding MCP servers"
         );
     }
-    crate::acp::mcp_config::project_servers_to_acp(merged, session_env)
+    crate::acp::mcp_config::project_servers_to_acp(merged, &env)
+}
+
+fn resolve_mcp_layers(
+    agent_key: &str,
+    profile: Option<&str>,
+    paths: &McpPaths,
+    session_env: &[(String, String)],
+    native_config_override: Option<&std::path::Path>,
+) -> Vec<crate::session::mcp::mcp_model::ResolvedMcpServer> {
+    crate::session::mcp::mcp_model::resolve_effective(
+        agent_key,
+        profile,
+        &paths.cwd,
+        &paths.config_path,
+        session_env,
+        native_config_override,
+    )
 }
 
 /// Apply current model pins and effort defaults to a cached respawn config,
@@ -1655,6 +1670,36 @@ time.sleep(60)
             supervisor.worker_state("s-restart").await,
             AcpWorkerState::Absent
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restart_admission_respects_purge_but_allows_its_own_stop_fence() {
+        for purging in [false, true] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let supervisor = Supervisor::new(VecSink::new());
+            let id = "s-restart-purge";
+            let restart = supervisor.try_begin_restart_with_reason(id).await.unwrap();
+            let _stop = supervisor
+                .begin_stop_request(id, "user_stopped", None, false)
+                .await;
+            let _purge = purging.then(|| supervisor.fence_spawn_admission(id));
+            let result = supervisor
+                .begin_resume_with_restart_claim(
+                    id,
+                    ResumeKind::SpawnFirst,
+                    crate::process::worker_registry::ResumeAuthority::Explicit,
+                    Some(&restart),
+                    None,
+                )
+                .await;
+            if purging {
+                assert!(matches!(result, Err(SupervisorError::PurgeInProgress(_))));
+                assert_eq!(supervisor.worker_state(id).await, AcpWorkerState::Absent);
+            } else {
+                assert!(matches!(result, Ok(ResumeReservationOutcome::Reserved(_))));
+            }
+        }
     }
 
     fn mcp_names(servers: &[agent_client_protocol::v1::schema::McpServer]) -> Vec<&str> {
@@ -2699,19 +2744,20 @@ time.sleep(60)
         let resolve = |profile: Option<&'static str>,
                        cwd: std::path::PathBuf,
                        config_path: std::path::PathBuf| async move {
-            let merged = tokio::task::spawn_blocking(move || {
-                resolve_mcp_layers(
-                    "claude",
-                    "resolve-test",
-                    profile,
-                    &cwd,
-                    &config_path,
-                    &[],
-                    None,
-                )
-            })
-            .await
-            .unwrap();
+            let merged = resolve_mcp_servers(
+                "claude",
+                "resolve-test",
+                profile.map(String::from),
+                McpPaths {
+                    cwd,
+                    config_path,
+                    sandboxed: false,
+                },
+                Vec::new(),
+                None,
+                "resolve failed",
+            )
+            .await;
             let val = serde_json::to_value(&merged).unwrap();
             let mut names: Vec<String> = val
                 .as_array()

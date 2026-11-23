@@ -142,8 +142,8 @@ fn wait_for_local_dashboard(h: &TuiTestHarness) -> (u16, String) {
 fn restart_local_from_tui(h: &TuiTestHarness) -> u32 {
     let before = daemon_pid(h).expect("serve.pid missing before restart");
     h.send_keys_unfenced("R");
-    h.wait_for("Press R again to restart.");
-    h.send_keys_unfenced("R");
+    h.wait_for("Press Enter to restart.");
+    h.send_keys_unfenced("Enter");
     wait_until(Duration::from_secs(30), Duration::from_millis(100), || {
         let pid = daemon_pid(h).ok_or("serve.pid missing after restart")?;
         if pid == before {
@@ -653,7 +653,6 @@ async fn native_creation_hooks_preserve_borrowed_scratch_resources() {
         ApiErrorCode, CreateSessionBody, CreationTrustRequest, DaemonClient, DaemonClientError,
         RUNTIME_EPOCH_HEADER,
     };
-    use std::os::unix::fs::PermissionsExt;
     require_tmux!();
     if std::process::Command::new("curl")
         .arg("--version")
@@ -664,6 +663,19 @@ async fn native_creation_hooks_preserve_borrowed_scratch_resources() {
         return;
     }
     let real_git = which::which("git").expect("git is available");
+    // Host git never runs repo hooks, so a `git` shim stands in for the
+    // checkout: it runs `probe` around `git worktree add`.
+    let add_shim = |probe: &std::path::Path, after: bool| {
+        let run = format!("[ \"$is_add\" = 7 ] && sh {probe:?}");
+        let body = if after {
+            format!("{real_git:?} \"$@\"; rc=$?; {run}; exit $rc")
+        } else {
+            format!("{run}; exec {real_git:?} \"$@\"")
+        };
+        format!(
+            "#!/bin/sh\n( while [ \"$1\" = -c ]; do shift 2; done; [ \"$1\" = worktree ] && [ \"$2\" = add ] && exit 7 ); is_add=$?\n{body}\n"
+        )
+    };
     for stage in [
         "on_create",
         "post_checkout",
@@ -690,8 +702,17 @@ async fn native_creation_hooks_preserve_borrowed_scratch_resources() {
         if stage == "checkout_failure" {
             let git = h.install_path_command("git").join("git");
             std::fs::write(&git, format!(
-            "#!/bin/sh\nif [ \"$1\" = worktree ] && [ \"$2\" = add ]; then mkdir -p \"$3\"; printf preserved > \"$3/foreign-file\"; printf '%s' \"$3\" > {failed_checkout:?}; echo checkout-refused >&2; exit 1; fi\nexec {real_git:?} \"$@\"\n"
+            "#!/bin/sh\n( while [ \"$1\" = -c ]; do shift 2; done; if [ \"$1\" = worktree ] && [ \"$2\" = add ]; then mkdir -p \"$3\"; printf preserved > \"$3/foreign-file\"; printf '%s' \"$3\" > {failed_checkout:?}; echo checkout-refused >&2; exit 1; fi ) || exit 1\nexec {real_git:?} \"$@\"\n"
         )).unwrap();
+        }
+        if matches!(stage, "post_checkout" | "trust_before_git") {
+            let probe = h.home_path().join(if stage == "post_checkout" {
+                "purge-owner.sh"
+            } else {
+                "trust-probe.sh"
+            });
+            let git = h.install_path_command("git").join("git");
+            std::fs::write(&git, add_shim(&probe, stage == "post_checkout")).unwrap();
         }
         let daemon = h.run_cli(&["serve", "--core-only", "--daemon"]);
         assert!(
@@ -752,10 +773,6 @@ curl --max-time 5 -fsS --unix-socket "{socket}" -H '{header}: {epoch}' -H 'Conte
                 serde_json::to_string(&format!("sh {hook:?}")).unwrap()
             ));
             std::fs::write(&config_path, config).unwrap();
-        } else if stage == "post_checkout" {
-            let git_hook = PathBuf::from(&owner.project_path).join(".git/hooks/post-checkout");
-            std::fs::copy(&hook, &git_hook).unwrap();
-            std::fs::set_permissions(&git_hook, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         let trust_seen = h.home_path().join("trust-seen");
         if stage == "trust_before_git" {
@@ -769,11 +786,9 @@ curl --max-time 5 -fsS --unix-socket "{socket}" -H '{header}: {epoch}' -H 'Conte
             };
             let hash = agent_of_empires::session::config::repo_config::compute_hooks_hash(&hooks);
             let trust = app.join("trusted_repos.toml");
-            let git_hook = source.join(".git/hooks/post-checkout");
-            std::fs::write(&git_hook, format!(r#"#!/bin/sh
+            std::fs::write(h.home_path().join("trust-probe.sh"), format!(r#"#!/bin/sh
 if grep -Fq 'hooks_hash = "{hash}"' {trust:?}; then printf approved > {trust_seen:?}; else printf missing > {trust_seen:?}; fi
 "#)).unwrap();
-            std::fs::set_permissions(git_hook, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         let mut borrower_body: CreateSessionBody = serde_json::from_value(serde_json::json!({
             "title":"scratch borrower", "path":owner.project_path, "tool":"creation-agent",
@@ -3183,8 +3198,8 @@ fn tui_local_restart_preserves_the_gate_without_the_env_variable() {
     h.wait_for("R: restart");
     std::fs::remove_file(app_dir_in(h.home_path()).join("serve.passphrase")).unwrap();
     h.send_keys_unfenced("R");
-    h.wait_for("Press R again to restart.");
-    h.send_keys_unfenced("R");
+    h.wait_for("Press Enter to restart.");
+    h.send_keys_unfenced("Enter");
     h.wait_for("Dashboard start failed");
     assert_eq!(daemon_pid(&h), Some(successor));
     assert!(
@@ -4438,8 +4453,8 @@ exit 0
             std::fs::write(&reconnect_flag, "").unwrap();
         }
         h.send_keys_unfenced("G");
-        h.wait_for("Press G again for a new passphrase.");
-        h.send_keys_unfenced("G");
+        h.wait_for("Press Enter for a new passphrase.");
+        h.send_keys_unfenced("Enter");
         if replacement_succeeds {
             let (successor, running) =
                 wait_until(Duration::from_secs(30), Duration::from_millis(50), || {
@@ -4568,8 +4583,8 @@ exit 0
         fs2::FileExt::try_lock_exclusive(&transaction).map_err(|error| error.to_string())
     });
     h.send_keys_unfenced("R");
-    h.wait_for("Press R again to restart.");
-    h.send_keys_unfenced("R");
+    h.wait_for("Press Enter to restart.");
+    h.send_keys_unfenced("Enter");
     h.wait_for("Elapsed:");
     assert!(!running.exists());
     std::fs::rename(&hidden, &running).unwrap();

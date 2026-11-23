@@ -585,6 +585,19 @@ fn switch_unavailable(error: &anyhow::Error, message: &'static str) -> Response 
 
 const CHECK_UNAVAILABLE: &str = "Couldn't check the switch to Terminal view; retry shortly";
 const SWITCH_UNAVAILABLE: &str = "Couldn't start the switch to Terminal view; retry shortly";
+const COMMAND_SELECTOR_CONFLICT: &str = "This Session's command picks a conversation with its own session flag, and AoE holds one for it too; remove the session flag from its command or arguments to switch";
+/// Ends a handoff owed from before the refusal above: its launch can never start. Clearing AoE's
+/// id is a way out only here, in Terminal view; Structured view refuses that clear.
+fn command_selector_ended(session_id: &str) -> String {
+    format!(
+        "Terminal view couldn't start this Session: its command picks a conversation with its own session flag, and AoE holds one for it too. Restart the Session with the session flag removed from its command or arguments, or run `aoe session set-session-id {session_id} \"\"` and restart it to run its command as written."
+    )
+}
+
+/// A handoff whose launch the command's own session selector refused; it ended in Terminal view.
+#[derive(Debug, thiserror::Error)]
+#[error("{}", command_selector_ended(.0))]
+struct CommandSelectorEnded(String);
 
 /// A coded refusal, so a client can show the matching dialog state. The body
 /// stays plain text because the current web client shows it as it is.
@@ -611,6 +624,7 @@ fn terminal_refusal(reason: TerminalSwitchReason, agent: &str) -> Response {
         CommandSelectsConversation => {
             "This Session's command picks its own conversation; switch without a choice, or remove the session flag from its command".into()
         }
+        CommandSelectorConflict => COMMAND_SELECTOR_CONFLICT.into(),
     };
     crate::server::api::text_error_with_code_header(
         crate::daemon::ApiErrorCode::TerminalSwitchRefused(reason),
@@ -687,19 +701,18 @@ fn recorded_outcome(
     }
 }
 
-/// What a persisted handoff does with the conversation. A `Discard` continues only when its
-/// target resumes: reservation records one for an earlier conversation and `Cleared` for `fresh`.
-fn handoff_outcome(
-    context: &HandoffContext,
-    terminal: Option<&crate::session::ConversationState>,
-) -> TerminalConversation {
-    match (context, terminal) {
-        (HandoffContext::Keep { .. }, _) => TerminalConversation::Continue,
-        (HandoffContext::Discard, Some(target)) if target.resumes() => {
-            TerminalConversation::Continue
+impl From<crate::session::TerminalHandoffOutcome> for TerminalConversation {
+    fn from(outcome: crate::session::TerminalHandoffOutcome) -> Self {
+        match outcome {
+            crate::session::TerminalHandoffOutcome::Continue => Self::Continue,
+            crate::session::TerminalHandoffOutcome::Fresh => Self::Fresh,
         }
-        (HandoffContext::Discard, _) => TerminalConversation::Fresh,
     }
+}
+
+/// What a persisted handoff does with the conversation, as it recorded.
+fn handoff_outcome(intent: &HandoffIntent) -> TerminalConversation {
+    intent.outcome.into()
 }
 
 /// Whether driving a persisted handoff gives the caller what it asked for. No choice drives any.
@@ -720,11 +733,31 @@ async fn terminal_plan(
     let plan = agent_terminal_plan(state, id, instance, agent, source_event_seq).await?;
     Ok(match plan {
         TerminalPlan::Blocked(_) => plan,
+        // Retirement replaces a pending rebind's command and conversation, so the old command's
+        // selector never reaches the launch.
+        plan if instance.terminal_rebind_pending => plan,
         plan if instance.command_session_selector().is_some() => {
-            TerminalPlan::CommandDecides(Box::new(plan))
+            // The launch refuses the selector beside AoE's own conversation, so refuse before
+            // retirement rather than leave the switch owed. A row that can't start owes no launch.
+            if instance.ensure_startable().is_ok()
+                && command_selector_conflicts(
+                    instance,
+                    matches!(plan, TerminalPlan::Continues { .. }),
+                )
+            {
+                TerminalPlan::Blocked(TerminalSwitchReason::CommandSelectorConflict)
+            } else {
+                TerminalPlan::CommandDecides(Box::new(plan))
+            }
         }
         plan => plan,
     })
+}
+
+/// Whether the launch refuses `row`'s command selector beside AoE's own conversation. A switch
+/// that `keeps_target` commits one; otherwise the row's own state decides.
+fn command_selector_conflicts(row: &Instance, keeps_target: bool) -> bool {
+    row.command_session_selector().is_some() && (keeps_target || row.conversation_state().resumes())
 }
 
 async fn agent_terminal_plan(
@@ -1056,6 +1089,11 @@ fn reserve_handoff_in(
                 fence_generation: generation,
             }
         });
+        let terminal = recorded.map(|outcome| match outcome {
+            TerminalConversation::Fresh => fresh_terminal_target(row.conversation_state()),
+            TerminalConversation::Continue => row.conversation_state(),
+        });
+        let outcome = crate::session::TerminalHandoffOutcome::of(&context, terminal.as_ref());
         row.terminal_handoff = Some(Box::new(HandoffIntent {
             id: intent_id,
             profile,
@@ -1070,12 +1108,11 @@ fn reserve_handoff_in(
             source_conversation: row.conversation_state(),
             runner,
             unborn_fence,
-            terminal: recorded.map(|outcome| match outcome {
-                TerminalConversation::Fresh => fresh_terminal_target(row.conversation_state()),
-                TerminalConversation::Continue => row.conversation_state(),
-            }),
+            terminal,
+            outcome,
             launch_required: row.ensure_startable().is_ok(),
             launch_started: false,
+            selector_ended: false,
             launch: None,
         }));
         Ok(HandoffKey {
@@ -1198,7 +1235,7 @@ fn record_retired_handoff_in(
         intent.source_conversation = source;
         intent.source_acp_session_id = source_acp_session_id;
         intent.runner = completed_runner;
-        intent.terminal = terminal;
+        intent.set_terminal(terminal);
         intent.final_event_seq = Some(final_event_seq);
         intent.stage = TerminalHandoffStage::TerminalCommitOwed;
         Ok(())
@@ -1256,11 +1293,26 @@ fn commit_terminal_in(
     })
 }
 
+/// A session id whose next `finish_handoff_in` runs this hook before canonical adoption.
+#[cfg(test)]
+type FinishAdoptionHook = (String, Box<dyn FnOnce() + Send>);
+#[cfg(test)]
+static BEFORE_FINISH_ADOPTION: std::sync::Mutex<Option<FinishAdoptionHook>> =
+    std::sync::Mutex::new(None);
+
 fn finish_handoff_in(
     native: &crate::server::session_store::NativeSessionStore,
     session_id: &str,
     key: HandoffKey,
 ) -> anyhow::Result<()> {
+    #[cfg(test)]
+    {
+        let mut armed = BEFORE_FINISH_ADOPTION.lock().unwrap();
+        if armed.as_ref().is_some_and(|(id, _)| id == session_id) {
+            let (_, hook) = armed.take().unwrap();
+            crate::server::session_store::before_next_adoption_for_test(hook);
+        }
+    }
     use crate::session::{LifecycleOperation, LifecycleReservationError, TerminalHandoffStage};
     let profile = native.storage().profile();
     let profile_identity = native.storage().bound_profile_identity()?;
@@ -1381,7 +1433,7 @@ async fn terminal_handoff_request(
         if conversation.is_some() && durable.command_session_selector().is_some() {
             return terminal_refusal(TerminalSwitchReason::CommandSelectsConversation, "");
         }
-        let outcome = handoff_outcome(&pending.context, pending.terminal.as_ref());
+        let outcome = handoff_outcome(pending);
         if !pending_handoff_honours(outcome, conversation) {
             let in_flight = match outcome {
                 TerminalConversation::Continue => "keeps the conversation",
@@ -1462,7 +1514,15 @@ async fn terminal_handoff_request(
             tracing::info!(target: "acp.switch", session = %id, to = "terminal", "view switched");
             view_response(&state, id, View::Terminal).await
         }
-        Err(error) => handoff_unavailable(&error),
+        Err(error) => match error.downcast_ref::<CommandSelectorEnded>() {
+            Some(ended) => crate::server::api::text_error_with_code_header(
+                crate::daemon::ApiErrorCode::TerminalSwitchRefused(
+                    TerminalSwitchReason::CommandSelectorConflict,
+                ),
+                ended.to_string(),
+            ),
+            None => handoff_unavailable(&error),
+        },
     }
 }
 
@@ -1530,7 +1590,7 @@ fn drive_terminal_handoff(
                     intent.ensure_retirement_target(&id, &mut target)?;
                     let deadline = std::time::Duration::from_secs(5);
                     // A continuing worker may hold the conversation's id, so only a fresh one deletes it.
-                    match handoff_outcome(&intent.context, intent.terminal.as_ref()) {
+                    match handoff_outcome(&intent) {
                         TerminalConversation::Continue => {
                             state
                                 .acp_supervisor
@@ -1616,12 +1676,32 @@ fn drive_terminal_handoff(
                     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                         let mut held =
                             TerminalHandoff::new(native, launch_id.clone(), launch_driver);
-                        let result = row.start_terminal_handoff_in(
-                            held.store(),
-                            key,
-                            &held.driver,
-                            allow_retry,
-                        );
+                        // The launch refuses the command's selector beside AoE's own conversation
+                        // on every retry, so a switch owed from before that refusal ends here. The
+                        // launch adopts a live pane before that check, so a kept one doesn't end,
+                        // and one tmux can't classify keeps the switch owed.
+                        let ended = command_selector_conflicts(&row, false)
+                            && match row.tmux_session() {
+                                Ok(pane) => match crate::tmux::utils::probe_pane(pane.name()) {
+                                    crate::tmux::utils::PaneProbe::Alive => false,
+                                    crate::tmux::utils::PaneProbe::Dead
+                                    | crate::tmux::utils::PaneProbe::Missing => true,
+                                    crate::tmux::utils::PaneProbe::Unknown => anyhow::bail!(
+                                        "tmux couldn't tell whether the kept pane is live"
+                                    ),
+                                },
+                                Err(_) => true,
+                            };
+                        let result = if ended {
+                            Ok(())
+                        } else {
+                            row.start_terminal_handoff_in(
+                                held.store(),
+                                key,
+                                &held.driver,
+                                allow_retry,
+                            )
+                        };
                         let attempt = HandoffKey {
                             id: key.id,
                             generation: row.lifecycle_generation,
@@ -1637,8 +1717,10 @@ fn drive_terminal_handoff(
                             .store()
                             .storage()
                             .acquire_instance_lifecycle_lock(&launch_id)?;
-                        held.store().adopt_runtime_fields(&row)?;
-                        held.store().refresh_pane_observations(&row)?;
+                        if !ended {
+                            held.store().adopt_runtime_fields(&row)?;
+                            held.store().refresh_pane_observations(&row)?;
+                        }
                         let identity = held.store().storage().bound_profile_identity()?;
                         let profile = held.store().storage().profile();
                         (held.store() as &dyn SessionStore).update(|rows, _| {
@@ -1656,8 +1738,13 @@ fn drive_terminal_handoff(
                                 crate::session::LifecycleReservationError::Superseded
                             );
                             intent.stage = HandoffStage::ProjectionCleanupOwed;
+                            if ended {
+                                intent.selector_ended = true;
+                                row.status = Status::Error;
+                            }
                             Ok(())
-                        })
+                        })?;
+                        Ok(())
                     })
                     .await??;
                 }
@@ -1666,7 +1753,7 @@ fn drive_terminal_handoff(
                     let cleanup_state = state.clone();
                     let cleanup_id = id.clone();
                     let cleanup_driver = driver.clone();
-                    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    let ended = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
                         let _driver = cleanup_driver;
                         let _title = crate::session::acquire_session_title_lock(&cleanup_id)?;
                         let _lifecycle = native
@@ -1688,6 +1775,9 @@ fn drive_terminal_handoff(
                             recorded.stage == HandoffStage::ProjectionCleanupOwed,
                             crate::session::LifecycleReservationError::Superseded
                         );
+                        // Read from disk, so a cleanup resumed after a failure or a restart still
+                        // reports the ending.
+                        let ended = recorded.selector_ended;
                         recorded.ensure_original_stopped(&cleanup_id)?;
                         let mut target = cleanup_state
                             .acp_supervisor
@@ -1701,10 +1791,36 @@ fn drive_terminal_handoff(
                             .acp_event_store
                             .delete_session_checked(&cleanup_id)?;
                         cleanup_state.acp_control_cache.forget(&cleanup_id);
-                        finish_handoff_in(&native, &cleanup_id, key)
+                        match finish_handoff_in(&native, &cleanup_id, key) {
+                            Ok(()) => {}
+                            // The removal is on disk; only canonical adoption failed, which
+                            // `update_owned` also counts as landed. A retry finds no handoff, so
+                            // this is the last chance to report the ending.
+                            Err(error)
+                                if ended && error.is::<crate::session::SessionCommitApplied>() =>
+                            {
+                                tracing::warn!(target: "acp.switch", session = %cleanup_id, %error, "ended handoff removed before canonical adoption failed");
+                            }
+                            Err(error) => return Err(error),
+                        }
+                        if ended {
+                            // Runtime only: kept on the published row, which the commit just
+                            // replaced, never on disk.
+                            current.terminal_handoff = None;
+                            current.status = Status::Error;
+                            current.last_error = Some(command_selector_ended(&cleanup_id));
+                            if let Err(error) = native.adopt_runtime_fields(&current) {
+                                tracing::warn!(target: "acp.switch", session = %cleanup_id, %error, "ended handoff's remedy not published");
+                            }
+                        }
+                        Ok(ended)
                     })
                     .await??;
-                    return Ok(());
+                    return if ended {
+                        Err(CommandSelectorEnded(id.clone()).into())
+                    } else {
+                        Ok(())
+                    };
                 }
             }
         }
@@ -1764,6 +1880,10 @@ pub(crate) async fn recover_pending_terminal_handoffs(
             .await;
         match result {
             Ok(Ok(())) => {}
+            Ok(Err(error)) if error.is::<CommandSelectorEnded>() => {
+                tracing::warn!(target: "acp.switch", session = %log_id, %error,
+                    "persisted terminal handoff ended without a launch")
+            }
             Ok(Err(error)) => tracing::warn!(target: "acp.switch", session = %log_id, %error,
                 "persisted terminal handoff remains pending"),
             Err(_) => break,
@@ -1957,14 +2077,28 @@ mod tests {
             state.has_acknowledged_agent_hooks = true
         })?;
         let project = tempfile::tempdir()?;
-        let mut row = Instance::new("switched agent", project.path().to_str().unwrap());
-        row.tool = "claude".into();
-        row.view = View::Structured;
-        row.source_profile = "default".into();
-        row.agent_name = Some("codex".into());
-        row.terminal_rebind_pending = true;
-        row.command = "claude --old".into();
-        row.extra_args = "--old-arg".into();
+        let switched = |title: &str, command: &str, sid: Option<&str>| {
+            let mut row = Instance::new(title, project.path().to_str().unwrap());
+            row.tool = "claude".into();
+            row.view = View::Structured;
+            row.source_profile = "default".into();
+            row.agent_name = Some("codex".into());
+            row.terminal_rebind_pending = true;
+            row.command = command.into();
+            row.extra_args = "--old-arg".into();
+            row.agent_session_id = sid.map(Into::into);
+            row
+        };
+        // The rebind replaces the old command and conversation, so the old selector beside
+        // AoE's old id never reaches the launch.
+        let rows = [
+            switched("switched agent", "claude --old", None),
+            switched(
+                "switched agent, old selector",
+                "claude --resume old-id",
+                Some("sid-old"),
+            ),
+        ];
         crate::session::config::update_config(|config| {
             config
                 .session
@@ -1975,29 +2109,45 @@ mod tests {
                 .agent_extra_args
                 .insert("codex".into(), "60".into());
         })?;
-        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(
-            crate::tmux::Session::generate_name(&row.id, &row.title),
-        );
-        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
-        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        let _panes: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                crate::tmux::test_helpers::TmuxTestSession::from_name(
+                    crate::tmux::Session::generate_name(&row.id, &row.title),
+                )
+            })
+            .collect();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", rows.to_vec());
+        let state = crate::server::test_support::build_test_app_state(rows.to_vec());
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
 
-        let response = acp_disable(
-            State(state.clone()),
-            Path(row.id.clone()),
-            Default::default(),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let stored = crate::session::Storage::open_unwatched("default")?.load()?;
-        let stored = stored.iter().find(|r| r.id == row.id).unwrap();
-        assert_eq!(stored.view, View::Terminal);
-        assert_eq!(stored.tool, "codex");
-        assert_eq!(stored.command, "sleep");
-        assert_eq!(stored.extra_args, "60");
-        assert!(!stored.terminal_rebind_pending);
+        for row in &rows {
+            let checked = acp_terminal_check(State(state.clone()), Path(row.id.clone())).await;
+            let checked = response_json(checked).await?.1;
+            assert_eq!(
+                checked["context"], "starts_fresh",
+                "{}: {checked}",
+                row.title
+            );
+            assert_eq!(checked["reason"], "agent_not_resumable", "{}", row.title);
+            let response = acp_disable(
+                State(state.clone()),
+                Path(row.id.clone()),
+                Default::default(),
+            )
+            .await
+            .into_response();
+            let (status, json) = response_json(response).await?;
+            assert_eq!(status, StatusCode::OK, "{}: {json}", row.title);
+            let stored = crate::session::Storage::open_unwatched("default")?.load()?;
+            let stored = stored.iter().find(|r| r.id == row.id).unwrap();
+            assert_eq!(stored.view, View::Terminal, "{}", row.title);
+            assert_eq!(stored.tool, "codex");
+            assert_eq!(stored.command, "sleep");
+            assert_eq!(stored.extra_args, "60");
+            assert_eq!(stored.agent_session_id, None, "{}", row.title);
+            assert!(!stored.terminal_rebind_pending);
+        }
         Ok(())
     }
 
@@ -3030,11 +3180,13 @@ mod tests {
         Ok(())
     }
 
+    /// Drives a no-choice `Discard` through retirement and commit, answering the stored outcome
+    /// as reserved and as retired.
     #[cfg(unix)]
     async fn retired_native_handoff_with_event_store(
         row: &Instance,
         event_store: Arc<crate::acp::event_store::EventStore>,
-    ) -> anyhow::Result<Arc<AppState>> {
+    ) -> anyhow::Result<(Arc<AppState>, [TerminalConversation; 2])> {
         use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
         use std::sync::atomic::Ordering;
         use std::time::Duration;
@@ -3097,6 +3249,7 @@ mod tests {
             .unwrap()
             .terminal_handoff
             .unwrap();
+        let reserved = handoff_outcome(&intent);
         let mut target = state.acp_supervisor.capture_retirement(&row.id)?;
         intent.ensure_retirement_target(&row.id, &mut target)?;
         let stop_state = state.clone();
@@ -3163,7 +3316,45 @@ mod tests {
             .capture_retirement(&row.id)?
             .lease
             .is_none());
-        Ok(state)
+        let retired = crate::session::Storage::open_unwatched(&row.source_profile)?
+            .load()?
+            .into_iter()
+            .find(|r| r.id == row.id)
+            .and_then(|r| r.terminal_handoff)
+            .expect("the committed handoff is still owed");
+        assert_eq!(retired.stage, HandoffStage::TerminalLaunchOwed);
+        Ok((state, [reserved, handoff_outcome(&retired)]))
+    }
+
+    /// A no-choice fresh switch reserves Fresh, so retirement deletes the ACP conversation; the
+    /// retired target is the row's own, which resumes its stored id, so the outcome then follows it.
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    async fn a_fresh_switch_over_a_stored_id_follows_the_retired_target() -> anyhow::Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir()?;
+        let events = Arc::new(crate::acp::event_store::EventStore::open(
+            &project.path().join("original-events.db"),
+            100,
+        )?);
+        let mut source = Instance::new("stored id", project.path().to_str().unwrap());
+        source.tool = "shell".into();
+        source.command = "sleep 60".into();
+        source.source_profile = "default".into();
+        source.view = View::Structured;
+        source.agent_session_id = Some("native-preserved".into());
+        let (_state, [reserved, retired]) =
+            retired_native_handoff_with_event_store(&source, events).await?;
+        assert_eq!(reserved, TerminalConversation::Fresh, "retirement deletes");
+        assert_eq!(retired, TerminalConversation::Continue);
+        let stored = crate::session::Storage::open_unwatched("default")?
+            .load()?
+            .into_iter()
+            .find(|r| r.id == source.id)
+            .unwrap();
+        assert_eq!(stored.agent_session_id.as_deref(), Some("native-preserved"));
+        Ok(())
     }
 
     #[tokio::test]
@@ -3235,7 +3426,8 @@ mod tests {
             );
             let pane_name = crate::tmux::Session::generate_name(&source.id, &source.title);
             let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&pane_name);
-            let state = retired_native_handoff_with_event_store(&source, events.clone()).await?;
+            let (state, _) =
+                retired_native_handoff_with_event_store(&source, events.clone()).await?;
             let storage = crate::session::Storage::open_unwatched("default")?;
             let mut stopped = Instance::new(
                 "deliberately stopped control",
@@ -4096,6 +4288,19 @@ mod tests {
         row
     }
 
+    /// The fake agent's argv record once it reads `expected`, or as it stands at the deadline: the
+    /// file exists before its line is written.
+    async fn argv_record(path: &std::path::Path, expected: &str) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let record = std::fs::read_to_string(path).unwrap_or_default();
+            if record == expected || std::time::Instant::now() >= deadline {
+                return record;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// A success body as JSON, or a refusal as `{error: <code header>, message: <text body>}`.
     /// Refusals must stay plain text: the current web client shows the body as it is.
     async fn response_json(response: Response) -> anyhow::Result<(StatusCode, serde_json::Value)> {
@@ -4317,6 +4522,64 @@ mod tests {
             handoff_context(decides(TerminalPlan::ResumesEarlier), None),
             Ok(HandoffContext::Discard)
         );
+        // Beside AoE's own conversation the launch refuses the selector. One rule decides both
+        // the pre-retirement block and an owed launch: a kept target always holds one.
+        let row = |command: &str, session_id: Option<&str>, intent: ResumeIntent| {
+            let mut row = Instance::new("conflict", "/tmp");
+            row.tool = "claude".into();
+            row.command = command.into();
+            row.agent_session_id = session_id.map(str::to_owned);
+            row.resume_intent = intent;
+            row
+        };
+        let selecting = "claude --resume old-id";
+        let fork = ResumeIntent::Fork { from: "sid".into() };
+        for (row, keeps_target, conflicts) in [
+            (row(selecting, None, ResumeIntent::Default), true, true),
+            (row(selecting, None, ResumeIntent::Default), false, false),
+            (
+                row(selecting, Some("sid"), ResumeIntent::Default),
+                false,
+                true,
+            ),
+            (
+                row(selecting, None, ResumeIntent::Use("sid".into())),
+                false,
+                true,
+            ),
+            (row(selecting, None, fork), false, true),
+            // A cleared id is no target, but a kept one still is.
+            (
+                row(selecting, Some("sid"), ResumeIntent::Cleared),
+                false,
+                false,
+            ),
+            (
+                row(selecting, Some("sid"), ResumeIntent::Cleared),
+                true,
+                true,
+            ),
+            (
+                row("claude", Some("sid"), ResumeIntent::Default),
+                true,
+                false,
+            ),
+        ] {
+            assert_eq!(
+                command_selector_conflicts(&row, keeps_target),
+                conflicts,
+                "{} {:?} {:?} {keeps_target}",
+                row.command,
+                row.agent_session_id,
+                row.resume_intent
+            );
+        }
+        for conversation in [None, Some(Continue), Some(Fresh)] {
+            assert_eq!(
+                handoff_context(TerminalPlan::Blocked(CommandSelectorConflict), conversation),
+                Err(CommandSelectorConflict)
+            );
+        }
         for (plan, conversation, expected) in [
             (TerminalPlan::ResumesEarlier, None, Some(Continue)),
             (decides(TerminalPlan::ResumesEarlier), None, Some(Continue)),
@@ -4566,7 +4829,8 @@ mod tests {
                 [true, false, true],
             ),
         ] {
-            let outcome = handoff_outcome(context, terminal);
+            let outcome: TerminalConversation =
+                crate::session::TerminalHandoffOutcome::of(context, terminal).into();
             for (conversation, honoured) in [None, Some(Continue), Some(Fresh)]
                 .into_iter()
                 .zip(honoured)
@@ -4597,6 +4861,7 @@ mod tests {
                 .execution
                 .expect("asserted binding has an execution"),
         };
+        kept.outcome = crate::session::TerminalHandoffOutcome::Continue;
         keeping.terminal_handoff = Some(Box::new(kept));
         let rows = vec![discarding, keeping];
         crate::server::test_support::seed_instances_on_disk_for_test("default", rows.clone());
@@ -4678,11 +4943,29 @@ mod tests {
         let mut held = selecting("own selector, AoE id", None);
         held.agent_session_id = Some("sid-held".into());
         let reserved = selecting("own selector, reserved", None);
+        let mut bound = selecting("own selector, bound", Some("sid-bound"));
+        bound.agent_session_id = Some("sid-bound".into());
+        bound.resume_intent = ResumeIntent::Use("sid-bound".into());
+        bound.resume_binding = Some(asserted_claude_binding("sid-bound", path));
+        let mut intended = selecting("own selector, intended target", None);
+        intended.resume_intent = ResumeIntent::Use("sid-intended".into());
+        // A cleared id is no conversation AoE holds, so the command decides.
+        let mut cleared = selecting("own selector, AoE id cleared", None);
+        cleared.agent_session_id = Some("sid-cleared".into());
+        cleared.resume_intent = ResumeIntent::Cleared;
+        // An archived row starts no pane, so its selector never reaches a launch.
+        let mut archived = selecting("own selector, archived", None);
+        archived.agent_session_id = Some("sid-archived".into());
+        archived.archived_at = Some(chrono::Utc::now());
         let rows = vec![
+            archived.clone(),
             unbound.clone(),
             unborn.clone(),
             held.clone(),
             reserved.clone(),
+            bound.clone(),
+            intended.clone(),
+            cleared.clone(),
         ];
         let _panes: Vec<_> = rows
             .iter()
@@ -4707,7 +4990,7 @@ mod tests {
             )
         };
 
-        for row in &rows[..3] {
+        for row in [&unbound, &unborn, &cleared] {
             let checked = acp_terminal_check(State(state.clone()), Path(row.id.clone())).await;
             let checked = response_json(checked).await?.1;
             assert_eq!(
@@ -4717,6 +5000,29 @@ mod tests {
             );
             assert_eq!(checked["reason"], "command_selects_conversation");
         }
+        // Beside AoE's own conversation the launch would refuse the selector: the check and
+        // the switch both refuse before retirement, so nothing is left owed.
+        let conflicting = [&held, &bound, &intended];
+        for row in conflicting {
+            let checked = acp_terminal_check(State(state.clone()), Path(row.id.clone())).await;
+            let checked = response_json(checked).await?.1;
+            assert_eq!(checked["context"], "blocked", "{}: {checked}", row.title);
+            assert_eq!(checked["reason"], "command_selector_conflict");
+        }
+        let checked = acp_terminal_check(State(state.clone()), Path(archived.id.clone())).await;
+        assert_eq!(
+            response_json(checked).await?.1["context"],
+            "command_decides"
+        );
+        let (status, json) = response_json(switch(&archived, b"").await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let switched = stored(&archived)?;
+        assert_eq!(switched.view, View::Terminal);
+        assert!(switched.terminal_handoff.is_none());
+        assert!(
+            !switched.tmux_session()?.exists_live(),
+            "an archived switch started a pane"
+        );
         // A choice is refused; without one the switch does what it did before.
         for (row, body, code) in [
             (
@@ -4738,6 +5044,11 @@ mod tests {
             (
                 &unborn,
                 br#"{"conversation":"continue"}"#,
+                "command_selects_conversation",
+            ),
+            (
+                &cleared,
+                br#"{"conversation":"fresh"}"#,
                 "command_selects_conversation",
             ),
         ] {
@@ -4844,21 +5155,546 @@ mod tests {
         assert_eq!(driven.view, View::Terminal);
         assert!(driven.terminal_handoff.is_none());
 
-        // As before, a launch refuses the command's selector next to AoE's own id and stays owed.
-        let (status, json) = response_json(switch(&held, b"").await.into_response()).await?;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
-        assert_eq!(json["error"], "handoff_pending");
-        let held = stored(&held)?;
-        assert_eq!(held.agent_session_id.as_deref(), Some("sid-held"));
-        let owed = held
-            .terminal_handoff
-            .as_ref()
-            .expect("the switch stays owed");
-        assert_eq!(
-            handoff_outcome(&owed.context, owed.terminal.as_ref()),
-            TerminalConversation::Continue
-        );
+        for row in conflicting {
+            for body in [
+                &b""[..],
+                br#"{"conversation":"fresh"}"#,
+                br#"{"conversation":"continue"}"#,
+            ] {
+                let (status, json) = response_json(switch(row, body).await.into_response()).await?;
+                assert_eq!(status, StatusCode::CONFLICT, "{}: {json}", row.title);
+                assert_eq!(json["error"], "command_selector_conflict", "{}", row.title);
+                let after = stored(row)?;
+                assert_eq!(after.view, View::Structured, "{}", row.title);
+                assert!(after.terminal_handoff.is_none(), "{}", row.title);
+                assert_eq!(after.acp_session_id, row.acp_session_id, "{}", row.title);
+                assert_eq!(
+                    after.agent_session_id, row.agent_session_id,
+                    "{}",
+                    row.title
+                );
+                assert_eq!(after.resume_intent, row.resume_intent, "{}", row.title);
+            }
+        }
         assert_eq!(std::fs::read_to_string(&argv)?, launched);
+        Ok(())
+    }
+
+    /// A switch whose Terminal pane is already live adopts it without a launch, so its cleanup
+    /// completes rather than reporting the command-selector ending.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_switch_that_adopts_a_live_pane_without_a_launch_completes() -> anyhow::Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let _store = crate::session::test_support::EnvGuard::set(&[(
+            "CLAUDE_CONFIG_DIR",
+            home.join(".claude"),
+        )]);
+        let argv = home.join("claude-argv");
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            &home,
+            "claude",
+            &format!(
+                "#!/bin/sh\necho \"$@\" >> {}\nexec sleep 60\n",
+                argv.display()
+            ),
+        );
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true
+        })?;
+        let project = tempfile::tempdir()?;
+        let mut row = structured_claude_row(
+            "live pane, no receipt",
+            project.path().to_str().unwrap(),
+            None,
+        );
+        row.command = "claude".into();
+        row.agent_session_id = Some("sid-held".into());
+        let name = crate::tmux::Session::generate_name(&row.id, &row.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name.clone());
+        let mut args: Vec<String> = ["new-session", "-d", "-s", &name, "sleep 600"]
+            .map(String::from)
+            .into();
+        crate::tmux::utils::append_pane_base_index_args(&mut args, &name);
+        assert!(crate::tmux::tmux_command().args(&args).status()?.success());
+        let live = crate::tmux::first_pane_id(&name);
+        assert!(live.is_some());
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let state = crate::server::test_support::build_test_app_state_impl_with_event_store(
+            vec![row.clone()],
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some(Arc::new(crate::acp::event_store::EventStore::open(
+                &project.path().join("events.db"),
+                100,
+            )?)),
+            |_| {},
+            |supervisor| supervisor,
+        );
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        let response = acp_disable(
+            State(state.clone()),
+            Path(row.id.clone()),
+            axum::body::Bytes::from_static(b""),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 8192).await?;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        let stored = crate::session::Storage::open_unwatched("default")?
+            .load()?
+            .into_iter()
+            .find(|r| r.id == row.id)
+            .unwrap();
+        assert!(stored.terminal_handoff.is_none());
+        assert_eq!(stored.view, View::Terminal);
+        assert_ne!(stored.status, Status::Error);
+        assert_eq!(
+            crate::tmux::first_pane_id(&name),
+            live,
+            "the live pane was kept"
+        );
+        let cached = find_instance(&state, &row.id).await.unwrap();
+        assert_ne!(cached.status, Status::Error);
+        assert!(cached.last_error.is_none());
+        assert!(!argv.exists(), "nothing was launched");
+        Ok(())
+    }
+
+    /// A switch owed with the command's own selector beside AoE's id ends, whether or not a launch
+    /// was already refused, and a restart without the selector launches. A pane an earlier attempt
+    /// kept is adopted instead.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_owed_switch_the_command_selector_refuses_ends_and_a_restart_launches(
+    ) -> anyhow::Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let _store = crate::session::test_support::EnvGuard::set(&[(
+            "CLAUDE_CONFIG_DIR",
+            home.join(".claude"),
+        )]);
+        let argv = home.join("claude-argv");
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            &home,
+            "claude",
+            &format!(
+                "#!/bin/sh\necho \"$@\" >> {}\nexec sleep 60\n",
+                argv.display()
+            ),
+        );
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true
+        })?;
+        let project = tempfile::tempdir()?;
+        let path = project.path().to_str().unwrap();
+        // Each way out the ended text names: remove the flag, or clear AoE's id.
+        let owed = |title: &str| {
+            let mut row = structured_claude_row(title, path, None);
+            row.command = "claude --resume old-id".into();
+            row.agent_session_id = Some("sid-held".into());
+            row
+        };
+        let flag_removed = owed("owed own selector, flag removed");
+        let id_cleared = owed("owed own selector, id cleared");
+        // An earlier attempt leaves `launch_started` set: refused before a pane, or with its pane
+        // kept when the daemon stopped before moving the stage on.
+        #[derive(PartialEq)]
+        enum Tried {
+            Never,
+            Refused,
+            KeptPane,
+        }
+        let attempted = |title: &str| {
+            let mut row = owed(title);
+            row.command = "claude".into();
+            row
+        };
+        #[derive(PartialEq)]
+        enum Resume {
+            Switch,
+            Recovery,
+            // A retried switch whose handoff removal commits but fails canonical adoption.
+            SwitchAdoptionFails,
+        }
+        // (row, earlier attempt, what resumes the cleanup)
+        let cases = [
+            (flag_removed.clone(), Tried::Never, Resume::Switch),
+            (id_cleared.clone(), Tried::Never, Resume::Recovery),
+            (
+                attempted("owed own selector, refused, by switch"),
+                Tried::Refused,
+                Resume::Switch,
+            ),
+            (
+                attempted("owed own selector, refused, by recovery"),
+                Tried::Refused,
+                Resume::Recovery,
+            ),
+            (
+                attempted("owed own selector, pane kept"),
+                Tried::KeptPane,
+                Resume::Switch,
+            ),
+            (
+                owed("owed own selector, adoption fails"),
+                Tried::Never,
+                Resume::SwitchAdoptionFails,
+            ),
+        ];
+        let rows: Vec<_> = cases.iter().map(|case| case.0.clone()).collect();
+        let _panes: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                crate::tmux::test_helpers::TmuxTestSession::from_name(
+                    crate::tmux::Session::generate_name(&row.id, &row.title),
+                )
+            })
+            .collect();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", rows.clone());
+        let db_path = project.path().join("events.db");
+        let state = crate::server::test_support::build_test_app_state_impl_with_event_store(
+            rows.clone(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some(Arc::new(crate::acp::event_store::EventStore::open(
+                &db_path, 100,
+            )?)),
+            |_| {},
+            |supervisor| supervisor,
+        );
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let db = rusqlite::Connection::open(&db_path)?;
+        let stored = |id: &str| -> anyhow::Result<Instance> {
+            let rows = crate::session::Storage::open_unwatched("default")?.load()?;
+            Ok(rows.into_iter().find(|r| r.id == id).unwrap())
+        };
+
+        let mut kept_pane = None;
+        for (held, tried, resume) in &cases {
+            // Reserve as a daemon without the refusal did; the switch then drives it.
+            {
+                let (native, durable) = load_handoff_row(&state, "default", &held.id).await?;
+                let cached = find_instance(&state, &held.id).await.unwrap();
+                let instance = adopt_persisted_structured_instance(cached, durable, "default");
+                let driver = Arc::new(
+                    crate::session::try_acquire_terminal_handoff_driver(&held.id)?.unwrap(),
+                );
+                let seq = state.acp_event_store.highest_seq_checked(&held.id)?;
+                let reserve_state = state.clone();
+                tokio::task::spawn_blocking(move || {
+                    reserve_handoff_in(
+                        native,
+                        &instance,
+                        HandoffContext::Discard,
+                        None,
+                        seq,
+                        reserve_state,
+                        driver,
+                    )
+                    .map(|_| ())
+                })
+                .await??;
+            }
+            assert!(stored(&held.id)?.terminal_handoff.is_some());
+            let switch = || {
+                acp_disable(
+                    State(state.clone()),
+                    Path(held.id.clone()),
+                    axum::body::Bytes::from_static(b""),
+                )
+            };
+            if *tried != Tried::Never {
+                let set_command = |command: &'static str| -> anyhow::Result<()> {
+                    crate::session::Storage::open_unwatched("default")?.update(|rows, _| {
+                        rows.iter_mut().find(|r| r.id == held.id).unwrap().command = command.into();
+                        Ok(())
+                    })
+                };
+                // The launch rereads its row after the hooks, so a selector added while they run
+                // reaches preflight past the switch's own check: refused after the reservation
+                // set `launch_started`, before any receipt or pane.
+                let entered = project.path().join("hook-entered");
+                let release = project.path().join("hook-release");
+                crate::session::config::update_config(|config| {
+                    config.hooks.on_launch = vec![format!(
+                        ": > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done",
+                        entered.display(),
+                        release.display()
+                    )]
+                })?;
+                let launching = tokio::spawn(acp_disable(
+                    State(state.clone()),
+                    Path(held.id.clone()),
+                    axum::body::Bytes::from_static(b""),
+                ));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !entered.exists() {
+                    assert!(std::time::Instant::now() < deadline, "the launch hook ran");
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                set_command("claude --resume old-id")?;
+                std::fs::write(&release, "")?;
+                let refused = launching.await?.into_response();
+                assert!(!refused.status().is_success(), "the launch refused it");
+                crate::session::config::update_config(|config| config.hooks.on_launch.clear())?;
+                std::fs::remove_file(&entered)?;
+                std::fs::remove_file(&release)?;
+                let tried_row = stored(&held.id)?;
+                let intent = tried_row
+                    .terminal_handoff
+                    .as_ref()
+                    .expect("launch still owed");
+                assert_eq!(intent.stage, HandoffStage::TerminalLaunchOwed);
+                assert!(intent.launch_started, "{}", held.title);
+                assert!(intent.launch.is_none(), "refused before the receipt");
+                if *tried == Tried::KeptPane {
+                    // A retry without the selector launches its pane, and the daemon stops before
+                    // the switch moves the stage on; the selector then comes back.
+                    set_command("claude")?;
+                    crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+                    let (native, mut launch) =
+                        load_handoff_row(&state, "default", &held.id).await?;
+                    let key = handoff_key(&launch)?;
+                    let driver = Arc::new(
+                        crate::session::try_acquire_terminal_handoff_driver(&held.id)?.unwrap(),
+                    );
+                    tokio::task::spawn_blocking(move || {
+                        launch.start_terminal_handoff_in(&native, key, &driver, true)
+                    })
+                    .await??;
+                    set_command("claude --resume old-id")?;
+                    assert_eq!(
+                        argv_record(&argv, "--session-id sid-held\n").await,
+                        "--session-id sid-held\n",
+                        "the kept pane ran"
+                    );
+                    // Pane ids are never reused within a tmux server; the PID lookup is not
+                    // available in every environment.
+                    kept_pane =
+                        crate::tmux::first_pane_id(stored(&held.id)?.tmux_session()?.name());
+                    assert!(kept_pane.is_some());
+                    std::fs::remove_file(&argv)?;
+                }
+                crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+            }
+            // The first cleanup fails after the skipped launch is saved, so the outcome must
+            // survive into a resumed cleanup.
+            db.execute(
+                "INSERT OR REPLACE INTO acp_rate_limit_budgets (session_id, spent, armed) VALUES (?1,2,1)",
+                [&held.id],
+            )?;
+            db.execute_batch(&format!("CREATE TRIGGER refuse_handoff_delete BEFORE DELETE ON acp_rate_limit_budgets WHEN OLD.session_id = '{}' BEGIN SELECT RAISE(ABORT, 'durable handoff cleanup blocked'); END;", held.id))?;
+            // Each fixture has the shape its row claims right before the switch under test.
+            let before = stored(&held.id)?;
+            let intent = before.terminal_handoff.as_ref().unwrap();
+            let shape = (intent.stage, intent.launch_started, intent.launch.is_some());
+            match tried {
+                Tried::Never => assert_eq!(
+                    shape,
+                    (HandoffStage::RetirementPending, false, false),
+                    "{}",
+                    held.title
+                ),
+                Tried::Refused => assert_eq!(
+                    shape,
+                    (HandoffStage::TerminalLaunchOwed, true, false),
+                    "{}",
+                    held.title
+                ),
+                Tried::KeptPane => {
+                    assert_eq!(shape, (HandoffStage::TerminalLaunchOwed, true, true));
+                    let pane = before.tmux_session()?;
+                    assert!(pane.exists_live() && !pane.is_pane_dead());
+                    assert_eq!(crate::tmux::first_pane_id(pane.name()), kept_pane);
+                }
+            }
+            assert_eq!(before.command, "claude --resume old-id", "{}", held.title);
+            if *tried == Tried::KeptPane {
+                // A tmux too slow to answer can't say whether the kept pane lives: the switch
+                // stays owed rather than ending on the selector.
+                let timeout = crate::tmux::TmuxTimeoutGuard::arm(before.tmux_session()?.name());
+                let unknown = switch().await.into_response();
+                drop(timeout);
+                assert_eq!(unknown.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(
+                    unknown
+                        .headers()
+                        .get(crate::daemon::ERROR_CODE_HEADER)
+                        .and_then(|v| v.to_str().ok()),
+                    Some("handoff_pending")
+                );
+                let still = stored(&held.id)?;
+                let intent = still.terminal_handoff.as_ref().expect("the switch is owed");
+                assert_eq!(
+                    (intent.stage, intent.launch_started, intent.launch.is_some()),
+                    (HandoffStage::TerminalLaunchOwed, true, true)
+                );
+                assert_eq!(
+                    crate::tmux::first_pane_id(still.tmux_session()?.name()),
+                    kept_pane
+                );
+            }
+            let interrupted = switch().await.into_response();
+            assert_eq!(interrupted.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let pending = stored(&held.id)?;
+            let intent = pending
+                .terminal_handoff
+                .as_ref()
+                .expect("cleanup still owed");
+            assert_eq!(intent.stage, HandoffStage::ProjectionCleanupOwed);
+            assert_eq!(
+                intent.selector_ended,
+                *tried != Tried::KeptPane,
+                "{}",
+                held.title
+            );
+            assert_eq!(pending.view, View::Terminal);
+            db.execute_batch("DROP TRIGGER refuse_handoff_delete")?;
+            if *resume == Resume::SwitchAdoptionFails {
+                let failing = state.clone();
+                *BEFORE_FINISH_ADOPTION.lock().unwrap() = Some((
+                    held.id.clone(),
+                    Box::new(move || {
+                        failing
+                            .canonical_metadata
+                            .blocking_write()
+                            .profiles
+                            .retain(|profile| profile.name != "default");
+                    }),
+                ));
+            }
+            if *tried == Tried::KeptPane {
+                // The kept pane was adopted, so the retried cleanup completes the switch.
+                assert_eq!(switch().await.into_response().status(), StatusCode::OK);
+                let adopted = stored(&held.id)?;
+                assert!(adopted.terminal_handoff.is_none());
+                assert_eq!(adopted.view, View::Terminal);
+                let pane = adopted.tmux_session()?;
+                assert!(pane.exists_live() && !pane.is_pane_dead());
+                assert_eq!(crate::tmux::first_pane_id(pane.name()), kept_pane);
+                let cached = find_instance(&state, &held.id).await.unwrap();
+                assert_ne!(cached.status, Status::Error);
+                assert!(cached.last_error.is_none());
+                assert!(!argv.exists(), "the adopted pane was not replaced");
+                continue;
+            }
+            if *resume != Resume::Recovery {
+                // A retried switch drives the cleanup and still answers with the coded refusal.
+                let response = switch().await.into_response();
+                let status = response.status();
+                let code = response
+                    .headers()
+                    .get(crate::daemon::ERROR_CODE_HEADER)
+                    .cloned();
+                let body = axum::body::to_bytes(response.into_body(), 8192).await?;
+                assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+                assert_eq!(
+                    code.as_ref().and_then(|v| v.to_str().ok()),
+                    Some("command_selector_conflict")
+                );
+                assert_eq!(
+                    std::str::from_utf8(&body)?,
+                    command_selector_ended(&held.id)
+                );
+            } else {
+                // So does the daemon's own recovery, which has no request to answer.
+                recover_pending_terminal_handoffs(&state, HandoffRecovery::Maintenance).await;
+            }
+            let ended = stored(&held.id)?;
+            assert!(ended.terminal_handoff.is_none(), "the handoff ended");
+            assert!(ended.lifecycle_reservation.is_none());
+            assert_eq!(ended.view, View::Terminal);
+            let cached = find_instance(&state, &held.id).await.unwrap();
+            assert_eq!(cached.status, Status::Error);
+            if *resume == Resume::SwitchAdoptionFails {
+                // The 409 above is the only place the remedy reaches: the degraded store keeps
+                // the stale published row, and `last_error` is runtime only, so reconciliation
+                // rebuilds the row from disk without it, as after a daemon restart.
+                assert!(cached.last_error.is_none());
+                assert_ne!(
+                    *state.canonical_health.read().await,
+                    crate::daemon::RuntimeHealth::Healthy
+                );
+                crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+                crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+                assert_eq!(
+                    *state.canonical_health.read().await,
+                    crate::daemon::RuntimeHealth::Healthy
+                );
+                let reconciled = find_instance(&state, &held.id).await.unwrap();
+                assert!(reconciled.terminal_handoff.is_none());
+                assert_eq!(reconciled.view, View::Terminal);
+                assert_eq!(reconciled.status, Status::Error);
+                assert!(reconciled.last_error.is_none());
+                // The ended switch is in Terminal view, so a retry just reports that.
+                assert_eq!(switch().await.into_response().status(), StatusCode::OK);
+            } else {
+                assert_eq!(
+                    cached.last_error.as_deref(),
+                    Some(command_selector_ended(&held.id).as_str())
+                );
+            }
+            assert!(!argv.exists(), "the refused launch ran nothing");
+        }
+
+        // Restart with the session flag removed (AoE's own id, which has no transcript here yet,
+        // replaces it), or clear AoE's id with the CLI the text names and the command runs as
+        // written.
+        use clap::Parser;
+        #[derive(Parser)]
+        struct SessionCli {
+            #[command(subcommand)]
+            command: crate::cli::session::SessionCommands,
+        }
+        let parsed =
+            SessionCli::try_parse_from(["aoe-session", "set-session-id", &id_cleared.id, ""])?;
+        crate::cli::session::run("default", parsed.command).await?;
+        crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+        for (row, command_override, command, launched) in [
+            (
+                &flag_removed,
+                Some("claude".to_string()),
+                "claude",
+                "--session-id sid-held\n",
+            ),
+            (
+                &id_cleared,
+                None,
+                "claude --resume old-id",
+                "--resume old-id\n",
+            ),
+        ] {
+            let _ = std::fs::remove_file(&argv);
+            let response = crate::server::api::restart_session(
+                State(state.clone()),
+                Path(row.id.clone()),
+                Ok(Some(axum::Json(crate::daemon::RestartSessionBody {
+                    command_override,
+                    ..Default::default()
+                }))),
+            )
+            .await;
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 8192).await?;
+            assert!(status.is_success(), "{}: {status}: {body:?}", row.title);
+            assert_eq!(
+                argv_record(&argv, launched).await,
+                launched,
+                "{}",
+                row.title
+            );
+            let restarted = stored(&row.id)?;
+            assert_eq!(restarted.command, command, "{}", row.title);
+            assert!(restarted.terminal_handoff.is_none());
+        }
+        let cleared = stored(&id_cleared.id)?;
+        assert_eq!(cleared.agent_session_id, None, "the clear dropped AoE's id");
         Ok(())
     }
 

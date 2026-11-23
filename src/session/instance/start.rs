@@ -453,7 +453,7 @@ impl Instance {
             row.terminal_handoff
                 .as_mut()
                 .expect("validated handoff")
-                .terminal = Some(target.clone());
+                .set_terminal(Some(target.clone()));
             Ok(())
         })?;
         self.adopt_conversation_state(target);

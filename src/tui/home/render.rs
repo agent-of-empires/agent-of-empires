@@ -696,12 +696,17 @@ pub(crate) fn compute_row_tag(
     }
 }
 
+/// A single-repo branch tag that only repeats the session title is dropped.
 fn branch_row_tag(inst: &crate::session::Instance) -> Option<RowTag> {
     if let Some(ws) = &inst.workspace_info {
+        if ws.repos.len() <= 1 && ws.branch == inst.title {
+            return None;
+        }
         workspace_branch_row_tag(&ws.branch, ws.repos.len())
     } else {
         inst.worktree_info
             .as_ref()
+            .filter(|w| w.branch != inst.title)
             .and_then(|w| plain_branch_row_tag(&w.branch))
     }
 }
@@ -1218,8 +1223,8 @@ impl HomeView {
         // `one_pane` already gives the narrow screen to a single pane, so a collapsed
         // sidebar there would only shrink it to a three-column strip plus preview.
         let narrow_layout = self.narrow_layout;
-        let single_pane_narrow = available_width < responsive::STACKED_BREAKPOINT
-            && matches!(narrow_layout, NarrowLayout::OnePane);
+        let narrow = responsive::is_narrow(available_width, self.narrow_breakpoint);
+        let single_pane_narrow = narrow && matches!(narrow_layout, NarrowLayout::OnePane);
         // A collapsed strip leaves enough preview space even on narrow terminals.
         if self.sidebar_collapsed && !single_pane_narrow {
             self.divider_col = None;
@@ -1235,7 +1240,7 @@ impl HomeView {
             let strip_col = self.diagnostics_dock(frame, strip_area, theme);
             self.render_collapsed_strip(frame, strip_col, theme);
             self.render_preview(frame, preview_area, theme);
-        } else if available_width < responsive::STACKED_BREAKPOINT {
+        } else if narrow {
             self.divider_col = None;
             match responsive::narrow_arrangement(
                 narrow_layout,
@@ -3272,7 +3277,7 @@ impl HomeView {
             );
             return;
         }
-        let compact = area.width < responsive::STACKED_BREAKPOINT;
+        let compact = responsive::is_narrow(area.width, self.narrow_breakpoint);
         let (border_color, title_color) = match self.view_mode {
             ViewMode::Structured => (theme.border, theme.title),
             ViewMode::Terminal | ViewMode::Tool(_) => {
@@ -5696,6 +5701,24 @@ mod tests {
             rendered_width(&rendered),
             BRANCH_TAG_WIDTH + 2,
             "a wide branch name must cap at the tag contract, got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn branch_row_tag_is_dropped_when_it_repeats_the_title() {
+        let mut inst = crate::session::Instance::new("feat/x", "/tmp/a");
+        inst.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "feat/x".into(),
+            main_repo_path: "/tmp".into(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        assert!(branch_row_tag(&inst).is_none());
+        inst.title = "Teutons".into();
+        assert_eq!(
+            branch_row_tag(&inst).map(|tag| tag.content),
+            Some("x".into())
         );
     }
 

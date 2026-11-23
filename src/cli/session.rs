@@ -1434,7 +1434,7 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         let tmux_session = crate::tmux::Session::new(&session_id, &title)?;
         tmux_session.wait_until_ready(
             std::time::Duration::from_secs(5),
-            crate::agents::ready_marker(&tool),
+            crate::agents::ready_markers(&tool),
         );
 
         match send_restart_wake(&working, &tmux_session, &wake_msg) {
@@ -2799,7 +2799,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                 pending.context = context;
                 pending.source_conversation = target.clone();
                 pending.source_acp_session_id = source_acp_session_id;
-                pending.terminal = Some(target);
+                pending.set_terminal(Some(target));
                 pending.launch_started = false;
                 // Retain the original checkpoint solely as the owned dead-pane receipt.
             }

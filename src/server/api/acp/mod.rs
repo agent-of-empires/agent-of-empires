@@ -84,6 +84,7 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> Response {
         SupervisorError::Superseded(_) => (StatusCode::CONFLICT, err.to_string()),
         SupervisorError::CapacityFull { .. }
         | SupervisorError::TeardownPending(_)
+        | SupervisorError::PurgeInProgress(_)
         | SupervisorError::EventStoreUnavailable(_)
         | SupervisorError::NativeStoreUnavailable => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string())
@@ -620,7 +621,12 @@ mod tests {
                     vec![inst.clone()],
                 );
             }
-            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            // A real switch launch dials the host's `codex-acp`, if any, for up to 10s.
+            let (launcher, _) = crate::server::test_support::counting_failing_launcher();
+            let state = crate::server::test_support::build_test_app_state_with_launcher(
+                vec![inst],
+                launcher,
+            );
             crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
 
             let delivering = state.session_service.prompt_submission(&id).await;

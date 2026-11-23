@@ -61,7 +61,7 @@ impl SettingsCategory {
             Self::StatusHooks => "Status Hooks",
             Self::Hooks => "Lifecycle Hooks",
             Self::Web => "Web",
-            Self::Acp => "Acp",
+            Self::Acp => "ACP",
             Self::Diff => "Diff",
             Self::Logging => "Logging",
             Self::Plugins => "Plugins",

@@ -461,20 +461,6 @@ impl Instance {
             .map(|(container, _)| container)
     }
 
-    pub(crate) fn ensure_container_in(
-        &mut self,
-        store: &dyn SessionStore,
-        launch_generation: Option<u64>,
-    ) -> Result<containers::DockerContainer> {
-        self.ensure_container_with_hook_in(
-            store,
-            &tokio_util::sync::CancellationToken::new(),
-            launch_generation,
-            Self::mint_before_start_env,
-        )
-        .map(|(container, _)| container)
-    }
-
     pub(crate) fn ensure_container_with_hook_in(
         &mut self,
         store: &dyn SessionStore,
@@ -2295,7 +2281,13 @@ mod tests {
             Ok(())
         })?;
         let error = stale
-            .run_pre_launch_hooks(true, &store, None, Some(generation))
+            .run_pre_launch_hooks(
+                true,
+                &store,
+                None,
+                Some(generation),
+                &tokio_util::sync::CancellationToken::new(),
+            )
             .unwrap_err();
         assert!(
             error.is::<LifecycleReservationError>(),

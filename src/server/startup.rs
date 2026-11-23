@@ -597,6 +597,7 @@ pub(crate) async fn start_server(
         token_lifetime,
         token_grace,
     ));
+    super::token::register_daemon_tokens(Arc::clone(&token_manager));
     let config = crate::session::config::profile_config::resolve_config_or_warn(profile);
     // Feed the unread-feature gate from this daemon's resolved config.
     crate::session::set_unread_enabled(config.session.unread_indicator);
@@ -975,7 +976,7 @@ pub(crate) async fn start_server(
                     );
                 } else {
                     println!(
-                        "Open the localhost URL in a browser. Other devices get 426 until you front aoe with HTTPS, or pass --dangerously-allow-plaintext-remote."
+                        "Open the localhost URL in a browser. Other devices are refused until you front aoe with HTTPS, or pass --dangerously-allow-plaintext-remote."
                     );
                 }
             }

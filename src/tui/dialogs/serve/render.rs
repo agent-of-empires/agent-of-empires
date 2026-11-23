@@ -9,7 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use super::{
     funnel_reset_applies, Flash, LinkChange, Logins, PendingConfirm, RestartEffect, ServeMode,
-    ServeMouse, ServeView, ServeViewState, TransportStatus, TunnelTransport, FLASH_TTL,
+    ServeMouse, ServeView, ServeViewState, TransportStatus, TunnelTransport, Unasked, FLASH_TTL,
 };
 use crate::tui::components::hint_buttons::scan_spaced_hints;
 use crate::tui::components::hover::paint_hover_bg;
@@ -121,7 +121,7 @@ pub(super) fn render(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Th
                 &mut mouse,
                 message,
                 view.control_error.as_deref(),
-                &error_recovery_keys(*mode, *transport),
+                &error_keys(*mode, *transport, view.funnel_reset_armed.is_some()),
             ),
         }
     }
@@ -279,7 +279,7 @@ fn render_mode_picker(
                 "Token + passphrase (2FA).",
                 "Pick transport on next screen.",
             ],
-            "  (brew install tailscale or cloudflared)",
+            "  (needs tailscale/cloudflared)",
         ),
     ];
     for (card_area, title, mode, available, headline, body_lines, unavailable_note) in cards {
@@ -398,7 +398,7 @@ fn render_confirm(
                 "URL rotates each restart",
                 "Not PWA-friendly",
             ],
-            "Not installed (brew install cloudflared)",
+            "Not installed (needs cloudflared)",
         ),
     ];
     for (card_area, title, transport, status, body_lines, not_installed) in cards {
@@ -565,6 +565,23 @@ fn render_qr(_url: &str) -> String {
     String::new()
 }
 
+const HANDOFF_INSTALL: &str = "Scan with your phone's camera, or open the link on any phone or computer. For notifications, install it (iPhone: Share › Add to Home Screen; Android and desktop: the browser's Install app), open it, sign in with the passphrase, and turn them on.";
+const HANDOFF_QUICK_TUNNEL: &str = "Scan with your phone's camera, or open the link on any phone or computer. The address changes on restart, so an installed app stops working; use Tailscale Funnel for that.";
+
+/// The line above the QR code. Tunnel only, because install and push need HTTPS. The host
+/// rather than the transport spots a quick tunnel, since a reattached Daemon has no transport.
+fn handoff_line(mode: ServeMode, url: &str, scannable: bool) -> Option<&'static str> {
+    if mode != ServeMode::Tunnel || !scannable || !cfg!(feature = "web") {
+        return None;
+    }
+    let quick = super::link_host(url).is_some_and(|host| host.ends_with(".trycloudflare.com"));
+    Some(if quick {
+        HANDOFF_QUICK_TUNNEL
+    } else {
+        HANDOFF_INSTALL
+    })
+}
+
 fn render_active(
     view: &ServeView,
     frame: &mut Frame,
@@ -592,7 +609,7 @@ fn render_active(
             mouse,
             "Daemon started but no URL available yet.",
             None,
-            &[],
+            &error_keys(ServeMode::Local, None, false),
         );
         return;
     };
@@ -749,7 +766,30 @@ fn render_active(
         rows.push((1, labeled("Passphrase: ", value, style), copy));
     }
 
-    let total: u16 = rows.iter().map(|(h, _, _)| h).sum();
+    let mut total: u16 = rows.iter().map(|(h, _, _)| h).sum();
+    // Drawn only when it fits, so a short terminal drops it before the QR code.
+    if let Some(text) = handoff_line(*mode, url, notice.is_none()) {
+        let line = Line::from(text);
+        let height = crate::tui::components::text::wrapped_line_count(
+            &line,
+            content.width.saturating_sub(2),
+        ) as u16
+            + 1;
+        if total + height <= content.height {
+            total += height;
+            rows.insert(
+                0,
+                (
+                    height,
+                    Paragraph::new(line)
+                        .style(dimmed)
+                        .wrap(Wrap { trim: true })
+                        .alignment(Alignment::Center),
+                    None,
+                ),
+            );
+        }
+    }
     let top_pad = Constraint::Length(content.height.saturating_sub(total) / 2);
     let constraints = std::iter::once(top_pad)
         .chain(rows.iter().map(|(h, _, _)| Constraint::Length(*h)))
@@ -775,8 +815,12 @@ fn render_active(
         .border_style(Style::default().fg(theme.border));
     let footer_inner = footer_block.inner(footer);
     frame.render_widget(footer_block, footer);
-    let footer_text = match view.pending_confirm.map(|(action, _)| action) {
-        Some(action) => {
+    let asking = view
+        .pending_confirm
+        .map(|(action, _)| (action, None))
+        .or(view.unasked.map(|(action, why)| (action, Some(why))));
+    let footer_text = match asking {
+        Some((action, unasked)) => {
             let effect = RestartEffect::of(
                 *mode,
                 urls,
@@ -786,14 +830,14 @@ fn render_active(
             );
             let (first, effect_text) = match action {
                 PendingConfirm::NewPassphrase => (
-                    "Press G again for a new passphrase.",
+                    "Press Enter for a new passphrase.",
                     "Every Device signs out.",
                 ),
                 PendingConfirm::Restart if effect.link == LinkChange::Replaced => {
-                    ("Press R again to restart.", "Agents keep running.")
+                    ("Press Enter to restart.", "Agents keep running.")
                 }
                 PendingConfirm::Restart => (
-                    "Press R again to restart.",
+                    "Press Enter to restart.",
                     match effect.logins {
                         Logins::Kept => "Devices stay signed in; agents keep running.",
                         Logins::Lost => "Every Device signs out; agents keep running.",
@@ -813,15 +857,35 @@ fn render_active(
             let funnel_back = (action == PendingConfirm::Restart && effect.retakes_funnel).then_some(
                 "The Funnel link comes back only if no other server holds it; otherwise the Daemon stops and says why.",
             );
+            let again = match action {
+                PendingConfirm::NewPassphrase => "Press G to check again.",
+                PendingConfirm::Restart => "Press R to check again.",
+            };
+            let (lead, first, cancels) = match unasked {
+                None => (None, first, Some("Any other key cancels.")),
+                Some(Unasked::EarlyEnter) => {
+                    (Some("Enter was pressed before this asked. "), again, None)
+                }
+                // Only a restart re-checks its effects; a new passphrase always signs everyone out.
+                Some(Unasked::Changed) => (
+                    Some("What a restart would change is different now. "),
+                    again,
+                    None,
+                ),
+            };
             let rest = [effect_text]
                 .into_iter()
                 .chain(link)
                 .chain(funnel_back)
-                .chain(["Any other key cancels."]);
-            let mut spans = vec![Span::styled(
+                .chain(cancels);
+            let mut spans: Vec<_> = lead
+                .map(|lead| Span::styled(lead, dimmed))
+                .into_iter()
+                .collect();
+            spans.push(Span::styled(
                 first,
                 Style::default().fg(theme.waiting).bold(),
-            )];
+            ));
             spans.extend(rest.map(|s| Span::styled(format!(" {s}"), dimmed)));
             Text::from(Line::from(spans))
         }
@@ -975,15 +1039,30 @@ fn split_url_and_token(url: &str) -> (String, Option<&str>) {
 }
 
 /// The keys `error_key` handles for this failure, shown before the way out.
-fn error_recovery_keys(mode: ServeMode, transport: Option<TunnelTransport>) -> Vec<&'static str> {
-    let mut keys = Vec::new();
+struct ErrorKeys {
+    recovery: Vec<&'static str>,
+    rest: &'static [&'static str],
+}
+
+fn error_keys(mode: ServeMode, transport: Option<TunnelTransport>, reset_armed: bool) -> ErrorKeys {
+    // Armed, Enter resets, so no hint offers it as the way out, nor as a click target.
+    if reset_armed {
+        return ErrorKeys {
+            recovery: Vec::new(),
+            rest: &["Press Enter to turn off Funnel on its port. Any other key cancels."],
+        };
+    }
+    let mut recovery = Vec::new();
     if mode == ServeMode::Tunnel {
-        keys.push("[P] Pick provider");
+        recovery.push("[P] Pick provider");
     }
     if funnel_reset_applies(mode, transport) {
-        keys.push("[R] Turn off Funnel on its port");
+        recovery.push("[R] Turn off Funnel on its port");
     }
-    keys
+    ErrorKeys {
+        recovery,
+        rest: &["[S] Force stop", "[Enter] Back to sessions"],
+    }
 }
 
 fn render_error(
@@ -993,14 +1072,14 @@ fn render_error(
     mouse: &mut ServeMouse,
     message: &str,
     control_error: Option<&str>,
-    recovery: &[&str],
+    keys: &ErrorKeys,
 ) {
     let inner = render_page(frame, area, " Serve failed ", theme.error, theme.error);
-    let rest = ["[S] Force stop", "[Enter] Back to sessions"];
+    let (recovery, rest) = (keys.recovery.as_slice(), keys.rest);
     const GAP: &str = "    ";
     let one_line = recovery
         .iter()
-        .chain(&rest)
+        .chain(rest)
         .copied()
         .collect::<Vec<_>>()
         .join(GAP);
@@ -1733,8 +1812,8 @@ mod tests {
             view.running_persists = running;
             view.pending_confirm = Some((key, Instant::now()));
             let first = match key {
-                G => "Press G again for a new passphrase.",
-                R => "Press R again to restart.",
+                G => "Press Enter for a new passphrase.",
+                R => "Press Enter to restart.",
             };
             // 60 columns wraps the longest confirm onto a third footer row.
             for width in [60, 80, 120] {
@@ -1752,6 +1831,29 @@ mod tests {
                 let (x, y) = crate::tui::dialogs::test_render::find(&buf, "cancels.");
                 assert_eq!(buf[(x, y)].fg, theme.dimmed, "{case}");
             }
+
+            // A check that shows its effects without asking names the key that asks again.
+            let again = match key {
+                G => "Press G to check again.",
+                R => "Press R to check again.",
+            };
+            view.pending_confirm = None;
+            let changed = (key == R).then_some((
+                Unasked::Changed,
+                "What a restart would change is different now. ",
+            ));
+            for (why, lead) in [(Unasked::EarlyEnter, "Enter was pressed before this asked. ")]
+                .into_iter()
+                .chain(changed)
+            {
+                view.unasked = Some((key, why));
+                let buf = crate::tui::dialogs::test_render::draw(120, 24, |f, theme| {
+                    render(&view, f, f.area(), theme)
+                });
+                let footer = text_in(&buf, Rect::new(0, 21, 120, 3));
+                assert_eq!(footer, format!("{lead}{again} {effects}"), "{case} {why:?}");
+            }
+            view.unasked = None;
 
             if help_restart.is_empty() {
                 continue;
@@ -1852,6 +1954,107 @@ mod tests {
                 view.handle_click(x, y).map(|k| k.code),
                 Some(KeyCode::Enter),
                 "{card}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_handoff_line_follows_the_mode_and_host() {
+        let funnel = "https://host.tailnet.ts.net/?token=t";
+        let named = "https://aoe.example.com/?token=t";
+        let quick = "https://a-b-c.trycloudflare.com/?token=t";
+        let lan = "http://192.168.1.42:8080/?token=t";
+        // (mode, URL, scannable, line)
+        for (mode, url, scannable, want) in [
+            (ServeMode::Tunnel, funnel, true, Some(HANDOFF_INSTALL)),
+            (ServeMode::Tunnel, named, true, Some(HANDOFF_INSTALL)),
+            (ServeMode::Tunnel, quick, true, Some(HANDOFF_QUICK_TUNNEL)),
+            // A withdrawn Funnel shows why in place of the QR code.
+            (ServeMode::Tunnel, funnel, false, None),
+            (ServeMode::Local, lan, true, None),
+        ] {
+            assert_eq!(
+                handoff_line(mode, url, scannable),
+                want.filter(|_| cfg!(feature = "web")),
+                "{mode:?} {url} scannable={scannable}"
+            );
+        }
+    }
+
+    /// Each non-blank QR row drawn whole, in order.
+    #[cfg(feature = "web")]
+    fn qr_drawn_whole(buf: &ratatui::buffer::Buffer, url: &str) -> bool {
+        let rows: Vec<String> = crate::tui::dialogs::test_render::text(buf)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let qr = render_qr(url);
+        let mut from = 0;
+        qr.lines().filter(|l| !l.trim().is_empty()).all(|line| {
+            match rows[from..].iter().position(|row| row.contains(line)) {
+                Some(i) => {
+                    from += i + 1;
+                    true
+                }
+                None => false,
+            }
+        })
+    }
+
+    /// The line is drawn when it fits and dropped before the QR code is cut, for a Daemon
+    /// this TUI started and for a reattached one, whose transport is unknown.
+    #[cfg(feature = "web")]
+    #[test]
+    fn the_handoff_line_never_costs_the_qr_code() {
+        use crate::server::tunnel::FunnelReach;
+        use crate::tui::dialogs::test_render::draw;
+        let funnel = "https://host.tailnet.ts.net/?token=t";
+        let quick = "https://a-b-c.trycloudflare.com/?token=t";
+        // (transport, URL, line)
+        for (transport, url, line) in [
+            (Some(TunnelTransport::Tailscale), funnel, HANDOFF_INSTALL),
+            (None, funnel, HANDOFF_INSTALL),
+            (
+                Some(TunnelTransport::Cloudflare),
+                quick,
+                HANDOFF_QUICK_TUNNEL,
+            ),
+            (None, quick, HANDOFF_QUICK_TUNNEL),
+        ] {
+            let view = view(ServeViewState::Active {
+                mode: ServeMode::Tunnel,
+                transport,
+                urls: vec![ServeUrl {
+                    label: None,
+                    url: url.to_string(),
+                }],
+                url_index: 0,
+                passphrase: Some("correct-horse".to_string()),
+                funnel: FunnelReach::Ours,
+                opened_at: Instant::now(),
+                log_offset: 0,
+            });
+            let shows = |width: u16, height: u16| {
+                let buf = draw(width, height, |f, theme| render(&view, f, f.area(), theme));
+                let drawn = text_in(&buf, buf.area).contains(line);
+                (drawn, qr_drawn_whole(&buf, url))
+            };
+            let case = format!("{transport:?} {url}");
+            assert_eq!(shows(120, 40), (true, true), "{case} at 120x40");
+            // At 80x24 the QR code alone fills the screen.
+            assert!(!shows(80, 24).0, "{case} at 80x24");
+            let mut dropped_while_qr_fits = false;
+            for height in 24..=40 {
+                let (drawn, whole) = shows(80, height);
+                assert!(
+                    !drawn || whole,
+                    "{case}: line drawn over a cut QR at 80x{height}"
+                );
+                dropped_while_qr_fits |= !drawn && whole;
+            }
+            assert!(
+                dropped_while_qr_fits,
+                "{case}: never dropped before the QR code"
             );
         }
     }

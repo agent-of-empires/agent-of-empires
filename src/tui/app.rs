@@ -6414,6 +6414,102 @@ mod tests {
         );
     }
 
+    /// #5766: the Serve key that opened Connections opens the Web dashboard from any row, in
+    /// either mode, but a held key stays in Connections. On the offline and outdated takeovers,
+    /// where only r and q act, it does nothing. Hold timing is `ConnectionsView`'s own test;
+    /// this one checks the hub is opened at the opening press's time.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_serve_key_in_connections_opens_the_web_dashboard_except_on_a_takeover() {
+        use crate::tui::dialogs::{ConnectionsView, DaemonAttention as A, DialogResult, WebState};
+        use crate::tui::session_feed::SidebarSource;
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        for (strict, key) in [
+            (
+                false,
+                KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT),
+            ),
+            (
+                true,
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            ),
+        ] {
+            let mut app = App::new(
+                "test",
+                AvailableTools::with_tools(&[]),
+                true,
+                false,
+                crate::file_watch::FileWatchService::noop(),
+            )
+            .unwrap();
+            app.home.strict_hotkeys = strict;
+            // A held key opens Connections, then never reaches the Serve screen, whose restart
+            // and reset use the same key. Times come from `before`, not the wall clock, so a
+            // stalled test can't make the hold look like a separate press.
+            let before = std::time::Instant::now();
+            app.home.handle_key(key, None);
+            let hub = app
+                .home
+                .connections_view
+                .as_mut()
+                .expect("the key opens Connections");
+            let later = |ms| before + std::time::Duration::from_millis(ms);
+            assert!(
+                matches!(
+                    hub.handle_key(key, strict, later(150)),
+                    DialogResult::Continue
+                ),
+                "strict={strict}: a repeat just after the opening press stays"
+            );
+            let repeat = KeyEvent::new_with_kind(key.code, key.modifiers, KeyEventKind::Repeat);
+            for _ in 0..30 {
+                app.home.handle_key(repeat, None);
+            }
+            assert!(app.home.connections_view.is_some(), "strict={strict}: held");
+            assert!(app.home.serve_view.is_none(), "strict={strict}: held");
+            // The Daemon row comes first and is selected, so Enter would do nothing here.
+            app.home.connections_view =
+                Some(ConnectionsView::new(Some(A::ReadOnly), WebState::Off));
+            app.home.handle_key(key, None);
+            assert!(app.home.connections_view.is_none(), "strict={strict}");
+            assert!(
+                app.home.serve_view.is_some(),
+                "strict={strict}: opens the Web dashboard"
+            );
+
+            for attention in [
+                A::Offline,
+                A::Outdated(crate::daemon::DaemonIncarnation::sample("old")),
+            ] {
+                let case = format!("strict={strict} {attention:?}");
+                app.home.serve_view = None;
+                app.home.sidebar_source = SidebarSource::Disconnected;
+                app.home.offline_attention = attention;
+                assert!(!app.handle_runtime_gate_key(key), "{case}");
+                assert!(app.home.serve_view.is_none(), "{case}");
+                assert!(app.home.connections_view.is_none(), "{case}");
+                assert!(app.daemon_restart.is_none(), "{case}");
+                assert_eq!(
+                    app.home.sidebar_source,
+                    SidebarSource::Disconnected,
+                    "{case}"
+                );
+                assert!(
+                    matches!(
+                        ConnectionsView::offline(attention, None, false).handle_key(
+                            key,
+                            strict,
+                            std::time::Instant::now()
+                        ),
+                        DialogResult::Continue
+                    ),
+                    "{case}: the takeover view ignores it"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn r_restarts_only_a_restartable_daemon_and_reports_the_outcome() {

@@ -21,6 +21,19 @@ impl Instance {
 
     /// Keep launch-owned process state without replacing a fresh status observation.
     pub(crate) fn inherit_process_runtime(&mut self, prior: Self) {
+        // An error that could not be written to disk survives the reload that
+        // re-reads the row without it, for the same turn of the same launch.
+        if self.lifecycle_generation == prior.lifecycle_generation {
+            if let (Some(fresh), Some(previous)) = (
+                self.pending_initial_turn.as_mut(),
+                prior.pending_initial_turn.as_ref(),
+            ) {
+                if fresh.error.is_none() && fresh.key() == previous.key() {
+                    fresh.error = previous.error.clone();
+                    fresh.error_code = previous.error_code.clone();
+                }
+            }
+        }
         self.inherit_acp_load_capability(&prior);
         self.last_start_time = prior.last_start_time;
         self.capture_poller = prior.capture_poller;
@@ -544,6 +557,39 @@ mod tests {
 
     fn inst() -> Instance {
         Instance::new("s", "/tmp/x")
+    }
+
+    /// An error that never reached disk survives a reload of the same turn of
+    /// the same launch, legacy turns included, and marks no other turn.
+    #[test]
+    fn unpersisted_turn_error_survives_reload_of_the_same_turn_only() {
+        let turn = |id: &str, text: &str, error: Option<&str>| PendingInitialTurn {
+            text: text.into(),
+            attachments: Vec::new(),
+            synthesized: false,
+            error: error.map(str::to_string),
+            error_code: error.map(|_| "code".to_string()),
+            id: id.into(),
+        };
+        for (prior_id, fresh_id, fresh_text, generation, kept) in [
+            ("a", "a", "same", 0, true),
+            ("a", "b", "same", 0, false),
+            ("", "", "same", 0, true),
+            ("", "", "other", 0, false),
+            ("a", "a", "same", 1, false),
+            ("", "", "same", 1, false),
+        ] {
+            let mut prior = inst();
+            prior.pending_initial_turn = Some(turn(prior_id, "same", Some("not typed")));
+            let mut fresh = inst();
+            fresh.lifecycle_generation = generation;
+            fresh.pending_initial_turn = Some(turn(fresh_id, fresh_text, None));
+            fresh.inherit_process_runtime(prior);
+            let got = fresh.pending_initial_turn.unwrap();
+            let case = (prior_id, fresh_id, fresh_text, generation);
+            assert_eq!(got.error.is_some(), kept, "{case:?}");
+            assert_eq!(got.error_code.is_some(), kept, "{case:?}");
+        }
     }
 
     #[test]

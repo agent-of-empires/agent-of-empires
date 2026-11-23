@@ -1192,11 +1192,11 @@ pub struct SessionConfig {
     pub sidebar_position: SidebarPosition,
 
     /// What the TUI does with the list and preview once the terminal is too
-    /// narrow for them to sit side by side (below 80 columns). `Stacked` keeps
-    /// the historical list-above-preview split, `OnePane` shows only one at a
-    /// time (the list, or the preview in live mode), and `BigPreview` keeps the
-    /// split but shrinks the list to its minimum while live mode is relaying
-    /// keys.
+    /// narrow for them to sit side by side (below `narrow_breakpoint`).
+    /// `Stacked` keeps the historical list-above-preview split, `OnePane` shows
+    /// only one at a time (the list, or the preview in live mode), and
+    /// `BigPreview` keeps the split but shrinks the list to its minimum while
+    /// live mode is relaying keys.
     #[serde(default)]
     #[setting(
         label = "Narrow terminal layout",
@@ -1207,6 +1207,31 @@ pub struct SessionConfig {
         summary = "On narrow terminals: stack the list over the preview, show one at a time, or give live mode most of the screen."
     )]
     pub narrow_layout: NarrowLayout,
+
+    /// Width in columns below which the TUI switches to `narrow_layout`: the
+    /// list above the preview instead of beside it. The preview also compares
+    /// its own pane width against this value to pick its compact title over its
+    /// info header, so a narrow preview can be compact while the layout is still
+    /// side by side. Narrower than this is also where a collapsed sidebar stops
+    /// being available to `one_pane`. Values below 50
+    /// are raised to 50, the narrowest side-by-side split that keeps the
+    /// preview's 40-column floor beside a minimal 10-column list, so the range
+    /// accepts them rather than blocking a config that holds one. A value
+    /// greater than the terminal width puts every width below it, so the narrow
+    /// layout always applies, which the arrangement handles like any other
+    /// narrow height.
+    #[serde(default = "default_narrow_breakpoint")]
+    #[setting(
+        label = "Narrow layout below this width",
+        widget = "number",
+        min = 0,
+        max = 1000,
+        validate = "range:0:1000",
+        tui_only,
+        global_only,
+        summary = "Window width in columns. Narrower terminal app windows stack the list over the preview. Values under 50 are raised to 50."
+    )]
+    pub narrow_breakpoint: u16,
 
     /// Percentage of split preview rows allocated to the paired terminal.
     #[serde(default = "default_split_terminal_height_percent")]
@@ -2262,7 +2287,7 @@ pub enum SidebarPosition {
 }
 
 /// How the TUI arranges the session list and preview on a narrow terminal, below
-/// 80 columns. See `SessionConfig::narrow_layout`.
+/// `SessionConfig::narrow_breakpoint`. See `SessionConfig::narrow_layout`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NarrowLayout {
@@ -2309,6 +2334,7 @@ impl Default for SessionConfig {
             show_diagnostics_pane: false,
             sidebar_position: SidebarPosition::default(),
             narrow_layout: NarrowLayout::default(),
+            narrow_breakpoint: default_narrow_breakpoint(),
             split_terminal_height_percent: default_split_terminal_height_percent(),
             split_terminal_min_width: default_split_terminal_min_width(),
             split_terminal_min_height: default_split_terminal_min_height(),
@@ -2363,6 +2389,10 @@ impl Default for SessionConfig {
             tie_workdir_to_name: true,
         }
     }
+}
+
+fn default_narrow_breakpoint() -> u16 {
+    crate::tui::responsive::STACKED_BREAKPOINT
 }
 
 fn default_split_terminal_height_percent() -> u16 {
@@ -2733,15 +2763,16 @@ pub struct WebConfig {
     pub notify_on_wake_fire: bool,
 
     /// Serve a Model Context Protocol server at `/mcp` on the daemon so MCP
-    /// clients holding the daemon token can list sessions (read-only tools for
-    /// now). When false the route does not exist. Read at daemon startup.
+    /// clients holding the daemon token can list, create and send to sessions,
+    /// read their output, wait on them and approve requests. When false the
+    /// route does not exist. Read at daemon startup.
     #[serde(default)]
     #[setting(
         label = "Let other apps control AoE",
         widget = "toggle",
         restart,
         global_only,
-        summary = "Apps like Claude Code can list your Sessions through MCP. Read-only for now. Works when aoe serve uses the access link without a passphrase, or --auth none."
+        summary = "Apps like Claude Code can list, create and send to your Sessions, read their output, wait on them and approve requests. Works when aoe serve uses the access link without a passphrase, or --auth none."
     )]
     pub mcp_enabled: bool,
 }
@@ -2949,8 +2980,8 @@ pub enum ColorMode {
 #[setting_section(name = "theme", category = "Theme")]
 pub struct ThemeConfig {
     /// Color theme for the TUI. A global preference: one theme paints every
-    /// surface regardless of the active session profile (see
-    /// `config::resolve_theme_name`), so it is not profile-overridable.
+    /// surface regardless of the active session profile, so it is not
+    /// profile-overridable.
     #[serde(default)]
     #[setting(
         label = "Theme",
@@ -2974,7 +3005,7 @@ pub struct ThemeConfig {
     /// Idle session keeps a fresh-idle tint and an animated breathe icon for
     /// this many minutes before snapping back to the static look, and is
     /// treated as actionable by the `w` keybind. The time-since-stop column
-    /// is `session.show_activity_age`.
+    /// is the separate "Show Session age" setting.
     #[serde(default = "default_idle_decay_minutes")]
     #[setting(
         label = "Highlight Sessions that just finished",
@@ -3433,6 +3464,7 @@ pub struct SandboxConfig {
     #[setting(
         label = "Folders to leave out",
         widget = "list",
+        validate = "volume_ignore_list",
         web = "elevation:sandbox config affects host isolation",
         advanced,
         summary = "Paths inside the Project the container shouldn't see, like node_modules."

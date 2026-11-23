@@ -4335,6 +4335,40 @@ async fn force_smart_rename_preflight_skips_name_gate_and_sees_only_user_overrid
     }
 }
 
+// #5784: the TUI decodes the 202 body as the session row.
+#[tokio::test]
+#[serial_test::serial]
+async fn force_smart_rename_answers_a_terminal_session_with_its_row() {
+    use axum::body::to_bytes;
+
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let project = tempfile::tempdir().expect("tempdir project");
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+    let mut inst = Instance::new("Vikings", project.path().to_str().unwrap());
+    inst.tool = "claude".to_string();
+    inst.source_profile = "default".to_string();
+    let id = inst.id.clone();
+
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    let resp = force_smart_rename(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(id.clone()),
+    )
+    .await
+    .into_response();
+    state.runtime.work.drain().await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert!(resp
+        .headers()
+        .contains_key(crate::daemon::RUNTIME_REVISION_HEADER));
+    assert!(resp
+        .headers()
+        .contains_key(crate::daemon::RUNTIME_EPOCH_HEADER));
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let row: crate::daemon::SessionResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(row.id, id);
+}
+
 // Regression witness for #2603: the ACP-capability and smart-rename overlays
 // share ONE per-request `SessionConfig` cache keyed by (profile, project_path),
 // so three instances covering two unique pairs must trigger exactly two
@@ -4567,6 +4601,14 @@ fn session_cfg_store_reresolves_only_after_an_input_edit() {
         format!("gitdir: {}/.git/worktrees/w\n", current.display()),
     )
     .unwrap();
+    // Git records the worktree in each admin dir; a link is only real if it does.
+    for repo in ["a", "b"] {
+        std::fs::write(
+            layout.path().join(repo).join(".git/worktrees/w/gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
+    }
     let worktree = worktree.to_str().unwrap();
     let link = |repo: &str| {
         let _ = std::fs::remove_file(&current);
@@ -5830,10 +5872,36 @@ fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
             anyhow::Error::new(crate::server::session_spawn::ImageUpdateFailed {
                 image: "ghcr.io/acme/sandbox:1".into(),
                 detail: format!("denied: token {SECRET} at /root/.docker/config.json"),
+                failure: crate::server::session_spawn::UpdateFailure::Pull(
+                    crate::containers::image_pull::PullFailureReason::Auth,
+                ),
             }),
             (
                 "sandbox_image_update_failed",
-                "Couldn't pull the latest Sandbox image ghcr.io/acme/sandbox:1.".into(),
+                "Couldn't download the sandbox image: the registry needs you to sign in.".into(),
+            ),
+        ),
+        (
+            "latest image pull cancelled for everyone",
+            anyhow::Error::new(crate::server::session_spawn::ImageUpdateFailed {
+                image: "ghcr.io/acme/sandbox:1".into(),
+                detail: String::new(),
+                failure: crate::server::session_spawn::UpdateFailure::Cancelled,
+            }),
+            (
+                "sandbox_image_update_failed",
+                "Couldn't pull the latest Sandbox image ghcr.io/acme/sandbox:1: the update was cancelled."
+                    .into(),
+            ),
+        ),
+        (
+            "missing image pull cancelled for everyone",
+            anyhow::Error::from(DockerError::PullCancelled("ghcr.io/acme/sandbox:1".into()))
+                .context("ensure image"),
+            (
+                "sandbox_image_pull_failed",
+                "Couldn't pull the Sandbox image ghcr.io/acme/sandbox:1: the pull was cancelled."
+                    .into(),
             ),
         ),
         (
@@ -5866,7 +5934,7 @@ fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
             "git: under context",
             anyhow::Error::from(GitError::BranchNotFound("nope".into()))
                 .context("while creating worktree"),
-            ("create_failed", "Branch 'nope' not found".into()),
+            ("branch_not_found", "Branch 'nope' not found".into()),
         ),
         (
             "git: worktree path template",
@@ -9600,7 +9668,14 @@ fn run_create_hooks_forwards_the_running_hook_and_its_output_to_progress() {
 
     let storage = crate::session::Storage::new_unwatched("default").unwrap();
     let record = |event| registration.progress.record(event);
-    run_create_hooks(&mut instance, &plan, &storage, Some(&record)).unwrap();
+    run_create_hooks(
+        &mut instance,
+        &plan,
+        &storage,
+        &tokio_util::sync::CancellationToken::new(),
+        Some(&record),
+    )
+    .unwrap();
 
     let snapshot = registry.snapshot("key", None).unwrap();
     assert_eq!(snapshot.hook.as_deref(), Some("echo from-the-hook"));
@@ -9609,6 +9684,143 @@ fn run_create_hooks_forwards_the_running_hook_and_its_output_to_progress() {
         "{:?}",
         snapshot.output
     );
+}
+
+/// Container setup in the on_create hooks pulls a missing image under the create's own
+/// cancel. A create cancelled while that pull is shared reads as cancelled, even when the pull
+/// is cancelled for everyone too; a pull cancelled only for everyone fails the create.
+#[test]
+#[serial_test::serial]
+fn a_create_cancelled_during_its_container_setup_pull_reads_as_cancelled() {
+    use crate::containers::error::DockerError;
+    use crate::containers::image_pull::{self, PullKey};
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+    const IMAGE: &str = "aoe-test/setup-pull:1";
+    let temp_home = tempfile::tempdir().unwrap();
+    let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+    // The runtime is up, but the image and the container are missing, so setup pulls.
+    let bin = tempfile::tempdir().unwrap();
+    for binary in ["docker", "podman", "container"] {
+        let script = bin.path().join(binary);
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncase \"$*\" in --version|info|'system status') exit 0;; \
+             *inspect*) echo 'Error: No such container (container not found)' >&2; exit 1;; esac\n\
+             exit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let _path = crate::session::test_support::path_prepended(bin.path());
+    let project = project_with_on_create_hooks(&["true"]);
+    let base = crate::session::HooksConfig::default();
+    let trust = crate::session::config::repo_config::check_repo_trust(project.path()).unwrap();
+    let review = crate::session::config::repo_config::creation_trust_fingerprint(&base, &trust);
+    let plan = resolve_create_hook_plan(
+        "default",
+        &base,
+        project.path(),
+        false,
+        Some(true),
+        Some(&review),
+    )
+    .unwrap();
+    let storage = crate::session::Storage::new_unwatched("default").unwrap();
+    let runtime = crate::containers::get_container_runtime();
+    let key = PullKey {
+        runtime: runtime.display_name(),
+        image: IMAGE.to_string(),
+    };
+    let until = |what: &str, done: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::yield_now();
+        }
+    };
+
+    // (create cancelled, pull cancelled for everyone)
+    for (own, shared) in [(true, true), (false, true), (true, false)] {
+        // Another create's pull of the same image, which this create's setup joins.
+        // It outlasts the test's own waits, so setup ending first shows the cancel ended it.
+        let other = image_pull::join_with(key.clone(), |pull| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !pull.kill.is_cancelled() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(DockerError::Cancelled(format!("pull of {IMAGE}")))
+        });
+        let mut instance = Instance::new("setup-pull", project.path().to_str().unwrap());
+        instance.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: IMAGE.to_string(),
+            container_name: "aoe-setup-pull-test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        });
+        instance.source_profile = "default".into();
+        storage
+            .update(|rows, _| {
+                *rows = vec![instance.clone()];
+                Ok(())
+            })
+            .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let error = std::thread::scope(|scope| {
+            let create =
+                scope.spawn(|| run_create_hooks(&mut instance, &plan, &storage, &cancel, None));
+            until("setup never joined the shared pull", &|| {
+                create.is_finished() || image_pull::waiters_for_test(&key) == 2
+            });
+            if create.is_finished() {
+                panic!("setup ended before its pull: {:?}", create.join().unwrap());
+            }
+            if own {
+                cancel.cancel();
+            }
+            if shared {
+                runtime.cancel_pull(IMAGE, Duration::from_secs(5));
+            } else {
+                until("the create's cancel didn't end its setup", &|| {
+                    create.is_finished()
+                });
+                assert_eq!(
+                    image_pull::waiters_for_test(&key),
+                    1,
+                    "the other create's pull goes on"
+                );
+            }
+            create
+                .join()
+                .unwrap()
+                .expect_err("a cancelled pull fails setup")
+        });
+        let case = format!("own={own} shared={shared}: {error:#}");
+        assert_eq!(
+            error.is::<crate::server::session_service::CreationCancelled>(),
+            own,
+            "{case}"
+        );
+        if !own {
+            assert!(
+                error.chain().any(|cause| matches!(
+                    cause.downcast_ref::<DockerError>(),
+                    Some(DockerError::PullCancelled(_))
+                )),
+                "{case}"
+            );
+        }
+        drop(other);
+        until("the stand-in pull never ended", &|| {
+            image_pull::waiters_for_test(&key) == 0
+        });
+    }
 }
 
 #[tokio::test]
@@ -10371,19 +10583,21 @@ async fn post_create_raw(
 fn only_a_local_owner_sees_why_the_latest_image_pull_failed() {
     let error = anyhow::Error::new(crate::server::session_spawn::ImageUpdateFailed {
         image: "img:1".into(),
-        detail: "manifest unknown".into(),
+        detail: "dial tcp: lookup ghcr.io: no such host".into(),
+        failure: crate::server::session_spawn::UpdateFailure::Pull(
+            crate::containers::image_pull::PullFailureReason::Network,
+        ),
     });
     let stage = crate::server::create_progress::CreateStage::PullingImage;
     let public = create_failure(&error, stage, "ref").unwrap();
-    assert_eq!(
-        public.message,
-        "Couldn't pull the latest Sandbox image img:1."
-    );
+    // The banner's wording for everyone; the runtime's output only for a local owner.
+    let why = "Couldn't download the sandbox image: no network connection.";
+    assert_eq!(public.message, why);
     for (local_owner, message) in [
-        (false, "Couldn't pull the latest Sandbox image img:1."),
+        (false, why.to_string()),
         (
             true,
-            "Couldn't pull the latest Sandbox image img:1. manifest unknown",
+            format!("{why} dial tcp: lookup ghcr.io: no such host"),
         ),
     ] {
         let shown = with_local_pull_detail(public.clone(), &error, local_owner);
@@ -10553,6 +10767,77 @@ async fn create_rejects_hook_env_without_sandbox() {
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"], "validation_failed");
     assert!(state.instances.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn create_rejects_blank_or_oversized_initial_prompt() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let state = crate::server::test_support::build_test_app_state_impl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |_| {},
+        |supervisor| supervisor,
+    );
+    let oversized = "x".repeat(crate::session::MAX_INITIAL_PROMPT_BYTES + 1);
+    for prompt in ["  \n", oversized.as_str()] {
+        let (status, body) = post_create(
+            &state,
+            serde_json::json!({
+                "title": "bad-prompt", "path": "", "tool": "claude",
+                "scratch": true, "view": "structured", "initial_prompt": prompt,
+            }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "validation_failed");
+        assert!(state.instances.read().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn create_persists_initial_prompt_as_pending_turn() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    crate::session::config::update_config(|config| {
+        config.default_profile = "chosen-default".to_string();
+    })
+    .unwrap();
+    crate::session::Storage::new_unwatched("chosen-default").unwrap();
+    let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+    let state = crate::server::test_support::build_test_app_state_impl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |state| {
+            state.profile = std::sync::RwLock::new(crate::session::config::effective_profile(""));
+        },
+        |supervisor| supervisor.with_launcher(launcher),
+    );
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    let (status, body) = post_create(
+        &state,
+        serde_json::json!({
+            "title": "with-prompt", "path": "", "tool": "claude",
+            "scratch": true, "view": "structured", "initial_prompt": "fix the bug",
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let instances = state.instances.read().await;
+    let turn = instances[0].pending_initial_turn.as_ref().expect("queued");
+    assert_eq!(turn.text, "fix the bug");
+    assert!(!turn.synthesized);
 }
 
 #[tokio::test]
@@ -10937,6 +11222,67 @@ fn the_failure_log_names_a_context_wrapped_cause() {
         logged.contains(&GitError::NotAGitRepo.to_string()),
         "{logged}"
     );
+}
+
+/// A create that lost its image pull to a shared cancel is not replayed, so a same-key retry
+/// runs again once the image can be pulled. Any other failure is replayed.
+#[tokio::test]
+async fn a_create_whose_shared_pull_was_cancelled_is_not_replayed() {
+    use crate::containers::error::DockerError;
+    use crate::server::session_spawn::{ImageUpdateFailed, UpdateFailure};
+    let failed = |cancelled| ImageUpdateFailed {
+        image: "img".into(),
+        detail: String::new(),
+        failure: if cancelled {
+            UpdateFailure::Cancelled
+        } else {
+            UpdateFailure::Pull(crate::containers::image_pull::PullFailureReason::Other)
+        },
+    };
+    let cases: Vec<(&str, anyhow::Error, bool)> = vec![
+        ("latest pull cancelled", failed(true).into(), false),
+        (
+            "missing image pull cancelled",
+            anyhow::Error::from(DockerError::PullCancelled("img".into())).context("ensure image"),
+            false,
+        ),
+        (
+            "missing image pull cancelled during container setup",
+            CreateHookFailed::new(DockerError::PullCancelled("img".into()).into(), None, false)
+                .into(),
+            false,
+        ),
+        ("latest pull failed", failed(false).into(), true),
+        (
+            "a hook failure wrapping another error",
+            CreateHookFailed::new(anyhow::anyhow!("exit 7"), None, false).into(),
+            true,
+        ),
+        (
+            "the create cancelled during container setup",
+            CreateHookFailed::wrap(
+                crate::server::session_service::CreationCancelled.into(),
+                None,
+                false,
+            ),
+            false,
+        ),
+    ];
+    // Not recorded means a same-key retry runs the create again instead of replaying.
+    for (case, error, replayed) in cases {
+        let failures = crate::server::create_progress::CreateProgressRegistry::default();
+        let progress = crate::server::create_progress::CreateProgress::default();
+        let result = run_create_task(
+            async { Err::<(), _>(error) },
+            &failures,
+            &progress,
+            Some(case),
+            "ref",
+        )
+        .await;
+        assert!(result.is_err(), "{case}");
+        assert_eq!(failures.recent_failure(case).is_some(), replayed, "{case}");
+    }
 }
 
 /// A create that panics after its request is gone is still logged under its reference
@@ -15793,5 +16139,78 @@ async fn the_list_projects_each_queues_count_and_what_it_waits_on() {
             "{}",
             row.id
         );
+    }
+}
+
+/// A missing project path and a missing worktree branch carry their code header, so a
+/// client that does not read error bodies can still say what was wrong.
+#[tokio::test]
+#[serial_test::serial]
+async fn missing_path_and_branch_refusals_carry_their_code() {
+    use crate::daemon::ApiErrorCode;
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let state = support::build_test_app_state(Vec::new());
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let missing = tempfile::tempdir().unwrap().path().join("missing");
+    let response = review_creation_trust(
+        State(state.clone()),
+        Ok(Json(
+            serde_json::from_value(serde_json::json!({"path": missing, "profile": "test"}))
+                .unwrap(),
+        )),
+    )
+    .await;
+    let code = |response: &axum::response::Response| {
+        ApiErrorCode::from_headers(response.status(), response.headers(), false)
+    };
+    assert_eq!(code(&response), Some(ApiErrorCode::WorkingDirMissing));
+
+    // `aoe add . -w ws/one -b --repo <missing>` names the repository it could not find.
+    let (project, _repo) = crate::git::test_support::init_repo();
+    let response = {
+        use axum::response::IntoResponse;
+        create_session(
+            State(state),
+            axum::extract::Query(CreateSessionQuery { wait: None }),
+            None,
+            None,
+            Ok(Json(
+                serde_json::from_value(serde_json::json!({
+                    "path": project.path(), "tool": "", "profile": "test",
+                    "worktree_branch": "ws/one", "create_new_branch": true,
+                    "extra_repo_paths": [missing], "cli": {"no_submodules": true},
+                }))
+                .unwrap(),
+            )),
+        )
+        .await
+        .into_response()
+    };
+    assert_eq!(code(&response), Some(ApiErrorCode::WorkingDirMissing));
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains(&*missing.to_string_lossy()), "{body}");
+
+    for (error, expected) in [
+        (
+            anyhow::Error::from(crate::git::error::GitError::BranchNotFound("feat/x".into())),
+            ApiErrorCode::BranchNotFound,
+        ),
+        (
+            crate::session::builder::BuildRefusal::WorkingDirMissing("/nope".into()).into(),
+            ApiErrorCode::WorkingDirMissing,
+        ),
+    ] {
+        let failure = create_failure(
+            &error,
+            crate::server::create_progress::CreateStage::Preparing,
+            "ref",
+        )
+        .unwrap();
+        assert_eq!(code(&create_failure_response(failure)), Some(expected));
     }
 }
