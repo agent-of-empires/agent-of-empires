@@ -160,6 +160,9 @@ impl Instance {
     /// refused, `lead` and the remedy. An explanation already recorded stays, and a confirmed
     /// absence marks it gone, so the Session still reads as terminated.
     fn latch_missing_pane(&mut self, absence: TmuxAbsence, message: &str, lead: &str) {
+        if absence == TmuxAbsence::Gone {
+            self.gone_after_unreachable();
+        }
         self.name_refused_restart(Some((absence, lead)), None);
         if self.last_error.is_none() {
             self.last_error.latch_tmux(absence, message);
@@ -214,6 +217,26 @@ impl Instance {
             Some((absence, _)) => self.last_error.latch_tmux(absence, message),
             None => self.last_error.set(message),
         }
+    }
+
+    /// An unreachable latch's text, now that tmux confirms the pane gone: the plain message, or
+    /// the lead before a diagnostic and remedy. Only that latch vouches the text is AoE's own, so
+    /// any other error is left as written.
+    fn gone_after_unreachable(&mut self) {
+        if self.last_error.absence() != Some(TmuxAbsence::Unreachable) {
+            return;
+        }
+        let Some(error) = self.last_error.as_deref() else {
+            return;
+        };
+        let gone = if error == TMUX_SERVER_UNREACHABLE_ERROR {
+            TMUX_SESSION_GONE_ERROR.to_owned()
+        } else if let Some(rest) = error.strip_prefix(TMUX_SERVER_UNREACHABLE_LEAD) {
+            format!("{TMUX_SESSION_GONE_LEAD}{rest}")
+        } else {
+            return;
+        };
+        self.last_error.latch_tmux(TmuxAbsence::Gone, gone);
     }
 
     /// Drop `named`, the remedy [`Self::name_refused_restart`] appended, from the recorded error,
@@ -1809,6 +1832,53 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
                 "a live error, refused and gone, then the flag removed",
                 &unflagged,
                 Some(format!("{TMUX_SESSION_GONE_LEAD} {live}.")),
+                true,
+            );
+
+            // 4660985739: unreachable, then absent. Under its own latch the unreachable lead
+            // becomes the gone one, keeping any diagnostic and the remedy once.
+            let mut refusing = conflicting();
+            poll_unreachable(&mut refusing);
+            poll_absent(&mut refusing);
+            check(
+                "refused, unreachable, then absent",
+                &refusing,
+                Some(refused(&refusing, TMUX_SESSION_GONE_LEAD)),
+                true,
+            );
+            let mut diagnosed = conflicting();
+            diagnosed.status = Status::Error;
+            diagnosed.last_error.set(live);
+            poll_unreachable(&mut diagnosed);
+            poll_absent(&mut diagnosed);
+            check(
+                "a live error, refused, unreachable, then absent",
+                &diagnosed,
+                Some(refused(
+                    &diagnosed,
+                    &format!("{TMUX_SESSION_GONE_LEAD} {live}."),
+                )),
+                true,
+            );
+            let mut lost = flag_removed();
+            poll_unreachable(&mut lost);
+            poll_absent(&mut lost);
+            check(
+                "unreachable, then absent",
+                &lost,
+                Some(TMUX_SESSION_GONE_ERROR.to_owned()),
+                true,
+            );
+            // Printed text that reads like the lead carries no latch, so it stays as written.
+            let printed = format!("{TMUX_SERVER_UNREACHABLE_LEAD} retrying in 5s");
+            let mut echoed = flag_removed();
+            echoed.status = Status::Error;
+            echoed.last_error.set(printed.as_str());
+            poll_absent(&mut echoed);
+            check(
+                "printed unreachable text, then absent",
+                &echoed,
+                Some(printed),
                 true,
             );
             assert!(mismatches.is_empty(), "{mismatches:#?}");
