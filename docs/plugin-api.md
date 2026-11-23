@@ -612,7 +612,7 @@ id = "my_pane"
 | `detail-badge` | per-session | A badge in the session detail view. |
 | `pane` | per-session | A dockable tool-window pane (requires `api_version >= 3`). See [Pane payload](#pane-payload). |
 | `home-pane` | global | A host-wide docked pane on the dashboard overview and the structured-view pane overlay, carrying the same block vocabulary as `pane` but session-less (requires `api_version >= 13`). Several plugins' home panes stack in snapshot order. |
-| `composer-status` | per-session | A read-only badge in the ACP composer footer beside the context hint, web only (requires `api_version >= 23`). |
+| `composer-status` | per-session | A read-only badge in the ACP composer footer beside the context hint, web only (requires `api_version >= 24`). |
 | `composer-action` | per-session | A button beside the ACP composer controls (requires `api_version >= 8`). |
 | `page` | global | A full dashboard view rendered from a plugin HTML file (requires `api_version >= 16`). Optional pushed state is opaque to the host. See [Pages](#pages). |
 | `notification` | n/a | A transient notification pushed via `ui.notify`; gated by the `notifications` capability, not a slot declaration. |

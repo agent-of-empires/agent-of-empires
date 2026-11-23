@@ -586,7 +586,7 @@ pub enum UiSlot {
     ComposerAction,
     /// A badge in a session's detail view (per session).
     DetailBadge,
-    /// A read-only status chip beside a session's composer (per session, API v23).
+    /// A read-only status chip beside a session's composer (per session, API v24).
     ComposerStatus,
     HomePane,
     Notification,
@@ -1500,10 +1500,10 @@ impl PluginManifest {
                 "composer-action UI slots require api_version >= 8".into(),
             );
         }
-        if self.api_version < 23 {
+        if self.api_version < 24 {
             check(
                 self.ui.iter().all(|u| u.slot != UiSlot::ComposerStatus),
-                "composer-status UI slots require api_version >= 23".into(),
+                "composer-status UI slots require api_version >= 24".into(),
             );
         }
         if self.api_version < 9 {

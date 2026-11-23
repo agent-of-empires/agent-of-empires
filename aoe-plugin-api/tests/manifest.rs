@@ -703,9 +703,9 @@ fn invalid_manifests_report_each_problem() {
             &["composer-action UI slots require api_version >= 8"],
         ),
         (
-            22,
+            23,
             "[[ui]]\nslot = \"composer-status\"\nid = \"ctx\"\n",
-            &["composer-status UI slots require api_version >= 23"],
+            &["composer-status UI slots require api_version >= 24"],
         ),
         (4, "[[screenshots]]\npath = \"a.png\"\nalt = \"a\"\n", &["screenshots require api_version >= 5"]),
         (5, "[[screenshots]]\npath = \"a.png\"\nalt = \"   \"\n", &["alt must not be empty"]),
@@ -909,8 +909,8 @@ fn suggestion_items_reject_host_owned_fields() {
 }
 
 #[test]
-fn composer_status_slot_parses_at_api_23() {
-    let parsed = parse(23, "[[ui]]\nslot = \"composer-status\"\nid = \"ctx\"\n");
+fn composer_status_slot_parses_at_api_24() {
+    let parsed = parse(24, "[[ui]]\nslot = \"composer-status\"\nid = \"ctx\"\n");
     assert_eq!(parsed.ui[0].slot, UiSlot::ComposerStatus);
     assert!(parsed.ui[0].slot.is_per_session());
 }
