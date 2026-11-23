@@ -38,6 +38,22 @@ export function DashboardSuggestions({
   const presetOf = useSuggestionPresets();
   const { undo, dismiss, clearUndo } = useDismissUndo(act);
 
+  // Offline, the disconnect banner already explains a missing snapshot.
+  if (!snapshot && loadFailed && !offline)
+    return (
+      <section className="mb-4 mt-3 w-full max-w-2xl" aria-label="Suggested sessions">
+        <p role="alert" className="px-1 text-xs text-status-error">
+          Could not load suggestions.{" "}
+          <button
+            type="button"
+            onClick={() => void ctrl.load()}
+            className="cursor-pointer text-brand-500 hover:underline"
+          >
+            Try again
+          </button>
+        </p>
+      </section>
+    );
   if (!snapshot || snapshot.providers.length === 0 || !snapshot.prefs.homepage) return null;
 
   const active = snapshot.items.filter((item) => !item.dismissed);

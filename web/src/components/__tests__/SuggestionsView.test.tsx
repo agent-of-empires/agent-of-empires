@@ -902,6 +902,9 @@ describe("SuggestionsView", () => {
 
     await open(null);
     expect((await screen.findByRole("alert")).textContent).toContain("Could not load");
+    fetchSuggestions.mockResolvedValue(snapshot());
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByText("Fix lifecycle")).toBeTruthy();
   });
 
   it("read-only disables Start and Refresh, drops Dismiss and explains why", async () => {

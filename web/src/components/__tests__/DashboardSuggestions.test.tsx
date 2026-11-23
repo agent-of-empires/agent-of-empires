@@ -241,6 +241,15 @@ describe("DashboardSuggestions", () => {
     expect(await screen.findByRole("button", { name: "Start" })).toBeTruthy();
   });
 
+  it("a failed first load shows one inline error with Try again", async () => {
+    fetchSuggestions.mockResolvedValueOnce(null).mockResolvedValue(snap([mk(1)]));
+    renderIt();
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("Could not load suggestions.");
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByRole("button", { name: "Start" })).toBeTruthy();
+  });
+
   it("shows the disconnected note and disables Start while offline", async () => {
     fetchSuggestions.mockResolvedValue(snap([mk(1)]));
     renderIt();

@@ -218,6 +218,14 @@ export function SuggestionsView({
             className="mt-4 rounded-md border border-status-error/40 bg-status-error/10 p-3 text-sm text-status-error"
           >
             {notice ?? "Could not load suggestions."}
+            {!notice && (
+              <>
+                {" "}
+                <button type="button" onClick={() => void load()} className="cursor-pointer underline">
+                  Try again
+                </button>
+              </>
+            )}
           </div>
         )}
 

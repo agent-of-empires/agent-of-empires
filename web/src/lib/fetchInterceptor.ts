@@ -67,6 +67,9 @@ export function installFetchErrorToasts(): void {
     const path = toPath(rawUrl);
     const isApi = path.startsWith("/api/");
     const sameOrigin = isSameOrigin(rawUrl);
+    const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+    // Every view that loads the suggestions snapshot shows its own load error.
+    const toastFailures = isApi && !(method === "GET" && path === "/api/suggestions");
 
     // A 401 or a rotation answers the token the request carried, not one saved while it was in flight.
     const sentToken = sameOrigin ? getToken() : null;
@@ -114,7 +117,7 @@ export function installFetchErrorToasts(): void {
           // Body not JSON; ignore.
         }
       }
-      if (isApi && res.status >= 500 && !isServerDown()) {
+      if (toastFailures && res.status >= 500 && !isServerDown()) {
         // The structured view treats this 503 as "queued, will retry", so don't toast it.
         if (await isTransientWorkerNotReady(res, path)) {
           return res;
@@ -127,7 +130,7 @@ export function installFetchErrorToasts(): void {
         throw err;
       }
       // The DisconnectBanner covers a known-down server.
-      if (isApi && !isServerDown() && !isPageLifecycleNetworkGlitch()) {
+      if (toastFailures && !isServerDown() && !isPageLifecycleNetworkGlitch()) {
         reportError(`Network error contacting ${path}. Check your connection.`);
       }
       throw err;
