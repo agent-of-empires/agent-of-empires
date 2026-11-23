@@ -1,10 +1,5 @@
-//! Drain sticky poller observations through profile-bound commits.
-//!
-//! Shared by the TUI tick (`apply_session_id_updates`) and the daemon's
-//! `status_poll_loop`. Without the daemon-side caller, sessions running
-//! under `aoe serve` without an attached TUI never persist post-`/clear`
-//! sids through the channel and `sessions.json` stays stale until the
-//! next launch's resume-time verify (#2291).
+//! Drain sticky poller observations through profile-bound commits, from the
+//! daemon's `status_poll_loop` (#2291).
 //!
 //! The helper takes `&mut [Instance]` and mutates the slice's per-instance
 //! agent conversation directly. It does NOT take any tokio lock and is

@@ -6,6 +6,7 @@ pub mod image_update;
 pub mod pull_progress;
 mod runtime;
 pub(crate) mod runtime_base;
+pub mod sandbox_image;
 pub mod stats;
 
 use std::collections::{HashMap, HashSet};

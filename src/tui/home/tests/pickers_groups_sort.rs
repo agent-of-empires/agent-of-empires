@@ -939,7 +939,7 @@ async fn test_delete_selected_group_updates_groups_field() {
     assert!(!group_paths.contains(&"work/projects"));
 
     // A reload from storage agrees with the in-memory tree.
-    env.view.reload().unwrap();
+    env.view.reload();
     let reloaded_groups = env.view.all_group_paths();
     let tree_groups: Vec<_> = env
         .view
@@ -1534,7 +1534,7 @@ async fn test_group_collapsed_state_persists_across_reload() {
     );
 
     // Reload (simulates the periodic refresh); the group index may change.
-    env.view.reload().unwrap();
+    env.view.reload();
     let still_collapsed = env.view.flat_items.iter().find_map(|item| match item {
         Item::Group {
             path, collapsed, ..

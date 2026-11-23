@@ -202,6 +202,8 @@ pub(crate) struct SessionRead {
     #[serde(deserialize_with = "deserialize_required_nullable")]
     pub archived_at: Option<String>,
     #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub ignored_at: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub trashed_at: Option<String>,
     #[serde(deserialize_with = "deserialize_required_nullable")]
     pub active_snoozed_until: Option<String>,
@@ -240,6 +242,7 @@ impl SessionRead {
             idle_entered_at: timestamp(row.idle_entered_at),
             last_error: row.last_error.map(str::to_string),
             archived_at: timestamp(row.archived_at),
+            ignored_at: timestamp(row.ignored_at),
             trashed_at: timestamp(row.trashed_at),
             active_snoozed_until: timestamp(row.active_snoozed_until),
             pinned_at: timestamp(row.pinned_at),
@@ -947,6 +950,7 @@ fn validate_session(session: &SessionRead) -> Result<(), &'static str> {
         session.trashed_at.as_deref(),
         session.active_snoozed_until.as_deref(),
         session.pinned_at.as_deref(),
+        session.ignored_at.as_deref(),
     ] {
         if value.is_some_and(|value| !valid_timestamp(value)) {
             return Err("schema_invalid");
@@ -1267,6 +1271,7 @@ mod tests {
             idle_entered_at: None,
             last_error: None,
             archived_at: None,
+            ignored_at: None,
             trashed_at: None,
             active_snoozed_until: None,
             pinned_at: None,
@@ -1345,6 +1350,7 @@ mod tests {
             idle_entered_at: None,
             last_error: None,
             archived_at: None,
+            ignored_at: None,
             trashed_at: None,
             active_snoozed_until: None,
             pinned_at: None,
@@ -1672,6 +1678,7 @@ mod tests {
             idle_entered_at: None,
             last_error: None,
             archived_at: None,
+            ignored_at: None,
             trashed_at: None,
             active_snoozed_until: None,
             pinned_at: None,

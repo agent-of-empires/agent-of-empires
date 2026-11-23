@@ -210,7 +210,7 @@ async fn the_route_shares_the_daemon_credential_gate() {
             .expect("the credential accepted by daemon auth must admit the runtime read");
         let hello = socket.next().await.unwrap().unwrap().into_text().unwrap();
         let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
-        assert_eq!(hello["data"]["protocol_version"], 4);
+        assert_eq!(hello["data"]["protocol_version"], 5);
         assert_eq!(hello["data"]["local_owner"], false);
         assert_eq!(hello["data"]["owner"]["uid"], serde_json::Value::Null);
         socket.close(None).await.unwrap();

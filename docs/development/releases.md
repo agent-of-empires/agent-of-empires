@@ -32,6 +32,8 @@ Semver, from conventional commits since the last `v*` tag: `feat` is minor, anyt
 
 `.github/workflows/nightly.yml` runs daily, and on `workflow_dispatch`. It skips when `main` has not moved since the last nightly. Otherwise it builds `main` through `build-binaries.yml` with the version stamped as `X.Y.(Z+1)-nightly.YYYYMMDD`, where `X.Y.Z` is the version in `Cargo.toml`, publishes a GitHub prerelease tagged `nightly-YYYYMMDD`, pushes the sandbox images as `:nightly`, and deletes all but the newest `NIGHTLY_KEEP` nightlies with their tags. It does not need `release` environment approval and never publishes to ClawHub.
 
+A nightly's release body carries the same grouped changelog bullets a stable release gets, which is what the in-app What's New dialog shows when a nightly update is applied. `.github/scripts/nightly-notes.py` renders them from the `[changelog]` rules in `release-plz.toml` (which commits are listed and in which group) between the previous `nightly-*` tag and the built commit, or the last stable tag for the first nightly. Its bullet shape copies that section's `body` template, so a template change is a change to both. Author handles are omitted, since they would need one API call per commit.
+
 The tag stays outside `v*` so `release.yml`, `docker.yml`'s tag trigger and release-plz ignore it, and the version sorts above the stable release it builds on. The update check follows the running binary's channel: stable builds only see stable releases and nightly builds only see nightlies. A nightly release's version is read from its name, `Agent of Empires vX.Y.Z-nightly.YYYYMMDD`, because its tag only carries the date.
 
 Once a migration is merged to `main`, its number and behavior are frozen: nightly users have already run it.

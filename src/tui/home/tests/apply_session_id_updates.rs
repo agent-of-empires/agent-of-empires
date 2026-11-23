@@ -37,7 +37,7 @@ async fn canonical_identity_updates_never_install_a_tui_poller_or_write_payloads
         .capture_poller
         .handle()
         .is_none());
-    view.reload().unwrap();
+    view.reload();
     assert_eq!(payload_bytes("test"), bytes);
 }
 

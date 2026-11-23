@@ -14,7 +14,7 @@ aoe remove <session>
 aoe remove <session> --keep-container
 ```
 
-In the TUI or web wizard, enable the sandbox toggle when creating a session. The TUI shows it when a container runtime is available and cannot set a per-session image.
+In the TUI or web wizard, enable the sandbox toggle when creating a session. The TUI shows it when a container runtime is available; `Ctrl+P` on it sets a per-session image.
 
 ## Deleting a stopped sandbox
 
@@ -33,7 +33,7 @@ or unrelated agent stores to bypass the refusal.
 ```toml
 [sandbox]
 enabled_by_default = false
-default_image = "ghcr.io/agent-of-empires/aoe-sandbox:latest"
+# default_image unset: the aoe-sandbox image tagged with your AoE version
 auto_cleanup = true
 cpu_limit = "4"
 memory_limit = "8g"
@@ -43,7 +43,7 @@ environment = ["ANTHROPIC_API_KEY"]
 | Option | Default | Description |
 |--------|---------|-------------|
 | `enabled_by_default` | `false` | Auto-enable the sandbox for new sessions. Overridable per project. |
-| `default_image` | `aoe-sandbox:latest` | Image to run |
+| `default_image` | (unset) | Image to run. Unset runs the [`aoe-sandbox` image](#available-images) tagged with your AoE version |
 | `allow_image_pull` | `true` | Let the web dashboard pull a newer sandbox image on the host, as the daemon user. Off, the dashboard shows the pull command to run instead. Global only, and the dashboard can't turn it on; pulling is always blocked in read-only and CityHall mode |
 | `container_runtime` | `docker` | `docker`, `podman`, or `apple_container`. Global only; a profile or repo override is ignored |
 | `auto_cleanup` | `true` | Remove the container when the session is deleted |
@@ -142,8 +142,14 @@ Two official images are available:
 
 | Image | Contents |
 |---|---|
-| `ghcr.io/agent-of-empires/aoe-sandbox:latest` | Supported agent CLIs, git, ripgrep and fzf |
-| `ghcr.io/agent-of-empires/aoe-dev-sandbox:latest` | Base image plus Rust, uv, Node.js LTS and GitHub CLI |
+| `ghcr.io/agent-of-empires/aoe-sandbox` | Supported agent CLIs, git, ripgrep and fzf |
+| `ghcr.io/agent-of-empires/aoe-dev-sandbox` | Base image plus Rust, uv, Node.js LTS and GitHub CLI |
+
+Each release publishes both as `:<version>` (e.g. `:1.19.0`), `:<major>.<minor>` and `:latest`. With `default_image` unset, AoE runs `aoe-sandbox:<version>` for the version you are running (`aoe --version`), so upgrading AoE also moves new sandboxes to the matching image. AoE pulls an image only when it is missing locally, so a pinned `:latest` keeps whatever copy was pulled first. Upgrading unpins a stored `default_image` that is exactly the old `ghcr.io/agent-of-empires/aoe-sandbox:latest` default; a profile keeps it as `""`, which also means automatic. Existing sessions keep the image they were created with.
+
+A profile inherits the global `default_image`. To use the automatic image in a profile while the global one is custom, set `default_image = ""` under `[sandbox]` in that profile's `config.toml`; clearing the field in the TUI's profile scope removes the override and inherits instead.
+
+If the matching tag cannot be pulled (right after a release, before the image is published, or offline), AoE uses the `:<major>.<minor>` tag instead, local or pulled. The session keeps that image, and AoE never pulls it again, so it does not pick up later updates to that tag. This also applies to a session created with `--sandbox-image` or the API's `sandbox_image` naming the exact tag of your version while no `default_image` is set. A nightly build uses `aoe-sandbox:nightly` and has no fallback. A pull that times out counts as failed, so the worst case waits for two pulls. If neither tag is available, session start fails naming both: retry later, or set `default_image` to an image you have locally.
 
 Use the dev image per session with `aoe add --sandbox-image ghcr.io/agent-of-empires/aoe-dev-sandbox:latest .`, or set `[sandbox] default_image`.
 
@@ -156,7 +162,7 @@ A session keeps the container it was created with, so pulling a newer image only
 Extend either image for project dependencies:
 
 ```dockerfile
-FROM ghcr.io/agent-of-empires/aoe-sandbox:latest
+FROM ghcr.io/agent-of-empires/aoe-sandbox:<version>
 RUN apt-get update && apt-get install -y python3 python3-pip \
     && rm -rf /var/lib/apt/lists/*
 ```
@@ -255,6 +261,8 @@ Log in once with [`aoe sandbox login`](../cli/reference.md#aoe-sandbox-login). I
 - Apple Container cannot run the login helper, so `separate_login` is refused there at once, and `aoe sandbox login` says so.
 
 AoE leaves an existing file as it is, so an install that was seeded from the host keeps the host's token after the switch. To switch, stop the sandboxes, delete `sandbox-v2/.credentials.json`, set the option and run `aoe sandbox login`. The option is global only: a profile cannot override it, because every profile that uses the same agent config directory shares the one file. Profiles with their own directory via `session.agent_config_dir` have separate shared files, but still follow the one global value.
+
+MCP servers hold credentials of their own. A plugin can rewrite what a sandboxed session receives with the [`mcp.rewrite` hook](../plugin-api.md#hooks). AoE does not copy host MCP definitions into a Claude sandbox's agent store (`.mcp.json` files inside the copied Claude `plugins/` directory are copied as they are), but other agents' MCP-bearing config files are still copied verbatim, so for those agents the hook alone does not keep host MCP secrets out of the sandbox.
 
 ### Reclaiming stores
 

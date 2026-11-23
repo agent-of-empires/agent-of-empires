@@ -41,14 +41,14 @@ pub use wire::{
     DeleteProfileQuery, DeleteSessionBody, EmptyTrashBody, EmptyTrashOutcome, EnsureToolBody,
     GroupLocation, GroupSessionFailure, GroupSessionFailureCode, GroupSessionOutcome,
     ListSessionsQuery, MoveDirection, MoveGroupBody, PendingApproval, PlanSummary,
-    PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome, QueuedPromptEntry, RenameOutcome,
-    RenameProfileBody, RenameSessionBody, ReorderBody, ReorderOutcome, RepoBaseInput,
-    RestartOutcome, RestartSessionBody, RestoreOutcome, SessionResponse, SessionsEnvelope,
-    SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody, TerminalSize, TerminalTarget,
-    TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome, TrashSessionBody, Tristate,
-    UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody, UpdateFavoriteBody, UpdateGroupBody,
-    UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
-    WorkspaceRepoSummary, WorktreeEditOutcome,
+    PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome, QueuedPromptEntry,
+    ReclaimOwnershipBody, RenameOutcome, RenameProfileBody, RenameSessionBody, ReorderBody,
+    ReorderOutcome, RepoBaseInput, RestartOutcome, RestartSessionBody, RestoreOutcome,
+    SessionResponse, SessionsEnvelope, SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody,
+    TerminalSize, TerminalTarget, TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome,
+    TrashSessionBody, Tristate, UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody,
+    UpdateFavoriteBody, UpdateGroupBody, UpdateIgnoredBody, UpdateNotificationsBody, UpdatePinBody,
+    UpdateSnoozeBody, UpdateUnreadBody, WorkspaceRepoSummary, WorktreeEditOutcome,
 };
 pub use wire::{
     ApplyUpdateBody, InstallPreviewBody, PluginJob, PluginJobAccepted, PluginJobKind, PluginJobLog,
@@ -267,6 +267,14 @@ fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &
             "Resume failed; the conversation is preserved for explicit retry".into()
         }
         Some(ApiErrorCode::StartFailed) => "Session start failed".into(),
+        // The body names the path or branch when this client may read it.
+        Some(ApiErrorCode::WorkingDirMissing) if body.is_empty() => {
+            "A project or repository path does not exist where the Daemon runs".into()
+        }
+        Some(ApiErrorCode::BranchNotFound) if body.is_empty() => {
+            "The worktree branch was not found".into()
+        }
+        Some(ApiErrorCode::WorkingDirMissing | ApiErrorCode::BranchNotFound) => body.into(),
         Some(ApiErrorCode::PurgeFailed) => "Session purge failed".into(),
         Some(ApiErrorCode::AccountSwapUnavailable) => "Account swap refused, nothing changed. The target must be another account (a tool with its own `agent_config_dir`) of the same agent, the session needs a recorded Claude conversation and a launch that can carry it, and a terminal session needs `auto_resume_on_restart` on for the target profile".into(),
         Some(ApiErrorCode::LifecycleLocked) => {
@@ -302,6 +310,7 @@ fn public_creation_failure(body: &str, local_owner: bool) -> String {
             | "sandbox_image_pull_failed"
             | "sandbox_image_update_failed"
             | "working_dir_missing"
+            | "branch_not_found"
             | "create_outcome_unknown"
             | "creation_cancelled"
             | "creation_trust_changed"

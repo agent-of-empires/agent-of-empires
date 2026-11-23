@@ -996,6 +996,21 @@ async fn handle_terminal_event(
             open_toggle_picker(state);
             Ok(false)
         }
+        Intent::ToggleThinking => {
+            // Expanding a thought above the reader would push their row down, so
+            // hold onto the one at the top and let the next frame find it again.
+            if state.scroll_offset.get() != u16::MAX {
+                state.anchor_scroll_to_top_line();
+            }
+            state.show_full_thinking = !state.show_full_thinking;
+            let message = if state.show_full_thinking {
+                "showing full thinking"
+            } else {
+                "thinking collapsed to a preview"
+            };
+            set_toast(state, toast_deadline, message.into(), ToastKind::Info);
+            Ok(false)
+        }
         Intent::AnswerElicitation => {
             start_elicitation_answer(state, toast_deadline);
             Ok(false)
@@ -1725,11 +1740,11 @@ fn accept_mention(state: &mut StructuredViewState) {
 
 fn apply_scroll(state: &mut StructuredViewState, delta: i32) {
     if delta == i32::MIN {
-        state.scroll_offset = 0;
+        state.scroll_offset.set(0);
         return;
     }
     if delta == i32::MAX {
-        state.scroll_offset = u16::MAX;
+        state.scroll_offset.set(u16::MAX);
         return;
     }
     // Resolve the current position first: `scroll_offset == u16::MAX`
@@ -1738,14 +1753,18 @@ fn apply_scroll(state: &mut StructuredViewState, delta: i32) {
     // still clamps to the bottom, so scrollback never moves (the
     // reported "wheel scroll does nothing").
     let max = state.last_scroll_max.get();
-    let current = state.scroll_offset.min(max);
+    let current = state.scroll_offset.get().min(max);
     if delta < 0 {
-        state.scroll_offset = current.saturating_sub((-delta) as u16);
+        state
+            .scroll_offset
+            .set(current.saturating_sub((-delta) as u16));
     } else {
         let next = current.saturating_add(delta as u16);
         // Scrolling back down to the bottom re-arms auto-follow so new
         // streaming content keeps the view pinned to the latest row.
-        state.scroll_offset = if next >= max { u16::MAX } else { next };
+        state
+            .scroll_offset
+            .set(if next >= max { u16::MAX } else { next });
     }
 }
 

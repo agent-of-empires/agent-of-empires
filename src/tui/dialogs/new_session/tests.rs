@@ -73,7 +73,7 @@ fn draw(dialog: &mut NewSessionDialog) -> ratatui::buffer::Buffer {
 fn config_seeds_the_worktree_toggle_and_sandbox_image() {
     let mut config = Config::default();
     config.worktree.enabled = true;
-    config.sandbox.default_image = "my-custom-sandbox:local".to_string();
+    config.sandbox.default_image = Some("my-custom-sandbox:local".to_string());
     let dialog =
         NewSessionDialog::new_with_config(vec!["claude"], "/tmp/project".to_string(), config);
     assert!(dialog.worktree_enabled);
@@ -493,7 +493,7 @@ fn the_sandbox_config_overlay_opens_on_ctrl_p_and_edits_the_image() {
         dialog.sandbox_image.value(),
         format!(
             "{}abc",
-            crate::containers::get_container_runtime().effective_default_image()
+            crate::containers::sandbox_image::automatic_sandbox_image()
         )
     );
 
@@ -2268,4 +2268,27 @@ fn workspace_is_unavailable_when_attaching_an_existing_branch() {
     assert!(screen_text(&draw(&mut dialog)).contains("Workspace: [ ]"));
     dialog.create_new_branch = true;
     assert!(screen_text(&draw(&mut dialog)).contains("Workspace: [x]"));
+}
+
+/// The daemon rejects `~` as a shell metacharacter, so a home-relative path
+/// must reach it already expanded, and completion must read the same directory.
+#[test]
+#[serial_test::serial]
+fn tilde_path_completes_and_submits_under_home() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    std::fs::create_dir_all(temp_home.path().join("code/projects")).unwrap();
+    for typed in ["~/code", "~//code", "~///code"] {
+        let mut dialog = single_tool_dialog();
+        dialog.focused_field = 0;
+        dialog.path = Input::new(format!("{typed}/pro"));
+        dialog.recompute_path_ghost();
+        assert_eq!(dialog.ghost_text(), Some("jects/"), "{typed}");
+        dialog.path = Input::new(typed.to_string());
+        assert_eq!(
+            submitted(dialog.build_submit_result()).path,
+            temp_home.path().join("code").to_string_lossy(),
+            "{typed}"
+        );
+    }
 }
