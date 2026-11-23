@@ -85,7 +85,7 @@ test("many composer-status items stay capped and keep Send on screen", async ({ 
   const viewport = page.viewportSize()!;
   const footer = await page.getByTestId("composer-footer").boundingBox();
   expect(footer!.y + footer!.height).toBeLessThanOrEqual(viewport.height);
-  const send = await page.getByRole("button", { name: "Send message" }).boundingBox();
-  expect(send!.x + send!.width).toBeLessThanOrEqual(viewport.width);
-  expect(send!.y + send!.height).toBeLessThanOrEqual(viewport.height);
+  const actions = await page.getByTestId("composer-actions").boundingBox();
+  expect(actions!.x + actions!.width).toBeLessThanOrEqual(viewport.width);
+  expect(actions!.y + actions!.height).toBeLessThanOrEqual(viewport.height);
 });
