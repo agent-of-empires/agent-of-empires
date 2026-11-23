@@ -173,9 +173,15 @@ impl Instance {
     /// fix a restart needs first. What ended it is `lead` (the pane itself is gone) followed by the
     /// diagnostic, else the diagnostic alone. The diagnostic is the one already recorded, such as
     /// a live error the agent showed, else `seen`. The remedy itself isn't stored, so after a
-    /// reload or a daemon restart this is how it comes back; once named it stays as it is.
+    /// reload or a daemon restart this is how it comes back. Once the row can launch again, a
+    /// remedy already named is dropped and what ended the pane stays.
     fn name_refused_restart(&mut self, lead: Option<(TmuxAbsence, &str)>, seen: Option<String>) {
         let remedy = Self::command_selector_remedy(&self.id);
+        let named = format!(" {REFUSED_RESTART} {remedy}");
+        if !self.command_selector_refuses_launch() {
+            self.drop_applied_remedy(&named);
+            return;
+        }
         // A pane confirmed gone stays gone when tmux later can't be reached.
         let lead = match lead {
             Some(_) if self.last_error.absence() == Some(TmuxAbsence::Gone) => {
@@ -183,11 +189,10 @@ impl Instance {
             }
             lead => lead,
         };
-        if !self.command_selector_refuses_launch()
-            || self
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.contains(&remedy))
+        if self
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains(&remedy))
         {
             return;
         }
@@ -204,10 +209,32 @@ impl Instance {
             (Some(lead), None) => lead.to_string(),
             (None, diagnostic) => ended_sentence(diagnostic),
         };
-        let message = format!("{ended} Terminal view can't start this Session again: {remedy}");
+        let message = format!("{ended}{named}");
         match lead {
             Some((absence, _)) => self.last_error.latch_tmux(absence, message),
             None => self.last_error.set(message),
+        }
+    }
+
+    /// Drop `named`, the remedy [`Self::name_refused_restart`] appended, from the recorded error,
+    /// keeping its latch. A bare tmux lead left behind reads as that latch's own message.
+    fn drop_applied_remedy(&mut self, named: &str) {
+        let Some(ended) = self
+            .last_error
+            .as_deref()
+            .and_then(|error| error.strip_suffix(named))
+        else {
+            return;
+        };
+        let ended = match ended {
+            TMUX_SESSION_GONE_LEAD => TMUX_SESSION_GONE_ERROR,
+            TMUX_SERVER_UNREACHABLE_LEAD => TMUX_SERVER_UNREACHABLE_ERROR,
+            ended => ended,
+        }
+        .to_owned();
+        match self.last_error.absence() {
+            Some(absence) => self.last_error.latch_tmux(absence, ended),
+            None => self.last_error.set(ended),
         }
     }
 
@@ -326,7 +353,7 @@ impl Instance {
                 self.latch_missing_pane(
                     TmuxAbsence::Unreachable,
                     TMUX_SERVER_UNREACHABLE_ERROR,
-                    "The tmux server could not be reached.",
+                    TMUX_SERVER_UNREACHABLE_LEAD,
                 );
                 return;
             }
@@ -1758,6 +1785,30 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
                 "gone, then refusing and unreachable",
                 &edited,
                 Some(refused(&edited, TMUX_SESSION_GONE_LEAD)),
+                true,
+            );
+
+            // Either remedy applied: the next poll drops it and keeps what ended the pane.
+            let mut cleared = conflicting();
+            poll_absent(&mut cleared);
+            cleared.resume_intent = ResumeIntent::Cleared;
+            poll_absent(&mut cleared);
+            check(
+                "refused and gone, then AoE's id cleared",
+                &cleared,
+                Some(TMUX_SESSION_GONE_ERROR.to_owned()),
+                true,
+            );
+            let mut unflagged = conflicting();
+            unflagged.status = Status::Error;
+            unflagged.last_error.set(live);
+            poll_absent(&mut unflagged);
+            unflagged.command = flag_removed().command;
+            poll_absent(&mut unflagged);
+            check(
+                "a live error, refused and gone, then the flag removed",
+                &unflagged,
+                Some(format!("{TMUX_SESSION_GONE_LEAD} {live}.")),
                 true,
             );
             assert!(mismatches.is_empty(), "{mismatches:#?}");

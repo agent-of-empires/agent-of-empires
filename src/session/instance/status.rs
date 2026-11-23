@@ -94,6 +94,12 @@ pub const TMUX_SESSION_GONE_ERROR: &str =
 /// Opens the `last_error` of a confirmed-absent pane whose restart is refused, ahead of its remedy.
 pub(crate) const TMUX_SESSION_GONE_LEAD: &str = "The tmux session is gone.";
 
+/// The same lead for a tmux server that couldn't be reached.
+pub(crate) const TMUX_SERVER_UNREACHABLE_LEAD: &str = "The tmux server could not be reached.";
+
+/// Introduces the remedy a refused restart needs.
+pub(crate) const REFUSED_RESTART: &str = "Terminal view can't start this Session again:";
+
 /// Whether `last_error` is the latch for a confirmed-absent pane. Its text can't tell: a pane can
 /// print anything.
 pub(crate) fn reports_tmux_session_gone(last_error: &LastError) -> bool {
