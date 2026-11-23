@@ -39,6 +39,12 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   const [session] = await waitForSessions(serve.baseUrl);
 
   const line = page.getByTestId("startup-wait-line");
+  // A line that mounts after a jump counts from the jumped clock, so each attempt jumps again until the offer shows.
+  const pastRestartDelay = (cost: string) =>
+    expect(async () => {
+      await page.clock.fastForward(31_000);
+      await expect(line.getByTestId("startup-wait-restart-cost")).toHaveText(cost, { timeout: 1_500 });
+    }).toPass({ timeout: 15_000 });
   await expect(line).toBeVisible({ timeout: 15_000 });
   await expect.poll(stalls, { timeout: 15_000 }).toBe(1);
   const restart = line.getByRole("button", { name: "Restart Claude Code" });
@@ -60,10 +66,7 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   const stopButton = page.getByRole("button", { name: "Stop", exact: true });
   await expect(stopButton).toBeVisible();
 
-  await page.clock.fastForward(31_000);
-  await expect(line.getByTestId("startup-wait-restart-cost")).toHaveText(
-    "Restarting stops the message you sent. Send it again once Claude Code is ready.",
-  );
+  await pastRestartDelay("Restarting stops the message you sent. Send it again once Claude Code is ready.");
   const restarted = page.waitForResponse((r) => r.url().endsWith("/acp/restart") && r.request().method() === "POST");
   await restart.click();
   const res = await restarted;
@@ -76,11 +79,8 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   await expect(line).toBeVisible();
   await expect(page.getByText("Structured view worker stopped")).toHaveCount(0);
   await expect(restart).toHaveCount(0);
-  await page.clock.fastForward(31_000);
   // The restart's stop unmounted the line before the restart answered; the stopped message is still named.
-  await expect(line.getByTestId("startup-wait-restart-cost")).toHaveText(
-    "The message you sent was stopped. Send it again once Claude Code is ready.",
-  );
+  await pastRestartDelay("The message you sent was stopped. Send it again once Claude Code is ready.");
   const again = page.waitForResponse((r) => r.url().endsWith("/acp/restart") && r.request().method() === "POST");
   await restart.click();
   expect((await again).status()).toBe(200);
