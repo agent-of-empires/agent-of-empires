@@ -166,6 +166,17 @@ mod tests {
         (delayed(started, release), sent, answer)
     }
 
+    /// Waits for the latest consent request to finish, failing instead of hanging.
+    async fn settled() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while consent_in_flight() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the consent request finishes");
+    }
+
     /// Quitting waits for a delayed consent request: an answer in time is saved silently,
     /// a failure or no answer is reported, and a superseded change reports nothing.
     #[tokio::test]
@@ -222,9 +233,7 @@ mod tests {
         let (stale, _stale_sent, stale_answer) = request();
         send_consent(stale);
         stale_answer.send(Err("stale".into())).unwrap();
-        while consent_in_flight() {
-            tokio::task::yield_now().await;
-        }
+        settled().await;
         let (newer, newer_sent, newer_answer) = request();
         send_consent(newer);
         newer_sent.await.unwrap();
@@ -234,9 +243,7 @@ mod tests {
             "the stale failure is not applied"
         );
         newer_answer.send(Ok(())).unwrap();
-        while consent_in_flight() {
-            tokio::task::yield_now().await;
-        }
+        settled().await;
         assert_eq!(take_consent_outcome(), Some(ConsentOutcome::Saved));
     }
 }

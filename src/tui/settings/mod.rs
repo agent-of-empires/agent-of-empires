@@ -791,8 +791,25 @@ impl SettingsView {
             || config_to_json(&self.repo_config) != self.baseline_repo;
     }
 
-    /// Confirms a save once the Daemon has acknowledged its consent change.
+    /// Confirms a save once the Daemon has acknowledged its consent change. A view opened
+    /// while the change was in flight read the old value, so an unedited toggle adopts the
+    /// saved one.
     pub(in crate::tui) fn consent_saved(&mut self) {
+        let baseline = self
+            .baseline_global
+            .pointer("/telemetry/enabled")
+            .and_then(serde_json::Value::as_bool);
+        let saved = crate::session::get_telemetry_settings().enabled;
+        if baseline == Some(self.global_config.telemetry.enabled)
+            && self.global_config.telemetry.enabled != saved
+        {
+            self.global_config.telemetry.enabled = saved;
+            if let Some(slot) = self.baseline_global.pointer_mut("/telemetry/enabled") {
+                *slot = saved.into();
+            }
+            self.rebuild_fields();
+            self.recompute_dirty();
+        }
         self.success_message = Some("Settings saved".to_string());
         self.success_message_expires_at = Some(std::time::Instant::now() + SUCCESS_MESSAGE_TTL);
     }
@@ -1362,8 +1379,18 @@ mod dirty_tracking_tests {
             "a consent change is not reported saved before the Daemon answers"
         );
         assert!(view.success_message_expires_at.is_none());
+        // A view reopened before the Daemon answers read the old value.
+        let mut reopened = SettingsView::new("test", None).unwrap();
+        assert!(!reopened.global_config.telemetry.enabled);
+        crate::session::update_config(|c| c.telemetry.enabled = true).unwrap();
         view.consent_saved();
         assert_eq!(view.success_message.as_deref(), Some("Settings saved"));
+        assert!(view.global_config.telemetry.enabled);
+        reopened.consent_saved();
+        assert!(reopened.global_config.telemetry.enabled);
+        assert!(!reopened.has_changes);
+
+        crate::session::update_config(|c| c.telemetry.enabled = false).unwrap();
 
         view.consent_not_saved("Telemetry setting not saved: read-only".into());
         assert!(!view.global_config.telemetry.enabled);
