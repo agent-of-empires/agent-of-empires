@@ -1,7 +1,9 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { fetchGroups } from "../lib/api";
+import type { GroupInfo } from "../lib/types";
 import { CancelButton, ConfirmButton, Dialog } from "./Dialog";
-import { useDialogFocus } from "./dialogHooks";
 import { isImeComposing } from "../lib/ime";
+import { GroupCombobox } from "./session-wizard/steps/GroupCombobox";
 
 const DIALOG_ID = "session-group-modal";
 const PROMPT_ID = `${DIALOG_ID}-prompt`;
@@ -9,29 +11,41 @@ const PROMPT_ID = `${DIALOG_ID}-prompt`;
 interface Props {
   sessionTitle: string;
   currentGroup: string;
+  /** Profile whose groups are offered; the served profile when omitted. */
+  profile?: string;
   /** Resolves false on failure so the modal stays open with an error. */
   onSave: (group: string) => Promise<boolean>;
   onClose: () => void;
 }
 
-export function SessionGroupModal({ sessionTitle, currentGroup, onSave, onClose }: Props) {
+export function SessionGroupModal({ sessionTitle, currentGroup, profile, onSave, onClose }: Props) {
   const [value, setValue] = useState(currentGroup);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const inputRef = useRef<HTMLInputElement | null>(null);
-  useDialogFocus(inputRef, true);
+  const [groups, setGroups] = useState<GroupInfo[]>([]);
+  const fieldRef = useRef<HTMLDivElement>(null);
 
-  const handleSave = async () => {
-    // A blank value ungroups; paths are sent as-is, with no slash normalization.
-    const next = value.trim();
+  useEffect(() => {
+    let live = true;
+    fetchGroups(profile)
+      .then((g) => live && setGroups(g))
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [profile]);
+
+  // A blank value ungroups; paths are sent as-is, with no slash normalization.
+  const save = async (next: string) => {
     if (next === currentGroup) return onClose();
     setSaving(true);
     setError(null);
     if (await onSave(next)) return onClose();
     setSaving(false);
     setError(next ? "Failed to update group." : "Failed to clear group.");
-    inputRef.current?.focus();
+    fieldRef.current?.querySelector("input")?.focus();
   };
+  const handleSave = () => save(value.trim());
 
   return (
     <Dialog
@@ -42,6 +56,17 @@ export function SessionGroupModal({ sessionTitle, currentGroup, onSave, onClose 
       onDismiss={() => !saving && onClose()}
       footer={
         <>
+          {currentGroup && (
+            <button
+              type="button"
+              onClick={() => void save("")}
+              disabled={saving}
+              data-testid="session-group-modal-remove"
+              className="mr-auto text-[13px] text-text-secondary hover:text-text-primary disabled:opacity-50"
+            >
+              Remove from group
+            </button>
+          )}
           <CancelButton onClick={onClose} disabled={saving} />
           <ConfirmButton
             onClick={handleSave}
@@ -57,27 +82,31 @@ export function SessionGroupModal({ sessionTitle, currentGroup, onSave, onClose 
       <p id={PROMPT_ID} className="text-[13px] text-text-secondary">
         Move <span className="text-text-primary">{sessionTitle}</span> to a group.
       </p>
-      <input
-        ref={inputRef}
-        type="text"
-        value={value}
-        onChange={(e) => {
-          setValue(e.target.value);
-          setError(null);
-        }}
+      <div
+        ref={fieldRef}
         onKeyDown={(e) => {
-          if (e.key === "Enter" && !isImeComposing(e)) {
+          if (e.key === "Enter" && !e.defaultPrevented && !isImeComposing(e)) {
             e.preventDefault();
             if (!saving) void handleSave();
           }
           if (e.key === "Escape" && !saving) onClose();
         }}
-        placeholder="Group (blank to ungroup)"
-        data-testid="session-group-modal-input"
-        className="w-full bg-surface-900 border border-surface-700 rounded px-2 py-1.5 text-[13px] font-mono text-text-primary focus:outline-none focus:border-brand-600"
-      />
+        className="bg-surface-900 border border-surface-700 rounded px-2 focus-within:border-brand-600"
+      >
+        <GroupCombobox
+          id="session-group-modal-field"
+          testId="session-group-modal-input"
+          autoFocus
+          value={value}
+          onChange={(v) => {
+            setValue(v);
+            setError(null);
+          }}
+          groups={groups}
+        />
+      </div>
       <p className="text-[12px] text-text-dim">
-        Leave blank to ungroup. Use <span className="font-mono">/</span> for hierarchy, for example{" "}
+        Use <span className="font-mono">/</span> for hierarchy, for example{" "}
         <span className="font-mono">work/projects</span>.
       </p>
       {error && (
