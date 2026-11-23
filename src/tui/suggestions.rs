@@ -522,8 +522,8 @@ pub(super) struct SuggestionsView {
     order: Vec<ItemKey>,
     pub(super) error: Option<String>,
     notice: Option<String>,
-    /// The resolved prefill, shown before the second `e` confirms it.
-    prepared: Option<(ItemKey, Start)>,
+    /// The resolved prefill, for the caller to open the dialog with.
+    prepared: Option<Start>,
     epoch: u64,
     selected: usize,
     detail_scroll: u16,
@@ -795,7 +795,7 @@ impl SuggestionsView {
 
     /// The prefill a prepare resolved, for the caller to open the dialog with.
     pub(super) fn take_prepared(&mut self) -> Option<Start> {
-        self.prepared.take().map(|(_, start)| start)
+        self.prepared.take()
     }
 
     /// Takes what a store poll holds for this view. True when state changed.
@@ -831,12 +831,12 @@ impl SuggestionsView {
             changed = true;
         }
         if matches!(polled.start, Some((_, _, PrepareTarget::View(e))) if e == self.epoch) {
-            if let Some((key, mut start, _)) = polled.start.take() {
+            if let Some((_, mut start, _)) = polled.start.take() {
                 self.preparing = None;
                 if self.prepare_another {
                     start.suggestion = None;
                 }
-                self.prepared = Some((key, start));
+                self.prepared = Some(start);
                 changed = true;
             }
         }
@@ -1343,18 +1343,15 @@ impl SuggestionsView {
         if detail.len() > 1 {
             detail.push(Line::from(""));
         }
-        let effective = store.effective_prompt(item);
-        let final_prompt = self
-            .prepared
-            .as_ref()
-            .filter(|(key, _)| *key == (item.provider_id.clone(), item.id.clone()))
-            .map(|(_, start)| start.initial_prompt.as_str());
-        let (header, prompt) = match final_prompt {
-            Some(prompt) => ("Prompt sent to the agent (untrusted source text)", prompt),
-            None => ("Prompt (untrusted source text)", effective.as_str()),
-        };
-        detail.push(Line::from(Span::styled(header, bold)));
-        detail.extend(plain(prompt).lines().map(|l| Line::from(format!("  {l}"))));
+        detail.push(Line::from(Span::styled(
+            "Prompt (untrusted source text)",
+            bold,
+        )));
+        detail.extend(
+            plain(&store.effective_prompt(item))
+                .lines()
+                .map(|l| Line::from(format!("  {l}"))),
+        );
         let preview = plain(&item.preview);
         if !preview.trim().is_empty() {
             detail.push(Line::from(""));

@@ -96,21 +96,13 @@ impl HomeView {
         })
     }
 
-    /// Enter on a suggestion row opens its started Session, or starts it with
-    /// its preset; on "View all" it opens the full view.
-    /// False when the cursor is on neither.
+    /// Enter on a suggestion row starts it with its preset; on "View all" it
+    /// opens the full view. False when the cursor is on neither. A started
+    /// suggestion is listed as its Session, not as a row.
     pub(super) fn activate_suggestion_row(&mut self) -> bool {
         if let Some(key) = self.cursor_suggestion() {
-            match self
-                .suggestions_feed
-                .entry(&key)
-                .and_then(|e| e.started_session)
-            {
-                Some(id) => {
-                    self.open_linked_session(&id);
-                }
-                None if self.mutations_blocked() => {}
-                None => self.suggestions_feed.start(key),
+            if !self.mutations_blocked() {
+                self.suggestions_feed.start(key);
             }
             return true;
         }
@@ -122,17 +114,6 @@ impl HomeView {
             return true;
         }
         false
-    }
-
-    /// [`try_open_linked_session`](Self::try_open_linked_session) with the reason flashed.
-    pub(super) fn open_linked_session(&mut self, id: &str) -> bool {
-        match self.try_open_linked_session(id) {
-            Ok(()) => true,
-            Err(reason) => {
-                self.flash_status(reason);
-                false
-            }
-        }
     }
 
     /// Selects the Session a suggestion was started as, expanding the Archived

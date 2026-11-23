@@ -4647,13 +4647,8 @@ impl HomeView {
                         (Some("Attach"), Some("Live"))
                     }
                 }
-                Some(Item::Suggestion { .. }) => {
-                    let started = self
-                        .cursor_suggestion()
-                        .and_then(|key| self.suggestions_feed.entry(&key))
-                        .is_some_and(|e| e.started_session.is_some());
-                    (Some(if started { "Open" } else { "Start" }), None)
-                }
+                // A started suggestion leaves the group, so a row always starts.
+                Some(Item::Suggestion { .. }) => (Some("Start"), None),
                 Some(Item::SuggestionsViewAll { .. }) => (Some("View all"), None),
                 None => (None, None),
             };

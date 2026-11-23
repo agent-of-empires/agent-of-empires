@@ -1107,12 +1107,8 @@ fn an_undelivered_first_prompt_is_announced_once_per_failure() {
 fn open_on_an_unknown_session_says_so_and_keeps_the_full_view() {
     let mut env = create_test_env_with_sessions(1);
     env.view.open_suggestions_view();
-    assert!(!env.view.open_linked_session("gone"));
-    assert!(env
-        .view
-        .status_flash_text()
-        .unwrap()
-        .contains("no longer exists"));
+    let reason = env.view.try_open_linked_session("gone").unwrap_err();
+    assert!(reason.contains("no longer exists"), "{reason}");
     assert!(env.view.suggestions_view.is_some());
 }
 
@@ -1131,7 +1127,7 @@ fn open_reaches_a_session_in_a_collapsed_archive_project_subgroup() {
         .insert(crate::session::archived_project_sub_path(&project), true);
     env.view.rebuild_flat_items();
 
-    assert!(env.view.open_linked_session(&target));
+    assert!(env.view.try_open_linked_session(&target).is_ok());
     assert_eq!(env.view.selected_session.as_deref(), Some(target.as_str()));
     assert!(!env.view.archived_section_collapsed);
 }
