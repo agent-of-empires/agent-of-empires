@@ -1,4 +1,4 @@
-# Structured View (Web Dashboard)
+# Structured View
 
 The **structured view** renders agent state as plans, tool-call cards, diffs and approvals instead of terminal output. It is the web dashboard's default view and is also available in the native TUI, with mobile and multi-pane desktop layouts.
 
@@ -34,7 +34,7 @@ Gemini CLI is deprecated upstream for individual accounts since 2026-06-18. Ente
 
 The global npm installs above are optional. `aoe acp doctor --fix` can install Claude, Codex, Pi and `aoe-agent` adapters into the data directory; use `--adapter <name>` or `--all-adapters` to choose. See [Requirements](#requirements).
 
-Tools outside the registry (aider, cursor, copilot, droid, hermes and kiro) use terminal view. Custom agents opt in with `agent_acp_cmd`, or inherit a supported base adapter through `agent_detect_as`. The inherited adapter does not execute the wrapper; pass account overrides explicitly. See [Configuration](guides/configuration.md#running-a-custom-agent-in-the-structured-view).
+Tools outside the registry (cursor, copilot, droid, hermes, kiro, qwen, antigravity and settl) use terminal view. Custom agents opt in with `agent_acp_cmd`, or inherit a supported base adapter through `agent_detect_as`. The inherited adapter does not execute the wrapper; pass account overrides explicitly. See [Configuration](guides/configuration.md#running-a-custom-agent-in-the-structured-view).
 
 ### Provider credentials
 
@@ -118,7 +118,7 @@ present. See [Structured View Quickstart](structured-view/quickstart.md) for the
 the model id forms (`claude-`, `gpt-`, `gemini-`, `anthropic:`, `openai:`, `google:`, and
 `openai-compatible:<vendor>/<model>` for a gateway) and undo instructions.
 
-In the web dashboard or TUI, create a session and choose an ACP-capable agent; **Structured** defaults on. Set `acp.structured_view` to `terminal` to preselect terminal view, or `off` to hide the option. The CLI defaults to terminal view; opt in with:
+In the web dashboard, create a session and choose an ACP-capable agent; **Structured** defaults on. In the TUI dialog the default is terminal view; tick Structured there. Set `acp.structured_view` to `terminal` to preselect terminal view, or `off` to hide the option. The CLI defaults to terminal view; opt in with:
 
 ```bash
 aoe acp doctor

@@ -769,7 +769,7 @@ mod tests {
         drained.lifecycle_reservation = Some(crate::session::LifecycleReservation {
             op: crate::session::LifecycleOperation::Capture,
             generation: 7,
-            at: chrono::Utc::now(),
+            at: crate::time::Timestamp::now(),
         });
 
         // Nothing moved under the guard, so the drained values land.
@@ -784,7 +784,7 @@ mod tests {
         let reservation = crate::session::LifecycleReservation {
             op: crate::session::LifecycleOperation::Launch,
             generation: 9,
-            at: chrono::Utc::now(),
+            at: crate::time::Timestamp::now(),
         };
         relaunched.lifecycle_generation = 9;
         relaunched.lifecycle_reservation = Some(reservation.clone());

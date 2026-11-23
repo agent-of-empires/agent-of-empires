@@ -601,7 +601,7 @@ async fn native_auxiliary_ensure_uses_fresh_context_and_refuses_purge() {
         .try_acquire_lifecycle_reservation(
             LifecycleOperation::Purge,
             Instance::LIFECYCLE_RESERVATION_TTL,
-            chrono::Utc::now(),
+            agent_of_empires::time::Timestamp::now(),
         )
         .unwrap();
     persist(&row);
@@ -935,7 +935,7 @@ async fn native_auxiliary_ensure_uses_fresh_context_and_refuses_purge() {
         .try_acquire_lifecycle_reservation(
             LifecycleOperation::Purge,
             Instance::LIFECYCLE_RESERVATION_TTL,
-            chrono::Utc::now(),
+            agent_of_empires::time::Timestamp::now(),
         )
         .unwrap();
     persist(container_row);

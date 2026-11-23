@@ -5,6 +5,7 @@ mod agents;
 mod drain;
 mod launch;
 mod publish;
+pub use publish::UserPrompt;
 mod requests;
 mod sink;
 mod teardown;
@@ -523,7 +524,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             workers: Arc::default(),
             next_seqs: Arc::default(),
             lifecycle: Arc::new(std::sync::Mutex::new(LifecycleTable::new(
-                chrono::Utc::now().timestamp_millis().max(1) as u64,
+                crate::time::Timestamp::now().as_millis().max(1) as u64,
             ))),
             restart_requests: Arc::default(),
             next_restart_request_id: AtomicU64::new(1),

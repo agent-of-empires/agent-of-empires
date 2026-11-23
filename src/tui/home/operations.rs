@@ -1003,8 +1003,7 @@ impl HomeView {
             let Some(stamp) = row
                 .trashed_at
                 .as_ref()
-                .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
-                .map(|stamp| stamp.with_timezone(&chrono::Utc))
+                .and_then(|stamp| crate::time::Timestamp::parse_rfc3339(stamp).ok())
             else {
                 continue;
             };
@@ -1170,7 +1169,7 @@ mod tests {
             branch: "old".into(),
             main_repo_path: repo_dir.path().to_string_lossy().into_owned(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: None,
         });
         if sandboxed {

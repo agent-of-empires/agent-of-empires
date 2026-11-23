@@ -691,7 +691,7 @@ async fn create_and_observe(
     key: &str,
     mut signal: Pin<&mut impl Future<Output = std::io::Result<()>>>,
 ) -> Result<SessionResponse> {
-    let create = client.create_session(body, epoch);
+    let create = client.create_session(body, epoch, crate::daemon::PromptOrigin::Cli);
     tokio::pin!(create);
     let (state, changes) = tokio::sync::watch::channel((false, false));
     let observation = observe_creation(client, body, epoch, key, changes);
@@ -1176,7 +1176,7 @@ mod tests {
             .try_acquire_lifecycle_reservation(
                 LifecycleOperation::Launch,
                 Instance::LIFECYCLE_RESERVATION_TTL,
-                chrono::Utc::now(),
+                crate::time::Timestamp::now(),
             )
             .unwrap();
         for view in [View::Terminal, View::Structured] {

@@ -1,7 +1,7 @@
 //! Durable lifecycle acquisition and commit helpers shared by every surface.
 
 use super::{Instance, LifecycleOperation, LifecycleReservationError};
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 
 pub(crate) fn purge_restored_row_must_be_kept(targeted_trashed: bool, still_trashed: bool) -> bool {
     targeted_trashed && !still_trashed
@@ -19,7 +19,7 @@ pub(crate) fn decide_purge_claim(
     all: &mut [Instance],
     id: &str,
     was_trashed: bool,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<PurgeClaimDecision, LifecycleReservationError> {
     let Some(stored) = all.iter_mut().find(|instance| instance.id == id) else {
         return Ok(PurgeClaimDecision::AlreadyGone);
@@ -48,7 +48,7 @@ pub(crate) enum RestoreClaimDecision {
 pub(crate) fn decide_restore_claim(
     all: &mut [Instance],
     id: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<RestoreClaimDecision, LifecycleReservationError> {
     let Some(stored) = all.iter_mut().find(|instance| instance.id == id) else {
         return Ok(RestoreClaimDecision::AlreadyGone);
@@ -122,7 +122,7 @@ pub(crate) fn commit_trash_relocation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use crate::time::Timestamp;
 
     fn trashed(id: &str) -> Instance {
         let mut instance = Instance::new("session", "/tmp/worktree");
@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn decisions_grant_or_reject_one_unified_reservation() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut restored = trashed("restored");
         restored.untrash();
         let mut busy = trashed("busy");
@@ -176,7 +176,7 @@ mod tests {
 
     #[test]
     fn relocation_commit_requires_exact_trash_generation() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut row = trashed("session");
         let generation = row
             .try_acquire_lifecycle_reservation(
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn restore_commit_requires_exact_generation() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut row = trashed("session");
         row.status = super::super::Status::Running;
         let generation = row
@@ -246,11 +246,11 @@ mod tests {
     fn absent_rows_are_reported_without_mutation() {
         let mut instances = Vec::new();
         assert_eq!(
-            decide_purge_claim(&mut instances, "gone", true, Utc::now()).unwrap(),
+            decide_purge_claim(&mut instances, "gone", true, Timestamp::now()).unwrap(),
             PurgeClaimDecision::AlreadyGone,
         );
         assert_eq!(
-            decide_restore_claim(&mut instances, "gone", Utc::now()).unwrap(),
+            decide_restore_claim(&mut instances, "gone", Timestamp::now()).unwrap(),
             RestoreClaimDecision::AlreadyGone,
         );
         assert_eq!(

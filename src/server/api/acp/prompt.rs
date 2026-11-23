@@ -121,6 +121,7 @@ fn queued_attachments_missing() -> Response {
 pub async fn acp_prompt(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
     req: Result<Json<PromptRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
@@ -140,6 +141,7 @@ pub async fn acp_prompt(
         queued_prompt_id: req.queued_prompt_id.clone(),
         no_revive: req.no_revive,
         refuse_if_ignored: false,
+        origin: super::super::prompt_origin(&headers),
     };
     match submit_prompt(&state, &SessionCaller::User, &id, submission).await {
         Ok(PromptSubmitted {
@@ -207,6 +209,7 @@ pub(crate) struct PromptSubmission<'a> {
     /// Refuse an ignored row under the instance lock instead of clearing the
     /// marker. MCP sends set this; a person's send clears Ignore.
     pub refuse_if_ignored: bool,
+    pub origin: crate::daemon::PromptOrigin,
 }
 
 /// What [`submit_prompt`] did with a prompt.
@@ -322,6 +325,7 @@ pub(crate) async fn submit_prompt(
         }
     }
     let origin_plugin = queued_row.as_ref().and_then(|r| r.origin_plugin.clone());
+    let origin = queued_row.as_ref().map_or(req.origin, |r| r.origin);
     // Decided under the guard so the decision and its dispatch are atomic
     // (#3621). The wake already cleared the dormant marker, hence the flag.
     let dispatch = state
@@ -365,6 +369,7 @@ pub(crate) async fn submit_prompt(
                 blobs: &attachments,
                 origin_device: None,
                 origin_plugin: origin_plugin.clone(),
+                origin,
                 supersede_pending_turn: true,
             },
         )
@@ -442,6 +447,7 @@ pub(crate) async fn submit_prompt(
                     ids
                 },
                 synthesized: false,
+                origin,
                 no_revive: req.no_revive,
             },
         )
@@ -458,13 +464,29 @@ pub(crate) async fn submit_prompt(
         // Kept in the queue instead of refused: the sandbox login or the hook is the
         // only thing missing, and the prompt is delivered once it is there.
         Err(SendTurnError::LoginRequired(blocked)) => {
-            let queued_id =
-                keep_held_prompt(state, id, &req, queued_row, &attachments, origin_plugin).await?;
+            let queued_id = keep_held_prompt(
+                state,
+                id,
+                &req,
+                queued_row,
+                &attachments,
+                origin_plugin,
+                origin,
+            )
+            .await?;
             return Err(PromptSubmitError::LoginRequired { blocked, queued_id });
         }
         Err(SendTurnError::HookFailed(message)) => {
-            let queued_id =
-                keep_held_prompt(state, id, &req, queued_row, &attachments, origin_plugin).await?;
+            let queued_id = keep_held_prompt(
+                state,
+                id,
+                &req,
+                queued_row,
+                &attachments,
+                origin_plugin,
+                origin,
+            )
+            .await?;
             return Err(PromptSubmitError::HookFailed { message, queued_id });
         }
         Err(e) => return Err(PromptSubmitError::Turn(e)),
@@ -477,6 +499,7 @@ pub(crate) async fn submit_prompt(
         attachments = attachments.len(),
         send_now = queued_row.is_some(),
         ?origin_plugin,
+        ?origin,
         "prompt sent"
     );
     if let Some(row) = &queued_row {
@@ -502,6 +525,7 @@ async fn keep_held_prompt(
     queued_row: Option<crate::daemon::QueuedPromptEntry>,
     attachments: &[crate::acp::event_store::AttachmentBlob],
     origin_plugin: Option<String>,
+    origin: crate::daemon::PromptOrigin,
 ) -> Result<String, PromptSubmitError> {
     if let Some(row) = queued_row {
         return Ok(row.id);
@@ -519,6 +543,7 @@ async fn keep_held_prompt(
             blobs: attachments,
             origin_device: None,
             origin_plugin,
+            origin,
             supersede_pending_turn: false,
         },
     )

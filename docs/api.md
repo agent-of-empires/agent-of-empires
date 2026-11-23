@@ -445,7 +445,7 @@ A daemon older than this field omits it entirely. Treat an absent
 ```bash
 curl -sS \
   -H "Authorization: Bearer $AOE_TOKEN" \
-  "http://localhost:7777/api/sessions?state=live"
+  "http://localhost:8080/api/sessions?state=live"
 ```
 
 ### Status values
@@ -828,7 +828,7 @@ curl -sS -X POST \
   -H "Authorization: Bearer $AOE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"message":"summarize the failing test"}' \
-  "http://localhost:7777/api/sessions/abc123/send"
+  "http://localhost:8080/api/sessions/abc123/send"
 ```
 
 ## GET /api/sessions/{id}/output
@@ -861,7 +861,7 @@ what the agent printed back, or as a polling read-only view.
 ```bash
 curl -sS \
   -H "Authorization: Bearer $AOE_TOKEN" \
-  "http://localhost:7777/api/sessions/abc123/output?lines=80&format=text"
+  "http://localhost:8080/api/sessions/abc123/output?lines=80&format=text"
 ```
 
 ## GET /api/sessions/{id}/acp/replay?view=retained
@@ -1080,7 +1080,11 @@ an aoe session as a controlled subagent. A typical loop:
    session list shows the session's `status` back at `Idle`.
 3. Capture the trailing region of `content` as the agent's reply.
 
-For long-running prompts, prefer polling status via
+This loop works for terminal-view sessions only. A structured-view
+session answers `send` with `400 acp_mode_unsupported`; drive it with
+`POST /api/sessions/{id}/acp/prompt`.
+
+For long-running prompts in a terminal-view session, prefer polling status via
 `GET /api/sessions` over polling `output`, then read `output` once
 when status returns to `Idle`. Status transitions are also broadcast
 to push subscribers if the dashboard's push notifications are

@@ -555,7 +555,7 @@ async fn recovered_completion_orders_updates_and_applies_rate_limit_parking() {
         let mut first = runner.attach(false).await;
         first.send_prompt("run", &[]).await.unwrap();
         assert!(matches!(runner.frame().await, ControlBody::Prompt { .. }));
-        let resets_at = chrono::Utc::now().timestamp() + reset_after;
+        let resets_at = crate::time::Timestamp::now().as_unix_secs() + reset_after;
         runner.send(ControlBody::Notify { method: "session/update".into(), params: serde_json::json!({"sessionId": "native", "update": {
             "sessionUpdate": "usage_update", "used": 1, "size": 2, "_meta": {"_claude/rateLimit": {"status": "rejected", "resetsAt": resets_at}}
         }}) }).await;
@@ -603,7 +603,7 @@ async fn recovered_completion_orders_updates_and_applies_rate_limit_parking() {
                 Event::AgentMessageChunk { text, .. } => chunks.push(text),
                 Event::RateLimit { info } => {
                     limited = true;
-                    assert_eq!(info.resets_at.unwrap().timestamp(), resets_at);
+                    assert_eq!(info.resets_at.unwrap().as_unix_secs(), resets_at);
                 }
                 Event::Stopped { reason } => {
                     assert_eq!(

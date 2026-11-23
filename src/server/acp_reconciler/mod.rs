@@ -1108,6 +1108,7 @@ mod tests {
                 merged_prompt_ids: Vec::new(),
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
             Event::Stopped {
                 reason: "prompt_complete".into(),
@@ -1276,7 +1277,7 @@ mod tests {
             prompt: "research".into(),
             model: "model".into(),
             output_file: String::new(),
-            started_at: chrono::Utc::now(),
+            started_at: crate::time::Timestamp::now(),
             workflow: None,
         };
         for (name, events, text, drains) in [
@@ -1304,7 +1305,7 @@ mod tests {
                 vec![
                     task.clone(),
                     Event::CancelRequested {
-                        escalates_at: chrono::Utc::now(),
+                        escalates_at: crate::time::Timestamp::now(),
                     },
                 ],
                 "follow up",
@@ -1341,7 +1342,14 @@ mod tests {
             }
             state
                 .session_service
-                .enqueue_prompt(name, "q".into(), text.into(), Vec::new(), None, None)
+                .enqueue_prompt(
+                    name,
+                    "q".into(),
+                    text.into(),
+                    Vec::new(),
+                    None,
+                    crate::server::session_service::QueueSender::default(),
+                )
                 .await
                 .unwrap();
             if drains {
@@ -1480,7 +1488,7 @@ mod tests {
         let held = held_for_login(id, &mut tick).await;
 
         // An archived row no longer waits on a launch, so it leaves the held set.
-        held.state.instances.write().await[0].archived_at = Some(chrono::Utc::now());
+        held.state.instances.write().await[0].archived_at = Some(crate::time::Timestamp::now());
         tick.run(&held.state).await;
         assert!(!held.state.session_service.sandbox_login.is_held(id));
     }
@@ -1544,7 +1552,9 @@ mod tests {
                 &crate::acp::Event::RateLimit {
                     info: crate::acp::state::RateLimitInfo {
                         status: "limited".into(),
-                        resets_at: Some(chrono::Utc::now() + chrono::Duration::days(3)),
+                        resets_at: Some(
+                            crate::time::Timestamp::now() + crate::time::Duration::days(3),
+                        ),
                         kind: "usage".into(),
                     },
                 },
@@ -1579,6 +1589,7 @@ mod tests {
                     prompt_ids: Vec::new(),
                     synthesized: false,
                     no_revive: false,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 },
             )
             .await;
@@ -1590,7 +1601,10 @@ mod tests {
                 "PR #7 was merged".into(),
                 Vec::new(),
                 None,
-                Some("cron".into()),
+                crate::server::session_service::QueueSender {
+                    plugin: Some("cron".into()),
+                    origin: crate::daemon::PromptOrigin::Unknown,
+                },
             )
             .await
             .unwrap();
@@ -1676,6 +1690,7 @@ mod tests {
                     prompt_ids: Vec::new(),
                     synthesized: false,
                     no_revive: false,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 },
             )
             .await;
@@ -1687,7 +1702,10 @@ mod tests {
                 "PR #7 was merged".into(),
                 Vec::new(),
                 None,
-                Some("cron".into()),
+                crate::server::session_service::QueueSender {
+                    plugin: Some("cron".into()),
+                    origin: crate::daemon::PromptOrigin::Unknown,
+                },
             )
             .await
             .unwrap();

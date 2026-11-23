@@ -34,7 +34,7 @@ pub(crate) enum LifecycleSignal {
     TerminalUsage,
     /// `ScheduleWakeup` registered an absolute wake time.
     WakeupPending {
-        at: chrono::DateTime<chrono::Utc>,
+        at: crate::time::Timestamp,
     },
     /// Validated traffic from a subagent session: liveness only, so it keeps
     /// any end-of-turn accounting already seen.
@@ -331,7 +331,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel::<LifecycleEnvelope>(8);
         let wake = LifecycleSignal::WakeupPending {
-            at: chrono::Utc::now(),
+            at: crate::time::Timestamp::now(),
         };
         forward_lifecycle_signals(
             true,
