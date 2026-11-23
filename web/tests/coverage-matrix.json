@@ -1385,8 +1385,9 @@
       "id": "profiles.lifecycle",
       "kind": "mocked-playwright",
       "risk": "high",
-      "specs": ["tests/profile-lifecycle.spec.ts"],
-      "components": ["web/src/components/settings/ProfileSelector.tsx"]
+      "specs": ["tests/profile-lifecycle.spec.ts", "src/components/settings/__tests__/ProfileSelector.test.tsx"],
+      "components": ["web/src/components/settings/ProfileSelector.tsx"],
+      "notes": "Enter is ignored while an IME composes."
     },
     {
       "id": "profiles.page",
@@ -2880,12 +2881,17 @@
       "id": "session.group-edit",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": ["tests/live/session-actions.spec.ts", "src/lib/api.test.ts"],
+      "specs": [
+        "tests/live/session-actions.spec.ts",
+        "src/lib/api.test.ts",
+        "src/components/__tests__/SessionGroupModal.test.tsx"
+      ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/SessionGroupModal.tsx",
         "web/src/lib/api.ts"
-      ]
+      ],
+      "notes": "Enter is ignored while an IME composes."
     },
     {
       "id": "session.delete-dialog-keyboard",
@@ -3322,7 +3328,8 @@
         "web/src/components/diff/find/FindBar.tsx",
         "web/src/lib/snippetHighlighter.ts",
         "web/src/components/diff/pierre/DiffWorkerPoolProvider.tsx"
-      ]
+      ],
+      "notes": "The find bar ignores Enter while an IME composes."
     },
     {
       "id": "settings.diff-section",
