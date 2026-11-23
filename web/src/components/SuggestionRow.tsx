@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { MoreHorizontal, Undo2, X } from "lucide-react";
 import { lockTitle } from "../lib/suggestionPlan";
 import type { StartedSession } from "../lib/types";
@@ -365,7 +365,7 @@ export function SuggestionStatusNotes({
   );
 }
 
-/** Shown for 10 s after a dismiss; `onStop` turns the item's kind off (homepage only). */
+/** Shown for 10 s after a dismiss; `onStop` turns the item's kind off. */
 export function UndoBar({
   title,
   disabled,
@@ -379,29 +379,38 @@ export function UndoBar({
   onStop?: () => void;
   stopLabel?: string;
 }) {
+  const [stopped, setStopped] = useState(false);
   return (
     <div className="mt-2 flex w-max max-w-full flex-wrap items-baseline gap-x-1 rounded-md bg-surface-800 px-3 py-1.5 text-[13px] text-text-secondary">
-      <span className="max-w-full truncate">Dismissed &ldquo;{title}&rdquo;.</span>
-      <button
-        type="button"
-        onClick={onUndo}
-        disabled={disabled}
-        className="flex-none cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
-      >
-        Undo
-      </button>
-      {onStop && stopLabel && (
+      {stopped ? (
+        <span>Stopped suggesting {stopLabel}. Turn it back on in Settings › Suggestions.</span>
+      ) : (
         <>
-          <span aria-hidden="true">·</span>
+          <span className="max-w-full truncate">Dismissed &ldquo;{title}&rdquo;.</span>
           <button
             type="button"
-            onClick={onStop}
+            onClick={onUndo}
             disabled={disabled}
             className="flex-none cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
           >
-            Stop suggesting {stopLabel}
+            Undo
           </button>
-          <span className="flex-none text-text-dim">(back on in Settings › Suggestions)</span>
+          {onStop && stopLabel && (
+            <>
+              <span aria-hidden="true">·</span>
+              <button
+                type="button"
+                onClick={() => {
+                  onStop();
+                  setStopped(true);
+                }}
+                disabled={disabled}
+                className="flex-none cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
+              >
+                Stop suggesting {stopLabel}
+              </button>
+            </>
+          )}
         </>
       )}
     </div>

@@ -1,7 +1,6 @@
 import type { SessionResponse } from "../lib/types";
 import { copySuggestionPrompt, liveSession } from "../lib/suggestionPlan";
 import { StartedPromptNote } from "./PromptBlockedNote";
-import { updateSuggestionSource } from "../lib/api";
 import { useAgentNames } from "../hooks/useAgentNames";
 import { useSuggestionPresets } from "../hooks/useSuggestionPresets";
 import { SuggestionItemActions } from "./SuggestionItemActions";
@@ -39,7 +38,7 @@ export function DashboardSuggestions({
   const { snapshot, loadFailed, busy, refreshing, notice, failures, offline, act, refresh } = ctrl;
   const agentName = useAgentNames();
   const presetOf = useSuggestionPresets();
-  const { undo, dismiss, clearUndo } = useDismissUndo(act);
+  const { undo, dismiss, stop } = useDismissUndo(act);
 
   // Offline, the disconnect banner already explains a missing snapshot.
   if (!snapshot && loadFailed && !offline)
@@ -169,12 +168,7 @@ export function DashboardSuggestions({
           disabled={busy !== null || readOnly || offline}
           onUndo={() => void dismiss(undo, false)}
           stopLabel={kindOf(undo)}
-          onStop={() => {
-            void act(`stop:${suggestionKey(undo)}`, () =>
-              updateSuggestionSource(undo.provider_id, undo.criterion, false),
-            );
-            clearUndo();
-          }}
+          onStop={() => stop(undo)}
         />
       )}
     </section>

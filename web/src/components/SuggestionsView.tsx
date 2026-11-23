@@ -83,7 +83,7 @@ export function SuggestionsView({
   const { snapshot, loading, loadFailed, refreshing, busy, notice, failures, offline, act, refresh, load } = ctrl;
   const agentName = useAgentNames();
   const presetOf = useSuggestionPresets();
-  const { undo, dismiss } = useDismissUndo(act);
+  const { undo, dismiss, stop } = useDismissUndo(act);
   const [filter, setFilter] = useState<Filter>(initialDismissed ? "dismissed" : "all");
   const [query, setQuery] = useState("");
   const [keyChips, setKeyChips] = useState<KeyChip[]>([]);
@@ -465,6 +465,11 @@ export function SuggestionsView({
                 title={undo.title}
                 disabled={busy !== null || disabled}
                 onUndo={() => void dismiss(undo, false)}
+                stopLabel={snapshot?.providers
+                  .find((p) => p.id === undo.provider_id)
+                  ?.sources.find((src) => src.criterion === undo.criterion)
+                  ?.label.toLowerCase()}
+                onStop={() => stop(undo)}
               />
             )}
           </>

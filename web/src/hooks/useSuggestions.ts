@@ -6,6 +6,7 @@ import {
   refreshSuggestions,
   startSuggestion,
   trashSession,
+  updateSuggestionSource,
   type StartHooksReview,
   type StartOptions,
   type SuggestionResult,
@@ -311,5 +312,8 @@ export function useDismissUndo(act: (key: string, run: () => Promise<SuggestionR
       setUndo(null);
     }
   };
-  return { undo, dismiss, clearUndo: () => setUndo(null) };
+  // Turns the item's kind off; the bar then says where to turn it back on.
+  const stop = (item: SuggestionItem) =>
+    void act(`stop:${suggestionKey(item)}`, () => updateSuggestionSource(item.provider_id, item.criterion, false));
+  return { undo, dismiss, stop };
 }

@@ -169,7 +169,7 @@ describe("DashboardSuggestions", () => {
     await waitFor(() => expect(screen.queryByText(/Dismissed/)).toBeNull());
   });
 
-  it("Stop suggesting turns the item's kind off and closes the bar", async () => {
+  it("Stop suggesting turns the item's kind off, then says where to turn it back on", async () => {
     const withKind = (items: SuggestionItem[]): SuggestionsSnapshot => ({
       items,
       prefs: PREFS,
@@ -188,10 +188,14 @@ describe("DashboardSuggestions", () => {
     updateSuggestionSource.mockResolvedValue(ok);
     renderIt();
     fireEvent.click(await screen.findByRole("button", { name: "Dismiss" }));
-    expect(await screen.findByText("(back on in Settings › Suggestions)")).toBeTruthy();
+    await screen.findByText(/Dismissed/);
+    expect(screen.queryByText(/Settings › Suggestions/)).toBeNull();
     fireEvent.click(await screen.findByRole("button", { name: "Stop suggesting assigned issues" }));
     await waitFor(() => expect(updateSuggestionSource).toHaveBeenCalledWith("github", "assigned", false));
-    await waitFor(() => expect(screen.queryByText(/Dismissed/)).toBeNull());
+    expect(
+      await screen.findByText("Stopped suggesting assigned issues. Turn it back on in Settings › Suggestions."),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
   });
 
   it("expires the undo bar after 10s", async () => {

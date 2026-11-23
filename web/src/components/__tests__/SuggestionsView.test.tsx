@@ -867,12 +867,12 @@ describe("SuggestionsView", () => {
       );
     }, 15_000);
 
-    it("a dismiss offers Undo here too", async () => {
+    it("a dismiss offers Undo and Stop suggesting here too", async () => {
       dismissSuggestion.mockResolvedValue(ok);
       await open(snapshot());
       fireEvent.click(await screen.findByRole("button", { name: "Dismiss" }));
       expect(await screen.findByText(/Dismissed/)).toBeTruthy();
-      expect(screen.queryByRole("button", { name: /Stop suggesting/ })).toBeNull();
+      expect(screen.getByRole("button", { name: "Stop suggesting assigned issues" })).toBeTruthy();
       fireEvent.click(screen.getByRole("button", { name: "Undo" }));
       await waitFor(() => expect(dismissSuggestion).toHaveBeenCalledWith("github", "issue-1", false));
     });
