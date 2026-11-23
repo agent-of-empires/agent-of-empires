@@ -231,11 +231,15 @@ export function useSessions() {
         }
         setTrashEpoch(cursor.epoch);
         setTrashError(false);
-      } finally {
-        trashInFlightRef.current = null;
+      } catch {
+        setTrashError(true);
       }
     })();
     trashInFlightRef.current = run;
+    // After the assignment: a failure before the first await settles `run` synchronously.
+    void run.then(() => {
+      trashInFlightRef.current = null;
+    });
     return run;
   }, [noteSeen]);
 
