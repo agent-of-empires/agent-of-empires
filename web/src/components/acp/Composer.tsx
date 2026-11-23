@@ -42,7 +42,6 @@ import {
   decideArrowRecall,
   decideBeforeInputAction,
   decideEnterAction,
-  fitTextarea,
   insertAtCaret,
   insertNewlineAtCaret,
   insertRawTextAtCaret,
@@ -146,7 +145,7 @@ export function Composer(props: Props) {
 
   usePluginDraftOperations(sessionId, client, taRef);
   usePrimerPrefill(props.primerPrefill, loadText);
-  useDraftPersistence(sessionId, client, composerText, draftTextRef, taRef);
+  useDraftPersistence(sessionId, client, composerText, draftTextRef);
   useEffect(() => {
     const consume = () => {
       const text = consumeComposerPrefill(sessionId);
@@ -253,7 +252,9 @@ export function Composer(props: Props) {
               <PopoverItems trigger="/" skillIndex={skillIndex} />
             </ComposerPrimitive.Unstable_TriggerPopover>
 
+            {/* asChild: the default TextareaAutosize writes inline heights that override field-sizing. */}
             <ComposerPrimitive.Input
+              asChild
               ref={taRef}
               rows={2}
               // Touch-primary Enter inserts a newline; sending is the Send button's job.
@@ -269,7 +270,6 @@ export function Composer(props: Props) {
                     : "Queue a follow-up… (sent when current turn ends)"
                   : "Send a message…  Type @ for files, / for commands")
               }
-              onInput={(e) => fitTextarea(e.currentTarget)}
               onFocus={() => {
                 // Belt and braces for UAs that lag the keyboard's layout-viewport update.
                 if (!isMobile) return;
@@ -307,11 +307,13 @@ export function Composer(props: Props) {
               }}
               autoFocus={!isMobile}
               className={[
-                "min-h-[56px] max-h-[200px] resize-none bg-transparent",
+                "field-sizing-content min-h-[56px] max-h-[200px] resize-none bg-transparent",
                 "px-4 pt-3 pb-1 text-sm leading-6 text-text-primary",
                 "placeholder:text-text-dim focus:outline-none",
               ].join(" ")}
-            />
+            >
+              <textarea />
+            </ComposerPrimitive.Input>
 
             <AttachmentChips attachments={attachments.supported} onRemove={attachments.remove} />
 
@@ -448,7 +450,6 @@ function usePluginDraftOperations(
           if (!el) return;
           el.focus();
           el.setSelectionRange(operation.text.length, operation.text.length);
-          fitTextarea(el);
         });
       } else if (!ta) {
         client.setText(`${client.getState().text}${operation.text}`);

@@ -7,8 +7,8 @@ import {
   waitForComposerConnected,
 } from "./helpers/acpMock";
 
-// Typing into the composer must not strand a bottom-pinned transcript.
-test("typing a multi-line draft keeps the transcript pinned to the bottom", async ({ page }) => {
+// The composer grows with its content up to a cap, and typing must not strand a bottom-pinned transcript.
+test("typing a multi-line draft grows the composer to its cap and keeps the transcript pinned", async ({ page }) => {
   const history = Array.from({ length: 120 }, (_, i) => `history line ${i}`).join("\n\n");
   const mock = await mockAcpSession(page, {
     title: "typing-keeps-pin",
@@ -24,12 +24,17 @@ test("typing a multi-line draft keeps the transcript pinned to the bottom", asyn
 
   const composer = page.getByRole("textbox").first();
   await composer.focus();
+  const height = () => composer.evaluate((el) => el.getBoundingClientRect().height);
+  const initialHeight = await height();
   const gaps: number[] = [];
-  for (let line = 0; line < 6; line++) {
+  for (let line = 0; line < 12; line++) {
     await composer.pressSequentially(`draft line ${line}`);
     await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
     gaps.push(await gap());
     await composer.press("Shift+Enter");
   }
   expect(Math.max(...gaps)).toBeLessThanOrEqual(1);
+  expect(initialHeight).toBeLessThan(100);
+  expect(await height()).toBe(200);
+  expect(await composer.evaluate((el) => el.scrollHeight > el.clientHeight)).toBe(true);
 });
