@@ -238,7 +238,7 @@ impl Instance {
     ) -> bool {
         let identity = if self.tool == "claude"
             || !matches!(acp_agent, "claude" | "claude-code")
-            || self.declared_agent().is_some()
+            || self.declared_agent_in(config).is_some()
         {
             self.tool.clone()
         } else {
@@ -301,15 +301,7 @@ impl Instance {
     }
 
     pub(crate) fn declared_agent(&self) -> Option<crate::plugin::agent_integration::DeclaredAgent> {
-        if crate::agents::get_agent(&self.tool).is_some() {
-            return None;
-        }
-        // Rule out the common no-declaration case before resolving config so a
-        // wrapper tool costs one resolve per session, not two.
-        if !crate::plugin::agent_integration::registry_declares(
-            &crate::plugin::registry(),
-            &self.tool,
-        ) {
+        if !self.may_be_declared() {
             return None;
         }
         let config = crate::session::config::repo_config::resolve_config_with_repo(
@@ -317,8 +309,18 @@ impl Instance {
             Path::new(&self.project_path),
         )
         .ok()?;
+        self.declared_agent_in(&config.session)
+    }
+
+    /// As [`Self::declared_agent`], with the caller's resolved `config`.
+    pub(crate) fn declared_agent_in(
+        &self,
+        config: &crate::session::config::SessionConfig,
+    ) -> Option<crate::plugin::agent_integration::DeclaredAgent> {
+        if !self.may_be_declared() {
+            return None;
+        }
         if config
-            .session
             .agent_command_override
             .get(&self.tool)
             .is_some_and(|command| !command.trim().is_empty())
@@ -329,7 +331,6 @@ impl Instance {
             crate::plugin::registry(),
             &self.tool,
             config
-                .session
                 .custom_agents
                 .iter()
                 .filter(|(_, command)| !command.trim().is_empty())
@@ -339,6 +340,15 @@ impl Instance {
             self.command.is_empty()
                 || agent.contribution().command.as_deref() == Some(self.command.as_str())
         })
+    }
+
+    /// Cheap config-free check: only a non-builtin tool the plugin registry declares can match.
+    fn may_be_declared(&self) -> bool {
+        crate::agents::get_agent(&self.tool).is_none()
+            && crate::plugin::agent_integration::registry_declares(
+                &crate::plugin::registry(),
+                &self.tool,
+            )
     }
 
     /// The pause to leave between typing into this session's pane and Enter.
@@ -1167,6 +1177,76 @@ mod tests {
         inst.command = "claude --model sonnet".to_string();
         assert!(inst.acp_transcript_cli_resumable("claude"));
         assert!(!inst.acp_transcript_cli_resumable("codex"));
+    }
+
+    /// The declaration lookup honors the caller's config instead of resolving
+    /// repository config again, so list rows sharing one cached config stay consistent.
+    #[test]
+    #[serial_test::serial]
+    fn declared_agent_in_uses_the_passed_config() {
+        let home = tempfile::tempdir().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let manifest = r#"
+id = "acme.wrapped-provider"
+name = "Integration test"
+version = "1.0.0"
+api_version = 19
+capabilities = ["session.integration"]
+
+[[agent_integrations]]
+tool = "wrapped-tool"
+command = "wrapped-tool"
+provider_versions = ["^18"]
+replies = true
+"#;
+        let dir = crate::plugin::plugins_dir()
+            .unwrap()
+            .join("acme.wrapped-provider");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.wrapped-provider".into(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: vec!["session.integration".into()],
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+
+        let mut inst = Instance::new("declared", home.path().join("project").to_str().unwrap());
+        inst.tool = "wrapped-tool".to_string();
+        inst.command = "wrapped-tool".to_string();
+        assert!(inst.declared_agent().is_some());
+
+        let mut overridden = crate::session::config::SessionConfig::default();
+        overridden
+            .agent_command_override
+            .insert("wrapped-tool".into(), "other --serve".into());
+        let default = crate::session::config::SessionConfig::default();
+        assert!(inst.declared_agent_in(&default).is_some());
+        assert!(inst.declared_agent_in(&overridden).is_none());
+
+        // The resumability preview follows the passed config, not the one on disk.
+        overridden
+            .agent_execution_as
+            .insert("wrapped-tool".into(), "claude".into());
+        overridden.agent_config_dir.insert(
+            "wrapped-tool".into(),
+            home.path().join(".claude").to_str().unwrap().into(),
+        );
+        assert!(!inst.acp_transcript_cli_resumable_with("claude", &default));
+        assert!(inst.acp_transcript_cli_resumable_with("claude", &overridden));
     }
 
     /// The switch previews resolve the same ACP target as the daemon launch.
