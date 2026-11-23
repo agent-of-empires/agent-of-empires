@@ -147,11 +147,11 @@ fn is_refusal(error: &HttpError) -> bool {
         || matches!(error, HttpError::Server { status, .. } if *status == reqwest::StatusCode::FORBIDDEN)
 }
 
+/// The client classifies by the `AoE-Error-Code` header and keeps only that code as `body`.
 fn is_unknown_image(error: &HttpError) -> bool {
     matches!(error, HttpError::Server { status, body }
         if *status == reqwest::StatusCode::BAD_REQUEST
-            && serde_json::from_str::<serde_json::Value>(body)
-                .is_ok_and(|v| v["error"] == "unknown_image"))
+            && body == crate::daemon::ApiErrorCode::UnknownImage.as_str())
 }
 
 /// How long Ctrl+E's prompt waits for its confirming key.
@@ -620,20 +620,16 @@ mod tests {
         };
         let bad = reqwest::StatusCode::BAD_REQUEST;
         for (error, unknown) in [
+            (server(bad, "unknown_image"), true),
+            (server(bad, "invalid_body"), false),
+            // The client never passes the JSON body through, so it doesn't count.
             (
                 server(bad, r#"{"error":"unknown_image","message":"x"}"#),
-                true,
-            ),
-            (
-                server(bad, r#"{"error":"invalid_body","message":"x"}"#),
                 false,
             ),
-            (server(bad, "unknown_image"), false),
+            (server(bad, ""), false),
             (
-                server(
-                    reqwest::StatusCode::FORBIDDEN,
-                    r#"{"error":"unknown_image"}"#,
-                ),
+                server(reqwest::StatusCode::FORBIDDEN, "unknown_image"),
                 false,
             ),
             (HttpError::Transport, false),

@@ -15,10 +15,11 @@ use serde::{Deserialize, Serialize};
 // Tokio's, so tests can drive overlapping checks on a paused clock.
 use tokio::time::Instant;
 
-use super::{api_error, cityhall_block, read_only_block};
+use super::{api_error, api_error_with_code_header, cityhall_block, read_only_block};
 use crate::containers::image_pull::PullState;
 use crate::containers::image_update::{self, ImageCheck};
 use crate::containers::ContainerRuntime;
+use crate::daemon::ApiErrorCode;
 use crate::server::AppState;
 use crate::session::ContainerRuntimeName;
 
@@ -231,9 +232,8 @@ fn resolve_image(configured: &Configured, requested: Option<&str>) -> Result<Str
     match requested {
         None => Ok(configured.default_image.clone()),
         Some(image) if configured.images.iter().any(|i| i == image) => Ok(image.to_string()),
-        Some(_) => Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "unknown_image",
+        Some(_) => Err(api_error_with_code_header(
+            ApiErrorCode::UnknownImage,
             "Only a configured sandbox image can be checked or pulled",
         )),
     }

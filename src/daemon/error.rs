@@ -39,6 +39,8 @@ pub enum ApiErrorCode {
     WorkingDirMissing,
     /// A worktree checkout named a branch that exists neither locally nor on a remote.
     BranchNotFound,
+    /// A sandbox image request named an image no profile configures.
+    UnknownImage,
     AgentHooksNotApproved,
     SmartRenameSkipped,
     SmartRenameFailed,
@@ -82,6 +84,7 @@ impl ApiErrorCode {
             Self::CreateOutcomeUnknown => "create_outcome_unknown",
             Self::WorkingDirMissing => "working_dir_missing",
             Self::BranchNotFound => "branch_not_found",
+            Self::UnknownImage => "unknown_image",
             Self::AgentHooksNotApproved => "agent_hooks_not_approved",
             Self::SmartRenameSkipped => "smart_rename_skipped",
             Self::SmartRenameFailed => "smart_rename_failed",
@@ -125,9 +128,10 @@ impl ApiErrorCode {
             | Self::AccountSwapUnavailable => StatusCode::CONFLICT,
             Self::PendingTargetGone => StatusCode::NOT_FOUND,
             Self::TlsRequired => StatusCode::UPGRADE_REQUIRED,
-            Self::CreateHookFailed | Self::WorkingDirMissing | Self::BranchNotFound => {
-                StatusCode::BAD_REQUEST
-            }
+            Self::CreateHookFailed
+            | Self::WorkingDirMissing
+            | Self::BranchNotFound
+            | Self::UnknownImage => StatusCode::BAD_REQUEST,
             Self::SmartRenameSkipped => StatusCode::CONFLICT,
             Self::SmartRenameFailed | Self::PluginPreviewFailed => StatusCode::BAD_GATEWAY,
             Self::SmartRenameTimeout => StatusCode::GATEWAY_TIMEOUT,
@@ -196,6 +200,7 @@ impl ApiErrorCode {
             b"create_hook_failed" => Self::CreateHookFailed,
             b"working_dir_missing" => Self::WorkingDirMissing,
             b"branch_not_found" => Self::BranchNotFound,
+            b"unknown_image" => Self::UnknownImage,
             b"smart_rename_skipped" => Self::SmartRenameSkipped,
             b"smart_rename_failed" => Self::SmartRenameFailed,
             b"smart_rename_timeout" => Self::SmartRenameTimeout,
@@ -343,6 +348,13 @@ mod tests {
                 Some(ApiErrorCode::BranchNotFound),
             ),
             (StatusCode::CONFLICT, "branch_not_found", false, None),
+            (
+                StatusCode::BAD_REQUEST,
+                "unknown_image",
+                false,
+                Some(ApiErrorCode::UnknownImage),
+            ),
+            (StatusCode::NOT_FOUND, "unknown_image", false, None),
             (
                 StatusCode::CONFLICT,
                 "group_not_empty",
