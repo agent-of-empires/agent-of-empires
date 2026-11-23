@@ -863,14 +863,18 @@ if grep -Fq 'hooks_hash = "{hash}"' {trust:?}; then printf approved > {trust_see
                 sdk.cancel_creation(&pending.id, &epoch).await.unwrap();
                 std::fs::write(&release, "continue").unwrap();
             };
-            let (result, ()) = tokio::join!(sdk.create_session(&borrower_body, &epoch), cancel);
+            let (result, ()) = tokio::join!(
+                sdk.create_session(&borrower_body, &epoch, PromptOrigin::Unknown),
+                cancel
+            );
             assert!(
                 matches!(&result, Err(DaemonClientError::Status { status, code: Some(ApiErrorCode::CreationCancelled), .. }) if *status == reqwest::StatusCode::CONFLICT),
                 "{result:?}"
             );
             result
         } else {
-            sdk.create_session(&borrower_body, &epoch).await
+            sdk.create_session(&borrower_body, &epoch, PromptOrigin::Unknown)
+                .await
         };
         if matches!(
             stage,
@@ -926,7 +930,8 @@ if grep -Fq 'hooks_hash = "{hash}"' {trust:?}; then printf approved > {trust_see
 #[parallel]
 async fn cancelled_creation_is_gone_from_the_first_read_after_the_failure() {
     use agent_of_empires::daemon::{
-        ApiErrorCode, CreateSessionBody, DaemonClient, DaemonClientError, RuntimeSnapshot,
+        ApiErrorCode, CreateSessionBody, DaemonClient, DaemonClientError, PromptOrigin,
+        RuntimeSnapshot,
     };
     require_tmux!();
     let mut h = TuiTestHarness::new_in_tmp("cancelled_creation_publish");
@@ -969,7 +974,7 @@ async fn cancelled_creation_is_gone_from_the_first_read_after_the_failure() {
     }))
     .unwrap();
     let owner = sdk
-        .create_session(&owner_body, &epoch)
+        .create_session(&owner_body, &epoch, PromptOrigin::Unknown)
         .await
         .unwrap()
         .outcome;
@@ -1011,7 +1016,10 @@ async fn cancelled_creation_is_gone_from_the_first_read_after_the_failure() {
         sdk.cancel_creation(&pending.id, &epoch).await.unwrap();
         std::fs::write(&release, "continue").unwrap();
     };
-    let (result, ()) = tokio::join!(sdk.create_session(&body, &epoch), cancel);
+    let (result, ()) = tokio::join!(
+        sdk.create_session(&body, &epoch, PromptOrigin::Unknown),
+        cancel
+    );
     assert!(
         matches!(
             &result,
