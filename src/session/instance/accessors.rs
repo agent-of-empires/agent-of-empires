@@ -230,9 +230,44 @@ impl Instance {
         )
     }
 
-    /// The ACP agent a structured switch launches. Mirrors `pick_agent_for_tool` minus the
-    /// live registry and default-agent fallback; resolves config only for a custom tool.
+    /// As [`Self::acp_transcript_cli_resumable`], with the caller's resolved `config`.
+    pub(crate) fn acp_transcript_cli_resumable_with(
+        &self,
+        acp_agent: &str,
+        config: &crate::session::config::SessionConfig,
+    ) -> bool {
+        let identity = if self.tool == "claude"
+            || !matches!(acp_agent, "claude" | "claude-code")
+            || self.declared_agent().is_some()
+        {
+            self.tool.clone()
+        } else {
+            Self::execution_agent_for(&self.tool, &self.get_tool_command(), config)
+                .map_or_else(|_| self.tool.clone(), |agent| agent.name.to_string())
+        };
+        crate::agents::acp_transcript_cli_resumable(&identity, acp_agent)
+    }
+
+    /// The ACP agent a structured switch launches; resolves config at the repo
+    /// only for a custom tool.
     pub(crate) fn effective_acp_agent(&self) -> String {
+        self.effective_acp_agent_with(|| {
+            crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                &self.effective_profile(),
+                self.repo_config_path(),
+            )
+            .session
+        })
+    }
+
+    /// Mirrors `pick_agent_for_tool` minus the live registry and default-agent
+    /// fallback. `session` runs only for a custom tool.
+    pub(crate) fn effective_acp_agent_with<
+        C: std::borrow::Borrow<crate::session::config::SessionConfig>,
+    >(
+        &self,
+        session: impl FnOnce() -> C,
+    ) -> String {
         if let Some(name) = self.agent_name.as_deref().filter(|name| !name.is_empty()) {
             return name.to_string();
         }
@@ -242,19 +277,16 @@ impl Instance {
         {
             return self.tool.clone();
         }
-        let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
-            &self.effective_profile(),
-            self.repo_config_path(),
-        );
-        if config
-            .session
+        let session = session();
+        let session = session.borrow();
+        if session
             .agent_acp_cmd
             .get(&self.tool)
             .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(&self.tool, cmd).is_ok())
         {
             return self.tool.clone();
         }
-        crate::acp::inherited_acp_base(&self.tool, &config.session.agent_detect_as)
+        crate::acp::inherited_acp_base(&self.tool, &session.agent_detect_as)
             .unwrap_or_else(|| self.tool.clone())
     }
 
@@ -1107,7 +1139,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
         const PROFILE: &str = "custom-claude-resumable-test";
-        let mut inst = Instance::new("custom", "/tmp/custom-claude");
+        let mut inst = Instance::new("custom", home.path().join("project").to_str().unwrap());
         inst.source_profile = PROFILE.to_string();
         inst.tool = "corp-claude".to_string();
         inst.command = "corp-wrapper --serve".to_string();
@@ -1126,7 +1158,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
         const PROFILE: &str = "effective-acp-agent-test";
-        let mut inst = Instance::new("custom", "/tmp/custom-claude");
+        let mut inst = Instance::new("custom", home.path().join("project").to_str().unwrap());
         inst.source_profile = PROFILE.to_string();
         inst.tool = "corp-claude".to_string();
         inst.command = "corp-wrapper --serve".to_string();

@@ -5044,6 +5044,73 @@ async fn list_sessions_resolves_config_once_per_repo_across_linked_worktrees() {
     );
 }
 
+// Sessions of one custom claude wrapper in one repo derive `keeps_context` from the shared
+// cached config, so the whole list costs one resolution, not one per row.
+#[tokio::test]
+#[serial_test::serial]
+async fn list_sessions_derives_keeps_context_from_the_cached_config() {
+    use std::sync::atomic::Ordering;
+
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+    let project = tempfile::tempdir().expect("tempdir project");
+    const PROFILE: &str = "keeps-context-list-test";
+    let path = crate::session::config::profile_config::get_profile_config_path(PROFILE).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let store = tmp_home.path().join(".claude");
+    std::fs::write(
+        &path,
+        format!(
+            "[session.agent_execution_as]\ncorp-claude = \"claude\"\n\
+             [session.agent_config_dir]\ncorp-claude = {store:?}\n\
+             [session.agent_detect_as]\ncorp-claude = \"claude\"\n"
+        ),
+    )
+    .unwrap();
+
+    let sessions: Vec<Instance> = (0..3)
+        .map(|_| {
+            let mut inst = Instance::new("test-session", project.path().to_str().unwrap());
+            inst.tool = "corp-claude".to_string();
+            inst.command = "corp-wrapper --serve".to_string();
+            inst.source_profile = PROFILE.to_string();
+            inst
+        })
+        .collect();
+    // The row constructor reads no config; only the list overlay can know this wrapper's identity.
+    let bare = super::model::session_response_from_instance_with_plan(
+        &sessions[0],
+        false,
+        None,
+        crate::daemon::AcpWorkerState::Absent,
+        None,
+        None,
+        None,
+    );
+    assert!(!bare.keeps_context);
+    let state = crate::server::test_support::build_test_app_state(sessions);
+
+    let response = list_sessions(
+        axum::extract::State(state.clone()),
+        axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::http::HeaderMap::new(),
+    )
+    .await
+    .into_response();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let envelope: crate::daemon::SessionsEnvelope = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(envelope.sessions.len(), 3);
+    assert!(envelope.sessions.iter().all(|s| s.keeps_context));
+    let misses = state.list_sessions_resolver_misses.load(Ordering::Relaxed);
+    assert_eq!(
+        misses, 1,
+        "rows sharing a profile and repo must share one resolution; got {misses}",
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn list_sessions_flags_only_terminal_sessions_when_structured_view_is_off() {
