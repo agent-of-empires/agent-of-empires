@@ -789,7 +789,7 @@ An `href` renders as a link only when it is an `http(s)` URL or a path starting 
 
 #### Pane actions
 
-Clicking an `action` block, or a `row` carrying a `method`, POSTs to `/api/plugins/{id}/action` with `{ method, params, session_id }`. `params` is the block's own `params` object, forwarded verbatim, so one method can serve every row in a list:
+Clicking an `action` block, or a `row` carrying a `method`, POSTs to `/api/plugins/{id}/action` with `{ method, params, session_id }`. `params` is the block's own `params` object, forwarded as given apart from the host-owned `session_id` and `origin`. The host also removes `composer` unless the plugin declares the composer-read capability. One method can serve every row in a list:
 
 ```json
 { "kind": "row", "label": "warn when daemon is stale", "prefix": "#3231",
@@ -797,6 +797,14 @@ Clicking an `action` block, or a `row` carrying a `method`, POSTs to `/api/plugi
 ```
 
 The host merges in the authoritative `session_id` (a plugin cannot spoof it) and delivers the call as a **fire-and-forget JSON-RPC notification**: no reply, no return value. The worker does its work and re-pushes its UI state, and the clicked control spins until the plugin's UI revision moves, with a 15s timeout. Actions are read-write-mode only and are not passphrase gated, so treat every method as reachable by anyone who can use the dashboard.
+
+The host also sets `params.origin`, overwriting any client value. It is session provenance, not proof of human intent:
+
+- `dashboard`: the request carried a signed-in browser login. Programmatic callers holding that session can send it too.
+- `socket`: a process on the daemon's Unix socket (same user, such as a coding agent).
+- `token`: any other caller (access token, or `--auth none`).
+
+A plugin that needs a person to approve something must not rely on `origin` alone; it needs its own trusted confirmation step. `params` must be a JSON object, `null` or omitted; anything else gets `400`.
 
 The TUI renders panes read-only: it draws the text of every kind (dropping icons, hrefs, and tooltips, and stacking `columns`) but cannot fire an action, so `action` blocks appear as inert `[action] <label>` labels.
 
