@@ -23,18 +23,9 @@ fn group_membership<'a>(
 }
 
 impl HomeView {
-    /// Why this process may not write `projects.json`, or `None` when it may.
-    ///
-    /// The runtime republishes the registry in every snapshot
-    /// (`global_projects`), so once it owns the rows a local write diverges
-    /// from the state it will send back next. No runtime route exists for a
-    /// client-side pin: the daemon's own project mutations map to
-    /// `POST /api/projects` / `PATCH /api/projects/{name}` /
-    /// Project registry has an independent local-write policy; sessions/groups never write locally.
+    /// Why this process may not write `projects.json`, or `None` when it may: only while a
+    /// writable Daemon is attached, since it republishes the registry in every snapshot.
     pub(super) fn project_write_block(&self) -> Option<&'static str> {
-        if !self.project_registry_authoritative {
-            return None;
-        }
         if self.session_feed.cityhall_mode() {
             return Some("The attached runtime serves a City Hall client, whose policy does not allow this process to write the project registry locally");
         }
@@ -913,17 +904,23 @@ impl HomeView {
     }
 
     /// Restore the selected trashed session, clearing `trashed_at` so it
-    /// returns to its prior bucket. No-op when the selection is not trashed.
+    /// returns to its prior bucket. Flashes a hint when the selection is not trashed.
     /// The session stays stopped (trash killed its panes); the user restarts
     /// it with `e` like any stopped session. See #2489.
     pub(super) fn restore_selected_from_trash(&mut self) {
-        let Some(id) = self.selected_session.clone() else {
+        let Some(id) = self
+            .selected_session
+            .clone()
+            .filter(|id| self.instances.get(id).is_some_and(|row| row.is_trashed()))
+        else {
+            self.flash_status("Select a session under Trash to restore it");
             return;
         };
-        let Some(instance) = self.instances.get(&id).filter(|row| row.is_trashed()) else {
-            return;
-        };
-        if instance.has_pending_trash() {
+        if self
+            .instances
+            .get(&id)
+            .is_some_and(|row| row.has_pending_trash())
+        {
             self.flash_status("Retry Trash first");
             return;
         }

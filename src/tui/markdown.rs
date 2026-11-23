@@ -8,10 +8,15 @@ const TAB_STOP_WIDTH: usize = 4;
 
 /// Parse Markdown into styled ratatui lines.
 pub(crate) fn render(text: &str) -> Vec<Line<'static>> {
+    render_with(text, HtmlMode::Drop)
+}
+
+fn render_with(text: &str, html: HtmlMode) -> Vec<Line<'static>> {
     use super::rich_text::{infallible, Memory, MemoryLines};
     let source = Memory;
     let mut output = MemoryLines::default();
     let mut builder = infallible(MarkdownBuilder::new(&source, &mut output));
+    builder.html = html;
     let options =
         pulldown_cmark::Options::ENABLE_STRIKETHROUGH | pulldown_cmark::Options::ENABLE_TABLES;
     for event in pulldown_cmark::Parser::new_ext(text, options) {
@@ -19,6 +24,22 @@ pub(crate) fn render(text: &str) -> Vec<Line<'static>> {
     }
     infallible(builder.finish());
     output.lines
+}
+
+/// Parse Markdown for a surface that quotes text rather than formatting it, so
+/// tags the parser reports as HTML stay visible instead of disappearing.
+pub(crate) fn render_keeping_html(text: &str) -> Vec<Line<'static>> {
+    render_with(text, HtmlMode::Literal)
+}
+
+/// Whether tags the parser reports as HTML are dropped or painted as text.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum HtmlMode {
+    /// Agent replies are formatted output: markup is meant to style them.
+    #[default]
+    Drop,
+    /// A quoted thought keeps whatever the model wrote.
+    Literal,
 }
 
 /// Parse Markdown and wrap it to the available terminal width.
@@ -48,6 +69,7 @@ pub(crate) struct MarkdownBuilder<'a, S: Source, K: Sink<S::Text, Error = S::Err
     lines: u64,
     pending_blanks: u64,
     current: bool,
+    html: HtmlMode,
 }
 
 impl<'a, S: Source, K: Sink<S::Text, Error = S::Error>> MarkdownBuilder<'a, S, K> {
@@ -67,6 +89,7 @@ impl<'a, S: Source, K: Sink<S::Text, Error = S::Error>> MarkdownBuilder<'a, S, K
             lines: 0,
             pending_blanks: 0,
             current: false,
+            html: HtmlMode::Drop,
         })
     }
     fn active_modifier(&self) -> Modifier {
@@ -237,6 +260,18 @@ impl<'a, S: Source, K: Sink<S::Text, Error = S::Error>> MarkdownBuilder<'a, S, K
                     self.span(text, Modifier::DIM)?;
                 }
             }
+            Event::Html(text) | Event::InlineHtml(text) => {
+                if self.html == HtmlMode::Literal {
+                    let text = convert(text);
+                    if self.table_open {
+                        if self.table_cells != 0 {
+                            self.table.push(TablePart::Text(text))?;
+                        }
+                    } else {
+                        self.push_literal(text)?;
+                    }
+                }
+            }
             Event::SoftBreak if !self.in_code_block => self.flush()?,
             Event::HardBreak => self.flush()?,
             Event::Rule => {
@@ -270,6 +305,21 @@ impl<'a, S: Source, K: Sink<S::Text, Error = S::Error>> MarkdownBuilder<'a, S, K
             std::mem::take(&mut self.pending_blanks),
         )?;
         self.lines += 1;
+        Ok(())
+    }
+    fn push_literal(&mut self, text: S::Text) -> Result<(), S::Error> {
+        let length = self.source.len(&text);
+        let mut start = 0;
+        while let Some(end) = self.source.find(&text, b'\n', start)? {
+            if start != end {
+                self.span(self.source.slice(&text, start..end)?, Modifier::DIM)?;
+            }
+            self.flush()?;
+            start = end + 1;
+        }
+        if start < length {
+            self.span(self.source.slice(&text, start..length)?, Modifier::DIM)?;
+        }
         Ok(())
     }
     fn push_code_text(&mut self, text: S::Text) -> Result<(), S::Error> {
@@ -444,5 +494,24 @@ mod tests {
             wrap_line_into(case.input, case.width, &mut actual);
             assert_eq!(actual, case.expected, "{}", case.name);
         }
+    }
+
+    #[test]
+    fn literal_html_stays_in_its_table_cell() {
+        let lines = render_keeping_html("| Choice |\n| --- |\n| before <b>yes</b> after |");
+        let rows: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec!["Choice".to_string(), "before <b>yes</b> after".to_string()],
+            "the tag stays with the text of the cell it was written in"
+        );
     }
 }

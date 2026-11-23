@@ -821,7 +821,7 @@ impl EmbeddedView {
     /// `width` columns, so the home view's selection extraction slices match the
     /// on-screen geometry. Styles are irrelevant to extraction.
     pub fn selection_text(&self, width: u16) -> ratatui::text::Text<'static> {
-        render::wrapped_transcript(&self.state, &crate::tui::styles::Theme::default(), width)
+        render::project_transcript(&self.state, &crate::tui::styles::Theme::default(), width)
     }
 
     /// Paste text into the composer, focusing it if needed, then load the file

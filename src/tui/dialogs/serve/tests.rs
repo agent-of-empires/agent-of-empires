@@ -3317,3 +3317,23 @@ fn a_funnel_reset_confirms_only_with_enter() {
         assert!(view.pending.is_none(), "refused={refused}");
     }
 }
+
+/// An unavailable card's note fits inside the card at the default width.
+#[test]
+fn unavailable_mode_notes_render_whole() {
+    let view = ServeView::for_test(ServeViewState::ModePicker {
+        selected: ServeMode::Local,
+        tunnel_available: false,
+        local_available: false,
+        flash: None,
+    });
+    let buffer = crate::tui::dialogs::test_render::draw(120, 40, |frame, theme| {
+        view.render(frame, frame.area(), theme)
+    });
+    for note in [
+        "(no non-loopback interface)",
+        "(needs tailscale/cloudflared)",
+    ] {
+        crate::tui::dialogs::test_render::find(&buffer, note);
+    }
+}

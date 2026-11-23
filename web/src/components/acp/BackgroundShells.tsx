@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Maximize2, Terminal, X } from "lucide-react";
 
+import { useFocusTrap } from "../../hooks/useFocusTrap";
 import { fetchTaskOutput, type TaskOutput } from "../../lib/api";
 import type { BackgroundShell } from "../../lib/acpTypes";
 import { CopyMarkdownButton } from "./CopyMarkdownButton";
@@ -48,33 +49,16 @@ export function ShellDetailModal({
   const panelRef = useRef<HTMLDivElement>(null);
 
   // Focus moves into the dialog, Tab stays inside it, and closing returns focus.
+  useFocusTrap(() => panelRef.current, { restoreFocus: true });
   useEffect(() => {
-    const previous = document.activeElement as HTMLElement | null;
-    const panel = panelRef.current;
-    panel?.focus();
+    panelRef.current?.focus();
+  }, []);
+  useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") return onClose();
-      if (e.key !== "Tab" || !panel) return;
-      const items = [...panel.querySelectorAll<HTMLElement>("button, [href], pre[tabindex]")];
-      if (items.length === 0) return e.preventDefault();
-      const first = items[0]!;
-      const last = items[items.length - 1]!;
-      if (
-        !panel.contains(document.activeElement) ||
-        (e.shiftKey && (document.activeElement === first || document.activeElement === panel))
-      ) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && document.activeElement === last) {
-        e.preventDefault();
-        first.focus();
-      }
+      if (e.key === "Escape") onClose();
     };
     window.addEventListener("keydown", onKey);
-    return () => {
-      window.removeEventListener("keydown", onKey);
-      previous?.focus();
-    };
+    return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
   // Poll while the shell runs, and until one read lands after it ends.

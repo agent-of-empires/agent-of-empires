@@ -261,6 +261,7 @@
         "idle_entered_at",
         "last_error",
         "archived_at",
+        "ignored_at",
         "trashed_at",
         "active_snoozed_until",
         "pinned_at",
@@ -305,6 +306,9 @@
           "type": ["string", "null"]
         },
         "archived_at": {
+          "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]
+        },
+        "ignored_at": {
           "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]
         },
         "trashed_at": {

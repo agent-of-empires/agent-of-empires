@@ -398,7 +398,7 @@ async fn selection_copy_rebuilds_an_evicted_width_without_losing_offscreen_conte
     model.apply_event(1, &event);
     let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
     let mut memory = StructuredViewState::new(inst.id.clone(), endpoint.clone(), http, None);
-    memory.transcript.server_rows = model.into_rows();
+    memory.transcript.set_rows(model.into_rows());
     let reference = render::wrapped_transcript(&memory, &Theme::default(), 32);
     let expected = reference
         .lines

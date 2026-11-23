@@ -187,6 +187,9 @@ pub struct CreateSessionBody {
     pub command_override: String,
     #[serde(default)]
     pub custom_instruction: Option<String>,
+    /// Typed into the agent as its first turn, only once it is ready.
+    #[serde(default)]
+    pub initial_prompt: Option<String>,
     pub profile: Option<String>,
     /// Structured view requires an ACP-capable agent.
     #[serde(default)]
@@ -742,6 +745,20 @@ pub struct UpdateSnoozeBody {
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct UpdateIgnoredBody {
+    pub ignored: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ReclaimOwnershipBody {
+    /// True takes ownership back by clearing the manager link and the ignore
+    /// marker together. Reserved so a future reclaim variant can reuse the
+    /// route without silently changing meaning.
+    #[serde(default)]
+    pub reclaim: bool,
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct UpdateUnreadBody {
     pub unread: bool,
 }
@@ -1037,6 +1054,13 @@ pub struct SessionResponse {
     /// `last_accessed_at` but leaves `idle_entered_at` alone.
     pub idle_entered_at: Option<String>,
     pub last_error: Option<String>,
+    /// Why the initial prompt was not typed into a terminal session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_prompt_error: Option<String>,
+    /// Machine-readable `initial_prompt_error` cause when one applies:
+    /// `agent_folder_not_trusted` or `agent_bypass_not_accepted`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_prompt_error_code: Option<String>,
     pub branch: Option<String>,
     pub main_repo_path: Option<String>,
     /// Base branch the worktree was created from when AoE managed the
@@ -1110,6 +1134,15 @@ pub struct SessionResponse {
     /// and the response simply omits the field. See #1581.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snoozed_until: Option<String>,
+    /// RFC3339 timestamp at which a managed session was ignored, or omitted
+    /// when it is not ignored. Ignore is distinct from archive, snooze, and
+    /// trash: the row stays present, live, and restorable, and its
+    /// `parent_session_id` names the session that manages it. Opening,
+    /// attaching, or sending from a direct user action clears it; MCP routine
+    /// reads leave it intact and sends refuse instead of clearing it. See
+    /// #5833.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignored_at: Option<String>,
     /// RFC3339 timestamp at which the session was moved to trash, or
     /// omitted when not trashed. Trashed rows are excluded from the
     /// default session list; the web client requests them with

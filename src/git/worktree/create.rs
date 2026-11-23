@@ -94,8 +94,16 @@ impl GitWorktree {
         }
     }
 
-    /// Fetches `branch` and records a non-`Ok` outcome as a warning.
+    /// Fetches `branch` and records a non-`Ok` outcome as a warning. A repo
+    /// without `remote` has nothing to fetch, so that is not a warning.
     fn fetch_with_warning(&self, warnings: &mut Vec<String>, remote: &str, branch: &str) {
+        let has_remote = open_repo_at(&self.repo_path).map_or(true, |repo| {
+            !matches!(repo.find_remote(remote), Err(e) if e.code() == git2::ErrorCode::NotFound)
+        });
+        if !has_remote {
+            tracing::info!(target: "git.worktree", "git fetch skipped: no remote {remote}");
+            return;
+        }
         let detail = match self.fetch_branch(remote, branch) {
             FetchOutcome::Ok => return,
             FetchOutcome::Failed(msg) | FetchOutcome::Skipped(msg) => msg,
@@ -574,12 +582,32 @@ pub(super) mod tests {
 
     #[test]
     fn fetch_branch_reports_outcome() {
-        let (no_remote, _repo) = init_repo();
+        let (no_remote, repo) = init_repo();
         let git_wt = GitWorktree::new(no_remote.path().to_path_buf()).unwrap();
         assert!(matches!(
             git_wt.fetch_branch("origin", "main"),
             FetchOutcome::Failed(_)
         ));
+        // A missing remote is skipped quietly; an unreachable one still warns.
+        let mut warnings = Vec::new();
+        git_wt.fetch_with_warning(&mut warnings, "origin", "main");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let gone = no_remote.path().join("gone");
+        repo.remote("origin", gone.to_str().unwrap()).unwrap();
+        git_wt.fetch_with_warning(&mut warnings, "origin", "main");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        // A configured remote that fails to load is not a missing one.
+        repo.config()
+            .unwrap()
+            .set_str(
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/main",
+            )
+            .unwrap();
+        let lookup = repo.find_remote("origin").map(|_| ()).unwrap_err();
+        assert_ne!(lookup.code(), git2::ErrorCode::NotFound, "{lookup}");
+        git_wt.fetch_with_warning(&mut warnings, "origin", "main");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
 
         let (_dirs, local, _, _) = fork_upstream_layout("main");
         let git_wt = GitWorktree::new(local).unwrap();

@@ -152,6 +152,14 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/favorite",
             patch(api::update_session_favorite).layer(read_only.clone()),
         )
+        .route(
+            "/api/sessions/{id}/ignored",
+            patch(api::update_session_ignored).layer(read_only.clone()),
+        )
+        .route(
+            "/api/sessions/{id}/reclaim-ownership",
+            post(api::reclaim_session_ownership).layer(read_only.clone()),
+        )
         .route("/api/sessions/{id}/color", patch(api::update_session_color))
         .route(
             "/api/sessions/{id}/archive",
@@ -430,6 +438,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/telemetry/consent", post(api::set_telemetry_consent))
         .route("/api/telemetry/reset-id", post(api::reset_telemetry_id))
         .route("/api/telemetry/seen", post(api::post_telemetry_seen))
+        .route(
+            "/api/telemetry/feature-use",
+            post(api::post_telemetry_feature_use),
+        )
         .route(
             "/api/telemetry/structured-interaction",
             post(api::post_telemetry_structured_interaction),

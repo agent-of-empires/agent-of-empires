@@ -316,6 +316,7 @@ fn session_json(
         created_at: wire_instant_at(&session.created_at)?,
         trashed_at: wire_instant(session.trashed_at.as_deref())?,
         archived_at: wire_instant(session.archived_at.as_deref())?,
+        ignored_at: wire_instant(session.ignored_at.as_deref())?,
         snoozed_until: wire_instant(session.active_snoozed_until.as_deref())?,
         pinned_at: wire_instant(session.pinned_at.as_deref())?,
         workspace_repos: session
@@ -994,6 +995,7 @@ mod tests {
             idle_entered_at: None,
             last_error: None,
             archived_at: None,
+            ignored_at: None,
             trashed_at: None,
             active_snoozed_until: None,
             pinned_at: None,

@@ -279,7 +279,7 @@ fn render_mode_picker(
                 "Token + passphrase (2FA).",
                 "Pick transport on next screen.",
             ],
-            "  (brew install tailscale or cloudflared)",
+            "  (needs tailscale/cloudflared)",
         ),
     ];
     for (card_area, title, mode, available, headline, body_lines, unavailable_note) in cards {
@@ -398,7 +398,7 @@ fn render_confirm(
                 "URL rotates each restart",
                 "Not PWA-friendly",
             ],
-            "Not installed (brew install cloudflared)",
+            "Not installed (needs cloudflared)",
         ),
     ];
     for (card_area, title, transport, status, body_lines, not_installed) in cards {

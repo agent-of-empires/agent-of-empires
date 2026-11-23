@@ -17,7 +17,7 @@ export function SandboxPanel({
         autoFocus={hasFinePointer()}
         value={data.sandboxImage}
         onChange={(v) => onChange("sandboxImage", v)}
-        placeholder="ghcr.io/agent-of-empires/aoe-sandbox:latest"
+        placeholder="Default: the configured default image, else the aoe-sandbox image for this AoE version"
       />
       <EnvVarList label="Container environment" values={data.extraEnv} onChange={(v) => onChange("extraEnv", v)} />
       <EnvVarList

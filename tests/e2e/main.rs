@@ -40,6 +40,7 @@ mod fork_cli;
 mod fork_structured_e2e;
 mod hermes_shared_project_correlation_e2e;
 mod hide_stopped;
+mod ignore_direct_input;
 mod intro;
 mod kiro_launch;
 mod live_send_paste_e2e;

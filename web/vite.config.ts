@@ -34,6 +34,8 @@ export default defineConfig(({ mode, command }) => {
 
   return {
     server: { proxy },
+    // ES workers can code-split, so Shiki grammars load as lazy chunks instead of one inlined IIFE.
+    worker: { format: "es" },
     plugins: [
       react(),
       tailwindcss(),
