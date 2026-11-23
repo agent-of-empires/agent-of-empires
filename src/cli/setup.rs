@@ -39,17 +39,9 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     let detection = Detection::detect_env();
     let app_dir = crate::session::get_app_dir().ok();
 
-    // Readiness, not mere installation: a current package whose Node runtime
-    // cannot run the sources still needs the install offer, and `--install-adapter
-    // --agent aoe-agent` has to reach it.
-    let adapter_missing = app_dir
-        .as_deref()
-        .is_some_and(|app_dir| !quickstart::bundled_ready(Some(app_dir)));
-    let install_allowed = args.install_adapter
-        || config.acp.allow_agent_install
-        || (!args.quick && adapter_missing && prompt_install(quickstart::BUNDLED_AGENT));
-
-    let mut plan = quickstart::plan(&detection, &config.acp, install_allowed);
+    // The explicit agent decides whether the bundled adapter matters at all, so
+    // it is resolved before any install is offered: `--agent claude` replaces
+    // the bundled agent, and a prompt answered here would be discarded below.
     if let Some(requested) = &args.agent {
         if requested != quickstart::BUNDLED_AGENT
             && !detection
@@ -69,6 +61,21 @@ pub async fn run(args: SetupArgs) -> Result<()> {
                 agent = quickstart::BUNDLED_AGENT
             );
         }
+    }
+
+    // Readiness, not mere installation: a current package whose Node runtime
+    // cannot run the sources still needs the install offer, and `--install-adapter
+    // --agent aoe-agent` has to reach it.
+    let adapter_missing = app_dir
+        .as_deref()
+        .is_some_and(|app_dir| !quickstart::bundled_ready(Some(app_dir)));
+    let install_allowed = bundled_target(args.agent.as_deref())
+        && (args.install_adapter
+            || config.acp.allow_agent_install
+            || (!args.quick && adapter_missing && prompt_install(quickstart::BUNDLED_AGENT)));
+
+    let mut plan = quickstart::plan(&detection, &config.acp, install_allowed);
+    if let Some(requested) = &args.agent {
         plan.bundled = requested == quickstart::BUNDLED_AGENT;
         plan.agent = requested.clone();
         plan.install = (plan.bundled && adapter_missing && install_allowed)
@@ -89,6 +96,13 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     );
     if let Some(reason) = plan.fallback {
         println!("Using it because {reason}.");
+    }
+    if args.install_adapter && !plan.bundled {
+        println!(
+            "Not installing the bundled {} adapter: the default is {}.",
+            quickstart::BUNDLED_AGENT,
+            plan.agent
+        );
     }
 
     let mut adapter_ready = !plan.bundled || detection.bundled_installed;
@@ -231,6 +245,13 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     }
 }
 
+/// Whether this run can end up on the bundled agent, and so whether an install
+/// is worth asking about. `--agent <name>` replaces the bundled agent, and the
+/// final plan then drops any install, so the answer must not be collected.
+fn bundled_target(requested: Option<&str>) -> bool {
+    requested.is_none_or(|agent| agent == quickstart::BUNDLED_AGENT)
+}
+
 /// Ask before an install. A non-tty caller (CI, a piped run) never installs
 /// silently, so the answer defaults to no.
 fn prompt_install(binary: &str) -> bool {
@@ -298,6 +319,15 @@ mod tests {
             "    undo: remove acp.acp_defaults.aoe-agent.model from that file"
         );
         assert!(!line.contains("(unset)"), "{line}");
+    }
+
+    /// `--agent claude` replaces the bundled agent, so offering to install the
+    /// bundled adapter would only collect an answer the plan discards.
+    #[test]
+    fn only_the_bundled_agent_offers_an_install() {
+        assert!(bundled_target(None));
+        assert!(bundled_target(Some(quickstart::BUNDLED_AGENT)));
+        assert!(!bundled_target(Some("claude-code")));
         assert_eq!(
             undo_instruction("acp.structured_view", &Undo::Value("auto".into())),
             "    undo: set acp.structured_view = \"auto\" in that file"
