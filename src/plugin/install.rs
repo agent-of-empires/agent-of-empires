@@ -2263,7 +2263,13 @@ fn with_publication_copy<T>(
             .finish(final_dir, result.is_ok())
             .map_err(publication_error)?;
     }
-    result
+    result.map_err(|error| {
+        if error.is::<publication::PriorBackup>() {
+            publication_error(error)
+        } else {
+            error
+        }
+    })
 }
 
 fn publication_error(error: anyhow::Error) -> anyhow::Error {
@@ -2477,7 +2483,7 @@ fn replace_and_build(
 ) -> Result<()> {
     let backup_dir = final_dir.with_file_name(format!("{plugin_id}.bak"));
 
-    if !fetched.journals_publication() && backup_dir.exists() {
+    if backup_dir.exists() {
         return Err(super::execution::RecoveryRequired(format!(
             "ambiguous prior update backup {}; manual recovery required",
             backup_dir.display()
@@ -2686,15 +2692,27 @@ mod tests {
             with_publication_copy(&fetched, &final_dir, Some((&prior, true)), |_, _| {
                 panic!("a backup obstruction must prevent publication")
             });
-        assert!(!super::super::execution::needs_recovery(&result));
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "publication backup already exists"
-        );
+        assert!(super::super::execution::needs_recovery(&result));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("publication backup already exists"));
         let marker = app.join(publication::MARKER);
         assert!(!marker.exists());
         assert!(!final_dir.exists());
         assert_eq!(std::fs::read(backup.join("payload")).unwrap(), b"prior");
+        std::fs::rename(&backup, &final_dir).unwrap();
+        let result: Result<()> =
+            with_publication_copy(&fetched, &final_dir, Some((&prior, false)), |_, _| {
+                panic!("an occupied install destination must prevent publication")
+            });
+        assert!(!super::super::execution::needs_recovery(&result));
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "plugin destination already exists"
+        );
+        assert!(!marker.exists());
+        assert_eq!(std::fs::read(final_dir.join("payload")).unwrap(), b"prior");
         assert!(std::fs::read_dir(&plugins).unwrap().all(|entry| {
             !entry
                 .unwrap()
@@ -2990,6 +3008,7 @@ mod tests {
                         "--nocapture",
                     ])
                     .env("AOE_PUBLICATION_CRASH_HOME", &home)
+                    .env("AOE_TMUX_SOCKET", home.join("tmux.sock"))
                     .env("NOTIFY_SOCKET", &notify_path)
                     .spawn()
                     .unwrap(),

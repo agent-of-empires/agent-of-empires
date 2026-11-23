@@ -16,6 +16,10 @@ use super::{publication_error, remove_owned_tree_checked, PriorMetadata};
 pub(super) const MARKER: &str = ".plugin-publication-active";
 const MAX_RECORD: usize = 4096;
 
+#[derive(Debug, thiserror::Error)]
+#[error("publication backup already exists")]
+pub(super) struct PriorBackup;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Identity {
@@ -195,6 +199,12 @@ impl Journal {
             .context("invalid publication target")?;
         let anchored = plugins.child(Path::new(directory))?;
         crate::process::prove_same_mount(plugins.descriptor(), anchored.descriptor())?;
+        if plugins
+            .entry_stat(Path::new(&format!("{id}.bak")))?
+            .is_some()
+        {
+            return Err(PriorBackup.into());
+        }
         let record = Self {
             schema: 1,
             id: id.to_owned(),
@@ -210,10 +220,6 @@ impl Journal {
         ensure!(
             update || record.old_tree.is_none(),
             "plugin destination already exists"
-        );
-        ensure!(
-            plugins.entry_stat(&record.backup())?.is_none(),
-            "publication backup already exists"
         );
         let bytes = record.encode()?;
         anchored.sync()?;
