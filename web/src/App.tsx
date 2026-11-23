@@ -65,6 +65,7 @@ import { getAttentionBadgeColors } from "./lib/attentionBadgeColors";
 import { useWebSettings } from "./hooks/useWebSettings";
 import { useDiffFiles } from "./hooks/useDiffFiles";
 import { useDiffComments } from "./hooks/useDiffComments";
+import { usePrefetchWhen } from "./hooks/usePrefetchWhen";
 import { clearStoredComments } from "./components/diff/comments/storage";
 import { useCommandActions, buildConversationActions, type SessionStateAction } from "./hooks/useCommandActions";
 import { usePluginCommands } from "./hooks/usePluginCommands";
@@ -177,10 +178,8 @@ const SettingsView = lazyView(
   () => import("./components/SettingsView").then((m) => m.SettingsView),
   <LazyFallback label="Loading settings…" />,
 );
-const SendCommentsDialog = lazyView(
-  () => import("./components/diff/comments/SendCommentsDialog").then((m) => m.SendCommentsDialog),
-  null,
-);
+const loadSendCommentsDialog = () => import("./components/diff/comments/SendCommentsDialog");
+const SendCommentsDialog = lazyView(() => loadSendCommentsDialog().then((m) => m.SendCommentsDialog), null);
 const loadCommandPalette = () => import("./components/command-palette/CommandPalette");
 const LazyCommandPalette = lazyView(() => loadCommandPalette().then((m) => m.CommandPalette), null);
 // Mounted only while open so the chunk is not fetched until needed.
@@ -988,6 +987,8 @@ function AppContent({
   // banner lives in the diff pane while the inline UI lives inside
   // DiffFileViewer, so the store is lifted here and threaded to both.
   const diffComments = useDiffComments(activeSessionId);
+  // Load the dialog chunk before it can be opened, so Escape works the moment it appears.
+  usePrefetchWhen(diffComments.count > 0, loadSendCommentsDialog);
   const commentsEnabled = !!activeSession;
   // A dormant structured worker wakes on send; archived and trashed sessions cannot start.
   const commentSendEnabled =
