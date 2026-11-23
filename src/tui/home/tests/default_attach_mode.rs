@@ -467,6 +467,38 @@ fn switch_view_target_gates_by_view_and_state() {
     assert_eq!(env.view.session_switch_view_target(&id), None);
 }
 
+/// The terminal -> structured confirm only promises continuity conditionally for a
+/// CLI-resumable tool (the wrapper may have no transcript), and still says a fresh
+/// conversation for a tool that cannot resume.
+#[test]
+#[serial]
+fn switch_to_structured_confirm_text_follows_resumability() {
+    let mut env = create_test_env_empty();
+    let id = add_session(&mut env.view, "term-one");
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.cursor = 0;
+    env.view.update_selected();
+    for (tool, present, absent) in [
+        ("claude", "transcript", "destroyed"),
+        ("codex", "destroyed", "transcript"),
+    ] {
+        env.view.mutate_instance(&id, |inst| {
+            inst.view = crate::session::View::Terminal;
+            inst.tool = tool.to_string();
+        });
+        env.view.prompt_switch_view_for_selected();
+        let screen = render_home(&mut env);
+        assert!(
+            screen.contains(present),
+            "{tool}: missing {present:?}:\n{screen}"
+        );
+        assert!(
+            !screen.contains(absent),
+            "{tool}: unexpected {absent:?}:\n{screen}"
+        );
+    }
+}
+
 /// Switching a terminal session into structured view is gated on `acp.structured_view`, so
 /// with it `off` an ACP-capable row offers no switch. A structured row can always switch back, so no session is stranded.
 #[test]
