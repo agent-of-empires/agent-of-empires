@@ -1607,6 +1607,7 @@ describe("SessionWizard Sandbox image status", () => {
     vi.mocked(fetchSandboxImageStatus).mockResolvedValueOnce({
       image: "ghcr.io/x/sb:2",
       state: "current",
+      pull: { state: "idle" },
     } as never);
     renderWizard();
     await waitFor(() => expect(vi.mocked(fetchSandboxImageStatus)).toHaveBeenCalled());
