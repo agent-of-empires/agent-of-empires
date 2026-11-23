@@ -31,7 +31,7 @@ export function TerminalSessionStack({
   return (
     <div className="flex-1 min-h-0 overflow-hidden relative">
       {/* Recency order would make React re-insert kept terminals, and re-insertion resets their scroll. */}
-      {[...visibleIds].sort().map((sessionId) => {
+      {visibleIds.toSorted().map((sessionId) => {
         const session = sessionsById.get(sessionId);
         if (!session) return null;
         const selected = sessionId === activeSessionId;

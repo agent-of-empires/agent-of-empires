@@ -110,7 +110,7 @@ export function buildDiffTree(files: RichDiffFile[], collapsedDirs: Set<string>)
   function walk(dir: InternalDir, depth: number, isRoot: boolean) {
     // Sort: directories first (alphabetical), then files (alphabetical)
     const sortedDirs = [...dir.children.values()].sort((a, b) => a.name.localeCompare(b.name));
-    const sortedFiles = [...dir.files].sort((a, b) => {
+    const sortedFiles = dir.files.toSorted((a, b) => {
       const aName = a.path.split("/").pop()!;
       const bName = b.path.split("/").pop()!;
       return aName.localeCompare(bName);

@@ -184,8 +184,8 @@ export function TrashMenu({
 
             <div className="min-h-0 flex-1 overflow-y-auto p-2">
               <div className="space-y-1">
-                {[...trashedWorkspaces]
-                  .sort((a, b) => workspaceTrashedAtMs(b) - workspaceTrashedAtMs(a))
+                {trashedWorkspaces
+                  .toSorted((a, b) => workspaceTrashedAtMs(b) - workspaceTrashedAtMs(a))
                   .map((ws) => (
                     <TrashRow
                       key={ws.id}
