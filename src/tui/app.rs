@@ -2589,9 +2589,10 @@ impl App {
         }
         let (completed, draft) = pending.into_parts();
         let mut unsent = completed;
-        // Set when the daemon refused a prompt and put it back in the composer:
-        // replaying the next segment into that text would submit them together.
-        let mut rejected = false;
+        // Set when an Enter brought no submit: replaying the next segment would
+        // land on text the composer still holds, so the rest waits for the next
+        // mount. Every segment stays in `unsent` while that is set.
+        let mut stopped = false;
         let failure = {
             let view = self
                 .home
@@ -2601,7 +2602,8 @@ impl App {
             let mut failure = None;
             // A refused send is back in the composer and had its own Enter, so
             // it becomes the next segment: pasting the one after it onto that
-            // text would submit both as one prompt.
+            // text would submit both as one prompt. Text the reader edited since
+            // is their own draft and stays where it is.
             if view.last_submit_rejected() {
                 let restored = view.take_restored_prompt();
                 if !restored.is_empty() {
@@ -2624,25 +2626,26 @@ impl App {
                     break;
                 }
                 if view.accepted_submits() == accepted {
-                    // The daemon kept nothing. A refused prompt is back in the
-                    // composer, so the replay drops just that segment; an Enter
-                    // the view never submitted keeps its text buffered.
-                    if view.last_submit_rejected() {
-                        unsent.remove(0);
-                    }
-                    rejected = true;
+                    // The daemon kept nothing and the view put the segment back
+                    // in its composer, either refused or held by the submit
+                    // lock. Take that copy so the segment has one owner, and
+                    // keep it here for the next mount instead of leaving a
+                    // second copy the next replay would append to.
+                    view.take_unsubmitted_text();
+                    stopped = true;
                     break;
                 }
                 unsent.remove(0);
             }
-            if failure.is_none() && !rejected && !draft.is_empty() {
+            if failure.is_none() && !stopped && !draft.is_empty() {
                 view.paste_text_with_file_load(&draft).await;
             }
             failure
         };
-        if rejected {
-            // What came after the refused prompt still has its own Enter to
-            // honour, and the draft was never typed into the composer.
+        if stopped {
+            // Every segment keeps its own Enter for the next mount, so the
+            // buffer holds them all rather than a row switch dropping the one
+            // the composer showed.
             self.home.pending_paste_for_structured_view.insert(
                 session_id.to_owned(),
                 PendingStructuredInput::from_parts(unsent, draft),
@@ -4025,13 +4028,24 @@ mod tests {
             .as_ref()
             .expect("the mount Enter asked for is on screen");
         assert_eq!(
-            view.composer_text(),
-            "quit",
+            view.submitted_prompts(),
+            ["quit".to_string()],
             "the keys reach the view Enter opened, and Enter is not kept as a newline"
         );
         assert!(
             view.toast_text().is_some(),
             "the Enter submits the draft it restores instead of leaving it unsent"
+        );
+        // The fake daemon refuses, so the buffer keeps the prompt on its own
+        // Enter rather than leaving a second copy in the composer.
+        assert_eq!(view.composer_text(), "");
+        assert_eq!(
+            app.home
+                .pending_paste_for_structured_view
+                .get(&id)
+                .map(PendingStructuredInput::text)
+                .as_deref(),
+            Some("quit")
         );
     }
 
@@ -4067,17 +4081,17 @@ mod tests {
             ["send this".to_string()],
             "only the text before Enter is submitted"
         );
-        // The refused prompt is back in the composer, so the text typed after
-        // Enter is kept for this row rather than appended to it.
-        assert_eq!(view.composer_text(), "send this");
+        // The refused prompt and the text typed after Enter both wait in this
+        // row's buffer, each with its own Enter, so the composer holds neither.
+        assert_eq!(view.composer_text(), "");
         assert_eq!(
             app.home
                 .pending_paste_for_structured_view
                 .get(&id)
                 .map(PendingStructuredInput::text)
                 .as_deref(),
-            Some(" not this"),
-            "text typed after Enter waits for the next mount of this row"
+            Some("send this not this"),
+            "the later text waits for the next mount of this row"
         );
     }
 
@@ -4117,8 +4131,8 @@ mod tests {
         assert_eq!(view.submitted_prompts(), ["first".to_string()]);
         assert_eq!(
             view.composer_text(),
-            "first",
-            "the refused prompt is back in the composer on its own"
+            "",
+            "the refused prompt has one owner, and it is not the composer"
         );
         assert_eq!(
             app.home
@@ -4126,13 +4140,13 @@ mod tests {
                 .get(&id)
                 .map(PendingStructuredInput::text)
                 .as_deref(),
-            Some("second"),
-            "the later segment waits for the next mount instead of riding along"
+            Some("firstsecond"),
+            "each segment waits for the next mount with its own Enter"
         );
 
         // Reopening the retained view starts the drain again, where the refused
-        // "first" is back in the composer. It has to go out as its own prompt
-        // rather than take "second" with it.
+        // "first" is still buffered. It has to go out as its own prompt rather
+        // than take "second" with it.
         app.open_structured_view(&id).await.unwrap();
         let view = app
             .home
@@ -4144,15 +4158,15 @@ mod tests {
             ["first".to_string(), "first".to_string()],
             "the restored prompt is retried alone, never joined with the next one"
         );
-        assert_eq!(view.composer_text(), "first");
+        assert_eq!(view.composer_text(), "");
         assert_eq!(
             app.home
                 .pending_paste_for_structured_view
                 .get(&id)
                 .map(PendingStructuredInput::text)
                 .as_deref(),
-            Some("second"),
-            "the later segment still waits on its own"
+            Some("firstsecond"),
+            "both segments still wait, each on its own Enter"
         );
     }
 
@@ -4253,10 +4267,188 @@ mod tests {
                 .get(&id)
                 .map(PendingStructuredInput::text)
                 .as_deref(),
-            Some("界"),
-            "the multibyte draft survives for the next mount, got {:?}",
+            Some("éa界"),
+            "the frozen segment and the multibyte draft both survive for the next mount, got {:?}",
             view.composer_text()
         );
+    }
+
+    /// An accepted segment leaves the submit lock held, so the segment after it
+    /// waits. That wait belongs to this row's buffer alone: reopening after the
+    /// lock clears must replay it once, never onto a copy the composer kept.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_held_segment_after_an_accepted_one_replays_once_on_reopen() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        app.open_structured_view(&id).await.unwrap();
+        for text in ["first", "second"] {
+            app.route_pasted_text(text).await;
+            assert!(app.hold_key_for_pending_structured_view(&KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )));
+        }
+
+        let mut view = EmbeddedView::for_test(&id);
+        view.accept_submits_for_test(2);
+        assert!(tx.send(Ok(view)).is_ok());
+        assert!(app.poll_structured_mount());
+        app.drain_structured_paste().await;
+
+        let view = app
+            .home
+            .structured_preview
+            .as_ref()
+            .expect("the mount is on screen");
+        assert_eq!(
+            view.submitted_prompts(),
+            ["first".to_string()],
+            "the submit lock holds the second segment instead of sending it"
+        );
+        assert_eq!(
+            view.composer_text(),
+            "",
+            "the held segment is not left in the composer as a second owner"
+        );
+        assert_eq!(
+            app.home
+                .pending_paste_for_structured_view
+                .get(&id)
+                .map(PendingStructuredInput::text)
+                .as_deref(),
+            Some("second")
+        );
+
+        // The socket's turn-start echo clears the lock; reopening the row then
+        // replays the held segment exactly once.
+        app.home
+            .structured_preview
+            .as_mut()
+            .expect("mounted")
+            .end_turn_for_test();
+        app.drain_pending_paste_for_structured_view(&id).await;
+
+        let view = app
+            .home
+            .structured_preview
+            .as_ref()
+            .expect("the mount is on screen");
+        assert_eq!(
+            view.submitted_prompts(),
+            ["first".to_string(), "second".to_string()],
+            "the held segment goes out once, not appended to itself"
+        );
+        assert_eq!(view.composer_text(), "");
+        assert!(!app.home.pending_paste_for_structured_view.contains_key(&id));
+    }
+
+    /// A refused segment belongs to its row's buffer, so leaving the row takes
+    /// the preview away without taking the text with it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_refused_segment_survives_leaving_the_row() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, ids) = app_on_two_structured_rows();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((ids[0].clone(), rx));
+        app.open_structured_view(&ids[0]).await.unwrap();
+        app.route_pasted_text("refused").await;
+        assert!(app.hold_key_for_pending_structured_view(&KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&ids[0]))).is_ok());
+        assert!(app.poll_structured_mount());
+        app.drain_structured_paste().await;
+        assert_eq!(
+            app.home
+                .structured_preview
+                .as_ref()
+                .expect("mounted")
+                .submitted_prompts(),
+            ["refused".to_string()]
+        );
+
+        // The selection moves to the other row, which drops this preview.
+        app.home.selected_session = Some(ids[1].clone());
+        app.home.structured_preview = None;
+        assert_eq!(
+            app.home
+                .pending_paste_for_structured_view
+                .get(&ids[0])
+                .map(PendingStructuredInput::text)
+                .as_deref(),
+            Some("refused"),
+            "the refused prompt outlives the preview it failed in"
+        );
+
+        // Coming back replays it on its own Enter.
+        app.home.selected_session = Some(ids[0].clone());
+        app.home.structured_preview = Some(EmbeddedView::for_test(&ids[0]));
+        app.drain_pending_paste_for_structured_view(&ids[0]).await;
+        assert_eq!(
+            app.home
+                .structured_preview
+                .as_ref()
+                .expect("mounted")
+                .submitted_prompts(),
+            ["refused".to_string()],
+            "the retry is one submit of the whole segment"
+        );
+    }
+
+    /// Text edited after a refusal is the reader's draft, not the refused
+    /// segment: reopening must not submit it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn editing_a_refused_prompt_keeps_it_out_of_the_replay() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        use crossterm::event::Event;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        app.home.structured_preview = Some(EmbeddedView::for_test(&id));
+        app.home.pending_paste_for_structured_view.insert(
+            id.clone(),
+            PendingStructuredInput::from_parts(Vec::new(), " typed later".into()),
+        );
+
+        // The reader submits from the mounted composer and the daemon refuses,
+        // restoring the prompt.
+        let view = app.home.structured_preview.as_mut().expect("mounted");
+        view.paste_text_with_file_load("refused").await;
+        view.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+        assert!(view.last_submit_rejected());
+        // They edit it, then leave and reopen the row without pressing Enter.
+        view.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('!'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+        assert_eq!(view.composer_text(), "refused!");
+
+        app.drain_pending_paste_for_structured_view(&id).await;
+
+        let view = app.home.structured_preview.as_ref().expect("mounted");
+        assert_eq!(
+            view.submitted_prompts(),
+            ["refused".to_string()],
+            "the edit is a draft, so reopening submits nothing"
+        );
+        assert_eq!(
+            view.composer_text(),
+            "refused! typed later",
+            "the edit stays in the composer with the text typed after its Enter"
+        );
+        assert!(!app.home.pending_paste_for_structured_view.contains_key(&id));
     }
 
     /// A click can move the selection before the mount is reconciled, so the

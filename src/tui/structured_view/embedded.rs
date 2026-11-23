@@ -481,8 +481,40 @@ impl EmbeddedView {
 
     /// Take the prompt a refused send restored to the composer, so the replay
     /// submits it on its own Enter instead of appending the next segment to it.
+    /// Empty once the composer holds anything else: that is the reader's own
+    /// draft, not the refused segment.
     pub(crate) fn take_restored_prompt(&mut self) -> String {
-        self.state.take_composer_text()
+        let restored = self.state.restored_prompt.take();
+        self.state.submit_rejected = false;
+        match restored {
+            Some(text) if text == self.state.composer.lines().join("\n").trim() => {
+                self.state.take_composer_text()
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// Take back whatever the view left in its composer after an Enter it did not
+    /// submit, whether the daemon refused it or the submit lock held it, so the
+    /// caller's buffer is the segment's only owner.
+    pub(crate) fn take_unsubmitted_text(&mut self) {
+        self.state.take_composer_text();
+        self.state.submit_rejected = false;
+        self.state.restored_prompt = None;
+    }
+
+    /// Accept the next `count` submits without a daemon, holding the submit lock
+    /// as a `Sent` response does until the turn-start echo clears it.
+    #[cfg(test)]
+    pub(crate) fn accept_submits_for_test(&mut self, count: usize) {
+        self.state.accept_submits_for_test = count;
+    }
+
+    /// The socket's turn-start echo releasing the submit lock, for tests with no
+    /// connection to deliver it.
+    #[cfg(test)]
+    pub(crate) fn end_turn_for_test(&mut self) {
+        self.state.in_flight = false;
     }
 
     /// The session this view is streaming.

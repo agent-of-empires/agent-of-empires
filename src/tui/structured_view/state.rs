@@ -133,6 +133,14 @@ pub struct StructuredViewState {
     /// True when the last submit was refused and its text put back in the
     /// composer, so a replay knows that text is not lost.
     pub submit_rejected: bool,
+    /// The text that refusal restored. A replay claims the composer only while
+    /// it still holds exactly that, so a later edit is never submitted as a
+    /// refused segment.
+    pub restored_prompt: Option<String>,
+    /// Test-only: submits to accept without a daemon, leaving the submit lock
+    /// held as a real `Sent` response would until the turn-start echo clears it.
+    #[cfg(test)]
+    pub accept_submits_for_test: usize,
     /// Every prompt the composer submitted, in order. Test-only, so the paste
     /// handoff can assert what each Enter actually sent.
     #[cfg(test)]
@@ -363,6 +371,9 @@ impl StructuredViewState {
             compaction_reminder_percent: None,
             accepted_submits: 0,
             submit_rejected: false,
+            restored_prompt: None,
+            #[cfg(test)]
+            accept_submits_for_test: 0,
             #[cfg(test)]
             submitted_prompts: Vec::new(),
         }
