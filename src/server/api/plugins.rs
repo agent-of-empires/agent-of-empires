@@ -1296,6 +1296,14 @@ mod tests {
             let final_dir = plugins.join("acme.blocking");
             let before = serde_json::to_value(Config::load().unwrap().plugins).unwrap();
             let before_lock = std::fs::read(root.join("plugins.lock")).ok();
+            let mut preparation = plugin::fetch::test_gate::install(
+                &plugins,
+                if boundary == "stage" {
+                    "staging-ready"
+                } else {
+                    "source-prepared"
+                },
+            );
             let mut gate = if boundary == "stage" {
                 plugin::fetch::test_gate::install(&manifest.canonicalize().unwrap(), "copy")
             } else {
@@ -1323,6 +1331,7 @@ mod tests {
             .await;
             assert_eq!(response.status(), StatusCode::ACCEPTED);
             let accepted: PluginJobAccepted = decode(response).await;
+            preparation.wait_for_preparation().await;
             tokio::time::timeout(std::time::Duration::from_secs(5), &mut gate.entered)
                 .await
                 .unwrap()
@@ -1514,6 +1523,7 @@ while not (p/'finish').exists():
         );
         let consent: plugin::install::InstallConsent = decode(response).await;
         let plugins = plugin::plugins_dir().unwrap();
+        let mut preparation = plugin::fetch::test_gate::install(&plugins, "source-prepared");
         let mut capture = plugin::fetch::test_gate::install(&plugins, "command-capture");
         let mut observe = plugin::fetch::test_gate::install(&plugins, "command-observe");
         let mut census = plugin::fetch::test_gate::install(&plugins, "command-census");
@@ -1552,6 +1562,7 @@ while not (p/'finish').exists():
         )
         .await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+        preparation.wait_for_preparation().await;
         tokio::time::timeout(Duration::from_secs(5), &mut capture.entered)
             .await
             .unwrap()
@@ -1645,12 +1656,16 @@ while not (p/'finish').exists():
 
     #[cfg(unix)]
     async fn decode<T: serde::de::DeserializeOwned>(response: Response) -> T {
-        serde_json::from_slice(
-            &axum::body::to_bytes(response.into_body(), 1024 * 1024)
-                .await
-                .unwrap(),
-        )
-        .unwrap()
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap_or_else(|error| {
+            panic!(
+                "cannot decode plugin response ({status}): {error}; body: {}",
+                String::from_utf8_lossy(&body)
+            )
+        })
     }
 
     #[cfg(unix)]
@@ -1737,10 +1752,11 @@ while not (p/'finish').exists():
             }),
         )
         .await;
-        assert!(matches!(
-            finish(&state, response).await.status,
-            PluginJobStatus::Failed { .. }
-        ));
+        let job = finish(&state, response).await;
+        let PluginJobStatus::Failed { error } = job.status else {
+            panic!("changed source must fail: {:?}", job.status);
+        };
+        assert!(error.contains("changed since it was shown"), "{error}");
         assert!(!installed.exists());
         assert!(!built.exists());
         assert!(!node_calls.exists());
@@ -1749,7 +1765,14 @@ while not (p/'finish').exists():
             .plugins
             .contains_key("aoe.dev-fixture"));
 
-        let consent: plugin::install::InstallConsent = decode(preview(state.clone()).await).await;
+        let response = preview(state.clone()).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{:?}",
+            decode::<serde_json::Value>(response).await
+        );
+        let consent: plugin::install::InstallConsent = decode(response).await;
         let response = start_plugin_install(
             State(state.clone()),
             None,

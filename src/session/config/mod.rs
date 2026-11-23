@@ -1169,6 +1169,21 @@ pub struct SessionConfig {
     )]
     pub pre_trust_agent_folders: bool,
 
+    /// Require native OS sandbox enforcement for remote plugin staging. Disabled
+    /// by default; enabling requires native OS sandbox support and tools and fails
+    /// closed when unavailable. Default streamed byte, archive-entry, and source
+    /// snapshot accounting cannot hard-limit Git/helper filesystem writes.
+    #[serde(default)]
+    #[setting(
+        label = "Strict plugin staging",
+        widget = "toggle",
+        advanced,
+        global_only,
+        repo = "deny",
+        web = "elevation:changes the machine-wide plugin staging filesystem security boundary"
+    )]
+    pub plugin_staging_sandbox: bool,
+
     /// Show the compact system-health strip below the session list. It reports
     /// CPU, memory pressure, and running agent and process counts. Off by
     /// default; also toggleable from the command palette.
@@ -2331,6 +2346,7 @@ impl Default for SessionConfig {
             default_tool: None,
             yolo_mode_default: false,
             pre_trust_agent_folders: false,
+            plugin_staging_sandbox: false,
             show_diagnostics_pane: false,
             sidebar_position: SidebarPosition::default(),
             narrow_layout: NarrowLayout::default(),
