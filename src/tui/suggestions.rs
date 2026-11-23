@@ -1237,6 +1237,18 @@ impl SuggestionsView {
                 (Some(_), _) => "Nothing to suggest right now.".to_string(),
             };
             lines.push(Line::from(Span::styled(message, dim)));
+            if store.snapshot.is_some() {
+                let status = Self::divider_status(store);
+                let checked = if status.is_empty() {
+                    String::new()
+                } else {
+                    format!("{status}. ")
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{checked}{} checks again.", self.key_label('r')),
+                    dim,
+                )));
+            }
         }
         let height = area.height as usize;
         let mut offset = selected_rows.1.saturating_sub(height);
@@ -3505,6 +3517,23 @@ mod tests {
         assert!(
             !rig.view.help && !rig.view.show_dismissed,
             "the key only closed the list"
+        );
+    }
+
+    #[test]
+    fn an_empty_list_says_when_it_was_checked_and_how_to_check_again() {
+        let mut rig = view_with(vec![item("a", None, false)], idle_worker());
+        rig.store.snapshot.as_mut().unwrap().items.clear();
+        rig.view.sync(&rig.store);
+        let text = render_sized(&rig, None, 80, 24);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines[2].contains("│ Nothing to suggest right now."),
+            "{text}"
+        );
+        assert!(
+            lines[3].contains("GitHub · nothing new. r checks again."),
+            "{text}"
         );
     }
 
