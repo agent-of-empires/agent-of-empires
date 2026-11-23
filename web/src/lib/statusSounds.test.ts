@@ -85,6 +85,7 @@ describe("nextStatusSoundState", () => {
 
   it.each([
     ["archived", { archived_at: "2025-01-01T00:00:00Z" }],
+    ["ignored", { ignored_at: "2025-01-01T00:00:00Z" }],
     ["snoozed", { snoozed_until: "2099-01-01T00:00:00Z" }],
     ["trashed", { trashed_at: "2025-01-01T00:00:00Z" }],
   ])("is silent for %s sessions", (_label, over) => {

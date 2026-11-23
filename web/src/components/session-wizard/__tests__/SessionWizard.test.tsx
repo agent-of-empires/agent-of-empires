@@ -128,6 +128,15 @@ const launch = async () => {
 };
 const payload = (call = 0) => createSession.mock.calls[call]![0];
 
+describe("SessionWizard dialog semantics", () => {
+  it("is a modal dialog named by its heading", async () => {
+    renderWizard();
+    const dialog = screen.getByRole("dialog", { name: "New session" });
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    await screen.findByRole("switch", { name: "Yolo mode" });
+  });
+});
+
 describe("SessionWizard native import late defaults", () => {
   it.each([true, false])(
     "keeps a native import on the host after the original registry settles (success %s)",
@@ -1583,11 +1592,25 @@ describe("SessionWizard Sandbox image status", () => {
     renderWizard();
     const row = screen.getByTestId("wizard-sandbox-row");
     await waitFor(() => expect(row.textContent).toContain("Update available · ghcr.io/x/sb:1"));
-    expect(vi.mocked(fetchSandboxImageStatus).mock.calls).toEqual([["ghcr.io/x/sb:1", { fresh: true }]]);
+    expect(vi.mocked(fetchSandboxImageStatus).mock.calls).toEqual([
+      ["ghcr.io/x/sb:1", { fresh: true, profile: "default" }],
+    ]);
 
     fireEvent.click(screen.getByRole("switch", { name: "Run in a safe container" }));
     expect(row.textContent).toContain("run on the host");
     expect(row.textContent).not.toContain("Update available");
+  });
+
+  it("asks for the served profile's automatic image when no image is set", async () => {
+    vi.mocked(fetchDockerStatus).mockResolvedValue({ available: true, runtime: "docker", runtime_name: "Docker" });
+    vi.mocked(fetchSettings).mockResolvedValueOnce({ sandbox: { enabled_by_default: true } } as never);
+    vi.mocked(fetchSandboxImageStatus).mockResolvedValueOnce({
+      image: "ghcr.io/x/sb:2",
+      state: "current",
+    } as never);
+    renderWizard();
+    await waitFor(() => expect(vi.mocked(fetchSandboxImageStatus)).toHaveBeenCalled());
+    expect(vi.mocked(fetchSandboxImageStatus).mock.calls[0]).toEqual([undefined, { fresh: true, profile: "default" }]);
   });
 });
 

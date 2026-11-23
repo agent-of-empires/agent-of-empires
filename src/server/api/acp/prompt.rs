@@ -74,6 +74,16 @@ fn before_start_hook_failed_queued(message: &str, queued_id: &str) -> Response {
         .into_response()
 }
 
+/// 409 for an MCP send that found the row ignored under the instance lock. A
+/// person's send clears Ignore instead.
+fn ignored_refused() -> Response {
+    (
+        StatusCode::CONFLICT,
+        "ignored: a person must reclaim ownership or unignore the session",
+    )
+        .into_response()
+}
+
 /// 409 for a prompt kept in the queue until the sandbox login exists.
 fn sandbox_login_required_queued(
     blocked: &crate::session::SandboxLoginRequired,
@@ -129,6 +139,7 @@ pub async fn acp_prompt(
         prompt_id: req.prompt_id.clone(),
         queued_prompt_id: req.queued_prompt_id.clone(),
         no_revive: req.no_revive,
+        refuse_if_ignored: false,
     };
     match submit_prompt(&state, &SessionCaller::User, &id, submission).await {
         Ok(PromptSubmitted {
@@ -150,6 +161,7 @@ pub async fn acp_prompt(
         Err(PromptSubmitError::Blocked(blocked)) => {
             crate::server::api::start_blocked_response(blocked)
         }
+        Err(PromptSubmitError::Ignored) => ignored_refused(),
         Err(PromptSubmitError::Attachments(code, msg))
         | Err(PromptSubmitError::Enqueue(code, msg)) => (code, msg).into_response(),
         Err(PromptSubmitError::QueuedPromptGone) => queued_prompt_gone(),
@@ -192,6 +204,9 @@ pub(crate) struct PromptSubmission<'a> {
     /// "Send now" for a row already in the session's queue.
     pub queued_prompt_id: Option<String>,
     pub no_revive: bool,
+    /// Refuse an ignored row under the instance lock instead of clearing the
+    /// marker. MCP sends set this; a person's send clears Ignore.
+    pub refuse_if_ignored: bool,
 }
 
 /// What [`submit_prompt`] did with a prompt.
@@ -216,6 +231,7 @@ pub(crate) enum PromptSubmitError {
     RevivalRefused,
     WorkerNotReady,
     Blocked(crate::session::StartBlocked),
+    Ignored,
     Attachments(StatusCode, String),
     QueuedPromptGone,
     QueuedPromptChanged,
@@ -255,15 +271,23 @@ pub(crate) async fn submit_prompt(
     else {
         return Err(PromptSubmitError::SessionNotFound);
     };
-    let woke_idle_dormant = match state
-        .session_service
-        .touch_and_wake_on_prompt(id, req.no_revive)
-        .await
-    {
+    let touch = if req.refuse_if_ignored {
+        state
+            .session_service
+            .touch_and_wake_on_prompt_refusing_ignored(id, req.no_revive)
+            .await
+    } else {
+        state
+            .session_service
+            .touch_and_wake_on_prompt(id, req.no_revive)
+            .await
+    };
+    let woke_idle_dormant = match touch {
         PromptTouch::Touched { idle_dormant } => idle_dormant,
         PromptTouch::RevivalRefused => return Err(PromptSubmitError::RevivalRefused),
         PromptTouch::WorkerNotReady => return Err(PromptSubmitError::WorkerNotReady),
         PromptTouch::Blocked(blocked) => return Err(PromptSubmitError::Blocked(blocked)),
+        PromptTouch::Ignored => return Err(PromptSubmitError::Ignored),
     };
     // Validated before publishing or resuming, so a rejected prompt leaves no
     // trace in the transcript and spawns no worker.
@@ -569,6 +593,7 @@ pub async fn acp_prompt_diff_comments(
         PromptTouch::Blocked(blocked) => {
             return crate::server::api::start_blocked_response(blocked)
         }
+        PromptTouch::Ignored => return ignored_refused(),
     };
     let dispatch = state
         .session_service

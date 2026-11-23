@@ -32,8 +32,14 @@ export type SandboxImageReply = SandboxImageStatus | { error: string } | null;
 export function useSandboxImageRowStatus(
   image: string,
   enabled: boolean,
+  profile?: string,
 ): { label: string; reply: SandboxImageReply } | null {
-  const [answer, setAnswer] = useState<{ image: string; label: string; reply: SandboxImageReply } | null>(null);
+  const [answer, setAnswer] = useState<{
+    image: string;
+    profile?: string;
+    label: string;
+    reply: SandboxImageReply;
+  } | null>(null);
   const started = useRef(false);
   const answered = useRef(false);
   useEffect(() => {
@@ -42,7 +48,7 @@ export function useSandboxImageRowStatus(
     let timer: ReturnType<typeof setTimeout> | null = null;
     let pulling = false;
     const check = async () => {
-      const reply = await fetchSandboxImageStatus(image || undefined, { fresh: !answered.current });
+      const reply = await fetchSandboxImageStatus(image || undefined, { fresh: !answered.current, profile });
       if (cancelled) return;
       answered.current = true;
       const conclusive = !!reply && "state" in reply;
@@ -52,7 +58,7 @@ export function useSandboxImageRowStatus(
         return;
       }
       pulling = conclusive && reply.pull.state === "running";
-      setAnswer({ image, label: sandboxImageStatusLabel(reply), reply });
+      setAnswer({ image, profile, label: sandboxImageStatusLabel(reply), reply });
       timer = setTimeout(check, pulling ? RUNNING_RECHECK_MS : IDLE_RECHECK_MS);
     };
     if (started.current) timer = setTimeout(check, IMAGE_RECHECK_MS);
@@ -62,6 +68,8 @@ export function useSandboxImageRowStatus(
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [image, enabled]);
-  return enabled && answer?.image === image ? { label: answer.label, reply: answer.reply } : null;
+  }, [image, enabled, profile]);
+  return enabled && answer?.image === image && answer.profile === profile
+    ? { label: answer.label, reply: answer.reply }
+    : null;
 }

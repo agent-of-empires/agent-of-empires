@@ -34,58 +34,34 @@ impl HomeView {
         self.telemetry_consent_dialog = Some(crate::tui::dialogs::TelemetryConsentDialog::new());
     }
 
-    /// Show the profile picker dialog with fresh data from disk.
+    /// Show the profile picker for the profiles in the latest Daemon snapshot.
     pub(in crate::tui) fn show_profile_picker(&mut self) {
         use crate::tui::dialogs::{ProfileEntry, ProfilePickerDialog};
         let current_profile = self
             .active_profile
             .clone()
             .unwrap_or_else(|| "all".to_owned());
-        let canonical = self.session_feed.applied_snapshot();
-        let mut entries: Vec<ProfileEntry> = if let Some(snapshot) = canonical.as_ref() {
-            snapshot
-                .contents
-                .profiles
-                .iter()
-                .map(|profile| ProfileEntry {
-                    name: profile.name.clone(),
-                    session_count: snapshot
-                        .contents
-                        .sessions
-                        .iter()
-                        .filter(|row| row.profile == profile.name)
-                        .count(),
-                    is_active: self.active_profile.as_deref() == Some(profile.name.as_str()),
-                })
-                .collect()
-        } else {
-            let entries = (|| -> anyhow::Result<Vec<ProfileEntry>> {
-                crate::session::list_profiles_for_display()?
-                    .into_iter()
-                    .map(|name| {
-                        let storage = Storage::open(&name, self.file_watch.clone())?;
-                        Ok(ProfileEntry {
-                            session_count: storage.load_complete_with_groups()?.0.len(),
-                            is_active: self.active_profile.as_deref() == Some(name.as_str()),
-                            name,
-                        })
-                    })
-                    .collect()
-            })();
-            match entries {
-                Ok(entries) => entries,
-                Err(error) => {
-                    self.info_dialog =
-                        Some(InfoDialog::new("Cannot Read Profiles", &error.to_string()));
-                    return;
-                }
-            }
+        let Some(snapshot) = self.session_feed.applied_snapshot() else {
+            return;
         };
-        if canonical.is_some() {
-            entries.sort_by(|left, right| {
-                (left.name == "default", &left.name).cmp(&(right.name == "default", &right.name))
-            });
-        }
+        let mut entries: Vec<ProfileEntry> = snapshot
+            .contents
+            .profiles
+            .iter()
+            .map(|profile| ProfileEntry {
+                name: profile.name.clone(),
+                session_count: snapshot
+                    .contents
+                    .sessions
+                    .iter()
+                    .filter(|row| row.profile == profile.name)
+                    .count(),
+                is_active: self.active_profile.as_deref() == Some(profile.name.as_str()),
+            })
+            .collect();
+        entries.sort_by(|left, right| {
+            (left.name == "default", &left.name).cmp(&(right.name == "default", &right.name))
+        });
         if self.active_profile.is_some() {
             entries.insert(
                 0,

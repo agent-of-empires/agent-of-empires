@@ -623,9 +623,12 @@ pub(super) async fn status_poll_loop_observed(
             .await;
             drop(reload_lane);
             drop(namespace);
-            if let Err(error) = state.runtime.publish(&state).await {
-                tracing::error!(target: "server.status", %error, "terminal snapshot publication failed");
-                continue;
+            // A status move must be published before the next tick so status hooks see every
+            // transition; idle ticks only request a publish.
+            if !changes.is_empty() {
+                if let Err(error) = state.runtime.publish(&state).await {
+                    tracing::error!(target: "server.status", %error, "terminal snapshot publication failed");
+                }
             }
             for change in changes {
                 if change.old == Status::Running && change.new == Status::Idle {

@@ -1,9 +1,11 @@
-// Sidebar triage against a real server (#1581): pin, archive, snooze, and bulk archive.
+// Sidebar triage against a real server (#1581): pin, archive, snooze, bulk archive, and the
+// managed-session actions of #5833 (ignore, take ownership).
 
 import { spawnSync } from "node:child_process";
+import { join } from "node:path";
 import type { Locator, Page } from "@playwright/test";
 import { test, expect, type ServeHandle } from "../helpers/liveTest";
-import { listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
+import { listSessions, resolveAoeBinary, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 
 async function openWithSession(page: Page, spawnServe: () => Promise<ServeHandle>, title: string) {
   const serve = await spawnServe();
@@ -16,6 +18,13 @@ async function openWithSession(page: Page, spawnServe: () => Promise<ServeHandle
 
 const contextMenu = (page: Page) => page.locator("[data-testid='sidebar-context-menu']");
 const menuItem = (page: Page, name: string) => page.locator(`[data-testid='sidebar-context-menu-${name}']`);
+
+/** Open the row menu and expand its More disclosure, where the managed-session actions live. */
+async function openMoreMenu(page: Page, target: Locator, item: string) {
+  await openMenu(page, target);
+  await menuItem(page, "more").click();
+  await expect(menuItem(page, item)).toBeVisible();
+}
 const field = (serve: ServeHandle, key: string) => async () => (await listSessions(serve.baseUrl))[0]?.[key] ?? null;
 
 /** Right-click `target` once any previous menu has finished closing, and wait for the new one. */
@@ -34,11 +43,26 @@ async function closeMenu(page: Page) {
 
 /** Click a menu item and return the PATCH body sent to `/api/sessions/:id/<endpoint>`. */
 async function patchVia(page: Page, sessionId: string, endpoint: string, click: () => Promise<void>) {
-  const patch = page.waitForResponse(
-    (res) => res.url().endsWith(`/api/sessions/${sessionId}/${endpoint}`) && res.request().method() === "PATCH",
+  return await writeVia(page, sessionId, endpoint, "PATCH", click);
+}
+
+/** The same for a POST, used by the managed-session actions. */
+async function postVia(page: Page, sessionId: string, endpoint: string, click: () => Promise<void>) {
+  return await writeVia(page, sessionId, endpoint, "POST", click);
+}
+
+async function writeVia(
+  page: Page,
+  sessionId: string,
+  endpoint: string,
+  method: "PATCH" | "POST",
+  click: () => Promise<void>,
+) {
+  const write = page.waitForResponse(
+    (res) => res.url().endsWith(`/api/sessions/${sessionId}/${endpoint}`) && res.request().method() === method,
   );
   await click();
-  const res = await patch;
+  const res = await write;
   expect(res.ok()).toBe(true);
   return res.request().postDataJSON();
 }
@@ -204,4 +228,63 @@ test("selecting two rows and bulk-archiving persists both", async ({ page, spawn
     .toBe(2);
   await expect(selected).toHaveCount(0, { timeout: 5_000 });
   await expect(page.locator("[data-testid='sidebar-sunk-section']")).toBeVisible({ timeout: 5_000 });
+});
+
+test("ignore keeps a managed row live, unignore restores it, and take ownership clears the manager link", async ({
+  page,
+  spawnServe,
+}) => {
+  // #5833: both actions are menu-only, so the menu, the REST call and the row's own state are
+  // what a person actually touches. `aoe add -P` is the documented way to make a managed row.
+  const childTitle = "managed-child";
+  const serve = await spawnServe({ seedFn: seedSessionViaAoeAdd({ title: "manager" }) });
+  const [parent] = await listSessions(serve.baseUrl);
+  const added = spawnSync(
+    resolveAoeBinary(),
+    ["add", join(serve.home, "project"), "-t", childTitle, "-c", "claude", "-P", parent!.id],
+    { env: serve.env },
+  );
+  expect(added.status, added.stderr?.toString()).toBe(0);
+
+  const child = () => listSessions(serve.baseUrl).then((rows) => rows.find((s) => s.title === childTitle));
+  // The response omits an unset marker, so read it as null rather than undefined.
+  const childField = (key: string) => async () => (await child())?.[key] ?? null;
+  await expect.poll(childField("parent_session_id"), { timeout: 10_000 }).toBe(parent!.id);
+  const childId = (await child())!.id;
+
+  await page.goto(`${serve.baseUrl}/`);
+  const row = page.locator("[data-testid='sidebar-session-row']", { hasText: childTitle });
+  await expect(row).toBeVisible({ timeout: 10_000 });
+
+  await openMoreMenu(page, row, "ignore");
+  await expect(menuItem(page, "ignore")).toContainText("Ignore managed session");
+  await expect(menuItem(page, "reclaim-ownership")).toContainText("Take ownership back");
+  expect(await patchVia(page, childId, "ignored", () => menuItem(page, "ignore").click())).toEqual({
+    ignored: true,
+  });
+  await expect.poll(childField("ignored_at"), { timeout: 5_000 }).toBeTruthy();
+
+  // An ignored row is still a live session: it keeps its own row and stays out of the footer.
+  await expect(row).toBeVisible();
+  await expect(page.locator("[data-testid='sidebar-sunk-section']")).toHaveCount(0);
+  // The sidebar learns the new marker from its poll, and the menu then offers the inverse.
+  await openMoreMenu(page, row, "ignore");
+  await expect(menuItem(page, "ignore")).toContainText("Unignore session", { timeout: 10_000 });
+  expect(await patchVia(page, childId, "ignored", () => menuItem(page, "ignore").click())).toEqual({
+    ignored: false,
+  });
+  await expect.poll(childField("ignored_at"), { timeout: 5_000 }).toBeNull();
+
+  // Take ownership clears the manager link and the ignore marker in one write, and the row drops
+  // both managed actions afterwards.
+  await openMoreMenu(page, row, "ignore");
+  await expect(menuItem(page, "ignore")).toContainText("Ignore managed session", { timeout: 10_000 });
+  expect(await postVia(page, childId, "reclaim-ownership", () => menuItem(page, "reclaim-ownership").click())).toEqual({
+    reclaim: true,
+  });
+  await expect.poll(childField("parent_session_id"), { timeout: 5_000 }).toBeNull();
+  await openMenu(page, row);
+  await expect(menuItem(page, "ignore")).toHaveCount(0, { timeout: 10_000 });
+  await expect(menuItem(page, "reclaim-ownership")).toHaveCount(0);
+  await expect(row).toBeVisible();
 });

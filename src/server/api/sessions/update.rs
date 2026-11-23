@@ -119,6 +119,10 @@ where
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("profile update refused")]
+struct ProfileUpdateRefused;
+
 pub(super) async fn commit_profile_update<F, R>(
     state: &Arc<AppState>,
     profile: String,
@@ -130,33 +134,73 @@ where
     F: FnOnce(&mut Vec<Instance>) -> R + Send + 'static,
     R: Send + 'static,
 {
+    commit_profile_update_with_refusal(
+        state,
+        profile,
+        label,
+        move |rows| Ok(mutate(rows)),
+        status_id,
+    )
+    .await
+}
+
+/// Like [`commit_profile_update`], but the mutation may refuse with the response
+/// to return. A refusal aborts the write, so eligibility checks run against the
+/// rows the commit would actually persist.
+pub(super) async fn commit_profile_update_with_refusal<F, R>(
+    state: &Arc<AppState>,
+    profile: String,
+    label: &'static str,
+    mutate: F,
+    status_id: Option<String>,
+) -> Result<R, axum::response::Response>
+where
+    F: FnOnce(&mut Vec<Instance>) -> Result<R, axum::response::Response> + Send + 'static,
+    R: Send + 'static,
+{
     if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
         return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
     }
     let commit_state = state.clone();
     let commit_profile = profile.clone();
     let persisted = tokio::task::spawn_blocking(move || {
-        let store = crate::server::session_store::NativeSessionStore::open(
+        let store = match crate::server::session_store::NativeSessionStore::open(
             commit_state,
             &commit_profile,
             status_id,
-        )?;
-        (&store as &dyn crate::session::SessionStore).update(|rows, _| Ok(mutate(rows)))
+        ) {
+            Ok(store) => store,
+            Err(error) => return (Err(error), None),
+        };
+        let mut mutate = Some(mutate);
+        let mut refusal = None;
+        let result = (&store as &dyn crate::session::SessionStore).update(|rows, _| {
+            let mutate = mutate.take().expect("profile mutation invoked twice");
+            match mutate(rows) {
+                Ok(value) => Ok(value),
+                Err(response) => {
+                    refusal = Some(response);
+                    Err(ProfileUpdateRefused.into())
+                }
+            }
+        });
+        (result, refusal)
     })
     .await;
     match persisted {
-        Ok(Ok(result)) => Ok(result),
-        Ok(Err(error)) if error.is::<crate::session::SessionCommitApplied>() => Err(
+        Ok((Ok(result), _)) => Ok(result),
+        Ok((Err(_), Some(response))) => Err(response),
+        Ok((Err(error), None)) if error.is::<crate::session::SessionCommitApplied>() => Err(
             super::super::api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "outcome_unconfirmed",
                 "The change committed, but runtime publication is unconfirmed. Check canonical state before retrying.",
             ),
         ),
-        Ok(Err(error)) if error.is::<crate::session::NativeStoreUnavailable>() => {
+        Ok((Err(error), None)) if error.is::<crate::session::NativeStoreUnavailable>() => {
             Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
         }
-        Ok(Err(error)) => {
+        Ok((Err(error), None)) => {
             tracing::error!(target: "http.api.sessions", %error, %label, "session commit failed");
             Err(persist_failed_response())
         }
