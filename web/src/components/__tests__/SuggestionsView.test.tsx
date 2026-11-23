@@ -143,6 +143,17 @@ describe("SuggestionsView", () => {
     expect(prepareSuggestion).not.toHaveBeenCalled();
   });
 
+  it("a started row turns into Open at once, before the reload answers", async () => {
+    startSuggestion.mockResolvedValue({ kind: "started", sessionId: "s1", title: "Fix lifecycle" });
+    await open(snapshot());
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    fetchSuggestions.mockReturnValue(new Promise(() => {}));
+    expect(await screen.findByRole("button", { name: "Open" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Start" })).toBeNull();
+    expect(screen.getByText(/started just now/)).toBeTruthy();
+    expect(startSuggestion).toHaveBeenCalledTimes(1);
+  });
+
   it("other rows stay usable while one starts", async () => {
     startSuggestion.mockReturnValue(new Promise(() => {}));
     await open(snapshot({ items: [item, { ...item, id: "issue-2", title: "Second" }] }));

@@ -147,6 +147,29 @@ export function useSuggestions(
           dropReview(key);
         }
         const name = result.title || item.title;
+        // Show the row as started now; a second Start before the reload would only get a 409.
+        if (mounted.current)
+          setSnapshot(
+            (snap) =>
+              snap && {
+                ...snap,
+                items: snap.items.map((it) =>
+                  suggestionKey(it) === key
+                    ? {
+                        ...it,
+                        started_session: {
+                          id: result.sessionId,
+                          title: name,
+                          status: "Starting",
+                          archived: false,
+                          created_at: new Date().toISOString(),
+                          started_via: "start",
+                        },
+                      }
+                    : it,
+                ),
+              },
+          );
         if (onOpenSession && toastBus.handler?.infoAction)
           toastBus.handler.infoAction(`Started \u201c${name}\u201d`, "Open", () => onOpenSession(result.sessionId));
         else toastBus.handler?.info(`Started \u201c${name}\u201d`);
