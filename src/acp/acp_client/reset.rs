@@ -1064,6 +1064,92 @@ done
         }
     }
 
+    /// An adapter that advertises session/fork but refuses one fails the spawn
+    /// without a context reset, so the pending fork survives: the next start
+    /// forks again instead of opening an empty conversation in the fork row.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_refused_fork_keeps_its_seed_for_the_next_start() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let script = tmp.path().join("fork-agent.sh");
+        let capture = tmp.path().join("capture.ndjson");
+        let refused = tmp.path().join("refused-once");
+        let script_body = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '__CAPTURE__'
+  id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
+  case $line in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"fork":{}}}}}\n' "$id" ;;
+    *'"method":"session/fork"'*)
+      if [ -e '__REFUSED__' ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"forked-session"}}\n' "$id"
+      else
+        : > '__REFUSED__'
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"fixture refused the fork"}}\n' "$id"
+      fi ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"empty-session"}}\n' "$id" ;;
+  esac
+done
+"#
+        .replace("__CAPTURE__", capture.to_str().unwrap())
+        .replace("__REFUSED__", refused.to_str().unwrap());
+        std::fs::write(&script, script_body).unwrap();
+
+        for (start, assigned) in [("first", None), ("second", Some("forked-session"))] {
+            let mut config = reset_fake_spawn_config(&script, tmp.path());
+            config.fork_from = Some("parent-session".into());
+            let mut client = AcpClient::spawn(config, AcpSessionId(format!("fork-{start}")))
+                .await
+                .unwrap();
+            let mut events = Vec::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while let Some(event) = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect(start)
+            {
+                let assigned = matches!(event, Event::AcpSessionAssigned { .. });
+                events.push(event);
+                if assigned {
+                    client.shutdown().await.unwrap();
+                }
+            }
+            client.shutdown().await.unwrap();
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, Event::SessionContextReset { .. })),
+                "{start} start: a refused fork must not reset the context: {events:?}"
+            );
+            let got = events.iter().find_map(|e| match e {
+                Event::AcpSessionAssigned { acp_session_id } => Some(acp_session_id.as_str()),
+                _ => None,
+            });
+            assert_eq!(got, assigned, "{start} start");
+            assert_eq!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, Event::AgentStartupError { .. })),
+                assigned.is_none(),
+                "{start} start: {events:?}"
+            );
+        }
+
+        let requests: Vec<serde_json::Value> = std::fs::read_to_string(capture)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let count = |method: &str| requests.iter().filter(|r| r["method"] == method).count();
+        assert_eq!(count("session/fork"), 2, "both starts fork the parent");
+        assert_eq!(
+            count("session/new"),
+            0,
+            "neither start opens an empty session"
+        );
+    }
+
     /// The deadline starts before enqueueing, so an expired command never
     /// sends the stateful session/new, and the loop keeps serving commands.
     #[tokio::test]

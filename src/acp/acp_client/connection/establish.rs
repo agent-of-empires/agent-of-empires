@@ -505,13 +505,10 @@ impl Session {
                         parent_acp_id = %parent,
                         "session/fork failed; failing spawn (no session/new fallback): {e}"
                     );
-                    // Clears the one-shot fork marker so reattach does not
-                    // retry the failing fork forever.
-                    self.shared
-                        .emit(Event::SessionContextReset {
-                            reason: format!("fork_failed: {e}"),
-                        })
-                        .await;
+                    // No reset event: it would clear the pending fork, and the next
+                    // start would open an empty conversation in the fork row. A
+                    // startup failure is retried only under the reconciler's
+                    // respawn budget, as a fork the agent cannot run is.
                     Err(e)
                 }
             };
