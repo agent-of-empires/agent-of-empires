@@ -1,3 +1,4 @@
+import { OFFLINE_TITLE } from "./connectionState";
 import type { SessionResponse, StartedSession, SuggestionItem, SuggestionPreset } from "./types";
 
 /** "agent-of-empires · Claude Code · Structured view · worktree", what Start will run for the item. */
@@ -33,4 +34,10 @@ export function liveSession(started: StartedSession | undefined, sessions?: Sess
         initial_prompt_error_code: live.initial_prompt_error_code,
       }
     : started;
+}
+
+/** Why suggestion actions are off: CityHall or a read-only server first, then offline. */
+export function lockTitle(readOnly: boolean, offline: boolean, cityhall = false) {
+  if (readOnly) return cityhall ? "Off in CityHall mode" : "Read-only: can't create Sessions";
+  return offline ? OFFLINE_TITLE : undefined;
 }

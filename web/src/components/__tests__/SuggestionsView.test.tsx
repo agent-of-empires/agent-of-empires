@@ -89,7 +89,13 @@ afterEach(() => {
 
 async function open(
   snap: SuggestionsSnapshot | null,
-  props: { readOnly?: boolean; initialDismissed?: boolean; sessions?: SessionResponse[] } = {},
+  props: {
+    readOnly?: boolean;
+    cityhall?: boolean;
+    initialDismissed?: boolean;
+    sessions?: SessionResponse[];
+    onOpenSettings?: () => void;
+  } = {},
 ) {
   fetchSuggestions.mockResolvedValue(snap);
   const onPrepare = vi.fn();
@@ -915,7 +921,19 @@ describe("SuggestionsView", () => {
     expect(start.title).toBe("Read-only: can't create Sessions");
     expect((screen.getByRole("button", { name: "Refresh" }) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.queryByRole("button", { name: "Dismiss" })).toBeNull();
-    expect(screen.getByText("This dashboard is read-only. Start, Dismiss and Refresh are off.")).toBeTruthy();
+    expect(screen.getByText("Read-only: suggestions can't be started or changed.")).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Start options" }) as HTMLButtonElement).disabled).toBe(true);
+    cleanup();
+
+    await open(snapshot(), { readOnly: true, onOpenSettings: vi.fn() });
+    await screen.findByText("Fix lifecycle");
+    expect((screen.getByRole("button", { name: "Settings › Suggestions" }) as HTMLButtonElement).disabled).toBe(true);
+    cleanup();
+
+    await open(snapshot(), { readOnly: true, cityhall: true });
+    await screen.findByText("Fix lifecycle");
+    expect(screen.getByRole("button", { name: "Refresh" }).getAttribute("title")).toBe("Off in CityHall mode");
+    expect(screen.getByText("Suggestions are view-only in CityHall mode. New session still works.")).toBeTruthy();
   });
 
   it("disables every mutation while offline", async () => {

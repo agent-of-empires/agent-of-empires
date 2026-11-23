@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { MoreHorizontal, Undo2, X } from "lucide-react";
-import { OFFLINE_TITLE } from "../lib/connectionState";
+import { lockTitle } from "../lib/suggestionPlan";
 import type { StartedSession } from "../lib/types";
 import { agoLabel } from "../lib/suggestionTime";
 import { MENU_ITEM, MenuPopover, StartInMenu, StartMenu, type StartMenuProps } from "./SuggestionStartMenu";
@@ -135,6 +135,8 @@ export function SuggestionRow({
 interface ActionsProps {
   dismissed?: boolean;
   readOnly: boolean;
+  /** The read-only state comes from CityHall mode. */
+  cityhall?: boolean;
   offline: boolean;
   busy: boolean;
   onStart: () => void;
@@ -160,6 +162,7 @@ function MoreMenu({
   stale,
   disabled,
   readOnly,
+  cityhall,
   offline,
   onDismiss,
 }: {
@@ -167,10 +170,11 @@ function MoreMenu({
   stale: boolean;
   disabled: boolean;
   readOnly: boolean;
+  cityhall?: boolean;
   offline: boolean;
   onDismiss: () => void;
 }) {
-  const unavailable = readOnly ? "Read-only: can't create Sessions" : offline ? OFFLINE_TITLE : undefined;
+  const unavailable = lockTitle(readOnly, offline, cityhall);
   return (
     <MenuPopover
       label="More"
@@ -242,6 +246,7 @@ function MoreMenu({
 export function SuggestionActions({
   dismissed = false,
   readOnly,
+  cityhall,
   offline,
   busy,
   onStart,
@@ -271,13 +276,14 @@ export function SuggestionActions({
           stale={stale}
           disabled={disabled}
           readOnly={readOnly}
+          cityhall={cityhall}
           offline={offline}
           onDismiss={onToggleDismiss}
         />
       </>
     );
   }
-  const unavailable = readOnly ? "Read-only: can't create Sessions" : offline ? OFFLINE_TITLE : undefined;
+  const unavailable = lockTitle(readOnly, offline, cityhall);
   const showStart = !dismissed && !stale;
   return (
     <>
@@ -310,7 +316,9 @@ export function SuggestionActions({
           Start with changes
         </button>
       )}
-      {showStart && menu && !failed && !starting && !startIn && <StartMenu {...menu} disabled={disabled} />}
+      {showStart && menu && !failed && !starting && !startIn && (
+        <StartMenu {...menu} disabled={disabled} locked={readOnly ? unavailable : undefined} />
+      )}
       {!readOnly && (
         <button
           type="button"
@@ -327,11 +335,25 @@ export function SuggestionActions({
   );
 }
 
-export function SuggestionStatusNotes({ readOnly, offline }: { readOnly: boolean; offline: boolean }) {
+export function SuggestionStatusNotes({
+  readOnly,
+  offline,
+  cityhall = false,
+  homepage = false,
+}: {
+  readOnly: boolean;
+  offline: boolean;
+  cityhall?: boolean;
+  /** Home already says when the whole dashboard is read-only. */
+  homepage?: boolean;
+}) {
   return (
     <>
-      {readOnly && (
-        <li className={SUGGESTION_NOTE_CLASS}>This dashboard is read-only. Start, Dismiss and Refresh are off.</li>
+      {readOnly && cityhall && (
+        <li className={SUGGESTION_NOTE_CLASS}>Suggestions are view-only in CityHall mode. New session still works.</li>
+      )}
+      {readOnly && !cityhall && !homepage && (
+        <li className={SUGGESTION_NOTE_CLASS}>Read-only: suggestions can&apos;t be started or changed.</li>
       )}
       {offline && (
         <li className={SUGGESTION_NOTE_CLASS}>

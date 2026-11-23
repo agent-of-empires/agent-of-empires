@@ -10,6 +10,7 @@ interface Props {
   snapshot: SuggestionsSnapshot;
   ctrl: ReturnType<typeof useSuggestions>;
   readOnly: boolean;
+  cityhall?: boolean;
   agentName: (id: string) => string;
   presetOf: (providerId: string, criterion: string) => SuggestionPresetEntry | undefined;
   onOpenSession: (sessionId: string) => void;
@@ -26,6 +27,7 @@ export function SuggestionItemActions({
   snapshot,
   ctrl,
   readOnly,
+  cityhall,
   agentName,
   presetOf,
   onOpenSession,
@@ -42,6 +44,7 @@ export function SuggestionItemActions({
     <SuggestionActions
       dismissed={item.dismissed}
       readOnly={readOnly}
+      cityhall={cityhall}
       offline={ctrl.offline}
       busy={ctrl.busy !== null}
       starting={ctrl.starting.includes(key)}

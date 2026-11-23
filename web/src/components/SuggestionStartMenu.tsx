@@ -99,6 +99,8 @@ export interface StartMenuProps {
   onStartWithChanges: () => void;
   onCopyPrompt: () => void;
   onEditPreset?: () => void;
+  /** Why the whole menu is off (read-only or CityHall); its title. */
+  locked?: string;
 }
 
 /** The ▾ next to Start. ↓ or Enter on the button opens it. */
@@ -111,6 +113,7 @@ export function StartMenu({
   onStartWithChanges,
   onCopyPrompt,
   onEditPreset,
+  locked,
 }: StartMenuProps) {
   return (
     <MenuPopover
@@ -119,7 +122,8 @@ export function StartMenu({
         <button
           type="button"
           aria-label="Start options"
-          title="Start options"
+          title={locked ?? "Start options"}
+          disabled={!!locked}
           aria-haspopup="menu"
           aria-expanded={open}
           onClick={toggle}

@@ -2419,6 +2419,7 @@ function AppContent({
           </div>
           <SuggestionsView
             readOnly={caps.readOnly || !caps.canManageSuggestions}
+            cityhall={caps.cityhall}
             onOpenMarketplace={
               caps.canManageProjects ? () => requestNavigate("/settings/plugins?marketplace=suggestions") : undefined
             }

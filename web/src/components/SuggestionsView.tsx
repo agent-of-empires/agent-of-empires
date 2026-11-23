@@ -1,12 +1,11 @@
 import { useState } from "react";
 import { ChevronDown, ChevronRight, RefreshCw, Search, Settings, X } from "lucide-react";
-import { OFFLINE_TITLE } from "../lib/connectionState";
 import { agoLabel } from "../lib/suggestionTime";
 import { chipId, filterSuggestions, keyChipGroups, type KeyChip } from "../lib/suggestionFilter";
 import type { SessionResponse, SuggestionItem, SuggestionProvider } from "../lib/types";
 import { suggestionKey, useDismissUndo, useSuggestions } from "../hooks/useSuggestions";
 import { SuggestionFilterMenu, FilterMenuItem } from "./SuggestionFilterMenu";
-import { liveSession, shortRef } from "../lib/suggestionPlan";
+import { liveSession, lockTitle, shortRef } from "../lib/suggestionPlan";
 import { useAgentNames } from "../hooks/useAgentNames";
 import { useSuggestionPresets } from "../hooks/useSuggestionPresets";
 import { SuggestionItemActions } from "./SuggestionItemActions";
@@ -18,6 +17,8 @@ import type { WizardPrefill } from "./session-wizard/SessionWizard";
 
 interface Props {
   readOnly?: boolean;
+  /** Read-only because of CityHall mode, which the copy says. */
+  cityhall?: boolean;
   /** Opens on the Dismissed filter. */
   initialDismissed?: boolean;
   onPrepare: (prefill: WizardPrefill) => void;
@@ -68,6 +69,7 @@ function groupByRepo(items: SuggestionItem[]) {
 
 export function SuggestionsView({
   readOnly = false,
+  cityhall = false,
   initialDismissed = false,
   onPrepare,
   onOpenSession,
@@ -96,7 +98,7 @@ export function SuggestionsView({
   };
 
   const disabled = readOnly || offline;
-  const unavailableTitle = readOnly ? "Read-only dashboard" : offline ? OFFLINE_TITLE : undefined;
+  const unavailableTitle = lockTitle(readOnly, offline, cityhall);
 
   const items = snapshot?.items ?? [];
   const active = items.filter((item) => !item.dismissed);
@@ -202,9 +204,10 @@ export function SuggestionsView({
               <button
                 type="button"
                 aria-label="Settings › Suggestions"
-                title="Settings › Suggestions"
+                title={readOnly ? lockTitle(true, false, cityhall) : "Settings › Suggestions"}
+                disabled={readOnly}
                 onClick={onOpenSettings}
-                className={`${TAP} inline-flex h-8 w-8 items-center justify-center rounded-md text-text-secondary hover:bg-surface-800`}
+                className={`${TAP} inline-flex h-8 w-8 items-center justify-center rounded-md text-text-secondary hover:bg-surface-800 disabled:opacity-50`}
               >
                 <Settings className="h-4 w-4" />
               </button>
@@ -409,6 +412,7 @@ export function SuggestionsView({
                                 snapshot={snapshot}
                                 ctrl={ctrl}
                                 readOnly={readOnly}
+                                cityhall={cityhall}
                                 agentName={agentName}
                                 presetOf={presetOf}
                                 onOpenSession={onOpenSession}
@@ -453,7 +457,7 @@ export function SuggestionsView({
                     )}
                   </li>
                 ))}
-              <SuggestionStatusNotes readOnly={readOnly} offline={offline} />
+              <SuggestionStatusNotes readOnly={readOnly} offline={offline} cityhall={cityhall} />
             </ul>
             {undo && (
               <UndoBar

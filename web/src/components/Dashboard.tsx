@@ -170,6 +170,7 @@ export function Dashboard({
         <DashboardSuggestions
           key={suggestionsEpoch}
           readOnly={readOnly || !canManageSuggestions}
+          cityhall={!canManageSuggestions}
           onPrepare={onPrepareSuggestion}
           onEditPreset={onEditSuggestionPreset}
           canLink={canLinkSuggestions}

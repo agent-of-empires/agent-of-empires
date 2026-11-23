@@ -13,6 +13,8 @@ import type { WizardPrefill } from "./session-wizard/SessionWizard";
 
 interface Props {
   readOnly?: boolean;
+  /** Read-only because of CityHall mode, which the copy says. */
+  cityhall?: boolean;
   onPrepare: (prefill: WizardPrefill) => void;
   onEditPreset?: (providerId: string, criterion: string) => void;
   canLink?: boolean;
@@ -24,6 +26,7 @@ interface Props {
 
 export function DashboardSuggestions({
   readOnly = false,
+  cityhall = false,
   onPrepare,
   onEditPreset,
   canLink = true,
@@ -112,6 +115,7 @@ export function DashboardSuggestions({
                 snapshot={snapshot}
                 ctrl={ctrl}
                 readOnly={readOnly}
+                cityhall={cityhall}
                 agentName={agentName}
                 presetOf={presetOf}
                 onOpenSession={onOpenSession}
@@ -150,7 +154,7 @@ export function DashboardSuggestions({
             )}
           </li>
         )}
-        <SuggestionStatusNotes readOnly={readOnly} offline={offline} />
+        <SuggestionStatusNotes readOnly={readOnly} offline={offline} cityhall={cityhall} homepage />
       </ul>
       {alert && (
         <p role="alert" className="mt-2 px-1 text-xs text-status-error">

@@ -226,7 +226,18 @@ describe("DashboardSuggestions", () => {
     expect((start as HTMLButtonElement).disabled).toBe(true);
     expect(start.getAttribute("title")).toBe("Read-only: can't create Sessions");
     expect(screen.queryByRole("button", { name: "Dismiss" })).toBeNull();
-    expect(screen.getByText(/This dashboard is read-only/)).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Start options" }) as HTMLButtonElement).disabled).toBe(true);
+    // The Home page already says it is read-only.
+    expect(screen.queryByText(/read-only/i)).toBeNull();
+  });
+
+  it("CityHall says suggestions are view-only and that New session still works", async () => {
+    fetchSuggestions.mockResolvedValue(snap([mk(1)]));
+    renderIt({ readOnly: true, cityhall: true });
+    const start = await screen.findByRole("button", { name: "Start" });
+    expect(start.getAttribute("title")).toBe("Off in CityHall mode");
+    expect(screen.getByRole("button", { name: "Start options" }).getAttribute("title")).toBe("Off in CityHall mode");
+    expect(screen.getByText("Suggestions are view-only in CityHall mode. New session still works.")).toBeTruthy();
   });
 
   it("stays hidden when the first fetch fails, and retries on reconnect", async () => {
