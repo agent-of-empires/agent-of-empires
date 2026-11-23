@@ -120,8 +120,11 @@ fn app_processes_input_and_exits_while_terminal_output_stays_stalled() {
     require_tmux!();
     let mut harness = TuiTestHarness::new_in_tmp("terminal_stalled_input");
     harness.stop_daemon_on_drop();
+    harness.append_config("[session]\nconfirm_before_quit = false");
     let barrier = harness.home_path().join("processed-input");
     harness.set_env("AOE_E2E_INPUT_BARRIER", &barrier);
+    let runtime = harness.home_path().join("runtime-state");
+    harness.set_env("AOE_E2E_RUNTIME_STATE", &runtime);
     harness.set_env("AOE_TMUX_SOCKET", harness.home_path().join("tmux.sock"));
     let mut size = nix::libc::winsize {
         ws_row: 24,
@@ -228,11 +231,12 @@ fn app_processes_input_and_exits_while_terminal_output_stays_stalled() {
         if initial
             .windows(b"aoe-e2e-0".len())
             .any(|bytes| bytes == b"aoe-e2e-0")
+            && fs::read_to_string(&runtime).ok().as_deref() == Some("ready")
         {
             Ok(())
         } else {
             Err(format!(
-                "waiting for initial coordinated App frame: {:?}",
+                "waiting for initial coordinated App frame and ready runtime: {:?}",
                 child.0.try_wait().unwrap()
             ))
         }
@@ -324,7 +328,7 @@ fn retained_copy_quit_reaps_hung_helper_before_its_thirty_second_timeout() {
     h.set_env("AOE_CLIPBOARD_STARTED", &started);
     h.set_env("AOE_CLIPBOARD_GATE", &gate);
     let mut row = Instance::new("RetainedShutdown", h.project_path().to_str().unwrap());
-    row.trashed_at = Some(chrono::Utc::now());
+    row.trashed_at = Some(agent_of_empires::time::Timestamp::now());
     row.status = Status::Stopped;
     let id = row.id.clone();
     fs::write(h.sessions_path(), serde_json::to_vec(&[row]).unwrap()).unwrap();
