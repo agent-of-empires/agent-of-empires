@@ -209,7 +209,7 @@ pub(crate) const MAX_QUEUED_PROMPTS_PER_SESSION: usize = 100;
 
 /// How many delivered prompt ids a session remembers, see
 /// [`SessionService::was_prompt_delivered`].
-const MAX_DELIVERED_PROMPT_IDS: usize = 64;
+const MAX_DELIVERED_PROMPT_IDS: usize = MAX_QUEUED_PROMPTS_PER_SESSION;
 
 /// Cap on a single queued prompt's text. Unlike `/acp/prompt`, which streams straight to the
 /// agent, this text is persisted and rewritten on every subsequent queue mutation, so
@@ -5058,10 +5058,14 @@ mod tests {
         let service = crate::server::test_support::build_test_app_state(vec![])
             .session_service
             .clone();
-        let ids: Vec<String> = (0..=MAX_DELIVERED_PROMPT_IDS)
-            .map(|n| format!("q{n}"))
-            .collect();
-        service.record_delivered_prompts("s", &ids);
+        let ids = |n: usize| (0..n).map(|n| format!("q{n}")).collect::<Vec<_>>();
+        // A full-queue batch keeps every id, so a retry of its first row is still answered.
+        service.record_delivered_prompts("s", &ids(MAX_QUEUED_PROMPTS_PER_SESSION));
+        assert!(service.was_prompt_delivered("s", "q0"));
+        service.record_delivered_prompts(
+            "s",
+            &ids(MAX_DELIVERED_PROMPT_IDS + 1)[MAX_DELIVERED_PROMPT_IDS..],
+        );
         assert!(!service.was_prompt_delivered("s", "q0"), "oldest evicted");
         assert!(service.was_prompt_delivered("s", &format!("q{MAX_DELIVERED_PROMPT_IDS}")));
         assert!(!service.was_prompt_delivered("other", "q1"));
