@@ -168,6 +168,8 @@ where
 /// make the Daemon contact an arbitrary registry or pull an arbitrary image.
 struct Configured {
     default_image: String,
+    /// What each profile resolves to, for a request that names no image.
+    profile_images: HashMap<String, String>,
     images: Vec<String>,
     runtime: ContainerRuntimeName,
     checks_enabled: bool,
@@ -189,14 +191,18 @@ impl Configured {
 /// whose pull gate is open.
 fn load_configured() -> anyhow::Result<Configured> {
     let config = crate::session::Config::load()?;
-    let default_image = config.sandbox.default_image.clone();
+    let default_image = config.sandbox.effective_image();
     let mut images = vec![default_image.clone()];
+    let mut profile_images = HashMap::new();
     for profile in crate::session::list_profiles()? {
         match crate::session::resolve_config(&profile) {
-            Ok(resolved) if !images.contains(&resolved.sandbox.default_image) => {
-                images.push(resolved.sandbox.default_image);
+            Ok(resolved) => {
+                let image = resolved.sandbox.effective_image();
+                if !images.contains(&image) {
+                    images.push(image.clone());
+                }
+                profile_images.insert(profile, image);
             }
-            Ok(_) => {}
             // An unreadable profile only drops its image from what may be checked or pulled.
             Err(e) => {
                 tracing::warn!(target: "http.api.sandbox_image", %profile, "skipping profile: {e:#}")
@@ -205,6 +211,7 @@ fn load_configured() -> anyhow::Result<Configured> {
     }
     Ok(Configured {
         default_image,
+        profile_images,
         images,
         runtime: config.sandbox.container_runtime,
         checks_enabled: config.updates.update_check_mode.is_enabled(),
@@ -228,10 +235,22 @@ async fn configured() -> Result<Configured, Response> {
     })
 }
 
-fn resolve_image(configured: &Configured, requested: Option<&str>) -> Result<String, Response> {
-    match requested {
-        None => Ok(configured.default_image.clone()),
-        Some(image) if configured.images.iter().any(|i| i == image) => Ok(image.to_string()),
+/// A blank request is the automatic image, as everywhere an image resolves; with no image
+/// named the launching `profile`'s image applies, else the global one.
+fn resolve_image(
+    configured: &Configured,
+    requested: Option<&str>,
+    profile: Option<&str>,
+) -> Result<String, Response> {
+    match requested.filter(|image| !image.trim().is_empty()) {
+        None => Ok(profile
+            .and_then(|profile| configured.profile_images.get(profile))
+            .unwrap_or(&configured.default_image)
+            .clone()),
+        // The configured images are trimmed, as every sandbox image resolves.
+        Some(image) if configured.images.iter().any(|i| i == image.trim()) => {
+            Ok(image.trim().to_string())
+        }
         Some(_) => Err(api_error_with_code_header(
             ApiErrorCode::UnknownImage,
             "Only a configured sandbox image can be checked or pulled",
@@ -265,6 +284,7 @@ fn pull_disabled() -> Response {
 pub(crate) async fn create_pull_refusal(
     state: &AppState,
     requested: Option<&str>,
+    profile: Option<&str>,
 ) -> Option<Response> {
     if let Some(resp) = read_only_block(state).or_else(|| cityhall_block(state)) {
         return Some(resp);
@@ -276,7 +296,7 @@ pub(crate) async fn create_pull_refusal(
     if pull_blocked(state, &configured).is_some() {
         return Some(pull_disabled());
     }
-    resolve_image(&configured, requested).err()
+    resolve_image(&configured, requested, profile).err()
 }
 
 fn runtime_key(runtime: &ContainerRuntime, image: &str) -> ImageKey {
@@ -306,6 +326,8 @@ pub(crate) fn status_generation_for_test(runtime: &ContainerRuntime, image: &str
 #[derive(Deserialize)]
 pub struct ImageStatusQuery {
     image: Option<String>,
+    /// The profile a blank `image` resolves for.
+    profile: Option<String>,
     /// Skip the cache, as the wizard does when it opens.
     #[serde(default)]
     fresh: bool,
@@ -338,7 +360,11 @@ pub async fn sandbox_image_status(
         Ok(configured) => configured,
         Err(resp) => return resp,
     };
-    let image = match resolve_image(&configured, query.image.as_deref()) {
+    let image = match resolve_image(
+        &configured,
+        query.image.as_deref(),
+        query.profile.as_deref(),
+    ) {
         Ok(image) => image,
         Err(resp) => return resp,
     };
@@ -418,7 +444,7 @@ async fn pull_request(
         return Err(pull_disabled());
     }
     let requested = requested_image(headers, body)?;
-    let image = resolve_image(&configured, requested.as_deref())?;
+    let image = resolve_image(&configured, requested.as_deref(), None)?;
     Ok((configured, image))
 }
 
@@ -748,6 +774,7 @@ mod tests {
     fn a_runtime_switch_keys_status_and_pulls_apart() {
         let configured = |runtime| Configured {
             default_image: "img".into(),
+            profile_images: HashMap::new(),
             images: Vec::new(),
             runtime,
             checks_enabled: true,
@@ -825,7 +852,7 @@ mod tests {
         let _app = crate::session::test_support::isolate_app_dir();
         crate::session::update_config(|c| {
             c.sandbox.allow_image_pull = true;
-            c.sandbox.default_image = IMAGE.into();
+            c.sandbox.default_image = Some(IMAGE.into());
         })
         .unwrap();
         let state = crate::server::test_support::build_test_app_state(Vec::new());
@@ -886,7 +913,7 @@ mod tests {
         let _app = crate::session::test_support::isolate_app_dir();
         crate::session::update_config(|c| {
             c.sandbox.allow_image_pull = true;
-            c.sandbox.default_image = IMAGE.into();
+            c.sandbox.default_image = Some(IMAGE.into());
         })
         .unwrap();
         let state = crate::server::test_support::build_test_app_state(Vec::new());
@@ -965,7 +992,7 @@ mod tests {
         crate::session::update_config(|c| {
             c.updates.update_check_mode = crate::session::config::UpdateCheckMode::Off;
             c.sandbox.allow_image_pull = true;
-            c.sandbox.default_image = IMAGE.into();
+            c.sandbox.default_image = Some(IMAGE.into());
         })
         .unwrap();
         let state = crate::server::test_support::build_test_app_state(Vec::new());
@@ -988,6 +1015,7 @@ mod tests {
                     State(state),
                     Query(ImageStatusQuery {
                         image: None,
+                        profile: None,
                         fresh: false,
                     }),
                 )
@@ -1137,7 +1165,7 @@ mod tests {
         let _app = crate::session::test_support::isolate_app_dir();
         crate::session::update_config(|c| {
             c.sandbox.allow_image_pull = false;
-            c.sandbox.default_image = IMAGE.into();
+            c.sandbox.default_image = Some(IMAGE.into());
         })
         .unwrap();
         let runtime = ContainerRuntime::from(ContainerRuntimeName::default());
@@ -1167,6 +1195,7 @@ mod tests {
                 State(state.clone()),
                 Query(ImageStatusQuery {
                     image: None,
+                    profile: None,
                     fresh: false,
                 }),
             )
@@ -1200,6 +1229,7 @@ mod tests {
                 State(state.clone()),
                 Query(ImageStatusQuery {
                     image: image.map(String::from),
+                    profile: None,
                     fresh: false,
                 }),
             )
@@ -1207,7 +1237,9 @@ mod tests {
 
         let (code, body) = json(status(None).await).await;
         assert_eq!(code, StatusCode::OK);
-        let default_image = crate::session::Config::load_or_warn().sandbox.default_image;
+        let default_image = crate::session::Config::load_or_warn()
+            .sandbox
+            .effective_image();
         assert_eq!(body["image"], default_image.as_str());
         // Checks off: no registry request, and never "current".
         assert_eq!(body["state"], "unknown");
@@ -1280,5 +1312,54 @@ mod tests {
                 .as_deref(),
             Some(digest.as_str())
         );
+    }
+
+    #[test]
+    fn a_requested_image_matches_the_configured_one_without_its_surrounding_whitespace() {
+        let configured = Configured {
+            default_image: "ubuntu:latest".to_string(),
+            profile_images: HashMap::new(),
+            images: vec!["ubuntu:latest".to_string()],
+            runtime: ContainerRuntimeName::Docker,
+            checks_enabled: true,
+            enabled_by_default: true,
+            allow_image_pull: true,
+            dismissed_digest: None,
+        };
+        assert_eq!(
+            resolve_image(&configured, Some(" ubuntu:latest "), None).ok(),
+            Some("ubuntu:latest".to_string())
+        );
+        assert!(resolve_image(&configured, Some("ubuntu:other"), None).is_err());
+    }
+
+    #[test]
+    fn a_blank_request_is_the_launching_profiles_image() {
+        let configured = Configured {
+            default_image: "global:1".to_string(),
+            profile_images: HashMap::from([("work".to_string(), "work:2".to_string())]),
+            images: vec!["global:1".to_string(), "work:2".to_string()],
+            runtime: ContainerRuntimeName::Docker,
+            checks_enabled: true,
+            enabled_by_default: true,
+            allow_image_pull: true,
+            dismissed_digest: None,
+        };
+        for (requested, profile, expected) in [
+            (Some(""), None, "global:1"),
+            (Some("  "), Some("work"), "work:2"),
+            (None, Some("work"), "work:2"),
+            (None, Some("gone"), "global:1"),
+            (Some(""), Some("work"), "work:2"),
+            (Some("global:1"), Some("work"), "global:1"),
+        ] {
+            assert_eq!(
+                resolve_image(&configured, requested, profile)
+                    .ok()
+                    .as_deref(),
+                Some(expected),
+                "{requested:?} for {profile:?}"
+            );
+        }
     }
 }

@@ -154,6 +154,12 @@ fn try_ensure_install_id() -> Result<Option<String>> {
         return Ok(None);
     }
     update_state_locked(|state| {
+        // Reread under the lock: opting out saves the flag before deleting the id under
+        // this lock, so a caller holding an older opted-in read can neither recreate the
+        // id nor pick up one a failed delete left behind.
+        if !crate::session::get_telemetry_settings().enabled {
+            return (None, false);
+        }
         if let Some(id) = state.install_id.as_ref().filter(|s| !s.trim().is_empty()) {
             return (Some(id.clone()), false);
         }
@@ -182,9 +188,17 @@ pub fn delete_install_id() -> Result<()> {
     Ok(())
 }
 
-pub fn reset_install_id() -> Result<Option<String>> {
-    delete_install_id()?;
-    try_ensure_install_id()
+/// Replaces any id with a fresh one whatever the saved opt-in, for opt-in and `reset-id`.
+/// Everything recorded under the old id goes with it.
+pub fn rotate_install_id() -> Result<String> {
+    update_state_locked(|state| {
+        let id = uuid::Uuid::new_v4().to_string();
+        *state = TelemetryState {
+            install_id: Some(id.clone()),
+            ..TelemetryState::default()
+        };
+        (id, true)
+    })
 }
 
 pub fn record_cli_command(name: &str) {

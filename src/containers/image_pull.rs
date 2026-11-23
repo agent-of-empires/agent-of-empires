@@ -308,6 +308,8 @@ fn reissue(error: &DockerError) -> DockerError {
             reason: *reason,
         },
         DockerError::Cancelled(what) => DockerError::Cancelled(what.clone()),
+        DockerError::DaemonNotRunning => DockerError::DaemonNotRunning,
+        DockerError::PermissionDenied => DockerError::PermissionDenied,
         DockerError::IoError(io) => {
             DockerError::IoError(std::io::Error::new(io.kind(), io.to_string()))
         }
@@ -461,6 +463,27 @@ mod tests {
         assert!(within("a retry", move || retry.wait(&CancellationToken::new())).is_ok());
         assert_eq!(calls.load(Ordering::SeqCst), 3, "per runtime, and a retry");
         assert_eq!(state(&shared), PullState::Done);
+    }
+
+    #[test]
+    fn a_waiter_keeps_a_socket_error_variant_for_session_creation() {
+        for (name, error) in [
+            (
+                "daemon",
+                (|| DockerError::DaemonNotRunning) as fn() -> DockerError,
+            ),
+            ("permission", || DockerError::PermissionDenied),
+        ] {
+            let waiter = join_with(key("Docker", name), move |_: &PullContext| Err(error()));
+            let got = within("a socket-error pull", move || {
+                waiter.wait(&CancellationToken::new())
+            });
+            match (name, got) {
+                ("daemon", Err(DockerError::DaemonNotRunning))
+                | ("permission", Err(DockerError::PermissionDenied)) => {}
+                (name, got) => panic!("{name}: {got:?}"),
+            }
+        }
     }
 
     #[test]

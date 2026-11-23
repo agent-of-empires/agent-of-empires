@@ -56,7 +56,7 @@ async fn native_group_rpc_admission_waits_for_real_commit_and_applied_snapshot()
         }
         assert_eq!(view.get_instance(&row.id).unwrap().group_path, "renamed");
         assert!(view.pending_namespace_intent.is_none());
-        view.reload().unwrap();
+        view.reload();
         assert_eq!(payload_bytes("test"), committed);
     }
 }
@@ -146,7 +146,7 @@ async fn local_unapplied_readonly_and_lost_authority_never_write_rows_or_groups(
             assert!(!view.get_instance(&row.id).unwrap().is_trashed());
             assert_eq!(view.get_instance(&row.id).unwrap().group_path, "work");
             assert_eq!(payload_bytes("test"), before, "{mode}");
-            view.reload().unwrap();
+            view.reload();
             assert_eq!(payload_bytes("test"), before, "{mode}");
         }
     }

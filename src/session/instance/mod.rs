@@ -571,6 +571,16 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<DateTime<Utc>>,
 
+    /// Managed-session ignore marker. A session driven by another session may
+    /// be ignored without being archived or trashed. Ignore is a sink state:
+    /// pin, favorite, archive and snooze clear it, and direct user engagement
+    /// (`touch_last_accessed`) wakes it. MCP routine access and sends refuse
+    /// an ignored managed session instead of quietly clearing the marker.
+    /// Additive: absent in older `sessions.json` rows, so no migration is
+    /// needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored_at: Option<DateTime<Utc>>,
+
     /// Favorite marker; sibling of archive. When set AND the session is in
     /// a "needs help" status (Waiting, Error, Idle, Unknown), the session
     /// pre-empts all non-favorited peers in the same status tier, pinning it

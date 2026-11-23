@@ -2801,7 +2801,7 @@ mod tests {
         crate::session::update_config(|c| {
             c.updates.update_check_mode = crate::session::config::UpdateCheckMode::Off;
             c.sandbox.allow_image_pull = true;
-            c.sandbox.default_image = IMAGE.into();
+            c.sandbox.default_image = Some(IMAGE.into());
         })
         .unwrap();
         let serve = |state: std::sync::Arc<crate::server::AppState>| async move {
@@ -2865,7 +2865,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        crate::session::update_config(|c| c.sandbox.default_image = OTHER.into()).unwrap();
+        crate::session::update_config(|c| c.sandbox.default_image = Some(OTHER.into())).unwrap();
         assert_eq!(
             client.sandbox_image_status(false, "").await.unwrap().pull,
             PullState::Idle,

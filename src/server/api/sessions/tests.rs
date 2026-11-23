@@ -2638,6 +2638,264 @@ async fn engagement_unsinks_archived_and_snoozed_row_in_one_canonical_commit() -
     Ok(())
 }
 
+/// Ignoring a managed row keeps it live and present. The response and the
+/// persisted row carry the ignore marker and the manager link, and neither
+/// archive nor trash is set by the mutation.
+#[tokio::test]
+#[serial_test::serial]
+async fn ignore_session_keeps_the_row_live_and_reports_its_manager() -> anyhow::Result<()> {
+    use axum::body::to_bytes;
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let mut row = Instance::new("managed ignore", "/tmp/managed-ignore");
+    row.source_profile = "receipt".into();
+    row.parent_session_id = Some("manager".into());
+    let id = row.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    let storage = Storage::new("receipt", state.file_watch.clone())?;
+    storage.update(|rows, _| {
+        rows.push(row);
+        Ok(())
+    })?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    state.runtime.publish(&state).await?;
+
+    let response = update_session_ignored(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(UpdateIgnoredBody { ignored: true })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    let json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert!(json["ignored_at"].is_string(), "{json}");
+    assert_eq!(json["parent_session_id"], "manager");
+    assert!(
+        json["archived_at"].is_null(),
+        "ignore is not archive: {json}"
+    );
+    assert!(json["trashed_at"].is_null(), "ignore is not trash: {json}");
+
+    let stored = storage
+        .load()?
+        .into_iter()
+        .find(|row| row.id == id)
+        .expect("row persisted");
+    assert!(stored.is_ignored());
+    assert!(!stored.is_archived());
+    assert!(!stored.is_trashed());
+    assert_eq!(stored.parent_session_id.as_deref(), Some("manager"));
+    Ok(())
+}
+
+/// Archive and trash outrank ignore, so the endpoint refuses instead of
+/// persisting a contradictory sink state.
+#[tokio::test]
+#[serial_test::serial]
+async fn ignore_refuses_an_archived_or_trashed_session() -> anyhow::Result<()> {
+    use axum::body::to_bytes;
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let mut archived = Instance::new("archived ignore", "/tmp/archived-ignore");
+    archived.source_profile = "receipt".into();
+    archived.parent_session_id = Some("manager".into());
+    archived.archive();
+    let mut trashed = Instance::new("trashed ignore", "/tmp/trashed-ignore");
+    trashed.source_profile = "receipt".into();
+    trashed.parent_session_id = Some("manager".into());
+    trashed.trash();
+    let mut raced = Instance::new("raced ignore", "/tmp/raced-ignore");
+    raced.source_profile = "receipt".into();
+    raced.parent_session_id = Some("manager".into());
+    let archived_id = archived.id.clone();
+    let trashed_id = trashed.id.clone();
+    let raced_id = raced.id.clone();
+    let rows = vec![archived, trashed, raced];
+    let state = crate::server::test_support::build_test_app_state(rows.clone());
+    let storage = Storage::new("receipt", state.file_watch.clone())?;
+    storage.update(|stored, _| {
+        stored.extend(rows);
+        Ok(())
+    })?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    state.runtime.publish(&state).await?;
+
+    for (id, expected, message) in [
+        (
+            archived_id.clone(),
+            "session_archived",
+            "An archived session cannot be ignored; unarchive it first",
+        ),
+        (
+            trashed_id.clone(),
+            "session_trashed",
+            "A session in trash cannot be ignored; restore it first",
+        ),
+    ] {
+        let response = update_session_ignored(
+            State(state.clone()),
+            Path(id),
+            Ok(Json(UpdateIgnoredBody { ignored: true })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{expected}");
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(json["error"], expected);
+        assert_eq!(json["message"], message, "{expected}");
+    }
+
+    let stored = storage.load()?;
+    for id in [&archived_id, &trashed_id] {
+        let row = stored
+            .iter()
+            .find(|row| row.id == *id)
+            .expect("row persisted");
+        assert!(!row.is_ignored(), "{id}");
+    }
+
+    // The snapshot can go stale between the handler's read and the commit: a
+    // local CLI archives the stored row while the dashboard still sees it live.
+    storage.update(|stored, _| {
+        let row = stored
+            .iter_mut()
+            .find(|row| row.id == raced_id)
+            .expect("raced row persisted");
+        row.archive();
+        Ok(())
+    })?;
+    let response = update_session_ignored(
+        State(state.clone()),
+        Path(raced_id.clone()),
+        Ok(Json(UpdateIgnoredBody { ignored: true })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::CONFLICT, "stale snapshot");
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    let json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(json["error"], "session_archived", "{json}");
+    let stored = storage.load()?;
+    let row = stored
+        .iter()
+        .find(|row| row.id == raced_id)
+        .expect("raced row persisted");
+    assert!(
+        !row.is_ignored(),
+        "stale snapshot must not mark the row ignored"
+    );
+    Ok(())
+}
+
+/// Ignore needs a manager to own the row; without one the endpoint refuses it,
+/// while clearing a leftover marker stays allowed.
+#[tokio::test]
+#[serial_test::serial]
+async fn ignore_refuses_a_session_without_a_manager() -> anyhow::Result<()> {
+    use axum::body::to_bytes;
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let mut row = Instance::new("unmanaged ignore", "/tmp/unmanaged-ignore");
+    row.source_profile = "receipt".into();
+    row.ignore();
+    let id = row.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    let storage = Storage::new("receipt", state.file_watch.clone())?;
+    storage.update(|rows, _| {
+        rows.push(row);
+        Ok(())
+    })?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    state.runtime.publish(&state).await?;
+
+    let response = update_session_ignored(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(UpdateIgnoredBody { ignored: true })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    let json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(json["error"], "session_not_managed");
+
+    let response = update_session_ignored(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(UpdateIgnoredBody { ignored: false })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let stored = storage
+        .load()?
+        .into_iter()
+        .find(|row| row.id == id)
+        .expect("row persisted");
+    assert!(!stored.is_ignored());
+    Ok(())
+}
+
+/// Taking ownership back clears the manager link and the ignore marker in one
+/// commit, while the row identity, conversation binding, and unrelated triage
+/// timestamps survive.
+#[tokio::test]
+#[serial_test::serial]
+async fn reclaim_ownership_clears_manager_and_ignore_in_one_commit() -> anyhow::Result<()> {
+    use axum::body::to_bytes;
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let mut row = Instance::new("managed reclaim", "/tmp/managed-reclaim");
+    row.source_profile = "receipt".into();
+    row.parent_session_id = Some("manager".into());
+    row.agent_session_id = Some("native-conversation".into());
+    row.ignore();
+    row.pinned_at = Some(chrono::Utc::now());
+    let id = row.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    let storage = Storage::new("receipt", state.file_watch.clone())?;
+    storage.update(|rows, _| {
+        rows.push(row);
+        Ok(())
+    })?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    state.runtime.publish(&state).await?;
+
+    let response = reclaim_session_ownership(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(ReclaimOwnershipBody { reclaim: true })),
+    )
+    .await;
+    let response =
+        assert_response_status(response.into_response(), StatusCode::OK, "reclaim").await;
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    let json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert!(json["ignored_at"].is_null(), "{json}");
+    assert!(json["parent_session_id"].is_null(), "{json}");
+
+    let stored = storage
+        .load()?
+        .into_iter()
+        .find(|row| row.id == id)
+        .expect("row persisted");
+    assert!(!stored.is_ignored());
+    assert!(stored.parent_session_id.is_none());
+    assert_eq!(stored.id, id);
+    assert_eq!(
+        stored.agent_session_id.as_deref(),
+        Some("native-conversation")
+    );
+    assert!(stored.is_pinned(), "unrelated triage survives reclaim");
+    assert!(!stored.is_archived());
+    assert!(!stored.is_trashed());
+    Ok(())
+}
+
 /// A trashed row is shelved, not mid-lifecycle: `/access` used to answer a
 /// generic `lifecycle_busy`, which the dashboard cannot act on, while every
 /// other entry point returned the row's own code.
@@ -5865,6 +6123,42 @@ fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
             (
                 "sandbox_image_pull_failed",
                 "Couldn't pull the Sandbox image ghcr.io/acme/sandbox:1.".into(),
+            ),
+        ),
+        // Both automatic tags failed: both are named, the runtime's output still is not.
+        (
+            "both automatic tags",
+            crate::containers::sandbox_image::AutomaticImagesUnavailable {
+                exact: "ghcr.io/acme/sandbox:1.19.0".into(),
+                minor: "ghcr.io/acme/sandbox:1.19".into(),
+                source: DockerError::ImagePullFailed {
+                    runtime: "Podman",
+                    image: "ghcr.io/acme/sandbox:1.19.0".into(),
+                    detail: format!("denied: token {SECRET} at /root/.docker/config.json"),
+                    reason: crate::containers::image_pull::PullFailureReason::Other,
+                },
+            }
+            .into(),
+            (
+                "sandbox_image_pull_failed",
+                "Couldn't pull the Sandbox image ghcr.io/acme/sandbox:1.19.0 or its minor tag \
+                 ghcr.io/acme/sandbox:1.19."
+                    .into(),
+            ),
+        ),
+        (
+            "both automatic tags, not found",
+            crate::containers::sandbox_image::AutomaticImagesUnavailable {
+                exact: "ghcr.io/acme/sandbox:1.19.0".into(),
+                minor: "ghcr.io/acme/sandbox:1.19".into(),
+                source: DockerError::ImageNotFound(format!("img {SECRET}")),
+            }
+            .into(),
+            (
+                "sandbox_image_pull_failed",
+                "Couldn't pull the Sandbox image ghcr.io/acme/sandbox:1.19.0 or its minor tag \
+                 ghcr.io/acme/sandbox:1.19."
+                    .into(),
             ),
         ),
         (
@@ -10692,7 +10986,7 @@ async fn create_refuses_pull_latest_image_when_it_cannot_pull() {
     let default_image = crate::session::Config::load()
         .unwrap()
         .sandbox
-        .default_image;
+        .effective_image();
     for (requested, refused) in [
         (None, None),
         (Some(default_image.as_str()), None),
@@ -10701,7 +10995,7 @@ async fn create_refuses_pull_latest_image_when_it_cannot_pull() {
             Some(StatusCode::BAD_REQUEST),
         ),
     ] {
-        let refusal = crate::server::api::create_pull_refusal(&state, requested).await;
+        let refusal = crate::server::api::create_pull_refusal(&state, requested, None).await;
         assert_eq!(refusal.map(|r| r.status()), refused, "{requested:?}");
     }
 }

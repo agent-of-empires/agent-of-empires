@@ -475,7 +475,8 @@ impl HomeView {
         {
             self.switch_profile(Some(row.profile.clone()))
         } else {
-            self.reload()
+            self.reload();
+            Ok(())
         };
         let failure = match loaded {
             Err(error) => Some(format!(
@@ -494,7 +495,6 @@ impl HomeView {
             self.pending_creation = Some(pending);
             return None;
         }
-        crate::tui::app::record_session_create();
         self.clear_creation_tracking(&pending.request_key);
         self.rebuild_group_trees();
         self.rebuild_flat_items();

@@ -452,8 +452,6 @@ pub struct HomeView {
     pending_namespace_intent: Option<NamespaceIntent>,
     namespace_unknown_message: Option<String>,
     runtime_outcome_messages: Vec<String>,
-    /// Independent project-registry policy remembers runtime attachment, not row-write authority.
-    project_registry_authoritative: bool,
     pub(super) structured_pending_approvals: HashMap<String, Vec<crate::daemon::PendingApproval>>,
     pub(super) structured_approval_poller: super::approval_poller::StructuredApprovalPoller,
 

@@ -726,7 +726,7 @@ mod tests {
         crate::session::update_config(|c| {
             c.updates.update_check_mode = crate::session::config::UpdateCheckMode::Off;
             c.sandbox.allow_image_pull = true;
-            c.sandbox.default_image = IMAGE.into();
+            c.sandbox.default_image = Some(IMAGE.into());
         })
         .unwrap();
         let state =
