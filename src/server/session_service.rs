@@ -1167,6 +1167,19 @@ impl SessionService {
         self.send_classified_turn(caller, id, turn, None).await
     }
 
+    /// [`Self::send_turn`] admitting its resume against `observed_stop` (`Some`: the stop
+    /// intent the caller decided on), so a newer stop is refused instead of cleared.
+    pub(crate) async fn send_turn_observing(
+        self: &Arc<Self>,
+        caller: &SessionCaller,
+        id: &str,
+        turn: SendTurnRequest<'_>,
+        observed_stop: Option<Option<crate::process::worker_registry::StopIntent>>,
+    ) -> Result<Option<u64>, SendTurnError> {
+        self.send_turn_inner(caller, id, turn, None, observed_stop)
+            .await
+    }
+
     /// [`Self::send_turn`], publishing with `classified_as` when the caller already cut the
     /// turn for an agent, else with [`Self::agent_profile`] once the worker is ready.
     async fn send_classified_turn(
@@ -1175,6 +1188,18 @@ impl SessionService {
         id: &str,
         turn: SendTurnRequest<'_>,
         classified_as: Option<crate::acp::supervisor::Classified>,
+    ) -> Result<Option<u64>, SendTurnError> {
+        self.send_turn_inner(caller, id, turn, classified_as, None)
+            .await
+    }
+
+    async fn send_turn_inner(
+        self: &Arc<Self>,
+        caller: &SessionCaller,
+        id: &str,
+        turn: SendTurnRequest<'_>,
+        classified_as: Option<crate::acp::supervisor::Classified>,
+        observed_stop: Option<Option<crate::process::worker_registry::StopIntent>>,
     ) -> Result<Option<u64>, SendTurnError> {
         let SendTurnRequest {
             resume_authority,
@@ -1272,10 +1297,11 @@ impl SessionService {
                     {
                         if let Err(e) = self
                             .acp_supervisor
-                            .begin_resume(
+                            .begin_resume_observing(
                                 id,
                                 crate::acp::supervisor::ResumeKind::Attach,
                                 resume_authority,
+                                observed_stop,
                             )
                             .await
                         {
@@ -1292,11 +1318,12 @@ impl SessionService {
                     return Err(SendTurnError::LoginRequired(blocked));
                 }
             }
-            match crate::server::acp_reconciler::trigger_resume_background(
+            match crate::server::acp_reconciler::trigger_resume_observing(
                 self,
                 id,
                 resume_authority,
                 origin,
+                observed_stop,
             )
             .await
             {

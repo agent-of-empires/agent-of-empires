@@ -332,18 +332,23 @@ pub(crate) async fn submit_prompt(
         .session_service
         .prompt_dispatch_under_submission(id, req.text, woke_idle_dormant, req.no_revive)
         .await;
-    // A typed prompt to a stop-fenced session starts it like an idle wake; `send_turn`
-    // admits the explicit resume and refuses if a newer stop wins.
+    // A typed prompt to a stop-fenced session starts it like an idle wake. The resume
+    // admits against this observed intent, so a newer stop wins and refuses the prompt.
+    let mut observed_stop = None;
     let dispatch = if !req.no_revive
         && matches!(
             dispatch,
             PromptDispatch::Queued {
                 reason: QueueReason::WorkerDown
             }
-        )
-        && crate::process::worker_registry::stop_requested(id)
-    {
-        PromptDispatch::Sent
+        ) {
+        match crate::process::worker_registry::stop_intent(id) {
+            Ok(Some(intent)) => {
+                observed_stop = Some(Some(intent));
+                PromptDispatch::Sent
+            }
+            _ => dispatch,
+        }
     } else {
         dispatch
     };
@@ -444,7 +449,7 @@ pub(crate) async fn submit_prompt(
     };
     let outcome = state
         .session_service
-        .send_turn(
+        .send_turn_observing(
             caller,
             id,
             SendTurnRequest {
@@ -465,6 +470,7 @@ pub(crate) async fn submit_prompt(
                 origin,
                 no_revive: req.no_revive,
             },
+            observed_stop,
         )
         .await;
     // A fresh prompt supersedes a queued rate-limit continuation (#3028),

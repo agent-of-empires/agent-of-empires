@@ -499,6 +499,52 @@ async fn user_prompt_to_a_stop_fenced_session_wakes_it() {
         .is_empty());
 }
 
+/// A stop written after the prompt's promotion decision is newer than the intent that
+/// decision observed: the resume is refused and the newer stop stays in force.
+#[tokio::test]
+#[serial_test::serial]
+async fn stop_newer_than_the_observed_one_refuses_the_prompt_start() {
+    use crate::process::worker_registry::{self, ResumeAuthority};
+
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-stop-fence-newer-stop".to_string();
+    let (state, launches) = failing_start_state(&id, false).await;
+    settle_stop_fence(&id);
+    let observed = worker_registry::stop_intent(&id).unwrap();
+    worker_registry::admit_resume(&id, ResumeAuthority::Explicit, &observed).unwrap();
+    settle_stop_fence(&id);
+    let newer = worker_registry::stop_intent(&id).unwrap();
+    assert_ne!(observed, newer);
+
+    let result = state
+        .session_service
+        .send_turn_observing(
+            &SessionCaller::User,
+            &id,
+            SendTurnRequest {
+                resume_authority: ResumeAuthority::Explicit,
+                text: "wake up",
+                attachments: &[],
+                woke_idle_dormant: false,
+                prompt_ids: Vec::new(),
+                synthesized: false,
+                origin: crate::daemon::PromptOrigin::Unknown,
+                no_revive: false,
+            },
+            Some(observed),
+        )
+        .await;
+
+    assert!(matches!(result, Err(SendTurnError::ResumeFailed(_))));
+    assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(worker_registry::stop_intent(&id).unwrap(), newer);
+    assert!(state
+        .session_service
+        .queued_prompts_snapshot(&id)
+        .await
+        .is_empty());
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn no_revive_prompt_to_a_stop_fenced_session_stays_fenced() {

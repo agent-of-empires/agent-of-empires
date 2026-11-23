@@ -85,6 +85,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 authority,
                 restart,
                 cancellation,
+                None,
             )
             .await?
         {
@@ -103,7 +104,20 @@ impl<S: BroadcastSink> Supervisor<S> {
         kind: ResumeKind,
         authority: crate::process::worker_registry::ResumeAuthority,
     ) -> Result<ResumeReservationOutcome, SupervisorError> {
-        self.begin_resume_with_restart_claim(session_id, kind, authority, None, None)
+        self.begin_resume_observing(session_id, kind, authority, None)
+            .await
+    }
+
+    /// [`Self::begin_resume`] admitting against `observed_stop` (`Some`: the stop intent the
+    /// caller already observed) so a newer stop is refused instead of cleared.
+    pub(crate) async fn begin_resume_observing(
+        &self,
+        session_id: &str,
+        kind: ResumeKind,
+        authority: crate::process::worker_registry::ResumeAuthority,
+        observed_stop: Option<Option<worker_registry::StopIntent>>,
+    ) -> Result<ResumeReservationOutcome, SupervisorError> {
+        self.begin_resume_with_restart_claim(session_id, kind, authority, None, None, observed_stop)
             .await
     }
 
@@ -114,9 +128,13 @@ impl<S: BroadcastSink> Supervisor<S> {
         authority: crate::process::worker_registry::ResumeAuthority,
         restart: Option<&RestartRequestGuard>,
         cancellation: Option<CancellationToken>,
+        observed_stop: Option<Option<worker_registry::StopIntent>>,
     ) -> Result<ResumeReservationOutcome, SupervisorError> {
-        let observed_stop = worker_registry::stop_intent(session_id)
-            .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?;
+        let observed_stop = match observed_stop {
+            Some(observed) => observed,
+            None => worker_registry::stop_intent(session_id)
+                .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?,
+        };
         // Hold the worker gate while claiming the matching durable stop token.
         let _workers = self.workers.lock().await;
         let request_state = lock_recover(&self.spawn_requests);
@@ -1797,6 +1815,7 @@ time.sleep(60)
                     ResumeKind::SpawnFirst,
                     crate::process::worker_registry::ResumeAuthority::Explicit,
                     Some(&restart),
+                    None,
                     None,
                 )
                 .await;
