@@ -234,7 +234,7 @@ export function SuggestionsView({
 
         {snapshot && (
           <div className="mt-3 flex flex-col gap-2">
-            <div className="flex flex-wrap items-center gap-2">
+            <div className="relative flex flex-wrap items-center gap-2">
               <label className="relative min-w-[160px] flex-1">
                 <Search className="pointer-events-none absolute left-2.5 top-2 h-4 w-4 text-text-dim" />
                 <input

@@ -132,3 +132,12 @@ test("the Start menu is a bottom sheet with 44px items on a phone", async ({ pag
     expect((await menuItems.nth(i).boundingBox())!.height).toBeGreaterThanOrEqual(44);
   }
 });
+
+test("the All repos menu stays on screen at 375px", async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 800 });
+  await page.goto("/suggestions");
+  await page.getByRole("button", { name: "All repos", exact: true }).click();
+  const box = (await page.getByRole("button", { name: /acme \(org\)/ }).boundingBox())!;
+  expect(box.x).toBeGreaterThanOrEqual(0);
+  expect(box.x + box.width).toBeLessThanOrEqual(375);
+});

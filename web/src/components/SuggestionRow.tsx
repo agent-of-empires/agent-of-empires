@@ -92,10 +92,11 @@ export function SuggestionRow({
   return (
     <li
       className={`flex items-center gap-3 border-t border-surface-700/40 px-3 py-2.5 first:rounded-t-lg first:border-t-0 last:rounded-b-lg ${
-        failure ? "bg-status-error/[0.07]" : ""
+        // On a phone the failure's two buttons go under the text, which keeps the full width.
+        failure ? "flex-wrap bg-status-error/[0.07] md:flex-nowrap" : ""
       }`}
     >
-      <div className="min-w-0 flex-1">
+      <div className={`min-w-0 flex-1 ${failure ? "max-md:basis-full" : ""}`}>
         {sourceRef && <SourceRef value={sourceRef} />}
         <div className={inlineRef !== undefined ? "md:flex md:items-baseline md:gap-3" : ""}>
           <p className={`truncate text-sm text-text-primary ${stale ? "opacity-[0.55]" : ""} md:min-w-0 md:flex-1`}>
@@ -127,7 +128,7 @@ export function SuggestionRow({
         )}
         {note}
       </div>
-      <div className="flex flex-none gap-1">{actions}</div>
+      <div className={`flex flex-none gap-1 ${failure ? "w-full justify-end md:w-auto" : ""}`}>{actions}</div>
     </li>
   );
 }
@@ -379,8 +380,8 @@ export function UndoBar({
   stopLabel?: string;
 }) {
   return (
-    <div className="mt-2 flex w-max max-w-full items-baseline gap-1 rounded-md bg-surface-800 px-3 py-1.5 text-[13px] text-text-secondary">
-      <span className="min-w-0 truncate">Dismissed &ldquo;{title}&rdquo;.</span>
+    <div className="mt-2 flex w-max max-w-full flex-wrap items-baseline gap-x-1 rounded-md bg-surface-800 px-3 py-1.5 text-[13px] text-text-secondary">
+      <span className="max-w-full truncate">Dismissed &ldquo;{title}&rdquo;.</span>
       <button
         type="button"
         onClick={onUndo}

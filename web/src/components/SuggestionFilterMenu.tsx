@@ -19,7 +19,8 @@ export function SuggestionFilterMenu({
   return (
     <div
       ref={ref}
-      className="relative"
+      // On a phone the menu spans the filter row instead of hanging off the button.
+      className="md:relative"
       onKeyDown={(e) => {
         if (e.key === "Escape" && open) {
           e.stopPropagation();
@@ -44,7 +45,7 @@ export function SuggestionFilterMenu({
         <ChevronDown className="h-3.5 w-3.5" />
       </button>
       {open && (
-        <div className="absolute left-0 z-20 mt-1 max-h-72 min-w-[220px] overflow-y-auto rounded-md border border-surface-700 bg-surface-800 py-1 shadow-lg">
+        <div className="absolute inset-x-0 z-20 mt-1 max-h-72 overflow-y-auto rounded-md border border-surface-700 bg-surface-800 py-1 shadow-lg md:right-auto md:min-w-[220px] md:max-w-md">
           {children}
         </div>
       )}

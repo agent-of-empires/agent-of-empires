@@ -102,10 +102,10 @@ export function SuggestionMappingWizard({ items, providers, disabled = false, on
           onChange={(e) => update(id, { checked: e.target.checked })}
           className="h-4 w-4 accent-brand-500"
         />
-        <span className="min-w-0 flex-1 break-all font-mono text-xs text-text-secondary">
-          {row.mapping_key}
-          {multi && <span className="text-text-dim"> ({providerName(row.provider_id)})</span>}
-          <span className="text-text-dim"> · {row.count}</span>
+        <span className="flex min-w-0 flex-1 font-mono text-xs text-text-secondary" title={row.mapping_key}>
+          <span className="min-w-0 truncate">{row.mapping_key}</span>
+          {multi && <span className="shrink-0 whitespace-pre text-text-dim"> ({providerName(row.provider_id)})</span>}
+          <span className="shrink-0 whitespace-pre text-text-dim"> · {row.count}</span>
         </span>
         {row.match && (
           <span className="rounded border border-surface-700 px-1.5 text-[11px] text-text-dim">

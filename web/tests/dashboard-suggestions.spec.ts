@@ -71,3 +71,34 @@ test("a long source reference keeps its number in view on a narrow row", async (
   expect(numberBox!.x + numberBox!.width).toBeLessThanOrEqual(refBox!.x + refBox!.width + 0.5);
   expect(numberBox!.width).toBeGreaterThan(0);
 });
+
+test("a failed start and the undo bar fit a 375px phone", async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 812 });
+  await mockHome(page);
+  await page.route("**/api/suggestions/start", (route) =>
+    route.fulfill({
+      status: 422,
+      json: { error: "start_failed", reason: "Docker isn't running", retryable: true },
+    }),
+  );
+  await page.route("**/api/suggestions/dismiss", (route) => route.fulfill({ json: {} }));
+  await page.goto("/");
+  const fits = async () =>
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(375);
+
+  await page.getByRole("button", { name: "Start", exact: true }).first().click();
+  await expect(page.getByRole("button", { name: "Try again" })).toBeVisible();
+  const title = page.getByText(items[0]!.title, { exact: true });
+  // The two buttons sit under the text instead of squeezing the title.
+  expect((await title.boundingBox())!.width).toBeGreaterThan(250);
+  await fits();
+
+  await page.getByRole("button", { name: "Dismiss" }).nth(1).click();
+  const undo = page.getByRole("button", { name: "Undo" });
+  await expect(undo).toBeVisible();
+  const bar = undo.locator("..");
+  const box = (await bar.boundingBox())!;
+  expect(box.x + box.width).toBeLessThanOrEqual(375);
+  expect((await bar.getByText(/^Dismissed/).boundingBox())!.width).toBeGreaterThan(100);
+  await fits();
+});
