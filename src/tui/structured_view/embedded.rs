@@ -447,11 +447,111 @@ impl EmbeddedView {
         }
     }
 
+    /// Toast the view is showing, for the paste handoff's submit assertion.
+    #[cfg(test)]
+    pub(crate) fn toast_text(&self) -> Option<&str> {
+        self.state.toast.as_ref().map(|toast| toast.text.as_str())
+    }
+
+    /// Offer these slash commands to the composer, so a pasted `/` query opens
+    /// the picker the replay has to get past.
+    #[cfg(test)]
+    pub(crate) fn offer_commands_for_test(&mut self, names: &[&str]) {
+        self.state.transcript.available_commands = names
+            .iter()
+            .map(|name| crate::acp::state::AvailableCommand {
+                name: (*name).to_string(),
+                description: String::new(),
+                accepts_input: false,
+                input_hint: None,
+            })
+            .collect();
+    }
+
+    /// Prompts the daemon took from this view. The paste drain advances its
+    /// replay only when this grows, so a rejected prompt is not counted as sent.
+    pub(crate) fn accepted_submits(&self) -> u64 {
+        self.state.accepted_submits
+    }
+
+    /// True when the last submit was refused and its text restored to the
+    /// composer.
+    pub(crate) fn last_submit_rejected(&self) -> bool {
+        self.state.submit_rejected
+    }
+
+    /// Prompts this view submitted, in order: test read for the paste-drain
+    /// handoff's Enter boundary.
+    #[cfg(test)]
+    pub(crate) fn submitted_prompts(&self) -> &[String] {
+        &self.state.submitted_prompts
+    }
+
     /// Composer content, joined on newlines: test read for the paste-drain
     /// handoff.
     #[cfg(test)]
     pub(crate) fn composer_text(&self) -> String {
         self.state.composer.lines().join("\n")
+    }
+
+    /// Take the prompt a refused send restored to the composer, so the replay
+    /// submits it on its own Enter instead of appending the next segment to it.
+    /// Empty once the composer holds anything else: that is the reader's own
+    /// draft, not the refused segment.
+    pub(crate) fn take_restored_prompt(&mut self) -> String {
+        let restored = self.state.restored_prompt.take();
+        self.state.submit_rejected = false;
+        match restored {
+            Some(text) if text == self.state.composer.lines().join("\n").trim() => {
+                self.state.take_composer_text()
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// Drain the composer into the caller's buffer, whitespace intact. The
+    /// replay parks text the composer already holds, so it lands on an empty
+    /// composer and a blocked send takes only the segment it pasted.
+    pub(crate) fn take_held_text(&mut self) -> String {
+        self.state.take_composer_raw()
+    }
+
+    /// Submit one frozen replay segment as its own prompt. A paste can open the
+    /// `/` or `@` completion pickers, whose Enter accepts the completion instead
+    /// of sending, so the segment goes through the composer's submit path
+    /// directly and the picker never sees the key.
+    pub(crate) async fn submit_replayed_segment(&mut self, segment: &str) {
+        self.paste_text_with_file_load(segment).await;
+        let text = self.state.take_composer_text();
+        // The submit lock holds the segment as a draft, matching a live Enter.
+        if self.state.in_flight {
+            self.state.set_composer_text(&text);
+            return;
+        }
+        super::send_prompt_now(&mut self.state, &mut self.toast_deadline, &text).await;
+    }
+
+    /// Take back whatever the view left in its composer after an Enter it did not
+    /// submit, whether the daemon refused it or the submit lock held it, so the
+    /// caller's buffer is the segment's only owner.
+    pub(crate) fn take_unsubmitted_text(&mut self) {
+        self.state.take_composer_text();
+        self.state.submit_rejected = false;
+        self.state.restored_prompt = None;
+    }
+
+    /// Accept the next `count` submits without a daemon, holding the submit lock
+    /// as a `Sent` response does until the turn-start echo clears it.
+    #[cfg(test)]
+    pub(crate) fn accept_submits_for_test(&mut self, count: usize) {
+        self.state.accept_submits_for_test = count;
+    }
+
+    /// The socket's turn-start echo releasing the submit lock, for tests with no
+    /// connection to deliver it.
+    #[cfg(test)]
+    pub(crate) fn end_turn_for_test(&mut self) {
+        self.state.in_flight = false;
     }
 
     /// The session this view is streaming.

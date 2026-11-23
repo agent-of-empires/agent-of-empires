@@ -273,6 +273,11 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
+                // Checked before the poll so a view nobody holds stops here even
+                // while every poll keeps failing.
+                if plugin_tx.is_closed() {
+                    break;
+                }
                 let snapshot = match http.plugin_ui_state().await {
                     Ok(snapshot) => snapshot,
                     // A fixed env credential cannot recover inside this view.
@@ -1841,6 +1846,20 @@ async fn send_prompt_now(
     text: &str,
 ) {
     use crate::acp::client::http::PromptDispositionWire;
+    // A test submit stands in for a `Sent` response: accepted, with the submit
+    // lock still held until the turn-start echo arrives.
+    #[cfg(test)]
+    if state.accept_submits_for_test > 0 {
+        state.accept_submits_for_test -= 1;
+        state.submitted_prompts.push(text.to_owned());
+        state.accepted_submits += 1;
+        state.submit_rejected = false;
+        state.restored_prompt = None;
+        state.in_flight = true;
+        return;
+    }
+    #[cfg(test)]
+    state.submitted_prompts.push(text.to_owned());
     state.in_flight = true;
     match state
         .http
@@ -1852,30 +1871,37 @@ async fn send_prompt_now(
         )
         .await
     {
-        Ok(dispatch) => match dispatch.disposition {
-            PromptDispositionWire::Queued => {
-                // A queued prompt starts no turn, so nothing will clear the
-                // submit lock for us.
-                state.in_flight = false;
-                refresh_queue(state).await;
-                set_toast(
-                    state,
-                    toast_deadline,
-                    format!("queued ({} waiting)", state.queue.len()),
-                    ToastKind::Info,
-                );
+        Ok(dispatch) => {
+            state.accepted_submits += 1;
+            state.submit_rejected = false;
+            state.restored_prompt = None;
+            match dispatch.disposition {
+                PromptDispositionWire::Queued => {
+                    // A queued prompt starts no turn, so nothing will clear the
+                    // submit lock for us.
+                    state.in_flight = false;
+                    refresh_queue(state).await;
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        format!("queued ({} waiting)", state.queue.len()),
+                        ToastKind::Info,
+                    );
+                }
+                PromptDispositionWire::Sent | PromptDispositionWire::Steered => {
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        format!("prompt sent ({} bytes)", text.len()),
+                        ToastKind::Info,
+                    );
+                }
             }
-            PromptDispositionWire::Sent | PromptDispositionWire::Steered => {
-                set_toast(
-                    state,
-                    toast_deadline,
-                    format!("prompt sent ({} bytes)", text.len()),
-                    ToastKind::Info,
-                );
-            }
-        },
+        }
         Err(e) => {
             state.in_flight = false;
+            state.submit_rejected = true;
+            state.restored_prompt = Some(text.to_owned());
             state.set_composer_text(text);
             set_toast(
                 state,

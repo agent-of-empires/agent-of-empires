@@ -25,7 +25,7 @@ fn read_mount_points(
 /// The kernel escapes only space, tab, newline and backslash in a path
 /// (as `\ooo`), so fields split on a literal space and paths stay raw bytes.
 fn parse_mount_points(mountinfo: &[u8]) -> std::collections::HashSet<std::path::PathBuf> {
-    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::ffi::OsStringExt as _;
 
     mountinfo
         .split(|&b| b == b'\n')
@@ -58,6 +58,1252 @@ fn parse_mount_points(mountinfo: &[u8]) -> std::collections::HashSet<std::path::
 }
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = false;
+
+/// A private mount namespace holds the only writable filesystem used by Git.
+/// Callers must stop and reap every Git command before calling `close`.
+pub(super) struct StagingVolume {
+    holder: Child,
+    init: super::StagingProcess,
+    journal: std::sync::Arc<fs::File>,
+    root: std::path::PathBuf,
+    mount: std::path::PathBuf,
+    filter: std::sync::Arc<fs::File>,
+    limit: u64,
+    closed: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StagingRecoveryScope {
+    machine: Option<String>,
+    pid_namespace: (u64, u64),
+}
+
+impl StagingRecoveryScope {
+    pub(crate) fn capture() -> anyhow::Result<Self> {
+        use std::io::Read as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let namespace = fs::metadata("/proc/self/ns/pid")?;
+        let machine = fs::File::open("/etc/machine-id").ok().and_then(|file| {
+            let mut machine = String::new();
+            file.take(128).read_to_string(&mut machine).ok()?;
+            machine.truncate(machine.trim_ascii_end().len());
+            if machine.len() != 32
+                || !machine.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || machine.bytes().all(|byte| byte == b'0')
+            {
+                return None;
+            }
+            machine.make_ascii_lowercase();
+            Some(machine)
+        });
+        Ok(Self {
+            machine,
+            pid_namespace: (namespace.dev(), namespace.ino()),
+        })
+    }
+
+    pub(crate) fn prove_current(&self, previous_boot: bool) -> anyhow::Result<()> {
+        let current = Self::capture()?;
+        if previous_boot {
+            anyhow::ensure!(
+                self.machine.is_some() && self.machine == current.machine,
+                "staging recovery belongs to an unproven host"
+            );
+        } else {
+            anyhow::ensure!(
+                self.pid_namespace == current.pid_namespace,
+                "staging recovery belongs to a different PID namespace"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn staging_memory_budget(requested: u64, page: u64, available: u64) -> anyhow::Result<(u64, u64)> {
+    // tmpfs data and inode metadata consume cgroup memory. This leaves room for
+    // both, the Daemon and Git, but does not reserve memory against other users.
+    let share = available / 4;
+    let bytes = requested.min(share) / page * page;
+    let inodes = (share / page).min(super::super::plugin::fetch::STAGING_ENTRY_LIMIT as u64 + 1024);
+    anyhow::ensure!(
+        bytes >= page && inodes >= 16,
+        "insufficient memory for strict tmpfs staging"
+    );
+    Ok((bytes, inodes))
+}
+
+fn staging_memory_headroom() -> anyhow::Result<u64> {
+    let meminfo = fs::read_to_string("/proc/meminfo").context("reading staging memory headroom")?;
+    let groups =
+        fs::read_to_string("/proc/self/cgroup").context("reading staging memory cgroups")?;
+    let mounts =
+        fs::read_to_string("/proc/self/mountinfo").context("reading staging cgroup mounts")?;
+    let available = staging_memory_headroom_from(&meminfo, &groups, &mounts)?;
+    anyhow::ensure!(
+        fs::read_to_string("/proc/self/cgroup")? == groups,
+        "memory cgroup changed while preparing strict staging"
+    );
+    Ok(available)
+}
+
+fn staging_memory_headroom_from(meminfo: &str, groups: &str, mounts: &str) -> anyhow::Result<u64> {
+    let mut available = parse_meminfo_field(meminfo, "MemAvailable")
+        .map(kib_to_bytes)
+        .context("available RAM is unknown; cannot size tmpfs staging safely")?;
+    let mut membership = None;
+    for line in groups.lines() {
+        let mut fields = line.splitn(3, ':');
+        let hierarchy = fields.next().context("missing memory cgroup hierarchy")?;
+        let controllers = fields.next().context("missing memory cgroup controllers")?;
+        let group = fields.next().context("missing memory cgroup path")?;
+        if controllers
+            .split(',')
+            .any(|controller| controller == "memory")
+        {
+            membership = Some((group, false));
+            break;
+        }
+        if hierarchy == "0" && controllers.is_empty() {
+            membership = Some((group, true));
+        }
+    }
+    let Some((group, unified)) = membership else {
+        return Ok(available);
+    };
+    let group = Path::new(group);
+    anyhow::ensure!(
+        group.is_absolute()
+            && group.components().all(|component| matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )),
+        "memory cgroup path escapes its hierarchy"
+    );
+    let mut selected = None;
+    let mut selected_depth = usize::MAX;
+    for line in mounts.lines() {
+        let (mount, filesystem) = line
+            .split_once(" - ")
+            .context("malformed memory mount inventory")?;
+        let mut filesystem = filesystem.split_ascii_whitespace();
+        let kind = filesystem
+            .next()
+            .context("missing memory filesystem type")?;
+        let _source = filesystem
+            .next()
+            .context("missing memory filesystem source")?;
+        let options = filesystem
+            .next()
+            .context("missing memory filesystem options")?;
+        if (unified && kind != "cgroup2")
+            || (!unified
+                && (kind != "cgroup" || !options.split(',').any(|option| option == "memory")))
+        {
+            continue;
+        }
+        let mut fields = mount.split_ascii_whitespace();
+        let root = staging_mount_path(fields.nth(3).context("missing memory mount root")?)?;
+        let point = staging_mount_path(fields.next().context("missing memory mount point")?)?;
+        let Ok(relative) = group.strip_prefix(&root) else {
+            continue;
+        };
+        let depth = root.components().count();
+        if depth < selected_depth {
+            let directory = point.join(relative);
+            selected = Some((point, directory));
+            selected_depth = depth;
+        }
+    }
+    let (root, mut directory) = selected.context("memory cgroup accounting is not visible")?;
+    let (maximum, current) = if unified {
+        ("memory.max", "memory.current")
+    } else {
+        ("memory.limit_in_bytes", "memory.usage_in_bytes")
+    };
+    let mut value = String::with_capacity(64);
+    loop {
+        anyhow::ensure!(
+            fs::metadata(&directory)?.is_dir(),
+            "memory cgroup directory disappeared"
+        );
+        directory.push(maximum);
+        let present = staging_memory_value(&directory, &mut value)?;
+        directory.pop();
+        if present && value.trim() != "max" {
+            let maximum: u64 = value
+                .trim()
+                .parse()
+                .context("invalid memory cgroup limit")?;
+            directory.push(current);
+            anyhow::ensure!(
+                staging_memory_value(&directory, &mut value)?,
+                "memory cgroup usage is unavailable"
+            );
+            directory.pop();
+            let current: u64 = value
+                .trim()
+                .parse()
+                .context("invalid memory cgroup usage")?;
+            available = available.min(maximum.saturating_sub(current));
+        }
+        if directory == root {
+            break;
+        }
+        anyhow::ensure!(
+            directory.pop() && directory.starts_with(&root),
+            "memory cgroup ancestry escaped its mount"
+        );
+    }
+    Ok(available)
+}
+
+fn staging_memory_value(path: &Path, value: &mut String) -> anyhow::Result<bool> {
+    use std::io::Read as _;
+    value.clear();
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("opening memory cgroup accounting"),
+    };
+    file.take(128).read_to_string(value)?;
+    anyhow::ensure!(value.len() < 128, "oversized memory cgroup accounting");
+    Ok(true)
+}
+
+fn staging_mount_path(value: &str) -> anyhow::Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let mut bytes = value.bytes();
+    let mut decoded = Vec::with_capacity(value.len());
+    while let Some(byte) = bytes.next() {
+        if byte == b'\\' {
+            let mut escaped = 0u16;
+            for _ in 0..3 {
+                let digit = bytes.next().context("truncated memory mount escape")?;
+                anyhow::ensure!(
+                    (b'0'..=b'7').contains(&digit),
+                    "invalid memory mount escape"
+                );
+                escaped = escaped * 8 + u16::from(digit - b'0');
+            }
+            decoded.push(u8::try_from(escaped).context("invalid memory mount byte")?);
+        } else {
+            decoded.push(byte);
+        }
+    }
+    let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(decoded));
+    anyhow::ensure!(
+        path.is_absolute()
+            && path.components().all(|component| matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )),
+        "memory mount path is not an absolute anchored path"
+    );
+    Ok(path)
+}
+
+impl StagingVolume {
+    #[cfg(test)]
+    pub(super) fn create(private_mount_path: &Path, limit: u64) -> anyhow::Result<Self> {
+        Self::create_recorded(private_mount_path, limit, |_| Ok(tempfile::tempfile()?))
+    }
+
+    pub(super) fn create_recorded(
+        private_mount_path: &Path,
+        limit: u64,
+        mut record: impl FnMut(super::StagingCustody) -> anyhow::Result<fs::File>,
+    ) -> anyhow::Result<Self> {
+        use std::io::Read as _;
+        use std::io::{BufRead as _, Write as _};
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::process::CommandExt as _;
+        anyhow::ensure!(
+            cfg!(any(target_arch = "x86_64", target_arch = "aarch64")),
+            "staging seccomp architecture unsupported"
+        );
+        let core_pattern =
+            fs::read("/proc/sys/kernel/core_pattern").context("reading host core dump routing")?;
+        anyhow::ensure!(
+            staging_core_pattern_supported(&core_pattern),
+            "socket-based host core dump routing cannot be bounded"
+        );
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        anyhow::ensure!(
+            page > 0 && limit > 0 && limit.is_multiple_of(page as u64),
+            "invalid staging capacity"
+        );
+        let (limit, inode_limit) =
+            staging_memory_budget(limit, page as u64, staging_memory_headroom()?)?;
+        let mount = fs::canonicalize(private_mount_path)?;
+        let metadata = fs::symlink_metadata(&mount)?;
+        anyhow::ensure!(
+            metadata.is_dir()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o077 == 0,
+            "staging mountpoint must be a private owned directory"
+        );
+        anyhow::ensure!(
+            fs::read_dir(&mount)?.next().is_none(),
+            "staging mountpoint is not empty"
+        );
+        let filter = std::sync::Arc::new(staging_socket_filter()?);
+        // The init blocks before mount acquisition until its durable birth proof
+        // is published. PID namespace teardown also kills escaped writer groups.
+        record(super::StagingCustody::Uncertain)?;
+        let script = r#"set -eu
+read -r host_pid rest < /proc/self/stat
+printf 'H%s\n' "$host_pid"
+read -r permission || exit 0
+[ "$permission" = acquire ]
+mount --make-rprivate /
+mount -t proc -o nosuid,nodev,noexec proc /proc
+mount -t tmpfs -o "size=$2,nr_inodes=$3,nosuid,nodev,noexec,mode=700" tmpfs "$1"
+mkdir "$1/tmp" "$1/dev"
+for device in null zero random urandom; do : > "$1/dev/$device"; done
+printf R
+read -r ignored || :
+"#;
+        let mut command = Command::new("unshare");
+        command
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--pid",
+                "--fork",
+                "--kill-child=KILL",
+                "--",
+                "/bin/sh",
+                "-c",
+                script,
+                "staging",
+            ])
+            .arg(&mount)
+            .arg(limit.to_string())
+            .arg(inode_limit.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        // The stdin pipe follows the volume, not its transient creator thread.
+        let parent = unsafe { libc::getpid() };
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
+                }
+                Ok(())
+            });
+        }
+        let mut holder = command
+            .spawn()
+            .context("starting bounded staging namespace")?;
+        let setup =
+            (|| -> anyhow::Result<(std::path::PathBuf, super::StagingProcess, fs::File)> {
+                let stdout = holder.stdout.take().context("missing staging handshake")?;
+                let mut stdout = std::io::BufReader::new(stdout);
+                let mut handshake = String::new();
+                // poll bounds failure; the complete line proves init reached its gate.
+                let mut poll = libc::pollfd {
+                    fd: stdout.get_ref().as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                anyhow::ensure!(
+                    unsafe { libc::poll(&mut poll, 1, 5000) } > 0,
+                    "staging init handshake timed out"
+                );
+                (&mut stdout).take(128).read_line(&mut handshake)?;
+                let init_pid: u32 = handshake
+                    .strip_prefix('H')
+                    .and_then(|line| line.strip_suffix('\n'))
+                    .context("invalid staging init handshake")?
+                    .parse()?;
+                let init_birth = super::process_birth_identity(init_pid)?
+                    .context("staging init exited before custody")?;
+                let holder_birth = super::process_birth_identity(holder.id())?
+                    .context("staging supervisor exited before custody")?;
+                let status = fs::read_to_string(format!("/proc/{init_pid}/status"))?;
+                let nesting = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("NSpid:"))
+                    .context("staging init PID namespace unavailable")?;
+                let mut nesting = nesting.split_ascii_whitespace();
+                anyhow::ensure!(
+                    nesting.next().and_then(|pid| pid.parse::<u32>().ok()) == Some(init_pid)
+                        && nesting.last() == Some("1"),
+                    "staging holder is not PID namespace init"
+                );
+                let stat = fs::read(format!("/proc/{init_pid}/stat"))?;
+                let parent_pid: u32 = stat_fields(&stat)?
+                    .nth(1)
+                    .context("missing staging init parent")?
+                    .parse()?;
+                anyhow::ensure!(
+                    parent_pid == holder.id(),
+                    "staging init has an unexpected supervisor"
+                );
+                let journal = record(super::StagingCustody::LinuxPidNamespace {
+                    holder: super::StagingProcess {
+                        pid: holder.id(),
+                        birth: holder_birth,
+                    },
+                    init: super::StagingProcess {
+                        pid: init_pid,
+                        birth: init_birth.clone(),
+                    },
+                })?;
+                holder
+                    .stdin
+                    .as_mut()
+                    .context("missing staging acquisition gate")?
+                    .write_all(b"acquire\n")?;
+                let mut poll = libc::pollfd {
+                    fd: stdout.get_ref().as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let result = unsafe { libc::poll(&mut poll, 1, 5000) };
+                anyhow::ensure!(
+                    result > 0 && poll.revents & libc::POLLIN != 0,
+                    "staging namespace handshake failed"
+                );
+                let mut ready = [0];
+                stdout.read_exact(&mut ready)?;
+                anyhow::ensure!(ready == *b"R", "invalid staging namespace handshake");
+                let root = std::path::PathBuf::from(format!("/proc/{}/root", holder.id()))
+                    .join(mount.strip_prefix("/")?);
+                let cpath = std::ffi::CString::new(root.as_os_str().as_encoded_bytes())?;
+                let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+                anyhow::ensure!(
+                    unsafe { libc::statfs(cpath.as_ptr(), stats.as_mut_ptr()) } == 0,
+                    "cannot inspect staging filesystem: {}",
+                    std::io::Error::last_os_error()
+                );
+                let stats = unsafe { stats.assume_init() };
+                let mut mount_stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+                anyhow::ensure!(
+                    unsafe { libc::statvfs(cpath.as_ptr(), mount_stats.as_mut_ptr()) } == 0,
+                    "cannot inspect staging mount options: {}",
+                    std::io::Error::last_os_error()
+                );
+                let mount_stats = unsafe { mount_stats.assume_init() };
+                anyhow::ensure!(
+                    stats.f_type == libc::TMPFS_MAGIC
+                        && stats.f_blocks.checked_mul(stats.f_bsize as u64) == Some(limit)
+                        && stats.f_files == inode_limit
+                        && mount_stats.f_flag
+                            & (libc::ST_NOSUID | libc::ST_NODEV | libc::ST_NOEXEC)
+                            == (libc::ST_NOSUID | libc::ST_NODEV | libc::ST_NOEXEC),
+                    "staging filesystem capacity differs from requested bound"
+                );
+                Ok((
+                    root,
+                    super::StagingProcess {
+                        pid: init_pid,
+                        birth: init_birth,
+                    },
+                    journal,
+                ))
+            })();
+        let (root, init, journal) = match setup {
+            Ok(acquired) => acquired,
+            Err(error) => {
+                stop_staging_child(&mut holder).map_err(|cleanup| {
+                    super::StagingAcquisitionUncertain(format!(
+                        "{error:#}; staging holder cleanup failed: {cleanup:#}"
+                    ))
+                })?;
+                return Err(super::StagingAcquisitionUncertain(format!(
+                    "{error:#}; staging acquisition custody requires recovery"
+                ))
+                .into());
+            }
+        };
+        let mut volume = Self {
+            holder,
+            init,
+            journal: std::sync::Arc::new(journal),
+            root,
+            mount,
+            filter,
+            limit,
+            closed: false,
+        };
+        // Exercise the actual sandbox, not merely the presence of its tools.
+        let probe = (|| -> anyhow::Result<()> {
+            let mut child = volume
+                .sandbox_command("/bin/true")
+                .spawn()
+                .context("probing staging sandbox")?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let status = match child.try_wait() {
+                    Ok(status) => status,
+                    Err(error) => {
+                        stop_staging_child(&mut child).map_err(|cleanup| {
+                            super::StagingAcquisitionUncertain(format!(
+                                "{error}; staging probe cleanup failed: {cleanup:#}"
+                            ))
+                        })?;
+                        return Err(error).context("waiting for staging sandbox probe");
+                    }
+                };
+                if let Some(status) = status {
+                    anyhow::ensure!(status.success(), "staging sandbox is unavailable");
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    stop_staging_child(&mut child).map_err(|cleanup| {
+                        super::StagingAcquisitionUncertain(format!(
+                            "staging probe timed out and cleanup failed: {cleanup:#}"
+                        ))
+                    })?;
+                    anyhow::bail!("staging sandbox probe timed out");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        })();
+        if let Err(error) = probe {
+            volume.close().map_err(|cleanup| {
+                super::StagingAcquisitionUncertain(format!(
+                    "{error:#}; staging volume cleanup failed: {cleanup:#}"
+                ))
+            })?;
+            return Err(error);
+        }
+        Ok(volume)
+    }
+
+    pub(super) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(super) fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    pub(super) fn git_command(&self) -> Command {
+        let mut command = self.sandbox_command("git");
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    fn sandbox_command(&self, executable: &str) -> Command {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+        let mut command = Command::new("nsenter");
+        command
+            .arg("--target")
+            .arg(self.holder.id().to_string())
+            .arg(format!(
+                "--pid=/proc/{}/ns/pid_for_children",
+                self.holder.id()
+            ))
+            .args([
+                "--user",
+                "--mount",
+                "--preserve-credentials",
+                "--",
+                "bwrap",
+                "--die-with-parent",
+                "--unshare-user",
+                "--disable-userns",
+                "--unshare-pid",
+                "--unshare-ipc",
+                "--unshare-uts",
+                "--cap-drop",
+                "ALL",
+                "--ro-bind",
+                "/",
+                "/",
+                "--bind",
+            ])
+            .arg(&self.mount)
+            .arg(&self.mount)
+            .arg("--bind")
+            .arg(self.mount.join("dev"))
+            .arg("/dev");
+        for device in ["null", "zero", "random", "urandom"] {
+            let path = format!("/dev/{device}");
+            command.args(["--dev-bind", &path, &path]);
+        }
+        command
+            .args([
+                "--proc",
+                "/proc",
+                "--remount-ro",
+                "/proc",
+                "--seccomp",
+                "198",
+                "--",
+            ])
+            .arg(executable)
+            .env("TMPDIR", self.mount.join("tmp"));
+        let filter = self.filter.clone();
+        let journal = self.journal.clone();
+        let parent = unsafe { libc::getpid() };
+        // Reopen the memfd to give concurrent spawns independent file offsets.
+        let filter_path = std::ffi::CString::new(format!("/proc/self/fd/{}", filter.as_raw_fd()))
+            .expect("numeric descriptor contains no NUL");
+        unsafe {
+            command.pre_exec(move || {
+                let _keep_alive = &filter;
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
+                }
+                append_staging_writer(journal.as_raw_fd())?;
+                // A nonzero limit below the minimum core size also suppresses
+                // piped core_pattern handlers, which ignore a zero limit.
+                let core_limit = libc::rlimit {
+                    rlim_cur: 1,
+                    rlim_max: 1,
+                };
+                if libc::setrlimit(libc::RLIMIT_CORE, &core_limit) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let fd = libc::open(filter_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let result = libc::dup2(fd, 198);
+                if fd != 198 {
+                    libc::close(fd);
+                }
+                if result < 0 || libc::fcntl(198, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command
+    }
+
+    pub(super) fn close(&mut self) -> anyhow::Result<()> {
+        if !self.closed {
+            stop_staging_child(&mut self.holder)?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while super::process_birth_identity(self.init.pid)?.as_ref() == Some(&self.init.birth)
+                && process_executing(self.init.pid)?
+            {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "staging PID namespace init is still executing"
+                );
+                std::thread::yield_now();
+            }
+            self.closed = true;
+        }
+        Ok(())
+    }
+}
+
+fn append_staging_writer(journal: std::os::fd::RawFd) -> std::io::Result<()> {
+    // Runs after fork: only stack storage and async-signal-safe syscalls.
+    let fd = unsafe {
+        libc::open(
+            c"/proc/self/stat".as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut stat = [0u8; 4096];
+    let length = unsafe { libc::read(fd, stat.as_mut_ptr().cast(), stat.len()) };
+    unsafe { libc::close(fd) };
+    if length <= 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let stat = &stat[..length as usize];
+    let invalid = || std::io::Error::from_raw_os_error(libc::EINVAL);
+    let pid_end = stat
+        .iter()
+        .position(|byte| *byte == b' ')
+        .ok_or_else(invalid)?;
+    let fields_start = stat
+        .windows(2)
+        .rposition(|pair| pair == b") ")
+        .ok_or_else(invalid)?
+        + 2;
+    let mut fields = stat[fields_start..]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty());
+    fields.next().ok_or_else(invalid)?;
+    fields.next().ok_or_else(invalid)?;
+    let group = fields.next().ok_or_else(invalid)?;
+    if group != &stat[..pid_end] {
+        return Err(invalid());
+    }
+    let start = fields.nth(16).ok_or_else(invalid)?;
+    let mut record = [0u8; 128];
+    let size = 2 + pid_end + 1 + start.len() + 1;
+    if size > record.len() || !start.iter().all(u8::is_ascii_digit) {
+        return Err(invalid());
+    }
+    record[..2].copy_from_slice(b"W ");
+    record[2..2 + pid_end].copy_from_slice(&stat[..pid_end]);
+    record[2 + pid_end] = b' ';
+    record[3 + pid_end..size - 1].copy_from_slice(start);
+    record[size - 1] = b'\n';
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(journal, metadata.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let metadata = unsafe { metadata.assume_init() };
+    if metadata.st_size < 0 || metadata.st_size as u64 + size as u64 > 1024 * 1024 {
+        return Err(std::io::Error::from_raw_os_error(libc::EFBIG));
+    }
+    if unsafe { libc::write(journal, record.as_ptr().cast(), size) } != size as isize
+        || unsafe { libc::fsync(journal) } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub(super) fn prove_staging_pid_namespace_gone(
+    holder: &super::StagingProcess,
+    init: &super::StagingProcess,
+    writers: &[super::StagingProcess],
+) -> anyhow::Result<()> {
+    fn gone(process: &super::StagingProcess) -> anyhow::Result<()> {
+        anyhow::ensure!(process.pid > 1, "invalid staging process identity");
+        match super::process_birth_identity(process.pid)? {
+            Some(current) if current != process.birth => anyhow::bail!("staging PID was reused"),
+            Some(_) => anyhow::ensure!(
+                !process_executing(process.pid)?,
+                "staging process remains live"
+            ),
+            None => {}
+        }
+        Ok(())
+    }
+    fn empty_group(process: &super::StagingProcess) -> anyhow::Result<()> {
+        gone(process)?;
+        // Signal zero changes nothing. ESRCH is kernel proof of group absence.
+        let result = unsafe { libc::kill(-(process.pid as i32), 0) };
+        let error = std::io::Error::last_os_error();
+        if result < 0 && error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        if result < 0 {
+            return Err(error).context("inspecting staging supervisor group");
+        }
+        anyhow::ensure!(
+            !runner_group_executing(process.pid)?,
+            "staging supervisor group remains live"
+        );
+        Ok(())
+    }
+    // PID 1 exit destroys every writer's PID namespace, even if Git changed
+    // process groups. The outer wrappers must separately release their mounts.
+    gone(init)?;
+    empty_group(holder)?;
+    for writer in writers {
+        empty_group(writer)?;
+    }
+    Ok(())
+}
+
+pub(super) fn prove_staging_host_mount_absent(mount: &Path) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let open = |path: &Path| -> std::io::Result<fs::File> {
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+    };
+    let mount = open(mount)?;
+    let parent = open(Path::new(&format!(
+        "/proc/self/fd/{}/..",
+        mount.as_raw_fd()
+    )))?;
+    let mount_id = |file: &fs::File| -> anyhow::Result<u64> {
+        let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
+        Ok(info
+            .lines()
+            .find_map(|line| line.strip_prefix("mnt_id:"))
+            .context("staging host mount identity unavailable")?
+            .trim()
+            .parse()?)
+    };
+    anyhow::ensure!(
+        mount_id(&mount)? == mount_id(&parent)?,
+        "staging path remains a host mount"
+    );
+    Ok(())
+}
+
+fn stop_staging_child(child: &mut Child) -> anyhow::Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+    // The unreaped owned child pins this PID. Never signal a numeric process group.
+    child.kill().context("stopping staging namespace")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while child.try_wait()?.is_none() {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "staging namespace did not stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+// Socket-based coredump handlers (@ and @@) override RLIMIT_CORE in the kernel.
+// Pipe handlers retain the special one-byte suppression used by the sandbox.
+fn staging_core_pattern_supported(pattern: &[u8]) -> bool {
+    !pattern.starts_with(b"@")
+}
+
+fn staging_socket_filter() -> anyhow::Result<fs::File> {
+    use std::io::Write as _;
+    use std::os::fd::FromRawFd as _;
+    // seccomp_data: nr at 0, arch at 4, args[0] at 16.
+    // Deny AF_UNIX sockets and socketpairs, including abstract host sockets.
+    // Internet sockets remain available. io_uring cannot bypass this filter.
+    // Keep the one-byte core limit immutable, but permit prlimit64 queries.
+    let arch = if cfg!(target_arch = "x86_64") {
+        0xc000003e
+    } else {
+        0xc00000b7
+    };
+    let instruction = |code, jt, jf, k| libc::sock_filter { code, jt, jf, k };
+    let deny = 0x00050000 | libc::EPERM as u32;
+    let filter = [
+        instruction(0x20, 0, 0, 4),
+        instruction(0x15, 1, 0, arch),
+        instruction(0x06, 0, 0, 0x80000000),
+        instruction(0x20, 0, 0, 0),
+        instruction(0x15, 0, 1, libc::SYS_io_uring_setup as u32),
+        instruction(0x06, 0, 0, deny),
+        // Reject x32 syscalls too; their syscall numbers use a separate ABI.
+        instruction(0x45, 0, 1, 0x40000000),
+        instruction(0x06, 0, 0, deny),
+        instruction(0x15, 1, 0, libc::SYS_socket as u32),
+        instruction(0x15, 0, 3, libc::SYS_socketpair as u32),
+        instruction(0x20, 0, 0, 16),
+        instruction(0x15, 0, 1, libc::AF_UNIX as u32),
+        instruction(0x06, 0, 0, deny),
+        instruction(0x20, 0, 0, 0),
+        instruction(0x15, 0, 3, libc::SYS_setrlimit as u32),
+        instruction(0x20, 0, 0, 16),
+        instruction(0x15, 0, 1, libc::RLIMIT_CORE),
+        instruction(0x06, 0, 0, deny),
+        instruction(0x20, 0, 0, 0),
+        instruction(0x15, 0, 8, libc::SYS_prlimit64 as u32),
+        instruction(0x20, 0, 0, 24),
+        instruction(0x15, 0, 6, libc::RLIMIT_CORE),
+        instruction(0x20, 0, 0, 32),
+        instruction(0x15, 1, 0, 0),
+        instruction(0x06, 0, 0, deny),
+        instruction(0x20, 0, 0, 36),
+        instruction(0x15, 1, 0, 0),
+        instruction(0x06, 0, 0, deny),
+        instruction(0x06, 0, 0, 0x7fff0000),
+    ];
+    let raw = unsafe { libc::memfd_create(c"staging-seccomp".as_ptr(), libc::MFD_CLOEXEC) };
+    anyhow::ensure!(raw >= 0, "cannot create staging seccomp filter");
+    let mut file = unsafe { fs::File::from_raw_fd(raw) };
+    let bytes = unsafe {
+        std::slice::from_raw_parts(filter.as_ptr().cast::<u8>(), std::mem::size_of_val(&filter))
+    };
+    file.write_all(bytes)?;
+    // bwrap reads from the current offset.
+    use std::io::Seek as _;
+    file.rewind()?;
+    Ok(file)
+}
+
+#[cfg(test)]
+mod staging_volume_tests {
+    use super::*;
+    use std::io::Read as _;
+
+    #[test]
+    fn core_pattern_classification_rejects_socket_handlers() {
+        for (pattern, supported) in [
+            (b"core\n".as_slice(), true),
+            (b"/tmp/core.%p\n".as_slice(), true),
+            (b"|/usr/lib/systemd/systemd-coredump %P\n".as_slice(), true),
+            (b"@/run/coredump.socket\n".as_slice(), false),
+            (b"@@/run/coredump.socket\n".as_slice(), false),
+            (b"@\n".as_slice(), false),
+            (b"@@\n".as_slice(), false),
+            (b"core@%p\n".as_slice(), true),
+            (b"".as_slice(), true),
+        ] {
+            assert_eq!(staging_core_pattern_supported(pattern), supported);
+        }
+    }
+
+    fn private_mount_fixture() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        directory
+    }
+
+    #[test]
+    #[ignore = "requires private user/mount/PID namespaces and bubblewrap"]
+    fn staging_volume_survives_its_creator_thread() {
+        let directory = private_mount_fixture();
+        let mount = directory.path().to_path_buf();
+        let (creator, mut volume) = std::thread::spawn(move || {
+            let creator = unsafe { libc::syscall(libc::SYS_gettid) };
+            (creator, StagingVolume::create(&mount, 1024 * 1024).unwrap())
+        })
+        .join()
+        .unwrap();
+        let creator_path = format!("/proc/self/task/{creator}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match fs::metadata(&creator_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Ok(_) if std::time::Instant::now() < deadline => std::thread::yield_now(),
+                other => panic!("creator task did not retire: {other:?}"),
+            }
+        }
+        let mut command = volume.sandbox_command("/bin/sh");
+        command.args(["-c", "printf retained > \"$TMPDIR/proof\""]);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(volume.root().join("tmp/proof")).unwrap(),
+            b"retained"
+        );
+        volume.close().unwrap();
+    }
+
+    fn decision(arch: u32, syscall: u32, argument: u32) -> u32 {
+        decision_with_arguments(arch, syscall, [u64::from(argument), 0, 0])
+    }
+
+    fn decision_with_arguments(arch: u32, syscall: u32, arguments: [u64; 3]) -> u32 {
+        let mut bytes = Vec::new();
+        staging_socket_filter()
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        let mut accumulator = 0;
+        let mut pc = 0;
+        loop {
+            let instruction = &bytes[pc * 8..pc * 8 + 8];
+            let code = u16::from_ne_bytes(instruction[..2].try_into().unwrap());
+            let k = u32::from_ne_bytes(instruction[4..].try_into().unwrap());
+            match code {
+                0x20 => {
+                    accumulator = match k {
+                        0 => syscall,
+                        4 => arch,
+                        16 => arguments[0] as u32,
+                        24 => arguments[1] as u32,
+                        32 => arguments[2] as u32,
+                        36 => (arguments[2] >> 32) as u32,
+                        _ => panic!("unexpected seccomp load"),
+                    }
+                }
+                0x15 => {
+                    pc += usize::from(if accumulator == k {
+                        instruction[2]
+                    } else {
+                        instruction[3]
+                    })
+                }
+                0x45 => {
+                    pc += usize::from(if accumulator & k != 0 {
+                        instruction[2]
+                    } else {
+                        instruction[3]
+                    })
+                }
+                0x06 => return k,
+                _ => panic!("unexpected seccomp instruction"),
+            }
+            pc += 1;
+        }
+    }
+
+    #[test]
+    fn seccomp_denies_host_unix_sockets_and_alternate_abis() {
+        let arch = if cfg!(target_arch = "x86_64") {
+            0xc000003e
+        } else {
+            0xc00000b7
+        };
+        let deny = 0x00050000 | libc::EPERM as u32;
+        assert_eq!(
+            decision(arch, libc::SYS_socket as u32, libc::AF_UNIX as u32),
+            deny
+        );
+        assert_eq!(
+            decision(arch, libc::SYS_socketpair as u32, libc::AF_UNIX as u32),
+            deny
+        );
+        assert_eq!(decision(arch, libc::SYS_io_uring_setup as u32, 0), deny);
+        assert_eq!(
+            decision(arch, libc::SYS_socket as u32 | 0x40000000, 1),
+            deny
+        );
+        let foreign_arch = if cfg!(target_arch = "x86_64") {
+            0xc00000b7
+        } else {
+            0xc000003e
+        };
+        assert_eq!(
+            decision(foreign_arch, libc::SYS_socket as u32, 1),
+            0x80000000
+        );
+        // i386 socketcall must never reach the native syscall-number checks.
+        assert_eq!(decision(0x40000003, 102, 1), 0x80000000);
+        assert_eq!(
+            decision(arch, libc::SYS_socket as u32, libc::AF_INET as u32),
+            0x7fff0000
+        );
+        assert_eq!(
+            decision(arch, libc::SYS_socket as u32, libc::AF_INET6 as u32),
+            0x7fff0000
+        );
+        assert_eq!(
+            decision(arch, libc::SYS_setrlimit as u32, libc::RLIMIT_CORE),
+            deny
+        );
+        assert_eq!(
+            decision(arch, libc::SYS_setrlimit as u32, libc::RLIMIT_NOFILE),
+            0x7fff0000
+        );
+        assert_eq!(
+            decision_with_arguments(
+                arch,
+                libc::SYS_prlimit64 as u32,
+                [0, u64::from(libc::RLIMIT_CORE), 0]
+            ),
+            0x7fff0000
+        );
+        for pointer in [1, 1u64 << 32] {
+            assert_eq!(
+                decision_with_arguments(
+                    arch,
+                    libc::SYS_prlimit64 as u32,
+                    [0, u64::from(libc::RLIMIT_CORE), pointer]
+                ),
+                deny
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_capacity_fails_before_mount_setup() {
+        assert!(StagingVolume::create(Path::new("/nonexistent-staging-test"), 0).is_err());
+        assert!(StagingVolume::create(Path::new("/nonexistent-staging-test"), 1).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires unprivileged user namespaces, mount, nsenter, and bubblewrap"]
+    fn real_staging_volume_enforces_capacity_and_releases_namespace() {
+        use std::io::Write as _;
+        let mount = private_mount_fixture();
+        let mut volume = StagingVolume::create(mount.path(), 1024 * 1024).unwrap();
+        let root = volume.root().to_path_buf();
+        let mut file = fs::File::create(root.join("fill")).unwrap();
+        let block = [0u8; 65536];
+        let mut written = 0;
+        loop {
+            match file.write(&block) {
+                Ok(0) => panic!("unexpected zero-length tmpfs write"),
+                Ok(count) => written += count,
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+                    break;
+                }
+            }
+        }
+        assert!(written <= 1024 * 1024);
+        drop(file);
+        volume.close().unwrap();
+        volume.close().unwrap();
+        assert!(!root.exists());
+        assert!(fs::read_dir(mount.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    #[ignore = "requires unprivileged user namespaces, mount, nsenter, bubblewrap, and Git"]
+    fn real_git_smudge_cannot_write_host_or_exceed_volume() {
+        let source = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        let target = host.path().join("protected");
+        fs::write(&target, b"unchanged").unwrap();
+        let fixture_git = |arguments: &[&str]| {
+            let result = Command::new("git")
+                .arg("-C")
+                .arg(source.path())
+                .args(arguments)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        fixture_git(&["init"]);
+        fs::write(
+            source.path().join(".gitattributes"),
+            "payload filter=attack\n",
+        )
+        .unwrap();
+        fs::write(source.path().join("payload"), "source readable\n").unwrap();
+        fixture_git(&["add", ".gitattributes", "payload"]);
+        fixture_git(&[
+            "-c",
+            "user.name=Staging Test",
+            "-c",
+            "user.email=staging@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "fixture",
+        ]);
+        let mount = private_mount_fixture();
+        let mut volume = StagingVolume::create(mount.path(), 1024 * 1024).unwrap();
+        let clone = |name: &str, smudge: &str| {
+            volume
+                .git_command()
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("STAGING_HOST_TARGET", &target)
+                .arg("-c")
+                .arg(format!("filter.attack.smudge={smudge}"))
+                .args(["-c", "filter.attack.required=true", "clone", "--no-local"])
+                .arg(source.path())
+                .arg(mount.path().join(name))
+                .output()
+                .unwrap()
+        };
+        let readable = clone("readable", "cat");
+        assert!(
+            readable.status.success(),
+            "{}",
+            String::from_utf8_lossy(&readable.stderr)
+        );
+        assert_eq!(
+            fs::read(volume.root().join("readable/payload")).unwrap(),
+            b"source readable\n"
+        );
+        fs::remove_dir_all(volume.root().join("readable")).unwrap();
+        let hostile = clone(
+            "host-write",
+            "sh -c 'printf attacked > \"$STAGING_HOST_TARGET\"'",
+        );
+        assert!(!hostile.status.success());
+        assert_eq!(fs::read(&target).unwrap(), b"unchanged");
+        fs::remove_dir_all(volume.root().join("host-write")).unwrap();
+        let overflow = clone("overflow", "head -c 2097152 /dev/zero");
+        assert!(!overflow.status.success());
+        assert_eq!(fs::read(&target).unwrap(), b"unchanged");
+        volume.close().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires unprivileged user namespaces, mount, nsenter, bubblewrap, and /usr/bin/python3"]
+    fn real_sandbox_denies_host_unix_socket() {
+        use std::os::unix::net::UnixListener;
+        let host = tempfile::tempdir().unwrap();
+        let socket = host.path().join("host.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mount = private_mount_fixture();
+        let mut volume = StagingVolume::create(mount.path(), 1024 * 1024).unwrap();
+        let result = volume
+            .sandbox_command("/usr/bin/python3")
+            .args([
+                "-c",
+                r#"import errno, socket, sys
+for create in (lambda: socket.socket(socket.AF_UNIX),
+               lambda: socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)):
+    try:
+        create()
+    except OSError as error:
+        if error.errno != errno.EPERM:
+            sys.exit(2)
+    else:
+        sys.exit(1)
+"#,
+            ])
+            .arg(&socket)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        volume.close().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires unprivileged user namespaces, mount, nsenter, bubblewrap, and /usr/bin/python3"]
+    fn real_sandbox_keeps_core_limit_below_minimum() {
+        let mount = private_mount_fixture();
+        let mut volume = StagingVolume::create(mount.path(), 1024 * 1024).unwrap();
+        let result = volume
+            .sandbox_command("/usr/bin/python3")
+            .args([
+                "-c",
+                r#"import ctypes, errno, resource
+assert resource.getrlimit(resource.RLIMIT_CORE) == (1, 1)
+try:
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 1))
+except (OSError, ValueError):
+    pass
+else:
+    raise AssertionError("core limit changed")
+libc = ctypes.CDLL(None, use_errno=True)
+class Limit(ctypes.Structure):
+    _fields_ = [("soft", ctypes.c_uint64), ("hard", ctypes.c_uint64)]
+query = Limit()
+assert libc.prlimit64(0, resource.RLIMIT_CORE, None, ctypes.byref(query)) == 0
+assert (query.soft, query.hard) == (1, 1)
+assert libc.prlimit64(0, resource.RLIMIT_CORE, ctypes.byref(Limit(0, 1)), None) == -1
+assert ctypes.get_errno() == errno.EPERM
+"#,
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        volume.close().unwrap();
+    }
+}
 
 pub(crate) fn codex_managed_preferences_present() -> bool {
     false
@@ -2545,5 +3791,120 @@ pub(crate) mod runtime_io {
             uid: credentials.uid,
             pid: credentials.pid as u32,
         })
+    }
+}
+
+#[cfg(test)]
+mod staging_memory_tests {
+    use super::*;
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn visible_ancestor_and_host_memory_bound_the_staging_quota() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("memory accounting");
+        let parent = root.join("parent");
+        let job = parent.join("job");
+        fs::create_dir_all(&job).unwrap();
+        let mounts = format!(
+            "31 20 0:27 / {} rw - cgroup2 cgroup rw\n",
+            root.to_str().unwrap().replace(' ', "\\040")
+        );
+        let groups = "0::/parent/job\n";
+        fs::write(job.join("memory.max"), (256 * MIB).to_string()).unwrap();
+        fs::write(job.join("memory.current"), (32 * MIB).to_string()).unwrap();
+        fs::write(parent.join("memory.max"), (64 * MIB).to_string()).unwrap();
+        fs::write(parent.join("memory.current"), (16 * MIB).to_string()).unwrap();
+        let narrow = temp.path().join("narrow");
+        fs::create_dir(&narrow).unwrap();
+        fs::write(narrow.join("memory.max"), "max\n").unwrap();
+        let narrow_mount = format!(
+            "32 20 0:27 /parent/job {} rw - cgroup2 cgroup rw\n",
+            narrow.display()
+        );
+        for inventory in [
+            format!("{mounts}{narrow_mount}"),
+            format!("{narrow_mount}{mounts}"),
+        ] {
+            assert_eq!(
+                staging_memory_headroom_from("MemAvailable: 131072 kB\n", groups, &inventory)
+                    .unwrap(),
+                48 * MIB
+            );
+        }
+        let headroom =
+            staging_memory_headroom_from("MemAvailable: 131072 kB\n", groups, &mounts).unwrap();
+        assert_eq!(headroom, 48 * MIB);
+        let (bytes, inodes) = staging_memory_budget(1024 * MIB, 4096, headroom).unwrap();
+        assert_eq!(bytes, 12 * MIB);
+        assert_eq!(inodes, 3072);
+        assert_eq!(
+            staging_memory_headroom_from("MemAvailable: 8192 kB\n", groups, &mounts).unwrap(),
+            8 * MIB
+        );
+        fs::write(job.join("memory.max"), "max\n").unwrap();
+        assert_eq!(
+            staging_memory_headroom_from("MemAvailable: 131072 kB\n", groups, &mounts).unwrap(),
+            48 * MIB
+        );
+        fs::write(parent.join("memory.current"), (65 * MIB).to_string()).unwrap();
+        let exhausted =
+            staging_memory_headroom_from("MemAvailable: 131072 kB\n", groups, &mounts).unwrap();
+        assert!(staging_memory_budget(1024 * MIB, 4096, exhausted).is_err());
+    }
+
+    #[test]
+    fn legacy_memory_controller_wins_over_an_unrelated_unified_hierarchy() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("memory");
+        let job = root.join("job");
+        fs::create_dir_all(&job).unwrap();
+        fs::write(root.join("memory.limit_in_bytes"), (128 * MIB).to_string()).unwrap();
+        fs::write(root.join("memory.usage_in_bytes"), (96 * MIB).to_string()).unwrap();
+        fs::write(job.join("memory.limit_in_bytes"), (64 * MIB).to_string()).unwrap();
+        fs::write(job.join("memory.usage_in_bytes"), (16 * MIB).to_string()).unwrap();
+        let mounts = format!(
+            "31 20 0:27 /unrelated /not-visible rw - cgroup2 cgroup rw\n\
+             32 20 0:28 /legacy {} rw - cgroup cgroup rw,memory\n",
+            root.display()
+        );
+        let available = staging_memory_headroom_from(
+            "MemAvailable: 131072 kB\n",
+            "0::/unrelated\n4:cpu,memory:/legacy/job\n",
+            &mounts,
+        )
+        .unwrap();
+        assert_eq!(available, 32 * MIB);
+        assert_eq!(
+            staging_memory_budget(1024 * MIB, 4096, available)
+                .unwrap()
+                .0,
+            8 * MIB
+        );
+        fs::remove_file(job.join("memory.usage_in_bytes")).unwrap();
+        assert!(staging_memory_headroom_from(
+            "MemAvailable: 131072 kB\n",
+            "4:memory:/legacy/job\n",
+            &mounts,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn unknown_accounting_never_grants_the_requested_quota() {
+        for (meminfo, groups, mounts) in [
+            ("MemTotal: 1000000 kB\n", "", ""),
+            ("MemAvailable: 131072 kB\n", "0::/job\n", ""),
+            ("MemAvailable: 131072 kB\n", "0::/../job\n", ""),
+        ] {
+            assert!(staging_memory_headroom_from(meminfo, groups, mounts).is_err());
+        }
+        let (bytes, inodes) = staging_memory_budget(1024 * MIB, 4096, 8 * 1024 * MIB).unwrap();
+        assert_eq!(bytes, 1024 * MIB);
+        assert!(inodes > super::super::super::plugin::fetch::STAGING_ENTRY_LIMIT as u64);
+        let aligned = staging_memory_budget(1024 * MIB, 4096, 1024 * 1024 + 3).unwrap();
+        assert_eq!(aligned.0, 256 * 1024);
+        assert!(staging_memory_budget(1024 * MIB, 4096, 4096).is_err());
     }
 }

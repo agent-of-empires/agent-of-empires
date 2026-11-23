@@ -3,7 +3,7 @@
 
 import { readFileSync } from "node:fs";
 import { test, expect } from "./helpers/mockedTest";
-import { mockStaticApis, mockSessionShellApis } from "./helpers/apiMocks";
+import { mockStaticApis, mockSessionShellApis, openPanelsByDefault } from "./helpers/apiMocks";
 import { mockSessionsList, sessionResponse } from "./helpers/sessions";
 import type { Page } from "@playwright/test";
 
@@ -280,6 +280,7 @@ test.describe("Plugin pages (#4460)", () => {
 
   test("split view shows the opened session below the page and tells the page", async ({ page }) => {
     await mockApis(page, [PAGE]);
+    await openPanelsByDefault(page);
     await page.route(`**${PAGE.url}`, (r) =>
       r.fulfill({ contentType: "text/html", headers: { "content-security-policy": PAGE_CSP }, body: BRIDGE_FIXTURE }),
     );

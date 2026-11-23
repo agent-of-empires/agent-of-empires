@@ -33,9 +33,6 @@ export interface WebSettings {
   collapsedDiffDirs: string[];
   sidebarSide: "left" | "right";
   sidebarCompact: boolean;
-  autoOpenDiffPane: boolean;
-  autoOpenTerminalPane: boolean;
-  autoOpenPluginPanes: boolean;
   /** Ordered key row above the soft keyboard in the live terminal. */
   mobileToolbarKeys: ToolbarKeyId[];
   showArrowJoystick: boolean;
@@ -63,9 +60,6 @@ function getDefaults(): WebSettings {
     collapsedDiffDirs: [],
     sidebarSide: "left",
     sidebarCompact: false,
-    autoOpenDiffPane: true,
-    autoOpenTerminalPane: true,
-    autoOpenPluginPanes: false,
     mobileToolbarKeys: [...DEFAULT_TOOLBAR_KEYS],
     showArrowJoystick: true,
     showForwardScrollbar: false,
@@ -89,9 +83,6 @@ function normalizeSnapshot(settings: WebSettings): WebSettings {
     structuredHistoryWindow: normalizeStructuredHistoryWindow(settings.structuredHistoryWindow),
     fileEditing: normalizeBool(settings.fileEditing, defaults.fileEditing),
     sidebarCompact: normalizeBool(settings.sidebarCompact, defaults.sidebarCompact),
-    autoOpenDiffPane: normalizeBool(settings.autoOpenDiffPane, defaults.autoOpenDiffPane),
-    autoOpenTerminalPane: normalizeBool(settings.autoOpenTerminalPane, defaults.autoOpenTerminalPane),
-    autoOpenPluginPanes: normalizeBool(settings.autoOpenPluginPanes, defaults.autoOpenPluginPanes),
     mobileToolbarKeys: normalizeToolbarKeys(settings.mobileToolbarKeys),
     showArrowJoystick: normalizeBool(settings.showArrowJoystick, defaults.showArrowJoystick),
     showForwardScrollbar: normalizeBool(settings.showForwardScrollbar, defaults.showForwardScrollbar),

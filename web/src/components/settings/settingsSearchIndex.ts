@@ -1,3 +1,4 @@
+import { PANEL_SETTING_FIELDS } from "../../lib/panelDefaults";
 import type { SettingsFieldDescriptor } from "../../lib/types";
 import type { TabId } from "../SettingsView";
 
@@ -17,6 +18,12 @@ export const SECTION_TO_TAB: Record<string, TabId> = {
   acp: "structured-view",
 };
 
+/** The tab that renders a field: its section's, unless the field is shown on another tab. */
+export function tabOf(d: Pick<SettingsFieldDescriptor, "section" | "field">): TabId | undefined {
+  if (d.section === "web" && (PANEL_SETTING_FIELDS as readonly string[]).includes(d.field)) return "panels";
+  return SECTION_TO_TAB[d.section];
+}
+
 export interface SettingsSearchHit {
   section: string;
   field: string;
@@ -34,7 +41,7 @@ export function buildSettingsSearchIndex(schema: SettingsFieldDescriptor[]): Set
   const hits: SettingsSearchHit[] = [];
   for (const d of schema) {
     if (d.web_write.policy === "local_only") continue;
-    const tab = SECTION_TO_TAB[d.section];
+    const tab = tabOf(d);
     if (!tab) continue;
     hits.push({
       section: d.section,
