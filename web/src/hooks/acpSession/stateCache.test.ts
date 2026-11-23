@@ -349,6 +349,29 @@ describe("pending queued rows", () => {
     expect(loadedIds("pr-up")).toEqual(["a"]);
   });
 
+  it("keeps a legacy row in the transcript until its own entry is durable", () => {
+    writeEntry("pr-full", withRows(row("a")), T);
+    const spy = vi.spyOn(Storage.prototype, "setItem").mockImplementation((k) => {
+      if (k.startsWith(PENDING_KEY_PREFIX)) throw new DOMException("full", "QuotaExceededError");
+    });
+    expect(loadedIds("pr-full")).toEqual(["a"]);
+    spy.mockRestore();
+    expect(pendingKeys("pr-full")).toEqual([]);
+    persistState("pr-full", withRows(row("a")), T + 1);
+    expect(loadedIds("pr-full")).toEqual(["a"]);
+  });
+
+  it("does not adopt a legacy row again once another tab confirmed it", async () => {
+    writeEntry("pr-done", withRows(row("a")), T);
+    expect(loadedIds("pr-done")).toEqual(["a"]);
+    cacheSet("pr-done", withRows(row("a", { pending: false })));
+    // A second tab (its own module state) opens before the transcript flush and still sees the legacy copy.
+    vi.resetModules();
+    const tab2 = await import("./stateCache");
+    expect(tab2.loadPersistedState("pr-done")?.queuedPrompts).toEqual([]);
+    expect(pendingKeys("pr-done")).toEqual([]);
+  });
+
   it("retries a pending write that failed on quota", () => {
     const spy = vi.spyOn(Storage.prototype, "setItem").mockImplementationOnce(() => {
       throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
