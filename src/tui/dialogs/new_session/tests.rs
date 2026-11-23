@@ -2594,3 +2594,38 @@ fn an_unresolved_project_waits_for_a_path_before_submitting() {
     let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
     assert_eq!(data.initial_prompt.as_deref(), Some("Review PR 4562"));
 }
+
+/// A suggestion with every row (From, Profile, Sandbox, the prompt line) fits
+/// 24 rows, with room for a three-line error: the layout drops spacer rows.
+#[test]
+fn a_full_suggestion_dialog_fits_80_by_24() {
+    let mut dialog = multi_tool_dialog();
+    dialog.docker_available = true;
+    dialog.structured_capable = true;
+    dialog.available_profiles = vec!["default".to_string(), "work".to_string()];
+    dialog.set_suggestion("Review PR 4562".to_string(), github_origin());
+    dialog.error_message = Some(format!("{} end-of-error", "word ".repeat(36)));
+    let screen = screen_of(&mut dialog, 80, 24);
+    let rows: Vec<String> = screen
+        .chars()
+        .collect::<Vec<_>>()
+        .chunks(80)
+        .map(|row| row.iter().collect())
+        .collect();
+    let all = rows.join("\n");
+    for label in [
+        "From GitHub",
+        "Profile",
+        "Title:",
+        "Tool:",
+        "Structured",
+        "YOLO",
+        "Worktree",
+        "Sandbox",
+        "Group",
+        "Prompt from GitHub",
+        "end-of-error",
+    ] {
+        assert!(all.contains(label), "{label}: {all}");
+    }
+}
