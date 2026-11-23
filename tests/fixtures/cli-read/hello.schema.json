@@ -17,7 +17,7 @@
     "runtime_instance_id"
   ],
   "properties": {
-    "protocol_version": { "const": 4 },
+    "protocol_version": { "const": 5 },
     "runtime_epoch": { "$ref": "#/$defs/uuid" },
     "prebind_instance_id": { "$ref": "#/$defs/uuid" },
     "runtime_instance_id": { "$ref": "#/$defs/uuid" },

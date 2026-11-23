@@ -38,6 +38,7 @@ impl Instance {
             last_accessed_at: None,
             idle_entered_at: None,
             archived_at: None,
+            ignored_at: None,
             favorited_at: None,
             snoozed_until: None,
             unread: false,

@@ -5587,6 +5587,31 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "triage.ignore-managed-session",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/triage.spec.ts"],
+      "components": [
+        "web/src/components/sidebar/SessionRowMenu.tsx",
+        "web/src/components/sidebar/SessionActions.tsx",
+        "web/src/hooks/useSidebarTriage.ts"
+      ],
+      "notes": "Against a real daemon: the row menu ignores a managed session (PATCH /ignored, which keeps the row live and out of the footer), then offers Unignore with the inverse body, and Take ownership back (POST /reclaim-ownership) clears the manager link so both managed actions leave the menu."
+    },
+    {
+      "id": "triage.ignore-managed-session-ranking",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/lib/api.test.ts",
+        "src/lib/__tests__/sidebarSort.test.ts",
+        "src/components/__tests__/SessionRowMenuOrder.test.tsx",
+        "src/components/__tests__/SessionRowMenuActions.test.tsx"
+      ],
+      "components": ["web/src/lib/api.ts", "web/src/lib/sidebarSort.ts"],
+      "notes": "An ignored session ranks last in the attention order, never needs attention, and stays out of the archived footer. The daemon side is covered by ignore_session_keeps_the_row_live_and_reports_its_manager and reclaim_ownership_clears_manager_and_ignore_in_one_commit."
+    },
+    {
       "id": "triage.api-wire-format",
       "kind": "vitest",
       "risk": "medium",

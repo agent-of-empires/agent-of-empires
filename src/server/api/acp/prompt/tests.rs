@@ -1038,20 +1038,26 @@ async fn a_manual_prompt_cannot_overtake_a_continuation_install() {
 #[test]
 fn prompt_persist_tiers() {
     // The recency-only tier does not clear a peer's archive by itself.
+    // Neither tier clears a peer's archive, but both are direct engagement and
+    // clear Ignore.
     let mut disk = crate::session::Instance::new("s", "/tmp/x");
     disk.view = crate::session::View::Structured;
     disk.last_accessed_at = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
     disk.archived_at = Some(chrono::Utc::now() - chrono::Duration::seconds(30));
+    disk.ignored_at = Some(chrono::Utc::now());
     crate::server::session_service::apply_prompt_persist_to_disk(&mut disk, false);
     assert!(disk.archived_at.is_some());
+    assert!(disk.ignored_at.is_none());
     assert!(disk.last_accessed_at > disk.archived_at);
 
     // A wake persist lifts a sunk row.
     let mut disk = crate::session::Instance::new("s", "/tmp/x");
     disk.view = crate::session::View::Structured;
     disk.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::minutes(10));
+    disk.ignored_at = Some(chrono::Utc::now());
     crate::server::session_service::apply_prompt_persist_to_disk(&mut disk, true);
     assert!(disk.snoozed_until.is_none());
+    assert!(disk.ignored_at.is_none());
     assert!(disk.last_accessed_at.is_some());
 }
 

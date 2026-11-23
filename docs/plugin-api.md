@@ -364,7 +364,7 @@ With `api_version >= 9` a worker can discover ACP capabilities and create host-o
 
 **Ownership.** `sessions.turn.send` reaches only a session the calling plugin created. To reach any other session, use `sessions.message.send`.
 
-**Busy sessions.** A turn aimed at an agent already running a non-steerable turn (or cancelling, or compacting) is refused with a retryable `agent_busy` rather than dropped. So is a `/compact` or `/clear` aimed at any running turn, steerable or not, since such a command runs on its own turn. A stopped or dormant session is not busy: the host wakes it the way a user prompt does, closes any turn the previous worker left open, resumes the worker, and waits. An archived or trashed session is never woken; the turn fails with `session_archived` or `session_trashed`.
+**Busy sessions.** A turn aimed at an agent already running a non-steerable turn (or cancelling, or compacting) is refused with a retryable `agent_busy` rather than dropped. So is a `/compact` or `/clear` aimed at any running turn, steerable or not, since such a command runs on its own turn. A stopped or dormant session is not busy: the host wakes it the way a user prompt does, closes any turn the previous worker left open, resumes the worker, and waits. An archived or trashed session is never woken; the turn fails with `session_archived` or `session_trashed`. An ignored session fails with `ignored` and keeps its marker.
 
 **Idempotency.** `sessions.create` takes a plugin-scoped `idempotency_key`: retrying with the same key and payload returns the existing session (`created: false`), while a different payload under that key is a conflict.
 
@@ -397,6 +397,7 @@ Status notifications follow canonical row adoption. Rejected or stale operations
 | `session_not_found` | No such session, which is also what a hard-deleted session looks like. |
 | `session_archived` | The session is archived; it is never woken. Skip it and keep the registration. |
 | `session_trashed` | The session is in the trash; it is never woken. |
+| `ignored` | The session is managed by another session and ignored; a plugin send is never delivered or allowed to clear the marker. A person must unignore it or reclaim ownership first. |
 | `rate_limited` | More than 600 messages per rolling hour for this plugin. A bucket of its own, separate from turns. |
 | `resume_failed` | A terminal session's agent could not resume. `data.resume_session_id` holds the preserved session id. |
 | `session_not_running` | A terminal pane vanished between the revive and the send. |
