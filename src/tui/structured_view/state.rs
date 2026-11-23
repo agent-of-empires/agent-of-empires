@@ -2,7 +2,7 @@
 //! and the websocket handle. Side effects run in the async loop in [`super`],
 //! so this state stays freely borrowable by the render layer.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
@@ -22,6 +22,7 @@ use crate::plugin::ui_state::{Notification, UiSnapshot};
 use crate::session::config::NoticePolicy;
 use crate::tui::components::hover::HoverState;
 use crate::tui::plugin_ui;
+use crate::tui::styles::Theme;
 
 /// Most plugin notifications buffered awaiting a free toast slot. The daemon
 /// already bounds its ring; this second guard drops old un-shown toasts rather
@@ -35,7 +36,15 @@ pub struct StructuredViewState {
     pub transcript: AcpTranscript,
     pub composer: TextArea<'static>,
     pub focus: Focus,
-    pub scroll_offset: u16,
+    /// First painted transcript row. Interior-mutable: the render writes back a
+    /// restored reading position.
+    pub scroll_offset: Cell<u16>,
+    /// Row the last frame painted at the top of the transcript. Interior-mutable:
+    /// the render borrows the state immutably.
+    top_row: RefCell<Option<ScrollAnchor>>,
+    /// Row to find again after the projection changes height above the reader,
+    /// set by a thought toggle taken while they are scrolled back.
+    scroll_anchor: RefCell<Option<ScrollAnchor>>,
     /// Nonce of the approval currently holding the modal action shelf. Identity
     /// is used instead of a list index so historical resolved rows can never
     /// make the highlighted request diverge from the request the keys resolve.
@@ -122,18 +131,97 @@ pub struct StructuredViewState {
     /// resolve the `u16::MAX` "stick to bottom" sentinel to a concrete position.
     /// Interior-mutable: the render borrows the state immutably. See `apply_scroll`.
     pub last_scroll_max: std::cell::Cell<u16>,
+    /// Whether thoughts render in full instead of as one preview line
+    /// (transcript `e`). Reasoning is often the part that explains a turn, so
+    /// collapsing is a choice rather than the only option.
+    pub show_full_thinking: bool,
     /// Context-window percentage at which the status line nudges toward `/compact`,
     /// or `None` when off or the fetch failed. Read from the daemon's `/api/about`,
     /// not local config, so a remote-attached view honours that daemon (#3253).
     pub compaction_reminder_percent: Option<u8>,
+    /// The wrapped transcript painted by the last frame. Wrapping a long
+    /// transcript costs far more than everything else in a frame, and most
+    /// frames repaint identical rows. Interior-mutable: the render borrows the
+    /// state immutably.
+    pub transcript_cache: RefCell<Option<TranscriptTextCache>>,
+}
+
+/// A wrapped transcript and the inputs it was built from. Any of them changing
+/// makes the text stale, so the cache is a match on all of them or nothing.
+pub struct TranscriptTextCache {
+    pub revision: u64,
+    pub width: u16,
+    pub theme: Theme,
+    pub roots: Option<SessionPathRoots>,
+    pub full_thinking: bool,
+    pub text: ratatui::text::Text<'static>,
+    /// Row identity per visual row, so a cached projection can still anchor.
+    pub groups: Vec<Option<String>>,
+}
+
+impl TranscriptTextCache {
+    pub fn matches(
+        &self,
+        revision: u64,
+        width: u16,
+        theme: &Theme,
+        roots: Option<&SessionPathRoots>,
+        full_thinking: bool,
+    ) -> bool {
+        self.revision == revision
+            && self.width == width
+            && &self.theme == theme
+            && self.roots.as_ref() == roots
+            && self.full_thinking == full_thinking
+    }
+}
+
+/// A row of the transcript worth finding again after the projection changes:
+/// the identity of the transcript row that produced it, how far into that row it
+/// sits, and where it was in the pane. Repeated text elsewhere names the same
+/// content, so the identity decides which copy the reader is on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScrollAnchor {
+    /// Transcript row identity, as tagged by the projection.
+    pub group: String,
+    /// Visual rows from the identity's first row to the anchored one.
+    pub row: u16,
+    /// Visual rows from the pane's top to the anchored one.
+    pub pane_row: u16,
+    /// The anchored row's text, for a projection that no longer holds its identity.
+    pub text: String,
+}
+
+impl StructuredViewState {
+    /// Remember the row the frame painted at the top of the transcript.
+    pub fn note_top_row(&self, row: Option<ScrollAnchor>) {
+        *self.top_row.borrow_mut() = row;
+    }
+
+    /// Hold onto that row so the next projection can put it back under the
+    /// reader, for a toggle that grows the transcript above them.
+    pub fn anchor_scroll_to_top_line(&self) {
+        *self.scroll_anchor.borrow_mut() = self.top_row.borrow().clone();
+    }
+
+    /// The row the next frame should scroll back to, if any.
+    pub fn take_scroll_anchor(&self) -> Option<ScrollAnchor> {
+        self.scroll_anchor.take()
+    }
 }
 
 /// One open choice-picker: a titled option list plus what accepting means.
 /// Generic so the mode picker and the elicitation answer flow share routing.
 pub struct ChoicePicker {
     pub title: String,
+    /// Context shown above the options, wrapped: the lead-in and the question's
+    /// own detail, which a one-line title cannot hold.
+    pub context: Option<String>,
     /// `(value, label)` rows; `value` is what gets submitted.
     pub options: Vec<(String, String)>,
+    /// Per-option detail, parallel to `options`: a question option's own
+    /// description, shown for the highlighted row. Empty when they carry none.
+    pub details: Vec<Option<String>>,
     pub selected: usize,
     pub purpose: ChoicePurpose,
 }
@@ -318,7 +406,9 @@ impl StructuredViewState {
             http,
             composer: new_composer_textarea(),
             focus: Focus::Composer,
-            scroll_offset: u16::MAX, // stick to bottom by default; render clamps to last row
+            scroll_offset: Cell::new(u16::MAX), // stick to bottom; render clamps to the last row
+            top_row: RefCell::new(None),
+            scroll_anchor: RefCell::new(None),
             selected_approval: None,
             ws,
             toast: None,
@@ -350,6 +440,8 @@ impl StructuredViewState {
             auto_presented_elicitation: None,
             last_scroll_max: std::cell::Cell::new(0),
             compaction_reminder_percent: None,
+            show_full_thinking: false,
+            transcript_cache: RefCell::new(None),
         }
     }
 

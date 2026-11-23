@@ -2428,7 +2428,7 @@ impl NewSessionDialog {
             path: if self.scratch {
                 String::new()
             } else {
-                self.path.value().trim().to_string()
+                path_input::expand_tilde(self.path.value().trim())
             },
             group: self.group.value().trim().to_string(),
             tool: self.available_tools[self.tool_index].clone(),

@@ -285,7 +285,9 @@ impl NativeRuntime {
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
         let health = state.canonical_health.read().await.clone();
+        let project_started = std::time::Instant::now();
         let sessions = super::api::sessions::project_sessions(state).await;
+        let project_ms = project_started.elapsed().as_secs_f64() * 1000.0;
         let metadata = state.canonical_metadata.read().await;
         let workspace_ordering =
             super::api::sessions::compute_merged_ordering(&sessions, &metadata.workspace_ordering);
@@ -322,11 +324,13 @@ impl NativeRuntime {
         let previous = self.snapshots.borrow().clone();
         if let Some(previous) = &previous {
             if previous.mutation_epoch == mutation_epoch && previous.value.contents == contents {
+                tracing::debug!(target: "server.runtime", project_ms, changed = false, "projected");
                 self.hooks
                     .reconcile(&contents.sessions, &metadata.status_hooks);
                 return Ok(previous.clone());
             }
         }
+        tracing::debug!(target: "server.runtime", project_ms, changed = true, "projected");
         let revision = previous
             .as_ref()
             .map_or(Some(1), |previous| {
@@ -698,7 +702,6 @@ async fn follow_runtime(mut socket: WebSocket, state: Arc<AppState>, local: Opti
     if first_subscriber {
         state.runtime.terminal_wake.notify_one();
     }
-    state.runtime.request_publish();
     if let Err(error) = state.runtime.publish(&state).await {
         tracing::debug!(target: "server.runtime", %error, "runtime publish failed");
         return;
@@ -855,17 +858,13 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(
-            snapshots
-                .borrow_and_update()
-                .as_ref()
-                .unwrap()
-                .value
-                .contents
-                .sessions[0]
-                .title,
-            "before"
-        );
+        // The tick only requests a publish; publish_loop performs it.
+        tokio::time::timeout(Duration::ZERO, state.runtime.wake.notified())
+            .await
+            .expect("tick left a publish request");
+        let publisher = tokio::spawn(publish_loop(state.clone()));
+        let title = published_title(&mut snapshots, "before").await;
+        assert_eq!(title, "before");
         storage
             .update(|rows, _| {
                 rows[0].title = "after".into();
@@ -885,12 +884,124 @@ mod tests {
             completed_rx.try_recv().is_err(),
             "exactly one tick ran after the write"
         );
-        let snapshot = snapshots.borrow_and_update().clone().unwrap();
-        let published = &snapshot.value.contents.sessions[0];
-        assert_eq!(published.title, "after");
-        assert_eq!(published.status, "Creating");
+        published_title(&mut snapshots, "after").await;
+        let snapshot = snapshots.borrow().clone().unwrap();
+        assert_eq!(snapshot.value.contents.sessions[0].status, "Creating");
         state.shutdown.cancel();
         polling.await;
+        publisher.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn status_changing_ticks_each_publish_behind_a_held_lane() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        let storage = crate::session::Storage::new_unwatched("test").unwrap();
+        let mut row = crate::session::Instance::new("moves", "/repo");
+        row.source_profile = "test".into();
+        row.status = crate::session::Status::Stopped;
+        storage
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        let set_status = |status| {
+            storage
+                .update(|rows, _| {
+                    rows[0].status = status;
+                    Ok(())
+                })
+                .unwrap()
+        };
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        let (_health_tx, health_rx) = tokio::sync::watch::channel(Arc::default());
+        let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut polling = Box::pin(super::super::status_poll::status_poll_loop_observed(
+            state.clone(),
+            health_rx,
+            Some(completed_tx),
+        ));
+        let deadline = Duration::from_secs(10);
+        let mut next_tick = async |polling: &mut std::pin::Pin<Box<_>>| {
+            tokio::time::timeout(deadline, async {
+                tokio::select! {
+                    _ = polling => panic!("poll loop stopped"),
+                    result = completed_rx.recv() => result.unwrap(),
+                }
+            })
+            .await
+            .unwrap()
+        };
+        next_tick(&mut polling).await;
+        let base = state
+            .runtime
+            .publish(&state)
+            .await
+            .unwrap()
+            .value
+            .cursor
+            .revision;
+
+        // Two status-changing ticks while a publication is in flight must not collapse.
+        let lane = state.runtime.publish_lane.lock().await;
+        set_status(crate::session::Status::Creating);
+        state.runtime.terminal_wake.notify_one();
+        tokio::time::timeout(deadline, async {
+            tokio::select! {
+                _ = &mut polling => panic!("poll loop stopped"),
+                _ = async {
+                    while state.instances.read().await[0].status
+                        != crate::session::Status::Creating
+                    {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                } => {}
+            }
+        })
+        .await
+        .unwrap();
+        set_status(crate::session::Status::Stopped);
+        state.runtime.terminal_wake.notify_one();
+        drop(lane);
+        next_tick(&mut polling).await;
+        next_tick(&mut polling).await;
+        let revision = state
+            .runtime
+            .snapshots
+            .borrow()
+            .clone()
+            .unwrap()
+            .value
+            .cursor
+            .revision;
+        assert_eq!(
+            revision,
+            base + 2,
+            "each status move needs its own publication"
+        );
+        state.shutdown.cancel();
+        polling.await;
+    }
+
+    async fn published_title(
+        snapshots: &mut tokio::sync::watch::Receiver<Option<Arc<PublishedSnapshot>>>,
+        want: &str,
+    ) -> String {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(snapshot) = snapshots.borrow_and_update().as_ref() {
+                    let title = &snapshot.value.contents.sessions[0].title;
+                    if title == want {
+                        return title.clone();
+                    }
+                }
+                snapshots.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap()
     }
 
     #[test]

@@ -11,6 +11,8 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::pin::Pin;
 
+use crate::session::MAX_INITIAL_PROMPT_BYTES as MAX_PROMPT_BYTES;
+
 fn parse_repo_base(raw: &str) -> Result<(String, String), String> {
     let (repo, branch) = raw
         .split_once('=')
@@ -176,6 +178,18 @@ pub struct AddArgs {
     #[arg(long = "structured-view")]
     structured_view: bool,
 
+    /// First turn sent to the agent once it is ready. Needs --structured-view
+    /// or --agent; delivered when `aoe serve` starts the worker. If the
+    /// session falls back to the terminal view, the prompt is typed only into an
+    /// agent with a ready marker; otherwise nothing is typed and the session
+    /// row carries `initial_prompt_error`.
+    #[arg(long, conflicts_with = "prompt_file")]
+    prompt: Option<String>,
+
+    /// Read the first turn from a file. Same rules as `--prompt`.
+    #[arg(long = "prompt-file", value_name = "PATH", conflicts_with = "prompt")]
+    prompt_file: Option<PathBuf>,
+
     /// Pick a specific ACP agent for the structured view (e.g., claude-code,
     /// codex).
     #[arg(long = "agent")]
@@ -212,11 +226,55 @@ pub struct AddArgs {
     scratch: bool,
 }
 
+const PROMPT_NEEDS_STRUCTURED: &str =
+    "--prompt needs the structured view; a terminal-view request is refused here.\n\
+     Pass --structured-view (or --agent). Without an installed ACP adapter the session falls back to \
+     the terminal view and the prompt is typed there once the agent is ready.";
+
+/// The `--prompt` / `--prompt-file` text, validated before anything is created.
+/// Kept as typed: only blankness is judged on the trimmed text.
+fn resolve_initial_prompt(args: &AddArgs) -> Result<Option<String>> {
+    let text = match (&args.prompt, &args.prompt_file) {
+        (Some(text), _) => text.clone(),
+        (None, Some(path)) => {
+            let meta = std::fs::metadata(path)
+                .with_context(|| format!("Failed to read prompt file: {}", path.display()))?;
+            if !meta.is_file() {
+                bail!("Prompt file is not a regular file: {}", path.display());
+            }
+            if meta.len() > MAX_PROMPT_BYTES as u64 {
+                bail!(prompt_too_large());
+            }
+            std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read prompt file: {}", path.display()))?
+        }
+        (None, None) => return Ok(None),
+    };
+    if text.len() > MAX_PROMPT_BYTES {
+        bail!(prompt_too_large());
+    }
+    if text.trim().is_empty() {
+        bail!("The initial prompt cannot be empty");
+    }
+    Ok(Some(text))
+}
+
+fn prompt_too_large() -> String {
+    format!(
+        "The initial prompt is larger than {} KiB",
+        MAX_PROMPT_BYTES / 1024
+    )
+}
+
 #[tracing::instrument(target = "cli.add", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     use crate::acp::client::{require_daemon, HttpClient};
     if args.interactive && !std::io::stdin().is_terminal() {
         bail!("--interactive requires a terminal; pass --title for non-interactive naming");
+    }
+    let initial_prompt = resolve_initial_prompt(&args)?;
+    if initial_prompt.is_some() && !(args.structured_view || args.agent.is_some()) {
+        bail!(PROMPT_NEEDS_STRUCTURED);
     }
     if args
         .tool
@@ -295,7 +353,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             },
             &epoch,
         )
-        .await?;
+        .await
+        .map_err(|error| with_missing_path(error.into(), &path))?;
     if args.interactive && title.is_none() {
         let titles: Vec<&str> = rows.iter().map(|row| row.title.as_str()).collect();
         let default = if args.generated_name {
@@ -355,6 +414,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         extra_args: args.extra_args.unwrap_or_default(),
         extra_env: Vec::new(),
         hook_env: explicit_hook_env(&args.hook_env),
+        initial_prompt,
         extra_repo_paths: args
             .extra_repos
             .iter()
@@ -417,7 +477,11 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     tokio::pin!(signal);
     let row = create_and_observe(&client, &body, &epoch, &key, signal.as_mut())
         .await
-        .map_err(with_skip_hint)?;
+        .map_err(with_skip_hint)
+        .map_err(|error| {
+            let existing = body.worktree_branch.as_deref();
+            with_create_branch_hint(error, existing.filter(|_| !body.create_new_branch))
+        })?;
     for warning in &row.warnings {
         eprintln!("Warning: {warning}");
     }
@@ -748,6 +812,33 @@ fn with_skip_hint(error: anyhow::Error) -> anyhow::Error {
     }
 }
 
+fn error_code(error: &anyhow::Error) -> Option<crate::daemon::ApiErrorCode> {
+    match error.downcast_ref::<DaemonClientError>() {
+        Some(DaemonClientError::Status { code, .. }) => *code,
+        _ => None,
+    }
+}
+
+/// Names the path the CLI sent, which a refusal without a readable body cannot.
+fn with_missing_path(error: anyhow::Error, path: &str) -> anyhow::Error {
+    match error_code(&error) {
+        Some(crate::daemon::ApiErrorCode::WorkingDirMissing) => {
+            anyhow::anyhow!("Path does not exist where the Daemon runs: {path}")
+        }
+        _ => error,
+    }
+}
+
+/// `-w <branch>` without `-b` checks out an existing branch; name the flag that creates one.
+fn with_create_branch_hint(error: anyhow::Error, existing_branch: Option<&str>) -> anyhow::Error {
+    match (existing_branch, error_code(&error)) {
+        (Some(branch), Some(crate::daemon::ApiErrorCode::BranchNotFound)) => {
+            anyhow::anyhow!("{error:#}\nPass -b to create branch '{branch}'.")
+        }
+        _ => error,
+    }
+}
+
 fn definitive(error: &DaemonClientError) -> bool {
     matches!(error, DaemonClientError::Status { status, code, .. }
         if status.is_client_error() && *status != reqwest::StatusCode::REQUEST_TIMEOUT
@@ -757,6 +848,39 @@ fn definitive(error: &DaemonClientError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both hints key off the Daemon's error code, never its message text.
+    #[test]
+    fn typed_refusals_name_the_path_and_the_create_flag() {
+        use crate::daemon::ApiErrorCode;
+        let status = |code: Option<ApiErrorCode>| {
+            anyhow::Error::from(DaemonClientError::Status {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                code,
+                body: String::new(),
+                truncated: false,
+            })
+        };
+        let missing = with_missing_path(status(Some(ApiErrorCode::WorkingDirMissing)), "/nope");
+        assert!(missing.to_string().ends_with(": /nope"), "{missing}");
+        let hinted =
+            with_create_branch_hint(status(Some(ApiErrorCode::BranchNotFound)), Some("feat/x"));
+        assert!(
+            hinted
+                .to_string()
+                .ends_with("Pass -b to create branch 'feat/x'."),
+            "{hinted}"
+        );
+        for (code, branch) in [
+            (Some(ApiErrorCode::BranchNotFound), None),
+            (None, Some("feat/x")),
+        ] {
+            let error = with_create_branch_hint(status(code), branch).to_string();
+            assert!(!error.contains("-b"), "{error}");
+        }
+        let other = with_missing_path(status(None), "/nope").to_string();
+        assert!(!other.contains("/nope"), "{other}");
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -920,6 +1044,96 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(!submitted.get());
+    }
+
+    fn parse_add(argv: &[&str]) -> Result<super::AddArgs, clap::Error> {
+        use clap::Parser;
+        match crate::cli::Cli::try_parse_from(argv)?.command {
+            Some(crate::cli::Commands::Add(args)) => Ok(*args),
+            _ => panic!("expected an add invocation"),
+        }
+    }
+
+    #[test]
+    fn initial_prompt_flags_are_exclusive_and_validated_as_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("p.md");
+        let file_arg = file.to_str().unwrap();
+        assert!(parse_add(&["aoe", "add", "--prompt", "a", "--prompt-file", file_arg]).is_err());
+
+        std::fs::write(&file, "  line one\nline two\n").unwrap();
+        for (argv, expected) in [
+            (vec!["aoe", "add"], Ok(None)),
+            (vec!["aoe", "add", "--prompt", "  go "], Ok(Some("  go "))),
+            (
+                vec!["aoe", "add", "--prompt-file", file_arg],
+                Ok(Some("  line one\nline two\n")),
+            ),
+            (
+                vec!["aoe", "add", "--prompt", "  \n"],
+                Err("cannot be empty"),
+            ),
+            (
+                vec!["aoe", "add", "--prompt-file", "/nonexistent/aoe-prompt"],
+                Err("Failed to read prompt file"),
+            ),
+            (
+                vec!["aoe", "add", "--prompt-file", dir.path().to_str().unwrap()],
+                Err("not a regular file"),
+            ),
+        ] {
+            let got = super::resolve_initial_prompt(&parse_add(&argv).unwrap());
+            match expected {
+                Ok(text) => assert_eq!(got.unwrap().as_deref(), text, "{argv:?}"),
+                Err(msg) => assert!(got.unwrap_err().to_string().contains(msg), "{argv:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_oversized_prompt_is_refused_the_same_way_inline_and_from_a_file() {
+        let big = "x".repeat(super::MAX_PROMPT_BYTES + 1);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("big.md");
+        std::fs::write(&file, &big).unwrap();
+        for argv in [
+            vec!["aoe", "add", "--prompt-file", file.to_str().unwrap()],
+            vec!["aoe", "add", "--prompt", big.as_str()],
+        ] {
+            let err = super::resolve_initial_prompt(&parse_add(&argv).unwrap()).unwrap_err();
+            assert!(
+                err.to_string().contains("larger than 64 KiB"),
+                "{argv:?}: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_prompt_is_refused_for_a_terminal_session_and_nothing_is_stored() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let err = super::run(
+            "default",
+            parse_add(&[
+                "aoe",
+                "add",
+                project.path().to_str().unwrap(),
+                "--prompt",
+                "go",
+            ])
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("--prompt needs the structured view"));
+        let (rows, _) = crate::session::Storage::new_unwatched("default")
+            .unwrap()
+            .load_with_groups()
+            .unwrap();
+        assert!(rows.is_empty());
     }
 
     #[test]
