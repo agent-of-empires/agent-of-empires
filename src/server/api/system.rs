@@ -2461,6 +2461,31 @@ struct ProfileCommitPause {
 static PROFILE_COMMIT_PAUSE: std::sync::Mutex<Option<ProfileCommitPause>> =
     std::sync::Mutex::new(None);
 
+/// Pauses an Agent default model PUT for `profile` after its profile check, before its write.
+#[cfg(test)]
+static AGENT_DEFAULT_MODEL_CHECKED: std::sync::Mutex<Option<ProfileCommitPause>> =
+    std::sync::Mutex::new(None);
+
+/// Pauses an Agent default model PUT for `profile` after it reads the machine config.
+#[cfg(test)]
+static AGENT_DEFAULT_MODEL_READ: std::sync::Mutex<Option<ProfileCommitPause>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn agent_default_model_pause(slot: &std::sync::Mutex<Option<ProfileCommitPause>>, profile: &str) {
+    let pause = slot
+        .lock()
+        .unwrap()
+        .take_if(|pause| pause.profile == profile);
+    if let Some(pause) = pause {
+        let _ = pause.entered.send(());
+        pause
+            .resume
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+    }
+}
+
 async fn commit_profile(
     state: Arc<AppState>,
     mutation: crate::daemon::ProfileMutation,
@@ -3096,7 +3121,7 @@ pub async fn get_agent_default_model(
 }
 
 /// `PUT /api/profiles/{name}/acp-defaults/{agent}/model`: set only this Agent's default
-/// model in the profile, refusing while either layer pins it.
+/// model in the profile, refusing while the profile's resolved settings pin it.
 ///
 /// The check and the write share the profile's lock and the settings write gate, so a
 /// pin saved through this Daemon after the caller read the default is honoured. The
@@ -3134,14 +3159,21 @@ pub async fn set_agent_default_model(
         .await
         .get(&agent)
         .is_some();
+    // Held until the write lands, so a rename or delete can't move the profile after the check
+    // and leave `update_profile_config` to recreate it.
+    let _namespace = state.profile_namespace.read().await;
     let _gate = write_gate().await;
     let result = tokio::task::spawn_blocking(move || {
         if let Err(e) = crate::session::require_known_profile(&name) {
             return Err(api_error(StatusCode::NOT_FOUND, "not_found", e.to_string()));
         }
+        #[cfg(test)]
+        agent_default_model_pause(&AGENT_DEFAULT_MODEL_CHECKED, &name);
         crate::session::update_profile_config(&name, |profile| {
             let global = crate::session::Config::load()?;
-            let resolved = crate::session::merge_configs(global, profile);
+            #[cfg(test)]
+            agent_default_model_pause(&AGENT_DEFAULT_MODEL_READ, &name);
+            let resolved = crate::session::merge_configs(global.clone(), profile);
             if !registered && !resolved.session.agent_acp_cmd.contains_key(&agent) {
                 return Err(DefaultModelRefused(
                     crate::daemon::ApiErrorCode::UnknownAgent,
@@ -3176,7 +3208,7 @@ pub async fn set_agent_default_model(
                 .as_object_mut()
                 .ok_or_else(|| anyhow::anyhow!("Agent defaults entry is not a table"))?
                 .insert("model".to_string(), serde_json::json!(model));
-            let global = crate::session::Config::load()?;
+            // The machine config the checks ran against, not a later read.
             Ok(AgentDefaultModel::of(
                 &crate::session::merge_configs(global, profile).acp,
                 &agent,
@@ -4789,8 +4821,8 @@ command = "zzzeta"
         );
     }
 
-    /// A pin in either layer refuses the write and leaves the profile file untouched, including
-    /// a pin saved after the caller last read the default.
+    /// A pin the profile resolves, from either layer, refuses the write and leaves the profile
+    /// file untouched, including a pin saved after the caller last read the default.
     #[tokio::test]
     #[serial_test::serial]
     async fn agent_default_model_put_refuses_a_pin_in_either_layer() {
@@ -4826,6 +4858,177 @@ command = "zzzeta"
             assert_eq!(code.as_deref(), Some("model_pinned"), "{name}");
             assert_eq!(body["error"], "model_pinned", "{name}");
             assert_eq!(std::fs::read(&path).unwrap_or_default(), file, "{name}");
+        }
+        // The profile's `pin_model` overrides the machine's, as a spawn resolves it.
+        set_machine_acp_defaults(pin("p"));
+        set_profile_acp_defaults("work", json!({"claude": {"pin_model": false}}));
+        assert_eq!(get_default_model("work", "claude").await["pinned"], false);
+        let (status, _, body) = put_default_model(&state, "work", "claude", "m").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "machine pins, profile unpins: {body}"
+        );
+    }
+
+    /// A rename or delete reaching the profile between the PUT's check and its write waits for
+    /// the write, so nothing recreates the old name and a rename carries the new default.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn agent_default_model_put_holds_the_profile_against_a_rename_or_delete(
+    ) -> anyhow::Result<()> {
+        use crate::daemon::ProfileMutation;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir()?;
+        crate::session::purge_owners::initialize(&root)?;
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        for (name, mutation, carried_to) in [
+            (
+                "rename",
+                ProfileMutation::Rename {
+                    name: "work".into(),
+                    body: crate::daemon::RenameProfileBody {
+                        new_name: "renamed".into(),
+                    },
+                },
+                Some("renamed"),
+            ),
+            (
+                "delete",
+                ProfileMutation::Delete {
+                    name: "work".into(),
+                    query: Default::default(),
+                },
+                None,
+            ),
+        ] {
+            crate::session::create_profile("work")?;
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let (entered, checked) = tokio::sync::oneshot::channel();
+            let (resume, paused) = std::sync::mpsc::channel();
+            *AGENT_DEFAULT_MODEL_CHECKED.lock().unwrap() = Some(ProfileCommitPause {
+                profile: "work".into(),
+                entered,
+                resume: paused,
+            });
+            let put = tokio::spawn({
+                let state = state.clone();
+                async move { put_default_model(&state, "work", "claude", "m").await }
+            });
+            checked.await?;
+            assert!(
+                state.profile_namespace.try_write().is_err(),
+                "{name}: the PUT must hold the namespace between its check and its write"
+            );
+            let commit = tokio::spawn(commit_profile(state.clone(), mutation));
+            // With the namespace held, a failed read means the mutation is queued for it.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while state.profile_namespace.try_read().is_ok() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{name} never queued"
+                );
+                tokio::task::yield_now().await;
+            }
+            assert!(!commit.is_finished(), "{name}");
+            resume.send(())?;
+            let (status, _, body) = put.await?;
+            assert_eq!(status, StatusCode::OK, "{name}: {body}");
+            assert_eq!(commit.await?.status(), StatusCode::OK, "{name}");
+            assert!(
+                !root.join("profiles/work").exists(),
+                "{name}: the PUT recreated the profile"
+            );
+            if let Some(carried_to) = carried_to {
+                assert_eq!(
+                    profile_acp(carried_to)["acp_defaults"]["claude"]["model"],
+                    "m",
+                    "{name}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The PUT answers from the machine config its pin check read, so a machine pin saved
+    /// during the write can't make a successful save report the pin.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn agent_default_model_put_answers_from_the_machine_config_it_checked(
+    ) -> anyhow::Result<()> {
+        use serde_json::json;
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::create_profile("work")?;
+        set_machine_acp_defaults(json!({}));
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let (entered, read) = tokio::sync::oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        *AGENT_DEFAULT_MODEL_READ.lock().unwrap() = Some(ProfileCommitPause {
+            profile: "work".into(),
+            entered,
+            resume: paused,
+        });
+        let put = tokio::spawn({
+            let state = state.clone();
+            async move { put_default_model(&state, "work", "claude", "m").await }
+        });
+        read.await?;
+        set_machine_acp_defaults(json!({"claude": {"model": "p", "pin_model": true}}));
+        resume.send(())?;
+        let (status, _, body) = put.await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            json!({"agent_key": "claude", "model": "m", "pinned": false})
+        );
+        Ok(())
+    }
+
+    /// A read-only Daemon refuses the PUT without reading its body, and still answers the GET.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn agent_default_model_route_refuses_read_only_before_the_body() {
+        use axum::http::{Method, Request};
+        use tower::ServiceExt;
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::create_profile("work").unwrap();
+        let state = crate::server::test_support::build_test_app_state_with_policy_configured(
+            Vec::new(),
+            vec!["localhost".into()],
+            Vec::new(),
+            None,
+            |state| state.read_only = true,
+        );
+        let app = crate::server::test_support::build_router_for_test(state);
+        let never_ends = || {
+            axum::body::Body::from_stream(futures_util::stream::pending::<
+                Result<axum::body::Bytes, std::io::Error>,
+            >())
+        };
+        for (method, body, status) in [
+            (Method::PUT, never_ends(), StatusCode::FORBIDDEN),
+            (Method::GET, axum::body::Body::empty(), StatusCode::OK),
+        ] {
+            let mut request = Request::builder()
+                .method(method.clone())
+                .uri("/api/profiles/work/acp-defaults/claude/model")
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .body(body)
+                .unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                crate::server::peer::ConnectionPeer::UnixOwner {
+                    uid: nix::unistd::geteuid().as_raw(),
+                },
+            ));
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                app.clone().oneshot(request),
+            )
+            .await
+            .expect("answered without reading the body")
+            .unwrap();
+            assert_eq!(response.status(), status, "{method}");
         }
     }
 

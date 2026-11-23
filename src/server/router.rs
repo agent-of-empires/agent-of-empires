@@ -231,7 +231,9 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/profiles/{name}/acp-defaults/{agent}/model",
-            get(api::get_agent_default_model).put(api::set_agent_default_model),
+            get(api::get_agent_default_model)
+                .put(api::set_agent_default_model)
+                .layer(read_only.clone()),
         )
         .route("/api/profiles/{name}/rename", patch(api::rename_profile))
         .route("/api/default-profile", patch(api::default_profile))
