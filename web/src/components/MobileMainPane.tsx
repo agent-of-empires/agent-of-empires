@@ -3,16 +3,14 @@ import { lazy, Suspense } from "react";
 import { StructuredSessionStack } from "./StructuredSessionStack";
 import { TerminalSessionStack } from "./TerminalSessionStack";
 import { PairedShellPane, type ShellMode } from "./PairedTerminal";
-import { BackgroundAgentsPanel, type AgentFocus } from "./acp/BackgroundAgentsPanel";
+import type { AgentFocus } from "./acp/BackgroundAgentsPanel";
 import { hasStartedBefore } from "./acp/startupWait";
 import { recreateContainerBlock, recreateContainerTitle } from "./sidebar/sessionActionTargets";
 import type { NewSessionLike } from "./acp/ContainerGoneBanner";
 import { FilesPane } from "./FilesPane";
 import { DiffFileList } from "./diff/DiffFileList";
 import { FileContentViewer } from "./diff/FileContentViewer";
-import { DiffFileViewer } from "./diff/DiffFileViewer";
 import { CommentsBanner } from "./diff/comments/CommentsBanner";
-import { SendCommentsDialog } from "./diff/comments/SendCommentsDialog";
 import { PluginPaneBody } from "./plugin/PluginPane";
 import type { RightPanelView } from "../lib/rightPanelView";
 import { isPluginPaneId, type PluginPane } from "../lib/pluginPanes";
@@ -23,6 +21,13 @@ import type { FileRef } from "../lib/fileRef";
 import type { ServerAbout } from "../lib/api";
 import { autoResumeSettingsHref } from "../lib/autoResumeSettingsHref";
 
+const BackgroundAgentsPanel = lazy(() =>
+  import("./acp/BackgroundAgentsPanel").then((m) => ({ default: m.BackgroundAgentsPanel })),
+);
+const DiffFileViewer = lazy(() => import("./diff/DiffFileViewer").then((m) => ({ default: m.DiffFileViewer })));
+const SendCommentsDialog = lazy(() =>
+  import("./diff/comments/SendCommentsDialog").then((m) => ({ default: m.SendCommentsDialog })),
+);
 const StructuredView = lazy(() => import("./acp/StructuredView").then((m) => ({ default: m.StructuredView })));
 
 interface Props {
@@ -249,16 +254,18 @@ export function MobileMainPane({
                   onBack={onCloseFile}
                 />
               ) : (
-                <DiffFileViewer
-                  sessionId={activeSessionId}
-                  filePath={selectedFilePath}
-                  repoName={selectedRepoName}
-                  targetLine={selectedFileLine}
-                  revision={revision}
-                  onClose={onCloseFile}
-                  commentsEnabled={commentsEnabled}
-                  commentsStore={diffComments}
-                />
+                <Suspense fallback={null}>
+                  <DiffFileViewer
+                    sessionId={activeSessionId}
+                    filePath={selectedFilePath}
+                    repoName={selectedRepoName}
+                    targetLine={selectedFileLine}
+                    revision={revision}
+                    onClose={onCloseFile}
+                    commentsEnabled={commentsEnabled}
+                    commentsStore={diffComments}
+                  />
+                </Suspense>
               )
             ) : (
               <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
@@ -294,12 +301,14 @@ export function MobileMainPane({
             className="absolute inset-0 z-10 flex flex-col min-h-0 overflow-hidden bg-surface-900"
             style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
           >
-            <BackgroundAgentsPanel
-              sessionId={activeSessionId}
-              readOnly={readOnly || !!activeSession?.trashed_at || !!activeSession?.archived_at}
-              focus={agentFocus}
-              onShowThread={onBackToAgent}
-            />
+            <Suspense fallback={null}>
+              <BackgroundAgentsPanel
+                sessionId={activeSessionId}
+                readOnly={readOnly || !!activeSession?.trashed_at || !!activeSession?.archived_at}
+                focus={agentFocus}
+                onShowThread={onBackToAgent}
+              />
+            </Suspense>
           </div>
         )}
 
@@ -329,31 +338,33 @@ export function MobileMainPane({
         )}
       </div>
       {sendDialogOpen && commentsEnabled && activeSessionId && (
-        <SendCommentsDialog
-          sessionId={activeSessionId}
-          delivery={activeSession?.view === "structured" ? "structured" : "terminal"}
-          comments={diffComments.comments}
-          isMultiRepo={commentsIsMultiRepo}
-          sendEnabled={commentSendEnabled}
-          sendDisabledReason={commentSendDisabledReason}
-          introDraft={diffComments.introDraft}
-          outroDraft={diffComments.outroDraft}
-          clearAfterSend={diffComments.clearAfterSend}
-          onChangeIntro={diffComments.setIntroDraft}
-          onChangeOutro={diffComments.setOutroDraft}
-          onChangeClearAfterSend={diffComments.setClearAfterSend}
-          onClose={onCloseSendDialog}
-          onSent={() => {
-            if (diffComments.clearAfterSend) {
-              diffComments.clearComments();
-              diffComments.setIntroDraft("");
-              diffComments.setOutroDraft("");
-            }
-            onCloseSendDialog();
-            onClearSelectedFile();
-            if (activeSession?.view !== "structured") onBackToAgent();
-          }}
-        />
+        <Suspense fallback={null}>
+          <SendCommentsDialog
+            sessionId={activeSessionId}
+            delivery={activeSession?.view === "structured" ? "structured" : "terminal"}
+            comments={diffComments.comments}
+            isMultiRepo={commentsIsMultiRepo}
+            sendEnabled={commentSendEnabled}
+            sendDisabledReason={commentSendDisabledReason}
+            introDraft={diffComments.introDraft}
+            outroDraft={diffComments.outroDraft}
+            clearAfterSend={diffComments.clearAfterSend}
+            onChangeIntro={diffComments.setIntroDraft}
+            onChangeOutro={diffComments.setOutroDraft}
+            onChangeClearAfterSend={diffComments.setClearAfterSend}
+            onClose={onCloseSendDialog}
+            onSent={() => {
+              if (diffComments.clearAfterSend) {
+                diffComments.clearComments();
+                diffComments.setIntroDraft("");
+                diffComments.setOutroDraft("");
+              }
+              onCloseSendDialog();
+              onClearSelectedFile();
+              if (activeSession?.view !== "structured") onBackToAgent();
+            }}
+          />
+        </Suspense>
       )}
     </div>
   );

@@ -562,11 +562,15 @@ describe("pane blocks", () => {
   });
 
   describe("markdown block", () => {
-    const md = (text: string, extra: Record<string, unknown> = {}) =>
-      renderBlocks({ kind: "markdown", text, ...extra });
+    // The markdown renderer is a lazy chunk, so wait for it to mount.
+    const md = async (text: string, extra: Record<string, unknown> = {}) => {
+      const result = renderBlocks({ kind: "markdown", text, ...extra });
+      await screen.findByTestId("plugin-pane-markdown");
+      return result;
+    };
 
-    it("renders GitHub-flavoured syntax", () => {
-      const { container } = md(
+    it("renders GitHub-flavoured syntax", async () => {
+      const { container } = await md(
         [
           "# Title",
           "",
@@ -600,8 +604,8 @@ describe("pane blocks", () => {
       expect(container.querySelectorAll("table td")).toHaveLength(2);
     });
 
-    it("links follow the row href policy", () => {
-      const { container } = md(
+    it("links follow the row href policy", async () => {
+      const { container } = await md(
         "[ext](https://example.com/x) [int](/session/abc) [js](javascript:alert(1)) [proto](//evil.com) [data](data:text/html,x)",
       );
       const ext = screen.getByText("ext").closest("a")!;
@@ -616,8 +620,8 @@ describe("pane blocks", () => {
       expect(container.querySelectorAll("a")).toHaveLength(2);
     });
 
-    it("strips raw HTML, comments and details, keeping inner markdown", () => {
-      const { container } = md(
+    it("strips raw HTML, comments and details, keeping inner markdown", async () => {
+      const { container } = await md(
         '<script>alert(1)</script>\n\n<!-- hidden note -->\n\n<details><summary>sum</summary>\n\n**inner**\n\n</details>\n\nx <b onclick="y()">bold</b> <img src="https://evil.test/p.png">',
       );
       expect(container.querySelector("script, details, summary, b, img")).toBeNull();
@@ -627,26 +631,26 @@ describe("pane blocks", () => {
       expect(container.querySelector("strong")?.textContent).toBe("inner");
     });
 
-    it("drops details content that has no blank line after the tag, as one HTML block", () => {
-      const { container } = md("<details>\n**inner**\n</details>\n\nafter");
+    it("drops details content that has no blank line after the tag, as one HTML block", async () => {
+      const { container } = await md("<details>\n**inner**\n</details>\n\nafter");
       expect(container.querySelector("details, strong")).toBeNull();
       expect(container.textContent?.trim()).toBe("after");
     });
 
-    it("renders a markdown image as its alt text, never loading the URL", () => {
-      const { container } = md("![the logo](https://evil.test/p.png)");
+    it("renders a markdown image as its alt text, never loading the URL", async () => {
+      const { container } = await md("![the logo](https://evil.test/p.png)");
       expect(container.querySelector("img")).toBeNull();
       expect(screen.getByText("the logo")).toBeTruthy();
     });
 
-    it("renders a markdown image without alt text as nothing", () => {
-      const { container } = md("before ![](https://evil.test/p.png) after");
+    it("renders a markdown image without alt text as nothing", async () => {
+      const { container } = await md("before ![](https://evil.test/p.png) after");
       expect(container.querySelector("img")).toBeNull();
       expect(container.textContent).toBe("before  after");
     });
 
-    it("tints with tone and drops a block without text", () => {
-      const { container } = md("warned", { tone: "warn" });
+    it("tints with tone and drops a block without text", async () => {
+      const { container } = await md("warned", { tone: "warn" });
       expect(container.querySelector("[data-testid='plugin-pane-markdown']")?.className).toContain(
         "text-status-waiting",
       );

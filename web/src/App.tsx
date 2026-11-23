@@ -64,7 +64,6 @@ import { useWebSettings } from "./hooks/useWebSettings";
 import { useDiffFiles } from "./hooks/useDiffFiles";
 import { useDiffComments } from "./hooks/useDiffComments";
 import { clearStoredComments } from "./components/diff/comments/storage";
-import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
 import { useCommandActions, buildConversationActions, type SessionStateAction } from "./hooks/useCommandActions";
 import { usePluginCommands } from "./hooks/usePluginCommands";
 import { useSettingsCommands } from "./hooks/useSettingsCommands";
@@ -164,12 +163,24 @@ const StructuredView = lazy(() =>
     default: m.StructuredView,
   })),
 );
+const BackgroundAgentsPanel = lazy(() =>
+  import("./components/acp/BackgroundAgentsPanel").then((m) => ({ default: m.BackgroundAgentsPanel })),
+);
+const DiffFileViewer = lazy(() =>
+  import("./components/diff/DiffFileViewer").then((m) => ({ default: m.DiffFileViewer })),
+);
+const SettingsView = lazy(() => import("./components/SettingsView").then((m) => ({ default: m.SettingsView })));
+const SendCommentsDialog = lazy(() =>
+  import("./components/diff/comments/SendCommentsDialog").then((m) => ({ default: m.SendCommentsDialog })),
+);
+const loadCommandPalette = () => import("./components/command-palette/CommandPalette");
+const CommandPalette = lazy(() => loadCommandPalette().then((m) => ({ default: m.CommandPalette })));
 import { type PaneDisplay } from "./components/Dock";
 import { DockGroups, type DockGroupView } from "./components/DockGroups";
 import { BottomDock } from "./components/BottomDock";
 import { PaneDndController } from "./components/PaneDndController";
 import { visibleToFullIndex, type DropTarget } from "./components/paneDnd";
-import { BackgroundAgentsPanel, type AgentFocus } from "./components/acp/BackgroundAgentsPanel";
+import type { AgentFocus } from "./components/acp/BackgroundAgentsPanel";
 import { hasStartedBefore } from "./components/acp/startupWait";
 import { DiffPane } from "./components/DiffPane";
 import { FilesPane } from "./components/FilesPane";
@@ -181,8 +192,6 @@ import { BUILTIN_PANES, isTerminalTabId, terminalIndexOf, terminalTabId, type Do
 import { MobileRightPanelPicker } from "./components/MobileRightPanelPicker";
 import { MobileMainPane } from "./components/MobileMainPane";
 import { ChromeCollapseHandle, CollapsibleRegion } from "./components/CollapsibleChrome";
-import { DiffFileViewer } from "./components/diff/DiffFileViewer";
-import { SettingsView } from "./components/SettingsView";
 import { ProjectFormModal } from "./components/ProjectFormModal";
 import { ScratchOverridesModal } from "./components/ScratchOverridesModal";
 import { HelpOverlay } from "./components/HelpOverlay";
@@ -203,7 +212,6 @@ import { LOGIN_REQUIRED_EVENT, TOKEN_EXPIRED_EVENT, resetTokenExpired } from "./
 import { AboutModal } from "./components/AboutModal";
 import { TipsModal } from "./components/TipsModal";
 import { useTips, shouldAutoPopTips } from "./hooks/useTips";
-import { CommandPalette } from "./components/command-palette/CommandPalette";
 import { useConversationSearch } from "./hooks/useConversationSearch";
 import { BannerStack } from "./components/BannerStack";
 import { ElevationPrompt } from "./components/ElevationPrompt";
@@ -899,6 +907,11 @@ function AppContent({
   // unit-tested directly.
   const tips = useTips();
   const [showPalette, setShowPalette] = useState(false);
+  // Warm the palette chunk once the app is idle so the first shortcut press opens it at once.
+  useEffect(() => {
+    const id = window.setTimeout(() => void loadCommandPalette(), 2000);
+    return () => window.clearTimeout(id);
+  }, []);
   // Palette content-search query (#2515); declared here so the keyboard
   // handlers below can clear it on close/toggle. Consumed lower down by
   // useConversationSearch.
@@ -2121,11 +2134,13 @@ function AppContent({
       if (plugin) return <PluginPaneBody entry={plugin.entry} />;
       if (id === "agents") {
         return (
-          <BackgroundAgentsPanel
-            sessionId={activeSessionId}
-            readOnly={caps.readOnly || !!activeSession?.trashed_at || !!activeSession?.archived_at}
-            focus={agentFocus}
-          />
+          <Suspense fallback={<LazyFallback label="Loading agents…" />}>
+            <BackgroundAgentsPanel
+              sessionId={activeSessionId}
+              readOnly={caps.readOnly || !!activeSession?.trashed_at || !!activeSession?.archived_at}
+              focus={agentFocus}
+            />
+          </Suspense>
         );
       }
       if (id === "files") {
@@ -2191,7 +2206,7 @@ function AppContent({
                       persistent={webSettings.persistentStructuredViews}
                       maxPersistentViews={webSettings.maxPersistentStructuredViews}
                       renderSession={(session, active, selected) => (
-                        <Suspense fallback={<AcpLoadingFallback />}>
+                        <Suspense fallback={<LazyFallback label="Loading acp…" />}>
                           <StructuredView
                             active={active}
                             selected={selected}
@@ -2256,16 +2271,18 @@ function AppContent({
                       onBack={handleCloseFile}
                     />
                   ) : (
-                    <DiffFileViewer
-                      sessionId={activeSessionId}
-                      filePath={selectedFilePath}
-                      repoName={selectedRepoName}
-                      targetLine={selectedFileLine}
-                      revision={revision}
-                      onClose={handleCloseFile}
-                      commentsEnabled={commentsEnabled}
-                      commentsStore={diffComments}
-                    />
+                    <Suspense fallback={<LazyFallback label="Loading diff…" />}>
+                      <DiffFileViewer
+                        sessionId={activeSessionId}
+                        filePath={selectedFilePath}
+                        repoName={selectedRepoName}
+                        targetLine={selectedFileLine}
+                        revision={revision}
+                        onClose={handleCloseFile}
+                        commentsEnabled={commentsEnabled}
+                        commentsStore={diffComments}
+                      />
+                    </Suspense>
                   ))}
               </div>
             }
@@ -2297,33 +2314,35 @@ function AppContent({
           )}
         </PaneDndController>
         {sendDialogOpen && commentsEnabled && activeSessionId && (
-          <SendCommentsDialog
-            sessionId={activeSessionId}
-            delivery={activeSession?.view === "structured" ? "structured" : "terminal"}
-            comments={diffComments.comments}
-            isMultiRepo={commentsIsMultiRepo}
-            sendEnabled={commentSendEnabled}
-            sendDisabledReason={commentSendDisabledReason}
-            introDraft={diffComments.introDraft}
-            outroDraft={diffComments.outroDraft}
-            clearAfterSend={diffComments.clearAfterSend}
-            onChangeIntro={diffComments.setIntroDraft}
-            onChangeOutro={diffComments.setOutroDraft}
-            onChangeClearAfterSend={diffComments.setClearAfterSend}
-            onClose={() => setSendDialogOpen(false)}
-            onSent={() => {
-              if (diffComments.clearAfterSend) {
-                diffComments.clearComments();
-                diffComments.setIntroDraft("");
-                diffComments.setOutroDraft("");
-              }
-              setSendDialogOpen(false);
-              // Close the diff viewer to show the agent transcript or terminal
-              // after dispatching feedback. The file remains in the diff list.
-              setSelectedFile(null);
-              toastBus.handler?.info("Comments sent to agent");
-            }}
-          />
+          <Suspense fallback={null}>
+            <SendCommentsDialog
+              sessionId={activeSessionId}
+              delivery={activeSession?.view === "structured" ? "structured" : "terminal"}
+              comments={diffComments.comments}
+              isMultiRepo={commentsIsMultiRepo}
+              sendEnabled={commentSendEnabled}
+              sendDisabledReason={commentSendDisabledReason}
+              introDraft={diffComments.introDraft}
+              outroDraft={diffComments.outroDraft}
+              clearAfterSend={diffComments.clearAfterSend}
+              onChangeIntro={diffComments.setIntroDraft}
+              onChangeOutro={diffComments.setOutroDraft}
+              onChangeClearAfterSend={diffComments.setClearAfterSend}
+              onClose={() => setSendDialogOpen(false)}
+              onSent={() => {
+                if (diffComments.clearAfterSend) {
+                  diffComments.clearComments();
+                  diffComments.setIntroDraft("");
+                  diffComments.setOutroDraft("");
+                }
+                setSendDialogOpen(false);
+                // Close the diff viewer to show the agent transcript or terminal
+                // after dispatching feedback. The file remains in the diff list.
+                setSelectedFile(null);
+                toastBus.handler?.info("Comments sent to agent");
+              }}
+            />
+          </Suspense>
         )}
       </div>
     );
@@ -2371,38 +2390,40 @@ function AppContent({
     }
     if (showSettings) {
       return (
-        <SettingsView
-          tab={settingsTab}
-          onClose={handleCloseSettings}
-          onSelectTab={(t) => {
-            const p = searchParams.get("profile");
-            // Marks a tab opened from the mobile section list, so its Back pops to it.
-            navigate(`/settings/${t}${p ? `?profile=${encodeURIComponent(p)}` : ""}`, {
-              state: { fromSettingsList: settingsTab === null },
-            });
-          }}
-          onShowList={() => {
-            if ((location.state as { fromSettingsList?: boolean } | null)?.fromSettingsList) {
-              navigate(-1);
-              return;
-            }
-            const p = searchParams.get("profile");
-            navigate(`/settings${p ? `?profile=${encodeURIComponent(p)}` : ""}`, { replace: true });
-          }}
-          onServerAboutRefresh={async () => {
-            await refreshServerAbout();
-            await refreshProjects();
-          }}
-          profile={searchParams.get("profile")}
-          field={searchParams.get("field")}
-          onSelectProfile={(p) => {
-            const next = new URLSearchParams(searchParams);
-            next.set("profile", p);
-            setSearchParams(next, { replace: true });
-          }}
-          readOnly={caps.readOnly}
-          cityhall={caps.cityhall}
-        />
+        <Suspense fallback={<LazyFallback label="Loading settings…" />}>
+          <SettingsView
+            tab={settingsTab}
+            onClose={handleCloseSettings}
+            onSelectTab={(t) => {
+              const p = searchParams.get("profile");
+              // Marks a tab opened from the mobile section list, so its Back pops to it.
+              navigate(`/settings/${t}${p ? `?profile=${encodeURIComponent(p)}` : ""}`, {
+                state: { fromSettingsList: settingsTab === null },
+              });
+            }}
+            onShowList={() => {
+              if ((location.state as { fromSettingsList?: boolean } | null)?.fromSettingsList) {
+                navigate(-1);
+                return;
+              }
+              const p = searchParams.get("profile");
+              navigate(`/settings${p ? `?profile=${encodeURIComponent(p)}` : ""}`, { replace: true });
+            }}
+            onServerAboutRefresh={async () => {
+              await refreshServerAbout();
+              await refreshProjects();
+            }}
+            profile={searchParams.get("profile")}
+            field={searchParams.get("field")}
+            onSelectProfile={(p) => {
+              const next = new URLSearchParams(searchParams);
+              next.set("profile", p);
+              setSearchParams(next, { replace: true });
+            }}
+            readOnly={caps.readOnly}
+            cityhall={caps.cityhall}
+          />
+        </Suspense>
       );
     }
 
@@ -2941,22 +2962,26 @@ function AppContent({
             />
           )}
 
-          <CommandPalette
-            open={showPalette}
-            onClose={() => {
-              setShowPalette(false);
-              setPaletteQuery("");
-            }}
-            actions={[
-              ...commandActions,
-              ...conversationActions,
-              ...pluginPageActions,
-              ...settingsCommands,
-              ...pluginCommandActions,
-            ]}
-            onSearchChange={setPaletteQuery}
-            searching={conversationSearching}
-          />
+          {showPalette && (
+            <Suspense fallback={null}>
+              <CommandPalette
+                open
+                onClose={() => {
+                  setShowPalette(false);
+                  setPaletteQuery("");
+                }}
+                actions={[
+                  ...commandActions,
+                  ...conversationActions,
+                  ...pluginPageActions,
+                  ...settingsCommands,
+                  ...pluginCommandActions,
+                ]}
+                onSearchChange={setPaletteQuery}
+                searching={conversationSearching}
+              />
+            </Suspense>
+          )}
 
           {pluginLinkPicker}
 
@@ -3020,10 +3045,10 @@ function AppContent({
   );
 }
 
-function AcpLoadingFallback() {
+function LazyFallback({ label }: { label: string }) {
   return (
     <div className="flex h-full items-center justify-center bg-surface-900 text-text-dim">
-      <div className="text-xs font-mono uppercase tracking-wide">Loading acp…</div>
+      <div className="text-xs font-mono uppercase tracking-wide">{label}</div>
     </div>
   );
 }

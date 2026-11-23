@@ -2,10 +2,9 @@ import { getSharedHighlighter, type DiffsHighlighter, type ThemedToken } from "@
 import { bundledLanguages } from "shiki";
 // Shiki's bundled theme registry, used to validate names before `getSharedHighlighter` throws on them.
 import { bundledThemes, type BundledTheme } from "shiki/themes";
+import { DEFAULT_SHIKI_THEME, DEFAULT_SHIKI_THEME_LIGHT } from "./shikiDefaults";
 
-/** Appearance-matched fallbacks for a `shiki_theme` Shiki doesn't ship. */
-export const DEFAULT_SHIKI_THEME = "github-dark";
-export const DEFAULT_SHIKI_THEME_LIGHT = "github-light";
+export { DEFAULT_SHIKI_THEME, DEFAULT_SHIKI_THEME_LIGHT };
 
 export function fallbackShikiTheme(appearance: "dark" | "light" | undefined): string {
   return appearance === "light" ? DEFAULT_SHIKI_THEME_LIGHT : DEFAULT_SHIKI_THEME;
