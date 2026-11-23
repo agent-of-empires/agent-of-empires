@@ -1151,6 +1151,24 @@ mod tests {
         assert!(!inst.acp_transcript_cli_resumable("codex"));
     }
 
+    /// A custom tool whose command runs claude directly needs no declaration.
+    #[test]
+    #[serial_test::serial]
+    fn custom_tool_running_claude_directly_is_transcript_resumable() {
+        let home = tempfile::tempdir().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
+        const PROFILE: &str = "custom-claude-direct-test";
+        let mut inst = Instance::new("custom", home.path().join("project").to_str().unwrap());
+        inst.source_profile = PROFILE.to_string();
+        inst.tool = "my-claude".to_string();
+        inst.command = "corp-wrapper --serve".to_string();
+        assert!(!inst.acp_transcript_cli_resumable("claude"));
+
+        inst.command = "claude --model sonnet".to_string();
+        assert!(inst.acp_transcript_cli_resumable("claude"));
+        assert!(!inst.acp_transcript_cli_resumable("codex"));
+    }
+
     /// The switch previews resolve the same ACP target as the daemon launch.
     #[test]
     #[serial_test::serial]
