@@ -114,6 +114,8 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
   // A status showed the current attempt's pull running, or the Daemon accepted it (it claims the
   // pull before it answers), so the outcome a status shows from then on is this attempt's.
   const [sawRunning, setSawRunning] = useState(false);
+  // Whether the last status showed a pull running, so a pull starting elsewhere re-arms the outcome notice.
+  const polledRunning = useRef(false);
   // The Daemon refuses checks and pulls while it can't read its configuration.
   const [configUnreadable, setConfigUnreadable] = useState(false);
   const [configNoticeDismissed, setConfigNoticeDismissed] = useState(false);
@@ -157,7 +159,10 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
         }
         offeredDigest.current = answer.state === "available" ? answer.remote_digest : null;
         setStatus(predatesPull ? { ...answer, pull: { state: "running" } } : answer);
-        if (answer.pull.state === "running") {
+        const running = answer.pull.state === "running";
+        if (running && !polledRunning.current) setNoticeDismissed(false);
+        polledRunning.current = running;
+        if (running) {
           pullConfirmed.current = true;
           setSawRunning(true);
           setWatchedPull(true);

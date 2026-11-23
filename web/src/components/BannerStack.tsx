@@ -1,4 +1,4 @@
-import { useEffect, type ReactNode } from "react";
+import { useLayoutEffect, type ReactNode } from "react";
 import { useConnectionBanner } from "../hooks/useConnectionBanner";
 import { useDashboardUpdate } from "../hooks/useDashboardUpdate";
 import { useSandboxImage } from "../hooks/useSandboxImage";
@@ -34,7 +34,8 @@ export function BannerStack({ onRetryServerSettings }: { onRetryServerSettings?:
   if (!higherShown && sandboxImage) top = <SandboxImageBanner view={sandboxImage} />;
 
   const setHigherBannerShown = sandbox?.setHigherBannerShown;
-  useEffect(() => {
+  // Before paint, so the chip and the banner never disagree on screen.
+  useLayoutEffect(() => {
     setHigherBannerShown?.(higherShown);
   }, [higherShown, setHigherBannerShown]);
 

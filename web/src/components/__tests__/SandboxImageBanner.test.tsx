@@ -857,6 +857,28 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
     expect(banner()?.textContent).toBe(UPDATED);
   });
 
+  it.each([
+    ["done", { state: "done" }, UPDATED],
+    ["failed", { state: "failed", reason: "other", message: FAILED, error: "no space left" }, FAILED],
+  ] as const)(
+    "shows the outcome of a pull started elsewhere after an earlier outcome was dismissed (%s)",
+    async (_, pull, words) => {
+      await mount(status());
+      fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+      fetchSandboxImageStatus.mockResolvedValue(status({ state: "current", pull: { state: "done" } }));
+      await pollAfter(0);
+      fireEvent.click(screen.getByRole("button", { name: "Dismiss sandbox image notice" }));
+      expect(bar()).toBeNull();
+      // Another client starts the next pull; this page only sees it by polling.
+      fetchSandboxImageStatus.mockResolvedValue(running());
+      await pollAfter(30_000);
+      expect(banner()?.textContent).toBe(DOWNLOADING);
+      fetchSandboxImageStatus.mockResolvedValue(status({ state: "current", pull }));
+      await pollAfter(2000);
+      expect(banner()?.textContent).toBe(words);
+    },
+  );
+
   it("shows a pull's failure reason from the Daemon, with its runtime output under Details", async () => {
     await mount(running());
     fetchSandboxImageStatus.mockResolvedValue(
