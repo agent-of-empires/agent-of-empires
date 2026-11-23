@@ -253,14 +253,8 @@ pub(crate) async fn spawn_structured_session(
             cli,
         } = spec;
 
-        let sandbox_image = sandbox_image.unwrap_or_else(|| {
-            if config.sandbox.default_image.is_empty() {
-                "ubuntu:latest".to_string()
-            } else {
-                config.sandbox.default_image.clone()
-            }
-        });
-
+        // Blank resolves against the profile-merged config in the builder.
+        let sandbox_image = sandbox_image.unwrap_or_default();
 
         let extra_repo_paths: Vec<String> = extra_repo_paths
             .into_iter()

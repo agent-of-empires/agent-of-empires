@@ -1778,7 +1778,7 @@ impl App {
             return;
         }
         let sandbox = Config::load_or_warn().sandbox;
-        let image = sandbox.default_image;
+        let image = sandbox.effective_image();
         let runtime = crate::containers::ContainerRuntime::from(sandbox.container_runtime);
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.image_update_rx = Some(rx);

@@ -1699,10 +1699,11 @@ export type SandboxImageStatus = SandboxImageState & {
  *  offline. `fresh` skips the Daemon's cache. */
 export async function fetchSandboxImageStatus(
   image?: string,
-  opts: { fresh?: boolean } = {},
+  opts: { fresh?: boolean; profile?: string } = {},
 ): Promise<SandboxImageStatus | { error: string } | null> {
   const query = new URLSearchParams();
   if (image) query.set("image", image);
+  if (opts.profile) query.set("profile", opts.profile);
   if (opts.fresh) query.set("fresh", "true");
   const qs = query.toString();
   const reply = await send(`/api/sandbox/image-status${qs ? `?${qs}` : ""}`).catch(() => null);
