@@ -8,15 +8,18 @@ describe("buildSettingsSearchIndex", () => {
       descriptor({ section: "sandbox", field: "enabled_by_default", label: "Enabled by Default" }),
       descriptor({ section: "acp", field: "show_tool_durations", label: "Show tool-call durations" }),
       descriptor({ section: "web", field: "notify_on_idle", label: "Notify on idle" }),
+      descriptor({ section: "web", field: "auto_open_diff_pane", label: "Open the diff panel" }),
     ]);
 
     expect(index.map((h) => `${h.section}.${h.field}`)).toEqual([
       "sandbox.enabled_by_default",
       "acp.show_tool_durations",
       "web.notify_on_idle",
+      "web.auto_open_diff_pane",
     ]);
+    expect(index.find((h) => h.field === "auto_open_diff_pane")?.tab).toBe("panels");
     expect(index.find((h) => h.section === "acp")?.tab).toBe("structured-view");
-    expect(index.find((h) => h.section === "web")?.tab).toBe("notifications");
+    expect(index.find((h) => h.field === "notify_on_idle")?.tab).toBe("notifications");
     expect(index.find((h) => h.section === "sandbox")?.tab).toBe("sandbox");
   });
 

@@ -94,10 +94,7 @@ async fn show_info(profile: &str, identifier: &str) -> Result<()> {
             "  Managed by aoe: {}",
             if wt_info.managed_by_aoe { "Yes" } else { "No" }
         );
-        println!(
-            "  Created at:    {}",
-            wt_info.created_at.format("%Y-%m-%d %H:%M:%S")
-        );
+        println!("  Created at:    {}", wt_info.created_at.to_ymd_hms());
 
         let worktree_path = PathBuf::from(&session.project_path);
         if worktree_path.exists() {
@@ -120,10 +117,7 @@ async fn show_info(profile: &str, identifier: &str) -> Result<()> {
                 "No"
             }
         );
-        println!(
-            "  Created at:    {}",
-            ws_info.created_at.format("%Y-%m-%d %H:%M:%S")
-        );
+        println!("  Created at:    {}", ws_info.created_at.to_ymd_hms());
         println!();
         for repo in &ws_info.repos {
             println!("  Repository: {}", repo.name);
@@ -182,7 +176,7 @@ fn purge_aside(inst: &Instance) -> Option<PathBuf> {
 
 /// A row is orphaned once its checkout is gone and no lifecycle operation, such as a purge that
 /// may restore it, has it reserved.
-fn is_orphaned_session(inst: &Instance, now: chrono::DateTime<chrono::Utc>) -> bool {
+fn is_orphaned_session(inst: &Instance, now: crate::time::Timestamp) -> bool {
     if inst.has_fresh_lifecycle_reservation(now) || inst.has_pending_trash() {
         return false;
     }
@@ -196,7 +190,7 @@ fn is_orphaned_session(inst: &Instance, now: chrono::DateTime<chrono::Utc>) -> b
 }
 
 pub(crate) fn find_orphaned_sessions(instances: &[Instance]) -> Vec<Instance> {
-    let now = chrono::Utc::now();
+    let now = crate::time::Timestamp::now();
     instances
         .iter()
         .filter(|inst| is_orphaned_session(inst, now))
@@ -220,7 +214,7 @@ pub(crate) fn remove_orphaned_sessions(storage: &Storage, orphans: &[Instance]) 
     }
     let mut removed = 0;
     storage.update(|instances, _groups| {
-        let now = chrono::Utc::now();
+        let now = crate::time::Timestamp::now();
         let before = instances.len();
         instances.retain(|inst| !(ids.contains(&inst.id) && is_orphaned_session(inst, now)));
         removed = before - instances.len();
@@ -540,7 +534,7 @@ mod tests {
                 branch: name.to_string(),
                 main_repo_path: tmp.path().join("main").to_string_lossy().into_owned(),
                 managed_by_aoe: true,
-                created_at: chrono::Utc::now(),
+                created_at: crate::time::Timestamp::now(),
                 base_branch: None,
             });
             inst
@@ -551,7 +545,7 @@ mod tests {
             .try_acquire_lifecycle_reservation(
                 crate::session::LifecycleOperation::Purge,
                 Instance::LIFECYCLE_RESERVATION_TTL,
-                chrono::Utc::now(),
+                crate::time::Timestamp::now(),
             )
             .unwrap();
         let rows = vec![gone.clone(), restored.clone(), locked.clone(), reserved];
@@ -688,13 +682,15 @@ mod tests {
             branch: "unfinished-trash".into(),
             main_repo_path: main.to_string_lossy().into_owned(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: None,
         });
         row.try_acquire_lifecycle_reservation(
             crate::session::LifecycleOperation::Trash,
             Instance::LIFECYCLE_RESERVATION_TTL,
-            chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+            crate::time::Timestamp::now()
+                - Instance::LIFECYCLE_RESERVATION_TTL
+                - crate::time::Duration::seconds(1),
         )
         .unwrap();
         row.trash();

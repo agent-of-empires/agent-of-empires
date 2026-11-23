@@ -227,7 +227,7 @@ async fn canonical_profile_collision_rejects_before_any_effect_or_partial_commit
                     .to_string_lossy()
                     .into_owned(),
                 managed_by_aoe: true,
-                created_at: chrono::Utc::now(),
+                created_at: crate::time::Timestamp::now(),
                 base_branch: None,
             });
         }
@@ -312,7 +312,7 @@ async fn canonical_refused_restart_preserves_launch_fields_and_snooze() {
     victim.lifecycle_reservation = Some(LifecycleReservation {
         op: LifecycleOperation::Launch,
         generation: 1,
-        at: chrono::Utc::now(),
+        at: crate::time::Timestamp::now(),
     });
     seed_profile("test", std::slice::from_ref(&victim));
     let state = native_state(&["test"]).await;

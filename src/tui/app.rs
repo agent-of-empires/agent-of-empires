@@ -12,7 +12,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use super::home::update_bar::{DrawnBar, UpdateBar};
-use super::home::{bindings, HomeView, TerminalMode};
+use super::home::{bindings, HomeView, PendingStructuredInput, TerminalMode};
 use super::styles::Theme;
 use crate::containers::image_update::ImageUpdate;
 use crate::session::config::AppStateConfig;
@@ -131,7 +131,22 @@ pub struct App {
     /// Debounce for structured preview-on-select, so fast navigation doesn't
     /// connect a WebSocket per keystroke.
     preview_mount_pending: Option<(String, std::time::Instant)>,
-    /// Cleared on failure so the user can retry.
+    /// A preview mount in flight and the row it targets. Connecting replays the
+    /// session's whole transcript, so it runs off the event loop.
+    structured_mount: Option<(
+        String,
+        tokio::sync::oneshot::Receiver<
+            Result<crate::tui::structured_view::embedded::EmbeddedView, String>,
+        >,
+    )>,
+    /// The row whose mount failed, so reselecting it doesn't retry every tick.
+    structured_mount_failed: Option<String>,
+    /// Set when Enter asked for a row whose mount was already in flight: the
+    /// completion takes over the screen instead of a second connect replaying it.
+    structured_mount_activate: Option<String>,
+    /// The row whose in-flight mount just took the screen for Enter: the run
+    /// loop delivers paste buffered for it once the poll returns.
+    structured_paste_drain: Option<String>,
     pending_install_version: Option<String>,
     /// The running binary keeps its old version until restart, so this stops
     /// periodic re-checks from re-offering a release we already installed.
@@ -336,6 +351,11 @@ impl App {
             mosh_active,
             pending_structured_view_open: None,
             preview_mount_pending: None,
+            structured_mount: None,
+            structured_mount_failed: None,
+            structured_mount_activate: None,
+            structured_paste_drain: None,
+
             pending_view_switch: None,
             pending_smart_rename: None,
             dashboard_launch: None,
@@ -888,26 +908,7 @@ impl App {
                                             "paste-burst: routed {} chars via handle_paste (chars={:?})",
                                             paste_text.len(), paste_text
                                         );
-                                        // Only an ACTIVE structured view owns text input.
-                                        if let Some(view) = self
-                                            .home
-                                            .structured_preview
-                                            .as_mut()
-                                            .filter(|v| v.is_active())
-                                        {
-                                            if let Err(e) = view
-                                                .handle_event(Event::Paste(paste_text.clone()))
-                                                .await
-                                            {
-                                                self.close_embedded_structured();
-                                                self.update_status =
-                                                    Some(UpdateStatus::transient(format!(
-                                                        "structured view: {e}"
-                                                    )));
-                                            }
-                                        } else {
-                                            self.home.handle_paste(&paste_text);
-                                        }
+                                        self.route_pasted_text(&paste_text).await;
                                     }
                                     if let Some(enter) = trailing_enter {
                                         if !self.should_quit {
@@ -924,7 +925,7 @@ impl App {
                                     if let Some(evt) = deferred {
                                         match evt {
                                             Event::Key(k) => { self.handle_key(k, terminal).await?; }
-                                            Event::Paste(text) => { self.home.handle_paste(&text); }
+                                            Event::Paste(text) => { self.route_pasted_text(&text).await; }
                                             Event::Resize(_, _) => {
                                                 self.home.invalidate_rows();
                                                 self.home.invalidate_presentation();
@@ -1281,23 +1282,7 @@ impl App {
                         }
                         Some(Ok(Event::Paste(text))) => {
                             crate::session::write_tui_activity();
-                            // Only an ACTIVE structured view owns pasted text.
-                            if let Some(view) = self
-                                .home
-                                .structured_preview
-                                .as_mut()
-                                .filter(|v| v.is_active())
-                            {
-                                if let Err(e) = view.handle_event(Event::Paste(text)).await {
-                                    self.close_embedded_structured();
-                                    self.update_status = Some(UpdateStatus::transient(format!(
-                                        "structured view: {e}"
-                                    )));
-                                }
-                                self.draw(terminal)?;
-                                continue;
-                            }
-                            self.home.handle_paste(&text);
+                            self.route_pasted_text(&text).await;
 
                             self.draw(terminal)?;
 
@@ -1610,7 +1595,9 @@ impl App {
                 needs_full_refresh = true;
             }
 
-            needs_full_refresh |= self.reconcile_structured_preview().await;
+            needs_full_refresh |= self.reconcile_structured_preview();
+            needs_full_refresh |= self.poll_structured_mount();
+            self.drain_structured_paste().await;
 
             // Same cadence keeps the embedded composer caret blinking.
             if let Some(view) = self.home.structured_preview.as_mut() {
@@ -2325,6 +2312,11 @@ impl App {
             }
             return Ok(());
         }
+        // Enter returned while the mount it asked for connects: Home would read
+        // the next keys as commands (`q` quits), so hold them for that composer.
+        if !ctrl_c && !self.home.has_dialog() && self.hold_key_for_pending_structured_view(&key) {
+            return Ok(());
+        }
         match (key.code, key.modifiers) {
             // Ctrl+C belongs to the agent in live-send.
             (KeyCode::Char('c'), KeyModifiers::CONTROL) if !self.home.is_live_send_capturing() => {
@@ -2492,6 +2484,17 @@ impl App {
                 .await;
             return Ok(());
         }
+        // A mount for this row is already connecting off the loop: a second
+        // connect here would block the loop and replay what it is about to
+        // install, so it hands the screen over when it lands.
+        if self
+            .structured_mount
+            .as_ref()
+            .is_some_and(|(target, _)| target == session_id)
+        {
+            self.structured_mount_activate = Some(session_id.to_owned());
+            return Ok(());
+        }
         match locate_daemon().await {
             Ok(endpoint) => {
                 self.connect_embedded_structured(endpoint, session_id).await;
@@ -2520,22 +2523,182 @@ impl App {
         }
     }
 
-    /// Consume the requested session's draft only if that session mounted.
-    async fn drain_pending_paste_for_structured_view(&mut self, session_id: &str) {
-        let Some(view) = self
+    /// Where pasted text goes: the active view, else the row Enter is still
+    /// connecting, else Home. Every paste path (bracketed paste and a Mosh-stripped
+    /// burst replayed as keys) routes through here.
+    async fn route_pasted_text(&mut self, text: &str) {
+        if let Some(view) = self
             .home
             .structured_preview
             .as_mut()
-            .filter(|view| view.session_id() == session_id)
-        else {
+            .filter(|v| v.is_active())
+        {
+            if let Err(e) = view.handle_event(Event::Paste(text.to_owned())).await {
+                self.close_embedded_structured();
+                self.update_status = Some(UpdateStatus::transient(format!("structured view: {e}")));
+            }
             return;
+        }
+        if let Some(target) = self.pending_structured_owner() {
+            self.home
+                .pending_paste_for_structured_view
+                .entry(target)
+                .or_default()
+                .push_str(text);
+            return;
+        }
+        self.home.handle_paste(text);
+    }
+
+    /// The row Enter is still connecting, while it is still the selected one.
+    /// A click moves the selection before the mount is reconciled, and input
+    /// must not then be buffered for the row the user has left.
+    fn pending_structured_owner(&mut self) -> Option<String> {
+        let target = self.structured_mount_activate.clone()?;
+        if self.home.selected_structured_session().as_deref() == Some(target.as_str()) {
+            return Some(target);
+        }
+        self.structured_mount_activate = None;
+        None
+    }
+
+    /// Hold keys typed while the mount Enter asked for is still connecting, so
+    /// they reach that row's composer instead of Home's shortcuts. Returns true
+    /// when the key was consumed.
+    fn hold_key_for_pending_structured_view(&mut self, key: &KeyEvent) -> bool {
+        let Some(target) = self.pending_structured_owner() else {
+            return false;
         };
-        if let Some(buf) = self
+        match (key.code, key.modifiers) {
+            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                self.home
+                    .pending_paste_for_structured_view
+                    .entry(target)
+                    .or_default()
+                    .push_str(&c.to_string());
+            }
+            // Enter is a submit, not text: it freezes what precedes it so no
+            // later key can rewrite a segment already on its way.
+            (KeyCode::Enter, KeyModifiers::NONE) => {
+                self.home
+                    .pending_paste_for_structured_view
+                    .entry(target)
+                    .or_default()
+                    .submit();
+            }
+            (KeyCode::Backspace, KeyModifiers::NONE) => {
+                if let Some(pending) = self.home.pending_paste_for_structured_view.get_mut(&target)
+                {
+                    pending.backspace();
+                }
+            }
+            // Esc gives up the hold instead of being swallowed until the
+            // connect settles. The text stays this row's unsent draft: Home's
+            // paste buffer belongs to whichever row is selected next.
+            (KeyCode::Esc, _) => {
+                self.structured_mount_activate = None;
+                return false;
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Deliver paste buffered for the row whose in-flight mount just took the
+    /// screen for Enter; `poll_structured_mount` names that row.
+    async fn drain_structured_paste(&mut self) {
+        if let Some(sid) = self.structured_paste_drain.take() {
+            self.drain_pending_paste_for_structured_view(&sid).await;
+        }
+    }
+
+    /// Consume the requested session's pending input only if that session mounted.
+    async fn drain_pending_paste_for_structured_view(&mut self, session_id: &str) {
+        let Some(pending) = self
             .home
             .pending_paste_for_structured_view
             .remove(session_id)
+        else {
+            return;
+        };
+        if self
+            .home
+            .structured_preview
+            .as_ref()
+            .is_none_or(|view| view.session_id() != session_id)
         {
-            view.paste_text_with_file_load(&buf).await;
+            self.home
+                .pending_paste_for_structured_view
+                .insert(session_id.to_owned(), pending);
+            return;
+        }
+        let (completed, draft) = pending.into_parts();
+        let mut unsent = completed;
+        // Text the composer holds when the row opens is the reader's own: it was
+        // typed after the last frozen segment. Replaying onto it would submit
+        // both as one prompt, and a blocked send would take it away, so it waits
+        // in the draft the replay ends on.
+        let mut draft = draft;
+        // Set when an Enter brought no submit: replaying the next segment would
+        // land on text the composer still holds, so the rest waits for the next
+        // mount. Every segment stays in `unsent` while that is set.
+        let mut stopped = false;
+        {
+            let view = self
+                .home
+                .structured_preview
+                .as_mut()
+                .expect("checked above");
+            // A refused send is back in the composer and had its own Enter, so
+            // it becomes the next segment: pasting the one after it onto that
+            // text would submit both as one prompt. Text the reader edited since
+            // is their own draft and stays where it is.
+            if view.last_submit_rejected() {
+                let restored = view.take_restored_prompt();
+                if !restored.is_empty() {
+                    unsent.insert(0, restored);
+                }
+            }
+            let held = view.take_held_text();
+            if !held.trim().is_empty() {
+                // Verbatim, so a leading indent or a trailing space survives,
+                // but the two were typed into different composers: a newline
+                // keeps them from being spliced into one word.
+                draft = if draft.is_empty() {
+                    held
+                } else {
+                    format!("{held}\n{draft}")
+                };
+            }
+            // Each segment was frozen when its Enter fell, so replaying them in
+            // order submits exactly what the user had typed before each Enter.
+            while let Some(segment) = unsent.first().cloned() {
+                let accepted = view.accepted_submits();
+                view.submit_replayed_segment(&segment).await;
+                if view.accepted_submits() == accepted {
+                    // The daemon kept nothing and the view put the segment back
+                    // in its composer, either refused or held by the submit
+                    // lock. Take that copy so the segment has one owner, and
+                    // keep it here for the next mount instead of leaving a
+                    // second copy the next replay would append to.
+                    view.take_unsubmitted_text();
+                    stopped = true;
+                    break;
+                }
+                unsent.remove(0);
+            }
+            if !stopped && !draft.is_empty() {
+                view.paste_text_with_file_load(&draft).await;
+            }
+        }
+        if stopped {
+            // Every segment keeps its own Enter for the next mount, so the
+            // buffer holds them all rather than a row switch dropping the one
+            // the composer showed.
+            self.home.pending_paste_for_structured_view.insert(
+                session_id.to_owned(),
+                PendingStructuredInput::from_parts(unsent, draft),
+            );
         }
     }
 
@@ -2551,9 +2714,107 @@ impl App {
             Ok(view) => {
                 self.home.structured_preview = Some(view);
                 self.preview_mount_pending = None;
+                self.structured_mount_failed = None;
+                // Enter mounted this session itself: a connect still queued for it
+                // would land on a view the user is already typing into.
+                if self
+                    .structured_mount
+                    .as_ref()
+                    .is_some_and(|(target, _)| target == session_id)
+                {
+                    self.structured_mount = None;
+                }
             }
             Err(e) => {
                 self.set_status(format!("structured view: {e}"));
+            }
+        }
+    }
+
+    /// Connect a preview mount off the event loop. Selecting a row must never
+    /// wait on this: the connect replays every transcript page in turn, which is
+    /// long enough that awaiting it here freezes both render and input.
+    fn start_structured_mount(
+        &mut self,
+        endpoint: crate::daemon::DaemonEndpoint,
+        session_id: &str,
+    ) {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+
+        let (mut tx, rx) = tokio::sync::oneshot::channel();
+        let mount_session = session_id.to_owned();
+        tokio::spawn(async move {
+            // A mount the selection left behind replays the whole transcript for
+            // nobody unless it is cut short when the receiver goes away.
+            let result = tokio::select! {
+                result = EmbeddedView::connect(endpoint, &mount_session) => {
+                    result.map_err(|e| format!("structured view: {e}"))
+                }
+                _ = tx.closed() => return,
+            };
+            let _ = tx.send(result);
+        });
+        self.structured_mount = Some((session_id.to_owned(), rx));
+    }
+
+    /// Install a finished preview mount, or drop one the selection left behind.
+    /// Returns true when the pane or its loading state changed, which a discarded
+    /// mount also does: the placeholder and any error status are only painted by
+    /// a redraw.
+    fn poll_structured_mount(&mut self) -> bool {
+        use tokio::sync::oneshot::error::TryRecvError;
+
+        let Some((target, mut rx)) = self.structured_mount.take() else {
+            return false;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => {
+                self.structured_mount = Some((target, rx));
+                return false;
+            }
+            Err(TryRecvError::Closed) => Err("structured view: mount was cancelled".to_owned()),
+        };
+        // Leave another row's debounce and loading flag alone: a stale
+        // completion for this row must not restart them.
+        let another_row_pending = self
+            .preview_mount_pending
+            .as_ref()
+            .is_some_and(|(pending, _)| *pending != target);
+        if !another_row_pending {
+            self.clear_preview_mount_pending();
+        }
+        // A completion is only wanted while the daemon sidebar is still the
+        // source: the row can survive going offline, and its mount must not.
+        let wanted = self.home.sidebar_source == crate::tui::session_feed::SidebarSource::Daemon
+            && self.home.selected_structured_session().as_deref() == Some(target.as_str());
+        // The target may have mounted while this connected, whether Enter opened
+        // it or it is a view the user has since left. Either way it already holds
+        // a draft that a replacement would drop.
+        let mounted = self
+            .home
+            .structured_preview
+            .as_ref()
+            .is_some_and(|view| view.session_id() == target.as_str());
+        match result {
+            Ok(view) if wanted && !mounted => {
+                self.structured_mount_failed = None;
+                self.home.structured_preview = Some(view);
+                if self.structured_mount_activate.as_deref() == Some(target.as_str()) {
+                    self.structured_mount_activate = None;
+                    self.activate_embedded();
+                    self.structured_paste_drain = Some(target);
+                }
+                true
+            }
+            Ok(_) => true,
+            Err(e) => {
+                self.structured_mount_activate = None;
+                if wanted {
+                    self.structured_mount_failed = Some(target);
+                    self.set_status(e);
+                }
+                true
             }
         }
     }
@@ -2569,10 +2830,34 @@ impl App {
     }
 
     /// Keep a streaming preview mounted for the selected structured session,
-    /// debounced and only while a daemon is already reachable. Returns true if
+    /// debounced and only while a daemon is already reachable. Only starts the
+    /// mount; `poll_structured_mount` installs it once it lands. Returns true if
     /// the mount set changed.
-    async fn reconcile_structured_preview(&mut self) -> bool {
+    fn reconcile_structured_preview(&mut self) -> bool {
         self.home.enforce_trash_read_only();
+        // A mount whose row the selection has left would replay the whole
+        // transcript before `poll_structured_mount` discarded it, so drop the
+        // receiver and let the task's `tx.closed()` cut it short.
+        let selected = self.home.selected_structured_session();
+        if self
+            .structured_mount
+            .as_ref()
+            .is_some_and(|(target, _)| selected.as_deref() != Some(target.as_str()))
+        {
+            self.structured_mount = None;
+            self.structured_mount_activate = None;
+        }
+        // A failure is remembered only for the row it belongs to, so the early
+        // returns below cannot strand it on a row the user has come back to.
+        let selecting_failed_row = self
+            .structured_mount_failed
+            .as_deref()
+            .is_some_and(|failed| {
+                self.home.selected_structured_session().as_deref() == Some(failed)
+            });
+        if !selecting_failed_row {
+            self.structured_mount_failed = None;
+        }
         let retained = self
             .home
             .selected_session
@@ -2616,6 +2901,9 @@ impl App {
         }
         if self.home.sidebar_source != crate::tui::session_feed::SidebarSource::Daemon {
             self.clear_preview_mount_pending();
+            self.structured_mount = None;
+            self.structured_mount_activate = None;
+            self.structured_mount_failed = None;
             return self.home.structured_preview.take().is_some();
         }
         if removed_retained {
@@ -2652,6 +2940,12 @@ impl App {
             self.clear_preview_mount_pending();
             return self.home.structured_preview.take().is_some();
         };
+        if self.structured_mount_failed.as_deref() == Some(sid.as_str()) {
+            // The row already failed to connect: keep the "press Enter" page
+            // rather than retrying it on every tick.
+            self.clear_preview_mount_pending();
+            return false;
+        }
         // Cheap discovery only: a down daemon keeps the "press Enter"
         // placeholder, and a stale mount is dropped.
         let Ok(endpoint) = crate::acp::client::discover() else {
@@ -2659,6 +2953,13 @@ impl App {
             return self.home.structured_preview.take().is_some();
         };
         self.home.structured_preview_pending = true;
+        if self
+            .structured_mount
+            .as_ref()
+            .is_some_and(|(target, _)| *target == sid)
+        {
+            return false;
+        }
         const PREVIEW_MOUNT_DEBOUNCE: Duration = Duration::from_millis(120);
         let now = std::time::Instant::now();
         match &self.preview_mount_pending {
@@ -2676,8 +2977,7 @@ impl App {
             return false;
         }
         let sid = self.preview_mount_pending.take().unwrap().0;
-        self.connect_embedded_structured(endpoint, &sid).await;
-        self.home.structured_preview_pending = false;
+        self.start_structured_mount(endpoint, &sid);
         true
     }
 
@@ -4244,6 +4544,1035 @@ mod tests {
             .any(|bytes| bytes == b"\x1b[?1000l"));
     }
 
+    /// An app whose selected row is a previewable structured session, with the
+    /// row's id so a mount can name it.
+    fn app_on_a_structured_row() -> (App, crate::session::test_support::AppDirGuard, String) {
+        let (app, guard, ids) = app_on_two_structured_rows();
+        (app, guard, ids[0].clone())
+    }
+
+    /// Two structured rows, with the first selected.
+    fn app_on_two_structured_rows() -> (App, crate::session::test_support::AppDirGuard, Vec<String>)
+    {
+        use crate::session::{GroupTree, Instance, Storage, View};
+        let guard = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let mut rows = Vec::new();
+        for title in ["first", "second"] {
+            let cwd = std::env::temp_dir().join(title);
+            let mut inst = Instance::new(title, &cwd.to_string_lossy());
+            inst.view = View::Structured;
+            inst.source_profile = "test".into();
+            rows.push(inst);
+        }
+        Storage::new_unwatched("test")
+            .unwrap()
+            .update(|instances, groups| {
+                *instances = rows.clone();
+                *groups = GroupTree::new_with_groups(instances, &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+        let mut app = App::new(
+            "test",
+            AvailableTools::with_tools(&[]),
+            false,
+            false,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+
+        app.home.sidebar_source = crate::tui::session_feed::SidebarSource::Daemon;
+        let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+        app.home.selected_session = Some(ids[0].clone());
+        assert_eq!(
+            app.home.selected_structured_session(),
+            Some(ids[0].clone()),
+            "fixture must select a previewable structured row"
+        );
+        (app, guard, ids)
+    }
+
+    /// Seeking through the list must not wait on the preview: the connect runs
+    /// on its own task, and this poll installs it only once it lands on the row
+    /// that is still selected.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_structured_mount_lands_off_the_event_loop() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        app.home.structured_preview_pending = true;
+        assert!(!app.poll_structured_mount(), "still connecting");
+        assert!(app.structured_mount.is_some(), "the mount stays queued");
+        assert!(app.home.structured_preview.is_none());
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&id, None))).is_ok());
+        assert!(app.poll_structured_mount(), "the landed mount redraws");
+        assert_eq!(
+            app.home.structured_preview.as_ref().map(|v| v.session_id()),
+            Some(id.as_str())
+        );
+        assert!(
+            !app.home.structured_preview_pending,
+            "the placeholder must clear once the transcript is mounted"
+        );
+    }
+
+    /// A completion for a row the user already left must not clear the
+    /// debounce and loading flag of the row they are on now.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_stale_completion_leaves_the_new_rows_pending_mount_alone() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, ids) = app_on_two_structured_rows();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((ids[0].clone(), rx));
+        app.home.selected_session = Some(ids[1].clone());
+        app.preview_mount_pending = Some((ids[1].clone(), std::time::Instant::now()));
+        app.home.structured_preview_pending = true;
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&ids[0], None))).is_ok());
+        assert!(app.poll_structured_mount(), "the stale mount is consumed");
+
+        assert_eq!(
+            app.preview_mount_pending
+                .as_ref()
+                .map(|(pending, _)| pending.as_str()),
+            Some(ids[1].as_str()),
+            "the row now selected keeps its debounce"
+        );
+        assert!(
+            app.home.structured_preview_pending,
+            "and its loading placeholder"
+        );
+    }
+
+    /// Enter on a row whose mount is already connecting must not start a second
+    /// blocking connect: it hands the row over when that mount lands.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enter_hands_over_an_in_flight_mount_instead_of_reconnecting() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+
+        app.open_structured_view(&id).await.unwrap();
+
+        assert!(
+            app.structured_mount.is_some(),
+            "the in-flight mount stays the only connect"
+        );
+        assert_eq!(app.structured_mount_activate.as_deref(), Some(id.as_str()));
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&id, None))).is_ok());
+        assert!(app.poll_structured_mount());
+        assert!(app.structured_mount_activate.is_none());
+        assert!(
+            app.home
+                .structured_preview
+                .as_ref()
+                .is_some_and(|view| view.is_active()),
+            "the landed mount takes the screen Enter asked for"
+        );
+    }
+
+    /// Paste or dictation typed while a mount was connecting must reach the
+    /// composer once that mount hands the screen over.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn paste_buffered_for_enter_lands_when_the_mount_hands_over() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        app.home.pending_paste_for_structured_view.insert(
+            id.clone(),
+            PendingStructuredInput::from_parts(Vec::new(), "typed while connecting".to_owned()),
+        );
+
+        app.open_structured_view(&id).await.unwrap();
+        assert_eq!(app.structured_mount_activate.as_deref(), Some(id.as_str()));
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&id, None))).is_ok());
+        assert!(app.poll_structured_mount());
+        assert_eq!(
+            app.structured_paste_drain.as_deref(),
+            Some(id.as_str()),
+            "the landed mount names its row for the run loop to drain"
+        );
+        app.drain_structured_paste().await;
+
+        assert_eq!(
+            app.home
+                .structured_preview
+                .as_ref()
+                .map(|view| view.composer_text()),
+            Some("typed while connecting".to_owned()),
+            "the buffered paste reaches the view Enter opened"
+        );
+        assert!(!app.home.pending_paste_for_structured_view.contains_key(&id));
+    }
+
+    /// Keys typed while the mount Enter asked for is still connecting belong to
+    /// the composer, not to Home: `q` must not quit.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn typing_while_enter_connects_is_held_for_the_composer() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        let backend = crate::tui::hyperlink::HyperlinkBackend::new(
+            crate::tui::terminal_output::Output::default(),
+            Default::default(),
+        );
+        let mut terminal = Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 100, 40)),
+            },
+        )
+        .unwrap();
+
+        app.open_structured_view(&id).await.unwrap();
+        assert_eq!(app.structured_mount_activate.as_deref(), Some(id.as_str()));
+
+        for c in ['q', 'u', 'i', 't'] {
+            app.handle_key(KeyEvent::from(KeyCode::Char(c)), &mut terminal)
+                .await
+                .unwrap();
+        }
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut terminal,
+        )
+        .await
+        .unwrap();
+        assert!(!app.should_quit, "`q` must be composer text, not Quit");
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&id, None))).is_ok());
+        assert!(app.poll_structured_mount());
+        app.drain_structured_paste().await;
+
+        let view = app
+            .home
+            .structured_preview
+            .as_ref()
+            .expect("the mount Enter asked for is on screen");
+        assert_eq!(
+            view.submitted_prompts(),
+            ["quit".to_string()],
+            "the keys reach the view Enter opened, and Enter is not kept as a newline"
+        );
+        assert!(
+            view.toast_text().is_some(),
+            "the Enter submits the draft it restores instead of leaving it unsent"
+        );
+        // The fake daemon refuses, so the buffer keeps the prompt on its own
+        // Enter rather than leaving a second copy in the composer.
+        assert_eq!(view.composer_text(), "");
+        assert_eq!(
+            app.home
+                .pending_paste_for_structured_view
+                .get(&id)
+                .map(PendingStructuredInput::text)
+                .as_deref(),
+            Some("quit")
+        );
+    }
+
+    /// Text typed after Enter must not ride along on that submission: the Enter
+    /// sends what preceded it, and the rest waits in the composer.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn text_typed_after_enter_waits_in_the_composer() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        app.open_structured_view(&id).await.unwrap();
+
+        app.route_pasted_text("send this").await;
+        assert!(app.hold_key_for_pending_structured_view(&KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        app.route_pasted_text(" not this").await;
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&id, None))).is_ok());
+        assert!(app.poll_structured_mount());
+        app.drain_structured_paste().await;
+
+        let view = app
+            .home
+            .structured_preview
+            .as_ref()
+            .expect("the mount Enter asked for is on screen");
+        assert_eq!(
+            view.submitted_prompts(),
+            ["send this".to_string()],
+            "only the text before Enter is submitted"
+        );
+        // The refused prompt and the text typed after Enter both wait in this
+        // row's buffer, each with its own Enter, so the composer holds neither.
+        assert_eq!(view.composer_text(), "");
+        assert_eq!(
+            app.home
+                .pending_paste_for_structured_view
+                .get(&id)
+                .map(PendingStructuredInput::text)
+                .as_deref(),
+            Some("send this\n not this"),
+            "the later text waits for the next mount of this row, whitespace intact"
+        );
+    }
+
+    /// Two Enter presses while the mount connects are two submissions, not one
+    /// draft with the boundary lost.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn repeated_enter_presses_stay_separate_submissions() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        app.open_structured_view(&id).await.unwrap();
+
+        for (text, enter) in [("first", true), ("second", true)] {
+            app.route_pasted_text(text).await;
+            if enter {
+                app.hold_key_for_pending_structured_view(&KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                ));
+            }
+        }
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&id, None))).is_ok());
+        assert!(app.poll_structured_mount());
+        app.drain_structured_paste().await;
+
+        // The fake daemon refuses every send and puts the prompt back in the
+        // composer. Replaying on that would paste "second" onto "first" and
+        // submit both, so the refused prompt is the last one this mount sends.
+        let view = app
+            .home
+            .structured_preview
+            .as_ref()
+            .expect("the mount Enter asked for is on screen");
+        assert_eq!(view.submitted_prompts(), ["first".to_string()]);
+        assert_eq!(
+            view.composer_text(),
+            "",
+            "the refused prompt has one owner, and it is not the composer"
+        );
+        assert_eq!(
+            app.home
+                .pending_paste_for_structured_view
+                .get(&id)
+                .map(PendingStructuredInput::text)
+                .as_deref(),
+            Some("first\nsecond"),
+            "each segment waits for the next mount with its own Enter"
+        );
+
+        // Reopening the retained view starts the drain again, where the refused
+        // "first" is still buffered. It has to go out as its own prompt rather
+        // than take "second" with it.
+        app.open_structured_view(&id).await.unwrap();
+        let view = app
+            .home
+            .structured_preview
+            .as_ref()
+            .expect("the retained view is still on screen");
+        assert_eq!(
+            view.submitted_prompts(),
+            ["first".to_string(), "first".to_string()],
+            "the restored prompt is retried alone, never joined with the next one"
+        );
+        assert_eq!(view.composer_text(), "");
+        assert_eq!(
+            app.home
+                .pending_paste_for_structured_view
+                .get(&id)
+                .map(PendingStructuredInput::text)
+                .as_deref(),
+            Some("first\nsecond"),
+            "both segments still wait, each on its own Enter"
+        );
+    }
+
+    /// Esc while a mount connects gives up the hold without handing the text to
+    /// Home, whose paste buffer feeds whichever row is selected next.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn esc_leaves_the_held_text_with_its_own_row() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, ids) = app_on_two_structured_rows();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((ids[0].clone(), rx));
+        app.open_structured_view(&ids[0]).await.unwrap();
+
+        app.route_pasted_text("typed for the first row").await;
+        assert!(!app.hold_key_for_pending_structured_view(&KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        )));
+
+        assert!(
+            app.home.pending_paste.is_none(),
+            "Esc must not put one row's text in Home's paste buffer"
+        );
+        assert_eq!(
+            app.home
+                .pending_paste_for_structured_view
+                .get(&ids[0])
+                .map(PendingStructuredInput::text)
+                .as_deref(),
+            Some("typed for the first row"),
+            "the text stays the first row's unsent draft"
+        );
+
+        // Selecting the other row and sending there drains the buffer that fed
+        // Send Message; with nothing in it, the text cannot follow the reader.
+        app.home.selected_session = Some(ids[1].clone());
+        assert!(
+            app.home.pending_paste.is_none(),
+            "Send Message on the second row finds nothing to prefill"
+        );
+
+        // The first row still gets its text back when its mount lands.
+        app.home.selected_session = Some(ids[0].clone());
+        assert!(tx.send(Ok(EmbeddedView::for_test(&ids[0], None))).is_ok());
+        assert!(app.poll_structured_mount());
+        // Esc dropped the activation request, so the drain belongs to the next
+        // Enter on this row, which replays the draft it kept.
+        app.drain_pending_paste_for_structured_view(&ids[0]).await;
+        let view = app
+            .home
+            .structured_preview
+            .as_ref()
+            .expect("the mount is on screen");
+        assert_eq!(view.composer_text(), "typed for the first row");
+    }
+
+    /// Backspace after a buffered Enter edits only the draft that has not been
+    /// submitted: the frozen segment keeps its text, so no byte offset can ever
+    /// land inside a multibyte character.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn backspace_after_enter_leaves_the_frozen_segment_alone() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        app.open_structured_view(&id).await.unwrap();
+
+        let hold = |app: &mut App, code| {
+            app.hold_key_for_pending_structured_view(&KeyEvent::new(code, KeyModifiers::NONE))
+        };
+        // Enter, then Backspace, then a multibyte character: with byte offsets
+        // into one flat string the Backspace shifts the draft under the frozen
+        // boundary and the replay slices inside 界.
+        app.route_pasted_text("éa").await;
+        hold(&mut app, KeyCode::Enter);
+        hold(&mut app, KeyCode::Backspace);
+        app.route_pasted_text("界").await;
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&id, None))).is_ok());
+        assert!(app.poll_structured_mount());
+        app.drain_structured_paste().await;
+
+        let view = app
+            .home
+            .structured_preview
+            .as_ref()
+            .expect("the mount Enter asked for is on screen");
+        assert_eq!(
+            view.submitted_prompts(),
+            ["éa".to_string()],
+            "the segment frozen by Enter is submitted whole"
+        );
+        assert_eq!(
+            app.home
+                .pending_paste_for_structured_view
+                .get(&id)
+                .map(PendingStructuredInput::text)
+                .as_deref(),
+            Some("éa\n界"),
+            "the frozen segment and the multibyte draft both survive for the next mount, got {:?}",
+            view.composer_text()
+        );
+    }
+
+    /// An accepted segment leaves the submit lock held, so the segment after it
+    /// waits. That wait belongs to this row's buffer alone: reopening after the
+    /// lock clears must replay it once, never onto a copy the composer kept.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_held_segment_after_an_accepted_one_replays_once_on_reopen() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        app.open_structured_view(&id).await.unwrap();
+        for text in ["first", "second"] {
+            app.route_pasted_text(text).await;
+            assert!(app.hold_key_for_pending_structured_view(&KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )));
+        }
+
+        let mut view = EmbeddedView::for_test(&id, None);
+        view.accept_submits_for_test(2);
+        assert!(tx.send(Ok(view)).is_ok());
+        assert!(app.poll_structured_mount());
+        app.drain_structured_paste().await;
+
+        let view = app
+            .home
+            .structured_preview
+            .as_ref()
+            .expect("the mount is on screen");
+        assert_eq!(
+            view.submitted_prompts(),
+            ["first".to_string()],
+            "the submit lock holds the second segment instead of sending it"
+        );
+        assert_eq!(
+            view.composer_text(),
+            "",
+            "the held segment is not left in the composer as a second owner"
+        );
+        assert_eq!(
+            app.home
+                .pending_paste_for_structured_view
+                .get(&id)
+                .map(PendingStructuredInput::text)
+                .as_deref(),
+            Some("second")
+        );
+
+        // The socket's turn-start echo clears the lock; reopening the row then
+        // replays the held segment exactly once.
+        app.home
+            .structured_preview
+            .as_mut()
+            .expect("mounted")
+            .end_turn_for_test();
+        app.drain_pending_paste_for_structured_view(&id).await;
+
+        let view = app
+            .home
+            .structured_preview
+            .as_ref()
+            .expect("the mount is on screen");
+        assert_eq!(
+            view.submitted_prompts(),
+            ["first".to_string(), "second".to_string()],
+            "the held segment goes out once, not appended to itself"
+        );
+        assert_eq!(view.composer_text(), "");
+        assert!(!app.home.pending_paste_for_structured_view.contains_key(&id));
+    }
+
+    /// Text the reader typed after the last frozen segment is theirs: a replay
+    /// must not paste onto it, and a blocked send must not take it away.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reader_text_in_the_composer_is_not_replayed_with_the_held_segment() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        app.home.structured_preview = Some(EmbeddedView::for_test(&id, None));
+        app.home.pending_paste_for_structured_view.insert(
+            id.clone(),
+            PendingStructuredInput::from_parts(vec!["frozen".into()], String::new()),
+        );
+
+        // The reader typed in the mounted composer, and the submit lock is held,
+        // so the replay cannot send the frozen segment either.
+        let view = app.home.structured_preview.as_mut().expect("mounted");
+        view.paste_text_with_file_load("also do X").await;
+        view.accept_submits_for_test(0);
+        app.drain_pending_paste_for_structured_view(&id).await;
+
+        assert_eq!(
+            app.home
+                .structured_preview
+                .as_ref()
+                .expect("mounted")
+                .submitted_prompts(),
+            ["frozen".to_string()],
+            "the segment goes out alone rather than merged with the reader's text"
+        );
+        assert_eq!(
+            app.home
+                .pending_paste_for_structured_view
+                .get(&id)
+                .map(PendingStructuredInput::text)
+                .as_deref(),
+            Some("frozen\nalso do X"),
+            "the reader's text is kept as the draft after the segment, on its own line"
+        );
+    }
+
+    /// The held text is parked as the reader typed it: trimming would drop
+    /// their leading indent and fuse it to the draft that follows.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn parked_reader_text_keeps_its_whitespace() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        app.home.structured_preview = Some(EmbeddedView::for_test(&id, None));
+        app.home.pending_paste_for_structured_view.insert(
+            id.clone(),
+            PendingStructuredInput::from_parts(vec![], "  indented".into()),
+        );
+        app.home
+            .structured_preview
+            .as_mut()
+            .expect("mounted")
+            .paste_text_with_file_load("  held line\n")
+            .await;
+
+        app.drain_pending_paste_for_structured_view(&id).await;
+
+        assert_eq!(
+            app.home
+                .structured_preview
+                .as_ref()
+                .expect("mounted")
+                .composer_text(),
+            "  held line\n\n  indented",
+            "both sides keep their whitespace and the draft stays after the held text"
+        );
+    }
+
+    /// A pasted segment can open the composer's slash picker. The replay must
+    /// submit it anyway: an Enter that accepts a completion leaves the segment
+    /// in the buffer, so reopening would strand it and everything behind it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_segment_that_opens_a_picker_is_submitted_not_completed() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        app.open_structured_view(&id).await.unwrap();
+        app.route_pasted_text("/compact").await;
+        assert!(app.hold_key_for_pending_structured_view(&KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        app.route_pasted_text("then explain").await;
+
+        let mut view = EmbeddedView::for_test(&id, None);
+        view.offer_commands_for_test(&["compact", "clear"]);
+        view.accept_submits_for_test(1);
+        assert!(tx.send(Ok(view)).is_ok());
+        assert!(app.poll_structured_mount());
+        app.drain_structured_paste().await;
+
+        let view = app
+            .home
+            .structured_preview
+            .as_ref()
+            .expect("the mount is on screen");
+        assert_eq!(
+            view.submitted_prompts(),
+            ["/compact".to_string()],
+            "the frozen segment goes out as typed, not as an accepted completion"
+        );
+        assert_eq!(
+            view.composer_text(),
+            "then explain",
+            "the input behind it is still in the composer, not stranded behind a picker"
+        );
+    }
+
+    /// A refused segment belongs to its row's buffer, so leaving the row takes
+    /// the preview away without taking the text with it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_refused_segment_survives_leaving_the_row() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, ids) = app_on_two_structured_rows();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((ids[0].clone(), rx));
+        app.open_structured_view(&ids[0]).await.unwrap();
+        app.route_pasted_text("refused").await;
+        assert!(app.hold_key_for_pending_structured_view(&KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&ids[0], None))).is_ok());
+        assert!(app.poll_structured_mount());
+        app.drain_structured_paste().await;
+        assert_eq!(
+            app.home
+                .structured_preview
+                .as_ref()
+                .expect("mounted")
+                .submitted_prompts(),
+            ["refused".to_string()]
+        );
+
+        // The selection moves to the other row, which drops this preview.
+        app.home.selected_session = Some(ids[1].clone());
+        app.home.structured_preview = None;
+        assert_eq!(
+            app.home
+                .pending_paste_for_structured_view
+                .get(&ids[0])
+                .map(PendingStructuredInput::text)
+                .as_deref(),
+            Some("refused"),
+            "the refused prompt outlives the preview it failed in"
+        );
+
+        // Coming back replays it on its own Enter.
+        app.home.selected_session = Some(ids[0].clone());
+        app.home.structured_preview = Some(EmbeddedView::for_test(&ids[0], None));
+        app.drain_pending_paste_for_structured_view(&ids[0]).await;
+        assert_eq!(
+            app.home
+                .structured_preview
+                .as_ref()
+                .expect("mounted")
+                .submitted_prompts(),
+            ["refused".to_string()],
+            "the retry is one submit of the whole segment"
+        );
+    }
+
+    /// Text edited after a refusal is the reader's draft, not the refused
+    /// segment: reopening must not submit it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn editing_a_refused_prompt_keeps_it_out_of_the_replay() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        use crossterm::event::Event;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        app.home.structured_preview = Some(EmbeddedView::for_test(&id, None));
+        app.home.pending_paste_for_structured_view.insert(
+            id.clone(),
+            PendingStructuredInput::from_parts(Vec::new(), " typed later".into()),
+        );
+
+        // The reader submits from the mounted composer and the daemon refuses,
+        // restoring the prompt.
+        let view = app.home.structured_preview.as_mut().expect("mounted");
+        view.paste_text_with_file_load("refused").await;
+        assert!(view.confirm_presentation(view.interaction_revision()));
+        view.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+        assert!(view.last_submit_rejected());
+        // They edit it, then leave and reopen the row without pressing Enter.
+        view.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('!'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+        assert_eq!(view.composer_text(), "refused!");
+
+        app.drain_pending_paste_for_structured_view(&id).await;
+
+        let view = app.home.structured_preview.as_ref().expect("mounted");
+        assert_eq!(
+            view.submitted_prompts(),
+            ["refused".to_string()],
+            "the edit is a draft, so reopening submits nothing"
+        );
+        assert_eq!(
+            view.composer_text(),
+            "refused!\n typed later",
+            "the edit stays in the composer, unchanged, with the text typed after its Enter"
+        );
+        assert!(!app.home.pending_paste_for_structured_view.contains_key(&id));
+    }
+
+    /// A click can move the selection before the mount is reconciled, so the
+    /// next paste must not still be buffered for the row the user left.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_paste_after_clicking_another_row_does_not_use_the_old_owner() {
+        let (mut app, _guard, ids) = app_on_two_structured_rows();
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((ids[0].clone(), rx));
+        app.open_structured_view(&ids[0]).await.unwrap();
+        assert_eq!(
+            app.structured_mount_activate.as_deref(),
+            Some(ids[0].as_str())
+        );
+
+        // The click lands before the event loop reconciles the mount target.
+        app.home.selected_session = Some(ids[1].clone());
+        app.route_pasted_text("pasted after the click").await;
+
+        assert!(
+            app.structured_mount_activate.is_none(),
+            "the row Enter asked for no longer owns new input"
+        );
+        assert!(
+            !app.home
+                .pending_paste_for_structured_view
+                .contains_key(&ids[0]),
+            "the paste must not be buffered for the row the user left"
+        );
+        assert!(
+            app.home.send_message_dialog.is_some()
+                || app.home.pending_paste.as_deref() == Some("pasted after the click"),
+            "the paste goes where Home's paste target is now"
+        );
+    }
+
+    /// A paste burst is replayed through the same owner check as a bracketed
+    /// paste: while a mount connects, neither may fall through to Home.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_paste_burst_while_enter_connects_stays_with_the_requested_row() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+
+        app.open_structured_view(&id).await.unwrap();
+        app.route_pasted_text("pasted while connecting").await;
+
+        assert!(
+            app.home.pending_paste.is_none(),
+            "a burst must not fall through to Home's paste target"
+        );
+        assert_eq!(
+            app.home
+                .pending_paste_for_structured_view
+                .get(&id)
+                .map(PendingStructuredInput::text)
+                .as_deref(),
+            Some("pasted while connecting")
+        );
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&id, None))).is_ok());
+        assert!(app.poll_structured_mount());
+        app.drain_structured_paste().await;
+
+        assert_eq!(
+            app.home
+                .structured_preview
+                .as_ref()
+                .map(|view| view.composer_text()),
+            Some("pasted while connecting".to_owned()),
+            "the burst reaches the view Enter opened"
+        );
+    }
+
+    /// The daemon connection can drop while its row stays selected, and a
+    /// completion from before the drop must not be installed on it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn losing_the_daemon_sidebar_drops_the_pending_mount() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        app.home.sidebar_source = crate::tui::session_feed::SidebarSource::Disconnected;
+
+        app.reconcile_structured_preview();
+
+        assert!(app.structured_mount.is_none(), "the mount is dropped");
+        assert!(tx.is_closed(), "the connect sees its receiver go away");
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        assert!(tx.send(Ok(EmbeddedView::for_test(&id, None))).is_ok());
+        assert!(app.poll_structured_mount(), "the completion still redraws");
+        assert!(
+            app.home.structured_preview.is_none(),
+            "a connect from before the drop is not installed"
+        );
+        assert_eq!(
+            app.structured_mount_failed, None,
+            "and its failure is not cached against the row"
+        );
+    }
+
+    /// Selecting another row cuts the connect short instead of letting it
+    /// replay a whole transcript the poll would then throw away.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn selecting_another_row_cancels_the_mount_in_flight() {
+        let (mut app, _guard, ids) = app_on_two_structured_rows();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((ids[0].clone(), rx));
+
+        app.home.selected_session = Some(ids[1].clone());
+        app.reconcile_structured_preview();
+
+        assert!(
+            app.structured_mount.is_none(),
+            "a mount for a row the selection left is dropped"
+        );
+        assert!(tx.is_closed(), "the connect sees its receiver go away");
+    }
+
+    /// A connect that finishes after the user kept moving is dropped, not
+    /// painted over the row they are on now.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_structured_mount_for_a_row_left_behind_is_dropped() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        app.home.selected_session = None;
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&id, None))).is_ok());
+        assert!(app.poll_structured_mount(), "the placeholder clears");
+        assert!(app.home.structured_preview.is_none());
+    }
+
+    /// A failed connect reports once and leaves the row on its "press Enter"
+    /// page instead of retrying the socket on every tick.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_structured_mount_is_not_retried_while_selected() {
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        assert!(tx.send(Err("ws connect failed".to_owned())).is_ok());
+
+        assert!(app.poll_structured_mount(), "the error status is painted");
+        assert_eq!(app.structured_mount_failed.as_deref(), Some(id.as_str()));
+        assert!(app
+            .update_status
+            .as_ref()
+            .is_some_and(|s| s.text.contains("ws connect failed")));
+        assert!(
+            !app.reconcile_structured_preview(),
+            "a row that already failed is not remounted"
+        );
+        assert!(app.structured_mount.is_none());
+        assert!(!app.home.structured_preview_pending);
+    }
+
+    /// Enter opens the same session while the preview connect is still running;
+    /// that opened view owns the keyboard and must survive the late arrival.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_late_mount_does_not_replace_the_open_view() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let mut opened = EmbeddedView::for_test(&id, None);
+        opened.activate();
+        app.home.structured_preview = Some(opened);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&id, None))).is_ok());
+        assert!(app.poll_structured_mount());
+        assert!(
+            app.home
+                .structured_preview
+                .as_ref()
+                .is_some_and(|v| v.is_active()),
+            "the view the user opened keeps the keyboard"
+        );
+    }
+
+    /// Selecting a row may leave the list entirely. That path returns before
+    /// the mount retry, and it must still forget the old row's failure.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_structured_row_is_forgotten_after_selecting_nothing() {
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+        assert!(tx.send(Err("ws connect failed".to_owned())).is_ok());
+        assert!(app.poll_structured_mount());
+        assert_eq!(app.structured_mount_failed.as_deref(), Some(id.as_str()));
+
+        app.home.selected_session = None;
+        app.reconcile_structured_preview();
+        assert_eq!(
+            app.structured_mount_failed, None,
+            "a failure belongs to the row it happened on"
+        );
+    }
+
+    /// A failed row is retried once the user has been on another row, so one
+    /// bad connect does not disable the preview for the rest of the session.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_structured_row_is_retried_after_leaving_it() {
+        let (mut app, _guard, ids) = app_on_two_structured_rows();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((ids[0].clone(), rx));
+        assert!(tx.send(Err("ws connect failed".to_owned())).is_ok());
+        assert!(app.poll_structured_mount(), "the error status is painted");
+        assert_eq!(
+            app.structured_mount_failed.as_deref(),
+            Some(ids[0].as_str())
+        );
+
+        app.home.selected_session = Some(ids[1].clone());
+        app.reconcile_structured_preview();
+        assert_eq!(
+            app.structured_mount_failed, None,
+            "the failure is forgotten so returning to the row retries it"
+        );
+    }
+
+    /// Leaving a view the user typed into does not unmount it, so a duplicate
+    /// connect landing afterwards must not take its draft away.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_late_mount_does_not_replace_a_view_the_user_left() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        app.home.structured_preview = Some(EmbeddedView::for_test(&id, None));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id.clone(), rx));
+
+        assert!(tx.send(Ok(EmbeddedView::for_test(&id, None))).is_ok());
+        assert!(
+            app.poll_structured_mount(),
+            "the pending placeholder clears"
+        );
+        assert!(
+            app.home
+                .structured_preview
+                .as_ref()
+                .is_some_and(|v| v.session_id() == id),
+            "the mounted view is kept rather than rebuilt underneath the user"
+        );
+    }
+
+    /// An in-flight mount is not restarted by the next tick's reconcile.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_in_flight_structured_mount_is_not_started_twice() {
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        app.structured_mount = Some((id, rx));
+
+        assert!(!app.reconcile_structured_preview());
+        assert!(
+            app.structured_mount.is_some(),
+            "the running mount is kept, not replaced"
+        );
+    }
+
     fn key_app() -> (App, Terminal<TuiBackend>) {
         let app = App::new(
             "test",
@@ -4841,7 +6170,7 @@ mod tests {
         .unwrap();
         app.home.show_changelog(Some("1.18.0".into()));
         let cache = serde_json::json!({
-            "checked_at": chrono::Utc::now(),
+            "checked_at": crate::time::Timestamp::now(),
             "latest_version": "1.19.0",
             "releases": [{"version": "1.19.0", "body": "### Performance\n- Faster startup", "published_at": null}]
         });
@@ -5112,7 +6441,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 ticker.tick().await;
-                if app.reconcile_structured_preview().await {
+                if app.reconcile_structured_preview() {
                     terminal
                         .draw(|frame| {
                             app.home.render(frame, frame.area(), &theme, None);
@@ -5236,7 +6565,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 ticker.tick().await;
-                if app.reconcile_structured_preview().await {
+                if app.reconcile_structured_preview() {
                     terminal
                         .draw(|frame| {
                             app.home.render(frame, frame.area(), &theme, None);
@@ -5281,12 +6610,14 @@ mod tests {
             crate::file_watch::FileWatchService::noop(),
         )
         .expect("app");
-        app.home
-            .pending_paste_for_structured_view
-            .insert("s-1".into(), "buffered draft".into());
-        app.home
-            .pending_paste_for_structured_view
-            .insert("s-2".into(), "other target".into());
+        app.home.pending_paste_for_structured_view.insert(
+            "s-1".into(),
+            PendingStructuredInput::from_parts(Vec::new(), "buffered draft".into()),
+        );
+        app.home.pending_paste_for_structured_view.insert(
+            "s-2".into(),
+            PendingStructuredInput::from_parts(Vec::new(), "other target".into()),
+        );
         app.home.structured_preview =
             Some(crate::tui::structured_view::embedded::EmbeddedView::for_test("s-1", None));
 
@@ -5304,7 +6635,8 @@ mod tests {
             app.home
                 .pending_paste_for_structured_view
                 .get("s-1")
-                .map(String::as_str),
+                .map(PendingStructuredInput::text)
+                .as_deref(),
             Some("buffered draft"),
         );
 
@@ -5317,14 +6649,19 @@ mod tests {
             "buffered draft",
             "the captured buffer must land in the mounted composer"
         );
-        assert_eq!(
-            app.home.pending_paste_for_structured_view.get("s-1"),
-            None,
+        assert!(
+            !app.home
+                .pending_paste_for_structured_view
+                .contains_key("s-1"),
             "a forwarded buffer must be consumed"
         );
         assert_eq!(
-            app.home.pending_paste_for_structured_view.get("s-2"),
-            Some(&"other target".to_string()),
+            app.home
+                .pending_paste_for_structured_view
+                .get("s-2")
+                .map(PendingStructuredInput::text)
+                .as_deref(),
+            Some("other target"),
             "another target's unsent draft must survive the drain"
         );
     }

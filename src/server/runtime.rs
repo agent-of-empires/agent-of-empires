@@ -364,7 +364,7 @@ impl NativeRuntime {
                 .iter()
                 .map(|row| (row.id.as_str(), row.status.as_str()))
                 .collect();
-            let changed_at = chrono::Utc::now();
+            let changed_at = crate::time::Timestamp::now();
             for row in &published.value.contents.sessions {
                 let Some(config) = metadata
                     .status_hooks
@@ -1402,7 +1402,7 @@ mod tests {
         let generation = row.try_acquire_lifecycle_reservation(
             crate::session::LifecycleOperation::Launch,
             Instance::LIFECYCLE_RESERVATION_TTL,
-            chrono::Utc::now() - chrono::Duration::minutes(11),
+            crate::time::Timestamp::now() - crate::time::Duration::minutes(11),
         )?;
         storage.update(|rows, _| {
             rows.push(row.clone());

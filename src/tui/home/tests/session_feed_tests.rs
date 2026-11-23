@@ -144,7 +144,7 @@ pub(super) fn archived_daemon_snapshot(view: &HomeView, id: &str) -> SessionFeed
         unreachable!()
     };
     Arc::make_mut(&mut snapshot).contents.sessions[0].archived_at =
-        Some(chrono::Utc::now().to_rfc3339());
+        Some(crate::time::Timestamp::now().to_rfc3339());
     SessionFeedResult::Snapshot(snapshot)
 }
 
@@ -173,7 +173,7 @@ fn session_dialogs_follow_their_original_identity_across_snapshots() {
                         branch: "fixture".into(),
                         main_repo_path: "/tmp".into(),
                         managed_by_aoe: true,
-                        created_at: chrono::Utc::now(),
+                        created_at: crate::time::Timestamp::now(),
                         base_branch: None,
                     });
                 });
@@ -200,7 +200,8 @@ fn session_dialogs_follow_their_original_identity_across_snapshots() {
             let next = Arc::make_mut(&mut snapshot);
             match change {
                 "trash" => {
-                    next.contents.sessions[0].trashed_at = Some(chrono::Utc::now().to_rfc3339());
+                    next.contents.sessions[0].trashed_at =
+                        Some(crate::time::Timestamp::now().to_rfc3339());
                     next.contents.sessions[0].lifecycle_generation += 1;
                 }
                 "purge" => next.contents.sessions.retain(|row| row.id != id),
@@ -1227,7 +1228,7 @@ fn daemon_update_clears_cached_approvals_when_a_row_is_sunk() {
         env.view
             .structured_pending_approvals
             .insert(id.clone(), pending_daemon_approvals());
-        let now = chrono::Utc::now();
+        let now = crate::time::Timestamp::now();
         env.view.mutate_instance(&id, |inst| {
             if label == "archived" {
                 inst.archived_at = Some(now);
@@ -1788,7 +1789,7 @@ fn canonical_revision_reloads_renames_moves_and_view_changes() {
         branch: "feature".into(),
         main_repo_path: "/tmp/repo".into(),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
         base_branch: Some("main".into()),
     });
     Storage::new_unwatched("test")
@@ -2950,8 +2951,9 @@ fn trash_transition_discards_diff_and_delayed_base_save() {
         .as_mut()
         .unwrap()
         .select_branch("review".into());
-    env.view
-        .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+    env.view.mutate_instance(&id, |inst| {
+        inst.trashed_at = Some(crate::time::Timestamp::now())
+    });
     env.view.drain_pending_diff_override();
     assert!(commands(Err("unexpected diff save".into())).is_none());
     env.view.enforce_trash_read_only();
@@ -2982,8 +2984,9 @@ fn trash_transition_cancels_auxiliary_stop_confirmation_and_late_submit() {
             "fixture",
             "stop_auxiliary",
         ));
-        env.view
-            .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+        env.view.mutate_instance(&id, |inst| {
+            inst.trashed_at = Some(crate::time::Timestamp::now())
+        });
         if late_submit {
             env.view.dispatch_confirm_submit("stop_auxiliary");
         } else {
@@ -3018,7 +3021,8 @@ fn trash_confirmation_rejects_a_changed_original_target() {
             let next = Arc::make_mut(&mut snapshot);
             match change {
                 "trash" => {
-                    next.contents.sessions[0].trashed_at = Some(chrono::Utc::now().to_rfc3339());
+                    next.contents.sessions[0].trashed_at =
+                        Some(crate::time::Timestamp::now().to_rfc3339());
                     next.contents.sessions[0].lifecycle_generation += 1;
                 }
                 "generation" => next.contents.sessions[0].lifecycle_generation += 1,
@@ -3586,7 +3590,7 @@ fn purge_dialog_rejects_stale_target_on_keyboard_and_mouse() {
                 unreachable!()
             };
             let row = &mut Arc::make_mut(&mut snapshot).contents.sessions[0];
-            row.trashed_at = Some(chrono::Utc::now().to_rfc3339());
+            row.trashed_at = Some(crate::time::Timestamp::now().to_rfc3339());
             row.trash_lifecycle_id = Some(uuid::Uuid::new_v4().to_string());
             row.lifecycle_generation = 7;
             env.view
@@ -3653,8 +3657,10 @@ fn purge_dialog_rejects_stale_target_on_keyboard_and_mouse() {
                     }
                     "generation" => row.lifecycle_generation += 1,
                     "timestamp" => {
-                        row.trashed_at =
-                            Some((chrono::Utc::now() + chrono::Duration::seconds(1)).to_rfc3339())
+                        row.trashed_at = Some(
+                            (crate::time::Timestamp::now() + crate::time::Duration::seconds(1))
+                                .to_rfc3339(),
+                        )
                     }
                     "uuid" => row.trash_lifecycle_id = Some(uuid::Uuid::new_v4().to_string()),
                     "selection" => {}
@@ -3700,7 +3706,7 @@ fn retained_trash_context_menu_keeps_opening_epoch() {
             row.lifecycle_reservation = Some(LifecycleReservation {
                 op: LifecycleOperation::Trash,
                 generation: 4,
-                at: chrono::Utc::now() - chrono::Duration::hours(1),
+                at: crate::time::Timestamp::now() - crate::time::Duration::hours(1),
             });
         });
         env.view.trashed_section_collapsed = false;
@@ -3772,9 +3778,9 @@ async fn keyboard_palette_recovery_executes_captured_commands_and_preserves_file
                     LifecycleOperation::Trash,
                     Instance::LIFECYCLE_RESERVATION_TTL,
                     if fresh {
-                        chrono::Utc::now()
+                        crate::time::Timestamp::now()
                     } else {
-                        chrono::Utc::now() - chrono::Duration::hours(1)
+                        crate::time::Timestamp::now() - crate::time::Duration::hours(1)
                     },
                 )
                 .unwrap();

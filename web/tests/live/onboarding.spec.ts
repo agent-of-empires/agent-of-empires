@@ -271,7 +271,7 @@ test.describe("telemetry signals", () => {
     }
   });
 
-  test("opening a session fires the diff_panel and web_terminal signals", async ({ page, spawnServe }) => {
+  test("opening a session and its diff fires the diff_panel and web_terminal signals", async ({ page, spawnServe }) => {
     // #1881
     const serve = await spawnServe({
       seedFn: ({ home, env }) => {
@@ -293,6 +293,8 @@ test.describe("telemetry signals", () => {
     const sessionRow = page.getByRole("link").filter({ hasText: "usage-signals" }).first();
     await expect(sessionRow).toBeVisible({ timeout: 10_000 });
     await sessionRow.click();
+    // Diff starts closed; the signal fires once it shows.
+    await page.getByTestId("pane-toggle-diff").first().click();
     for (const surface of ["web_terminal", "diff_panel"]) {
       await expect.poll(() => pings().some((p) => p.surface === surface), { timeout: 10_000 }).toBe(true);
     }

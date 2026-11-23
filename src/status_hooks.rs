@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::time::Timestamp;
 use aoe_settings_derive::SettingsSection;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
@@ -114,7 +114,7 @@ pub struct StatusHookContext {
     pub group_path: String,
     pub old_status: Status,
     pub new_status: Status,
-    pub changed_at: DateTime<Utc>,
+    pub changed_at: Timestamp,
 }
 
 impl StatusHookContext {
@@ -123,7 +123,7 @@ impl StatusHookContext {
         instance: &Instance,
         old_status: Status,
         new_status: Status,
-        changed_at: DateTime<Utc>,
+        changed_at: Timestamp,
     ) -> Self {
         Self {
             session_id: instance.id.clone(),
@@ -518,7 +518,7 @@ mod tests {
                 &instance,
                 Status::Idle,
                 Status::Running,
-                Utc::now(),
+                Timestamp::now(),
             );
             let pending = hooks
                 .prepare_transition(context.clone(), &config, Default::default())
@@ -624,7 +624,7 @@ mod tests {
             ..Default::default()
         };
 
-        let observed_before = Utc::now();
+        let observed_before = Timestamp::now();
         let task = hooks
             .prepare_transition(
                 StatusHookContext::from_instance(
@@ -637,7 +637,7 @@ mod tests {
                 Default::default(),
             )
             .unwrap();
-        let observed_after = Utc::now();
+        let observed_after = Timestamp::now();
         assert!(take_recorded_launches().is_empty());
 
         task.await;
@@ -671,7 +671,7 @@ mod tests {
                     &instance,
                     Status::Running,
                     Status::Waiting,
-                    Utc::now(),
+                    Timestamp::now(),
                 ),
                 &config,
                 Default::default(),
@@ -683,7 +683,7 @@ mod tests {
                     &instance,
                     Status::Waiting,
                     Status::Running,
-                    Utc::now()
+                    Timestamp::now()
                 ),
                 &config,
                 Default::default()
@@ -715,7 +715,7 @@ mod tests {
                     &instance,
                     Status::Running,
                     Status::Waiting,
-                    Utc::now(),
+                    Timestamp::now(),
                 ),
                 &config,
                 Default::default(),
@@ -727,7 +727,7 @@ mod tests {
                     &instance,
                     Status::Waiting,
                     Status::Idle,
-                    Utc::now(),
+                    Timestamp::now(),
                 ),
                 &config,
                 Default::default(),
@@ -748,9 +748,7 @@ mod tests {
         instance.tool = "codex".to_string();
         instance.group_path = "Backend".to_string();
         instance.source_profile = "work".to_string();
-        let changed_at = DateTime::parse_from_rfc3339("2026-05-20T10:11:12Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let changed_at = Timestamp::parse_rfc3339("2026-05-20T10:11:12Z").unwrap();
         let context = StatusHookContext::from_instance(
             &instance,
             Status::Running,

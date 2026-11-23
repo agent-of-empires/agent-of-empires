@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 
 use crate::acp::agent_registry::AgentRegistry;
 use crate::process::worker_registry::WorkerRecord;
@@ -69,7 +69,7 @@ fn cached_observation(
 fn executable_updated(
     observed: &Observed,
     launched: Option<&std::path::Path>,
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
 ) -> bool {
     launched.is_some_and(|launched| launched != observed.resolved)
         || observed
@@ -78,15 +78,15 @@ fn executable_updated(
 }
 
 /// Whole seconds, so a binary written in the launch second is not flagged.
-fn modified_after(mtime: SystemTime, started_at: DateTime<Utc>) -> bool {
+fn modified_after(mtime: SystemTime, started_at: Timestamp) -> bool {
     let modified = mtime.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    modified as i64 > started_at.timestamp()
+    modified as i64 > started_at.as_unix_secs()
 }
 
 fn is_stale(
     path: &std::path::Path,
     launched: Option<&std::path::Path>,
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
 ) -> bool {
     let Some(observed) =
         cached_observation(path.display().to_string(), || Some(path.to_path_buf()))
@@ -111,8 +111,7 @@ pub fn binary_updated(inst: &Instance) -> bool {
             .ok()
             .flatten()
             .and_then(|record| {
-                let started_at =
-                    DateTime::from_timestamp(i64::try_from(record.started_at).ok()?, 0)?;
+                let started_at = Timestamp::from_unix_secs(i64::try_from(record.started_at).ok()?)?;
                 adapter_command(inst, &record)?;
                 let path = record.launch_executable.as_ref()?;
                 Some(is_stale(
@@ -149,7 +148,7 @@ mod tests {
 
     #[test]
     fn mtime_is_compared_in_whole_seconds() {
-        let started = DateTime::from_timestamp(1_000, 500_000_000).unwrap();
+        let started = Timestamp::from_millis(1_000_500).unwrap();
         let at = |secs| UNIX_EPOCH + Duration::from_secs(secs);
         assert!(!modified_after(at(999), started));
         assert!(!modified_after(at(1_000), started));
@@ -194,7 +193,7 @@ mod tests {
 
         let mut inst = Instance::new("t", "/tmp");
         inst.status = Status::Idle;
-        inst.started_at = DateTime::from_timestamp(1_000, 0);
+        inst.started_at = Timestamp::from_unix_secs(1_000);
         // No recorded executable (older row or a launch that did not pin one): never offered,
         // whatever the observer's PATH holds.
         assert!(!binary_updated(&inst));
@@ -202,7 +201,7 @@ mod tests {
         inst.launch_executable = Some(bin.clone());
         assert!(binary_updated(&inst));
         // A launch after the file was written is current.
-        inst.started_at = Some(Utc::now() + chrono::Duration::hours(1));
+        inst.started_at = Some(Timestamp::now() + crate::time::Duration::hours(1));
         assert!(!binary_updated(&inst));
     }
 
@@ -227,7 +226,7 @@ mod tests {
 
         let mut inst = Instance::new("t", "/tmp");
         inst.status = Status::Idle;
-        inst.started_at = DateTime::from_timestamp(1_000, 0);
+        inst.started_at = Timestamp::from_unix_secs(1_000);
         inst.launch_executable = Some(link.clone());
         inst.launch_resolved_executable = std::fs::canonicalize(&link).ok();
         assert!(!binary_updated(&inst));
@@ -290,7 +289,7 @@ mod tests {
         symlink(&v1, &link).unwrap();
         let mut inst = Instance::new("t", "/tmp");
         inst.status = Status::Idle;
-        inst.started_at = DateTime::from_timestamp(1_000, 0);
+        inst.started_at = Timestamp::from_unix_secs(1_000);
         inst.launch_executable = Some(link.clone());
         inst.launch_resolved_executable = std::fs::canonicalize(&link).ok();
         assert!(!binary_updated(&inst));
@@ -322,7 +321,7 @@ mod tests {
                 .unwrap();
         }
         symlink(&v1, &link).unwrap();
-        let started = DateTime::from_timestamp(1_000, 0).unwrap();
+        let started = Timestamp::from_unix_secs(1_000).unwrap();
         let launched = std::fs::canonicalize(&link).unwrap();
         assert!(!is_stale(&link, Some(&launched), started));
 
@@ -349,7 +348,7 @@ mod tests {
         let mut inst = Instance::new("t", "/tmp");
         inst.status = Status::Idle;
         inst.launch_executable = Some(bin);
-        inst.started_at = DateTime::from_timestamp(1_000, 0);
+        inst.started_at = Timestamp::from_unix_secs(1_000);
         assert!(binary_updated(&inst));
 
         inst.sandbox_info = Some(crate::session::SandboxInfo {

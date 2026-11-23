@@ -157,7 +157,7 @@ fn attention_sort_and_the_archived_section_hide_nothing() {
         instance_in("util-archived", "/tmp/util", "util"),
         Status::Stopped,
     );
-    archived.archived_at = Some(chrono::Utc::now());
+    archived.archived_at = Some(crate::time::Timestamp::now());
     let mut env = seeded_env(
         test_home(),
         &[

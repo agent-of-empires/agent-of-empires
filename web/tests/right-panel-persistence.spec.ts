@@ -1,62 +1,85 @@
+import type { Page } from "@playwright/test";
+
 import { test, expect } from "./helpers/mockedTest";
+import { mockSessionShellApis, mockStaticApis } from "./helpers/apiMocks";
 import { mockSessionsList } from "./helpers/sessions";
+import { clickSidebarSession } from "./helpers/sidebar";
 
-const V1_KEY = "aoe-pane-layout"; // pre-#2437 per-pane {open, dock} shape
-const V2_KEY = "aoe-pane-layout-v2";
-const SESSION = "pinch-test";
+const LAYOUT_KEY = "aoe-pane-layout-v3";
+const SESSIONS = ["alpha", "beta", "gamma"];
 
-// The v2 layout is per-session tab groups. These tests assert only whether the
-// diff / terminal kinds are open for the active session, so flatten the active
-// session's tabs (falling back to the template before it is seeded) to booleans.
-async function getLayout(page: import("@playwright/test").Page, { sessionOnly = false } = {}) {
-  const raw = await page.evaluate((k) => localStorage.getItem(k), V2_KEY);
-  if (!raw) return null;
-  const store = JSON.parse(raw) as {
-    template?: { right?: { tabs: string[] }[]; bottom?: { tabs: string[] }[] };
-    sessions?: Record<string, { right?: { tabs: string[] }[]; bottom?: { tabs: string[] }[] }>;
-  };
-  const layout = sessionOnly ? store.sessions?.[SESSION] : (store.sessions?.[SESSION] ?? store.template);
-  if (!layout) return null;
-  const tabs = [...(layout.right?.[0]?.tabs ?? []), ...(layout.bottom?.[0]?.tabs ?? [])];
-  return { diff: tabs.includes("diff"), terminal: tabs.some((t) => t.startsWith("terminal:")) };
+/** Serves the Daemon's panel defaults; the returned object changes what later reads see. */
+async function mockPanelDefaults(page: Page) {
+  const web = { auto_open_diff_pane: false, auto_open_terminal_pane: false };
+  await page.route(
+    (url) => url.pathname === "/api/settings",
+    (r) => r.fulfill({ json: { web } }),
+  );
+  return web;
 }
 
-test.describe("Right dock pane-layout persistence", () => {
-  test("mobile with empty storage seeds both panes closed", async ({ page }) => {
-    await page.setViewportSize({ width: 375, height: 812 });
-    await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
-    expect(await getLayout(page)).toEqual({ diff: false, terminal: false });
+async function boot(page: Page) {
+  await mockStaticApis(page);
+  await mockSessionShellApis(page);
+  await page.route("**/api/sessions/*/diff/files", (r) =>
+    r.fulfill({
+      json: {
+        files: [
+          { path: "a.txt", status: "modified", additions: 1, deletions: 0 },
+          { path: "b.txt", status: "added", additions: 2, deletions: 0 },
+        ],
+        per_repo_bases: [],
+        warning: null,
+      },
+    }),
+  );
+  await mockSessionsList(page, () => SESSIONS.map((id) => ({ id, title: id })));
+  const defaults = await mockPanelDefaults(page);
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await page.goto("/");
+  return defaults;
+}
+
+const dockTabs = (page: Page) => page.locator('[data-pane-dock="right"] [data-testid^="pane-tab-"]');
+const savedSessions = (page: Page) =>
+  page.evaluate((k) => Object.keys(JSON.parse(localStorage.getItem(k) ?? "{}").sessions ?? {}), LAYOUT_KEY);
+
+test.describe("Side panel defaults", () => {
+  test("Sessions start closed, a closed Diff shows its count, and viewing saves nothing", async ({ page }) => {
+    await boot(page);
+    await clickSidebarSession(page, "alpha");
+    const diffToggle = page.getByTestId("pane-toggle-diff");
+    await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
+    await expect(page.getByTestId("pane-badge-diff")).toHaveText("2");
+    await expect(dockTabs(page)).toHaveCount(0);
+    await clickSidebarSession(page, "beta");
+    await expect(page).toHaveURL(/\/session\/beta$/);
+    expect(await savedSessions(page)).toEqual([]);
   });
 
-  test("stored layout overrides the mobile viewport default", async ({ page }) => {
-    await page.setViewportSize({ width: 375, height: 812 });
-    await page.addInitScript((k) => localStorage.setItem(k, JSON.stringify({ diff: true, terminal: true })), V1_KEY);
-    await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
-    expect(await getLayout(page)).toEqual({ diff: true, terminal: true });
-  });
+  test("turning a default on reaches Sessions already viewed", async ({ page }) => {
+    const defaults = await boot(page);
+    const diffToggle = page.getByTestId("pane-toggle-diff");
+    await clickSidebarSession(page, "alpha");
+    await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
 
-  test("desktop seeds both panes open; the keyboard toggle flips the diff pane and survives reload", async ({
-    page,
-  }) => {
-    await page.setViewportSize({ width: 1280, height: 720 });
-    // Per-session layout: toggles need an active session, so open one directly.
-    // The layout is seeded only once the Session row is known (#4574), so wait
-    // for that stored seed before toggling it.
-    await mockSessionsList(page, () => [{ id: SESSION }]);
-    await page.goto(`/session/${SESSION}`);
-    await expect(page.locator("header")).toBeVisible();
-    await expect.poll(() => getLayout(page, { sessionOnly: true })).toEqual({ diff: true, terminal: true });
-
-    // Shift+D toggles the diff pane specifically (Ctrl+Alt+B now collapses the
-    // whole dock). Focus the body first so the handler receives the event.
-    await page.locator("body").click();
-    await page.keyboard.press("Shift+D");
-    await expect.poll(() => getLayout(page)).toEqual({ diff: false, terminal: true });
-
+    defaults.auto_open_diff_pane = true;
     await page.reload();
-    await expect(page.locator("header")).toBeVisible();
-    expect(await getLayout(page)).toEqual({ diff: false, terminal: true });
+    await expect(diffToggle).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("pane-badge-diff")).toHaveCount(0);
+    await clickSidebarSession(page, "beta");
+    await expect(page).toHaveURL(/\/session\/beta$/);
+    await expect(diffToggle).toHaveAttribute("aria-pressed", "true");
+  });
+
+  test("a layout the user changed survives reload while the others follow the default", async ({ page }) => {
+    await boot(page);
+    await clickSidebarSession(page, "alpha");
+    await page.getByTestId("pane-toggle-terminal").click();
+    await expect(page.getByTestId("pane-tab-terminal:0")).toBeVisible();
+    await page.reload();
+    await expect(page.getByTestId("pane-tab-terminal:0")).toBeVisible();
+    await clickSidebarSession(page, "beta");
+    await expect(dockTabs(page)).toHaveCount(0);
   });
 });

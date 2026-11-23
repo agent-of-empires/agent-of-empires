@@ -148,6 +148,25 @@ pub struct StructuredViewState {
     /// or `None` when off or the fetch failed. Read from the daemon's `/api/about`,
     /// not local config, so a remote-attached view honours that daemon (#3253).
     pub compaction_reminder_percent: Option<u8>,
+    /// Prompts the daemon took from this view. A caller replaying buffered input
+    /// advances only when this grows: a rejected prompt comes back to the
+    /// composer, and Enter can be consumed by the view without a submit.
+    pub accepted_submits: u64,
+    /// True when the last submit was refused and its text put back in the
+    /// composer, so a replay knows that text is not lost.
+    pub submit_rejected: bool,
+    /// The text that refusal restored. A replay claims the composer only while
+    /// it still holds exactly that, so a later edit is never submitted as a
+    /// refused segment.
+    pub restored_prompt: Option<String>,
+    /// Test-only: submits to accept without a daemon, leaving the submit lock
+    /// held as a real `Sent` response would until the turn-start echo clears it.
+    #[cfg(test)]
+    pub accept_submits_for_test: usize,
+    /// Every prompt the composer submitted, in order. Test-only, so the paste
+    /// handoff can assert what each Enter actually sent.
+    #[cfg(test)]
+    pub submitted_prompts: Vec<String>,
     /// The wrapped transcript painted by the last frame. Wrapping a long
     /// transcript costs far more than everything else in a frame, and most
     /// frames repaint identical rows. Interior-mutable: the render borrows the
@@ -497,6 +516,13 @@ impl StructuredViewState {
             auto_presented_elicitation: None,
             last_scroll_max: std::cell::Cell::new(0),
             compaction_reminder_percent: None,
+            accepted_submits: 0,
+            submit_rejected: false,
+            restored_prompt: None,
+            #[cfg(test)]
+            accept_submits_for_test: 0,
+            #[cfg(test)]
+            submitted_prompts: Vec::new(),
             show_full_thinking: false,
             transcript_cache: RefCell::new(None),
         }
@@ -554,7 +580,13 @@ impl StructuredViewState {
     /// Drain the composer's current text and clear it so the user can
     /// start the next prompt.
     pub fn take_composer_text(&mut self) -> String {
-        let text = self.composer.lines().join("\n").trim().to_string();
+        self.take_composer_raw().trim().to_string()
+    }
+
+    /// `take_composer_text` without the trim, for a caller parking the text
+    /// rather than sending it: the surrounding whitespace is the reader's.
+    pub fn take_composer_raw(&mut self) -> String {
+        let text = self.composer.lines().join("\n");
         // Replace with a fresh textarea so cursor + selection state
         // also reset; ratatui-textarea has no public "clear" today.
         self.composer = new_composer_textarea();

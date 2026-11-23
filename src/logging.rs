@@ -515,7 +515,7 @@ where
         write!(
             writer,
             "{}  {} {}: ",
-            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            crate::time::Timestamp::now().to_rfc3339_opts(crate::time::SecondsFormat::Micros, true),
             meta.level(),
             meta.target(),
         )?;
@@ -676,7 +676,7 @@ fn write_raw_startup_marker(writer: &mut dyn Write) {
         });
     let line = format!(
         "{} INFO log.runtime [AOE_START_MARKER] version={} pid={pid} boot_id={boot_id} start_id={start_id} exe={exe}\n",
-        chrono::Utc::now().to_rfc3339(),
+        crate::time::Timestamp::now().to_rfc3339(),
         env!("CARGO_PKG_VERSION"),
     );
     let _ = writer.write_all(line.as_bytes());

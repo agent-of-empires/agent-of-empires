@@ -132,7 +132,12 @@ pub(super) async fn requeue_interrupted_monitor(state: &AppState, session_id: &s
     }
     state
         .session_service
-        .set_pending_initial_turn(session_id, MONITOR_RESTART_REMINDER.to_string(), vec![])
+        .set_pending_initial_turn(
+            session_id,
+            MONITOR_RESTART_REMINDER.to_string(),
+            vec![],
+            crate::daemon::PromptOrigin::Aoe,
+        )
         .await;
     tracing::debug!(target: "acp.supervisor", session = %session_id, "queued monitor re-arm reminder");
 }
@@ -966,6 +971,7 @@ mod tests {
                 merged_prompt_ids: Vec::new(),
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
             crate::acp::Event::AgentMessageChunk {
                 text: "woken".into(),
@@ -1150,6 +1156,7 @@ mod tests {
                     prompt_id: None,
                     synthesized: false,
                     origin_plugin: None,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 },
             )
             .unwrap();
@@ -1263,6 +1270,7 @@ mod tests {
                 merged_prompt_ids: Vec::new(),
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
             Event::Stopped {
                 reason: "prompt_complete".into(),

@@ -147,7 +147,8 @@ test("model search focuses on open, handles keyboard selection, and resets after
 
   await modelChip.click();
   await search.fill("sonnet");
-  await page.getByRole("textbox", { name: /Send a message/i }).click();
+  // The composer's corner, clear of the open menu whatever the composer's width.
+  await page.getByRole("textbox", { name: /Send a message/i }).click({ position: { x: 8, y: 8 } });
   await expect(search).toBeHidden();
   await modelChip.click();
   await expect(search).toHaveValue("");

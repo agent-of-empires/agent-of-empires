@@ -298,7 +298,7 @@ fn tree_order<'a>(sessions: &'a [&'a SessionRead]) -> Vec<(&'a SessionRead, usiz
 
 /// The local `aoe list --json` row, filled from a snapshot. The timestamps are
 /// parsed back to instants so the serializer spells them the way the local
-/// command's own `DateTime<Utc>` fields do.
+/// command's own `Timestamp` fields do.
 fn session_json(
     session: &SessionRead,
     profile: &str,
@@ -342,20 +342,17 @@ fn session_json(
     })
 }
 
-fn wire_instant(value: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc>>, ReadFailure> {
+fn wire_instant(value: Option<&str>) -> Result<Option<crate::time::Timestamp>, ReadFailure> {
     value
         .map(|value| {
-            chrono::DateTime::parse_from_rfc3339(value)
-                .map(|parsed| parsed.with_timezone(&chrono::Utc))
+            crate::time::Timestamp::parse_rfc3339(value)
                 .map_err(|_| ReadFailure::post("schema_invalid"))
         })
         .transpose()
 }
 
-fn wire_instant_at(value: &str) -> Result<chrono::DateTime<chrono::Utc>, ReadFailure> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .map(|parsed| parsed.with_timezone(&chrono::Utc))
-        .map_err(|_| ReadFailure::post("schema_invalid"))
+fn wire_instant_at(value: &str) -> Result<crate::time::Timestamp, ReadFailure> {
+    crate::time::Timestamp::parse_rfc3339(value).map_err(|_| ReadFailure::post("schema_invalid"))
 }
 
 fn render_status(
@@ -463,13 +460,13 @@ fn render_show(
             status: &'static str,
             state: &'static str,
             #[serde(skip_serializing_if = "Option::is_none")]
-            trashed_at: Option<chrono::DateTime<chrono::Utc>>,
+            trashed_at: Option<crate::time::Timestamp>,
             #[serde(skip_serializing_if = "Option::is_none")]
-            archived_at: Option<chrono::DateTime<chrono::Utc>>,
+            archived_at: Option<crate::time::Timestamp>,
             #[serde(skip_serializing_if = "Option::is_none")]
-            snoozed_until: Option<chrono::DateTime<chrono::Utc>>,
+            snoozed_until: Option<crate::time::Timestamp>,
             #[serde(skip_serializing_if = "Option::is_none")]
-            pinned_at: Option<chrono::DateTime<chrono::Utc>>,
+            pinned_at: Option<crate::time::Timestamp>,
             #[serde(skip_serializing_if = "Option::is_none")]
             agent_session_id: Option<String>,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -527,7 +524,7 @@ fn render_show(
             output,
             "  State:   {} ({})",
             session.state.as_str(),
-            timestamp.format("%+")
+            timestamp.to_rfc3339()
         );
     }
     output.push_str(&format!("  Profile: {}\n", terminal_text(profile_name)));
@@ -668,7 +665,7 @@ fn render_trash(
             "  {}  {}  (trashed {})",
             session.id,
             terminal_text(&session.title),
-            timestamp.format("%+")
+            timestamp.to_rfc3339()
         );
     }
     Ok(output)
@@ -1129,17 +1126,21 @@ mod tests {
             use crate::session::{WorkspaceInfo, WorkspaceRepo, WorktreeInfo};
 
             let _app = crate::session::test_support::isolate_app_dir();
-            let now = chrono::Utc::now();
-            let instant = |value: &str| chrono::DateTime::parse_from_rfc3339(value).unwrap();
+            let now = crate::time::Timestamp::now();
+            let instant = |value: &str| crate::time::Timestamp::parse_rfc3339(value).unwrap();
             let cases: [(&str, fn(&mut Instance)); 5] = [
                 ("live", |_| {}),
-                ("archived", |i| i.archived_at = Some(chrono::Utc::now())),
+                ("archived", |i| {
+                    i.archived_at = Some(crate::time::Timestamp::now())
+                }),
                 ("trashed", |i| i.trash()),
                 ("snoozed", |i| {
-                    i.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::minutes(5))
+                    i.snoozed_until =
+                        Some(crate::time::Timestamp::now() + crate::time::Duration::minutes(5))
                 }),
                 ("expired snooze", |i| {
-                    i.snoozed_until = Some(chrono::Utc::now() - chrono::Duration::minutes(5))
+                    i.snoozed_until =
+                        Some(crate::time::Timestamp::now() - crate::time::Duration::minutes(5))
                 }),
             ];
             for (label, mutate) in cases {
@@ -1327,9 +1328,9 @@ mod tests {
         }
         #[test]
         fn session_json_mirrors_the_api_snooze_and_pin_keys() {
-            let now = chrono::Utc::now();
-            let future = now + chrono::Duration::minutes(15);
-            let past = now - chrono::Duration::minutes(15);
+            let now = crate::time::Timestamp::now();
+            let future = now + crate::time::Duration::minutes(15);
+            let past = now - crate::time::Duration::minutes(15);
             let row = |f: &dyn Fn(&mut Instance)| {
                 let mut inst = Instance::new("z", "/repo");
                 f(&mut inst);
@@ -2056,7 +2057,8 @@ mod tests {
             runtime_epoch: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
             prebind_instance_id: "11111111-2222-3333-4444-555555555555".into(),
             runtime_instance_id: "66666666-7777-8888-9999-aaaaaaaaaaaa".into(),
-            observed_at: "2026-01-01T00:00:00Z".parse().expect("a pinned instant"),
+            observed_at: crate::time::Timestamp::parse_rfc3339("2026-01-01T00:00:00Z")
+                .expect("a pinned instant"),
         };
         let exchange = record_exchange(&[], RecordedOwner::Remote, &pins);
         let args = ProjectListArgs {
@@ -2133,7 +2135,7 @@ mod tests {
                 runtime_epoch: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
                 prebind_instance_id: "bbbbbbbb-cccc-dddd-eeee-ffffffffffff".into(),
                 runtime_instance_id: "cccccccc-dddd-eeee-ffff-000000000000".into(),
-                observed_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                observed_at: crate::time::Timestamp::parse_rfc3339("2026-01-01T00:00:00Z").unwrap(),
             },
         );
         let hello = super::super::dto::parse_hello(&frames.hello).unwrap();
