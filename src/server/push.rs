@@ -726,15 +726,16 @@ struct Due {
     last_notified: Option<std::time::Instant>,
 }
 
-/// Puts back what `due` consumed: its dwell and the cooldown it started, as if never selected.
+/// Puts back what `due` consumed: the cooldown it started, as nothing was sent, and its dwell
+/// once, as if never selected.
 fn put_back(dwell: &mut HashMap<String, DwellState>, due: Due) {
     let Some(state) = dwell.get_mut(&due.id) else {
         return;
     };
+    state.last_notified = due.last_notified;
     if state.put_back_since.replace(due.since) == Some(due.since) {
         return;
     }
-    state.last_notified = due.last_notified;
     match due.event {
         NotificationEvent::Waiting => state.waiting_since = Some(due.since),
         NotificationEvent::Idle => state.idle_since = Some(due.since),
@@ -2007,9 +2008,10 @@ mod tests {
             selected.push(due.len());
             due.into_iter().for_each(|due| put_back(&mut dwell, due));
         }
+        // 4664770203: a discarded candidate sent nothing, so it leaves no cooldown behind, and the
+        // change's own candidate is selected at the same instant.
         handle_status_change(&mut dwell, change(Status::Error, Status::Error));
-        let past_cooldown = later + std::time::Duration::from_secs(3600);
-        selected.push(due_events(&mut dwell, &watch, past_cooldown).len());
+        selected.push(due_events(&mut dwell, &watch, later).len());
         assert_eq!(selected, [1, 1, 0, 1]);
     }
 
