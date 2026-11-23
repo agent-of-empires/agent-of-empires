@@ -112,6 +112,8 @@ interface Props {
   suggestions?: {
     /** Overrides the sidebar's `readOnly` for the Group. */
     readOnly?: boolean;
+    cityhall?: boolean;
+    onEditPreset?: (providerId: string, criterion: string) => void;
     onPrepare: (prefill: WizardPrefill) => void;
     onViewAll: () => void;
     onOpenSession: (sessionId: string) => void;

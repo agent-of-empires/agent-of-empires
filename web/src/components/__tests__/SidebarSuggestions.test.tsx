@@ -5,15 +5,21 @@ import { SidebarSuggestions } from "../sidebar/SidebarSuggestions";
 import { updateSuggestionPrefs } from "../../lib/api";
 import type { SuggestionItem, SuggestionsSnapshot } from "../../lib/types";
 
-const { fetchSuggestions, startSuggestion } = vi.hoisted(() => ({
+const { fetchSuggestions, startSuggestion, dismissSuggestion, fetchSuggestionProjects } = vi.hoisted(() => ({
   fetchSuggestions: vi.fn(),
   startSuggestion: vi.fn(),
+  dismissSuggestion: vi.fn(),
+  fetchSuggestionProjects: vi.fn(),
 }));
 
 vi.mock("../../lib/api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../lib/api")>()),
   fetchSuggestions,
   startSuggestion,
+  dismissSuggestion,
+  fetchSuggestionProjects,
+  fetchAgents: () => Promise.resolve(null),
+  fetchSuggestionPresets: () => Promise.resolve(null),
 }));
 
 const mk = (n: number, over: Partial<SuggestionItem> = {}): SuggestionItem => ({
@@ -109,14 +115,44 @@ describe("SidebarSuggestions", () => {
     fireEvent.click(toggle);
     const rows = screen.getAllByTestId("sidebar-suggested-row");
     expect(rows.map((r) => r.textContent)).toEqual([
-      "Item 1ex/1 · Assigned to you",
-      "Item 2ex/2 · Assigned to you",
-      "Item 3ex/3 · Assigned to you",
+      "Item 1Startex/1 · Assigned to you",
+      "Item 2Startex/2 · Assigned to you",
+      "Item 3Startex/3 · Assigned to you",
     ]);
     fireEvent.click(screen.getByTestId("sidebar-suggested-view-all"));
     expect(props.onViewAll).toHaveBeenCalled();
     fireEvent.click(rows[0]!);
     expect(startSuggestion).toHaveBeenCalledWith("github", "i1", {});
+  });
+
+  it("a row reads as a Start action and its \u25be menu has the homepage choices", async () => {
+    dismissSuggestion.mockResolvedValue({ ok: true, data: undefined });
+    fetchSuggestions.mockResolvedValue(snap(ITEMS, true));
+    renderIt();
+    fireEvent.click(await screen.findByTestId("sidebar-suggested-toggle"));
+    const row = screen.getByRole("button", { name: "Start a session: Item 1" });
+    expect(row.querySelector("svg")).toBeTruthy();
+    fireEvent.click(screen.getAllByRole("button", { name: "Start options" })[0]!);
+    expect(screen.getAllByRole("menuitem").map((m) => m.textContent)).toEqual([
+      "Start with changesOpens the New session dialog, prefilled",
+      "Copy prompt",
+      "Open in GitHub \u2197",
+      "Dismiss",
+    ]);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Dismiss" }));
+    await waitFor(() => expect(dismissSuggestion).toHaveBeenCalledWith("github", "i1", true));
+  });
+
+  it("a repo with no Project opens Start in\u2026 from the row", async () => {
+    fetchSuggestionProjects.mockResolvedValue([{ name: "aoe", path: "/work/aoe" }]);
+    fetchSuggestions.mockResolvedValue(snap([mk(1, { mapping_key: "acme/web" })], true));
+    renderIt();
+    fireEvent.click(await screen.findByTestId("sidebar-suggested-toggle"));
+    fireEvent.click(screen.getByRole("button", { name: "Start in a Project: Item 1" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: /aoe/ }));
+    await waitFor(() =>
+      expect(startSuggestion).toHaveBeenCalledWith("github", "i1", { project: { path: "/work/aoe" } }),
+    );
   });
 
   it("shows the hooks review when a start needs trust, and resumes with the approval", async () => {
@@ -153,7 +189,7 @@ describe("SidebarSuggestions", () => {
     fireEvent.click(screen.getAllByTestId("sidebar-suggested-row")[0]!);
     await waitFor(() =>
       expect(screen.getAllByTestId("sidebar-suggested-row")[0]!.textContent).toBe(
-        "Item 1Couldn't start: Docker isn't running. Start it, then try again.",
+        "Item 1StartCouldn't start: Docker isn't running. Start it, then try again.",
       ),
     );
   });
@@ -164,7 +200,7 @@ describe("SidebarSuggestions", () => {
     renderIt();
     fireEvent.click(await screen.findByTestId("sidebar-suggested-toggle"));
     expect(screen.getAllByTestId("sidebar-suggested-row").map((r) => r.textContent)).toEqual([
-      "Item 2ex/2 · Assigned to you",
+      "Item 2Startex/2 · Assigned to you",
     ]);
     expect(screen.getByTestId("sidebar-suggested-toggle").textContent).toBe("Suggested (1)");
     cleanup();

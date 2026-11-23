@@ -1,4 +1,4 @@
-import { copySuggestionPrompt, startSummary } from "../lib/suggestionPlan";
+import { startMenuFor } from "../lib/suggestionPlan";
 import { suggestionKey, type useSuggestions } from "../hooks/useSuggestions";
 import type { SuggestionItem, SuggestionPresetEntry, SuggestionsSnapshot } from "../lib/types";
 import { SuggestionActions } from "./SuggestionRow";
@@ -36,7 +36,6 @@ export function SuggestionItemActions({
   const key = suggestionKey(item);
   const provider = snapshot.providers.find((p) => p.id === item.provider_id);
   const providerName = provider?.name ?? item.provider_id;
-  const kindLabel = provider?.sources.find((s) => s.criterion === item.criterion)?.label;
   const linked = !!item.resolved_project;
   return (
     <SuggestionActions
@@ -63,16 +62,12 @@ export function SuggestionItemActions({
       menu={
         item.dismissed
           ? undefined
-          : {
-              uses: startSummary(item, presetOf(item.provider_id, item.criterion)?.preset, agentName),
-              providerName,
-              sourceUrl: item.source_url,
-              kindLabel,
-              onStartWithChanges: () => void ctrl.startWithChanges(item),
-              onCopyPrompt: () => void copySuggestionPrompt(item),
-              onEditPreset:
-                onEditPreset && kindLabel ? () => onEditPreset(item.provider_id, item.criterion) : undefined,
-            }
+          : startMenuFor(item, snapshot, {
+              startWithChanges: (it) => void ctrl.startWithChanges(it),
+              agentName,
+              presetOf,
+              onEditPreset,
+            })
       }
       started={
         item.started_session && {

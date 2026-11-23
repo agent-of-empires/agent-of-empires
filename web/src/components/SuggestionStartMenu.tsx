@@ -101,6 +101,11 @@ export interface StartMenuProps {
   onEditPreset?: () => void;
   /** Why the whole menu is off (read-only or CityHall); its title. */
   locked?: string;
+  /** Adds Dismiss, for a row with no ✕ of its own (the sidebar). */
+  onDismiss?: () => void;
+  align?: "left" | "right";
+  /** Replaces the bordered chevron's classes. */
+  triggerClassName?: string;
 }
 
 /** The ▾ next to Start. ↓ or Enter on the button opens it. */
@@ -114,10 +119,14 @@ export function StartMenu({
   onCopyPrompt,
   onEditPreset,
   locked,
+  onDismiss,
+  align,
+  triggerClassName = `${CHEVRON_BUTTON} w-8`,
 }: StartMenuProps) {
   return (
     <MenuPopover
       label="Start options"
+      align={align}
       trigger={({ open, toggle }) => (
         <button
           type="button"
@@ -133,7 +142,7 @@ export function StartMenu({
               toggle();
             }
           }}
-          className={`${CHEVRON_BUTTON} w-8`}
+          className={triggerClassName}
         >
           <ChevronDown className="h-4 w-4" />
         </button>
@@ -197,6 +206,23 @@ export function StartMenu({
               <span className="block text-[11px] text-text-dim">Settings › Suggestions</span>
             </button>
           )}
+          {onDismiss && (
+            <>
+              <hr className="my-1 border-surface-700/60" />
+              <button
+                type="button"
+                role="menuitem"
+                disabled={disabled}
+                className={MENU_ITEM}
+                onClick={() => {
+                  close();
+                  onDismiss();
+                }}
+              >
+                Dismiss
+              </button>
+            </>
+          )}
         </>
       )}
     </MenuPopover>
@@ -208,10 +234,15 @@ export function StartInMenu({
   disabled,
   title,
   onPick,
+  align,
+  renderTrigger = (p) => <StartInTrigger {...p} />,
 }: {
   disabled: boolean;
   title?: string;
   onPick: (path: string) => void;
+  align?: "left" | "right";
+  /** Replaces the "Start in… ▾" button, e.g. with a whole sidebar row. */
+  renderTrigger?: (props: { open: boolean; disabled: boolean; title?: string; onToggle: () => void }) => ReactNode;
 }) {
   const [projects, setProjects] = useState<SuggestionProject[] | null>(null);
   const [failed, setFailed] = useState(false);
@@ -230,17 +261,18 @@ export function StartInMenu({
   return (
     <MenuPopover
       label="Start in a Project"
-      trigger={({ open, toggle }) => (
-        <StartInTrigger
-          open={open}
-          disabled={disabled}
-          title={title}
-          onToggle={() => {
+      align={align}
+      trigger={({ open, toggle }) =>
+        renderTrigger({
+          open,
+          disabled,
+          title,
+          onToggle: () => {
             if (!open) load();
             toggle();
-          }}
-        />
-      )}
+          },
+        })
+      }
     >
       {(close) =>
         projects === null ? (

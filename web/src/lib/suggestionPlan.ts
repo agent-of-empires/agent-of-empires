@@ -1,7 +1,15 @@
 import { prepareSuggestion } from "./api";
 import { OFFLINE_TITLE } from "./connectionState";
 import { reportError, reportInfo } from "./toastBus";
-import type { SessionResponse, StartedSession, SuggestionItem, SuggestionPreset } from "./types";
+import type {
+  SessionResponse,
+  StartedSession,
+  SuggestionItem,
+  SuggestionPreset,
+  SuggestionPresetEntry,
+  SuggestionsSnapshot,
+} from "./types";
+import type { StartMenuProps } from "../components/SuggestionStartMenu";
 
 /** "agent-of-empires · Claude Code · Structured view · worktree", what Start will run for the item. */
 export function startSummary(
@@ -54,4 +62,29 @@ export async function copySuggestionPrompt(item: Pick<SuggestionItem, "provider_
   } catch {
     reportError("Could not copy the prompt.");
   }
+}
+
+/** The \u25be menu of a suggestion that is not started yet, shared by every view. */
+export function startMenuFor(
+  item: SuggestionItem,
+  snapshot: SuggestionsSnapshot,
+  opts: {
+    startWithChanges: (item: SuggestionItem) => void;
+    agentName: (id: string) => string;
+    presetOf: (providerId: string, criterion: string) => SuggestionPresetEntry | undefined;
+    onEditPreset?: (providerId: string, criterion: string) => void;
+  },
+): Omit<StartMenuProps, "disabled"> {
+  const provider = snapshot.providers.find((p) => p.id === item.provider_id);
+  const kindLabel = provider?.sources.find((s) => s.criterion === item.criterion)?.label;
+  return {
+    uses: startSummary(item, opts.presetOf(item.provider_id, item.criterion)?.preset, opts.agentName),
+    providerName: provider?.name ?? item.provider_id,
+    sourceUrl: item.source_url,
+    kindLabel,
+    onStartWithChanges: () => opts.startWithChanges(item),
+    onCopyPrompt: () => void copySuggestionPrompt(item),
+    onEditPreset:
+      opts.onEditPreset && kindLabel ? () => opts.onEditPreset!(item.provider_id, item.criterion) : undefined,
+  };
 }
