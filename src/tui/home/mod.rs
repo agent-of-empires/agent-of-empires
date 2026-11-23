@@ -248,9 +248,10 @@ impl PendingStructuredInput {
         self.draft.pop();
     }
 
-    /// An empty Enter submits nothing, matching the composer it replays into.
+    /// An empty Enter submits nothing, matching the composer it replays into,
+    /// which trims the text before it decides.
     pub(super) fn submit(&mut self) {
-        if !self.draft.is_empty() {
+        if !self.draft.trim().is_empty() {
             self.completed.push(std::mem::take(&mut self.draft));
         }
     }

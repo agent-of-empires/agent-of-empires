@@ -2589,6 +2589,11 @@ impl App {
         }
         let (completed, draft) = pending.into_parts();
         let mut unsent = completed;
+        // Text the composer holds when the row opens is the reader's own: it was
+        // typed after the last frozen segment. Replaying onto it would submit
+        // both as one prompt, and a blocked send would take it away, so it waits
+        // in the draft the replay ends on.
+        let mut draft = draft;
         // Set when an Enter brought no submit: replaying the next segment would
         // land on text the composer still holds, so the rest waits for the next
         // mount. Every segment stays in `unsent` while that is set.
@@ -2609,6 +2614,10 @@ impl App {
                 if !restored.is_empty() {
                     unsent.insert(0, restored);
                 }
+            }
+            let held = view.take_held_text();
+            if !held.is_empty() {
+                draft = format!("{held}{draft}");
             }
             // Each segment was frozen when its Enter fell, so replaying them in
             // order submits exactly what the user had typed before each Enter.
@@ -4343,6 +4352,46 @@ mod tests {
         );
         assert_eq!(view.composer_text(), "");
         assert!(!app.home.pending_paste_for_structured_view.contains_key(&id));
+    }
+
+    /// Text the reader typed after the last frozen segment is theirs: a replay
+    /// must not paste onto it, and a blocked send must not take it away.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reader_text_in_the_composer_is_not_replayed_with_the_held_segment() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let (mut app, _guard, id) = app_on_a_structured_row();
+        app.home.structured_preview = Some(EmbeddedView::for_test(&id));
+        app.home.pending_paste_for_structured_view.insert(
+            id.clone(),
+            PendingStructuredInput::from_parts(vec!["frozen".into()], String::new()),
+        );
+
+        // The reader typed in the mounted composer, and the submit lock is held,
+        // so the replay cannot send the frozen segment either.
+        let view = app.home.structured_preview.as_mut().expect("mounted");
+        view.paste_text_with_file_load("also do X").await;
+        view.accept_submits_for_test(0);
+        app.drain_pending_paste_for_structured_view(&id).await;
+
+        assert_eq!(
+            app.home
+                .structured_preview
+                .as_ref()
+                .expect("mounted")
+                .submitted_prompts(),
+            ["frozen".to_string()],
+            "the segment goes out alone rather than merged with the reader's text"
+        );
+        assert_eq!(
+            app.home
+                .pending_paste_for_structured_view
+                .get(&id)
+                .map(PendingStructuredInput::text)
+                .as_deref(),
+            Some("frozenalso do X"),
+            "the reader's text is kept as the draft after the segment, not merged into it"
+        );
     }
 
     /// A refused segment belongs to its row's buffer, so leaving the row takes

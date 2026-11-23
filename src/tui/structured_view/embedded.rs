@@ -494,6 +494,13 @@ impl EmbeddedView {
         }
     }
 
+    /// Drain the composer into the caller's buffer. The replay parks text the
+    /// composer already holds, so it lands on an empty composer and a blocked
+    /// send takes only the segment it pasted.
+    pub(crate) fn take_held_text(&mut self) -> String {
+        self.state.take_composer_text()
+    }
+
     /// Take back whatever the view left in its composer after an Enter it did not
     /// submit, whether the daemon refused it or the submit lock held it, so the
     /// caller's buffer is the segment's only owner.

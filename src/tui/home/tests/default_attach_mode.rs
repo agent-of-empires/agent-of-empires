@@ -735,6 +735,19 @@ fn send_message_merges_buffered_paste_for_same_session() {
     );
 }
 
+/// A whitespace-only Enter freezes nothing: the composer trims the text and
+/// sends nothing, so a frozen segment of spaces would stop the replay on every
+/// mount and hold back the segments after it.
+#[test]
+fn a_whitespace_only_enter_freezes_no_segment() {
+    let mut pending = crate::tui::home::PendingStructuredInput::default();
+    pending.push_str("   ");
+    pending.submit();
+    let (completed, draft) = pending.into_parts();
+    assert!(completed.is_empty(), "no segment for what submits nothing");
+    assert_eq!(draft, "   ", "the text stays the draft the reader can edit");
+}
+
 /// A paste captured for another structured session gets its own entry, so the earlier
 /// target's unsent draft survives and neither session's draft leaks into the other.
 #[test]
