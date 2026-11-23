@@ -153,7 +153,17 @@ async fn single_profile_mode_scopes_disk_watch_but_not_config_watch() {
         "active-only",
         &["active-only", "peer-one", "peer-two", "peer-deleted"],
     );
-    e.view.reload_storage_only().expect("reload");
+    e.view
+        .session_feed
+        .publish_for_test(crate::tui::session_feed::SessionFeedResult::Snapshot(
+            std::sync::Arc::new(super::tests::fixture_snapshot(
+                Vec::new(),
+                "active-only",
+                "test",
+                0,
+            )),
+        ));
+    e.view.reload_storage_only();
     let keys: Vec<_> = e.view.disk_watch.handles.keys().collect();
     assert_eq!(keys, ["active-only"]);
     assert!(has_config_watch(&e.view, "peer-one"));
@@ -175,7 +185,7 @@ async fn reload_failure_dialog_waits_until_live_send_exits() {
     let view = &mut e.view;
     view.live_send = Some(live_send_state("active", "active", "aoe_test_live_failure"));
     view.reload_failure_state
-        .record_storage(&Err(anyhow::anyhow!("disk unreadable")));
+        .record_config(&Err(anyhow::anyhow!("config unreadable")));
 
     assert!(!view.try_present_reload_failure_dialog());
     assert!(view.info_dialog.is_none());
@@ -239,7 +249,6 @@ async fn rewire_fast_path_preserves_relevant_latch_and_clears_stale_one() {
 
 #[derive(Clone, Copy)]
 enum Slot {
-    Storage,
     Config,
     DiskInit,
     ConfigInit,
@@ -258,14 +267,8 @@ fn run_steps(name: &str, steps: Vec<Step>) -> ReloadFailureState {
     let mut s = ReloadFailureState::default();
     for (i, step) in steps.into_iter().enumerate() {
         match step {
-            Step::Fail(Slot::Storage) => {
-                assert!(!s.record_storage(&Err(anyhow::anyhow!("storage err"))));
-            }
             Step::Fail(Slot::Config) => {
                 assert!(!s.record_config(&Err(anyhow::anyhow!("config err"))));
-            }
-            Step::Heal(Slot::Storage) => {
-                s.record_storage(&Ok(()));
             }
             Step::Heal(Slot::Config) => {
                 s.record_config(&Ok(()));
@@ -295,16 +298,21 @@ fn reload_failure_ack_latch() {
         (
             "recovery clears the failure and the ack latch",
             vec![
-                Fail(Storage),
+                Fail(Config),
                 Ack,
                 Expect(false, true),
-                Heal(Storage),
+                Heal(Config),
                 Expect(false, false),
             ],
         ),
         (
             "a new source failing in an acked burst re-arms",
-            vec![Fail(Storage), Ack, Fail(Config), Expect(true, true)],
+            vec![
+                Fail(Config),
+                Ack,
+                InitErr(DiskInit, watcher_err(Some("d"), "disk")),
+                Expect(true, true),
+            ],
         ),
         (
             "init slots clear independently",
@@ -423,8 +431,8 @@ fn reload_failure_ack_latch() {
     }
 
     let mut s = ReloadFailureState::default();
-    assert!(!s.record_storage(&Err(anyhow::anyhow!("x"))));
-    assert!(s.record_storage(&Ok(())), "failed-to-ok edge returns true");
+    assert!(!s.record_config(&Err(anyhow::anyhow!("x"))));
+    assert!(s.record_config(&Ok(())), "failed-to-ok edge returns true");
 }
 
 /// A same-path dir recreated with a new inode forces both rewires to rebuild the entry.

@@ -54,7 +54,7 @@ async fn canonical_archive_merges_peer_fields_rows_groups_and_timestamp() {
     );
     assert_eq!(view.get_instance(&victim.id).unwrap().extra_args, "--peer");
     assert!(view.get_instance(&peer.id).is_some());
-    view.reload().unwrap();
+    view.reload();
     assert_eq!(payload_bytes("test"), committed_bytes);
 }
 
@@ -294,7 +294,7 @@ async fn canonical_peer_deleted_rows_and_cleared_sid_are_not_resurrected() {
         .agent_session_id
         .is_none());
     assert_eq!(view.get_instance(&victim.id).unwrap().group_path, "changed");
-    view.reload().unwrap();
+    view.reload();
     assert_eq!(payload_bytes("test"), bytes);
 }
 
@@ -402,7 +402,7 @@ async fn native_delete_admission_does_not_take_lifecycle_flock_and_only_snapshot
             apply_published(&mut view, &state).await;
         }
         assert!(view.get_instance(&victim.id).is_none());
-        view.reload().unwrap();
+        view.reload();
         assert_eq!(payload_bytes("test"), committed);
     }
 }

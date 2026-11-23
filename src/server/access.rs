@@ -435,6 +435,7 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("POST", "/api/telemetry/consent"),
     ("POST", "/api/telemetry/reset-id"),
     ("POST", "/api/telemetry/seen"),
+    ("POST", "/api/telemetry/feature-use"),
     ("POST", "/api/telemetry/structured-interaction"),
     // Ephemeral foreground-presence heartbeat. Does not mutate user data.
     ("POST", "/api/presence"),

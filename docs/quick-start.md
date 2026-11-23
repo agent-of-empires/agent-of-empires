@@ -8,7 +8,7 @@ aoe
 
 The TUI starts or reuses the local Daemon through its private Unix socket and reads canonical session rows from it. Starting the TUI does not open a web listener. The shared Daemon keeps running when you quit the TUI; `aoe serve --stop` stops it.
 
-If startup or connection fails, the TUI shows the diagnostic and masks daemon-owned session state. Press `r` to reconnect or retry local startup after fixing the cause, or `q` to quit. A Daemon left over from before an upgrade shows as **Outdated** instead: when aoe can restart it, `r` does so in place and reconnects; otherwise the dialog says how and `r` checks again. See [Starting the server](guides/web-dashboard.md#starting-the-server).
+If no Daemon can be reached or started, `aoe` exits with the error. If the connection drops later, the TUI shows the diagnostic and masks daemon-owned session state. Press `r` to reconnect after fixing the cause, or `q` to quit. A Daemon left over from before an upgrade shows as **Outdated** instead: when aoe can restart it, `r` does so in place and reconnects; otherwise the dialog says how and `r` checks again. See [Starting the server](guides/web-dashboard.md#starting-the-server).
 
 | Key | Action |
 |-----|--------|
@@ -37,10 +37,11 @@ The CLI asks the Daemon to provision and save the session. A terminal-view sessi
 `Ctrl+b d` detaches back to the TUI. Inside tmux, attaching switches your client to the
 agent's tmux session; `Ctrl+b L` switches back.
 
-`aoe add` starts a local Daemon when needed. Use `--no-autostart` to require one already
-running. With `--daemon-url` or `AOE_DAEMON_URL`, creation runs only on the selected
-Daemon, never locally if that connection fails. Pass an absolute path on that host,
-or `--scratch`; registered `--project` names and agent settings also come from that host.
+`aoe` and `aoe add` start a local Daemon when needed. Use `--no-autostart` to require one
+already running; without one, the TUI refuses to open. With `--daemon-url` or
+`AOE_DAEMON_URL`, creation runs only on the selected Daemon, never locally if that
+connection fails. Pass an absolute path on that host, or `--scratch`; registered
+`--project` names and agent settings also come from that host.
 `--hook-env KEY` explicitly reads that client variable; no other client environment is sent.
 For a remote terminal session without `--launch`, run the printed start command on the
 Daemon host, not on the client machine. You can also start it from the Daemon dashboard.

@@ -3084,7 +3084,7 @@ pub struct UpdatesConfig {
     )]
     pub update_check_mode: UpdateCheckMode,
 
-    /// Auto-update installed external plugins at TUI and `aoe serve` startup.
+    /// Auto-update installed external plugins when the Daemon (`aoe serve`) starts.
     /// Off by default. The sweep applies only updates that need no new consent;
     /// any version that changes capabilities, build steps, or UI slots is left
     /// for a manual `aoe plugin update` so its new grant is reviewed.
@@ -3096,7 +3096,7 @@ pub struct UpdatesConfig {
         label = "Update plugins automatically",
         widget = "toggle",
         global_only,
-        summary = "When AoE starts. Installs plugin updates that don't ask for anything new. Updates that need new permissions still wait for you. Applies to every Profile."
+        summary = "When the Daemon starts. Installs plugin updates that don't ask for anything new. Updates that need new permissions still wait for you. Applies to every Profile."
     )]
     pub auto_update_plugins: bool,
 }
