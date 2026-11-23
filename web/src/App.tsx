@@ -688,6 +688,11 @@ function AppContent({
     for (const p of pluginPanes) m.set(p.id, p);
     return m;
   }, [pluginPanes]);
+  // With plugin auto-open on, loaded plugin panes show as tabs unless the user closed them.
+  const autoPlugins = useMemo(
+    () => (panelDefaults.plugins ? pluginPanes.map((p) => ({ id: p.id, defaultDock: p.defaultDock })) : []),
+    [panelDefaults.plugins, pluginPanes],
+  );
   // A persisted tab is visible only if its backing pane currently exists: diff
   // and terminals always do; a plugin tab does only while its plugin is loaded.
   const tabAvailable = useCallback(
@@ -704,17 +709,8 @@ function AppContent({
     placeTab,
     toggleKind,
     togglePlugin,
-    syncPlugins,
     setDockCollapsed,
-  } = usePaneLayout(activeSessionId, activeOutsideRepository, panelDefaults, tabAvailable);
-
-  // Auto-add newly available plugin panes as tabs in their default dock; the
-  // layout suppresses any the user explicitly closed. Adding one saves the
-  // layout, so wait for the Session row: a non-git seed must never keep Diff (#4574).
-  useEffect(() => {
-    if (activeOutsideRepository === null || !panelDefaults.plugins) return;
-    syncPlugins(pluginPanes.map((p) => ({ id: p.id, defaultDock: p.defaultDock })));
-  }, [pluginPanes, syncPlugins, panelDefaults.plugins, activeOutsideRepository]);
+  } = usePaneLayout(activeSessionId, activeOutsideRepository, panelDefaults, autoPlugins, tabAvailable);
 
   // One-shot lookup from plugin id to its manifest identity (icon name +
   // icon_asset URL), so a pane gets a real identity glyph, up to the plugin's

@@ -21,6 +21,7 @@ import {
   sweepOrphanPaneLayouts,
   syncPluginTabs,
   usePaneLayout,
+  type AutoPane,
   type DockLayout,
   type PlaceTarget,
 } from "../paneLayout";
@@ -144,9 +145,12 @@ const V3_KEY = "aoe-pane-layout-v3";
 const persistV3 = (sessions: Record<string, unknown>) =>
   localStorage.setItem(V3_KEY, JSON.stringify({ version: 3, sessions }));
 const savedSessions = () => Object.keys(JSON.parse(localStorage.getItem(V3_KEY) ?? "{}").sessions ?? {});
+const NO_PLUGINS: AutoPane[] = [];
+const PLUGIN: AutoPane[] = [{ id: "plugin:p:a", defaultDock: "right" }];
 
 describe("usePaneLayout persistence", () => {
-  const hook = (session = "s1", prefs = CLOSED) => renderHook(() => usePaneLayout(session, false, prefs)).result;
+  const hook = (session = "s1", prefs = CLOSED) =>
+    renderHook(() => usePaneLayout(session, false, prefs, NO_PLUGINS)).result;
   const persistGroups = (
     right: { tabs: string[]; active: string }[],
     bottom: { tabs: string[]; active: string }[] = [],
@@ -165,12 +169,33 @@ describe("usePaneLayout persistence", () => {
     ]);
   });
 
-  it("syncPlugins adds a tab without revealing a collapsed dock", () => {
-    const result = hook();
+  it("shows an auto-opened plugin without saving it, and saves it with the user's next change", () => {
+    const { result, rerender } = renderHook(({ prefs }) => usePaneLayout("s1", false, prefs, PLUGIN), {
+      initialProps: { prefs: CLOSED },
+    });
+    expect(dockTabs(result.current.layout, "right")).toEqual(["plugin:p:a"]);
+    rerender({ prefs: OPEN });
+    expect(dockTabs(result.current.layout, "right")).toEqual(["diff", "terminal:0", "plugin:p:a"]);
+    expect(savedSessions()).toEqual([]);
+
     act(() => result.current.setDockCollapsed("right", true));
-    act(() => result.current.syncPlugins([{ id: "plugin:p:a", defaultDock: "right" }]));
-    expect(dockOf(result.current.layout, "plugin:p:a")).toBe("right");
+    expect(JSON.parse(localStorage.getItem(V3_KEY)!).sessions.s1.right[0].tabs).toEqual([
+      "diff",
+      "terminal:0",
+      "plugin:p:a",
+    ]);
     expect(isDockCollapsed(result.current.layout, "right")).toBe(true);
+  });
+
+  it("adds a newly loaded plugin to a saved layout unless the user closed it", () => {
+    const { result, rerender } = renderHook(({ plugins }) => usePaneLayout("s1", false, CLOSED, plugins), {
+      initialProps: { plugins: NO_PLUGINS },
+    });
+    act(() => result.current.toggleKind("terminal", "right"));
+    rerender({ plugins: PLUGIN });
+    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:0", "plugin:p:a"]);
+    act(() => result.current.closeTab("plugin:p:a"));
+    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:0"]);
   });
 
   it.each([
@@ -212,10 +237,9 @@ describe("usePaneLayout persistence", () => {
   });
 
   it("saves nothing until the user changes a layout, so the defaults keep applying", () => {
-    const { result, rerender } = renderHook(({ prefs }) => usePaneLayout("s1", false, prefs), {
+    const { result, rerender } = renderHook(({ prefs }) => usePaneLayout("s1", false, prefs, NO_PLUGINS), {
       initialProps: { prefs: OPEN },
     });
-    act(() => result.current.syncPlugins([]));
     expect(savedSessions()).toEqual([]);
     rerender({ prefs: CLOSED });
     expect(dockTabs(result.current.layout, "right")).toEqual([]);
@@ -238,6 +262,29 @@ describe("usePaneLayout persistence", () => {
   });
 });
 
+describe("usePaneLayout upgrade from v2", () => {
+  const V2_KEY = "aoe-pane-layout-v2";
+  const shells = (l: DockLayout) => [dockTabs(l, "right"), dockTabs(l, "bottom"), l.nextTerminalIndex];
+
+  it("keeps the terminals of a v2 Session so a new tab never reuses a live shell, and writes v3 before deleting v2", () => {
+    let terminals = layout(["diff", "terminal:0"]);
+    terminals = addTerminal(terminals, "right").layout;
+    terminals = addTerminal(terminals, "bottom").layout;
+    localStorage.setItem(
+      V2_KEY,
+      JSON.stringify({ version: 2, template: emptyLayout(), sessions: { s1: terminals, s2: layout(["diff"]) } }),
+    );
+    const { result } = renderHook(() => usePaneLayout("s1", false, CLOSED, NO_PLUGINS));
+    expect(shells(result.current.layout)).toEqual([["diff", "terminal:0", "terminal:1"], ["terminal:2"], 3]);
+
+    act(() => sweepOrphanPaneLayouts(new Set(["s1", "s2"])));
+    expect(savedSessions()).toEqual(["s1"]);
+    expect(localStorage.getItem(V2_KEY)).toBeNull();
+    act(() => result.current.addTerminal("right"));
+    expect(dockTabs(result.current.layout, "right")).toContain("terminal:3");
+  });
+});
+
 describe("usePaneLayout outside a repository (#4574)", () => {
   it.each([
     // [outside, terminal default, seeded tabs]
@@ -247,12 +294,12 @@ describe("usePaneLayout outside a repository (#4574)", () => {
     [true, true, ["terminal:0"]],
     [true, false, []],
   ])("outside=%s terminal=%s seeds %o with the Diff default on", (outside, terminal, expected) => {
-    const { result } = renderHook(() => usePaneLayout("s1", outside, { diff: true, terminal }));
+    const { result } = renderHook(() => usePaneLayout("s1", outside, { diff: true, terminal }, NO_PLUGINS));
     expect(dockTabs(result.current.layout, "right")).toEqual(expected);
   });
 
   it("saves what was shown when the user acts while status is unknown", () => {
-    const { result, rerender } = renderHook(({ outside }) => usePaneLayout("s1", outside, OPEN), {
+    const { result, rerender } = renderHook(({ outside }) => usePaneLayout("s1", outside, OPEN, NO_PLUGINS), {
       initialProps: { outside: null as boolean | null },
     });
     act(() => result.current.openTab("plugin:p:a", "right"));
@@ -264,7 +311,7 @@ describe("usePaneLayout outside a repository (#4574)", () => {
   });
 
   it("applies a flag that arrives after seeding, but never closes a Diff the user opened", () => {
-    const { result, rerender } = renderHook(({ outside }) => usePaneLayout("s1", outside, OPEN), {
+    const { result, rerender } = renderHook(({ outside }) => usePaneLayout("s1", outside, OPEN, NO_PLUGINS), {
       initialProps: { outside: false },
     });
     expect(dockTabs(result.current.layout, "right")).toContain("diff");
@@ -307,7 +354,7 @@ describe("usePaneLayout file edit guard", () => {
     const release = registerFileEditor(key, "files", discard);
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
     return {
-      result: renderHook(() => usePaneLayout("s1", false, CLOSED, tabAvailable)).result,
+      result: renderHook(() => usePaneLayout("s1", false, CLOSED, NO_PLUGINS, tabAvailable)).result,
       discard,
       release,
       confirm,

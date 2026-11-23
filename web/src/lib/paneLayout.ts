@@ -6,8 +6,9 @@ import { safeGetItem, safeRemoveItem, safeSetItem } from "./safeStorage";
 import { BUILTIN_PANES, isTerminalTabId, terminalTabId, type DockLocation } from "./panes";
 
 const LAYOUT_KEY = "aoe-pane-layout-v3";
-// Earlier layout stores, replaced without migrating and deleted to free quota.
-const REPLACED_KEYS = ["aoe-pane-layout-v2", "aoe-pane-layout", "aoe-right-collapsed"];
+const V2_KEY = "aoe-pane-layout-v2";
+// Earlier layout stores, deleted once v3 is written to free quota.
+const REPLACED_KEYS = [V2_KEY, "aoe-pane-layout", "aoe-right-collapsed"];
 
 /** `"diff"`, `"terminal:<n>"`, or `"plugin:<plugin>:<entry>"`. */
 export type TabId = string;
@@ -240,7 +241,10 @@ export function removeAllTerminals(layout: DockLayout): DockLayout {
 }
 
 /** Add available plugin panes that are neither open nor closed, leaving open ones in place. */
-export function syncPluginTabs(layout: DockLayout, available: { id: TabId; defaultDock: DockLocation }[]): DockLayout {
+export function syncPluginTabs(
+  layout: DockLayout,
+  available: readonly { id: TabId; defaultDock: DockLocation }[],
+): DockLayout {
   let next = layout;
   for (const p of available) {
     if (dockOf(next, p.id)) continue;
@@ -314,29 +318,43 @@ function normalizeDock(v: unknown): DockLayout {
   };
 }
 
-function parseStore(raw: string | null): LayoutStore {
+function parseSessions(raw: string | null, version: 2 | 3): Record<string, DockLayout> {
   try {
     const parsed = JSON.parse(raw ?? "null") as Record<string, unknown> | null;
-    if (parsed?.version !== 3) return { version: 3, sessions: {} };
+    if (parsed?.version !== version) return {};
     const sessions: Record<string, DockLayout> = {};
     for (const [id, layout] of Object.entries((parsed.sessions ?? {}) as Record<string, unknown>)) {
       sessions[id] = normalizeDock(layout);
     }
-    return { version: 3, sessions };
+    return sessions;
   } catch {
-    return { version: 3, sessions: {} };
+    return {};
   }
 }
 
+/** v3 if written, else the v2 layouts whose added terminals may still be live shells: keeping their tab ids and
+ *  next index stops a new tab from reusing one. Other v2 layouts were seeds or simple toggles and are dropped. */
+function loadStore(): LayoutStore {
+  const raw = safeGetItem(LAYOUT_KEY);
+  if (raw !== null) return { version: 3, sessions: parseSessions(raw, 3) };
+  const v2 = Object.entries(parseSessions(safeGetItem(V2_KEY), 2)).filter(([, l]) => l.nextTerminalIndex > 1);
+  return { version: 3, sessions: Object.fromEntries(v2) };
+}
+
 const listeners = new Set<() => void>();
-let cachedRaw: string | null | undefined;
+let cachedSource: string | undefined;
 let cachedStore: LayoutStore = { version: 3, sessions: {} };
 
-function readStore(): LayoutStore {
+function storedSource(): string {
   const raw = safeGetItem(LAYOUT_KEY);
-  if (raw !== cachedRaw) {
-    cachedRaw = raw;
-    cachedStore = parseStore(raw);
+  return raw !== null ? `3:${raw}` : `2:${safeGetItem(V2_KEY) ?? ""}`;
+}
+
+function readStore(): LayoutStore {
+  const source = storedSource();
+  if (source !== cachedSource) {
+    cachedSource = source;
+    cachedStore = loadStore();
   }
   return cachedStore;
 }
@@ -348,7 +366,7 @@ function updateStore(fn: (s: LayoutStore) => LayoutStore): void {
   // A failed write keeps the change in memory rather than re-reading the stale copy.
   safeSetItem(LAYOUT_KEY, JSON.stringify(next));
   cachedStore = next;
-  cachedRaw = safeGetItem(LAYOUT_KEY);
+  cachedSource = storedSource();
   for (const l of listeners) l();
 }
 
@@ -357,13 +375,15 @@ function subscribe(listener: () => void): () => void {
   return () => void listeners.delete(listener);
 }
 
-/** Drops saved layouts of Sessions not in `live`, and the stores this one replaced. */
+/** Drops saved layouts of Sessions not in `live`, writes v3 if it was read from v2, then deletes the old stores. */
 export function sweepOrphanPaneLayouts(live: ReadonlySet<string>): void {
-  for (const key of REPLACED_KEYS) safeRemoveItem(key);
+  const upgrading = safeGetItem(LAYOUT_KEY) === null;
   updateStore((s) => {
     const kept = Object.entries(s.sessions).filter(([id]) => live.has(id));
-    return kept.length === Object.keys(s.sessions).length ? s : { version: 3, sessions: Object.fromEntries(kept) };
+    const unchanged = kept.length === Object.keys(s.sessions).length;
+    return unchanged && !upgrading ? s : { version: 3, sessions: Object.fromEntries(kept) };
   });
+  if (safeGetItem(LAYOUT_KEY) !== null) for (const key of REPLACED_KEYS) safeRemoveItem(key);
 }
 
 export interface PaneLayoutApi {
@@ -378,7 +398,6 @@ export interface PaneLayoutApi {
   placeTab: (tabId: TabId, target: PlaceTarget) => void;
   toggleKind: (kind: "diff" | "terminal" | "agents" | "files", defaultDock: DockLocation) => void;
   togglePlugin: (id: TabId, defaultDock: DockLocation) => void;
-  syncPlugins: (available: { id: TabId; defaultDock: DockLocation }[]) => void;
   setDockCollapsed: (dock: DockLocation, collapsed: boolean) => void;
 }
 
@@ -405,36 +424,45 @@ function terminalTabs(layout: DockLayout): { id: TabId; dock: DockLocation }[] {
   );
 }
 
-/** `outsideRepository` drops Diff from the seed; `null` (not yet known) seeds no Diff. */
+export type AutoPane = { id: TabId; defaultDock: DockLocation };
+
+/**
+ * Shows the saved layout, or the seed, plus `autoPlugins` the user has not closed. Only a user change saves,
+ * so the defaults keep reaching every other Session. `outsideRepository` drops Diff from the seed; `null`
+ * (not yet known) seeds no Diff.
+ */
 export function usePaneLayout(
   sessionId: string | null,
   outsideRepository: boolean | null,
   prefs: SeedPrefs,
+  autoPlugins: readonly AutoPane[],
   tabAvailable: (id: TabId) => boolean = () => true,
 ): PaneLayoutApi {
   const store = useSyncExternalStore(subscribe, readStore);
   const seedDiff = prefs.diff && outsideRepository === false;
+  const derive = useCallback(
+    (saved: DockLayout | undefined) =>
+      syncPluginTabs(saved ?? seedLayout({ diff: seedDiff, terminal: prefs.terminal }), autoPlugins),
+    [seedDiff, prefs.terminal, autoPlugins],
+  );
   const layout = useMemo(
-    () =>
-      sessionId
-        ? (store.sessions[sessionId] ?? seedLayout({ diff: seedDiff, terminal: prefs.terminal }))
-        : emptyDockLayout(),
-    [store, sessionId, seedDiff, prefs.terminal],
+    () => (sessionId ? derive(store.sessions[sessionId]) : emptyDockLayout()),
+    [store, sessionId, derive],
   );
 
   const shownRef = useLatestRef({ layout, tabAvailable });
-  // Starts from what is shown, so the saved layout is the one the user changed.
+  const deriveRef = useLatestRef(derive);
   const mutate = useCallback(
     (fn: (l: DockLayout) => DockLayout) => {
       if (!sessionId) return;
       updateStore((s) => {
-        const current = s.sessions[sessionId] ?? shownRef.current.layout;
+        const current = deriveRef.current(s.sessions[sessionId]);
         const updated = fn(current);
         if (updated === current) return s;
         return { version: 3, sessions: { ...s.sessions, [sessionId]: updated } };
       });
     },
-    [sessionId, shownRef],
+    [sessionId, deriveRef],
   );
 
   const confirmLeaving = useCallback(
@@ -516,10 +544,6 @@ export function usePaneLayout(
       }),
     [guardedMutate],
   );
-  const syncPlugins = useCallback(
-    (available: { id: TabId; defaultDock: DockLocation }[]) => mutate((l) => syncPluginTabs(l, available)),
-    [mutate],
-  );
   const setDockCollapsedCb = useCallback(
     (dock: DockLocation, collapsed: boolean) => guardedMutate((l) => setDockCollapsed(l, dock, collapsed)),
     [guardedMutate],
@@ -535,7 +559,6 @@ export function usePaneLayout(
     placeTab: placeTabCb,
     toggleKind,
     togglePlugin,
-    syncPlugins,
     setDockCollapsed: setDockCollapsedCb,
   };
 }
