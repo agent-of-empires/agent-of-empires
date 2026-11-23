@@ -485,8 +485,11 @@ html[data-ios-standalone]:not([data-editing]) {
 :root {
   scrollbar-color: var(--color-surface-700) transparent;
 }
-* {
-  scrollbar-width: thin;
+/* Gated: Safari 18.2+ honors scrollbar-width without scrollbar-color, which disables the webkit rules. */
+@supports (scrollbar-color: auto) {
+  * {
+    scrollbar-width: thin;
+  }
 }
 @supports not (scrollbar-color: auto) {
   ::-webkit-scrollbar {
