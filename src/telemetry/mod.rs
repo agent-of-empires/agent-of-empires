@@ -2,7 +2,9 @@
 //! fire-and-forget with hard timeouts, and every field is sanitized to closed allowlists.
 
 pub mod aggregate;
+pub mod consent;
 pub mod events;
+pub mod feature_use;
 pub mod features;
 pub mod form_factor;
 pub mod plugins;
@@ -19,7 +21,6 @@ pub use events::{
 pub use form_factor::WebClientFormFactor;
 pub use state::{
     cli_usage_due, ensure_install_id, install_id, record_cli_command, record_cli_usage_flush,
-    reset_install_id,
 };
 
 use crate::session::Instance;
@@ -75,18 +76,8 @@ fn opted_in_with(config: &crate::session::Config) -> bool {
     config.telemetry.enabled && !do_not_track()
 }
 
-pub fn apply_opt_in_change(enabled: bool) {
-    if enabled {
-        if !do_not_track() {
-            let _ = state::ensure_install_id();
-        }
-    } else if let Err(e) = state::delete_install_id() {
-        tracing::debug!(target: "telemetry", "failed to delete install id on opt-out: {e}");
-    }
-}
-
 fn now_rfc3339() -> String {
-    chrono::Utc::now().to_rfc3339()
+    crate::time::Timestamp::now().to_rfc3339()
 }
 
 const SUBSTRATES: [&str; 5] = ["scratch", "workspace", "worktree", "sandbox", "local"];
@@ -118,11 +109,12 @@ fn substrate_bucket(inst: &Instance) -> &'static str {
     "local"
 }
 
+/// Reads the id and never creates one: only the Daemon does, on opt-in or for a snapshot.
 pub fn build_process_start(surface: Surface) -> Option<ProcessStart> {
     if !is_opted_in() {
         return None;
     }
-    let install_id = state::ensure_install_id()?;
+    let install_id = state::install_id()?;
     let (update_status, update_releases_behind) =
         crate::update::cached_version_health(env!("CARGO_PKG_VERSION"));
     Some(ProcessStart {
@@ -345,6 +337,8 @@ fn assemble_usage_snapshot(
         distinct_sessions_by_agent: BTreeMap::new(),
         distinct_sessions_by_model_bucket: BTreeMap::new(),
         features,
+        prefs: features::active_prefs(config),
+        feature_uses: BTreeMap::new(),
         usage_seen,
         web_clients_seen: BTreeMap::new(),
         structured_clients_seen: BTreeMap::new(),
@@ -416,7 +410,7 @@ pub fn build_cli_usage() -> Option<CliUsage> {
     if command_counts.is_empty() {
         return None;
     }
-    let install_id = state::ensure_install_id()?;
+    let install_id = state::install_id()?;
     let window_start = window_start
         .map(|w| w.to_rfc3339())
         .unwrap_or_else(now_rfc3339);
@@ -477,6 +471,9 @@ fn record_snapshot_fp(snapshot: &UsageSnapshot) {
 
 /// Only confirmed sends are recorded, so a failed send never suppresses a retry.
 fn snapshot_matches_last(snapshot: &UsageSnapshot) -> bool {
+    if snapshot.carries_deltas() {
+        return false;
+    }
     let fp = snapshot_fingerprint(snapshot);
     match LAST_SNAPSHOT_FP.lock() {
         Ok(last) => *last == Some(fp),
@@ -599,6 +596,8 @@ mod tests {
             distinct_sessions_by_agent: BTreeMap::new(),
             distinct_sessions_by_model_bucket: BTreeMap::new(),
             features: BTreeMap::new(),
+            prefs: BTreeMap::new(),
+            feature_uses: BTreeMap::new(),
             usage_seen: usage_signals::zeroed(),
             web_clients_seen: BTreeMap::new(),
             structured_clients_seen: BTreeMap::new(),
@@ -634,7 +633,8 @@ mod tests {
         trashed_archived.archive();
         trashed_archived.trash();
         let mut expired = Instance::new("expired", "/tmp/h");
-        expired.snoozed_until = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        expired.snoozed_until =
+            Some(crate::time::Timestamp::now() - crate::time::Duration::hours(1));
 
         let m = aggregate_instances(&[
             pinned_a,
@@ -720,6 +720,37 @@ mod tests {
             "repeating the latest snapshot dedups against it"
         );
 
+        // Deltas are zeroed after a confirmed send, so an equal count later is new usage.
+        let deltas: [(&str, fn(&mut UsageSnapshot)); 8] = [
+            ("feature_uses", |s| {
+                s.feature_uses.insert("command_palette".into(), 1);
+            }),
+            ("usage_seen", |s| {
+                s.usage_seen.insert("web".into(), 1);
+            }),
+            ("web_clients_seen", |s| {
+                s.web_clients_seen.insert("desktop".into(), true);
+            }),
+            ("session_creates", |s| {
+                s.session_creates_since_last_snapshot = 1
+            }),
+            ("approvals", |s| s.approvals_resolved = 1),
+            ("agent_switches", |s| s.agent_switches = 1),
+            ("plan_mode", |s| s.plan_mode_seen = true),
+            ("prompts_queued", |s| s.prompts_queued = 1),
+        ];
+        for (name, add) in deltas {
+            let mut used = changed.clone();
+            add(&mut used);
+            record_snapshot_fp(&used);
+            assert!(
+                !snapshot_matches_last(&used),
+                "{name}: a repeated count must not dedupe"
+            );
+            used.clear_deltas();
+            assert!(!used.carries_deltas(), "{name}: clear_deltas zeroes it");
+        }
+
         *LAST_SNAPSHOT_FP.lock().unwrap() = None;
     }
 
@@ -743,6 +774,7 @@ mod tests {
         assert_eq!(snapshot.session_total, 1);
         assert_eq!(snapshot.session_creates_since_last_snapshot, 3);
         assert_eq!(snapshot.features, features::active_features(&config));
+        assert_eq!(snapshot.prefs, features::active_prefs(&config));
     }
 
     #[test]

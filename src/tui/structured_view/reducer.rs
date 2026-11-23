@@ -48,8 +48,13 @@ pub struct AcpTranscript {
     /// The daemon-owned ordered transcript, reconciled by row id from the WS
     /// `transcript_snapshot` / `transcript_delta` channel and the
     /// `?view=rows` replay. `render.rs` projects these to text; nothing here
-    /// builds them. See the module docs.
-    pub server_rows: Vec<TranscriptRow>,
+    /// builds them. See the module docs. Private so every change bumps
+    /// `projection_revision`, which the render cache keys on.
+    server_rows: Vec<TranscriptRow>,
+    /// Bumped on every change to what `render.rs` projects from this struct:
+    /// the rows, and the subagent roster their cards read. A change that skips
+    /// it leaves the cached transcript stale.
+    projection_revision: u64,
     pub pending_approvals: Vec<PendingApproval>,
     /// Pending `AskUserQuestion` elicitations. The native TUI does not
     /// render the answer form (that is web-only); it surfaces a notice and
@@ -91,8 +96,10 @@ pub struct AcpTranscript {
     /// with `turn_active` for the busy spinner, never for send-vs-park or Esc.
     pub background_agent_active: bool,
     background_subagent_active: bool,
-    /// ACP subagents roster; titles and badges the parent tool cards.
-    pub subagents: Vec<SubagentRecord>,
+    /// ACP subagents roster; titles and badges the parent tool cards. Private
+    /// for the same reason as the rows: a write that skips the revision leaves
+    /// the cached transcript showing a child's old state.
+    subagents: Vec<SubagentRecord>,
     /// Whether the agent accepts `_session/steering`. When true the composer
     /// sends a mid-turn prompt straight through instead of parking it: the
     /// daemon injects it into the running turn. Re-derived as `false` on a
@@ -224,6 +231,7 @@ impl AcpTranscript {
             session_title: None,
             agent_name: None,
             server_rows: Vec::new(),
+            projection_revision: 0,
             pending_approvals: Vec::new(),
             pending_elicitations: Vec::new(),
             status_text: None,
@@ -257,6 +265,40 @@ impl AcpTranscript {
         for row in rows {
             upsert_transcript_row(&mut self.server_rows, row);
         }
+        self.projection_revision += 1;
+    }
+
+    /// The ordered transcript rows, as the daemon folded them.
+    pub fn rows(&self) -> &[TranscriptRow] {
+        &self.server_rows
+    }
+
+    /// Replace the whole row buffer (a replay reseed, or a fold this view
+    /// built itself in the retained reader).
+    pub fn set_rows(&mut self, rows: Vec<TranscriptRow>) {
+        self.server_rows = rows;
+        self.projection_revision += 1;
+    }
+
+    /// Identifies the projected content for render caching: it changes with
+    /// every row write and roster change, so an unchanged value means an
+    /// unchanged projection.
+    pub fn projection_revision(&self) -> u64 {
+        self.projection_revision
+    }
+
+    /// The subagent roster, as the daemon last folded it.
+    pub fn subagents(&self) -> &[SubagentRecord] {
+        &self.subagents
+    }
+
+    /// Replace the subagent roster. A child's state closes or reopens its
+    /// parent's card without a row delta, so this bumps the revision too.
+    pub fn set_subagents(&mut self, subagents: Vec<SubagentRecord>) {
+        if self.subagents != subagents {
+            self.subagents = subagents;
+            self.projection_revision += 1;
+        }
     }
 
     /// Apply one incremental transcript row change (a WS `transcript_delta`):
@@ -269,6 +311,7 @@ impl AcpTranscript {
             TranscriptDelta::Patch { row, .. } => patch_transcript_row(&mut self.server_rows, row),
             TranscriptDelta::Remove(id) => self.server_rows.retain(|r| r.id != id),
         }
+        self.projection_revision += 1;
     }
 
     /// Drop the transcript rows ahead of a `?view=rows` rebuild, used when the
@@ -278,6 +321,7 @@ impl AcpTranscript {
     /// pushes a corrected `reduced_state`, so the next frame is authoritative.
     pub fn drop_rows(&mut self) {
         self.server_rows.clear();
+        self.projection_revision += 1;
     }
 
     /// Optimistically clear an approval card by nonce after the resolve
@@ -348,7 +392,7 @@ impl AcpTranscript {
         }
         self.background_agent_active =
             self.background_subagent_active || !state.background_tasks.is_empty();
-        self.subagents = state.subagents;
+        self.set_subagents(state.subagents);
         self.agent_name = Some(state.agent.0);
         self.turn_active = state.turn_active;
         self.steering = state.steering;
@@ -475,7 +519,7 @@ mod tests {
         AcpSessionId, AgentName, AuthStatusKind, Event, Plan, PlanStep, ThinkingSignal, ToolCall,
     };
     use crate::acp::transcript::{TranscriptModel, TranscriptRowKind};
-    use chrono::Utc;
+    use crate::time::Timestamp;
 
     fn tool(id: &str, name: &str) -> ToolCall {
         ToolCall {
@@ -484,7 +528,7 @@ mod tests {
             name: name.into(),
             kind: "execute".into(),
             args_preview: "ls".into(),
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             parent_tool_call_id: None,
             memory_recall: None,
             diffs: Vec::new(),
@@ -556,7 +600,7 @@ mod tests {
             options: Vec::new(),
             choice: false,
             plan: None,
-            requested_at: Utc::now(),
+            requested_at: Timestamp::now(),
             resolved: None,
         }
     }
@@ -575,6 +619,7 @@ mod tests {
                 attachments: vec![],
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
             Event::PromptCapabilities {
                 steering: true,
@@ -584,7 +629,7 @@ mod tests {
                 load_session: None,
             },
             Event::CancelRequested {
-                escalates_at: Utc::now(),
+                escalates_at: Timestamp::now(),
             },
             Event::ModesAvailable {
                 current_mode_id: "plan".into(),
@@ -630,7 +675,7 @@ mod tests {
             description: None,
             tool_call_id: None,
             questions: Vec::new(),
-            requested_at: Utc::now(),
+            requested_at: Timestamp::now(),
             resolved: None,
         }];
 
@@ -668,7 +713,7 @@ mod tests {
             (
                 "thinking",
                 Some(ThinkingSignal {
-                    started_at: Utc::now(),
+                    started_at: Timestamp::now(),
                 }),
                 false,
                 Some("thinking…"),
@@ -677,7 +722,7 @@ mod tests {
             (
                 "compacting outranks thinking",
                 Some(ThinkingSignal {
-                    started_at: Utc::now(),
+                    started_at: Timestamp::now(),
                 }),
                 true,
                 Some("compacting…"),
@@ -763,7 +808,7 @@ mod tests {
             prompt: "do the thing".into(),
             model: "claude-opus-4-8".into(),
             output_file: "/tmp/a1.output".into(),
-            started_at: chrono::Utc::now(),
+            started_at: crate::time::Timestamp::now(),
             workflow: None,
         }]);
         assert!(!state.turn_active, "fixture invariant: no main turn opened");
@@ -785,7 +830,7 @@ mod tests {
             prompt: "do the thing".into(),
             model: "claude-opus-4-8".into(),
             output_file: "/tmp/a1.output".into(),
-            started_at: chrono::Utc::now(),
+            started_at: crate::time::Timestamp::now(),
             workflow: None,
         }]);
         t.apply_reduced_state(1, launched, &[]);
@@ -859,7 +904,7 @@ mod tests {
         ];
         for (roster, want) in cases {
             let mut t = AcpTranscript::new("s-1");
-            t.subagents = roster;
+            t.set_subagents(roster);
             assert_eq!(t.stoppable_subagent().map(|r| r.session_id.as_str()), want);
         }
     }
@@ -925,6 +970,7 @@ mod tests {
             attachments: vec![],
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let reset = || Event::SessionContextReset {
             reason: "worker restarted".into(),
@@ -1038,6 +1084,7 @@ mod tests {
                 attachments: Vec::new(),
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
             Event::AgentMessageChunk {
                 text: "one".into(),

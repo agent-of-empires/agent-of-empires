@@ -234,7 +234,7 @@ async fn serve(mut socket: WebSocket, state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use crate::time::Timestamp;
 
     fn change(id: &str, new: Status) -> StatusChange {
         StatusChange {
@@ -243,7 +243,7 @@ mod tests {
             effective_profile: "default".to_string(),
             old: Status::Running,
             new,
-            at: Utc::now(),
+            at: Timestamp::now(),
         }
     }
 

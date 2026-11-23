@@ -1655,8 +1655,8 @@ export interface UpdateStatus {
   update_command?: string;
 }
 
-export function fetchUpdateStatus(): Promise<UpdateStatus | null> {
-  return fetchJson<UpdateStatus>("/api/system/update-status");
+export function fetchUpdateStatus(init?: RequestInit): Promise<UpdateStatus | null> {
+  return fetchJson<UpdateStatus>("/api/system/update-status", init);
 }
 
 /** Persist that the update banner was dismissed for `version`, server-side, so
@@ -1699,10 +1699,11 @@ export type SandboxImageStatus = SandboxImageState & {
  *  offline. `fresh` skips the Daemon's cache. */
 export async function fetchSandboxImageStatus(
   image?: string,
-  opts: { fresh?: boolean } = {},
+  opts: { fresh?: boolean; profile?: string } = {},
 ): Promise<SandboxImageStatus | { error: string } | null> {
   const query = new URLSearchParams();
   if (image) query.set("image", image);
+  if (opts.profile) query.set("profile", opts.profile);
   if (opts.fresh) query.set("fresh", "true");
   const qs = query.toString();
   const reply = await send(`/api/sandbox/image-status${qs ? `?${qs}` : ""}`).catch(() => null);
@@ -1973,17 +1974,21 @@ export async function enqueueServerPrompt(
 ): Promise<ServerQueuedPrompt | null> {
   return fetchJson<ServerQueuedPrompt>(
     queuePath(sessionId),
-    jsonInit("POST", {
-      id: prompt.id,
-      text: prompt.text,
-      origin_device: prompt.originDevice,
-      attachments: (prompt.attachments ?? []).map((a) => ({
-        kind: a.kind,
-        mime_type: a.mimeType,
-        data: a.dataB64,
-        name: a.name,
-      })),
-    }),
+    jsonInit(
+      "POST",
+      {
+        id: prompt.id,
+        text: prompt.text,
+        origin_device: prompt.originDevice,
+        attachments: (prompt.attachments ?? []).map((a) => ({
+          kind: a.kind,
+          mime_type: a.mimeType,
+          data: a.dataB64,
+          name: a.name,
+        })),
+      },
+      { "X-Aoe-Prompt-Origin": "dashboard" },
+    ),
   );
 }
 
@@ -3177,6 +3182,24 @@ export async function startSession(id: string): Promise<StartSessionResult> {
 export async function setSessionSnooze(id: string, minutes: number | null): Promise<SessionResponse | null> {
   try {
     return await sessionUpdate(id, "snooze", jsonInit("PATCH", { minutes }));
+  } catch {
+    return null;
+  }
+}
+
+/** Ignore or unignore a session managed by another session. The row stays present and live. */
+export async function setSessionIgnored(id: string, ignored: boolean): Promise<SessionResponse | null> {
+  try {
+    return await sessionUpdate(id, "ignored", jsonInit("PATCH", { ignored }));
+  } catch {
+    return null;
+  }
+}
+
+/** Take ownership back from a managing session: clears its manager link and ignore marker. */
+export async function reclaimSessionOwnership(id: string): Promise<SessionResponse | null> {
+  try {
+    return await sessionUpdate(id, "reclaim-ownership", jsonInit("POST", { reclaim: true }));
   } catch {
     return null;
   }

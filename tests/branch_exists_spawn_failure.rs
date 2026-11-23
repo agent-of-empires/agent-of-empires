@@ -14,7 +14,7 @@ use agent_of_empires::session::worktree_edit::{
     edit_worktree_workdir, WorktreeEditError, WorktreeEditRequest,
 };
 use agent_of_empires::session::WorktreeInfo;
-use chrono::Utc;
+use agent_of_empires::time::Timestamp;
 use serial_test::serial;
 use tempfile::TempDir;
 
@@ -84,7 +84,7 @@ fn branch_exists_propagates_spawn_failure_and_caller_refuses() {
         branch: "original".to_string(),
         main_repo_path: dir.path().to_string_lossy().to_string(),
         managed_by_aoe: true,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         base_branch: None,
     };
 

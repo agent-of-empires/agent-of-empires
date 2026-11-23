@@ -9,6 +9,7 @@ import {
   type SessionReceipt,
   type SessionSettingOutcome,
 } from "../../lib/api";
+import { reportFeatureUse } from "../../lib/featureUse";
 import type { SessionResponse } from "../../lib/types";
 import { reportError } from "../../lib/toastBus";
 import { AddProjectModal } from "./AddProjectModal";
@@ -164,6 +165,7 @@ export function SessionActionProvider({
       }
       const previous = active(kind, selected, server);
       if (Object.is(next, previous ? previous.value : server)) return;
+      if (kind === "color") reportFeatureUse("session_color");
       const targets = selected.map((target) => ({ ...target }));
       const key = batchKey(kind, targets);
       const sent = [...(previous?.sent ?? [])];

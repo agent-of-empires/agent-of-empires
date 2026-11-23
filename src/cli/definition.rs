@@ -176,7 +176,7 @@ pub enum Commands {
         command: ProjectCommands,
     },
 
-    /// Reclaim per-session sandbox agent stores and log agent sandboxes in
+    /// Clean up sandbox agent stores and log in sandboxed agents
     Sandbox {
         #[command(subcommand)]
         command: SandboxCommands,

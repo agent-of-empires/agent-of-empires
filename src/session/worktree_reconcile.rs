@@ -322,7 +322,7 @@ mod tests {
             branch: "work".into(),
             main_repo_path: main.to_str().unwrap().into(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: None,
         });
         storage

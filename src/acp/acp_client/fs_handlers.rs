@@ -14,7 +14,7 @@ use super::SessionResources;
 
 /// Issue #1147: monotonic ns-since-process-start, used as a thin
 /// correlation token in the structured view ACP tool-dispatch trace. Wall-clock
-/// fields like `chrono::Utc::now()` jitter under NTP slew and are too
+/// fields like `crate::time::Timestamp::now()` jitter under NTP slew and are too
 /// coarse to detect interleaved entry/exit between concurrent handlers;
 /// `Instant` is monotonic and ns-resolved on every supported platform.
 /// Cast to `u64` because `Instant::elapsed()` returns `Duration` whose

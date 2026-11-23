@@ -391,6 +391,8 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("PATCH", "/api/sessions/{id}/diff-base"),
     ("PATCH", "/api/sessions/{id}/favorite"),
     ("PATCH", "/api/sessions/{id}/group"),
+    ("PATCH", "/api/sessions/{id}/ignored"),
+    ("POST", "/api/sessions/{id}/reclaim-ownership"),
     ("PATCH", "/api/groups"),
     ("POST", "/api/groups"),
     ("DELETE", "/api/groups"),
@@ -433,6 +435,7 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("POST", "/api/telemetry/consent"),
     ("POST", "/api/telemetry/reset-id"),
     ("POST", "/api/telemetry/seen"),
+    ("POST", "/api/telemetry/feature-use"),
     ("POST", "/api/telemetry/structured-interaction"),
     // Ephemeral foreground-presence heartbeat. Does not mutate user data.
     ("POST", "/api/presence"),
@@ -466,6 +469,7 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     // The setup wizard never shows in CityHall mode.
     ("PATCH", "/api/setup"),
     ("POST", "/api/sandbox/image-pull"),
+    ("POST", "/api/sandbox/image-pull/cancel"),
     ("POST", "/api/sandbox/image-dismiss"),
     ("POST", "/api/sessions/creation-trust"),
     ("POST", "/api/sessions/empty-trash"),

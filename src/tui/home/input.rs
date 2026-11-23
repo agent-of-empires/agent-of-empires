@@ -55,14 +55,14 @@ pub(super) fn web_plugin_disabled() -> bool {
         .is_some_and(|p| !p.enabled)
 }
 
-/// Persist the first-run intro picks: theme name to `config.theme.name`, attach mode to
-/// `default_attach_mode`, telemetry opt-in to `config.telemetry.enabled`. Failures are
-/// logged and swallowed so a config write hiccup cannot block startup.
+/// Persist the first-run intro picks: theme name to `config.theme.name` and attach mode to
+/// `default_attach_mode`; the telemetry answer goes to the Daemon, which owns consent.
+/// Failures are logged and swallowed so a config write hiccup cannot block startup.
 fn apply_intro_outcome(outcome: &IntroOutcome) {
-    if outcome.final_theme.is_none()
-        && outcome.final_attach_mode.is_none()
-        && outcome.telemetry_opt_in.is_none()
-    {
+    if let Some(opt_in) = outcome.telemetry_opt_in {
+        crate::tui::telemetry::set_consent(opt_in);
+    }
+    if outcome.final_theme.is_none() && outcome.final_attach_mode.is_none() {
         return;
     }
     let result = update_config(|config| {
@@ -72,41 +72,10 @@ fn apply_intro_outcome(outcome: &IntroOutcome) {
         if let Some(mode) = outcome.final_attach_mode {
             config.session.default_attach_mode = mode;
         }
-        if let Some(opt_in) = outcome.telemetry_opt_in {
-            config.telemetry.enabled = opt_in;
-        }
     });
     if let Err(e) = result {
         tracing::warn!(target: "tui.input", "Failed to persist intro outcome: {e}");
     }
-    if outcome.telemetry_opt_in.is_some() {
-        if let Err(e) = update_app_state(|state| {
-            state.has_responded_to_telemetry = true;
-        }) {
-            tracing::warn!(target: "tui.input", "Failed to persist intro outcome: {e}");
-        }
-    }
-    // Sync the install id with the saved opt-in choice (no-op under
-    // DO_NOT_TRACK). Done after save so telemetry.json matches config.
-    if let Some(opt_in) = outcome.telemetry_opt_in {
-        crate::telemetry::apply_opt_in_change(opt_in);
-    }
-}
-
-/// Persist the answer to the telemetry consent popup: set the opt-in flag, mark the
-/// prompt answered so it never returns, and reconcile the install id.
-fn persist_telemetry_consent(opt_in: bool) {
-    if let Err(e) = update_config(|config| {
-        config.telemetry.enabled = opt_in;
-    }) {
-        tracing::warn!(target: "tui.input", "Failed to persist telemetry consent: {e}");
-    }
-    if let Err(e) = update_app_state(|state| {
-        state.has_responded_to_telemetry = true;
-    }) {
-        tracing::warn!(target: "tui.input", "Failed to persist telemetry consent: {e}");
-    }
-    crate::telemetry::apply_opt_in_change(opt_in);
 }
 
 /// Decompose pasted text into `TmuxKey`s safe for the live-send worker.
@@ -520,9 +489,8 @@ impl HomeView {
         let trashed_at = row
             .trashed_at
             .as_deref()
-            .map(chrono::DateTime::parse_from_rfc3339)
-            .transpose()?
-            .map(|stamp| stamp.with_timezone(&chrono::Utc));
+            .map(crate::time::Timestamp::parse_rfc3339)
+            .transpose()?;
         anyhow::ensure!(
             trashed_at == instance.trashed_at,
             "Trash identity changed; reopen the delete confirmation"
@@ -585,8 +553,7 @@ impl HomeView {
                 && row
                     .trashed_at
                     .as_deref()
-                    .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
-                    .map(|stamp| stamp.with_timezone(&chrono::Utc))
+                    .and_then(|stamp| crate::time::Timestamp::parse_rfc3339(stamp).ok())
                     == pending.request.expected_trashed_at)
     }
 
@@ -1946,7 +1913,7 @@ impl HomeView {
                 };
                 if let Some(opt_in) = opt_in {
                     self.telemetry_consent_dialog = None;
-                    persist_telemetry_consent(opt_in);
+                    crate::tui::telemetry::set_consent(opt_in);
                 }
             }
             return true;
@@ -2454,13 +2421,13 @@ impl HomeView {
                 DialogResult::Continue => {}
                 DialogResult::Submit(opt_in) => {
                     self.telemetry_consent_dialog = None;
-                    persist_telemetry_consent(opt_in);
+                    crate::tui::telemetry::set_consent(opt_in);
                 }
                 // Cancel can't be produced by this dialog (Esc maps to a
                 // decline), but treat it as a decline for completeness.
                 DialogResult::Cancel => {
                     self.telemetry_consent_dialog = None;
-                    persist_telemetry_consent(false);
+                    crate::tui::telemetry::set_consent(false);
                 }
             }
             return None;
@@ -3439,6 +3406,9 @@ impl HomeView {
             )
         {
             return None;
+        }
+        if let Some(feature) = id.feature_use() {
+            crate::tui::telemetry::report_feature_use(feature);
         }
         match id {
             ActionId::Quit => return Some(Action::Quit),
@@ -4425,6 +4395,9 @@ impl HomeView {
     }
 
     fn open_command_palette(&mut self) {
+        crate::tui::telemetry::report_feature_use(
+            crate::telemetry::feature_use::FeatureUse::CommandPalette,
+        );
         let mut entries: Vec<PaletteCommand> = builtin_commands(self.strict_hotkeys);
 
         // Quit lives in the registry but is excluded from `builtin_commands` (no palette
@@ -4710,7 +4683,7 @@ impl HomeView {
 
         // A collapsed group may hide an idle session from `flat_items`. Keep
         // the existing most-recently-accessed selection for hidden rows.
-        let mut best_hidden: Option<(String, Option<chrono::DateTime<chrono::Utc>>)> = None;
+        let mut best_hidden: Option<(String, Option<crate::time::Timestamp>)> = None;
         for inst in self.instances.values() {
             if visible_sessions.contains(&inst.id)
                 || current_session.as_deref() == Some(inst.id.as_str())
@@ -4967,6 +4940,9 @@ impl HomeView {
     }
 
     pub(super) fn apply_sort_order(&mut self, new_order: SortOrder) {
+        if new_order != self.sort_order {
+            crate::tui::telemetry::report_feature_use(new_order.into());
+        }
         self.sort_order = new_order;
         if self.search_active && !self.search_query.value().is_empty() {
             self.refresh_flat_items();
@@ -4984,6 +4960,7 @@ impl HomeView {
     }
 
     pub(super) fn apply_group_by(&mut self, new_mode: GroupByMode) {
+        crate::tui::telemetry::report_feature_use(new_mode.into());
         self.group_by = new_mode;
         self.rebuild_flat_items();
         self.reseat_cursor_after_rebuild();
@@ -5696,6 +5673,9 @@ impl HomeView {
             self.flash_status("Still creating this session; it has no runtime yet");
             return;
         }
+        if let Some(feature) = action.feature_use() {
+            crate::tui::telemetry::report_feature_use(feature);
+        }
         match action {
             ContextMenuAction::Rename => self.open_rename_for_selected(),
             ContextMenuAction::Delete => self.open_delete_for_selected(),
@@ -5815,6 +5795,7 @@ impl HomeView {
     /// and the badge. Always opens, even with nothing eligible, so an explicit "Show tips"
     /// gives an empty state rather than silence.
     pub(super) fn open_tips_dialog(&mut self) {
+        crate::tui::telemetry::report_feature_use(crate::telemetry::feature_use::FeatureUse::Tips);
         let config = load_config().ok().flatten().unwrap_or_default();
         let signals = crate::tips::TipSignals::from(&config);
         let eligible = crate::tips::eligible(crate::tips::TipSurface::Tui, &signals);
@@ -7966,7 +7947,7 @@ impl HomeView {
     /// taps of one key while a stray keystroke is harmless. The key is read off the binding
     /// table so the hint can't drift from it; a chord that isn't a bare character falls
     /// back to the dialog's own y/Enter.
-    fn confirm_by_repeating(
+    pub(super) fn confirm_by_repeating(
         &self,
         opener: ActionId,
         title: &str,

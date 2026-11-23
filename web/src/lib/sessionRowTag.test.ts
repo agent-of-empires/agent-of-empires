@@ -69,6 +69,12 @@ describe("parseSessionRowTagMode", () => {
 });
 
 describe("computeSessionRowTag", () => {
+  it("drops a branch tag that repeats the row label", () => {
+    const ws = workspace({ branch: "feat/x" });
+    expect(computeSessionRowTag(ws, "branch", "feat/x")).toBeNull();
+    expect(computeSessionRowTag(ws, "branch", "Teutons")?.content).toBe("x");
+  });
+
   it("uses the last branch path segment and truncates to the TUI branch width", () => {
     const tag = computeSessionRowTag(workspace({ branch: "feature/configurable-session-name-suffix" }), "branch");
     expect(tag?.content).toBe("configurable");

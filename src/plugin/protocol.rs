@@ -113,6 +113,33 @@ pub fn parse_request(line: &str) -> Result<Option<RpcRequest>, serde_json::Error
     serde_json::from_str(trimmed).map(Some)
 }
 
+/// A worker line answering a host-initiated request: an `id` and a `result` or `error`, no `method`.
+pub struct WorkerReply {
+    pub id: String,
+    pub outcome: Result<Value, String>,
+}
+
+pub fn parse_worker_reply(line: &str) -> Option<WorkerReply> {
+    let value: Value = serde_json::from_str(line.trim()).ok()?;
+    let obj = value.as_object()?;
+    if obj.contains_key("method") {
+        return None;
+    }
+    let id = obj.get("id")?.as_str()?.to_string();
+    let outcome = match obj.get("error").filter(|error| !error.is_null()) {
+        _ if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") => {
+            Err("worker reply is not a JSON-RPC 2.0 response".to_string())
+        }
+        Some(error) => Err(error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("worker error")
+            .to_string()),
+        None => Ok(obj.get("result")?.clone()),
+    };
+    Some(WorkerReply { id, outcome })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,5 +187,48 @@ mod tests {
         let parsed: Value = serde_json::from_str(err.trim()).unwrap();
         assert_eq!(parsed["error"]["code"], json!(codes::FORBIDDEN));
         assert!(parsed.get("result").is_none());
+    }
+
+    #[test]
+    fn worker_replies_are_told_apart_from_requests() {
+        let ok =
+            parse_worker_reply(r#"{"jsonrpc":"2.0","id":"h-1","result":{"drop":"*"}}"#).unwrap();
+        assert_eq!(ok.id, "h-1");
+        assert_eq!(ok.outcome.unwrap()["drop"], "*");
+
+        let err = parse_worker_reply(
+            r#"{"jsonrpc":"2.0","id":"h-2","error":{"code":-1,"message":"nope"}}"#,
+        )
+        .unwrap();
+        assert_eq!(err.outcome.unwrap_err(), "nope");
+
+        for line in [
+            r#"{"id":"h-4","result":{"drop":"*"}}"#,
+            r#"{"jsonrpc":"1.0","id":"h-4","result":{"drop":"*"}}"#,
+            r#"{"jsonrpc":2,"id":"h-4","result":{"drop":"*"}}"#,
+            r#"{"id":"h-4","error":{"code":-32601}}"#,
+        ] {
+            let reply = parse_worker_reply(line).unwrap();
+            assert_eq!(reply.id, "h-4", "{line}");
+            assert!(
+                reply.outcome.is_err(),
+                "a reply without the 2.0 envelope is rejected, not applied: {line}"
+            );
+        }
+
+        let null_error =
+            parse_worker_reply(r#"{"jsonrpc":"2.0","id":"h-3","result":{"ok":1},"error":null}"#)
+                .unwrap();
+        assert_eq!(null_error.outcome.unwrap()["ok"], 1, "null error is absent");
+
+        for not_a_reply in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"events.publish","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"x"}"#,
+            r#"{"jsonrpc":"2.0","id":7,"result":1}"#,
+            "not json",
+            "",
+        ] {
+            assert!(parse_worker_reply(not_a_reply).is_none(), "{not_a_reply}");
+        }
     }
 }

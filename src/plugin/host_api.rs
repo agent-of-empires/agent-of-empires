@@ -184,6 +184,10 @@ pub fn dispatch(
     params: &Value,
 ) -> Result<Value, DispatchError> {
     match method {
+        "projects.list" => {
+            ctx.require(CAP_SESSION_READ)?;
+            projects_list(state)
+        }
         "events.publish" => {
             ctx.require(CAP_WORKER)?;
             events_publish(state, params)
@@ -252,6 +256,16 @@ pub fn dispatch(
     }
 }
 
+fn projects_list(state: &HostApiState) -> Result<Value, DispatchError> {
+    let profile = crate::session::config::effective_profile(&state.profile);
+    let projects: Vec<Value> = crate::session::projects::load_merged(&profile)
+        .map_err(|e| DispatchError::internal(e.to_string()))?
+        .into_iter()
+        .map(|project| json!({ "name": project.name, "path": project.path }))
+        .collect();
+    Ok(json!({ "projects": projects }))
+}
+
 fn str_param<'a>(params: &'a Value, key: &str) -> Result<&'a str, DispatchError> {
     params
         .get(key)
@@ -278,7 +292,7 @@ fn events_publish(state: &HostApiState, params: &Value) -> Result<Value, Dispatc
         serde_json::to_string(payload).map_err(|e| DispatchError::internal(e.to_string()))?;
     let conn = state.events.lock().unwrap_or_else(|p| p.into_inner());
     let seq = events::highest_seq(&conn, &state.schema, topic) + 1;
-    let created_at = chrono::Utc::now().timestamp_millis();
+    let created_at = crate::time::Timestamp::now().as_millis();
     events::insert_event(&conn, &state.schema, topic, seq, &payload_json, created_at)
         .map_err(|e| DispatchError::internal(e.to_string()))?;
     events::prune_retention(&conn, &state.schema, topic, state.retention, &[]);
@@ -680,7 +694,7 @@ fn plugin_storage_set(
 ) -> Result<Value, DispatchError> {
     let key = storage_key(params)?;
     let value_json = storage_value(params)?;
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = crate::time::Timestamp::now().as_millis();
     let conn = state.events.lock().unwrap_or_else(|p| p.into_inner());
     enforce_key_quota(&conn, &ctx.plugin_id, &key)?;
     conn.execute(
@@ -704,7 +718,7 @@ fn plugin_storage_cas(
         .get("expected")
         .cloned()
         .ok_or_else(|| DispatchError::invalid_params("missing param \"expected\""))?;
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = crate::time::Timestamp::now().as_millis();
     let mut conn = state.events.lock().unwrap_or_else(|p| p.into_inner());
     let tx = conn
         .transaction()
@@ -991,6 +1005,80 @@ mod tests {
     }
 
     #[test]
+    fn projects_list_is_capability_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = dispatch(
+            &state(tmp.path()),
+            &ctx(&[CAP_WORKER]),
+            "projects.list",
+            &json!({}),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, codes::FORBIDDEN);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn projects_list_returns_registered_name_and_path() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        crate::session::projects::add(
+            "default",
+            crate::session::projects::ProjectScope::Global,
+            crate::session::projects::Project::new(
+                "target",
+                "/tmp/project-target",
+                crate::session::projects::ProjectScope::Global,
+            ),
+            false,
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let result = dispatch(
+            &state(tmp.path()),
+            &ctx(&[CAP_SESSION_READ]),
+            "projects.list",
+            &json!({}),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            json!({ "projects": [{ "name": "target", "path": "/tmp/project-target" }] })
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn projects_list_merges_profile_projects_over_global() {
+        use crate::session::projects::{add, Project, ProjectScope};
+        let _guard = crate::session::test_support::isolate_app_dir();
+        crate::session::create_profile("work").unwrap();
+        let put = |scope, name: &str, path: &str| {
+            add("work", scope, Project::new(name, path, scope), true).unwrap();
+        };
+        put(ProjectScope::Global, "shared", "/tmp/project-shared");
+        put(ProjectScope::Global, "only-global", "/tmp/project-global");
+        put(ProjectScope::Profile, "renamed", "/tmp/project-shared");
+        put(ProjectScope::Profile, "only-work", "/tmp/project-work");
+        let tmp = tempfile::tempdir().unwrap();
+        let state = HostApiState::open(&tmp.path().join("plugin_events.db"), "work", 100).unwrap();
+        let result = dispatch(
+            &state,
+            &ctx(&[CAP_SESSION_READ]),
+            "projects.list",
+            &json!({}),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            json!({ "projects": [
+                { "name": "renamed", "path": "/tmp/project-shared" },
+                { "name": "only-global", "path": "/tmp/project-global" },
+                { "name": "only-work", "path": "/tmp/project-work" },
+            ] })
+        );
+    }
+
+    #[test]
     fn ungranted_capability_is_forbidden() {
         let tmp = tempfile::tempdir().unwrap();
         let state = state(tmp.path());
@@ -1188,8 +1276,8 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
-        let now = chrono::Utc::now();
-        let hour = chrono::Duration::hours(1);
+        let now = crate::time::Timestamp::now();
+        let hour = crate::time::Duration::hours(1);
 
         let mut rows = Vec::new();
         let mut seed = |title: &str, f: &dyn Fn(&mut Instance)| {
@@ -1620,7 +1708,7 @@ method = "{tool}.session_id"
                             manifest.as_bytes(),
                         ),
                         capabilities: vec!["runtime.worker".into()],
-                        granted_at: chrono::Utc::now(),
+                        granted_at: crate::time::Timestamp::now(),
                     }),
                     ..Default::default()
                 },

@@ -704,19 +704,18 @@ fn recorded_outcome(
     }
 }
 
-/// What a persisted handoff does with the conversation. A `Discard` continues only when its
-/// target resumes: reservation records one for an earlier conversation and `Cleared` for `fresh`.
-fn handoff_outcome(
-    context: &HandoffContext,
-    terminal: Option<&crate::session::ConversationState>,
-) -> TerminalConversation {
-    match (context, terminal) {
-        (HandoffContext::Keep { .. }, _) => TerminalConversation::Continue,
-        (HandoffContext::Discard, Some(target)) if target.resumes() => {
-            TerminalConversation::Continue
+impl From<crate::session::TerminalHandoffOutcome> for TerminalConversation {
+    fn from(outcome: crate::session::TerminalHandoffOutcome) -> Self {
+        match outcome {
+            crate::session::TerminalHandoffOutcome::Continue => Self::Continue,
+            crate::session::TerminalHandoffOutcome::Fresh => Self::Fresh,
         }
-        (HandoffContext::Discard, _) => TerminalConversation::Fresh,
     }
+}
+
+/// What a persisted handoff does with the conversation, as it recorded.
+fn handoff_outcome(intent: &HandoffIntent) -> TerminalConversation {
+    intent.outcome.into()
 }
 
 /// Whether driving a persisted handoff gives the caller what it asked for. No choice drives any.
@@ -988,7 +987,7 @@ fn claim_handoff_in(
         row.lifecycle_reservation = Some(LifecycleReservation {
             op: LifecycleOperation::Launch,
             generation,
-            at: chrono::Utc::now(),
+            at: crate::time::Timestamp::now(),
         });
         row.terminal_handoff
             .as_mut()
@@ -1083,7 +1082,7 @@ fn reserve_handoff_in(
         let generation = row.try_acquire_lifecycle_reservation(
             LifecycleOperation::Launch,
             Instance::LIFECYCLE_RESERVATION_TTL,
-            chrono::Utc::now(),
+            crate::time::Timestamp::now(),
         )?;
         let unborn_fence = unborn_producer.map(|(producer_epoch, producer_id)| {
             crate::session::TerminalHandoffUnbornFence {
@@ -1093,6 +1092,11 @@ fn reserve_handoff_in(
                 fence_generation: generation,
             }
         });
+        let terminal = recorded.map(|outcome| match outcome {
+            TerminalConversation::Fresh => fresh_terminal_target(row.conversation_state()),
+            TerminalConversation::Continue => row.conversation_state(),
+        });
+        let outcome = crate::session::TerminalHandoffOutcome::of(&context, terminal.as_ref());
         row.terminal_handoff = Some(Box::new(HandoffIntent {
             id: intent_id,
             profile,
@@ -1107,10 +1111,8 @@ fn reserve_handoff_in(
             source_conversation: row.conversation_state(),
             runner,
             unborn_fence,
-            terminal: recorded.map(|outcome| match outcome {
-                TerminalConversation::Fresh => fresh_terminal_target(row.conversation_state()),
-                TerminalConversation::Continue => row.conversation_state(),
-            }),
+            terminal,
+            outcome,
             launch_required: row.ensure_startable().is_ok(),
             launch_started: false,
             selector_ended: false,
@@ -1238,7 +1240,7 @@ fn record_retired_handoff_in(
         intent.source_conversation = source;
         intent.source_acp_session_id = source_acp_session_id;
         intent.runner = completed_runner;
-        intent.terminal = terminal;
+        intent.set_terminal(terminal);
         intent.final_event_seq = Some(final_event_seq);
         intent.stage = TerminalHandoffStage::TerminalCommitOwed;
         Ok(())
@@ -1474,7 +1476,7 @@ async fn terminal_handoff_request(
         if conversation.is_some() && durable.command_session_selector().is_some() {
             return terminal_refusal(TerminalSwitchReason::CommandSelectsConversation, "");
         }
-        let outcome = handoff_outcome(&pending.context, pending.terminal.as_ref());
+        let outcome = handoff_outcome(pending);
         if !pending_handoff_honours(outcome, conversation) {
             let in_flight = match outcome {
                 TerminalConversation::Continue => "keeps the conversation",
@@ -1631,7 +1633,7 @@ fn drive_terminal_handoff(
                     intent.ensure_retirement_target(&id, &mut target)?;
                     let deadline = std::time::Duration::from_secs(5);
                     // A continuing worker may hold the conversation's id, so only a fresh one deletes it.
-                    match handoff_outcome(&intent.context, intent.terminal.as_ref()) {
+                    match handoff_outcome(&intent) {
                         TerminalConversation::Continue => {
                             state
                                 .acp_supervisor
@@ -3252,11 +3254,13 @@ mod tests {
         Ok(())
     }
 
+    /// Drives a no-choice `Discard` through retirement and commit, answering the stored outcome
+    /// as reserved and as retired.
     #[cfg(unix)]
     async fn retired_native_handoff_with_event_store(
         row: &Instance,
         event_store: Arc<crate::acp::event_store::EventStore>,
-    ) -> anyhow::Result<Arc<AppState>> {
+    ) -> anyhow::Result<(Arc<AppState>, [TerminalConversation; 2])> {
         use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
         use std::sync::atomic::Ordering;
         use std::time::Duration;
@@ -3319,6 +3323,7 @@ mod tests {
             .unwrap()
             .terminal_handoff
             .unwrap();
+        let reserved = handoff_outcome(&intent);
         let mut target = state.acp_supervisor.capture_retirement(&row.id)?;
         intent.ensure_retirement_target(&row.id, &mut target)?;
         let stop_state = state.clone();
@@ -3385,7 +3390,14 @@ mod tests {
             .capture_retirement(&row.id)?
             .lease
             .is_none());
-        Ok(state)
+        let retired = crate::session::Storage::open_unwatched(&row.source_profile)?
+            .load()?
+            .into_iter()
+            .find(|r| r.id == row.id)
+            .and_then(|r| r.terminal_handoff)
+            .expect("the committed handoff is still owed");
+        assert_eq!(retired.stage, HandoffStage::TerminalLaunchOwed);
+        Ok((state, [reserved, handoff_outcome(&retired)]))
     }
 
     #[tokio::test]
@@ -3481,7 +3493,7 @@ mod tests {
             &root.path().join("events.db"),
             100,
         )?);
-        let state = retired_native_handoff_with_event_store(&source, events.clone()).await?;
+        let (state, _) = retired_native_handoff_with_event_store(&source, events.clone()).await?;
         let sentinel = events.highest_seq_checked(&source.id)? + 1;
         events.record(
             &source.id,
@@ -3776,6 +3788,37 @@ mod tests {
         Ok(())
     }
 
+    /// A no-choice fresh switch reserves Fresh, so retirement deletes the ACP conversation; the
+    /// retired target is the row's own, which resumes its stored id, so the outcome then follows it.
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    async fn a_fresh_switch_over_a_stored_id_follows_the_retired_target() -> anyhow::Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir()?;
+        let events = Arc::new(crate::acp::event_store::EventStore::open(
+            &project.path().join("original-events.db"),
+            100,
+        )?);
+        let mut source = Instance::new("stored id", project.path().to_str().unwrap());
+        source.tool = "shell".into();
+        source.command = "sleep 60".into();
+        source.source_profile = "default".into();
+        source.view = View::Structured;
+        source.agent_session_id = Some("native-preserved".into());
+        let (_state, [reserved, retired]) =
+            retired_native_handoff_with_event_store(&source, events).await?;
+        assert_eq!(reserved, TerminalConversation::Fresh, "retirement deletes");
+        assert_eq!(retired, TerminalConversation::Continue);
+        let stored = crate::session::Storage::open_unwatched("default")?
+            .load()?
+            .into_iter()
+            .find(|r| r.id == source.id)
+            .unwrap();
+        assert_eq!(stored.agent_session_id.as_deref(), Some("native-preserved"));
+        Ok(())
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     #[cfg(unix)]
@@ -3845,7 +3888,8 @@ mod tests {
             );
             let pane_name = crate::tmux::Session::generate_name(&source.id, &source.title);
             let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&pane_name);
-            let state = retired_native_handoff_with_event_store(&source, events.clone()).await?;
+            let (state, _) =
+                retired_native_handoff_with_event_store(&source, events.clone()).await?;
             let storage = crate::session::Storage::open_unwatched("default")?;
             let mut stopped = Instance::new(
                 "deliberately stopped control",
@@ -3924,9 +3968,10 @@ mod tests {
                 storage.update(|rows, _| {
                     let current = rows.iter_mut().find(|row| row.id == source.id).unwrap();
                     assert_eq!(handoff_key(current)?, live_key);
-                    current.lifecycle_reservation.as_mut().unwrap().at = chrono::Utc::now()
-                        - Instance::LIFECYCLE_RESERVATION_TTL
-                        - chrono::Duration::seconds(1);
+                    current.lifecycle_reservation.as_mut().unwrap().at =
+                        crate::time::Timestamp::now()
+                            - Instance::LIFECYCLE_RESERVATION_TTL
+                            - crate::time::Duration::seconds(1);
                     Ok(())
                 })?;
                 // The blocked real host hook proves the live driver, not the marker age.
@@ -5247,7 +5292,8 @@ mod tests {
                 [true, false, true],
             ),
         ] {
-            let outcome = handoff_outcome(context, terminal);
+            let outcome: TerminalConversation =
+                crate::session::TerminalHandoffOutcome::of(context, terminal).into();
             for (conversation, honoured) in [None, Some(Continue), Some(Fresh)]
                 .into_iter()
                 .zip(honoured)
@@ -5278,6 +5324,7 @@ mod tests {
                 .execution
                 .expect("asserted binding has an execution"),
         };
+        kept.outcome = crate::session::TerminalHandoffOutcome::Continue;
         keeping.terminal_handoff = Some(Box::new(kept));
         let rows = vec![discarding, keeping];
         crate::server::test_support::seed_instances_on_disk_for_test("default", rows.clone());
@@ -5372,7 +5419,7 @@ mod tests {
         // An archived row starts no pane, so its selector never reaches a launch.
         let mut archived = selecting("own selector, archived", None);
         archived.agent_session_id = Some("sid-archived".into());
-        archived.archived_at = Some(chrono::Utc::now());
+        archived.archived_at = Some(crate::time::Timestamp::now());
         let rows = vec![
             archived.clone(),
             unbound.clone(),

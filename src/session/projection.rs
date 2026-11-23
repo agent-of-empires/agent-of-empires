@@ -3,7 +3,7 @@
 //! Borrowed and typed so each surface formats timestamps and names fields to
 //! its own contract without a second derivation from the `Instance`.
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 
 use super::{Instance, SessionBucket, Status, WorkspaceRepo, WorktreeInfo};
 
@@ -19,15 +19,16 @@ pub(crate) struct SessionProjection<'a> {
     pub profile: &'a str,
     pub status: Status,
     pub bucket: SessionBucket,
-    pub created_at: DateTime<Utc>,
-    pub last_accessed_at: Option<DateTime<Utc>>,
-    pub idle_entered_at: Option<DateTime<Utc>>,
+    pub created_at: Timestamp,
+    pub last_accessed_at: Option<Timestamp>,
+    pub idle_entered_at: Option<Timestamp>,
     pub last_error: Option<&'a str>,
     pub last_error_evidence: Option<super::OperationErrorEvidence>,
-    pub archived_at: Option<DateTime<Utc>>,
-    pub trashed_at: Option<DateTime<Utc>>,
-    pub active_snoozed_until: Option<DateTime<Utc>>,
-    pub pinned_at: Option<DateTime<Utc>>,
+    pub archived_at: Option<Timestamp>,
+    pub ignored_at: Option<Timestamp>,
+    pub trashed_at: Option<Timestamp>,
+    pub active_snoozed_until: Option<Timestamp>,
+    pub pinned_at: Option<Timestamp>,
     pub agent_session_id: Option<&'a str>,
     pub parent_session_id: Option<&'a str>,
     pub worktree: Option<&'a WorktreeInfo>,
@@ -52,6 +53,7 @@ impl<'a> SessionProjection<'a> {
             last_error: inst.last_error.as_deref(),
             last_error_evidence: inst.last_error_evidence,
             archived_at: inst.archived_at,
+            ignored_at: inst.ignored_at,
             trashed_at: inst.trashed_at,
             active_snoozed_until: inst.active_snoozed_until(),
             pinned_at: inst.pinned_at,

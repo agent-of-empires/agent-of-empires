@@ -122,7 +122,7 @@ pub struct WorktreeInfo {
     pub branch: String,
     pub main_repo_path: String,
     pub managed_by_aoe: bool,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Branch the worktree was created from when `managed_by_aoe` is
     /// true. None means "the repo's default branch was used" (the
     /// historical behavior before #948) or the worktree was attached
@@ -181,7 +181,7 @@ pub struct WorkspaceInfo {
     pub branch: String,
     pub workspace_dir: String,
     pub repos: Vec<WorkspaceRepo>,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     #[serde(default = "default_true")]
     pub cleanup_on_delete: bool,
 }
@@ -397,6 +397,9 @@ pub struct PluginCreateIdempotency {
     pub key: String,
     pub payload_hash: String,
 }
+
+/// Largest accepted `initial_prompt`, in bytes.
+pub const MAX_INITIAL_PROMPT_BYTES: usize = 64 * 1024;
 
 #[cfg(test)]
 mod tests {

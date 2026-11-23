@@ -195,6 +195,40 @@ describe("UpdateBanner", () => {
     }
   });
 
+  it("a poll pending past 15s is abandoned, keeps the offer, and the hourly cadence resumes", async () => {
+    vi.useFakeTimers();
+    // Native AbortSignal.timeout ignores fake timers; route it through the faked setTimeout.
+    vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), ms);
+      return controller.signal;
+    });
+    try {
+      fetchUpdateStatus.mockResolvedValueOnce(makeStatus());
+      render(<Banner />);
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(screen.getByRole("status", { name: /^Update available/ })).toBeTruthy();
+
+      // The newest poll never answers; only the request deadline settles it (as null, like fetchJson).
+      fetchUpdateStatus.mockImplementationOnce(
+        (init?: RequestInit) => new Promise((resolve) => init?.signal?.addEventListener("abort", () => resolve(null))),
+      );
+      fetchUpdateStatus.mockResolvedValue(makeStatus());
+      act(() => {
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      expect(fetchUpdateStatus).toHaveBeenCalledTimes(2);
+
+      await act(() => vi.advanceTimersByTimeAsync(15_000));
+      expect(screen.getByRole("status", { name: /^Update available/ })).toBeTruthy();
+      await act(() => vi.advanceTimersByTimeAsync(60 * 60_000));
+      expect(fetchUpdateStatus).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.restoreAllMocks();
+      vi.useRealTimers();
+    }
+  });
+
   it("a slower older poll can't restore an offer a newer poll withdrew", async () => {
     fetchUpdateStatus.mockResolvedValue(makeStatus());
     render(<Banner />);

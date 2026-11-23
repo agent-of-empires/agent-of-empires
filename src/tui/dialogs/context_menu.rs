@@ -51,6 +51,24 @@ pub enum ContextMenuAction {
     RetryTrash,
 }
 
+impl ContextMenuAction {
+    /// Same vocabulary as `ActionId::feature_use`, so a menu click and its hotkey count alike.
+    pub fn feature_use(self) -> Option<crate::telemetry::feature_use::FeatureUse> {
+        use crate::telemetry::feature_use::FeatureUse as F;
+        Some(match self {
+            ContextMenuAction::ToggleArchive => F::ArchiveToggle,
+            ContextMenuAction::ToggleSnooze => F::SnoozeToggle,
+            ContextMenuAction::ToggleUnread => F::UnreadToggle,
+            ContextMenuAction::NewFromSelection => F::NewFromSelection,
+            ContextMenuAction::Fork => F::Fork,
+            ContextMenuAction::TogglePin => F::ProjectPinToggle,
+            ContextMenuAction::EmptyTrash => F::TrashEmpty,
+            ContextMenuAction::Restore => F::TrashRestore,
+            _ => return None,
+        })
+    }
+}
+
 pub struct SessionMenuTarget {
     pub id: String,
     pub profile: String,

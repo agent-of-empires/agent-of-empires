@@ -208,6 +208,14 @@ fn resolve_host_creation(
                 .collect::<Result<_>>()?;
     }
     for path in &mut body.extra_repo_paths {
+        if !std::path::Path::new(path).is_dir() {
+            return Err(anyhow::Error::new(
+                crate::session::builder::BuildRefusal::WorkingDirMissing(path.clone()),
+            )
+            .context(format!(
+                "Repository path does not exist or is not a directory: {path}"
+            )));
+        }
         *path = std::path::Path::new(path)
             .canonicalize()
             .context("Failed to resolve an additional repository on the Daemon host")?
@@ -381,31 +389,11 @@ fn resolve_host_creation(
     body.sandbox |= config.sandbox.enabled_by_default
         && crate::containers::get_container_runtime().is_available();
     if body.sandbox {
-        let explicit = body
-            .sandbox_image
-            .take()
-            .map(|mut image| {
-                image.truncate(image.trim_end().len());
-                let leading = image.len() - image.trim_start().len();
-                if leading != 0 {
-                    image.drain(..leading);
-                }
-                image
-            })
-            .filter(|image| !image.is_empty());
-        body.sandbox_image = Some(match explicit {
-            Some(image) => image,
-            None => {
-                let configured = config.sandbox.default_image.trim();
-                if configured.is_empty() {
-                    crate::containers::get_container_runtime()
-                        .default_sandbox_image()
-                        .to_owned()
-                } else {
-                    configured.to_owned()
-                }
-            }
-        });
+        body.sandbox_image = Some(
+            config
+                .sandbox
+                .resolve_image(body.sandbox_image.take().as_deref()),
+        );
     }
     if body.view == crate::session::View::Structured {
         use crate::session::builder::structured::{
@@ -514,7 +502,7 @@ provider_versions = ["^18"]
                             manifest.as_bytes(),
                         ),
                         capabilities: vec!["session.integration".into()],
-                        granted_at: chrono::Utc::now(),
+                        granted_at: crate::time::Timestamp::now(),
                     }),
                     ..Default::default()
                 },
