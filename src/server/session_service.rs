@@ -4156,6 +4156,7 @@ mod tests {
             error: error.map(str::to_string),
             error_code: None,
             id: String::new(),
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
 
         assert!(service.turn_is_deliverable("sess-switch", &turn("fresh", None)));
@@ -5227,6 +5228,7 @@ mod tests {
             error: None,
             error_code: None,
             id: String::new(),
+            origin: crate::daemon::PromptOrigin::Unknown,
         });
         inst
     }

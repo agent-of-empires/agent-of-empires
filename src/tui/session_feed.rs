@@ -494,7 +494,7 @@ async fn run_command_writer(
             let epoch = epoch.clone();
             creations.spawn(async move {
                 let outcome = client
-                    .create_session(&body, &epoch)
+                    .create_session(&body, &epoch, crate::daemon::PromptOrigin::Tui)
                     .await
                     .map(|receipt| CommandReply::Created(Box::new(receipt)))
                     .map_err(CommandFailure::creation);

@@ -864,7 +864,16 @@ pub async fn create_session(
     };
     let wait_ready = query.wait.as_deref() == Some("ready");
     let origin = crate::server::api::prompt_origin(&headers);
-    create_session_with(state, local_owner, &reference, wait_ready, body, None, origin).await
+    create_session_with(
+        state,
+        local_owner,
+        &reference,
+        wait_ready,
+        body,
+        None,
+        origin,
+    )
+    .await
 }
 
 /// `POST /api/sessions` once the caller is authorized and the body parsed, for a surface

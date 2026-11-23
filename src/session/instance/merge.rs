@@ -584,6 +584,7 @@ mod tests {
             error: error.map(str::to_string),
             error_code: error.map(|_| "code".to_string()),
             id: id.into(),
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         for (prior_id, fresh_id, fresh_text, generation, kept) in [
             ("a", "a", "same", 0, true),

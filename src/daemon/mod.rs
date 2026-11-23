@@ -510,15 +510,17 @@ impl DaemonClient {
         &self,
         body: &CreateSessionBody,
         epoch: &str,
+        origin: PromptOrigin,
     ) -> Result<MutationReceipt<SessionResponse>, DaemonClientError> {
-        self.request_mutation_with_outcome(
-            self.http
-                .post(self.sessions_url.clone())
-                .timeout(Duration::from_secs(30 * 60))
-                .json(body),
-            epoch,
-        )
-        .await
+        let mut request = self
+            .http
+            .post(self.sessions_url.clone())
+            .timeout(Duration::from_secs(30 * 60))
+            .json(body);
+        if let Some(origin) = origin.as_header_value() {
+            request = request.header(PromptOrigin::HEADER, origin);
+        }
+        self.request_mutation_with_outcome(request, epoch).await
     }
 
     /// Request deferred cancellation; the returned cursor confirms the daemon
@@ -1521,7 +1523,10 @@ mod tests {
                 "path": "/tmp", "tool": "claude", "cli": {},
             }))
             .unwrap();
-            let error = client.create_session(&body, "epoch").await.unwrap_err();
+            let error = client
+                .create_session(&body, "epoch", PromptOrigin::Unknown)
+                .await
+                .unwrap_err();
             assert!(matches!(
                 &error,
                 DaemonClientError::Status {

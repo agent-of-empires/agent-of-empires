@@ -11162,8 +11162,14 @@ async fn create_persists_initial_prompt_as_pending_turn() {
         assert!(!turn.synthesized);
         turn.origin
     };
-    assert_eq!(origin_of("with-prompt"), crate::daemon::PromptOrigin::Unknown);
-    assert_eq!(origin_of("with-prompt-tui"), crate::daemon::PromptOrigin::Tui);
+    assert_eq!(
+        origin_of("with-prompt"),
+        crate::daemon::PromptOrigin::Unknown
+    );
+    assert_eq!(
+        origin_of("with-prompt-tui"),
+        crate::daemon::PromptOrigin::Tui
+    );
 }
 
 #[tokio::test]

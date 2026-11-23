@@ -651,7 +651,7 @@ async fn daemon_group_move_preserves_live_terminal_and_restarts_in_target_profil
 async fn native_creation_hooks_preserve_borrowed_scratch_resources() {
     use agent_of_empires::daemon::{
         ApiErrorCode, CreateSessionBody, CreationTrustRequest, DaemonClient, DaemonClientError,
-        RUNTIME_EPOCH_HEADER,
+        PromptOrigin, RUNTIME_EPOCH_HEADER,
     };
     require_tmux!();
     if std::process::Command::new("curl")
@@ -729,7 +729,7 @@ async fn native_creation_hooks_preserve_borrowed_scratch_resources() {
         }))
         .unwrap();
         let owner = sdk
-            .create_session(&owner_body, &epoch)
+            .create_session(&owner_body, &epoch, PromptOrigin::Unknown)
             .await
             .unwrap()
             .outcome;
@@ -826,10 +826,12 @@ if grep -Fq 'hooks_hash = "{hash}"' {trust:?}; then printf approved > {trust_see
                 mcp.replace("secret-before-review", "secret-after-review"),
             )
             .unwrap();
-            assert!(matches!(sdk.create_session(&borrower_body, &epoch).await,
+            assert!(
+                matches!(sdk.create_session(&borrower_body, &epoch, PromptOrigin::Unknown).await,
                 Err(DaemonClientError::Status { code: Some(ApiErrorCode::CreationTrustChanged), body, .. })
                     if !["secret-before-review", "secret-after-review", "secret-header"]
-                        .iter().any(|secret| body.contains(secret))));
+                        .iter().any(|secret| body.contains(secret)))
+            );
             assert!(!app.join("trusted_repos.toml").exists());
             let repo = git2::Repository::open(&source).unwrap();
             assert!(repo
