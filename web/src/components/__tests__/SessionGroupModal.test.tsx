@@ -59,6 +59,7 @@ describe("SessionGroupModal", () => {
     if (via === "enter") {
       // The open list takes the first Enter; the second saves.
       fireEvent.keyDown(input, { key: "Enter" });
+      expect(onSave).not.toHaveBeenCalled();
       fireEvent.keyDown(input, { key: "Enter" });
     } else fireEvent.click(saveBtn);
     if (saved == null) expect(onSave).not.toHaveBeenCalled();
