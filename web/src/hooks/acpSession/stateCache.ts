@@ -159,15 +159,26 @@ function writePendingRow(sessionId: string, row: QueuedPrompt): boolean {
   return ok;
 }
 
+function writeDoneMark(sessionId: string, id: string): boolean {
+  const key = donePrefix(sessionId) + id;
+  const body = JSON.stringify({ savedAt: Date.now() });
+  return safeSetItem(key, body) || (evictOldestPersistedAcpState(storageKey(sessionId)) && safeSetItem(key, body));
+}
+
 function syncPendingRows(sessionId: string, state: AcpState): void {
   if (typeof window === "undefined") return;
   const rows = pendingRowsOf(state);
   const ids = new Set(rows.map((q) => q.id));
   const written = writtenPendingText.get(sessionId);
+  const known = new Set(ids);
   try {
     for (const id of knownPendingIds.get(sessionId) ?? []) {
       if (ids.has(id)) continue;
-      safeSetItem(donePrefix(sessionId) + id, JSON.stringify({ savedAt: Date.now() }));
+      // The terminal mark goes first; until it is stored the row stays tracked and its entry stays, so this retries.
+      if (!writeDoneMark(sessionId, id)) {
+        known.add(id);
+        continue;
+      }
       window.localStorage.removeItem(pendingPrefix(sessionId) + id);
       written?.delete(id);
     }
@@ -181,7 +192,7 @@ function syncPendingRows(sessionId: string, state: AcpState): void {
   } catch {
     // Storage unavailable.
   }
-  knownPendingIds.set(sessionId, ids);
+  knownPendingIds.set(sessionId, known);
 }
 
 /** The state with its unconfirmed rows taken from their own entries; the stored list never carries pending rows. */

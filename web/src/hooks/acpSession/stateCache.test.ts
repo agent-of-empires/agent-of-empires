@@ -12,7 +12,7 @@ import {
   type BackgroundAgent,
   type BackgroundShell,
 } from "../../lib/acpTypes";
-import { PENDING_KEY_PREFIX, STORAGE_KEY_PREFIX } from "../../lib/acpStateStorage";
+import { PENDING_DONE_KEY_PREFIX, PENDING_KEY_PREFIX, STORAGE_KEY_PREFIX } from "../../lib/acpStateStorage";
 import {
   cacheGet,
   cacheSet,
@@ -370,6 +370,22 @@ describe("pending queued rows", () => {
     const tab2 = await import("./stateCache");
     expect(tab2.loadPersistedState("pr-done")?.queuedPrompts).toEqual([]);
     expect(pendingKeys("pr-done")).toEqual([]);
+  });
+
+  it("keeps a row's entry until its terminal mark is stored, so a failed mark is retried", async () => {
+    writeEntry("pr-mark", withRows(row("a")), T);
+    expect(loadedIds("pr-mark")).toEqual(["a"]);
+    const spy = vi.spyOn(Storage.prototype, "setItem").mockImplementation((k) => {
+      if (k.startsWith(PENDING_DONE_KEY_PREFIX)) throw new DOMException("full", "QuotaExceededError");
+    });
+    cacheSet("pr-mark", withRows(row("a", { pending: false })));
+    spy.mockRestore();
+    expect(pendingKeys("pr-mark")).toEqual(["a"]);
+    cacheSet("pr-mark", withRows(row("a", { pending: false })));
+    expect(pendingKeys("pr-mark")).toEqual([]);
+    vi.resetModules();
+    const tab2 = await import("./stateCache");
+    expect(tab2.loadPersistedState("pr-mark")?.queuedPrompts).toEqual([]);
   });
 
   it("retries a pending write that failed on quota", () => {
