@@ -3159,11 +3159,12 @@ pub async fn set_agent_default_model(
         .await
         .get(&agent)
         .is_some();
-    // Held until the write lands, so a rename or delete can't move the profile after the check
-    // and leave `update_profile_config` to recreate it.
-    let _namespace = state.profile_namespace.read().await;
-    let _gate = write_gate().await;
+    // Owned by the write, which outlives a cancelled handler, so a rename or delete can't move
+    // the profile after the check and leave `update_profile_config` to recreate it.
+    let namespace = state.profile_namespace.clone().read_owned().await;
+    let gate = write_gate().await;
     let result = tokio::task::spawn_blocking(move || {
+        let _guards = (namespace, gate);
         if let Err(e) = crate::session::require_known_profile(&name) {
             return Err(api_error(StatusCode::NOT_FOUND, "not_found", e.to_string()));
         }
@@ -4872,37 +4873,47 @@ command = "zzzeta"
     }
 
     /// A rename or delete reaching the profile between the PUT's check and its write waits for
-    /// the write, so nothing recreates the old name and a rename carries the new default.
+    /// the write, even when the request is cancelled, so nothing recreates the old name and a
+    /// rename carries the new default.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial]
     async fn agent_default_model_put_holds_the_profile_against_a_rename_or_delete(
     ) -> anyhow::Result<()> {
         use crate::daemon::ProfileMutation;
-        let _home = crate::session::test_support::isolate_app_dir();
-        let root = crate::session::get_app_dir()?;
-        crate::session::purge_owners::initialize(&root)?;
-        let state = crate::server::test_support::build_test_app_state(Vec::new());
-        for (name, mutation, carried_to) in [
-            (
-                "rename",
+        let mutation = |rename: bool| {
+            if rename {
                 ProfileMutation::Rename {
                     name: "work".into(),
                     body: crate::daemon::RenameProfileBody {
                         new_name: "renamed".into(),
                     },
-                },
-                Some("renamed"),
-            ),
-            (
-                "delete",
+                }
+            } else {
                 ProfileMutation::Delete {
                     name: "work".into(),
                     query: Default::default(),
-                },
-                None,
-            ),
-        ] {
+                }
+            }
+        };
+        for (rename, cancelled) in [(true, false), (false, false), (true, true), (false, true)] {
+            let name = format!(
+                "{}{}",
+                if rename { "rename" } else { "delete" },
+                if cancelled { ", cancelled" } else { "" }
+            );
+            // A fresh app dir per row, so no row sees another's profiles.
+            let _home = crate::session::test_support::isolate_app_dir();
+            let root = crate::session::get_app_dir()?;
+            crate::session::purge_owners::initialize(&root)?;
+            let state = crate::server::test_support::build_test_app_state(Vec::new());
+            let carried_to = rename.then_some("renamed");
+            // A delete must leave a profile behind.
+            crate::session::create_profile("other")?;
             crate::session::create_profile("work")?;
+            assert!(
+                root.join("profiles/work").exists() && !root.join("profiles/renamed").exists(),
+                "{name}: the row's fixture"
+            );
             crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
             let (entered, checked) = tokio::sync::oneshot::channel();
             let (resume, paused) = std::sync::mpsc::channel();
@@ -4916,11 +4927,18 @@ command = "zzzeta"
                 async move { put_default_model(&state, "work", "claude", "m").await }
             });
             checked.await?;
+            let put = if cancelled {
+                put.abort();
+                assert!(put.await.unwrap_err().is_cancelled(), "{name}");
+                None
+            } else {
+                Some(put)
+            };
             assert!(
                 state.profile_namespace.try_write().is_err(),
                 "{name}: the PUT must hold the namespace between its check and its write"
             );
-            let commit = tokio::spawn(commit_profile(state.clone(), mutation));
+            let commit = tokio::spawn(commit_profile(state.clone(), mutation(rename)));
             // With the namespace held, a failed read means the mutation is queued for it.
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
             while state.profile_namespace.try_read().is_ok() {
@@ -4932,8 +4950,11 @@ command = "zzzeta"
             }
             assert!(!commit.is_finished(), "{name}");
             resume.send(())?;
-            let (status, _, body) = put.await?;
-            assert_eq!(status, StatusCode::OK, "{name}: {body}");
+            if let Some(put) = put {
+                let (status, _, body) = put.await?;
+                assert_eq!(status, StatusCode::OK, "{name}: {body}");
+            }
+            // The mutation gets the namespace only once the write releases it.
             assert_eq!(commit.await?.status(), StatusCode::OK, "{name}");
             assert!(
                 !root.join("profiles/work").exists(),
