@@ -51,5 +51,13 @@ test("the JS fallback grows the composer to its cap and keeps the transcript pin
     const supports = CSS.supports.bind(CSS) as (...args: string[]) => boolean;
     CSS.supports = (...args: string[]) => !String(args[0]).includes("field-sizing") && supports(...args);
   });
+  // Chromium still honors the field-sizing-content class, so neutralize it to make JS the only sizer.
+  await page.addInitScript(() => {
+    document.addEventListener("DOMContentLoaded", () => {
+      const style = document.createElement("style");
+      style.textContent = "textarea { field-sizing: fixed !important }";
+      document.head.appendChild(style);
+    });
+  });
   await typeUntilCapKeepsPin(page, "200px");
 });
