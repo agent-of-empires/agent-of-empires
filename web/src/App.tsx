@@ -182,7 +182,7 @@ const loadSendCommentsDialog = () => import("./components/diff/comments/SendComm
 const SendCommentsDialog = lazyView(() => loadSendCommentsDialog().then((m) => m.SendCommentsDialog), null);
 const loadCommandPalette = () => import("./components/command-palette/CommandPalette");
 const LazyCommandPalette = lazyView(() => loadCommandPalette().then((m) => m.CommandPalette), null);
-// Mounted only while open so the chunk is not fetched until needed.
+// Mounted only while open; the chunk itself is prefetched on idle.
 function CommandPalette(props: ComponentProps<typeof LazyCommandPalette>) {
   return props.open ? <LazyCommandPalette {...props} /> : null;
 }
