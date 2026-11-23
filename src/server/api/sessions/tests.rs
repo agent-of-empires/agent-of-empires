@@ -11459,6 +11459,7 @@ async fn a_link_records_whether_start_or_the_wizard_made_it() {
         false,
         serde_json::from_value(start).unwrap(),
         None,
+        crate::daemon::PromptOrigin::Unknown,
         StartedVia::Start,
     )
     .await;

@@ -74,7 +74,12 @@ pub(super) fn record_status(
         "INSERT INTO suggestion_providers (profile, provider_id, error, updated_at)
          VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT (profile, provider_id) DO UPDATE SET error = ?3, updated_at = ?4",
-        params![profile, provider_id, error, chrono::Utc::now().timestamp()],
+        params![
+            profile,
+            provider_id,
+            error,
+            crate::time::Timestamp::now().as_unix_secs()
+        ],
     )?;
     // A new status replaces the old error's fix; `error` stores its own afterwards.
     conn.execute(
@@ -809,7 +814,7 @@ mod tests {
         let mut trashed = session("trashed");
         trashed.trash();
         let mut archived = session("archived");
-        archived.archived_at = Some(chrono::Utc::now());
+        archived.archived_at = Some(crate::time::Timestamp::now());
         let instances = [session("unlinked"), archived, trashed];
         let link = |item: &str, session: &str| Link {
             provider_id: "acme.github".to_string(),

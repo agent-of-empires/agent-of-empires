@@ -671,6 +671,7 @@ pub async fn start_suggestion(
         false,
         create,
         None,
+        crate::daemon::PromptOrigin::Unknown,
         crate::plugin::suggestions::StartedVia::Start,
     )
     .await;

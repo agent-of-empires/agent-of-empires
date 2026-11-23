@@ -57,7 +57,7 @@ pub(crate) fn register_provider() -> crate::plugin::ReloadRegistryOnDrop {
                 grant: Some(crate::session::CapabilityGrant {
                     manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(MANIFEST.as_bytes()),
                     capabilities: vec!["runtime.worker".to_string()],
-                    granted_at: chrono::Utc::now(),
+                    granted_at: crate::time::Timestamp::now(),
                 }),
                 ..crate::session::PluginConfig::default()
             },

@@ -30,7 +30,7 @@ pub(crate) fn set(
         provider_id,
         spec,
         params,
-        chrono::Utc::now().timestamp(),
+        crate::time::Timestamp::now().as_unix_secs(),
     )
 }
 

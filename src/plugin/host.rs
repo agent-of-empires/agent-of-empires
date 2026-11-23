@@ -3199,7 +3199,7 @@ variables = []
                                 manifest.as_bytes(),
                             ),
                             capabilities: vec!["runtime.worker".to_string()],
-                            granted_at: chrono::Utc::now(),
+                            granted_at: crate::time::Timestamp::now(),
                         }),
                         ..PluginConfig::default()
                     },

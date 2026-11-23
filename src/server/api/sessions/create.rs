@@ -1137,6 +1137,7 @@ pub async fn create_session(
 /// worker runs. `body_prompt_origin` attributes the body's own `initial_prompt` when no
 /// `initial_turn` is given.
 /// `via` is how a suggestion link it claims is recorded.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_session_with(
     state: Arc<AppState>,
     local_owner: bool,
