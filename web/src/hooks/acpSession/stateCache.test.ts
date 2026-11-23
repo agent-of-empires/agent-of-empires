@@ -276,6 +276,8 @@ describe("pending queued rows", () => {
   const writeRow = (id: string, r: ReturnType<typeof row>) =>
     localStorage.setItem(`${PENDING_KEY_PREFIX}${id}:${r.id}`, JSON.stringify({ savedAt: T, row: r }));
   const loadedIds = (id: string) => loadPersistedState(id)?.queuedPrompts.map((q) => q.id);
+  const loadedPending = (id: string) =>
+    loadPersistedState(id)?.queuedPrompts.map(({ id: rowId, text }) => ({ id: rowId, text }));
 
   beforeEach(() => {
     vi.useFakeTimers();
@@ -328,6 +330,34 @@ describe("pending queued rows", () => {
     expect(pendingKeys("pr-tabs")).toEqual(["a", "b", "c"]);
     cacheSet("pr-tabs", withRows(row("a", { pending: false }), row("c")));
     expect(pendingKeys("pr-tabs")).toEqual(["b", "c"]);
+  });
+
+  it("persists an edit to a pending row, without recreating a row another tab removed", () => {
+    cacheSet("pr-edit", withRows(row("a")));
+    cacheSet("pr-edit", withRows(row("a", { text: "edited" })));
+    expect(loadedPending("pr-edit")).toEqual([{ id: "a", text: "edited" }]);
+    localStorage.removeItem(`${PENDING_KEY_PREFIX}pr-edit:a`);
+    cacheSet("pr-edit", withRows(row("a", { text: "edited again" })));
+    expect(pendingKeys("pr-edit")).toEqual([]);
+  });
+
+  it("migrates pending rows from an older transcript before a flush strips them", () => {
+    writeEntry("pr-up", withRows(row("a")), T);
+    expect(loadedIds("pr-up")).toEqual(["a"]);
+    expect(pendingKeys("pr-up")).toEqual(["a"]);
+    persistState("pr-up", withRows(row("a")), T + 1);
+    expect(loadedIds("pr-up")).toEqual(["a"]);
+  });
+
+  it("retries a pending write that failed on quota", () => {
+    const spy = vi.spyOn(Storage.prototype, "setItem").mockImplementationOnce(() => {
+      throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
+    });
+    cacheSet("pr-quota", withRows(row("a")));
+    expect(pendingKeys("pr-quota")).toEqual([]);
+    cacheSet("pr-quota", withRows(row("a")));
+    expect(pendingKeys("pr-quota")).toEqual(["a"]);
+    spy.mockRestore();
   });
 
   it("never stores attachment rows, and clearAcpCache removes the entries", () => {
