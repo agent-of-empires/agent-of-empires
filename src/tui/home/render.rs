@@ -439,8 +439,8 @@ fn spinner_idle_fresh(
         .current_frame()
 }
 
-/// Structured view row icon for a session. Centralizes the archive/snooze override that
-/// kills the live spinner for sunk rows so the list reads as parked. Crate-visible so
+/// Structured view row icon for a session. Centralizes the archive/snooze/ignore override
+/// that kills the live spinner for sunk rows so the list reads as parked. Crate-visible so
 /// tests can pin the override without the full render pipeline.
 pub(crate) fn agent_row_icon(inst: &crate::session::Instance) -> &'static str {
     // A dormant (idle-reaped, resumable) structured worker gets its own glyph, taking
@@ -464,7 +464,7 @@ pub(crate) fn agent_row_icon(inst: &crate::session::Instance) -> &'static str {
     if matches!(inst.status, Status::Error | Status::Deleting) {
         return icon;
     }
-    if inst.is_archived() || inst.is_snoozed() || inst.is_trashed() {
+    if inst.is_archived() || inst.is_snoozed() || inst.is_ignored() || inst.is_trashed() {
         ICON_STOPPED
     } else {
         icon
@@ -518,9 +518,9 @@ fn decorate_row(
         // is the textual cue, so this is a dim color with no italic modifier.
         icon = sunk_icon;
         style = Style::default().fg(theme.dimmed);
-    } else if in_attention && inst.is_snoozed() {
-        // Snooze decoration is Attention-only; elsewhere the row paints its real state
-        // and the timer keeps running.
+    } else if in_attention && (inst.is_snoozed() || inst.is_ignored()) {
+        // Snooze and ignore decoration is Attention-only; elsewhere the row paints its
+        // real state. Ignored rows stay present and live, unlike archive and trash.
         icon = sunk_icon;
         style = Style::default()
             .fg(theme.dimmed)
@@ -535,12 +535,15 @@ fn decorate_row(
             .add_modifier(Modifier::RAPID_BLINK);
     }
 
-    // Prefix priority: archive (none) > snooze (`z `) > urgent (`! `). Both are
-    // Attention-only so other sorts show no decoration for state the user did not opt into.
+    // Prefix priority: archive (none) > snooze (`z `) > ignore (`i `) > urgent (`! `).
+    // Snooze, ignore and urgent are Attention-only so other sorts show no decoration
+    // for state the user did not opt into.
     let title_text = if inst.is_archived() || inst.is_trashed() {
         Cow::Owned(inst.title.clone())
     } else if in_attention && inst.is_snoozed() {
         Cow::Owned(format!("z {}", inst.title))
+    } else if in_attention && inst.is_ignored() {
+        Cow::Owned(format!("i {}", inst.title))
     } else if in_attention && inst.is_urgent() {
         Cow::Owned(format!("! {}", inst.title))
     } else {
@@ -696,12 +699,17 @@ pub(crate) fn compute_row_tag(
     }
 }
 
+/// A single-repo branch tag that only repeats the session title is dropped.
 fn branch_row_tag(inst: &crate::session::Instance) -> Option<RowTag> {
     if let Some(ws) = &inst.workspace_info {
+        if ws.repos.len() <= 1 && ws.branch == inst.title {
+            return None;
+        }
         workspace_branch_row_tag(&ws.branch, ws.repos.len())
     } else {
         inst.worktree_info
             .as_ref()
+            .filter(|w| w.branch != inst.title)
             .and_then(|w| plain_branch_row_tag(&w.branch))
     }
 }
@@ -2061,6 +2069,7 @@ impl HomeView {
                             let unread_resting = crate::session::unread_enabled()
                                 && inst.is_unread()
                                 && !inst.is_archived()
+                                && !inst.is_ignored()
                                 && !inst.is_snoozed()
                                 && matches!(inst.status, Status::Idle | Status::Unknown);
                             let color = if is_shown_dormant && !unread_resting {
@@ -5696,6 +5705,24 @@ mod tests {
             rendered_width(&rendered),
             BRANCH_TAG_WIDTH + 2,
             "a wide branch name must cap at the tag contract, got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn branch_row_tag_is_dropped_when_it_repeats_the_title() {
+        let mut inst = crate::session::Instance::new("feat/x", "/tmp/a");
+        inst.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "feat/x".into(),
+            main_repo_path: "/tmp".into(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        assert!(branch_row_tag(&inst).is_none());
+        inst.title = "Teutons".into();
+        assert_eq!(
+            branch_row_tag(&inst).map(|tag| tag.content),
+            Some("x".into())
         );
     }
 

@@ -68,7 +68,7 @@ pub struct InstanceParams {
     /// repository's detected default branch. See #948.
     pub base_branch: Option<String>,
     pub sandbox: bool,
-    /// The sandbox image to use. Required when sandbox is true.
+    /// The sandbox image to use; blank resolves to the configured default.
     pub sandbox_image: String,
     pub yolo_mode: bool,
     /// Additional environment entries for the container.
@@ -1129,7 +1129,7 @@ pub(crate) fn plan_instance(
         instance.sandbox_info = Some(SandboxInfo {
             enabled: true,
             container_id: None,
-            image: params.sandbox_image.clone(),
+            image: config.sandbox.resolve_image(Some(&params.sandbox_image)),
             container_name: containers::DockerContainer::generate_name(&instance.id),
             extra_env: if params.extra_env.is_empty() {
                 None

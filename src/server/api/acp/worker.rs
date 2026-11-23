@@ -1052,10 +1052,7 @@ pub async fn switch_acp_agent(
             }
             Err(error) => return launch_error_response("agent switch completion", &error),
         };
-    state
-        .telemetry_structured
-        .agent_switches
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::telemetry::consent::bump(&state.telemetry_structured.agent_switches);
 
     let reason = req
         .reason

@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-import { InstallAgentError, installAcpAgent } from "../../lib/api";
+import { InstallAgentError, installAcpAgent, type InstallAgentResponse } from "../../lib/api";
 
 /** Copy for each `install-agent` refusal; any other failure shows the server's message. */
 const REFUSAL_COPY: Record<string, string> = {
@@ -25,6 +25,8 @@ export function useAdapterInstall(sessionId: string, respawn: () => Promise<bool
   const [error, setError] = useState<string | null>(null);
   const [errorCode, setErrorCode] = useState<string | null>(null);
   const [output, setOutput] = useState<string | null>(null);
+  // npm's answer when it ran; null when the request was refused or never answered.
+  const [result, setResult] = useState<InstallAgentResponse | null>(null);
   const [recovered, setRecovered] = useState(0);
 
   const install = async (): Promise<string | null> => {
@@ -32,8 +34,10 @@ export function useAdapterInstall(sessionId: string, respawn: () => Promise<bool
     setError(null);
     setErrorCode(null);
     setOutput(null);
+    setResult(null);
     try {
       const res = await installAcpAgent(sessionId);
+      setResult(res);
       setOutput(`${res.stdout}\n${res.stderr}`.trim() || null);
       if (!res.success) {
         setState("failed");
@@ -53,7 +57,7 @@ export function useAdapterInstall(sessionId: string, respawn: () => Promise<bool
     }
   };
 
-  return { state, error, errorCode, output, recovered, install };
+  return { state, error, errorCode, output, result, recovered, install };
 }
 
 // The event names the agent ("Failed to start structured view agent \"x\": ...");

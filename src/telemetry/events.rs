@@ -6,7 +6,7 @@ use serde::Serialize;
 
 /// Bump on any wire shape change, including additive optional fields. v14 excludes trashed
 /// sessions from every census, so v13 and v14 series must not be averaged together.
-pub const SCHEMA_VERSION: u32 = 14;
+pub const SCHEMA_VERSION: u32 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -87,7 +87,7 @@ pub struct UsageSnapshot {
     pub session_sandboxed: u32,
     pub session_yolo: u32,
 
-    /// `aoe serve` reports the window peak; the TUI reports the point-in-time total.
+    /// The window peak, or the point-in-time total when a consent change discarded the window.
     pub peak_concurrent_sessions: u32,
 
     pub session_pinned: u32,
@@ -109,6 +109,11 @@ pub struct UsageSnapshot {
     pub distinct_sessions_by_model_bucket: BTreeMap<String, u32>,
 
     pub features: BTreeMap<String, bool>,
+    /// Closed-vocabulary layout and ordering preferences, see `features::active_prefs`.
+    pub prefs: BTreeMap<String, String>,
+    /// Accessory-feature uses since the last confirmed snapshot, keyed by the
+    /// `feature_use` registry. Every key is always present.
+    pub feature_uses: BTreeMap<String, u32>,
 
     pub usage_seen: BTreeMap<String, u32>,
 
@@ -139,6 +144,45 @@ pub struct UsageSnapshot {
     /// Only builtin and featured plugins are named; others are counted by source only.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub plugins_active: BTreeMap<String, bool>,
+}
+
+impl UsageSnapshot {
+    /// Whether any counter that is cleared after a confirmed send is non-zero. Such a
+    /// snapshot is never deduped: the same count in a later window is new usage.
+    pub fn carries_deltas(&self) -> bool {
+        self.feature_uses
+            .values()
+            .chain(self.usage_seen.values())
+            .any(|&n| n > 0)
+            || self
+                .web_clients_seen
+                .values()
+                .chain(self.structured_clients_seen.values())
+                .any(|&seen| seen)
+            || self.session_creates_since_last_snapshot > 0
+            || self.approvals_resolved > 0
+            || self.agent_switches > 0
+            || self.plan_mode_seen
+            || self.prompts_queued > 0
+    }
+
+    /// Zero every delta, keeping map keys, for counts that must not be reported.
+    pub fn clear_deltas(&mut self) {
+        self.feature_uses.values_mut().for_each(|n| *n = 0);
+        self.usage_seen.values_mut().for_each(|n| *n = 0);
+        self.web_clients_seen
+            .values_mut()
+            .for_each(|seen| *seen = false);
+        self.structured_clients_seen
+            .values_mut()
+            .for_each(|seen| *seen = false);
+        self.session_creates_since_last_snapshot = 0;
+        self.approvals_resolved = 0;
+        self.approvals_by_decision.clear();
+        self.agent_switches = 0;
+        self.plan_mode_seen = false;
+        self.prompts_queued = 0;
+    }
 }
 
 #[derive(Debug, Clone, Default)]

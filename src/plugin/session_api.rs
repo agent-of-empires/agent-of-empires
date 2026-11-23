@@ -712,7 +712,7 @@ async fn sessions_turn_send(
 
         let woke_idle_dormant = match deps
             .session_service
-            .touch_and_wake_on_prompt(&req.session_id, false)
+            .touch_and_wake_on_prompt_refusing_ignored(&req.session_id, false)
             .await
         {
             PromptTouch::Touched { idle_dormant } => idle_dormant,
@@ -730,6 +730,16 @@ async fn sessions_turn_send(
                     codes::FAILED_PRECONDITION,
                     blocked.code(),
                     blocked.to_string(),
+                ));
+            }
+            PromptTouch::Ignored => {
+                if marked_pending {
+                    clear_revival_pending(&deps.session_service, &req.session_id).await;
+                }
+                return Err(DispatchError::with_kind(
+                    codes::FAILED_PRECONDITION,
+                    "ignored",
+                    "The session is ignored because another session manages it",
                 ));
             }
         };
@@ -942,6 +952,7 @@ async fn deliver_message(
         &req.session_id,
         req.message.clone(),
         true,
+        true,
     )
     .await
     .map_err(|error| map_terminal_error(error.error))?;
@@ -967,11 +978,21 @@ async fn deliver_structured(
         .admit_prompt_submission(&caller, id)
         .await
         .map_err(|e| map_send_error(e.into()))?;
-    let woke_idle_dormant = match service.touch_and_wake_on_prompt(id, false).await {
+    let woke_idle_dormant = match service
+        .touch_and_wake_on_prompt_refusing_ignored(id, false)
+        .await
+    {
         PromptTouch::Touched { idle_dormant } => idle_dormant,
         PromptTouch::RevivalRefused => return Err(map_send_error(SendTurnError::RevivalRefused)),
         PromptTouch::WorkerNotReady => return Err(map_send_error(SendTurnError::WorkerNotReady)),
         PromptTouch::Blocked(blocked) => return Err(blocked_error(blocked)),
+        PromptTouch::Ignored => {
+            return Err(DispatchError::with_kind(
+                codes::FAILED_PRECONDITION,
+                "ignored",
+                "The session is ignored because another session manages it",
+            ))
+        }
     };
     let was_running = service.acp_supervisor.is_running(id).await;
     let dispatch = service
@@ -1179,6 +1200,11 @@ fn map_terminal_error(e: SendKeysError) -> DispatchError {
         SendKeysError::StructuredView => {
             DispatchError::internal("terminal send reached a structured session")
         }
+        SendKeysError::Ignored => DispatchError::with_kind(
+            codes::FAILED_PRECONDITION,
+            "ignored",
+            "the session is ignored because another session manages it",
+        ),
         SendKeysError::Tmux(error) => {
             tracing::warn!(target: "plugin.host", %error, "plugin terminal send failed");
             DispatchError::internal("terminal send failed")
@@ -1737,9 +1763,13 @@ mod tests {
     async fn message_send_reports_missing_and_shelved_sessions_with_stable_kinds() {
         let _home = crate::session::test_support::isolate_app_dir();
         type Shelve = (&'static str, fn(&mut Instance));
-        let shelves: [Shelve; 2] = [
+        let shelves: [Shelve; 3] = [
             ("session_archived", Instance::archive),
             ("session_trashed", Instance::trash),
+            ("ignored", |row| {
+                row.parent_session_id = Some("manager".into());
+                row.ignore();
+            }),
         ];
         let mut prior = Vec::new();
         for (want, shelve) in shelves {
@@ -1754,13 +1784,15 @@ mod tests {
                 prior.push(inst);
             }
         }
-        let (deps, state, _dir) = test_deps(prior.clone());
+        let (deps, state, _dir) = test_deps_native(prior.clone()).await;
         let ctx = ctx_with(&["session.message"]);
         for inst in &prior {
             let want = if inst.is_archived() {
                 "session_archived"
-            } else {
+            } else if inst.is_trashed() {
                 "session_trashed"
+            } else {
+                "ignored"
             };
             let err = dispatch(
                 &deps,
@@ -1943,6 +1975,9 @@ mod tests {
             text: "queued before the park".to_string(),
             attachments: Vec::new(),
             synthesized: true,
+            error: None,
+            error_code: None,
+            id: String::new(),
         };
         parked.pending_initial_turn = Some(seeded.clone());
         let (deps, state, _dir) = test_deps(vec![parked]);
@@ -3039,6 +3074,9 @@ mod tests {
                 text: "run the nightly task".to_string(),
                 attachments: Vec::new(),
                 synthesized: false,
+                error: None,
+                error_code: None,
+                id: String::new(),
             });
             crate::session::test_support::sandbox_needing_login(home.path(), &mut row);
             let (deps, state, _dir) = test_deps_native(vec![row]).await;

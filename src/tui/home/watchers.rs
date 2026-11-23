@@ -458,7 +458,6 @@ impl Eq for WatcherInitError {}
 pub(in crate::tui) struct ReloadFailureState {
     canonical_error: Option<String>,
     daemon_error: Option<String>,
-    storage_error: Option<String>,
     config_error: Option<String>,
     pub(super) disk_watcher_init_error: Option<WatcherInitError>,
     pub(super) config_watcher_init_error: Option<WatcherInitError>,
@@ -499,14 +498,6 @@ impl ReloadFailureState {
                 false
             }
         }
-    }
-
-    pub(in crate::tui) fn record_storage(&mut self, result: &anyhow::Result<()>) -> bool {
-        let safe = result
-            .as_ref()
-            .map(|_| ())
-            .map_err(|error| anyhow::anyhow!(crate::session::sanitized_load_failure(error)));
-        self.record(|s| &mut s.storage_error, &safe)
     }
 
     pub(in crate::tui) fn record_config(&mut self, result: &anyhow::Result<()>) -> bool {
@@ -566,7 +557,6 @@ impl ReloadFailureState {
     pub(in crate::tui) fn has_any_failure(&self) -> bool {
         self.daemon_error.is_some()
             || self.canonical_error.is_some()
-            || self.storage_error.is_some()
             || self.config_error.is_some()
             || self.disk_watcher_init_error.is_some()
             || self.config_watcher_init_error.is_some()
@@ -583,9 +573,6 @@ impl ReloadFailureState {
         }
         if let Some(error) = &self.daemon_error {
             lines.push(format!("- Runtime: {error}"));
-        }
-        if let Some(e) = &self.storage_error {
-            lines.push(format!("- Storage: {e}"));
         }
         if let Some(e) = &self.config_error {
             lines.push(format!("- Config: {e}"));
