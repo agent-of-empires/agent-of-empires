@@ -63,7 +63,7 @@ one in a persistent session with optional worktree and container isolation.
 
 ## How It Works
 
-Each agent runs in its own [tmux](https://github.com/tmux/tmux/wiki) session, or under a persistent worker in the structured view, so your agents keep running when you close the TUI, disconnect SSH, or your terminal crashes. Reopen `aoe` and everything is where you left it. The key shortcut to know: **`Ctrl+b d`** detaches from a session and returns to the TUI.
+Each agent runs in its own [tmux](https://github.com/tmux/tmux/wiki) session, or under a persistent worker in the structured view, so your agents keep running when you close the TUI, disconnect SSH, or your terminal crashes. Reopen `aoe` and everything is where you left it. The key shortcut to know: **`Ctrl+b d`** detaches from a tmux session and returns to the TUI; in the structured view, **`Ctrl+Q`** does the same.
 
 ## Install
 
