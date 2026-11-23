@@ -1487,7 +1487,8 @@ impl NewSessionDialog {
             },
             None => Vec::new(),
         };
-        let wrapped = wrap_prompt(self.prompt.value(), cols);
+        // One cell short of the inner width, so the cursor past a full row stays on it.
+        let wrapped = wrap_prompt(self.prompt.value(), cols.saturating_sub(1));
         let prompt_rows = wrapped.len().clamp(1, PROMPT_MAX_ROWS * 2);
         // Prompt header and rows, the close hint, the two border rows, and for
         // a source its header, rows and a blank line.

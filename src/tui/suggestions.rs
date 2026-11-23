@@ -471,19 +471,24 @@ fn provider_status(provider: &Provider, any_items: bool) -> String {
     }
 }
 
-/// Key hints in rows of `width`, never splitting a key from its label.
-fn key_rows(units: &[String], width: usize) -> Vec<String> {
+/// `units` joined by `gap` into rows of `width`, never splitting a unit.
+fn word_rows(units: &[String], gap: &str, width: usize) -> Vec<String> {
     let mut rows: Vec<String> = Vec::new();
     for unit in units {
         match rows.last_mut() {
-            Some(row) if rendered_width(row) + 3 + rendered_width(unit) <= width => {
-                row.push_str("   ");
+            Some(row) if rendered_width(row) + gap.len() + rendered_width(unit) <= width => {
+                row.push_str(gap);
                 row.push_str(unit);
             }
             _ => rows.push(unit.clone()),
         }
     }
     rows
+}
+
+/// Key hints in rows of `width`, never splitting a key from its label.
+fn key_rows(units: &[String], width: usize) -> Vec<String> {
+    word_rows(units, "   ", width)
 }
 
 /// "just now", "5 min ago", "3h ago", "2d ago".
@@ -909,36 +914,36 @@ impl SuggestionsView {
         ]
     }
 
-    /// Lines above the list: why the list may be stale or partial.
+    /// Lines above the list, word-wrapped to `width`: why the list may be
+    /// stale or partial.
     fn list_notices(
         &self,
         store: &SuggestionsFeed,
         block: Option<MutationBlock>,
         theme: &Theme,
+        width: usize,
     ) -> Vec<Line<'static>> {
-        let mut lines = Vec::new();
+        let mut notes: Vec<(String, Style)> = Vec::new();
+        let waiting = Style::default().fg(theme.waiting);
         if let Some(blocked) = block {
-            lines.push(Line::from(Span::styled(
-                block_note(blocked),
-                Style::default().fg(theme.waiting),
-            )));
+            notes.push((block_note(blocked).to_string(), waiting));
         }
         if let Some(profile) = &store.foreign_profile {
-            lines.push(Line::from(Span::styled(
-                plain(&format!(
+            notes.push((
+                format!(
                     "Suggestions are published under profile {profile}. Switch to it to see them."
-                )),
-                Style::default().fg(theme.waiting),
-            )));
+                ),
+                waiting,
+            ));
         }
         let failures = store.provider_failures();
         for (name, error, fix) in &failures {
-            lines.push(Line::from(Span::styled(
+            notes.push((
                 format!("{name} couldn't refresh: {error}"),
                 Style::default().fg(theme.error),
-            )));
+            ));
             if let Some(fix) = fix {
-                lines.push(Line::from(format!("  {fix}")));
+                notes.push((format!("  {fix}"), Style::default().fg(theme.text)));
             }
         }
         if !failures.is_empty() {
@@ -947,10 +952,10 @@ impl SuggestionsView {
             } else {
                 "Shown from the last refresh. "
             };
-            lines.push(Line::from(Span::styled(
+            notes.push((
                 format!("{shown}{} retries.", self.key_label('r')),
                 Style::default().fg(theme.dimmed),
-            )));
+            ));
         }
         for provider in store
             .snapshot
@@ -958,14 +963,23 @@ impl SuggestionsView {
             .flat_map(|s| &s.providers)
             .filter(|p| !p.enabled)
         {
-            lines.push(Line::from(Span::styled(
-                plain(&format!(
+            notes.push((
+                format!(
                     "{0} suggestions are hidden because {0} is off in Settings › Suggestions.",
                     provider.name
-                )),
+                ),
                 Style::default().fg(theme.dimmed),
-            )));
+            ));
         }
+        let mut lines: Vec<Line<'static>> = notes
+            .into_iter()
+            .flat_map(|(text, style)| {
+                let words: Vec<String> = plain_line(&text).split(' ').map(str::to_string).collect();
+                word_rows(&words, " ", width)
+                    .into_iter()
+                    .map(move |row| Line::from(Span::styled(truncate_to_width(&row, width), style)))
+            })
+            .collect();
         if !lines.is_empty() {
             lines.push(Line::from(""));
         }
@@ -1048,13 +1062,15 @@ impl SuggestionsView {
                     .areas(body);
             (body, footer_area, list_area, detail_area)
         };
-        let (mut body, mut footer_area, mut list_area, mut detail_area) = split(&units);
         let detail_rows: usize = detail.iter().map(|l| wrapped_line_count(l, width)).sum();
-        let visible = detail_area.height.saturating_sub(1) as usize;
+        let visible = split(&units).3.height.saturating_sub(1) as usize;
+        if !self.help && self.detail_scroll > 0 {
+            units.insert(units.len() - 2, "PgUp back".to_string());
+        }
         if !self.help && detail_rows > visible + self.detail_scroll as usize {
             units.insert(units.len() - 2, "PgDn more".to_string());
-            (body, footer_area, list_area, detail_area) = split(&units);
         }
+        let (body, footer_area, list_area, detail_area) = split(&units);
 
         if self.help {
             let key_width = self
@@ -1137,7 +1153,7 @@ impl SuggestionsView {
     ) {
         let width = area.width as usize;
         let dim = Style::default().fg(theme.dimmed);
-        let mut lines = self.list_notices(store, mutation_block, theme);
+        let mut lines = self.list_notices(store, mutation_block, theme, width);
         let headed = self.has_groups(store);
         let mut selected_rows = (0, 0);
         for index in 0..self.order.len() {
@@ -3535,6 +3551,29 @@ mod tests {
             lines[3].contains("GitHub · nothing new. r checks again."),
             "{text}"
         );
+    }
+
+    #[test]
+    fn key_rows_never_split_a_key_from_its_label() {
+        let units: Vec<String> = ["↵ start", "e change first", "N new", "Esc back"]
+            .map(str::to_string)
+            .to_vec();
+        for width in [1, 10, 20, 40] {
+            let rows = key_rows(&units, width);
+            let rejoined: Vec<&str> = rows.iter().flat_map(|r| r.split("   ")).collect();
+            assert_eq!(rejoined, units, "{width}: {rows:?}");
+        }
+    }
+
+    #[test]
+    fn a_long_refresh_error_wraps_and_a_scrolled_detail_offers_pgup() {
+        let mut rig = view_with(vec![item("a", None, false)], idle_worker());
+        rig.store.snapshot.as_mut().unwrap().providers[0].error =
+            Some(format!("{} tail-of-error", "word ".repeat(20)));
+        press(&mut rig, KeyCode::PageDown, true);
+        let text = render_sized(&rig, None, 80, 24);
+        assert!(text.contains("tail-of-error"), "{text}");
+        assert!(text.contains("PgUp back"), "{text}");
     }
 
     #[test]
