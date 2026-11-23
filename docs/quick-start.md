@@ -50,7 +50,7 @@ for the Daemon's result. If the connection is lost, the CLI checks canonical sta
 resubmitting creation. An unknown result includes a request key: inspect the Daemon's
 session list before creating again.
 
-Press `t` to toggle between the structured view and the paired shell terminal, where you can run builds and git commands without interrupting the agent.
+Press `t` to toggle between the agent view and the paired shell terminal, where you can run builds and git commands without interrupting the agent.
 
 Drag the border between the session list and preview to resize the list. In terminals
 narrower than `session.narrow_breakpoint` columns (80 by default), the list moves above
@@ -63,7 +63,7 @@ chosen height.
 
 A **project** is a saved directory path you register once so you can start sessions from it without retyping. Registering is only a convenience: `n` and `aoe add <path>` work on any path. Add one with `aoe project add /path/to/repo`, or press `p` in the TUI and then `a`. Once a project exists, `b` starts a session from it. See [Multi-repo workspaces](guides/multi-repo-workspaces.md#the-project-registry).
 
-A **group** is unrelated: it is a label you assign to existing sessions to sort them in the sidebar, set from the rename dialog or with `aoe group move`. Projects are where sessions start; groups are how they are bucketed once they exist. See [the grouping axes](guides/web/dashboard.md#sorting-and-grouping).
+A **group** is unrelated: it is a label you assign to existing sessions to sort them in the sidebar, set from the rename dialog or with `aoe group move`. Projects are where sessions start; groups are how they are bucketed once they exist. See [the grouping axes](guides/web/dashboard.md#sidebar-grouping-repo-organization-group-both-or-status).
 
 ## Worktrees
 
@@ -88,7 +88,7 @@ aoe add --sandbox .        # run the agent in a container
 aoe add -c opencode .      # use a different agent
 ```
 
-The sandbox mounts your project at `/workspace` and shares authentication through persistent volumes; the TUI has a checkbox for it when a container runtime is available. The agent picker in the new-session dialog lists every detected tool. See the [container sandbox guide](guides/sandbox.md).
+The sandbox mounts your project at `/workspace` and seeds the agent's credentials into a private per-session store on the host (Claude Code shares one credential file across its sandboxes); the TUI has a checkbox for it when a container runtime is available. The agent picker in the new-session dialog lists every detected tool. See the [container sandbox guide](guides/sandbox.md).
 
 ## The web dashboard
 
