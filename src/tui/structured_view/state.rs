@@ -22,8 +22,8 @@ use crate::plugin::ui_state::{Notification, UiSnapshot};
 use crate::session::config::NoticePolicy;
 use crate::tui::components::hover::HoverState;
 use crate::tui::plugin_ui;
-use crate::tui::terminal_output::next_interaction_revision;
 use crate::tui::styles::Theme;
+use crate::tui::terminal_output::next_interaction_revision;
 
 /// Most plugin notifications buffered awaiting a free toast slot. The daemon
 /// already bounds its ring; this second guard drops old un-shown toasts rather
@@ -803,22 +803,20 @@ mod tests {
     #[test]
     fn changing_subagent_stop_target_requires_a_new_presentation() {
         let mut state = test_state(None);
-        state
-            .transcript
-            .subagents
-            .push(crate::acp::state::SubagentRecord {
-                session_id: "child-a".into(),
-                parent_session_id: "s-1".into(),
-                parent_tool_call_id: None,
-                title: None,
-                description: None,
-                state: crate::acp::state::SubagentState::Running,
-                stop_reason: None,
-                error: None,
-                cancel_capable: true,
-                model: None,
-                background: false,
-            });
+        let mut child = crate::acp::state::SubagentRecord {
+            session_id: "child-a".into(),
+            parent_session_id: "s-1".into(),
+            parent_tool_call_id: None,
+            title: None,
+            description: None,
+            state: crate::acp::state::SubagentState::Running,
+            stop_reason: None,
+            error: None,
+            cancel_capable: true,
+            model: None,
+            background: false,
+        };
+        state.transcript.set_subagents(vec![child.clone()]);
         state.reconcile_interaction_authority();
         assert!(!state.interaction_presented());
         let first = state.interaction_revision;
@@ -827,13 +825,15 @@ mod tests {
         assert_eq!(state.interaction_revision, first);
         assert!(state.interaction_presented());
 
-        state.transcript.subagents[0].session_id = "child-b".into();
+        child.session_id = "child-b".into();
+        state.transcript.set_subagents(vec![child.clone()]);
         state.reconcile_interaction_authority();
         assert!(!state.interaction_presented());
         assert!(!state.confirm_presentation(first));
         assert!(state.confirm_presentation(state.interaction_revision));
 
-        state.transcript.subagents[0].cancel_capable = false;
+        child.cancel_capable = false;
+        state.transcript.set_subagents(vec![child]);
         state.reconcile_interaction_authority();
         assert!(!state.interaction_presented());
     }

@@ -23,8 +23,8 @@ mod session_feed;
 pub mod settings;
 pub(crate) mod structured_view;
 pub(crate) mod styles;
-pub(crate) mod terminal_output;
 mod telemetry;
+pub(crate) mod terminal_output;
 mod worker;
 
 pub use app::*;
