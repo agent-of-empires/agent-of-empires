@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Pencil } from "lucide-react";
 import { TextFileEditor } from "./TextFileEditor";
 import { requestComposerPrefill } from "../../lib/composerPrefill";
@@ -7,8 +7,9 @@ import { fileDraftKey, getFileDraft } from "../../lib/fileEditGuard";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { extensionToLanguage } from "./comments/language";
 import { BinaryFileView } from "./BinaryFileView";
-const FullFileViewer = lazy(() => import("./FullFileViewer").then((m) => ({ default: m.FullFileViewer })));
-const MarkdownFileView = lazy(() => import("./MarkdownFileView").then((m) => ({ default: m.MarkdownFileView })));
+import { lazyView } from "../../lib/lazyView";
+const FullFileViewer = lazyView(() => import("./FullFileViewer").then((m) => m.FullFileViewer), null);
+const MarkdownFileView = lazyView(() => import("./MarkdownFileView").then((m) => m.MarkdownFileView), null);
 import { BackButton, Centered, MarkdownToggle, TooLarge } from "./viewerChrome";
 
 interface Props {
@@ -154,13 +155,11 @@ function SessionFileViewer({ sessionId, filePath, onBack, structured }: Props) {
       ) : data?.truncated ? (
         <TooLarge what="File too large to display inline" hint="Open it in your editor instead." />
       ) : data ? (
-        <Suspense fallback={null}>
-          {showRendered ? (
-            <MarkdownFileView content={data.content} />
-          ) : (
-            <FullFileViewer content={data.content} filePath={filePath} />
-          )}
-        </Suspense>
+        showRendered ? (
+          <MarkdownFileView content={data.content} />
+        ) : (
+          <FullFileViewer content={data.content} filePath={filePath} />
+        )
       ) : null}
     </div>
   );

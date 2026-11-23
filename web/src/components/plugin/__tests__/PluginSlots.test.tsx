@@ -791,4 +791,28 @@ describe("pane blocks", () => {
     fireEvent.click(toggle);
     expect(body.className).toContain("line-clamp-3");
   });
+
+  it("keeps a failed markdown chunk local to its block", async () => {
+    // A fresh module graph: the shared one already resolved the real chunk.
+    vi.resetModules();
+    vi.doMock("../BlockMarkdown", () => {
+      throw new Error("chunk failed");
+    });
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { PluginPaneBody: Fresh } = await import("../PluginPane");
+    render(
+      <Fresh
+        entry={pane({
+          blocks: [
+            { kind: "heading", text: "GitHub" },
+            { kind: "markdown", text: "hi" },
+          ],
+        })}
+      />,
+    );
+    expect(await screen.findByText("Couldn't load this view.")).toBeTruthy();
+    expect(screen.getByText("GitHub")).toBeTruthy();
+    vi.doUnmock("../BlockMarkdown");
+    errSpy.mockRestore();
+  });
 });
