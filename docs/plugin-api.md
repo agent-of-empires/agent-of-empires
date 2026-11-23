@@ -182,7 +182,7 @@ A capability this host version does not recognize is rejected, not granted.
 
 ## Commands
 
-Palette entries, namespaced by the host as `plugin.<id>.<command-id>`. A command with no `action` is delivered to the worker as a `plugin.command.invoke` notification. The CLI lists them in `aoe --help` but cannot run them yet.
+Palette entries, namespaced by the host as `plugin.<id>.<command-id>`. A command with no `action` is delivered to the worker as a `plugin.command.invoke` notification. The CLI lists them in `aoe --help` but cannot run them yet. A command whose name a core subcommand or an earlier plugin already uses is not listed.
 
 ```toml
 [[commands]]
