@@ -1,4 +1,4 @@
-import { useCallback, useId, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 
 import type { GroupInfo } from "../../../lib/types";
 import { ROW_INPUT } from "../WizardRows";
@@ -15,11 +15,16 @@ export function GroupCombobox({
   value,
   onChange,
   groups,
+  autoFocus,
+  testId,
 }: {
   id: string;
   value: string;
   onChange: (value: string) => void;
   groups: GroupInfo[];
+  /** Focus the input on mount and return focus to the previous element on unmount. */
+  autoFocus?: boolean;
+  testId?: string;
 }) {
   const listId = useId();
   const inputRef = useRef<HTMLInputElement>(null);
@@ -85,11 +90,22 @@ export function GroupCombobox({
   }, [open, active, listId, options.length, placement.maxHeight]);
   const noGroups = groups.length === 0;
 
+  useEffect(() => {
+    if (!autoFocus) return;
+    const previous = document.activeElement as HTMLElement | null;
+    inputRef.current?.focus();
+    inputRef.current?.select();
+    return () => previous?.focus?.();
+    // Mount-only, like useDialogFocus.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   return (
     <div className="relative">
       <input
         ref={inputRef}
         id={id}
+        data-testid={testId}
         type="text"
         role="combobox"
         data-owns-escape
