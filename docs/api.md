@@ -1084,7 +1084,7 @@ This loop works for terminal-view sessions only. A structured-view
 session answers `send` with `400 acp_mode_unsupported`; drive it with
 `POST /api/sessions/{id}/acp/prompt`.
 
-For long-running prompts, prefer polling status via
+For long-running prompts in a terminal-view session, prefer polling status via
 `GET /api/sessions` over polling `output`, then read `output` once
 when status returns to `Idle`. Status transitions are also broadcast
 to push subscribers if the dashboard's push notifications are
