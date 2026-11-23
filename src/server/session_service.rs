@@ -5628,7 +5628,20 @@ mod tests {
                 if remain_on_exit {
                     crate::tmux::test_helpers::wait_for_pane_dead(&target);
                 } else {
-                    crate::tmux::test_helpers::wait_for_pane_command(&target, "sh");
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        while !pane_text(pane).contains("login banner, nothing is running here")
+                            || !crate::tmux::utils::is_shell_command(
+                                &crate::tmux::test_helpers::pane_field(
+                                    &target,
+                                    "#{pane_current_command}",
+                                ),
+                            )
+                        {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("the login shell is observable");
                 }
             }
             let service = crate::server::test_support::build_test_app_state(vec![inst.clone()])
