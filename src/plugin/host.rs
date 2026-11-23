@@ -1546,6 +1546,7 @@ impl PluginHost {
                 inbound: Some(tx),
                 manifest_hash: manifest_hash.to_string(),
                 ui_generation: None,
+                suggestions_hash: None,
                 events_inbound: None,
                 lifecycle_events: false,
                 dropped_events: 0,
@@ -2232,6 +2233,7 @@ rl.on('line', (line) => {
             granted_capabilities: vec!["runtime.worker".into()],
             ui_contributions: std::collections::HashSet::new(),
             ui_generation: 0,
+            suggestions_spec: None,
             deep_link_pages: Default::default(),
         });
         let pending = Arc::new(PendingRequests::new());
@@ -2314,6 +2316,7 @@ process.stdout.write(JSON.stringify({jsonrpc:"2.0",method:"events.publish",param
                 ui_contributions: std::collections::HashSet::new(),
                 deep_link_pages: Default::default(),
                 ui_generation: 0,
+                suggestions_spec: None,
             });
             let mut child = tokio::process::Command::new("node")
                 .arg("-e")
@@ -2371,6 +2374,7 @@ process.stdout.write(JSON.stringify({jsonrpc:"2.0",method:"events.publish",param
             ui_contributions: std::collections::HashSet::new(),
             deep_link_pages: Default::default(),
             ui_generation: 0,
+            suggestions_spec: None,
         });
         let mut child = tokio::process::Command::new("node")
             .arg("-e")
@@ -2458,6 +2462,7 @@ send({method:"events.publish", params:{topic:"last",payload:{ok:true}}});
             ui_contributions: std::collections::HashSet::new(),
             deep_link_pages: Default::default(),
             ui_generation: 0,
+            suggestions_spec: None,
         });
         let pending = Arc::new(PendingRequests::new());
         const WORKER: &str = r#"
@@ -2561,6 +2566,7 @@ require('readline').createInterface({ input: process.stdin }).on('line', () => {
             granted_capabilities: vec!["runtime.worker".into()],
             ui_contributions: std::collections::HashSet::new(),
             ui_generation: 0,
+            suggestions_spec: None,
             deep_link_pages: Default::default(),
         });
         let pending = Arc::new(PendingRequests::new());
