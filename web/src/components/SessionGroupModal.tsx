@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { fetchGroups } from "../lib/api";
 import type { GroupInfo } from "../lib/types";
 import { CancelButton, ConfirmButton, Dialog } from "./Dialog";
@@ -41,8 +42,11 @@ export function SessionGroupModal({ sessionTitle, currentGroup, profile, onSave,
     setSaving(true);
     setError(null);
     if (await onSave(next)) return onClose();
-    setSaving(false);
-    setError(next ? "Failed to update group." : "Failed to clear group.");
+    // Commit first so the refocus doesn't open the list over the error (`openOnFocus`).
+    flushSync(() => {
+      setSaving(false);
+      setError(next ? "Failed to update group." : "Failed to clear group.");
+    });
     fieldRef.current?.querySelector("input")?.focus();
   };
   const handleSave = () => save(value.trim());
@@ -97,6 +101,8 @@ export function SessionGroupModal({ sessionTitle, currentGroup, profile, onSave,
           id="session-group-modal-field"
           testId="session-group-modal-input"
           autoFocus
+          disabled={saving}
+          openOnFocus={!error}
           value={value}
           onChange={(v) => {
             setValue(v);

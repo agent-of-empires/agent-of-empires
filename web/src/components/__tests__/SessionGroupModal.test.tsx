@@ -10,7 +10,7 @@ import { expectRestoresFocus } from "./dialogTestUtils";
 
 vi.mock("../../lib/api", () => ({ fetchGroups: vi.fn() }));
 
-const group = (path: string): GroupInfo => ({ path, session_count: 2, archived: false }) as GroupInfo;
+const group = (path: string): GroupInfo => ({ path, session_count: 2 });
 
 function setup(currentGroup = "work", onSave: (group: string) => Promise<boolean> = vi.fn().mockResolvedValue(true)) {
   const onClose = vi.fn();
@@ -62,7 +62,10 @@ describe("SessionGroupModal", () => {
       fireEvent.keyDown(input, { key: "Enter" });
     } else fireEvent.click(saveBtn);
     if (saved == null) expect(onSave).not.toHaveBeenCalled();
-    else expect(onSave).toHaveBeenCalledWith(saved);
+    else {
+      expect(onSave).toHaveBeenCalledTimes(1);
+      expect(onSave).toHaveBeenCalledWith(saved);
+    }
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
   });
 
@@ -86,11 +89,13 @@ describe("SessionGroupModal", () => {
   ])("from %j to %j a failed save shows %j and stays open", async (current, typed, message) => {
     const { input, saveBtn, onClose } = setup(current, vi.fn().mockResolvedValue(false));
     fireEvent.change(input, { target: { value: typed } });
+    input.blur();
     fireEvent.click(saveBtn);
     await waitFor(() => expect(errorText()).toBe(message));
     expect(onClose).not.toHaveBeenCalled();
     expect(saveBtn.disabled).toBe(false);
     expect(document.activeElement).toBe(input);
+    expect(screen.queryByTestId("group-combobox-popup")).toBeNull();
     fireEvent.change(input, { target: { value: "again" } });
     expect(errorText()).toBeUndefined();
   });

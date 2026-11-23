@@ -17,6 +17,8 @@ export function GroupCombobox({
   groups,
   autoFocus,
   testId,
+  disabled,
+  openOnFocus = true,
 }: {
   id: string;
   value: string;
@@ -25,6 +27,9 @@ export function GroupCombobox({
   /** Focus the input on mount and return focus to the previous element on unmount. */
   autoFocus?: boolean;
   testId?: string;
+  disabled?: boolean;
+  /** False keeps the list closed on focus, e.g. for a programmatic refocus. */
+  openOnFocus?: boolean;
 }) {
   const listId = useId();
   const inputRef = useRef<HTMLInputElement>(null);
@@ -106,6 +111,7 @@ export function GroupCombobox({
         ref={inputRef}
         id={id}
         data-testid={testId}
+        disabled={disabled}
         type="text"
         role="combobox"
         data-owns-escape
@@ -120,7 +126,7 @@ export function GroupCombobox({
           onChange(e.target.value);
           show(e.target.value);
         }}
-        onFocus={() => show(value)}
+        onFocus={() => openOnFocus && show(value)}
         onBlur={() => setOpen(false)}
         onKeyDown={(e) => {
           if (e.key === "ArrowDown" || e.key === "ArrowUp") {
