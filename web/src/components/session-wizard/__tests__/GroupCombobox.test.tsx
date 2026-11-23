@@ -161,10 +161,21 @@ describe("GroupCombobox", () => {
     }
   });
 
-  it("dropUp opens the list upward even with room below", () => {
-    render(<GroupCombobox id="g" value="" onChange={() => {}} groups={GROUPS} dropUp />);
-    fireEvent.focus(input());
-    expect(screen.getByTestId("group-combobox-popup").className).toContain("bottom-full");
+  it.each([
+    ["opens upward even with room below", 400, "bottom-full"],
+    ["opens downward when there is little room above", 100, "top-full"],
+  ])("dropUp %s", (_name, fieldTop, placement) => {
+    const spy = vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      const top = this.getAttribute("role") === "combobox" ? fieldTop : 0;
+      return { top, bottom: top + 40 } as DOMRect;
+    });
+    try {
+      render(<GroupCombobox id="g" value="" onChange={() => {}} groups={GROUPS} dropUp />);
+      fireEvent.focus(input());
+      expect(screen.getByTestId("group-combobox-popup").className).toContain(placement);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("re-measures the room when the sheet scrolls with the list open", () => {

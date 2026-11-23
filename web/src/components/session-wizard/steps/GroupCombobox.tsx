@@ -6,6 +6,8 @@ import { groupOptions, optionLabel, type GroupOption } from "./groupOptions";
 import { isImeComposing } from "../../../lib/ime";
 
 const LIST_MAX = 288;
+/** Least room above (about three rows) for `dropUp` to force upward. */
+const DROP_UP_MIN = 132;
 
 const keyOf = (option: GroupOption) => (option.kind === "group" ? `group:${option.group.path}` : "create");
 
@@ -56,7 +58,7 @@ export function GroupCombobox({
     const bottom = viewport ? Math.min(area.bottom, viewport.offsetTop + viewport.height) : area.bottom;
     const below = bottom - field.bottom - 8;
     const above = field.top - top - 8;
-    const up = dropUp || below < Math.min(LIST_MAX, above);
+    const up = (dropUp && above >= DROP_UP_MIN) || below < Math.min(LIST_MAX, above);
     setPlacement({ up, maxHeight: Math.max(0, Math.min(LIST_MAX, up ? above : below)) });
   }, [dropUp]);
 
