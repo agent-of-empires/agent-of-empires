@@ -238,7 +238,7 @@ impl RetainedView {
                     );
                 }
                 if let Some(state) = self.state.as_mut() {
-                    state.transcript.server_rows = snapshot.rows;
+                    state.transcript.set_rows(snapshot.rows);
                 }
                 self.unfinished_outputs = snapshot.unfinished_outputs;
             }
@@ -270,7 +270,7 @@ impl RetainedView {
             .state
             .as_ref()
             .filter(|state| {
-                !state.transcript.server_rows.is_empty() || !self.unfinished_outputs.is_empty()
+                !state.transcript.rows().is_empty() || !self.unfinished_outputs.is_empty()
             })
             .map_or_else(Default::default, |state| {
                 render::wrapped_transcript(
@@ -585,7 +585,7 @@ impl EmbeddedView {
     /// `width` columns, so the home view's selection extraction slices match the
     /// on-screen geometry. Styles are irrelevant to extraction.
     pub fn selection_text(&self, width: u16) -> ratatui::text::Text<'static> {
-        render::wrapped_transcript(
+        render::project_transcript(
             &self.state,
             &crate::tui::styles::Theme::default(),
             width,
@@ -795,7 +795,7 @@ mod retained_tests {
                     message_id: None,
                 },
             );
-            state.transcript.server_rows = model.into_rows();
+            state.transcript.set_rows(model.into_rows());
             let mut view = RetainedView::new(None, &inst);
             view.state = Some(state);
             for width in [8, 32] {
@@ -883,7 +883,7 @@ mod retained_tests {
                 async_subagent: false,
             },
         );
-        state.transcript.server_rows = model.into_rows();
+        state.transcript.set_rows(model.into_rows());
         let mut view = RetainedView::new(None, &inst);
         view.state = Some(state);
         assert!(view.rendered_text(80).is_none());
@@ -1041,7 +1041,7 @@ mod retained_tests {
                         async_subagent: false,
                     },
                 );
-                state.transcript.server_rows = model.into_rows();
+                state.transcript.set_rows(model.into_rows());
                 let mut view = RetainedView::new(None, &inst);
                 view.state = Some(state);
                 for width in [32, 80] {
@@ -1180,7 +1180,7 @@ mod retained_tests {
                         async_subagent: false,
                     },
                 );
-                state.transcript.server_rows = model.into_rows();
+                state.transcript.set_rows(model.into_rows());
                 let mut view = RetainedView::new(None, &inst);
                 view.state = Some(state);
                 for width in [32, 80] {

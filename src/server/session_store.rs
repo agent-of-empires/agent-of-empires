@@ -566,21 +566,40 @@ impl SessionStore for NativeSessionStore {
         drop(lifecycle);
         let runtime = self.runtime.clone();
         let work = self.state.runtime.work.clone();
+        let shutdown = work.shutdown.clone();
         let _entered = runtime.enter();
         work.spawn("lifecycle reservation release", async move {
-            let fresh_namespace = if namespace.is_none() {
-                Some(self.state.profile_namespace.clone().read_owned().await)
-            } else {
-                None
-            };
-            let _namespace = (namespace, fresh_namespace);
-            let result = tokio::task::spawn_blocking(move || {
-                self.release_lifecycle_reservation(&id, release, generation, None)
-            }).await;
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::warn!(target: "session.lifecycle", %error, "native reservation release failed"),
-                Err(error) => tracing::error!(target: "session.lifecycle", %error, "native reservation release task failed"),
+            let mut namespace = namespace;
+            let source = Arc::new((self, id));
+            loop {
+                let fresh_namespace = if namespace.is_none() {
+                    Some(source.0.state.profile_namespace.clone().read_owned().await)
+                } else {
+                    None
+                };
+                let namespace = namespace.take();
+                let attempt = Arc::clone(&source);
+                let result = tokio::task::spawn_blocking(move || {
+                    let _namespace = (namespace, fresh_namespace);
+                    attempt.0.release_lifecycle_reservation(&attempt.1, release, generation, None)
+                }).await;
+                match result {
+                    Ok(Ok(())) => break,
+                    Ok(Err(error)) => {
+                        tracing::warn!(target: "session.lifecycle", %error, "native reservation release failed");
+                        if !matches!(release, crate::session::LifecycleRelease::IndeterminateLaunch) {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(target: "session.lifecycle", %error, "native reservation release task failed");
+                        break;
+                    }
+                }
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                }
             }
         });
     }

@@ -410,7 +410,7 @@ async fn run(
     let profile = cli.profile.unwrap_or_default();
 
     let serve_lock = match &mut cli.command {
-        Some(Commands::Serve(args)) => cli::serve::lock_for_startup(&profile, args).await?,
+        Some(Commands::Serve(args)) => cli::serve::lock_for_startup(&profile, args, true).await?,
         _ => None,
     };
 

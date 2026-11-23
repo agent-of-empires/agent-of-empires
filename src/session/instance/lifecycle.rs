@@ -281,6 +281,7 @@ impl Instance {
         storage: &dyn crate::session::SessionStore,
         generation: u64,
         restart: bool,
+        expected: Option<&ConversationState>,
     ) -> Result<()> {
         let committed = storage.update(|instances, _groups| {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
@@ -289,6 +290,10 @@ impl Instance {
             if !stored.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation) {
                 return Ok(false);
             }
+            anyhow::ensure!(
+                expected.is_none_or(|expected| expected.matches_launch_observation(stored)),
+                LaunchIndeterminateCause::OwnershipUnproven
+            );
             stored.status = self.status;
             stored.idle_entered_at = self.idle_entered_at;
             stored.last_accessed_at = self.last_accessed_at;
@@ -1935,7 +1940,7 @@ mod tests {
             "the launch being built still carries it"
         );
         first
-            .commit_lifecycle_launch(&storage, generation, false)
+            .commit_lifecycle_launch(&storage, generation, false, None)
             .unwrap();
         let disk = storage
             .load()
@@ -1986,7 +1991,7 @@ mod tests {
         committed.started_at = Some(launched_at);
         committed.launch_executable = Some("/opt/agent/bin/claude".into());
         committed
-            .commit_lifecycle_launch(&storage, reserved_generation, false)
+            .commit_lifecycle_launch(&storage, reserved_generation, false, None)
             .unwrap();
         let disk = storage
             .load()
@@ -2028,7 +2033,7 @@ mod tests {
             })
             .unwrap();
         let error = stale
-            .commit_lifecycle_launch(&storage, stale_token, false)
+            .commit_lifecycle_launch(&storage, stale_token, false, None)
             .unwrap_err();
         assert!(matches!(
             error.downcast_ref::<LifecycleReservationError>(),

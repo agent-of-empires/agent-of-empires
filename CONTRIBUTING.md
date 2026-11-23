@@ -44,6 +44,11 @@ server, and the optional shared build cache.
 - Use a `feature/`, `fix/`, `docs/`, or `refactor/` branch.
 - Follow the coding and testing rules in [AGENTS.md](AGENTS.md).
 - Format with `cargo fmt` and fix `cargo clippy` warnings.
+- Update the documentation your change makes materially wrong or incomplete in
+  the same PR: `docs/`, `CONTEXT.md`, ADRs, and generated references such as
+  `docs/cli/reference.md`. Do not add docs for unchanged behavior; correcting
+  documentation that is already wrong is in scope for any PR, docs-only ones
+  included.
 - Keep tests deterministic and isolated from user state.
 - Use conventional commit and PR titles, for example
   `fix: preserve sessions after reconnect`.
@@ -104,7 +109,11 @@ Reviewers tag each requested change with a priority:
 - **P3**: a nit or optional improvement. Never blocks merge and needs no
   follow-up issue; mention it only when useful.
 
-Every requested change states what would satisfy it.
+Every requested change states what would satisfy it. Documentation a PR leaves
+materially stale counts as a finding: give it the priority its impact warrants
+and name the document that must change. Do not ask for docs describing behavior
+the PR does not change; correcting documentation that is already wrong is in
+scope for any PR.
 
 When the findings are few, none blocks under this rubric, and each fix is small,
 the reviewer may push the fixes to the PR branch instead of waiting on the

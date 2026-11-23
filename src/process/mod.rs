@@ -166,6 +166,33 @@ pub(crate) mod test_support {
     pub(super) fn executable() -> Option<std::path::PathBuf> {
         EXECUTABLE.with(|slot| slot.borrow().clone())
     }
+
+    /// Opens a FIFO's write end once its reader is there, failing at `deadline` instead of
+    /// blocking forever when the reader has gone.
+    #[cfg(unix)]
+    pub(crate) fn open_fifo_writer(
+        path: &std::path::Path,
+        deadline: std::time::Instant,
+    ) -> std::fs::File {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+            {
+                Ok(file) => return file,
+                Err(err) if err.raw_os_error() == Some(libc::ENXIO) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the FIFO's reader went away before it was released"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(err) => panic!("opening {}: {err}", path.display()),
+            }
+        }
+    }
 }
 
 pub(crate) fn executable_for_native_launch() -> std::io::Result<std::path::PathBuf> {
@@ -748,7 +775,7 @@ fn wait_with_timeout_inner_with_clock(
 /// The caller keeps control of stdin; pipe it to null when the child might
 /// prompt (SSH passphrases, credential helpers).
 pub fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<Option<Output>> {
-    run_with_timeout_inner(cmd, timeout, false, None)
+    run_with_timeout_inner(cmd, timeout, false, None, None)
 }
 
 /// [`run_with_timeout`] that also kills the child once `cancel` fires, returning `Ok(None)`.
@@ -757,7 +784,7 @@ pub fn run_until_cancelled(
     timeout: Duration,
     cancel: &CancellationToken,
 ) -> std::io::Result<Option<Output>> {
-    run_with_timeout_inner(cmd, timeout, false, Some(cancel))
+    run_with_timeout_inner(cmd, timeout, false, Some(cancel), None)
 }
 
 /// [`run_with_timeout`] variant that makes the child a process-group leader
@@ -774,6 +801,7 @@ pub fn run_with_timeout_process_group(
         cmd,
         timeout,
         cfg!(any(target_os = "linux", target_os = "macos")),
+        None,
         None,
     )
 }
@@ -810,7 +838,66 @@ pub(crate) fn run_until_cancelled_process_group(
         timeout,
         cfg!(any(target_os = "linux", target_os = "macos")),
         Some(cancel),
+        None,
     )
+}
+
+/// [`run_until_cancelled_process_group`] that also passes `on_output` each stream's bytes while
+/// the child runs, best effort: usually by the next poll, later behind a backlog of more than
+/// one pass.
+pub(crate) fn run_until_cancelled_process_group_observed(
+    cmd: &mut Command,
+    timeout: Duration,
+    cancel: &CancellationToken,
+    on_output: &mut dyn FnMut(OutputStream, &[u8]),
+) -> std::io::Result<Option<Output>> {
+    platform::configure_process_group(cmd);
+    run_with_timeout_inner(
+        cmd,
+        timeout,
+        cfg!(any(target_os = "linux", target_os = "macos")),
+        Some(cancel),
+        Some(on_output),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+/// Reads what a child appended to its capture files since the last call.
+struct OutputTail<'a> {
+    stdout: std::fs::File,
+    stderr: std::fs::File,
+    forward: &'a mut dyn FnMut(OutputStream, &[u8]),
+}
+
+/// Bytes read per stream on one pass while the child runs, so a fast writer can't hold off the
+/// wait loop's deadline and cancel checks.
+const TAIL_PASS_LIMIT: usize = 64 * 1024;
+
+impl OutputTail<'_> {
+    /// Best effort: a failed read loses progress, not the captured output. `limit` bounds each
+    /// stream's bytes; `None` drains to the current end.
+    fn forward_new(&mut self, limit: Option<usize>) {
+        let mut buf = [0u8; 8192];
+        for (stream, file) in [
+            (OutputStream::Stdout, &mut self.stdout),
+            (OutputStream::Stderr, &mut self.stderr),
+        ] {
+            let mut left = limit.unwrap_or(usize::MAX);
+            while left > 0 {
+                let want = left.min(buf.len());
+                let Ok(n @ 1..) = file.read(&mut buf[..want]) else {
+                    break;
+                };
+                (self.forward)(stream, &buf[..n]);
+                left -= n;
+            }
+        }
+    }
 }
 
 fn run_with_timeout_inner(
@@ -818,18 +905,52 @@ fn run_with_timeout_inner(
     timeout: Duration,
     kill_process_group: bool,
     cancel: Option<&CancellationToken>,
+    on_output: Option<&mut dyn FnMut(OutputStream, &[u8])>,
 ) -> std::io::Result<Option<Output>> {
+    // Before any setup, so a cancelled run can't fail on it instead.
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Ok(None);
+    }
     let mut stdout_file = tempfile::NamedTempFile::new()?;
     let mut stderr_file = tempfile::NamedTempFile::new()?;
     cmd.stdout(Stdio::from(stdout_file.reopen()?));
     cmd.stderr(Stdio::from(stderr_file.reopen()?));
+    // Separate handles, so tailing doesn't move the offsets the final read starts from.
+    let mut tail = match on_output {
+        Some(forward) => Some(OutputTail {
+            stdout: stdout_file.reopen()?,
+            stderr: stderr_file.reopen()?,
+            forward,
+        }),
+        None => None,
+    };
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Ok(None);
+    }
     let mut child = cmd.spawn()?;
 
-    let Some(status) =
-        wait_with_timeout_inner(&mut child, timeout, kill_process_group, false, cancel)?
-    else {
+    let waited = match tail.as_mut() {
+        None => wait_with_timeout_inner(&mut child, timeout, kill_process_group, false, cancel)?,
+        Some(tail) => wait_with_timeout_inner_with_clock(
+            &mut child,
+            timeout,
+            kill_process_group,
+            false,
+            cancel,
+            Instant::now,
+            |pause| {
+                tail.forward_new(Some(TAIL_PASS_LIMIT));
+                std::thread::sleep(pause);
+            },
+        )?,
+    };
+    let Some(status) = waited else {
         return Ok(None);
     };
+    // Only a child that exited drains: a killed one's backlog would hold back its outcome.
+    if let Some(tail) = tail.as_mut() {
+        tail.forward_new(None);
+    }
     // Regular files, rather than pipes drained by background threads, keep
     // output capture bounded when a descendant outlives the direct child. A
     // read reaches the current EOF without waiting for every inherited writer
@@ -2948,19 +3069,204 @@ finally:
     }
 
     #[test]
+    fn a_cancel_before_spawn_starts_nothing() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        // A missing program would fail to spawn, so `Ok(None)` shows no spawn was tried.
+        let mut cmd = Command::new("/nonexistent/aoe-cancelled-before-spawn");
+        assert!(matches!(
+            run_until_cancelled_process_group(&mut cmd, Duration::from_secs(5), &cancel),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn a_tail_pass_reads_a_bounded_amount_and_the_final_one_drains() {
+        use std::io::Write as _;
+        let total = 3 * TAIL_PASS_LIMIT + 7;
+        let file = |byte| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            file.write_all(&vec![byte; total]).unwrap();
+            file
+        };
+        let (stdout, stderr) = (file(b'o'), file(b'e'));
+        let received = std::cell::RefCell::new(Vec::<(OutputStream, u8)>::new());
+        let mut forward = |stream, bytes: &[u8]| {
+            received
+                .borrow_mut()
+                .extend(bytes.iter().map(|&byte| (stream, byte)));
+        };
+        let mut tail = OutputTail {
+            stdout: stdout.reopen().unwrap(),
+            stderr: stderr.reopen().unwrap(),
+            forward: &mut forward,
+        };
+        // Bytes forwarded per stream since the last read; each stream carries only its own.
+        let take = || {
+            let bytes = std::mem::take(&mut *received.borrow_mut());
+            [(OutputStream::Stdout, b'o'), (OutputStream::Stderr, b'e')].map(|(stream, own)| {
+                let mine: Vec<u8> = bytes
+                    .iter()
+                    .filter(|(s, _)| *s == stream)
+                    .map(|&(_, b)| b)
+                    .collect();
+                assert!(
+                    mine.iter().all(|&b| b == own),
+                    "{stream:?} got another stream's bytes"
+                );
+                mine.len()
+            })
+        };
+        tail.forward_new(Some(TAIL_PASS_LIMIT));
+        assert_eq!(take(), [TAIL_PASS_LIMIT; 2], "a bounded pass per stream");
+        tail.forward_new(None);
+        assert_eq!(
+            take(),
+            [total - TAIL_PASS_LIMIT; 2],
+            "the final pass drains the rest, from where the bounded one stopped"
+        );
+    }
+
+    /// A cancelled run returns without draining the backlog its child left unread. After the
+    /// cancel, passes run only for the kill's 250 ms grace, which reaches a small part of the
+    /// backlog; the old final drain forwarded all of it.
+    #[test]
+    #[cfg(unix)]
+    fn a_cancel_is_not_held_behind_the_unread_backlog() {
+        const BACKLOG: usize = 16 << 20;
+        let dir = tempfile::tempdir().unwrap();
+        let written = dir.path().join("written");
+        let mut cmd = Command::new("sh");
+        // `written` appears once the backlog and `ready` are both out.
+        cmd.args([
+            "-c",
+            &format!("head -c {BACKLOG} /dev/zero; echo ready >&2; : > \"$1\"; exec sleep 600"),
+            "sh",
+        ])
+        .arg(&written);
+        let cancel = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (mut forwarded, mut at_cancel, mut gate_expired) = (0usize, None, false);
+        let mut forward = |stream: OutputStream, bytes: &[u8]| {
+            // Hold the first callback until the child is done writing, so `ready` is read in that
+            // pass however the child was scheduled. On expiry, cancel rather than panic here, so
+            // the runner still kills and reaps the child.
+            while !gate_expired && !written.exists() {
+                if Instant::now() >= deadline {
+                    gate_expired = true;
+                    cancel.cancel();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            match stream {
+                OutputStream::Stdout => forwarded += bytes.len(),
+                OutputStream::Stderr => {
+                    at_cancel.get_or_insert(forwarded);
+                    cancel.cancel();
+                }
+            }
+        };
+        let result = run_until_cancelled_process_group_observed(
+            &mut cmd,
+            Duration::from_secs(30),
+            &cancel,
+            &mut forward,
+        )
+        .unwrap();
+        assert!(!gate_expired, "the child never wrote its backlog");
+        assert!(result.is_none(), "cancelled");
+        // At most one bounded pass came first; none if stdout was still empty at its read.
+        assert!(
+            at_cancel.is_some_and(|bytes| bytes <= TAIL_PASS_LIMIT),
+            "forwarded {at_cancel:?} before the cancel"
+        );
+        assert!(
+            forwarded < BACKLOG / 2,
+            "forwarded {forwarded} of {BACKLOG} bytes: the backlog was drained"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn observed_output_arrives_while_the_child_still_runs() {
+        use std::io::Write as _;
+        use std::sync::mpsc;
+        const DEADLINE: Duration = Duration::from_secs(10);
+        let dir = tempfile::tempdir().unwrap();
+        let gate = dir.path().join("gate");
+        nix::unistd::mkfifo(&gate, nix::sys::stat::Mode::S_IRWXU).unwrap();
+
+        let (chunk_tx, chunks) = mpsc::channel();
+        let (done_tx, done) = mpsc::channel();
+        let child_gate = gate.clone();
+        std::thread::spawn(move || {
+            let mut cmd = Command::new("sh");
+            // Blocks opening the FIFO until the test opens its write end.
+            cmd.args([
+                "-c",
+                "printf 'first\\n'; read x < \"$1\"; printf 'last\\n' >&2",
+                "sh",
+            ])
+            .arg(&child_gate);
+            let mut forward = |stream: OutputStream, bytes: &[u8]| {
+                let _ = chunk_tx.send((stream, bytes.to_vec()));
+            };
+            let _ = done_tx.send(run_until_cancelled_process_group_observed(
+                &mut cmd,
+                Duration::from_secs(30),
+                &CancellationToken::new(),
+                &mut forward,
+            ));
+        });
+
+        let mut received: Vec<(OutputStream, Vec<u8>)> = Vec::new();
+        let read = |received: &[(OutputStream, Vec<u8>)], stream| {
+            received
+                .iter()
+                .filter(|(s, _)| *s == stream)
+                .flat_map(|(_, b)| b.iter().copied())
+                .collect::<Vec<u8>>()
+        };
+        while read(&received, OutputStream::Stdout) != b"first\n" {
+            received.push(chunks.recv_timeout(DEADLINE).expect("first line forwarded"));
+        }
+        assert!(
+            done.try_recv().is_err(),
+            "the child is still blocked on the gate"
+        );
+
+        test_support::open_fifo_writer(&gate, Instant::now() + DEADLINE)
+            .write_all(b"go\n")
+            .unwrap();
+        let output = done
+            .recv_timeout(DEADLINE)
+            .expect("the child exits once released")
+            .unwrap()
+            .expect("no timeout");
+        received.extend(chunks.try_iter());
+        assert_eq!(read(&received, OutputStream::Stderr), b"last\n");
+        assert_eq!(output.stdout, b"first\n", "the final capture is unaffected");
+        assert_eq!(output.stderr, b"last\n");
+    }
+
+    #[test]
     #[cfg(unix)]
     fn run_with_timeout_kills_child_on_deadline_or_cancel() {
         use std::io::Read;
         use std::os::fd::AsRawFd;
         use std::os::unix::{net::UnixStream, process::CommandExt};
+        // The cancel case's timeout: kills the child if the cancel never comes.
+        const WATCHDOG: Duration = Duration::from_secs(60);
 
         for cancelled in [false, true] {
             let (mut pid_reader, pid_writer) = UnixStream::pair().unwrap();
             pid_reader
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
+            // Outlives the watchdog, so only a kill ends it.
             let mut cmd = Command::new("sleep");
-            cmd.arg("5");
+            cmd.arg("600");
             unsafe {
                 cmd.pre_exec(move || {
                     let pid = libc::getpid().to_ne_bytes();
@@ -2973,27 +3279,45 @@ finally:
                 });
             }
 
-            let start = Instant::now();
-            let result = if cancelled {
-                let cancel = CancellationToken::new();
-                cancel.cancel();
-                run_until_cancelled(&mut cmd, Duration::from_secs(60), &cancel).unwrap()
-            } else {
-                run_with_timeout(&mut cmd, Duration::from_millis(300)).unwrap()
+            let mut read_pid = move || {
+                let mut pid = [0; std::mem::size_of::<libc::pid_t>()];
+                pid_reader
+                    .read_exact(&mut pid)
+                    .expect("child must publish its PID before exec");
+                libc::pid_t::from_ne_bytes(pid) as u32
             };
-            let mut pid = [0; std::mem::size_of::<libc::pid_t>()];
-            pid_reader
-                .read_exact(&mut pid)
-                .expect("child must publish its PID before exec");
-            assert_child_reaped(libc::pid_t::from_ne_bytes(pid) as u32);
+            let start = Instant::now();
+            let (result, pid) = if cancelled {
+                // Cancelled once the child runs: a token cancelled before the spawn starts nothing.
+                let cancel = CancellationToken::new();
+                let canceller = std::thread::spawn({
+                    let cancel = cancel.clone();
+                    move || {
+                        let pid = read_pid();
+                        cancel.cancel();
+                        pid
+                    }
+                });
+                let result = run_until_cancelled(&mut cmd, WATCHDOG, &cancel);
+                (result.unwrap(), canceller.join().unwrap())
+            } else {
+                let result = run_with_timeout(&mut cmd, Duration::from_millis(300)).unwrap();
+                (result, read_pid())
+            };
+            assert_child_reaped(pid);
             assert!(
                 result.is_none(),
                 "cancelled={cancelled}: child must be killed"
             );
-            assert!(
-                start.elapsed() < Duration::from_secs(4),
-                "cancelled={cancelled}: wait should return promptly, not block on the child"
-            );
+            let elapsed = start.elapsed();
+            if cancelled {
+                assert!(elapsed < WATCHDOG, "the cancel killed it, not the watchdog");
+            } else {
+                assert!(
+                    elapsed < Duration::from_secs(4),
+                    "the deadline returns promptly, not when the child would exit"
+                );
+            }
         }
     }
 

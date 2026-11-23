@@ -461,20 +461,6 @@ impl Instance {
             .map(|(container, _)| container)
     }
 
-    pub(crate) fn ensure_container_in(
-        &mut self,
-        store: &dyn SessionStore,
-        launch_generation: Option<u64>,
-    ) -> Result<containers::DockerContainer> {
-        self.ensure_container_with_hook_in(
-            store,
-            &tokio_util::sync::CancellationToken::new(),
-            launch_generation,
-            Self::mint_before_start_env,
-        )
-        .map(|(container, _)| container)
-    }
-
     pub(crate) fn ensure_container_with_hook_in(
         &mut self,
         store: &dyn SessionStore,
@@ -700,15 +686,39 @@ impl Instance {
         // Pulls only a missing image, aborting when the start is cancelled. A create
         // that asks for the latest image force-pulls earlier, before its hooks.
         checkpoint()?;
-        let runtime = containers::get_container_runtime();
-        runtime.ensure_image(&image, cancel)?;
+        let used_image =
+            containers::ContainerRuntime::from(global_config.sandbox.container_runtime)
+                .ensure_image(
+                    &image,
+                    launch_config.sandbox().picks_automatic_image(&image),
+                    cancel,
+                )?;
         checkpoint()?;
+        // The automatic image may have fallen back to its minor tag; record
+        // what the container actually runs.
+        let container = if used_image == image {
+            container
+        } else {
+            if let Some(sandbox) = self.sandbox_info.as_mut() {
+                sandbox.image = used_image.clone();
+            }
+            DockerContainer::new(
+                &self.id,
+                &used_image,
+                global_config.sandbox.container_runtime.into(),
+            )
+        };
 
         // Mint before building the container config so the docker-run env also
         // carries the values (leak-safe via the inherit path in run_create).
         // A container just removed for its credential mount was minted above.
         if !recreate {
             self.ensure_before_start_env(true, &launch_config, &mut scoped_hook)?;
+        }
+        // A `before_start` hook may have reloaded the row, which records the
+        // requested image again.
+        if let Some(sandbox) = self.sandbox_info.as_mut() {
+            sandbox.image = used_image;
         }
         let mut config = self.build_container_config(&launch_config)?;
         // The profile `spawn_prepared_launch` gives `scope_prefix_for`, so the
@@ -2295,7 +2305,13 @@ mod tests {
             Ok(())
         })?;
         let error = stale
-            .run_pre_launch_hooks(true, &store, None, Some(generation))
+            .run_pre_launch_hooks(
+                true,
+                &store,
+                None,
+                Some(generation),
+                &tokio_util::sync::CancellationToken::new(),
+            )
             .unwrap_err();
         assert!(
             error.is::<LifecycleReservationError>(),

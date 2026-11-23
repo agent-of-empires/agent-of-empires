@@ -66,6 +66,11 @@ impl ContainerRuntime {
         self.base.name
     }
 
+    /// False when `read_only` volumes are mounted read-write instead.
+    pub fn supports_read_only_volumes(&self) -> bool {
+        self.base.supports_read_only_volumes
+    }
+
     pub fn is_available(&self) -> bool {
         self.base.is_available()
     }
@@ -134,13 +139,26 @@ impl ContainerRuntime {
     pub(crate) fn join_pull(&self, image: &str) -> image_pull::Waiter {
         let base = self.base;
         let pulled = image.to_string();
-        image_pull::join_with(self.pull_key(image), move |kill| {
-            base.pull_until_cancelled(&pulled, kill)
+        image_pull::join_with(self.pull_key(image), move |pull| {
+            base.pull_until_cancelled(&pulled, pull)
         })
     }
 
     pub(crate) fn pull_state(&self, image: &str) -> image_pull::PullState {
         image_pull::state(&self.pull_key(image))
+    }
+
+    pub(crate) fn running_pull_id(&self, image: &str) -> Option<u64> {
+        image_pull::running_flight_id(&self.pull_key(image))
+    }
+
+    /// Cancels this process's running pull of `image` for every waiter; see [`image_pull::cancel`].
+    pub(crate) fn cancel_pull(
+        &self,
+        image: &str,
+        backstop: std::time::Duration,
+    ) -> image_pull::PullState {
+        image_pull::cancel(&self.pull_key(image), backstop)
     }
 
     fn pull_key(&self, image: &str) -> image_pull::PullKey {
@@ -169,25 +187,22 @@ impl ContainerRuntime {
         parts.join(" ")
     }
 
+    /// Pulls only a missing image; returns the image to run, see
+    /// `sandbox_image::ensure_sandbox_image`. `automatic` says the user chose no image.
     pub fn ensure_image(
         &self,
         image: &str,
+        automatic: bool,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<()> {
-        if self.base.image_exists_locally(image) {
-            tracing::info!(target: "containers.runtime", "Using local {} image '{}'", self.base.name, image);
-            return Ok(());
-        }
-        tracing::info!(target: "containers.runtime", "Pulling {} image '{}'", self.base.name, image);
-        self.pull_image_until_cancelled(image, cancel)
-    }
-
-    pub fn default_sandbox_image(&self) -> &'static str {
-        self.base.default_sandbox_image()
-    }
-
-    pub fn effective_default_image(&self) -> String {
-        self.base.effective_default_image()
+    ) -> anyhow::Result<String> {
+        super::sandbox_image::ensure_sandbox_image(
+            &RuntimeImages {
+                runtime: self,
+                cancel,
+            },
+            image,
+            automatic,
+        )
     }
 
     pub fn does_container_exist(&self, name: &str) -> Result<bool> {
@@ -949,6 +964,29 @@ fn parse_batch_states(stdout: &str, prefix: &str) -> HashMap<String, ContainerSt
         .collect()
 }
 
+/// The runtime as an [`super::sandbox_image::ImageSource`]: a pull joins the one running for
+/// the same runtime and image.
+struct RuntimeImages<'a> {
+    runtime: &'a ContainerRuntime,
+    cancel: &'a tokio_util::sync::CancellationToken,
+}
+
+impl super::sandbox_image::ImageSource for RuntimeImages<'_> {
+    fn exists_locally(&self, image: &str) -> bool {
+        let base = self.runtime.base;
+        let exists = base.image_exists_locally(image);
+        if exists {
+            tracing::info!(target: "containers.runtime", "Using local {} image '{}'", base.name, image);
+        }
+        exists
+    }
+
+    fn pull(&self, image: &str) -> Result<()> {
+        tracing::info!(target: "containers.runtime", "Pulling {} image '{}'", self.runtime.base.name, image);
+        self.runtime.pull_image_until_cancelled(image, self.cancel)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1165,7 +1203,9 @@ mod tests {
         let (_env, runtimes) = available_runtimes();
         for rt in runtimes {
             assert!(!rt.image_exists_locally(MISSING_IMAGE));
-            assert!(rt.ensure_image(MISSING_IMAGE, &Default::default()).is_err());
+            assert!(rt
+                .ensure_image(MISSING_IMAGE, false, &Default::default())
+                .is_err());
         }
     }
 

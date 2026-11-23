@@ -2153,6 +2153,14 @@ impl Storage {
         // Writes sharing a stamp fall in one filesystem timestamp tick, which closes
         // within a tick of first seeing it whatever the filesystem clock's offset.
         let settled = read_started >= first_seen + SessionsFileCache::TIMESTAMP_TICK;
+        tracing::debug!(
+            target: "session.inventory",
+            profile = %self.profile,
+            has_stamp = stamp.is_some(),
+            settled,
+            rows = rows.len(),
+            "parsed the sessions inventory instead of reusing the cache"
+        );
         if let Some(stamp) = stamp.filter(|_| settled) {
             if stamp_file()?.as_ref() == Some(&stamp) {
                 cache.entry = Some((stamp, complete, rows.clone()));

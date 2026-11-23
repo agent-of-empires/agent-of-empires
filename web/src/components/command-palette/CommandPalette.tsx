@@ -6,6 +6,7 @@ import { GROUP_ORDER, TAB_ORDER, type PaletteTab } from "./groups";
 import type { CommandAction, CommandActionGroup } from "./types";
 import { matchCheat, type CheatEffect } from "../../lib/cheats";
 import { reportInfo } from "../../lib/toastBus";
+import { reportFeatureUse } from "../../lib/featureUse";
 
 // The cmdk item value; the pre-filter and <Command.Item> must use the same string.
 function actionValue(a: CommandAction): string {
@@ -48,6 +49,7 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
   const handleSearchChange = (value: string) => {
     const hit = matchCheat(value);
     if (hit) {
+      reportFeatureUse("cheat_code");
       reportInfo(hit.toast);
       setCheat((prev) => ({ effect: hit.effect, id: (prev?.id ?? 0) + 1 }));
       setSearch("");
