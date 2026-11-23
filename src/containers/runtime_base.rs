@@ -14,10 +14,9 @@ use tokio_util::sync::CancellationToken;
 const STOP_SETTINGS_FORMAT: &str =
     "{{json .Config.Entrypoint}}|{{json .HostConfig.Init}}|{{json .Config.StopTimeout}}";
 
-/// Stop args for a container whose settings printed as `settings`. With no
-/// ENTRYPOINT, no init and no explicit timeout, PID 1 is the appended `sleep`,
-/// which ignores SIGTERM, so waiting out the grace only delays SIGKILL. Any
-/// other setup, or an unreadable answer, keeps the runtime's grace.
+/// Stop args for a container whose settings printed as `settings`. `sleep`
+/// as PID 1 ignores SIGTERM, so waiting out the grace only delays SIGKILL.
+/// A set ENTRYPOINT, init or timeout, or an unreadable answer, keeps the grace.
 fn stop_args(settings: Option<&str>) -> &'static [&'static str] {
     let mut fields = settings.unwrap_or_default().split('|');
     match (fields.next(), fields.next(), fields.next(), fields.next()) {
@@ -28,18 +27,32 @@ fn stop_args(settings: Option<&str>) -> &'static [&'static str] {
     }
 }
 
-/// Full `stop` arguments for container `name`. `inspect` runs the given
-/// `inspect` arguments and returns its output, or `None` when it cannot run.
+/// Whether `top` output lists `sleep` as the container's first process. The
+/// daemon may default init on, which `inspect` cannot show, so PID 1 is read.
+fn pid1_is_sleep(top_stdout: &str) -> bool {
+    top_stdout.lines().nth(1).map(str::trim) == Some("sleep")
+}
+
+/// Full `stop` arguments for container `name`. `run` runs the given runtime
+/// arguments and returns the output, or `None` when it cannot run. `-t 0` needs
+/// the settings gate and `sleep` as PID 1; anything else keeps the grace.
 pub(crate) fn stop_args_for(
     name: &str,
-    inspect: impl FnOnce(&[String]) -> Option<std::process::Output>,
+    mut run: impl FnMut(&[String]) -> Option<std::process::Output>,
 ) -> Vec<String> {
-    let probe = ["inspect", "--format", STOP_SETTINGS_FORMAT, name].map(str::to_owned);
-    let settings = inspect(&probe)
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
-    stop_args(settings.as_deref())
-        .iter()
+    let mut stdout = |args: &[&str]| {
+        run(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    let mut args =
+        stop_args(stdout(&["inspect", "--format", STOP_SETTINGS_FORMAT, name]).as_deref());
+    if args.len() > 1
+        && !stdout(&["top", name, "-eo", "comm"]).is_some_and(|top| pid1_is_sleep(&top))
+    {
+        args = &["stop"];
+    }
+    args.iter()
         .map(|arg| (*arg).to_owned())
         .chain([name.to_owned()])
         .collect()
@@ -1036,6 +1049,47 @@ mod tests {
         ] {
             assert_eq!(stop_args(settings), expected, "{settings:?}");
         }
+    }
+
+    #[test]
+    fn pid1_is_sleep_reads_the_first_listed_process() {
+        for (top, expected) in [
+            ("COMMAND\nsleep", true),
+            ("COMMAND\nsleep\nsh", true),
+            ("COMMAND\ndocker-init\nsleep", false),
+            ("COMMAND\nsh\nsleep", false),
+            ("COMMAND", false),
+            ("", false),
+        ] {
+            assert_eq!(pid1_is_sleep(top), expected, "{top:?}");
+        }
+    }
+
+    #[test]
+    fn stop_args_for_needs_both_the_settings_and_a_sleep_pid1() {
+        let answer = |stdout: &str, ok: bool| {
+            let mut output = std::process::Command::new(if ok { "true" } else { "false" })
+                .output()
+                .unwrap();
+            output.stdout = stdout.as_bytes().to_vec();
+            Some(output)
+        };
+        let stop = |inspect: Option<&str>, top: Option<&str>| {
+            stop_args_for("c1", |args| match args[0].as_str() {
+                "inspect" => answer(inspect.unwrap_or(""), inspect.is_some()),
+                _ => answer(top.unwrap_or(""), top.is_some()),
+            })
+        };
+        let now = ["stop", "-t", "0", "c1"];
+        let grace = ["stop", "c1"];
+        assert_eq!(stop(Some("null|null|null"), Some("COMMAND\nsleep")), now);
+        assert_eq!(
+            stop(Some("null|null|null"), Some("COMMAND\ndocker-init\nsleep")),
+            grace
+        );
+        assert_eq!(stop(Some("null|null|null"), None), grace);
+        assert_eq!(stop(Some("null|true|null"), Some("COMMAND\nsleep")), grace);
+        assert_eq!(stop(None, Some("COMMAND\nsleep")), grace);
     }
 
     #[test]
