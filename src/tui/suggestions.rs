@@ -1464,13 +1464,21 @@ impl SuggestionsFeed {
             .collect()
     }
 
-    /// Enabled providers that failed their last refresh, as `(name, error)`.
-    pub(super) fn provider_failures(&self) -> Vec<(String, String)> {
+    /// Enabled providers that failed their last refresh, as `(name, error,
+    /// fix)`; `fix` is the advice of the first failing setup check that has one.
+    pub(super) fn provider_failures(&self) -> Vec<(String, String, Option<String>)> {
         self.snapshot
             .iter()
             .flat_map(|s| &s.providers)
             .filter(|p| p.enabled)
-            .filter_map(|p| Some((plain(&p.name), plain(p.error.as_deref()?))))
+            .filter_map(|p| {
+                let fix = p
+                    .checks
+                    .iter()
+                    .find(|c| c.status == "fail" && !c.fix.trim().is_empty())
+                    .map(|c| plain_line(&c.fix));
+                Some((plain(&p.name), plain(p.error.as_deref()?), fix))
+            })
             .collect()
     }
 
@@ -2001,6 +2009,7 @@ mod tests {
                 updated_at: Some(crate::time::Timestamp::now().as_unix_secs() - 120),
                 refreshing: false,
                 sources: vec![],
+                checks: vec![],
             }],
             items,
             prefs: Prefs::default(),
@@ -2102,6 +2111,7 @@ mod tests {
                 updated_at: None,
                 refreshing: false,
                 sources: vec![],
+                checks: vec![],
             }],
             items: vec![it],
             prefs: Prefs::default(),

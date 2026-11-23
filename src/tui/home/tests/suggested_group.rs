@@ -1141,25 +1141,39 @@ fn a_failed_open_in_the_full_view_is_shown_there() {
         .is_some_and(|e| e.contains("no longer exists")));
 }
 
+/// A failed refresh leads with the error, the plugin's fix and the retry key;
+/// the start hint shows only when there are rows to start.
 #[test]
 #[serial]
-fn a_provider_failing_before_its_first_item_still_shows_the_group_with_the_error() {
+fn a_failed_refresh_leads_with_the_error_and_how_to_retry() {
     let mut env = create_test_env_with_sessions(1);
-    env.view
-        .suggestions_feed
-        .set_snapshot_for_test(serde_json::json!({
-            "providers": [{ "id": "gh", "name": "GitHub", "error": "token expired" }],
-            "items": [],
-            "prefs": { "sidebar": true }
-        }));
-    env.view.rebuild_flat_items();
-    select_suggested_header(&mut env);
+    for count in [0, 2] {
+        let mut snap = snapshot(count, &[]);
+        snap["providers"][0]["error"] = "token expired".into();
+        snap["providers"][0]["checks"] = serde_json::json!([
+            { "id": "a", "label": "A", "status": "ok", "fix": "not this" },
+            { "id": "t", "label": "Token", "status": "fail", "fix": "Run gh auth login" }
+        ]);
+        env.view.suggestions_feed.set_snapshot_for_test(snap);
+        env.view.rebuild_flat_items();
+        select_suggested_header(&mut env);
 
-    let text = render_home_to_string(&mut env.view, 120, 40);
-    assert!(
-        text.contains("GitHub couldn't refresh: token expired"),
-        "{text}"
-    );
+        let text = render_home_to_string(&mut env.view, 120, 40);
+        let error = text.find("GitHub couldn't refresh: token expired");
+        let retry = text.find("S opens the full view; r there retries.");
+        assert!(error.is_some() && error < retry, "{text}");
+        assert!(text.contains("Run gh auth login") && !text.contains("not this"));
+        assert_eq!(
+            text.contains("These are from the last refresh."),
+            count > 0,
+            "{count}: {text}"
+        );
+        assert_eq!(
+            text.contains("Enter to expand"),
+            count > 0,
+            "{count}: {text}"
+        );
+    }
 }
 
 #[test]

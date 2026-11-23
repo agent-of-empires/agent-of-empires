@@ -65,6 +65,16 @@ pub struct Provider {
     pub(crate) refreshing: bool,
     #[serde(default)]
     pub(crate) sources: Vec<Source>,
+    #[serde(default)]
+    pub(crate) checks: Vec<Check>,
+}
+
+/// A provider's setup check; `fix` is the plugin's own untrusted advice.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Check {
+    pub(crate) status: String,
+    #[serde(default)]
+    pub(crate) fix: String,
 }
 
 /// A source's effective preset, as `GET /api/suggestions` resolves it.

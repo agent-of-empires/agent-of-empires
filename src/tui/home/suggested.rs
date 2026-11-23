@@ -259,23 +259,46 @@ impl HomeView {
         let (title, lines): (String, Vec<Line>) = match self.flat_items.get(self.cursor) {
             Some(Item::Group { path, .. }) if crate::session::is_suggested_section_path(path) => {
                 let total = self.suggestions_feed.keys().len();
-                let mut lines = vec![
-                    Line::from(format!(
-                        "From {} suggestions.",
-                        join_names(&self.suggestions_feed.provider_names())
-                    )),
-                    Line::from(""),
-                ];
-                for (name, error) in self.suggestions_feed.provider_failures() {
+                let failures = self.suggestions_feed.provider_failures();
+                let mut lines = Vec::new();
+                for (name, error, fix) in &failures {
                     lines.push(Line::from(Span::styled(
                         format!("{name} couldn't refresh: {error}"),
                         Style::default().fg(theme.error),
                     )));
+                    if let Some(fix) = fix {
+                        lines.push(Line::from(format!("  {fix}")));
+                    }
                 }
-                lines.push(Line::from(Span::styled(
-                    "Enter to expand, then Enter on one to start a session.",
-                    dim,
+                if !failures.is_empty() {
+                    if total > 0 {
+                        lines.push(Line::from(Span::styled(
+                            "These are from the last refresh.",
+                            Style::default().fg(theme.waiting),
+                        )));
+                    }
+                    let open = super::bindings::label(
+                        super::bindings::ActionId::Suggestions,
+                        self.strict_hotkeys,
+                    );
+                    let retry = if self.strict_hotkeys { "R" } else { "r" };
+                    lines.push(Line::from(Span::styled(
+                        format!("{open} opens the full view; {retry} there retries."),
+                        dim,
+                    )));
+                    lines.push(Line::from(""));
+                }
+                lines.push(Line::from(format!(
+                    "From {} suggestions.",
+                    join_names(&self.suggestions_feed.provider_names())
                 )));
+                if total > 0 {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        "Enter to expand, then Enter on one to start a session.",
+                        dim,
+                    )));
+                }
                 (format!("Suggested ({total})"), lines)
             }
             Some(Item::SuggestionsViewAll { total, .. }) => (
