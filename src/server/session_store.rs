@@ -1038,6 +1038,7 @@ mod tests {
                     prompt_id: None,
                     synthesized: false,
                     origin_plugin: None,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 };
                 state.acp_event_store.record(&id, 1, &event).unwrap();
                 state
@@ -1230,7 +1231,7 @@ mod tests {
                         "first".into(),
                         vec![],
                         None,
-                        None,
+                        crate::server::session_service::QueueSender::default(),
                     );
                     tokio::pin!(enqueue);
                     assert!(futures_util::poll!(&mut enqueue).is_pending());
@@ -1243,7 +1244,14 @@ mod tests {
                     assert_eq!(
                         state
                             .session_service
-                            .enqueue_prompt(&id, "B".into(), "second".into(), vec![], None, None)
+                            .enqueue_prompt(
+                                &id,
+                                "B".into(),
+                                "second".into(),
+                                vec![],
+                                None,
+                                crate::server::session_service::QueueSender::default()
+                            )
                             .await
                             .unwrap()
                             .seq,
@@ -2475,7 +2483,7 @@ mod tests {
                         "accepted while cohort copy is unlocked".into(),
                         vec![],
                         None,
-                        None,
+                        crate::server::session_service::QueueSender::default(),
                     ),
                 )
                 .await
@@ -2490,7 +2498,7 @@ mod tests {
                 "accepted across checkpoint adoption".into(),
                 vec![],
                 None,
-                None,
+                crate::server::session_service::QueueSender::default(),
             );
             tokio::pin!(after_checkpoint);
             if queue_race {
@@ -2515,7 +2523,7 @@ mod tests {
                             "accepted after checkpoint".into(),
                             vec![],
                             None,
-                            None
+                            crate::server::session_service::QueueSender::default()
                         )
                         .await
                         .unwrap()

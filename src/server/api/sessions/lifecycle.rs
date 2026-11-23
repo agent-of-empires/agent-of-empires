@@ -3079,6 +3079,7 @@ async fn finish_structured_restart(
                                     woke_idle_dormant: false,
                                     prompt_ids: Vec::new(),
                                     synthesized: true,
+                                    origin: crate::daemon::PromptOrigin::Aoe,
                                     no_revive: true,
                                 },
                             )

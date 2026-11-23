@@ -534,7 +534,10 @@ async fn admit_and_create(
         plugin_create_idempotency: None,
         // Set here (not just inside the service) so the idempotency probe below
         // hashes the same payload the create will.
-        pending_initial_turn: req.initial_turn.as_ref().map(|t| t.text.clone()),
+        pending_initial_turn: req
+            .initial_turn
+            .as_ref()
+            .map(|t| (t.text.clone(), crate::daemon::PromptOrigin::Plugin)),
         parent_session_id: None,
         acp_mode_id: req.mode_id.clone(),
         view: crate::session::View::Structured,
@@ -587,14 +590,17 @@ async fn admit_and_create(
     // cannot overshoot the cap.
     let _reservation = deps.policy.admit_create(plugin_id, active_sessions)?;
 
-    let initial_turn_text = req.initial_turn.as_ref().map(|t| t.text.as_str());
+    let initial_turn = req
+        .initial_turn
+        .as_ref()
+        .map(|t| (t.text.as_str(), crate::daemon::PromptOrigin::Plugin));
     let (outcome, created) = deps
         .session_service
         .create_structured_session(
             spec,
             Some(plugin_id),
             req.idempotency_key.as_deref(),
-            initial_turn_text,
+            initial_turn,
         )
         .await
         .map_err(map_create_error)?;
@@ -777,6 +783,7 @@ async fn sessions_turn_send(
                 woke_idle_dormant,
                 prompt_ids: Vec::new(),
                 synthesized: false,
+                origin: crate::daemon::PromptOrigin::Plugin,
                 no_revive: false, },
             )
             .await;
@@ -1011,7 +1018,10 @@ async fn deliver_structured(
                     req.message.clone(),
                     Vec::new(),
                     None,
-                    Some(plugin_id.to_string()),
+                    crate::server::session_service::QueueSender {
+                        plugin: Some(plugin_id.to_string()),
+                        origin: crate::daemon::PromptOrigin::Plugin,
+                    },
                 )
                 .await
                 .map_err(|_| DispatchError::internal("the message could not be saved; retry"))?
@@ -1033,6 +1043,7 @@ async fn deliver_structured(
                 woke_idle_dormant,
                 prompt_ids: Vec::new(),
                 synthesized: false,
+                origin: crate::daemon::PromptOrigin::Plugin,
                 no_revive: false,
             },
         )
@@ -1112,7 +1123,10 @@ async fn keep_for_login(
             text.to_string(),
             Vec::new(),
             None,
-            origin_plugin.map(str::to_string),
+            crate::server::session_service::QueueSender {
+                plugin: origin_plugin.map(str::to_string),
+                origin: crate::daemon::PromptOrigin::Plugin,
+            },
         )
         .await
         .map(|entry| entry.id)
@@ -1871,6 +1885,7 @@ mod tests {
                 prompt_id: None,
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
         ));
         let out = dispatch(
@@ -1979,6 +1994,7 @@ mod tests {
             error: None,
             error_code: None,
             id: String::new(),
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         parked.pending_initial_turn = Some(seeded.clone());
         let (deps, state, _dir) = test_deps(vec![parked]);
@@ -2187,12 +2203,10 @@ mod tests {
             .acp_supervisor
             .publish_user_prompt_with_attachments(
                 "sess-3649",
-                "the winning turn".into(),
-                &[],
-                Vec::new(),
-                false,
-                None,
-                None,
+                crate::acp::supervisor::UserPrompt {
+                    text: "the winning turn".into(),
+                    ..Default::default()
+                },
             )
             .await;
         drop(winner);
@@ -2255,6 +2269,7 @@ mod tests {
             prompt_id: None,
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         // Each state named by the disposition it would have leaked.
         for (label, events, expected) in [
@@ -2918,7 +2933,7 @@ mod tests {
                     format!("row {n}"),
                     Vec::new(),
                     None,
-                    None,
+                    crate::server::session_service::QueueSender::default(),
                 )
                 .await
                 .expect("the row is queued");
@@ -3031,6 +3046,7 @@ mod tests {
                 merged_prompt_ids: Vec::new(),
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
         ));
         fill_queue(&deps.session_service, "sess-msg-full").await;
@@ -3080,6 +3096,7 @@ mod tests {
                 error: None,
                 error_code: None,
                 id: String::new(),
+                origin: crate::daemon::PromptOrigin::Unknown,
             });
             crate::session::test_support::sandbox_needing_login(home.path(), &mut row);
             let (deps, state, _dir) = test_deps_native(vec![row]).await;

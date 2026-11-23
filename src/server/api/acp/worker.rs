@@ -3475,6 +3475,7 @@ mod tests {
                     attachments: Vec::new(),
                     synthesized: false,
                     origin_plugin: None,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 };
                 state
                     .acp_event_store
@@ -4455,6 +4456,7 @@ mod tests {
             prompt_id: None,
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let rate_limit = || crate::acp::Event::RateLimit {
             info: RateLimitInfo {

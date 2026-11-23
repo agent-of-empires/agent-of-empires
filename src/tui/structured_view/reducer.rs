@@ -619,6 +619,7 @@ mod tests {
                 attachments: vec![],
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
             Event::PromptCapabilities {
                 steering: true,
@@ -969,6 +970,7 @@ mod tests {
             attachments: vec![],
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let reset = || Event::SessionContextReset {
             reason: "worker restarted".into(),
@@ -1082,6 +1084,7 @@ mod tests {
                 attachments: Vec::new(),
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
             Event::AgentMessageChunk {
                 text: "one".into(),

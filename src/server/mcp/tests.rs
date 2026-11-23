@@ -868,6 +868,7 @@ fn user_prompt(text: &str) -> crate::acp::Event {
         merged_prompt_ids: Vec::new(),
         synthesized: false,
         origin_plugin: None,
+        origin: crate::daemon::PromptOrigin::Unknown,
     }
 }
 
@@ -938,6 +939,21 @@ async fn send_reports_the_dispatch_and_the_prompts_seq() {
                     .then_some(seq)
             });
         assert_eq!(sent["seq"].as_u64(), recorded, "{case}: {sent}");
+        if disposition != "queued" {
+            let origin = state
+                .acp_event_store
+                .replay_from(id, 0)
+                .into_iter()
+                .find_map(|(_, e)| match e {
+                    crate::acp::Event::UserPromptSent { text, origin, .. }
+                        if text == "the new prompt" =>
+                    {
+                        Some(origin)
+                    }
+                    _ => None,
+                });
+            assert_eq!(origin, Some(crate::daemon::PromptOrigin::Mcp), "{case}");
+        }
         assert_eq!(
             sent["queued_id"].is_string(),
             disposition == "queued",
@@ -1209,10 +1225,9 @@ async fn create_session_stores_a_structured_prompt_and_its_parent() {
         .unwrap();
     assert_eq!(row.parent_session_id.as_deref(), Some("parent"));
     assert_eq!(row.group_path, "team");
-    assert_eq!(
-        row.pending_initial_turn.map(|turn| turn.text).as_deref(),
-        Some("review the diff")
-    );
+    let turn = row.pending_initial_turn.unwrap();
+    assert_eq!(turn.text, "review the diff");
+    assert_eq!(turn.origin, crate::daemon::PromptOrigin::Mcp);
 
     // A caller that names no parent becomes it only where an explicit parent would pass.
     // (caller, extra arguments, parent, group)

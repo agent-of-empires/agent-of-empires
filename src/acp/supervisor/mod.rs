@@ -5,6 +5,7 @@ mod agents;
 mod drain;
 mod launch;
 mod publish;
+pub use publish::UserPrompt;
 mod requests;
 mod sink;
 mod teardown;

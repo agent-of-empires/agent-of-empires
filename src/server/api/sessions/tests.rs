@@ -848,6 +848,7 @@ async fn create_receipts_include_published_rows_and_idempotent_retries() -> anyh
             axum::extract::Query(create::CreateSessionQuery { wait: None }),
             None,
             None,
+            axum::http::HeaderMap::new(),
             Ok(Json(body)),
         )
         .await
@@ -970,6 +971,7 @@ async fn an_always_yolo_agent_records_yolo_mode_whatever_the_request_says() -> a
             axum::extract::Query(create::CreateSessionQuery { wait: None }),
             None,
             None,
+            axum::http::HeaderMap::new(),
             Ok(Json(body)),
         )
         .await
@@ -1081,6 +1083,7 @@ async fn canonical_fork_refusals_do_not_create_sessions() -> anyhow::Result<()> 
             axum::extract::Query(create::CreateSessionQuery { wait: None }),
             None,
             None,
+            axum::http::HeaderMap::new(),
             Ok(Json(create_body_from_json(body))),
         )
         .await
@@ -9208,6 +9211,7 @@ async fn rename_session_quiesces_structured_worker_only_on_profile_move() -> any
                         prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
+                        origin: crate::daemon::PromptOrigin::Unknown,
                     },
                 )
                 .await
@@ -10526,6 +10530,7 @@ fn native_runtime_frame_stays_readable_with_a_valid_full_text_queue() {
             created_at: "2026-01-01T00:00:00Z".into(),
             origin_device: None,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         })
         .collect();
     let snapshot = RuntimeSnapshot {
@@ -10833,12 +10838,21 @@ async fn post_create_bytes(
     state: &std::sync::Arc<AppState>,
     body: serde_json::Value,
 ) -> (axum::http::StatusCode, axum::body::Bytes) {
+    post_create_bytes_with(state, axum::http::HeaderMap::new(), body).await
+}
+
+async fn post_create_bytes_with(
+    state: &std::sync::Arc<AppState>,
+    headers: axum::http::HeaderMap,
+    body: serde_json::Value,
+) -> (axum::http::StatusCode, axum::body::Bytes) {
     use axum::response::IntoResponse;
     let response = create_session(
         axum::extract::State(state.clone()),
         axum::extract::Query(CreateSessionQuery { wait: None }),
         None,
         None,
+        headers,
         Ok(axum::Json(serde_json::from_value(body).unwrap())),
     )
     .await
@@ -10863,6 +10877,7 @@ async fn post_create_raw(
         axum::extract::Query(CreateSessionQuery { wait: None }),
         None,
         None,
+        axum::http::HeaderMap::new(),
         Ok(axum::Json(serde_json::from_value(body).unwrap())),
     )
     .await
@@ -11125,19 +11140,42 @@ async fn create_persists_initial_prompt_as_pending_turn() {
         |supervisor| supervisor.with_launcher(launcher),
     );
     crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
-    let (status, body) = post_create(
-        &state,
-        serde_json::json!({
-            "title": "with-prompt", "path": "", "tool": "claude",
-            "scratch": true, "view": "structured", "initial_prompt": "fix the bug",
-        }),
-    )
-    .await;
-    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let mut tui = axum::http::HeaderMap::new();
+    tui.insert(
+        axum::http::HeaderName::from_static("x-aoe-prompt-origin"),
+        axum::http::HeaderValue::from_static("tui"),
+    );
+    for (title, headers) in [
+        ("with-prompt", axum::http::HeaderMap::new()),
+        ("with-prompt-tui", tui),
+    ] {
+        let (status, bytes) = post_create_bytes_with(
+            &state,
+            headers,
+            serde_json::json!({
+                "title": title, "path": "", "tool": "claude",
+                "scratch": true, "view": "structured", "initial_prompt": "fix the bug",
+            }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::CREATED, "{bytes:?}");
+    }
     let instances = state.instances.read().await;
-    let turn = instances[0].pending_initial_turn.as_ref().expect("queued");
-    assert_eq!(turn.text, "fix the bug");
-    assert!(!turn.synthesized);
+    let origin_of = |title: &str| {
+        let row = instances.iter().find(|i| i.title == title).expect("row");
+        let turn = row.pending_initial_turn.as_ref().expect("queued");
+        assert_eq!(turn.text, "fix the bug");
+        assert!(!turn.synthesized);
+        turn.origin
+    };
+    assert_eq!(
+        origin_of("with-prompt"),
+        crate::daemon::PromptOrigin::Unknown
+    );
+    assert_eq!(
+        origin_of("with-prompt-tui"),
+        crate::daemon::PromptOrigin::Tui
+    );
 }
 
 #[tokio::test]
@@ -11314,6 +11352,7 @@ async fn a_dropped_create_finishes_and_its_retry_returns_the_same_session() {
                         },
                     )),
                     None,
+                    axum::http::HeaderMap::new(),
                     Ok(Json(serde_json::from_value(body).unwrap())),
                 )
                 .await
@@ -14998,6 +15037,7 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
         prompt_id: None,
         synthesized: false,
         origin_plugin: None,
+        origin: crate::daemon::PromptOrigin::Unknown,
     };
     let limit = || Event::RateLimit {
         info: crate::acp::state::RateLimitInfo {
@@ -15027,7 +15067,12 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
     }
     state
         .session_service
-        .set_pending_initial_turn("pending-only", "earlier continuation".into(), Vec::new())
+        .set_pending_initial_turn(
+            "pending-only",
+            "earlier continuation".into(),
+            Vec::new(),
+            crate::daemon::PromptOrigin::Unknown,
+        )
         .await;
     state.acp_supervisor.hydrate_seqs(
         [
@@ -15089,7 +15134,12 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
 
     state
         .session_service
-        .set_pending_initial_turn("explicit", "newer continuation".into(), Vec::new())
+        .set_pending_initial_turn(
+            "explicit",
+            "newer continuation".into(),
+            Vec::new(),
+            crate::daemon::PromptOrigin::Unknown,
+        )
         .await;
     let g = generation("explicit");
     assert!(
@@ -15158,6 +15208,7 @@ async fn the_selected_work_verdict_survives_a_concurrent_pending_turn_drain() {
             prompt_id: None,
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         },
         Event::RateLimit {
             info: crate::acp::state::RateLimitInfo {
@@ -15404,7 +15455,12 @@ async fn an_explicit_wake_discards_a_stale_continuation_before_the_worker_can_dr
     };
     state
         .session_service
-        .set_pending_initial_turn("stale", "old task".into(), Vec::new())
+        .set_pending_initial_turn(
+            "stale",
+            "old task".into(),
+            Vec::new(),
+            crate::daemon::PromptOrigin::Unknown,
+        )
         .await;
     for (parked, explicit) in [(false, true), (true, false)] {
         lifecycle::discard_stale_continuation(&state, "stale", parked, explicit).await;
@@ -16310,6 +16366,7 @@ async fn the_list_projects_each_queues_count_and_what_it_waits_on() {
         created_at: "2026-01-01T00:00:00Z".into(),
         origin_device: None,
         origin_plugin: None,
+        origin: crate::daemon::PromptOrigin::Unknown,
     };
     // (id, queued texts, worker running, turn running, steerable, expected reason).
     // "parked" has no worker but a rate-limit park, so a prompt sent now would go out.
@@ -16391,6 +16448,7 @@ async fn the_list_projects_each_queues_count_and_what_it_waits_on() {
                 prompt_id: None,
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             };
             state.acp_event_store.record(id, 2, &prompt).unwrap();
         }
@@ -16484,6 +16542,7 @@ async fn missing_path_and_branch_refusals_carry_their_code() {
             axum::extract::Query(CreateSessionQuery { wait: None }),
             None,
             None,
+            axum::http::HeaderMap::new(),
             Ok(Json(
                 serde_json::from_value(serde_json::json!({
                     "path": project.path(), "tool": "", "profile": "test",

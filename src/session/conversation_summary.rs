@@ -378,6 +378,7 @@ mod tests {
             attachments: vec![],
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         }
     }
     fn synthesized_user(text: &str) -> Event {
@@ -388,6 +389,7 @@ mod tests {
             attachments: vec![],
             synthesized: true,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         }
     }
     fn agent(text: &str) -> Event {
@@ -440,6 +442,7 @@ mod tests {
             attachments: vec![],
             synthesized: false,
             origin_plugin: Some("cron".into()),
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let events = vec![(1, user("typed")), (2, plugin)];
         let (text, _, turns) = extract_transcript_delta(&events, 0);

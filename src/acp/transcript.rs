@@ -373,6 +373,7 @@ impl TranscriptModel {
                 merged_prompt_ids,
                 synthesized,
                 origin_plugin,
+                ..
             } => {
                 self.begin_turn();
                 // A rate-limit resume continuation replays a prompt the user
@@ -1585,6 +1586,7 @@ mod tests {
             prompt_id: None,
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let mut m = TranscriptModel::new();
         let deltas = m.apply_event(3, &with_attachment);
@@ -1608,6 +1610,7 @@ mod tests {
                     prompt_id: prompt_id.map(Into::into),
                     synthesized: false,
                     origin_plugin: None,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 },
             );
             assert_eq!(m.rows()[0].id, want, "prompt_id={prompt_id:?}");
@@ -1623,6 +1626,7 @@ mod tests {
                 prompt_id: Some("q1".into()),
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
         );
         assert_eq!(m.rows()[0].id, "q1");
@@ -1636,6 +1640,7 @@ mod tests {
             prompt_id: Some("q1".into()),
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let deltas = m.apply_event(9, &retry);
         assert!(matches!(deltas.as_slice(), [TranscriptDelta::Patch { id, .. }] if id == "q1"));
@@ -1682,6 +1687,7 @@ mod tests {
             prompt_id: None,
             synthesized: true,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let mut m = TranscriptModel::new();
         let deltas = m.apply_event(1, &ev);
@@ -1698,6 +1704,7 @@ mod tests {
             prompt_id: None,
             synthesized: false,
             origin_plugin: Some("cron".into()),
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let mut m = TranscriptModel::new();
         m.apply_event(1, &ev);

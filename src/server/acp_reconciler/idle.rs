@@ -592,6 +592,7 @@ mod tests {
                 attachments: Vec::new(),
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             }
         }
         let finished_turn = |extra: Vec<Event>, tail: Vec<Event>| {

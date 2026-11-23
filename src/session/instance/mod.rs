@@ -250,6 +250,12 @@ pub struct PendingInitialTurn {
     /// it existed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub id: String,
+    /// Carried onto the resulting `Event::UserPromptSent`.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::daemon::PromptOrigin::is_unknown"
+    )]
+    pub origin: crate::daemon::PromptOrigin,
 }
 
 impl PendingInitialTurn {

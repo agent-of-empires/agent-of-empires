@@ -3302,7 +3302,7 @@ mod tests {
             "accepted".into(),
             vec![],
             None,
-            None,
+            crate::server::session_service::QueueSender::default(),
         );
         tokio::pin!(enqueue);
         assert!(futures_util::poll!(&mut enqueue).is_pending());

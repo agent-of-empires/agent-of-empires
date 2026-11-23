@@ -574,6 +574,7 @@ mod tests {
             attachments: vec![attachment.clone()],
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         // (events, expected prompt)
         let cases = [
