@@ -197,6 +197,8 @@ pub const KNOWN_SUB_TARGETS: &[&str] = &[
     "migrations.v048",
     "migrations.v052",
     "migrations.v053",
+    "migrations.v058",
+    "migrations.v061",
     "server.file_watch",
     "server.lifecycle",
     "server.idle_reap",

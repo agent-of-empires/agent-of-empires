@@ -831,8 +831,8 @@ impl SettingsView {
                             None => collapsed,
                         }
                     }
-                    Some(text) => text.to_string(),
-                    None => String::new(),
+                    Some(text) if !text.trim().is_empty() => text.to_string(),
+                    _ => field.unset_display().unwrap_or_default(),
                 };
                 self.render_text_field(canvas, value_area, &display, index, is_selected, theme);
             }

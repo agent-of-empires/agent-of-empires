@@ -6125,6 +6125,42 @@ fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
                 "Couldn't pull the Sandbox image ghcr.io/acme/sandbox:1.".into(),
             ),
         ),
+        // Both automatic tags failed: both are named, the runtime's output still is not.
+        (
+            "both automatic tags",
+            crate::containers::sandbox_image::AutomaticImagesUnavailable {
+                exact: "ghcr.io/acme/sandbox:1.19.0".into(),
+                minor: "ghcr.io/acme/sandbox:1.19".into(),
+                source: DockerError::ImagePullFailed {
+                    runtime: "Podman",
+                    image: "ghcr.io/acme/sandbox:1.19.0".into(),
+                    detail: format!("denied: token {SECRET} at /root/.docker/config.json"),
+                    reason: crate::containers::image_pull::PullFailureReason::Other,
+                },
+            }
+            .into(),
+            (
+                "sandbox_image_pull_failed",
+                "Couldn't pull the Sandbox image ghcr.io/acme/sandbox:1.19.0 or its minor tag \
+                 ghcr.io/acme/sandbox:1.19."
+                    .into(),
+            ),
+        ),
+        (
+            "both automatic tags, not found",
+            crate::containers::sandbox_image::AutomaticImagesUnavailable {
+                exact: "ghcr.io/acme/sandbox:1.19.0".into(),
+                minor: "ghcr.io/acme/sandbox:1.19".into(),
+                source: DockerError::ImageNotFound(format!("img {SECRET}")),
+            }
+            .into(),
+            (
+                "sandbox_image_pull_failed",
+                "Couldn't pull the Sandbox image ghcr.io/acme/sandbox:1.19.0 or its minor tag \
+                 ghcr.io/acme/sandbox:1.19."
+                    .into(),
+            ),
+        ),
         (
             "latest image pull",
             anyhow::Error::new(crate::server::session_spawn::ImageUpdateFailed {
@@ -10950,7 +10986,7 @@ async fn create_refuses_pull_latest_image_when_it_cannot_pull() {
     let default_image = crate::session::Config::load()
         .unwrap()
         .sandbox
-        .default_image;
+        .effective_image();
     for (requested, refused) in [
         (None, None),
         (Some(default_image.as_str()), None),
@@ -10959,7 +10995,7 @@ async fn create_refuses_pull_latest_image_when_it_cannot_pull() {
             Some(StatusCode::BAD_REQUEST),
         ),
     ] {
-        let refusal = crate::server::api::create_pull_refusal(&state, requested).await;
+        let refusal = crate::server::api::create_pull_refusal(&state, requested, None).await;
         assert_eq!(refusal.map(|r| r.status()), refused, "{requested:?}");
     }
 }
