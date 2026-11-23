@@ -182,7 +182,7 @@ A capability this host version does not recognize is rejected, not granted.
 
 ## Commands
 
-Palette and CLI entries, namespaced by the host as `plugin.<id>.<command-id>`.
+Palette entries, namespaced by the host as `plugin.<id>.<command-id>`. A command with no `action` is delivered to the worker as a `plugin.command.invoke` notification. The CLI lists them in `aoe --help` but cannot run them yet. A command whose name a core subcommand or an earlier plugin already uses is not listed.
 
 ```toml
 [[commands]]
@@ -851,7 +851,7 @@ To mutate the draft, include a `draft_operation` in the pushed payload, which re
 
 ## Status
 
-Status segments the plugin contributes, consumed by the status surface. Requires `api_version >= 4`.
+Reserved. The manifest accepts `[[status]]` (with `api_version >= 4`) but no host surface reads it yet; use a `status-bar` [UI slot](#ui-slots) for visible status.
 
 ```toml
 [[status]]
