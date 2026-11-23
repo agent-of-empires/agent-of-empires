@@ -123,7 +123,7 @@ From the command line, `aoe add --prompt <text>` or `--prompt-file <path>` sets 
 
 ## Read-only dashboards and CityHall
 
-A read-only dashboard lists suggestions but cannot change anything: "This dashboard is read-only. Start, Dismiss and Refresh are off." The same applies to the TUI view. Offline, suggestions stay visible from the last fetch ("Disconnected. Suggestions show from the last fetch; reconnect to start one.").
+A read-only dashboard lists suggestions but cannot change anything: "This dashboard is read-only. Start, Dismiss and Refresh are off." The TUI says "Read-only daemon: you can browse, not start or dismiss." at the top of the view and when a key on Home is refused, and `r` only reloads. Offline, suggestions stay visible from the last fetch ("Disconnected. Suggestions show from the last fetch; reconnect to start one.").
 
 In [CityHall mode](web-dashboard.md#cityhall-client-mode) the suggestion routes that change anything (start, refresh, dismiss, source and preference changes, preset and mapping edits) are refused server-side, and plugin lifecycle is hidden, so setup and the Marketplace are unavailable. Reading suggestions stays allowed. The [API reference](../plugin-api.md#suggestions-api) lists the exact routes.
 

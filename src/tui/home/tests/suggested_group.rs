@@ -587,7 +587,11 @@ fn z_dismisses_when_the_daemon_accepts_mutations_and_is_refused_otherwise() {
     env.view.update_selected();
 
     env.view.handle_key(key(KeyCode::Char('z')), None);
-    assert!(env.view.status_flash_text().unwrap().contains("read-only"));
+    assert!(env
+        .view
+        .status_flash_text()
+        .unwrap()
+        .contains("Disconnected"));
     // Requests are FIFO: a refused dismiss never reached the worker ahead of this one.
     env.view
         .suggestions_feed
@@ -638,7 +642,11 @@ fn enter_on_an_unstarted_suggestion_is_refused_while_mutations_are_unavailable()
     env.view.cursor += 1;
     env.view.update_selected();
     env.view.handle_key(key(KeyCode::Enter), None);
-    assert!(env.view.status_flash_text().unwrap().contains("read-only"));
+    assert!(env
+        .view
+        .status_flash_text()
+        .unwrap()
+        .contains("Disconnected"));
     assert!(requests.try_recv().is_err(), "no prepare was sent");
 }
 
@@ -682,7 +690,11 @@ fn a_home_prepare_answered_after_the_full_view_opened_is_dropped() {
     });
     assert!(env.view.new_dialog.is_none());
     let view = env.view.suggestions_view.as_ref().expect("view stays open");
-    assert!(view.error.as_deref().unwrap().contains("Start again"));
+    assert!(view
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("Press Enter on it again"));
 }
 
 #[test]

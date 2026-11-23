@@ -439,12 +439,10 @@ fn start_for(snapshot: Option<&Snapshot>, key: &ItemKey, prepared: Prepared) -> 
     }
 }
 
-/// The note for a daemon that refuses mutations, in the web dashboard's words.
-fn block_note(block: MutationBlock) -> &'static str {
+/// The note for a daemon that refuses mutations.
+pub(super) fn block_note(block: MutationBlock) -> &'static str {
     match block {
-        MutationBlock::ReadOnly => {
-            "This dashboard is read-only. Start, Dismiss and Refresh are off."
-        }
+        MutationBlock::ReadOnly => "Read-only daemon: you can browse, not start or dismiss.",
         MutationBlock::Offline => {
             "Disconnected. Suggestions show from the last fetch; reconnect to start one."
         }
@@ -2906,7 +2904,7 @@ mod tests {
         for (block, note) in [
             (
                 MutationBlock::ReadOnly,
-                "This dashboard is read-only. Start, Dismiss and Refresh are off.",
+                "Read-only daemon: you can browse, not start or dismiss.",
             ),
             (
                 MutationBlock::Offline,

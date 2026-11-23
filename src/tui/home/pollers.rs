@@ -129,7 +129,7 @@ impl HomeView {
         {
             if let Some(view) = &mut self.suggestions_view {
                 // The full view owns suggestion starts now, so say why nothing opened.
-                view.set_error("Suggestion ready, press Start again in this list");
+                view.set_error("Suggestion ready. Press Enter on it again to start it.");
             } else if self.cursor_suggestion().as_ref() == Some(&key) && self.new_dialog.is_none() {
                 if target == PrepareTarget::HomeAnother {
                     start.suggestion = None;
@@ -178,7 +178,13 @@ impl HomeView {
                 say(self, format!("Already started{opens}"), false);
             }
             StartAnswer::AlreadyStarted(None) => {
-                say(self, "Already starting. Reload in a moment.".into(), false);
+                let message = if self.suggestions_view.is_some() {
+                    let reload = if self.strict_hotkeys { "R" } else { "r" };
+                    format!("Already starting. Press {reload} in a moment to reload.")
+                } else {
+                    "Already starting. It shows under its Project in a moment.".to_string()
+                };
+                say(self, message, false);
             }
             StartAnswer::TrustChanged => self.suggestions_feed.restart_after_trust_change(key),
             StartAnswer::NeedsTrust {

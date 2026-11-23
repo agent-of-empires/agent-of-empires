@@ -201,10 +201,10 @@ impl HomeView {
 
     /// Flashes why the daemon refuses mutations; true when it does.
     fn mutations_blocked(&mut self) -> bool {
-        if self.session_feed.mutations_available() {
+        let Some(block) = self.session_feed.mutation_block() else {
             return false;
-        }
-        self.flash_status("The daemon is read-only or unavailable");
+        };
+        self.flash_status(crate::tui::suggestions::block_note(block));
         true
     }
 
@@ -289,15 +289,17 @@ impl HomeView {
                     lines.push(Line::from(""));
                 }
                 lines.push(Line::from(format!(
-                    "From {} suggestions.",
+                    "Suggestions from {}.",
                     join_names(&self.suggestions_feed.provider_names())
                 )));
                 if total > 0 {
+                    let hint = if self.suggested_section_collapsed {
+                        "Enter to expand, then Enter on one to start a session."
+                    } else {
+                        "Enter on one starts a session. Enter or ← collapses the group."
+                    };
                     lines.push(Line::from(""));
-                    lines.push(Line::from(Span::styled(
-                        "Enter to expand, then Enter on one to start a session.",
-                        dim,
-                    )));
+                    lines.push(Line::from(Span::styled(hint, dim)));
                 }
                 (format!("Suggested ({total})"), lines)
             }
