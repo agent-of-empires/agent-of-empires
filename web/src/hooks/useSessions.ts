@@ -168,11 +168,9 @@ export function useSessions() {
   const syncTrash = useCallback((): Promise<void> => {
     if (!trashWantedRef.current) return Promise.resolve();
     if (trashInFlightRef.current) return trashInFlightRef.current;
-    const request = new AbortController();
-    const deadline = setTimeout(() => request.abort(), POLL_DEADLINE_MS);
     const run = (async () => {
       try {
-        const data = await fetchTrashedSessions(request.signal);
+        const data = await fetchTrashedSessions(AbortSignal.timeout(POLL_DEADLINE_MS));
         if (!data) {
           setTrashError(true);
           return;
@@ -234,7 +232,6 @@ export function useSessions() {
         setTrashEpoch(cursor.epoch);
         setTrashError(false);
       } finally {
-        clearTimeout(deadline);
         trashInFlightRef.current = null;
       }
     })();
