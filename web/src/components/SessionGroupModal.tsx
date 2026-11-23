@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { fetchGroups } from "../lib/api";
+import { reportError } from "../lib/logger";
 import type { GroupInfo } from "../lib/types";
 import { CancelButton, ConfirmButton, Dialog } from "./Dialog";
 import { isImeComposing } from "../lib/ime";
@@ -30,7 +31,7 @@ export function SessionGroupModal({ sessionTitle, currentGroup, profile, onSave,
     let live = true;
     fetchGroups(profile)
       .then((g) => live && setGroups(g))
-      .catch(() => {});
+      .catch((err) => reportError(err, { level: "warn", target: "web.client" }));
     return () => {
       live = false;
     };

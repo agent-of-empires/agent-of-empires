@@ -143,6 +143,7 @@ describe("SessionGroupModal", () => {
   it("Remove from group saves a blank group and is absent without one", async () => {
     const { onSave, onClose, unmount } = setup("work");
     fireEvent.click(screen.getByRole("button", { name: "Remove from group" }));
+    expect(onSave).toHaveBeenCalledTimes(1);
     expect(onSave).toHaveBeenCalledWith("");
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
     unmount();
