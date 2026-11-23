@@ -66,14 +66,15 @@ impl HomeView {
     }
 
     /// Whether the bundled adapter could start a turn here, under the same
-    /// setting the launch honors.
+    /// setting the launch honors. The readiness itself comes from the detection
+    /// worker: probing node here would spawn a process on the UI thread every
+    /// time the dialog opens.
     fn bundle_ready(&self) -> bool {
-        let config = load_config().ok().flatten().unwrap_or_default();
-        if config.acp.structured_view == StructuredView::Off {
+        if !self.bundled_ready {
             return false;
         }
-        let app_dir = crate::session::get_app_dir().ok();
-        crate::acp::quickstart::bundled_ready(app_dir.as_deref())
+        let config = load_config().ok().flatten().unwrap_or_default();
+        config.acp.structured_view != StructuredView::Off
     }
 
     pub(super) fn dialog_tools_with_bundle(

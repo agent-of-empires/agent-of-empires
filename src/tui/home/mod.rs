@@ -427,6 +427,9 @@ pub struct HomeView {
     pub(super) search_match_index: usize,
 
     pub(super) available_tools: AvailableTools,
+    /// The bundled adapter could start a turn here, as the detection worker last
+    /// found it. Cached because the check spawns a node process.
+    pub(super) bundled_ready: bool,
 
     pub(super) plugin_ui: crate::tui::plugin_ui_poller::PluginUiState,
     pub(super) show_diagnostics: bool,

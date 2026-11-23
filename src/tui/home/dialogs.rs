@@ -19,6 +19,11 @@ impl HomeView {
         self.available_tools = tools;
     }
 
+    /// Record what the detection worker found about the bundled adapter.
+    pub fn set_bundled_ready(&mut self, ready: bool) {
+        self.bundled_ready = ready;
+    }
+
     pub fn show_changelog(&mut self, from_version: Option<String>) {
         tracing::info!(
             target: "tui.dialog",

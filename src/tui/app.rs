@@ -95,7 +95,7 @@ pub type TuiBackend = crate::tui::hyperlink::HyperlinkBackend<std::io::Stdout>;
 pub struct App {
     home: HomeView,
     tool_detection: Option<ToolDetection>,
-    available_tools_rx: Option<tokio::sync::oneshot::Receiver<AvailableTools>>,
+    available_tools_rx: Option<tokio::sync::oneshot::Receiver<DetectedTools>>,
     pending_forced_tool_detection: bool,
     startup_dialogs_pending: bool,
     suppress_first_run_dialogs: bool,
@@ -153,6 +153,14 @@ pub struct App {
     /// The running binary keeps its old version until restart, so this stops
     /// periodic re-checks from re-offering a release we already installed.
     last_installed_version_in_session: Option<String>,
+}
+
+/// What the detection worker reports: the terminal tools, and whether the
+/// bundled adapter could start a turn.
+#[derive(Debug)]
+struct DetectedTools {
+    tools: AvailableTools,
+    bundled: bool,
 }
 
 struct ToolDetection {
@@ -420,7 +428,12 @@ impl App {
         match std::thread::Builder::new()
             .name("aoe-agent-detection".into())
             .spawn(move || {
-                let _ = tx.send(AvailableTools::detect_cancellable(&worker_cancel, force));
+                let tools = AvailableTools::detect_cancellable(&worker_cancel, force);
+                // The node probe behind this spawns a process and can time out, so it
+                // runs here once and the dialog reads the cached answer.
+                let app_dir = crate::session::get_app_dir().ok();
+                let bundled = crate::acp::quickstart::bundled_ready(app_dir.as_deref());
+                let _ = tx.send(DetectedTools { tools, bundled });
             }) {
             Ok(thread) => {
                 self.tool_detection = Some(ToolDetection {
@@ -437,7 +450,7 @@ impl App {
     fn poll_tool_detection(&mut self) -> bool {
         if let Some(rx) = self.available_tools_rx.as_mut() {
             match rx.try_recv() {
-                Ok(tools) => {
+                Ok(DetectedTools { tools, bundled }) => {
                     if self.home.no_agents_dialog.is_some() {
                         if tools.any_available() {
                             self.home.no_agents_dialog = None;
@@ -446,6 +459,7 @@ impl App {
                         }
                     }
                     self.home.set_available_tools(tools);
+                    self.home.set_bundled_ready(bundled);
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
                 Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
@@ -3814,7 +3828,11 @@ mod tests {
             if let Ok(state) = saved_state {
                 assert!(state.has_seen_welcome);
             }
-            tx.send(AvailableTools::with_tools(&["claude"])).unwrap();
+            tx.send(DetectedTools {
+                tools: AvailableTools::with_tools(&["claude"]),
+                bundled: false,
+            })
+            .unwrap();
             assert!(app.poll_tool_detection());
 
             assert!(
@@ -3914,7 +3932,11 @@ mod tests {
             );
 
             if deliver_result {
-                tx.send(AvailableTools::with_tools(&[])).unwrap();
+                tx.send(DetectedTools {
+                    tools: AvailableTools::with_tools(&[]),
+                    bundled: false,
+                })
+                .unwrap();
             } else {
                 drop(tx);
             }
@@ -4112,7 +4134,11 @@ mod tests {
             .unwrap();
             let (tx, rx) = tokio::sync::oneshot::channel();
             app.available_tools_rx = Some(rx);
-            tx.send(AvailableTools::with_tools(tools)).unwrap();
+            tx.send(DetectedTools {
+                tools: AvailableTools::with_tools(tools),
+                bundled: false,
+            })
+            .unwrap();
             assert!(app.poll_tool_detection());
             assert_eq!(
                 app.home.no_agents_dialog.is_some(),
@@ -4161,7 +4187,11 @@ mod tests {
             assert!(app.home.intro_dialog.is_none());
             assert!(!Config::load_or_warn().app_state.has_seen_welcome);
 
-            tx.send(AvailableTools::with_tools(tools)).unwrap();
+            tx.send(DetectedTools {
+                tools: AvailableTools::with_tools(tools),
+                bundled: false,
+            })
+            .unwrap();
             assert!(app.poll_tool_detection());
             if suppress {
                 assert!(

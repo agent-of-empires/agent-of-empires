@@ -21,10 +21,10 @@ pub const OTARI_SUPPORT_URL: &str = "https://discord.gg/4gf3zXrQUc";
 /// An `AOE_AGENT_MODEL` value that routes the bundled agent through Otari.
 pub const OTARI_MODEL_EXAMPLE: &str = "openai-compatible:anthropic/claude-fable-5";
 
-/// The bundled agent is unusable and no install is permitted, so a detected
-/// agent takes the default.
+/// The bundled agent cannot start a turn here (missing, or its Node is too old)
+/// and no install is permitted, so a detected agent takes the default.
 const FALLBACK_NO_BUNDLE: &str =
-    "the bundled aoe-agent is not installed and installing it was not requested";
+    "the bundled aoe-agent is not ready to run a turn here and installing it was not requested";
 
 /// What this machine has, as `aoe agents` and `aoe acp doctor` see it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
