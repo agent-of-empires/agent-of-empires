@@ -332,10 +332,17 @@ pub(crate) async fn submit_prompt(
         .session_service
         .prompt_dispatch_under_submission(id, req.text, woke_idle_dormant, req.no_revive)
         .await;
-    // A typed prompt to a stop-fenced session starts it like an idle wake. The resume
-    // admits against this observed intent, so a newer stop wins and refuses the prompt.
+    // A prompt typed on a foreground surface to a stop-fenced session starts it like an
+    // idle wake. The resume admits against this observed intent, so a newer stop wins and
+    // refuses the prompt. MCP, plugin and automated prompts keep waiting behind the fence.
     let mut observed_stop = None;
     let dispatch = if !req.no_revive
+        && matches!(
+            req.origin,
+            crate::daemon::PromptOrigin::Dashboard
+                | crate::daemon::PromptOrigin::Tui
+                | crate::daemon::PromptOrigin::Cli
+        )
         && matches!(
             dispatch,
             PromptDispatch::Queued {

@@ -461,6 +461,15 @@ fn settle_stop_fence(id: &str) {
     assert!(worker_registry::stop_requested(id));
 }
 
+fn dashboard_headers() -> axum::http::HeaderMap {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        crate::daemon::PromptOrigin::HEADER,
+        axum::http::HeaderValue::from_static("dashboard"),
+    );
+    headers
+}
+
 /// A prompt typed into a stop-fenced session starts it (explicit resume) instead of
 /// parking behind the fence; a `no_revive` sender still parks.
 #[tokio::test]
@@ -476,7 +485,7 @@ async fn user_prompt_to_a_stop_fenced_session_wakes_it() {
     let response = acp_prompt(
         State(Arc::clone(&state)),
         Path(id.clone()),
-        axum::http::HeaderMap::new(),
+        dashboard_headers(),
         prompt_req("wake up"),
     )
     .await
@@ -543,6 +552,32 @@ async fn stop_newer_than_the_observed_one_refuses_the_prompt_start() {
         .queued_prompts_snapshot(&id)
         .await
         .is_empty());
+}
+
+/// A prompt without a foreground origin (MCP, plugin, automated) parks behind the fence.
+#[tokio::test]
+#[serial_test::serial]
+async fn non_foreground_prompt_to_a_stop_fenced_session_stays_queued() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-stop-fence-unknown-origin".to_string();
+    let (state, launches) = failing_start_state(&id, false).await;
+    settle_stop_fence(&id);
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        axum::http::HeaderMap::new(),
+        prompt_req("automated"),
+    )
+    .await
+    .into_response();
+
+    assert!(response.status().is_success(), "{}", response.status());
+    assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(crate::process::worker_registry::stop_requested(&id));
+    let queued = state.session_service.queued_prompts_snapshot(&id).await;
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].text, "automated");
 }
 
 #[tokio::test]
