@@ -179,12 +179,11 @@ impl Instance {
     /// reload or a daemon restart this is how it comes back. Once the row can launch again, a
     /// remedy already named is dropped and what ended the pane stays.
     fn name_refused_restart(&mut self, lead: Option<(TmuxAbsence, &str)>, seen: Option<String>) {
-        let remedy = Self::command_selector_remedy(&self.id);
-        let named = format!(" {REFUSED_RESTART} {remedy}");
-        if !self.command_selector_refuses_launch() {
-            self.drop_applied_remedy(&named);
+        if self.drop_remedy_if_launchable() {
             return;
         }
+        let remedy = Self::command_selector_remedy(&self.id);
+        let named = format!(" {REFUSED_RESTART} {remedy}");
         // A pane confirmed gone stays gone when tmux later can't be reached.
         let lead = match lead {
             Some(_) if self.last_error.absence() == Some(TmuxAbsence::Gone) => {
@@ -237,6 +236,16 @@ impl Instance {
             return;
         };
         self.last_error.latch_tmux(TmuxAbsence::Gone, gone);
+    }
+
+    /// Whether the row can launch again, having dropped a remedy already named if so.
+    fn drop_remedy_if_launchable(&mut self) -> bool {
+        if self.command_selector_refuses_launch() {
+            return false;
+        }
+        let remedy = Self::command_selector_remedy(&self.id);
+        self.drop_applied_remedy(&format!(" {REFUSED_RESTART} {remedy}"));
+        true
     }
 
     /// Drop `named`, the remedy [`Self::name_refused_restart`] appended, from the recorded error,
@@ -383,9 +392,12 @@ impl Instance {
             tmux::SessionExistence::Present => {
                 self.unknown_since = None;
                 self.ever_confirmed_present = true;
-                // tmux shows the pane again, so it explains itself.
+                // tmux shows the pane again, so it explains itself, from a fresh capture.
                 if self.last_error.absence().is_some() {
                     self.last_error.clear();
+                    self.detection.activity = None;
+                    self.detection.captured_at = None;
+                    self.detection.observation_key = None;
                 }
             }
         }
@@ -674,6 +686,11 @@ impl Instance {
         hook: Option<tmux::detect::HookObservation>,
         is_dead: bool,
     ) {
+        // An edited command can make a named remedy stale without moving the screen, so this runs
+        // before the returns below that reuse or keep the last verdict.
+        if self.status == Status::Error {
+            self.drop_remedy_if_launchable();
+        }
         let activity = metadata.and_then(|m| m.window_activity);
         let plan = tmux::DetectionPlan::for_manifest(&self.source_profile, rules_tool, agent)
             .expect("manifest was resolved before polling");
@@ -1925,6 +1942,127 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
                 inst.command,
                 inst.last_error
             );
+        }
+
+        // 4664722975: every return before the remedy reconcile. Either remedy applied drops the
+        // remedy on a poll that reuses the last verdict, and on one that reads an agent-owned
+        // viewer. Each case first shows its return taken with the remedy still named.
+        let viewer = home.path().join("viewer.txt");
+        std::fs::write(
+            &viewer,
+            format!(
+                "{}showing detailed transcript · ctrl+o to toggle\n",
+                "\n".repeat(150)
+            ),
+        )
+        .expect("write viewer");
+        let mut mismatches = Vec::new();
+        let before = chrono::Utc::now().timestamp() - 100;
+        let remedies: [(&str, fn(&mut Instance)); 2] = [
+            ("flag removed", |inst| inst.command = "claude".into()),
+            ("AoE's id cleared", |inst| {
+                inst.resume_intent = ResumeIntent::Cleared
+            }),
+        ];
+        for ((label, rule), (fix, apply)) in [
+            ("unchanged screen", "screen_unchanged"),
+            ("agent-owned viewer", "transcript_viewer"),
+        ]
+        .into_iter()
+        .flat_map(|case| remedies.map(|remedy| (case, remedy)))
+        {
+            let mut inst = conflicting();
+            let name = tmux::Session::generate_name(&inst.id, &inst.title);
+            let shown = format!("{name}_shown");
+            let _pane = spawn_pane(&name, &format!("cat {}; sleep 300", shell_quote(&frame)));
+            let _shown = spawn_pane(&shown, &format!("cat {}; sleep 300", shell_quote(&viewer)));
+            assert!(wait_for_pane(&name, "turn over"), "{label}: never painted");
+            assert!(
+                wait_for_pane(&shown, "showing detailed transcript"),
+                "{label}: viewer never painted"
+            );
+            let guard = crate::tmux::SessionCacheGuard::capture();
+            guard.force_present(&[name.as_str(), shown.as_str()]);
+            let dead_at = |activity| tmux::PaneMetadata {
+                pane_dead: true,
+                ..agent_pane_metadata("claude", Some(activity))
+            };
+            // The viewer's polls each see a new activity second, so neither reuses the cache.
+            let (pane, activity, edited_at) = if rule == "screen_unchanged" {
+                (name.as_str(), before, before)
+            } else {
+                (shown.as_str(), before + 1, before + 2)
+            };
+            let poll = |inst: &mut Instance, pane: &str, activity| {
+                inst.update_status_with_metadata_inner(Some(&dead_at(activity)), Some(pane));
+                (
+                    inst.status,
+                    inst.last_error.as_deref().map(str::to_owned),
+                    inst.detection.rule,
+                )
+            };
+            poll(&mut inst, &name, before);
+            let named = refused(&inst, "The terminal ended.");
+            let taken = poll(&mut inst, pane, activity);
+            if taken != (Status::Error, Some(named.clone()), Some(rule)) {
+                mismatches.push(format!("{label}, {fix}, still refused: {taken:?}"));
+            }
+            apply(&mut inst);
+            let seen = poll(&mut inst, pane, edited_at);
+            let want = (
+                Status::Error,
+                Some("The terminal ended.".to_owned()),
+                Some(rule),
+            );
+            if seen != want {
+                mismatches.push(format!("{label}, {fix}: {seen:?}, want {want:?}"));
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+
+        // The outside-diff comment on :387: a hookless pane whose tmux server went away and came
+        // back, its screen unchanged throughout, gets a status read from a fresh capture rather
+        // than an Error with nothing to explain it. The stuck Error predates #5930, which emptied
+        // its explanation.
+        {
+            let mut inst = flag_removed();
+            // Idle already, so the first read publishes without waiting to be confirmed.
+            inst.status = Status::Idle;
+            let name = tmux::Session::generate_name(&inst.id, &inst.title);
+            let _pane = spawn_pane(&name, &format!("cat {}; sleep 300", shell_quote(&frame)));
+            assert!(
+                wait_for_pane(&name, "turn over"),
+                "idle frame never painted"
+            );
+            let metadata = agent_pane_metadata("claude", Some(before));
+            let present = |inst: &mut Instance| {
+                let guard = crate::tmux::SessionCacheGuard::capture();
+                guard.force_present(&[name.as_str()]);
+                inst.last_error_check = None;
+                inst.update_status_with_metadata_inner(Some(&metadata), Some(&name));
+                (
+                    inst.status,
+                    inst.last_error.as_deref().map(str::to_owned),
+                    inst.detection.rule,
+                )
+            };
+            present(&mut inst);
+            let (live, explained, rule) = present(&mut inst);
+            assert_eq!(rule, Some("screen_unchanged"), "the cache must be in play");
+            {
+                let guard = crate::tmux::SessionCacheGuard::capture();
+                guard.force_unreachable();
+                inst.unknown_since = Some(std::time::Instant::now() - Duration::from_secs(60));
+                inst.update_status_with_metadata_inner(Some(&metadata), Some(&name));
+            }
+            assert_eq!(
+                inst.last_error.as_deref(),
+                Some(TMUX_SERVER_UNREACHABLE_ERROR)
+            );
+            let (status, error, rule) = present(&mut inst);
+            assert_ne!(rule, Some("screen_unchanged"), "tmux back must recapture");
+            assert_eq!((status, &error), (live, &explained));
+            assert!(status != Status::Error || error.is_some(), "{error:?}");
         }
 
         // What a dead pane printed leads the remedy: with a hook (4660763982), and on the
