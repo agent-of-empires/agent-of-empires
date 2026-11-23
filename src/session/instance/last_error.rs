@@ -33,6 +33,13 @@ impl LastError {
         self.absence = Some(absence);
     }
 
+    /// tmux confirmed the pane gone: the message stays, now as that latch.
+    pub(crate) fn confirm_gone(&mut self) {
+        if self.message.is_some() {
+            self.absence = Some(TmuxAbsence::Gone);
+        }
+    }
+
     pub(crate) fn absence(&self) -> Option<TmuxAbsence> {
         self.absence
     }

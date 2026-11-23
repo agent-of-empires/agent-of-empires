@@ -180,7 +180,7 @@ use launch_command::{
     splice_subcommand_or_append, PreparedLaunch,
 };
 use omp::{gate_omp_launch, wrap_omp_host_launch, wrap_omp_launch};
-use pane_status::{resolve_detected_status, summarize_error_from_pane};
+use pane_status::{pane_error_line, resolve_detected_status, summarize_error_from_pane};
 
 use status::{UNKNOWN_ERROR_WINDOW_CONFIRMED_PRESENT, UNKNOWN_ERROR_WINDOW_NEVER_PRESENT};
 use tmux_session::tmux_env_session_name_for_instance_id;
