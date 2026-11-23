@@ -27,10 +27,14 @@ fn stop_args(settings: Option<&str>) -> &'static [&'static str] {
     }
 }
 
-/// Whether `top` output lists `sleep` as the container's first process. The
+/// Whether `top -eo pid,comm` output lists `sleep` as the container's first process. The
 /// daemon may default init on, which `inspect` cannot show, so PID 1 is read.
 fn pid1_is_sleep(top_stdout: &str) -> bool {
-    top_stdout.lines().nth(1).map(str::trim) == Some("sleep")
+    top_stdout
+        .lines()
+        .nth(1)
+        .and_then(|row| row.split_whitespace().last())
+        == Some("sleep")
 }
 
 /// Full `stop` arguments for container `name`. `run` runs the given runtime
@@ -48,7 +52,7 @@ pub(crate) fn stop_args_for(
     let mut args =
         stop_args(stdout(&["inspect", "--format", STOP_SETTINGS_FORMAT, name]).as_deref());
     if args.len() > 1
-        && !stdout(&["top", name, "-eo", "comm"]).is_some_and(|top| pid1_is_sleep(&top))
+        && !stdout(&["top", name, "-eo", "pid,comm"]).is_some_and(|top| pid1_is_sleep(&top))
     {
         args = &["stop"];
     }
@@ -1054,11 +1058,11 @@ mod tests {
     #[test]
     fn pid1_is_sleep_reads_the_first_listed_process() {
         for (top, expected) in [
-            ("COMMAND\nsleep", true),
-            ("COMMAND\nsleep\nsh", true),
-            ("COMMAND\ndocker-init\nsleep", false),
-            ("COMMAND\nsh\nsleep", false),
-            ("COMMAND", false),
+            ("PID COMMAND\n91483 sleep", true),
+            ("PID COMMAND\n91483 sleep\n91500 sh", true),
+            ("PID COMMAND\n91570 docker-init\n91584 sleep", false),
+            ("PID COMMAND\n91659 sh\n91675 sleep", false),
+            ("PID COMMAND", false),
             ("", false),
         ] {
             assert_eq!(pid1_is_sleep(top), expected, "{top:?}");
@@ -1082,14 +1086,23 @@ mod tests {
         };
         let now = ["stop", "-t", "0", "c1"];
         let grace = ["stop", "c1"];
-        assert_eq!(stop(Some("null|null|null"), Some("COMMAND\nsleep")), now);
         assert_eq!(
-            stop(Some("null|null|null"), Some("COMMAND\ndocker-init\nsleep")),
+            stop(Some("null|null|null"), Some("PID COMMAND\n91483 sleep")),
+            now
+        );
+        assert_eq!(
+            stop(
+                Some("null|null|null"),
+                Some("PID COMMAND\n91570 docker-init\n91584 sleep")
+            ),
             grace
         );
         assert_eq!(stop(Some("null|null|null"), None), grace);
-        assert_eq!(stop(Some("null|true|null"), Some("COMMAND\nsleep")), grace);
-        assert_eq!(stop(None, Some("COMMAND\nsleep")), grace);
+        assert_eq!(
+            stop(Some("null|true|null"), Some("PID COMMAND\n91483 sleep")),
+            grace
+        );
+        assert_eq!(stop(None, Some("PID COMMAND\n91483 sleep")), grace);
     }
 
     #[test]
