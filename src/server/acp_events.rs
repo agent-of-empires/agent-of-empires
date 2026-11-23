@@ -776,7 +776,8 @@ fn revival_pending_clears_on(status: Status) -> bool {
     )
 }
 
-/// The Retry attempt that owns a row's `Starting`, by session id.
+/// The Retry attempt that owns a row's `Starting`, by session id. Taken after `instances` when
+/// both are held, and never across an await.
 pub(crate) type RetryStarting = std::sync::Mutex<std::collections::HashMap<String, RetryAttempt>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
