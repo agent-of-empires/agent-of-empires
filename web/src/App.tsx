@@ -1,6 +1,4 @@
 import {
-  lazy,
-  Suspense,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -159,12 +157,11 @@ import { TerminalSessionStack } from "./components/TerminalSessionStack";
 // Lazy-load the acp surface so non-acp users never download
 // the @assistant-ui/react, shiki, and in-house StringDiff/DiffLine
 // dependency tree. Cuts ~hundreds of KB off the cold-start bundle
-// for the (currently default) tmux-only flow. The Suspense fallback
-// below covers the brief load while the chunk arrives.
-const StructuredView = lazy(() =>
-  import("./components/acp/StructuredView").then((m) => ({
-    default: m.StructuredView,
-  })),
+// for the (currently default) tmux-only flow. The fallback covers the brief
+// load while the chunk arrives.
+const StructuredView = lazyView(
+  () => import("./components/acp/StructuredView").then((m) => m.StructuredView),
+  <LazyFallback label="Loading acp…" />,
 );
 const BackgroundAgentsPanel = lazyView(
   () => import("./components/acp/BackgroundAgentsPanel").then((m) => m.BackgroundAgentsPanel),
@@ -2217,48 +2214,46 @@ function AppContent({
                       persistent={webSettings.persistentStructuredViews}
                       maxPersistentViews={webSettings.maxPersistentStructuredViews}
                       renderSession={(session, active, selected) => (
-                        <Suspense fallback={<LazyFallback label="Loading acp…" />}>
-                          <StructuredView
-                            active={active}
-                            selected={selected}
-                            sessionId={session.id}
-                            acpWorkerState={session.acp_worker_state ?? "absent"}
-                            rateLimitAutoResume={session.rate_limit_auto_resume}
-                            rateLimitFailoverTo={session.rate_limit_failover_to}
-                            settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
-                            tool={session.tool}
-                            acpAgent={session.acp_agent ?? null}
-                            startedBefore={hasStartedBefore(session)}
-                            acpProvider={session.acp_provider ?? null}
-                            clearAliases={session.clear_aliases}
-                            compactAliases={session.compact_aliases}
-                            onStartSession={() => void handleStartSession(session.id)}
-                            archivedAt={session.archived_at ?? null}
-                            snoozedUntil={session.snoozed_until ?? null}
-                            queuedCount={session.queued_count}
-                            trashedAt={session.trashed_at ?? null}
-                            onRestore={
-                              session.trashed_at
-                                ? () => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, session.id))
-                                : undefined
-                            }
-                            onOpenFileRef={handleOpenFileRef}
-                            fileRefSession={session}
-                            onOpenAgentsPane={openAgentsPane}
-                            serverReadOnly={caps.readOnly}
-                            isSandboxed={session.is_sandboxed}
-                            recreateContainerTitle={recreateContainerTitle(session)}
-                            recreateContainerBlock={recreateContainerBlock(session, !!session.archived_at)}
-                            onSwitchToTerminal={
-                              canSwitchToTerminal ? () => handleSwitchView(session.id, false) : undefined
-                            }
-                            onOpenTerminal={
-                              canSwitchToTerminal ? (mode) => handleOpenPairedTerminal(session.id, mode) : undefined
-                            }
-                            canRestartAgent={canRestartAgent}
-                            newSessionLike={newSessionLike(session)}
-                          />
-                        </Suspense>
+                        <StructuredView
+                          active={active}
+                          selected={selected}
+                          sessionId={session.id}
+                          acpWorkerState={session.acp_worker_state ?? "absent"}
+                          rateLimitAutoResume={session.rate_limit_auto_resume}
+                          rateLimitFailoverTo={session.rate_limit_failover_to}
+                          settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
+                          tool={session.tool}
+                          acpAgent={session.acp_agent ?? null}
+                          startedBefore={hasStartedBefore(session)}
+                          acpProvider={session.acp_provider ?? null}
+                          clearAliases={session.clear_aliases}
+                          compactAliases={session.compact_aliases}
+                          onStartSession={() => void handleStartSession(session.id)}
+                          archivedAt={session.archived_at ?? null}
+                          snoozedUntil={session.snoozed_until ?? null}
+                          queuedCount={session.queued_count}
+                          trashedAt={session.trashed_at ?? null}
+                          onRestore={
+                            session.trashed_at
+                              ? () => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, session.id))
+                              : undefined
+                          }
+                          onOpenFileRef={handleOpenFileRef}
+                          fileRefSession={session}
+                          onOpenAgentsPane={openAgentsPane}
+                          serverReadOnly={caps.readOnly}
+                          isSandboxed={session.is_sandboxed}
+                          recreateContainerTitle={recreateContainerTitle(session)}
+                          recreateContainerBlock={recreateContainerBlock(session, !!session.archived_at)}
+                          onSwitchToTerminal={
+                            canSwitchToTerminal ? () => handleSwitchView(session.id, false) : undefined
+                          }
+                          onOpenTerminal={
+                            canSwitchToTerminal ? (mode) => handleOpenPairedTerminal(session.id, mode) : undefined
+                          }
+                          canRestartAgent={canRestartAgent}
+                          newSessionLike={newSessionLike(session)}
+                        />
                       )}
                     />
                   ) : (

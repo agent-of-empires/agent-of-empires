@@ -1,5 +1,3 @@
-import { lazy, Suspense } from "react";
-
 import { StructuredSessionStack } from "./StructuredSessionStack";
 import { TerminalSessionStack } from "./TerminalSessionStack";
 import { PairedShellPane, type ShellMode } from "./PairedTerminal";
@@ -31,7 +29,7 @@ const SendCommentsDialog = lazyView(
   () => import("./diff/comments/SendCommentsDialog").then((m) => m.SendCommentsDialog),
   null,
 );
-const StructuredView = lazy(() => import("./acp/StructuredView").then((m) => ({ default: m.StructuredView })));
+const StructuredView = lazyView(() => import("./acp/StructuredView").then((m) => m.StructuredView), null);
 
 interface Props {
   /** Start a Session, for a queued row's "Start and send". */
@@ -173,39 +171,37 @@ export function MobileMainPane({
               persistent={webSettings.persistentStructuredViews}
               maxPersistentViews={webSettings.maxPersistentStructuredViews}
               renderSession={(session, active, selected) => (
-                <Suspense fallback={null}>
-                  <StructuredView
-                    active={active}
-                    selected={selected}
-                    sessionId={session.id}
-                    acpWorkerState={session.acp_worker_state ?? "absent"}
-                    rateLimitAutoResume={session.rate_limit_auto_resume}
-                    rateLimitFailoverTo={session.rate_limit_failover_to}
-                    settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
-                    tool={session.tool}
-                    acpAgent={session.acp_agent ?? null}
-                    startedBefore={hasStartedBefore(session)}
-                    acpProvider={session.acp_provider ?? null}
-                    clearAliases={session.clear_aliases}
-                    compactAliases={session.compact_aliases}
-                    onStartSession={onStartSession && (() => onStartSession(session.id))}
-                    archivedAt={session.archived_at ?? null}
-                    snoozedUntil={session.snoozed_until ?? null}
-                    queuedCount={session.queued_count}
-                    trashedAt={session.trashed_at ?? null}
-                    onOpenFileRef={onOpenFileRef}
-                    fileRefSession={session}
-                    onOpenAgentsPane={onOpenAgentsPane}
-                    serverReadOnly={readOnly}
-                    isSandboxed={session.is_sandboxed}
-                    recreateContainerTitle={recreateContainerTitle(session)}
-                    recreateContainerBlock={recreateContainerBlock(session, !!session.archived_at)}
-                    onSwitchToTerminal={onSwitchToTerminal ? () => onSwitchToTerminal(session.id) : undefined}
-                    onOpenTerminal={onOpenTerminal ? (mode) => onOpenTerminal(session.id, mode) : undefined}
-                    canRestartAgent={canRestartAgent}
-                    newSessionLike={newSessionLike?.(session)}
-                  />
-                </Suspense>
+                <StructuredView
+                  active={active}
+                  selected={selected}
+                  sessionId={session.id}
+                  acpWorkerState={session.acp_worker_state ?? "absent"}
+                  rateLimitAutoResume={session.rate_limit_auto_resume}
+                  rateLimitFailoverTo={session.rate_limit_failover_to}
+                  settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
+                  tool={session.tool}
+                  acpAgent={session.acp_agent ?? null}
+                  startedBefore={hasStartedBefore(session)}
+                  acpProvider={session.acp_provider ?? null}
+                  clearAliases={session.clear_aliases}
+                  compactAliases={session.compact_aliases}
+                  onStartSession={onStartSession && (() => onStartSession(session.id))}
+                  archivedAt={session.archived_at ?? null}
+                  snoozedUntil={session.snoozed_until ?? null}
+                  queuedCount={session.queued_count}
+                  trashedAt={session.trashed_at ?? null}
+                  onOpenFileRef={onOpenFileRef}
+                  fileRefSession={session}
+                  onOpenAgentsPane={onOpenAgentsPane}
+                  serverReadOnly={readOnly}
+                  isSandboxed={session.is_sandboxed}
+                  recreateContainerTitle={recreateContainerTitle(session)}
+                  recreateContainerBlock={recreateContainerBlock(session, !!session.archived_at)}
+                  onSwitchToTerminal={onSwitchToTerminal ? () => onSwitchToTerminal(session.id) : undefined}
+                  onOpenTerminal={onOpenTerminal ? (mode) => onOpenTerminal(session.id, mode) : undefined}
+                  canRestartAgent={canRestartAgent}
+                  newSessionLike={newSessionLike?.(session)}
+                />
               )}
             />
           ) : (
