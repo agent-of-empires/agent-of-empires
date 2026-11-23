@@ -4,7 +4,7 @@ AoE forwards your configured [MCP](https://modelcontextprotocol.io) servers to s
 
 ## Configuration
 
-Create `mcp.json` in the AoE app directory (`$XDG_CONFIG_HOME/agent-of-empires/mcp.json` on Linux, `~/.agent-of-empires/mcp.json` otherwise). It uses the standard `mcpServers` shape for the fields AoE forwards:
+Manage AoE-owned servers with `aoe mcp add`, `aoe mcp edit` and `aoe mcp remove` (see the [CLI reference](../cli/reference.md#aoe-mcp)), or edit `mcp.json` directly. Create `mcp.json` in the AoE app directory (`$XDG_CONFIG_HOME/agent-of-empires/mcp.json` on Linux, `~/.agent-of-empires/mcp.json` otherwise). It uses the standard `mcpServers` shape for the fields AoE forwards:
 
 ```json
 {
@@ -67,7 +67,9 @@ aoe mcp list --json
 
 Each row shows the server name, transport, its winning provenance (`agent-native:claude`, `global`, `profile:<name>`, `project-local`), and which layers it shadowed.
 
-The dashboard's **MCP servers** settings tab shows the same merged set plus two things the CLI does not:
+`aoe mcp list` prints the same merged set, plus conflicts and servers kept after removal.
+
+Resolve conflicts and kept servers in the dashboard's **MCP servers** settings tab; in [CityHall client mode](web-dashboard.md#cityhall-client-mode) the tab is read-only, listing conflicts and kept servers without the resolve, keep and drop actions:
 
 - **Conflicts.** AoE remembers the last definition it saw in an agent's native config. If that file changes on disk, the changed server is flagged and you pick a side. Keeping AoE's version stores it in the global `mcp.json`, which outranks the native layer; choosing the native version accepts the new definition. AoE never writes back to an agent-native config.
 - **Kept after removal.** A server that disappears from a native config is kept in view with a warning, so you can **keep** it (promoting it into the global `mcp.json`) or **drop** it.

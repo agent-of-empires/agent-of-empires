@@ -1333,7 +1333,7 @@ mod tests {
             branch: "feature/auth".to_string(),
             main_repo_path: "/tmp/proj".to_string(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: None,
         });
         assert_eq!(

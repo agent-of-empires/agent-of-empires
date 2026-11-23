@@ -445,7 +445,7 @@ A daemon older than this field omits it entirely. Treat an absent
 ```bash
 curl -sS \
   -H "Authorization: Bearer $AOE_TOKEN" \
-  "http://localhost:7777/api/sessions?state=live"
+  "http://localhost:8080/api/sessions?state=live"
 ```
 
 ### Status values
@@ -551,12 +551,11 @@ retains its existing readiness checks.
 
 `pull_latest_image: true` force-pulls the session's Sandbox image before its
 container starts and its `on_create` hooks run, so it requires a running engine.
-It applies the dashboard's pull gate. An unsandboxed request is refused with
-`400 validation_failed`. A request that can't pull (`sandbox.allow_image_pull`
-off) gets `403 pull_disabled`, and one in read-only or CityHall mode gets that
-mode's refusal. Only a configured image may be pulled: the global or a
-profile's `sandbox.default_image`. Any other `sandbox_image` is refused with
-`400 unknown_image`, and an omitted one pulls the profile's default.
+It applies the dashboard's [pull gate](#sandbox-image), with the same refusals,
+and only a configured image may be pulled; an omitted `sandbox_image` pulls the
+profile's default. The pull is shared with the dashboard's, so
+[`image-pull/cancel`](#post-apisandboximage-pullcancel) also fails a create
+waiting on it. An unsandboxed request is refused with `400 validation_failed`.
 These refusals come before anything is provisioned. While the pull runs, the
 create-progress `stage` is `pulling_image`. A failed pull ends the creation with
 `400 sandbox_image_update_failed`, and the session and its resources are rolled
@@ -741,6 +740,134 @@ When `profile` is omitted, creation uses the server's selected profile or the co
 }
 ```
 
+## Sandbox image
+
+These endpoints back the dashboard's sandbox image banner (see
+[Available images](guides/sandbox.md#available-images)). They act only on a
+configured image: the global or a profile's `sandbox.default_image`. Any other
+image is refused with `400 unknown_image`, and an omitted one means the global
+`sandbox.default_image`. Images are checked and pulled with the configured
+`container_runtime`. When the configuration can't be read, every endpoint except
+`image-dismiss` answers `500 config_unreadable` rather than fall back to defaults.
+
+**The pull gate.** `image-pull` and `image-pull/cancel` are refused in read-only
+mode (`403 read_only`), in CityHall mode (`403 cityhall_mode`), and with
+`403 pull_disabled` when `sandbox.allow_image_pull` is off (see
+[Configuration](guides/sandbox.md#configuration)). The gate is checked before the
+body. `POST /api/sessions` applies the same gate to
+[`pull_latest_image`](#post-apisessions).
+
+Both take an optional body: none for the global default image, or JSON
+`{"image": "<configured image>"}` sent as `application/json`. Any other body,
+including `{}`, gets `400 invalid_body`. A JSON body naming an image that isn't
+configured gets `400 unknown_image`.
+
+### GET /api/sandbox/image-status
+
+`?image=<ref>&fresh=true`, both optional. Reports whether the registry has a
+newer image, and the state of the image's pull. Registry answers are cached for
+15 minutes per image and runtime; `fresh=true` waits for a check that starts
+after the request. The cached answer is dropped when a pull started by
+`image-pull` ends, or when a create's `pull_latest_image` pull succeeds. Other
+pulls, such as a missing image pulled when a session starts, leave it until it
+expires.
+
+```json
+{
+  "image": "ghcr.io/acme/sandbox:latest",
+  "state": "available",
+  "remote_digest": "sha256:9f2c4e6a8b0d1f3e5a7c9b1d3f5e7a9c1b3d5f7e9a1c3b5d7f9e1a3c5b7d9f1e",
+  "dismissed": false,
+  "checks_enabled": true,
+  "sandbox_in_use": true,
+  "pull": { "state": "running", "phase": "downloading", "layers_done": 2, "layers_known": 5 },
+  "pull_blocked": null,
+  "pull_command": "docker pull ghcr.io/acme/sandbox:latest",
+  "runtime": "Docker"
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `state` | `available` (with `remote_digest`, the registry's newer digest), `current`, `unknown` (with `reason`) or `check_failed` (with `error`: `registry_unreachable`, `registry_auth` or `registry_bad_response`) |
+| `reason` | `unparseable`, `pinned` (the reference names a digest), `not_pulled`, `no_local_digest`, `runtime_unavailable` or `checks_off` |
+| `dismissed` | `true` when `state` is `available` and `remote_digest` is the dismissed digest |
+| `checks_enabled` | `false` when `[updates] update_check_mode` is `off`. `state` is then `unknown` with `checks_off`, and no registry is asked |
+| `sandbox_in_use` | `sandbox.enabled_by_default` is on, or a sandboxed session exists |
+| `pull` | The image's pull, below |
+| `pull_blocked` | `read_only`, `cityhall` or `disabled` when the pull gate refuses, otherwise `null` |
+| `pull_command` | Always present: the runtime's pull command for the image, to run on the host when `pull_blocked` is set |
+| `runtime` | `Docker`, `Podman` or `Apple Container` |
+
+`pull.state` is one of:
+
+- `idle`: no pull of the image has run since the Daemon started, or the last one
+  ended because its last waiter left.
+- `running`: once the runtime prints a layer line, it also carries `phase`
+  (`downloading`, then `unpacking`), `layers_done` and `layers_known`. Only
+  Docker reports them; Podman and Apple Container report a bare
+  `{"state": "running"}`.
+- `done`.
+- `cancelled`: ended by `image-pull/cancel`.
+- `failed`, with `reason` (`timeout`, `network`, `disk_space`, `auth` or
+  `other`), `message` (the wording both clients show) and `error` (the
+  runtime's output). Every runtime's failure is classified: `timeout` when the
+  10-minute limit kills the pull, otherwise a match on the runtime's output. The
+  phrases matched come from Docker's output, so another runtime's failure can
+  read `other` where Docker's would be named.
+
+A finished state stays until the image's next pull starts.
+
+### POST /api/sandbox/image-pull
+
+Starts a pull of the image, or joins the one already running, so at most one
+pull runs per image. It answers `202` straight away, and progress is read from
+`image-status`:
+
+```json
+{ "image": "ghcr.io/acme/sandbox:latest", "pull": { "state": "running" } }
+```
+
+A pull started here keeps running when the page closes or a create waiting on it
+leaves. It ends when it finishes, is cancelled, or reaches the runtime's
+10-minute timeout (`failed` with `reason: timeout`).
+
+### POST /api/sandbox/image-pull/cancel
+
+Same body and gate as `image-pull`. Cancels the image's running pull for every
+waiter, waits up to 5 s for it to end, then answers `200`:
+
+```json
+{ "image": "ghcr.io/acme/sandbox:latest", "pull": { "state": "cancelled" } }
+```
+
+`pull` is normally `cancelled`; it is `done` or `failed`
+if the pull ended another way first, and `running` if it hasn't ended within
+5 s. With no pull running it answers the current state, so a repeat is
+harmless.
+
+A create waiting on the cancelled pull fails with `400`:
+`sandbox_image_update_failed` for a `pull_latest_image` pull, or
+`sandbox_image_pull_failed` for a missing image's pull. The failure isn't kept
+under its `idempotency_key`, so a retry with the same key runs again. A create
+that was itself cancelled gets its own cancellation's `409 creation_cancelled`
+instead.
+
+### POST /api/sandbox/image-dismiss
+
+Body `{"digest": "sha256:<64 lowercase hex>"}`; anything else gets
+`400 invalid_digest`. Saves the digest as `app_state.dismissed_image_digest`,
+which the TUI shares, and answers:
+
+```json
+{ "dismissed_image_digest": "sha256:9f2c4e6a8b0d1f3e5a7c9b1d3f5e7a9c1b3d5f7e9a1c3b5d7f9e1a3c5b7d9f1e" }
+```
+
+The dismissal holds only while the registry still serves that digest: a newer
+one shows again.
+It is refused in read-only mode (`403 read_only`) and CityHall mode
+(`403 cityhall_mode`), but not by `sandbox.allow_image_pull`. A failed save answers `500 save_failed`.
+
 ## POST /api/sessions/{id}/restart
 
 Explicitly relaunch a session, including a running agent. Unlike `/start`, which
@@ -828,7 +955,7 @@ curl -sS -X POST \
   -H "Authorization: Bearer $AOE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"message":"summarize the failing test"}' \
-  "http://localhost:7777/api/sessions/abc123/send"
+  "http://localhost:8080/api/sessions/abc123/send"
 ```
 
 ## GET /api/sessions/{id}/output
@@ -861,7 +988,7 @@ what the agent printed back, or as a polling read-only view.
 ```bash
 curl -sS \
   -H "Authorization: Bearer $AOE_TOKEN" \
-  "http://localhost:7777/api/sessions/abc123/output?lines=80&format=text"
+  "http://localhost:8080/api/sessions/abc123/output?lines=80&format=text"
 ```
 
 ## GET /api/sessions/{id}/acp/replay?view=retained
@@ -1080,7 +1207,11 @@ an aoe session as a controlled subagent. A typical loop:
    session list shows the session's `status` back at `Idle`.
 3. Capture the trailing region of `content` as the agent's reply.
 
-For long-running prompts, prefer polling status via
+This loop works for terminal-view sessions only. A structured-view
+session answers `send` with `400 acp_mode_unsupported`; drive it with
+`POST /api/sessions/{id}/acp/prompt`.
+
+For long-running prompts in a terminal-view session, prefer polling status via
 `GET /api/sessions` over polling `output`, then read `output` once
 when status returns to `Idle`. Status transitions are also broadcast
 to push subscribers if the dashboard's push notifications are

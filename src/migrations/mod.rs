@@ -70,6 +70,7 @@ mod v058_account_limits_window_shape;
 mod v059_owner_only_event_logs;
 mod v060_terminal_handoff_outcome;
 mod v061_unpin_default_sandbox_image;
+mod v062_plugin_staging_evidence;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -110,7 +111,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 61;
+const CURRENT_VERSION: u32 = 62;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -321,6 +322,11 @@ const MIGRATIONS: &[Migration] = &[
         61,
         "unpin_default_sandbox_image",
         v061_unpin_default_sandbox_image::run,
+    ),
+    (
+        62,
+        "plugin_staging_evidence",
+        v062_plugin_staging_evidence::run,
     ),
 ];
 

@@ -95,7 +95,7 @@ struct MirroredFields {
     pending_turn_failure: Option<(u64, String, String, Option<String>)>,
     queued_prompts: Vec<crate::daemon::QueuedPromptEntry>,
     queued_prompt_next_seq: u64,
-    idle_dormant_since: Option<chrono::DateTime<chrono::Utc>>,
+    idle_dormant_since: Option<crate::time::Timestamp>,
     /// Mirrored as `disk = max(disk, memory)`, not copied, because the field is
     /// documented monotone non-decreasing and disk can legitimately lead memory
     /// when a peer process touched the row.
@@ -112,7 +112,14 @@ struct MirroredFields {
     /// recency but never clears `archived_at` / `snoozed_until` /
     /// `idle_dormant_since`, so no queue mutation can lift a sink. Writing this
     /// as `touch_last_accessed()` would.
-    last_accessed_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_accessed_at: Option<crate::time::Timestamp>,
+}
+
+/// The plugin and surface a queued prompt came from.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct QueueSender {
+    pub plugin: Option<String>,
+    pub origin: crate::daemon::PromptOrigin,
 }
 
 /// Append `text` to the instance's queue, or update the row already holding `prompt_id`.
@@ -123,13 +130,17 @@ fn enqueue_row(
     attachments: Vec<crate::daemon::PromptAttachmentRef>,
     origin_device: Option<String>,
     origin_plugin: Option<String>,
+    origin: crate::daemon::PromptOrigin,
 ) -> crate::daemon::QueuedPromptEntry {
-    inst.last_accessed_at = inst.last_accessed_at.max(Some(chrono::Utc::now()));
+    inst.last_accessed_at = inst
+        .last_accessed_at
+        .max(Some(crate::time::Timestamp::now()));
     if let Some(existing) = inst.queued_prompts.iter_mut().find(|q| q.id == prompt_id) {
         // A repost of unchanged content (a client restoring its cache) keeps the
         // sender; other content is the poster's.
         if existing.text != text || existing.attachments != attachments {
             existing.origin_plugin = origin_plugin.clone();
+            existing.origin = origin;
         }
         existing.text = text.clone();
         existing.attachments = attachments.clone();
@@ -139,6 +150,7 @@ fn enqueue_row(
             prompt_id = %existing.id,
             seq = existing.seq,
             origin_plugin = ?existing.origin_plugin,
+            origin = ?existing.origin,
             repost = true,
             "prompt enqueued"
         );
@@ -154,9 +166,10 @@ fn enqueue_row(
         // The server's clock, drawn in the same critical section that
         // assigns `seq`, so row order and stamp order agree and the
         // resume admission can order rows against the park (#4092).
-        created_at: chrono::Utc::now().to_rfc3339(),
+        created_at: crate::time::Timestamp::now().to_rfc3339(),
         origin_device: origin_device.clone(),
         origin_plugin: origin_plugin.clone(),
+        origin,
     };
     tracing::info!(
         target: "acp.queue",
@@ -164,6 +177,7 @@ fn enqueue_row(
         prompt_id = %entry.id,
         seq,
         origin_plugin = ?entry.origin_plugin,
+        origin = ?entry.origin,
         repost = false,
         "prompt enqueued"
     );
@@ -240,10 +254,10 @@ fn queue_drain_batch<'a>(
             .position(|e| profile.is_solo_command(&e.text))
             .unwrap_or(queue.len())
     };
-    // One turn has one origin, so a plugin's message never merges into another sender's.
+    // One turn has one origin, so a message never merges into another sender's.
     let batch_end = queue[..batch_end]
         .iter()
-        .position(|e| e.origin_plugin != queue[0].origin_plugin)
+        .position(|e| (e.origin, &e.origin_plugin) != (queue[0].origin, &queue[0].origin_plugin))
         .unwrap_or(batch_end);
     let sub = &queue[..batch_end];
     let combined = sub
@@ -452,6 +466,8 @@ pub(crate) struct SendTurnRequest<'a> {
     /// continuation) rather than the user typing it just now, so the
     /// transcript model can skip rendering a duplicate row for it.
     pub synthesized: bool,
+    /// Where the turn entered AoE, recorded on its `UserPromptSent`.
+    pub origin: crate::daemon::PromptOrigin,
     /// Refuse rather than resume a worker that is not currently running
     /// (#4081 review: the `WorkerDown`-only check in `acp_prompt` misses a
     /// rate-limit-exhausted park, where dispatch is `Sent` but no worker is
@@ -700,12 +716,12 @@ impl SessionService {
         mut spec: StructuredSessionSpec,
         plugin_id: Option<&str>,
         idempotency_key: Option<&str>,
-        initial_turn: Option<&str>,
+        initial_turn: Option<(&str, crate::daemon::PromptOrigin)>,
     ) -> anyhow::Result<(SpawnOutcome, bool)> {
         // Persisted with the instance in the same Storage::update, so the
         // create and its first turn are accepted atomically; the drain paths
         // deliver it once the worker is live.
-        spec.pending_initial_turn = initial_turn.map(str::to_string);
+        spec.pending_initial_turn = initial_turn.map(|(text, origin)| (text.to_string(), origin));
         let Some(plugin_id) = plugin_id else {
             let outcome = spawn_structured_session(self, spec).await?;
             return Ok((outcome, true));
@@ -1167,6 +1183,7 @@ impl SessionService {
             woke_idle_dormant,
             prompt_ids,
             synthesized,
+            origin,
             no_revive,
         } = turn;
         use crate::server::acp_reconciler::ResumeTrigger;
@@ -1345,12 +1362,15 @@ impl SessionService {
             .acp_supervisor
             .publish_user_prompt_with_attachments(
                 id,
-                text.to_string(),
-                attachments,
-                prompt_ids,
-                synthesized,
-                caller.message_origin().map(str::to_string),
-                profile,
+                crate::acp::supervisor::UserPrompt {
+                    text: text.to_string(),
+                    attachments,
+                    prompt_ids,
+                    synthesized,
+                    origin,
+                    origin_plugin: caller.message_origin().map(str::to_string),
+                    classified_as: profile,
+                },
             )
             .await;
         let receiver_ready = match &receiver {
@@ -1673,7 +1693,7 @@ impl SessionService {
         let Some(_submission) = self.prompt_submission_for_session(id).await else {
             return;
         };
-        let Some((text, attachment_refs, synthesized, profile, caller)) = ({
+        let Some((text, attachment_refs, synthesized, origin, profile, caller)) = ({
             let instances = self.instances.read().await;
             instances
                 .iter()
@@ -1696,6 +1716,7 @@ impl SessionService {
                                 turn.text,
                                 turn.attachments,
                                 turn.synthesized,
+                                turn.origin,
                                 i.source_profile.clone(),
                                 caller,
                             )
@@ -1743,6 +1764,7 @@ impl SessionService {
                     woke_idle_dormant: false,
                     prompt_ids: Vec::new(),
                     synthesized,
+                    origin,
                     no_revive: false,
                 },
             )
@@ -1803,6 +1825,7 @@ impl SessionService {
         id: &str,
         text: String,
         attachments: Vec<crate::daemon::PromptAttachmentRef>,
+        origin: crate::daemon::PromptOrigin,
     ) {
         let turn = crate::session::PendingInitialTurn {
             text,
@@ -1811,6 +1834,7 @@ impl SessionService {
             error: None,
             error_code: None,
             id: crate::session::PendingInitialTurn::fresh_id(),
+            origin,
         };
         let profile = {
             let mut instances = self.instances.write().await;
@@ -2115,7 +2139,7 @@ impl SessionService {
         text: String,
         attachments: Vec<crate::daemon::PromptAttachmentRef>,
         origin_device: Option<String>,
-        origin_plugin: Option<String>,
+        sender: QueueSender,
     ) -> Option<crate::daemon::QueuedPromptEntry> {
         self.mutate_instance_persisted(id, move |inst| {
             enqueue_row(
@@ -2124,7 +2148,8 @@ impl SessionService {
                 text,
                 attachments,
                 origin_device,
-                origin_plugin,
+                sender.plugin,
+                sender.origin,
             )
         })
         .await
@@ -2142,7 +2167,7 @@ impl SessionService {
         text: String,
         attachments: Vec<crate::daemon::PromptAttachmentRef>,
         origin_device: Option<String>,
-        origin_plugin: Option<String>,
+        sender: QueueSender,
     ) -> Result<Option<crate::daemon::QueuedPromptEntry>, QueuePersistFailed> {
         let outcome = self
             .mutate_instance_persisted_with(id, true, move |inst| {
@@ -2159,7 +2184,8 @@ impl SessionService {
                     text,
                     attachments,
                     origin_device,
-                    origin_plugin,
+                    sender.plugin,
+                    sender.origin,
                 );
                 let row_id = entry.id.clone();
                 let undo: Undo = Box::new(move |inst| {
@@ -2191,6 +2217,10 @@ impl SessionService {
     }
 
     /// Replace a queued prompt's text in place.
+    ///
+    /// The row keeps its `origin` (provenance) but loses `origin_plugin`: once a
+    /// human rewrites the text, the plugin no longer authored the message, so it
+    /// delivers as a plain user turn.
     ///
     /// Enforces the same non-empty invariant `queue_enqueue` does, because the
     /// drain relies on it: a row whose text is blank and which carries no
@@ -2565,6 +2595,7 @@ impl SessionService {
             },
             None => caller,
         };
+        let origin = sub[0].origin;
         let sent_ids: Vec<String> = sub.iter().map(|e| e.id.clone()).collect();
         // Reload every buffered attachment blob for the batch, in queue order, so a queued
         // screenshot/file is forwarded with the text (matches the client's old
@@ -2608,6 +2639,7 @@ impl SessionService {
                     woke_idle_dormant: false,
                     prompt_ids: sent_ids.clone(),
                     synthesized: false,
+                    origin,
                     no_revive: false,
                 },
                 Some(classified),
@@ -3461,7 +3493,9 @@ fn spec_payload_hash(spec: &StructuredSessionSpec) -> String {
     field("profile", &spec.profile);
     field(
         "initial_turn",
-        spec.pending_initial_turn.as_deref().unwrap_or_default(),
+        spec.pending_initial_turn
+            .as_ref()
+            .map_or("", |(text, _)| text.as_str()),
     );
     field(
         "acp_mode_id",
@@ -3537,7 +3571,7 @@ pub(crate) fn apply_prompt_persist_to_disk(disk: &mut crate::session::Instance, 
     if wake {
         disk.touch_last_accessed();
     } else {
-        let now = chrono::Utc::now();
+        let now = crate::time::Timestamp::now();
         disk.last_accessed_at = disk.last_accessed_at.max(Some(now));
         disk.ignored_at = None;
     }
@@ -3691,6 +3725,37 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_time_prompt_keeps_the_origin_its_surface_passed() -> anyhow::Result<()> {
+        use crate::daemon::PromptOrigin;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let app = crate::session::get_app_dir()?;
+        crate::session::purge_owners::initialize(&app)?;
+        crate::tmux::tool_retirement::initialize(&app)?;
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })?;
+        crate::session::config::update_config(|config| config.systemd.enabled = false)?;
+        let _storage = crate::session::Storage::new_unwatched("default")?;
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        for (plugin, origin) in [
+            (None, PromptOrigin::Mcp),
+            (Some("cron"), PromptOrigin::Plugin),
+        ] {
+            let mut spec = test_spec();
+            spec.scratch = true;
+            let (outcome, _) = state
+                .session_service
+                .create_structured_session(spec, plugin, None, Some(("go", origin)))
+                .await?;
+            let turn = outcome.instance.pending_initial_turn.expect("pending turn");
+            assert_eq!((turn.text.as_str(), turn.origin), ("go", origin));
+        }
+        Ok(())
+    }
+
     /// Skipping setup skips only on_create: on_launch still runs.
     #[tokio::test]
     #[serial_test::serial]
@@ -3729,9 +3794,9 @@ mod tests {
     #[test]
     fn idempotent_match_survives_triage_but_not_removal() {
         let mut archived = plugin_instance("cron", "k", "h");
-        archived.archived_at = Some(chrono::Utc::now());
+        archived.archived_at = Some(crate::time::Timestamp::now());
         let mut trashed = plugin_instance("cron", "k2", "h");
-        trashed.trashed_at = Some(chrono::Utc::now());
+        trashed.trashed_at = Some(crate::time::Timestamp::now());
         let instances = vec![archived, trashed];
 
         assert!(matches!(
@@ -3858,7 +3923,10 @@ mod tests {
         );
 
         let mut with_turn = test_spec();
-        with_turn.pending_initial_turn = Some("run the nightly task".to_string());
+        with_turn.pending_initial_turn = Some((
+            "run the nightly task".to_string(),
+            crate::daemon::PromptOrigin::Unknown,
+        ));
         assert_ne!(
             a,
             spec_payload_hash(&with_turn),
@@ -3960,6 +4028,7 @@ mod tests {
                         prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
+                        origin: crate::daemon::PromptOrigin::Unknown,
                     },
                 )
                 .await,
@@ -3979,6 +4048,7 @@ mod tests {
                         prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
+                        origin: crate::daemon::PromptOrigin::Unknown,
                     },
                 )
                 .await,
@@ -3998,6 +4068,7 @@ mod tests {
                         prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
+                        origin: crate::daemon::PromptOrigin::Unknown,
                     },
                 )
                 .await,
@@ -4021,6 +4092,7 @@ mod tests {
                         prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
+                        origin: crate::daemon::PromptOrigin::Unknown,
                     },
                 )
                 .await,
@@ -4040,6 +4112,7 @@ mod tests {
                         prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
+                        origin: crate::daemon::PromptOrigin::Unknown,
                     },
                 )
                 .await,
@@ -4085,6 +4158,7 @@ mod tests {
             error: error.map(str::to_string),
             error_code: None,
             id: String::new(),
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
 
         assert!(service.turn_is_deliverable("sess-switch", &turn("fresh", None)));
@@ -4222,7 +4296,7 @@ mod tests {
                         text.to_string(),
                         Vec::new(),
                         None,
-                        None,
+                        QueueSender::default(),
                     )
                     .await
                     .unwrap();
@@ -4273,6 +4347,7 @@ mod tests {
                     prompt_ids: Vec::new(),
                     synthesized: false,
                     no_revive: false,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 },
                 Some(cut_with),
             )
@@ -4308,7 +4383,7 @@ mod tests {
                     text.to_string(),
                     Vec::new(),
                     None,
-                    None,
+                    QueueSender::default(),
                 )
                 .await
                 .unwrap();
@@ -4379,7 +4454,7 @@ mod tests {
                         text.to_string(),
                         Vec::new(),
                         None,
-                        None,
+                        QueueSender::default(),
                     )
                     .await
                     .unwrap();
@@ -4503,6 +4578,7 @@ mod tests {
                             prompt_ids: Vec::new(),
                             synthesized: false,
                             no_revive: false,
+                            origin: crate::daemon::PromptOrigin::Unknown,
                         },
                         Some(crate::acp::supervisor::Classified {
                             agent: "opencode".into(),
@@ -4551,7 +4627,14 @@ mod tests {
         let classified = service.agent_profile(id, Some("/new")).await.unwrap();
         assert_eq!(classified.agent, "claude");
         service
-            .enqueue_prompt(id, "q0".into(), "hello".into(), Vec::new(), None, None)
+            .enqueue_prompt(
+                id,
+                "q0".into(),
+                "hello".into(),
+                Vec::new(),
+                None,
+                QueueSender::default(),
+            )
             .await
             .unwrap();
         service.drain_queued_prompts_once(id).await;
@@ -4594,6 +4677,7 @@ mod tests {
                     prompt_ids: Vec::new(),
                     synthesized: false,
                     no_revive: false,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 },
                 Some(cut_for_bridge),
             )
@@ -4602,6 +4686,90 @@ mod tests {
         service.acp_supervisor.test_flush_worker_commands(id).await;
         assert!(recorded.lock().unwrap().is_empty());
         assert!(!service.fold_control_state(id).await.turn_active);
+        crate::process::worker_registry::delete(id).ok();
+    }
+
+    /// A drain records the origin each stored row or pending turn carries, and a queue batch
+    /// stops where the origin changes.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn drains_record_the_stored_origin() {
+        use crate::daemon::PromptOrigin;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let first_origin = |service: &Arc<SessionService>, id: &str| {
+            service
+                .acp_event_store
+                .replay_from(id, 0)
+                .into_iter()
+                .find_map(|(_, e)| match e {
+                    crate::acp::Event::UserPromptSent { text, origin, .. } => Some((text, origin)),
+                    _ => None,
+                })
+        };
+        let rows = [
+            ("dashboard", PromptOrigin::Dashboard, PromptOrigin::Cli),
+            ("cli", PromptOrigin::Cli, PromptOrigin::Unknown),
+        ];
+        for (case, origin, next) in rows {
+            let id = format!("origin-queue-{case}");
+            let service =
+                crate::server::test_support::build_test_app_state(vec![structured_idle_row(
+                    &id, "claude",
+                )])
+                .session_service
+                .clone();
+            let _recorded = service
+                .acp_supervisor
+                .test_insert_worker_cmd_recording(&id)
+                .await;
+            let _live = save_agent_record(&id, "claude", true);
+            for (prompt_id, text, origin) in [("a", "first", origin), ("b", "second", next)] {
+                service
+                    .enqueue_prompt(
+                        &id,
+                        prompt_id.into(),
+                        text.into(),
+                        vec![],
+                        None,
+                        QueueSender {
+                            plugin: None,
+                            origin,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            service.drain_queued_prompts_once(&id).await;
+            assert_eq!(
+                first_origin(&service, &id),
+                Some(("first".to_string(), origin)),
+                "{case}"
+            );
+            let left = service.queued_prompts_snapshot(&id).await;
+            assert_eq!(left.len(), 1, "{case}: the other origin stays queued");
+            assert_eq!(left[0].origin, next, "{case}");
+            crate::process::worker_registry::delete(&id).ok();
+        }
+
+        let id = "origin-pending";
+        let service = crate::server::test_support::build_test_app_state(vec![structured_idle_row(
+            id, "claude",
+        )])
+        .session_service
+        .clone();
+        let _recorded = service
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(id)
+            .await;
+        let _live = save_agent_record(id, "claude", true);
+        service
+            .set_pending_initial_turn(id, "wake up".into(), vec![], PromptOrigin::Aoe)
+            .await;
+        service.drain_pending_initial_turn(id).await;
+        assert_eq!(
+            first_origin(&service, id),
+            Some(("wake up".to_string(), PromptOrigin::Aoe))
+        );
         crate::process::worker_registry::delete(id).ok();
     }
 
@@ -4643,7 +4811,7 @@ mod tests {
                 "keep this turn queued".into(),
                 Vec::new(),
                 None,
-                None,
+                QueueSender::default(),
             )
             .await
             .unwrap();
@@ -4708,6 +4876,7 @@ mod tests {
                     merged_prompt_ids: Vec::new(),
                     synthesized: false,
                     origin_plugin: None,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 },
             ),
             "publish must reach the event store"
@@ -4727,7 +4896,7 @@ mod tests {
                         size: 9,
                     }],
                     None,
-                    None,
+                    QueueSender::default(),
                 )
                 .await
                 .expect("session exists");
@@ -4787,7 +4956,7 @@ mod tests {
                 "follow-up".into(),
                 vec![],
                 None,
-                None,
+                QueueSender::default(),
             )
             .await
             .expect("session exists");
@@ -4846,7 +5015,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn editing_a_queued_prompt_drops_the_plugin_sender() {
+    async fn editing_a_queued_prompt_keeps_its_origin_and_drops_the_plugin_sender() {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let mut inst = Instance::new("edit-origin", "/tmp/aoe-edit-origin");
         inst.id = "sess-edit-origin".to_string();
@@ -4863,17 +5032,21 @@ mod tests {
                 "from the plugin".into(),
                 vec![],
                 None,
-                Some("cron".into()),
+                QueueSender {
+                    plugin: Some("cron".into()),
+                    origin: crate::daemon::PromptOrigin::Plugin,
+                },
             )
             .await
             .expect("session exists");
         let outcome = service
-            .edit_queued_prompt("sess-edit-origin", "q1".into(), "typed by the user".into())
+            .edit_queued_prompt("sess-edit-origin", "q1".into(), "reworded".into())
             .await;
         assert!(matches!(outcome, EditQueuedOutcome::Updated));
         let queue = service.queued_prompts_snapshot("sess-edit-origin").await;
-        assert_eq!(queue[0].text, "typed by the user");
+        assert_eq!(queue[0].text, "reworded");
         assert_eq!(queue[0].origin_plugin, None);
+        assert_eq!(queue[0].origin, crate::daemon::PromptOrigin::Plugin);
     }
 
     /// A client restoring its cached queue reposts every row; unchanged ones keep their sender.
@@ -4888,19 +5061,27 @@ mod tests {
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let service = state.session_service.clone();
-        let enqueue = |origin: Option<&str>| {
+        let enqueue = |origin: Option<&str>, surface| {
             service.enqueue_prompt(
                 "sess-requeue-same",
                 "q1".into(),
                 "from the plugin".into(),
                 vec![],
                 None,
-                origin.map(str::to_string),
+                QueueSender {
+                    plugin: origin.map(str::to_string),
+                    origin: surface,
+                },
             )
         };
-        enqueue(Some("cron")).await.unwrap();
-        let repost = enqueue(None).await.unwrap();
+        enqueue(Some("cron"), crate::daemon::PromptOrigin::Plugin)
+            .await
+            .unwrap();
+        let repost = enqueue(None, crate::daemon::PromptOrigin::Dashboard)
+            .await
+            .unwrap();
         assert_eq!(repost.origin_plugin.as_deref(), Some("cron"));
+        assert_eq!(repost.origin, crate::daemon::PromptOrigin::Plugin);
     }
 
     #[tokio::test]
@@ -4914,23 +5095,40 @@ mod tests {
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let service = state.session_service.clone();
-        let enqueue = |text: &str, origin: Option<&str>| {
+        let enqueue = |text: &str, origin: Option<&str>, surface| {
             service.enqueue_prompt(
                 "sess-requeue",
                 "q1".into(),
                 text.into(),
                 vec![],
                 None,
-                origin.map(str::to_string),
+                QueueSender {
+                    plugin: origin.map(str::to_string),
+                    origin: surface,
+                },
             )
         };
-        enqueue("from the plugin", Some("cron")).await.unwrap();
-        let replaced = enqueue("typed in the dashboard", None).await.unwrap();
+        enqueue(
+            "from the plugin",
+            Some("cron"),
+            crate::daemon::PromptOrigin::Plugin,
+        )
+        .await
+        .unwrap();
+        let replaced = enqueue(
+            "typed in the dashboard",
+            None,
+            crate::daemon::PromptOrigin::Dashboard,
+        )
+        .await
+        .unwrap();
         assert_eq!(replaced.text, "typed in the dashboard");
         assert_eq!(replaced.origin_plugin, None);
+        assert_eq!(replaced.origin, crate::daemon::PromptOrigin::Dashboard);
         let queue = service.queued_prompts_snapshot("sess-requeue").await;
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].origin_plugin, None);
+        assert_eq!(queue[0].origin, crate::daemon::PromptOrigin::Dashboard);
     }
 
     /// Every queue mutation that can race a delivery waits for it.
@@ -4960,7 +5158,7 @@ mod tests {
                 "original".into(),
                 vec![],
                 None,
-                None,
+                QueueSender::default(),
             )
             .await
             .expect("session exists");
@@ -5032,6 +5230,7 @@ mod tests {
             error: None,
             error_code: None,
             id: String::new(),
+            origin: crate::daemon::PromptOrigin::Unknown,
         });
         inst
     }
@@ -6101,6 +6300,7 @@ mod tests {
                 error: None,
                 error_code: None,
                 id: String::new(),
+                origin: crate::daemon::PromptOrigin::Unknown,
             });
             inst
         }
@@ -6190,7 +6390,7 @@ mod tests {
         let _tmp = isolate_app_dir();
         let profile = "default";
 
-        let stale = chrono::Utc::now() - chrono::Duration::seconds(600);
+        let stale = crate::time::Timestamp::now() - crate::time::Duration::seconds(600);
         let mut inst = Instance::new("queue", "/tmp/aoe-queue-recency");
         inst.id = "sess-recency".to_string();
         inst.view = crate::session::View::Structured;
@@ -6222,7 +6422,7 @@ mod tests {
                 "follow-up behind a live turn".into(),
                 vec![],
                 None,
-                None,
+                QueueSender::default(),
             )
             .await
             .expect("session exists");
@@ -6296,7 +6496,7 @@ mod tests {
                     format!("prompt {i}"),
                     vec![],
                     None,
-                    None,
+                    QueueSender::default(),
                 )
                 .await
             }));
@@ -6366,7 +6566,7 @@ mod tests {
                         release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
                     });
                     entered_rx.await.unwrap();
-                    let mut enqueue = Some(Box::pin(service.enqueue_prompt(&id, "A".into(), "first".into(), vec![], None, None)));
+                    let mut enqueue = Some(Box::pin(service.enqueue_prompt(&id, "A".into(), "first".into(), vec![], None, QueueSender::default())));
                     std::future::poll_fn(|cx| {
                         assert!(enqueue.as_mut().unwrap().as_mut().poll(cx).is_pending());
                         Poll::Ready(())
@@ -6377,7 +6577,7 @@ mod tests {
                     let saved_path = storage.sessions_path().with_extension("saved");
                     let mut successor = if cancel {
                         drop(enqueue.take());
-                        let mut b = Box::pin(service.enqueue_prompt(&id, "B".into(), "second".into(), vec![], None, None));
+                        let mut b = Box::pin(service.enqueue_prompt(&id, "B".into(), "second".into(), vec![], None, QueueSender::default()));
                         std::future::poll_fn(|cx| {
                             assert!(b.as_mut().poll(cx).is_pending());
                             Poll::Ready(())
@@ -6408,7 +6608,7 @@ mod tests {
                     assert_eq!(ids(&service.queued_prompts_snapshot(&id).await), ["A"], "stale reload, cancel={cancel}");
                     let b = match successor.take() {
                         Some(b) => tokio::time::timeout(Duration::from_secs(10), b).await.unwrap(),
-                        None => service.enqueue_prompt(&id, "B".into(), "second".into(), vec![], None, None).await,
+                        None => service.enqueue_prompt(&id, "B".into(), "second".into(), vec![], None, QueueSender::default()).await,
                     }.unwrap();
                     assert_eq!(b.seq, 1);
                     let guard = tokio::time::timeout(Duration::from_secs(10), service.disk_reload_guard()).await.unwrap();
@@ -6480,7 +6680,7 @@ mod tests {
                     });
                     entered_rx.await.unwrap();
                     let submission = service.prompt_submission(&id).await;
-                    let mut enqueue = Box::pin(service.enqueue_prompt(&id, "A".into(), "first".into(), vec![], None, None));
+                    let mut enqueue = Box::pin(service.enqueue_prompt(&id, "A".into(), "first".into(), vec![], None, QueueSender::default()));
                     std::future::poll_fn(|cx| {
                         assert!(enqueue.as_mut().poll(cx).is_pending());
                         Poll::Ready(())
@@ -6522,7 +6722,7 @@ mod tests {
                         assert_eq!(cache.inventory.iter().map(|profile| profile.name.as_str()).collect::<Vec<_>>(), ["default", "external-old"]);
                     }
                     let _submission = service.prompt_submission(&id).await;
-                    service.enqueue_prompt(&id, "B".into(), "second".into(), vec![], None, None).await.unwrap();
+                    service.enqueue_prompt(&id, "B".into(), "second".into(), vec![], None, QueueSender::default()).await.unwrap();
                     let snapshot_guard = service.disk_reload_guard().await;
                     let epoch = state.mutation_epoch.load(std::sync::atomic::Ordering::SeqCst);
                     let (fresh, fresh_metadata) = crate::server::reload::load_profiles_for_reload(&state.file_watch);
@@ -6569,6 +6769,7 @@ mod tests {
             error: None,
             error_code: None,
             id: crate::session::PendingInitialTurn::fresh_id(),
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         type Mutate = fn(Arc<SessionService>) -> futures_util::future::BoxFuture<'static, ()>;
         type Check = fn(&Instance) -> bool;
@@ -6579,8 +6780,15 @@ mod tests {
                 false,
                 |s| {
                     Box::pin(async move {
-                        s.enqueue_prompt("s", "p".into(), "t".into(), vec![], None, None)
-                            .await;
+                        s.enqueue_prompt(
+                            "s",
+                            "p".into(),
+                            "t".into(),
+                            vec![],
+                            None,
+                            QueueSender::default(),
+                        )
+                        .await;
                     })
                 },
                 |i| i.queued_prompts.len() == 1,
@@ -6590,9 +6798,15 @@ mod tests {
                 None,
                 false,
                 |s| {
-                    Box::pin(
-                        async move { s.set_pending_initial_turn("s", "r".into(), vec![]).await },
-                    )
+                    Box::pin(async move {
+                        s.set_pending_initial_turn(
+                            "s",
+                            "r".into(),
+                            vec![],
+                            crate::daemon::PromptOrigin::Unknown,
+                        )
+                        .await
+                    })
                 },
                 |i| i.pending_initial_turn.is_some(),
             ),
@@ -6621,7 +6835,7 @@ mod tests {
             inst.view = crate::session::View::Structured;
             inst.source_profile = "default".into();
             inst.pending_initial_turn = pending_turn;
-            inst.idle_dormant_since = dormant.then(chrono::Utc::now);
+            inst.idle_dormant_since = dormant.then(crate::time::Timestamp::now);
             let storage = crate::session::Storage::new_unwatched("default").unwrap();
             storage
                 .update(|rows, _| {
@@ -6770,7 +6984,7 @@ mod tests {
                 .try_acquire_lifecycle_reservation(
                     LifecycleOperation::Stop,
                     Instance::LIFECYCLE_RESERVATION_TTL,
-                    chrono::Utc::now(),
+                    crate::time::Timestamp::now(),
                 )
                 .unwrap();
             crate::server::test_support::seed_instances_on_disk_for_test(
@@ -6830,7 +7044,7 @@ mod tests {
                             let newer = row.try_acquire_lifecycle_reservation(
                                 LifecycleOperation::Stop,
                                 Instance::LIFECYCLE_RESERVATION_TTL,
-                                chrono::Utc::now(),
+                                crate::time::Timestamp::now(),
                             )?;
                             row.status = Status::Stopped;
                             row.mark_idle_dormant();
@@ -6896,7 +7110,7 @@ mod tests {
             let mut visible = Instance::new("prompt-wake", "/tmp/aoe-prompt-wake");
             visible.source_profile = "default".into();
             visible.view = crate::session::View::Structured;
-            visible.idle_dormant_since = Some(chrono::Utc::now());
+            visible.idle_dormant_since = Some(crate::time::Timestamp::now());
             let mut persisted = visible.clone();
             match reason {
                 "archived" => persisted.archive(),
@@ -6967,7 +7181,7 @@ mod tests {
         let mut instance = Instance::new("failed-prompt-wake", "/tmp/aoe-failed-prompt-wake");
         instance.source_profile = "default".into();
         instance.view = crate::session::View::Structured;
-        instance.idle_dormant_since = Some(chrono::Utc::now());
+        instance.idle_dormant_since = Some(crate::time::Timestamp::now());
         let storage = crate::session::Storage::new_unwatched("default").unwrap();
         storage
             .update(|rows, _| {
@@ -7021,6 +7235,7 @@ mod tests {
             attachments: Vec::new(),
             synthesized: true,
             id: crate::session::PendingInitialTurn::fresh_id(),
+            origin: crate::daemon::PromptOrigin::Unknown,
         });
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
         let service = state.session_service.clone();
@@ -7043,7 +7258,7 @@ mod tests {
                 "plain".into(),
                 vec![],
                 None,
-                None,
+                QueueSender::default(),
             )
             .await
             .expect("session exists");
@@ -7056,7 +7271,7 @@ mod tests {
                 "fresh".into(),
                 vec![],
                 None,
-                None,
+                QueueSender::default(),
             )
             .await
             .expect("session exists");
@@ -7080,6 +7295,7 @@ mod tests {
             attachments: Vec::new(),
             synthesized: true,
             id: crate::session::PendingInitialTurn::fresh_id(),
+            origin: crate::daemon::PromptOrigin::Unknown,
         });
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
         let profile = state.instances.read().await[0].source_profile.clone();
@@ -7097,7 +7313,7 @@ mod tests {
                 "fresh".into(),
                 vec![],
                 None,
-                None,
+                QueueSender::default(),
             )
             .await
             .expect("persisted")
@@ -7123,6 +7339,7 @@ mod tests {
             attachments: Vec::new(),
             synthesized: true,
             id: crate::session::PendingInitialTurn::fresh_id(),
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let mut inst = Instance::new("queue", "/tmp/aoe-queue-project");
         inst.id = "sess-undo".to_string();
@@ -7151,7 +7368,7 @@ mod tests {
                 "fresh".into(),
                 vec![],
                 None,
-                None,
+                QueueSender::default(),
             )
             .await;
 
@@ -7176,6 +7393,7 @@ mod tests {
             attachments: Vec::new(),
             synthesized: true,
             id: crate::session::PendingInitialTurn::fresh_id(),
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let mut inst = Instance::new("queue", "/tmp/aoe-queue-project");
         inst.id = "sess-cancel".to_string();
@@ -7213,7 +7431,7 @@ mod tests {
             "fresh".into(),
             vec![],
             None,
-            None,
+            QueueSender::default(),
         ));
         let polled = futures_util::poll!(enqueue.as_mut());
         let parked = {
@@ -7259,11 +7477,25 @@ mod tests {
 
         // Enqueue two.
         let a = service
-            .enqueue_prompt("sess-q", "a".into(), "first".into(), vec![], None, None)
+            .enqueue_prompt(
+                "sess-q",
+                "a".into(),
+                "first".into(),
+                vec![],
+                None,
+                QueueSender::default(),
+            )
             .await
             .expect("session exists");
         let b = service
-            .enqueue_prompt("sess-q", "b".into(), "second".into(), vec![], None, None)
+            .enqueue_prompt(
+                "sess-q",
+                "b".into(),
+                "second".into(),
+                vec![],
+                None,
+                QueueSender::default(),
+            )
             .await
             .expect("session exists");
         assert_eq!((a.seq, b.seq), (0, 1));
@@ -7281,7 +7513,7 @@ mod tests {
                 "first edited".into(),
                 vec![],
                 None,
-                None,
+                QueueSender::default(),
             )
             .await
             .expect("session exists");
@@ -7331,7 +7563,14 @@ mod tests {
 
         // A gone session is a None/no-op, never a panic.
         assert!(service
-            .enqueue_prompt("sess-gone", "z".into(), "x".into(), vec![], None, None)
+            .enqueue_prompt(
+                "sess-gone",
+                "z".into(),
+                "x".into(),
+                vec![],
+                None,
+                QueueSender::default()
+            )
             .await
             .is_none());
     }
@@ -7347,6 +7586,7 @@ mod tests {
             created_at: "t".into(),
             origin_device: None,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         // claude's profile clears with "/clear".
         let claude = crate::acp::agent_profiles::resolve("claude");
@@ -7398,6 +7638,7 @@ mod tests {
 
     #[test]
     fn queue_drain_batch_never_merges_across_an_origin_boundary() {
+        use crate::daemon::PromptOrigin;
         use crate::daemon::QueuedPromptEntry;
         let entry = |id: &str, seq: u64, origin: Option<&str>| QueuedPromptEntry {
             id: id.into(),
@@ -7407,6 +7648,11 @@ mod tests {
             created_at: "t".into(),
             origin_device: None,
             origin_plugin: origin.map(str::to_string),
+            origin: PromptOrigin::Unknown,
+        };
+        let surface = |mut e: QueuedPromptEntry, origin| {
+            e.origin = origin;
+            e
         };
         let profile = crate::acp::agent_profiles::resolve("claude");
         let q = vec![
@@ -7418,6 +7664,16 @@ mod tests {
         let ids = |sub: &[QueuedPromptEntry]| sub.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
         assert_eq!(ids(queue_drain_batch(&q, profile).0), ["a"]);
         assert_eq!(ids(queue_drain_batch(&q[1..], profile).0), ["b", "c"]);
+        assert_eq!(ids(queue_drain_batch(&q[3..], profile).0), ["d"]);
+
+        let q = vec![
+            surface(entry("a", 0, None), PromptOrigin::Dashboard),
+            surface(entry("b", 1, None), PromptOrigin::Dashboard),
+            surface(entry("c", 2, None), PromptOrigin::Cli),
+            surface(entry("d", 3, None), PromptOrigin::Unknown),
+        ];
+        assert_eq!(ids(queue_drain_batch(&q, profile).0), ["a", "b"]);
+        assert_eq!(ids(queue_drain_batch(&q[2..], profile).0), ["c"]);
         assert_eq!(ids(queue_drain_batch(&q[3..], profile).0), ["d"]);
     }
 
@@ -7486,6 +7742,7 @@ mod tests {
                         prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
+                        origin: crate::daemon::PromptOrigin::Unknown,
                     },
                 )
                 .await;
@@ -7553,6 +7810,7 @@ mod tests {
                     prompt_ids: Vec::new(),
                     synthesized: false,
                     no_revive: false,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 },
             )
             .await;
@@ -7622,6 +7880,7 @@ mod tests {
                         prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
+                        origin: crate::daemon::PromptOrigin::Unknown,
                     },
                 )
                 .await;
@@ -7654,7 +7913,7 @@ mod tests {
         inst.id = id.to_string();
         inst.view = crate::session::View::Structured;
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
-        let at = chrono::Utc::now().timestamp_millis();
+        let at = crate::time::Timestamp::now().as_millis();
         let store = &state.acp_event_store;
         let service = &state.session_service;
         let first = prompt("go");

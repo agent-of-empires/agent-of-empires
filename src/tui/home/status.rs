@@ -622,10 +622,7 @@ impl HomeView {
                     &mut instance.idle_dormant_since,
                 ),
             ] {
-                *current = raw
-                    .map(chrono::DateTime::parse_from_rfc3339)
-                    .transpose()?
-                    .map(|stamp| stamp.with_timezone(&chrono::Utc));
+                *current = raw.map(crate::time::Timestamp::parse_rfc3339).transpose()?;
             }
             next.insert(row.id.clone(), instance);
         }

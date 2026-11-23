@@ -718,6 +718,18 @@
       "notes": "The real schema-driven switch persists machine-wide, rejects profile overrides, survives reload, and changes MCP route availability only after daemon restart."
     },
     {
+      "id": "settings.strict-plugin-staging",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/settings-persistence.spec.ts"],
+      "components": [
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
+        "src/session/config/mod.rs"
+      ],
+      "notes": "The real Advanced Session switch defaults off, saves strict plugin staging machine-wide, rejects profile overrides and non-boolean PATCH values, and preserves opt-in across reload and daemon restart. Switching off persists too; TCP saves require schema elevation."
+    },
+    {
       "id": "settings.mcp-enabled-copy",
       "kind": "deferred",
       "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/5769",
@@ -3378,6 +3390,14 @@
         "web/src/components/SettingsView.tsx",
         "web/src/lib/paneLayout.ts"
       ]
+    },
+    {
+      "id": "app-shell.panel-defaults",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/right-panel-persistence.spec.ts", "src/lib/__tests__/paneLayout.test.ts"],
+      "components": ["web/src/App.tsx", "web/src/components/ActivityBar.tsx", "web/src/components/TopBar.tsx"],
+      "notes": "Diff and terminal follow the Daemon's web.auto_open_* defaults (off) until the user changes a Session's tabs; nothing is saved on view, so a changed default reaches Sessions already viewed. A closed Diff shows its changed-file count."
     },
     {
       "id": "devices",

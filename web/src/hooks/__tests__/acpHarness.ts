@@ -64,6 +64,7 @@ export interface Call {
   method: string;
   url: string;
   body: string | null;
+  headers: Record<string, string>;
 }
 
 export type Route = (call: Call) => Response | Promise<Response> | undefined;
@@ -84,6 +85,7 @@ export function installAcpFakes(route: Route = () => undefined): Call[] {
         method: (init?.method ?? "GET").toUpperCase(),
         url: typeof input === "string" ? input : input.toString(),
         body: typeof init?.body === "string" ? init.body : null,
+        headers: (init?.headers ?? {}) as Record<string, string>,
       };
       calls.push(call);
       const res = await route(call);

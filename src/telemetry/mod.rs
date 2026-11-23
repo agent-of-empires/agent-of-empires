@@ -77,7 +77,7 @@ fn opted_in_with(config: &crate::session::Config) -> bool {
 }
 
 fn now_rfc3339() -> String {
-    chrono::Utc::now().to_rfc3339()
+    crate::time::Timestamp::now().to_rfc3339()
 }
 
 const SUBSTRATES: [&str; 5] = ["scratch", "workspace", "worktree", "sandbox", "local"];
@@ -633,7 +633,8 @@ mod tests {
         trashed_archived.archive();
         trashed_archived.trash();
         let mut expired = Instance::new("expired", "/tmp/h");
-        expired.snoozed_until = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        expired.snoozed_until =
+            Some(crate::time::Timestamp::now() - crate::time::Duration::hours(1));
 
         let m = aggregate_instances(&[
             pinned_a,

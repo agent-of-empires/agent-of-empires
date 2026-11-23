@@ -416,7 +416,7 @@ fn drain_and_persist_session_ids_inner(
                             .try_acquire_lifecycle_reservation(
                                 crate::session::LifecycleOperation::Capture,
                                 Instance::LIFECYCLE_RESERVATION_TTL,
-                                chrono::Utc::now(),
+                                crate::time::Timestamp::now(),
                             )
                             .map_err(anyhow::Error::from)
                     })?;
@@ -1609,7 +1609,7 @@ mod tests {
         instance.lifecycle_reservation = Some(crate::session::LifecycleReservation {
             op: crate::session::LifecycleOperation::Trash,
             generation: 1,
-            at: chrono::Utc::now(),
+            at: crate::time::Timestamp::now(),
         });
         seed_instance_on_disk(profile, &instance);
         attach_poller_with_update(&mut instance, sid);

@@ -3,7 +3,8 @@
 
 use agent_of_empires::{
     daemon::{
-        CreateSessionBody, DaemonClient, DeleteSessionBody, RuntimeSnapshot, SessionMutation,
+        CreateSessionBody, DaemonClient, DeleteSessionBody, PromptOrigin, RuntimeSnapshot,
+        SessionMutation,
     },
     session::{LifecycleOperation, PanePresence},
 };
@@ -83,7 +84,10 @@ async fn test_force_remove_session_kills_agent_tmux_session() {
         "worktree_branch": "feature/force-remove", "create_new_branch": true,
     }))
     .unwrap();
-    let created = sdk.create_session(&body, &epoch).await.unwrap();
+    let created = sdk
+        .create_session(&body, &epoch, PromptOrigin::Unknown)
+        .await
+        .unwrap();
     let id = created.outcome.id;
     let worktree = PathBuf::from(created.outcome.project_path);
     let payload = worktree.join("payload.txt");

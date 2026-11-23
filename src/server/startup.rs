@@ -1983,7 +1983,7 @@ mod tests {
                 auth: "auth".into(),
                 owner_token_hash: push::sha256_token("old_token"),
                 user_agent: "UA".into(),
-                created_at: chrono::Utc::now(),
+                created_at: crate::time::Timestamp::now(),
                 generation: 0,
                 origin: "https://aoe.example.test".into(),
             })
