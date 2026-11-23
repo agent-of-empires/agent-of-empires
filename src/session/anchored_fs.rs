@@ -549,6 +549,27 @@ impl AnchoredDir {
         Ok((stat.st_dev, stat.st_ino))
     }
 
+    pub(crate) fn created(&self) -> Option<std::time::SystemTime> {
+        File::from(self.fd.try_clone().ok()?)
+            .metadata()
+            .ok()?
+            .created()
+            .ok()
+    }
+
+    pub(crate) fn descriptor(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.fd)
+    }
+
+    pub(crate) fn require_owned_directory(&self) -> Result<()> {
+        let stat = fstat(&self.fd)?;
+        anyhow::ensure!(
+            stat.st_uid == nix::unistd::geteuid().as_raw() && stat.st_mode & 0o022 == 0,
+            "anchored directory is not owned or permits shared writes"
+        );
+        Ok(())
+    }
+
     pub(crate) fn sync(&self) -> Result<()> {
         #[cfg(test)]
         if FAIL_SYNC_ONCE.with(|path| {
@@ -877,6 +898,25 @@ impl AnchoredDir {
             Ok(()) | Err(Errno::ENOENT) => Ok(()),
             Err(error) => Err(error).context("removing anchored file"),
         }
+    }
+
+    pub(crate) fn require_current_child(&self, leaf: &Path, child: &Self) -> Result<()> {
+        let (device, inode) = child.identity()?;
+        let entry = self
+            .entry_stat(leaf)?
+            .context("anchored directory disappeared")?;
+        anyhow::ensure!(
+            (entry.st_dev, entry.st_ino) == (device, inode)
+                && entry.st_mode & libc::S_IFMT == libc::S_IFDIR,
+            "anchored directory changed before removal"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn remove_empty_child(&self, leaf: &Path, child: &Self) -> Result<()> {
+        self.require_current_child(leaf, child)?;
+        unlinkat(&self.fd, leaf, UnlinkatFlags::RemoveDir)
+            .context("removing empty anchored directory")
     }
 
     /// Publish a complete regular file. A seed never replaces any existing

@@ -131,7 +131,18 @@ struct StagingEvidence {
     mount: PathBuf,
     directory_identity: (u64, u64),
     mount_identity: (u64, u64),
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    removal: Option<StagingRemovalProof>,
     custody: crate::process::StagingCustody,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagingRemovalProof {
+    plugins_identity: (u64, u64),
+    plugins_created: std::time::SystemTime,
+    directory_created: std::time::SystemTime,
+    mount_created: std::time::SystemTime,
 }
 
 fn staging_directory_identity(directory: &crate::session::AnchoredDir) -> Result<(u64, u64)> {
@@ -143,7 +154,7 @@ fn staging_directory_identity(directory: &crate::session::AnchoredDir) -> Result
 
 fn staging_evidence(
     root: &crate::session::AnchoredDir,
-) -> Result<(StagingEvidence, Vec<crate::process::StagingProcess>)> {
+) -> Result<(StagingEvidence, Vec<crate::process::StagingProcess>, bool)> {
     use std::io::Read as _;
     let file = root
         .open_regular(Path::new(STAGING_MARKER), 1024 * 1024)?
@@ -197,7 +208,14 @@ fn staging_evidence(
         "invalid staging owner birth identity"
     );
     let mut writers = Vec::new();
+    let mut cleanup_started = false;
     for line in lines {
+        anyhow::ensure!(!cleanup_started, "records after staging cleanup intent");
+        if line == b"D" {
+            anyhow::ensure!(evidence.removal.is_some(), "missing staging removal proof");
+            cleanup_started = true;
+            continue;
+        }
         let mut fields = std::str::from_utf8(line)?.split_ascii_whitespace();
         if line == b"U" {
             evidence.custody = crate::process::StagingCustody::Uncertain;
@@ -224,7 +242,7 @@ fn staging_evidence(
             },
         });
     }
-    Ok((evidence, writers))
+    Ok((evidence, writers, cleanup_started))
 }
 
 pub(crate) fn record_staging_custody(
@@ -237,9 +255,9 @@ pub(crate) fn record_staging_custody(
         .and_then(Path::parent)
         .context("staging mount has no application root")?;
     let root = crate::session::AnchoredDir::open(app)?;
-    let (mut evidence, writers) = staging_evidence(&root)?;
+    let (mut evidence, writers, cleanup_started) = staging_evidence(&root)?;
     anyhow::ensure!(
-        writers.is_empty(),
+        writers.is_empty() && !cleanup_started,
         "staging custody cannot replace admitted writers"
     );
     anyhow::ensure!(
@@ -256,22 +274,21 @@ pub(crate) fn record_staging_custody(
         .replace(&bytes)?;
     root.sync()
         .context("persisting staging custody replacement")?;
-    open_staging_journal(&root, app)
+    open_staging_journal(&root)
 }
 
-fn open_staging_journal(root: &crate::session::AnchoredDir, app: &Path) -> Result<std::fs::File> {
-    use nix::fcntl::{open, openat, OFlag};
+fn open_staging_journal(root: &crate::session::AnchoredDir) -> Result<std::fs::File> {
+    use nix::fcntl::{openat, OFlag};
     use nix::sys::stat::Mode;
     use std::os::unix::fs::MetadataExt as _;
-    let parent = open(
-        app,
-        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    )?;
     let fd = openat(
-        &parent,
+        root.descriptor(),
         STAGING_MARKER,
-        OFlag::O_WRONLY | OFlag::O_APPEND | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        OFlag::O_WRONLY
+            | OFlag::O_APPEND
+            | OFlag::O_NOFOLLOW
+            | OFlag::O_CLOEXEC
+            | OFlag::O_NONBLOCK,
         Mode::empty(),
     )?;
     let journal = std::fs::File::from(fd);
@@ -292,14 +309,15 @@ pub(super) fn mark_staging_publication(marker: &Path) -> Result<()> {
         .parent()
         .context("staging marker has no application root")?;
     let root = crate::session::AnchoredDir::open(app)?;
-    let (evidence, _) = staging_evidence(&root)?;
+    let (evidence, _, cleanup_started) = staging_evidence(&root)?;
     anyhow::ensure!(
-        evidence.owner_pid == std::process::id()
+        !cleanup_started
+            && evidence.owner_pid == std::process::id()
             && crate::process::process_birth_identity(evidence.owner_pid)?.as_ref()
                 == Some(&evidence.owner_birth),
         "staging publication owner changed"
     );
-    let mut journal = open_staging_journal(&root, app)?;
+    let mut journal = open_staging_journal(&root)?;
     journal.write_all(b"U\n")?;
     journal.sync_all()?;
     Ok(())
@@ -310,7 +328,7 @@ fn recover_staging(root_path: &Path) -> Result<()> {
     let marker_identity = root
         .entry_stat(Path::new(STAGING_MARKER))?
         .context("staging marker disappeared before recovery")?;
-    let (evidence, writers) = staging_evidence(&root)?;
+    let (evidence, writers, cleanup_started) = staging_evidence(&root)?;
     let boot = crate::process::boot_id().context("plugin staging boot identity unavailable")?;
     let previous_boot = boot != evidence.owner_birth.boot_id;
     #[cfg(target_os = "linux")]
@@ -334,50 +352,115 @@ fn recover_staging(root_path: &Path) -> Result<()> {
         }
     }
     crate::process::prove_staging_custody_gone(&evidence.custody, &writers, previous_boot)?;
-    let mut components = evidence.mount.components();
-    anyhow::ensure!(
-        components
-            .next()
-            .is_some_and(|part| part.as_os_str() == "plugins")
-            && components.next().is_some_and(|part| part
-                .as_os_str()
-                .to_str()
-                .is_some_and(|name| name.starts_with(".staging-")))
-            && components
-                .next()
-                .is_some_and(|part| part.as_os_str() == "volume")
-            && components.next().is_none(),
-        "plugin staging evidence names an unexpected mount"
-    );
-    let directory = evidence
-        .mount
-        .parent()
-        .context("missing staging directory")?;
-    let anchored = root.child(directory)?;
-    let mount = anchored.child(Path::new("volume"))?;
-    anyhow::ensure!(
-        staging_directory_identity(&anchored)? == evidence.directory_identity
-            && staging_directory_identity(&mount)? == evidence.mount_identity
-            && mount.read_dir_complete(Path::new(""), 1)?.is_empty()
-            && anchored.read_dir_complete(Path::new(""), 2)?
-                == [std::ffi::OsString::from("volume")],
-        "plugin staging mount or directory identity changed"
-    );
-    crate::process::prove_staging_host_mount_absent(&root_path.join(&evidence.mount))?;
-    // Kernel resources are gone. Leave the empty anchored directories untouched;
-    // marker retirement must not gain recursive deletion authority.
-    let current = root
-        .entry_stat(Path::new(STAGING_MARKER))?
-        .context("staging marker disappeared during recovery")?;
-    anyhow::ensure!(
-        current.st_dev == marker_identity.st_dev
-            && current.st_ino == marker_identity.st_ino
-            && current.st_mode == marker_identity.st_mode,
-        "staging marker identity changed during recovery"
-    );
+    let directory = staging_directory_leaf(&evidence.mount)?;
+    let check_marker = || -> Result<()> {
+        let current = root
+            .entry_stat(Path::new(STAGING_MARKER))?
+            .context("staging marker disappeared during recovery")?;
+        anyhow::ensure!(
+            current.st_dev == marker_identity.st_dev
+                && current.st_ino == marker_identity.st_ino
+                && current.st_mode == marker_identity.st_mode,
+            "staging marker identity changed during recovery"
+        );
+        Ok(())
+    };
+    let plugins = root.child(Path::new("plugins"))?;
+    if let Some(proof) = &evidence.removal {
+        root.require_owned_directory()?;
+        plugins.require_owned_directory()?;
+        anyhow::ensure!(
+            staging_directory_identity(&plugins)? == proof.plugins_identity
+                && plugins.created() == Some(proof.plugins_created),
+            "plugin staging parent identity changed"
+        );
+    }
+    if !cleanup_started || plugins.entry_stat(directory)?.is_some() {
+        let stage = plugins.child(directory)?;
+        anyhow::ensure!(
+            staging_directory_identity(&stage)? == evidence.directory_identity,
+            "plugin staging directory identity changed"
+        );
+        crate::process::prove_staging_host_mount_absent(plugins.descriptor(), stage.descriptor())?;
+        if let Some(proof) = &evidence.removal {
+            stage.require_owned_directory()?;
+            anyhow::ensure!(
+                stage.created() == Some(proof.directory_created),
+                "plugin staging directory birth changed"
+            );
+        }
+
+        let volume = Path::new("volume");
+        let mount = if !cleanup_started || stage.entry_stat(volume)?.is_some() {
+            let mount = stage.child(volume)?;
+            anyhow::ensure!(
+                staging_directory_identity(&mount)? == evidence.mount_identity
+                    && mount.read_dir_complete(Path::new(""), 1)?.is_empty()
+                    && stage.read_dir_complete(Path::new(""), 2)?
+                        == [std::ffi::OsString::from("volume")],
+                "plugin staging mount changed or staging is not empty"
+            );
+            crate::process::prove_staging_host_mount_absent(
+                stage.descriptor(),
+                mount.descriptor(),
+            )?;
+            Some(mount)
+        } else {
+            None
+        };
+        if let Some(proof) = &evidence.removal {
+            if let Some(mount) = &mount {
+                anyhow::ensure!(
+                    mount.created() == Some(proof.mount_created),
+                    "plugin staging mount birth changed"
+                );
+            }
+            // Persist intent before either rmdir, so a retry need not infer deletion.
+            let mut journal = open_staging_journal(&root)?;
+            check_marker()?;
+            if !cleanup_started {
+                journal.write_all(b"D\n")?;
+            }
+            journal.sync_all()?;
+            root.require_current_child(Path::new("plugins"), &plugins)?;
+            if let Some(mount) = &mount {
+                plugins.require_current_child(directory, &stage)?;
+                stage.remove_empty_child(volume, mount)?;
+            }
+            stage.sync()?;
+            plugins.remove_empty_child(directory, &stage)?;
+        }
+    }
+    if evidence.removal.is_some() {
+        plugins.sync()?;
+    }
+    check_marker()?;
     root.remove_file(Path::new(STAGING_MARKER))?;
     root.sync()?;
     Ok(())
+}
+
+fn staging_directory_leaf(mount: &Path) -> Result<&Path> {
+    use std::path::Component::Normal;
+
+    let mut components = mount.components();
+    let (Some(Normal(plugins)), Some(Normal(directory)), Some(Normal(volume)), None) = (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    ) else {
+        bail!("plugin staging evidence names an unexpected mount");
+    };
+    anyhow::ensure!(
+        plugins == "plugins"
+            && directory
+                .to_str()
+                .is_some_and(|name| name.starts_with(".staging-"))
+            && volume == "volume",
+        "plugin staging evidence names an unexpected mount"
+    );
+    Ok(Path::new(directory))
 }
 
 pub(super) fn create_staging_marker(marker: &Path, mount: &Path) -> Result<()> {
@@ -389,9 +472,23 @@ pub(super) fn create_staging_marker(marker: &Path, mount: &Path) -> Result<()> {
         .context("plugin staging marker has no parent")?;
     let root = crate::session::AnchoredDir::open(parent)?;
     let relative = mount.strip_prefix(parent)?;
-    let directory = relative
-        .parent()
-        .context("staging mount has no directory")?;
+    let directory = staging_directory_leaf(relative)?;
+    let plugins = root.child(Path::new("plugins"))?;
+    let stage = plugins.child(directory)?;
+    let mount_dir = stage.child(Path::new("volume"))?;
+    let removal = match (plugins.created(), stage.created(), mount_dir.created()) {
+        (Some(plugins_created), Some(directory_created), Some(mount_created)) => {
+            stage.sync()?;
+            plugins.sync()?;
+            Some(StagingRemovalProof {
+                plugins_identity: staging_directory_identity(&plugins)?,
+                plugins_created,
+                directory_created,
+                mount_created,
+            })
+        }
+        _ => None,
+    };
     let evidence_record = StagingEvidence {
         schema: 1,
         owner_pid: std::process::id(),
@@ -400,8 +497,9 @@ pub(super) fn create_staging_marker(marker: &Path, mount: &Path) -> Result<()> {
         #[cfg(target_os = "linux")]
         owner_scope: crate::process::StagingRecoveryScope::capture()?,
         mount: relative.to_path_buf(),
-        directory_identity: staging_directory_identity(&root.child(directory)?)?,
-        mount_identity: staging_directory_identity(&root.child(relative)?)?,
+        directory_identity: staging_directory_identity(&stage)?,
+        mount_identity: staging_directory_identity(&mount_dir)?,
+        removal,
         custody: crate::process::StagingCustody::Prepared,
     };
     let mut evidence = root
@@ -2522,7 +2620,7 @@ mod tests {
         }
     }
 
-    fn crash_staging_and_recover(phase: &str) {
+    fn crash_staging_and_recover(phase: &str, legacy: bool) {
         use std::io::Read as _;
         use std::os::unix::net::UnixListener;
         use std::time::{Duration, Instant};
@@ -2587,6 +2685,7 @@ mod tests {
             recover_staging(&root).is_err(),
             "live owner must retain staging"
         );
+        assert!(root.join("plugins/.staging-crash/volume").is_dir());
         assert!(begin_operation().is_err());
         let anchored = crate::session::AnchoredDir::open(&root).unwrap();
         let original = anchored
@@ -2596,7 +2695,7 @@ mod tests {
 
         #[cfg(target_os = "linux")]
         if phase == "writers" {
-            let (evidence, writers) = staging_evidence(&anchored).unwrap();
+            let (evidence, writers, _) = staging_evidence(&anchored).unwrap();
             let crate::process::StagingCustody::LinuxPidNamespace { init, .. } = evidence.custody
             else {
                 panic!("missing PID namespace custody")
@@ -2697,7 +2796,7 @@ mod tests {
                 original
             );
         }
-        let (mut evidence, _) = staging_evidence(&anchored).unwrap();
+        let (mut evidence, _, _) = staging_evidence(&anchored).unwrap();
         evidence.owner_pid = std::process::id();
         evidence.owner_birth = crate::process::process_birth_identity(std::process::id())
             .unwrap()
@@ -2763,10 +2862,41 @@ mod tests {
             .unwrap()
             .replace(&original)
             .unwrap();
-        if phase == "prepared" {
+        let stage = root.join("plugins/.staging-crash");
+        let mount = stage.join("volume");
+        let unrelated = root.join("plugins/.staging-unrelated");
+        std::fs::create_dir(&unrelated).unwrap();
+        let (mut evidence, _, _) = staging_evidence(&anchored).unwrap();
+        let may_remove = !legacy
+            && [&root.join("plugins"), &stage, &mount].iter().all(|path| {
+                std::fs::metadata(path)
+                    .and_then(|metadata| metadata.created())
+                    .is_ok()
+            });
+        if legacy {
+            evidence.removal = None;
+            save_header(&evidence);
+        }
+        if phase == "prepared" && !legacy {
             let outside = tempfile::tempdir().unwrap();
             std::fs::write(outside.path().join("retained"), b"untouched").unwrap();
-            let mount = root.join("plugins/.staging-crash/volume");
+            let empty_replacement = stage.with_file_name(".staging-replacement");
+            std::fs::rename(&stage, &empty_replacement).unwrap();
+            std::fs::create_dir_all(&mount).unwrap();
+            assert!(recover_staging(&root).is_err());
+            assert!(mount.is_dir(), "replacement stage must survive");
+            std::fs::remove_dir(&mount).unwrap();
+            std::fs::remove_dir(&stage).unwrap();
+            std::fs::rename(&empty_replacement, &stage).unwrap();
+
+            for dir in [&stage, &mount] {
+                let retained = dir.join("retained");
+                std::fs::write(&retained, b"untouched").unwrap();
+                assert!(recover_staging(&root).is_err());
+                assert_eq!(std::fs::read(&retained).unwrap(), b"untouched");
+                assert!(mount.is_dir(), "nonempty staging must remain intact");
+                std::fs::remove_file(retained).unwrap();
+            }
             let saved = mount.with_file_name("saved");
             std::fs::rename(&mount, &saved).unwrap();
             std::os::unix::fs::symlink(outside.path(), &mount).unwrap();
@@ -2779,7 +2909,44 @@ mod tests {
                 b"untouched"
             );
             std::fs::remove_file(&mount).unwrap();
+            assert!(
+                recover_staging(&root).is_err(),
+                "missing mount without cleanup intent"
+            );
             std::fs::rename(&saved, &mount).unwrap();
+
+            if let Some(proof) = evidence.removal.as_mut() {
+                proof.directory_created += Duration::from_secs(1);
+                save_header(&evidence);
+                assert!(recover_staging(&root).is_err());
+                assert!(
+                    mount.is_dir(),
+                    "device and inode alone cannot authorize removal"
+                );
+                anchored
+                    .bind_file(std::ffi::OsStr::new(STAGING_MARKER))
+                    .unwrap()
+                    .replace(&original)
+                    .unwrap();
+            }
+        }
+        if may_remove && phase == "prepared" {
+            crate::session::anchored_fs::FAIL_SYNC_ONCE.set(Some(stage.clone()));
+            assert!(recover_stale_staging().is_err());
+            assert!(
+                stage.is_dir(),
+                "cleanup was interrupted after mountpoint removal"
+            );
+            assert!(!mount.exists());
+            assert!(root.join(STAGING_MARKER).exists());
+            std::fs::rename(&unrelated, &mount).unwrap();
+            assert!(recover_stale_staging().is_err());
+            assert!(mount.is_dir(), "a retry must preserve a replacement mount");
+            std::fs::rename(&mount, &unrelated).unwrap();
+            crate::session::anchored_fs::FAIL_SYNC_ONCE.set(Some(root.join("plugins")));
+            assert!(recover_stale_staging().is_err());
+            assert!(!stage.exists());
+            assert!(root.join(STAGING_MARKER).exists());
         }
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -2797,18 +2964,31 @@ mod tests {
         assert!(check_recovery_evidence().is_ok());
         assert!(begin_operation().is_ok());
         assert!(!root.join(STAGING_MARKER).exists());
+        if may_remove {
+            assert!(std::fs::symlink_metadata(&stage)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound));
+        } else {
+            assert!(
+                mount.is_dir(),
+                "a journal without birth proof cannot remove staging"
+            );
+        }
         assert!(
-            std::fs::read_dir(root.join("plugins/.staging-crash/volume"))
-                .unwrap()
-                .next()
-                .is_none()
+            unrelated.is_dir(),
+            "recovery must not scan other staging directories"
         );
     }
 
     #[test]
     #[serial]
     fn startup_reclaims_preacquisition_after_real_daemon_crash() {
-        crash_staging_and_recover("prepared");
+        crash_staging_and_recover("prepared", false);
+    }
+
+    #[test]
+    #[serial]
+    fn startup_reclaims_legacy_journal_without_removing_staging_directory() {
+        crash_staging_and_recover("prepared", true);
     }
 
     #[test]
@@ -2817,7 +2997,7 @@ mod tests {
     #[ignore = "requires private user/PID/mount namespaces, nsenter, Git, and bubblewrap"]
     fn startup_reclaims_bounded_linux_volume_after_real_daemon_crash() {
         for phase in ["volume", "writers"] {
-            crash_staging_and_recover(phase);
+            crash_staging_and_recover(phase, false);
         }
     }
 

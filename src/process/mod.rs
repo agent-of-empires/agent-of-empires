@@ -183,14 +183,17 @@ pub(crate) fn prove_staging_custody_gone(
     }
 }
 
-pub(crate) fn prove_staging_host_mount_absent(mount: &Path) -> anyhow::Result<()> {
+pub(crate) fn prove_staging_host_mount_absent(
+    parent: std::os::fd::BorrowedFd<'_>,
+    child: std::os::fd::BorrowedFd<'_>,
+) -> anyhow::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        platform::prove_staging_host_mount_absent(mount)
+        platform::prove_staging_host_mount_absent(parent, child)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = mount;
+        let _ = (parent, child);
         anyhow::bail!("staging mount absence unsupported on this platform")
     }
 }

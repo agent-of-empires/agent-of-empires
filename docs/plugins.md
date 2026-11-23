@@ -211,10 +211,13 @@ retry. The `<app_dir>/.plugin-staging-active` journal records native staging own
 Disabling strict mode does not clear existing recovery evidence.
 Startup and worker admission can retire an abandoned pre-consent journal only
 after proving its recorded owners, PID namespace and native supervisor groups
-have exited and its original host mountpoint is unchanged. This does not erase
-other recovery evidence. Partial journals, legacy markers and interrupted
-publication remain fenced; a started macOS image operation also requires manual
-inspection when ownership is uncertain.
+have exited and its original host mountpoint is unchanged. If the journal also
+proves the exact directory identities, recovery removes only the empty staging
+mountpoint and its staging directory. Journals without directory birth proof
+can still retire without deleting those directories. Nonempty, replaced, and
+unrelated directories are never cleaned by this recovery. Partial journals,
+legacy markers, and interrupted publication remain fenced; a started macOS image
+operation also requires manual inspection when ownership is uncertain.
 Same-boot Linux recovery requires the original PID namespace. After a reboot,
 recovery requires a matching, nonempty machine identity; missing or foreign
 identity leaves the journal fenced.
