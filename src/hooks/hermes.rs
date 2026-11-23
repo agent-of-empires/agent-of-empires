@@ -142,7 +142,7 @@ fn render_hermes_allowlist(
     events: &[ResolvedHookEvent],
 ) -> Result<(PathBuf, String)> {
     let allowlist_path = config_dir.join(HERMES_ALLOWLIST_FILE);
-    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let now = crate::time::Timestamp::now().to_rfc3339_opts(crate::time::SecondsFormat::Secs, true);
 
     let mut data: Value = match SymlinkPolicy::for_target(target).read(&allowlist_path)? {
         Some(content) => serde_json::from_str(&content)

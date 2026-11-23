@@ -1,6 +1,6 @@
 //! Rendering for HomeView
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
@@ -28,8 +28,8 @@ use crate::tui::styles::{has_min_contrast, Theme};
 
 /// Derive a frame offset from a session's creation timestamp so that
 /// sessions started at different times show visually distinct spinner positions.
-fn session_offset(created_at: &DateTime<Utc>) -> usize {
-    created_at.timestamp_millis() as usize
+fn session_offset(created_at: &Timestamp) -> usize {
+    created_at.as_millis() as usize
 }
 
 /// Build the list-pane title. `prefix` is the leading label ("aoe", "Terminals",
@@ -404,21 +404,21 @@ fn clamp_scroll_to_capture(
     scroll_offset.min(real_max)
 }
 
-fn spinner_running(created_at: &DateTime<Utc>) -> &'static str {
+fn spinner_running(created_at: &Timestamp) -> &'static str {
     spinners::dots()
         .set_interval(Duration::from_millis(220))
         .offset(session_offset(created_at))
         .current_frame()
 }
 
-fn spinner_waiting(created_at: &DateTime<Utc>) -> &'static str {
+fn spinner_waiting(created_at: &Timestamp) -> &'static str {
     spinners::orbit()
         .set_interval(Duration::from_millis(400))
         .offset(session_offset(created_at))
         .current_frame()
 }
 
-fn spinner_starting(created_at: &DateTime<Utc>) -> &'static str {
+fn spinner_starting(created_at: &Timestamp) -> &'static str {
     spinners::breathe()
         .set_interval(Duration::from_millis(180))
         .offset(session_offset(created_at))
@@ -428,10 +428,7 @@ fn spinner_starting(created_at: &DateTime<Utc>) -> &'static str {
 /// Slow `breathe` rattle for a freshly-stopped Idle session, the same animation as
 /// Starting but slower and colored `theme.fresh_idle`, so it reads as a gentle reminder.
 /// The phase offset uses `idle_entered_at` so sessions don't all sync to one frame.
-fn spinner_idle_fresh(
-    created_at: &DateTime<Utc>,
-    idle_entered_at: Option<DateTime<Utc>>,
-) -> &'static str {
+fn spinner_idle_fresh(created_at: &Timestamp, idle_entered_at: Option<Timestamp>) -> &'static str {
     let offset_ts = idle_entered_at.unwrap_or(*created_at);
     spinners::breathe()
         .set_interval(Duration::from_millis(280))
@@ -792,12 +789,12 @@ pub(crate) fn profile_short_code(profile: &str) -> String {
 
 /// Format a timestamp as a compact relative age (`3m`, `2h`, `4d`, `2mo`), empty for
 /// `None` so callers can substitute unconditionally.
-fn format_relative_age(ts: Option<DateTime<Utc>>) -> String {
+fn format_relative_age(ts: Option<Timestamp>) -> String {
     let Some(ts) = ts else {
         return String::new();
     };
-    let now = Utc::now();
-    let secs = (now - ts).num_seconds();
+    let now = Timestamp::now();
+    let secs = (now - ts).whole_seconds();
     if secs <= 0 {
         return "<1m".to_string();
     }
@@ -823,8 +820,8 @@ fn format_relative_age(ts: Option<DateTime<Utc>>) -> String {
 /// Format a remaining snooze as a compact countdown that fits `LAST_ACTIVITY_SLOT` (`23m`,
 /// `1h`, `5d`), falling back to `<1m` so a sub-minute remainder reads as "about to wake".
 /// The validator caps at 30 days, which the day branch covers.
-fn format_snooze_remaining(delta: chrono::Duration) -> String {
-    let secs = delta.num_seconds();
+fn format_snooze_remaining(delta: crate::time::Duration) -> String {
+    let secs = delta.whole_seconds();
     if secs < 60 {
         return "<1m".to_string();
     }
@@ -5496,15 +5493,15 @@ mod tests {
 
     #[test]
     fn format_relative_age_buckets() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let cases = [
             (None, ""),
-            (Some(now + chrono::Duration::hours(1)), "<1m"),
-            (Some(now - chrono::Duration::seconds(30)), "<1m"),
-            (Some(now - chrono::Duration::minutes(5)), "5m"),
-            (Some(now - chrono::Duration::hours(3)), "3h"),
-            (Some(now - chrono::Duration::days(7)), "7d"),
-            (Some(now - chrono::Duration::days(60)), "2mo"),
+            (Some(now + crate::time::Duration::hours(1)), "<1m"),
+            (Some(now - crate::time::Duration::seconds(30)), "<1m"),
+            (Some(now - crate::time::Duration::minutes(5)), "5m"),
+            (Some(now - crate::time::Duration::hours(3)), "3h"),
+            (Some(now - crate::time::Duration::days(7)), "7d"),
+            (Some(now - crate::time::Duration::days(60)), "2mo"),
         ];
         for (ts, expected) in cases {
             assert_eq!(format_relative_age(ts), expected, "{ts:?}");
@@ -5689,7 +5686,7 @@ mod tests {
 
     #[test]
     fn row_age_only_on_resting_or_snoozed_rows() {
-        let five_min_ago = Some(Utc::now() - chrono::Duration::minutes(5));
+        let five_min_ago = Some(Timestamp::now() - crate::time::Duration::minutes(5));
         let mut inst = crate::session::Instance::new("a", "/tmp/a");
         inst.idle_entered_at = five_min_ago;
         inst.last_accessed_at = five_min_ago;
@@ -5765,7 +5762,7 @@ mod tests {
             branch: "feat/x".into(),
             main_repo_path: "/tmp".into(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: None,
         });
         assert!(branch_row_tag(&inst).is_none());

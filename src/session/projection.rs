@@ -3,7 +3,7 @@
 //! Borrowed and typed so each surface formats timestamps and names fields to
 //! its own contract without a second derivation from the `Instance`.
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 
 use super::{Instance, SessionBucket, Status, WorkspaceRepo, WorktreeInfo};
 
@@ -19,15 +19,15 @@ pub(crate) struct SessionProjection<'a> {
     pub profile: &'a str,
     pub status: Status,
     pub bucket: SessionBucket,
-    pub created_at: DateTime<Utc>,
-    pub last_accessed_at: Option<DateTime<Utc>>,
-    pub idle_entered_at: Option<DateTime<Utc>>,
+    pub created_at: Timestamp,
+    pub last_accessed_at: Option<Timestamp>,
+    pub idle_entered_at: Option<Timestamp>,
     pub last_error: Option<&'a str>,
-    pub archived_at: Option<DateTime<Utc>>,
-    pub ignored_at: Option<DateTime<Utc>>,
-    pub trashed_at: Option<DateTime<Utc>>,
-    pub active_snoozed_until: Option<DateTime<Utc>>,
-    pub pinned_at: Option<DateTime<Utc>>,
+    pub archived_at: Option<Timestamp>,
+    pub ignored_at: Option<Timestamp>,
+    pub trashed_at: Option<Timestamp>,
+    pub active_snoozed_until: Option<Timestamp>,
+    pub pinned_at: Option<Timestamp>,
     pub agent_session_id: Option<&'a str>,
     pub parent_session_id: Option<&'a str>,
     pub worktree: Option<&'a WorktreeInfo>,

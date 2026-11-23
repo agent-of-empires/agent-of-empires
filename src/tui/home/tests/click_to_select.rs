@@ -182,8 +182,8 @@ fn trash_inspection_never_requests_interaction() {
                 .unwrap();
                 let id = env.view.instance_at(0).id.clone();
                 env.view.mutate_instance(&id, |inst| {
-                    inst.trashed_at = Some(chrono::Utc::now());
-                    inst.archived_at = archived.then(chrono::Utc::now);
+                    inst.trashed_at = Some(crate::time::Timestamp::now());
+                    inst.archived_at = archived.then(crate::time::Timestamp::now);
                 });
                 env.view.trashed_section_collapsed = false;
                 env.view.rebuild_flat_items();
@@ -269,8 +269,9 @@ fn trash_inspection_never_requests_interaction() {
 fn trash_enter_before_reader_mount_keeps_navigation_in_reader() {
     let mut env = create_test_env_with_sessions(2);
     let id = env.view.instance_at(0).id.clone();
-    env.view
-        .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+    env.view.mutate_instance(&id, |inst| {
+        inst.trashed_at = Some(crate::time::Timestamp::now())
+    });
     env.view.trashed_section_collapsed = false;
     env.view.rebuild_flat_items();
     env.view.select_session_by_id(&id);
@@ -296,7 +297,7 @@ fn trash_transition_discards_edit_dialog_and_stale_menu_actions() {
                 branch: "fixture".into(),
                 main_repo_path: "/tmp".into(),
                 managed_by_aoe: true,
-                created_at: chrono::Utc::now(),
+                created_at: crate::time::Timestamp::now(),
                 base_branch: None,
             });
         });
@@ -304,8 +305,9 @@ fn trash_transition_discards_edit_dialog_and_stale_menu_actions() {
         env.view
             .handle_key(bindings::key_event(action, false).unwrap(), None);
         assert!(env.view.rename_dialog.is_some() || env.view.worktree_name_dialog.is_some());
-        env.view
-            .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+        env.view.mutate_instance(&id, |inst| {
+            inst.trashed_at = Some(crate::time::Timestamp::now())
+        });
         env.view.enforce_trash_read_only();
         assert!(env.view.rename_dialog.is_none());
         assert!(env.view.worktree_name_dialog.is_none());
@@ -351,7 +353,7 @@ fn trash_dwell_and_engagement_do_not_mark_retained_data_read() {
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
     env.view.mutate_instance(&id, |inst| {
-        inst.trashed_at = Some(chrono::Utc::now());
+        inst.trashed_at = Some(crate::time::Timestamp::now());
         inst.mark_unread();
     });
     let snapshot = super::session_feed_tests::daemon_snapshot(&env.view, &id, "Stopped");

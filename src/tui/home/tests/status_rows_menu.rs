@@ -52,7 +52,7 @@ fn archived_running_session_renders_stopped_icon_not_spinner() {
     // spinner branch would fire in the absence of the override.
     env.view.mutate_instance(&id, |inst| {
         inst.status = Status::Running;
-        inst.archived_at = Some(chrono::Utc::now());
+        inst.archived_at = Some(crate::time::Timestamp::now());
     });
 
     let inst = env.view.get_instance(&id).expect("session present");
@@ -68,7 +68,8 @@ fn archived_running_session_renders_stopped_icon_not_spinner() {
     env.view.mutate_instance(&id, |inst| {
         inst.status = Status::Running;
         inst.archived_at = None;
-        inst.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::minutes(15));
+        inst.snoozed_until =
+            Some(crate::time::Timestamp::now() + crate::time::Duration::minutes(15));
     });
     let inst = env.view.get_instance(&id).expect("session present");
     assert_eq!(
@@ -380,8 +381,9 @@ fn system_health_survives_refresh_but_closes_on_selection_change() {
 fn trash_system_health_releases_reader_keyboard() {
     let mut env = create_test_env_with_sessions(2);
     let id = env.view.instance_at(0).id.clone();
-    env.view
-        .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+    env.view.mutate_instance(&id, |inst| {
+        inst.trashed_at = Some(crate::time::Timestamp::now())
+    });
     env.view.trashed_section_collapsed = false;
     env.view.rebuild_flat_items();
     env.view.select_session_by_id(&id);
@@ -865,7 +867,7 @@ async fn empty_trash_escalates_a_row_that_keeps_failing() {
                     branch: "gone".into(),
                     main_repo_path: "/nonexistent/aoe-test-repo".into(),
                     managed_by_aoe: true,
-                    created_at: chrono::Utc::now(),
+                    created_at: crate::time::Timestamp::now(),
                     base_branch: None,
                 });
                 row.trash();
@@ -892,9 +894,8 @@ async fn empty_trash_escalates_a_row_that_keeps_failing() {
             let body = DeleteSessionBody {
                 expected_trash: true,
                 expected_trashed_at: Some(
-                    chrono::DateTime::parse_from_rfc3339(row.trashed_at.as_ref().unwrap())
-                        .unwrap()
-                        .with_timezone(&chrono::Utc),
+                    crate::time::Timestamp::parse_rfc3339(row.trashed_at.as_ref().unwrap())
+                        .unwrap(),
                 ),
                 expected_generation: Some(row.lifecycle_generation),
                 expected_trash_lifecycle_id: row.trash_lifecycle_id.clone(),
@@ -1274,7 +1275,7 @@ async fn empty_trash_confirm_purges_every_trashed_row() {
                         expected_trash: true,
                         use_cleanup_defaults: true,
                         expected_trashed_at: Some(
-                            chrono::DateTime::parse_from_rfc3339(
+                            crate::time::Timestamp::parse_rfc3339(
                                 view.session_feed
                                     .applied_session(id)
                                     .unwrap()
@@ -1282,8 +1283,7 @@ async fn empty_trash_confirm_purges_every_trashed_row() {
                                     .as_ref()
                                     .unwrap(),
                             )
-                            .unwrap()
-                            .with_timezone(&chrono::Utc),
+                            .unwrap(),
                         ),
                         expected_generation: Some(
                             view.session_feed

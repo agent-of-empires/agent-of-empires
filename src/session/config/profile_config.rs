@@ -753,8 +753,13 @@ mod tests {
         let mut global = Config::default();
         global.theme.name = "catppuccin-latte".to_string();
         global.session.sidebar_position = SidebarPosition::Right;
+        global.session.plugin_staging_sandbox = true;
         let profile = profile_from(json!({
-            "session": {"sidebar_position": "left", "snooze_duration_minutes": 12},
+            "session": {
+                "sidebar_position": "left",
+                "snooze_duration_minutes": 12,
+                "plugin_staging_sandbox": false
+            },
             "theme": {"name": "tokyo-night", "idle_decay_minutes": 20}
         }));
 
@@ -762,6 +767,7 @@ mod tests {
 
         assert_eq!(merged.theme.name, "catppuccin-latte");
         assert_eq!(merged.session.sidebar_position, SidebarPosition::Right);
+        assert!(merged.session.plugin_staging_sandbox);
         assert_eq!(merged.session.snooze_duration_minutes, 12);
         assert_eq!(merged.theme.idle_decay_minutes, 20);
     }

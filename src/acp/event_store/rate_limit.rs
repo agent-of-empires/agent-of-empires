@@ -440,13 +440,15 @@ fn seed_budget_from_log(
 mod tests {
     use super::super::test_support::*;
     use super::*;
-    use chrono::Utc;
+    use crate::time::Timestamp;
 
     fn rate_limit_event(secs_until_reset: i64) -> Event {
         Event::RateLimit {
             info: RateLimitInfo {
                 status: "usage limit reached".into(),
-                resets_at: Some(Utc::now() + chrono::Duration::seconds(secs_until_reset)),
+                resets_at: Some(
+                    Timestamp::now() + crate::time::Duration::seconds(secs_until_reset),
+                ),
                 kind: "rate_limit".into(),
             },
         }
@@ -454,7 +456,7 @@ mod tests {
 
     fn auto_resume() -> Event {
         Event::RateLimitAutoResumed {
-            resets_at: Utc::now(),
+            resets_at: Timestamp::now(),
             manual: false,
         }
     }
@@ -501,7 +503,7 @@ mod tests {
                 "resumed with nothing to redeliver",
                 vec![
                     Event::RateLimitAutoResumed {
-                        resets_at: Utc::now(),
+                        resets_at: Timestamp::now(),
                         manual: true,
                     },
                     Event::AcpSessionAssigned {
@@ -572,6 +574,7 @@ mod tests {
             attachments: vec![attachment.clone()],
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         // (events, expected prompt)
         let cases = [
@@ -615,7 +618,7 @@ mod tests {
             assert_eq!(store.rate_limited_turn_prompt(&id), want, "case {i}");
         }
 
-        let before = Utc::now().timestamp_millis();
+        let before = Timestamp::now().as_millis();
         store.record("latest", 1, &rate_limit_event(3600)).unwrap();
         let second = rate_limit_event(7200);
         let Event::RateLimit { info: ref expected } = second else {
@@ -623,19 +626,33 @@ mod tests {
         };
         let expected_resets = expected.resets_at;
         store.record("latest", 2, &second).unwrap();
-        let after = Utc::now().timestamp_millis();
+        let after = Timestamp::now().as_millis();
 
         let (info, recorded_at) = store.latest_rate_limit_event("latest").expect("stored");
         assert_eq!(info.resets_at, expected_resets, "latest event wins");
         assert!((before..=after).contains(&recorded_at));
         assert!(store.latest_rate_limit_event("latest-none").is_none());
+
+        // chrono wrote years past 9999 with a sign; such rows still load.
+        store.record("legacy", 1, &rate_limit_event(0)).unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE acp_events SET event_json = json_set(event_json, '$.RateLimit.info.resets_at', '+57000-01-01T00:00:00Z') WHERE session_id = 'legacy'",
+                [],
+            )
+            .unwrap();
+        let (info, _) = store.latest_rate_limit_event("legacy").expect("legacy row");
+        assert_eq!(info.status, "usage limit reached");
+        assert_eq!(info.kind, "rate_limit");
+        assert_eq!(info.resets_at, Some(Timestamp::MAX));
     }
 
     #[test]
     fn rate_limit_redelivery_streak_counts_resumes_and_resets_organically() {
         let (_tmp, store) = open_store(1000);
         let manual_resume = || Event::RateLimitAutoResumed {
-            resets_at: Utc::now(),
+            resets_at: Timestamp::now(),
             manual: true,
         };
         let streak = || store.rate_limit_redelivery_streak("s-1");

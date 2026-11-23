@@ -519,7 +519,7 @@ pub fn rollback_worktree_branch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use crate::time::Timestamp;
 
     #[test]
     fn pinned_stop_targets_only_the_recorded_container() {
@@ -583,7 +583,7 @@ mod tests {
             branch: branch.to_string(),
             main_repo_path: main_repo.to_string(),
             managed_by_aoe: managed,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             base_branch: None,
         }
     }

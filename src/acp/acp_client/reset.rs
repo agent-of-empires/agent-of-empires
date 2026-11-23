@@ -953,6 +953,7 @@ done
                     attachments: vec![],
                     synthesized: false,
                     origin_plugin: None,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 });
                 events.push(Event::AgentMessageChunk {
                     text: "prior assistant turn".into(),

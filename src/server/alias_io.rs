@@ -408,7 +408,14 @@ mod tests {
         let _submission = service.prompt_submission(&id).await;
         tokio::time::timeout(
             Duration::from_secs(10),
-            service.enqueue_prompt(&id, "A".into(), "first".into(), vec![], None, None),
+            service.enqueue_prompt(
+                &id,
+                "A".into(),
+                "first".into(),
+                vec![],
+                None,
+                crate::server::session_service::QueueSender::default(),
+            ),
         )
         .await
         .expect("a persisted mutation must not wait on the blocked alias")

@@ -489,9 +489,8 @@ impl HomeView {
         let trashed_at = row
             .trashed_at
             .as_deref()
-            .map(chrono::DateTime::parse_from_rfc3339)
-            .transpose()?
-            .map(|stamp| stamp.with_timezone(&chrono::Utc));
+            .map(crate::time::Timestamp::parse_rfc3339)
+            .transpose()?;
         anyhow::ensure!(
             trashed_at == instance.trashed_at,
             "Trash identity changed; reopen the delete confirmation"
@@ -554,8 +553,7 @@ impl HomeView {
                 && row
                     .trashed_at
                     .as_deref()
-                    .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
-                    .map(|stamp| stamp.with_timezone(&chrono::Utc))
+                    .and_then(|stamp| crate::time::Timestamp::parse_rfc3339(stamp).ok())
                     == pending.request.expected_trashed_at)
     }
 
@@ -4686,7 +4684,7 @@ impl HomeView {
 
         // A collapsed group may hide an idle session from `flat_items`. Keep
         // the existing most-recently-accessed selection for hidden rows.
-        let mut best_hidden: Option<(String, Option<chrono::DateTime<chrono::Utc>>)> = None;
+        let mut best_hidden: Option<(String, Option<crate::time::Timestamp>)> = None;
         for inst in self.instances.values() {
             if visible_sessions.contains(&inst.id)
                 || current_session.as_deref() == Some(inst.id.as_str())

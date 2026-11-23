@@ -3,7 +3,7 @@ import sitemap from '@astrojs/sitemap';
 import tailwindcss from '@tailwindcss/vite';
 
 export default defineConfig({
-  site: 'https://agent-of-empires.com',
+  site: 'https://www.agent-of-empires.com',
   vite: {
     plugins: [tailwindcss()],
   },
@@ -20,8 +20,10 @@ export default defineConfig({
     '/guides/apple-containers/': '/guides/sandbox/',
     '/guides/agent-override/': '/docs/guides/configuration/#agent-command-overrides',
     '/guides/web/diff/': '/guides/diff-view/',
-    '/guides/web/settings/': '/guides/web/dashboard/#settings-and-profiles',
+    '/guides/web/settings/': '/guides/web/dashboard/#settings',
     '/guides/session-fork/': '/guides/session-resume/#forking-a-session',
+    // Released setup wizards link here.
+    '/docs/guides/web-dashboard/': '/guides/web-dashboard/',
   },
   integrations: [
     sitemap({

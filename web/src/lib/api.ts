@@ -1974,17 +1974,21 @@ export async function enqueueServerPrompt(
 ): Promise<ServerQueuedPrompt | null> {
   return fetchJson<ServerQueuedPrompt>(
     queuePath(sessionId),
-    jsonInit("POST", {
-      id: prompt.id,
-      text: prompt.text,
-      origin_device: prompt.originDevice,
-      attachments: (prompt.attachments ?? []).map((a) => ({
-        kind: a.kind,
-        mime_type: a.mimeType,
-        data: a.dataB64,
-        name: a.name,
-      })),
-    }),
+    jsonInit(
+      "POST",
+      {
+        id: prompt.id,
+        text: prompt.text,
+        origin_device: prompt.originDevice,
+        attachments: (prompt.attachments ?? []).map((a) => ({
+          kind: a.kind,
+          mime_type: a.mimeType,
+          data: a.dataB64,
+          name: a.name,
+        })),
+      },
+      { "X-Aoe-Prompt-Origin": "dashboard" },
+    ),
   );
 }
 

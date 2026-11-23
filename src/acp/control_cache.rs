@@ -178,7 +178,7 @@ mod tests {
                     name: "Edit".into(),
                     kind: "edit".into(),
                     args_preview: String::new(),
-                    started_at: chrono::Utc::now(),
+                    started_at: crate::time::Timestamp::now(),
                     diffs: Vec::new(),
                     memory_recall: None,
                     parent_tool_call_id: None,
@@ -187,7 +187,7 @@ mod tests {
                 options: Vec::new(),
                 choice: false,
                 plan: None,
-                requested_at: chrono::Utc::now(),
+                requested_at: crate::time::Timestamp::now(),
                 resolved: None,
             },
         };
