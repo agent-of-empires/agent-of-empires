@@ -463,7 +463,10 @@ fn provider_status(provider: &Provider, any_items: bool, theme: &Theme) -> (Stri
         (format!("{name}: nothing new"), theme.dimmed)
     } else {
         let ago = provider.updated_at.map_or_else(String::new, |at| {
-            format!(" {}", ago_label(chrono::Utc::now().timestamp() - at))
+            format!(
+                " {}",
+                ago_label(crate::time::Timestamp::now().as_unix_secs() - at)
+            )
         });
         (format!("{name}: updated{ago}"), theme.text)
     }
@@ -1965,7 +1968,7 @@ mod tests {
                 name: "GitHub".into(),
                 error: None,
                 enabled: true,
-                updated_at: Some(chrono::Utc::now().timestamp() - 120),
+                updated_at: Some(crate::time::Timestamp::now().as_unix_secs() - 120),
                 refreshing: false,
                 sources: vec![],
             }],
