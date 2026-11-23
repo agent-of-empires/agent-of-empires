@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginUiEntry } from "../../../lib/api";
 import { PluginPaneBody } from "../PluginPane";
 import {
@@ -562,6 +562,8 @@ describe("pane blocks", () => {
   });
 
   describe("markdown block", () => {
+    // Preload the lazy renderer so the first case does not race a cold import against findBy's timeout.
+    beforeAll(() => import("../BlockMarkdown"));
     // The markdown renderer is a lazy chunk, so wait for it to mount.
     const md = async (text: string, extra: Record<string, unknown> = {}) => {
       const result = renderBlocks({ kind: "markdown", text, ...extra });
