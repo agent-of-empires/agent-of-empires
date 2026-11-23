@@ -195,6 +195,11 @@ version = "0.3.6"
 version = "1.44"
 features = ["full"]
 
+[target."cfg(target_os = \"linux\")".dev-dependencies.rustix]
+version = "1"
+features = ["pty"]
+default-features = false
+
 [target."cfg(unix)".dependencies.filedescriptor]
 version = "0.8"
 optional = true
