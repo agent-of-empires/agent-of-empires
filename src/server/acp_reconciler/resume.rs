@@ -393,10 +393,16 @@ async fn seed_in_flight_status(state: &AppState, id: &str) {
     let mut instances = state.instances.write().await;
     if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
         if !crate::server::acp_events::retired_before_retry(&state.retry_starting, inst, newest) {
+            let old_status = inst.status;
             crate::server::acp_events::apply_status_seed(
                 inst,
                 fold.sidebar_status(),
                 &state.status_tx,
+            );
+            crate::server::acp_events::settle_retry_starting(
+                &state.retry_starting,
+                inst,
+                old_status,
             );
         }
     }
@@ -727,6 +733,35 @@ pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
 mod tests {
     use super::super::test_fixtures::{structured_instance, test_state};
     use super::*;
+
+    /// #5921: the resume seed that moves a Retry's row out of `Starting` forgets its owner, as
+    /// the listener does, so no stale watermark is left behind.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_seed_that_leaves_starting_settles_the_retry() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = Instance::new("seed", "/tmp/aoe-5921-seed");
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Error;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let stopped = || crate::acp::Event::Stopped {
+            reason: "end_turn".into(),
+        };
+        state.acp_event_store.record(&id, 1, &stopped()).unwrap();
+        state.acp_supervisor.hydrate_seqs([(id.clone(), 1)]);
+        crate::server::acp_events::RetryStartingGuard::begin(&state, &id)
+            .await
+            .expect("an Error row starts")
+            .disarm();
+        state.acp_event_store.record(&id, 2, &stopped()).unwrap();
+        seed_in_flight_status(&state, &id).await;
+        assert_ne!(
+            state.instances.read().await[0].status,
+            crate::session::Status::Starting
+        );
+        assert!(!state.retry_starting.lock().unwrap().contains_key(&id));
+    }
 
     #[tokio::test]
     #[serial_test::serial]

@@ -550,15 +550,11 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             // between. A future refactor that makes `apply_status_intent`
             // assign `status` more than once has to revisit this.
             let old_status = inst.status;
-            let after_rollback = live_worker
-                && status_update.is_some()
-                && take_rolled_back_retry(&state.retry_starting, &inst.id, frame.seq);
-            if after_rollback
-                && matches!(
-                    frame.event.as_ref(),
-                    crate::acp::state::Event::AgentStartupError { .. }
-                )
-            {
+            let rolled_back_failure = live_worker
+                && status_update.is_some_and(|(_, projected)| {
+                    take_rolled_back_retry(&state.retry_starting, &inst.id, frame.seq, projected)
+                });
+            if rolled_back_failure {
                 report_failure_after_rollback(inst, &state.status_tx);
             } else if let Some((policy, projected)) = status_update.filter(|_| {
                 live_worker && !retired_before_retry(&state.retry_starting, inst, frame.seq)
@@ -805,19 +801,18 @@ impl RetryAttempt {
 
 static NEXT_RETRY_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// Whether a status projected at `seq` predates a Retry's `Starting`, so it is the retired
-/// worker's and must not move the row.
+/// Whether a status projected at `seq` predates a Retry, so it is the retired worker's and must
+/// not move the row: neither its `Starting` nor the status a rollback put back.
 pub(crate) fn retired_before_retry(
     retry_starting: &RetryStarting,
     inst: &Instance,
     seq: u64,
 ) -> bool {
-    inst.status == Status::Starting
-        && retry_starting
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&inst.id)
-            .is_some_and(|owner| seq <= owner.watermark)
+    retry_starting
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&inst.id)
+        .is_some_and(|owner| seq <= owner.watermark)
 }
 
 /// The seq a fold's projection speaks for, for [`retired_before_retry`]. While a Retry owns the
@@ -843,7 +838,11 @@ pub(crate) async fn newest_status_seq(
 }
 
 /// Forget a Retry's attempt once its row has left `Starting`.
-fn settle_retry_starting(retry_starting: &RetryStarting, inst: &Instance, old_status: Status) {
+pub(crate) fn settle_retry_starting(
+    retry_starting: &RetryStarting,
+    inst: &Instance,
+    old_status: Status,
+) {
     if old_status == Status::Starting && inst.status != Status::Starting {
         retry_starting
             .lock()
@@ -853,13 +852,19 @@ fn settle_retry_starting(retry_starting: &RetryStarting, inst: &Instance, old_st
 }
 
 /// Forgets a rolled-back Retry once its new worker reports a status past the watermark. True
-/// when it did, so the caller can tell that report is the attempt's own.
-fn take_rolled_back_retry(retry_starting: &RetryStarting, id: &str, seq: u64) -> bool {
+/// when that report is an Error: the attempt's own failure, whichever failure frame comes first
+/// (an incompatible agent publishes one before its startup error).
+fn take_rolled_back_retry(
+    retry_starting: &RetryStarting,
+    id: &str,
+    seq: u64,
+    projected: Status,
+) -> bool {
     let mut owners = retry_starting.lock().unwrap_or_else(|e| e.into_inner());
     match owners.get(id) {
         Some(owner) if owner.rolled_back && seq > owner.watermark => {
             owners.remove(id);
-            true
+            projected == Status::Error
         }
         _ => false,
     }
@@ -1249,7 +1254,9 @@ pub(super) async fn recover_structured_unread_after_lag(
                 continue;
             }
             let old_status = inst.status;
-            if !retired_before_retry(retry_starting, inst, newest_status_seq) {
+            if take_rolled_back_retry(retry_starting, &inst.id, newest_status_seq, projected) {
+                report_failure_after_rollback(inst, status_tx);
+            } else if !retired_before_retry(retry_starting, inst, newest_status_seq) {
                 apply_status_intent(inst, StatusPolicy::Authoritative, projected, status_tx);
                 settle_retry_starting(retry_starting, inst, old_status);
             }
@@ -1446,8 +1453,9 @@ pub(crate) mod retry_test_gate {
     type Gate = (Option<oneshot::Sender<()>>, Option<oneshot::Receiver<()>>);
     static GATES: std::sync::Mutex<Vec<(String, Gate)>> = std::sync::Mutex::new(Vec::new());
 
-    /// Test-only: parks a Retry's rollback for `id` before it takes `instances`, until released.
-    /// Dropping the gate releases a parked rollback.
+    /// Test-only: parks a Retry for `id` until released: its rollback, before it takes
+    /// `instances`, or with `id#launched`, a spawn just past installing its worker. Dropping the
+    /// gate releases a parked Retry.
     pub(crate) struct RevertGate {
         id: String,
         release: Option<oneshot::Sender<()>>,
@@ -1475,7 +1483,7 @@ pub(crate) mod retry_test_gate {
             }
         }
 
-        pub(super) async fn wait(id: &str) {
+        pub(crate) async fn wait(id: &str) {
             let gate = {
                 let mut gates = GATES.lock().unwrap_or_else(|e| e.into_inner());
                 gates
@@ -2727,6 +2735,118 @@ mod tests {
         }
     }
 
+    /// #5921: lag recovery after a Retry's rollback treats the new worker's Error as the
+    /// attempt's failure, as the listener does: a Stopped row shows it and an Error row notifies
+    /// it once, whether or not an incompatible agent's Error came first. A fold the retired
+    /// worker wrote doesn't move the restored status. Every row runs before the assertion.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn lag_recovery_reports_a_retry_failure_after_its_rollback() {
+        use crate::acp::Event;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let incompatible = || Event::IncompatibleAgent {
+            detail: crate::acp::state::StartupErrorDetail::MissingAgentInfo {
+                expected_package: "pkg".into(),
+                install_command: "install".into(),
+                auto_install: false,
+            },
+        };
+        let turn_end = || Event::Stopped {
+            reason: "end_turn".into(),
+        };
+        // (prior, the new worker's events after the retired worker's turn end at seq 1, the
+        // status after recovery, errored pushes)
+        let cases = [
+            (
+                Status::Error,
+                vec![Event::startup_error("spawn failed")],
+                Status::Error,
+                1,
+            ),
+            (
+                Status::Stopped,
+                vec![Event::startup_error("spawn failed")],
+                Status::Error,
+                1,
+            ),
+            (
+                Status::Error,
+                vec![incompatible(), Event::startup_error("spawn failed")],
+                Status::Error,
+                1,
+            ),
+            (
+                Status::Stopped,
+                vec![incompatible(), Event::startup_error("spawn failed")],
+                Status::Error,
+                1,
+            ),
+            // Only the retired worker's turn end: the restored Error stays.
+            (Status::Error, vec![], Status::Error, 0),
+        ];
+        let mut mismatches = Vec::new();
+        for (prior, later, want, pushes) in cases {
+            let case = format!("prior={prior:?}, {} new events", later.len());
+            let mut inst = stopped_structured_instance();
+            inst.status = prior;
+            let id = inst.id.clone();
+            let state = test_support::build_test_app_state(vec![inst]);
+            state
+                .acp_event_store
+                .record(&id, 1, &turn_end())
+                .expect("record");
+            state.acp_supervisor.hydrate_seqs([(id.clone(), 1)]);
+            let mut changes = state.status_tx.subscribe();
+            drop(
+                RetryStartingGuard::begin(&state, &id)
+                    .await
+                    .expect("the row starts"),
+            );
+            drained(&state).await;
+            for (seq, event) in (2..).zip(later) {
+                state
+                    .acp_event_store
+                    .record(&id, seq, &event)
+                    .expect("record");
+            }
+            recover_structured_unread_after_lag(
+                &state.instances,
+                &state.session_service,
+                &state.instance_locks,
+                crate::file_watch::FileWatchService::noop(),
+                &state.status_tx,
+                &state.retry_starting,
+            )
+            .await;
+            let mut seen = Vec::new();
+            while let Ok(change) = changes.try_recv() {
+                seen.push(change);
+            }
+            let got = (
+                state.instances.read().await[0].status,
+                crate::server::push::errors_pushed(seen.iter().cloned()),
+                state
+                    .retry_starting
+                    .lock()
+                    .unwrap()
+                    .get(&id)
+                    .map(RetryAttempt::is_rolled_back),
+            );
+            let owner = (pushes == 0).then_some(true);
+            if got != (want, pushes, owner) {
+                let steps: Vec<_> = seen
+                    .iter()
+                    .map(|c| (c.old, c.new, c.restores_prior))
+                    .collect();
+                mismatches.push(format!(
+                    "{case}: (status, errored pushes, owner) {got:?}, changes {steps:?}"
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
     async fn published_status(state: &Arc<AppState>, id: &str) -> Option<Status> {
         let snapshot = state.runtime.publish(state).await.expect("publishes");
         snapshot
@@ -2892,12 +3012,16 @@ mod tests {
         use retry_test_gate::RevertGate;
         let temp = tempfile::tempdir().expect("tempdir");
         let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let frame = |id: &str, seq, event| AcpBroadcastFrame {
+        // The status the fold projects for each frame, as a warm cache attaches it.
+        let frame = |id: &str, seq, event: Event| AcpBroadcastFrame {
             session_id: id.to_string(),
             seq,
+            sidebar_status: Some(match event {
+                Event::IncompatibleAgent { .. } => Status::Error,
+                _ => Status::Idle,
+            }),
             event: Arc::new(event),
             worker_generation: None,
-            sidebar_status: Some(Status::Idle),
         };
         // A heal the listener applies in turn, so once its change arrives every earlier frame
         // has been handled.
@@ -2905,13 +3029,23 @@ mod tests {
             acp_session_id: "acp-heal".into(),
         };
         let mut mismatches = Vec::new();
-        for (prior, rollback_first) in [
-            (Status::Error, true),
-            (Status::Error, false),
-            (Status::Stopped, true),
-            (Status::Stopped, false),
+        // An incompatible agent publishes its own Error before the startup error.
+        let incompatible = || Event::IncompatibleAgent {
+            detail: crate::acp::state::StartupErrorDetail::MissingAgentInfo {
+                expected_package: "pkg".into(),
+                install_command: "install".into(),
+                auto_install: false,
+            },
+        };
+        for (prior, rollback_first, prelude) in [
+            (Status::Error, true, false),
+            (Status::Error, false, false),
+            (Status::Stopped, true, false),
+            (Status::Stopped, false, false),
+            (Status::Error, true, true),
+            (Status::Stopped, true, true),
         ] {
-            let case = format!("prior={prior:?} rollback_first={rollback_first}");
+            let case = format!("prior={prior:?} rollback_first={rollback_first} prelude={prelude}");
             let mut inst = stopped_structured_instance();
             inst.status = prior;
             let id = inst.id.clone();
@@ -2934,7 +3068,11 @@ mod tests {
                 drained(&state).await;
                 let listener = tokio::spawn(acp_event_listener(state.clone()));
                 await_subscribed(&state).await;
-                send(6, Event::startup_error("spawn failed"));
+                if prelude {
+                    send(6, incompatible());
+                } else {
+                    send(6, Event::startup_error("spawn failed"));
+                }
                 send(7, Event::startup_error("spawn failed"));
                 listener
             } else {
