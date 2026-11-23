@@ -2412,6 +2412,7 @@ mod tests {
             Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
             None,
             None,
+            axum::http::HeaderMap::new(),
             Ok(Json(body)),
         )
         .await
