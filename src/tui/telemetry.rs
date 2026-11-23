@@ -20,7 +20,8 @@ pub(crate) enum ConsentOutcome {
 
 type Post = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 
-static CONSENT_OUTCOME: Mutex<Option<ConsentOutcome>> = Mutex::new(None);
+/// The latest finished request's outcome, tagged with its request number.
+static CONSENT_OUTCOME: Mutex<Option<(u64, ConsentOutcome)>> = Mutex::new(None);
 static CONSENT_PENDING: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
 static CONSENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static CONSENT_ORDER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -84,18 +85,17 @@ fn send_consent(request: Post) {
                 ConsentOutcome::NotSaved(format!("Telemetry setting not saved: {error}"))
             }
         };
-        // A newer change is queued and will report its own outcome.
-        if CONSENT_SEQUENCE.load(Ordering::SeqCst) == sequence {
-            *guard(&CONSENT_OUTCOME) = Some(outcome);
-        }
+        *guard(&CONSENT_OUTCOME) = Some((sequence, outcome));
     });
     // The latest task waits behind every earlier one, so it alone marks completion.
     *guard(&CONSENT_PENDING) = Some(task);
 }
 
-/// The outcome of the latest consent change, once, after the Daemon answered.
+/// The outcome of the latest consent change, once, after the Daemon answered. An older
+/// request's outcome is dropped: the newer change reports its own.
 pub(crate) fn take_consent_outcome() -> Option<ConsentOutcome> {
-    guard(&CONSENT_OUTCOME).take()
+    let (sequence, outcome) = guard(&CONSENT_OUTCOME).take()?;
+    (sequence == CONSENT_SEQUENCE.load(Ordering::SeqCst)).then_some(outcome)
 }
 
 /// Whether a consent change is still waiting for the Daemon's answer.
@@ -217,5 +217,26 @@ mod tests {
         );
         second_answer.send(Ok(())).unwrap();
         assert_eq!(finish_pending_consent_within(wait).await, None);
+
+        // A failure that finished unread never answers for a newer pending request.
+        let (stale, _stale_sent, stale_answer) = request();
+        send_consent(stale);
+        stale_answer.send(Err("stale".into())).unwrap();
+        while consent_in_flight() {
+            tokio::task::yield_now().await;
+        }
+        let (newer, newer_sent, newer_answer) = request();
+        send_consent(newer);
+        newer_sent.await.unwrap();
+        assert_eq!(
+            take_consent_outcome(),
+            None,
+            "the stale failure is not applied"
+        );
+        newer_answer.send(Ok(())).unwrap();
+        while consent_in_flight() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(take_consent_outcome(), Some(ConsentOutcome::Saved));
     }
 }
