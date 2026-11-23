@@ -69,11 +69,14 @@ def main():
         production.update(identities)
     print(f"Verified {len(production)} host production pins and Rustix backend", flush=True)
 
-    for test_filter, expected_count in (
+    suites = [
         ("forced_batch_", EXPECTED_TESTS),
         ("event::read::tests::", 16),
         ("event::stream::tests::", 2),
-    ):
+    ]
+    if sys.platform.startswith("linux"):
+        suites.append(("event::source::unix::mio::tests::", 7))
+    for test_filter, expected_count in suites:
         command = [
             "cargo", "test", "--manifest-path", str(MANIFEST), "--locked", "--lib",
             "--features", "event-stream", test_filter, "--",

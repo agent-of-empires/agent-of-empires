@@ -65,9 +65,10 @@ The first nightly appears after the next scheduled run, or `gh workflow run nigh
 
 These three path patches are experimental, not approved forks or supported-release
 commitments. Their scope remains under review in [PR #5493](https://github.com/agent-of-empires/agent-of-empires/pull/5493).
-The Crossterm candidate is in [draft PR #5593](https://github.com/agent-of-empires/agent-of-empires/pull/5593);
-[upstream report #1173](https://github.com/crossterm-rs/crossterm/issues/1173)
-links its standalone reproduction and implementation.
+The Crossterm candidate in [draft PR #5593](https://github.com/agent-of-empires/agent-of-empires/pull/5593)
+tracks [Crossterm #1179 at `e409fa05`](https://github.com/crossterm-rs/crossterm/pull/1179/commits/e409fa05aa9e7d446d773a1ad3f78f2c8db319c2)
+for its Unix Mio reader and wake socket. The 0.29 import layout and test probes
+are local adaptations; the event reader and stream changes are separate experiments.
 Before landing, choose official dependencies that satisfy the required behavior,
 redesign the affected changes without the patches, or approve separate temporary
 exceptions. Each exception must name a willing owner, scope, expiry date or release,

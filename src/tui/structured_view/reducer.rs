@@ -273,8 +273,7 @@ impl AcpTranscript {
         &self.server_rows
     }
 
-    /// Replace the whole row buffer (a replay reseed, or a fold this view
-    /// built itself in the retained reader).
+    #[cfg(test)]
     pub fn set_rows(&mut self, rows: Vec<TranscriptRow>) {
         self.server_rows = rows;
         self.projection_revision += 1;

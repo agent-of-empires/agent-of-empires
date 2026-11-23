@@ -1282,9 +1282,7 @@ pub struct TranscriptGeometry {
     pub total_lines: usize,
 }
 
-/// The transcript pre-wrapped at `width`: the single source of transcript
-/// geometry for painting, scroll clamping, and selection. The live projection
-/// is cached, so an unchanged transcript costs a clone rather than a re-wrap.
+#[cfg(test)]
 pub(super) fn wrapped_transcript(
     state: &StructuredViewState,
     theme: &Theme,
@@ -1293,9 +1291,7 @@ pub(super) fn wrapped_transcript(
     wrapped_transcript_rows(state, theme, width).0
 }
 
-/// [`wrapped_transcript`] plus, per visual row, the transcript row identity it
-/// came from, so a scroll anchor can find its own row again after the
-/// projection moves it.
+/// Wrap the transcript and retain each visual row's identity for scroll anchoring.
 pub(super) fn wrapped_transcript_rows(
     state: &StructuredViewState,
     theme: &Theme,
