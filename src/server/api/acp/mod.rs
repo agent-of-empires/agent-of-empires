@@ -502,14 +502,15 @@ mod tests {
         assert_eq!(state.instances.read().await[0].group_path, "moved");
     }
 
-    /// A failed Retry leaves only its rolled-back owner, kept for the new worker's startup error.
-    fn rolled_back_only(state: &AppState) -> bool {
+    /// Whether `id`'s Retry owner is rolled back, `None` with no owner. A failed Retry keeps its
+    /// rolled-back owner for the new worker's startup error.
+    fn rolled_back(state: &AppState, id: &str) -> Option<bool> {
         state
             .retry_starting
             .lock()
             .unwrap()
-            .values()
-            .all(crate::server::acp_events::RetryAttempt::is_rolled_back)
+            .get(id)
+            .map(crate::server::acp_events::RetryAttempt::is_rolled_back)
     }
 
     fn retry_request(
@@ -593,7 +594,7 @@ mod tests {
                 "{endpoint}"
             );
             assert_eq!(state.instances.read().await[0].status, Error, "{endpoint}");
-            assert!(rolled_back_only(&state), "{endpoint}");
+            assert_eq!(rolled_back(&state, &id), Some(true), "{endpoint}");
         }
     }
 
@@ -646,7 +647,7 @@ mod tests {
                     state.instances.read().await[0].status,
                     crate::session::Status::Error
                 );
-                assert!(rolled_back_only(&state));
+                assert_eq!(rolled_back(&state, &id), None);
             } else {
                 assert!(response.status().is_success(), "{}", response.status());
                 assert_ne!(
@@ -710,7 +711,79 @@ mod tests {
         drop(release);
         assert_eq!(restored, (Starting, Error));
         assert_eq!(state.instances.read().await[0].status, Error);
-        assert!(rolled_back_only(&state));
+        assert_eq!(rolled_back(&state, "sess-5671-drop"), Some(true));
+    }
+
+    /// #5921: a Retry the agent policy refuses answers 403 before it shows `Starting`, as a
+    /// restart does.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_retry_the_agent_policy_refuses_never_shows_starting() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let id = "sess-5921-policy".to_string();
+        let state = errored_retry_state(project.path(), &id).await;
+        crate::session::config::update_config(|config| {
+            config.acp.restrict_agents = true;
+            config.acp.allowed_agents = vec!["claude".into()];
+        })
+        .unwrap();
+        let mut changes = state.status_tx.subscribe();
+        let response = spawn_acp(State(state.clone()), Path(id.clone()), retry_request())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(matches!(
+            changes.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            state.instances.read().await[0].status,
+            crate::session::Status::Error
+        );
+        assert_eq!(rolled_back(&state, &id), None);
+    }
+
+    /// #5921: once a Retry's worker is installed its launch has succeeded, so a request dropped
+    /// after that leaves `Starting` for the worker's own frames rather than rolling back.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_retry_dropped_after_its_worker_is_installed_keeps_starting() {
+        use crate::server::acp_events::retry_test_gate::RevertGate;
+        use crate::session::Status::{Error, Starting};
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let id = "sess-5921-launched".to_string();
+        let launcher = crate::server::test_support::succeeding_launcher();
+        let state = errored_retry_state_with(project.path(), &id, launcher).await;
+        let (gate, parked) = RevertGate::arm(&format!("{id}#launched"));
+        let mut changes = state.status_tx.subscribe();
+        let mut launch = Box::pin(spawn_acp(
+            State(state.clone()),
+            Path(id.clone()),
+            retry_request(),
+        ));
+        tokio::select! {
+            response = &mut launch => panic!("launch ended before the gate: {}", response.into_response().status()),
+            parked = tokio::time::timeout(std::time::Duration::from_secs(10), parked) => {
+                parked.expect("the launch reaches the gate").expect("gate open");
+            }
+        }
+        assert_eq!(next_change(&mut changes).await, (Error, Starting));
+        drop(launch);
+        drop(gate);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            state.runtime.work.drain(),
+        )
+        .await
+        .expect("runtime work settles");
+        assert!(matches!(
+            changes.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(state.instances.read().await[0].status, Starting);
+        assert_eq!(rolled_back(&state, &id), Some(false));
     }
 
     /// #4116: a peer archive committed while the `before_session` hook runs (after the handler's

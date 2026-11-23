@@ -255,6 +255,12 @@ pub async fn spawn_acp(
             &SupervisorError::SpawnCancelled(id.clone()),
         );
     }
+    if reservation.is_some() && !super::super::agent_policy().await.allows(&agent) {
+        return supervisor_error_response(
+            "spawn failed",
+            &SupervisorError::AgentNotAllowed(agent.clone()),
+        );
+    }
     // Past every refusal: only the launch itself can fail from here.
     let starting = if reservation.is_some() {
         RetryStartingGuard::begin(&state, &id).await
@@ -267,6 +273,12 @@ pub async fn spawn_acp(
             return supervisor_error_response("spawn failed", &e);
         }
     }
+    // The worker is installed, so its own frames move the row whatever happens to this request.
+    if let Some(starting) = starting {
+        starting.disarm();
+    }
+    #[cfg(test)]
+    crate::server::acp_events::retry_test_gate::RevertGate::wait(&format!("{id}#launched")).await;
     if rate_limit_resume_resets_at.is_some() {
         // Reacquire only for installing the continuation. The guard is not
         // held while the adapter launch and its hooks run.
@@ -298,9 +310,6 @@ pub async fn spawn_acp(
         state
             .acp_supervisor
             .publish_rate_limit_auto_resumed(&id, resets_at, true);
-    }
-    if let Some(starting) = starting {
-        starting.disarm();
     }
     Json(SpawnAcpResponse {
         session_id: id,
