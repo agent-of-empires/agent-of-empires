@@ -785,9 +785,7 @@ pub(crate) struct RetryAttempt {
     attempt: u64,
     /// The latest event seq when the attempt began: frames at or below it are a retired worker's.
     watermark: u64,
-    /// What the row was before the first of the attempts held `Starting`.
-    prior: Status,
-    /// The attempt's launch failed and its rollback restored `prior`. Kept until the new worker
+    /// The attempt's launch failed and its rollback restored the Error. Kept until the new worker
     /// reports past `watermark`, since its startup error can arrive after the rollback.
     rolled_back: bool,
 }
@@ -870,9 +868,8 @@ fn take_rolled_back_retry(
     }
 }
 
-/// A rolled-back Retry's new worker failed to start. Its rollback put the prior status back
-/// first, so the failure is new: a Stopped row takes the Error its Stopped guard would refuse
-/// (the attempt's own launch, as `Launch` admits), and an Error row re-arms push's error dwell.
+/// A rolled-back Retry's new worker failed to start. Its rollback put the Error back first,
+/// so the failure is new and re-arms push's error dwell.
 fn report_failure_after_rollback(inst: &mut Instance, status_tx: &broadcast::Sender<StatusChange>) {
     tracing::info!(
         target: "acp.retry_starting",
@@ -886,16 +883,11 @@ fn report_failure_after_rollback(inst: &mut Instance, status_tx: &broadcast::Sen
         }
         return;
     }
-    let policy = if inst.status == Status::Stopped {
-        StatusPolicy::Launch
-    } else {
-        StatusPolicy::Authoritative
-    };
-    apply_status_intent(inst, policy, Status::Error, status_tx);
+    apply_status_intent(inst, StatusPolicy::Authoritative, Status::Error, status_tx);
 }
 
 /// A Retry's `Starting`, held until the launch succeeds. Dropped armed (an error return, a
-/// panic or a cancelled handler), it restores the prior status unless a newer frame moved the row
+/// panic or a cancelled handler), it restores the Error unless a newer frame moved the row
 /// or a later attempt owns it.
 pub(crate) struct RetryStartingGuard {
     state: Arc<AppState>,
@@ -905,7 +897,7 @@ pub(crate) struct RetryStartingGuard {
 }
 
 impl RetryStartingGuard {
-    /// Moves an `Error` or `Stopped` row to `Starting`, or takes over the `Starting` an earlier
+    /// Moves an `Error` row to `Starting`, or takes over the `Starting` an earlier
     /// attempt left; `None` otherwise. Callers hold the session's launch admission (a spawn
     /// reservation, or a restart claim with the old worker gone), which proves no earlier attempt
     /// is still launching, so taking over is safe even before that attempt's guard has dropped.
@@ -919,10 +911,10 @@ impl RetryStartingGuard {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let took_over = inst.status == Status::Starting;
-        let prior = match (inst.status, owners.get(id)) {
-            (Status::Starting, Some(earlier)) if !earlier.rolled_back => earlier.prior,
+        match (inst.status, owners.get(id)) {
+            (Status::Starting, Some(earlier)) if !earlier.rolled_back => {}
             (Status::Starting, _) => return None,
-            (prior, _) => {
+            _ => {
                 apply_status_intent(
                     inst,
                     StatusPolicy::Launch,
@@ -934,15 +926,13 @@ impl RetryStartingGuard {
                 }
                 state.note_row_mutation();
                 state.runtime.request_publish();
-                prior
             }
-        };
+        }
         owners.insert(
             id.to_string(),
             RetryAttempt {
                 attempt,
                 watermark,
-                prior,
                 rolled_back: false,
             },
         );
@@ -951,7 +941,6 @@ impl RetryStartingGuard {
             session = %id,
             attempt,
             watermark,
-            prior = ?prior,
             took_over,
             "Retry shows Starting"
         );
@@ -997,7 +986,7 @@ async fn revert_retry_starting(state: &AppState, id: &str, attempt: u64) {
     #[cfg(test)]
     retry_test_gate::RevertGate::wait(id).await;
     let mut instances = state.instances.write().await;
-    let prior = {
+    {
         let mut owners = state
             .retry_starting
             .lock()
@@ -1006,23 +995,19 @@ async fn revert_retry_starting(state: &AppState, id: &str, attempt: u64) {
         match owners.get_mut(id) {
             Some(owner) if owner.attempt == attempt && !owner.rolled_back => {
                 owner.rolled_back = true;
-                Some(owner.prior)
             }
             _ => return,
         }
-    };
-    if let (Some(inst), Some(prior)) = (
-        instances
-            .iter_mut()
-            .find(|i| i.id == id && i.status == Status::Starting),
-        prior,
-    ) {
-        let restored = commit_status_intent(inst, StatusPolicy::Authoritative, prior);
+    }
+    if let Some(inst) = instances
+        .iter_mut()
+        .find(|i| i.id == id && i.status == Status::Starting)
+    {
+        let restored = commit_status_intent(inst, StatusPolicy::Authoritative, Status::Error);
         tracing::info!(
             target: "acp.retry_starting",
             session = %id,
             attempt,
-            prior = ?prior,
             restored = restored.is_some(),
             "Retry launch failed; rolled back its Starting"
         );
@@ -1090,7 +1075,7 @@ fn commit_status_intent(
             }
         }
         StatusPolicy::Launch => {
-            if !matches!(inst.status, Status::Error | Status::Stopped) {
+            if inst.status != Status::Error {
                 return None;
             }
         }
@@ -1409,7 +1394,8 @@ pub(crate) enum StatusPolicy {
     Background,
     /// Only takes effect from `Error`, `Stopped` or a Retry's `Starting`: a fresh worker attached.
     Heal,
-    /// A Retry starting the Agent from `Error` or `Stopped`. Set by handlers, never by an event.
+    /// A Retry starting the Agent from `Error`. Set by handlers, never by an event. A Stopped row
+    /// is already Idle by then: `resume_structured_stop` resumes it first (#5977).
     Launch,
 }
 
@@ -2736,8 +2722,8 @@ mod tests {
     }
 
     /// #5921: lag recovery after a Retry's rollback treats the new worker's Error as the
-    /// attempt's failure, as the listener does: a Stopped row shows it and an Error row notifies
-    /// it once, whether or not an incompatible agent's Error came first. A fold the retired
+    /// attempt's failure, as the listener does: the Error row notifies it once, whether or not an
+    /// incompatible agent's Error came first. A fold the retired
     /// worker wrote doesn't move the restored status. Every row runs before the assertion.
     #[tokio::test]
     #[serial_test::serial]
@@ -2755,41 +2741,21 @@ mod tests {
         let turn_end = || Event::Stopped {
             reason: "end_turn".into(),
         };
-        // (prior, the new worker's events after the retired worker's turn end at seq 1, the
-        // status after recovery, errored pushes)
+        // (the new worker's events after the retired worker's turn end at seq 1, errored pushes)
         let cases = [
+            (vec![Event::startup_error("spawn failed")], 1),
             (
-                Status::Error,
-                vec![Event::startup_error("spawn failed")],
-                Status::Error,
-                1,
-            ),
-            (
-                Status::Stopped,
-                vec![Event::startup_error("spawn failed")],
-                Status::Error,
-                1,
-            ),
-            (
-                Status::Error,
                 vec![incompatible(), Event::startup_error("spawn failed")],
-                Status::Error,
-                1,
-            ),
-            (
-                Status::Stopped,
-                vec![incompatible(), Event::startup_error("spawn failed")],
-                Status::Error,
                 1,
             ),
             // Only the retired worker's turn end: the restored Error stays.
-            (Status::Error, vec![], Status::Error, 0),
+            (vec![], 0),
         ];
         let mut mismatches = Vec::new();
-        for (prior, later, want, pushes) in cases {
-            let case = format!("prior={prior:?}, {} new events", later.len());
+        for (later, pushes) in cases {
+            let case = format!("{} new events", later.len());
             let mut inst = stopped_structured_instance();
-            inst.status = prior;
+            inst.status = Status::Error;
             let id = inst.id.clone();
             let state = test_support::build_test_app_state(vec![inst]);
             state
@@ -2834,7 +2800,7 @@ mod tests {
                     .map(RetryAttempt::is_rolled_back),
             );
             let owner = (pushes == 0).then_some(true);
-            if got != (want, pushes, owner) {
+            if got != (Status::Error, pushes, owner) {
                 let steps: Vec<_> = seen
                     .iter()
                     .map(|c| (c.old, c.new, c.restores_prior))
@@ -3002,7 +2968,7 @@ mod tests {
     }
 
     /// #5921: a Retry whose new worker fails to start pushes that failure exactly once, whether
-    /// its startup error or its rollback lands first, from an Error or a Stopped row, and even
+    /// its startup error or its rollback lands first, and even
     /// when the startup error reaches the listener twice. Every cell runs before the one
     /// assertion, so each shows on its own.
     #[tokio::test]
@@ -3037,17 +3003,10 @@ mod tests {
                 auto_install: false,
             },
         };
-        for (prior, rollback_first, prelude) in [
-            (Status::Error, true, false),
-            (Status::Error, false, false),
-            (Status::Stopped, true, false),
-            (Status::Stopped, false, false),
-            (Status::Error, true, true),
-            (Status::Stopped, true, true),
-        ] {
-            let case = format!("prior={prior:?} rollback_first={rollback_first} prelude={prelude}");
+        for (rollback_first, prelude) in [(true, false), (false, false), (true, true)] {
+            let case = format!("rollback_first={rollback_first} prelude={prelude}");
             let mut inst = stopped_structured_instance();
-            inst.status = prior;
+            inst.status = Status::Error;
             let id = inst.id.clone();
             let state = test_support::build_test_app_state(vec![inst]);
             state.acp_supervisor.hydrate_seqs([(id.clone(), 5)]);
@@ -3122,73 +3081,6 @@ mod tests {
                     .collect();
                 mismatches.push(format!(
                     "{case}: (last status, errored pushes, owner left) {got:?}, changes {steps:?}"
-                ));
-            }
-        }
-        assert!(mismatches.is_empty(), "{mismatches:#?}");
-    }
-
-    /// #5921: only a rolled-back Retry's own startup error takes a Stopped row to Error. Without
-    /// an owner, with one whose launch hasn't failed, or from the retired worker at or below the
-    /// watermark, the Stopped guard holds. Every row runs before the one assertion.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn a_stopped_row_ignores_a_startup_error_no_rollback_owns() {
-        use crate::acp::Event;
-        let temp = tempfile::tempdir().expect("tempdir");
-        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let owner = |watermark, rolled_back| RetryAttempt {
-            attempt: 0,
-            watermark,
-            prior: Status::Stopped,
-            rolled_back,
-        };
-        let mut mismatches = Vec::new();
-        for owner in [None, Some(owner(5, false)), Some(owner(6, true))] {
-            let inst = stopped_structured_instance();
-            let id = inst.id.clone();
-            let state = test_support::build_test_app_state(vec![inst]);
-            if let Some(owner) = owner {
-                state
-                    .retry_starting
-                    .lock()
-                    .unwrap()
-                    .insert(id.clone(), owner);
-            }
-            let mut changes = state.status_tx.subscribe();
-            let listener = tokio::spawn(acp_event_listener(state.clone()));
-            await_subscribed(&state).await;
-            for (seq, event) in [
-                (6, Event::startup_error("spawn failed")),
-                (
-                    7,
-                    Event::AcpSessionAssigned {
-                        acp_session_id: "acp-heal".into(),
-                    },
-                ),
-            ] {
-                state
-                    .acp_events_tx
-                    .send(AcpBroadcastFrame {
-                        session_id: id.clone(),
-                        seq,
-                        event: Arc::new(event),
-                        worker_generation: None,
-                        sidebar_status: Some(Status::Idle),
-                    })
-                    .expect("listener is subscribed");
-            }
-            // The heal is the first change, so the startup error before it moved nothing.
-            let change = tokio::time::timeout(std::time::Duration::from_secs(10), changes.recv())
-                .await
-                .expect("the heal's change arrives")
-                .expect("status channel open");
-            listener.abort();
-            let _ = listener.await;
-            if (change.old, change.new) != (Status::Stopped, Status::Idle) {
-                mismatches.push(format!(
-                    "{owner:?}: first change {:?}",
-                    (change.old, change.new)
                 ));
             }
         }
@@ -3866,7 +3758,7 @@ mod tests {
             (Running, false, Heal, Idle, Running),
             (Starting, false, Heal, Idle, Idle),
             (Error, false, Launch, Starting, Starting),
-            (Stopped, false, Launch, Starting, Starting),
+            (Stopped, false, Launch, Starting, Stopped),
             (Idle, false, Launch, Starting, Idle),
             (Running, false, Launch, Starting, Running),
             (Waiting, false, Launch, Starting, Waiting),

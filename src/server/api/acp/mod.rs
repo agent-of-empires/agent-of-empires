@@ -598,6 +598,54 @@ mod tests {
         }
     }
 
+    /// #5921: a Retry from a Stopped row shows Idle, not Starting, through either handler:
+    /// `resume_structured_stop` resumes it before `RetryStartingGuard::begin`, which admits only
+    /// Error. A Starting glyph here is #5977.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_retry_from_stopped_shows_idle_through_the_handlers() {
+        use crate::session::Status;
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut got = Vec::new();
+        for endpoint in ["spawn", "restart"] {
+            let id = format!("sess-5921-stopped-{endpoint}");
+            let state = errored_retry_state(project.path(), &id).await;
+            {
+                let mut rows = state.instances.write().await;
+                rows[0].status = Status::Stopped;
+                crate::server::test_support::seed_instances_on_disk_for_test(
+                    "default",
+                    rows.clone(),
+                );
+            }
+            let mut changes = state.status_tx.subscribe();
+            let _ = if endpoint == "spawn" {
+                spawn_acp(State(state.clone()), Path(id.clone()), retry_request())
+                    .await
+                    .into_response()
+            } else {
+                restart_acp(State(state.clone()), Path(id.clone()), retry_request())
+                    .await
+                    .into_response()
+            };
+            let mut sent = Vec::new();
+            while let Ok(change) = changes.try_recv() {
+                sent.push((change.old, change.new));
+            }
+            got.push((endpoint, sent, state.instances.read().await[0].status));
+        }
+        let want = [
+            ("spawn", vec![(Status::Stopped, Status::Idle)], Status::Idle),
+            (
+                "restart",
+                vec![(Status::Stopped, Status::Idle)],
+                Status::Idle,
+            ),
+        ];
+        assert_eq!(got, want);
+    }
+
     /// #5921: restart takes its capacity slot before it shows `Starting`. With the only slot held
     /// by another session it is refused with no status change; its own worker in that slot is
     /// stopped first, so it restarts.

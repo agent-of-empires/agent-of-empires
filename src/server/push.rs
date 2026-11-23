@@ -1931,7 +1931,7 @@ mod tests {
 
     /// #5671: a Retry's rollback to Error resumes the earlier error instead of arming a second
     /// "errored" push. Any other launch failure, such as a Terminal launch or a Retry's new worker
-    /// failing, is new and notifies again once the cooldown has passed, as is one from Stopped.
+    /// failing, is new and notifies again once the cooldown has passed.
     #[test]
     fn only_a_retry_rollback_resumes_the_earlier_error() {
         let change = |old, new, restores_prior| StatusChange {
@@ -1952,7 +1952,6 @@ mod tests {
             (vec![Status::Running, Status::Error], true, false, true, 0),
             (vec![Status::Running, Status::Error], false, false, true, 1),
             (vec![Status::Running, Status::Error], false, true, true, 1),
-            (vec![Status::Stopped], false, false, true, 1),
             (vec![Status::Running, Status::Error], true, false, false, 1),
         ];
         for (before, notified, skipped, rollback, want) in cases {
