@@ -36,6 +36,7 @@ jobs:
       tag: ${{ steps.plan.outputs.tag }}
       sha: ${{ steps.plan.outputs.sha }}
       stable: ${{ steps.plan.outputs.stable }}
+      previous: ${{ steps.plan.outputs.previous }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -62,12 +63,17 @@ jobs:
           # Next patch, so a nightly sorts above the stable release it builds on.
           BASE="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]*)"/\1/')"
           IFS=. read -r MAJOR MINOR PATCH <<< "${BASE%%-*}"
+          STABLE="$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*')"
+          # What the release notes diff against: a nightly user is upgrading from the
+          # previous nightly, and the first one covers everything since stable.
+          PREVIOUS="$(git describe --tags --abbrev=0 --match 'nightly-*' 2>/dev/null || echo "$STABLE")"
           {
             echo "skip=false"
             echo "sha=$SHA"
             echo "tag=$TAG"
             echo "version=${MAJOR}.${MINOR}.$((PATCH + 1))-nightly.${TAG#nightly-}"
-            echo "stable=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*')"
+            echo "stable=$STABLE"
+            echo "previous=$PREVIOUS"
           } >> "$GITHUB_OUTPUT"
 
   build:
@@ -85,24 +91,46 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
       - name: Download all artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
           merge-multiple: true
 
+      # The same grouped bullets a stable release ships, so the in-app "What's New"
+      # dialog has something to show when a nightly update is applied.
       - name: Write release notes
         env:
           SHA: ${{ needs.prepare.outputs.sha }}
-          STABLE: ${{ needs.prepare.outputs.stable }}
+          BASE: ${{ needs.prepare.outputs.previous }}
         run: |
-          cat > release-notes.md <<EOF
-          Nightly build of \`main\` at ${SHA}.
-
-          Changes since ${STABLE}: https://github.com/${GITHUB_REPOSITORY}/compare/${STABLE}...${SHA}
-
-          Moving from a nightly back to a stable release may not work until the next stable ships. See https://www.agent-of-empires.com/docs/installation/#nightly-channel
-          EOF
+          set -euo pipefail
+          # The compare link uses the base commit, not its tag: pruning deletes old
+          # nightly tags, so a tag-based link would 404 from the oldest kept release.
+          BASE_SHA="$(git rev-parse "$BASE^{commit}")"
+          python3 .github/scripts/nightly-notes.py \
+            --base "$BASE_SHA" --head "$SHA" \
+            --repo-url "https://github.com/${GITHUB_REPOSITORY}" > changes.md
+          {
+            echo "Nightly build of \`main\` at ${SHA}."
+            echo
+            if grep -q '[^[:space:]]' changes.md; then
+              cat changes.md
+            else
+              echo "No user-facing changes since ${BASE}."
+            fi
+            echo
+            echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${BASE_SHA}...${SHA}"
+            echo
+            echo "Moving from a nightly back to a stable release may not work until the next stable ships. See https://www.agent-of-empires.com/docs/installation/#nightly-channel"
+          } > release-notes.md
+          cat release-notes.md
 
       - name: Create prerelease
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
