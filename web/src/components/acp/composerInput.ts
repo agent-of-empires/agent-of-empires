@@ -69,6 +69,15 @@ export function composerWrapperLayout(opts: { keyboardOpen: boolean; accessoryBa
   };
 }
 
+const supportsFieldSizing = typeof CSS !== "undefined" && CSS.supports("field-sizing", "content");
+
+/** JS grow-to-cap fallback; a no-op where CSS `field-sizing: content` sizes the textarea. */
+export function fitTextareaFallback(el: HTMLTextAreaElement, supported = supportsFieldSizing) {
+  if (supported) return;
+  el.style.height = "auto";
+  el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+}
+
 /** Replace the value the way a keystroke would. The native setter bypasses React's
  *  patched one, the caret is set before dispatch because the primitive reads it in
  *  the same onChange, and the InputEvent carries the `inputType`/`data` the
@@ -129,6 +138,7 @@ export function insertRawTextAtCaret(ta: HTMLTextAreaElement, text: string, repl
     "insertText",
     text,
   );
+  fitTextareaFallback(ta);
 }
 
 /** Client-side mirror of the server's per-prompt attachment cap. */

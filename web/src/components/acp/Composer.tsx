@@ -42,6 +42,7 @@ import {
   decideArrowRecall,
   decideBeforeInputAction,
   decideEnterAction,
+  fitTextareaFallback,
   insertAtCaret,
   insertNewlineAtCaret,
   insertRawTextAtCaret,
@@ -145,7 +146,7 @@ export function Composer(props: Props) {
 
   usePluginDraftOperations(sessionId, client, taRef);
   usePrimerPrefill(props.primerPrefill, loadText);
-  useDraftPersistence(sessionId, client, composerText, draftTextRef);
+  useDraftPersistence(sessionId, client, composerText, draftTextRef, taRef);
   useEffect(() => {
     const consume = () => {
       const text = consumeComposerPrefill(sessionId);
@@ -270,6 +271,7 @@ export function Composer(props: Props) {
                     : "Queue a follow-up… (sent when current turn ends)"
                   : "Send a message…  Type @ for files, / for commands")
               }
+              onInput={(e) => fitTextareaFallback(e.currentTarget)}
               onFocus={() => {
                 // Belt and braces for UAs that lag the keyboard's layout-viewport update.
                 if (!isMobile) return;
@@ -450,6 +452,7 @@ function usePluginDraftOperations(
           if (!el) return;
           el.focus();
           el.setSelectionRange(operation.text.length, operation.text.length);
+          fitTextareaFallback(el);
         });
       } else if (!ta) {
         client.setText(`${client.getState().text}${operation.text}`);

@@ -6,6 +6,7 @@ import {
   decideArrowRecall,
   decideBeforeInputAction,
   decideEnterAction,
+  fitTextareaFallback,
   insertAtCaret,
   insertNewlineAtCaret,
   insertSlashCommand,
@@ -152,5 +153,28 @@ describe("caret insertion", () => {
     expect(events[0]!.event.data).toBe("/help");
     // The primitive reads selectionStart in the same onChange that applies the text.
     expect(events[0]!.caret).toBe(10);
+  });
+});
+
+describe("fitTextareaFallback", () => {
+  function textarea(scrollHeight: number) {
+    const ta = document.createElement("textarea");
+    Object.defineProperty(ta, "scrollHeight", { value: scrollHeight });
+    return ta;
+  }
+
+  it("grows to the content height, capped at 200px, when field-sizing is unsupported", () => {
+    const short = textarea(120);
+    fitTextareaFallback(short, false);
+    expect(short.style.height).toBe("120px");
+    const tall = textarea(500);
+    fitTextareaFallback(tall, false);
+    expect(tall.style.height).toBe("200px");
+  });
+
+  it("leaves sizing to CSS when field-sizing is supported", () => {
+    const ta = textarea(120);
+    fitTextareaFallback(ta, true);
+    expect(ta.style.height).toBe("");
   });
 });

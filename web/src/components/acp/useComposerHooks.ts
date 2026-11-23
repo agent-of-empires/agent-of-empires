@@ -8,7 +8,7 @@ import type { Unstable_TriggerAdapter, Unstable_TriggerItem } from "@assistant-u
 import { getDraft, setDraft } from "../../lib/acpDrafts";
 import type { AcpState, PromptAttachmentInput, PromptCapabilities, QueuedPrompt } from "../../lib/acpTypes";
 import { useClearAliases } from "../../lib/agentProfileContext";
-import { fileToBase64, kindSupported, MAX_ATTACHMENTS, mimeToKind } from "./composerInput";
+import { fileToBase64, fitTextareaFallback, kindSupported, MAX_ATTACHMENTS, mimeToKind } from "./composerInput";
 import { nextRecallTarget, recallBannerInfo, type RecallCursor, type RecallNav } from "./recallNav";
 import { fuzzyFilter, useFilesIndex } from "./useFilesIndex";
 
@@ -45,7 +45,7 @@ export function useComposerClient() {
   return { client, composerText, draftTextRef };
 }
 
-/** Set the text, then focus with the caret at the end. */
+/** Set the text, then focus with the caret at the end and resize (setText fires no input event). */
 export function useLoadText(client: ComposerClient, taRef: TextareaRef) {
   return useCallback(
     (text: string) => {
@@ -60,6 +60,7 @@ export function useLoadText(client: ComposerClient, taRef: TextareaRef) {
         } catch {
           // Detached nodes can throw.
         }
+        fitTextareaFallback(el);
       });
     },
     [client, taRef],
@@ -73,11 +74,15 @@ export function useDraftPersistence(
   client: ComposerClient,
   composerText: string,
   draftTextRef: React.RefObject<string>,
+  taRef: TextareaRef,
 ) {
   useEffect(() => {
     const saved = getDraft(sessionId);
     if (saved && client.getState().text === "") {
       client.setText(saved);
+      requestAnimationFrame(() => {
+        if (taRef.current) fitTextareaFallback(taRef.current);
+      });
     }
     const flush = () => setDraft(sessionId, draftTextRef.current);
     // iOS Safari fires pagehide only on real unload, not on app switch.
@@ -93,7 +98,7 @@ export function useDraftPersistence(
       document.removeEventListener("visibilitychange", onHidden);
       flush();
     };
-  }, [client, sessionId, draftTextRef]);
+  }, [client, sessionId, draftTextRef, taRef]);
 
   // Reads the ref at fire time so a write scheduled before a send persists the cleared text.
   useEffect(() => {
