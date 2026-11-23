@@ -81,7 +81,7 @@ mod tests {
             effective_profile: "default".to_string(),
             old: Status::Running,
             new: Status::Idle,
-            at: chrono::Utc::now(),
+            at: crate::time::Timestamp::now(),
             restores_prior: false,
         }
     }
@@ -192,7 +192,7 @@ mod tests {
             session_id: session.to_string(),
             effective_profile: profile.to_string(),
             kind: LifecycleKind::Created,
-            at: chrono::Utc::now(),
+            at: crate::time::Timestamp::now(),
             summary: Some(serde_json::json!({ "id": session })),
         }
     }

@@ -8,14 +8,15 @@ aoe
 
 The TUI starts or reuses the local Daemon through its private Unix socket and reads canonical session rows from it. Starting the TUI does not open a web listener. The shared Daemon keeps running when you quit the TUI; `aoe serve --stop` stops it.
 
-If startup or connection fails, the TUI shows the diagnostic and masks daemon-owned session state. Press `r` to reconnect or retry local startup after fixing the cause, or `q` to quit. A Daemon left over from before an upgrade shows as **Outdated** instead: when aoe can restart it, `r` does so in place and reconnects; otherwise the dialog says how and `r` checks again. See [Starting the server](guides/web-dashboard.md#starting-the-server).
+If no Daemon can be reached or started, `aoe` exits with the error. If the connection drops later, the TUI shows the diagnostic and masks daemon-owned session state. Press `r` to reconnect after fixing the cause, or `q` to quit. A Daemon left over from before an upgrade shows as **Outdated** instead: when aoe can restart it, `r` does so in place and reconnects; otherwise the dialog says how and `r` checks again. See [Starting the server](guides/web-dashboard.md#starting-the-server).
 
 | Key | Action |
 |-----|--------|
 | `n` | New session |
 | `b` | New session from a saved project |
-| `p` | Manage saved projects |
-| `Enter` | Attach to a session |
+| `p` | Manage saved projects (on a project header, pins it instead) |
+| `Enter` | [Live mode](guides/live-mode.md): type to the agent with the list still visible |
+| `Tab` | Attach to the session's tmux pane |
 | `d` | Delete a session |
 | `t` | Toggle Agent / Terminal view |
 | `T` | Attach to the session's paired terminal |
@@ -26,6 +27,8 @@ If startup or connection fails, the TUI shows the diagnostic and masks daemon-ow
 | `q` | Quit |
 | `Ctrl+b d` | Detach from the tmux session |
 
+These are the welcome wizard's defaults. Choosing tmux there, or skipping that page, swaps `Enter` and `Tab`.
+
 ## Your first session
 
 Press `n` and fill in your project path (or leave `.`), or run `aoe add /path/to/project`.
@@ -34,10 +37,11 @@ The CLI asks the Daemon to provision and save the session. A terminal-view sessi
 `Ctrl+b d` detaches back to the TUI. Inside tmux, attaching switches your client to the
 agent's tmux session; `Ctrl+b L` switches back.
 
-`aoe add` starts a local Daemon when needed. Use `--no-autostart` to require one already
-running. With `--daemon-url` or `AOE_DAEMON_URL`, creation runs only on the selected
-Daemon, never locally if that connection fails. Pass an absolute path on that host,
-or `--scratch`; registered `--project` names and agent settings also come from that host.
+`aoe` and `aoe add` start a local Daemon when needed. Use `--no-autostart` to require one
+already running; without one, the TUI refuses to open. With `--daemon-url` or
+`AOE_DAEMON_URL`, creation runs only on the selected Daemon, never locally if that
+connection fails. Pass an absolute path on that host, or `--scratch`; registered
+`--project` names and agent settings also come from that host.
 `--hook-env KEY` explicitly reads that client variable; no other client environment is sent.
 For a remote terminal session without `--launch`, run the printed start command on the
 Daemon host, not on the client machine. You can also start it from the Daemon dashboard.
@@ -47,7 +51,7 @@ for the Daemon's result. If the connection is lost, the CLI checks canonical sta
 resubmitting creation. An unknown result includes a request key: inspect the Daemon's
 session list before creating again.
 
-Press `t` to toggle between the structured view and the paired shell terminal, where you can run builds and git commands without interrupting the agent.
+Press `t` to toggle between the agent view and the paired shell terminal, where you can run builds and git commands without interrupting the agent.
 
 Drag the border between the session list and preview to resize the list. In terminals
 narrower than `session.narrow_breakpoint` columns (80 by default), the list moves above
@@ -60,7 +64,7 @@ chosen height.
 
 A **project** is a saved directory path you register once so you can start sessions from it without retyping. Registering is only a convenience: `n` and `aoe add <path>` work on any path. Add one with `aoe project add /path/to/repo`, or press `p` in the TUI and then `a`. Once a project exists, `b` starts a session from it. See [Multi-repo workspaces](guides/multi-repo-workspaces.md#the-project-registry).
 
-A **group** is unrelated: it is a label you assign to existing sessions to sort them in the sidebar, set from the rename dialog or with `aoe group move`. Projects are where sessions start; groups are how they are bucketed once they exist. See [the grouping axes](guides/web/dashboard.md#sorting-and-grouping).
+A **group** is unrelated: it is a label you assign to existing sessions to sort them in the sidebar, set from the rename dialog or with `aoe group move`. Projects are where sessions start; groups are how they are bucketed once they exist. See [the grouping axes](guides/web/dashboard.md#sidebar-grouping-repo-organization-group-both-or-status).
 
 ## Worktrees
 
@@ -85,7 +89,7 @@ aoe add --sandbox .        # run the agent in a container
 aoe add -c opencode .      # use a different agent
 ```
 
-The sandbox mounts your project at `/workspace` and shares authentication through persistent volumes; the TUI has a checkbox for it when a container runtime is available. The agent picker in the new-session dialog lists every detected tool. See the [container sandbox guide](guides/sandbox.md).
+The sandbox mounts your project at `/workspace` and seeds the agent's credentials into a private per-session store on the host (Claude Code shares one credential file across its sandboxes); the TUI has a checkbox for it when a container runtime is available. The agent picker in the new-session dialog lists every detected tool. See the [container sandbox guide](guides/sandbox.md).
 
 ## The web dashboard
 

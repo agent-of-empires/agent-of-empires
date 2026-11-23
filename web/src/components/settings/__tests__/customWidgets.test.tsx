@@ -106,6 +106,14 @@ it("LoggingTargetsWidget exposes the session lifecycle area and saves only that 
   expect(save).toHaveBeenLastCalledWith({ ...initial, "session.status_change": "info" });
 });
 
+it("LoggingTargetsWidget exposes the v058 and v061 migration targets and saves them", () => {
+  const { save } = mount(LoggingTargetsWidget, "Targets", {});
+  fireEvent.change(control("migrations.v058", "select"), { target: { value: "debug" } });
+  expect(save).toHaveBeenLastCalledWith({ "migrations.v058": "debug" });
+  fireEvent.change(control("migrations.v061", "select"), { target: { value: "info" } });
+  expect(save).toHaveBeenLastCalledWith({ "migrations.v061": "info" });
+});
+
 describe("ThemeNameWidget", () => {
   it.each([
     [true, 1],

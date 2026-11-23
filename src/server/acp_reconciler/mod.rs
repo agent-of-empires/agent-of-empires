@@ -585,13 +585,19 @@ async fn release_logged_in(state: &Arc<AppState>, held: Vec<String>) -> Vec<Stri
     .unwrap_or_default()
 }
 
-/// Spawns the pending-initial-turn drain (#2897) for sessions with a live worker.
+/// Spawns the pending-initial-turn drain (#2897) for sessions with a live worker,
+/// and the terminal drain for terminal sessions.
 async fn drain_pending_initial_turns(state: &Arc<AppState>) {
     let candidates: Vec<String> = {
         let instances = state.instances.read().await;
         instances
             .iter()
-            .filter(|i| i.pending_initial_turn.is_some() && is_resumable(i))
+            .filter(|i| {
+                is_resumable(i)
+                    && i.pending_initial_turn
+                        .as_ref()
+                        .is_some_and(|turn| state.session_service.turn_is_deliverable(&i.id, turn))
+            })
             .map(|i| i.id.clone())
             .collect()
     };
@@ -604,6 +610,29 @@ async fn drain_pending_initial_turns(state: &Arc<AppState>) {
             "acp.pending_initial_turn_drain",
             crate::task_util::PanicPolicy::Log,
             async move { service.drain_pending_initial_turn(&id).await },
+        );
+    }
+    // Terminal rows whose create-time delivery was cut short by a restart.
+    let terminal: Vec<String> = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .filter(|i| {
+                !i.is_structured()
+                    && i.pending_initial_turn.as_ref().is_some_and(|turn| {
+                        turn.is_creation_prompt()
+                            && state.session_service.turn_is_deliverable(&i.id, turn)
+                    })
+            })
+            .map(|i| i.id.clone())
+            .collect()
+    };
+    for id in terminal {
+        let service = Arc::clone(&state.session_service);
+        crate::task_util::spawn_supervised(
+            "tmux.pending_initial_turn_drain",
+            crate::task_util::PanicPolicy::Log,
+            async move { service.drain_terminal_initial_turn(&id).await },
         );
     }
 }
@@ -1115,6 +1144,7 @@ mod tests {
                 merged_prompt_ids: Vec::new(),
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
             Event::Stopped {
                 reason: "prompt_complete".into(),
@@ -1283,7 +1313,7 @@ mod tests {
             prompt: "research".into(),
             model: "model".into(),
             output_file: String::new(),
-            started_at: chrono::Utc::now(),
+            started_at: crate::time::Timestamp::now(),
             workflow: None,
         };
         for (name, events, text, drains) in [
@@ -1311,7 +1341,7 @@ mod tests {
                 vec![
                     task.clone(),
                     Event::CancelRequested {
-                        escalates_at: chrono::Utc::now(),
+                        escalates_at: crate::time::Timestamp::now(),
                     },
                 ],
                 "follow up",
@@ -1348,7 +1378,14 @@ mod tests {
             }
             state
                 .session_service
-                .enqueue_prompt(name, "q".into(), text.into(), Vec::new(), None, None)
+                .enqueue_prompt(
+                    name,
+                    "q".into(),
+                    text.into(),
+                    Vec::new(),
+                    None,
+                    crate::server::session_service::QueueSender::default(),
+                )
                 .await
                 .unwrap();
             if drains {
@@ -1487,7 +1524,7 @@ mod tests {
         let held = held_for_login(id, &mut tick).await;
 
         // An archived row no longer waits on a launch, so it leaves the held set.
-        held.state.instances.write().await[0].archived_at = Some(chrono::Utc::now());
+        held.state.instances.write().await[0].archived_at = Some(crate::time::Timestamp::now());
         tick.run(&held.state).await;
         assert!(!held.state.session_service.sandbox_login.is_held(id));
     }
@@ -1551,7 +1588,9 @@ mod tests {
                 &crate::acp::Event::RateLimit {
                     info: crate::acp::state::RateLimitInfo {
                         status: "limited".into(),
-                        resets_at: Some(chrono::Utc::now() + chrono::Duration::days(3)),
+                        resets_at: Some(
+                            crate::time::Timestamp::now() + crate::time::Duration::days(3),
+                        ),
                         kind: "usage".into(),
                     },
                 },
@@ -1586,6 +1625,7 @@ mod tests {
                     prompt_ids: Vec::new(),
                     synthesized: false,
                     no_revive: false,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 },
             )
             .await;
@@ -1597,7 +1637,10 @@ mod tests {
                 "PR #7 was merged".into(),
                 Vec::new(),
                 None,
-                Some("cron".into()),
+                crate::server::session_service::QueueSender {
+                    plugin: Some("cron".into()),
+                    origin: crate::daemon::PromptOrigin::Unknown,
+                },
             )
             .await
             .unwrap();
@@ -1683,6 +1726,7 @@ mod tests {
                     prompt_ids: Vec::new(),
                     synthesized: false,
                     no_revive: false,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 },
             )
             .await;
@@ -1694,7 +1738,10 @@ mod tests {
                 "PR #7 was merged".into(),
                 Vec::new(),
                 None,
-                Some("cron".into()),
+                crate::server::session_service::QueueSender {
+                    plugin: Some("cron".into()),
+                    origin: crate::daemon::PromptOrigin::Unknown,
+                },
             )
             .await
             .unwrap();

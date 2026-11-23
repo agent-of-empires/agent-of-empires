@@ -3,8 +3,8 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use crate::time::Timestamp;
 use anyhow::{Context, Result};
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::containers::DockerContainer;
@@ -124,7 +124,7 @@ impl DeletionResult {
 }
 
 pub(crate) struct TrashPurgeConsent {
-    pub trashed_at: chrono::DateTime<Utc>,
+    pub trashed_at: crate::time::Timestamp,
     pub trash_lifecycle_id: String,
     pub lifecycle_generation: u64,
     pub force_failed: bool,
@@ -157,7 +157,7 @@ pub(crate) fn drop_failed_purge(
             crate::session::LifecycleReservationError::Superseded
         );
         anyhow::ensure!(
-            !row.has_fresh_lifecycle_reservation(Utc::now()),
+            !row.has_fresh_lifecycle_reservation(Timestamp::now()),
             crate::session::LifecycleReservationError::Superseded
         );
         if row.failed_purge_forced() != Some(true) {
@@ -325,7 +325,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
             .storage()
             .acquire_instance_lifecycle_lock(&id)
             .context("failed to acquire instance purge lock")?;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut reserved = None;
         let mut rejected = None;
         let mut busy_holder = None;
@@ -2619,7 +2619,7 @@ mod tests {
             branch: branch.to_string(),
             main_repo_path: main_repo.to_string_lossy().into_owned(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: None,
         }
     }
@@ -2673,7 +2673,7 @@ mod tests {
                 base_branch: None,
                 base_branch_override: None,
             }],
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             cleanup_on_delete: true,
         });
         storage
@@ -3430,7 +3430,7 @@ mod tests {
             assert_eq!(result.teardown_started, change == "group after teardown");
             let retained = storage.load().unwrap();
             assert_eq!(retained.len(), 1);
-            assert!(!retained[0].has_fresh_lifecycle_reservation(Utc::now()));
+            assert!(!retained[0].has_fresh_lifecycle_reservation(Timestamp::now()));
             if change.starts_with("group ") {
                 assert_eq!(retained[0].group_path, "peer-group");
             }
@@ -3492,7 +3492,7 @@ mod tests {
         assert_eq!(retained.len(), 1);
         assert!(retained[0].is_structured());
         assert_eq!(retained[0].status, crate::session::Status::Idle);
-        assert!(!retained[0].has_fresh_lifecycle_reservation(Utc::now()));
+        assert!(!retained[0].has_fresh_lifecycle_reservation(Timestamp::now()));
     }
 
     #[test]
@@ -3518,7 +3518,7 @@ mod tests {
                     .try_acquire_lifecycle_reservation(
                         LifecycleOperation::Restore,
                         Instance::LIFECYCLE_RESERVATION_TTL,
-                        Utc::now(),
+                        Timestamp::now(),
                     )
                     .unwrap())
             })
@@ -4041,7 +4041,7 @@ mod tests {
             branch: "retained-branch".into(),
             main_repo_path: alias.to_string_lossy().into_owned(),
             managed_by_aoe: false,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             base_branch: None,
         });
         storage
@@ -4223,7 +4223,7 @@ mod tests {
         stored.workspace_info = Some(crate::session::WorkspaceInfo {
             branch: "work".into(),
             workspace_dir: workspace.to_string_lossy().into_owned(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             cleanup_on_delete: false,
             repos: vec![crate::session::WorkspaceRepo {
                 source_path: repo.to_string_lossy().into_owned(),
@@ -4241,7 +4241,7 @@ mod tests {
             .try_acquire_lifecycle_reservation(
                 LifecycleOperation::Launch,
                 Instance::LIFECYCLE_RESERVATION_TTL,
-                Utc::now(),
+                Timestamp::now(),
             )
             .unwrap();
         storage
@@ -4299,7 +4299,7 @@ mod tests {
             .try_acquire_lifecycle_reservation(
                 LifecycleOperation::Launch,
                 Instance::LIFECYCLE_RESERVATION_TTL,
-                Utc::now(),
+                Timestamp::now(),
             )
             .unwrap();
         let marker = scratch.join("owned");
@@ -4374,7 +4374,7 @@ mod tests {
             .try_acquire_lifecycle_reservation(
                 LifecycleOperation::Launch,
                 Instance::LIFECYCLE_RESERVATION_TTL,
-                Utc::now(),
+                Timestamp::now(),
             )
             .unwrap();
         let marker = scratch.join("owned");
@@ -4439,7 +4439,7 @@ mod tests {
             .try_acquire_lifecycle_reservation(
                 LifecycleOperation::Launch,
                 Instance::LIFECYCLE_RESERVATION_TTL,
-                Utc::now(),
+                Timestamp::now(),
             )
             .unwrap();
         let marker = scratch.join("owned");
@@ -4450,7 +4450,7 @@ mod tests {
             .try_acquire_lifecycle_reservation(
                 LifecycleOperation::Stop,
                 Instance::LIFECYCLE_RESERVATION_TTL,
-                Utc::now(),
+                Timestamp::now(),
             )
             .unwrap();
         storage
@@ -4493,7 +4493,7 @@ mod tests {
         let _guard = crate::session::test_support::isolate_app_dir();
         super::super::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
-        let earlier = Utc::now() - chrono::Duration::minutes(5);
+        let earlier = Timestamp::now() - crate::time::Duration::minutes(5);
         for (profile, same_lifecycle, same_timestamp) in [
             ("purge-stale-force", false, false),
             ("purge-same-clock-force", false, true),
@@ -4503,7 +4503,7 @@ mod tests {
             let mut requested = create_test_instance();
             requested.source_profile = profile.to_string();
             requested.trash();
-            let trashed_at = Utc::now();
+            let trashed_at = Timestamp::now();
             requested.trashed_at = Some(if same_timestamp { trashed_at } else { earlier });
             storage
                 .update(|instances, _| {
@@ -4596,7 +4596,7 @@ mod tests {
         assert!(!result.teardown_started);
         let retained = storage.load().unwrap();
         assert_eq!(retained.len(), 1);
-        assert!(!retained[0].has_fresh_lifecycle_reservation(Utc::now()));
+        assert!(!retained[0].has_fresh_lifecycle_reservation(Timestamp::now()));
 
         let mut retry = retained.into_iter().next().unwrap();
         retry.source_profile = profile.to_string();
@@ -4677,7 +4677,7 @@ mod tests {
         assert!(!result.teardown_started);
         let retained = storage.load().unwrap().remove(0);
         assert!(!retained.same_trash_lifecycle(&selected));
-        assert!(!retained.has_fresh_lifecycle_reservation(Utc::now()));
+        assert!(!retained.has_fresh_lifecycle_reservation(Timestamp::now()));
         assert_eq!(retained.failed_purge_forced(), None);
     }
 
@@ -5223,7 +5223,7 @@ mod tests {
                     base_branch_override: None,
                 })
                 .collect(),
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             cleanup_on_delete: true,
         }
     }
@@ -5508,7 +5508,7 @@ mod tests {
                 branch: "feature/x".to_string(),
                 main_repo_path: temp.path().join("not-a-repo").display().to_string(),
                 managed_by_aoe: true,
-                created_at: chrono::Utc::now(),
+                created_at: crate::time::Timestamp::now(),
                 base_branch: None,
             });
             let store = temp
@@ -5826,7 +5826,7 @@ mod tests {
                 branch: "feature/delete-me".to_string(),
                 main_repo_path: main_repo.to_string_lossy().to_string(),
                 managed_by_aoe: true,
-                created_at: chrono::Utc::now(),
+                created_at: crate::time::Timestamp::now(),
                 base_branch: None,
             });
 
@@ -5921,7 +5921,7 @@ mod tests {
                 branch: "main".to_string(),
                 main_repo_path: bare.to_string_lossy().to_string(),
                 managed_by_aoe: true,
-                created_at: chrono::Utc::now(),
+                created_at: crate::time::Timestamp::now(),
                 base_branch: None,
             });
 
@@ -6044,7 +6044,7 @@ mod tests {
                     branch: "work".into(),
                     workspace_dir: workspace.to_string_lossy().into_owned(),
                     repos: repos.clone(),
-                    created_at: Utc::now(),
+                    created_at: Timestamp::now(),
                     cleanup_on_delete: true,
                 });
                 let mut peer = Instance::new(
@@ -6071,7 +6071,7 @@ mod tests {
                         branch: "work".into(),
                         main_repo_path: repos[0].main_repo_path.clone(),
                         managed_by_aoe: false,
-                        created_at: Utc::now(),
+                        created_at: Timestamp::now(),
                         base_branch: None,
                     });
                 }
@@ -6183,7 +6183,7 @@ mod tests {
                     base_branch: None,
                     base_branch_override: None,
                 }],
-                created_at: chrono::Utc::now(),
+                created_at: crate::time::Timestamp::now(),
                 cleanup_on_delete: true,
             });
 
@@ -6390,7 +6390,7 @@ mod tests {
                 branch: "feature/delete-me".to_string(),
                 main_repo_path: main_repo.to_string_lossy().to_string(),
                 managed_by_aoe: true,
-                created_at: chrono::Utc::now(),
+                created_at: crate::time::Timestamp::now(),
                 base_branch: None,
             });
             let request = DeletionRequest {
@@ -6463,7 +6463,7 @@ mod tests {
                 branch: "feature/keep-me".to_string(),
                 main_repo_path: main_repo.to_string_lossy().to_string(),
                 managed_by_aoe: true,
-                created_at: chrono::Utc::now(),
+                created_at: crate::time::Timestamp::now(),
                 base_branch: None,
             });
 
@@ -6569,7 +6569,7 @@ mod tests {
                 branch: "feature/race-repro".to_string(),
                 main_repo_path: main_repo.to_string_lossy().to_string(),
                 managed_by_aoe: true,
-                created_at: chrono::Utc::now(),
+                created_at: crate::time::Timestamp::now(),
                 base_branch: None,
             });
 
@@ -6664,7 +6664,7 @@ mod tests {
                 branch: branch.to_string(),
                 main_repo_path: main_repo.to_string_lossy().to_string(),
                 managed_by_aoe: true,
-                created_at: chrono::Utc::now(),
+                created_at: crate::time::Timestamp::now(),
                 base_branch: None,
             });
             instance.sandbox_info = Some(SandboxInfo {
@@ -6925,7 +6925,7 @@ mod tests {
                     base_branch: None,
                     base_branch_override: None,
                 }],
-                created_at: chrono::Utc::now(),
+                created_at: crate::time::Timestamp::now(),
                 cleanup_on_delete: true,
             });
             let request = DeletionRequest {
@@ -7141,7 +7141,7 @@ mod tests {
             ),
             (
                 7,
-                row.trashed_at.unwrap() - chrono::Duration::seconds(1),
+                row.trashed_at.unwrap() - crate::time::Duration::seconds(1),
                 row.trash_lifecycle_id.clone().unwrap(),
             ),
             (7, row.trashed_at.unwrap(), uuid::Uuid::new_v4().to_string()),

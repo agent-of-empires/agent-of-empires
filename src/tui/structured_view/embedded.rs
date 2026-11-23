@@ -238,7 +238,7 @@ impl RetainedView {
                     );
                 }
                 if let Some(state) = self.state.as_mut() {
-                    state.transcript.server_rows = snapshot.rows;
+                    state.transcript.set_rows(snapshot.rows);
                 }
                 self.unfinished_outputs = snapshot.unfinished_outputs;
             }
@@ -270,7 +270,7 @@ impl RetainedView {
             .state
             .as_ref()
             .filter(|state| {
-                !state.transcript.server_rows.is_empty() || !self.unfinished_outputs.is_empty()
+                !state.transcript.rows().is_empty() || !self.unfinished_outputs.is_empty()
             })
             .map_or_else(Default::default, |state| {
                 render::wrapped_transcript(
@@ -585,7 +585,7 @@ impl EmbeddedView {
     /// `width` columns, so the home view's selection extraction slices match the
     /// on-screen geometry. Styles are irrelevant to extraction.
     pub fn selection_text(&self, width: u16) -> ratatui::text::Text<'static> {
-        render::wrapped_transcript(
+        render::project_transcript(
             &self.state,
             &crate::tui::styles::Theme::default(),
             width,
@@ -647,11 +647,11 @@ mod retained_tests {
             branch: "retained-paths".into(),
             main_repo_path: main.to_string_lossy().into_owned(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: None,
         });
         let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
-        let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
+        let at = crate::time::Timestamp::from_unix_secs(100).unwrap();
         state
             .acp_event_store
             .record(
@@ -795,7 +795,7 @@ mod retained_tests {
                     message_id: None,
                 },
             );
-            state.transcript.server_rows = model.into_rows();
+            state.transcript.set_rows(model.into_rows());
             let mut view = RetainedView::new(None, &inst);
             view.state = Some(state);
             for width in [8, 32] {
@@ -850,7 +850,7 @@ mod retained_tests {
         let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
         let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
         let mut model = crate::acp::transcript::TranscriptModel::new();
-        let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
+        let at = crate::time::Timestamp::from_unix_secs(100).unwrap();
         model.apply_event(
             1,
             &Event::ToolCallStarted {
@@ -883,7 +883,7 @@ mod retained_tests {
                 async_subagent: false,
             },
         );
-        state.transcript.server_rows = model.into_rows();
+        state.transcript.set_rows(model.into_rows());
         let mut view = RetainedView::new(None, &inst);
         view.state = Some(state);
         assert!(view.rendered_text(80).is_none());
@@ -982,7 +982,7 @@ mod retained_tests {
                 let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
                 let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
                 let mut model = crate::acp::transcript::TranscriptModel::new();
-                let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
+                let at = crate::time::Timestamp::from_unix_secs(100).unwrap();
                 model.apply_event(
                     1,
                     &Event::ToolCallStarted {
@@ -1041,7 +1041,7 @@ mod retained_tests {
                         async_subagent: false,
                     },
                 );
-                state.transcript.server_rows = model.into_rows();
+                state.transcript.set_rows(model.into_rows());
                 let mut view = RetainedView::new(None, &inst);
                 view.state = Some(state);
                 for width in [32, 80] {
@@ -1176,11 +1176,11 @@ mod retained_tests {
                         is_error: failed,
                         content: final_text.into(),
                         output: blocks.clone(),
-                        completed_at: chrono::Utc::now(),
+                        completed_at: crate::time::Timestamp::now(),
                         async_subagent: false,
                     },
                 );
-                state.transcript.server_rows = model.into_rows();
+                state.transcript.set_rows(model.into_rows());
                 let mut view = RetainedView::new(None, &inst);
                 view.state = Some(state);
                 for width in [32, 80] {
@@ -1306,7 +1306,7 @@ mod retained_tests {
                                 kind: "execute".into(),
                                 args_preview: "{}".into(),
                                 prompt: None,
-                                started_at: chrono::Utc::now(),
+                                started_at: crate::time::Timestamp::now(),
                                 parent_tool_call_id: None,
                                 memory_recall: None,
                                 diffs: Vec::new(),
@@ -1399,7 +1399,7 @@ mod retained_tests {
                             kind: "execute".into(),
                             args_preview: "{}".into(),
                             prompt: None,
-                            started_at: chrono::Utc::now(),
+                            started_at: crate::time::Timestamp::now(),
                             parent_tool_call_id: None,
                             memory_recall: None,
                             diffs: Vec::new(),
@@ -1790,7 +1790,7 @@ mod retained_tests {
         );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let mut inst = crate::session::Instance::new("retained", "/tmp");
-        inst.trashed_at = Some(chrono::Utc::now());
+        inst.trashed_at = Some(crate::time::Timestamp::now());
         for id in ["obsolete", "refresh"] {
             inst.id = id.into();
             let mut obsolete = RetainedView::new(Some(endpoint.clone()), &inst);

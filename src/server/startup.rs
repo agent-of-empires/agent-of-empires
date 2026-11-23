@@ -801,6 +801,8 @@ pub(crate) async fn start_server(
         }
     };
 
+    install_mcp_rewriter(plugin_host.clone());
+
     // Telemetry (opt-in, no-op otherwise).
     crate::telemetry::spawn_process_start(crate::telemetry::Surface::Serve);
 
@@ -976,7 +978,7 @@ pub(crate) async fn start_server(
                     );
                 } else {
                     println!(
-                        "Open the localhost URL in a browser. Other devices get 426 until you front aoe with HTTPS, or pass --dangerously-allow-plaintext-remote."
+                        "Open the localhost URL in a browser. Other devices are refused until you front aoe with HTTPS, or pass --dangerously-allow-plaintext-remote."
                     );
                 }
             }
@@ -1632,6 +1634,14 @@ async fn remote_rotation_loop(
     }
 }
 
+/// Always installed, read-only serve included: it still resumes and respawns agents, and with no
+/// host a rewriter fails closed for sessions a hook applies to.
+fn install_mcp_rewriter(plugin_host: Option<std::sync::Arc<crate::plugin::host::PluginHost>>) {
+    crate::acp::mcp_rewrite::set_rewriter(Some(std::sync::Arc::new(
+        crate::plugin::mcp_rewrite::PluginMcpRewriter::new(plugin_host),
+    )));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1737,6 +1747,17 @@ mod tests {
             let n = socket.recv(&mut buf).unwrap();
             assert_eq!(&buf[..n], b"STOPPING=1\n");
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn install_mcp_rewriter_sets_the_slot_without_a_plugin_host() {
+        use crate::acp::mcp_rewrite::test_support::{slot_is_set, SlotGuard};
+
+        let _slot = SlotGuard::clear_on_drop();
+        assert!(!slot_is_set());
+        install_mcp_rewriter(None);
+        assert!(slot_is_set());
     }
 
     /// The sweep fires at its interval, not the next recheck, and a window
@@ -1963,7 +1984,7 @@ mod tests {
                 auth: "auth".into(),
                 owner_token_hash: push::sha256_token("old_token"),
                 user_agent: "UA".into(),
-                created_at: chrono::Utc::now(),
+                created_at: crate::time::Timestamp::now(),
                 generation: 0,
                 origin: "https://aoe.example.test".into(),
             })

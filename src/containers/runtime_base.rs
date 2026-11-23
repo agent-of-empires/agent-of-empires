@@ -114,10 +114,16 @@ impl RuntimeBase {
         cgroup_probe: Some(("{{.CgroupDriver}} {{.SecurityOptions}}", "name=rootless")),
         supported_run_flags: ALL_RUN_FLAGS,
         not_found_markers: &["no such container"],
-        daemon_down_markers: &["Cannot connect to the Docker daemon"],
-        // Scoped to "docker daemon socket" so unrelated permission errors are not misclassified.
+        // Older CLIs say "daemon", current ones "API".
+        daemon_down_markers: &[
+            "Cannot connect to the Docker daemon",
+            "failed to connect to the docker API",
+        ],
+        // Scoped to the daemon connection (older CLIs say "daemon socket", current ones "API")
+        // so unrelated permission errors are not misclassified.
         permission_denied_markers: &[
             "permission denied while trying to connect to the docker daemon socket",
+            "permission denied while trying to connect to the docker api",
         ],
     };
 
@@ -176,6 +182,26 @@ impl RuntimeBase {
         self.permission_denied_markers
             .iter()
             .any(|m| lower.contains(m))
+    }
+
+    /// A failed pull's socket problem. Only a daemon-down marker or a permission error that
+    /// names the socket qualifies: the broad permission markers alone could match a registry
+    /// refusal, which must stay a failed pull. Podman's socket-permission stderr also carries
+    /// its daemon-down marker, so permission wins there.
+    pub fn pull_socket_error(&self, stderr: &str) -> Option<DockerError> {
+        let lower = stderr.to_lowercase();
+        let names_socket = self.is_permission_denied(stderr)
+            && ["socket", ".sock", "connect to the docker api"]
+                .iter()
+                .any(|name| lower.contains(name));
+        if !self.is_daemon_down(stderr) && !names_socket {
+            return None;
+        }
+        Some(if self.is_permission_denied(stderr) {
+            DockerError::PermissionDenied
+        } else {
+            DockerError::DaemonNotRunning
+        })
     }
 
     pub fn is_not_found(&self, stderr: &str) -> bool {
@@ -386,6 +412,9 @@ impl RuntimeBase {
                 stderr_summary = %stderr.trim().chars().take(200).collect::<String>(),
                 "image pull failed"
             );
+            if let Some(error) = self.pull_socket_error(&stderr) {
+                return Err(error);
+            }
             return Err(DockerError::ImagePullFailed {
                 runtime: self.name,
                 image: image.to_string(),
@@ -402,17 +431,6 @@ impl RuntimeBase {
             "image pull completed"
         );
         Ok(())
-    }
-
-    pub fn default_sandbox_image(&self) -> &'static str {
-        "ghcr.io/agent-of-empires/aoe-sandbox:latest"
-    }
-
-    pub fn effective_default_image(&self) -> String {
-        crate::session::Config::load()
-            .ok()
-            .map(|c| c.sandbox.default_image)
-            .unwrap_or_else(|| self.default_sandbox_image().to_string())
     }
 
     pub fn build_create_args(
@@ -1029,6 +1047,86 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_pull_tells_a_socket_permission_error_from_a_stopped_daemon() {
+        let kind = |error: Option<DockerError>| match error {
+            None => "pull_failed".to_string(),
+            Some(DockerError::DaemonNotRunning) => "daemon_down".to_string(),
+            Some(DockerError::PermissionDenied) => "permission_denied".to_string(),
+            Some(other) => format!("other:{other}"),
+        };
+        for (base, stderr, expected) in [
+            (
+                &PODMAN,
+                "Error: unable to connect to Podman socket: Connection refused",
+                "daemon_down",
+            ),
+            (
+                &PODMAN,
+                "Error: unable to connect to Podman socket: dial unix \
+                 /run/user/1000/podman/podman.sock: connect: permission denied",
+                "permission_denied",
+            ),
+            (
+                &DOCKER,
+                "Cannot connect to the Docker daemon at unix:///var/run/docker.sock.",
+                "daemon_down",
+            ),
+            (
+                &DOCKER,
+                "failed to connect to the docker API at unix:///var/run/docker.sock; check if \
+                 the path is correct and if the daemon is running: dial unix \
+                 /var/run/docker.sock: connect: no such file or directory",
+                "daemon_down",
+            ),
+            // Docker's own wording has no daemon-down marker.
+            (
+                &DOCKER,
+                "permission denied while trying to connect to the Docker daemon socket at \
+                 unix:///var/run/docker.sock: Post \"http://%2Fvar%2Frun%2Fdocker.sock/v1.47/images/create\"",
+                "permission_denied",
+            ),
+            // The current CLI names the API endpoint, with `.sock` but not "socket".
+            (
+                &DOCKER,
+                "permission denied while trying to connect to the docker API at \
+                 unix:///var/run/docker.sock",
+                "permission_denied",
+            ),
+            (
+                &APPLE,
+                "Error: permission denied accessing container socket",
+                "permission_denied",
+            ),
+            (
+                &DOCKER,
+                "Error response from daemon: pull access denied for example/img, repository does \
+                 not exist or may require 'docker login': denied: requested access to the \
+                 resource is denied",
+                "pull_failed",
+            ),
+            (
+                &DOCKER,
+                "Error response from daemon: Get \"https://registry.example/v2/\": permission \
+                 denied by registry policy",
+                "pull_failed",
+            ),
+            // A registry refusal is a failed pull, never a socket problem.
+            (
+                &PODMAN,
+                "Error: initializing source docker://example/img:1: permission denied by registry",
+                "pull_failed",
+            ),
+        ] {
+            assert_eq!(
+                kind(base.pull_socket_error(stderr)),
+                expected,
+                "{}: {stderr}",
+                base.name
+            );
+        }
+    }
+
+    #[test]
     fn stderr_markers_do_not_bleed_across_runtimes() {
         let runtimes = [&DOCKER, &PODMAN, &APPLE];
         let daemon_down = [
@@ -1052,6 +1150,9 @@ mod tests {
         assert!(runtimes
             .iter()
             .all(|base| base.is_permission_denied(docker_pd)));
+        assert!(DOCKER.is_permission_denied(
+            "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock"
+        ));
         let podman_only = "Error: unable to connect to Podman socket: connect: permission denied";
         assert!(!DOCKER.is_permission_denied(podman_only));
         assert!(PODMAN.is_permission_denied(podman_only));

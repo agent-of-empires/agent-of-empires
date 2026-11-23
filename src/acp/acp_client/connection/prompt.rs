@@ -119,8 +119,12 @@ struct Turn {
 
 impl Turn {
     fn apply(&mut self, signal: LifecycleSignal) {
-        self.watchdog
-            .apply_signal(signal, Instant::now(), chrono::Utc::now(), self.cfg);
+        self.watchdog.apply_signal(
+            signal,
+            Instant::now(),
+            crate::time::Timestamp::now(),
+            self.cfg,
+        );
     }
 
     fn start_cancel_grace(&mut self, deadline: Instant) {
@@ -437,8 +441,10 @@ impl Session {
         let shared = &self.shared;
         match result {
             Err(error) => {
-                let captured =
-                    captured_rate_limit_reset(&shared.rate_limit_rejections, chrono::Utc::now());
+                let captured = captured_rate_limit_reset(
+                    &shared.rate_limit_rejections,
+                    crate::time::Timestamp::now(),
+                );
                 // A marker only in the text used to park through the
                 // connection error path, which a rejection no longer takes.
                 return classify_rate_limit_error(error, captured.clone())
@@ -449,7 +455,7 @@ impl Session {
         }
         let info = take_rate_limit_from_captured_rejection(
             &shared.rate_limit_rejections,
-            chrono::Utc::now(),
+            crate::time::Timestamp::now(),
         )?;
         info!(
             target: "acp.protocol",
@@ -471,8 +477,8 @@ impl Session {
             }
             *current = Some(deadline);
         }
-        let escalates_at =
-            chrono::Utc::now() + chrono::Duration::from_std(CANCEL_ESCALATION_GRACE).unwrap();
+        let escalates_at = crate::time::Timestamp::now()
+            + crate::time::Duration::try_from(CANCEL_ESCALATION_GRACE).unwrap();
         self.shared
             .emit(Event::CancelRequested { escalates_at })
             .await;

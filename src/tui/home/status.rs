@@ -137,13 +137,21 @@ impl HomeView {
     }
 
     pub fn connect_runtime(&mut self) {
+        self.connect_runtime_prepared(None);
+    }
+
+    /// Connects the sidebar feed, reusing a connection startup already opened.
+    pub(in crate::tui) fn connect_runtime_prepared(
+        &mut self,
+        prepared: Option<crate::tui::session_feed::Prepared>,
+    ) {
         self.session_feed_reload_retry_at = None;
         self.session_feed_failed_cursor = None;
         self.canonical_metadata_lag = None;
         self.pending_created_attach = None;
         self.set_sidebar_source(crate::tui::session_feed::SidebarSource::Connecting, None);
         self.session_feed
-            .connect(self.active_profile.clone().unwrap_or_default());
+            .connect_prepared(self.active_profile.clone().unwrap_or_default(), prepared);
     }
 
     /// The Daemon state the footer's R entry and the Connections hub surface. None while
@@ -220,9 +228,6 @@ impl HomeView {
         }
         self.runtime_failure_reason = reason.map(str::to_owned);
         self.sidebar_source = source;
-        if source == SidebarSource::Daemon {
-            self.project_registry_authoritative = true;
-        }
         if source != SidebarSource::Daemon {
             self.pending_created_attach = None;
             self.cancel_native_attachment();
@@ -617,10 +622,7 @@ impl HomeView {
                     &mut instance.idle_dormant_since,
                 ),
             ] {
-                *current = raw
-                    .map(chrono::DateTime::parse_from_rfc3339)
-                    .transpose()?
-                    .map(|stamp| stamp.with_timezone(&chrono::Utc));
+                *current = raw.map(crate::time::Timestamp::parse_rfc3339).transpose()?;
             }
             next.insert(row.id.clone(), instance);
         }

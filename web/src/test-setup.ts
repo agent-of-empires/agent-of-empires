@@ -1,6 +1,9 @@
 import "fake-indexeddb/auto";
-import { afterEach } from "vitest";
+import { afterEach, vi } from "vitest";
 import { cleanup } from "@testing-library/react";
+
+// Feature-use pings would interleave with fetch sequences that tests assert on.
+vi.mock("./lib/featureUse", () => ({ reportFeatureUse: vi.fn() }));
 
 // Unmount after each test so React work can't fire after jsdom teardown.
 afterEach(() => {

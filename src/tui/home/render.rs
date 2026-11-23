@@ -1,6 +1,6 @@
 //! Rendering for HomeView
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
@@ -28,8 +28,8 @@ use crate::tui::styles::{has_min_contrast, Theme};
 
 /// Derive a frame offset from a session's creation timestamp so that
 /// sessions started at different times show visually distinct spinner positions.
-fn session_offset(created_at: &DateTime<Utc>) -> usize {
-    created_at.timestamp_millis() as usize
+fn session_offset(created_at: &Timestamp) -> usize {
+    created_at.as_millis() as usize
 }
 
 /// Build the list-pane title. `prefix` is the leading label ("aoe", "Terminals",
@@ -404,21 +404,21 @@ fn clamp_scroll_to_capture(
     scroll_offset.min(real_max)
 }
 
-fn spinner_running(created_at: &DateTime<Utc>) -> &'static str {
+fn spinner_running(created_at: &Timestamp) -> &'static str {
     spinners::dots()
         .set_interval(Duration::from_millis(220))
         .offset(session_offset(created_at))
         .current_frame()
 }
 
-fn spinner_waiting(created_at: &DateTime<Utc>) -> &'static str {
+fn spinner_waiting(created_at: &Timestamp) -> &'static str {
     spinners::orbit()
         .set_interval(Duration::from_millis(400))
         .offset(session_offset(created_at))
         .current_frame()
 }
 
-fn spinner_starting(created_at: &DateTime<Utc>) -> &'static str {
+fn spinner_starting(created_at: &Timestamp) -> &'static str {
     spinners::breathe()
         .set_interval(Duration::from_millis(180))
         .offset(session_offset(created_at))
@@ -428,10 +428,7 @@ fn spinner_starting(created_at: &DateTime<Utc>) -> &'static str {
 /// Slow `breathe` rattle for a freshly-stopped Idle session, the same animation as
 /// Starting but slower and colored `theme.fresh_idle`, so it reads as a gentle reminder.
 /// The phase offset uses `idle_entered_at` so sessions don't all sync to one frame.
-fn spinner_idle_fresh(
-    created_at: &DateTime<Utc>,
-    idle_entered_at: Option<DateTime<Utc>>,
-) -> &'static str {
+fn spinner_idle_fresh(created_at: &Timestamp, idle_entered_at: Option<Timestamp>) -> &'static str {
     let offset_ts = idle_entered_at.unwrap_or(*created_at);
     spinners::breathe()
         .set_interval(Duration::from_millis(280))
@@ -439,8 +436,8 @@ fn spinner_idle_fresh(
         .current_frame()
 }
 
-/// Structured view row icon for a session. Centralizes the archive/snooze override that
-/// kills the live spinner for sunk rows so the list reads as parked. Crate-visible so
+/// Structured view row icon for a session. Centralizes the archive/snooze/ignore override
+/// that kills the live spinner for sunk rows so the list reads as parked. Crate-visible so
 /// tests can pin the override without the full render pipeline.
 pub(crate) fn agent_row_icon(inst: &crate::session::Instance) -> &'static str {
     // A dormant (idle-reaped, resumable) structured worker gets its own glyph, taking
@@ -464,7 +461,7 @@ pub(crate) fn agent_row_icon(inst: &crate::session::Instance) -> &'static str {
     if matches!(inst.status, Status::Error | Status::Deleting) {
         return icon;
     }
-    if inst.is_archived() || inst.is_snoozed() || inst.is_trashed() {
+    if inst.is_archived() || inst.is_snoozed() || inst.is_ignored() || inst.is_trashed() {
         ICON_STOPPED
     } else {
         icon
@@ -518,9 +515,9 @@ fn decorate_row(
         // is the textual cue, so this is a dim color with no italic modifier.
         icon = sunk_icon;
         style = Style::default().fg(theme.dimmed);
-    } else if in_attention && inst.is_snoozed() {
-        // Snooze decoration is Attention-only; elsewhere the row paints its real state
-        // and the timer keeps running.
+    } else if in_attention && (inst.is_snoozed() || inst.is_ignored()) {
+        // Snooze and ignore decoration is Attention-only; elsewhere the row paints its
+        // real state. Ignored rows stay present and live, unlike archive and trash.
         icon = sunk_icon;
         style = Style::default()
             .fg(theme.dimmed)
@@ -535,12 +532,15 @@ fn decorate_row(
             .add_modifier(Modifier::RAPID_BLINK);
     }
 
-    // Prefix priority: archive (none) > snooze (`z `) > urgent (`! `). Both are
-    // Attention-only so other sorts show no decoration for state the user did not opt into.
+    // Prefix priority: archive (none) > snooze (`z `) > ignore (`i `) > urgent (`! `).
+    // Snooze, ignore and urgent are Attention-only so other sorts show no decoration
+    // for state the user did not opt into.
     let title_text = if inst.is_archived() || inst.is_trashed() {
         Cow::Owned(inst.title.clone())
     } else if in_attention && inst.is_snoozed() {
         Cow::Owned(format!("z {}", inst.title))
+    } else if in_attention && inst.is_ignored() {
+        Cow::Owned(format!("i {}", inst.title))
     } else if in_attention && inst.is_urgent() {
         Cow::Owned(format!("! {}", inst.title))
     } else {
@@ -696,12 +696,17 @@ pub(crate) fn compute_row_tag(
     }
 }
 
+/// A single-repo branch tag that only repeats the session title is dropped.
 fn branch_row_tag(inst: &crate::session::Instance) -> Option<RowTag> {
     if let Some(ws) = &inst.workspace_info {
+        if ws.repos.len() <= 1 && ws.branch == inst.title {
+            return None;
+        }
         workspace_branch_row_tag(&ws.branch, ws.repos.len())
     } else {
         inst.worktree_info
             .as_ref()
+            .filter(|w| w.branch != inst.title)
             .and_then(|w| plain_branch_row_tag(&w.branch))
     }
 }
@@ -784,12 +789,12 @@ pub(crate) fn profile_short_code(profile: &str) -> String {
 
 /// Format a timestamp as a compact relative age (`3m`, `2h`, `4d`, `2mo`), empty for
 /// `None` so callers can substitute unconditionally.
-fn format_relative_age(ts: Option<DateTime<Utc>>) -> String {
+fn format_relative_age(ts: Option<Timestamp>) -> String {
     let Some(ts) = ts else {
         return String::new();
     };
-    let now = Utc::now();
-    let secs = (now - ts).num_seconds();
+    let now = Timestamp::now();
+    let secs = (now - ts).whole_seconds();
     if secs <= 0 {
         return "<1m".to_string();
     }
@@ -815,8 +820,8 @@ fn format_relative_age(ts: Option<DateTime<Utc>>) -> String {
 /// Format a remaining snooze as a compact countdown that fits `LAST_ACTIVITY_SLOT` (`23m`,
 /// `1h`, `5d`), falling back to `<1m` so a sub-minute remainder reads as "about to wake".
 /// The validator caps at 30 days, which the day branch covers.
-fn format_snooze_remaining(delta: chrono::Duration) -> String {
-    let secs = delta.num_seconds();
+fn format_snooze_remaining(delta: crate::time::Duration) -> String {
+    let secs = delta.whole_seconds();
     if secs < 60 {
         return "<1m".to_string();
     }
@@ -2061,6 +2066,7 @@ impl HomeView {
                             let unread_resting = crate::session::unread_enabled()
                                 && inst.is_unread()
                                 && !inst.is_archived()
+                                && !inst.is_ignored()
                                 && !inst.is_snoozed()
                                 && matches!(inst.status, Status::Idle | Status::Unknown);
                             let color = if is_shown_dormant && !unread_resting {
@@ -5437,15 +5443,15 @@ mod tests {
 
     #[test]
     fn format_relative_age_buckets() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let cases = [
             (None, ""),
-            (Some(now + chrono::Duration::hours(1)), "<1m"),
-            (Some(now - chrono::Duration::seconds(30)), "<1m"),
-            (Some(now - chrono::Duration::minutes(5)), "5m"),
-            (Some(now - chrono::Duration::hours(3)), "3h"),
-            (Some(now - chrono::Duration::days(7)), "7d"),
-            (Some(now - chrono::Duration::days(60)), "2mo"),
+            (Some(now + crate::time::Duration::hours(1)), "<1m"),
+            (Some(now - crate::time::Duration::seconds(30)), "<1m"),
+            (Some(now - crate::time::Duration::minutes(5)), "5m"),
+            (Some(now - crate::time::Duration::hours(3)), "3h"),
+            (Some(now - crate::time::Duration::days(7)), "7d"),
+            (Some(now - crate::time::Duration::days(60)), "2mo"),
         ];
         for (ts, expected) in cases {
             assert_eq!(format_relative_age(ts), expected, "{ts:?}");
@@ -5630,7 +5636,7 @@ mod tests {
 
     #[test]
     fn row_age_only_on_resting_or_snoozed_rows() {
-        let five_min_ago = Some(Utc::now() - chrono::Duration::minutes(5));
+        let five_min_ago = Some(Timestamp::now() - crate::time::Duration::minutes(5));
         let mut inst = crate::session::Instance::new("a", "/tmp/a");
         inst.idle_entered_at = five_min_ago;
         inst.last_accessed_at = five_min_ago;
@@ -5696,6 +5702,24 @@ mod tests {
             rendered_width(&rendered),
             BRANCH_TAG_WIDTH + 2,
             "a wide branch name must cap at the tag contract, got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn branch_row_tag_is_dropped_when_it_repeats_the_title() {
+        let mut inst = crate::session::Instance::new("feat/x", "/tmp/a");
+        inst.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "feat/x".into(),
+            main_repo_path: "/tmp".into(),
+            managed_by_aoe: true,
+            created_at: crate::time::Timestamp::now(),
+            base_branch: None,
+        });
+        assert!(branch_row_tag(&inst).is_none());
+        inst.title = "Teutons".into();
+        assert_eq!(
+            branch_row_tag(&inst).map(|tag| tag.content),
+            Some("x".into())
         );
     }
 

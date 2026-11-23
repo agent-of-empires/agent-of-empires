@@ -12,7 +12,7 @@
 //! `docs/plans/web-push-notifications.md`.
 
 use crate::session::Status;
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -30,7 +30,7 @@ pub struct StatusChange {
     pub effective_profile: String,
     pub old: Status,
     pub new: Status,
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
     /// Puts back the status a failed Retry's `Starting` replaced, rather than reporting a new one.
     pub restores_prior: bool,
 }
@@ -70,7 +70,7 @@ fn publish_committed(
             effective_profile: inst.effective_profile(),
             old,
             new: inst.status,
-            at: Utc::now(),
+            at: Timestamp::now(),
             restores_prior,
         },
     );
@@ -92,7 +92,7 @@ pub fn publish_new_failure(
             effective_profile: inst.effective_profile(),
             old: Status::Error,
             new: Status::Error,
-            at: Utc::now(),
+            at: Timestamp::now(),
             restores_prior: false,
         },
     );
@@ -152,7 +152,7 @@ const TEST_DELAY_MS: u64 = 3_000;
 pub struct VapidKeypairFile {
     pub private_pem: String,
     pub public_b64url: String,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 pub struct VapidKeypair {
@@ -245,7 +245,7 @@ impl VapidKeypair {
         let file = VapidKeypairFile {
             private_pem: self.private_pem.clone(),
             public_b64url: self.public_b64url.clone(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         };
         let body = serde_json::to_string_pretty(&file)?;
 
@@ -276,7 +276,7 @@ pub struct Subscription {
     /// current (or grace-period) token.
     pub owner_token_hash: [u8; 32],
     pub user_agent: String,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Monotonic counter for optimistic-lock GC: the send path snapshots
     /// the generation before sending; the GC path removes only if the
     /// counter still matches. Prevents wiping a freshly re-subscribed
@@ -303,8 +303,8 @@ pub struct SubscriptionStore {
 /// Most recent delivery results for one endpoint, reported by `/api/push/status`.
 #[derive(Clone, Default, Serialize, Debug, PartialEq)]
 pub struct DeliveryRecord {
-    pub last_success_at: Option<DateTime<Utc>>,
-    pub last_failure_at: Option<DateTime<Utc>>,
+    pub last_success_at: Option<Timestamp>,
+    pub last_failure_at: Option<Timestamp>,
     pub last_failure: Option<&'static str>,
 }
 
@@ -330,7 +330,7 @@ impl SubscriptionStore {
     pub fn record_delivery(&self, endpoint: &str, outcome: super::push_send::SendOutcome) {
         let mut map = self.delivery.lock().unwrap_or_else(|e| e.into_inner());
         let rec = map.entry(endpoint.to_string()).or_default();
-        let now = Utc::now();
+        let now = Timestamp::now();
         if outcome == super::push_send::SendOutcome::Delivered {
             rec.last_success_at = Some(now);
         } else {
@@ -1378,7 +1378,7 @@ pub async fn subscribe(
         auth: body.keys.auth,
         owner_token_hash: auth.0,
         user_agent,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         generation: 0,
         origin,
     };
@@ -1605,7 +1605,7 @@ mod tests {
             auth: "auth".into(),
             owner_token_hash: [1u8; 32],
             user_agent: "UA".into(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             generation: 0,
             origin: "http://localhost:8080".into(),
         };
@@ -1640,7 +1640,7 @@ mod tests {
                 auth: "auth".into(),
                 owner_token_hash: [1u8; 32],
                 user_agent: "UA".into(),
-                created_at: Utc::now(),
+                created_at: Timestamp::now(),
                 generation: 0,
                 origin: String::new(),
             };
@@ -1682,7 +1682,7 @@ mod tests {
             auth: "auth".into(),
             owner_token_hash: hash,
             user_agent: "UA".into(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             generation: 0,
             origin: "http://localhost:8080".into(),
         };
@@ -1721,7 +1721,7 @@ mod tests {
             auth: "auth".into(),
             owner_token_hash: [owner; 32],
             user_agent: "UA".into(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             generation: 0,
             origin: "http://localhost:8080".into(),
         };
@@ -1758,7 +1758,7 @@ mod tests {
             auth: "auth".into(),
             owner_token_hash: [1u8; 32],
             user_agent: "UA".into(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             generation: 0,
             origin: "http://localhost:8080".into(),
         };
@@ -1848,7 +1848,7 @@ mod tests {
             auth: "auth".into(),
             owner_token_hash: [1u8; 32],
             user_agent: "UA".into(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             generation: 0,
             origin: "http://localhost:42041".into(),
         };
@@ -1866,7 +1866,7 @@ mod tests {
             auth: "auth".into(),
             owner_token_hash: [1u8; 32],
             user_agent: "UA".into(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             generation: 0,
             origin: "https://aoe.example.com/".into(),
         };
@@ -1884,7 +1884,7 @@ mod tests {
             auth: "auth".into(),
             owner_token_hash: [1u8; 32],
             user_agent: "UA".into(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             generation: 0,
             origin: String::new(),
         };
@@ -1905,7 +1905,7 @@ mod tests {
                 effective_profile: "default".into(),
                 old: Status::Running,
                 new: Status::Waiting,
-                at: Utc::now(),
+                at: Timestamp::now(),
                 restores_prior: false,
             },
         );
@@ -1922,7 +1922,7 @@ mod tests {
                 effective_profile: "default".into(),
                 old: Status::Waiting,
                 new: Status::Running,
-                at: Utc::now(),
+                at: Timestamp::now(),
                 restores_prior: false,
             },
         );
@@ -1940,7 +1940,7 @@ mod tests {
             effective_profile: "default".into(),
             old,
             new,
-            at: Utc::now(),
+            at: Timestamp::now(),
             restores_prior,
         };
         let watch = crate::server::state::WebWatch::Nothing;
@@ -1994,7 +1994,7 @@ mod tests {
             effective_profile: "default".into(),
             old,
             new,
-            at: Utc::now(),
+            at: Timestamp::now(),
             restores_prior: false,
         };
         let watch = crate::server::state::WebWatch::Nothing;
@@ -2068,7 +2068,7 @@ mod tests {
             effective_profile: "default".into(),
             old: Status::Running,
             new,
-            at: Utc::now(),
+            at: Timestamp::now(),
             restores_prior: false,
         };
 
@@ -2165,7 +2165,7 @@ mod tests {
                 effective_profile: "default".into(),
                 old: Status::Running,
                 new: Status::Waiting,
-                at: Utc::now(),
+                at: Timestamp::now(),
                 restores_prior: false,
             },
         );
@@ -2178,7 +2178,7 @@ mod tests {
                 effective_profile: "default".into(),
                 old: Status::Waiting,
                 new: Status::Stopped,
-                at: Utc::now(),
+                at: Timestamp::now(),
                 restores_prior: false,
             },
         );

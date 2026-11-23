@@ -53,6 +53,8 @@ export interface SessionResponse {
   /** Web pin time; `pinned_at != null` is the pinned state. */
   pinned_at?: string | null;
   archived_at?: string | null;
+  /** Ignored because another session manages it; distinct from archive and trash. */
+  ignored_at?: string | null;
   /** Null once the snooze expires, so any non-null value is an active snooze. */
   snoozed_until?: string | null;
   trashed_at?: string | null;
