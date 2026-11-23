@@ -74,8 +74,12 @@ const supportsFieldSizing = typeof CSS !== "undefined" && CSS.supports("field-si
 /** JS grow-to-cap fallback; a no-op where CSS `field-sizing: content` sizes the textarea. */
 export function fitTextareaFallback(el: HTMLTextAreaElement, supported = supportsFieldSizing) {
   if (supported) return;
+  // Collapsing to measure would grow the transcript viewport and clamp its scrollTop, stranding a pinned transcript short of the bottom.
+  const parent = el.parentElement;
+  if (parent) parent.style.minHeight = `${parent.offsetHeight}px`;
   el.style.height = "auto";
   el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+  if (parent) parent.style.minHeight = "";
 }
 
 /** Replace the value the way a keystroke would. The native setter bypasses React's
