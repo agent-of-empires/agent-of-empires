@@ -364,8 +364,10 @@ pub(crate) fn normalize_mapping(
         ));
     }
     let mut stored: Vec<String> = Vec::with_capacity(paths.len());
+    let registered = prepare::Resolver::new(registered);
     for path in paths {
-        let project = resolve_path(registered, path)
+        let project = registered
+            .path(path)
             .ok_or_else(|| format!("{path:?} is not exactly one registered project"))?;
         if stored.contains(&project.path) {
             return Err(format!("{path:?} is listed twice"));

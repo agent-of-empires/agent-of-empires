@@ -2,6 +2,7 @@
 //! expansion and project resolution.
 
 use super::*;
+use std::cell::RefCell;
 
 /// Why `prepare` refused an item.
 #[derive(Debug, PartialEq, Eq)]
@@ -55,37 +56,65 @@ fn expand(template: &str, variables: &BTreeMap<String, String>) -> Result<String
     Ok(out)
 }
 
-/// The registered project `wanted` names, by exact path or name. An absolute
-/// path that matches a project beats a project merely named like it. Zero or
-/// several matches resolve to nothing: a project is never guessed.
-fn resolve_hint(projects: &[Project], wanted: &str) -> Option<Project> {
-    let mut hits = if std::path::Path::new(wanted).is_absolute() {
-        by_path(projects, wanted)
-    } else {
-        Vec::new()
-    };
-    if hits.is_empty() {
-        hits = projects.iter().filter(|p| p.name == wanted).collect();
-    }
-    match hits[..] {
-        [only] => Some(only.clone()),
-        _ => None,
-    }
+/// The registered projects with their canonical paths, canonicalized once so
+/// each resolution is a lookup rather than a syscall chain per project.
+pub(crate) struct Resolver<'a> {
+    projects: &'a [Project],
+    keys: Vec<String>,
+    wanted: RefCell<HashMap<String, String>>,
 }
 
-fn by_path<'a>(projects: &'a [Project], path: &str) -> Vec<&'a Project> {
-    let key = projects::canonical_key(path);
-    projects
-        .iter()
-        .filter(|p| projects::canonical_key(&p.path) == key)
-        .collect()
-}
+impl<'a> Resolver<'a> {
+    pub(crate) fn new(projects: &'a [Project]) -> Self {
+        Self {
+            projects,
+            keys: projects
+                .iter()
+                .map(|p| projects::canonical_key(&p.path))
+                .collect(),
+            wanted: RefCell::default(),
+        }
+    }
 
-/// The registered project at exactly `path`, never matched by name.
-pub(super) fn resolve_path(projects: &[Project], path: &str) -> Option<Project> {
-    match by_path(projects, path)[..] {
-        [only] => Some(only.clone()),
-        _ => None,
+    fn by_path(&self, path: &str) -> Vec<&'a Project> {
+        let key = self
+            .wanted
+            .borrow_mut()
+            .entry(path.to_string())
+            .or_insert_with(|| projects::canonical_key(path))
+            .clone();
+        self.projects
+            .iter()
+            .zip(&self.keys)
+            .filter_map(|(p, k)| (*k == key).then_some(p))
+            .collect()
+    }
+
+    /// The registered project at exactly `path`, never matched by name.
+    pub(super) fn path(&self, path: &str) -> Option<Project> {
+        match self.by_path(path)[..] {
+            [only] => Some(only.clone()),
+            _ => None,
+        }
+    }
+
+    /// The registered project `wanted` names, by exact path or name. An
+    /// absolute path that matches a project beats a project merely named like
+    /// it. Zero or several matches resolve to nothing: a project is never
+    /// guessed.
+    fn hint(&self, wanted: &str) -> Option<Project> {
+        let mut hits = if std::path::Path::new(wanted).is_absolute() {
+            self.by_path(wanted)
+        } else {
+            Vec::new()
+        };
+        if hits.is_empty() {
+            hits = self.projects.iter().filter(|p| p.name == wanted).collect();
+        }
+        match hits[..] {
+            [only] => Some(only.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -93,26 +122,23 @@ pub(super) fn resolve_path(projects: &[Project], path: &str) -> Option<Project> 
 /// path resolves supplies both; otherwise the provider's `hint` applies and an
 /// extra is never promoted to primary.
 fn resolve_projects(
-    registered: &[Project],
+    registered: &Resolver,
     hint: Option<&str>,
     mapped: Option<&[String]>,
 ) -> (Option<Project>, Vec<Project>) {
     let from_mapping = mapped
         .and_then(|paths| paths.split_first())
         .and_then(|(first, rest)| {
-            let primary = resolve_path(registered, first)?;
+            let primary = registered.path(first)?;
             let extras = rest
                 .iter()
-                .filter_map(|path| resolve_path(registered, path))
+                .filter_map(|path| registered.path(path))
                 .collect();
             Some((primary, extras))
         });
     match from_mapping {
         Some((primary, extras)) => (Some(primary), extras),
-        None => (
-            hint.and_then(|wanted| resolve_hint(registered, wanted)),
-            Vec::new(),
-        ),
+        None => (hint.and_then(|wanted| registered.hint(wanted)), Vec::new()),
     }
 }
 
@@ -153,13 +179,14 @@ pub(crate) fn attach_projects(mappings: &Mappings, snapshot: &mut Value, registe
     let Some(items) = snapshot["items"].as_array_mut() else {
         return;
     };
+    let registered = Resolver::new(registered);
     for item in items {
         let provider_id = item["provider_id"].as_str().unwrap_or_default().to_string();
         let mapped = item["mapping_key"]
             .as_str()
             .and_then(|key| mappings.get(&(provider_id, key.to_string())));
         let (project, _) = resolve_projects(
-            registered,
+            &registered,
             item["project"].as_str(),
             mapped.map(Vec::as_slice),
         );
@@ -279,7 +306,8 @@ pub(crate) fn prepare(
     };
     let registered = projects::load_merged(profile)
         .map_err(|error| PrepareRefusal::Registry(error.to_string()))?;
-    let (project, extras) = resolve_projects(&registered, item.project.as_deref(), mapped);
+    let (project, extras) =
+        resolve_projects(&Resolver::new(&registered), item.project.as_deref(), mapped);
     let effective = preset
         .cloned()
         .unwrap_or_else(|| default_preset(&project_config(profile, project.as_ref())));
@@ -561,19 +589,40 @@ mod tests {
             Project::new("target", "/tmp/aoe-by-path", scope),
         ];
         assert_eq!(
-            resolve_hint(&registered, "/tmp/aoe-by-path").unwrap().name,
+            Resolver::new(&registered)
+                .hint("/tmp/aoe-by-path")
+                .unwrap()
+                .name,
             "target"
         );
         assert_eq!(
-            resolve_hint(&registered, "target").unwrap().path,
+            Resolver::new(&registered).hint("target").unwrap().path,
             "/tmp/aoe-by-path"
         );
         let named_only = [Project::new("/tmp/aoe-by-name", "/tmp/aoe-x", scope)];
         assert_eq!(
-            resolve_hint(&named_only, "/tmp/aoe-by-name").unwrap().path,
+            Resolver::new(&named_only)
+                .hint("/tmp/aoe-by-name")
+                .unwrap()
+                .path,
             "/tmp/aoe-x",
             "a path that names no project still falls back to the name"
         );
+    }
+
+    #[test]
+    fn a_path_is_canonicalized_once_however_many_items_ask() {
+        let registered = [Project::new(
+            "api",
+            "/tmp/aoe-api",
+            projects::ProjectScope::Global,
+        )];
+        let resolver = Resolver::new(&registered);
+        for _ in 0..3 {
+            assert_eq!(resolver.path("/tmp/aoe-api").unwrap().name, "api");
+            assert_eq!(resolver.hint("/tmp/aoe-api").unwrap().name, "api");
+        }
+        assert_eq!(resolver.wanted.borrow().len(), 1);
     }
 
     #[test]
