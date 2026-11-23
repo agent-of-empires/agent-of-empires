@@ -1853,7 +1853,16 @@ async fn send_prompt_now(
 ) {
     use crate::acp::client::http::PromptDispositionWire;
     state.in_flight = true;
-    match state.http.prompt(&state.session_id, text, false).await {
+    match state
+        .http
+        .prompt(
+            &state.session_id,
+            text,
+            false,
+            crate::daemon::PromptOrigin::Tui,
+        )
+        .await
+    {
         Ok(dispatch) => match dispatch.disposition {
             PromptDispositionWire::Queued => {
                 // A queued prompt starts no turn, so nothing will clear the
@@ -2091,7 +2100,7 @@ where
 
 #[cfg(test)]
 pub(crate) fn approval_update_for_test(nonce: &str, seq: u64) -> WsMessage {
-    let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
+    let at = crate::time::Timestamp::from_unix_secs(100).unwrap();
     WsMessage::ReducedState {
         seq,
         unchanged: Vec::new(),

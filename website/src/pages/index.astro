@@ -34,7 +34,7 @@ const compactFeatures = [
   {
     n: '05',
     title: 'Structured View',
-    description: 'Mobile-first native rendering of agent state via the Agent Client Protocol. Plan panels, tool-call cards, swipe-to-approve.',
+    description: 'Mobile-first native rendering of agent state via the Agent Client Protocol. Plan panels, tool-call cards, tap-to-approve cards with hold-to-confirm for destructive actions.',
   },
   {
     n: '06',
@@ -54,7 +54,7 @@ const compactFeatures = [
   {
     n: '09',
     title: 'tmux Persistence',
-    description: 'Sessions persist in tmux. Close aoe anytime and your agents keep running.',
+    description: 'Terminal sessions live in tmux and structured sessions run under a persistent worker. Close aoe anytime and your agents keep running.',
   },
 ];
 
@@ -111,7 +111,7 @@ const agents = ['Claude Code', 'Codex', 'OpenCode', 'Gemini CLI', 'Mistral Vibe'
           <img
             id="demo-img"
             src="/assets/demo.gif"
-            alt="Agent of Empires TUI showing session management with Claude Code, git worktree creation, and Docker container status indicators"
+            alt="Agent of Empires TUI: creating a Claude Code session and prompting it in live mode"
             class="block w-full"
             width="960"
             height="576"
@@ -119,9 +119,9 @@ const agents = ['Claude Code', 'Codex', 'OpenCode', 'Gemini CLI', 'Mistral Vibe'
           >
         </div>
         <p class="mt-4 font-mono text-xs text-gray-500">
-          Same live sessions, two front-ends:
-          <a href="/tui/" class="text-brand-400 hover:text-brand-300">the TUI</a>
-          and
+          Same live sessions, two front-ends:{' '}
+          <a href="/tui/" class="text-brand-400 hover:text-brand-300">the TUI</a>{' '}
+          and{' '}
           <a href="/web/" class="text-brand-400 hover:text-brand-300">the web dashboard</a>.
         </p>
         <p class="mt-2 text-sm text-gray-400">

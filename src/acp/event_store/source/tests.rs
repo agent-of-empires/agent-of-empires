@@ -138,7 +138,7 @@ fn retained_source_preserves_byte_offsets_identity_and_private_metadata() {
                 prompt: "prompt".into(),
                 model: "model".into(),
                 output_file: "/private/agent/transcript.jsonl".into(),
-                started_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+                started_at: crate::time::Timestamp::from_unix_secs(1_700_000_000).unwrap(),
                 workflow: None,
             },
         )
@@ -285,7 +285,7 @@ async fn malformed_retained_events_preserve_valid_output_and_report_incompletene
     instance.trash();
     let session = instance.id.clone();
     let state = crate::server::test_support::build_test_app_state(vec![instance]);
-    let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
+    let at = crate::time::Timestamp::from_unix_secs(100).unwrap();
     let events = [
         Event::ToolCallStarted {
             tool_call: ToolCall {

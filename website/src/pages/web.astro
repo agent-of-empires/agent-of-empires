@@ -9,9 +9,9 @@ const features = [
   { n: '01', title: 'Real terminal in the browser', description: 'A full terminal streamed over WebSocket renders the same session in the page, not a screenshot or a summary.' },
   { n: '02', title: 'Installable PWA', description: 'Add to home screen on iOS or install in Chrome on desktop. It behaves like a native app once installed.' },
   { n: '03', title: 'Remote phone access', description: 'Press R and open the Web dashboard to expose it over HTTPS with QR pairing via Tailscale Funnel or Cloudflare Tunnel.' },
-  { n: '04', title: 'Structured view', description: 'Mobile-first native rendering of agent state via the Agent Client Protocol: plan panels, tool-call cards, swipe-to-approve.' },
+  { n: '04', title: 'Structured view', description: 'Mobile-first native rendering of agent state via the Agent Client Protocol: plan panels, tool-call cards, tap-to-approve cards with hold-to-confirm for destructive actions.' },
   { n: '05', title: 'Token auth', description: 'Token-based authentication by default, with persisted login sessions so signed-in devices survive a daemon restart.' },
-  { n: '06', title: 'Read-only mode', description: 'Hand out a view-only link so a teammate can watch a session live without being able to type into it.' },
+  { n: '06', title: 'Read-only mode', description: 'Start the dashboard with --read-only to watch every session live. Nobody connected can type, prompt or change anything.' },
 ];
 ---
 
@@ -33,7 +33,7 @@ const features = [
       </h1>
       <p class="text-lg md:text-xl text-gray-300 max-w-2xl leading-relaxed mb-8">
         A real terminal in the page, installable as a PWA, and pairable to your phone over HTTPS. The web
-        dashboard is a first-class front-end to Agent of Empires, driving the very same live sessions as the
+        dashboard is a first-class front-end to Agent of Empires, driving the very same live sessions as the{' '}
         <a href="/tui/" class="text-brand-400 hover:text-brand-300">keyboard-driven TUI</a>.
       </p>
       <InstallInline class="mb-5" />

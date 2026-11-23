@@ -52,8 +52,9 @@ fn trash_reader_never_opens_links_from_previous_pane() {
         env.view.preview_link_at(PANE.x, PANE.y),
         Some("https://example.com/old".into())
     );
-    env.view
-        .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+    env.view.mutate_instance(&id, |inst| {
+        inst.trashed_at = Some(crate::time::Timestamp::now())
+    });
     assert_eq!(env.view.preview_link_at(PANE.x, PANE.y), None);
 }
 

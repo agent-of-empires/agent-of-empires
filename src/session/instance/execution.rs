@@ -4345,7 +4345,7 @@ sandbox = "unsupported"
                             manifest.as_bytes(),
                         ),
                         capabilities: Vec::new(),
-                        granted_at: chrono::Utc::now(),
+                        granted_at: crate::time::Timestamp::now(),
                     }),
                     ..Default::default()
                 },

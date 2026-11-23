@@ -1,6 +1,6 @@
 //! `TranscriptModel`: the server-side render model for the structured-view transcript.
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use super::elicitations::ElicitationAnswer;
@@ -34,7 +34,7 @@ pub struct TranscriptRow<
     pub id: Text,
     pub group_id: Text,
     pub kind: TranscriptRowKind,
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
     pub text: Text,
     /// Set on tool-lifecycle rows so a client pairs a completion with its start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -211,10 +211,9 @@ mod tests {
     use crate::acp::state::test_support::{chunk, prompt, stopped};
     use crate::acp::state::{DiffPreview, MemoryRecall};
     use crate::daemon::PromptAttachmentKind;
-    use chrono::TimeZone;
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(secs, 0).single().expect("valid ts")
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_unix_secs(secs).expect("valid ts")
     }
 
     fn tool(id: &str, name: &str) -> ToolCall {
@@ -553,6 +552,7 @@ mod tests {
             prompt_id: None,
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let mut m = TranscriptModel::new();
         let deltas = m.apply_event(3, &with_attachment);
@@ -576,6 +576,7 @@ mod tests {
                     prompt_id: prompt_id.map(Into::into),
                     synthesized: false,
                     origin_plugin: None,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 },
             );
             assert_eq!(m.rows()[0].id, want, "prompt_id={prompt_id:?}");
@@ -591,6 +592,7 @@ mod tests {
                 prompt_id: Some("q1".into()),
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
         );
         assert_eq!(m.rows()[0].id, "q1");
@@ -604,6 +606,7 @@ mod tests {
             prompt_id: Some("q1".into()),
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let deltas = m.apply_event(9, &retry);
         assert!(matches!(deltas.as_slice(), [TranscriptDelta::Patch { id, .. }] if id == "q1"));
@@ -649,6 +652,7 @@ mod tests {
             prompt_id: None,
             synthesized: true,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let mut m = TranscriptModel::new();
         let deltas = m.apply_event(1, &ev);
@@ -663,6 +667,7 @@ mod tests {
             prompt_id: None,
             synthesized: false,
             origin_plugin: Some("cron".into()),
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let mut m = TranscriptModel::new();
         m.apply_event(1, &ev);

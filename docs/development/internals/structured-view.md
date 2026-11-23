@@ -427,6 +427,10 @@ Profiles are conservative: an unverified tool surface is omitted rather than gue
 - Approval nonces are server-generated and single-use, so a compromised agent cannot synthesize one. `AOE_TOKEN` is not forwarded to the agent subprocess.
 - **Sandboxed sessions** wrap the agent argv in `docker exec` while the daemon stays on the host, and `fs/*` paths are translated from container to host before the inside-roots check. Translation covers the workspace mounts only, so config, credential, and `extra_volumes` mounts are rejected. The image must bundle the ACP adapters, or the handshake exits with status 127.
 
+## Prompt origin
+
+`UserPromptSent.origin` records where a prompt entered AoE: `dashboard`, `tui`, `cli`, `mcp`, `plugin`, `aoe` (daemon-generated turns) or `unknown`. HTTP clients self-identify with the `X-Aoe-Prompt-Origin` header and the daemon accepts only `dashboard`, `tui` and `cli` from it, never from a body. It is provenance, not proof that a human was present, and `unknown` (missing, forged or pre-origin data) must be treated as untrusted.
+
 ## Global tuning (`[acp]`)
 
 ```toml

@@ -70,7 +70,7 @@ thiserror = "2.0"
 anyhow = "1.0"
 
 # Time handling
-chrono = { version = "0.4", features = ["serde"] }
+time = { version = "0.3.55", features = ["parsing"] }
 
 # UUID generation
 uuid = { version = "1.23", features = ["v4", "serde"] }
@@ -191,7 +191,7 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["r
 # escape the intended root.
 cap-std = "4.0.2"
 rmcp = { version = "3.5.1", features = ["transport-streamable-http-server"] }
-schemars = { version = "1", features = ["chrono04"] }
+schemars = "1"
 
 # Unix-only: O_NOFOLLOW for capability-safe filesystem operations.
 [target.'cfg(unix)'.dependencies]

@@ -313,7 +313,7 @@ mod tests {
             branch: "work".into(),
             main_repo_path: live_alias.to_str().unwrap().into(),
             managed_by_aoe: false,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: None,
         });
         let protection = CleanupProtection::new(&owners).unwrap();

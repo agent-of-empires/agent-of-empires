@@ -545,6 +545,55 @@ pub struct EnsureToolBody {
 }
 
 #[cfg(test)]
+mod prompt_origin_tests {
+    use super::*;
+    use crate::acp::state::Event;
+
+    #[test]
+    fn data_without_a_known_origin_decodes_as_unknown() {
+        let event = |extra: &str| -> Event {
+            serde_json::from_str(&format!(r#"{{"UserPromptSent":{{"text":"hi"{extra}}}}}"#))
+                .unwrap()
+        };
+        let row = |extra: &str| -> QueuedPromptEntry {
+            serde_json::from_str(&format!(
+                r#"{{"id":"q","seq":0,"text":"hi","created_at":"t"{extra}}}"#
+            ))
+            .unwrap()
+        };
+        for extra in ["", r#","origin":"from_a_newer_daemon""#] {
+            assert!(matches!(
+                event(extra),
+                Event::UserPromptSent {
+                    origin: PromptOrigin::Unknown,
+                    ..
+                }
+            ));
+            assert_eq!(row(extra).origin, PromptOrigin::Unknown);
+        }
+        assert_eq!(row(r#","origin":"cli""#).origin, PromptOrigin::Cli);
+        assert!(!serde_json::to_string(&row("")).unwrap().contains("origin"));
+    }
+
+    #[test]
+    fn http_accepts_only_the_three_client_origins() {
+        let cases = [
+            (Some("dashboard"), PromptOrigin::Dashboard),
+            (Some("tui"), PromptOrigin::Tui),
+            (Some("cli"), PromptOrigin::Cli),
+            (Some("mcp"), PromptOrigin::Unknown),
+            (Some("plugin"), PromptOrigin::Unknown),
+            (Some("aoe"), PromptOrigin::Unknown),
+            (Some("Dashboard"), PromptOrigin::Unknown),
+            (None, PromptOrigin::Unknown),
+        ];
+        for (header, want) in cases {
+            assert_eq!(PromptOrigin::from_header_value(header), want, "{header:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod legacy_tool_body_tests {
     use super::*;
 
@@ -689,7 +738,7 @@ pub struct DeleteSessionBody {
     pub cleanup_intent: Option<crate::session::deletion::CleanupIntent>,
     /// Consent is bound to the trash lifecycle selected by the client.
     #[serde(default)]
-    pub expected_trashed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub expected_trashed_at: Option<crate::time::Timestamp>,
     #[serde(default)]
     pub expected_trash_lifecycle_id: Option<String>,
     #[serde(default)]
@@ -860,6 +909,52 @@ impl PromptAttachmentKind {
     }
 }
 
+/// Where a prompt entered AoE. Self-identified HTTP provenance or a daemon-assigned
+/// source, never proof that a human was present. Treat `Unknown` as untrusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptOrigin {
+    Dashboard,
+    Tui,
+    Cli,
+    Mcp,
+    Plugin,
+    /// AoE itself: a wake-up, continuation or other daemon-generated turn.
+    Aoe,
+    /// Missing, forged or pre-origin data. Also catches values a newer daemon wrote.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl PromptOrigin {
+    pub fn is_unknown(&self) -> bool {
+        *self == Self::Unknown
+    }
+
+    /// Request header the dashboard, TUI and CLI identify themselves with.
+    pub const HEADER: &'static str = "x-aoe-prompt-origin";
+
+    /// The origin a client may claim over HTTP. Anything else is `Unknown`.
+    pub fn from_header_value(value: Option<&str>) -> Self {
+        match value {
+            Some("dashboard") => Self::Dashboard,
+            Some("tui") => Self::Tui,
+            Some("cli") => Self::Cli,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn as_header_value(self) -> Option<&'static str> {
+        match self {
+            Self::Dashboard => Some("dashboard"),
+            Self::Tui => Some("tui"),
+            Self::Cli => Some("cli"),
+            _ => None,
+        }
+    }
+}
+
 /// Metadata only: the blob is fetched lazily from `GET /acp/attachments/{id}` so the event
 /// log stays small.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -896,6 +991,9 @@ pub struct QueuedPromptEntry {
     /// Plugin that queued this through `sessions.message.send`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_plugin: Option<String>,
+    /// Where it was queued from, assigned by the daemon.
+    #[serde(default, skip_serializing_if = "PromptOrigin::is_unknown")]
+    pub origin: PromptOrigin,
 }
 
 /// Ephemeral worker lifecycle; never persisted to the event log.

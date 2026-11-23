@@ -2,7 +2,7 @@
 
 use crate::daemon::PromptAttachmentRef;
 use crate::session::Status;
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -89,7 +89,7 @@ pub struct ToolCall<
     /// The `prompt` argument in full, set only when `args_preview` was cut.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<Text>,
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
     /// The sub-agent `Task` call this call runs under, from `_meta.claudeCode.parentToolUseId`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_tool_call_id: Option<Text>,
@@ -115,7 +115,7 @@ pub struct DiffPreview {
     pub path: String,
     pub old_text: Option<String>,
     pub new_text: Option<String>,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 /// One renderable block of a tool call's completion, bridged from ACP `ToolCallContent`.
@@ -157,14 +157,14 @@ pub enum ToolOutputBlock {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThinkingSignal {
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RateLimitInfo {
     pub status: String,
     /// When the quota window clears, if the agent reported it.
-    pub resets_at: Option<DateTime<Utc>>,
+    pub resets_at: Option<Timestamp>,
     pub kind: String,
 }
 
@@ -206,7 +206,7 @@ pub struct AgentSwitchInfo {
     pub from: String,
     pub to: String,
     pub reason: String,
-    pub switched_at: DateTime<Utc>,
+    pub switched_at: Timestamp,
 }
 
 /// The agent's last-reported context-window usage and cumulative cost.
@@ -499,7 +499,7 @@ pub struct WorkflowRunRecord {
     #[serde(default)]
     pub finished: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ended_at: Option<DateTime<Utc>>,
+    pub ended_at: Option<Timestamp>,
 }
 
 /// Finished shells kept for the Background panel's Recent group.
@@ -511,9 +511,9 @@ pub struct BackgroundShellRecord {
     pub task_id: String,
     pub command: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<DateTime<Utc>>,
+    pub started_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ended_at: Option<DateTime<Utc>>,
+    pub ended_at: Option<Timestamp>,
     #[serde(default)]
     pub finished: bool,
 }
@@ -594,10 +594,10 @@ pub struct BackgroundAgentTool {
     pub ok: Option<bool>,
     /// Transcript timestamp of the call; `None` when the line carried none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<DateTime<Utc>>,
+    pub started_at: Option<Timestamp>,
     /// Transcript timestamp of the matching result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ended_at: Option<DateTime<Utc>>,
+    pub ended_at: Option<Timestamp>,
 }
 
 /// One async background sub-agent, built up from `BackgroundAgent*` events.
@@ -612,9 +612,9 @@ pub struct BackgroundAgentRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<WorkflowRef>,
     pub status: BackgroundAgentStatus,
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ended_at: Option<DateTime<Utc>>,
+    pub ended_at: Option<Timestamp>,
     #[serde(default)]
     pub tool_count: u32,
     #[serde(default)]
@@ -725,7 +725,7 @@ pub struct AcpState {
     pub compaction_tool_id: Option<String>,
 
     pub last_seq: u64,
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 #[derive(Debug, Error)]
@@ -789,8 +789,8 @@ pub enum Event {
         /// Structured completion blocks (images, audio, resources, text).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         output: Vec<ToolOutputBlock>,
-        #[serde(default = "chrono::Utc::now")]
-        completed_at: DateTime<Utc>,
+        #[serde(default = "crate::time::Timestamp::now")]
+        completed_at: Timestamp,
         #[serde(default)]
         async_subagent: bool,
     },
@@ -809,7 +809,7 @@ pub enum Event {
         #[serde(default)]
         prompt: Option<String>,
         #[serde(default)]
-        started_at: Option<DateTime<Utc>>,
+        started_at: Option<Timestamp>,
         /// Replaces the call's diffs when present (Codex sends them on updates).
         #[serde(default)]
         diffs: Option<Vec<DiffPreview>>,
@@ -852,7 +852,7 @@ pub enum Event {
     },
     /// Auto-resume breadcrumb; `manual` when the user pressed RESUME NOW.
     RateLimitAutoResumed {
-        resets_at: DateTime<Utc>,
+        resets_at: Timestamp,
         #[serde(default)]
         manual: bool,
     },
@@ -910,7 +910,7 @@ pub enum Event {
         output_file: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workflow: Option<WorkflowRef>,
-        started_at: DateTime<Utc>,
+        started_at: Timestamp,
     },
     /// Throttled snapshot of a running background sub-agent.
     BackgroundAgentProgress {
@@ -923,7 +923,7 @@ pub enum Event {
         last_tool: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         last_text: Option<String>,
-        at: DateTime<Utc>,
+        at: Timestamp,
     },
     /// Terminal state for a background sub-agent.
     BackgroundAgentCompleted {
@@ -935,12 +935,12 @@ pub enum Event {
         result: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         warning: Option<String>,
-        ended_at: DateTime<Utc>,
+        ended_at: Timestamp,
     },
     /// A subagent session was announced or its snapshot changed.
     SubagentUpdated {
         subagent: SubagentRecord,
-        at: DateTime<Utc>,
+        at: Timestamp,
     },
     /// A background task that is not a sub-agent (Bash `run_in_background`, or
     /// a `Workflow` run) started, from the tool result's `toolResponse`. Its
@@ -954,13 +954,13 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workflow: Option<WorkflowLaunch>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        started_at: Option<DateTime<Utc>>,
+        started_at: Option<Timestamp>,
     },
     /// A background task reached a terminal state.
     BackgroundTaskFinished {
         task_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        ended_at: Option<DateTime<Utc>>,
+        ended_at: Option<Timestamp>,
     },
     /// The adapter runtime failed a prompt before emitting any transcript.
     PromptRuntimeError {
@@ -981,7 +981,7 @@ pub enum Event {
     },
     /// aoe sent `session/cancel` and armed the escalation watchdog.
     CancelRequested {
-        escalates_at: DateTime<Utc>,
+        escalates_at: Timestamp,
     },
     Stopped {
         reason: String,
@@ -1024,6 +1024,12 @@ pub enum Event {
         /// text was not typed by the user.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_plugin: Option<String>,
+        /// Where the prompt entered AoE. `Unknown` on events recorded before it existed.
+        #[serde(
+            default,
+            skip_serializing_if = "crate::daemon::PromptOrigin::is_unknown"
+        )]
+        origin: crate::daemon::PromptOrigin,
     },
     PromptCapabilities {
         image: bool,
@@ -1066,7 +1072,7 @@ pub enum Event {
     },
     /// The agent called the Claude SDK's `ScheduleWakeup` tool.
     WakeupScheduled {
-        at: DateTime<Utc>,
+        at: Timestamp,
         reason: Option<String>,
     },
     /// The agent armed the Claude SDK's `Monitor` tool.
@@ -1110,7 +1116,7 @@ impl AcpState {
             session_id,
             agent,
             model,
-            updated_at: Utc::now(),
+            updated_at: Timestamp::now(),
             ..Self::default()
         }
     }
@@ -1127,7 +1133,7 @@ impl AcpState {
     }
 
     /// Task ids can be reused, so only the run still open on `task_id` closes.
-    fn close_workflow_run(&mut self, task_id: &str, ended_at: Option<DateTime<Utc>>) {
+    fn close_workflow_run(&mut self, task_id: &str, ended_at: Option<Timestamp>) {
         if let Some(run) = self
             .workflow_runs
             .iter_mut()
@@ -1266,7 +1272,7 @@ impl AcpState {
             }
             Event::ThinkingStarted | Event::AgentThoughtChunk { .. } => {
                 self.thinking = Some(ThinkingSignal {
-                    started_at: Utc::now(),
+                    started_at: Timestamp::now(),
                 });
                 self.turn_active = true;
                 self.sidebar_phase = SidebarPhase::Active;
@@ -1526,7 +1532,7 @@ impl AcpState {
             | Event::MonitorArmed { .. } => {}
         }
         self.last_seq = seq;
-        self.updated_at = Utc::now();
+        self.updated_at = Timestamp::now();
         Ok(self.last_seq)
     }
 
@@ -1610,7 +1616,7 @@ impl AcpState {
             from,
             to,
             reason,
-            switched_at: Utc::now(),
+            switched_at: Timestamp::now(),
         });
     }
 
@@ -1625,7 +1631,7 @@ impl AcpState {
     /// The RFD snapshot is authoritative for the async agent that child
     /// belongs to, so it replaces the transcript tailer's heuristics and,
     /// unlike them, may reopen an idle agent that was messaged again.
-    fn apply_subagent(&mut self, subagent: SubagentRecord, at: DateTime<Utc>) {
+    fn apply_subagent(&mut self, subagent: SubagentRecord, at: Timestamp) {
         if let Some(tool_call_id) = subagent.parent_tool_call_id.as_deref() {
             if let Some(agent) = self
                 .background_agents
@@ -1654,7 +1660,7 @@ impl AcpState {
 
 impl BackgroundAgentRecord {
     /// Folds a child's RFD snapshot in; `at` stamps a newly ended agent.
-    fn reconcile(&mut self, child: &SubagentRecord, at: DateTime<Utc>) {
+    fn reconcile(&mut self, child: &SubagentRecord, at: Timestamp) {
         let (status, ended) = match child.state {
             SubagentState::Running => (BackgroundAgentStatus::Running, false),
             SubagentState::RequiresAction => (BackgroundAgentStatus::RequiresAction, false),
@@ -1689,6 +1695,7 @@ pub(crate) mod test_support {
             attachments: Vec::new(),
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         }
     }
 
@@ -1739,7 +1746,7 @@ mod tests {
             name: "shell".into(),
             kind: "execute".into(),
             args_preview: "{}".into(),
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             parent_tool_call_id: None,
             memory_recall: None,
             diffs: Vec::new(),
@@ -1753,7 +1760,7 @@ mod tests {
             description: None,
             tool_call_id: None,
             questions: Vec::new(),
-            requested_at: Utc::now(),
+            requested_at: Timestamp::now(),
             resolved: None,
         };
         let launched = || Event::BackgroundAgentLaunched {
@@ -1763,7 +1770,7 @@ mod tests {
             prompt: "do it".into(),
             model: "claude-opus-4-8".into(),
             output_file: "/tmp/bg-1.output".into(),
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             workflow: None,
         };
         let completed = |status| Event::BackgroundAgentCompleted {
@@ -1772,7 +1779,7 @@ mod tests {
             tools: Vec::new(),
             result: None,
             warning: None,
-            ended_at: Utc::now(),
+            ended_at: Timestamp::now(),
         };
         let startup_error = || Event::startup_error("boom");
         let assigned = || Event::AcpSessionAssigned {
@@ -2115,7 +2122,7 @@ mod tests {
 
     fn cancel() -> Event {
         Event::CancelRequested {
-            escalates_at: Utc::now(),
+            escalates_at: Timestamp::now(),
         }
     }
 
@@ -2126,7 +2133,7 @@ mod tests {
             name: "Read".into(),
             kind: "read".into(),
             args_preview: "{}".into(),
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             parent_tool_call_id: None,
             memory_recall: None,
             diffs: Vec::new(),
@@ -2138,7 +2145,7 @@ mod tests {
             path: path.into(),
             old_text: None,
             new_text: Some("new".into()),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         }
     }
 
@@ -2291,7 +2298,7 @@ mod tests {
             is_error,
             content: String::new(),
             output: Vec::new(),
-            completed_at: Utc::now(),
+            completed_at: Timestamp::now(),
             async_subagent: false,
         };
         assert!(
@@ -2361,7 +2368,7 @@ mod tests {
         // A rate-limit park ends on a live prompt, session, or organic stop.
         assert!(applied([rate_limit()]).rate_limit.is_some());
         let resumed = Event::RateLimitAutoResumed {
-            resets_at: Utc::now(),
+            resets_at: Timestamp::now(),
             manual: false,
         };
         assert!(
@@ -2405,7 +2412,7 @@ mod tests {
             is_error: false,
             content: String::new(),
             output: Vec::new(),
-            completed_at: Utc::now(),
+            completed_at: Timestamp::now(),
             async_subagent: false,
         };
         assert!(applied([Event::ToolCallStarted {
@@ -2495,7 +2502,7 @@ mod tests {
                 description: None,
                 tool_call_id: Some(tool_call_id.into()),
                 questions: Vec::new(),
-                requested_at: Utc::now(),
+                requested_at: Timestamp::now(),
                 resolved: None,
             },
         };
@@ -2524,7 +2531,7 @@ mod tests {
             tools,
             last_tool: Some("Read".into()),
             last_text: None,
-            at: Utc::now(),
+            at: Timestamp::now(),
         };
         let mut s = applied([
             Event::BackgroundAgentLaunched {
@@ -2534,7 +2541,7 @@ mod tests {
                 prompt: "do the thing".into(),
                 model: "claude-opus-4-8".into(),
                 output_file: "/tmp/a1.output".into(),
-                started_at: Utc::now(),
+                started_at: Timestamp::now(),
                 workflow: None,
             },
             progress(
@@ -2566,7 +2573,7 @@ mod tests {
                 tools: vec![],
                 result: Some("done".into()),
                 warning: None,
-                ended_at: Utc::now(),
+                ended_at: Timestamp::now(),
             },
         )
         .unwrap();
@@ -2609,7 +2616,7 @@ mod tests {
             prompt: "do the thing".into(),
             model: "claude-opus-4-8".into(),
             output_file: "/tmp/a1.output".into(),
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             workflow: None,
         }
     }
@@ -2629,7 +2636,7 @@ mod tests {
                 model: None,
                 background: false,
             },
-            at: Utc::now(),
+            at: Timestamp::now(),
         }
     }
 
@@ -2756,7 +2763,7 @@ mod tests {
             tools: vec![],
             last_tool: None,
             last_text: None,
-            at: Utc::now(),
+            at: Timestamp::now(),
         }
     }
 
@@ -2767,7 +2774,7 @@ mod tests {
             tools: vec![],
             result: None,
             warning: None,
-            ended_at: Utc::now(),
+            ended_at: Timestamp::now(),
         }
     }
 
@@ -2896,7 +2903,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let ended_at: Option<DateTime<Utc>> = "2026-10-30T10:01:00Z".parse().ok();
+        let ended_at = Timestamp::parse_rfc3339("2026-10-30T10:01:00Z").ok();
         let mut s = applied([workflow("wfx", "toolu_a"), workflow("wfy", "toolu_b")]);
         assert_eq!(
             runs(&s),

@@ -1,11 +1,11 @@
 use std::io;
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use pulldown_cmark::disk::{Cursor, TextRef};
 
 use super::{invalid, Context};
 
-pub(super) fn read(context: &Context, value: TextRef) -> io::Result<DateTime<Utc>> {
+pub(super) fn read(context: &Context, value: TextRef) -> io::Result<Timestamp> {
     let source = context.spool.view(value)?;
     let mut cursor = Cursor::new(&source, 0..value.len)?;
     let mut normalized = [0u8; 256];
@@ -57,7 +57,7 @@ pub(super) fn read(context: &Context, value: TextRef) -> io::Result<DateTime<Utc
         }
     }
     let text = std::str::from_utf8(&normalized[..length]).map_err(io::Error::other)?;
-    text.parse::<DateTime<Utc>>()
+    Timestamp::parse_rfc3339(text)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 

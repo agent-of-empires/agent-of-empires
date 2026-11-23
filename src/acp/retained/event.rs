@@ -1,6 +1,6 @@
 use std::io;
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use pulldown_cmark::disk::TextRef;
 
 use super::json::{Kind, ValueRef};
@@ -71,10 +71,10 @@ impl<'a> Object<'a> {
             .map(|value| self.context.list(value))
             .transpose()
     }
-    fn date(&self, name: &str) -> io::Result<DateTime<Utc>> {
+    fn date(&self, name: &str) -> io::Result<Timestamp> {
         super::date::read(self.context, self.text(name)?)
     }
-    fn optional_date(&self, name: &str) -> io::Result<Option<DateTime<Utc>>> {
+    fn optional_date(&self, name: &str) -> io::Result<Option<Timestamp>> {
         self.optional_text(name)?
             .map(|value| super::date::read(self.context, value))
             .transpose()
@@ -150,7 +150,7 @@ impl Context {
             self.check_output(output)?;
             let completed_at = match self.property(object.value, "completed_at")? {
                 Some(value) => super::date::read(self, self.text(value)?)?,
-                None => Utc::now(),
+                None => Timestamp::now(),
             };
             return Ok(View::ToolCallCompleted {
                 tool_call_id: object.text("tool_call_id")?,

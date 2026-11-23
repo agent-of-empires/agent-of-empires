@@ -1,6 +1,6 @@
 use std::{convert::Infallible, fmt};
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 
 use super::event::View;
 use super::storage::{
@@ -714,7 +714,7 @@ impl<B: Backend> Core<B> {
         title: Option<B::Input<'a>>,
         args: Option<B::Input<'a>>,
         prompt: Option<B::Input<'a>>,
-        started_at: Option<DateTime<Utc>>,
+        started_at: Option<Timestamp>,
         diffs: Option<B::DiffsInput<'a>>,
     ) -> Result<B::Changes, B::Error> {
         let terminal = self
@@ -732,7 +732,7 @@ impl<B: Backend> Core<B> {
             title,
             args,
             prompt,
-            started_at.unwrap_or_else(Utc::now),
+            started_at.unwrap_or_else(Timestamp::now),
             diffs,
         )?;
         if !synthesized.is_empty() {
@@ -780,7 +780,7 @@ impl<B: Backend> Core<B> {
         name: Option<B::Input<'a>>,
         args: Option<B::Input<'a>>,
         prompt: Option<B::Input<'a>>,
-        started_at: DateTime<Utc>,
+        started_at: Timestamp,
         diffs: Option<B::DiffsInput<'a>>,
     ) -> Result<B::Changes, B::Error> {
         if self.find_tool_start(id)?.is_some() {
@@ -861,7 +861,7 @@ impl<B: Backend> Core<B> {
     }
 
     fn sweep_open_tools(&mut self, seq: u64, emit_rows: bool) -> Result<B::Changes, B::Error> {
-        let now = emit_rows.then(Utc::now);
+        let now = emit_rows.then(Timestamp::now);
         let mut changes = self.backend.changes();
         let mut after = None;
         loop {
@@ -954,7 +954,7 @@ impl<B: Backend> Core<B> {
             id,
             group_id,
             kind,
-            at: Utc::now(),
+            at: Timestamp::now(),
             text,
             tool_call_id: None,
             tool: None,

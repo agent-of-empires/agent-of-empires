@@ -26,8 +26,8 @@ fn project(
     let (projection, invocations) = model.into_projection().unwrap();
     (context, projection, invocations)
 }
-fn at() -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::from_timestamp(100, 0).unwrap()
+fn at() -> crate::time::Timestamp {
+    crate::time::Timestamp::from_unix_secs(100).unwrap()
 }
 
 #[test]

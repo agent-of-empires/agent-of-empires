@@ -35,7 +35,8 @@ pub(super) fn wakeup_event_from_raw(raw_input: &serde_json::Value) -> Option<Eve
         return None;
     }
     let delay_ms = (delay_secs * 1000.0).clamp(0.0, i64::MAX as f64) as i64;
-    let Some(at) = chrono::Utc::now().checked_add_signed(chrono::Duration::milliseconds(delay_ms))
+    let Some(at) =
+        crate::time::Timestamp::now().checked_add(crate::time::Duration::milliseconds(delay_ms))
     else {
         warn!(
             target: "acp.protocol.wakeup",
@@ -111,7 +112,7 @@ pub(super) fn background_task_started_from_value(v: &serde_json::Value) -> Optio
             tool_call_id,
             description: String::new(),
             workflow: None,
-            started_at: Some(chrono::Utc::now()),
+            started_at: Some(crate::time::Timestamp::now()),
         }),
         // The task tailer needs the tool call id to recognise the run's end.
         "Workflow" if str_field("status") == Some("async_launched") && tool_call_id.is_some() => {
@@ -126,7 +127,7 @@ pub(super) fn background_task_started_from_value(v: &serde_json::Value) -> Optio
                     summary: str_field("summary").map(str::to_string),
                     transcript_dir: str_field("transcriptDir").unwrap_or_default().to_string(),
                 }),
-                started_at: Some(chrono::Utc::now()),
+                started_at: Some(crate::time::Timestamp::now()),
             })
         }
         _ => None,
@@ -150,7 +151,7 @@ pub(super) fn background_task_stopped_from_value(v: &serde_json::Value) -> Optio
     }
     Some(Event::BackgroundTaskFinished {
         task_id: tr.get("task_id")?.as_str()?.to_string(),
-        ended_at: Some(chrono::Utc::now()),
+        ended_at: Some(crate::time::Timestamp::now()),
     })
 }
 
@@ -185,7 +186,7 @@ pub(super) fn background_agent_launched_from_value(v: &serde_json::Value) -> Opt
         prompt: str_field("prompt"),
         model: str_field("resolvedModel"),
         output_file: str_field("outputFile"),
-        started_at: chrono::Utc::now(),
+        started_at: crate::time::Timestamp::now(),
         workflow: None,
     })
 }
@@ -341,7 +342,7 @@ mod tests {
             ("negative", serde_json::json!({ "delaySeconds": -1.0 })),
             // JSON has no infinity literal, so it arrives as a numeric string.
             ("non-finite", serde_json::json!({ "delaySeconds": "inf" })),
-            // Finite, but past the range chrono can add to `now`.
+            // Finite, but past the range `Timestamp` can add to `now`.
             ("overflowing", serde_json::json!({ "delaySeconds": 1e18 })),
         ] {
             assert!(
@@ -351,10 +352,10 @@ mod tests {
         }
 
         // The numeric-string fallback is unique to this layer.
-        let before = chrono::Utc::now();
+        let before = crate::time::Timestamp::now();
         match wakeup_event_from_raw(&serde_json::json!({ "delaySeconds": "600" })) {
             Some(Event::WakeupScheduled { at, .. }) => {
-                let delta = (at - before).num_seconds();
+                let delta = (at - before).whole_seconds();
                 assert!((600..660).contains(&delta), "expected ~600s, got {delta}s");
             }
             other => panic!("expected WakeupScheduled, got {other:?}"),

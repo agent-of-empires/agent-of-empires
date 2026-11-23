@@ -639,7 +639,7 @@ fn collect_rows(
         .map(|i| InstanceRow {
             id: i.id.clone(),
             title: i.title.clone(),
-            created_at_epoch: i.created_at.timestamp().max(0) as u64,
+            created_at_epoch: i.created_at.as_unix_secs().max(0) as u64,
         })
         .collect();
 
@@ -792,7 +792,7 @@ fn detail_row(profile: &str, profile_explicit: bool, identifier: &str) -> Result
         Substrate::Tmux
     };
     let (id, title, tool) = (inst.id.clone(), inst.title.clone(), inst.tool.clone());
-    let created = inst.created_at.timestamp().max(0) as u64;
+    let created = inst.created_at.as_unix_secs().max(0) as u64;
 
     let rows = collect_rows(&mut instances, SubstrateFilter::All, true);
     Ok(pick_row(rows, &id, substrate).unwrap_or(Row {

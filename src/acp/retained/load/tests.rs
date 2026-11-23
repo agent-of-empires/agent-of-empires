@@ -105,6 +105,7 @@ async fn retained_queue_drain_retry_preserves_merged_ids_without_duplicate_rows(
         merged_prompt_ids: vec!["queued-second".into(), "queued-third".into()],
         synthesized: false,
         origin_plugin: None,
+        origin: crate::daemon::PromptOrigin::Unknown,
     };
     for sequence in 1..=2 {
         state
@@ -137,7 +138,7 @@ async fn retained_blocks_preserve_groups_output_precedence_and_elicitation_remov
     let inst = crate::session::Instance::new("retained blocks", "/tmp");
     let id = inst.id.clone();
     let state = crate::server::test_support::build_test_app_state(vec![inst]);
-    let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
+    let at = crate::time::Timestamp::from_unix_secs(100).unwrap();
     let first = format!("first{}", "é🦀".repeat(16_384));
     let completed = |id: &str| Event::ToolCallCompleted {
         tool_call_id: id.into(),

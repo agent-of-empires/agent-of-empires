@@ -19,7 +19,7 @@ fn fork_from_selection_seeds_terminal_fork_and_inherits_parent_context() {
         branch: "feature".into(),
         main_repo_path: "/tmp/repo".into(),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
         base_branch: None,
     });
     let id = inst.id.clone();
@@ -328,7 +328,7 @@ fn test_shift_n_prefills_from_selected_session() {
         branch: "feature-branch".to_string(),
         main_repo_path: "/tmp/repo".to_string(),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
         base_branch: None,
     });
     let mut ungrouped = Instance::new("ungrouped", "/tmp/u");
@@ -768,7 +768,9 @@ async fn group_profile_move_preflights_creating_and_expired_reservations() {
     let stale = LifecycleReservation {
         op: LifecycleOperation::Launch,
         generation: 1,
-        at: chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+        at: crate::time::Timestamp::now()
+            - Instance::LIFECYCLE_RESERVATION_TTL
+            - crate::time::Duration::seconds(1),
     };
     source
         .update(|instances, _groups| {

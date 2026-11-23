@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 
 use super::storage::{Backend, InputTool, Memory};
 use crate::acp::state::Event;
@@ -20,9 +20,9 @@ event_view! { 'a, B;
     UserPromptSent { text: B::Input<'a>, attachments: B::AttachmentsInput<'a>, prompt_id: Option<B::Input<'a>>, merged_prompt_ids: B::PromptIdsInput<'a>, synthesized: bool, origin_plugin: Option<B::Input<'a>> },
     UserDiffCommentsPrompt { intro: B::Input<'a>, outro: B::Input<'a>, is_multi_repo: bool, comments: B::CommentsInput<'a>, assembled_markdown: B::Input<'a> },
     ToolCallStarted { tool_call: InputTool<'a, B> },
-    ToolCallCompleted { tool_call_id: B::Input<'a>, is_error: bool, content: B::Input<'a>, output: B::OutputInput<'a>, completed_at: DateTime<Utc>, async_subagent: bool },
+    ToolCallCompleted { tool_call_id: B::Input<'a>, is_error: bool, content: B::Input<'a>, output: B::OutputInput<'a>, completed_at: Timestamp, async_subagent: bool },
     ToolCallContent { tool_call_id: B::Input<'a>, content: B::Input<'a> },
-    ToolCallUpdated { tool_call_id: B::Input<'a>, title: Option<B::Input<'a>>, args_preview: Option<B::Input<'a>>, prompt: Option<B::Input<'a>>, started_at: Option<DateTime<Utc>>, diffs: Option<B::DiffsInput<'a>> },
+    ToolCallUpdated { tool_call_id: B::Input<'a>, title: Option<B::Input<'a>>, args_preview: Option<B::Input<'a>>, prompt: Option<B::Input<'a>>, started_at: Option<Timestamp>, diffs: Option<B::DiffsInput<'a>> },
     ElicitationRequested { tool_call_id: Option<B::Input<'a>> },
     ElicitationResolved { nonce: B::Input<'a>, answers: B::AnswersInput<'a> },
     Stopped,
@@ -36,7 +36,7 @@ event_view! { 'a, B;
     PromptRuntimeError { message: B::Input<'a> },
     ModeSwitchFailed { mode_id: B::Input<'a>, reason: B::Input<'a> },
     SessionNotice { severity: B::Input<'a>, title: B::Input<'a>, description: Option<B::Input<'a>>, key: Option<B::Input<'a>> },
-    RateLimitAutoResumed { resets_at: DateTime<Utc>, manual: bool },
+    RateLimitAutoResumed { resets_at: Timestamp, manual: bool },
     ConversationSummary { text: B::Input<'a> },
     ThinkingStarted,
     PromptCapabilities { steering: bool },
@@ -217,6 +217,7 @@ pub(crate) fn memory(event: &Event) -> View<'_, Memory> {
             merged_prompt_ids,
             synthesized,
             origin_plugin,
+            ..
         } => View::UserPromptSent {
             text,
             attachments,

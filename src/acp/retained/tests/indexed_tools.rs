@@ -1,14 +1,7 @@
 use super::*;
 use crate::acp::transcript::{storage::DeltaOf, TranscriptModel, TranscriptRow};
 
-type ToolSignature = (
-    String,
-    String,
-    String,
-    String,
-    Option<String>,
-    DateTime<Utc>,
-);
+type ToolSignature = (String, String, String, String, Option<String>, Timestamp);
 type RowSignature = (
     String,
     String,

@@ -1,6 +1,6 @@
 use std::{io, ops::Deref, rc::Rc};
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use pulldown_cmark::disk::{Record, TextRef};
 
 use super::json::ValueRef;
@@ -57,12 +57,12 @@ impl Record for Byte {
 }
 
 #[derive(Clone, Copy)]
-struct Stamp(DateTime<Utc>);
+struct Stamp(Timestamp);
 impl Record for Stamp {
     const SIZE: usize = 12;
     fn encode(&self, bytes: &mut [u8]) {
-        bytes[..8].copy_from_slice(&self.0.timestamp().to_le_bytes());
-        bytes[8..].copy_from_slice(&self.0.timestamp_subsec_nanos().to_le_bytes());
+        bytes[..8].copy_from_slice(&self.0.as_unix_secs().to_le_bytes());
+        bytes[8..].copy_from_slice(&self.0.subsec_nanos().to_le_bytes());
     }
     fn decode(bytes: &[u8]) -> io::Result<Self> {
         if bytes.len() != Self::SIZE {
@@ -70,7 +70,7 @@ impl Record for Stamp {
         }
         let seconds = i64::from_le_bytes(bytes[..8].try_into().map_err(io::Error::other)?);
         let nanos = u32::from_le_bytes(bytes[8..].try_into().map_err(io::Error::other)?);
-        DateTime::from_timestamp(seconds, nanos)
+        Timestamp::from_unix_parts(seconds, nanos)
             .map(Self)
             .ok_or_else(|| invalid("invalid retained timestamp"))
     }

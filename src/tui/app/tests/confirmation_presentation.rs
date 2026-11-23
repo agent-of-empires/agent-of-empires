@@ -439,7 +439,8 @@ async fn home_pending_frame_cannot_route_mouse_to_reordered_sessions() {
             let mut row = Instance::new(title, root.path().to_str().unwrap());
             row.source_profile = "test".into();
             row.status = Status::Stopped;
-            row.created_at = chrono::Utc::now() - chrono::Duration::seconds(3 - index as i64);
+            row.created_at =
+                crate::time::Timestamp::now() - ::time::Duration::seconds(3 - index as i64);
             row.sort_index = Some(index as u32);
             row
         })

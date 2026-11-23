@@ -454,7 +454,7 @@ mod tests {
     use crate::acp::approvals::{Approval, Nonce};
     use crate::acp::state::test_support::{chunk as assistant, prompt as user, stopped};
     use crate::acp::state::{Plan, PlanStep};
-    use chrono::Utc;
+    use crate::time::Timestamp;
 
     fn done() -> Event {
         stopped("prompt_complete")
@@ -467,7 +467,7 @@ mod tests {
             name: name.to_string(),
             kind: kind.to_string(),
             args_preview: args.to_string(),
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             parent_tool_call_id: None,
             memory_recall: None,
             diffs: Vec::new(),
@@ -486,7 +486,7 @@ mod tests {
             is_error,
             content: String::new(),
             output: Vec::new(),
-            completed_at: Utc::now(),
+            completed_at: Timestamp::now(),
             async_subagent: false,
         }
     }
@@ -531,7 +531,7 @@ mod tests {
                 options: Vec::new(),
                 choice: false,
                 plan: None,
-                requested_at: Utc::now(),
+                requested_at: Timestamp::now(),
                 resolved: None,
             },
         };

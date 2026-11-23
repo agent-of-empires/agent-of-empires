@@ -493,7 +493,7 @@ pub(crate) mod test_support {
                     base_branch_override: None,
                 })
                 .collect(),
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             cleanup_on_delete: true,
         }
     }

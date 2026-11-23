@@ -775,7 +775,7 @@ fn test_group_has_managed_worktrees_and_containers() {
         branch: "feature-branch".to_string(),
         main_repo_path: "/tmp/main".to_string(),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
         base_branch: None,
     });
     let mut sandboxed = Instance::new("box-session", "/tmp/box");
@@ -1308,7 +1308,7 @@ async fn test_delete_group_with_sessions_updates_groups_field() {
     hidden.lifecycle_reservation = Some(LifecycleReservation {
         op: LifecycleOperation::Launch,
         generation: 1,
-        at: chrono::Utc::now(),
+        at: crate::time::Timestamp::now(),
     });
     storage
         .update(|instances, groups| {
@@ -2184,7 +2184,8 @@ fn test_non_strict_w_cycles_through_all_idle_sessions_in_attention_sort() {
         let mut inst = Instance::new(&title, &path);
         inst.source_profile = "test".to_string();
         inst.status = Status::Idle;
-        inst.last_accessed_at = Some(chrono::Utc::now() - chrono::Duration::minutes(minutes_ago));
+        inst.last_accessed_at =
+            Some(crate::time::Timestamp::now() - crate::time::Duration::minutes(minutes_ago));
         env.view.add_instance(inst);
     }
     env.view.flat_items = env.view.build_flat_items();
@@ -2823,7 +2824,7 @@ fn test_ctrl_arrows_do_not_reorder_under_a_computed_sort() {
 #[serial]
 fn test_alt_arrows_jump_between_just_finished_sessions() {
     use crate::session::Status;
-    use chrono::{Duration as ChronoDuration, Utc};
+    use crate::time::{Duration as SignedDuration, Timestamp};
 
     let mut env = create_test_env_with_mixed_sessions();
     env.view.idle_decay_window = std::time::Duration::from_secs(30 * 60);
@@ -2839,8 +2840,8 @@ fn test_alt_arrows_jump_between_just_finished_sessions() {
     assert!(ids.len() >= 3);
 
     // One finished a minute ago and one is working; the one between them went idle yesterday.
-    let fresh = Utc::now() - ChronoDuration::minutes(1);
-    let stale = Utc::now() - ChronoDuration::days(1);
+    let fresh = Timestamp::now() - SignedDuration::minutes(1);
+    let stale = Timestamp::now() - SignedDuration::days(1);
     for (idx, status, entered) in [
         (0, Status::Idle, Some(fresh)),
         (1, Status::Idle, Some(stale)),
@@ -3055,7 +3056,7 @@ async fn test_ctrl_down_stops_at_the_last_group() {
 #[serial]
 fn test_alt_arrows_leave_live_send_before_jumping() {
     use crate::session::Status;
-    use chrono::{Duration as ChronoDuration, Utc};
+    use crate::time::{Duration as SignedDuration, Timestamp};
 
     let mut env = create_test_env_with_mixed_sessions();
     env.view.idle_decay_window = std::time::Duration::from_secs(30 * 60);
@@ -3072,7 +3073,7 @@ fn test_alt_arrows_leave_live_send_before_jumping() {
 
     env.view.mutate_instance(&ids[2], |inst| {
         inst.status = Status::Idle;
-        inst.idle_entered_at = Some(Utc::now() - ChronoDuration::minutes(1));
+        inst.idle_entered_at = Some(Timestamp::now() - SignedDuration::minutes(1));
     });
     env.view.rebuild_flat_items();
     env.view.cursor = 0;
@@ -3868,7 +3869,7 @@ async fn test_a_hidden_destination_moves_the_selection_to_its_header() {
 #[serial]
 fn test_ctrl_alt_arrows_do_not_jump_out_of_live_send() {
     use crate::session::Status;
-    use chrono::{Duration as ChronoDuration, Utc};
+    use crate::time::{Duration as SignedDuration, Timestamp};
 
     let mut env = create_test_env_with_mixed_sessions();
     env.view.idle_decay_window = std::time::Duration::from_secs(30 * 60);
@@ -3886,7 +3887,7 @@ fn test_ctrl_alt_arrows_do_not_jump_out_of_live_send() {
     // The same fixture the Alt+Down jump lands on, so a jump here would be unmistakable.
     env.view.mutate_instance(&ids[2], |inst| {
         inst.status = Status::Idle;
-        inst.idle_entered_at = Some(Utc::now() - ChronoDuration::minutes(1));
+        inst.idle_entered_at = Some(Timestamp::now() - SignedDuration::minutes(1));
     });
     env.view.rebuild_flat_items();
     env.view.cursor = 0;

@@ -47,8 +47,8 @@ async fn wait_for(
     .await
     .expect("retained reader did not reach the requested visible state");
 }
-fn at() -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::from_timestamp(100, 0).unwrap()
+fn at() -> crate::time::Timestamp {
+    crate::time::Timestamp::from_unix_secs(100).unwrap()
 }
 fn tool(id: &str) -> Event {
     Event::ToolCallStarted {

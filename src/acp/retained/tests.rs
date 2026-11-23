@@ -10,11 +10,11 @@ use crate::acp::{
         TranscriptDelta, TranscriptRowKind,
     },
 };
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use sha2::{Digest, Sha256};
 
-fn at() -> DateTime<Utc> {
-    DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+fn at() -> Timestamp {
+    crate::time::Timestamp::from_unix_secs(1_700_000_000).unwrap()
 }
 fn tool(id: &str) -> Event {
     Event::ToolCallStarted {
@@ -222,7 +222,7 @@ fn retained_snapshots_survive_eviction_reuse_and_row_removal() {
 }
 
 #[test]
-fn timestamps_preserve_chrono_grammar_without_payload_sized_strings() {
+fn timestamps_parse_without_payload_sized_strings() {
     let context = Context::new(Arc::new(AtomicBool::new(false))).unwrap();
     for value in [
         "2000-01-01T00:00:00Z",
@@ -238,7 +238,7 @@ fn timestamps_preserve_chrono_grammar_without_payload_sized_strings() {
         "2000-1-1T0:0:0.123 456Z",
         "not a date",
     ] {
-        let expected = value.parse::<DateTime<Utc>>().ok();
+        let expected = Timestamp::parse_rfc3339(value).ok();
         let source = context.spool.append(value.as_bytes()).unwrap();
         assert_eq!(date::read(&context, source).ok(), expected, "{value:?}");
     }
@@ -247,7 +247,7 @@ fn timestamps_preserve_chrono_grammar_without_payload_sized_strings() {
     for _ in 0..128 {
         writer.write_all(&[b'0'; 8192]).unwrap();
     }
-    writer.write_all(b"2000-1-1T0:0:0.").unwrap();
+    writer.write_all(b"2000-01-01T00:00:00.").unwrap();
     for _ in 0..128 {
         writer.write_all(&[b'1'; 8192]).unwrap();
     }
@@ -255,9 +255,7 @@ fn timestamps_preserve_chrono_grammar_without_payload_sized_strings() {
     let source = writer.finish().unwrap();
     assert_eq!(
         date::read(&context, source).unwrap(),
-        "2000-01-01T00:00:00.111111111Z"
-            .parse::<DateTime<Utc>>()
-            .unwrap()
+        Timestamp::parse_rfc3339("2000-01-01T00:00:00.111111111Z").unwrap()
     );
 }
 
