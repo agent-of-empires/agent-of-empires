@@ -735,6 +735,36 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
     expect(screen.queryByText("cancels are off here")).toBeNull();
   });
 
+  it("ignores an earlier Cancel's reply once a later Cancel for the same image is out", async () => {
+    const cancelButton = () => screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement;
+    let first!: (r: { ok: boolean; pull?: SandboxImagePull; message?: string }) => void;
+    let second!: (r: { ok: boolean; pull?: SandboxImagePull; message?: string }) => void;
+    cancelSandboxImagePull
+      .mockReturnValueOnce(new Promise((r) => (first = r)))
+      .mockReturnValueOnce(new Promise((r) => (second = r)));
+    await mount(running());
+    fireEvent.click(cancelButton());
+    // The banner moves to another image and back, so the first Cancel no longer holds it.
+    fetchSandboxImageStatus.mockResolvedValue({ ...running(), image: "ghcr.io/example/other:1" });
+    await pollAfter(2000);
+    fetchSandboxImageStatus.mockResolvedValue(running());
+    await pollAfter(2000);
+    expect(cancelButton().disabled).toBe(false);
+    fireEvent.click(cancelButton());
+    expect(cancelButton().disabled).toBe(true);
+
+    // The first reply, refused, lands while the second Cancel is out.
+    fetchSandboxImageStatus.mockReturnValueOnce(new Promise(() => {}));
+    await act(async () => first({ ok: false, message: "first refusal" }));
+    expect(cancelButton().disabled, "the old reply freed the pending Cancel").toBe(true);
+    expect(banner()?.textContent).toBe(DOWNLOADING);
+    expect(screen.queryByText("first refusal")).toBeNull();
+
+    // The second Cancel's own reply decides.
+    await act(async () => second({ ok: true, pull: { state: "cancelled" } }));
+    expect(banner()?.textContent).toBe(CANCELLED);
+  });
+
   it("frees Cancel when a create's pull supersedes the attempt it was sent for", async () => {
     let answer!: (r: { ok: boolean; pull?: SandboxImagePull }) => void;
     cancelSandboxImagePull.mockReturnValueOnce(new Promise((r) => (answer = r)));
