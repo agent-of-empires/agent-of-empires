@@ -37,12 +37,15 @@ pub struct Snapshot {
 #[serde(default)]
 pub struct Prefs {
     pub(crate) show_source_ref: bool,
+    /// "Show in the sidebar": the web sidebar group and the TUI Home group.
+    pub(crate) sidebar: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
         Self {
             show_source_ref: true,
+            sidebar: false,
         }
     }
 }

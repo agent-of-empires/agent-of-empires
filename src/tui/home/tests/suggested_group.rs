@@ -17,7 +17,11 @@ fn snapshot(count: usize, dismissed: &[usize]) -> serde_json::Value {
             })
         })
         .collect();
-    serde_json::json!({ "providers": [{ "id": "gh", "name": "GitHub" }], "items": items })
+    serde_json::json!({
+        "providers": [{ "id": "gh", "name": "GitHub" }],
+        "items": items,
+        "prefs": { "sidebar": true }
+    })
 }
 
 fn suggested_rows(env: &TestEnv) -> Vec<&Item> {
@@ -65,6 +69,18 @@ fn group_is_absent_without_providers_and_collapsed_by_default() {
     env.view
         .suggestions_feed
         .set_snapshot_for_test(serde_json::json!({ "providers": [], "items": [] }));
+    env.view.rebuild_flat_items();
+    assert!(suggested_rows(&env).is_empty());
+}
+
+/// The dashboard's "Show in the sidebar" pref also hides the Home group.
+#[test]
+#[serial]
+fn the_group_follows_the_sidebar_pref() {
+    let mut env = create_test_env_with_sessions(1);
+    let mut snap = snapshot(2, &[]);
+    snap["prefs"]["sidebar"] = false.into();
+    env.view.suggestions_feed.set_snapshot_for_test(snap);
     env.view.rebuild_flat_items();
     assert!(suggested_rows(&env).is_empty());
 }
@@ -525,8 +541,15 @@ fn a_started_suggestion_is_not_listed_in_the_group() {
     env.view.handle_key(key(KeyCode::Enter), None);
 
     let rows = suggested_rows(&env);
+    assert!(matches!(
+        rows[0],
+        Item::Group {
+            session_count: 1,
+            ..
+        }
+    ));
     assert!(matches!(rows[1], Item::Suggestion { id, .. } if id == "i1"));
-    assert!(matches!(rows[2], Item::SuggestionsViewAll { total: 2, .. }));
+    assert!(matches!(rows[2], Item::SuggestionsViewAll { total: 1, .. }));
 }
 
 #[test]
@@ -924,7 +947,7 @@ fn the_full_view_says_so_when_the_selected_suggestion_has_no_link() {
 
 #[test]
 #[serial]
-fn view_all_counts_what_the_full_view_lists_stale_items_included() {
+fn the_group_counts_only_the_rows_it_lists_not_stale_items() {
     let (mut env, _requests) = expanded_env(2);
     let mut snap = snapshot(2, &[]);
     snap["items"][1]["stale"] = true.into();
@@ -935,13 +958,13 @@ fn view_all_counts_what_the_full_view_lists_stale_items_included() {
     assert!(matches!(
         rows[0],
         Item::Group {
-            session_count: 2,
+            session_count: 1,
             ..
         }
     ));
     assert!(matches!(
         rows.last().unwrap(),
-        Item::SuggestionsViewAll { total: 2, .. }
+        Item::SuggestionsViewAll { total: 1, .. }
     ));
     assert_eq!(
         rows.iter()
@@ -1026,7 +1049,7 @@ fn the_source_reference_shows_on_the_row_and_preview_unless_hidden() {
     for (prefs, suffix, meta) in [
         (None, " #0", "GitHub · #0 · review requested"),
         (
-            Some(serde_json::json!({ "show_source_ref": false })),
+            Some(serde_json::json!({ "show_source_ref": false, "sidebar": true })),
             "",
             "GitHub · review requested",
         ),
@@ -1126,7 +1149,8 @@ fn a_provider_failing_before_its_first_item_still_shows_the_group_with_the_error
         .suggestions_feed
         .set_snapshot_for_test(serde_json::json!({
             "providers": [{ "id": "gh", "name": "GitHub", "error": "token expired" }],
-            "items": []
+            "items": [],
+            "prefs": { "sidebar": true }
         }));
     env.view.rebuild_flat_items();
     select_suggested_header(&mut env);

@@ -1059,13 +1059,13 @@ pub fn append_trash_section(items: &mut Vec<Item>, instances: &[Instance], colla
 pub fn append_suggested_section(
     items: &mut Vec<Item>,
     suggestions: &[(String, String)],
-    total: usize,
     collapsed: bool,
     failed: bool,
 ) {
     if suggestions.is_empty() && !failed {
         return;
     }
+    let total = suggestions.len();
     items.push(Item::Group {
         path: SUGGESTED_SECTION_PATH.to_string(),
         name: SUGGESTED_SECTION_NAME.to_string(),

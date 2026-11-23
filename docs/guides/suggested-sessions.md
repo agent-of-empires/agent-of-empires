@@ -60,7 +60,7 @@ If a provider is switched off, its items are hidden and the view says "<provider
 | Setting | What it does |
 |---|---|
 | Show on the homepage | The homepage section. |
-| Show in the sidebar | A collapsed **Suggested (N)** group at the bottom of the web session sidebar, above Trash, absent when there are no open suggestions. Started suggestions are not listed, since the Session is already under its Project. Expanded, it lists 3 items and **View all**; clicking an item starts it like **Start**. Off by default. |
+| Show in the sidebar | A collapsed **Suggested (N)** group at the bottom of the web session sidebar and of the TUI Home list, above Trash, absent when there are no open suggestions. Started suggestions are not listed, since the Session is already under its Project. Expanded, it lists 3 items and **View all**; clicking an item starts it like **Start**. Off by default. |
 | Show where each one comes from | Shows where each suggestion comes from, such as `owner/repo#123`, on web rows and before the title on TUI rows. On by default. |
 | Sources | Drag to set which source comes first (Alt+↑/↓ on a focused row, a move-up button on a phone). Each has an on/off switch. A source that uses an agent says so, since it spends your agent usage. A source error can carry a fix button from the plugin. |
 | *Source* · Kinds | One row per kind of suggestion, such as Review requests: what it starts with ("Claude Code · Structured view · worktree"), a switch to suggest it, and **Edit** for its [preset](#presets). |
@@ -95,7 +95,7 @@ Change any proposal with its select, then **Link N repos** stores every checked 
 
 > The TUI keys below are provisional until #4597 settles the key bindings.
 
-**Home.** A collapsed **Suggested (N)** group sits above Trash and is absent when there are no open suggestions, unless a provider failed: the group stays and its preview shows the error. Enter expands it to 3 items and a "View all" row. Rows show the title with the source reference after it, and the preview names what Enter starts ("Starts with Claude Code · Structured · worktree") with the prompt it will send. On an item, Enter starts it with its kind's [preset](#presets) and the status line says "Started <title>"; the row then leaves the group, since the Session is listed under its Project. `z` (`Z` in strict mode) dismisses it, and `Ctrl+K` lists "Open in <provider>". `N` (`Ctrl+N`) opens the New session dialog prefilled from the item, without linking it.
+**Home.** With **Show in the sidebar** on, a collapsed **Suggested (N)** group sits above Trash and is absent when there are no open suggestions, unless a provider failed: the group stays and its preview shows the error. Enter expands it to 3 items and a "View all" row. Rows show the title with the source reference after it, and the preview names what Enter starts ("Starts with Claude Code · Structured · worktree") with the prompt it will send. On an item, Enter starts it with its kind's [preset](#presets) and the status line says "Started <title>"; the row then leaves the group, since the Session is listed under its Project. `z` (`Z` in strict mode) dismisses it, and `Ctrl+K` lists "Open in <provider>". `N` (`Ctrl+N`) opens the New session dialog prefilled from the item, without linking it.
 
 **Full view.** `S` opens it (`Ctrl+S` in strict mode).
 

@@ -33,6 +33,19 @@ pub(super) enum SuggestedRow {
 }
 
 impl HomeView {
+    /// Appends the Suggested group when the daemon's "Show in the sidebar" pref is on.
+    pub(super) fn append_suggested(&self, items: &mut Vec<Item>) {
+        let feed = &self.suggestions_feed;
+        if feed.shown_on_home() {
+            append_suggested_section(
+                items,
+                &feed.keys(),
+                self.suggested_section_collapsed,
+                feed.has_provider_failure(),
+            );
+        }
+    }
+
     pub fn toggle_suggested_section(&mut self) {
         self.suggested_section_collapsed = !self.suggested_section_collapsed;
         self.rebuild_flat_items();
@@ -245,7 +258,7 @@ impl HomeView {
         let bold = Style::default().add_modifier(Modifier::BOLD);
         let (title, lines): (String, Vec<Line>) = match self.flat_items.get(self.cursor) {
             Some(Item::Group { path, .. }) if crate::session::is_suggested_section_path(path) => {
-                let total = self.suggestions_feed.listed_count();
+                let total = self.suggestions_feed.keys().len();
                 let mut lines = vec![
                     Line::from(format!(
                         "From {} suggestions.",

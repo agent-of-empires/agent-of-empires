@@ -1407,13 +1407,9 @@ impl SuggestionsFeed {
             || self.is_recent(&(item.provider_id.clone(), item.id.clone()))
     }
 
-    /// How many suggestions the full view lists by default, stale ones included.
-    pub(super) fn listed_count(&self) -> usize {
-        self.snapshot
-            .iter()
-            .flat_map(|s| &s.items)
-            .filter(|i| self.is_listed(i, false))
-            .count()
+    /// Whether Home shows the Suggested group: the daemon's "Show in the sidebar" pref.
+    pub(super) fn shown_on_home(&self) -> bool {
+        self.snapshot.as_ref().is_some_and(|s| s.prefs.sidebar)
     }
 
     /// `(provider_id, id)` of every suggestion of a listed provider that is
@@ -2735,7 +2731,7 @@ mod tests {
     }
 
     #[test]
-    fn the_listed_count_matches_the_rows_the_full_view_shows() {
+    fn home_starts_only_fresh_items_while_the_view_lists_stale_ones_too() {
         let mut stale = item("old", None, false);
         stale.stale = true;
         let dismissed = item("gone", None, true);
@@ -2745,7 +2741,6 @@ mod tests {
         );
         assert_eq!(rig.store.keys().len(), 1, "Home starts only the fresh one");
         assert_eq!(rig.view.order.len(), 2, "the view lists the stale one too");
-        assert_eq!(rig.store.listed_count(), rig.view.order.len());
     }
 
     #[test]
