@@ -1,11 +1,14 @@
 // @vitest-environment jsdom
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { renderHook, act } from "@testing-library/react";
 
 import type { ActivityRow } from "../../lib/acpTypes";
 import { DEFAULT_HISTORY_WINDOW } from "../../lib/acpHistoryWindow";
 import { useHistoryWindow } from "../useHistoryWindow";
+import { useWebSettings } from "../useWebSettings";
+
+afterEach(() => window.localStorage.clear());
 
 function transcript(turns: number, perTurn: number): ActivityRow[] {
   const rows: ActivityRow[] = [];
@@ -126,5 +129,28 @@ describe("useHistoryWindow", () => {
     expect(result.current.windowedActivity[0]!.id).toBe("u-0");
     expect(result.current.windowedActivity).toHaveLength(long.length);
     expect(result.current.canLoadEarlier).toBe(false);
+  });
+
+  it("uses the configured window on open and ignores later setting changes for the open session", () => {
+    window.localStorage.setItem("aoe-web-settings", JSON.stringify({ structuredHistoryWindow: 50 }));
+    const activity = transcript(100, 1);
+    const { result } = renderHook(() => ({
+      view: useHistoryWindow("s1", activity, false),
+      web: useWebSettings(),
+    }));
+    expect(result.current.view.windowedActivity).toHaveLength(50);
+
+    act(() => result.current.web.update({ structuredHistoryWindow: 1000 }));
+    expect(result.current.view.windowedActivity).toHaveLength(50);
+  });
+
+  it("keeps the window captured at open when the setting changes before history loads", () => {
+    const { result, rerender } = renderHook(
+      ({ a }: { a: ActivityRow[] }) => ({ view: useHistoryWindow("s1", a, false), web: useWebSettings() }),
+      { initialProps: { a: [] as ActivityRow[] } },
+    );
+    act(() => result.current.web.update({ structuredHistoryWindow: 50 }));
+    rerender({ a: transcript(150, 1) });
+    expect(result.current.view.windowedActivity).toHaveLength(DEFAULT_HISTORY_WINDOW);
   });
 });

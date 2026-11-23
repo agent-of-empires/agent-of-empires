@@ -32,19 +32,19 @@ fn saving_during_creation_never_persists_the_display_placeholder() {
     let creations = crate::session::config::AppStateConfig::load()
         .unwrap()
         .sessions_created;
-    view.reload().unwrap();
+    view.reload();
     assert!(!storage.load().unwrap().iter().any(|row| row.id == stub));
     assert!(
         view.get_instance(&stub).is_some(),
         "saving must preserve the pending display"
     );
-    view.reload().unwrap();
+    view.reload();
     assert!(
         view.get_instance(&stub).is_some(),
         "reload must preserve the pending display"
     );
     view.cancel_creation();
-    view.reload().unwrap();
+    view.reload();
     assert_eq!(payload_bytes("default"), before);
     assert!(!storage.load().unwrap().iter().any(|row| row.id == stub));
     assert!(view.get_instance(&stub).is_none());
@@ -480,7 +480,7 @@ fn retrying_a_snapshot_preserves_one_creation_stub_and_never_resubmits_or_cancel
     existing.source_profile = "default".into();
     existing.status = Status::Idle;
     seed_profile("default", std::slice::from_ref(&existing));
-    view.reload().unwrap();
+    view.reload();
     view.session_feed.publish_for_test(creation_snapshot(
         vec![crate::server::api::sessions::session_response_from_instance(&existing, false)],
         "test",

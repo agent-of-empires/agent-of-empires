@@ -388,6 +388,7 @@ pub struct HomeView {
     pub(super) sidebar_position: crate::session::config::SidebarPosition,
 
     pub(super) narrow_layout: crate::session::config::NarrowLayout,
+    pub(super) narrow_breakpoint: u16,
     pub(super) passive_pane_synced: std::collections::HashMap<String, PassiveSynced>,
     pub(super) passive_pane_declined:
         std::collections::HashMap<String, ((u16, u16), std::time::Instant)>,
@@ -456,8 +457,6 @@ pub struct HomeView {
     pending_namespace_intent: Option<NamespaceIntent>,
     namespace_unknown_message: Option<String>,
     runtime_outcome_messages: Vec<String>,
-    /// Independent project-registry policy remembers runtime attachment, not row-write authority.
-    project_registry_authoritative: bool,
     pub(super) structured_pending_approvals: HashMap<String, Vec<crate::daemon::PendingApproval>>,
     pub(super) structured_approval_poller: super::approval_poller::StructuredApprovalPoller,
 

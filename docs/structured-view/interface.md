@@ -8,7 +8,7 @@ The structured view renders in both the TUI and the web dashboard. This page cov
 
 Both surfaces consume the same `aoe serve` daemon over the same HTTP and WebSocket API, so the conversation log, pending approvals, and worker state stay in sync.
 
-- Structured sessions show a `[structured]` badge in the TUI session list, and Enter opens the native view. `session.show_structured_badge = false` hides the badge and returns its width to the title and plugin row badges. The local TUI starts a same-host Daemon without a web listener during bootstrap or explicit reconnect, unless `--no-autostart` or `AOE_NO_AUTOSTART=1` is set. It reuses an existing daemon and reports unavailable runtimes without opening TCP. An explicit `AOE_DAEMON_URL` selects the remote daemon instead.
+- Structured sessions show a `[structured]` badge in the TUI session list, and Enter opens the native view. `session.show_structured_badge = false` hides the badge and returns its width to the title and plugin row badges. The local TUI starts a same-host Daemon without a web listener at launch or on an explicit reconnect, unless `--no-autostart` or `AOE_NO_AUTOSTART=1` is set, and does not open without one. It reuses an existing daemon and never opens TCP. An explicit `AOE_DAEMON_URL` selects the remote daemon instead.
 - Terminal sessions work in both surfaces: the TUI attaches to the pane and the dashboard streams it (see [Terminal view](../guides/web/terminal.md)).
 - Switching views keeps the worktree, files, and commits. Claude can resume its native transcript in terminal view only when AoE can bind the ACP ID to a shared native store. An explicit [native-store assertion](../guides/session-resume.md#pinning-or-resetting-a-conversation) can name another store. An ACP ID alone is not store provenance: an unresolved or unshared store is refused before worker teardown. Switching back can reload the Claude transcript. Other agents start fresh under the new view.
 - A healthy structured session shows Idle or Active in the session list, observed through the ACP event stream rather than tmux pane probing.
@@ -20,6 +20,8 @@ Both surfaces consume the same `aoe serve` daemon over the same HTTP and WebSock
 ### TUI keybinds
 
 The view opens with the composer ready. The transcript stays scrollable from the composer, a pending authorization opens a focused approval shelf above it, and the status line keeps the worker state and primary controls visible. The active session's agent, directory, and permission mode sit in a compact card in the upper left; user turns use a `›` gutter and agent replies a `•` gutter, so only modal decisions get a full-width border.
+
+The approval shelf shows the request itself above its buttons: the command or path, which the title has to elide to one line, then the other arguments as `key: value` lines. A command that runs over several lines keeps them. The body is capped at five rows, or fewer on a short terminal, and anything dropped is counted in a `+N more` footer, so read the full request in the dashboard when that footer appears. The question popup shows the lead-in and the question's own detail above the options, plus the highlighted answer's description, so a question reads without opening the dashboard.
 
 | Focus       | Key             | Action                                                |
 | ----------- | --------------- | ----------------------------------------------------- |
@@ -39,6 +41,7 @@ The view opens with the composer ready. The transcript stays scrollable from the
 | Transcript  | `Tab`           | Cycle to a pending approval card |
 | Transcript  | `m`             | Open the permission-mode picker |
 | Transcript  | `t`             | Flip Fast mode or Ultracode, when the agent offers them |
+| Transcript  | `e`             | Show every thought in full, or collapse to one preview line |
 | Transcript  | `a`             | Answer a pending question (single-select forms) |
 | Transcript  | `s` / `c`       | Skip / cancel a pending question |
 | Transcript  | `o`             | Open this session in the web dashboard |

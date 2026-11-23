@@ -159,6 +159,7 @@ pub use types::{
     AuxiliaryObservation, AuxiliaryTarget, LegacyToolAdoption, LegacyToolIdentity,
     LegacyToolObservation, PaneObservation, PanePresence, PluginCreateIdempotency, SandboxInfo,
     TerminalInfo, TmuxServerIdentity, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
+    MAX_INITIAL_PROMPT_BYTES,
 };
 pub(crate) use types::{
     PrimeAgentCapturePlan, PriorToolSession, ResumeIntent, SandboxPin, SandboxStoreTransitionPath,
@@ -236,6 +237,42 @@ pub struct PendingInitialTurn {
     /// once, before the park.
     #[serde(default)]
     pub synthesized: bool,
+    /// Why a terminal session's initial prompt was not typed. An errored turn
+    /// is not retried; the user's next terminal send discards it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Stable machine-readable form of `error`, for the causes a client can act
+    /// on (`agent_folder_not_trusted`, `agent_bypass_not_accepted`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Identifies this turn across reloads, so state kept for one turn never
+    /// applies to a later turn with the same text. Empty on rows written before
+    /// it existed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+}
+
+impl PendingInitialTurn {
+    pub fn fresh_id() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    /// Stable across reloads: `id`, or for a row written before it existed, a key
+    /// built from the turn's content.
+    pub fn key(&self) -> String {
+        if self.id.is_empty() {
+            format!("legacy:{}:{}", self.synthesized, self.text)
+        } else {
+            self.id.clone()
+        }
+    }
+
+    /// A create-time prompt typed by the user. The terminal drain delivers only
+    /// these: a rate-limit continuation is ACP-only and carries attachments the
+    /// terminal cannot send.
+    pub fn is_creation_prompt(&self) -> bool {
+        !self.synthesized && self.attachments.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -533,6 +570,16 @@ pub struct Instance {
     pub launch_resolved_executable: Option<std::path::PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<DateTime<Utc>>,
+
+    /// Managed-session ignore marker. A session driven by another session may
+    /// be ignored without being archived or trashed. Ignore is a sink state:
+    /// pin, favorite, archive and snooze clear it, and direct user engagement
+    /// (`touch_last_accessed`) wakes it. MCP routine access and sends refuse
+    /// an ignored managed session instead of quietly clearing the marker.
+    /// Additive: absent in older `sessions.json` rows, so no migration is
+    /// needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored_at: Option<DateTime<Utc>>,
 
     /// Favorite marker; sibling of archive. When set AND the session is in
     /// a "needs help" status (Waiting, Error, Idle, Unknown), the session

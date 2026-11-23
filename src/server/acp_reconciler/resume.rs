@@ -156,17 +156,23 @@ async fn admit(
     }
 }
 
-/// A refused admission ends the attempt without a spawn, so it is the only
-/// record of why a counted attempt did nothing. A concurrent shutdown or a
-/// pending teardown is routine; anything else is logged where it is seen.
-fn log_refused_admission(id: &str, what: &str, error: &SupervisorError) {
-    match error {
-        SupervisorError::SpawnCancelled(_) | SupervisorError::TeardownPending(_) => {
+/// Record why admission did not produce a spawn, and whether reconciliation
+/// should re-arm the session and keep or refund the attempt's budget charge.
+fn refused_admission(id: &str, what: &str, error: SupervisorError) -> ResumeOutcome {
+    match &error {
+        SupervisorError::SpawnCancelled(_)
+        | SupervisorError::PurgeInProgress(_)
+        | SupervisorError::TeardownPending(_) => {
             tracing::debug!(target: "acp.supervisor", session = %id, "{what} not admitted: {error}");
         }
         _ => {
             tracing::warn!(target: "acp.supervisor", session = %id, "{what} not admitted: {error}");
         }
+    }
+    match error {
+        SupervisorError::PurgeInProgress(_) => ResumeOutcome::AdmissionDeferred,
+        SupervisorError::TeardownPending(_) => ResumeOutcome::Retry,
+        _ => ResumeOutcome::SpawnFinished,
     }
 }
 
@@ -201,14 +207,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                 lifecycle_generation: target.lifecycle_generation,
             }
         }
-        Err(error) => {
-            log_refused_admission(&id, "resume", &error);
-            // A durable stop fence is terminal; only a pending teardown clears.
-            return match error {
-                SupervisorError::TeardownPending(_) => ResumeOutcome::Retry,
-                _ => ResumeOutcome::SpawnFinished,
-            };
-        }
+        Err(error) => return refused_admission(&id, "resume", error),
     };
     reservation.expected_lifecycle_generation = Some(target.lifecycle_generation);
     // The snapshot may predate an archive, snooze, trash or stop.
@@ -302,10 +301,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                             lifecycle_generation: target.lifecycle_generation,
                         }
                     }
-                    Err(error) => {
-                        log_refused_admission(&id, "fallback spawn", &error);
-                        return ResumeOutcome::SpawnFinished;
-                    }
+                    Err(error) => return refused_admission(&id, "fallback spawn", error),
                 };
                 reservation.expected_lifecycle_generation = Some(target.lifecycle_generation);
             }
@@ -374,6 +370,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                 lifecycle_generation: target.lifecycle_generation,
             }
         }
+        Err(SupervisorError::TeardownPending(_)) => return ResumeOutcome::Retry,
         // The supervisor already parked the session; a startup error would bury it.
         Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::RateLimited(_))) | Ok(()) => {}
         Err(e) => report_spawn_failure(&state.session_service, &target, &agent, &e).await,
@@ -461,6 +458,7 @@ async fn build_spawn_request(
         claude_store_pin,
         instance,
         prior_conversation,
+        workspace_info,
     ) = {
         let instances = service.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
@@ -486,6 +484,7 @@ async fn build_spawn_request(
             inst.clone(),
             target.stored_acp_session_id.is_none()
                 && (inst.agent_session_id.is_some() || inst.pi_session_path.is_some()),
+            inst.workspace_info.clone(),
         )
     };
     let config_path = instance.repo_config_path().to_path_buf();
@@ -561,6 +560,7 @@ async fn build_spawn_request(
         fork_from,
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
         sandbox_info,
+        workspace_info,
         source_profile: Some(target.source_profile.clone()),
         yolo_mode: target.yolo_mode,
         acp_mode_id,
@@ -775,6 +775,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(req.model.as_deref(), Some("claude-opus-5"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn build_spawn_request_carries_the_workspace_layout() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut ws = crate::server::test_support::workspace_instance(
+            "ws-resume",
+            std::path::Path::new("/tmp/aoe-ws-resume"),
+        );
+        ws.id = "sess-ws-resume".to_string();
+        ws.source_profile = "default".into();
+        ws.view = crate::session::View::Structured;
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![ws.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![ws.clone()]);
+
+        // The target snapshot carries no workspace; the request must read the live row.
+        let mut target = ResumeTarget::from_instance(&ws);
+        target.project_path = "/tmp/aoe-ws-resume-stale".to_string();
+        let req = build_spawn_request(&state.session_service, &target, LaunchOrigin::Unattended)
+            .await
+            .unwrap();
+        crate::server::test_support::assert_carries_workspace(
+            req.workspace_info.as_ref(),
+            &ws,
+            "build_spawn_request",
+        );
     }
 
     /// #4127: a request is not an observation. Building one derives the route
@@ -1046,6 +1073,19 @@ mod tests {
             crate::daemon::AcpWorkerState::Absent
         );
         assert!(state.acp_event_store.replay_from(id, 0).is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pending_retirement_after_snapshot_retries_without_refunding() {
+        let id = "sess-pending-retirement";
+        let (_home, state, _project) = test_state(id);
+        let target = ResumeTarget::from_instance(&state.instances.read().await[0]);
+        let stopping = state.acp_supervisor.test_hold_stopping(id).unwrap();
+
+        let outcome = resume_one(Arc::clone(&state), target).await;
+        assert!(matches!(outcome, ResumeOutcome::Retry));
+        state.acp_supervisor.test_settle_stopping(&stopping);
     }
 
     #[tokio::test]

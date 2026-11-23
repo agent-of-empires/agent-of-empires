@@ -31,23 +31,9 @@ impl HomeView {
             }
         };
         self.rewire_config_subscriptions(&config_targets);
-        let projection = if let Some(snapshot) = self.session_feed.applied_snapshot() {
-            self.apply_canonical_projection(&snapshot, true)
-        } else {
-            // Before attachment there is no acknowledged runtime frame to reconstruct.
-            (|| -> anyhow::Result<()> {
-                if let Some(profile) = self.active_profile.clone() {
-                    if !self.storages.contains_key(&profile) {
-                        self.storages.insert(
-                            profile.clone(),
-                            Storage::open(&profile, self.file_watch.clone())?,
-                        );
-                    }
-                    self.storages.retain(|name, _| name == &profile);
-                    self.rewire_disk_subscriptions(std::slice::from_ref(&profile));
-                }
-                self.load_storage_projection()
-            })()
+        let projection = match self.session_feed.applied_snapshot() {
+            Some(snapshot) => self.apply_canonical_projection(&snapshot, true),
+            None => Ok(()),
         };
         if let Err(error) = projection {
             self.active_profile = previous_profile;

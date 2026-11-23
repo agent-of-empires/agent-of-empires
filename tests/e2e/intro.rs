@@ -57,13 +57,16 @@ fn wait_for_config(h: &TuiTestHarness, needles: &[&str]) -> String {
 }
 
 /// The first run walks every page in order; keeping the default structured
-/// view agent, picking Tmux attach and the `empire` theme persists all three.
+/// view agent, picking Tmux attach and the `empire` theme persists all three,
+/// and the opt-in reaches the Daemon, which saves it and mints the install id.
 #[test]
 #[parallel]
-fn intro_walkthrough_persists_attach_and_theme_choices() {
+fn intro_walkthrough_persists_attach_theme_and_consent_choices() {
     require_tmux!();
 
     let mut h = TuiTestHarness::new("intro_walkthrough");
+    h.stop_daemon_on_drop();
+    h.set_env("DO_NOT_TRACK", "0");
     force_first_run(&h);
     h.spawn_tui();
 
@@ -75,6 +78,8 @@ fn intro_walkthrough_persists_attach_and_theme_choices() {
     h.send_keys("Enter");
     h.wait_for("(2/7)");
     h.assert_screen_contains("Help improve aoe with anonymous usage telemetry?");
+    h.send_keys("Up");
+    h.wait_for("▶ Enable anonymous telemetry");
     h.send_keys("Enter");
     h.wait_for("(3/7)");
     h.assert_screen_contains("Start your first session");
@@ -113,8 +118,12 @@ fn intro_walkthrough_persists_attach_and_theme_choices() {
             // The chosen agent is machine-dependent, so assert the write landed
             // rather than a specific name.
             "default_agent = ",
+            "[telemetry]\nenabled = true",
         ],
     );
+    let telemetry = std::fs::read_to_string(app_dir_in(h.home_path()).join("telemetry.json"))
+        .expect("the Daemon minted an install id");
+    assert!(telemetry.contains("install_id"), "{telemetry}");
 }
 
 #[test]
