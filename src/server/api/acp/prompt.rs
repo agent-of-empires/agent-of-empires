@@ -355,8 +355,11 @@ pub(crate) async fn submit_prompt(
                 PromptDispatch::Sent
             }
             Ok(None) => dispatch,
-            // An unreadable intent still fences: admission re-reads it and refuses.
-            Err(_) => PromptDispatch::Sent,
+            // Unreadable: observe no stop, so admission still refuses it and any newer stop.
+            Err(_) => {
+                observed_stop = Some(None);
+                PromptDispatch::Sent
+            }
         }
     } else {
         dispatch

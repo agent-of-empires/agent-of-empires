@@ -554,6 +554,39 @@ async fn stop_newer_than_the_observed_one_refuses_the_prompt_start() {
         .is_empty());
 }
 
+/// An unreadable stop intent keeps fencing: the resume is refused, nothing launches or
+/// queues, and the file is left for the operator.
+#[tokio::test]
+#[serial_test::serial]
+async fn stop_fence_unreadable_intent_refuses_the_prompt_start() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-stop-fence-unreadable".to_string();
+    let (state, launches) = failing_start_state(&id, false).await;
+    settle_stop_fence(&id);
+    let stop_file = crate::process::worker_registry::workers_dir()
+        .unwrap()
+        .join(format!("{id}.stop"));
+    std::fs::write(&stop_file, b"\xff not json").unwrap();
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        dashboard_headers(),
+        prompt_req("wake up"),
+    )
+    .await
+    .into_response();
+
+    assert!(!response.status().is_success(), "{}", response.status());
+    assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(stop_file.exists());
+    assert!(state
+        .session_service
+        .queued_prompts_snapshot(&id)
+        .await
+        .is_empty());
+}
+
 /// A prompt without a foreground origin (MCP, plugin, automated) parks behind the fence.
 #[tokio::test]
 #[serial_test::serial]
