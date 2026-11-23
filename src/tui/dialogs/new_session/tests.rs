@@ -196,7 +196,11 @@ fn hostile_suggestion_text_is_neutralised_and_a_blank_one_is_omitted() {
     dialog.handle_key(ctrl_key(KeyCode::Char('o')));
     let screen = screen_of(&mut dialog, 100, 40);
     assert!(!screen.contains('\u{1b}'));
-    assert!(screen.contains("run \u{fffd}[31mnow\u{23ce}then stop"));
+    assert!(screen.contains("run \u{fffd}[31mnow "), "{screen}");
+    assert!(
+        screen.contains("│then stop "),
+        "the newline breaks the row: {screen}"
+    );
 
     let mut dialog = single_tool_dialog();
     dialog.set_suggestion("   ".to_string(), github_origin());
@@ -2556,18 +2560,29 @@ fn tilde_path_completes_and_submits_under_home() {
 }
 
 #[test]
-fn the_prompt_wraps_and_places_the_cursor_by_display_cells() {
+fn the_prompt_wraps_by_word_and_line_and_places_the_cursor_by_display_cells() {
     use super::render::wrap_prompt;
     // 40 double-width characters are 80 cells: 34 fit a 68-cell row.
-    let rows = wrap_prompt(&"\u{4e2d}".repeat(40));
+    let rows = wrap_prompt(&"\u{4e2d}".repeat(40), 68);
     assert_eq!(rows.len(), 2);
     assert_eq!((rows[0].0, rows[0].1.chars().count()), (0, 34));
     assert_eq!((rows[1].0, rows[1].1.chars().count()), (34, 6));
     // A row filled to the width leaves an empty one for the cursor.
-    let rows = wrap_prompt(&"\u{4e2d}".repeat(34));
-    assert_eq!(rows.len(), 2);
+    let rows = wrap_prompt(&"\u{4e2d}".repeat(34), 68);
     assert_eq!(rows[1], (34, String::new()));
-    assert_eq!(wrap_prompt("").len(), 1);
+    assert_eq!(wrap_prompt("", 68).len(), 1);
+    // A newline starts a row, and a word that does not fit moves down whole.
+    let rows = wrap_prompt("Review PR\nRead the diff carefully", 12);
+    let rows: Vec<(usize, &str)> = rows.iter().map(|(i, t)| (*i, t.as_str())).collect();
+    assert_eq!(
+        rows,
+        [
+            (0, "Review PR"),
+            (10, "Read the "),
+            (19, "diff "),
+            (24, "carefully")
+        ]
+    );
 }
 
 #[test]

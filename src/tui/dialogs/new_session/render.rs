@@ -50,32 +50,46 @@ fn overlay_hover_rects(entries: &[(usize, Rect)], fields: &[(usize, Rect)]) -> V
         .collect()
 }
 
-const PROMPT_TEXT_WIDTH: usize = 68;
 const PROMPT_MAX_ROWS: usize = 4;
+/// The Ctrl+O editor is as wide as the New Session dialog it opens over.
+const PROMPT_EDITOR_WIDTH: u16 = 80;
 
-/// Splits `text` into rows of at most `PROMPT_TEXT_WIDTH` display cells, as
-/// `(index of the row's first char, row text)`. A row that fills the width is
-/// followed by an empty one, which is where the cursor goes.
-pub(super) fn wrap_prompt(text: &str) -> Vec<(usize, String)> {
-    let mut rows = vec![(0, String::new())];
-    let mut cells = 0;
+/// Splits `text` into rows of at most `cols` display cells, as `(index of
+/// the row's first char, row text)`. A newline starts a row; a long line
+/// breaks after its last space that fits, else mid-word. A row that fills
+/// the width is followed by an empty one, which is where the cursor goes.
+/// Untrusted characters show as in [`prompt_display`], one char per char.
+pub(super) fn wrap_prompt(text: &str, cols: usize) -> Vec<(usize, String)> {
+    let cols = cols.max(1);
+    let cells = |row: &[char]| row.iter().map(|c| c.width().unwrap_or(0)).sum::<usize>();
+    let mut rows: Vec<(usize, Vec<char>)> = vec![(0, Vec::new())];
     let mut count = 0;
     for (index, ch) in text.chars().enumerate() {
-        let width = ch.width().unwrap_or(0);
-        if cells + width > PROMPT_TEXT_WIDTH {
-            rows.push((index, String::new()));
-            cells = 0;
-        }
-        if let Some((_, row)) = rows.last_mut() {
-            row.push(ch);
-        }
-        cells += width;
         count = index + 1;
+        if ch == '\n' {
+            rows.push((index + 1, Vec::new()));
+            continue;
+        }
+        let ch = prompt_display_char(ch);
+        let width = ch.width().unwrap_or(0);
+        let (first, row) = rows.last_mut().expect("one row");
+        if !row.is_empty() && cells(row) + width > cols {
+            let after_space = row.iter().rposition(|c| *c == ' ').map(|p| p + 1);
+            let split = after_space
+                .filter(|&p| cells(&row[p..]) + width <= cols)
+                .unwrap_or(row.len());
+            let carried = row.split_off(split);
+            let next = *first + split;
+            rows.push((next, carried));
+        }
+        rows.last_mut().expect("one row").1.push(ch);
     }
-    if cells == PROMPT_TEXT_WIDTH {
-        rows.push((count, String::new()));
+    if rows.last().is_some_and(|(_, row)| cells(row) >= cols) {
+        rows.push((count, Vec::new()));
     }
-    rows
+    rows.into_iter()
+        .map(|(first, row)| (first, row.into_iter().collect()))
+        .collect()
 }
 
 /// Provider text is untrusted: one cell per char, with newlines shown as `⏎`
@@ -85,11 +99,17 @@ fn prompt_display(s: &str) -> String {
     s.chars()
         .map(|c| match c {
             '\n' => '⏎',
-            c if c.is_control() => '\u{fffd}',
-            '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => '\u{fffd}',
-            c => c,
+            c => prompt_display_char(c),
         })
         .collect()
+}
+
+fn prompt_display_char(c: char) -> char {
+    match c {
+        c if c.is_control() => '\u{fffd}',
+        '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => '\u{fffd}',
+        c => c,
+    }
 }
 
 /// Hard-wraps `line` into rows of at most `cols` display cells. Zero-width
@@ -1455,7 +1475,7 @@ impl NewSessionDialog {
     /// there is one, above the editable prompt. Both are hard-wrapped by cell
     /// width so the row count is exact; source rows past the area fold into a count.
     fn render_prompt_editor(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let width = HELP_DIALOG_WIDTH.min(area.width);
+        let width = PROMPT_EDITOR_WIDTH.min(area.width);
         let cols = usize::from(width.saturating_sub(2)).max(1);
         let source: Vec<String> = match &self.prompt_origin {
             Some(origin) => match origin.source_text.as_deref() {
@@ -1467,7 +1487,7 @@ impl NewSessionDialog {
             },
             None => Vec::new(),
         };
-        let wrapped = wrap_prompt(&prompt_display(self.prompt.value()));
+        let wrapped = wrap_prompt(self.prompt.value(), cols);
         let prompt_rows = wrapped.len().clamp(1, PROMPT_MAX_ROWS * 2);
         // Prompt header and rows, the close hint, the two border rows, and for
         // a source its header, rows and a blank line.
