@@ -3,6 +3,7 @@
 // global mousemove/mouseup handlers, so stubbed /api reproduces them.
 
 import { test, expect } from "./helpers/mockedTest";
+import { openPanelsByDefault } from "./helpers/apiMocks";
 import type { Page } from "@playwright/test";
 import { clickSidebarSession } from "./helpers/sidebar";
 import { mockTerminalApis } from "./helpers/terminal-mocks";
@@ -29,6 +30,7 @@ async function dragHandle(page: Page, testId: string, key: string, dx: number) {
 
 test("sidebar and right panel widths persist across reload after dragging their handles", async ({ page }) => {
   await mockTerminalApis(page);
+  await openPanelsByDefault(page);
   await page.setViewportSize({ width: 1400, height: 900 });
   await page.goto("/");
   await clickSidebarSession(page, "pinch-test");

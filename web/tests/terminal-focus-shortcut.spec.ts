@@ -3,6 +3,7 @@ import { test, expect, observeFor } from "./helpers/mockedTest";
 import type { Page } from "@playwright/test";
 import { clickSidebarSession } from "./helpers/sidebar";
 import { mockTerminalApis } from "./helpers/terminal-mocks";
+import { openPanelsByDefault } from "./helpers/apiMocks";
 
 async function openSession(page: Page) {
   await clickSidebarSession(page, "pinch-test");
@@ -55,6 +56,7 @@ test.describe("Cmd/Ctrl+` desktop", () => {
 
   test("toggles between agent and paired with the right panel open, stably under rapid presses", async ({ page }) => {
     await mockTerminalApis(page);
+    await openPanelsByDefault(page);
     await page.goto("/");
     await openSession(page);
     await blurAll(page);
@@ -80,6 +82,7 @@ test.describe("Cmd/Ctrl+` desktop", () => {
 
   test("expands collapsed right panel and focuses paired (latch)", async ({ page }) => {
     await mockTerminalApis(page);
+    await openPanelsByDefault(page);
     await page.goto("/");
     await openSession(page);
 
@@ -94,6 +97,7 @@ test.describe("Cmd/Ctrl+` desktop", () => {
 
   test("paired latch fires once ensureTerminal resolves (slow paired)", async ({ page }) => {
     await mockTerminalApis(page);
+    await openPanelsByDefault(page);
     let releaseTerminal!: () => void;
     const terminalPending = new Promise<void>((resolve) => {
       releaseTerminal = resolve;
@@ -123,6 +127,7 @@ test.describe("Cmd/Ctrl+` desktop", () => {
 
   test("with diff viewer open, Cmd+` to agent closes the diff", async ({ page }) => {
     await mockTerminalApis(page);
+    await openPanelsByDefault(page);
     const file = { path: "src/foo.ts", old_path: null, status: "modified", additions: 1, deletions: 1 };
     const oldContent = "export const value = 1;\n";
     const newContent = "export const value = 2;\n";
@@ -167,6 +172,7 @@ test.describe("Cmd/Ctrl+` desktop", () => {
 
   test("Ctrl+Q returns focus from the terminal to the active sidebar row", async ({ page }) => {
     await mockTerminalApis(page);
+    await openPanelsByDefault(page);
     await page.goto("/");
     await openSession(page);
     await focusKind(page, "agent");
@@ -198,6 +204,7 @@ test.describe("Cmd/Ctrl+` mobile", () => {
 
   test("toggle works correctly on a mobile viewport", async ({ page }) => {
     await mockTerminalApis(page);
+    await openPanelsByDefault(page);
     await page.goto("/");
     await page.getByRole("button", { name: "Toggle sidebar" }).click();
     await openSession(page);
@@ -215,6 +222,7 @@ test.describe("Cmd/Ctrl+` mobile", () => {
   });
   test("Ctrl+Q returns from the mobile keyboard proxy without sending a terminal control byte", async ({ page }) => {
     const terminal = await mockTerminalApis(page);
+    await openPanelsByDefault(page);
     await page.goto("/");
     await page.getByRole("button", { name: "Toggle sidebar" }).click();
     await openSession(page);
