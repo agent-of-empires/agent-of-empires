@@ -3934,9 +3934,14 @@ impl HomeView {
         };
 
         let existing_groups: Vec<String> = self.all_group_paths();
-        let current_profile = self
-            .profile_for_cursor(self.cursor)
-            .unwrap_or_else(|| self.config_profile());
+        // A structured fork opens in its parent's profile, which the dialog then
+        // keeps: a custom agent's command and store are the profile's.
+        let current_profile = if parent_is_structured {
+            parent_profile.clone()
+        } else {
+            self.profile_for_cursor(self.cursor)
+                .unwrap_or_else(|| self.config_profile())
+        };
         let profiles =
             list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
         let mut dialog = NewSessionDialog::new(

@@ -2005,6 +2005,30 @@ fn structured_fork_stays_structured_despite_terminal_default() {
     ));
 }
 
+/// A structured fork runs its parent's agent in its parent's profile, which the
+/// daemon enforces: the dialog keeps both rather than build a request it refuses.
+#[test]
+fn structured_fork_keeps_its_tool_and_profile() {
+    let mut dialog = multi_tool_dialog();
+    dialog.available_profiles = vec!["work".into(), "personal".into()];
+    dialog.profile_index = 0;
+    dialog.set_fork_from(crate::session::ForkSeed::Structured {
+        parent_acp_session_id: "acp-parent".into(),
+    });
+    let fields = dialog.field_indices();
+    for field in [fields.tool, fields.profile] {
+        dialog.focused_field = field;
+        for code in [KeyCode::Right, KeyCode::Left, KeyCode::Char(' ')] {
+            dialog.handle_key(key(code));
+        }
+        dialog.activate_focused_field();
+    }
+    dialog.focused_field = fields.tool;
+    dialog.handle_key(key(KeyCode::Char('2')));
+    assert_eq!(dialog.selected_tool(), "claude");
+    assert_eq!(dialog.selected_profile(), "work");
+}
+
 /// A structured fork whose agent cannot run structured here is refused, not sent
 /// as a terminal session carrying an ACP parent id.
 #[test]

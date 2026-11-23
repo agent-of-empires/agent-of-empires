@@ -727,7 +727,8 @@ impl NewSessionDialog {
     /// Switch tools and reset the per-tool YOLO, sandbox and Ctrl+P fields.
     /// Reselecting the current tool keeps the user's edits.
     fn select_tool_index(&mut self, index: usize) {
-        if index == self.tool_index {
+        // A structured fork runs its parent's agent: the daemon refuses another.
+        if index == self.tool_index || self.structured_fork() {
             return;
         }
         self.tool_index = index;
@@ -838,6 +839,11 @@ impl NewSessionDialog {
     #[cfg(test)]
     pub fn structured_value(&self) -> bool {
         self.structured_enabled && self.structured_capable
+    }
+
+    #[cfg(test)]
+    pub fn profile_value(&self) -> &str {
+        self.selected_profile()
     }
 
     #[cfg(test)]
@@ -1554,7 +1560,7 @@ impl NewSessionDialog {
         let fields = self.field_indices();
 
         if self.focused_field == fields.profile {
-            if self.available_profiles.len() > 1 {
+            if self.available_profiles.len() > 1 && !self.structured_fork() {
                 self.profile_index = (self.profile_index + 1) % self.available_profiles.len();
                 self.reload_config_defaults();
             }
@@ -1765,7 +1771,9 @@ impl NewSessionDialog {
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
                 if self.focused_field == fields.profile =>
             {
-                if self.available_profiles.len() > 1 {
+                // A structured fork stays in its parent's profile, where its
+                // agent's command and store are defined: the daemon refuses another.
+                if self.available_profiles.len() > 1 && !self.structured_fork() {
                     if key.code == KeyCode::Left {
                         self.profile_index = if self.profile_index == 0 {
                             self.available_profiles.len() - 1

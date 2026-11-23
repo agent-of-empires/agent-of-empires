@@ -278,11 +278,14 @@ fn fork_from_selection_keeps_a_custom_structured_parent_structured_under_a_termi
             .insert("claude-acct".into(), "~/.claude-acct".into());
     })
     .unwrap();
+    // The parent lives in another profile than the view's.
+    crate::session::create_profile("personal").unwrap();
     let mut inst = Instance::new("parent", "/tmp/repo");
-    inst.source_profile = "test".to_string();
+    inst.source_profile = "personal".to_string();
     inst.tool = "claude-acct".into();
     inst.view = crate::session::View::Structured;
     inst.acp_session_id = Some("acp-parent-custom".into());
+    let parent_profile = inst.effective_profile();
     let id = inst.id.clone();
     env.view.add_instance(inst);
     env.view.selected_session = Some(id);
@@ -303,6 +306,11 @@ fn fork_from_selection_keeps_a_custom_structured_parent_structured_under_a_termi
     assert!(
         dialog.structured_value(),
         "the fork opens structured whatever the default view"
+    );
+    assert_eq!(
+        dialog.profile_value(),
+        parent_profile,
+        "the fork opens in its parent's profile"
     );
 }
 
