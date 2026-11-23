@@ -39,17 +39,17 @@ type Filter = "all" | "dismissed" | { provider: string };
 const CHIP = "inline-flex h-8 flex-none items-center gap-1.5 rounded-full border px-3 text-xs";
 
 function providerStatus(provider: SuggestionProvider, itemCount: number) {
-  if (provider.refreshing) return { text: `⠙ ${provider.name}: refreshing…`, tone: "text-text-muted" };
+  if (provider.refreshing) return { text: `⠙ ${provider.name} · refreshing…`, tone: "text-text-muted" };
   if (provider.status === "pending")
-    return { text: `${provider.name}: waiting for first results`, tone: "text-text-muted" };
+    return { text: `${provider.name} · waiting for first results`, tone: "text-text-muted" };
   if (provider.status === "error")
     return {
-      text: `${provider.name}: couldn't refresh, ${provider.error ?? "provider error"}`,
+      text: `${provider.name} · couldn't refresh, ${provider.error ?? "provider error"}`,
       tone: "text-status-error",
     };
-  if (itemCount === 0) return { text: `${provider.name}: nothing new`, tone: "text-text-dim" };
+  if (itemCount === 0) return { text: `${provider.name} · nothing new`, tone: "text-text-dim" };
   const updated = provider.updated_at ? `updated ${agoLabel(provider.updated_at * 1000)}` : "updated";
-  return { text: `${provider.name} ${updated}`, tone: "text-text-secondary" };
+  return { text: `${provider.name} · ${updated}`, tone: "text-text-secondary" };
 }
 
 /** The `#12` of a `owner/repo#12` reference, which the group header already names. */
@@ -171,9 +171,11 @@ export function SuggestionsView({
         <header className="flex items-center justify-between gap-4">
           <div className="min-w-0">
             <h1 className="text-lg font-semibold">Suggested sessions</h1>
-            {snapshot && (
+            {snapshot && snapshot.providers.length > 0 && (
               <ul aria-label="Provider status" className="mt-1 flex flex-wrap gap-x-3 font-mono text-xs text-text-dim">
-                <li>{active.length}</li>
+                <li>
+                  {active.length} suggestion{active.length === 1 ? "" : "s"}
+                </li>
                 {providers.map((provider) => {
                   const { text, tone } = providerStatus(
                     provider,
@@ -189,17 +191,19 @@ export function SuggestionsView({
             )}
           </div>
           <div className="flex flex-none items-center gap-1">
-            <button
-              type="button"
-              aria-label="Refresh"
-              onClick={() => void refresh()}
-              disabled={anyRefreshing || disabled}
-              title={unavailableTitle}
-              className={`${TAP} inline-flex h-8 items-center gap-2 rounded-md border border-surface-700 px-2.5 text-sm text-text-secondary hover:bg-surface-800 disabled:opacity-50 md:px-3`}
-            >
-              <RefreshCw className={`h-4 w-4 ${anyRefreshing ? "animate-spin" : ""}`} />
-              <span className="hidden md:inline">{anyRefreshing ? "Refreshing…" : "Refresh"}</span>
-            </button>
+            {snapshot?.providers.length !== 0 && (
+              <button
+                type="button"
+                aria-label="Refresh"
+                onClick={() => void refresh()}
+                disabled={anyRefreshing || disabled}
+                title={unavailableTitle}
+                className={`${TAP} inline-flex h-8 items-center gap-2 rounded-md border border-surface-700 px-2.5 text-sm text-text-secondary hover:bg-surface-800 disabled:opacity-50 md:px-3`}
+              >
+                <RefreshCw className={`h-4 w-4 ${anyRefreshing ? "animate-spin" : ""}`} />
+                <span className="hidden md:inline">{anyRefreshing ? "Refreshing…" : "Refresh"}</span>
+              </button>
+            )}
             {onOpenSettings && (
               <button
                 type="button"

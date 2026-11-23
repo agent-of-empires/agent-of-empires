@@ -87,7 +87,7 @@ export function DashboardSuggestions({
           }}
           className="text-xs text-brand-500 hover:underline"
         >
-          View all ({active.length})
+          {active.length > 0 ? `View all (${active.length})` : "View all"}
         </a>
       </div>
       <ul className="rounded-lg border border-surface-700/40 bg-surface-900">

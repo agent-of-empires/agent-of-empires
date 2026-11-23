@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import { MoreHorizontal, Undo2, X } from "lucide-react";
+import { MoreHorizontal, X } from "lucide-react";
 import { lockTitle } from "../lib/suggestionPlan";
 import type { StartedSession } from "../lib/types";
 import { agoLabel } from "../lib/suggestionTime";
@@ -111,7 +111,7 @@ export function SuggestionRow({
                 {" · "}
               </>
             )}
-            {session ? <StartedReason session={session} /> : reason}
+            {session ? <StartedReason session={session} /> : stale ? "No longer open at the source" : reason}
             {project && (
               <>
                 {" · "}
@@ -327,9 +327,11 @@ export function SuggestionActions({
           title={label}
           onClick={onToggleDismiss}
           disabled={disabled}
-          className={`${TAP} inline-flex h-8 w-8 items-center justify-center rounded-md text-text-secondary hover:bg-surface-700/50 disabled:opacity-50`}
+          className={`${TAP} inline-flex h-8 items-center justify-center rounded-md text-text-secondary hover:bg-surface-700/50 disabled:opacity-50 ${
+            dismissed ? "border border-surface-700 bg-surface-800 px-3 text-xs font-medium text-text-primary" : "w-8"
+          }`}
         >
-          {dismissed ? <Undo2 className="h-4 w-4" /> : <X className="h-4 w-4" />}
+          {dismissed ? "Restore" : <X className="h-4 w-4" />}
         </button>
       )}
     </>

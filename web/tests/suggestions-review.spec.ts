@@ -134,7 +134,7 @@ test("a provider error stays visible next to the last items", async ({ page }) =
   await page.goto("/suggestions");
 
   await expect(page.getByRole("list", { name: "Provider status" })).toContainText(
-    "GitHub: couldn't refresh, Rate limit exceeded",
+    "GitHub · couldn't refresh, Rate limit exceeded",
   );
   await expect(page.getByText(item.title, { exact: true })).toBeVisible();
 });
@@ -156,7 +156,8 @@ test("read-only dashboard disables Start, hides Dismiss and says why", async ({ 
   await expect(start).toBeDisabled();
   await expect(start).toHaveAttribute("title", "Read-only: can't create Sessions");
   await expect(page.getByRole("button", { name: "Dismiss" })).toHaveCount(0);
-  await expect(page.getByText("This dashboard is read-only. Start, Dismiss and Refresh are off.")).toBeVisible();
+  await expect(page.getByText("Read-only: suggestions can't be started or changed.")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start options" })).toBeDisabled();
 });
 
 test("an empty list says there is nothing to suggest", async ({ page }) => {
@@ -336,7 +337,8 @@ test("a dismiss on the full view shows Undo, and Undo restores the row", async (
   await page.getByRole("button", { name: "Dismiss", exact: true }).click();
   await expect(page.getByText(`Dismissed “${item.title}”.`)).toBeVisible();
   await expect(page.getByText(item.title, { exact: true })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: /Stop suggesting/ })).toHaveCount(0);
+  // Stop suggesting is offered here as on Home.
+  await expect(page.getByRole("button", { name: /Stop suggesting/ })).toBeVisible();
 
   await page.getByRole("button", { name: "Undo" }).click();
   expect((await undismiss).postDataJSON()).toEqual({ provider_id: "github", id: "issue-1" });

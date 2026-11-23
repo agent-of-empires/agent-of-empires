@@ -110,7 +110,7 @@ describe("first-run hint", () => {
   it("names the featured source, and opens the sheet", async () => {
     renderHint();
     const hint = await screen.findByTestId("suggestions-hint");
-    expect(hint.textContent).toContain("from your GitHub issues and PRs?");
+    expect(hint.textContent).toContain("based on your GitHub issues and PRs?");
     fireEvent.click(screen.getByTestId("suggestions-hint-open"));
     expect(screen.getByTestId("suggestions-setup-sheet")).toBeTruthy();
     expect(screen.getByText("Install 1 plugin")).toBeTruthy();

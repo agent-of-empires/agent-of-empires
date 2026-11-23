@@ -43,7 +43,7 @@ test("hint sits under the cards and above the 'press n' line", async ({ page }) 
   await page.goto("/");
   const hint = page.getByTestId("suggestions-hint");
   await expect(hint).toBeVisible();
-  await expect(hint).toContainText("from your GitHub issues and PRs?");
+  await expect(hint).toContainText("based on your GitHub issues and PRs?");
 
   const [cards, hintBox, pressN] = await Promise.all([
     page.locator("[data-tour=dashboard-new-session]").boundingBox(),

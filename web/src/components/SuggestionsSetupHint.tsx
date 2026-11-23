@@ -91,7 +91,7 @@ export function SuggestionsSetupHint({
         role="status"
         data-testid="suggestions-hint-error"
       >
-        Couldn't look up suggestion sources. {featured.message}
+        Couldn&apos;t look up suggestion sources: {featured.message.replace(/[.!]$/, "")}.
         <button
           type="button"
           className="min-h-8 cursor-pointer font-medium text-brand-500 hover:underline"
@@ -112,7 +112,7 @@ export function SuggestionsSetupHint({
         className="mt-3.5 flex flex-wrap items-center justify-center gap-x-2 text-center text-xs text-text-dim"
         data-testid="suggestions-hint"
       >
-        <span>Want AoE to suggest what to work on next, from your {names} issues and PRs?</span>
+        <span>Want AoE to suggest what to work on next, based on your {names} issues and PRs?</span>
         <button
           type="button"
           className="min-h-8 cursor-pointer font-medium text-brand-500 hover:underline"

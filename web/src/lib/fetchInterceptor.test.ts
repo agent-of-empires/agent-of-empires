@@ -297,6 +297,7 @@ describe("installFetchErrorToasts", () => {
     ["a non-/api 5xx", json(500, {}), "/static", undefined, false, null],
     // Every view that loads suggestions shows its own error.
     ["the suggestions snapshot", json(500, {}), "/api/suggestions", undefined, false, null],
+    ["plugin discovery", json(503, {}), "/api/plugins/discover?q=x", undefined, false, null],
     [
       "a suggestions mutation",
       json(500, {}),

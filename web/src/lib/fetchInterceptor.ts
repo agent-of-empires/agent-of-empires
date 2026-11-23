@@ -39,6 +39,9 @@ export function isLoginAttemptPath(path: string): boolean {
   );
 }
 
+/** GETs whose every caller shows its own error, so a toast would only repeat it. */
+const SELF_REPORTED = new Set(["/api/suggestions", "/api/plugins/discover"]);
+
 const ACP_PROMPT_PATH = /^\/api\/sessions\/[^/]+\/acp\/prompt$/;
 
 /** The retryable `worker_not_ready` 503 of a prompt POST to a resuming worker. Reads a clone. */
@@ -68,8 +71,7 @@ export function installFetchErrorToasts(): void {
     const isApi = path.startsWith("/api/");
     const sameOrigin = isSameOrigin(rawUrl);
     const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
-    // Every view that loads the suggestions snapshot shows its own load error.
-    const toastFailures = isApi && !(method === "GET" && path === "/api/suggestions");
+    const toastFailures = isApi && !(method === "GET" && SELF_REPORTED.has(path.split("?")[0]!));
 
     // A 401 or a rotation answers the token the request carried, not one saved while it was in flight.
     const sentToken = sameOrigin ? getToken() : null;

@@ -842,14 +842,17 @@ describe("SuggestionsView", () => {
         ],
       });
       const status = await screen.findByRole("list", { name: "Provider status" });
-      expect(status.textContent).toContain("⠙ GitHub: refreshing…");
-      expect(status.textContent).toContain("Linear: couldn't refresh, API key rejected");
+      expect(status.textContent).toContain("⠙ GitHub · refreshing…");
+      expect(status.textContent).toContain("Linear · couldn't refresh, API key rejected");
       cleanup();
       await open({ ...base, items: [{ ...base.items[0]!, provider_id: "linear" }] });
       expect((await screen.findByRole("list", { name: "Provider status" })).textContent).toContain(
-        "GitHub: nothing new",
+        "GitHub · nothing new",
       );
-      expect(screen.getByRole("list", { name: "Provider status" }).textContent).toContain("Linear updated 2 min ago");
+      expect(screen.getByRole("list", { name: "Provider status" }).textContent).toContain("Linear · updated 2 min ago");
+      expect(screen.getByRole("list", { name: "Provider status" }).querySelector("li")?.textContent).toBe(
+        "1 suggestion",
+      );
     });
 
     it("follows a refreshing provider until it answers", async () => {
@@ -876,6 +879,27 @@ describe("SuggestionsView", () => {
       fireEvent.click(screen.getByRole("button", { name: "Undo" }));
       await waitFor(() => expect(dismissSuggestion).toHaveBeenCalledWith("github", "issue-1", false));
     });
+  });
+
+  it("says why a stale row is greyed, labels Restore, and drops the count and Refresh with no provider", async () => {
+    await open(
+      snapshot({
+        items: [
+          { ...item, stale: true },
+          { ...item, id: "issue-2", dismissed: true },
+        ],
+      }),
+    );
+    expect(await screen.findByText(/No longer open at the source/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /^Dismissed/ }));
+    expect(screen.getByRole("button", { name: "Restore" }).textContent).toBe("Restore");
+    cleanup();
+
+    await open(snapshot({ items: [], providers: [] }));
+    await waitFor(() => expect(fetchSuggestions).toHaveBeenCalled());
+    await act(async () => {});
+    expect(screen.queryByRole("list", { name: "Provider status" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Refresh" })).toBeNull();
   });
 
   it("a stale item shows a notice and reloads instead of opening the wizard", async () => {

@@ -279,7 +279,7 @@ export function SuggestionsSettings({
             onChange={(v) => void patch({ homepage: v })}
           />
         </Row>
-        <Row title="Show in the sidebar" description={'A "Suggested" Group above Trash.'}>
+        <Row title="Show in the sidebar" description={'A "Suggested" Group under your Projects.'}>
           <SuggestionSwitch
             checked={prefs.sidebar}
             disabled={disabled}
