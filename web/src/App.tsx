@@ -7,6 +7,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ComponentProps,
   type ReactNode,
 } from "react";
 import { Puzzle } from "lucide-react";
@@ -21,6 +22,7 @@ import type { NavigateOptions, To } from "react-router-dom";
 import { Navigate, useLocation, useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
+import { lazyView } from "./lib/lazyView";
 import { useSessions } from "./hooks/useSessions";
 import { useAttentionCounts } from "./hooks/useAttentionCounts";
 import { useStatusSounds } from "./hooks/useStatusSounds";
@@ -163,18 +165,28 @@ const StructuredView = lazy(() =>
     default: m.StructuredView,
   })),
 );
-const BackgroundAgentsPanel = lazy(() =>
-  import("./components/acp/BackgroundAgentsPanel").then((m) => ({ default: m.BackgroundAgentsPanel })),
+const BackgroundAgentsPanel = lazyView(
+  () => import("./components/acp/BackgroundAgentsPanel").then((m) => m.BackgroundAgentsPanel),
+  <LazyFallback label="Loading agents…" />,
 );
-const DiffFileViewer = lazy(() =>
-  import("./components/diff/DiffFileViewer").then((m) => ({ default: m.DiffFileViewer })),
+const DiffFileViewer = lazyView(
+  () => import("./components/diff/DiffFileViewer").then((m) => m.DiffFileViewer),
+  <LazyFallback label="Loading diff…" />,
 );
-const SettingsView = lazy(() => import("./components/SettingsView").then((m) => ({ default: m.SettingsView })));
-const SendCommentsDialog = lazy(() =>
-  import("./components/diff/comments/SendCommentsDialog").then((m) => ({ default: m.SendCommentsDialog })),
+const SettingsView = lazyView(
+  () => import("./components/SettingsView").then((m) => m.SettingsView),
+  <LazyFallback label="Loading settings…" />,
+);
+const SendCommentsDialog = lazyView(
+  () => import("./components/diff/comments/SendCommentsDialog").then((m) => m.SendCommentsDialog),
+  null,
 );
 const loadCommandPalette = () => import("./components/command-palette/CommandPalette");
-const CommandPalette = lazy(() => loadCommandPalette().then((m) => ({ default: m.CommandPalette })));
+const LazyCommandPalette = lazyView(() => loadCommandPalette().then((m) => m.CommandPalette), null);
+// Mounted only while open so the chunk is not fetched until needed.
+function CommandPalette(props: ComponentProps<typeof LazyCommandPalette>) {
+  return props.open ? <LazyCommandPalette {...props} /> : null;
+}
 import { type PaneDisplay } from "./components/Dock";
 import { DockGroups, type DockGroupView } from "./components/DockGroups";
 import { BottomDock } from "./components/BottomDock";
@@ -2134,13 +2146,11 @@ function AppContent({
       if (plugin) return <PluginPaneBody entry={plugin.entry} />;
       if (id === "agents") {
         return (
-          <Suspense fallback={<LazyFallback label="Loading agents…" />}>
-            <BackgroundAgentsPanel
-              sessionId={activeSessionId}
-              readOnly={caps.readOnly || !!activeSession?.trashed_at || !!activeSession?.archived_at}
-              focus={agentFocus}
-            />
-          </Suspense>
+          <BackgroundAgentsPanel
+            sessionId={activeSessionId}
+            readOnly={caps.readOnly || !!activeSession?.trashed_at || !!activeSession?.archived_at}
+            focus={agentFocus}
+          />
         );
       }
       if (id === "files") {
@@ -2271,18 +2281,16 @@ function AppContent({
                       onBack={handleCloseFile}
                     />
                   ) : (
-                    <Suspense fallback={<LazyFallback label="Loading diff…" />}>
-                      <DiffFileViewer
-                        sessionId={activeSessionId}
-                        filePath={selectedFilePath}
-                        repoName={selectedRepoName}
-                        targetLine={selectedFileLine}
-                        revision={revision}
-                        onClose={handleCloseFile}
-                        commentsEnabled={commentsEnabled}
-                        commentsStore={diffComments}
-                      />
-                    </Suspense>
+                    <DiffFileViewer
+                      sessionId={activeSessionId}
+                      filePath={selectedFilePath}
+                      repoName={selectedRepoName}
+                      targetLine={selectedFileLine}
+                      revision={revision}
+                      onClose={handleCloseFile}
+                      commentsEnabled={commentsEnabled}
+                      commentsStore={diffComments}
+                    />
                   ))}
               </div>
             }
@@ -2314,35 +2322,33 @@ function AppContent({
           )}
         </PaneDndController>
         {sendDialogOpen && commentsEnabled && activeSessionId && (
-          <Suspense fallback={null}>
-            <SendCommentsDialog
-              sessionId={activeSessionId}
-              delivery={activeSession?.view === "structured" ? "structured" : "terminal"}
-              comments={diffComments.comments}
-              isMultiRepo={commentsIsMultiRepo}
-              sendEnabled={commentSendEnabled}
-              sendDisabledReason={commentSendDisabledReason}
-              introDraft={diffComments.introDraft}
-              outroDraft={diffComments.outroDraft}
-              clearAfterSend={diffComments.clearAfterSend}
-              onChangeIntro={diffComments.setIntroDraft}
-              onChangeOutro={diffComments.setOutroDraft}
-              onChangeClearAfterSend={diffComments.setClearAfterSend}
-              onClose={() => setSendDialogOpen(false)}
-              onSent={() => {
-                if (diffComments.clearAfterSend) {
-                  diffComments.clearComments();
-                  diffComments.setIntroDraft("");
-                  diffComments.setOutroDraft("");
-                }
-                setSendDialogOpen(false);
-                // Close the diff viewer to show the agent transcript or terminal
-                // after dispatching feedback. The file remains in the diff list.
-                setSelectedFile(null);
-                toastBus.handler?.info("Comments sent to agent");
-              }}
-            />
-          </Suspense>
+          <SendCommentsDialog
+            sessionId={activeSessionId}
+            delivery={activeSession?.view === "structured" ? "structured" : "terminal"}
+            comments={diffComments.comments}
+            isMultiRepo={commentsIsMultiRepo}
+            sendEnabled={commentSendEnabled}
+            sendDisabledReason={commentSendDisabledReason}
+            introDraft={diffComments.introDraft}
+            outroDraft={diffComments.outroDraft}
+            clearAfterSend={diffComments.clearAfterSend}
+            onChangeIntro={diffComments.setIntroDraft}
+            onChangeOutro={diffComments.setOutroDraft}
+            onChangeClearAfterSend={diffComments.setClearAfterSend}
+            onClose={() => setSendDialogOpen(false)}
+            onSent={() => {
+              if (diffComments.clearAfterSend) {
+                diffComments.clearComments();
+                diffComments.setIntroDraft("");
+                diffComments.setOutroDraft("");
+              }
+              setSendDialogOpen(false);
+              // Close the diff viewer to show the agent transcript or terminal
+              // after dispatching feedback. The file remains in the diff list.
+              setSelectedFile(null);
+              toastBus.handler?.info("Comments sent to agent");
+            }}
+          />
         )}
       </div>
     );
@@ -2390,40 +2396,38 @@ function AppContent({
     }
     if (showSettings) {
       return (
-        <Suspense fallback={<LazyFallback label="Loading settings…" />}>
-          <SettingsView
-            tab={settingsTab}
-            onClose={handleCloseSettings}
-            onSelectTab={(t) => {
-              const p = searchParams.get("profile");
-              // Marks a tab opened from the mobile section list, so its Back pops to it.
-              navigate(`/settings/${t}${p ? `?profile=${encodeURIComponent(p)}` : ""}`, {
-                state: { fromSettingsList: settingsTab === null },
-              });
-            }}
-            onShowList={() => {
-              if ((location.state as { fromSettingsList?: boolean } | null)?.fromSettingsList) {
-                navigate(-1);
-                return;
-              }
-              const p = searchParams.get("profile");
-              navigate(`/settings${p ? `?profile=${encodeURIComponent(p)}` : ""}`, { replace: true });
-            }}
-            onServerAboutRefresh={async () => {
-              await refreshServerAbout();
-              await refreshProjects();
-            }}
-            profile={searchParams.get("profile")}
-            field={searchParams.get("field")}
-            onSelectProfile={(p) => {
-              const next = new URLSearchParams(searchParams);
-              next.set("profile", p);
-              setSearchParams(next, { replace: true });
-            }}
-            readOnly={caps.readOnly}
-            cityhall={caps.cityhall}
-          />
-        </Suspense>
+        <SettingsView
+          tab={settingsTab}
+          onClose={handleCloseSettings}
+          onSelectTab={(t) => {
+            const p = searchParams.get("profile");
+            // Marks a tab opened from the mobile section list, so its Back pops to it.
+            navigate(`/settings/${t}${p ? `?profile=${encodeURIComponent(p)}` : ""}`, {
+              state: { fromSettingsList: settingsTab === null },
+            });
+          }}
+          onShowList={() => {
+            if ((location.state as { fromSettingsList?: boolean } | null)?.fromSettingsList) {
+              navigate(-1);
+              return;
+            }
+            const p = searchParams.get("profile");
+            navigate(`/settings${p ? `?profile=${encodeURIComponent(p)}` : ""}`, { replace: true });
+          }}
+          onServerAboutRefresh={async () => {
+            await refreshServerAbout();
+            await refreshProjects();
+          }}
+          profile={searchParams.get("profile")}
+          field={searchParams.get("field")}
+          onSelectProfile={(p) => {
+            const next = new URLSearchParams(searchParams);
+            next.set("profile", p);
+            setSearchParams(next, { replace: true });
+          }}
+          readOnly={caps.readOnly}
+          cityhall={caps.cityhall}
+        />
       );
     }
 
@@ -2962,26 +2966,22 @@ function AppContent({
             />
           )}
 
-          {showPalette && (
-            <Suspense fallback={null}>
-              <CommandPalette
-                open
-                onClose={() => {
-                  setShowPalette(false);
-                  setPaletteQuery("");
-                }}
-                actions={[
-                  ...commandActions,
-                  ...conversationActions,
-                  ...pluginPageActions,
-                  ...settingsCommands,
-                  ...pluginCommandActions,
-                ]}
-                onSearchChange={setPaletteQuery}
-                searching={conversationSearching}
-              />
-            </Suspense>
-          )}
+          <CommandPalette
+            open={showPalette}
+            onClose={() => {
+              setShowPalette(false);
+              setPaletteQuery("");
+            }}
+            actions={[
+              ...commandActions,
+              ...conversationActions,
+              ...pluginPageActions,
+              ...settingsCommands,
+              ...pluginCommandActions,
+            ]}
+            onSearchChange={setPaletteQuery}
+            searching={conversationSearching}
+          />
 
           {pluginLinkPicker}
 
