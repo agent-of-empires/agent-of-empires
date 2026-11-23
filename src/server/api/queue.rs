@@ -543,6 +543,7 @@ mod tests {
         assert_eq!(post().await.status(), StatusCode::OK);
         service.drain_queued_prompts_once(&id).await;
         assert!(service.queued_prompts_snapshot(&id).await.is_empty());
+        service.acp_supervisor.test_flush_worker_commands(&id).await;
         let delivered = commands.lock().unwrap().len();
         assert_eq!(delivered, 1, "the drain delivered the prompt once");
 
@@ -555,6 +556,7 @@ mod tests {
         assert_eq!(body["delivered"], true);
         assert!(service.queued_prompts_snapshot(&id).await.is_empty());
         service.drain_queued_prompts_once(&id).await;
+        service.acp_supervisor.test_flush_worker_commands(&id).await;
         assert_eq!(commands.lock().unwrap().len(), delivered);
     }
 
