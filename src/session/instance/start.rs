@@ -1577,7 +1577,7 @@ mod tests {
                             Ok(row.try_acquire_lifecycle_reservation(
                                 LifecycleOperation::Launch,
                                 Instance::LIFECYCLE_RESERVATION_TTL,
-                                chrono::Utc::now(),
+                                Timestamp::now(),
                             )?)
                         })
                         .unwrap();

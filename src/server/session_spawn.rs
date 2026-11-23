@@ -2243,6 +2243,7 @@ mod tests {
             Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
             None,
             None,
+            axum::http::HeaderMap::new(),
             Ok(Json(serde_json::from_value(body.clone()).unwrap())),
         )
         .await
@@ -2260,6 +2261,7 @@ mod tests {
             Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
             None,
             None,
+            axum::http::HeaderMap::new(),
             Ok(Json(serde_json::from_value(body).unwrap())),
         )
         .await
@@ -2387,6 +2389,7 @@ mod tests {
                 Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
                 None,
                 None,
+                axum::http::HeaderMap::new(),
                 Ok(Json(serde_json::from_value(create_body).unwrap())),
             )
             .await
@@ -2530,6 +2533,7 @@ mod tests {
             Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
             None,
             None,
+            axum::http::HeaderMap::new(),
             Ok(Json(serde_json::from_value(body).unwrap())),
         )
         .await

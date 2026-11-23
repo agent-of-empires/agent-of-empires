@@ -1669,9 +1669,8 @@ mod tests {
                 instance.launch_executable = Some(executable.clone());
                 instance.launch_resolved_executable = Some(root.path().join("prior-agent"));
                 instance.started_at = Some(
-                    chrono::DateTime::<Utc>::from(
-                        std::fs::metadata(&executable).unwrap().modified().unwrap(),
-                    ) + chrono::Duration::seconds(1),
+                    Timestamp::from(std::fs::metadata(&executable).unwrap().modified().unwrap())
+                        + crate::time::Duration::seconds(1),
                 );
                 let storage =
                     crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();

@@ -2951,7 +2951,7 @@ mod tests {
         let finalized_in_observer = finalized.clone();
         let retained_capture =
             std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        let retained_start = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let retained_start = crate::time::Timestamp::from_unix_secs(1_700_000_000).unwrap();
         let _observer = FinalizeObserver::install(inst.id.clone(), move |instance, phase| {
             match phase {
                 FinalizePhase::Before => {
