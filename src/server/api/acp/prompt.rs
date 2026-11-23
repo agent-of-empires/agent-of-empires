@@ -332,6 +332,21 @@ pub(crate) async fn submit_prompt(
         .session_service
         .prompt_dispatch_under_submission(id, req.text, woke_idle_dormant, req.no_revive)
         .await;
+    // A typed prompt to a stop-fenced session starts it like an idle wake; `send_turn`
+    // admits the explicit resume and refuses if a newer stop wins.
+    let dispatch = if !req.no_revive
+        && matches!(
+            dispatch,
+            PromptDispatch::Queued {
+                reason: QueueReason::WorkerDown
+            }
+        )
+        && crate::process::worker_registry::stop_requested(id)
+    {
+        PromptDispatch::Sent
+    } else {
+        dispatch
+    };
     // Refused before touching the pending-turn/queue state below, so a
     // rejected prompt leaves both untouched (#4081 review).
     if req.no_revive

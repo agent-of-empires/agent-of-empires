@@ -439,6 +439,91 @@ async fn rate_limit_park_is_sendable_at_the_shared_decision_point() {
     }
 }
 
+/// Settles a durable stop fence for `id`, as `aoe acp stop` leaves it.
+fn settle_stop_fence(id: &str) {
+    use crate::process::worker_registry::{self, WorkerRecord};
+    let record = WorkerRecord::new(
+        id.into(),
+        std::process::id(),
+        worker_registry::socket_path_for(id).unwrap(),
+        "aoe-agent".into(),
+        "aoe-agent".into(),
+        std::path::PathBuf::from("/tmp"),
+        None,
+        vec![],
+        vec![],
+        None,
+        None,
+    );
+    worker_registry::save(&record).unwrap();
+    worker_registry::request_stop(&record).unwrap();
+    worker_registry::retire_selected(&record).unwrap();
+    assert!(worker_registry::stop_requested(id));
+}
+
+/// A prompt typed into a stop-fenced session starts it (explicit resume) instead of
+/// parking behind the fence; a `no_revive` sender still parks.
+#[tokio::test]
+#[serial_test::serial]
+async fn user_prompt_to_a_stop_fenced_session_wakes_it() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-stop-fence-wake".to_string();
+    let (state, launches) = failing_start_state(&id, false).await;
+    settle_stop_fence(&id);
+    // The detached start holds a `SessionService` clone until it ends.
+    let refs_at_rest = Arc::strong_count(&state.session_service);
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        prompt_req("wake up"),
+    )
+    .await
+    .into_response();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while Arc::strong_count(&state.session_service) > refs_at_rest {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the detached start never finished");
+
+    assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!crate::process::worker_registry::stop_requested(&id));
+    assert!(state
+        .session_service
+        .queued_prompts_snapshot(&id)
+        .await
+        .is_empty());
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn no_revive_prompt_to_a_stop_fenced_session_stays_fenced() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-stop-fence-no-revive".to_string();
+    let (state, launches) = failing_start_state(&id, false).await;
+    settle_stop_fence(&id);
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        no_revive_prompt_req("automated"),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(crate::process::worker_registry::stop_requested(&id));
+    assert!(state
+        .session_service
+        .queued_prompts_snapshot(&id)
+        .await
+        .is_empty());
+}
+
 /// #4081 review: `no_revive` must refuse a prompt to a fully stopped worker
 /// (`WorkerDown`) rather than queue it, since queuing still hands the prompt
 /// off once something else revives the worker. An idle-dormant session is
