@@ -1416,7 +1416,8 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
 
         // A live pane moved into another session is not this session's pane.
         let other = tmux::Session::generate_name("aoe_test_5788_cap", "pane id moved");
-        let _other_guard = spawn_pane(&other, "sleep 300");
+        let _other_guard = spawn_pane(&other, "echo aoe-owns; sleep 300");
+        assert!(wait_for_pane(&other, "aoe-owns"));
         let moved = tmux::first_pane_id(&other).expect("other pane id");
         metadata.pane_id = moved.clone();
         let (out, count) = forks(Some(&metadata), &session);

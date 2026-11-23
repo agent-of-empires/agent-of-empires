@@ -330,15 +330,16 @@ fn capture_output(success: bool, stdout: &[u8]) -> Option<String> {
     success.then(|| String::from_utf8_lossy(stdout).into_owned())
 }
 
-/// Capture `pane_id` only while `session_name` still lists it: one tmux call prints an ownership
-/// marker, then the capture. Membership comes from the session's own pane list, not the bare id,
-/// which resolves through whichever session sharing a linked window was active last.
+/// Capture `pane_id` only while `session_name` still lists it. Membership comes from the
+/// session's own pane list, not the bare id, which resolves through whichever session sharing a
+/// linked window was active last. One tmux call frames its markers with a per-call nonce that
+/// pane output cannot contain, so screen text never reads as a membership result.
 fn capture_pane_in_session(
     pane_id: &str,
     session_name: &str,
     lines: usize,
 ) -> std::io::Result<Option<String>> {
-    const OWNS: &str = "aoe-owns";
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
     let output = crate::tmux::tmux_command()
         .args([
             "list-panes",
@@ -348,7 +349,11 @@ fn capture_pane_in_session(
             "-f",
             &format!("#{{==:#{{pane_id}},{pane_id}}}"),
             "-F",
-            OWNS,
+            &format!("{nonce}:owns"),
+            ";",
+            "display-message",
+            "-p",
+            &format!("{nonce}:capture"),
             ";",
             "capture-pane",
             "-t",
@@ -362,9 +367,11 @@ fn capture_pane_in_session(
     let Some(text) = capture_output(output.status.success(), &output.stdout) else {
         return Ok(None);
     };
-    Ok(text
-        .strip_prefix(OWNS)
-        .and_then(|rest| rest.strip_prefix('\n'))
+    let Some(rest) = text.strip_prefix(&format!("{nonce}:owns\n")) else {
+        return Ok(None);
+    };
+    Ok(rest
+        .strip_prefix(&format!("{nonce}:capture\n"))
         .map(str::to_owned))
 }
 
