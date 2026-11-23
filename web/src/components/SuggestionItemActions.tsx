@@ -1,6 +1,4 @@
-import { prepareSuggestion } from "../lib/api";
-import { reportError, reportInfo } from "../lib/toastBus";
-import { startSummary } from "../lib/suggestionPlan";
+import { copySuggestionPrompt, startSummary } from "../lib/suggestionPlan";
 import { suggestionKey, type useSuggestions } from "../hooks/useSuggestions";
 import type { SuggestionItem, SuggestionPresetEntry, SuggestionsSnapshot } from "../lib/types";
 import { SuggestionActions } from "./SuggestionRow";
@@ -71,17 +69,7 @@ export function SuggestionItemActions({
               sourceUrl: item.source_url,
               kindLabel,
               onStartWithChanges: () => void ctrl.startWithChanges(item),
-              onCopyPrompt: () => {
-                void prepareSuggestion(item.provider_id, item.id).then(async (r) => {
-                  if (!r.ok) return reportError(r.error);
-                  try {
-                    await navigator.clipboard.writeText(r.data.initial_prompt);
-                    reportInfo("Prompt copied");
-                  } catch {
-                    reportError("Could not copy the prompt.");
-                  }
-                });
-              },
+              onCopyPrompt: () => void copySuggestionPrompt(item),
               onEditPreset:
                 onEditPreset && kindLabel ? () => onEditPreset(item.provider_id, item.criterion) : undefined,
             }

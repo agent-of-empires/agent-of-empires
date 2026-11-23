@@ -22,6 +22,8 @@ export function PromptBlockedNote({
   code,
   message,
   onTryAgain,
+  inSession = false,
+  onCopyPrompt,
   disabled = false,
   live = "alert",
 }: {
@@ -30,6 +32,10 @@ export function PromptBlockedNote({
   message: string;
   /** Starts a fresh Session; without it the note says how to go on in this one. */
   onTryAgain?: () => Promise<unknown> | void;
+  /** Shown on the Session page, where the terminal is right there. */
+  inSession?: boolean;
+  /** Copies the prompt to paste once the folder is trusted. */
+  onCopyPrompt?: () => void;
   disabled?: boolean;
   /** Rows re-render on every poll, so they announce politely. */
   live?: "alert" | "status";
@@ -56,9 +62,25 @@ export function PromptBlockedNote({
       <p role={live} className="break-words">
         {label}: {(code && PLAIN[code]) || message}
       </p>
-      {actions && (step === "idle" || step === "failed") && (
+      {code === FOLDER && (
         <p>
+          {inSession
+            ? "Choose \u201cYes, I trust this folder\u201d in the terminal, then type the prompt."
+            : "Open the Session and choose \u201cYes, I trust this folder\u201d, then paste the prompt."}
+          {onCopyPrompt && !disabled && (
+            <>
+              {" "}
+              <button type="button" className={LINK} onClick={onCopyPrompt}>
+                Copy prompt
+              </button>
+            </>
+          )}
+        </p>
+      )}
+      {actions && (step === "idle" || step === "failed") && (
+        <p className="text-text-secondary">
           {step === "failed" && <span>Couldn&apos;t turn on pre-trust. </span>}
+          Or trust every folder AoE starts Claude Code in:{" "}
           <button type="button" className={LINK} onClick={() => setStep("confirm")}>
             Turn on pre-trust
           </button>
@@ -66,8 +88,9 @@ export function PromptBlockedNote({
       )}
       {actions && (step === "confirm" || step === "saving") && (
         <p className="text-text-secondary">
-          Claude Code will trust each folder AoE starts it in. That also runs the repo&apos;s own .claude/settings.json
-          hooks. {/* Focus follows the step, since the button that had it is gone. */}
+          This turns on Pre-trust agent folders: Claude Code will trust each folder AoE starts it in, which also runs
+          the repo&apos;s own .claude/settings.json hooks.{" "}
+          {/* Focus follows the step, since the button that had it is gone. */}
           <button type="button" className={LINK} disabled={step === "saving"} onClick={() => void turnOn()} autoFocus>
             Turn on
           </button>{" "}
@@ -99,10 +122,13 @@ export function PromptBlockedNote({
 export function StartedPromptNote({
   session,
   onTryAgain,
+  onCopyPrompt,
   disabled,
 }: {
   session?: StartedSession;
   onTryAgain: () => Promise<unknown>;
+  /** The preset's prompt; a Start with changes Session had its own, so it gets none. */
+  onCopyPrompt: () => void;
   disabled: boolean;
 }) {
   if (!session?.initial_prompt_error) return null;
@@ -114,6 +140,7 @@ export function StartedPromptNote({
         message={session.initial_prompt_error}
         // Redoing from the preset would drop a Start with changes Session's own prompt, agent or project.
         onTryAgain={session.started_via === "start" ? onTryAgain : undefined}
+        onCopyPrompt={session.started_via === "start" ? onCopyPrompt : undefined}
         disabled={disabled}
         live="status"
       />

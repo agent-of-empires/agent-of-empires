@@ -50,6 +50,34 @@ describe("PromptBlockedNote", () => {
     expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
   });
 
+  it("an untrusted folder names the direct fix first, with Copy prompt, then pre-trust", () => {
+    const onCopyPrompt = vi.fn();
+    const { container, rerender } = render(
+      <PromptBlockedNote
+        label="Prompt not sent"
+        code="agent_folder_not_trusted"
+        message={LONG}
+        onCopyPrompt={onCopyPrompt}
+      />,
+    );
+    expect(container.textContent).toContain(
+      "Open the Session and choose \u201cYes, I trust this folder\u201d, then paste the prompt.",
+    );
+    const names = screen.getAllByRole("button").map((b) => b.textContent);
+    expect(names).toEqual(["Copy prompt", "Turn on pre-trust"]);
+    fireEvent.click(screen.getByRole("button", { name: "Copy prompt" }));
+    expect(onCopyPrompt).toHaveBeenCalled();
+    expect(container.textContent).toContain("Or trust every folder AoE starts Claude Code in:");
+    fireEvent.click(screen.getByRole("button", { name: "Turn on pre-trust" }));
+    expect(container.textContent).toContain("Pre-trust agent folders");
+
+    // On the Session page the terminal is right there.
+    rerender(
+      <PromptBlockedNote label="Initial prompt not sent" code="agent_folder_not_trusted" message={LONG} inSession />,
+    );
+    expect(container.textContent).toContain("Choose \u201cYes, I trust this folder\u201d in the terminal");
+  });
+
   it("Bypass Permissions and unknown codes have no action", () => {
     const { rerender } = render(
       <PromptBlockedNote

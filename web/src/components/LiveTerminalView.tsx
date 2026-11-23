@@ -537,6 +537,7 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
           {session.initial_prompt_error && (
             <div className="pointer-events-auto bg-surface-900/90 border border-surface-700/60 rounded-2xl px-4 py-2 max-w-md text-center">
               <PromptBlockedNote
+                inSession
                 label="Initial prompt not sent"
                 code={session.initial_prompt_error_code}
                 message={session.initial_prompt_error}

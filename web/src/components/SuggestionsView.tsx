@@ -5,7 +5,7 @@ import { chipId, filterSuggestions, keyChipGroups, type KeyChip } from "../lib/s
 import type { SessionResponse, SuggestionItem, SuggestionProvider } from "../lib/types";
 import { suggestionKey, useDismissUndo, useSuggestions } from "../hooks/useSuggestions";
 import { SuggestionFilterMenu, FilterMenuItem } from "./SuggestionFilterMenu";
-import { liveSession, lockTitle, shortRef } from "../lib/suggestionPlan";
+import { copySuggestionPrompt, liveSession, lockTitle, shortRef } from "../lib/suggestionPlan";
 import { useAgentNames } from "../hooks/useAgentNames";
 import { useSuggestionPresets } from "../hooks/useSuggestionPresets";
 import { SuggestionItemActions } from "./SuggestionItemActions";
@@ -403,6 +403,7 @@ export function SuggestionsView({
                               <StartedPromptNote
                                 session={liveSession(item.started_session, sessions)}
                                 onTryAgain={() => ctrl.retryBlocked(item)}
+                                onCopyPrompt={() => void copySuggestionPrompt(item)}
                                 disabled={disabled}
                               />
                             }

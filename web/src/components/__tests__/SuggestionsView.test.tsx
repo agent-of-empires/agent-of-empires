@@ -498,6 +498,8 @@ describe("SuggestionsView", () => {
       expect(within(row).getByRole("status").textContent).toBe(
         "Prompt not sent: Claude Code is asking whether to trust this folder, so the prompt was not typed.",
       );
+      expect(row.textContent).toContain("Open the Session and choose \u201cYes, I trust this folder\u201d");
+      expect(within(row).getByRole("button", { name: "Copy prompt" })).toBeTruthy();
       fireEvent.click(within(row).getByRole("button", { name: "Turn on pre-trust" }));
       fireEvent.click(within(row).getByRole("button", { name: "Turn on" }));
       fireEvent.click(await within(row).findByRole("button", { name: "Try again" }));

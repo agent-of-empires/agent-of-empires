@@ -1,4 +1,6 @@
+import { prepareSuggestion } from "./api";
 import { OFFLINE_TITLE } from "./connectionState";
+import { reportError, reportInfo } from "./toastBus";
 import type { SessionResponse, StartedSession, SuggestionItem, SuggestionPreset } from "./types";
 
 /** "agent-of-empires · Claude Code · Structured view · worktree", what Start will run for the item. */
@@ -40,4 +42,16 @@ export function liveSession(started: StartedSession | undefined, sessions?: Sess
 export function lockTitle(readOnly: boolean, offline: boolean, cityhall = false) {
   if (readOnly) return cityhall ? "Off in CityHall mode" : "Read-only: can't create Sessions";
   return offline ? OFFLINE_TITLE : undefined;
+}
+
+/** The kind's preset prompt for this item, on the clipboard. */
+export async function copySuggestionPrompt(item: Pick<SuggestionItem, "provider_id" | "id">) {
+  const r = await prepareSuggestion(item.provider_id, item.id);
+  if (!r.ok) return reportError(r.error);
+  try {
+    await navigator.clipboard.writeText(r.data.initial_prompt);
+    reportInfo("Prompt copied");
+  } catch {
+    reportError("Could not copy the prompt.");
+  }
 }
