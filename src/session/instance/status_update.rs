@@ -198,12 +198,7 @@ impl Instance {
         {
             return;
         }
-        let diagnostic = self
-            .last_error
-            .as_deref()
-            .filter(|_| self.last_error.absence().is_none())
-            .map(str::to_owned)
-            .or(seen);
+        let diagnostic = self.last_error.diagnostic().map(str::to_owned).or(seen);
         let ended = match (lead.map(|(_, lead)| lead), diagnostic.as_deref()) {
             (Some(lead), Some(diagnostic)) => {
                 format!("{lead} {}", ended_sentence(Some(diagnostic)))
@@ -264,10 +259,7 @@ impl Instance {
             ended => ended,
         }
         .to_owned();
-        match self.last_error.absence() {
-            Some(absence) => self.last_error.latch_tmux(absence, ended),
-            None => self.last_error.set(ended),
-        }
+        self.last_error.rewrite(ended);
     }
 
     pub(super) fn update_status_with_metadata_inner(
@@ -1776,6 +1768,19 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
                 Some(live.to_owned()),
                 true,
             );
+            // The outside-diff comment on :205: that kept error then leads the remedy, after the
+            // gone lead, once the row starts refusing.
+            plain.command = conflicting().command;
+            poll_absent(&mut plain);
+            check(
+                "a plain error, gone, then refusing",
+                &plain,
+                Some(refused(
+                    &plain,
+                    &format!("{TMUX_SESSION_GONE_LEAD} {live}."),
+                )),
+                true,
+            );
 
             // 4660763979: a published launch refusal, then absent, then the pane back.
             let mut handoff = conflicting();
@@ -1851,6 +1856,17 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
                 Some(format!("{TMUX_SESSION_GONE_LEAD} {live}.")),
                 true,
             );
+            unflagged.command = conflicting().command;
+            poll_absent(&mut unflagged);
+            check(
+                "a live error, refused and gone, the flag removed, then back",
+                &unflagged,
+                Some(refused(
+                    &unflagged,
+                    &format!("{TMUX_SESSION_GONE_LEAD} {live}."),
+                )),
+                true,
+            );
 
             // 4660985739: unreachable, then absent. Under its own latch the unreachable lead
             // becomes the gone one, keeping any diagnostic and the remedy once.
@@ -1895,7 +1911,19 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             check(
                 "printed unreachable text, then absent",
                 &echoed,
-                Some(printed),
+                Some(printed.clone()),
+                true,
+            );
+            // Kept as the pane printed it, so none of it is taken for AoE's lead.
+            echoed.command = conflicting().command;
+            poll_absent(&mut echoed);
+            check(
+                "printed unreachable text, gone, then refusing",
+                &echoed,
+                Some(refused(
+                    &echoed,
+                    &format!("{TMUX_SESSION_GONE_LEAD} {printed}."),
+                )),
                 true,
             );
             assert!(mismatches.is_empty(), "{mismatches:#?}");
