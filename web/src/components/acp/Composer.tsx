@@ -12,6 +12,7 @@ import { useSkillIndex } from "../../hooks/useSkillIndex";
 import { consumeComposerPrefill, subscribeComposerPrefill } from "../../lib/composerPrefill";
 import { clearDraft } from "../../lib/acpDrafts";
 import type { AcpState, PromptAttachmentInput, PromptCapabilities, QueuedPrompt } from "../../lib/acpTypes";
+import { isImeComposing } from "../../lib/ime";
 import { isIOS, isStandalone } from "../../lib/platform";
 import { sessionEntries } from "../../lib/pluginUi";
 import { usePluginUiEntries } from "../../lib/pluginUiContext";
@@ -184,7 +185,7 @@ export function Composer(props: Props) {
       ctrlKey: e.ctrlKey,
       metaKey: e.metaKey,
       altKey: e.altKey,
-      isComposing: e.nativeEvent.isComposing,
+      isComposing: isImeComposing(e),
     };
     const recallAction = decideArrowRecall(keys, {
       caretAtStart: !!el && el.selectionStart === 0 && el.selectionEnd === 0,

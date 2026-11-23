@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { SNOOZE_MAX_MINUTES, SNOOZE_PRESETS } from "./format";
 import { SidebarModal } from "./SidebarModal";
+import { isImeComposing } from "../../lib/ime";
 
 const UNITS = {
   m: { label: "minutes", minutes: 1 },
@@ -89,7 +90,7 @@ export function SnoozeModal({
           value={customValue}
           onChange={(e) => setCustomValue(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter") submitCustom();
+            if (e.key === "Enter" && !isImeComposing(e)) submitCustom();
           }}
           placeholder="3"
           data-testid="snooze-modal-custom-value"
@@ -119,7 +120,7 @@ export function SnoozeModal({
           value={untilValue}
           onChange={(e) => setUntilValue(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter") submitUntil();
+            if (e.key === "Enter" && !isImeComposing(e)) submitUntil();
           }}
           data-testid="snooze-modal-until-value"
           aria-label="Snooze until"
