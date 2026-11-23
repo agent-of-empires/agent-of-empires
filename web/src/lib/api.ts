@@ -1267,7 +1267,7 @@ export function fetchAgentModelDefault(profile: string, agent: string): Promise<
   return fetchJson<AgentModelDefault>(agentModelUrl(profile, agent));
 }
 
-/** Sets only `agent`'s default model in `profile`. `pinned`: a pin in either layer refused it, so nothing changed. */
+/** Sets only `agent`'s default model in `profile`. `pinned`: the profile's resolved settings pin it, so nothing changed. */
 export async function putAgentModelDefault(
   profile: string,
   agent: string,
