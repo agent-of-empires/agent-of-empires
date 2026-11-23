@@ -6,7 +6,7 @@
 
 use std::sync::mpsc::TryRecvError;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -518,7 +518,7 @@ pub(super) struct SuggestionsView {
     preparing: Option<ItemKey>,
     /// The in-flight `prepare` is for "Start another", which does not claim the link.
     prepare_another: bool,
-    /// Strict mode keys: dismiss is `Z`, not `z`.
+    /// Strict mode keys follow Home's rule: a bare letter moves to Shift, Shift to Ctrl.
     pub(super) strict: bool,
     /// `pre_trust_agent_folders` is on, so a Session blocked on folder trust can start again.
     pub(super) pretrusted: bool,
@@ -650,7 +650,10 @@ impl SuggestionsView {
         store: &mut SuggestionsFeed,
     ) -> SuggestionsAction {
         let mutations_allowed = block.is_none();
-        match key.code {
+        let Some(code) = self.unstrict(key) else {
+            return SuggestionsAction::Continue;
+        };
+        match code {
             KeyCode::Esc | KeyCode::Char('q') => return SuggestionsAction::Close,
             KeyCode::Up | KeyCode::Char('k') => self.select(self.selected.saturating_sub(1)),
             KeyCode::Down | KeyCode::Char('j') => self.select(self.selected + 1),
@@ -681,7 +684,7 @@ impl SuggestionsView {
                     }
                 }
             }
-            KeyCode::Char(c) if c == self.dismiss_key() && mutations_allowed => {
+            KeyCode::Char('z') if mutations_allowed => {
                 if let Some(item) = self.item_at(store, self.selected) {
                     let (key, dismissed) =
                         ((item.provider_id.clone(), item.id.clone()), !item.dismissed);
@@ -689,12 +692,12 @@ impl SuggestionsView {
                     store.dismiss(&key, dismissed);
                 }
             }
-            KeyCode::Char(c) if c == self.dismiss_key() => {
+            KeyCode::Char('z') => {
                 self.error = block.map(|b| block_note(b).to_string());
             }
             KeyCode::Enter | KeyCode::Char('e' | 'N') => {
-                let review = key.code != KeyCode::Enter;
-                let another = key.code == KeyCode::Char('N');
+                let review = code != KeyCode::Enter;
+                let another = code == KeyCode::Char('N');
                 let Some(key) = self.selected_key() else {
                     return SuggestionsAction::Continue;
                 };
@@ -732,11 +735,30 @@ impl SuggestionsView {
         SuggestionsAction::Continue
     }
 
-    fn dismiss_key(&self) -> char {
-        if self.strict {
-            'Z'
-        } else {
-            'z'
+    /// The non-strict key a key press stands for, or `None` for a bare letter
+    /// strict mode reserves. Navigation keys and `q` do not move.
+    fn unstrict(&self, key: KeyEvent) -> Option<KeyCode> {
+        if !self.strict {
+            return Some(key.code);
+        }
+        match key.code {
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(KeyCode::Char('N'))
+            }
+            KeyCode::Char(c @ ('E' | 'D' | 'R' | 'T' | 'Z')) => {
+                Some(KeyCode::Char(c.to_ascii_lowercase()))
+            }
+            KeyCode::Char('e' | 'd' | 'r' | 't' | 'z' | 'N') => None,
+            code => Some(code),
+        }
+    }
+
+    /// How a key reads in the current mode: `z` shows as `Z`, `N` as `Ctrl+N` in strict mode.
+    fn key_label(&self, c: char) -> String {
+        match (self.strict, c) {
+            (false, c) => c.to_string(),
+            (true, 'N') => "Ctrl+N".to_string(),
+            (true, c) => c.to_ascii_uppercase().to_string(),
         }
     }
 
@@ -877,8 +899,12 @@ impl SuggestionsView {
         }
         footer.push(Line::from(Span::styled(
             format!(
-                "j/k select · Enter start/open · e start with changes · N new · {} dismiss/restore · d dismissed · r refresh · PgUp/PgDn prompt · Esc back",
-                self.dismiss_key()
+                "j/k select · Enter start/open · {} start with changes · {} new · {} dismiss/restore · {} dismissed · {} refresh · PgUp/PgDn prompt · Esc back",
+                self.key_label('e'),
+                self.key_label('N'),
+                self.key_label('z'),
+                self.key_label('d'),
+                self.key_label('r'),
             ),
             Style::default().fg(theme.dimmed),
         )));
@@ -946,9 +972,9 @@ impl SuggestionsView {
             let current = index == self.selected;
             let marker = if current { "› " } else { "  " };
             let state = match (item.dismissed, store.is_recent(&item_key)) {
-                (false, _) => "",
-                (true, true) => " [dismissed, z to undo]",
-                (true, false) => " [dismissed]",
+                (false, _) => String::new(),
+                (true, true) => format!(" [dismissed, {} to undo]", self.key_label('z')),
+                (true, false) => " [dismissed]".to_string(),
             };
             let title_style = if item.dismissed || item.stale {
                 Style::default().fg(theme.dimmed)
@@ -990,15 +1016,19 @@ impl SuggestionsView {
                     .as_ref()
                     .is_some_and(Started::one_click);
                 let next = match code.as_deref() {
-                    Some(FOLDER_NOT_TRUSTED) if self.pretrusted && one_click => "Enter tries again",
+                    Some(FOLDER_NOT_TRUSTED) if self.pretrusted && one_click => {
+                        "Enter tries again".to_string()
+                    }
                     Some(FOLDER_NOT_TRUSTED) if self.pretrusted => {
-                        "trust the folder in the Session · Enter opens it"
+                        "trust the folder in the Session · Enter opens it".to_string()
                     }
-                    Some(FOLDER_NOT_TRUSTED) => "t turn on pre-trust",
+                    Some(FOLDER_NOT_TRUSTED) => {
+                        format!("{} turn on pre-trust", self.key_label('t'))
+                    }
                     Some(BYPASS_NOT_ACCEPTED) => {
-                        "accept Bypass Permissions once in the Session · Enter opens it"
+                        "accept Bypass Permissions once in the Session · Enter opens it".to_string()
                     }
-                    _ => "Enter opens it",
+                    _ => "Enter opens it".to_string(),
                 };
                 lines.push(Line::from(Span::styled(
                     format!("    Prompt not typed · {next}"),
@@ -1029,9 +1059,14 @@ impl SuggestionsView {
         }
         if lines.is_empty() {
             let message = match (&store.snapshot, store.busy) {
-                (None, true) => "Loading suggestions…",
-                (None, false) => "No suggestions loaded. Press r to reload.",
-                (Some(_), _) => "Nothing to suggest right now.",
+                (None, true) => "Loading suggestions…".to_string(),
+                (None, false) => {
+                    format!(
+                        "No suggestions loaded. Press {} to reload.",
+                        self.key_label('r')
+                    )
+                }
+                (Some(_), _) => "Nothing to suggest right now.".to_string(),
             };
             lines.push(Line::from(Span::styled(
                 message,
@@ -1914,7 +1949,6 @@ impl SuggestionsFeed {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
 
     fn item(id: &str, project: Option<&str>, dismissed: bool) -> Item {
         Item {
@@ -3146,6 +3180,25 @@ mod tests {
             assert!(poll_until_settled(&mut rig));
         }
         assert_eq!(seen.try_iter().collect::<Vec<_>>(), ["refresh", "load"]);
+    }
+
+    #[test]
+    fn strict_mode_moves_each_view_letter_like_home_does() {
+        let worker = Worker::spawn("t", |_| Res::Snapshot(Err("unused".into())));
+        let mut rig = view_with(vec![item("a", None, false), item("b", None, true)], worker);
+        rig.view.strict = true;
+        let ctrl_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
+
+        for bare in ['d', 'e', 'N'] {
+            press(&mut rig, KeyCode::Char(bare), true);
+        }
+        assert!(!rig.view.show_dismissed && rig.view.preparing.is_none());
+        press(&mut rig, KeyCode::Char('D'), true);
+        assert!(rig.view.show_dismissed, "D shows dismissed");
+        rig.view.handle_key(ctrl_n, None, &mut rig.store);
+        assert!(rig.view.preparing.is_some() && rig.view.prepare_another);
+        let text = render_text(&rig);
+        assert!(text.contains("Ctrl+N new"), "{text}");
     }
 
     #[test]
