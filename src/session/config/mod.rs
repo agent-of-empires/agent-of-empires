@@ -2775,6 +2775,41 @@ pub struct WebConfig {
         summary = "Apps like Claude Code can list, create and send to your Sessions, read their output, wait on them and approve requests. Works when aoe serve uses the access link without a passphrase, or --auth none."
     )]
     pub mcp_enabled: bool,
+
+    /// Show the diff pane when a Session opens whose pane layout the user has
+    /// not changed in this browser.
+    #[serde(default)]
+    #[setting(
+        label = "Open the diff panel in Sessions",
+        widget = "toggle",
+        web_only,
+        global_only,
+        summary = "Show the changed files beside every Session you haven't arranged yourself."
+    )]
+    pub auto_open_diff_pane: bool,
+
+    /// Show a terminal pane when a Session opens whose pane layout the user
+    /// has not changed in this browser.
+    #[serde(default)]
+    #[setting(
+        label = "Open a terminal panel in Sessions",
+        widget = "toggle",
+        web_only,
+        global_only,
+        summary = "Show a shell beside every Session you haven't arranged yourself."
+    )]
+    pub auto_open_terminal_pane: bool,
+
+    /// Add panes contributed by installed plugins as tabs when they load.
+    #[serde(default)]
+    #[setting(
+        label = "Open plugin panels automatically",
+        widget = "toggle",
+        web_only,
+        global_only,
+        summary = "Add panes from installed plugins, such as the GitHub pull-request pane, as they load."
+    )]
+    pub auto_open_plugin_panes: bool,
 }
 
 impl Default for WebConfig {
@@ -2786,6 +2821,9 @@ impl Default for WebConfig {
             notify_on_error: true,
             notify_on_wake_fire: true,
             mcp_enabled: false,
+            auto_open_diff_pane: false,
+            auto_open_terminal_pane: false,
+            auto_open_plugin_panes: false,
         }
     }
 }

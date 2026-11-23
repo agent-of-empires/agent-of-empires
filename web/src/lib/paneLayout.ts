@@ -1,16 +1,13 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useSyncExternalStore } from "react";
 
 import { confirmFileEditPanes } from "./fileEditGuard";
 import { useLatestRef } from "../hooks/useLatestRef";
-import { getWebSettingsSnapshot, useWebSettings } from "../hooks/useWebSettings";
-import { safeGetItem, safeSetItem } from "./safeStorage";
+import { safeGetItem, safeRemoveItem, safeSetItem } from "./safeStorage";
 import { BUILTIN_PANES, isTerminalTabId, terminalTabId, type DockLocation } from "./panes";
 
-const LAYOUT_KEY = "aoe-pane-layout-v2";
-// v1 per-browser layout, read once to seed the v2 per-session template.
-const LEGACY_V1_KEY = "aoe-pane-layout";
-// The pre-pane single right-column collapse flag.
-const LEGACY_COLLAPSED_KEY = "aoe-right-collapsed";
+const LAYOUT_KEY = "aoe-pane-layout-v3";
+// Earlier layout stores, replaced without migrating and deleted to free quota.
+const REPLACED_KEYS = ["aoe-pane-layout-v2", "aoe-pane-layout", "aoe-right-collapsed"];
 
 /** `"diff"`, `"terminal:<n>"`, or `"plugin:<plugin>:<entry>"`. */
 export type TabId = string;
@@ -32,12 +29,10 @@ export interface DockLayout {
   collapsed: Record<DockLocation, boolean>;
 }
 
+/** Only Sessions whose layout the user changed; the rest follow {@link seedLayout}. */
 interface LayoutStore {
-  version: 2;
-  template: DockLayout;
+  version: 3;
   sessions: Record<string, DockLayout>;
-  // Sessions seeded before their repository status was known; true once the user closed Diff there.
-  provisional: Record<string, boolean>;
 }
 
 const DOCKS: DockLocation[] = ["right", "bottom"];
@@ -256,60 +251,19 @@ export function syncPluginTabs(layout: DockLayout, available: { id: TabId; defau
   return next;
 }
 
-// Background and Files are opt-in, so they never auto-open as empty tabs.
-const AUTO_OPEN_PANES = BUILTIN_PANES.filter((p) => p.id !== "agents" && p.id !== "files");
-
-function defaultTemplate(): DockLayout {
-  // Narrow viewports start empty and use the mobile picker.
-  const open = typeof window !== "undefined" && window.innerWidth >= 768;
-  const base = emptyDockLayout();
-  if (!open) return base;
-  let l: DockLayout = base;
-  for (const p of AUTO_OPEN_PANES) {
-    const tabId = p.id === "terminal" ? terminalTabId(0) : p.id;
-    l = addTab(l, p.defaultDock, tabId, false);
-  }
-  return l;
+export interface SeedPrefs {
+  diff: boolean;
+  terminal: boolean;
 }
 
-function migrateTemplate(): DockLayout {
-  const v1 = safeGetItem(LEGACY_V1_KEY);
-  if (v1) {
-    try {
-      const parsed = JSON.parse(v1) as Record<string, unknown>;
-      let l = emptyDockLayout();
-      for (const p of AUTO_OPEN_PANES) {
-        const v = parsed[p.id];
-        let open = true;
-        let dock: DockLocation = p.defaultDock;
-        if (typeof v === "boolean") {
-          open = v; // phase-1 bare boolean shape
-        } else if (v && typeof v === "object") {
-          const s = v as Record<string, unknown>;
-          if (typeof s.open === "boolean") open = s.open;
-          if (s.dock === "right" || s.dock === "bottom") dock = s.dock;
-        }
-        if (open) {
-          const tabId = p.id === "terminal" ? terminalTabId(0) : p.id;
-          l = addTab(l, dock, tabId, false);
-        }
-      }
-      return l;
-    } catch {
-      // Fall through to the collapsed flag and defaults.
-    }
+/** What a Session shows until the user changes its layout. */
+export function seedLayout(prefs: SeedPrefs): DockLayout {
+  let l = emptyDockLayout();
+  for (const p of BUILTIN_PANES) {
+    if (p.id === "diff" && prefs.diff) l = addTab(l, p.defaultDock, "diff", false);
+    if (p.id === "terminal" && prefs.terminal) l = addTab(l, p.defaultDock, terminalTabId(0), false);
   }
-  const collapsed = safeGetItem(LEGACY_COLLAPSED_KEY);
-  if (collapsed === "1") return emptyDockLayout();
-  if (collapsed === "0") {
-    let l = emptyDockLayout();
-    for (const p of AUTO_OPEN_PANES) {
-      const tabId = p.id === "terminal" ? terminalTabId(0) : p.id;
-      l = addTab(l, p.defaultDock, tabId, false);
-    }
-    return l;
-  }
-  return defaultTemplate();
+  return l;
 }
 
 function normalizeGroups(v: unknown): PaneGroup[] {
@@ -360,28 +314,56 @@ function normalizeDock(v: unknown): DockLayout {
   };
 }
 
-function loadStore(): LayoutStore {
-  const raw = safeGetItem(LAYOUT_KEY);
-  if (raw) {
-    try {
-      const parsed = JSON.parse(raw) as Record<string, unknown>;
-      if (parsed && parsed.version === 2) {
-        const sessionsRaw = (parsed.sessions ?? {}) as Record<string, unknown>;
-        const sessions: Record<string, DockLayout> = {};
-        for (const [id, layout] of Object.entries(sessionsRaw)) {
-          sessions[id] = normalizeDock(layout);
-        }
-        const provisional: Record<string, boolean> = {};
-        for (const [id, closed] of Object.entries((parsed.provisional ?? {}) as Record<string, unknown>)) {
-          provisional[id] = closed === true;
-        }
-        return { version: 2, template: normalizeDock(parsed.template), sessions, provisional };
-      }
-    } catch {
-      // Malformed JSON: fall through to migration and defaults.
+function parseStore(raw: string | null): LayoutStore {
+  try {
+    const parsed = JSON.parse(raw ?? "null") as Record<string, unknown> | null;
+    if (parsed?.version !== 3) return { version: 3, sessions: {} };
+    const sessions: Record<string, DockLayout> = {};
+    for (const [id, layout] of Object.entries((parsed.sessions ?? {}) as Record<string, unknown>)) {
+      sessions[id] = normalizeDock(layout);
     }
+    return { version: 3, sessions };
+  } catch {
+    return { version: 3, sessions: {} };
   }
-  return { version: 2, template: migrateTemplate(), sessions: {}, provisional: {} };
+}
+
+const listeners = new Set<() => void>();
+let cachedRaw: string | null | undefined;
+let cachedStore: LayoutStore = { version: 3, sessions: {} };
+
+function readStore(): LayoutStore {
+  const raw = safeGetItem(LAYOUT_KEY);
+  if (raw !== cachedRaw) {
+    cachedRaw = raw;
+    cachedStore = parseStore(raw);
+  }
+  return cachedStore;
+}
+
+function updateStore(fn: (s: LayoutStore) => LayoutStore): void {
+  const current = readStore();
+  const next = fn(current);
+  if (next === current) return;
+  // A failed write keeps the change in memory rather than re-reading the stale copy.
+  safeSetItem(LAYOUT_KEY, JSON.stringify(next));
+  cachedStore = next;
+  cachedRaw = safeGetItem(LAYOUT_KEY);
+  for (const l of listeners) l();
+}
+
+function subscribe(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => void listeners.delete(listener);
+}
+
+/** Drops saved layouts of Sessions not in `live`, and the stores this one replaced. */
+export function sweepOrphanPaneLayouts(live: ReadonlySet<string>): void {
+  for (const key of REPLACED_KEYS) safeRemoveItem(key);
+  updateStore((s) => {
+    const kept = Object.entries(s.sessions).filter(([id]) => live.has(id));
+    return kept.length === Object.keys(s.sessions).length ? s : { version: 3, sessions: Object.fromEntries(kept) };
+  });
 }
 
 export interface PaneLayoutApi {
@@ -423,109 +405,38 @@ function terminalTabs(layout: DockLayout): { id: TabId; dock: DockLocation }[] {
   );
 }
 
-export interface AutoOpenPanePrefs {
-  diff: boolean;
-  terminal: boolean;
-}
-
-/** Strip auto-open panes from the template at seed time, so the prefs affect existing users but only new sessions. Purely subtractive. */
-export function seedLayout(template: DockLayout, prefs: AutoOpenPanePrefs): DockLayout {
-  let l = template;
-  if (!prefs.diff) l = removeTab(l, "diff");
-  if (!prefs.terminal) l = removeAllTerminals(l);
-  return l;
-}
-
-/** Re-adds the template's Diff at its template position, active only if the user left the dock's active tab as the Diff-less seed had it. */
-function restoreDiff(stored: DockLayout, template: DockLayout, terminal: boolean): DockLayout {
-  const at = findTab(template, "diff");
-  if (!at || findTab(stored, "diff")) return stored;
-  const bare = seedLayout(template, { diff: false, terminal });
-  const activate = isActiveTab(template, "diff") && stored[at.dock][0]?.active === bare[at.dock][0]?.active;
-  const next = addTab(stored, at.dock, "diff", activate);
-  const tabs = next[at.dock][0]!.tabs;
-  tabs.splice(tabs.indexOf("diff"), 1);
-  tabs.splice(Math.min(at.index, tabs.length), 0, "diff");
-  return next;
-}
-
-/** `outsideRepository` drops Diff from the seed only, so a Diff tab the user opened stays; `null` (not yet known) seeds no Diff. */
+/** `outsideRepository` drops Diff from the seed; `null` (not yet known) seeds no Diff. */
 export function usePaneLayout(
   sessionId: string | null,
-  outsideRepository: boolean | null = false,
+  outsideRepository: boolean | null,
+  prefs: SeedPrefs,
   tabAvailable: (id: TabId) => boolean = () => true,
 ): PaneLayoutApi {
-  const [store, setStore] = useState(loadStore);
-  const { settings } = useWebSettings();
-  const { autoOpenDiffPane, autoOpenTerminalPane } = settings;
-  const outsideRepositoryRef = useLatestRef(outsideRepository);
-  useEffect(() => {
-    safeSetItem(LAYOUT_KEY, JSON.stringify(store));
-  }, [store]);
-
+  const store = useSyncExternalStore(subscribe, readStore);
+  const seedDiff = prefs.diff && outsideRepository === false;
   const layout = useMemo(
     () =>
       sessionId
-        ? (store.sessions[sessionId] ??
-          seedLayout(store.template, {
-            diff: autoOpenDiffPane && outsideRepository === false,
-            terminal: autoOpenTerminalPane,
-          }))
+        ? (store.sessions[sessionId] ?? seedLayout({ diff: seedDiff, terminal: prefs.terminal }))
         : emptyDockLayout(),
-    [store, sessionId, autoOpenDiffPane, autoOpenTerminalPane, outsideRepository],
+    [store, sessionId, seedDiff, prefs.terminal],
   );
 
+  const shownRef = useLatestRef({ layout, tabAvailable });
+  // Starts from what is shown, so the saved layout is the one the user changed.
   const mutate = useCallback(
     (fn: (l: DockLayout) => DockLayout) => {
       if (!sessionId) return;
-      setStore((s) => {
-        // Read prefs synchronously: depending on `settings` would rebuild the pane API on any setting change.
-        const prefs = getWebSettingsSnapshot();
-        const current =
-          s.sessions[sessionId] ??
-          seedLayout(s.template, {
-            diff: prefs.autoOpenDiffPane && outsideRepositoryRef.current === false,
-            terminal: prefs.autoOpenTerminalPane,
-          });
+      updateStore((s) => {
+        const current = s.sessions[sessionId] ?? shownRef.current.layout;
         const updated = fn(current);
-        if (updated === current && sessionId in s.sessions) return s;
-        const tracked =
-          sessionId in s.provisional || (!(sessionId in s.sessions) && outsideRepositoryRef.current === null);
-        const provisional = tracked
-          ? {
-              ...s.provisional,
-              [sessionId]:
-                s.provisional[sessionId] === true || (!!findTab(current, "diff") && !findTab(updated, "diff")),
-            }
-          : s.provisional;
-        return { ...s, sessions: { ...s.sessions, [sessionId]: updated }, provisional };
+        if (updated === current) return s;
+        return { version: 3, sessions: { ...s.sessions, [sessionId]: updated } };
       });
     },
-    [sessionId, outsideRepositoryRef],
+    [sessionId, shownRef],
   );
 
-  // The seed lacked Diff while the status was unknown; add it back for a git Session unless the user closed it.
-  const isProvisional = sessionId !== null && sessionId in store.provisional;
-  /* eslint-disable react-you-might-not-need-an-effect/no-event-handler, react-you-might-not-need-an-effect/no-derived-state, react-you-might-not-need-an-effect/no-chain-state-updates -- one-shot reconcile when the status prop resolves */
-  useEffect(() => {
-    if (outsideRepository === null || !sessionId || !isProvisional) return;
-    setStore((s) => {
-      if (!(sessionId in s.provisional)) return s;
-      const { [sessionId]: closed, ...provisional } = s.provisional;
-      const stored = s.sessions[sessionId];
-      if (outsideRepository || closed || !stored || !getWebSettingsSnapshot().autoOpenDiffPane)
-        return { ...s, provisional };
-      const prefs = getWebSettingsSnapshot();
-      return {
-        ...s,
-        provisional,
-        sessions: { ...s.sessions, [sessionId]: restoreDiff(stored, s.template, prefs.autoOpenTerminalPane) },
-      };
-    });
-  }, [outsideRepository, sessionId, isProvisional]);
-  /* eslint-enable react-you-might-not-need-an-effect/no-event-handler, react-you-might-not-need-an-effect/no-derived-state, react-you-might-not-need-an-effect/no-chain-state-updates */
-
-  const shownRef = useLatestRef({ layout, tabAvailable });
   const confirmLeaving = useCallback(
     (fn: (l: DockLayout) => DockLayout) => {
       const { layout: current, tabAvailable: available } = shownRef.current;

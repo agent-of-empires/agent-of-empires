@@ -11,6 +11,10 @@ The dashboard is the home screen of the web app: a workspace sidebar on the left
 - **Top bar** carries the command-palette trigger, the right-panel picker, and the overflow (three-dot) **More options** menu.
 - **Home screen** (no session selected) shows the AoE logo and a count of running, waiting, and error sessions.
 
+### Side panels
+
+The diff and terminal panels start closed. Open one from its top-bar icon; a closed diff icon shows how many files had changed when you opened the Session. A Session keeps the panels you open or close in it, in that browser. **Settings > Panels** sets the defaults; they apply to every Session whose panels you haven't changed.
+
 ### Status glyphs
 
 Each sidebar row carries an animated braille glyph encoding the session's state: a spinner of dots while **Running**, an orbiting dot while **Waiting** or **Creating**, a slow breathe while **Starting** or freshly idle. Errors render in the error color. The frame is offset by each session's creation time so rows don't pulse in lockstep.

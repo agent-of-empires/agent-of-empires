@@ -1,6 +1,5 @@
 import { test, expect } from "./helpers/mockedTest";
 import type { Page } from "@playwright/test";
-import { clickSidebarSession } from "./helpers/sidebar";
 import { makeAllDifferentPatch } from "./helpers/patch";
 import {
   diffFileResponse,
@@ -150,8 +149,7 @@ test.describe("Large diff handling", () => {
         makeAllDifferentPatch("pnpm-lock.yaml", oldContent, newContent),
       ),
     });
-    await page.goto("/");
-    await clickSidebarSession(page, "pinch-test");
+    await openDiffSession(page);
   }
 
   test("a +10k/-13k lockfile churn renders without crashing", async ({ page }) => {

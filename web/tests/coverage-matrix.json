@@ -3366,6 +3366,14 @@
       ]
     },
     {
+      "id": "app-shell.panel-defaults",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/right-panel-persistence.spec.ts", "src/lib/__tests__/paneLayout.test.ts"],
+      "components": ["web/src/App.tsx", "web/src/components/ActivityBar.tsx", "web/src/components/TopBar.tsx"],
+      "notes": "Diff and terminal follow the Daemon's web.auto_open_* defaults (off) until the user changes a Session's tabs; nothing is saved on view, so a changed default reaches Sessions already viewed. A closed Diff shows its changed-file count."
+    },
+    {
       "id": "devices",
       "kind": "live-playwright",
       "risk": "medium",
