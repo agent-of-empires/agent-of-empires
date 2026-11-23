@@ -795,6 +795,14 @@ impl RetryAttempt {
     pub(crate) fn is_rolled_back(&self) -> bool {
         self.rolled_back
     }
+
+    pub(crate) fn rolled_back_for_test() -> Self {
+        Self {
+            attempt: 0,
+            watermark: 0,
+            rolled_back: true,
+        }
+    }
 }
 
 static NEXT_RETRY_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
