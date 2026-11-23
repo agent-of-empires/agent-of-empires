@@ -3547,14 +3547,20 @@
       "id": "acp.memory-recall",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": ["tests/live/acp-transcript.spec.ts", "tests/acp-structured-view.spec.ts"],
+      "specs": [
+        "tests/live/acp-transcript.spec.ts",
+        "tests/acp-structured-view.spec.ts",
+        "src/components/acp/ToolCards.render.test.tsx"
+      ],
       "components": [
         "web/src/components/acp/ToolCards.tsx",
+        "web/src/components/acp/NamedToolCards.tsx",
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/AcpRuntime.tsx",
         "web/src/lib/memoryClassify.ts",
         "web/src/lib/memoryRecall.ts"
-      ]
+      ],
+      "notes": "Synthesized memory renders as markdown; raw HTML is dropped and javascript: links are blocked."
     },
     {
       "id": "acp.attachments",
