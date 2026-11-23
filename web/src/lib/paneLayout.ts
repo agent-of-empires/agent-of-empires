@@ -453,10 +453,10 @@ export function usePaneLayout(
   const shownRef = useLatestRef({ layout, tabAvailable });
   const deriveRef = useLatestRef(derive);
   const mutate = useCallback(
-    (fn: (l: DockLayout) => DockLayout) => {
+    (fn: (l: DockLayout) => DockLayout, derive = deriveRef.current) => {
       if (!sessionId) return;
       updateStore((s) => {
-        const current = deriveRef.current(s.sessions[sessionId]);
+        const current = derive(s.sessions[sessionId]);
         const updated = fn(current);
         if (updated === current) return s;
         return { version: 3, sessions: { ...s.sessions, [sessionId]: updated } };
@@ -491,11 +491,13 @@ export function usePaneLayout(
       const close = (l: DockLayout) => removeTab(l, tabId);
       if (!before) return guardedMutate(close);
       if (!confirmLeaving(close)) return;
+      // A switch during the kill must not derive another Session's defaults into this one.
+      const derive = deriveRef.current;
       void before().then((ok) => {
-        if (ok) mutate(close);
+        if (ok) mutate(close, derive);
       });
     },
-    [mutate, guardedMutate, confirmLeaving],
+    [mutate, guardedMutate, confirmLeaving, deriveRef],
   );
   const activateTab = useCallback(
     (dock: DockLocation, tabId: TabId) => guardedMutate((l) => activateOrRevealTab(l, dock, tabId)),

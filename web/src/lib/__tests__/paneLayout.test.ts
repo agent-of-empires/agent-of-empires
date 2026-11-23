@@ -187,6 +187,18 @@ describe("usePaneLayout persistence", () => {
     expect(isDockCollapsed(result.current.layout, "right")).toBe(true);
   });
 
+  it("finishes a deferred close with the derivation of the Session that started it", async () => {
+    const { result, rerender } = renderHook(
+      ({ session, outside }) => usePaneLayout(session, outside, OPEN, NO_PLUGINS),
+      { initialProps: { session: "s1", outside: false } },
+    );
+    let finish!: (ok: boolean) => void;
+    act(() => result.current.closeTab("terminal:0", () => new Promise((r) => (finish = r))));
+    rerender({ session: "s2", outside: true });
+    await act(async () => finish(true));
+    expect(JSON.parse(localStorage.getItem(V3_KEY)!).sessions.s1.right[0].tabs).toEqual(["diff"]);
+  });
+
   it("adds a newly loaded plugin to a saved layout unless the user closed it", () => {
     const { result, rerender } = renderHook(({ plugins }) => usePaneLayout("s1", false, CLOSED, plugins), {
       initialProps: { plugins: NO_PLUGINS },
