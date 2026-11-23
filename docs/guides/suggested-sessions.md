@@ -97,7 +97,7 @@ Change any proposal with its select, then **Link N repos** stores every checked 
 
 **Home.** With **Show in the sidebar** on, a collapsed **Suggested (N)** group sits above Trash and is absent when there are no open suggestions, unless a provider failed: the group stays and its preview leads with the error, the provider's own fix when it reports one, and how to retry (`r` in the full view). Enter expands it to 3 items and a "View all" row. Rows show the title with the source reference after it, and the preview names what Enter starts ("Starts with Claude Code · Structured · worktree") with the prompt it will send. On an item, Enter starts it with its kind's [preset](#presets) and the status line says "Started <title>"; the row then leaves the group, since the Session is listed under its Project. `z` (`Z` in strict mode) dismisses it, and `Ctrl+K` lists "Open in <provider>". `N` (`Ctrl+N`) opens the New session dialog prefilled from the item, without linking it.
 
-**Full view.** `S` opens it (`Ctrl+S` in strict mode).
+**Full view.** `S` opens it (`Ctrl+S` in strict mode). Items are grouped under their repo or Project. The divider shows when each provider last updated, and a provider that failed to refresh is named at the top of the list with its fix. Below the divider are what Enter starts, the prompt, and the item's source text. The key line shows only the keys for the selected item.
 
 Strict mode moves the letters by Home's rule: a bare letter takes Shift, and a Shift letter takes Ctrl.
 
@@ -111,7 +111,8 @@ Strict mode moves the letters by Home's rule: a bare letter takes Shift, and a S
 | `d` | `D` | Show or hide dismissed items |
 | `t` | `T` | Turn on pre-trust, on a Session blocked on folder trust |
 | `r` | `R` | Ask providers to refresh, then reload the list. On a read-only dashboard it only reloads |
-| PgUp / PgDn | PgUp / PgDn | Scroll the prompt |
+| PgUp / PgDn | PgUp / PgDn | Scroll the detail: the prompt, then the item's source text |
+| `?` | `?` | List every key; any key closes the list |
 | Esc / `q` | Esc / `q` | Back |
 
 If the repo has hooks nobody has approved, Enter shows them, with a one-line summary of each MCP server, in a review dialog; approving starts the session and cancelling starts nothing. A hooks review that is out of date (the hooks changed after you read them) shows again. A start that fails shows "Couldn't start: <reason>" with what to do on its row and in the preview until the next try, and Enter tries again. An item whose repo is linked to no Project opens the New session dialog to pick one, from Home and from the full view. A stale item says "No longer open at the source. Dismiss it, or wait for the next refresh." When a started Claude Code Session did not get its prompt, its row says "Prompt not typed" and the detail pane gives the reason. If Claude Code is asking whether to trust the folder, `t` (`T` in strict mode) turns on pre-trust (`pre_trust_agent_folders`, after saying that the repo's own Claude Code settings then run too), and Enter then moves the blocked Session to Trash and starts the suggestion again. A Session started from the New session dialog is not retried: trust the folder in the Session itself. If it is asking to accept Bypass Permissions, open the Session once and accept it.

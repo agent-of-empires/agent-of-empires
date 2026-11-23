@@ -7,8 +7,8 @@
 use std::sync::mpsc::TryRecvError;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
@@ -21,6 +21,9 @@ use crate::daemon::suggestions::{Item, Prepared, Provider, Snapshot, Started, Wi
 use crate::acp::client::locate_daemon;
 #[cfg(not(test))]
 use crate::daemon::DaemonClient;
+use crate::tui::components::text::{
+    fixed_width, rendered_width, truncate_to_width, wrapped_line_count,
+};
 use crate::tui::session_feed::MutationBlock;
 use crate::tui::styles::Theme;
 use crate::tui::worker::Worker;
@@ -450,17 +453,15 @@ fn block_note(block: MutationBlock) -> &'static str {
 
 const STALE_NOTE: &str = "No longer open at the source. Dismiss it, or wait for the next refresh.";
 
-/// One status line per provider: when it last updated, or why it did not.
-fn provider_status(provider: &Provider, any_items: bool, theme: &Theme) -> (String, Color) {
+/// A working provider's status for the divider: when it last updated.
+fn provider_status(provider: &Provider, any_items: bool) -> String {
     let name = &provider.name;
     if provider.refreshing {
-        (format!("⠙ {name}: refreshing…"), theme.dimmed)
-    } else if let Some(error) = &provider.error {
-        (format!("{name}: couldn't refresh, {error}"), theme.error)
+        format!("⠙ {name} · refreshing…")
     } else if provider.updated_at.is_none() {
-        (format!("{name}: waiting for first results"), theme.dimmed)
+        format!("{name} · waiting for first results")
     } else if !any_items {
-        (format!("{name}: nothing new"), theme.dimmed)
+        format!("{name} · nothing new")
     } else {
         let ago = provider.updated_at.map_or_else(String::new, |at| {
             format!(
@@ -468,8 +469,23 @@ fn provider_status(provider: &Provider, any_items: bool, theme: &Theme) -> (Stri
                 ago_label(crate::time::Timestamp::now().as_unix_secs() - at)
             )
         });
-        (format!("{name}: updated{ago}"), theme.text)
+        format!("{name} · updated{ago}")
     }
+}
+
+/// Key hints in rows of `width`, never splitting a key from its label.
+fn key_rows(units: &[String], width: usize) -> Vec<String> {
+    let mut rows: Vec<String> = Vec::new();
+    for unit in units {
+        match rows.last_mut() {
+            Some(row) if rendered_width(row) + 3 + rendered_width(unit) <= width => {
+                row.push_str("   ");
+                row.push_str(unit);
+            }
+            _ => rows.push(unit.clone()),
+        }
+    }
+    rows
 }
 
 /// "just now", "5 min ago", "3h ago", "2d ago".
@@ -514,6 +530,8 @@ pub(super) struct SuggestionsView {
     selected: usize,
     detail_scroll: u16,
     show_dismissed: bool,
+    /// The `?` key list replaces the list and detail.
+    help: bool,
     /// The item a `prepare` is in flight for.
     preparing: Option<ItemKey>,
     /// The in-flight `prepare` is for "Start another", which does not claim the link.
@@ -543,6 +561,7 @@ impl SuggestionsView {
             selected: 0,
             detail_scroll: 0,
             show_dismissed: false,
+            help: false,
             preparing: None,
             prepare_another: false,
             strict: false,
@@ -650,10 +669,15 @@ impl SuggestionsView {
         store: &mut SuggestionsFeed,
     ) -> SuggestionsAction {
         let mutations_allowed = block.is_none();
+        if self.help {
+            self.help = false;
+            return SuggestionsAction::Continue;
+        }
         let Some(code) = self.unstrict(key) else {
             return SuggestionsAction::Continue;
         };
         match code {
+            KeyCode::Char('?') => self.help = true,
             KeyCode::Esc | KeyCode::Char('q') => return SuggestionsAction::Close,
             KeyCode::Up | KeyCode::Char('k') => self.select(self.selected.saturating_sub(1)),
             KeyCode::Down | KeyCode::Char('j') => self.select(self.selected + 1),
@@ -821,6 +845,151 @@ impl SuggestionsView {
         changed
     }
 
+    /// The keys that apply to the selected row; `?` lists them all.
+    fn row_keys(&self, store: &SuggestionsFeed, block: Option<MutationBlock>) -> Vec<String> {
+        let mut keys = Vec::new();
+        if let Some(item) = self.item_at(store, self.selected) {
+            let key = (item.provider_id.clone(), item.id.clone());
+            if let Some(started) = &item.started_session {
+                let untrusted = store
+                    .blocked_prompt(item)
+                    .is_some_and(|(_, code)| code.as_deref() == Some(FOLDER_NOT_TRUSTED));
+                let retry = untrusted && self.pretrusted && started.one_click() && block.is_none();
+                keys.push(if retry { "↵ try again" } else { "↵ open" }.to_string());
+            } else if block.is_none() && !item.stale {
+                let retry = store.failed.as_ref().is_some_and(|(k, _)| *k == key);
+                keys.push(if retry { "↵ try again" } else { "↵ start" }.to_string());
+                keys.push(format!("{} change first", self.key_label('e')));
+            }
+            if block.is_none() {
+                if !item.stale {
+                    keys.push(format!("{} new", self.key_label('N')));
+                }
+                let verb = if item.dismissed { "restore" } else { "dismiss" };
+                keys.push(format!("{} {verb}", self.key_label('z')));
+            }
+        }
+        if block.is_some() {
+            keys.push(format!("{} reload", self.key_label('r')));
+        }
+        keys.push("? all keys".to_string());
+        keys.push("Esc back".to_string());
+        keys
+    }
+
+    /// Every key of the view, for the `?` overlay.
+    fn help_lines(&self) -> Vec<(String, &'static str)> {
+        let dismissed = if self.show_dismissed {
+            "hide dismissed"
+        } else {
+            "show dismissed"
+        };
+        vec![
+            ("j/k".to_string(), "select"),
+            (
+                "↵".to_string(),
+                "start with the preset, or open a started one",
+            ),
+            (
+                self.key_label('e'),
+                "change first: the New session dialog, prefilled",
+            ),
+            (
+                self.key_label('N'),
+                "a new session for the item, without its link",
+            ),
+            (self.key_label('z'), "dismiss or restore"),
+            (self.key_label('d'), dismissed),
+            (
+                self.key_label('t'),
+                "turn on pre-trust for a Session blocked on it",
+            ),
+            (self.key_label('r'), "refresh the providers, then reload"),
+            ("PgUp/PgDn".to_string(), "scroll the detail"),
+            ("Ctrl+K".to_string(), "open in the provider"),
+            ("Esc".to_string(), "back"),
+        ]
+    }
+
+    /// Lines above the list: why the list may be stale or partial.
+    fn list_notices(
+        &self,
+        store: &SuggestionsFeed,
+        block: Option<MutationBlock>,
+        theme: &Theme,
+    ) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        if let Some(blocked) = block {
+            lines.push(Line::from(Span::styled(
+                block_note(blocked),
+                Style::default().fg(theme.waiting),
+            )));
+        }
+        if let Some(profile) = &store.foreign_profile {
+            lines.push(Line::from(Span::styled(
+                plain(&format!(
+                    "Suggestions are published under profile {profile}. Switch to it to see them."
+                )),
+                Style::default().fg(theme.waiting),
+            )));
+        }
+        let failures = store.provider_failures();
+        for (name, error, fix) in &failures {
+            lines.push(Line::from(Span::styled(
+                format!("{name} couldn't refresh: {error}"),
+                Style::default().fg(theme.error),
+            )));
+            if let Some(fix) = fix {
+                lines.push(Line::from(format!("  {fix}")));
+            }
+        }
+        if !failures.is_empty() {
+            let shown = if self.order.is_empty() {
+                ""
+            } else {
+                "Shown from the last refresh. "
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{shown}{} retries.", self.key_label('r')),
+                Style::default().fg(theme.dimmed),
+            )));
+        }
+        for provider in store
+            .snapshot
+            .iter()
+            .flat_map(|s| &s.providers)
+            .filter(|p| !p.enabled)
+        {
+            lines.push(Line::from(Span::styled(
+                plain(&format!(
+                    "{0} suggestions are hidden because {0} is off in Settings › Suggestions.",
+                    provider.name
+                )),
+                Style::default().fg(theme.dimmed),
+            )));
+        }
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines
+    }
+
+    /// The divider's text: each working provider's status.
+    fn divider_status(store: &SuggestionsFeed) -> String {
+        let items = store.snapshot.iter().flat_map(|s| &s.items);
+        let statuses: Vec<String> = store
+            .snapshot
+            .iter()
+            .flat_map(|s| &s.providers)
+            .filter(|p| p.enabled && p.error.is_none())
+            .map(|p| {
+                let any = items.clone().any(|i| i.provider_id == p.id);
+                plain_line(&provider_status(p, any))
+            })
+            .collect();
+        statuses.join(" · ")
+    }
+
     pub(super) fn render(
         &self,
         frame: &mut Frame,
@@ -836,9 +1005,24 @@ impl SuggestionsView {
             .border_type(BorderType::Rounded)
             .style(Style::default().bg(theme.background).fg(theme.text))
             .border_style(Style::default().fg(theme.border));
-        let inner = block.inner(area);
+        let bordered = block.inner(area);
         frame.render_widget(block, area);
+        // A one-cell margin inside the border, above and at the sides.
+        let inner = Rect {
+            x: bordered.x + 1,
+            y: bordered.y + 1,
+            width: bordered.width.saturating_sub(2),
+            height: bordered.height.saturating_sub(1),
+        };
+        let width = inner.width.max(1);
+        let dim = Style::default().fg(theme.dimmed);
 
+        let detail = self.detail_lines(store, theme);
+        let mut units = if self.help {
+            vec!["any key closes".to_string()]
+        } else {
+            self.row_keys(store, mutation_block)
+        };
         let mut footer: Vec<Line> = Vec::new();
         if let Some(error) = &self.error {
             footer.push(Line::from(Span::styled(
@@ -848,136 +1032,159 @@ impl SuggestionsView {
         }
         if let Some(notice) = &self.notice {
             footer.push(Line::from(Span::styled(
-                notice.as_str(),
+                plain(notice),
                 Style::default().fg(theme.hint),
             )));
         }
-        if let Some(blocked) = mutation_block {
-            footer.push(Line::from(Span::styled(
-                block_note(blocked),
-                Style::default().fg(theme.waiting),
-            )));
-        }
-        if let Some(profile) = &store.foreign_profile {
-            footer.push(Line::from(Span::styled(
-                plain(&format!(
-                    "Suggestions are published under profile {profile}. Switch to it to see them."
-                )),
-                Style::default().fg(theme.waiting),
-            )));
-        }
-        for provider in store
-            .snapshot
-            .iter()
-            .flat_map(|s| &s.providers)
-            .filter(|p| !p.enabled)
-        {
-            footer.push(Line::from(Span::styled(
-                plain(&format!(
-                    "{0} suggestions are hidden because {0} is off in Settings › Suggestions.",
-                    provider.name
-                )),
-                Style::default().fg(theme.dimmed),
-            )));
-        }
-        for provider in store
-            .snapshot
-            .iter()
-            .flat_map(|s| &s.providers)
-            .filter(|p| p.enabled)
-        {
-            let any_items = store
-                .snapshot
-                .iter()
-                .flat_map(|s| &s.items)
-                .any(|i| i.provider_id == provider.id);
-            let (status, color) = provider_status(provider, any_items, theme);
-            footer.push(Line::from(Span::styled(
-                plain(&status),
-                Style::default().fg(color),
-            )));
-        }
-        footer.push(Line::from(Span::styled(
-            format!(
-                "j/k select · Enter start/open · {} start with changes · {} new · {} dismiss/restore · {} dismissed · {} refresh · PgUp/PgDn prompt · Esc back",
-                self.key_label('e'),
-                self.key_label('N'),
-                self.key_label('z'),
-                self.key_label('d'),
-                self.key_label('r'),
-            ),
-            Style::default().fg(theme.dimmed),
-        )));
-        let width = (inner.width as usize).max(1);
-        let wrapped_rows: usize = footer
-            .iter()
-            .map(|line| line.width().div_ceil(width).max(1))
-            .sum();
-        let footer_height = (wrapped_rows as u16).min(inner.height.saturating_sub(1));
-        let [body, footer_area] = *Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(footer_height)])
-            .split(inner)
-        else {
-            return;
+        let footer_rows = |footer: &[Line], units: &[String]| -> u16 {
+            let messages: usize = footer.iter().map(|l| wrapped_line_count(l, width)).sum();
+            (messages + key_rows(units, width as usize).len() + 1) as u16
         };
-        let [list_area, detail_area] = *Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-            .split(body)
-        else {
-            return;
+        let split = |units: &[String]| -> (Rect, Rect, Rect, Rect) {
+            let footer_height = footer_rows(&footer, units).min(inner.height.saturating_sub(1));
+            let [body, footer_area] =
+                Layout::vertical([Constraint::Min(1), Constraint::Length(footer_height)])
+                    .areas(inner);
+            let [list_area, detail_area] =
+                Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .areas(body);
+            (body, footer_area, list_area, detail_area)
         };
+        let (mut body, mut footer_area, mut list_area, mut detail_area) = split(&units);
+        let detail_rows: usize = detail.iter().map(|l| wrapped_line_count(l, width)).sum();
+        let visible = detail_area.height.saturating_sub(1) as usize;
+        if !self.help && detail_rows > visible + self.detail_scroll as usize {
+            units.insert(units.len() - 2, "PgDn more".to_string());
+            (body, footer_area, list_area, detail_area) = split(&units);
+        }
 
-        let height = list_area.height as usize;
-        let headed = self.has_groups(store);
-        // A heading opens the window and every group in it.
-        let heading_at = |first: usize, index: usize| {
-            headed
-                && (index == first
-                    || self.group_key(store, index) != self.group_key(store, index - 1))
-        };
-        let window = |first: usize| -> usize {
-            (first..=self.selected)
-                .map(|i| 2 + usize::from(heading_at(first, i)))
-                .sum()
-        };
-        let mut start = self.selected.min(self.order.len().saturating_sub(1));
-        while start > 0 && window(start - 1) <= height {
-            start -= 1;
+        if self.help {
+            let key_width = self
+                .help_lines()
+                .iter()
+                .map(|(k, _)| rendered_width(k))
+                .max()
+                .unwrap_or(0);
+            let mut lines = vec![Line::from(Span::styled(
+                "Keys",
+                Style::default().add_modifier(Modifier::BOLD),
+            ))];
+            lines.extend(self.help_lines().into_iter().map(|(key, what)| {
+                Line::from(vec![
+                    Span::styled(
+                        format!("  {}", fixed_width(&key, key_width)),
+                        Style::default().fg(theme.accent),
+                    ),
+                    Span::raw(format!("   {what}")),
+                ])
+            }));
+            frame.render_widget(Paragraph::new(lines), body);
+        } else {
+            self.render_list(frame, list_area, theme, store, mutation_block);
+            // The divider joins the frame's border, with each provider's status on it.
+            let status = Self::divider_status(store);
+            let status = if status.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " {} ",
+                    truncate_to_width(&status, area.width.saturating_sub(5) as usize)
+                )
+            };
+            let rule = (area.width as usize).saturating_sub(3 + rendered_width(&status));
+            let border = Style::default().fg(theme.border);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("├─", border),
+                    Span::styled(status, dim),
+                    Span::styled(format!("{}┤", "─".repeat(rule)), border),
+                ])),
+                Rect {
+                    x: area.x,
+                    width: area.width,
+                    height: 1,
+                    ..detail_area
+                },
+            );
+            frame.render_widget(
+                Paragraph::new(detail)
+                    .wrap(Wrap { trim: false })
+                    .scroll((self.detail_scroll, 0)),
+                Rect {
+                    y: detail_area.y + 1,
+                    height: detail_area.height.saturating_sub(1),
+                    ..detail_area
+                },
+            );
         }
-        let mut lines: Vec<Line> = Vec::new();
-        for index in start..self.order.len() {
-            if lines.len() >= height {
-                break;
-            }
+        footer.insert(0, Line::from(""));
+        footer.extend(
+            key_rows(&units, width as usize)
+                .into_iter()
+                .map(|row| Line::from(Span::styled(row, dim))),
+        );
+        frame.render_widget(
+            Paragraph::new(footer).wrap(Wrap { trim: true }),
+            footer_area,
+        );
+    }
+
+    fn render_list(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        store: &SuggestionsFeed,
+        mutation_block: Option<MutationBlock>,
+    ) {
+        let width = area.width as usize;
+        let dim = Style::default().fg(theme.dimmed);
+        let mut lines = self.list_notices(store, mutation_block, theme);
+        let headed = self.has_groups(store);
+        let mut selected_rows = (0, 0);
+        for index in 0..self.order.len() {
             let Some(item) = self.item_at(store, index) else {
                 continue;
             };
             let item_key = (item.provider_id.clone(), item.id.clone());
-            if heading_at(start, index) {
-                let key = self.group_key(store, index);
+            let first = lines.len();
+            let group = self.group_key(store, index);
+            if headed && (index == 0 || group != self.group_key(store, index - 1)) {
                 let name = item.group().map_or("No project", |(_, name)| name);
+                let repo = item
+                    .mapping_key
+                    .as_deref()
+                    .filter(|repo| *repo != name)
+                    .map(|repo| format!("  {repo}"))
+                    .unwrap_or_default();
                 let count = (0..self.order.len())
-                    .filter(|&i| self.group_key(store, i) == key)
-                    .count();
+                    .filter(|&i| self.group_key(store, i) == group)
+                    .count()
+                    .to_string();
+                let label_width = width.saturating_sub(count.len() + 1);
+                let name = format!("▾ {}", plain_line(name));
+                let repo = plain_line(&repo);
+                let repo_width = label_width.saturating_sub(rendered_width(&name));
                 lines.push(Line::from(vec![
                     Span::styled(
-                        plain(name),
-                        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                        truncate_to_width(&name, label_width),
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(format!(" ({count})"), Style::default().fg(theme.dimmed)),
+                    Span::styled(fixed_width(&repo, repo_width), dim),
+                    Span::styled(format!(" {count}"), dim),
                 ]));
             }
             let current = index == self.selected;
-            let marker = if current { "› " } else { "  " };
+            let marker = if current { "  › " } else { "    " };
             let state = match (item.dismissed, store.is_recent(&item_key)) {
                 (false, _) => String::new(),
                 (true, true) => format!(" [dismissed, {} to undo]", self.key_label('z')),
                 (true, false) => " [dismissed]".to_string(),
             };
             let title_style = if item.dismissed || item.stale {
-                Style::default().fg(theme.dimmed)
+                dim
             } else if current {
                 Style::default()
                     .fg(theme.title)
@@ -990,74 +1197,37 @@ impl SuggestionsView {
                 .source_ref(item)
                 .map(|r| {
                     let short = item.mapping_key.as_deref().and_then(|k| r.strip_prefix(k));
-                    format!(" {}", short.filter(|r| r.starts_with('#')).unwrap_or(r))
+                    plain_line(short.filter(|r| r.starts_with('#')).unwrap_or(r))
                 })
                 .unwrap_or_default();
+            let ref_width = rendered_width(&source_ref);
+            let title_width = width.saturating_sub(ref_width + usize::from(ref_width > 0));
             lines.push(Line::from(vec![
                 Span::styled(
-                    plain(&format!("{marker}{}{state}", item.title)),
+                    fixed_width(
+                        &plain_line(&format!("{marker}{}{state}", item.title)),
+                        title_width,
+                    ),
                     title_style,
                 ),
-                Span::styled(plain(&source_ref), Style::default().fg(theme.dimmed)),
+                Span::styled(
+                    if ref_width > 0 {
+                        format!(" {source_ref}")
+                    } else {
+                        String::new()
+                    },
+                    dim,
+                ),
             ]));
-            let failure = store.failed.as_ref().filter(|(key, _)| *key == item_key);
-            if let Some((_, message)) = failure {
-                lines.push(Line::from(Span::styled(
-                    plain(&format!(
-                        "    Couldn't start: {message} · Enter tries again"
-                    )),
-                    Style::default().fg(theme.error),
-                )));
-                continue;
-            }
-            if let Some((_, code)) = store.blocked_prompt(item) {
-                let one_click = item
-                    .started_session
-                    .as_ref()
-                    .is_some_and(Started::one_click);
-                let next = match code.as_deref() {
-                    Some(FOLDER_NOT_TRUSTED) if self.pretrusted && one_click => {
-                        "Enter tries again".to_string()
-                    }
-                    Some(FOLDER_NOT_TRUSTED) if self.pretrusted => {
-                        "trust the folder in the Session · Enter opens it".to_string()
-                    }
-                    Some(FOLDER_NOT_TRUSTED) => {
-                        format!("{} turn on pre-trust", self.key_label('t'))
-                    }
-                    Some(BYPASS_NOT_ACCEPTED) => {
-                        "accept Bypass Permissions once in the Session · Enter opens it".to_string()
-                    }
-                    _ => "Enter opens it".to_string(),
-                };
-                lines.push(Line::from(Span::styled(
-                    format!("    Prompt not typed · {next}"),
-                    Style::default().fg(theme.error),
-                )));
-                continue;
-            }
-            lines.push(Line::from(Span::styled(
-                plain(&format!(
-                    "    {} · {}{}",
-                    item.reason,
-                    item.resolved_project
-                        .as_ref()
-                        .map(|p| p.name.as_str())
-                        .or(item.project.as_deref())
-                        .unwrap_or("no project"),
-                    item.started_session
-                        .as_ref()
-                        .map(|s| if s.archived {
-                            " · Archived: Enter opens".to_string()
-                        } else {
-                            format!(" · Session {}: Enter opens", s.status.to_lowercase())
-                        })
-                        .unwrap_or_default()
-                )),
-                Style::default().fg(theme.dimmed),
-            )));
+            lines.push(self.subtitle(store, item, headed, theme));
+            selected_rows = if current {
+                (first, lines.len())
+            } else {
+                selected_rows
+            };
+            lines.push(Line::from(""));
         }
-        if lines.is_empty() {
+        if self.order.is_empty() {
             let message = match (&store.snapshot, store.busy) {
                 (None, true) => "Loading suggestions…".to_string(),
                 (None, false) => {
@@ -1068,81 +1238,132 @@ impl SuggestionsView {
                 }
                 (Some(_), _) => "Nothing to suggest right now.".to_string(),
             };
-            lines.push(Line::from(Span::styled(
-                message,
-                Style::default().fg(theme.dimmed),
+            lines.push(Line::from(Span::styled(message, dim)));
+        }
+        let height = area.height as usize;
+        let mut offset = selected_rows.1.saturating_sub(height);
+        offset = offset.min(selected_rows.0);
+        frame.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), area);
+    }
+
+    /// The line under an item's title: why it cannot go on, else its reason
+    /// and Session.
+    fn subtitle(
+        &self,
+        store: &SuggestionsFeed,
+        item: &Item,
+        headed: bool,
+        theme: &Theme,
+    ) -> Line<'static> {
+        let error = Style::default().fg(theme.error);
+        let item_key = (item.provider_id.clone(), item.id.clone());
+        if let Some((_, message)) = store.failed.as_ref().filter(|(key, _)| *key == item_key) {
+            return Line::from(Span::styled(
+                plain_line(&format!(
+                    "      Couldn't start: {message} · Enter tries again"
+                )),
+                error,
+            ));
+        }
+        if let Some((_, code)) = store.blocked_prompt(item) {
+            let one_click = item
+                .started_session
+                .as_ref()
+                .is_some_and(Started::one_click);
+            let next = match code.as_deref() {
+                Some(FOLDER_NOT_TRUSTED) if self.pretrusted && one_click => {
+                    "Enter tries again".to_string()
+                }
+                Some(FOLDER_NOT_TRUSTED) if self.pretrusted => {
+                    "trust the folder in the Session · Enter opens it".to_string()
+                }
+                Some(FOLDER_NOT_TRUSTED) => format!("{} turn on pre-trust", self.key_label('t')),
+                Some(BYPASS_NOT_ACCEPTED) => {
+                    "accept Bypass Permissions once in the Session · Enter opens it".to_string()
+                }
+                _ => "Enter opens it".to_string(),
+            };
+            return Line::from(Span::styled(
+                format!("      Prompt not typed · {next}"),
+                error,
+            ));
+        }
+        let mut parts = vec![item.reason.clone()];
+        // A heading already names the Project.
+        if !(headed && item.group().is_some()) {
+            parts.push(
+                item.resolved_project
+                    .as_ref()
+                    .map(|p| p.name.clone())
+                    .or_else(|| item.project.clone())
+                    .unwrap_or_else(|| "no project".to_string()),
+            );
+        }
+        if let Some(s) = &item.started_session {
+            parts.push(if s.archived {
+                "Archived: Enter opens".to_string()
+            } else {
+                format!("Session {}: Enter opens", s.status.to_lowercase())
+            });
+        }
+        Line::from(Span::styled(
+            plain_line(&format!("      {}", parts.join(" · "))),
+            Style::default().fg(theme.dimmed),
+        ))
+    }
+
+    /// The detail under the divider: what stops the item, what Enter starts,
+    /// the prompt, then the source text. The title is on the selected row.
+    fn detail_lines(&self, store: &SuggestionsFeed, theme: &Theme) -> Vec<Line<'static>> {
+        let Some(item) = self.item_at(store, self.selected) else {
+            return Vec::new();
+        };
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let mut detail: Vec<Line> = vec![Line::from("")];
+        if let Some((_, message)) = store
+            .failed
+            .as_ref()
+            .filter(|(key, _)| (&key.0, &key.1) == (&item.provider_id, &item.id))
+        {
+            detail.push(Line::from(Span::styled(
+                plain(&format!("Couldn't start: {message} · Enter tries again")),
+                Style::default().fg(theme.error),
             )));
         }
-        frame.render_widget(Paragraph::new(lines), list_area);
-
-        let mut detail: Vec<Line> = Vec::new();
-        if let Some(item) = self.item_at(store, self.selected) {
+        if let Some((message, _)) = store.blocked_prompt(item) {
             detail.push(Line::from(Span::styled(
-                plain(&item.title),
-                Style::default().add_modifier(Modifier::BOLD),
+                plain(&format!("Prompt not typed: {message}")),
+                Style::default().fg(theme.error),
             )));
-            if let Some((_, message)) = store
-                .failed
-                .as_ref()
-                .filter(|(key, _)| (&key.0, &key.1) == (&item.provider_id, &item.id))
-            {
-                detail.push(Line::from(Span::styled(
-                    plain(&format!("Couldn't start: {message} · Enter tries again")),
-                    Style::default().fg(theme.error),
-                )));
-            }
-            if let Some((message, _)) = store.blocked_prompt(item) {
-                detail.push(Line::from(Span::styled(
-                    plain(&format!("Prompt not typed: {message}")),
-                    Style::default().fg(theme.error),
-                )));
-            }
-            let mut source = vec![store.provider_name(&item.provider_id)];
-            source.extend(store.source_ref(item));
-            source.push(&item.source_url);
-            detail.push(Line::from(plain(&source.join(" · "))));
-            detail.extend(
-                plain(&item.preview)
-                    .lines()
-                    .map(|l| Line::from(l.to_owned())),
-            );
-            detail.push(Line::from(""));
-            let effective = store.effective_prompt(item);
-            let final_prompt = self
-                .prepared
-                .as_ref()
-                .filter(|(key, _)| *key == (item.provider_id.clone(), item.id.clone()))
-                .map(|(_, start)| start.initial_prompt.as_str());
-            let (header, prompt) = match final_prompt {
-                Some(prompt) => ("Prompt sent to the agent (untrusted source text):", prompt),
-                None => (
-                    "Prompt Enter sends (untrusted source text):",
-                    effective.as_str(),
-                ),
-            };
-            if let Some(line) = store.preset_line(item) {
-                detail.push(Line::from(Span::styled(
-                    plain(&line),
-                    Style::default().fg(theme.accent),
-                )));
-            }
+        }
+        if let Some(line) = store.preset_line(item) {
             detail.push(Line::from(Span::styled(
-                header,
+                plain(&line),
                 Style::default().fg(theme.accent),
             )));
-            detail.extend(plain(prompt).lines().map(|l| Line::from(l.to_owned())));
         }
-        frame.render_widget(
-            Paragraph::new(detail)
-                .block(Block::default().borders(Borders::TOP))
-                .wrap(Wrap { trim: false })
-                .scroll((self.detail_scroll, 0)),
-            detail_area,
-        );
-        frame.render_widget(
-            Paragraph::new(footer).wrap(Wrap { trim: true }),
-            footer_area,
-        );
+        if detail.len() > 1 {
+            detail.push(Line::from(""));
+        }
+        let effective = store.effective_prompt(item);
+        let final_prompt = self
+            .prepared
+            .as_ref()
+            .filter(|(key, _)| *key == (item.provider_id.clone(), item.id.clone()))
+            .map(|(_, start)| start.initial_prompt.as_str());
+        let (header, prompt) = match final_prompt {
+            Some(prompt) => ("Prompt sent to the agent (untrusted source text)", prompt),
+            None => ("Prompt (untrusted source text)", effective.as_str()),
+        };
+        detail.push(Line::from(Span::styled(header, bold)));
+        detail.extend(plain(prompt).lines().map(|l| Line::from(format!("  {l}"))));
+        let preview = plain(&item.preview);
+        if !preview.trim().is_empty() {
+            detail.push(Line::from(""));
+            detail.push(Line::from(Span::styled("Source text", bold)));
+            detail.extend(preview.lines().map(|l| Line::from(format!("  {l}"))));
+        }
+        detail
     }
 
     #[cfg(test)]
@@ -1334,14 +1555,6 @@ impl SuggestionsFeed {
             .as_ref()
             .is_none_or(|s| s.prefs.show_source_ref);
         (shown && !item.source_ref.is_empty()).then_some(item.source_ref.as_str())
-    }
-
-    fn provider_name<'a>(&'a self, id: &'a str) -> &'a str {
-        self.snapshot
-            .iter()
-            .flat_map(|s| &s.providers)
-            .find(|p| p.id == id)
-            .map_or(id, |p| p.name.as_str())
     }
 
     /// Whether the provider is listed: items of an unlisted provider are not
@@ -2043,8 +2256,12 @@ mod tests {
     }
 
     fn render_text_blocked(rig: &Rig, block: Option<MutationBlock>) -> String {
+        render_sized(rig, block, 100, 24)
+    }
+
+    fn render_sized(rig: &Rig, block: Option<MutationBlock>, width: u16, height: u16) -> String {
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| {
                 rig.view
@@ -2055,10 +2272,18 @@ mod tests {
             .backend()
             .buffer()
             .content
-            .chunks(100)
+            .chunks(width as usize)
             .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The rendered row holding `needle`, trimmed of the border.
+    fn row<'a>(text: &'a str, needle: &str) -> &'a str {
+        text.lines()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} in {text}"))
+            .trim_matches(|c: char| c == '│' || c.is_whitespace())
     }
 
     fn ids(rig: &Rig) -> Vec<String> {
@@ -2259,7 +2484,7 @@ mod tests {
             idle_worker(),
         );
         assert_eq!(ids(&rig), ["b1", "b2", "a1", "loose"]);
-        assert!(render_text(&rig).contains("web (2)"));
+        assert!(row(&render_text(&rig), "▾ web").ends_with(" 2"));
         for _ in 0..3 {
             press(&mut rig, KeyCode::Char('j'), true);
         }
@@ -2269,7 +2494,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{needle} in {text}"))
         };
         assert!(
-            at("api (1)") < at("No project (1)"),
+            at("▾ api") < at("▾ No project"),
             "the window scrolled to the last group"
         );
         let flat = view_with(vec![item("x", None, false)], idle_worker());
@@ -2296,11 +2521,12 @@ mod tests {
         );
         assert_eq!(ids(&rig), ["f1", "w1", "loose"]);
         let text = render_text(&rig);
-        assert!(text.contains("freebuf (1)"), "{text}");
-        assert!(text.contains("web (1)"), "{text}");
-        assert!(text.contains("No project (1)"), "{text}");
+        assert!(row(&text, "▾ freebuf  acme/freebuf").ends_with(" 1"));
+        assert!(row(&text, "▾ web  acme/web").ends_with(" 1"));
+        assert!(row(&text, "▾ No project").ends_with(" 1"));
+        let f1 = row(&text, "› f1");
         assert!(
-            text.contains("f1 #38"),
+            f1.ends_with(" #38") && !f1.contains("acme/"),
             "the heading names the repo: {text}"
         );
     }
@@ -2731,19 +2957,29 @@ mod tests {
     }
 
     #[test]
-    fn each_provider_gets_a_status_line() {
+    fn each_provider_gets_a_status_on_the_divider_and_a_failure_leads_the_list() {
         let mut rig = view_with(vec![item("a", None, false)], idle_worker());
-        assert!(render_text(&rig).contains("GitHub: updated 2 min ago"));
+        let text = render_text(&rig);
+        assert!(text.contains("├─ GitHub · updated 2 min ago ─"), "{text}");
         let provider = &mut rig.store.snapshot.as_mut().unwrap().providers[0];
         provider.refreshing = true;
-        assert!(render_text(&rig).contains("⠙ GitHub: refreshing…"));
+        assert!(render_text(&rig).contains("⠙ GitHub · refreshing…"));
         let provider = &mut rig.store.snapshot.as_mut().unwrap().providers[0];
         provider.refreshing = false;
         provider.error = Some("API key rejected".into());
-        assert!(render_text(&rig).contains("GitHub: couldn't refresh, API key rejected"));
+        let text = render_text(&rig);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines[2].contains("GitHub couldn't refresh: API key rejected"),
+            "{text}"
+        );
+        assert!(
+            lines[3].contains("Shown from the last refresh. r retries."),
+            "{text}"
+        );
         rig.store.snapshot.as_mut().unwrap().providers[0].error = None;
         rig.store.snapshot.as_mut().unwrap().items.clear();
-        assert!(render_text(&rig).contains("GitHub: nothing new"));
+        assert!(render_text(&rig).contains("GitHub · nothing new"));
     }
 
     #[test]
@@ -2765,12 +3001,16 @@ mod tests {
     }
 
     #[test]
-    fn the_subtitle_prefers_the_resolved_project_over_the_hint() {
+    fn the_heading_prefers_the_resolved_project_over_the_hint() {
         let resolved = in_project(item("a", Some("hint-name"), false), "api");
         let hinted = item("b", Some("hint-name"), false);
         let rig = view_with(vec![resolved, hinted], idle_worker());
         let text = render_text(&rig);
-        assert!(text.contains("reason · api"), "{text}");
+        assert!(text.contains("▾ api"), "{text}");
+        assert!(
+            !text.contains("reason · api"),
+            "the heading names it: {text}"
+        );
         assert!(text.contains("reason · hint-name"), "{text}");
     }
 
@@ -2991,30 +3231,26 @@ mod tests {
         hostile.draft.prompt = "run \u{1b}[31mrm -rf\u{1b}[0m now".into();
         let rig = view_with(vec![hostile], idle_worker());
         let text = render_text(&rig);
+        assert!(row(&text, "› a").ends_with(" ref-a"), "{text}");
         for expected in [
-            "a ref-a",
             "reason · repo",
-            "GitHub · ref-a · https://example.test/x",
+            "Source text",
             "preview text",
-            "Prompt Enter sends",
+            "Prompt (untrusted source text)",
             "run \u{fffd}[31mrm -rf\u{fffd}[0m now",
         ] {
-            assert!(text.contains(expected), "missing {expected:?}");
+            assert!(text.contains(expected), "missing {expected:?}: {text}");
         }
         assert!(!text.contains('\u{1b}'));
     }
 
     #[test]
     fn the_source_reference_follows_the_pref() {
-        for (shown, row, detail, entry_ref) in [
-            (true, "a ref-a", "GitHub · ref-a · https://", "ref-a"),
-            (false, "› a", "GitHub · https://", ""),
-        ] {
+        for (shown, entry_ref) in [(true, "ref-a"), (false, "")] {
             let mut rig = view_with(vec![item("a", None, false)], idle_worker());
             rig.store.snapshot.as_mut().unwrap().prefs.show_source_ref = shown;
             let text = render_text(&rig);
-            assert!(text.contains(row), "{shown}: {text}");
-            assert!(text.contains(detail), "{shown}: {text}");
+            assert_eq!(row(&text, "› a").ends_with(" ref-a"), shown, "{text}");
             assert_eq!(text.contains("ref-a"), shown, "{text}");
             let key = ("p".to_string(), "a".to_string());
             assert_eq!(rig.store.entry(&key).unwrap().source_ref, entry_ref);
@@ -3209,6 +3445,72 @@ mod tests {
         assert!(rig.view.preparing.is_some() && rig.view.prepare_another);
         let text = render_text(&rig);
         assert!(text.contains("Ctrl+N new"), "{text}");
+    }
+
+    /// At 80x24 a heading reads apart from its rows, the divider carries the
+    /// provider status, and no key is split from its label.
+    #[test]
+    fn the_view_reads_at_80_by_24() {
+        let mut long = in_project(item("b", None, false), "web");
+        long.draft.prompt = (0..40).map(|i| format!("line {i}\n")).collect();
+        let mut rig = view_with(
+            vec![
+                in_project(item("a", None, false), "web"),
+                long,
+                in_project(item("c", None, false), "cli"),
+            ],
+            idle_worker(),
+        );
+        press(&mut rig, KeyCode::Char('j'), true);
+        let text = render_sized(&rig, None, 80, 24);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 24);
+        assert!(lines[2].contains("▾ web") && lines[2].trim_end_matches(['│', ' ']).ends_with('2'));
+        assert!(lines[3].contains("    a"), "{text}");
+        assert!(
+            lines[5].trim_matches(['│', ' ']).is_empty(),
+            "a gap between items: {text}"
+        );
+        assert!(lines[6].contains("  › b"), "{text}");
+        assert!(text.contains("├─ GitHub · updated 2 min ago ─"), "{text}");
+        let keys = [
+            "↵ start",
+            "e change first",
+            "N new",
+            "z dismiss",
+            "PgDn more",
+            "? all keys",
+            "Esc back",
+        ];
+        for key in keys {
+            assert!(
+                lines.iter().any(|l| l.contains(key)),
+                "{key:?} split or missing: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn question_mark_lists_every_key_and_any_key_closes_it() {
+        let mut rig = view_with(vec![item("a", None, false)], idle_worker());
+        rig.view.strict = true;
+        press(&mut rig, KeyCode::Char('?'), true);
+        let text = render_sized(&rig, None, 80, 24);
+        for (key, what) in [
+            ("E", "change first"),
+            ("Ctrl+N", "a new session"),
+            ("T", "turn on pre-trust"),
+        ] {
+            assert!(
+                row(&text, what).starts_with(&format!("{key} ")),
+                "{key:?}: {text}"
+            );
+        }
+        press(&mut rig, KeyCode::Char('D'), true);
+        assert!(
+            !rig.view.help && !rig.view.show_dismissed,
+            "the key only closed the list"
+        );
     }
 
     #[test]
