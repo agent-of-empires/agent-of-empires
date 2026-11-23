@@ -522,6 +522,8 @@ mod tests {
             .acp_supervisor
             .test_insert_worker_cmd_recording(&id)
             .await;
+        let _live = crate::acp::supervisor::test_support::save_agent_record(&id, "claude", true);
+        service.acp_supervisor.test_publish_worker_attached(&id);
         let post = || async {
             queue_enqueue(
                 State(Arc::clone(&state)),
