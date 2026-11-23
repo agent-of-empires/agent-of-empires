@@ -59,6 +59,7 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
         stored_acp_session_id: None,
         fork_from: None,
         sandbox_info: None,
+        workspace_info: None,
         source_profile: None,
         mcp_servers: Vec::new(),
         seed_history_replay: false,
@@ -106,7 +107,7 @@ async fn drain_first_snapshot(client: &mut AcpClient, agent: &str) -> bool {
                 continue;
             }
             let agent = agent.to_string();
-            let now = chrono::Utc::now().to_rfc3339();
+            let now = crate::time::Timestamp::now().to_rfc3339();
             let _ = tokio::task::spawn_blocking(move || {
                 crate::acp::option_catalog::record(&agent, &options, now)
             })

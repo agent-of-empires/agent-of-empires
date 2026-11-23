@@ -534,7 +534,10 @@ async fn admit_and_create(
         plugin_create_idempotency: None,
         // Set here (not just inside the service) so the idempotency probe below
         // hashes the same payload the create will.
-        pending_initial_turn: req.initial_turn.as_ref().map(|t| t.text.clone()),
+        pending_initial_turn: req
+            .initial_turn
+            .as_ref()
+            .map(|t| (t.text.clone(), crate::daemon::PromptOrigin::Plugin)),
         parent_session_id: None,
         acp_mode_id: req.mode_id.clone(),
         view: crate::session::View::Structured,
@@ -587,14 +590,17 @@ async fn admit_and_create(
     // cannot overshoot the cap.
     let _reservation = deps.policy.admit_create(plugin_id, active_sessions)?;
 
-    let initial_turn_text = req.initial_turn.as_ref().map(|t| t.text.as_str());
+    let initial_turn = req
+        .initial_turn
+        .as_ref()
+        .map(|t| (t.text.as_str(), crate::daemon::PromptOrigin::Plugin));
     let (outcome, created) = deps
         .session_service
         .create_structured_session(
             spec,
             Some(plugin_id),
             req.idempotency_key.as_deref(),
-            initial_turn_text,
+            initial_turn,
         )
         .await
         .map_err(map_create_error)?;
@@ -712,7 +718,7 @@ async fn sessions_turn_send(
 
         let woke_idle_dormant = match deps
             .session_service
-            .touch_and_wake_on_prompt(&req.session_id, false)
+            .touch_and_wake_on_prompt_refusing_ignored(&req.session_id, false)
             .await
         {
             PromptTouch::Touched { idle_dormant } => idle_dormant,
@@ -730,6 +736,16 @@ async fn sessions_turn_send(
                     codes::FAILED_PRECONDITION,
                     blocked.code(),
                     blocked.to_string(),
+                ));
+            }
+            PromptTouch::Ignored => {
+                if marked_pending {
+                    clear_revival_pending(&deps.session_service, &req.session_id).await;
+                }
+                return Err(DispatchError::with_kind(
+                    codes::FAILED_PRECONDITION,
+                    "ignored",
+                    "The session is ignored because another session manages it",
                 ));
             }
         };
@@ -767,6 +783,7 @@ async fn sessions_turn_send(
                 woke_idle_dormant,
                 prompt_ids: Vec::new(),
                 synthesized: false,
+                origin: crate::daemon::PromptOrigin::Plugin,
                 no_revive: false, },
             )
             .await;
@@ -942,6 +959,7 @@ async fn deliver_message(
         &req.session_id,
         req.message.clone(),
         true,
+        true,
     )
     .await
     .map_err(|error| map_terminal_error(error.error))?;
@@ -967,11 +985,21 @@ async fn deliver_structured(
         .admit_prompt_submission(&caller, id)
         .await
         .map_err(|e| map_send_error(e.into()))?;
-    let woke_idle_dormant = match service.touch_and_wake_on_prompt(id, false).await {
+    let woke_idle_dormant = match service
+        .touch_and_wake_on_prompt_refusing_ignored(id, false)
+        .await
+    {
         PromptTouch::Touched { idle_dormant } => idle_dormant,
         PromptTouch::RevivalRefused => return Err(map_send_error(SendTurnError::RevivalRefused)),
         PromptTouch::WorkerNotReady => return Err(map_send_error(SendTurnError::WorkerNotReady)),
         PromptTouch::Blocked(blocked) => return Err(blocked_error(blocked)),
+        PromptTouch::Ignored => {
+            return Err(DispatchError::with_kind(
+                codes::FAILED_PRECONDITION,
+                "ignored",
+                "The session is ignored because another session manages it",
+            ))
+        }
     };
     let was_running = service.acp_supervisor.is_running(id).await;
     let dispatch = service
@@ -990,7 +1018,10 @@ async fn deliver_structured(
                     req.message.clone(),
                     Vec::new(),
                     None,
-                    Some(plugin_id.to_string()),
+                    crate::server::session_service::QueueSender {
+                        plugin: Some(plugin_id.to_string()),
+                        origin: crate::daemon::PromptOrigin::Plugin,
+                    },
                 )
                 .await
                 .map_err(|_| DispatchError::internal("the message could not be saved; retry"))?
@@ -1012,6 +1043,7 @@ async fn deliver_structured(
                 woke_idle_dormant,
                 prompt_ids: Vec::new(),
                 synthesized: false,
+                origin: crate::daemon::PromptOrigin::Plugin,
                 no_revive: false,
             },
         )
@@ -1091,7 +1123,10 @@ async fn keep_for_login(
             text.to_string(),
             Vec::new(),
             None,
-            origin_plugin.map(str::to_string),
+            crate::server::session_service::QueueSender {
+                plugin: origin_plugin.map(str::to_string),
+                origin: crate::daemon::PromptOrigin::Plugin,
+            },
         )
         .await
         .map(|entry| entry.id)
@@ -1179,6 +1214,11 @@ fn map_terminal_error(e: SendKeysError) -> DispatchError {
         SendKeysError::StructuredView => {
             DispatchError::internal("terminal send reached a structured session")
         }
+        SendKeysError::Ignored => DispatchError::with_kind(
+            codes::FAILED_PRECONDITION,
+            "ignored",
+            "the session is ignored because another session manages it",
+        ),
         SendKeysError::Tmux(error) => {
             tracing::warn!(target: "plugin.host", %error, "plugin terminal send failed");
             DispatchError::internal("terminal send failed")
@@ -1737,9 +1777,13 @@ mod tests {
     async fn message_send_reports_missing_and_shelved_sessions_with_stable_kinds() {
         let _home = crate::session::test_support::isolate_app_dir();
         type Shelve = (&'static str, fn(&mut Instance));
-        let shelves: [Shelve; 2] = [
+        let shelves: [Shelve; 3] = [
             ("session_archived", Instance::archive),
             ("session_trashed", Instance::trash),
+            ("ignored", |row| {
+                row.parent_session_id = Some("manager".into());
+                row.ignore();
+            }),
         ];
         let mut prior = Vec::new();
         for (want, shelve) in shelves {
@@ -1754,13 +1798,15 @@ mod tests {
                 prior.push(inst);
             }
         }
-        let (deps, state, _dir) = test_deps(prior.clone());
+        let (deps, state, _dir) = test_deps_native(prior.clone()).await;
         let ctx = ctx_with(&["session.message"]);
         for inst in &prior {
             let want = if inst.is_archived() {
                 "session_archived"
-            } else {
+            } else if inst.is_trashed() {
                 "session_trashed"
+            } else {
+                "ignored"
             };
             let err = dispatch(
                 &deps,
@@ -1839,6 +1885,7 @@ mod tests {
                 prompt_id: None,
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
         ));
         let out = dispatch(
@@ -1891,7 +1938,8 @@ mod tests {
         let parks: Vec<Park> = vec![
             ("idle-dormant", |i| i.mark_idle_dormant()),
             ("snoozed", |i| {
-                i.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1))
+                i.snoozed_until =
+                    Some(crate::time::Timestamp::now() + crate::time::Duration::hours(1))
             }),
             ("stopped, nothing to clear", |_| {}),
         ];
@@ -1946,6 +1994,7 @@ mod tests {
             error: None,
             error_code: None,
             id: String::new(),
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         parked.pending_initial_turn = Some(seeded.clone());
         let (deps, state, _dir) = test_deps(vec![parked]);
@@ -2154,12 +2203,10 @@ mod tests {
             .acp_supervisor
             .publish_user_prompt_with_attachments(
                 "sess-3649",
-                "the winning turn".into(),
-                &[],
-                Vec::new(),
-                false,
-                None,
-                None,
+                crate::acp::supervisor::UserPrompt {
+                    text: "the winning turn".into(),
+                    ..Default::default()
+                },
             )
             .await;
         drop(winner);
@@ -2222,6 +2269,7 @@ mod tests {
             prompt_id: None,
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         // Each state named by the disposition it would have leaked.
         for (label, events, expected) in [
@@ -2236,7 +2284,7 @@ mod tests {
             (
                 "cancelling",
                 vec![Event::CancelRequested {
-                    escalates_at: chrono::Utc::now(),
+                    escalates_at: crate::time::Timestamp::now(),
                 }],
                 crate::acp::dispatch::PromptDispatch::Queued {
                     reason: crate::acp::dispatch::QueueReason::Cancelling,
@@ -2294,7 +2342,8 @@ mod tests {
         let parks: Vec<Park> = vec![
             ("idle-dormant", |i| i.mark_idle_dormant()),
             ("snoozed", |i| {
-                i.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1))
+                i.snoozed_until =
+                    Some(crate::time::Timestamp::now() + crate::time::Duration::hours(1))
             }),
             ("stopped by the user, nothing to clear", |_| {}),
         ];
@@ -2344,7 +2393,8 @@ mod tests {
         type Park = (&'static str, fn(&mut Instance));
         let parks: Vec<Park> = vec![
             ("snoozed", |i| {
-                i.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1))
+                i.snoozed_until =
+                    Some(crate::time::Timestamp::now() + crate::time::Duration::hours(1))
             }),
             ("idle-dormant", |i| i.mark_idle_dormant()),
             ("idle", |i| i.status = Status::Idle),
@@ -2883,7 +2933,7 @@ mod tests {
                     format!("row {n}"),
                     Vec::new(),
                     None,
-                    None,
+                    crate::server::session_service::QueueSender::default(),
                 )
                 .await
                 .expect("the row is queued");
@@ -2996,6 +3046,7 @@ mod tests {
                 merged_prompt_ids: Vec::new(),
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
         ));
         fill_queue(&deps.session_service, "sess-msg-full").await;
@@ -3045,6 +3096,7 @@ mod tests {
                 error: None,
                 error_code: None,
                 id: String::new(),
+                origin: crate::daemon::PromptOrigin::Unknown,
             });
             crate::session::test_support::sandbox_needing_login(home.path(), &mut row);
             let (deps, state, _dir) = test_deps_native(vec![row]).await;

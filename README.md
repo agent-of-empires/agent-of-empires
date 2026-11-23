@@ -63,7 +63,7 @@ one in a persistent session with optional worktree and container isolation.
 
 ## How It Works
 
-Each agent runs in its own [tmux](https://github.com/tmux/tmux/wiki) session, so your agents keep running when you close the TUI, disconnect SSH, or your terminal crashes. Reopen `aoe` and everything is where you left it. The key shortcut to know: **`Ctrl+b d`** detaches from a session and returns to the TUI.
+Each agent runs in its own [tmux](https://github.com/tmux/tmux/wiki) session, or under a persistent worker in the structured view, so your agents keep running when you close the TUI, disconnect SSH, or your terminal crashes. Reopen `aoe` and everything is where you left it. The key shortcut to know: **`Ctrl+b d`** detaches from a tmux session and returns to the TUI; in the structured view, **`Ctrl+Q`** does the same.
 
 ## Install
 
@@ -95,7 +95,7 @@ aoe serve                    # Start the web dashboard
 
 ## FAQ
 
-**What happens when I close aoe?** Nothing. Sessions are tmux sessions running in the background; they are removed only when you delete them.
+**What happens when I close aoe?** Nothing. Sessions are tmux sessions, or persistent workers in the structured view, running in the background; they are removed only when you delete them.
 
 **Which AI tools are supported?** Run `aoe agents` for the current list and availability on your machine.
 

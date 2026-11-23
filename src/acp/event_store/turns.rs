@@ -547,7 +547,8 @@ impl EventStore {
     /// agent's follow-up turn is still pending. Old finishes expire so a turn
     /// that never came cannot hold the runner forever.
     fn has_unhandled_finish(&self, session_id: &str) -> Option<bool> {
-        let stale_cutoff = chrono::Utc::now().timestamp_millis() - BACKGROUND_AGENT_STALE_AFTER_MS;
+        let stale_cutoff =
+            crate::time::Timestamp::now().as_millis() - BACKGROUND_AGENT_STALE_AFTER_MS;
         logged(
             self.conn().query_row(
                 "SELECT EXISTS (
@@ -614,7 +615,8 @@ impl EventStore {
             Some(false) => {}
         }
         let conn = self.conn();
-        let stale_cutoff = chrono::Utc::now().timestamp_millis() - BACKGROUND_AGENT_STALE_AFTER_MS;
+        let stale_cutoff =
+            crate::time::Timestamp::now().as_millis() - BACKGROUND_AGENT_STALE_AFTER_MS;
         let bg_in_flight: i64 = logged(
             conn.query_row(
                 "SELECT COUNT(*) FROM (
@@ -817,7 +819,7 @@ mod tests {
             tools: Vec::new(),
             last_tool: None,
             last_text: None,
-            at: chrono::Utc::now(),
+            at: crate::time::Timestamp::now(),
         };
         let startup_error = Event::startup_error("boom");
         // (events, in flight)
@@ -859,7 +861,7 @@ mod tests {
             tools: Vec::new(),
             result: None,
             warning: None,
-            ended_at: chrono::Utc::now(),
+            ended_at: crate::time::Timestamp::now(),
         };
         store.record("s-5", 4, &completed).unwrap();
         assert!(
@@ -874,7 +876,7 @@ mod tests {
             [user_prompt("go"), stopped("prompt_complete")],
         );
         let stale_at =
-            chrono::Utc::now().timestamp_millis() - (BACKGROUND_AGENT_STALE_AFTER_MS + 60_000);
+            crate::time::Timestamp::now().as_millis() - (BACKGROUND_AGENT_STALE_AFTER_MS + 60_000);
         store.record_at("stale", 3, &progress(), stale_at).unwrap();
         assert!(
             !store.has_in_flight_turn("stale"),
@@ -946,7 +948,7 @@ mod tests {
                 model: None,
                 background: true,
             },
-            at: chrono::Utc::now(),
+            at: crate::time::Timestamp::now(),
         };
         let switched = Event::AgentSwitched {
             from: "claude".into(),
@@ -994,7 +996,7 @@ mod tests {
                 kind: "execute".into(),
                 args_preview: "{}".into(),
                 prompt: None,
-                started_at: chrono::Utc::now(),
+                started_at: crate::time::Timestamp::now(),
                 parent_tool_call_id: None,
                 memory_recall: None,
                 diffs: Vec::new(),
@@ -1072,7 +1074,7 @@ mod tests {
     fn an_old_unhandled_finish_no_longer_holds_live_work() {
         let (_tmp, store) = open_store(1000);
         let old =
-            chrono::Utc::now().timestamp_millis() - (BACKGROUND_AGENT_STALE_AFTER_MS + 60_000);
+            crate::time::Timestamp::now().as_millis() - (BACKGROUND_AGENT_STALE_AFTER_MS + 60_000);
         store.record_at("s", 1, &user_prompt("go"), old).unwrap();
         store
             .record_at("s", 2, &stopped("prompt_complete"), old)
@@ -1177,7 +1179,7 @@ mod tests {
                 options: Vec::new(),
                 choice: false,
                 plan: None,
-                requested_at: chrono::Utc::now(),
+                requested_at: crate::time::Timestamp::now(),
                 resolved: None,
             },
         };
@@ -1189,7 +1191,7 @@ mod tests {
                 description: None,
                 tool_call_id: None,
                 questions: Vec::new(),
-                requested_at: chrono::Utc::now(),
+                requested_at: crate::time::Timestamp::now(),
                 resolved: None,
             },
         };
@@ -1243,7 +1245,7 @@ mod tests {
                     tools: Vec::new(),
                     result: None,
                     warning: None,
-                    ended_at: chrono::Utc::now(),
+                    ended_at: crate::time::Timestamp::now(),
                 },
                 bg_launched("bg-b", "/tmp/b.jsonl"),
                 bg_launched("bg-c", ""),
@@ -1343,7 +1345,7 @@ mod tests {
             tools: Vec::new(),
             result: None,
             warning: None,
-            ended_at: chrono::Utc::now(),
+            ended_at: crate::time::Timestamp::now(),
         });
         // Enough events for the periodic sweep of completed work to run.
         for _ in 0..150 {
@@ -1615,7 +1617,7 @@ mod tests {
                     tools: Vec::new(),
                     result: None,
                     warning: None,
-                    ended_at: chrono::Utc::now(),
+                    ended_at: crate::time::Timestamp::now(),
                 },
             ],
         );
@@ -1659,7 +1661,7 @@ mod tests {
                 description: None,
                 tool_call_id: None,
                 questions: Vec::new(),
-                requested_at: chrono::Utc::now(),
+                requested_at: crate::time::Timestamp::now(),
                 resolved: None,
             },
         };
@@ -1668,7 +1670,7 @@ mod tests {
             is_error: false,
             content: String::new(),
             output: Vec::new(),
-            completed_at: chrono::Utc::now(),
+            completed_at: crate::time::Timestamp::now(),
             async_subagent: false,
         };
         record_from(
@@ -1727,7 +1729,7 @@ mod tests {
             prompt: "do it".into(),
             model: "claude-opus-4-8".into(),
             output_file: output_file.into(),
-            started_at: chrono::Utc::now(),
+            started_at: crate::time::Timestamp::now(),
             workflow: None,
         }
     }

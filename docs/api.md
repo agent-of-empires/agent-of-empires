@@ -57,7 +57,7 @@ without a token. To connect an agent, see
 | --- | --- | --- |
 | `list_sessions` | `state` (`live`, default, or `all`), `group` (exact path and descendants), `children_of` (direct parent id) | The `{sessions, workspace_ordering}` envelope from the published canonical snapshot. |
 | `whoami` | none | `{session}`: the calling session (same row shape as `GET /api/sessions`) when the request carries its own session credential, `null` otherwise. |
-| `create_session` | `path`, `tool`, and optionally `title`, `view` (`terminal`, default, or `structured`), `agent_name`, `agent_model`, `agent_effort`, `group`, `worktree_enabled`, `worktree_branch`, `create_new_branch`, `base_branch`, `sandbox`, `sandbox_image`, `yolo_mode`, `profile`, `prompt`, `parent_session_id`, `idempotency_key` | `{session, fresh, prompt_sent, prompt_delivery, prompt_error?}`. `fresh` is false when `idempotency_key` matched an earlier create, whose session it returns. `prompt_delivery` is one of: `none` (no `prompt`); `pending_initial_turn` (a structured session stored it as its first turn); `sent` (typed into a terminal session once its agent's status rules show an empty or live input box); `blocked_waiting` (the terminal agent is waiting on a dialog, such as Claude's folder-trust question, so nothing was typed: a person answers it in the terminal, then `send` the prompt); `not_ready` (the terminal agent did not reach its input prompt within 30 s, so nothing was typed; an agent without a status manifest has no input-prompt rule to read, so it gets `not_ready` at once. `send` can deliver the prompt, but it has no dialog check for such an agent either, so check the pane first (`read_output`)); `not_running` (the terminal session did not start); `replayed` (a retry of an earlier create with the same key; the prompt is not delivered again, and the first create's outcome is not reported, so read it with `read_output`); `failed` (typing it failed). `prompt_error` explains `failed`, `blocked_waiting` and `not_ready`. A `prompt` that strips to nothing is refused with `invalid_request`. An omitted `parent_session_id` defaults to the calling session when that session is top-level, in the profile being created in, and no `group` is given; otherwise the new session is top-level. |
+| `create_session` | `path`, `tool`, and optionally `title`, `view` (`terminal`, default, or `structured`), `agent_name`, `agent_model`, `agent_effort`, `group`, `worktree_enabled`, `worktree_branch`, `create_new_branch`, `base_branch`, `sandbox`, `sandbox_image`, `yolo_mode`, `profile`, `prompt`, `parent_session_id`, `idempotency_key` | `{session, fresh, prompt_sent, prompt_delivery, prompt_error?}`. `fresh` is false when `idempotency_key` matched an earlier create, whose session it returns. `prompt_delivery` is one of: `none` (no `prompt`); `pending_initial_turn` (a structured session stored it as its first turn); `sent` (typed into a terminal session once its agent's status rules show an empty or live input box); `blocked_waiting` (the terminal agent is waiting on a dialog, such as Claude's folder-trust question, so nothing was typed: a person answers it in the terminal, then `send` the prompt); `not_ready` (the terminal agent did not reach its input prompt within 30 s, so nothing was typed; an agent without a status manifest has no input-prompt rule to read, so it gets `not_ready` at once. `send` can deliver the prompt, but it has no dialog check for such an agent either, so check the pane first (`read_output`)); `ignored` (the session was ignored, because another session manages it, before the prompt could be typed, so nothing was typed: take ownership back, then `send` the prompt); `not_running` (the terminal session did not start); `replayed` (a retry of an earlier create with the same key; the prompt is not delivered again, and the first create's outcome is not reported, so read it with `read_output`); `failed` (typing it failed). `prompt_error` explains `failed`, `blocked_waiting`, `not_ready` and `ignored`. A `prompt` that strips to nothing is refused with `invalid_request`. An omitted `parent_session_id` defaults to the calling session when that session is top-level, in the profile being created in, and no `group` is given; otherwise the new session is top-level. |
 | `send` | `session_id`, `message` | `{disposition, reason?, queued_id?, seq?}`. A structured session reports `sent`, `steered` or `queued` and the prompt's event `seq`; a terminal session reports `sent` with no seq. A message that strips to nothing is refused with `invalid_request` in either view. A terminal session is refused with `waiting`, and nothing is typed, when its agent's status rules detect a dialog or question waiting on a person (such as Claude's folder-trust question), or, for an agent with a status manifest, when its pane can't be captured. This check is only as good as those rules: a dialog they don't recognise, or any pane of an agent without a status manifest, is typed into, so `send` is not a way to keep an agent's questions or approvals for a person. HTTP `POST /send` still types into such a pane. A stopped terminal session is refused with `not_running`; `send` doesn't start it. A structured prompt that was recorded before its agent stopped is refused with `send_failed`; `read_output` shows it, so don't resend it. A structured prompt held for the sandbox login, or because the session's `before_start` hook failed, stays in the queue and is refused with `send_failed` naming its `queued_id`; it goes out after the login, so don't resend it. |
 | `send_to_parent` | `message` | What `send` returns, for a prompt sent to the calling session's parent. Listed in `tools/list` only when the caller has a parent in its own profile that is neither archived nor trashed; otherwise refused with `no_parent`. |
 | `read_output` | `session_id`, `since` and `raw` (structured), `lines` (terminal, 1 to 2000, default 200) | A structured session's transcript after `since` as text, or its raw events, with `next_since` and `has_more`; a terminal session's pane capture. A text page holds whole events up to 48 KB, so following `next_since` reads every event once; one event that alone renders past 48 KB comes back whole as the only event on its page. |
@@ -445,7 +445,7 @@ A daemon older than this field omits it entirely. Treat an absent
 ```bash
 curl -sS \
   -H "Authorization: Bearer $AOE_TOKEN" \
-  "http://localhost:7777/api/sessions?state=live"
+  "http://localhost:8080/api/sessions?state=live"
 ```
 
 ### Status values
@@ -828,7 +828,7 @@ curl -sS -X POST \
   -H "Authorization: Bearer $AOE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"message":"summarize the failing test"}' \
-  "http://localhost:7777/api/sessions/abc123/send"
+  "http://localhost:8080/api/sessions/abc123/send"
 ```
 
 ## GET /api/sessions/{id}/output
@@ -861,7 +861,7 @@ what the agent printed back, or as a polling read-only view.
 ```bash
 curl -sS \
   -H "Authorization: Bearer $AOE_TOKEN" \
-  "http://localhost:7777/api/sessions/abc123/output?lines=80&format=text"
+  "http://localhost:8080/api/sessions/abc123/output?lines=80&format=text"
 ```
 
 ## GET /api/sessions/{id}/acp/replay?view=retained
@@ -1080,7 +1080,11 @@ an aoe session as a controlled subagent. A typical loop:
    session list shows the session's `status` back at `Idle`.
 3. Capture the trailing region of `content` as the agent's reply.
 
-For long-running prompts, prefer polling status via
+This loop works for terminal-view sessions only. A structured-view
+session answers `send` with `400 acp_mode_unsupported`; drive it with
+`POST /api/sessions/{id}/acp/prompt`.
+
+For long-running prompts in a terminal-view session, prefer polling status via
 `GET /api/sessions` over polling `output`, then read `output` once
 when status returns to `Idle`. Status transitions are also broadcast
 to push subscribers if the dashboard's push notifications are

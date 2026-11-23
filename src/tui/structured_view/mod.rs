@@ -1861,7 +1861,16 @@ async fn send_prompt_now(
     #[cfg(test)]
     state.submitted_prompts.push(text.to_owned());
     state.in_flight = true;
-    match state.http.prompt(&state.session_id, text, false).await {
+    match state
+        .http
+        .prompt(
+            &state.session_id,
+            text,
+            false,
+            crate::daemon::PromptOrigin::Tui,
+        )
+        .await
+    {
         Ok(dispatch) => {
             state.accepted_submits += 1;
             state.submit_rejected = false;

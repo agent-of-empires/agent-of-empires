@@ -925,6 +925,7 @@ mod workspace_ordering_tests {
             urgent: false,
             pinned_at: None,
             archived_at: None,
+            ignored_at: None,
             snoozed_until: None,
             unread: false,
         }

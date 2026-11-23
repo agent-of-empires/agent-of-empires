@@ -642,12 +642,9 @@ button:focus-visible {
   border-color: #e2e8f0;
   color: #b45309;
 }
-[data-theme="light"] .prose-content pre {
-  background: linear-gradient(180deg, #f1f5f9 0%, #e2e8f0 100%);
-  border-color: #cbd5e1;
-}
 [data-theme="light"] .prose-content pre code {
-  color: #1e293b;
+  background: none;
+  color: #f1f5f9;
 }
 [data-theme="light"] .prose-content a {
   color: #b45309;

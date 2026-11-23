@@ -236,7 +236,7 @@ impl EventStore {
     pub fn record(&self, session_id: &str, seq: u64, event: &Event) -> Result<()> {
         let json = serde_json::to_string(event)
             .with_context(|| format!("serialise event for {session_id}@{seq}"))?;
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = crate::time::Timestamp::now().as_millis();
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let inserted = events::insert_event(&tx, &self.schema, session_id, seq, &json, now_ms)?;
@@ -630,7 +630,7 @@ pub(super) mod test_support {
             name: "Bash".into(),
             kind: "execute".into(),
             args_preview: "ls".into(),
-            started_at: chrono::Utc::now(),
+            started_at: crate::time::Timestamp::now(),
             parent_tool_call_id: None,
             memory_recall: None,
             diffs: Vec::new(),

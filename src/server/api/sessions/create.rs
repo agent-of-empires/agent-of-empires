@@ -217,7 +217,7 @@ pub(super) async fn resolve_canonical_fork_seed(
                 super::lifecycle::lifecycle_rejection(state, &error)
                     .unwrap_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())
             })?;
-        if source.has_fresh_lifecycle_reservation(chrono::Utc::now()) {
+        if source.has_fresh_lifecycle_reservation(crate::time::Timestamp::now()) {
             return Err((
                 StatusCode::CONFLICT,
                 crate::daemon::ApiErrorCode::LifecycleLocked.header(),
@@ -244,7 +244,7 @@ pub(super) async fn resolve_canonical_fork_seed(
         .iter()
         .find(|row| row.id == source_id)
         .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
-    if source.has_fresh_lifecycle_reservation(chrono::Utc::now()) {
+    if source.has_fresh_lifecycle_reservation(crate::time::Timestamp::now()) {
         return Err((
             StatusCode::CONFLICT,
             crate::daemon::ApiErrorCode::LifecycleLocked.header(),
@@ -846,6 +846,7 @@ pub async fn create_session(
     axum::extract::Query(query): axum::extract::Query<CreateSessionQuery>,
     local: Option<axum::Extension<crate::server::principal::Principal>>,
     request_id: Option<axum::Extension<crate::server::router::RequestId>>,
+    headers: axum::http::HeaderMap,
     body: Result<Json<CreateSessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     let local_owner = crate::server::principal::authorize(
@@ -862,20 +863,33 @@ pub async fn create_session(
         Err(rej) => return rej.into_response(),
     };
     let wait_ready = query.wait.as_deref() == Some("ready");
-    create_session_with(state, local_owner, &reference, wait_ready, body, None).await
+    let origin = crate::server::api::prompt_origin(&headers);
+    create_session_with(
+        state,
+        local_owner,
+        &reference,
+        wait_ready,
+        body,
+        None,
+        origin,
+    )
+    .await
 }
 
 /// `POST /api/sessions` once the caller is authorized and the body parsed, for a surface
 /// that builds the body itself. `local_owner` sees hook failure detail, `reference` names
 /// the request in failure logs and responses, `wait_ready` is `?wait=ready`, and
-/// `initial_turn` is a structured session's first prompt, delivered once its worker runs.
+/// `initial_turn` is a structured session's first prompt and its origin, delivered once its
+/// worker runs. `body_prompt_origin` attributes the body's own `initial_prompt` when no
+/// `initial_turn` is given.
 pub(crate) async fn create_session_with(
     state: Arc<AppState>,
     local_owner: bool,
     reference: &str,
     wait_ready: bool,
     body: CreateSessionBody,
-    initial_turn: Option<String>,
+    initial_turn: Option<(String, crate::daemon::PromptOrigin)>,
+    body_prompt_origin: crate::daemon::PromptOrigin,
 ) -> axum::response::Response {
     if let Some(key) = body.idempotency_key.as_deref() {
         if key.is_empty() || key.len() > IDEMPOTENCY_KEY_MAX_LEN {
@@ -1121,8 +1135,12 @@ pub(crate) async fn create_session_with(
                 "pull_latest_image requires sandbox",
             );
         }
-        if let Some(refusal) =
-            crate::server::api::create_pull_refusal(&state, body.sandbox_image.as_deref()).await
+        if let Some(refusal) = crate::server::api::create_pull_refusal(
+            &state,
+            body.sandbox_image.as_deref(),
+            body.profile.as_deref(),
+        )
+        .await
         {
             return refusal;
         }
@@ -1473,7 +1491,10 @@ pub(crate) async fn create_session_with(
         );
     }
 
-    let initial_turn = initial_turn.or(body.initial_prompt.take());
+    let initial_turn = initial_turn.or(body
+        .initial_prompt
+        .take()
+        .map(|text| (text, body_prompt_origin)));
     let profile = body.profile.unwrap_or(default_profile);
     // `body.profile` is the caller's authority when it names one; otherwise
     // the served profile resolved above, which is also what the validation
@@ -1564,7 +1585,14 @@ pub(crate) async fn create_session_with(
                 panic_hook::fire(key.as_deref()).await;
                 task_state
                     .session_service
-                    .create_structured_session(spec, None, None, initial_turn.as_deref())
+                    .create_structured_session(
+                        spec,
+                        None,
+                        None,
+                        initial_turn
+                            .as_ref()
+                            .map(|(text, origin)| (text.as_str(), *origin)),
+                    )
                     .await
             },
             &task_state.create_progress,
@@ -1950,6 +1978,17 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, S
                 crate::server::session_spawn::UpdateFailure::Pull(reason) => reason.user_text(),
             };
             return ("sandbox_image_update_failed", message);
+        }
+        if let Some(both) =
+            cause.downcast_ref::<crate::containers::sandbox_image::AutomaticImagesUnavailable>()
+        {
+            return (
+                "sandbox_image_pull_failed",
+                format!(
+                    "Couldn't pull the Sandbox image {} or its minor tag {}.",
+                    both.exact, both.minor
+                ),
+            );
         }
         match cause.downcast_ref::<DockerError>() {
             Some(DockerError::NotInstalled) => return unavailable(not_installed(runtime())),

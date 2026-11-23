@@ -176,8 +176,7 @@ fn purge_body(session: &SessionResponse, args: &RemoveArgs) -> Result<DeleteSess
         (&session.trashed_at, &session.trash_lifecycle_id)
     {
         body.expected_trash = true;
-        body.expected_trashed_at =
-            Some(chrono::DateTime::parse_from_rfc3339(trashed_at)?.with_timezone(&chrono::Utc));
+        body.expected_trashed_at = Some(crate::time::Timestamp::parse_rfc3339(trashed_at)?);
         body.expected_trash_lifecycle_id = Some(lifecycle_id.clone());
         body.expected_generation = Some(session.lifecycle_generation);
     }
