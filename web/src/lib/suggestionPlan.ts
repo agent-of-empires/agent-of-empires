@@ -33,6 +33,12 @@ export function startSummary(
 /** "owner/repo#12" as "#12". */
 export const shortRef = (ref: string) => (ref.includes("#") ? ref.slice(ref.lastIndexOf("#")) : ref);
 
+export const STALE_REASON = "No longer open at the source";
+
+/** "Couldn't start: …" for a failed row; the server's reason may already end in a full stop. */
+export const failureText = ({ reason, hint }: { reason: string; hint?: string }) =>
+  `Couldn't start: ${/[.!?]$/.test(reason) ? reason : `${reason}.`}${hint ? ` ${hint}` : ""}`;
+
 /** The snapshot's Session with its status and prompt error from the live sessions poll, which the snapshot lags. */
 export function liveSession(started: StartedSession | undefined, sessions?: SessionResponse[]) {
   const live = started && sessions?.find((s) => s.id === started.id);

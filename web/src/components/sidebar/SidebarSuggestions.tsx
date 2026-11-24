@@ -1,7 +1,7 @@
 import { useContext } from "react";
 import { Play } from "lucide-react";
 import { dismissSuggestion } from "../../lib/api";
-import { lockTitle, startMenuFor } from "../../lib/suggestionPlan";
+import { failureText, lockTitle, shortRef, STALE_REASON, startMenuFor } from "../../lib/suggestionPlan";
 import { SidebarCompactContext } from "../../lib/sidebarCompact";
 import { toastBus } from "../../lib/toastBus";
 import type { SuggestionItem, SuggestionsSnapshot } from "../../lib/types";
@@ -142,6 +142,7 @@ function SuggestedRows({
     <>
       {items.map((item) => {
         const key = suggestionKey(item);
+        const descId = `sidebar-suggested-${key}-desc`;
         const failure = failures[key];
         const disabled = busy !== null || ctrl.starting.includes(key) || !!unavailable || !!item.stale;
         // A repo with no Project picks one first, as "Start in…" does on Home.
@@ -158,14 +159,18 @@ function SuggestedRows({
               >
                 {item.title}
               </span>
-              <span className="hidden shrink-0 text-[11px] text-brand-500 group-hover:inline">
+              <span className="hidden shrink-0 text-[11px] text-brand-500 group-hover:inline group-has-[:focus-visible]:inline">
                 {startIn ? "Start in\u2026" : "Start"}
               </span>
             </span>
-            <span className="block truncate text-[11px] text-text-muted">
+            <span id={descId} className="block truncate text-[11px] text-text-muted">
               {failure
-                ? `Couldn't start: ${failure.reason}${failure.hint ? `. ${failure.hint}` : ""}`
-                : [snapshot.prefs.show_source_ref ? item.source_ref : null, item.reason].filter(Boolean).join(" · ")}
+                ? failureText(failure)
+                : item.stale
+                  ? STALE_REASON
+                  : [snapshot.prefs.show_source_ref ? shortRef(item.source_ref) : null, item.reason]
+                      .filter(Boolean)
+                      .join(" · ")}
             </span>
           </>
         );
@@ -174,6 +179,8 @@ function SuggestedRows({
           onKeyDown: onSidebarArrowKey,
           [NAV_ITEM]: "",
           title: unavailable ?? item.title,
+          // The aria-label replaces the row's text, so the reason or failure line is its description.
+          "aria-describedby": descId,
           className: `${rowClass} relative min-w-0 flex-1`,
         };
         return (

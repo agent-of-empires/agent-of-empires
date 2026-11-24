@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from "react";
 import { MoreHorizontal, X } from "lucide-react";
-import { lockTitle } from "../lib/suggestionPlan";
+import { failureText, lockTitle, STALE_REASON } from "../lib/suggestionPlan";
 import type { StartedSession } from "../lib/types";
 import { agoLabel } from "../lib/suggestionTime";
 import { MENU_ITEM, MenuPopover, StartInMenu, StartMenu, type StartMenuProps } from "./SuggestionStartMenu";
@@ -111,7 +111,7 @@ export function SuggestionRow({
                 {" · "}
               </>
             )}
-            {session ? <StartedReason session={session} /> : stale ? "No longer open at the source" : reason}
+            {session ? <StartedReason session={session} /> : stale ? STALE_REASON : reason}
             {project && (
               <>
                 {" · "}
@@ -120,12 +120,7 @@ export function SuggestionRow({
             )}
           </p>
         </div>
-        {failure && (
-          <p className="mt-0.5 break-words text-xs text-status-error">
-            Couldn&apos;t start: {/[.!?]$/.test(failure.reason) ? failure.reason : `${failure.reason}.`}
-            {failure.hint ? ` ${failure.hint}` : ""}
-          </p>
-        )}
+        {failure && <p className="mt-0.5 break-words text-xs text-status-error">{failureText(failure)}</p>}
         {note}
       </div>
       <div className={`flex flex-none gap-1 ${failure ? "w-full justify-end md:w-auto" : ""}`}>{actions}</div>
@@ -199,7 +194,7 @@ function MoreMenu({
             type="button"
             role="menuitem"
             disabled={disabled || stale}
-            title={stale ? "No longer open at the source" : unavailable}
+            title={stale ? STALE_REASON : unavailable}
             className={MENU_ITEM}
             onClick={() => {
               close();

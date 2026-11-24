@@ -183,10 +183,10 @@ describe("SidebarSuggestions", () => {
     );
   });
 
-  it("a failed start shows the reason and what to do", async () => {
+  it("a failed start shows the reason and what to do, also to a screen reader", async () => {
     startSuggestion.mockResolvedValueOnce({
       kind: "failed",
-      reason: "Docker isn't running",
+      reason: "Docker isn't running.",
       hint: "Start it, then try again.",
       retryable: true,
     });
@@ -194,11 +194,25 @@ describe("SidebarSuggestions", () => {
     renderIt();
     fireEvent.click(await screen.findByTestId("sidebar-suggested-toggle"));
     fireEvent.click(screen.getAllByTestId("sidebar-suggested-row")[0]!);
+    const text = "Couldn't start: Docker isn't running. Start it, then try again.";
     await waitFor(() =>
-      expect(screen.getAllByTestId("sidebar-suggested-row")[0]!.textContent).toBe(
-        "Item 1StartCouldn't start: Docker isn't running. Start it, then try again.",
-      ),
+      expect(screen.getAllByTestId("sidebar-suggested-row")[0]!.textContent).toBe(`Item 1Start${text}`),
     );
+    expect(screen.getByRole("button", { name: "Start a session: Item 1" }).getAttribute("aria-describedby")).toBe(
+      screen.getByText(text).id,
+    );
+  });
+
+  it("shows the short ref, and says why a stale row is greyed", async () => {
+    fetchSuggestions.mockResolvedValue(
+      snap([mk(1, { source_ref: "acme/web#12" }), mk(2, { source_ref: "acme/web#13", stale: true })], true),
+    );
+    renderIt();
+    fireEvent.click(await screen.findByTestId("sidebar-suggested-toggle"));
+    expect(screen.getAllByTestId("sidebar-suggested-row").map((r) => r.textContent)).toEqual([
+      "Item 1Start#12 · Assigned to you",
+      "Item 2StartNo longer open at the source",
+    ]);
   });
 
   it("hides started suggestions, and the group is absent with nothing open", async () => {
