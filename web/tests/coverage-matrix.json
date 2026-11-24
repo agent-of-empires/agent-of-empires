@@ -2948,12 +2948,15 @@
       "risk": "high",
       "specs": [
         "tests/live/session-actions.spec.ts",
+        "tests/session-group-edit-short-viewport.spec.ts",
         "src/lib/api.test.ts",
-        "src/components/__tests__/SessionGroupModal.test.tsx"
+        "src/components/__tests__/SessionGroupModal.test.tsx",
+        "src/components/session-wizard/__tests__/GroupCombobox.test.tsx"
       ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/SessionGroupModal.tsx",
+        "web/src/components/session-wizard/steps/GroupCombobox.tsx",
         "web/src/lib/api.ts"
       ],
       "notes": "Enter is ignored while an IME composes."
