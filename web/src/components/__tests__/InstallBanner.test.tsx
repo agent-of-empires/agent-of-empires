@@ -7,6 +7,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import type { PushState } from "../../hooks/usePushSubscription";
 import type { InstallHint } from "../../lib/platform";
 import { INSTALL_STEPS } from "../../lib/tourSteps";
+import { setServerDown } from "../../lib/connectionState";
 
 const mocks = vi.hoisted(() => ({
   hint: null as InstallHint | null,
@@ -157,6 +158,23 @@ describe("InstallBanner", () => {
       screen.getByRole("button", { name: INSTALL_BANNER_HIDE_LABEL, description: INSTALL_BANNER_HIDE_TIP }),
     );
     expect(region()).toBeNull();
+  });
+
+  it.each([
+    { from: true, to: false, name: "hides the steps once a restarted Daemon has push off" },
+    { from: false, to: true, name: "shows the steps once a restarted Daemon has push on" },
+  ])("$name", async ({ from, to }) => {
+    mocks.hint = "ios";
+    mocks.serverEnabled = from;
+    await mount();
+    expect(region() !== null).toBe(from);
+    mocks.serverEnabled = to;
+    await act(async () => {
+      setServerDown(true);
+      setServerDown(false);
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+    });
+    expect(region() !== null).toBe(to);
   });
 
   it("asks the server about push only for a tab that can't subscribe", async () => {

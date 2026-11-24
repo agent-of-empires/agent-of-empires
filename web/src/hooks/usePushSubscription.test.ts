@@ -3,6 +3,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { setServerDown } from "../lib/connectionState";
 import { usePushSubscription, type PushState } from "./usePushSubscription";
 
 type Hook = ReturnType<typeof usePushSubscription>;
@@ -597,6 +598,18 @@ describe("usePushSubscription health", () => {
       for (let i = 0; i < 10; i++) await Promise.resolve();
     });
     expect(result.current.health).toBe("revoked");
+  });
+
+  it("re-checks when the Daemon reconnects, which may have turned push off", async () => {
+    const { result } = await mountAndSettle();
+    expect(result.current.state).toEqual({ kind: "enabled" });
+    installFetch({ status: { ok: true, body: { enabled: false } } });
+    await act(async () => {
+      setServerDown(true);
+      setServerDown(false);
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    expect(result.current.state).toEqual({ kind: "disabled-by-server" });
   });
 
   it.each([
