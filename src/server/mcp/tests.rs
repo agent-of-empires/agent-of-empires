@@ -201,7 +201,36 @@ async fn call(app: &axum::Router, name: &str, arguments: Value) -> Value {
     assert_eq!(status, StatusCode::OK);
     let result = message.unwrap()["result"].clone();
     assert_ne!(result["isError"], json!(true), "{result}");
-    result["structuredContent"].clone()
+    structured_content(name, &result)
+}
+
+/// Every tool the server can list, `send_to_parent` included.
+fn all_tools() -> Vec<rmcp::model::Tool> {
+    (super::McpServer::tool_router()
+        + super::McpServer::control_router()
+        + super::McpServer::wait_router())
+    .list_all()
+}
+
+/// A successful result's `structuredContent`, checked as a strict MCP 2025-06-18 client
+/// checks it: an object that validates against the tool's `outputSchema`, with the text
+/// content carrying the same JSON.
+fn structured_content(name: &str, result: &Value) -> Value {
+    let tool = all_tools().into_iter().find(|tool| tool.name == name);
+    let schema = tool.and_then(|tool| tool.output_schema).expect(name);
+    let validator = jsonschema::validator_for(&Value::Object(schema.as_ref().clone())).unwrap();
+    let content = result["structuredContent"].clone();
+    assert!(content.is_object(), "{name}: {result}");
+    if let Err(error) = validator.validate(&content) {
+        panic!("{name}: {error}: {content}");
+    }
+    let text = result["content"][0]["text"].as_str().expect(name);
+    assert_eq!(
+        serde_json::from_str::<Value>(text).unwrap(),
+        content,
+        "{name}"
+    );
+    content
 }
 
 fn session_in(title: &str, group: &str, parent: Option<&str>) -> Instance {
@@ -361,9 +390,6 @@ async fn tools_list_advertises_each_tool_with_an_output_schema() {
             "whoami"
         ]
     );
-    for tool in tools.as_array().unwrap() {
-        assert!(tool["outputSchema"].is_object(), "{tool}");
-    }
     let list = tools
         .as_array()
         .unwrap()
@@ -402,10 +428,25 @@ async fn tools_list_advertises_each_tool_with_an_output_schema() {
     assert!(properties.contains_key("prompt") && properties.contains_key("parent_session_id"));
 }
 
+/// MCP 2025-06-18 types `outputSchema` as `{type: "object", ...}`; a strict client rejects the
+/// whole tool list over one tool without it, so an `Option`, enum or array result can't be one.
+#[test]
+fn every_tool_declares_an_object_output_schema() {
+    let tools = all_tools();
+    assert!(tools.iter().any(|tool| tool.name == "send_to_parent"));
+    for tool in tools {
+        let schema = tool.output_schema.as_deref().expect(&tool.name);
+        assert_eq!(schema.get("type"), Some(&json!("object")), "{}", tool.name);
+    }
+}
+
 #[tokio::test]
 async fn whoami_is_null() {
     let app = app(true, vec![]);
-    assert_eq!(call(&app, "whoami", json!({})).await, Value::Null);
+    assert_eq!(
+        call(&app, "whoami", json!({})).await,
+        json!({"session": null})
+    );
 }
 
 /// The daemon-wide bearer still authenticates `/mcp` with no `X-AoE-Session` header, even
@@ -413,7 +454,10 @@ async fn whoami_is_null() {
 #[tokio::test]
 async fn whoami_is_null_for_the_plain_daemon_bearer_even_with_a_secret_configured() {
     let (app, _secret) = app_with_mcp_session_secret(vec![]);
-    assert_eq!(call(&app, "whoami", json!({})).await, Value::Null);
+    assert_eq!(
+        call(&app, "whoami", json!({})).await,
+        json!({"session": null})
+    );
 }
 
 /// `--auth=none` skips the token gate entirely, but a caller presenting a valid session
@@ -436,7 +480,7 @@ async fn whoami_resolves_the_calling_session_under_auth_none() {
     assert_eq!(status, StatusCode::OK);
     let result = message.unwrap()["result"].clone();
     assert_ne!(result["isError"], json!(true), "{result}");
-    assert_eq!(result["structuredContent"]["id"], id);
+    assert_eq!(structured_content("whoami", &result)["session"]["id"], id);
 }
 
 /// `--auth=passphrase` bypasses the passphrase wall entirely for a real Unix-socket peer
@@ -481,7 +525,7 @@ async fn whoami_resolves_the_calling_session_under_auth_passphrase_on_loopback()
     assert_eq!(status, StatusCode::OK);
     let result = message.unwrap()["result"].clone();
     assert_ne!(result["isError"], json!(true), "{result}");
-    assert_eq!(result["structuredContent"]["id"], id);
+    assert_eq!(structured_content("whoami", &result)["session"]["id"], id);
 }
 
 /// Off-box, a valid session credential must not bypass the passphrase wall: that wall
@@ -574,7 +618,7 @@ async fn whoami_resolves_the_calling_session_for_a_browser_authenticated_request
     let message: Value = serde_json::from_slice(&bytes).unwrap();
     let result = message["result"].clone();
     assert_ne!(result["isError"], json!(true), "{result}");
-    assert_eq!(result["structuredContent"]["id"], id);
+    assert_eq!(structured_content("whoami", &result)["session"]["id"], id);
 }
 
 fn tools_call(id: i64, name: &str, arguments: Value) -> Value {
@@ -604,7 +648,7 @@ async fn whoami_resolves_the_calling_session_for_a_valid_credential() {
     assert_eq!(status, StatusCode::OK);
     let result = message.unwrap()["result"].clone();
     assert_ne!(result["isError"], json!(true), "{result}");
-    assert_eq!(result["structuredContent"]["id"], id);
+    assert_eq!(structured_content("whoami", &result)["session"]["id"], id);
 }
 
 #[tokio::test]
@@ -824,6 +868,7 @@ fn user_prompt(text: &str) -> crate::acp::Event {
         merged_prompt_ids: Vec::new(),
         synthesized: false,
         origin_plugin: None,
+        origin: crate::daemon::PromptOrigin::Unknown,
     }
 }
 
@@ -894,12 +939,116 @@ async fn send_reports_the_dispatch_and_the_prompts_seq() {
                     .then_some(seq)
             });
         assert_eq!(sent["seq"].as_u64(), recorded, "{case}: {sent}");
+        if disposition != "queued" {
+            let origin = state
+                .acp_event_store
+                .replay_from(id, 0)
+                .into_iter()
+                .find_map(|(_, e)| match e {
+                    crate::acp::Event::UserPromptSent { text, origin, .. }
+                        if text == "the new prompt" =>
+                    {
+                        Some(origin)
+                    }
+                    _ => None,
+                });
+            assert_eq!(origin, Some(crate::daemon::PromptOrigin::Mcp), "{case}");
+        }
         assert_eq!(
             sent["queued_id"].is_string(),
             disposition == "queued",
             "{case}: {sent}"
         );
     }
+}
+
+/// Routine MCP access must not unsnooze or unignore a managed session: a send
+/// is refused with its own code, and reading leaves the row's markers intact.
+#[tokio::test]
+#[serial_test::serial]
+async fn mcp_send_and_read_leave_an_ignored_managed_session_alone() {
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let managed = {
+        let mut inst = structured_session("mcp-managed");
+        inst.parent_session_id = Some("mcp-manager".into());
+        inst.ignore();
+        inst.snooze(30);
+        inst.ignore();
+        inst
+    };
+    let ignored_at = managed.ignored_at;
+    let snoozed_until = managed.snoozed_until;
+    let (app, state) = seeded_app(vec![structured_session("mcp-manager"), managed], false).await;
+
+    let refused = call_result(
+        &app,
+        "send",
+        json!({"session_id": "mcp-managed", "message": "hello"}),
+    )
+    .await;
+    assert_eq!(error_code(&refused), Some("ignored"), "{refused}");
+
+    let read = call(&app, "read_output", json!({"session_id": "mcp-managed"})).await;
+    assert_eq!(read["view"], "structured", "{read}");
+
+    let instances = state.instances.read().await;
+    let row = instances
+        .iter()
+        .find(|inst| inst.id == "mcp-managed")
+        .unwrap();
+    assert_eq!(
+        row.ignored_at, ignored_at,
+        "MCP access must not clear ignore"
+    );
+    assert_eq!(
+        row.snoozed_until, snoozed_until,
+        "MCP access must not unsnooze"
+    );
+    assert_eq!(row.parent_session_id.as_deref(), Some("mcp-manager"));
+}
+
+/// A terminal send re-reads the canonical row under the instance lock: an ignore committed
+/// after the dashboard snapshot refuses before any keys are typed.
+#[tokio::test]
+#[serial_test::serial]
+async fn mcp_terminal_send_refuses_an_ignore_committed_after_the_snapshot() {
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let mut live = Instance::new("mcp-ignored-pane", "/tmp/aoe-mcp-ignored-pane");
+    live.source_profile = "default".into();
+    let id = live.id.clone();
+    let (app, _state) = seeded_app(vec![live.clone()], false).await;
+
+    // A local CLI or another process marks the stored row ignored; the in-memory
+    // snapshot the pre-check reads still looks live.
+    let mut ignored = live;
+    ignored.ignore();
+    test_support::seed_instances_on_disk_for_test("default", vec![ignored]);
+
+    let refused = call_result(&app, "send", json!({"session_id": id, "message": "hello"})).await;
+    assert_eq!(error_code(&refused), Some("ignored"), "{refused}");
+}
+
+/// An ignored row whose pane is still coming up is refused as ignored rather than
+/// left to the transient "still starting" status: the person who hid it is not told
+/// to retry into it.
+#[tokio::test]
+#[serial_test::serial]
+async fn mcp_send_reports_ignored_before_a_pane_is_ready() {
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let mut live = Instance::new("mcp-ignored-starting", "/tmp/aoe-mcp-ignored-starting");
+    live.source_profile = "default".into();
+    live.status = crate::session::Status::Creating;
+    let id = live.id.clone();
+    let (app, _state) = seeded_app(vec![live.clone()], false).await;
+
+    // A peer ignores the row while its pane is still starting; the snapshot this
+    // daemon holds still shows it live.
+    let mut ignored = live;
+    ignored.ignore();
+    test_support::seed_instances_on_disk_for_test("default", vec![ignored]);
+
+    let refused = call_result(&app, "send", json!({"session_id": id, "message": "hello"})).await;
+    assert_eq!(error_code(&refused), Some("ignored"), "{refused}");
 }
 
 /// A structured transcript reads as text from a cursor, pages on from `next_since`, and comes
@@ -1076,10 +1225,9 @@ async fn create_session_stores_a_structured_prompt_and_its_parent() {
         .unwrap();
     assert_eq!(row.parent_session_id.as_deref(), Some("parent"));
     assert_eq!(row.group_path, "team");
-    assert_eq!(
-        row.pending_initial_turn.map(|turn| turn.text).as_deref(),
-        Some("review the diff")
-    );
+    let turn = row.pending_initial_turn.unwrap();
+    assert_eq!(turn.text, "review the diff");
+    assert_eq!(turn.origin, crate::daemon::PromptOrigin::Mcp);
 
     // A caller that names no parent becomes it only where an explicit parent would pass.
     // (caller, extra arguments, parent, group)
@@ -1398,7 +1546,7 @@ fn approval_requested(
                 kind: "execute".into(),
                 args_preview: json!({"command": "cargo test\nmore"}).to_string(),
                 prompt: None,
-                started_at: chrono::Utc::now(),
+                started_at: crate::time::Timestamp::now(),
                 parent_tool_call_id: None,
                 memory_recall: None,
                 diffs: Vec::new(),
@@ -1407,7 +1555,7 @@ fn approval_requested(
             choice: is_choice_list(&options),
             options,
             plan: None,
-            requested_at: chrono::Utc::now(),
+            requested_at: crate::time::Timestamp::now(),
             resolved: None,
         },
     }

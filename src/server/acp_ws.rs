@@ -791,7 +791,7 @@ mod tests {
             model: "test-model".into(),
             output_file: String::new(),
             workflow: None,
-            started_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            started_at: crate::time::Timestamp::from_unix_secs(0).unwrap(),
         }
     }
 
@@ -815,7 +815,7 @@ mod tests {
                 model: None,
                 background: false,
             },
-            at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            at: crate::time::Timestamp::from_unix_secs(0).unwrap(),
         };
         reduced.apply_event(2, subagent).unwrap();
         let full = serde_json::to_value(&reduced).unwrap();
@@ -884,7 +884,7 @@ mod tests {
                 name: "Edit".into(),
                 kind: "edit".into(),
                 args_preview: "{}".into(),
-                started_at: chrono::Utc::now(),
+                started_at: crate::time::Timestamp::now(),
                 parent_tool_call_id: None,
                 memory_recall: None,
                 diffs: Vec::new(),
@@ -893,7 +893,7 @@ mod tests {
             options: Vec::new(),
             choice: false,
             plan: None,
-            requested_at: chrono::Utc::now(),
+            requested_at: crate::time::Timestamp::now(),
             resolved: None,
         };
         let history = vec![
@@ -1069,7 +1069,7 @@ mod tests {
         use crate::acp::state::test_support::{prompt, stopped};
         use crate::acp::state::ToolCall;
         use crate::acp::transcript::{TranscriptDelta, TranscriptRowKind};
-        let at = chrono::Utc::now();
+        let at = crate::time::Timestamp::now();
         let started = |id: &str| Event::ToolCallStarted {
             tool_call: ToolCall {
                 prompt: None,
@@ -1222,6 +1222,7 @@ mod tests {
                 prompt_id: None,
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
         );
         let folded = state.session_service.fold_control_state("s-fold").await;
@@ -1245,7 +1246,7 @@ mod tests {
         record(
             3,
             Event::CancelRequested {
-                escalates_at: chrono::Utc::now(),
+                escalates_at: crate::time::Timestamp::now(),
             },
         );
         let folded = state.session_service.fold_control_state("s-fold").await;
@@ -1392,7 +1393,7 @@ mod tests {
                         tools: tools.clone(),
                         last_tool: Some("Read".into()),
                         last_text: Some("latest preview".into()),
-                        at: chrono::DateTime::from_timestamp(1, 0).unwrap(),
+                        at: crate::time::Timestamp::from_unix_secs(1).unwrap(),
                     },
                 ),
                 (
@@ -1404,7 +1405,7 @@ mod tests {
                         tools,
                         result: Some("complete result".into()),
                         warning: None,
-                        ended_at: chrono::DateTime::from_timestamp(2, 0).unwrap(),
+                        ended_at: crate::time::Timestamp::from_unix_secs(2).unwrap(),
                     },
                 ),
             ] {
@@ -1465,7 +1466,7 @@ mod tests {
                 name: "Edit".into(),
                 kind: "edit".into(),
                 args_preview: "{}".into(),
-                started_at: chrono::Utc::now(),
+                started_at: crate::time::Timestamp::now(),
                 parent_tool_call_id: None,
                 memory_recall: None,
                 diffs: Vec::new(),
@@ -1474,7 +1475,7 @@ mod tests {
             options: Vec::new(),
             choice: false,
             plan: None,
-            requested_at: chrono::Utc::now(),
+            requested_at: crate::time::Timestamp::now(),
             resolved: None,
         };
         let state = crate::server::test_support::build_test_app_state(Vec::new());
@@ -1582,7 +1583,7 @@ mod tests {
 
         let _home = crate::session::test_support::isolate_app_dir();
         let state = crate::server::test_support::build_test_app_state(Vec::new());
-        let at = chrono::Utc::now();
+        let at = crate::time::Timestamp::now();
         for (seq, id) in [(1, "missed"), (2, "queued")] {
             let event = Event::ToolCallStarted {
                 tool_call: ToolCall {

@@ -32,7 +32,11 @@ pub(super) fn expand_tilde(path: &str) -> String {
         }
     } else if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
-            return home.join(rest).to_string_lossy().to_string();
+            // `join` replaces `home` with an absolute remainder, as in `~//tmp`.
+            return home
+                .join(rest.trim_start_matches('/'))
+                .to_string_lossy()
+                .to_string();
         }
     }
     path.to_string()
@@ -53,7 +57,7 @@ fn path_completion_base(parent_prefix: &str) -> Option<PathBuf> {
     }
 
     if let Some(stripped) = trimmed.strip_prefix("~/") {
-        return dirs::home_dir().map(|home| home.join(stripped));
+        return dirs::home_dir().map(|home| home.join(stripped.trim_start_matches('/')));
     }
 
     Some(PathBuf::from(trimmed))

@@ -126,7 +126,9 @@ AoE preserves the pane, process, conversation association, capture poller and sc
 
 Workspace conversion also reports an unconfirmed restart as a warning, retaining the runtime and concurrent record edits instead of claiming restart success. An automatic sandbox revival resolves any required credential hook outside the lifecycle locks, then rechecks admission while retaining the original physical restart target.
 
-An indeterminate creation still finalizes its idempotency key: its durable status changes from `Creating` to `Starting`, never to ready. A keyed retry returns that same session without another launch. If durable finalization fails, the request reports unavailable; the existing lifecycle work queue can finalize only that same generation after storage recovers. A concurrent status or launch generation is not overwritten. A later ensure rechecks live-pane readiness, using the existing shell and command-override exemptions. Hook readiness must match the active launch, conversation ID and execution binding; another launch's status cannot authorize input.
+An indeterminate creation finalizes its idempotency key by changing `Creating` to `Starting`, never to ready. A keyed retry returns that same session without another launch. If the write fails, the request reports unavailable. While the daemon runs, the lifecycle work queue retries finalization for the same generation. A keyed retry cannot launch again while finalization remains pending.
+
+A later ensure rechecks live-pane readiness. A hook can establish readiness only when its launch, conversation and execution binding match the observed pane and its process ID. Automatic input does not use hook status as readiness evidence.
 
 A renamed pane is not confirmed absence: AoE checks its captured session and pane IDs on the original tmux server. Cleanup rechecks death, ownership and exclusive occupancy of that session. Added panes or windows refuse whole-session cleanup and scope release. An inconclusive recheck returns `launch_indeterminate` without changing the current Status or recording a new failed-resume marker. A marker already justified by confirmed death remains intact if later removal becomes indeterminate.
 
@@ -253,7 +255,7 @@ Launch success requires confirmation that the adopted child is durably published
 A returned parent, missing child, or unsupported route preserves the pending fork.
 Automatic recovery still depends on the agent's capture capability and supported execution context; dispatching a native fork adds no new child-ID discovery path.
 
-Forking needs an agent that can branch a conversation: claude, codex, opencode, pi, and prime-agent in the supported managed contexts, and the Claude adapter for structured sessions. Resume-only agents (gemini, vibe, copilot) and agents without resume in AoE (cursor, droid, kiro, qwen) hide or refuse the action.
+Forking needs an agent that can branch a conversation: claude, codex, opencode, pi, and prime-agent in the supported managed contexts, and the Claude adapter for structured sessions. Resume-only agents (gemini, vibe, copilot, cursor, hermes, kimi) and agents without resume in AoE (droid, kiro, qwen, antigravity, settl) hide or refuse the action.
 
 Pi terminal forks require the same working directory and an attested host `pi` on `PATH` that supports both `--fork` and `--session-id`. AoE assigns the child id before launch. A sandboxed Pi, an unattestable wrapper, or a Pi without either flag refuses the fork rather than creating an untracked conversation. The child copies the parent's saved transcript, starting from the last persisted message. Stopping the child saves its launch-scoped transcript before clearing publication evidence; later starts resume that exact child rather than forking the parent again. Forking into a new worktree is not supported for Pi.
 

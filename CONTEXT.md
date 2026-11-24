@@ -58,14 +58,21 @@ _Avoid_: delete, hard delete
 **Snooze**:
 Hiding a Session until a chosen time. Expired snoozes lift on their own.
 
+**Ignored**:
+A Session managed by another Session, hidden from attention without being Archived or Trashed. It stays live, stays in the list, and accepts direct user input, which clears the marker. Non-user sends (MCP `send_to`, plugin messages and turns) are rejected with an `ignored` error until it is unignored or reclaimed. Archive, Pin, Favorite, or Snooze cancels Ignore, and Archive takes precedence over it; Ignoring clears a Pin but changes no other state. Reclaiming ownership clears the manager link and Ignore together.
+_Avoid_: archived, snoozed, deleted
+
+**Managed session**:
+A Session whose `parent_session_id` names the Session that created or drives it. The manager is metadata, not a bucket: the row still appears in the list even while Ignored, which only removes it from attention.
+
 **Dismissed**:
-A Session that is trashed, snoozed or archived. The "do not bother me" states as one set.
+A Session that is trashed, snoozed, archived or ignored. The "do not bother me" states as one set.
 
 **Pin**:
-Forcing a Session to the top of the dashboard. Pinning cancels Archive and Snooze.
+Forcing a Session to the top of the dashboard. Pinning cancels Archive, Ignore and Snooze.
 
 **Favorite**:
-A user mark on a Session. Favoriting cancels Archive and Snooze, like Pin. In the TUI, favorites-first (on by default) lifts favorites to the top of their scope, except that Attention sort ranks a favorite only within its tier after urgency and Custom sort keeps manual order; the web sidebar uses favorite only as a tiebreak within its attention tier.
+A user mark on a Session. Favoriting cancels Archive, Ignore and Snooze, like Pin. In the TUI, favorites-first (on by default) lifts favorites to the top of their scope, except that Attention sort ranks a favorite only within its tier after urgency and Custom sort keeps manual order; the web sidebar uses favorite only as a tiebreak within its attention tier.
 _Avoid_: star, pin (different concept)
 
 **Unread**:

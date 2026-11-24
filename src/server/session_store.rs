@@ -476,7 +476,7 @@ impl NativeSessionStore {
 
     pub(crate) fn retire_trash_reservation(&self, id: &str, generation: u64) -> Result<()> {
         self.settle_lifecycle_reservation(id, None, |row| {
-            row.retire_trash_reservation_if_owned(generation, chrono::Utc::now());
+            row.retire_trash_reservation_if_owned(generation, crate::time::Timestamp::now());
         })
     }
 
@@ -567,21 +567,40 @@ impl SessionStore for NativeSessionStore {
         drop(lifecycle);
         let runtime = self.runtime.clone();
         let work = self.state.runtime.work.clone();
+        let shutdown = work.shutdown.clone();
         let _entered = runtime.enter();
         work.spawn("lifecycle reservation release", async move {
-            let fresh_namespace = if namespace.is_none() {
-                Some(self.state.profile_namespace.clone().read_owned().await)
-            } else {
-                None
-            };
-            let _namespace = (namespace, fresh_namespace);
-            let result = tokio::task::spawn_blocking(move || {
-                self.release_lifecycle_reservation(&id, release, generation, None)
-            }).await;
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::warn!(target: "session.lifecycle", %error, "native reservation release failed"),
-                Err(error) => tracing::error!(target: "session.lifecycle", %error, "native reservation release task failed"),
+            let mut namespace = namespace;
+            let source = Arc::new((self, id));
+            loop {
+                let fresh_namespace = if namespace.is_none() {
+                    Some(source.0.state.profile_namespace.clone().read_owned().await)
+                } else {
+                    None
+                };
+                let namespace = namespace.take();
+                let attempt = Arc::clone(&source);
+                let result = tokio::task::spawn_blocking(move || {
+                    let _namespace = (namespace, fresh_namespace);
+                    attempt.0.release_lifecycle_reservation(&attempt.1, release, generation, None)
+                }).await;
+                match result {
+                    Ok(Ok(())) => break,
+                    Ok(Err(error)) => {
+                        tracing::warn!(target: "session.lifecycle", %error, "native reservation release failed");
+                        if !matches!(release, crate::session::LifecycleRelease::IndeterminateLaunch) {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(target: "session.lifecycle", %error, "native reservation release task failed");
+                        break;
+                    }
+                }
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                }
             }
         });
     }
@@ -1277,6 +1296,7 @@ mod tests {
                     prompt_id: None,
                     synthesized: false,
                     origin_plugin: None,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 };
                 state.acp_event_store.record(&id, 1, &event).unwrap();
                 state
@@ -1469,7 +1489,7 @@ mod tests {
                         "first".into(),
                         vec![],
                         None,
-                        None,
+                        crate::server::session_service::QueueSender::default(),
                     );
                     tokio::pin!(enqueue);
                     assert!(futures_util::poll!(&mut enqueue).is_pending());
@@ -1482,7 +1502,14 @@ mod tests {
                     assert_eq!(
                         state
                             .session_service
-                            .enqueue_prompt(&id, "B".into(), "second".into(), vec![], None, None)
+                            .enqueue_prompt(
+                                &id,
+                                "B".into(),
+                                "second".into(),
+                                vec![],
+                                None,
+                                crate::server::session_service::QueueSender::default()
+                            )
                             .await
                             .unwrap()
                             .seq,
@@ -1520,16 +1547,18 @@ mod tests {
             let mut row = Instance::new("live structured", "/tmp");
             row.source_profile = "default".into();
             row.view = crate::session::View::Structured;
-            let prior_access = chrono::Utc::now() - chrono::Duration::days(2);
+            let prior_access = crate::time::Timestamp::now() - crate::time::Duration::days(2);
             row.last_accessed_at = Some(prior_access);
-            row.idle_entered_at = Some(chrono::Utc::now() - chrono::Duration::hours(3));
+            row.idle_entered_at =
+                Some(crate::time::Timestamp::now() - crate::time::Duration::hours(3));
             let storage = Storage::new_unwatched("default")?;
             storage.update(|rows, _| {
                 *rows = vec![row.clone()];
                 Ok(())
             })?;
             row.status = status;
-            row.idle_entered_at = Some(chrono::Utc::now() - chrono::Duration::minutes(7));
+            row.idle_entered_at =
+                Some(crate::time::Timestamp::now() - crate::time::Duration::minutes(7));
             row.plugin_revival_pending = true;
             row.last_error = Some("live diagnostic".into());
             let idle = row.idle_entered_at;
@@ -1924,7 +1953,7 @@ mod tests {
                 branch: "work".into(),
                 main_repo_path: main.to_string_lossy().into_owned(),
                 managed_by_aoe: true,
-                created_at: chrono::Utc::now(),
+                created_at: crate::time::Timestamp::now(),
                 base_branch: None,
             });
             if policy == "cityhall_structured" {
@@ -2712,7 +2741,7 @@ mod tests {
                         "accepted while cohort copy is unlocked".into(),
                         vec![],
                         None,
-                        None,
+                        crate::server::session_service::QueueSender::default(),
                     ),
                 )
                 .await
@@ -2727,7 +2756,7 @@ mod tests {
                 "accepted across checkpoint adoption".into(),
                 vec![],
                 None,
-                None,
+                crate::server::session_service::QueueSender::default(),
             );
             tokio::pin!(after_checkpoint);
             if queue_race {
@@ -2752,7 +2781,7 @@ mod tests {
                             "accepted after checkpoint".into(),
                             vec![],
                             None,
-                            None
+                            crate::server::session_service::QueueSender::default()
                         )
                         .await
                         .unwrap()

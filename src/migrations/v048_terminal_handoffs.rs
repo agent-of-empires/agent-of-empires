@@ -48,6 +48,11 @@ fn migrate_file(path: &Path) -> Result<()> {
             .filter(|value| !value.is_null())
         {
             (|| -> Result<()> {
+                // v060 records the outcome; these relationships don't read it.
+                let mut intent = intent.clone();
+                if let Some(fields) = intent.as_object_mut() {
+                    fields.entry("outcome").or_insert_with(|| "fresh".into());
+                }
                 let intent: crate::session::TerminalHandoffIntent =
                     serde::Deserialize::deserialize(intent)
                         .context("existing terminal handoff authority is malformed")?;
@@ -185,6 +190,7 @@ mod tests {
             },
             unborn_fence: None,
             terminal: None,
+            outcome: crate::session::TerminalHandoffOutcome::Fresh,
             launch_required: false,
             launch_started: false,
             selector_ended: false,

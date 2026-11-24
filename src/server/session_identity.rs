@@ -14,7 +14,7 @@ pub(super) type SessionIdentityBaseline = (
     Option<std::time::SystemTime>,
     u64,
     crate::session::Status,
-    chrono::DateTime<chrono::Utc>,
+    crate::time::Timestamp,
 );
 
 /// Preserve concurrent changes to any part of the native conversation.
@@ -839,7 +839,7 @@ mod tests {
         drained.lifecycle_reservation = Some(crate::session::LifecycleReservation {
             op: crate::session::LifecycleOperation::Capture,
             generation: 7,
-            at: chrono::Utc::now(),
+            at: crate::time::Timestamp::now(),
         });
 
         // Nothing moved under the guard, so the drained values land.
@@ -854,7 +854,7 @@ mod tests {
         let reservation = crate::session::LifecycleReservation {
             op: crate::session::LifecycleOperation::Launch,
             generation: 9,
-            at: chrono::Utc::now(),
+            at: crate::time::Timestamp::now(),
         };
         relaunched.lifecycle_generation = 9;
         relaunched.lifecycle_reservation = Some(reservation.clone());
@@ -882,7 +882,7 @@ mod tests {
         walked.lifecycle_reservation = Some(crate::session::LifecycleReservation {
             op: crate::session::LifecycleOperation::Capture,
             generation: walked.lifecycle_generation,
-            at: chrono::Utc::now(),
+            at: crate::time::Timestamp::now(),
         });
         let now = std::time::Instant::now();
         walked.capture_poller.repair_mut().reprobe(now);
@@ -890,7 +890,7 @@ mod tests {
             .capture_poller
             .set_retry_after(Some(now + std::time::Duration::from_secs(30)));
         let mut reused = original.clone();
-        reused.created_at += chrono::Duration::seconds(1);
+        reused.created_at += crate::time::Duration::seconds(1);
         apply_drained_identity_if_unchanged(&mut reused, &walked, &baseline);
         apply_poller_repair_if_lifecycle_unchanged(
             &mut reused,

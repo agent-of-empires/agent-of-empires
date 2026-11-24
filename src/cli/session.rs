@@ -570,7 +570,7 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         let decision = crate::session::claim::decide_restore_claim(
             instances,
             &restore_id,
-            chrono::Utc::now(),
+            crate::time::Timestamp::now(),
         )?;
         let fresh = if matches!(
             decision,
@@ -1533,7 +1533,7 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
                     && stored.lifecycle_generation == working.lifecycle_generation,
                 crate::session::LifecycleReservationError::Superseded
             );
-            stored.last_accessed_at = Some(chrono::Utc::now());
+            stored.last_accessed_at = Some(crate::time::Timestamp::now());
             Ok(())
         }) {
             Ok(()) => true,
@@ -1665,7 +1665,7 @@ fn confirmed_terminated(inst: &Instance) -> bool {
     is_terminated(
         inst.status,
         inst.last_error.as_deref(),
-        inst.has_fresh_launch_reservation(chrono::Utc::now()),
+        inst.has_fresh_launch_reservation(crate::time::Timestamp::now()),
         existence,
     )
 }
@@ -2197,7 +2197,7 @@ mod rename_tests {
             branch: "agent-old".into(),
             main_repo_path: repo.to_str().unwrap().into(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: Some("main".into()),
         });
         let id = target.id.clone();
@@ -2451,7 +2451,7 @@ mod rename_tests {
             branch: "drifted".to_string(),
             main_repo_path: "/tmp/repo".to_string(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: None,
         });
         let tied_id = tied.id.clone();
@@ -2486,7 +2486,7 @@ mod rename_tests {
             branch: "main-branch".to_string(),
             main_repo_path: "/tmp/repo".to_string(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: None,
         });
         let active_id = active.id.clone();
@@ -2549,7 +2549,7 @@ mod rename_tests {
             branch: "agent-old".into(),
             main_repo_path: dir.path().join("repo").to_str().unwrap().into(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: None,
         });
         let id = target.id.clone();
@@ -2908,7 +2908,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                 pending.context = context;
                 pending.source_conversation = target.clone();
                 pending.source_acp_session_id = source_acp_session_id;
-                pending.terminal = Some(target);
+                pending.set_terminal(Some(target));
                 pending.launch_started = false;
                 if stage == crate::session::TerminalHandoffStage::ProjectionCleanupOwed {
                     pending.stage = crate::session::TerminalHandoffStage::TerminalLaunchOwed;
@@ -3279,7 +3279,7 @@ mod set_base_target_tests {
                     base_branch_override: None,
                 })
                 .collect(),
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             cleanup_on_delete: true,
         });
         inst
@@ -3667,7 +3667,7 @@ mod start_blocked_tests {
             let profile = "archive-trashed";
             let project = temp.path().join("project");
             let mut inst = Instance::new("trashed", project.to_str().unwrap());
-            inst.pinned_at = Some(chrono::Utc::now());
+            inst.pinned_at = Some(crate::time::Timestamp::now());
             inst.trash();
             let id = inst.id.clone();
             let storage = Storage::new_unwatched(profile).unwrap();
@@ -3742,7 +3742,9 @@ mod session_mutation_tests {
         row.try_acquire_lifecycle_reservation(
             crate::session::LifecycleOperation::Trash,
             Instance::LIFECYCLE_RESERVATION_TTL,
-            chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+            crate::time::Timestamp::now()
+                - Instance::LIFECYCLE_RESERVATION_TTL
+                - crate::time::Duration::seconds(1),
         )
         .unwrap();
         row.trash();
@@ -4201,7 +4203,7 @@ mod wait_decision_tests {
 
     #[test]
     fn adopt_stored_sees_a_launch_commit_and_keeps_detection_state() {
-        let now = chrono::Utc::now();
+        let now = crate::time::Timestamp::now();
         let mut live = Instance::new("t", "/p");
         live.try_acquire_lifecycle_reservation(
             LifecycleOperation::Launch,

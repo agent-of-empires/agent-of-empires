@@ -206,7 +206,7 @@ impl std::error::Error for LaunchIndeterminateCause {}
 pub(crate) struct NativeStartAdmission {
     pub(super) tmux_session: String,
     pub(super) revival: Option<RevivalTarget>,
-    created_at: chrono::DateTime<chrono::Utc>,
+    created_at: crate::time::Timestamp,
     selection: [u8; 32],
 }
 
@@ -1030,7 +1030,21 @@ impl Instance {
                 cause,
             );
         }
-        if let Err(error) = self.commit_lifecycle_launch(storage, generation, restart) {
+        let expected = matches!(
+            outcome,
+            StartOutcome::Fresh | StartOutcome::FreshAfterFailedResume { .. }
+        )
+        .then_some(&probe.expected);
+        if let Err(error) = self.commit_lifecycle_launch(storage, generation, restart, expected) {
+            if let Some(&cause) = error.downcast_ref::<LaunchIndeterminateCause>() {
+                return self.preserve_indeterminate_launch(
+                    storage,
+                    generation,
+                    &probe,
+                    sandbox_prior.as_ref(),
+                    cause,
+                );
+            }
             self.fail_reserved_launch(storage, generation, &error, None, None);
             return Err(error);
         }
@@ -1633,7 +1647,7 @@ mod tests {
             Some(&LifecycleReservationError::Superseded)
         );
         let mut reused = original;
-        reused.created_at += chrono::Duration::seconds(1);
+        reused.created_at += crate::time::Duration::seconds(1);
         let changed = admission.verify_context(&reused).unwrap_err();
         assert_eq!(
             changed.downcast_ref::<LifecycleReservationError>(),
@@ -1691,6 +1705,13 @@ mod tests {
             StartOutcome::Indeterminate {
                 cause: LaunchIndeterminateCause::OwnershipUnproven,
             }
+        );
+        let error = instance
+            .commit_lifecycle_launch(&storage, generation, false, Some(&probe.expected))
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<LaunchIndeterminateCause>(),
+            Some(&LaunchIndeterminateCause::OwnershipUnproven)
         );
         assert_eq!(
             crate::tmux::test_helpers::pane_field(
@@ -3327,7 +3348,7 @@ mod tests {
         let finalized_in_observer = finalized.clone();
         let retained_capture =
             std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        let retained_start = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let retained_start = crate::time::Timestamp::from_unix_secs(1_700_000_000).unwrap();
         let _observer = FinalizeObserver::install(inst.id.clone(), move |instance, phase| {
             match phase {
                 FinalizePhase::Before => {
@@ -3946,7 +3967,10 @@ exec sleep 60
             assert!(hook.wait().unwrap().success());
             assert_eq!(
                 instance.ensure_pane_ready().unwrap(),
-                crate::session::EnsureReadyOutcome::AlreadyAlive
+                crate::session::EnsureReadyOutcome::Indeterminate {
+                    cause: LaunchIndeterminateCause::StabilizationExpired,
+                },
+                "even B's qualified hook cannot authorize a replacement process"
             );
             assert_eq!(only_pane_id(&name), pane);
             assert_eq!(

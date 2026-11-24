@@ -240,9 +240,9 @@ const PAGES = [
   {
     source: "docs/structured-view.md",
     dest: "docs/structured-view.md",
-    title: "Structured View (Web Dashboard)",
+    title: "Structured View",
     description:
-      "The web dashboard's default structured view: native rendering of AI agent state via the Agent Client Protocol (ACP). Plan panels, tool-call cards, swipe-to-approve, multi-provider support.",
+      "The web dashboard's default structured view: native rendering of AI agent state via the Agent Client Protocol (ACP). Plan panels, tool-call cards, approval cards, multi-provider support.",
   },
   {
     source: "docs/structured-view/interface.md",

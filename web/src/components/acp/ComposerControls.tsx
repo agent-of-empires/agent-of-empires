@@ -29,19 +29,21 @@ export function PopoverItems({ trigger, skillIndex }: { trigger: string; skillIn
                 item={item}
                 index={i}
                 className={[
-                  "flex w-full items-start gap-2 px-3 py-2 text-left text-xs",
+                  "group flex w-full items-start gap-2 px-3 py-2 text-left text-xs",
                   "hover:bg-surface-800/60",
-                  "data-[highlighted=true]:bg-surface-800",
+                  "data-highlighted:bg-brand-600/20",
                 ].join(" ")}
               >
-                <span className="font-mono text-text-dim">{trigger}</span>
+                <span className="font-mono text-text-dim group-data-highlighted:text-text-primary">{trigger}</span>
                 <span className="min-w-0 flex-1">
                   <span className="flex items-center gap-1.5">
                     <span className="block truncate font-medium text-text-primary">{item.label}</span>
                     {source && <ProvenanceBadge label={badgeLabel(source)} tone={badgeTone(source)} />}
                   </span>
                   {item.description && (
-                    <span className="block truncate text-[11px] text-text-dim">{item.description}</span>
+                    <span className="block truncate text-[11px] text-text-dim group-data-highlighted:text-text-primary">
+                      {item.description}
+                    </span>
                   )}
                 </span>
               </ComposerPrimitive.Unstable_TriggerPopoverItem>

@@ -69,15 +69,17 @@ pub(crate) struct SessionJson {
     pub(crate) command: String,
     pub(crate) profile: String,
     pub(crate) state: &'static str,
-    pub(crate) created_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) created_at: crate::time::Timestamp,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) trashed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) trashed_at: Option<crate::time::Timestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) archived_at: Option<crate::time::Timestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) snoozed_until: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) ignored_at: Option<crate::time::Timestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) pinned_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) snoozed_until: Option<crate::time::Timestamp>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pinned_at: Option<crate::time::Timestamp>,
     pub(crate) workspace_repos: Vec<WorkspaceRepoJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) worktree: Option<WorktreeJson>,
