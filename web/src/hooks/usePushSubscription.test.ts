@@ -264,6 +264,31 @@ describe("usePushSubscription enable()", () => {
     expect(called("/api/push/vapid-public-key") && called("/api/push/subscribe")).toBe(true);
   });
 
+  it("replays a refresh asked for while permission is pending, so a Daemon with push off isn't offered", async () => {
+    noSubscription();
+    const { result } = await mountAndSettle();
+    expect(result.current.state).toEqual({ kind: "off" });
+    let answer!: (p: NotificationPermission) => void;
+    vi.mocked(Notification.requestPermission).mockReturnValueOnce(new Promise((r) => (answer = r)));
+    // The Daemon restarts with push off while the permission prompt is open.
+    installFetch({ status: { ok: true, body: { enabled: false } }, vapid: 404 });
+    let enabling!: Promise<void>;
+    act(() => {
+      enabling = result.current.enable();
+    });
+    await act(async () => {
+      setServerDown(true);
+      setServerDown(false);
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    await act(async () => {
+      answer("granted");
+      await enabling;
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    expect(result.current.state).toEqual({ kind: "disabled-by-server" });
+  });
+
   it.each<[string, () => void, PushState]>([
     ["permission is refused", () => setPermission("denied"), { kind: "denied" }],
     [

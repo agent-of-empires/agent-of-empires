@@ -115,6 +115,8 @@ let snapshot = INITIAL;
 const listeners = new Set<() => void>();
 // A refresh must not run over an action in flight, and actions do not overlap.
 let busy = false;
+// A refresh asked for during an action, such as a reconnect while permission is pending, runs once it settles.
+let refreshQueued = false;
 // Bumped by every refresh and action; writes from an older generation are dropped.
 let generation = 0;
 // Every pending refresh re-registration POST; actions wait for all so none lands after them.
@@ -123,6 +125,7 @@ let registration: Promise<unknown> = Promise.resolve();
 function reset() {
   generation++;
   busy = false;
+  refreshQueued = false;
   snapshot = INITIAL;
 }
 
@@ -141,7 +144,10 @@ function publish(gen: number, next: Partial<Snapshot>) {
 }
 
 async function refresh() {
-  if (busy) return;
+  if (busy) {
+    refreshQueued = true;
+    return;
+  }
   const gen = ++generation;
   const live = () => gen === generation;
   const unsupported = unsupportedState();
@@ -195,7 +201,11 @@ function beginAction(): number | null {
 function endAction(gen: number) {
   if (gen !== generation) return;
   busy = false;
-  if (listeners.size === 0) reset();
+  if (listeners.size === 0) return reset();
+  if (refreshQueued) {
+    refreshQueued = false;
+    void refresh();
+  }
 }
 
 // Also the repair path: iOS only allows requestPermission and a first subscribe inside a
