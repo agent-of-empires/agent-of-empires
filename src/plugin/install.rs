@@ -479,8 +479,11 @@ pub(super) fn create_staging_marker(marker: &Path, mount: &Path) -> Result<()> {
     let plugins = root.child(Path::new("plugins"))?;
     let stage = plugins.child(directory)?;
     let mount_dir = stage.child(Path::new("volume"))?;
+    let owned = [&root, &plugins, &stage, &mount_dir]
+        .into_iter()
+        .all(|dir| dir.require_owned_directory().is_ok());
     let removal = match (plugins.created(), stage.created(), mount_dir.created()) {
-        (Some(plugins_created), Some(directory_created), Some(mount_created)) => {
+        (Some(plugins_created), Some(directory_created), Some(mount_created)) if owned => {
             stage.sync()?;
             plugins.sync()?;
             Some(StagingRemovalProof {
@@ -3242,8 +3245,9 @@ mod tests {
         }
     }
 
-    fn crash_staging_and_recover(phase: &str, legacy: bool) {
+    fn crash_staging_and_recover(phase: &str, legacy: bool, plugins_mode: u32) {
         use std::io::Read as _;
+        use std::os::unix::fs::PermissionsExt as _;
         use std::os::unix::net::UnixListener;
         use std::time::{Duration, Instant};
         struct Daemon(std::process::Child);
@@ -3255,6 +3259,9 @@ mod tests {
         }
         let _home = isolate_app_dir();
         let root = crate::session::get_app_dir().unwrap();
+        let plugins = root.join("plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+        std::fs::set_permissions(&plugins, std::fs::Permissions::from_mode(plugins_mode)).unwrap();
         let control_dir = tempfile::tempdir_in("/tmp").unwrap();
         let socket = control_dir.path().join("control");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -3490,11 +3497,15 @@ mod tests {
         std::fs::create_dir(&unrelated).unwrap();
         let (mut evidence, _, _) = staging_evidence(&anchored).unwrap();
         let may_remove = !legacy
+            && plugins_mode & 0o022 == 0
             && [&root.join("plugins"), &stage, &mount].iter().all(|path| {
                 std::fs::metadata(path)
                     .and_then(|metadata| metadata.created())
                     .is_ok()
             });
+        if plugins_mode & 0o022 != 0 {
+            assert!(evidence.removal.is_none());
+        }
         if legacy {
             evidence.removal = None;
             save_header(&evidence);
@@ -3615,7 +3626,7 @@ mod tests {
         } else {
             assert!(
                 mount.is_dir(),
-                "a journal without birth proof cannot remove staging"
+                "a journal without deletion authority cannot remove staging"
             );
         }
         assert!(
@@ -3627,13 +3638,15 @@ mod tests {
     #[test]
     #[serial]
     fn startup_reclaims_preacquisition_after_real_daemon_crash() {
-        crash_staging_and_recover("prepared", false);
+        for mode in [0o755, 0o775] {
+            crash_staging_and_recover("prepared", false, mode);
+        }
     }
 
     #[test]
     #[serial]
     fn startup_reclaims_legacy_journal_without_removing_staging_directory() {
-        crash_staging_and_recover("prepared", true);
+        crash_staging_and_recover("prepared", true, 0o755);
     }
 
     #[test]
@@ -3642,7 +3655,7 @@ mod tests {
     #[ignore = "requires private user/PID/mount namespaces, nsenter, Git, and bubblewrap"]
     fn startup_reclaims_bounded_linux_volume_after_real_daemon_crash() {
         for phase in ["volume", "writers"] {
-            crash_staging_and_recover(phase, false);
+            crash_staging_and_recover(phase, false, 0o755);
         }
     }
 
