@@ -152,6 +152,22 @@ describe("ArrowJoystick", () => {
     expect(j.sent()).toEqual([RIGHT, UP]);
   });
 
+  it("restarts from the new press when a fresh touch reuses the lost pointer's ID", () => {
+    const j = mount();
+    j.down(1);
+    j.move(30, 0);
+    // No end event for pointer 1, and the next touch reuses its ID 60px left of the first.
+    const pad = screen.getByRole("group", { name: "Arrow keys joystick" });
+    fireEvent.pointerDown(pad, { pointerId: 1, isPrimary: true, clientX: 40, clientY: 100 });
+    j.wait(2000);
+    expect(j.sent()).toEqual([RIGHT]);
+    // 30px up from the new press, still left of the old origin.
+    fireEvent.pointerMove(pad, { pointerId: 1, isPrimary: true, clientX: 40, clientY: 70 });
+    j.up(1);
+    j.wait(2000);
+    expect(j.sent()).toEqual([RIGHT, UP]);
+  });
+
   it("a fresh touch anywhere stops a gesture that never ended", () => {
     const j = mount();
     j.down(1);

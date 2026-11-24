@@ -65,12 +65,10 @@ export function ArrowJoystick({ onArrow }: { onArrow: (sequence: string) => void
       if (originRef.current?.pointerId === e.pointerId) endGesture();
     };
     // A new primary pointer of the same type means no other such pointer is down, so a held gesture
-    // lost its end event. Capture runs before the pad's own pointerdown, which then starts fresh.
+    // lost its end event, even when the new press reuses its ID. Capture runs before the pad's own
+    // pointerdown, which then starts fresh.
     const onPointerStart = (e: PointerEvent) => {
-      const origin = originRef.current;
-      if (origin && e.isPrimary && e.pointerType === origin.pointerType && e.pointerId !== origin.pointerId) {
-        endGesture();
-      }
+      if (e.isPrimary && e.pointerType === originRef.current?.pointerType) endGesture();
     };
     const onHidden = () => {
       if (document.visibilityState === "hidden") endGesture();
