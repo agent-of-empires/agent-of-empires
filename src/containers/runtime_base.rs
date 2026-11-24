@@ -42,19 +42,32 @@ fn pid_is_sleep(top_stdout: &str, pid: &str) -> bool {
     })
 }
 
+/// Time the optional stop probes may use in total, so a stalled runtime delays
+/// the stop itself by at most this much.
+const STOP_PROBE_BUDGET: Duration = Duration::from_secs(3);
+
 /// Full `stop` arguments for container `name`. `run` runs the given runtime
-/// arguments and returns the output, or `None` when it cannot run. `sleep` as
+/// arguments within the given time and returns the output, or `None` when it
+/// cannot run or times out. `sleep` as
 /// PID 1 ignores SIGTERM, so waiting out the grace only delays SIGKILL: `-t 0`
 /// needs the settings gate and `top` showing PID 1 is `sleep`. Anything else,
 /// including a failed probe, keeps the runtime's grace.
 pub(crate) fn stop_args_for(
     name: &str,
-    mut run: impl FnMut(&[String]) -> Option<std::process::Output>,
+    mut run: impl FnMut(&[String], Duration) -> Option<std::process::Output>,
 ) -> Vec<String> {
+    let deadline = Instant::now() + STOP_PROBE_BUDGET;
     let mut stdout = |args: &[&str]| {
-        run(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        run(
+            &args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(),
+            remaining,
+        )
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
     };
     let settings = stdout(&["inspect", "--format", STOP_SETTINGS_FORMAT, name]);
     let immediate = bare_pid1(settings.as_deref()).is_some_and(|pid| {
@@ -338,7 +351,7 @@ impl RuntimeBase {
         self.probe_output_with_timeout(cmd, RUNTIME_CMD_TIMEOUT)
     }
 
-    fn probe_output_with_timeout(
+    pub(crate) fn probe_output_with_timeout(
         &self,
         cmd: &mut Command,
         timeout: Duration,
@@ -857,10 +870,10 @@ impl RuntimeBase {
 
     pub fn stop_container(&self, name: &str) -> Result<()> {
         tracing::info!(target: "containers.runtime", runtime = %self.name, %name, "stopping container");
-        let args = stop_args_for(name, |args| {
-            let mut inspect = self.command();
-            inspect.args(args);
-            self.probe_output(&mut inspect).ok()
+        let args = stop_args_for(name, |args, timeout| {
+            let mut probe = self.command();
+            probe.args(args);
+            self.probe_output_with_timeout(&mut probe, timeout).ok()
         });
         let mut cmd = self.command();
         cmd.args(args);
@@ -1085,6 +1098,31 @@ mod tests {
     }
 
     #[test]
+    fn stop_probes_share_one_short_deadline() {
+        let mut timeouts = Vec::new();
+        let args = stop_args_for("c1", |args, timeout| {
+            timeouts.push(timeout);
+            let mut output = std::process::Command::new("true").output().unwrap();
+            if args[0] == "inspect" {
+                output.stdout = b"null|null|null|91483".to_vec();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            Some(output)
+        });
+        assert_eq!(args, ["stop", "c1"]);
+        assert_eq!(timeouts.len(), 2);
+        assert!(timeouts[0] <= STOP_PROBE_BUDGET);
+        assert!(timeouts[1] < timeouts[0]);
+        let mut calls = 0;
+        stop_args_for("c1", |_, _| {
+            calls += 1;
+            std::thread::sleep(STOP_PROBE_BUDGET + Duration::from_millis(50));
+            None
+        });
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
     fn stop_args_for_needs_both_the_settings_and_a_sleep_pid1() {
         let answer = |stdout: &str, ok: bool| {
             let mut output = std::process::Command::new(if ok { "true" } else { "false" })
@@ -1094,7 +1132,7 @@ mod tests {
             Some(output)
         };
         let stop = |inspect: Option<&str>, top: Option<&str>| {
-            stop_args_for("c1", |args| match args[0].as_str() {
+            stop_args_for("c1", |args, _| match args[0].as_str() {
                 "inspect" => answer(inspect.unwrap_or(""), inspect.is_some()),
                 _ => answer(top.unwrap_or(""), top.is_some()),
             })
