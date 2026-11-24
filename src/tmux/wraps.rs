@@ -161,15 +161,16 @@ pub(crate) fn relink_continuations(
 }
 
 /// `rows` with each `at` row replaced by its `fresh` twin when the two show
-/// the same text and the twin opens on the target the row before it ended
-/// on, so a label repainted between the captures keeps its old row. A row
+/// the same text and the twin opens on the last target an earlier row named,
+/// so a label repainted between the captures keeps its old row. That target
+/// passes over rows naming none, a continuation left unread included. A row
 /// capture opens from default attributes, so a reset first drops whatever the
 /// previous row left set.
 fn splice_rows(rows: &[&[u8]], at: &[usize], fresh: &[&[u8]], terminated: bool) -> Vec<u8> {
     let plain = |row: &[u8]| crate::tmux::utils::strip_ansi(&String::from_utf8_lossy(row));
     let links = |row: &[u8]| crate::tmux::osc8::row_links(&String::from_utf8_lossy(row));
     let mut out = Vec::new();
-    let mut prev: &[u8] = &[];
+    let mut carried: Option<String> = None;
     for (i, &row) in rows.iter().enumerate() {
         if i > 0 {
             out.push(b'\n');
@@ -179,19 +180,20 @@ fn splice_rows(rows: &[&[u8]], at: &[usize], fresh: &[&[u8]], terminated: bool) 
             .ok()
             .map(|n| fresh[n])
             .filter(|twin| plain(twin).trim_end() == plain(row).trim_end())
-            .filter(|twin| {
-                links(twin).first().map(|l| l.uri.clone()) == links(prev).pop().map(|l| l.uri)
-            });
-        match twin {
+            .filter(|twin| links(twin).first().map(|l| &l.uri) == carried.as_ref());
+        let kept = match twin {
             Some(twin) => {
                 out.extend_from_slice(b"\x1b[0m");
-                out.extend_from_slice(twin);
-                prev = twin;
+                twin
             }
-            None => {
-                out.extend_from_slice(row);
-                prev = row;
-            }
+            None => row,
+        };
+        out.extend_from_slice(kept);
+        if let Some(link) = crate::tmux::osc8::has_hyperlink(kept)
+            .then(|| links(kept).pop())
+            .flatten()
+        {
+            carried = Some(link.uri);
         }
     }
     if terminated {
@@ -329,6 +331,28 @@ mod tests {
             String::from_utf8(splice_rows(&rows, &[1, 2, 3], &fresh, true)).unwrap(),
             want
         );
+    }
+
+    #[test]
+    fn a_label_longer_than_the_reread_budget_relinks_its_newest_rows() {
+        let a = |text: &str| format!("\x1b]8;;https://e.co/a\x1b\\{text}\x1b]8;;\x1b\\");
+        let rows = MAX_RELINKED_ROWS + 10;
+        // Only the first row advertises the target; every row wraps.
+        let body: Vec<String> = std::iter::once(a("x"))
+            .chain((1..rows).map(|_| "x".to_string()))
+            .collect();
+        let body: Vec<&[u8]> = body.iter().map(|r| r.as_bytes()).collect();
+        let wraps: Vec<u32> = (0..rows as u32 - 1).collect();
+        let at = unlinked_continuations(&body, &wraps, rows - 3);
+        assert_eq!(at.len(), MAX_RELINKED_ROWS);
+        assert!(at[0] > 1, "older continuations are left out");
+        let fresh = vec![a("x"); at.len()];
+        let fresh: Vec<&[u8]> = fresh.iter().map(|r| r.as_bytes()).collect();
+        let out = String::from_utf8(splice_rows(&body, &at, &fresh, false)).unwrap();
+        let out: Vec<&str> = out.split('\n').collect();
+        for &i in &at {
+            assert_eq!(out[i], format!("\x1b[0m{}", a("x")), "row {i}");
+        }
     }
 
     #[test]
