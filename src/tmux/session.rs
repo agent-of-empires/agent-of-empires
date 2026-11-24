@@ -1109,10 +1109,21 @@ impl Session {
             Some(mark) => {
                 match crate::tmux::wraps::split_at_sentinel(pane0_content.as_bytes(), mark) {
                     Some((rows, joined)) => {
-                        let rows = String::from_utf8_lossy(rows).into_owned();
-                        let wrapped =
-                            crate::tmux::wraps::soft_wraps(&rows, &String::from_utf8_lossy(joined));
-                        (rows, wrapped)
+                        let wrapped = crate::tmux::wraps::soft_wraps(
+                            &String::from_utf8_lossy(rows),
+                            &String::from_utf8_lossy(joined),
+                        );
+                        let mut rows = rows.to_vec();
+                        if let Some(cursor) = &cursor {
+                            crate::tmux::wraps::relink_continuations(
+                                &pane0,
+                                &mut rows,
+                                &wrapped,
+                                cursor.pane_height,
+                                deadline,
+                            );
+                        }
+                        (String::from_utf8_lossy(&rows).into_owned(), wrapped)
                     }
                     // The joined half went missing; its bytes must not render.
                     None => return Ok(WindowCapture::default()),
