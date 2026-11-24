@@ -733,10 +733,7 @@ impl SuggestionsView {
                     .and_then(|i| i.started_session.as_ref())
                     .filter(|_| !another)
                 {
-                    let untrusted = item
-                        .and_then(|i| store.blocked_prompt(i))
-                        .is_some_and(|(_, code)| code.as_deref() == Some(FOLDER_NOT_TRUSTED));
-                    if untrusted && self.pretrusted && started.one_click() && block.is_none() {
+                    if item.is_some_and(|i| self.retries(store, i, block)) {
                         return SuggestionsAction::TryAgain(key, started.id.clone());
                     }
                     return SuggestionsAction::OpenSession(started.id.clone());
@@ -848,16 +845,29 @@ impl SuggestionsView {
         changed
     }
 
+    /// Whether Enter on `item` trashes its blocked Session and starts it again:
+    /// a one-click start still open at the source, blocked on folder trust,
+    /// with pre-trust on and a daemon that accepts the Trash.
+    fn retries(&self, store: &SuggestionsFeed, item: &Item, block: Option<MutationBlock>) -> bool {
+        block.is_none()
+            && self.pretrusted
+            && !item.stale
+            && item
+                .started_session
+                .as_ref()
+                .is_some_and(Started::one_click)
+            && store
+                .blocked_prompt(item)
+                .is_some_and(|(_, code)| code.as_deref() == Some(FOLDER_NOT_TRUSTED))
+    }
+
     /// The keys that apply to the selected row; `?` lists them all.
     fn row_keys(&self, store: &SuggestionsFeed, block: Option<MutationBlock>) -> Vec<String> {
         let mut keys = Vec::new();
         if let Some(item) = self.item_at(store, self.selected) {
             let key = (item.provider_id.clone(), item.id.clone());
-            if let Some(started) = &item.started_session {
-                let untrusted = store
-                    .blocked_prompt(item)
-                    .is_some_and(|(_, code)| code.as_deref() == Some(FOLDER_NOT_TRUSTED));
-                let retry = untrusted && self.pretrusted && started.one_click() && block.is_none();
+            if item.started_session.is_some() {
+                let retry = self.retries(store, item, block);
                 keys.push(if retry { "↵ try again" } else { "↵ open" }.to_string());
             } else if block.is_none() && !item.stale {
                 let retry = store.failed.as_ref().is_some_and(|(k, _)| *k == key);
@@ -1233,7 +1243,7 @@ impl SuggestionsView {
                     dim,
                 ),
             ]));
-            lines.push(self.subtitle(store, item, headed, theme));
+            lines.push(self.subtitle(store, item, headed, mutation_block, theme));
             selected_rows = if current {
                 (first, lines.len())
             } else {
@@ -1279,6 +1289,7 @@ impl SuggestionsView {
         store: &SuggestionsFeed,
         item: &Item,
         headed: bool,
+        block: Option<MutationBlock>,
         theme: &Theme,
     ) -> Line<'static> {
         let error = Style::default().fg(theme.error);
@@ -1292,14 +1303,8 @@ impl SuggestionsView {
             ));
         }
         if let Some((_, code)) = store.blocked_prompt(item) {
-            let one_click = item
-                .started_session
-                .as_ref()
-                .is_some_and(Started::one_click);
             let next = match code.as_deref() {
-                Some(FOLDER_NOT_TRUSTED) if self.pretrusted && one_click => {
-                    "Enter tries again".to_string()
-                }
+                _ if self.retries(store, item, block) => "Enter tries again".to_string(),
                 Some(FOLDER_NOT_TRUSTED) if self.pretrusted => {
                     "trust the folder in the Session · Enter opens it".to_string()
                 }
@@ -2618,18 +2623,24 @@ mod tests {
     }
 
     #[test]
-    fn a_session_not_made_by_one_click_start_is_opened_not_retried() {
+    fn a_session_not_made_by_one_click_start_or_now_stale_is_opened_not_retried() {
         let mut rig = blocked_rig("agent_folder_not_trusted");
         rig.view.pretrusted = true;
-        for via in [None, Some("wizard")] {
-            rig.store.snapshot.as_mut().unwrap().items[0]
-                .started_session
-                .as_mut()
-                .unwrap()
-                .started_via = via.map(Into::into);
+        for (via, stale) in [
+            (None, false),
+            (Some("wizard"), false),
+            (Some("start"), true),
+        ] {
+            let item = &mut rig.store.snapshot.as_mut().unwrap().items[0];
+            item.stale = stale;
+            item.started_session.as_mut().unwrap().started_via = via.map(Into::into);
             let text = render_text(&rig);
             assert!(text.contains("trust the folder in the Session"), "{text}");
             assert!(!text.contains("Enter tries again"), "{text}");
+            assert!(
+                text.contains("↵ open") && !text.contains("↵ try again"),
+                "{text}"
+            );
             assert!(matches!(
                 press(&mut rig, KeyCode::Enter, true),
                 SuggestionsAction::OpenSession(s) if s == "s1"
