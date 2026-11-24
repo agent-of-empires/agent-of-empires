@@ -154,7 +154,10 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
         answer.pull.state !== "running";
       if (answer) {
         watching = answer.checks_enabled && answer.sandbox_in_use;
-        if (cancelImage.current !== null && cancelImage.current !== answer.image) {
+        // A Cancel belongs to the pull it was sent for: once a status names another image, or shows that
+        // pull ended, its reply can't own the banner, which may already show a new pull of the same image.
+        const ended = answer.pull.state !== "running" && !predatesPull;
+        if (cancelImage.current !== null && (cancelImage.current !== answer.image || ended)) {
           cancelImage.current = null;
           cancelToken.current++;
           setCancelling(false);

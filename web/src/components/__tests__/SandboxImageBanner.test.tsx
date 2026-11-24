@@ -852,6 +852,24 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
     expect(cancelSandboxImagePull).toHaveBeenCalledOnce();
   });
 
+  it("retires a pending Cancel once a poll sees its pull end, so the same image restarting isn't blocked", async () => {
+    let answer!: (r: { ok: boolean; pull?: SandboxImagePull }) => void;
+    cancelSandboxImagePull.mockReturnValueOnce(new Promise((r) => (answer = r)));
+    // Found by polling: no Update now here and no create notification.
+    await mount(running());
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    fetchSandboxImageStatus.mockResolvedValue(status({ state: "current", pull: { state: "done" } }));
+    await pollAfter(2000);
+    // Another client pulls the same image again.
+    fetchSandboxImageStatus.mockResolvedValue(running());
+    await pollAfter(30_000);
+    expect((screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
+    // Hold the next poll, so what shows is the old reply's doing alone.
+    fetchSandboxImageStatus.mockReturnValueOnce(new Promise(() => {}));
+    await act(async () => answer({ ok: true, pull: { state: "cancelled" } }));
+    expect(banner()?.textContent).toContain(DOWNLOADING);
+  });
+
   it("offers no Update now or Retry on an outcome while the Daemon won't pull from the web", async () => {
     const cases: [SandboxImagePull, string, string][] = [
       [{ state: "cancelled" }, CANCELLED, "Update now"],
