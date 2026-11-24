@@ -79,6 +79,9 @@ describe("SessionGroupModal", () => {
     fireEvent.keyDown(input, init);
     expect(onSave).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole("listbox")).toBeTruthy();
+    // The open list takes the first plain Enter; the second saves.
+    fireEvent.keyDown(input, { key: "Enter" });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onSave).toHaveBeenCalledWith("new");
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
@@ -176,6 +179,11 @@ describe("SessionGroupModal", () => {
     resolve(false);
     await waitFor(() => expect(errorText()).toBe("Failed to clear group."));
     expect(screen.queryByTestId("group-combobox-popup")).toBeNull();
+  });
+
+  it("names the group field for assistive tech", () => {
+    const { input } = setup();
+    expect(screen.getByRole("combobox", { name: "Group" })).toBe(input);
   });
 
   it("Remove from group saves a blank group and is absent without one", async () => {

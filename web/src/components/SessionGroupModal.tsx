@@ -99,6 +99,9 @@ export function SessionGroupModal({ sessionTitle, currentGroup, profile, onSave,
         }}
         className="bg-surface-900 border border-surface-700 rounded px-2 focus-within:border-brand-600"
       >
+        <label htmlFor="session-group-modal-field" className="sr-only">
+          Group
+        </label>
         <GroupCombobox
           id="session-group-modal-field"
           testId="session-group-modal-input"
