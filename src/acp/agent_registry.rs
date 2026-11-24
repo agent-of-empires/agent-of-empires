@@ -34,6 +34,44 @@ impl AgentSpec {
     }
 }
 
+/// Whether a custom `agent_acp_cmd` runs the Claude ACP adapter, the only adapter known to
+/// load Claude session ids. Matches the adapter binary or an `npx`/`bunx` launch of its package.
+pub fn runs_claude_adapter(cmd: &str) -> bool {
+    const ADAPTERS: [&str; 2] = ["claude-agent-acp", "claude-code-acp"];
+    let Ok(spec) = AgentSpec::from_acp_cmd("", cmd) else {
+        return false;
+    };
+    let basename = |path: &str| {
+        std::path::Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+    };
+    let Some(program) = basename(&spec.command) else {
+        return false;
+    };
+    if ADAPTERS.contains(&program.as_str()) {
+        return true;
+    }
+    if !matches!(program.as_str(), "npx" | "bunx") {
+        return false;
+    }
+    spec.args
+        .iter()
+        .find(|arg| !arg.starts_with('-'))
+        .is_some_and(|package| {
+            let unscoped = package
+                .strip_prefix('@')
+                .map_or(package.as_str(), |scoped| {
+                    scoped.split_once('/').map_or(scoped, |(_, name)| name)
+                });
+            unscoped
+                .split('@')
+                .next()
+                .is_some_and(|name| ADAPTERS.contains(&name))
+        })
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentRegistry {
     pub agents: HashMap<String, AgentSpec>,
@@ -393,6 +431,26 @@ mod tests {
         );
         for bad in ["", "   ", "ocp run \"unterminated"] {
             assert!(AgentSpec::from_acp_cmd("x", bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn runs_claude_adapter_matches_only_the_claude_adapters() {
+        for (cmd, expected) in [
+            ("claude-agent-acp", true),
+            ("/opt/bin/claude-code-acp --flag", true),
+            ("npx -y @agentclientprotocol/claude-agent-acp@latest", true),
+            ("bunx @zed-industries/claude-code-acp", true),
+            ("npx claude-agent-acp@1.2.3", true),
+            ("my-adapter --stdio", false),
+            ("launcher claude-work", false),
+            ("npx -y some-other-acp", false),
+            ("sh -c claude-agent-acp", false),
+            ("claude", false),
+            ("", false),
+            ("claude-agent-acp \"unterminated", false),
+        ] {
+            assert_eq!(runs_claude_adapter(cmd), expected, "{cmd:?}");
         }
     }
 

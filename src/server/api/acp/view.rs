@@ -4241,7 +4241,7 @@ mod tests {
             c.session.agent_execution_as.insert(tool(), "claude".into());
             c.session
                 .agent_acp_cmd
-                .insert(tool(), "launcher claude-work".into());
+                .insert(tool(), "claude-agent-acp".into());
             c.session
                 .agent_config_dir
                 .insert(tool(), own_store.to_str().unwrap().into());

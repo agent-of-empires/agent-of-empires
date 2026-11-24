@@ -293,7 +293,7 @@ impl Instance {
         let own_cmd = session
             .agent_acp_cmd
             .get(&self.tool)
-            .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(&self.tool, cmd).is_ok());
+            .is_some_and(|cmd| crate::acp::agent_registry::runs_claude_adapter(cmd));
         let launcher_store = super::hooks::host_home(&self.resolved_host_environment())
             .and_then(|home| session.agent_config_dir_for(&self.tool, &home));
         own_cmd
@@ -1362,7 +1362,7 @@ replies = true
         let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
         const PROFILE: &str = "own-acp-cmd-claude-test";
         let own_store = home.path().join(".claude-work");
-        let write_config = |execution_as: bool| {
+        let write_config = |execution_as: bool, acp_cmd: &str| {
             let mut session = toml::Table::new();
             let entry = |value: &str| {
                 toml::Value::Table(toml::Table::from_iter([(
@@ -1373,7 +1373,7 @@ replies = true
             if execution_as {
                 session.insert("agent_execution_as".into(), entry("claude"));
             }
-            session.insert("agent_acp_cmd".into(), entry("launcher claude-work"));
+            session.insert("agent_acp_cmd".into(), entry(acp_cmd));
             session.insert(
                 "agent_config_dir".into(),
                 entry(own_store.to_str().unwrap()),
@@ -1409,7 +1409,7 @@ replies = true
             inst
         };
 
-        write_config(true);
+        write_config(true, "claude-agent-acp");
         let bound = instance("claude-work", Some(&own_store));
         assert!(bound.resumes_claude_under_own_acp_cmd("claude-work"));
         assert!(!bound.resumes_claude_under_own_acp_cmd("claude"));
@@ -1422,9 +1422,23 @@ replies = true
             assert!(!instance(builtin, Some(&own_store)).resumes_claude_under_own_acp_cmd(builtin));
         }
 
-        write_config(false);
+        write_config(false, "claude-agent-acp");
         assert!(!instance("claude-work", Some(&own_store))
             .resumes_claude_under_own_acp_cmd("claude-work"));
+
+        // An adapter not known to load Claude session ids starts fresh.
+        for (cmd, expected) in [
+            ("my-adapter --stdio", false),
+            ("npx -y claude-code-acp", true),
+        ] {
+            write_config(true, cmd);
+            assert_eq!(
+                instance("claude-work", Some(&own_store))
+                    .resumes_claude_under_own_acp_cmd("claude-work"),
+                expected,
+                "{cmd}"
+            );
+        }
     }
 
     /// A session stored with the fallback's own command keeps its capture after
