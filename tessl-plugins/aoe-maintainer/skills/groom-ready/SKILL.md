@@ -40,12 +40,19 @@ issue whose newest finding, in any state, has the tag
 of a stale finding for step 3. Order them by priority label (`P0`, `P1`,
 `P2`, `P3`, none), then by most recently updated.
 
+Retire each open or in-progress finding whose issue is not in the list: read
+`gh issue view <n> -R $REPO --json state,labels` and run
+`tessl finding update <id> --file update.json` with `"state": "resolved"` if
+the issue now has `ready-for-agent` or `tessl`, otherwise `"state": "ignored"`
+with the closed state or excluded label in `analysis`.
+
 ## 2. Assess each issue
 
 Read the body and comments with
 `gh issue view <n> -R $REPO --json body,comments,labels,state,updatedAt`.
-Skip the issue if its `state` is not `OPEN` or its labels now include one
-that step 1 excludes. An issue is ready when all of these hold:
+Skip the issue, retiring its finding as step 1 does, if its `state` is not
+`OPEN` or its labels now include one that step 1 excludes. An issue is ready
+when all of these hold:
 
 1. **Problem**: current and expected behavior are stated.
 2. **Repro**: a bug has steps, a log, or a failing test. Features skip this.
