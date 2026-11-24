@@ -16,6 +16,7 @@ const TONES = {
   failed: { bar: "bg-status-error/10 border-status-error/30 text-text-primary", dot: "bg-status-error" },
 };
 
+export const CANCEL_NOT_READY = "Available once the Daemon confirms the download.";
 const linkButton = "min-h-8 underline cursor-pointer hover:opacity-80";
 
 /** Top-of-app banner for a newer sandbox image, with the pull and its outcome. */
@@ -63,7 +64,8 @@ export function SandboxImageBanner({ view }: { view: SandboxImageBannerView }) {
             <button
               type="button"
               onClick={view.onCancel}
-              disabled={view.cancelling}
+              disabled={view.cancelling || !view.cancelReady}
+              title={view.cancelReady ? undefined : CANCEL_NOT_READY}
               className={`${linkButton} disabled:opacity-50 disabled:cursor-default`}
             >
               Cancel

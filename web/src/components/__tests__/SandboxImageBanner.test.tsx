@@ -7,7 +7,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import type { SandboxImagePull, SandboxImageStatus } from "../../lib/api";
 import { useSandboxImageBanner } from "../../hooks/useSandboxImageBanner";
 import { notifySandboxImagePullStarted, notifySandboxImagePulled } from "../../lib/sandboxImageEvents";
-import { SandboxImageBanner } from "../SandboxImageBanner";
+import { CANCEL_NOT_READY, SandboxImageBanner } from "../SandboxImageBanner";
 
 const fetchSandboxImageStatus = vi.fn();
 const pullSandboxImage = vi.fn((): Promise<{ ok: boolean; message?: string }> => Promise.resolve({ ok: true }));
@@ -809,16 +809,47 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
   it("keeps a cancelled outcome once Cancel answers, while the Update now reply is still out", async () => {
     pullSandboxImage.mockReturnValueOnce(new Promise(() => {}));
     await mount(status());
+    // A status confirms the pull before its reply does.
+    fetchSandboxImageStatus.mockResolvedValue(running());
     fireEvent.click(screen.getByRole("button", { name: "Update now" }));
     await pollAfter(0);
-    expect(banner()?.textContent).toBe(DOWNLOADING);
-    // The Daemon never reported the pull running before it was cancelled.
     fetchSandboxImageStatus.mockResolvedValue(status({ pull: { state: "cancelled" } }));
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     await pollAfter(0);
     expect(banner()?.textContent).toBe(CANCELLED);
     await pollAfter(2000);
     expect(banner()?.textContent).toBe(CANCELLED);
+  });
+
+  it.each([
+    { name: "the Daemon accepts the update", confirm: "reply" },
+    { name: "a status shows it running", confirm: "status" },
+  ])("offers Cancel only once $name, so it can't reach the Daemon before the pull", async ({ confirm }) => {
+    let accept!: (r: { ok: boolean }) => void;
+    pullSandboxImage.mockReturnValueOnce(new Promise((r) => (accept = r)));
+    await mount(status());
+    fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    // The Daemon hasn't registered the pull yet.
+    fetchSandboxImageStatus.mockResolvedValue(status());
+    await pollAfter(0);
+    expect(banner()?.textContent).toContain(DOWNLOADING);
+    const early = screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement;
+    expect(early.disabled).toBe(true);
+    expect(early.title).toBe(CANCEL_NOT_READY);
+    fireEvent.click(early);
+    expect(cancelSandboxImagePull).not.toHaveBeenCalled();
+    if (confirm === "reply") {
+      // Hold the poll the reply sends, so only the acceptance confirms the pull.
+      fetchSandboxImageStatus.mockReturnValueOnce(new Promise(() => {}));
+      await act(async () => accept({ ok: true }));
+    } else {
+      fetchSandboxImageStatus.mockResolvedValue(running());
+      await pollAfter(2000);
+    }
+    const ready = screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement;
+    expect(ready.disabled).toBe(false);
+    fireEvent.click(ready);
+    expect(cancelSandboxImagePull).toHaveBeenCalledOnce();
   });
 
   it("offers no Update now or Retry on an outcome while the Daemon won't pull from the web", async () => {

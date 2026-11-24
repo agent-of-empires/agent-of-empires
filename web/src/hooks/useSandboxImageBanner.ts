@@ -39,6 +39,9 @@ export type SandboxImageBannerView =
       kind: "updating";
       progress: SandboxPullProgress;
       onCancel?: () => void;
+      /** False until the Daemon accepts this page's update or a status shows it running: a Cancel sent
+       *  earlier could reach the Daemon before the pull and miss it. */
+      cancelReady: boolean;
       cancelling: boolean;
       cancelRefused: string | null;
       onHide: () => void;
@@ -331,7 +334,9 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
       const image = status.image;
       const onCancel = status.pull_blocked ? undefined : () => cancel(image);
       return {
-        view: hidden ? null : { kind: "updating", progress, onCancel, cancelling, cancelRefused, onHide: hide },
+        view: hidden
+          ? null
+          : { kind: "updating", progress, onCancel, cancelReady: sawRunning, cancelling, cancelRefused, onHide: hide },
         running: { progress, hidden, onShow: show },
       };
     }
