@@ -1,6 +1,7 @@
 //! CLI command implementations
 
 pub mod acp;
+pub mod acp_history;
 pub mod add;
 pub mod agents;
 pub mod cityhall;
