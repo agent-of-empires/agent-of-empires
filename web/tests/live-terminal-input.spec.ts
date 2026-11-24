@@ -340,7 +340,14 @@ test.describe("Live terminal bundled font", () => {
 
   test("JetBrains Mono loads from the bundle and sizes rows from its metrics", async ({ page }) => {
     await openLiveTerminal(page, { settings: { desktopFontSize: 14, terminalFontFamily: "JetBrains Mono" } });
-    await expect.poll(() => page.evaluate(() => document.fonts.check('14px "JetBrains Mono"'))).toBe(true);
+    // check() also passes for an unregistered family, so require the bundled face itself.
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          [...document.fonts].some((f) => f.family === "JetBrains Mono" && f.weight === "400" && f.status === "loaded"),
+        ),
+      )
+      .toBe(true);
     await expect(scroller(page)).toHaveCSS("line-height", "18px");
   });
 });
