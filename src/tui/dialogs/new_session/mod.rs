@@ -625,7 +625,7 @@ impl NewSessionDialog {
             worktree_config_mode: false,
             worktree_config_focused_field: 0,
             sandbox_enabled,
-            sandbox_image: Input::new(config.sandbox.default_image.clone()),
+            sandbox_image: Input::new(config.sandbox.effective_image()),
             docker_available,
             yolo_mode,
             yolo_mode_default: yolo_mode,
@@ -1151,7 +1151,7 @@ impl NewSessionDialog {
         self.worktree_dirty = false;
         self.sandbox_dirty = false;
 
-        self.sandbox_image = Input::new(config.sandbox.default_image.clone());
+        self.sandbox_image = Input::new(config.sandbox.effective_image());
 
         if self.sandbox_enabled {
             self.extra_env = config.sandbox.environment.clone();
@@ -1241,7 +1241,7 @@ impl NewSessionDialog {
             worktree_config_mode: false,
             worktree_config_focused_field: 0,
             sandbox_enabled: false,
-            sandbox_image: Input::new(config.sandbox.default_image.clone()),
+            sandbox_image: Input::new(config.sandbox.effective_image()),
             docker_available: false,
             yolo_mode: false,
             yolo_mode_default: false,
@@ -1325,9 +1325,7 @@ impl NewSessionDialog {
             worktree_config_mode: false,
             worktree_config_focused_field: 0,
             sandbox_enabled: false,
-            sandbox_image: Input::new(
-                containers::get_container_runtime().effective_default_image(),
-            ),
+            sandbox_image: Input::new(SandboxConfig::default().effective_image()),
             docker_available: false,
             yolo_mode: false,
             yolo_mode_default: false,
@@ -2428,7 +2426,7 @@ impl NewSessionDialog {
             path: if self.scratch {
                 String::new()
             } else {
-                self.path.value().trim().to_string()
+                path_input::expand_tilde(self.path.value().trim())
             },
             group: self.group.value().trim().to_string(),
             tool: self.available_tools[self.tool_index].clone(),

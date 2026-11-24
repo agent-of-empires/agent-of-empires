@@ -594,6 +594,16 @@ describe("recent-first cold open + loadOlder (#2236)", () => {
 });
 
 describe("sendPrompt outcomes", () => {
+  it("identifies the dashboard as the prompt's origin", async () => {
+    calls = installAcpFakes(({ url }) =>
+      url.includes("/acp/prompt") ? json({ disposition: "sent" }, 202) : undefined,
+    );
+    const { result, unmount } = await openSession("s-1");
+    await act(() => result.current.sendPrompt("hello"));
+    expect(posts("/acp/prompt")[0]!.headers["X-Aoe-Prompt-Origin"]).toBe("dashboard");
+    unmount();
+  });
+
   it.each([
     ["a 500", () => new Response("boom", { status: 500 })],
     [

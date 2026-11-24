@@ -2261,6 +2261,7 @@ mod serve {
                 attachments: vec![],
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             };
             assert!(!should_trigger_smart_rename(&non_stop, id, &empty, &empty));
 

@@ -39,7 +39,7 @@
     },
     "namespace": { "type": "string", "pattern": "^(debug|release):[a-z0-9._-]{1,200}$" },
     "timestamp": {
-      "description": "Grammar owned by the code, not by this document: `display_timestamp` in src/cli/list.rs emits chrono SecondsFormat::AutoSi in UTC with a `Z` zone, which is 0, 3, 6 or 9 fractional digits, and `valid_timestamp` in src/cli/runtime_read/dto.rs admits exactly those, a whole second included. Any other fractional width, a numeric offset, lowercase separators, a control character and a missing `Z` are refused; change this pattern only with those two functions.",
+      "description": "Grammar owned by the code, not by this document: `display_timestamp` in src/cli/list.rs emits SecondsFormat::AutoSi in UTC with a `Z` zone, which is 0, 3, 6 or 9 fractional digits, and `valid_timestamp` in src/cli/runtime_read/dto.rs admits exactly those, a whole second included. Any other fractional width, a numeric offset, lowercase separators, a control character and a missing `Z` are refused; change this pattern only with those two functions.",
       "type": "string",
       "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.([0-9]{3}|[0-9]{6}|[0-9]{9}))?Z$"
     },
@@ -261,6 +261,7 @@
         "idle_entered_at",
         "last_error",
         "archived_at",
+        "ignored_at",
         "trashed_at",
         "active_snoozed_until",
         "pinned_at",
@@ -305,6 +306,9 @@
           "type": ["string", "null"]
         },
         "archived_at": {
+          "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]
+        },
+        "ignored_at": {
           "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]
         },
         "trashed_at": {

@@ -454,6 +454,24 @@ impl SettingsView {
                     let text = input.value().to_string();
                     let field = &mut self.fields[self.selected_field];
 
+                    // Committing the stored value is a no-op: re-parsing the text could
+                    // still alter it, e.g. an explicit `""` override to unset. A profile
+                    // or repo row that only inherits shows the merged value; committing
+                    // that pins it as an override.
+                    let stored = self.scope == SettingsScope::Global || field.has_override;
+                    let unchanged = stored
+                        && match &field.value {
+                            FieldValue::Text(v) => *v == text,
+                            FieldValue::OptionalText(v) => v.as_deref().unwrap_or_default() == text,
+                            FieldValue::Number(v) => v.to_string() == text,
+                            _ => false,
+                        };
+                    if unchanged {
+                        self.error_message = None;
+                        return SettingsAction::Continue;
+                    }
+
+                    let previous = field.value.clone();
                     match &mut field.value {
                         FieldValue::Text(ref mut v) => {
                             *v = text;
@@ -474,12 +492,13 @@ impl SettingsView {
                     }
 
                     if let Err(e) = field.validate() {
+                        // The row keeps its last valid value; the editor keeps the rejected
+                        // text, which must not count as the stored value on the next Enter.
+                        let rejected = std::mem::replace(&mut field.value, previous);
                         self.error_message = Some(e);
-                        self.editing_input = match &field.value {
-                            FieldValue::Text(v) => Some(Input::new(v.clone())),
-                            FieldValue::OptionalText(v) => {
-                                Some(Input::new(v.clone().unwrap_or_default()))
-                            }
+                        self.editing_input = match rejected {
+                            FieldValue::Text(v) => Some(Input::new(v)),
+                            FieldValue::OptionalText(v) => Some(Input::new(v.unwrap_or_default())),
                             FieldValue::Number(v) => Some(Input::new(v.to_string())),
                             _ => None,
                         };
@@ -1211,6 +1230,167 @@ mod tests {
                     .map(|i| i.value().to_string());
                 assert_eq!(value.as_deref(), Some("FOO=bar"), "paste={paste}");
             }
+        }
+    }
+
+    mod text_edit {
+        use super::*;
+        use crate::session::config::profile_config::{
+            load_profile_config, merge_configs, save_profile_config, ProfileConfig,
+        };
+        use crate::tui::settings::{SettingsFocus, SettingsScope};
+        use serial_test::serial;
+
+        /// Enter on a text row without editing it must not rewrite the value:
+        /// a profile's `default_image = ""` (automatic) would otherwise turn
+        /// into "inherit" and pick up a custom global image.
+        #[test]
+        #[serial]
+        fn committing_an_unchanged_value_keeps_the_override() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let _ = crate::session::Storage::new_unwatched("test").unwrap();
+            crate::session::config::update_config(|c| {
+                c.sandbox.default_image = Some("ghcr.io/example/custom:1".into());
+            })
+            .unwrap();
+            let profile: ProfileConfig =
+                toml::from_str("[sandbox]\ndefault_image = \"\"\n").unwrap();
+            save_profile_config("test", &profile).unwrap();
+
+            let mut view = SettingsView::new("test", None).unwrap();
+            view.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+            assert_eq!(view.scope, SettingsScope::Profile);
+            view.open_search();
+            view.search_selected = view
+                .search_hits
+                .iter()
+                .position(|h| h.field_ident == "sandbox.default_image")
+                .expect("default image is searchable in profile scope");
+            view.jump_to_selected_search_hit();
+            view.focus = SettingsFocus::Fields;
+            assert_eq!(
+                view.fields[view.selected_field].ident(),
+                "sandbox.default_image"
+            );
+
+            for _ in 0..2 {
+                view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            }
+            assert!(view.editing_input.is_none(), "the second Enter commits");
+            view.save().unwrap();
+
+            let saved = load_profile_config("test").unwrap();
+            assert_eq!(
+                saved.overrides["sandbox"]["default_image"],
+                serde_json::json!(""),
+                "{saved:?}"
+            );
+            let global = crate::session::Config::load().unwrap();
+            assert_eq!(
+                merge_configs(global, &saved).sandbox.effective_image(),
+                crate::containers::sandbox_image::automatic_sandbox_image()
+            );
+        }
+
+        /// A profile row shows the merged value; confirming an inherited one pins it, so a
+        /// later change of the global value does not move the profile.
+        #[test]
+        #[serial]
+        fn committing_an_inherited_value_pins_it_as_an_override() {
+            const PINNED: &str = "ghcr.io/example/custom:1";
+            let temp = tempfile::TempDir::new().unwrap();
+            let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let _ = crate::session::Storage::new_unwatched("test").unwrap();
+            crate::session::config::update_config(|c| {
+                c.sandbox.default_image = Some(PINNED.into());
+            })
+            .unwrap();
+
+            let mut view = SettingsView::new("test", None).unwrap();
+            view.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+            assert_eq!(view.scope, SettingsScope::Profile);
+            view.open_search();
+            view.search_selected = view
+                .search_hits
+                .iter()
+                .position(|h| h.field_ident == "sandbox.default_image")
+                .expect("default image is searchable in profile scope");
+            view.jump_to_selected_search_hit();
+            view.focus = SettingsFocus::Fields;
+            assert!(!view.fields[view.selected_field].has_override);
+
+            for _ in 0..2 {
+                view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            }
+            assert!(view.editing_input.is_none(), "the second Enter commits");
+            view.save().unwrap();
+
+            crate::session::config::update_config(|c| {
+                c.sandbox.default_image = Some("ghcr.io/example/other:2".into());
+            })
+            .unwrap();
+            let saved = load_profile_config("test").unwrap();
+            let global = crate::session::Config::load().unwrap();
+            assert_eq!(
+                merge_configs(global, &saved).sandbox.effective_image(),
+                PINNED,
+                "{saved:?}"
+            );
+        }
+
+        /// An invalid edit stays invalid on every confirmation: the editor keeps the text, the
+        /// error stays, and the row keeps its last valid value until a valid one is committed.
+        #[test]
+        #[serial]
+        fn an_invalid_edit_confirmed_twice_is_still_rejected_until_corrected() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let _ = crate::session::Storage::new_unwatched("test").unwrap();
+
+            let mut view = SettingsView::new("test", None).unwrap();
+            view.open_search();
+            view.search_selected = view
+                .search_hits
+                .iter()
+                .position(|h| h.field_ident == "session.snooze_duration_minutes")
+                .expect("snooze duration is searchable");
+            view.jump_to_selected_search_hit();
+            view.focus = SettingsFocus::Fields;
+            let ident = "session.snooze_duration_minutes";
+            assert_eq!(view.fields[view.selected_field].ident(), ident);
+            let valid = match view.fields[view.selected_field].value {
+                FieldValue::Number(n) => n,
+                _ => panic!("a number row"),
+            };
+
+            view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            view.editing_input = Some(tui_input::Input::new("0".to_string()));
+            for _ in 0..2 {
+                view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                assert!(view.error_message.is_some(), "0 is rejected");
+                assert_eq!(
+                    view.editing_input.as_ref().map(|i| i.value().to_string()),
+                    Some("0".to_string()),
+                    "the editor stays open on the rejected text"
+                );
+                assert!(
+                    matches!(view.fields[view.selected_field].value, FieldValue::Number(n) if n == valid),
+                    "the row keeps its last valid value"
+                );
+            }
+
+            // Not the stored value, so the commit is applied rather than skipped.
+            assert_ne!(valid, 45);
+            view.editing_input = Some(tui_input::Input::new("45".to_string()));
+            view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(view.error_message.is_none());
+            assert!(view.editing_input.is_none());
+            assert!(matches!(
+                view.fields[view.selected_field].value,
+                FieldValue::Number(45)
+            ));
+            assert_eq!(view.global_config.session.snooze_duration_minutes, 45);
         }
     }
 

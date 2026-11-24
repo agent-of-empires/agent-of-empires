@@ -71,16 +71,19 @@ fn daemon_status_clears_a_stale_error_message() {
     // Canonical last_error replaces stale pane diagnostics.
     let mut env = create_test_env_empty();
     let id = structured_row(&mut env, Status::Error);
-    env.view.mutate_instance(&id, |inst| {
-        inst.last_error = Some("Container is not running".to_string())
-    });
+    env.view
+        .mutate_instance(&id, |inst| inst.last_error.set("Container is not running"));
 
     env.view
         .apply_daemon_status_update(&update(&env.view, &id, Status::Idle));
 
     let inst = env.view.get_instance(&id).expect("row still present");
     assert_eq!(inst.status, Status::Idle);
-    assert_eq!(inst.last_error, None, "the phantom container error is gone");
+    assert_eq!(
+        inst.last_error.as_deref(),
+        None,
+        "the phantom container error is gone"
+    );
 }
 
 #[test]
@@ -145,7 +148,7 @@ pub(super) fn archived_daemon_snapshot(view: &HomeView, id: &str) -> SessionFeed
         unreachable!()
     };
     Arc::make_mut(&mut snapshot).contents.sessions[0].archived_at =
-        Some(chrono::Utc::now().to_rfc3339());
+        Some(crate::time::Timestamp::now().to_rfc3339());
     SessionFeedResult::Snapshot(snapshot)
 }
 
@@ -174,7 +177,7 @@ fn session_dialogs_follow_their_original_identity_across_snapshots() {
                         branch: "fixture".into(),
                         main_repo_path: "/tmp".into(),
                         managed_by_aoe: true,
-                        created_at: chrono::Utc::now(),
+                        created_at: crate::time::Timestamp::now(),
                         base_branch: None,
                     });
                 });
@@ -201,7 +204,8 @@ fn session_dialogs_follow_their_original_identity_across_snapshots() {
             let next = Arc::make_mut(&mut snapshot);
             match change {
                 "trash" => {
-                    next.contents.sessions[0].trashed_at = Some(chrono::Utc::now().to_rfc3339());
+                    next.contents.sessions[0].trashed_at =
+                        Some(crate::time::Timestamp::now().to_rfc3339());
                     next.contents.sessions[0].lifecycle_generation += 1;
                 }
                 "purge" => next.contents.sessions.retain(|row| row.id != id),
@@ -911,8 +915,9 @@ fn terminal_rows_take_status_and_observations_from_the_daemon_only() {
     env.view.mutate_instance(&id, |instance| {
         instance.view = crate::session::View::Terminal;
         instance.status = Status::Running;
-        instance.last_error =
-            Some("tmux session is gone. The agent process may have exited or been killed.".into());
+        instance
+            .last_error
+            .set("tmux session is gone. The agent process may have exited or been killed.");
         instance.pane_dead_observed = false;
         instance.agent_pane = PaneObservation::default();
         instance.auxiliary = vec![crate::session::AuxiliaryObservation {
@@ -947,7 +952,7 @@ fn terminal_rows_take_status_and_observations_from_the_daemon_only() {
     env.view.apply_session_feed();
     let instance = env.view.get_instance(&id).unwrap();
     assert_eq!(instance.status, Status::Idle);
-    assert_eq!(instance.last_error, None);
+    assert_eq!(instance.last_error.as_deref(), None);
     assert_eq!(instance.agent_pane.state, PanePresence::Alive);
     assert_eq!(
         instance.auxiliary_presence(&AuxiliaryTarget::Host { index: 0 }),
@@ -1185,7 +1190,7 @@ fn daemon_status_reconciles_last_error_on_a_same_status_tick() {
         let mut env = create_test_env_empty();
         let id = structured_row(&mut env, status);
         env.view
-            .mutate_instance(&id, |inst| inst.last_error = Some(seeded.to_string()));
+            .mutate_instance(&id, |inst| inst.last_error.set(seeded));
 
         let mut u = update(&env.view, &id, status);
         u.last_error = incoming.map(str::to_string);
@@ -1194,7 +1199,7 @@ fn daemon_status_reconciles_last_error_on_a_same_status_tick() {
         assert_eq!(
             env.view
                 .get_instance(&id)
-                .and_then(|i| i.last_error.clone()),
+                .and_then(|i| i.last_error.as_deref().map(str::to_owned)),
             expected.map(str::to_string),
             "status={status:?} incoming={incoming:?}"
         );
@@ -1228,7 +1233,7 @@ fn daemon_update_clears_cached_approvals_when_a_row_is_sunk() {
         env.view
             .structured_pending_approvals
             .insert(id.clone(), pending_daemon_approvals());
-        let now = chrono::Utc::now();
+        let now = crate::time::Timestamp::now();
         env.view.mutate_instance(&id, |inst| {
             if label == "archived" {
                 inst.archived_at = Some(now);
@@ -1268,7 +1273,7 @@ fn terminal_status_converges_in_one_feed_apply_without_a_local_probe() {
     env.view.mutate_instance(&id, |instance| {
         instance.view = crate::session::View::Terminal;
         instance.status = Status::Running;
-        instance.last_error = Some("stale local probe error".into());
+        instance.last_error.set("stale local probe error");
         instance.pane_dead_observed = false;
         instance.agent_pane = PaneObservation {
             state: PanePresence::Alive,
@@ -1345,7 +1350,7 @@ fn daemon_stop_result_lands_stopped_without_a_local_write() {
     let id = env.view.instance_at(0).id.clone();
     env.view.mutate_instance(&id, |inst| {
         inst.status = Status::Running;
-        inst.last_error = Some("stale local probe error".into());
+        inst.last_error.set("stale local probe error");
     });
 
     let mut respond = env.view.session_feed.command_driver_for_test();
@@ -1362,7 +1367,7 @@ fn daemon_stop_result_lands_stopped_without_a_local_write() {
     assert_eq!(
         env.view
             .get_instance(&id)
-            .and_then(|inst| inst.last_error.clone()),
+            .and_then(|inst| inst.last_error.as_deref().map(str::to_owned)),
         Some("stale local probe error".to_string())
     );
     let submitted = respond(Ok(crate::daemon::RuntimeCursor {
@@ -1385,7 +1390,7 @@ fn daemon_stop_result_lands_stopped_without_a_local_write() {
     env.view.apply_daemon_status_update(&stopped);
     let inst = env.view.get_instance(&id).expect("row still present");
     assert_eq!(inst.status, Status::Stopped);
-    assert_eq!(inst.last_error, None);
+    assert_eq!(inst.last_error.as_deref(), None);
 }
 
 /// A refused stop submit fails loudly with reconnect guidance and leaves the
@@ -1397,7 +1402,7 @@ fn daemon_unreachable_stop_fails_without_a_local_write() {
     let id = env.view.instance_at(0).id.clone();
     env.view.mutate_instance(&id, |inst| {
         inst.status = Status::Running;
-        inst.last_error = Some("stale local probe error".into());
+        inst.last_error.set("stale local probe error");
     });
 
     // No command driver: the feed has no runtime, so the submit refuses.
@@ -1445,6 +1450,14 @@ fn restart_attachment_waits_for_its_receipt_and_lifecycle_generation() {
         ),
         (
             "Running",
+            PanePresence::Alive,
+            5,
+            Some("restarted-agent"),
+            "test",
+            true,
+        ),
+        (
+            "Unknown",
             PanePresence::Alive,
             5,
             Some("restarted-agent"),
@@ -1597,6 +1610,88 @@ fn restart_attachment_waits_for_its_receipt_and_lifecycle_generation() {
     }
 }
 
+/// Live send into an agent whose status adapter has not classified its screen
+/// yet must attach: the daemon confirms the pane by identity, and the snapshot
+/// reports that same pane alive. A status the row is not in (stopped) still
+/// refuses the attachment.
+#[test]
+#[serial]
+fn live_send_attaches_an_agent_pane_whose_status_is_unclassified() {
+    use crate::daemon::{RuntimeCursor, TerminalTarget, TerminalTargetStatus};
+    use crate::session::{PaneObservation, PanePresence};
+    use crate::tui::home::live_send::LiveSendTarget;
+    use crate::tui::home::panes::PaneIntent;
+
+    for (reflected_status, attach) in [("Unknown", true), ("Stopped", false)] {
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        env.view.select_session_by_id(&id);
+        let mut row = daemon_row(env.view.get_instance(&id).unwrap(), "Unknown");
+        row.view = crate::session::View::Terminal;
+        row.lifecycle_generation = 4;
+        row.agent_pane = PaneObservation {
+            state: PanePresence::Alive,
+            tmux_session: Some("agent-4".into()),
+            legacy_tool: None,
+        };
+        let SessionFeedResult::Snapshot(mut snapshot) = snapshot_of(vec![row]) else {
+            unreachable!()
+        };
+        env.view
+            .session_feed
+            .publish_for_test(SessionFeedResult::Snapshot(snapshot.clone()));
+        env.view.apply_session_feed();
+        let mut respond = env.view.session_feed.engagement_native_driver_for_test();
+        env.view
+            .prepare_live_send_target(&id, LiveSendTarget::Agent, None)
+            .unwrap();
+        assert!(matches!(
+            respond(
+                Ok(RuntimeCursor {
+                    epoch: "test".into(),
+                    revision: 2,
+                }),
+                Some(TerminalTarget {
+                    tmux_session: "agent-4".into(),
+                    status: TerminalTargetStatus::Alive,
+                    lifecycle_generation: 4,
+                    profile: "test".into(),
+                }),
+            ),
+            Some(crate::tui::session_feed::SessionRequest::EnsureAgent { .. })
+        ));
+        env.view.apply_session_feed();
+        assert!(
+            env.view.take_native_attachment().is_none(),
+            "{reflected_status}: the receipt alone is not canonical application"
+        );
+
+        let committed = std::sync::Arc::make_mut(&mut snapshot);
+        committed.cursor.revision = 2;
+        committed.contents.sessions[0].status = reflected_status.into();
+        env.view
+            .session_feed
+            .publish_for_test(SessionFeedResult::Snapshot(snapshot));
+        env.view.apply_session_feed();
+        let attachment = env.view.take_native_attachment();
+        if attach {
+            let attachment = attachment.expect("an unclassified but live pane must go live");
+            assert_eq!(attachment.id, id);
+            assert_eq!(attachment.tmux_name, "agent-4");
+            assert!(matches!(
+                attachment.intent,
+                PaneIntent::LiveSend(LiveSendTarget::Agent)
+            ));
+        } else {
+            assert!(
+                attachment.is_none(),
+                "{reflected_status}: a stopped row must not attach"
+            );
+        }
+        assert!(env.view.take_native_attachment().is_none());
+    }
+}
+
 /// A complete runtime row, with deliberate canonical changes for the scenario.
 fn canonical_row(
     instance: &Instance,
@@ -1706,7 +1801,7 @@ fn canonical_revision_reloads_renames_moves_and_view_changes() {
         branch: "feature".into(),
         main_repo_path: "/tmp/repo".into(),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
         base_branch: Some("main".into()),
     });
     Storage::new_unwatched("test")
@@ -2436,9 +2531,7 @@ fn disk_ahead_reload_keeps_complete_model_and_newer_frame_applies_without_waitin
             Ok(())
         })
         .unwrap();
-    env.view
-        .reload_storage_only()
-        .expect("routine disk-ahead reload is recoverable");
+    env.view.reload_storage_only();
     assert_eq!(
         serde_json::to_value(env.view.cloned_instances()).unwrap(),
         before
@@ -2503,7 +2596,7 @@ fn persistent_metadata_lag_latches_across_revisions_without_focus_theft() {
         1,
     );
     seed_profile("test", &[]);
-    env.view.reload_storage_only().unwrap();
+    env.view.reload_storage_only();
     let first = env.view.canonical_metadata_lag.as_mut().unwrap();
     first.first_seen = std::time::Instant::now() - HomeView::CANONICAL_RELOAD_RETRY_INTERVAL;
     let first_seen = first.first_seen;
@@ -2904,8 +2997,9 @@ fn trash_transition_discards_diff_and_delayed_base_save() {
         .as_mut()
         .unwrap()
         .select_branch("review".into());
-    env.view
-        .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+    env.view.mutate_instance(&id, |inst| {
+        inst.trashed_at = Some(crate::time::Timestamp::now())
+    });
     env.view.drain_pending_diff_override();
     assert!(commands(Err("unexpected diff save".into())).is_none());
     env.view.enforce_trash_read_only();
@@ -2936,8 +3030,9 @@ fn trash_transition_cancels_auxiliary_stop_confirmation_and_late_submit() {
             "fixture",
             "stop_auxiliary",
         ));
-        env.view
-            .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+        env.view.mutate_instance(&id, |inst| {
+            inst.trashed_at = Some(crate::time::Timestamp::now())
+        });
         if late_submit {
             env.view.dispatch_confirm_submit("stop_auxiliary");
         } else {
@@ -2972,7 +3067,8 @@ fn trash_confirmation_rejects_a_changed_original_target() {
             let next = Arc::make_mut(&mut snapshot);
             match change {
                 "trash" => {
-                    next.contents.sessions[0].trashed_at = Some(chrono::Utc::now().to_rfc3339());
+                    next.contents.sessions[0].trashed_at =
+                        Some(crate::time::Timestamp::now().to_rfc3339());
                     next.contents.sessions[0].lifecycle_generation += 1;
                 }
                 "generation" => next.contents.sessions[0].lifecycle_generation += 1,
@@ -3540,7 +3636,7 @@ fn purge_dialog_rejects_stale_target_on_keyboard_and_mouse() {
                 unreachable!()
             };
             let row = &mut Arc::make_mut(&mut snapshot).contents.sessions[0];
-            row.trashed_at = Some(chrono::Utc::now().to_rfc3339());
+            row.trashed_at = Some(crate::time::Timestamp::now().to_rfc3339());
             row.trash_lifecycle_id = Some(uuid::Uuid::new_v4().to_string());
             row.lifecycle_generation = 7;
             env.view
@@ -3607,8 +3703,10 @@ fn purge_dialog_rejects_stale_target_on_keyboard_and_mouse() {
                     }
                     "generation" => row.lifecycle_generation += 1,
                     "timestamp" => {
-                        row.trashed_at =
-                            Some((chrono::Utc::now() + chrono::Duration::seconds(1)).to_rfc3339())
+                        row.trashed_at = Some(
+                            (crate::time::Timestamp::now() + crate::time::Duration::seconds(1))
+                                .to_rfc3339(),
+                        )
                     }
                     "uuid" => row.trash_lifecycle_id = Some(uuid::Uuid::new_v4().to_string()),
                     "selection" => {}
@@ -3654,7 +3752,7 @@ fn retained_trash_context_menu_keeps_opening_epoch() {
             row.lifecycle_reservation = Some(LifecycleReservation {
                 op: LifecycleOperation::Trash,
                 generation: 4,
-                at: chrono::Utc::now() - chrono::Duration::hours(1),
+                at: crate::time::Timestamp::now() - crate::time::Duration::hours(1),
             });
         });
         env.view.trashed_section_collapsed = false;
@@ -3724,9 +3822,9 @@ async fn keyboard_palette_recovery_executes_captured_commands_and_preserves_file
                     LifecycleOperation::Trash,
                     Instance::LIFECYCLE_RESERVATION_TTL,
                     if fresh {
-                        chrono::Utc::now()
+                        crate::time::Timestamp::now()
                     } else {
-                        chrono::Utc::now() - chrono::Duration::hours(1)
+                        crate::time::Timestamp::now() - crate::time::Duration::hours(1)
                     },
                 )
                 .unwrap();

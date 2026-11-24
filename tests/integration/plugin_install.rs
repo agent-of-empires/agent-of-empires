@@ -78,7 +78,7 @@ fn legacy_runtime_requires_worker_declaration() {
                     grant: Some(CapabilityGrant {
                         manifest_hash: PluginManifest::hash_bytes(manifest.as_bytes()),
                         capabilities,
-                        granted_at: chrono::Utc::now(),
+                        granted_at: agent_of_empires::time::Timestamp::now(),
                     }),
                     ..Default::default()
                 },

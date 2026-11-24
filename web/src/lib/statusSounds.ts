@@ -31,7 +31,9 @@ const MUTE_FLAG = {
 } as const;
 
 function eventFor(s: SessionResponse): StatusSoundEvent | undefined {
-  if (s.archived_at != null || s.snoozed_until != null || s.trashed_at != null) return undefined;
+  if (s.archived_at != null || s.ignored_at != null || s.snoozed_until != null || s.trashed_at != null) {
+    return undefined;
+  }
   const event = EVENT_FOR_STATUS[s.status];
   // A session muted for push notifications is muted here too.
   if (event && s[MUTE_FLAG[event]] === false) return undefined;

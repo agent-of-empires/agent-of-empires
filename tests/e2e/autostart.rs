@@ -1,4 +1,4 @@
-//! A CLI command that needs the daemon starts one, exactly once under a race,
+//! A CLI command or the TUI that needs the daemon starts one, exactly once under a race,
 //! and `--no-autostart` / `AOE_NO_AUTOSTART` opt out.
 
 use serial_test::parallel;
@@ -55,9 +55,11 @@ fn opt_out_hard_fails_without_spawning() {
     );
 }
 
+/// With autostart off and no Daemon, the TUI refuses to open and starts nothing; once a
+/// core runs, the TUI reuses it.
 #[test]
 #[parallel]
-fn native_opt_out_refuses_spawn_and_reuses_existing_core() {
+fn native_opt_out_refuses_to_open_and_reuses_existing_core() {
     crate::harness::require_tmux!();
     for use_env in [false, true] {
         let mut h = TuiTestHarness::new_in_tmp(if use_env {
@@ -67,13 +69,15 @@ fn native_opt_out_refuses_spawn_and_reuses_existing_core() {
         });
         h.stop_daemon_on_drop();
         h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
-        if use_env {
+        let args: &[&str] = if use_env {
             h.set_env("AOE_NO_AUTOSTART", "1");
-            h.spawn_tui();
+            &[]
         } else {
-            h.spawn(&["--no-autostart"]);
-        }
-        h.wait_for("Not responding");
+            &["--no-autostart"]
+        };
+        let (status, stderr) = h.run_tui_to_exit(args);
+        assert_ne!(status, 0, "the TUI opened without a Daemon");
+        assert!(stderr.contains("autostart is disabled"), "{stderr}");
         let app = app_dir_in(h.home_path());
         assert!(!app.join("serve.pid").exists(), "opt-out started a daemon");
         assert!(
@@ -83,15 +87,15 @@ fn native_opt_out_refuses_spawn_and_reuses_existing_core() {
 
         h.run_cli_ok(&["serve", "--core-only", "--daemon"]);
         let original_pid = std::fs::read_to_string(app.join("serve.pid")).unwrap();
-        h.send_keys("r");
+        h.spawn(args);
         h.wait_for_runtime_ready();
         assert_eq!(
             std::fs::read_to_string(app.join("serve.pid")).unwrap(),
             original_pid,
-            "reconnect replaced the existing owner"
+            "the TUI replaced the existing owner"
         );
         let launch: serde_json::Value =
             serde_json::from_slice(&std::fs::read(app.join("serve.launch")).unwrap()).unwrap();
-        assert_eq!(launch["core_only"], true, "reconnect changed exposure");
+        assert_eq!(launch["core_only"], true, "the TUI changed exposure");
     }
 }

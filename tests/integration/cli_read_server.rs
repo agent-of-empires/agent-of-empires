@@ -210,7 +210,7 @@ async fn the_route_shares_the_daemon_credential_gate() {
             .expect("the credential accepted by daemon auth must admit the runtime read");
         let hello = socket.next().await.unwrap().unwrap().into_text().unwrap();
         let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
-        assert_eq!(hello["data"]["protocol_version"], 4);
+        assert_eq!(hello["data"]["protocol_version"], 5);
         assert_eq!(hello["data"]["local_owner"], false);
         assert_eq!(hello["data"]["owner"]["uid"], serde_json::Value::Null);
         socket.close(None).await.unwrap();
@@ -320,7 +320,7 @@ async fn a_failed_host_hook_does_not_poison_runtime_reads() {
     failed.tool = "claude".into();
     failed.source_profile = "main".into();
     failed.status = Status::Error;
-    failed.last_error = Some(failure.clone());
+    failed.last_error.set(failure.clone());
     let mut healthy = Instance::new("healthy independent row", "/healthy-repo");
     healthy.id = "healthy-row".into();
     healthy.tool = "claude".into();
@@ -334,7 +334,7 @@ async fn a_failed_host_hook_does_not_poison_runtime_reads() {
         let mut rows = state.instances.write().await;
         let failed = rows.iter_mut().find(|row| row.id == "failed-hook").unwrap();
         failed.status = Status::Error;
-        failed.last_error = Some(failure.clone());
+        failed.last_error.set(failure.clone());
     }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -639,9 +639,7 @@ async fn archive_and_trash_after_a_clock_correction_remain_readable() {
     let _home = TempAppDir::new();
     agent_of_empires::session::create_profile("main").unwrap();
     agent_of_empires::session::create_profile("healthy").unwrap();
-    let future = chrono::DateTime::parse_from_rfc3339("9999-12-31T23:59:59Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let future = agent_of_empires::time::Timestamp::parse_rfc3339("9999-12-31T23:59:59Z").unwrap();
     let mut live = Instance::new("clock live", "/repo");
     live.id = "live-row".into();
     live.source_profile = "main".into();

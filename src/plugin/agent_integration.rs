@@ -1525,7 +1525,7 @@ send_keys_enter_delay_ms = {delay_ms}
                             manifest.as_bytes(),
                         ),
                         capabilities: vec!["session.integration".into()],
-                        granted_at: chrono::Utc::now(),
+                        granted_at: crate::time::Timestamp::now(),
                     }),
                     ..PluginConfig::default()
                 },
@@ -1569,7 +1569,7 @@ oneshot_flag = "-p"
                             manifest.as_bytes(),
                         ),
                         capabilities: Vec::new(),
-                        granted_at: chrono::Utc::now(),
+                        granted_at: crate::time::Timestamp::now(),
                     }),
                     ..Default::default()
                 },
@@ -1654,7 +1654,7 @@ oneshot_flag = "-p"
                                 manifest.as_bytes(),
                             ),
                             capabilities: Vec::new(),
-                            granted_at: chrono::Utc::now(),
+                            granted_at: crate::time::Timestamp::now(),
                         }),
                         ..Default::default()
                     },
@@ -1823,7 +1823,7 @@ mode = "native_only"
                             manifest.as_bytes(),
                         ),
                         capabilities: vec!["session.integration".into()],
-                        granted_at: chrono::Utc::now(),
+                        granted_at: crate::time::Timestamp::now(),
                     }),
                     ..Default::default()
                 },
@@ -1918,7 +1918,7 @@ sandbox = "unsupported"
                             manifest.as_bytes(),
                         ),
                         capabilities: Vec::new(),
-                        granted_at: chrono::Utc::now(),
+                        granted_at: crate::time::Timestamp::now(),
                     }),
                     ..Default::default()
                 },
@@ -2609,7 +2609,7 @@ command = "acme-omp-shim"
                             manifest.as_bytes(),
                         ),
                         capabilities: Vec::new(),
-                        granted_at: chrono::Utc::now(),
+                        granted_at: crate::time::Timestamp::now(),
                     }),
                     ..Default::default()
                 },

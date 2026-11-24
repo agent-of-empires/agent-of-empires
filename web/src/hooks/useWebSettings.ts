@@ -1,5 +1,6 @@
 import { useCallback, useSyncExternalStore } from "react";
 
+import { DEFAULT_HISTORY_WINDOW } from "../lib/acpHistoryWindow";
 import { DEFAULT_CONVERSATION_FONT_SIZE, normalizeConversationFontSize } from "../lib/conversationFontSize";
 import {
   DEFAULT_PERSISTENT_STRUCTURED_VIEWS,
@@ -7,6 +8,7 @@ import {
 } from "../lib/persistentStructuredViews";
 import { DEFAULT_PERSISTENT_TERMINALS, normalizePersistentTerminalLimit } from "../lib/persistentTerminals";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
+import { normalizeStructuredHistoryWindow } from "../lib/structuredHistoryWindow";
 import { DEFAULT_TOOLBAR_KEYS, normalizeToolbarKeys, type ToolbarKeyId } from "../lib/terminalToolbarKeys";
 
 const STORAGE_KEY = "aoe-web-settings";
@@ -16,6 +18,8 @@ export interface WebSettings {
   desktopFontSize: number;
   structuredMobileFontSize: number;
   structuredDesktopFontSize: number;
+  /** Rows a structured view shows when a session opens. */
+  structuredHistoryWindow: number;
   terminalFontFamily: string;
   autoOpenKeyboard: boolean;
   persistentTerminals: boolean;
@@ -29,9 +33,6 @@ export interface WebSettings {
   collapsedDiffDirs: string[];
   sidebarSide: "left" | "right";
   sidebarCompact: boolean;
-  autoOpenDiffPane: boolean;
-  autoOpenTerminalPane: boolean;
-  autoOpenPluginPanes: boolean;
   /** Ordered key row above the soft keyboard in the live terminal. */
   mobileToolbarKeys: ToolbarKeyId[];
   showArrowJoystick: boolean;
@@ -45,6 +46,7 @@ function getDefaults(): WebSettings {
     desktopFontSize: 14,
     structuredMobileFontSize: DEFAULT_CONVERSATION_FONT_SIZE,
     structuredDesktopFontSize: DEFAULT_CONVERSATION_FONT_SIZE,
+    structuredHistoryWindow: DEFAULT_HISTORY_WINDOW,
     terminalFontFamily: "",
     autoOpenKeyboard: true,
     persistentTerminals: false,
@@ -58,9 +60,6 @@ function getDefaults(): WebSettings {
     collapsedDiffDirs: [],
     sidebarSide: "left",
     sidebarCompact: false,
-    autoOpenDiffPane: true,
-    autoOpenTerminalPane: true,
-    autoOpenPluginPanes: false,
     mobileToolbarKeys: [...DEFAULT_TOOLBAR_KEYS],
     showArrowJoystick: true,
     showForwardScrollbar: false,
@@ -81,11 +80,9 @@ function normalizeSnapshot(settings: WebSettings): WebSettings {
     maxPersistentStructuredViews: normalizePersistentStructuredViewLimit(settings.maxPersistentStructuredViews),
     structuredMobileFontSize: normalizeConversationFontSize(settings.structuredMobileFontSize),
     structuredDesktopFontSize: normalizeConversationFontSize(settings.structuredDesktopFontSize),
+    structuredHistoryWindow: normalizeStructuredHistoryWindow(settings.structuredHistoryWindow),
     fileEditing: normalizeBool(settings.fileEditing, defaults.fileEditing),
     sidebarCompact: normalizeBool(settings.sidebarCompact, defaults.sidebarCompact),
-    autoOpenDiffPane: normalizeBool(settings.autoOpenDiffPane, defaults.autoOpenDiffPane),
-    autoOpenTerminalPane: normalizeBool(settings.autoOpenTerminalPane, defaults.autoOpenTerminalPane),
-    autoOpenPluginPanes: normalizeBool(settings.autoOpenPluginPanes, defaults.autoOpenPluginPanes),
     mobileToolbarKeys: normalizeToolbarKeys(settings.mobileToolbarKeys),
     showArrowJoystick: normalizeBool(settings.showArrowJoystick, defaults.showArrowJoystick),
     showForwardScrollbar: normalizeBool(settings.showForwardScrollbar, defaults.showForwardScrollbar),

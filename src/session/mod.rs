@@ -88,6 +88,7 @@ pub(crate) use instance::test_helpers::frozen_test_helper;
 pub(crate) use instance::test_helpers::{publish_host_pi_transcript, seed_claude_transcript};
 #[cfg(test)]
 pub(crate) use instance::ActiveExecution;
+pub use instance::LastError;
 pub(crate) use instance::CAPTURE_FAILED_RULE;
 pub(crate) use instance::{
     duplicate_session_error, is_duplicate_session, persist_session_with_storage,
@@ -109,9 +110,10 @@ pub use instance::{
     PendingInitialTurn, PluginCreateIdempotency, PollerStart, SandboxInfo, SandboxLoginRequired,
     SandboxLoginUnsupported, SessionBucket, SessionGone, StartBlocked, StartOutcome, Status,
     TerminalInfo, TmuxServerIdentity, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
-    SESSION_COLORS, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR,
+    MAX_INITIAL_PROMPT_BYTES, SESSION_COLORS, TMUX_SERVER_UNREACHABLE_ERROR,
+    TMUX_SESSION_GONE_ERROR,
 };
-pub(crate) use instance::{resolved_agent_for, UNBOUND_STORE_HINT};
+pub(crate) use instance::{reports_tmux_session_gone, resolved_agent_for, UNBOUND_STORE_HINT};
 pub(crate) use instance::{
     ConversationState, LaunchFinalizationPending, LaunchReservation, ManagedResumeRefused,
     ResumeAttemptPolicy, ResumeLaunchOptions, ResumeProfileConfig, TerminalContextResume,
@@ -122,9 +124,11 @@ pub use instance::{
 };
 pub(crate) use instance::{Held, SandboxPin, Unserved};
 pub(crate) use instance::{
-    TerminalHandoffContext, TerminalHandoffIntent, TerminalHandoffKey, TerminalHandoffStage,
-    TerminalHandoffUnbornFence,
+    TerminalHandoffContext, TerminalHandoffIntent, TerminalHandoffKey, TerminalHandoffOutcome,
+    TerminalHandoffStage, TerminalHandoffUnbornFence,
 };
+#[cfg(test)]
+pub(crate) use instance::{TmuxAbsence, TMUX_SESSION_GONE_LEAD};
 #[cfg(test)]
 pub(crate) use move_journal::{
     record as record_move_journal, MoveJournalEntry, MOVE_JOURNAL_VERSION,
