@@ -59,3 +59,13 @@ lenses:
       - docker/**
       - acp-worker/**
       - '!src/tui/**'
+  - ref: ./tessl-plugins/aoe-maintainer/lenses/aoe-keyboard-focus/SKILL.md
+    globs:
+      - web/src/**
+      - src/tui/**
+      - '!web/src/lib/generated/**'
+      - '!**/*.test.ts'
+      - '!**/*.test.tsx'
+      - '!**/__tests__/**'
+      - '!src/tui/**/tests/**'
+      - '!src/tui/**/tests.rs'
