@@ -1,5 +1,6 @@
-//! OSC 8 hyperlink extraction. `vt100` drops OSC 8, so targets are kept beside
-//! the grid, paired with the visible text they wrapped.
+//! OSC 8 hyperlinks: [`GridLinks`] keeps them on a vt100 grid's cells, which
+//! vt100 itself cannot, and [`extract_links`] pairs each target in a frame's
+//! text with the visible text it wraps.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PaneLink {
@@ -23,7 +24,7 @@ fn usable_uri(uri: &str) -> bool {
     crate::session::preview_link_openable(uri) && !uri.chars().any(char::is_control)
 }
 
-pub(crate) struct Osc8Scanner {
+struct Osc8Scanner {
     buf: Vec<u8>,
 }
 
@@ -38,11 +39,11 @@ enum Seq {
 }
 
 impl Osc8Scanner {
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self { buf: Vec::new() }
     }
 
-    pub(crate) fn feed(&mut self, chunk: &[u8]) -> Vec<PaneLink> {
+    fn feed(&mut self, chunk: &[u8]) -> Vec<PaneLink> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
         loop {
@@ -89,7 +90,7 @@ impl Osc8Scanner {
     }
 
     /// Emit a link whose close never arrived, for one-shot (non-streaming) input.
-    pub(crate) fn finish(&mut self) -> Option<PaneLink> {
+    fn finish(&mut self) -> Option<PaneLink> {
         let start = find(&self.buf, OSC8_OPEN)?;
         self.buf.drain(..start);
         let Seq::Found { uri, consumed } = parse_seq(&self.buf) else {
@@ -174,6 +175,334 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         from = start + 1;
     }
     None
+}
+
+/// Zero-width code points appended to every cell printed inside an OSC 8 run,
+/// naming the run's target. vt100 keeps them as part of the cell's contents,
+/// so the target moves with the cell through scrolling, erasure, insertion and
+/// scrollback without a parallel position table. Variation Selectors
+/// Supplement: zero width, and meaningless outside ideographic variation
+/// sequences, which pane output does not carry (stray ones are dropped).
+const MARK_BASE: u32 = 0xE0100;
+const MARK_RADIX: u32 = 240;
+/// Distinct targets one grid names at once; a run past this prints as plain
+/// text until [`GridLinks::reclaim`] frees an id no cell names any more.
+const MAX_GRID_LINKS: usize = 1024;
+/// A reclaim that frees fewer ids than this skips the next this many
+/// reclaims, so a flood of new targets cannot rescan the grid per link.
+const RECLAIM_COOLDOWN: usize = MAX_GRID_LINKS / 16;
+/// vt100 stops appending to a cell at 18 of its 22 bytes, and both marks
+/// (8 bytes) must still fit behind the zero-width code points they follow.
+const MARKED_CELL_LIMIT: usize = 14;
+
+fn is_mark(c: char) -> bool {
+    (MARK_BASE..MARK_BASE + MARK_RADIX).contains(&u32::from(c))
+}
+
+fn push_mark(out: &mut Vec<u8>, id: u16) {
+    let id = u32::from(id);
+    let mut buf = [0u8; 4];
+    for digit in [id / MARK_RADIX, id % MARK_RADIX] {
+        let c = char::from_u32(MARK_BASE + digit).expect("mark range is valid");
+        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    }
+}
+
+/// A cell's visible text and the link id its marks name, if any.
+pub(crate) fn split_cell(contents: &str) -> (std::borrow::Cow<'_, str>, Option<u16>) {
+    if !contents.chars().any(is_mark) {
+        return (std::borrow::Cow::Borrowed(contents), None);
+    }
+    let digits: Vec<u32> = contents
+        .chars()
+        .filter(|&c| is_mark(c))
+        .map(|c| u32::from(c) - MARK_BASE)
+        .collect();
+    let id = match digits[..] {
+        [.., hi, lo] => u16::try_from(hi * MARK_RADIX + lo).ok(),
+        _ => None,
+    };
+    let text: String = contents.chars().filter(|&c| !is_mark(c)).collect();
+    (std::borrow::Cow::Owned(text), id)
+}
+
+/// OSC 8 state for one vt100 grid, stored as the parser's callbacks so a
+/// reseed that replaces the parser replaces this with it.
+///
+/// [`Self::mark`] runs the stream through its own `vte` parser to find each
+/// glyph printed inside a hyperlink and appends that link's mark after the
+/// glyph and any zero-width code points joining its cell. vt100 then stores
+/// the mark in the same cell.
+#[derive(Default)]
+pub(crate) struct GridLinks {
+    vte: vte::Parser,
+    scan: LinkScan,
+}
+
+struct Target {
+    uri: String,
+    /// Whether the primary and the alternate grid may hold a cell naming it.
+    on: [bool; 2],
+}
+
+/// What the byte just fed completed.
+#[derive(Default, Clone, Copy)]
+enum Event {
+    #[default]
+    None,
+    /// A glyph vt100 draws into a new cell, of this many UTF-8 bytes.
+    Glyph(usize),
+    /// A zero-width code point vt100 appends to the previous cell.
+    ZeroWidth(usize),
+    /// A mark code point arriving from the pane, to drop.
+    Stray,
+    /// A control, escape, or OSC, after which a later zero-width code point
+    /// may land on another cell.
+    Other,
+}
+
+#[derive(Default)]
+struct LinkScan {
+    active: Option<u16>,
+    targets: Vec<Option<Target>>,
+    free: Vec<u16>,
+    ids: std::collections::HashMap<String, u16>,
+    /// The alternate grid is the one being drawn.
+    alt: bool,
+    /// A target that found the table full, waiting on [`GridLinks::reclaim`].
+    starved: Option<String>,
+    cooldown: usize,
+    event: Event,
+}
+
+impl LinkScan {
+    fn intern(&mut self, uri: &str) -> Option<u16> {
+        if let Some(&id) = self.ids.get(uri) {
+            return Some(id);
+        }
+        let id = match self.free.pop() {
+            Some(id) => id,
+            None if self.targets.len() < MAX_GRID_LINKS => {
+                self.targets.push(None);
+                u16::try_from(self.targets.len() - 1).ok()?
+            }
+            None => return None,
+        };
+        self.targets[usize::from(id)] = Some(Target {
+            uri: uri.to_string(),
+            on: [false; 2],
+        });
+        self.ids.insert(uri.to_string(), id);
+        Some(id)
+    }
+
+    fn open(&mut self, uri: &str) -> Option<u16> {
+        let id = self.intern(uri);
+        if id.is_none() {
+            if self.cooldown == 0 {
+                self.starved = Some(uri.to_string());
+            } else {
+                self.cooldown -= 1;
+            }
+        }
+        id
+    }
+}
+
+impl vte::Perform for LinkScan {
+    fn print(&mut self, c: char) {
+        if is_mark(c) {
+            self.event = Event::Stray;
+            return;
+        }
+        // Mirrors which code points vt100 draws into a new cell.
+        if c == '\u{fffd}' || ('\u{80}'..'\u{a0}').contains(&c) {
+            return;
+        }
+        if unicode_width::UnicodeWidthChar::width(c).unwrap_or(1) == 0 {
+            self.event = Event::ZeroWidth(c.len_utf8());
+            return;
+        }
+        self.event = Event::Glyph(c.len_utf8());
+        let grid = usize::from(self.alt);
+        if let Some(Some(target)) = self.active.map(|id| &mut self.targets[usize::from(id)]) {
+            target.on[grid] = true;
+        }
+    }
+
+    fn execute(&mut self, _byte: u8) {
+        self.event = Event::Other;
+    }
+
+    fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, _action: char) {
+        self.event = Event::Other;
+    }
+
+    fn csi_dispatch(
+        &mut self,
+        params: &vte::Params,
+        intermediates: &[u8],
+        _ignore: bool,
+        action: char,
+    ) {
+        self.event = Event::Other;
+        if intermediates != b"?" || !matches!(action, 'h' | 'l') {
+            return;
+        }
+        // The modes vt100 switches grids on; 1049 clears the alternate grid.
+        for param in params {
+            match (param, action) {
+                ([47], _) => self.alt = action == 'h',
+                ([1049], 'h') => {
+                    self.alt = true;
+                    for target in self.targets.iter_mut().flatten() {
+                        target.on[1] = false;
+                    }
+                }
+                ([1049], _) => self.alt = false,
+                _ => {}
+            }
+        }
+    }
+
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        self.event = Event::Other;
+        let [b"8", _, uri @ ..] = params else {
+            return;
+        };
+        // vte splits on every `;`, including any inside the URI.
+        let uri = uri.join(&b';');
+        self.active = match std::str::from_utf8(&uri) {
+            Ok("") => None,
+            Ok(uri) if uri.len() <= MAX_URI && usable_uri(uri) => self.open(uri),
+            _ => None,
+        };
+    }
+
+    fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        self.event = Event::Other;
+        // RIS resets the terminal, hyperlink and both grids included.
+        if intermediates.is_empty() && byte == b'c' {
+            self.active = None;
+            self.alt = false;
+            for target in self.targets.iter_mut().flatten() {
+                target.on = [false; 2];
+            }
+        }
+    }
+}
+
+impl vt100::Callbacks for GridLinks {}
+
+/// A glyph's mark not yet written: it goes at byte `at` of the chunk, after
+/// whatever zero-width code points joined the glyph's `cell` bytes.
+struct Owed {
+    id: u16,
+    at: usize,
+    cell: usize,
+}
+
+impl GridLinks {
+    /// The leading `.1` bytes of `bytes` with a mark after each glyph printed
+    /// inside a hyperlink, ready for the grid's own `process`. Fewer than all
+    /// bytes when a target found the table full: process them, then call
+    /// [`Self::reclaim`] and mark the rest. Borrows when nothing needed marking.
+    pub(crate) fn mark<'a>(&mut self, bytes: &'a [u8]) -> (std::borrow::Cow<'a, [u8]>, usize) {
+        let mut out: Option<Vec<u8>> = None;
+        let mut flushed = 0;
+        let mut owed: Option<Owed> = None;
+        let settle = |out: &mut Option<Vec<u8>>, flushed: &mut usize, owed: Option<Owed>| {
+            if let Some(owed) = owed {
+                let out = out.get_or_insert_with(|| Vec::with_capacity(bytes.len() + 64));
+                out.extend_from_slice(&bytes[*flushed..owed.at]);
+                push_mark(out, owed.id);
+                *flushed = owed.at;
+            }
+        };
+        let mut used = bytes.len();
+        for i in 0..bytes.len() {
+            self.vte.advance(&mut self.scan, &bytes[i..=i]);
+            match std::mem::take(&mut self.scan.event) {
+                Event::None => {}
+                // vt100 rechecks a cell's width on U+FE0F only when it follows
+                // the glyph directly, so the mark waits behind it.
+                Event::ZeroWidth(len) => match owed.as_mut() {
+                    Some(o) if o.cell + len < MARKED_CELL_LIMIT => {
+                        o.at = i + 1;
+                        o.cell += len;
+                    }
+                    _ => settle(&mut out, &mut flushed, owed.take()),
+                },
+                Event::Glyph(len) => {
+                    settle(&mut out, &mut flushed, owed.take());
+                    owed = self.scan.active.map(|id| Owed {
+                        id,
+                        at: i + 1,
+                        cell: len,
+                    });
+                }
+                Event::Stray => {
+                    settle(&mut out, &mut flushed, owed.take());
+                    let out = out.get_or_insert_with(|| Vec::with_capacity(bytes.len() + 64));
+                    // A mark is four UTF-8 bytes; one split across reads stays.
+                    out.extend_from_slice(&bytes[flushed..(i + 1).saturating_sub(4).max(flushed)]);
+                    flushed = i + 1;
+                }
+                Event::Other => settle(&mut out, &mut flushed, owed.take()),
+            }
+            if self.scan.starved.is_some() {
+                used = i + 1;
+                break;
+            }
+        }
+        settle(&mut out, &mut flushed, owed);
+        let marked = match out {
+            None => std::borrow::Cow::Borrowed(&bytes[..used]),
+            Some(mut out) => {
+                out.extend_from_slice(&bytes[flushed..used]);
+                std::borrow::Cow::Owned(out)
+            }
+        };
+        (marked, used)
+    }
+
+    /// A target is waiting for [`Self::reclaim`].
+    pub(crate) fn starved(&self) -> bool {
+        self.scan.starved.is_some()
+    }
+
+    /// Free every id that no cell of either grid can name, given `live`, the
+    /// ids the drawn grid's cells (scrollback included) name now, then open
+    /// the starved target. The hidden grid's ids stay held until it is drawn.
+    pub(crate) fn reclaim(&mut self, live: &std::collections::HashSet<u16>) {
+        let scan = &mut self.scan;
+        let grid = usize::from(scan.alt);
+        let mut freed = 0;
+        for (id, slot) in scan.targets.iter_mut().enumerate() {
+            let Some(target) = slot else {
+                continue;
+            };
+            let id = u16::try_from(id).expect("ids fit u16");
+            target.on[grid] = live.contains(&id);
+            if target.on == [false; 2] && scan.active != Some(id) {
+                scan.ids.remove(&target.uri);
+                *slot = None;
+                scan.free.push(id);
+                freed += 1;
+            }
+        }
+        if freed < RECLAIM_COOLDOWN {
+            scan.cooldown = RECLAIM_COOLDOWN;
+        }
+        if let Some(uri) = scan.starved.take() {
+            scan.active = scan.intern(&uri);
+        }
+    }
+
+    pub(crate) fn uri(&self, id: u16) -> Option<&str> {
+        let target = self.scan.targets.get(usize::from(id))?.as_ref()?;
+        Some(&target.uri)
+    }
 }
 
 #[cfg(test)]

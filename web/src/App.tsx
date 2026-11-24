@@ -2796,7 +2796,7 @@ function AppContent({
                 activeId={activeWorkspace?.id ?? null}
                 activeSessionId={activeSessionId}
                 open={sidebarOpen}
-                onToggle={() => setSidebarOpen(false)}
+                onOpenChange={setSidebarOpen}
                 onSelect={handleSelectWorkspace}
                 onToggleGroup={toggleSidebarGroup}
                 onNew={(prefill) => {

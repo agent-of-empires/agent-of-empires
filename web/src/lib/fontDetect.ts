@@ -1,39 +1,11 @@
-// Detect installed monospace fonts from a curated list by width probing, which needs no permission, unlike queryLocalFonts().
+// Detect installed fonts by width probing, which needs no permission, unlike queryLocalFonts(). It measures what the
+// page can render, so a font the browser withholds from web content counts as absent.
 
 const BASELINES = ["monospace", "serif", "sans-serif"] as const;
 // Mixed glyphs so differing metrics show a width delta.
 const PROBE = "mmmmmmmmmmlliWQ0Ogq{}[]#@";
 
-// Nerd Fonts are listed under their installed family names.
-export const MONOSPACE_FONT_CANDIDATES = [
-  "JetBrains Mono",
-  "JetBrainsMono Nerd Font",
-  "Fira Code",
-  "FiraCode Nerd Font",
-  "MesloLGS NF",
-  "MesloLGL Nerd Font",
-  "Hack",
-  "Hack Nerd Font",
-  "Cascadia Code",
-  "CaskaydiaCove Nerd Font",
-  "Source Code Pro",
-  "SauceCodePro Nerd Font",
-  "IBM Plex Mono",
-  "Roboto Mono",
-  "Ubuntu Mono",
-  "DejaVu Sans Mono",
-  "Menlo",
-  "Monaco",
-  "SF Mono",
-  "Consolas",
-  "Courier New",
-  "Liberation Mono",
-  "Inconsolata",
-  "Anonymous Pro",
-  "Victor Mono",
-];
-
-export function detectInstalledFonts(candidates: string[] = MONOSPACE_FONT_CANDIDATES): string[] {
+export function detectInstalledFonts(candidates: readonly string[]): string[] {
   const ctx = document.createElement("canvas").getContext("2d");
   if (!ctx) return [];
   const size = 48;

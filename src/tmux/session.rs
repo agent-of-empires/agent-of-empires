@@ -325,6 +325,15 @@ fn chrome_rows(window_height: u16, pane_height: u16) -> u16 {
     }
 }
 
+/// One live-view capture of a session's window.
+#[derive(Debug, Default)]
+pub(crate) struct WindowCapture {
+    pub(crate) content: String,
+    pub(crate) cursor: Option<PaneCursor>,
+    /// Rows of `content` that soft-wrap onto the next row, ascending.
+    pub(crate) wrapped: Vec<u32>,
+}
+
 /// A `capture-pane` result: its output, or `None` when tmux reported failure.
 fn capture_output(success: bool, stdout: &[u8]) -> Option<String> {
     success.then(|| String::from_utf8_lossy(stdout).into_owned())
@@ -953,6 +962,23 @@ impl Session {
         lines: usize,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> Result<(String, Option<PaneCursor>)> {
+        self.capture_window(lines, false, deadline)
+            .map(|capture| (capture.content, capture.cursor))
+    }
+
+    /// [`Self::capture_window_composited_with_cursor`] plus which rows
+    /// soft-wrap, for the Web dashboard. A composited window reports none.
+    pub(crate) fn capture_window_with_wraps(&self, lines: usize) -> Result<WindowCapture> {
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.capture_window(lines, true, &deadline)
+    }
+
+    fn capture_window(
+        &self,
+        lines: usize,
+        with_wraps: bool,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> Result<WindowCapture> {
         /// Gates the window-dimensions line. A chained `display-message` can
         /// silently produce nothing while the invocation still exits 0 (the
         /// same hazard `is_probe_line` guards in the vt seed path), and without
@@ -968,6 +994,8 @@ impl Session {
         let pane0 = super::utils::first_pane_id_with_deadline(&self.name, deadline)
             .ok_or_else(|| anyhow::anyhow!("No agent pane in session {}", self.name))?;
         let window = &pane0;
+        let start = format!("-{}", lines);
+        let joined_mark = with_wraps.then(crate::tmux::wraps::sentinel);
         let mut command = crate::tmux::tmux_command();
         command.args([
             "display-message",
@@ -994,8 +1022,29 @@ impl Session {
             // Keep trailing bg fills, matching the VT path.
             "-N",
             "-S",
-            &format!("-{}", lines),
+            &start,
             ";",
+        ]);
+        // The same window with wrapped rows joined, for the wrap flags.
+        if let Some(mark) = &joined_mark {
+            command.args([
+                "display-message",
+                "-p",
+                "-t",
+                &pane0,
+                mark,
+                ";",
+                "capture-pane",
+                "-t",
+                &pane0,
+                "-p",
+                "-J",
+                "-S",
+                &start,
+                ";",
+            ]);
+        }
+        command.args([
             "display-message",
             "-p",
             "-t",
@@ -1006,7 +1055,7 @@ impl Session {
         let output = deadline.run(&mut command)?;
 
         if !output.status.success() {
-            return Ok((String::new(), None));
+            return Ok(WindowCapture::default());
         }
 
         // The first line carrying neither sentinel starts the capture.
@@ -1056,26 +1105,60 @@ impl Session {
         } else {
             unreliable_position(cursor_before)
         };
+        let (pane0_content, wrapped) = match &joined_mark {
+            Some(mark) => {
+                match crate::tmux::wraps::split_at_sentinel(pane0_content.as_bytes(), mark) {
+                    Some((rows, joined)) => {
+                        let wrapped = crate::tmux::wraps::soft_wraps(
+                            &String::from_utf8_lossy(rows),
+                            &String::from_utf8_lossy(joined),
+                        );
+                        let mut rows = rows.to_vec();
+                        if let Some(cursor) = &cursor {
+                            crate::tmux::wraps::relink_continuations(
+                                &pane0,
+                                &mut rows,
+                                &wrapped,
+                                cursor.pane_height,
+                                deadline,
+                            );
+                        }
+                        (String::from_utf8_lossy(&rows).into_owned(), wrapped)
+                    }
+                    // The joined half went missing; its bytes must not render.
+                    None => return Ok(WindowCapture::default()),
+                }
+            }
+            None => (pane0_content, Vec::new()),
+        };
+        let single = |content: String, cursor: Option<PaneCursor>| WindowCapture {
+            content,
+            cursor,
+            wrapped,
+        };
 
         let Some((count, window_width, window_height)) = dims else {
-            return Ok((pane0_content, cursor));
+            return Ok(single(pane0_content, cursor));
         };
         if count <= 1 || window_width == 0 || window_height == 0 {
-            return Ok((pane0_content, cursor));
+            return Ok(single(pane0_content, cursor));
         }
         // Zoom changes geometry, not the agent pane's capture or input identity.
         if zoomed {
-            return Ok((pane0_content, cursor));
+            return Ok(single(pane0_content, cursor));
         }
 
         // Any failure in the split path (fork error, unparseable layout) falls
         // back to the pane-0 bytes already in hand, so a composite that cannot
         // be built is never worse than the old single-pane preview.
         let Some(layout) = self.capture_window_layout_with_deadline(count, deadline) else {
-            return Ok((pane0_content, cursor));
+            return Ok(single(pane0_content, cursor));
         };
         if layout.first_pane_id() != Some(pane0.as_str()) {
-            return Ok((layout.composite(), None));
+            return Ok(WindowCapture {
+                content: layout.composite(),
+                ..WindowCapture::default()
+            });
         }
         // Reuse the pane-0 bytes bracketed by the cursor probes above. The
         // layout capture happens in a second tmux invocation, so using its
@@ -1102,7 +1185,11 @@ impl Session {
             || layout.composite(),
             |rows| layout.composite_with_first_pane_rows(&pane0, rows),
         );
-        Ok((content, cursor))
+        Ok(WindowCapture {
+            content,
+            cursor,
+            wrapped: Vec::new(),
+        })
     }
 
     /// Second fork of capture_window_composited_with_cursor: window dimensions

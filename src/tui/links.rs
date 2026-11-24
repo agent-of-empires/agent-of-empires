@@ -2,17 +2,16 @@
 //! advertised, then plain URLs in the row's own text. An advertised target wins
 //! wherever the two overlap, since a bare match is only inference.
 //!
-//! Neither the vt100 grid nor a ratatui cell can carry a hyperlink, so OSC 8
-//! targets ride alongside the text (`PreviewCache::links`) and are re-anchored
-//! here to the row showing them.
+//! A ratatui cell cannot carry a hyperlink, so the OSC 8 targets in the frame
+//! (each row re-emits its own) ride alongside the text (`PreviewCache::links`)
+//! and are re-anchored here to the row showing them by text.
 //!
-//! Matching on text has a known limit: the pane's table outlives the row that
-//! filled it, so a link once printed as `[docs](x)` makes every later standalone
-//! `docs` on screen resolve to `x`. `MIN_LINK_TEXT` and word alignment rule out
-//! the worst of it, but not a common word. Hovering shows the target first and
-//! only a [`crate::util::is_openable_link`] target ever opens, which keeps this
-//! misleading rather than dangerous; removing it needs per-cell positions
-//! `vt100` does not keep.
+//! Matching on text has a known limit: a link printed as `[docs](x)` makes every
+//! other standalone `docs` in the same frame resolve to `x`. `MIN_LINK_TEXT` and
+//! word alignment rule out the worst of it, but not a common word. Hovering
+//! shows the target first and only a [`crate::util::is_openable_link`] target
+//! ever opens, which keeps this misleading rather than dangerous; removing it
+//! means carrying cell positions through `parse_output_text`.
 //!
 //! The result never overlaps itself: the painter and the click hit-test must
 //! agree about which candidate owns a cell, or the terminal advertises one
@@ -41,9 +40,10 @@ const TRAILING_TRIM: &[char] = &['.', ',', ';', ':', '!', '?', '\'', '"', '>', '
 /// is placed, so the painter, the click hit-test and the OSC 8 re-emitted to the
 /// host terminal all see the same set.
 ///
-/// Matching on text is what makes the OSC 8 half survive scrolling, a reseed
-/// from `capture-pane`, or the sequence having left the stream: none of those
-/// preserve cell positions. A link whose text wraps two rows matches on neither.
+/// A link wrapped over two rows is one entry per row, each row's piece of the
+/// text with the whole target, so both rows match. A piece shorter than
+/// `MIN_LINK_TEXT` does not, and a bare URL wrapped by the pane is cut at the
+/// edge rather than joined.
 pub(crate) fn link_spans_for_line(
     line: &ratatui::text::Line,
     width: u16,
@@ -129,7 +129,7 @@ struct Candidate {
     span: LinkSpan,
     /// The pane said so, rather than the row text implying it.
     advertised: bool,
-    /// Position in the pane's link table; higher is more recently printed.
+    /// Position in the frame's link list; higher is lower on the pane.
     rank: usize,
 }
 
