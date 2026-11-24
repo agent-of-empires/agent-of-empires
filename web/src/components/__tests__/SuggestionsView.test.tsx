@@ -953,7 +953,9 @@ describe("SuggestionsView", () => {
 
     await open(snapshot(), { readOnly: true, onOpenSettings: vi.fn() });
     await screen.findByText("Fix lifecycle");
-    expect((screen.getByRole("button", { name: "Settings › Suggestions" }) as HTMLButtonElement).disabled).toBe(true);
+    const gear = screen.getByRole("button", { name: "Settings › Suggestions" }) as HTMLButtonElement;
+    expect(gear.disabled).toBe(true);
+    expect(gear.title).toBe("Read-only: settings can't be changed");
     cleanup();
 
     await open(snapshot(), { readOnly: true, cityhall: true });

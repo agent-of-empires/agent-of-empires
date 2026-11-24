@@ -208,7 +208,13 @@ export function SuggestionsView({
               <button
                 type="button"
                 aria-label="Settings › Suggestions"
-                title={readOnly ? lockTitle(true, false, cityhall) : "Settings › Suggestions"}
+                title={
+                  readOnly
+                    ? cityhall
+                      ? "Off in CityHall mode"
+                      : "Read-only: settings can't be changed"
+                    : "Settings › Suggestions"
+                }
                 disabled={readOnly}
                 onClick={onOpenSettings}
                 className={`${TAP} inline-flex h-8 w-8 items-center justify-center rounded-md text-text-secondary hover:bg-surface-800 disabled:opacity-50`}
