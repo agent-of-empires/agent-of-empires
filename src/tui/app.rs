@@ -5329,10 +5329,24 @@ mod tests {
                 Some(b.clone()),
                 "{case}: A's pull took off B"
             );
-            assert_ne!(
-                app.pulled_image,
-                Some(b.clone()),
-                "{case}: B's offer is suppressed"
+            // A's pull never learned A's digest, so A moving to B's digest is still an update.
+            let a_at_b = ImageUpdate {
+                image: a.image.clone(),
+                remote_digest: b.remote_digest.clone(),
+            };
+            answer_pull(
+                &mut app,
+                PullRequest::Poll,
+                PullAnswer {
+                    report: PullReport::State(PullState::Idle),
+                    offer: Some(ImageOffer::Update(a_at_b.clone())),
+                    image: Some(a.image.clone()),
+                },
+            );
+            assert_eq!(
+                app.image_update,
+                Some(a_at_b),
+                "{case}: A's pull took B's digest as its own"
             );
         }
 
