@@ -159,8 +159,8 @@ const CELL_APPEND_LIMIT: usize = 18;
 /// Both marks (8 bytes) fit only in a cell holding fewer bytes than this; a
 /// fuller cell keeps its text and goes unlinked.
 const MARKED_CELL_LIMIT: usize = CELL_APPEND_LIMIT - 4;
-/// vte's OSC parameter slots; a payload with more `;` loses its tail.
-const MAX_OSC_PARAMS: usize = 16;
+/// Bytes of an OSC kept for [`LinkScan::osc`]; a longer one names no target.
+const MAX_OSC: usize = MAX_URI + 256;
 
 fn is_mark(c: char) -> bool {
     (MARK_BASE..MARK_BASE + MARK_RADIX).contains(&u32::from(c))
@@ -252,8 +252,11 @@ struct LinkScan {
     event: Event,
     /// The last event was a glyph, so a selector arriving now is the pane's.
     after_glyph: bool,
-    /// Bytes fed since the last event, so an OSC knows its own length.
-    since_event: usize,
+    /// The bytes from the last ESC, so an OSC reads its whole payload: vte
+    /// keeps 16 parameters and drops the rest.
+    osc: Vec<u8>,
+    /// `osc` outgrew [`MAX_OSC`].
+    osc_cut: bool,
 }
 
 impl LinkScan {
@@ -275,6 +278,17 @@ impl LinkScan {
         });
         self.ids.insert(uri.to_string(), id);
         Some(id)
+    }
+
+    fn keep_osc_byte(&mut self, byte: u8) {
+        if byte == 0x1b {
+            self.osc.clear();
+            self.osc_cut = false;
+        } else if self.osc.len() >= MAX_OSC {
+            self.osc_cut = true;
+            return;
+        }
+        self.osc.push(byte);
     }
 
     fn open(&mut self, uri: &str) -> Option<u16> {
@@ -354,19 +368,26 @@ impl vte::Perform for LinkScan {
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
         self.event = Event::Other;
-        let [b"8", _, uri @ ..] = params else {
+        let [b"8", _, ..] = params else {
             return;
         };
-        // `ESC ]`, the payload, and the byte ending it: anything more means
-        // vte ran out of parameter slots and dropped the target's tail.
-        let payload = params.iter().map(|p| p.len()).sum::<usize>() + params.len() - 1;
-        if params.len() == MAX_OSC_PARAMS && self.since_event != payload + 3 {
+        // vte drops the C0 controls inside an OSC, so they are no part of it.
+        let payload: Vec<u8> = match self.osc.split_first() {
+            Some((0x1b, rest)) if !self.osc_cut => {
+                rest.iter().copied().filter(|&b| b >= 0x20).collect()
+            }
+            _ => Vec::new(),
+        };
+        let uri = payload.strip_prefix(b"]8;").and_then(|rest| {
+            rest.iter()
+                .position(|&b| b == b';')
+                .map(|at| &rest[at + 1..])
+        });
+        let Some(uri) = uri else {
             self.active = None;
             return;
-        }
-        // vte splits on every `;`, including any inside the URI.
-        let uri = uri.join(&b';');
-        self.active = match std::str::from_utf8(&uri) {
+        };
+        self.active = match std::str::from_utf8(uri) {
             Ok("") => None,
             Ok(uri) if uri.len() <= MAX_URI && usable_uri(uri) => self.open(uri),
             _ => None,
@@ -427,12 +448,11 @@ impl GridLinks {
         };
         let mut used = input.len();
         for i in skip..input.len() {
-            self.scan.since_event += 1;
             self.vte.advance(&mut self.scan, &input[i..=i]);
+            self.scan.keep_osc_byte(input[i]);
             let event = std::mem::take(&mut self.scan.event);
             if !matches!(event, Event::None) {
                 self.scan.after_glyph = matches!(event, Event::Glyph(_));
-                self.scan.since_event = 0;
             }
             match event {
                 Event::None => {}

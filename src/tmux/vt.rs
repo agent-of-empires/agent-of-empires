@@ -4170,19 +4170,26 @@ mod tests {
     }
 
     #[test]
-    fn an_osc8_target_vte_truncated_is_dropped() {
-        // vte keeps 16 parameters: `8`, the params field, then the target's pieces.
-        for (semicolons, kept) in [(13, true), (15, false)] {
+    fn an_osc8_target_keeps_every_semicolon() {
+        // vte keeps 16 parameters: `8`, the params field, then the target's
+        // pieces, so a target with 14 or more semicolons passes its cap.
+        for semicolons in [13, 14, 30] {
             let url = format!("https://example.com/a{}", ";x".repeat(semicolons));
-            let mut grid = new_parser(2, 20, 0);
-            feed(&mut grid, osc8(&url, "go").as_bytes());
-            let row = row_to_ansi(&grid, 0, 20);
-            let want = if kept {
-                format!("\x1b[0m{}", osc8(&url, "go"))
-            } else {
-                "\x1b[0mgo".to_string()
-            };
-            assert_eq!(row, want, "{semicolons} semicolons");
+            let want = format!("\x1b[0m{}", osc8(&url, "go"));
+            // vt100 and the scan both skip U+FFFD, so it ends no event.
+            for lead in ["", "\u{fffd}"] {
+                let input = format!("{lead}{}", osc8(&url, "go"));
+                for split in 0..input.len() {
+                    let mut grid = new_parser(2, 20, 0);
+                    feed(&mut grid, &input.as_bytes()[..split]);
+                    feed(&mut grid, &input.as_bytes()[split..]);
+                    assert_eq!(
+                        row_to_ansi(&grid, 0, 20),
+                        want,
+                        "{semicolons} semicolons, lead {lead:?}, split at {split}"
+                    );
+                }
+            }
         }
     }
 
