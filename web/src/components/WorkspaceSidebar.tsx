@@ -466,7 +466,12 @@ export function WorkspaceSidebar(props: Props) {
 
         <SidebarSystemHealth />
 
-        <div className="border-t border-surface-700/20 p-2 max-md:pb-[max(0.5rem,env(safe-area-inset-bottom))] flex items-center gap-1">
+        {/* The rail is a fixed 88px, so its controls stack to fit a scaled root font. */}
+        <div
+          className={`border-t border-surface-700/20 p-2 max-md:pb-[max(0.5rem,env(safe-area-inset-bottom))] flex items-center ${
+            compact ? "flex-col gap-2" : "gap-1"
+          }`}
+        >
           {(trashedWorkspaces.length > 0 || (props.trashedCount ?? 0) > 0) && (
             <TrashMenu
               trashedWorkspaces={trashedWorkspaces}
