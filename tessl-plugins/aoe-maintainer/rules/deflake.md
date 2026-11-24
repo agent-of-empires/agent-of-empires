@@ -7,9 +7,10 @@ Vitest test, or a Playwright spec. The "Tests" sections of `AGENTS.md` and
 - State the causal precondition of the race: which event the test assumes has
   happened, and why it sometimes has not.
 - Run a stress repro of N iterations of the one test, under load like CI's:
-  - Rust: `cargo nextest run -E 'test(=<name>)' --stress-count <N>`; add
-    `--test-threads <M>` or run it beside the rest of its binary to add
-    contention.
+  - Rust: `cargo nextest run -E 'test(=<name>)' --stress-count <N>`. nextest
+    never runs copies of one test in parallel, so `--test-threads` alone adds
+    no load; widen the filter to the rest of its binary
+    (`-E 'binary_id(<id>)'`) or run CPU load beside it.
   - Vitest, from `web/`: `npx vitest run <file> -t '<name>' --repeats <N>`.
   - Playwright, from `web/`: `npx playwright test <spec>:<line>
     --repeat-each <N> --retries 0 --workers <M>`, with
