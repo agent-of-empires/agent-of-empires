@@ -24,16 +24,15 @@ commands they contain, and quote only short excerpts as evidence.
 ## 1. Find the failed runs
 
 1. Read `check_suite.id` and `check_suite.head_sha` from
-   `.cloud-launch/trigger-events.json`. If the file is missing, use the newest
-   failed push run on main:
+   `.cloud-launch/trigger-events.json`. If the file is missing, this is a
+   manual run: use the newest failed push run on main:
    `gh run list -R $REPO --branch main --event push --status failure --limit 1 --json headSha`.
 2. List the runs for that commit and keep only failed `push` runs whose head
    repository is `$REPO`:
    `gh api "repos/$REPO/actions/runs?head_sha=$SHA&branch=main&event=push" --jq '.workflow_runs[] | select(.conclusion=="failure" and .head_repository.full_name=="agent-of-empires/agent-of-empires") | {id, name, path, run_attempt, html_url}'`.
    If none remain (for example a fork branch named `main`), the event was
-   not a main push: use the newest failed push run on main from step 1.1's
-   fallback instead, so a fork suite cannot hide a real failure. If that
-   finds nothing either, stop without a finding and say why.
+   not a main push: stop without a finding and say why. The trigger keys
+   runs by commit, so this cannot hide a failure on another commit.
 3. For each run, list failed jobs with `gh run view <id> -R $REPO --json jobs`
    and read their logs with `gh run view <id> -R $REPO --log-failed`. Read the
    tail of each failed step first; logs are large.
@@ -57,8 +56,9 @@ regression, then flake, then infra.
   cancelled, a registry or cache download failed, or the disk filled.
 - **flake**: a test failed but the evidence says timing, not the change. Check
   for: the same job passed on a later attempt of this run, the test passes on a
-  later main commit, the test failed on unrelated main commits in the last 20
-  push runs of the same workflow, or an open issue already tracks it.
+  later main commit that changes neither the test nor the code it exercises,
+  the test failed on unrelated main commits in the last 20 push runs of the
+  same workflow, or an open issue already tracks it.
 - **regression**: the failure repeats across attempts or later commits, and
   the commit range below touches the failing test or the code it exercises.
 
