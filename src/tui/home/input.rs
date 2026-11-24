@@ -3694,7 +3694,12 @@ impl HomeView {
             return false;
         };
         if inst.is_structured() {
-            crate::session::fork::structured_fork_capable(&inst.tool, inst.agent_name.as_deref())
+            crate::session::fork::structured_fork_capable_in(
+                &inst.source_profile,
+                inst.repo_config_path(),
+                &inst.tool,
+                inst.agent_name.as_deref(),
+            )
         } else {
             let sandboxed = inst.is_sandboxed();
             inst.fork_parent_ref().ok().flatten().is_some_and(|parent| {
@@ -3852,7 +3857,13 @@ impl HomeView {
         let group_path = parent.group_path.clone();
         let title = parent.title.clone();
         let parent_is_structured = parent.is_structured();
-        let parent_agent_name = parent.agent_name.clone();
+        let parent_can_fork_structured = parent_is_structured
+            && crate::session::fork::structured_fork_capable_in(
+                &parent.source_profile,
+                parent.repo_config_path(),
+                &tool,
+                parent.agent_name.as_deref(),
+            );
         let parent_acp_session_id = parent.acp_session_id.clone();
         let parent_profile = parent.effective_profile();
         let parent_sandboxed = parent.is_sandboxed();
@@ -3865,7 +3876,7 @@ impl HomeView {
             // `acp_can_fork` projection: a resume-only ACP agent has no fork strategy, so
             // `session/fork` would be refused and silently downgrade to `session/new`,
             // handing back an empty session the user thinks is a fork.
-            if !crate::session::fork::structured_fork_capable(&tool, parent_agent_name.as_deref()) {
+            if !parent_can_fork_structured {
                 self.info_dialog = Some(InfoDialog::new(
                         "Fork not supported",
                         &format!(
@@ -3923,9 +3934,14 @@ impl HomeView {
         };
 
         let existing_groups: Vec<String> = self.all_group_paths();
-        let current_profile = self
-            .profile_for_cursor(self.cursor)
-            .unwrap_or_else(|| self.config_profile());
+        // A structured fork opens in its parent's profile, which the dialog then
+        // keeps: a custom agent's command and store are the profile's.
+        let current_profile = if parent_is_structured {
+            parent_profile.clone()
+        } else {
+            self.profile_for_cursor(self.cursor)
+                .unwrap_or_else(|| self.config_profile())
+        };
         let profiles =
             list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
         let mut dialog = NewSessionDialog::new(

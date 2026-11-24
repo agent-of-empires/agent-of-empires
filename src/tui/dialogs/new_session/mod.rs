@@ -694,8 +694,8 @@ impl NewSessionDialog {
         self.fork_seed = Some(seed);
         if self.terminal_fork() {
             self.structured_capable = false;
-            self.apply_structured_default();
         }
+        self.apply_structured_default();
     }
 
     /// A terminal fork resumes through the agent CLI; a structured child would
@@ -704,6 +704,16 @@ impl NewSessionDialog {
         matches!(
             self.fork_seed,
             Some(crate::session::ForkSeed::Terminal { .. })
+        )
+    }
+
+    /// A structured fork seeds the child through the ACP `session/fork` handshake; a
+    /// terminal child would carry the parent's ACP id without that handshake, so the
+    /// view follows the seed whatever the configured default.
+    fn structured_fork(&self) -> bool {
+        matches!(
+            self.fork_seed,
+            Some(crate::session::ForkSeed::Structured { .. })
         )
     }
 
@@ -717,7 +727,8 @@ impl NewSessionDialog {
     /// Switch tools and reset the per-tool YOLO, sandbox and Ctrl+P fields.
     /// Reselecting the current tool keeps the user's edits.
     fn select_tool_index(&mut self, index: usize) {
-        if index == self.tool_index {
+        // A structured fork runs its parent's agent: the daemon refuses another.
+        if index == self.tool_index || self.structured_fork() {
             return;
         }
         self.tool_index = index;
@@ -739,6 +750,9 @@ impl NewSessionDialog {
     /// The Yolo choice resets only when the view moves the session onto or off an
     /// always-Yolo agent.
     fn set_structured(&mut self, enabled: bool) {
+        if self.structured_fork() && !enabled {
+            return;
+        }
         let was_locked = self.selected_tool_always_yolo();
         self.structured_enabled = enabled;
         self.structured_choice = Some(enabled);
@@ -821,6 +835,17 @@ impl NewSessionDialog {
         self.yolo_mode
     }
 
+    /// The view the session would be created in.
+    #[cfg(test)]
+    pub fn structured_value(&self) -> bool {
+        self.structured_enabled && self.structured_capable
+    }
+
+    #[cfg(test)]
+    pub fn profile_value(&self) -> &str {
+        self.selected_profile()
+    }
+
     #[cfg(test)]
     pub fn fork_seed(&self) -> Option<&crate::session::ForkSeed> {
         self.fork_seed.as_ref()
@@ -830,8 +855,9 @@ impl NewSessionDialog {
     /// incapable tool forces it off, and a capable one restores the user's
     /// choice or else the configured default.
     fn apply_structured_default(&mut self) {
-        self.structured_enabled =
-            self.structured_capable && self.structured_choice.unwrap_or(self.structured_default);
+        self.structured_enabled = self.structured_capable
+            && (self.structured_fork()
+                || self.structured_choice.unwrap_or(self.structured_default));
     }
 
     /// The test constructors skip config resolution, so capability is opted
@@ -1534,7 +1560,7 @@ impl NewSessionDialog {
         let fields = self.field_indices();
 
         if self.focused_field == fields.profile {
-            if self.available_profiles.len() > 1 {
+            if self.available_profiles.len() > 1 && !self.structured_fork() {
                 self.profile_index = (self.profile_index + 1) % self.available_profiles.len();
                 self.reload_config_defaults();
             }
@@ -1745,7 +1771,9 @@ impl NewSessionDialog {
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
                 if self.focused_field == fields.profile =>
             {
-                if self.available_profiles.len() > 1 {
+                // A structured fork stays in its parent's profile, where its
+                // agent's command and store are defined: the daemon refuses another.
+                if self.available_profiles.len() > 1 && !self.structured_fork() {
                     if key.code == KeyCode::Left {
                         self.profile_index = if self.profile_index == 0 {
                             self.available_profiles.len() - 1
@@ -2367,6 +2395,13 @@ impl NewSessionDialog {
     /// capable), surfacing a refusal inline. Runs before any worktree, scratch
     /// or container work, so a refusal cannot orphan resources.
     fn validate_structured(&mut self) -> bool {
+        if self.structured_fork() && !self.structured_capable {
+            self.error_message = Some(format!(
+                "This fork continues a structured view conversation, but '{}' cannot run in the structured view here.",
+                self.available_tools[self.tool_index]
+            ));
+            return false;
+        }
         if !(self.structured_enabled && self.structured_capable) {
             return true;
         }
