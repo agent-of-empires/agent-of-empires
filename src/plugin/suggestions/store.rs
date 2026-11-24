@@ -319,6 +319,7 @@ pub(crate) fn started_sessions<'a>(
                 json!({
                     "id": inst.id,
                     "started_via": link.started_via.as_str(),
+                    "initial_prompt": link.started_via.prompt(),
                     "title": inst.title,
                     "status": inst.status.wire_str(),
                     "archived": inst.is_archived(),
@@ -820,7 +821,7 @@ mod tests {
             provider_id: "acme.github".to_string(),
             item_id: item.to_string(),
             session_id: session.to_string(),
-            started_via: StartedVia::Start,
+            started_via: StartedVia::Start(Some("fix it".to_string())),
         };
         let links = [
             link("a", "archived"),

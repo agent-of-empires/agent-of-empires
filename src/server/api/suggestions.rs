@@ -657,6 +657,7 @@ pub async fn start_suggestion(
     let prompt = prefill["initial_prompt"]
         .as_str()
         .filter(|prompt| !prompt.is_empty());
+    let sent = prompt.map(String::from);
     let create = create_body(
         &prefill,
         &path,
@@ -677,7 +678,7 @@ pub async fn start_suggestion(
         create,
         None,
         crate::daemon::PromptOrigin::Unknown,
-        crate::plugin::suggestions::StartedVia::Start,
+        crate::plugin::suggestions::StartedVia::Start(sent),
     )
     .await;
     start_outcome(response, profile, path).await

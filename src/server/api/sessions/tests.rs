@@ -11460,7 +11460,7 @@ async fn a_link_records_whether_start_or_the_wizard_made_it() {
         serde_json::from_value(start).unwrap(),
         None,
         crate::daemon::PromptOrigin::Unknown,
-        StartedVia::Start,
+        StartedVia::Start(Some("the preset prompt".to_string())),
     )
     .await;
     assert_eq!(response.status(), axum::http::StatusCode::CREATED);
@@ -11470,9 +11470,39 @@ async fn a_link_records_whether_start_or_the_wizard_made_it() {
         .unwrap();
     let instances = state.instances.read().await;
     let started = crate::plugin::suggestions::started_sessions(&links, instances.iter());
-    let via = |id: &str| started[&("acme.gh".to_string(), id.to_string())]["started_via"].clone();
-    assert_eq!(via("42"), "wizard");
-    assert_eq!(via("43"), "start");
+    let field =
+        |id: &str, name: &str| started[&("acme.gh".to_string(), id.to_string())][name].clone();
+    assert_eq!(field("42", "started_via"), "wizard");
+    assert_eq!(field("43", "started_via"), "start");
+    assert_eq!(field("42", "initial_prompt"), serde_json::Value::Null);
+    assert_eq!(field("43", "initial_prompt"), "the preset prompt");
+
+    // A preset edited after Start cannot change what the link recorded.
+    host.with_suggestions_db(|conn, profile| {
+        crate::plugin::suggestions::set_preset(
+            conn,
+            profile,
+            "acme.gh",
+            "assigned",
+            &crate::plugin::suggestions::Preset {
+                agent: "claude".to_string(),
+                view: crate::plugin::suggestions::PresetView::Structured,
+                worktree: false,
+                sandbox: false,
+                yolo: false,
+                prompt: Some("a different prompt".to_string()),
+            },
+        )
+        .unwrap();
+    });
+    let links = host
+        .with_suggestions_db(crate::plugin::suggestions::links)
+        .unwrap();
+    let started = crate::plugin::suggestions::started_sessions(&links, instances.iter());
+    assert_eq!(
+        started[&("acme.gh".to_string(), "43".to_string())]["initial_prompt"],
+        "the preset prompt"
+    );
 }
 
 /// Starts racing on one suggestion leave exactly one primary Session.

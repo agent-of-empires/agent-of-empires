@@ -193,6 +193,7 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
              holder      TEXT NOT NULL,
              pending     INTEGER NOT NULL,
              started_via TEXT NOT NULL DEFAULT 'wizard',
+             started_prompt TEXT,
              PRIMARY KEY (profile, provider_id, item_id)
          );
          CREATE TABLE IF NOT EXISTS suggestion_provider_prefs (
@@ -214,6 +215,14 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch(
             "ALTER TABLE suggestion_links ADD COLUMN started_via TEXT NOT NULL DEFAULT 'wizard'",
         )?;
+    }
+    let has_prompt: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('suggestion_links') WHERE name = 'started_prompt'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_prompt == 0 {
+        conn.execute_batch("ALTER TABLE suggestion_links ADD COLUMN started_prompt TEXT")?;
     }
     Ok(())
 }

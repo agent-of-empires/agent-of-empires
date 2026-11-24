@@ -38,19 +38,28 @@ fn is_starting(session_id: &str) -> bool {
 }
 
 /// How the Session behind a link was started.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StartedVia {
     /// `POST /api/suggestions/start`: the preset's own prompt, agent and project.
-    Start,
+    /// Holds the exact prompt it sent, so a preset edited later cannot change it.
+    Start(Option<String>),
     /// A create carrying a suggestion, from "Start with changes".
     Wizard,
 }
 
 impl StartedVia {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
-            Self::Start => "start",
+            Self::Start(_) => "start",
             Self::Wizard => "wizard",
+        }
+    }
+
+    /// The prompt a Start sent; none for the wizard.
+    pub(crate) fn prompt(&self) -> Option<&str> {
+        match self {
+            Self::Start(prompt) => prompt.as_deref(),
+            Self::Wizard => None,
         }
     }
 }
@@ -80,9 +89,16 @@ pub(crate) fn claim_link(
     let tx = conn.unchecked_transaction()?;
     let inserted = tx.execute(
         "INSERT OR IGNORE INTO suggestion_links
-             (profile, provider_id, item_id, holder, pending, started_via)
-         VALUES (?1, ?2, ?3, ?4, 1, ?5)",
-        params![profile, provider_id, item_id, session_id, via.as_str()],
+             (profile, provider_id, item_id, holder, pending, started_via, started_prompt)
+         VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6)",
+        params![
+            profile,
+            provider_id,
+            item_id,
+            session_id,
+            via.as_str(),
+            via.prompt()
+        ],
     )?;
     if inserted == 1 {
         tx.commit()?;
@@ -109,9 +125,17 @@ pub(crate) fn claim_link(
         return Ok(Claim::Session(holder));
     }
     tx.execute(
-        "UPDATE suggestion_links SET holder = ?4, pending = 1, started_via = ?5
+        "UPDATE suggestion_links
+         SET holder = ?4, pending = 1, started_via = ?5, started_prompt = ?6
          WHERE profile = ?1 AND provider_id = ?2 AND item_id = ?3",
-        params![profile, provider_id, item_id, session_id, via.as_str()],
+        params![
+            profile,
+            provider_id,
+            item_id,
+            session_id,
+            via.as_str(),
+            via.prompt()
+        ],
     )?;
     tx.commit()?;
     Ok(Claim::Won)
@@ -129,7 +153,8 @@ pub(crate) struct Link {
 /// that is not recorded yet, so a join to live Sessions drops it.
 pub(crate) fn links(conn: &Connection, profile: &str) -> rusqlite::Result<Vec<Link>> {
     conn.prepare(
-        "SELECT provider_id, item_id, holder, started_via FROM suggestion_links WHERE profile = ?1",
+        "SELECT provider_id, item_id, holder, started_via, started_prompt
+         FROM suggestion_links WHERE profile = ?1",
     )?
     .query_map([profile], |row| {
         let via: String = row.get(3)?;
@@ -138,7 +163,7 @@ pub(crate) fn links(conn: &Connection, profile: &str) -> rusqlite::Result<Vec<Li
             item_id: row.get(1)?,
             session_id: row.get(2)?,
             started_via: if via == "start" {
-                StartedVia::Start
+                StartedVia::Start(row.get(4)?)
             } else {
                 StartedVia::Wizard
             },
@@ -195,7 +220,7 @@ mod tests {
                 "acme.github",
                 "a",
                 session,
-                StartedVia::Start,
+                StartedVia::Start(None),
                 live,
             )
             .unwrap()
@@ -215,7 +240,7 @@ mod tests {
                 "acme.github",
                 "b",
                 "s4",
-                StartedVia::Start,
+                StartedVia::Start(None),
                 &live
             )
             .unwrap(),
@@ -228,7 +253,7 @@ mod tests {
                 "acme.github",
                 "a",
                 "s5",
-                StartedVia::Start,
+                StartedVia::Start(None),
                 &live
             )
             .unwrap(),
@@ -255,7 +280,7 @@ mod tests {
                 "acme.github",
                 "a",
                 session,
-                StartedVia::Start,
+                StartedVia::Start(None),
                 &|_| false,
             )
             .unwrap()
@@ -304,7 +329,7 @@ mod tests {
     #[test]
     fn a_link_remembers_how_it_was_started_and_a_takeover_replaces_it() {
         let conn = store();
-        let via = || links(&conn, "p").unwrap()[0].started_via;
+        let via = || links(&conn, "p").unwrap()[0].started_via.clone();
         assert_eq!(
             claim_link(
                 &conn,
@@ -312,13 +337,13 @@ mod tests {
                 "acme.github",
                 "a",
                 "s1",
-                StartedVia::Start,
+                StartedVia::Start(Some("fix it".to_string())),
                 &|_| false
             )
             .unwrap(),
             Claim::Won
         );
-        assert_eq!(via(), StartedVia::Start);
+        assert_eq!(via(), StartedVia::Start(Some("fix it".to_string())));
         // The holder is gone: the next claim takes the row over and its own way.
         assert_eq!(
             claim_link(
@@ -334,6 +359,7 @@ mod tests {
             Claim::Won
         );
         assert_eq!(via(), StartedVia::Wizard);
+        assert_eq!(via().prompt(), None, "the takeover drops the old prompt");
     }
 
     #[test]
@@ -353,5 +379,6 @@ mod tests {
         let rows = links(&conn, "p").unwrap();
         assert_eq!(rows.len(), 1, "the link survives");
         assert_eq!(rows[0].started_via, StartedVia::Wizard);
+        assert_eq!(rows[0].started_via.prompt(), None);
     }
 }
