@@ -82,6 +82,10 @@ fn assert_link_underlined_and_opens(h: &TuiTestHarness, opened: &std::path::Path
 /// Route activation straight into live-send so the preview paints the pane,
 /// mirroring `live_send_paste_e2e`.
 fn write_live_send_config(h: &TuiTestHarness) {
+    write_live_send_config_with(h, "");
+}
+
+fn write_live_send_config_with(h: &TuiTestHarness, extra: &str) {
     let config_dir = app_dir_in(h.home_path());
     let config_content = format!(
         r#"[updates]
@@ -96,7 +100,8 @@ has_acknowledged_agent_hooks = true
 [session]
 default_attach_mode = "live_send"
 
-{systemd_off}"#,
+{systemd_off}
+{extra}"#,
         version = env!("CARGO_PKG_VERSION"),
         systemd_off = crate::harness::SYSTEMD_OFF,
     );
@@ -160,6 +165,79 @@ fn test_preview_click_opens_osc8_hyperlink() {
     h.wait_for_timeout(LINK_TEXT, Duration::from_secs(20));
 
     assert_link_underlined_and_opens(&h, &opened);
+}
+
+/// `capture-pane -e` closes a soft-wrapped link at each row's end, so with
+/// the VT grid off a click on the link's continuation row must still open it.
+#[test]
+#[parallel]
+fn test_preview_click_opens_a_wrapped_link_continuation_without_vt() {
+    require_tmux!();
+    if !TuiTestHarness::tmux_reemits_hyperlinks() {
+        eprintln!("Skipping test: tmux older than 3.4 (no OSC 8)");
+        return;
+    }
+
+    let mut h = TuiTestHarness::new("preview_wrapped_link");
+    write_live_send_config_with(&h, "[tmux]\nvt_live = false\n");
+    // Longer than the preview is wide, so the label wraps onto a second row.
+    let label = "w".repeat(150);
+    let script = h.home_path().join("emit-wrapped.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf 'before \\033]8;;{LINK_URL}\\033\\\\{label}\\033]8;;\\033\\\\ AFTERMARK\\n'\n"
+        ),
+    )
+    .expect("write link script");
+    let opened = h.home_path().join("opened-urls.txt");
+    h.set_env("AOE_OPEN_URL_TO", opened.as_os_str());
+
+    let project = h.project_path();
+    let add = h.run_cli(&["add", project.to_str().unwrap(), "-t", "Linky"]);
+    assert!(
+        add.status.success(),
+        "aoe add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    h.spawn_tui();
+    h.wait_for("Linky");
+    h.send_keys("t");
+    h.send_keys("Enter");
+    h.wait_for_timeout("LIVE", Duration::from_secs(15));
+    h.type_text(&format!("clear; sh {}", script.display()));
+    h.send_keys("Enter");
+    h.wait_for_timeout("AFTERMARK", Duration::from_secs(20));
+
+    let screen = h.capture_screen();
+    let (row, line) = screen
+        .lines()
+        .enumerate()
+        .find(|(_, l)| l.contains(" AFTERMARK") && !l.contains("before"))
+        .map(|(i, l)| (i as u16 + 1, l.to_string()))
+        .unwrap_or_else(|| panic!("the label must wrap before AFTERMARK:\n{screen}"));
+    let tail = &line[..line.find(" AFTERMARK").expect("marker in row")];
+    assert!(
+        tail.ends_with("ww"),
+        "row must hold the link's tail: {line:?}"
+    );
+    // The last cell of the label's tail, 1-based.
+    let col = tail.chars().count() as u16;
+    h.send_mouse_click(0, col, row);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&opened)
+        .map(|s| s.contains(LINK_URL))
+        .unwrap_or(false)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "click at ({col},{row}) on the continuation never opened {LINK_URL}; screen:\n{}",
+            h.capture_screen()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// A URL that is merely visible in the output, carrying no sequence at all,
@@ -236,8 +314,8 @@ fn test_preview_click_opens_a_bare_url_with_no_osc8() {
 
 /// The same contract in Agent view, which is where the issue was reported and
 /// which renders through the in-process vt100 grid rather than `capture-pane`.
-/// The debug trace asserts the target was collected from a grid frame, rather
-/// than the test passing on a silent fall back to capture.
+/// The debug trace asserts a grid frame carried the target, rather than the
+/// test passing on a silent fall back to capture.
 ///
 /// The pane runs a custom agent so it emits a known sequence without any real
 /// agent installed.
@@ -316,26 +394,21 @@ custom_agents = {{ "{LINK_AGENT}" = "{LINK_AGENT}" }}
     h.wait_for_timeout(LINK_TEXT, Duration::from_secs(20));
 
     // The channel arms on a throttle after the pane settles, so the preview can
-    // serve a frame or two from the capture fallback first. Wait for a collection
-    // after the arm: the grid serializes rows differently from `capture-pane`,
-    // so its first frame re-collects the targets it carries.
+    // serve a frame or two from the capture fallback first. Wait for a frame
+    // the worker sampled from the grid that still carries the link.
     let log_path = config_dir.join("debug.log");
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        let after_arm = log
-            .find("vt channel armed")
-            .map(|at| &log[at..])
-            .unwrap_or_default();
-        if after_arm
+        if log
             .lines()
-            .any(|l| l.contains("collected pane hyperlinks") && l.contains(LINK_TEXT))
+            .any(|l| l.contains("published a frame carrying OSC 8") && l.contains("from_grid=true"))
         {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "Agent view never collected the target from a VT grid frame; log was:\n{log}"
+            "Agent view never published a VT grid frame carrying the link; log was:\n{log}"
         );
         std::thread::sleep(Duration::from_millis(250));
     }
