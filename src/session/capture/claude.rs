@@ -49,6 +49,11 @@ fn claude_store_identity(path: &Path) -> PathBuf {
     super::canonicalize_allowing_missing_leaf(path).unwrap_or_else(|| path.to_path_buf())
 }
 
+/// Whether two paths name the same Claude store.
+pub(crate) fn same_claude_store(a: &Path, b: &Path) -> bool {
+    claude_store_identity(a) == claude_store_identity(b)
+}
+
 /// Whether `store` is Claude's built-in `<home>/.claude` store.
 pub(crate) fn is_default_claude_store(store: &Path, home: &Path) -> bool {
     claude_store_identity(store) == claude_store_identity(&home.join(".claude"))

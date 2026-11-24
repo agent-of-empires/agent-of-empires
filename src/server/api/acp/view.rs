@@ -400,9 +400,14 @@ async fn deferred_enable_request(
                 )
             })
             .unwrap_or(false);
+    let (execution_agent, seed_agent) = if instance.resumes_claude_under_own_acp_cmd(&agent_name) {
+        ("claude".to_owned(), "claude")
+    } else {
+        (instance.execution_identity_name(&agent_name), &*agent_name)
+    };
     let seed = resolve_structured_seed(
-        &instance.execution_identity_name(&agent_name),
-        &agent_name,
+        &execution_agent,
+        seed_agent,
         instance.acp_session_id.as_deref(),
         resume_sid,
         instance.import_pending == Some(true),
@@ -4220,6 +4225,78 @@ mod tests {
         );
         assert_eq!(cause, Some(StartupCause::SandboxLoginUnsupported));
         assert!(!state.session_service.sandbox_login.is_held(&id));
+    }
+
+    /// A custom claude tool with its own `agent_acp_cmd` seeds `session/load` with the
+    /// stored id only when the bound store is the one its launcher reads.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn own_acp_cmd_claude_tool_seeds_only_from_its_config_dir() {
+        let app = crate::session::test_support::isolate_app_dir();
+        let own_store = app.path().join(".claude-work");
+        let project = app.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::session::config::update_config(|c| {
+            let tool = || "claude-work".to_string();
+            c.session.agent_execution_as.insert(tool(), "claude".into());
+            c.session
+                .agent_acp_cmd
+                .insert(tool(), "launcher claude-work".into());
+            c.session
+                .agent_config_dir
+                .insert(tool(), own_store.to_str().unwrap().into());
+        })
+        .unwrap();
+        let transcripts =
+            own_store
+                .join("projects")
+                .join(crate::session::capture::encode_claude_project_path(
+                    &crate::session::capture::canonicalize_or_raw(project.to_str().unwrap())
+                        .to_string_lossy(),
+                ));
+        std::fs::create_dir_all(&transcripts).unwrap();
+        std::fs::write(transcripts.join("sid.jsonl"), "{}\n").unwrap();
+
+        for (bound_store, expected) in [
+            (own_store.clone(), Some("sid".to_string())),
+            (app.path().join(".claude"), None),
+        ] {
+            let mut inst = Instance::new("claude-work", project.to_str().unwrap());
+            inst.tool = "claude-work".into();
+            inst.source_profile = "default".into();
+            inst.view = View::Structured;
+            inst.agent_session_id = Some("sid".into());
+            inst.agent_session_binding = Some(crate::session::ConversationBinding {
+                session_id: "sid".into(),
+                execution: Some(crate::session::ExecutionBinding {
+                    agent: "claude".into(),
+                    stores: vec![bound_store],
+                    configuration: Vec::new(),
+                    cwd: project.clone(),
+                    cwd_filesystem: "host".into(),
+                    filesystem: "host".into(),
+                    exported_default_store: Some(true),
+                }),
+                provenance: crate::session::ConversationProvenance::Observed,
+                transcript_path: None,
+            });
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![inst.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let exclusion =
+                crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &inst.id, true)
+                    .await
+                    .unwrap();
+            let (request, _reservation) =
+                deferred_enable_request(&state, &inst, "claude-work".to_string(), None, exclusion)
+                    .await
+                    .expect("structured row")
+                    .expect("enable request");
+            assert_eq!(request.stored_acp_session_id, expected);
+        }
     }
 
     /// An enable queued behind the transition lock must spawn on a provider

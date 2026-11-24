@@ -255,6 +255,53 @@ impl Instance {
         crate::agents::acp_transcript_cli_resumable(&identity, acp_agent)
     }
 
+    /// A custom tool running claude through its own `agent_acp_cmd` launcher, which reads the
+    /// tool's `agent_config_dir` rather than any pinned store. Its terminal transcript loads
+    /// only when the bound store is that directory; without a binding this is false.
+    /// Resolves config only for such a tool.
+    pub(crate) fn resumes_claude_under_own_acp_cmd(&self, acp_agent: &str) -> bool {
+        self.resumes_claude_under_own_acp_cmd_with(acp_agent, || {
+            crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                &self.effective_profile(),
+                self.repo_config_path(),
+            )
+            .session
+        })
+    }
+
+    /// As [`Self::resumes_claude_under_own_acp_cmd`], with the caller's `session` config.
+    pub(crate) fn resumes_claude_under_own_acp_cmd_with<
+        C: std::borrow::Borrow<crate::session::config::SessionConfig>,
+    >(
+        &self,
+        acp_agent: &str,
+        session: impl FnOnce() -> C,
+    ) -> bool {
+        if self.tool == "claude"
+            || acp_agent != self.tool
+            || crate::session::fork::builtin_acp_registry()
+                .get(&self.tool)
+                .is_some()
+        {
+            return false;
+        }
+        let Some(pin) = self.selected_claude_store_pin() else {
+            return false;
+        };
+        let session = session();
+        let session = session.borrow();
+        let own_cmd = session
+            .agent_acp_cmd
+            .get(&self.tool)
+            .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(&self.tool, cmd).is_ok());
+        let launcher_store = super::hooks::host_home(&self.resolved_host_environment())
+            .and_then(|home| session.agent_config_dir_for(&self.tool, &home));
+        own_cmd
+            && launcher_store
+                .is_some_and(|dir| crate::session::capture::same_claude_store(&dir, &pin.store))
+            && self.acp_transcript_cli_resumable_with("claude", session)
+    }
+
     /// The ACP agent a structured switch launches; resolves config at the repo
     /// only for a custom tool.
     pub(crate) fn effective_acp_agent(&self) -> String {
@@ -1304,6 +1351,80 @@ replies = true
         inst.agent_name = Some("codex".to_string());
         assert_eq!(inst.effective_acp_agent(), "codex");
         assert!(!inst.acp_transcript_cli_resumable(&inst.effective_acp_agent()));
+    }
+
+    /// A custom tool with its own `agent_acp_cmd` loads its terminal transcript only
+    /// from the store its launcher reads.
+    #[test]
+    #[serial_test::serial]
+    fn own_acp_cmd_claude_tool_resumes_only_from_its_config_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
+        const PROFILE: &str = "own-acp-cmd-claude-test";
+        let own_store = home.path().join(".claude-work");
+        let write_config = |execution_as: bool| {
+            let mut session = toml::Table::new();
+            let entry = |value: &str| {
+                toml::Value::Table(toml::Table::from_iter([(
+                    "claude-work".into(),
+                    toml::Value::String(value.into()),
+                )]))
+            };
+            if execution_as {
+                session.insert("agent_execution_as".into(), entry("claude"));
+            }
+            session.insert("agent_acp_cmd".into(), entry("launcher claude-work"));
+            session.insert(
+                "agent_config_dir".into(),
+                entry(own_store.to_str().unwrap()),
+            );
+            let path =
+                crate::session::config::profile_config::get_profile_config_path(PROFILE).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let config = toml::Table::from_iter([("session".into(), toml::Value::Table(session))]);
+            std::fs::write(path, toml::to_string(&config).unwrap()).unwrap();
+        };
+        let instance = |tool: &str, store: Option<&std::path::Path>| {
+            let mut inst = Instance::new("own", home.path().join("project").to_str().unwrap());
+            inst.source_profile = PROFILE.to_string();
+            inst.tool = tool.to_string();
+            inst.command = "launcher".to_string();
+            if let Some(store) = store {
+                inst.agent_session_id = Some("sid".into());
+                inst.agent_session_binding = Some(ConversationBinding {
+                    session_id: "sid".into(),
+                    execution: Some(ExecutionBinding {
+                        agent: "claude".into(),
+                        stores: vec![store.to_path_buf()],
+                        configuration: Vec::new(),
+                        cwd: home.path().to_path_buf(),
+                        cwd_filesystem: "host".into(),
+                        filesystem: "host".into(),
+                        exported_default_store: Some(true),
+                    }),
+                    provenance: ConversationProvenance::Observed,
+                    transcript_path: None,
+                });
+            }
+            inst
+        };
+
+        write_config(true);
+        let bound = instance("claude-work", Some(&own_store));
+        assert!(bound.resumes_claude_under_own_acp_cmd("claude-work"));
+        assert!(!bound.resumes_claude_under_own_acp_cmd("claude"));
+        assert!(!bound.resumes_claude_under_own_acp_cmd("codex"));
+        let other_store = home.path().join(".claude");
+        assert!(!instance("claude-work", Some(&other_store))
+            .resumes_claude_under_own_acp_cmd("claude-work"));
+        assert!(!instance("claude-work", None).resumes_claude_under_own_acp_cmd("claude-work"));
+        for builtin in ["claude", "claude-code"] {
+            assert!(!instance(builtin, Some(&own_store)).resumes_claude_under_own_acp_cmd(builtin));
+        }
+
+        write_config(false);
+        assert!(!instance("claude-work", Some(&own_store))
+            .resumes_claude_under_own_acp_cmd("claude-work"));
     }
 
     /// A session stored with the fallback's own command keeps its capture after

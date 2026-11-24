@@ -167,8 +167,10 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                 resp.acp_can_fork =
                     crate::session::fork::custom_structured_fork_capable(agent_key, None, cfg);
             }
-            resp.keeps_context =
-                inst.acp_transcript_cli_resumable_with(&inst.effective_acp_agent_with(|| cfg), cfg);
+            let agent = inst.effective_acp_agent_with(|| cfg);
+            resp.keeps_context = inst.acp_transcript_cli_resumable_with(&agent, cfg)
+                || (!inst.is_structured()
+                    && inst.resumes_claude_under_own_acp_cmd_with(&agent, || cfg));
         }
         // The solo commands of the agent that classifies this session's prompts, resolved as the
         // queue and publication resolve it, so a custom agent's declared reset is advertised.
