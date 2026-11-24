@@ -1996,7 +1996,9 @@ mod tests {
                 )
             };
             reload(load_profiles_for_reload(&state.file_watch), 0).await;
-            state.instances.write().await[0].last_error = Some("daemon-only".into());
+            state.instances.write().await[0]
+                .last_error
+                .set("daemon-only");
             let accepted_metadata = state.canonical_metadata.read().await.clone();
 
             let profiles = home.app_dir().join("profiles");

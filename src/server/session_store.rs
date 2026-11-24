@@ -1302,7 +1302,7 @@ mod tests {
             row.idle_entered_at =
                 Some(crate::time::Timestamp::now() - crate::time::Duration::minutes(7));
             row.plugin_revival_pending = true;
-            row.last_error = Some("live diagnostic".into());
+            row.last_error.set("live diagnostic");
             let idle = row.idle_entered_at;
             let id = row.id.clone();
             let state = crate::server::test_support::build_test_app_state(vec![row]);

@@ -1420,7 +1420,8 @@ fn trashed_preview_surfaces_delete_failure() {
 
     env.view.mutate_instance(&id, |inst| {
         inst.status = Status::Error;
-        inst.last_error = Some("worktree removal failed: directory locked".to_string());
+        inst.last_error
+            .set("worktree removal failed: directory locked".to_string());
     });
 
     let screen = render_home_to_string(&mut env.view, 120, 40);
@@ -1473,7 +1474,7 @@ fn archived_preview_surfaces_delete_failure() {
     env.view.select_session_by_id(&id);
     env.view.mutate_instance(&id, |inst| {
         inst.status = Status::Error;
-        inst.last_error = Some("container teardown failed".to_string());
+        inst.last_error.set("container teardown failed".to_string());
     });
 
     let screen = render_home_to_string(&mut env.view, 120, 40);

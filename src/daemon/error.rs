@@ -50,6 +50,8 @@ pub enum ApiErrorCode {
     SessionArchived,
     SessionTrashed,
     AccountSwapUnavailable,
+    ModelPinned,
+    UnknownAgent,
     TerminalSwitchRefused(TerminalSwitchReason),
 }
 
@@ -94,6 +96,8 @@ impl ApiErrorCode {
             Self::SessionArchived => "session_archived",
             Self::SessionTrashed => "session_trashed",
             Self::AccountSwapUnavailable => "account_swap_unavailable",
+            Self::ModelPinned => "model_pinned",
+            Self::UnknownAgent => "unknown_agent",
             Self::TerminalSwitchRefused(reason) => reason.as_str(),
         }
     }
@@ -125,13 +129,15 @@ impl ApiErrorCode {
             | Self::SessionNotRunning
             | Self::SessionArchived
             | Self::SessionTrashed
-            | Self::AccountSwapUnavailable => StatusCode::CONFLICT,
+            | Self::AccountSwapUnavailable
+            | Self::ModelPinned => StatusCode::CONFLICT,
             Self::PendingTargetGone => StatusCode::NOT_FOUND,
             Self::TlsRequired => StatusCode::UPGRADE_REQUIRED,
             Self::CreateHookFailed
             | Self::WorkingDirMissing
             | Self::BranchNotFound
-            | Self::UnknownImage => StatusCode::BAD_REQUEST,
+            | Self::UnknownImage
+            | Self::UnknownAgent => StatusCode::BAD_REQUEST,
             Self::SmartRenameSkipped => StatusCode::CONFLICT,
             Self::SmartRenameFailed | Self::PluginPreviewFailed => StatusCode::BAD_GATEWAY,
             Self::SmartRenameTimeout => StatusCode::GATEWAY_TIMEOUT,
@@ -209,6 +215,8 @@ impl ApiErrorCode {
             b"session_archived" => Self::SessionArchived,
             b"session_trashed" => Self::SessionTrashed,
             b"account_swap_unavailable" => Self::AccountSwapUnavailable,
+            b"model_pinned" => Self::ModelPinned,
+            b"unknown_agent" => Self::UnknownAgent,
             other => Self::TerminalSwitchRefused(
                 TerminalSwitchReason::ALL
                     .into_iter()
@@ -382,6 +390,20 @@ mod tests {
                 false,
                 Some(ApiErrorCode::AccountSwapUnavailable),
             ),
+            (
+                StatusCode::CONFLICT,
+                "model_pinned",
+                false,
+                Some(ApiErrorCode::ModelPinned),
+            ),
+            (StatusCode::BAD_REQUEST, "model_pinned", false, None),
+            (
+                StatusCode::BAD_REQUEST,
+                "unknown_agent",
+                false,
+                Some(ApiErrorCode::UnknownAgent),
+            ),
+            (StatusCode::CONFLICT, "unknown_agent", false, None),
         ] {
             let mut headers = HeaderMap::new();
             headers.insert(ERROR_CODE_HEADER, HeaderValue::from_static(value));
