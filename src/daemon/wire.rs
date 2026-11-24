@@ -775,8 +775,16 @@ pub struct UpdatePinBody {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct UpdateFavoriteBody {
-    pub favorited: bool,
+#[serde(untagged)]
+pub enum UpdateFavoriteBody {
+    Scoped {
+        // A distinct value key makes older Daemons reject the scoped request.
+        profile: String,
+        scoped_favorited: bool,
+    },
+    Unscoped {
+        favorited: bool,
+    },
 }
 
 #[derive(Serialize, Deserialize)]

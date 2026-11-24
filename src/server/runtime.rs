@@ -547,6 +547,15 @@ pub(crate) async fn session_mutation_response<T: serde::Serialize>(
     id: &str,
     outcome: Option<T>,
 ) -> Response {
+    scoped_session_mutation_response(state, id, None, outcome).await
+}
+
+pub(super) async fn scoped_session_mutation_response<T: serde::Serialize>(
+    state: &Arc<AppState>,
+    id: &str,
+    profile: Option<&str>,
+    outcome: Option<T>,
+) -> Response {
     #[derive(serde::Serialize)]
     struct Body<'a, T> {
         #[serde(flatten)]
@@ -554,7 +563,7 @@ pub(crate) async fn session_mutation_response<T: serde::Serialize>(
         #[serde(skip_serializing_if = "Option::is_none")]
         outcome: Option<T>,
     }
-    published_session_response(state, id, |session| {
+    published_session_response(state, id, profile, |session| {
         Json(Body { session, outcome }).into_response()
     })
     .await
@@ -566,7 +575,7 @@ pub(crate) async fn accepted_session_mutation_response(
     state: &Arc<AppState>,
     id: &str,
 ) -> Response {
-    published_session_response(state, id, |session| {
+    published_session_response(state, id, None, |session| {
         (axum::http::StatusCode::ACCEPTED, Json(session)).into_response()
     })
     .await
@@ -575,6 +584,7 @@ pub(crate) async fn accepted_session_mutation_response(
 async fn published_session_response(
     state: &Arc<AppState>,
     id: &str,
+    profile: Option<&str>,
     respond: impl FnOnce(&crate::daemon::SessionResponse) -> Response,
 ) -> Response {
     let snapshot = match state.runtime.publish(state).await {
@@ -589,7 +599,7 @@ async fn published_session_response(
         .contents
         .sessions
         .iter()
-        .find(|row| row.id == id)
+        .find(|row| row.id == id && profile.is_none_or(|profile| row.profile == profile))
     else {
         return super::api::session_gone_after_persist();
     };

@@ -96,6 +96,83 @@ fn assert_refused(output: &Output, code: &str) {
     assert!(!stderr.contains("Started aoe daemon"), "{stderr}");
 }
 
+#[test]
+#[parallel]
+fn favorite_writes_require_a_writable_daemon_and_stay_in_profile() {
+    let fixture = Fixture::new();
+    let main = fixture.app.join("profiles/main/sessions.json");
+    let other = fixture.app.join("profiles/other/sessions.json");
+    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+    let mut rows: Vec<Instance> = serde_json::from_slice(&std::fs::read(&main).unwrap()).unwrap();
+    rows[0].archive();
+    std::fs::write(&other, serde_json::to_vec(&rows).unwrap()).unwrap();
+    rows[0].unarchive();
+    rows[0].trash();
+    let mut marked = Instance::new("Already favorited", "/isolated/marked");
+    marked.id = "marked-row".into();
+    marked.view = View::Structured;
+    marked.favorite();
+    rows.push(marked);
+    std::fs::write(&main, serde_json::to_vec(&rows).unwrap()).unwrap();
+    let before = std::fs::read(&main).unwrap();
+
+    let run = |verb, id| fixture.run(&["--no-autostart", "session", verb, id]);
+    let favorite = |path: &std::path::Path| {
+        let rows: Vec<Instance> = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        rows[0].is_favorited()
+    };
+    assert_refused(&run("favorite", "daemon-only-row"), "aoe serve");
+    assert_refused(&run("unfavorite", "marked-row"), "aoe serve");
+    assert_eq!(std::fs::read(&main).unwrap(), before);
+    assert!(!favorite(&main));
+    fixture.assert_not_started();
+
+    let start = fixture.run(&["serve", "--core-only", "--daemon", "--read-only"]);
+    assert!(start.status.success(), "{start:?}");
+    assert_refused(&run("favorite", "daemon-only-row"), "403 Forbidden");
+    assert_refused(&run("unfavorite", "marked-row"), "403 Forbidden");
+    let stored: Vec<Instance> = serde_json::from_slice(&std::fs::read(&main).unwrap()).unwrap();
+    assert!(stored
+        .iter()
+        .find(|row| row.id == "marked-row")
+        .unwrap()
+        .is_favorited());
+    assert!(!favorite(&main));
+    let stop = fixture.run(&["serve", "--stop"]);
+    assert!(stop.status.success(), "{stop:?}");
+
+    let start = fixture.run(&["serve", "--core-only", "--daemon"]);
+    assert!(start.status.success(), "{start:?}");
+    let output = run("favorite", "Disk must not answer");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"Favorited: Disk must not answer\n");
+    assert!(favorite(&main));
+    assert!(!favorite(&other));
+    let output = run("unfavorite", "daemon-only");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"Unfavorited: Disk must not answer\n");
+    assert!(!favorite(&main));
+    let stored: Vec<Instance> = serde_json::from_slice(&std::fs::read(&main).unwrap()).unwrap();
+    assert!(stored
+        .iter()
+        .find(|row| row.id == "daemon-only-row")
+        .unwrap()
+        .is_trashed());
+    let output = fixture.run(&[
+        "--no-autostart",
+        "-p",
+        "other",
+        "session",
+        "favorite",
+        "Disk must not answer",
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let rows: Vec<Instance> = serde_json::from_slice(&std::fs::read(&other).unwrap()).unwrap();
+    assert!(rows[0].is_favorited());
+    assert!(!rows[0].is_archived());
+    assert!(!favorite(&main));
+}
+
 #[tokio::test]
 #[parallel]
 async fn unreachable_selected_targets_never_answer_from_disk() {

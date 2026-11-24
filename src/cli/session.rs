@@ -424,12 +424,8 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::SetBase(args) => set_base(profile, args).await,
         SessionCommands::Snooze(args) => snooze_session(profile, args).await,
         SessionCommands::Unsnooze(args) => unsnooze_session(profile, args).await,
-        SessionCommands::Favorite(args) => {
-            mark_session(profile, args, "Favorited", Instance::favorite).await
-        }
-        SessionCommands::Unfavorite(args) => {
-            mark_session(profile, args, "Unfavorited", Instance::unfavorite).await
-        }
+        SessionCommands::Favorite(args) => set_favorite(profile, args, true).await,
+        SessionCommands::Unfavorite(args) => set_favorite(profile, args, false).await,
         SessionCommands::Color(args) => set_color_session(profile, args).await,
         SessionCommands::Archive(args) => archive_session(profile, args).await,
         SessionCommands::Unarchive(args) => {
@@ -442,6 +438,52 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         }
         SessionCommands::EmptyTrash => empty_trash(profile).await,
     }
+}
+
+async fn set_favorite(profile: &str, args: SessionIdArgs, favorited: bool) -> Result<()> {
+    use crate::daemon::{DaemonClientError, SessionMutation, UpdateFavoriteBody};
+
+    let (client, epoch) = super::group::daemon_client().await?;
+    let mut snapshot = client.runtime_snapshot(&epoch).await?;
+    let profile = if profile.is_empty() {
+        &snapshot.contents.default_profile
+    } else {
+        anyhow::ensure!(
+            snapshot
+                .contents
+                .profiles
+                .iter()
+                .any(|row| row.name == profile),
+            "Profile '{profile}' does not exist"
+        );
+        profile
+    };
+    snapshot
+        .contents
+        .sessions
+        .retain(|row| row.profile == profile);
+    let row = super::resolve_session(&args.identifier, &snapshot.contents.sessions)?;
+    let cursor = client
+        .mutate_session(
+            &row.id,
+            &SessionMutation::Favorite(UpdateFavoriteBody::Scoped {
+                profile: row.profile.clone(),
+                scoped_favorited: favorited,
+            }),
+            &epoch,
+        )
+        .await?;
+    anyhow::ensure!(
+        cursor.revision >= snapshot.cursor.revision,
+        DaemonClientError::InvalidMutationReceipt
+    );
+    let verb = if favorited {
+        "Favorited"
+    } else {
+        "Unfavorited"
+    };
+    println!("{verb}: {}", row.title);
+    Ok(())
 }
 
 /// Flips one boolean marker on a session and reports it with `verb`.

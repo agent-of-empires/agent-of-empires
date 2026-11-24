@@ -71,37 +71,49 @@ pub async fn update_session_favorite(
         Ok(body) => body,
         Err(rejection) => return rejection.into_response(),
     };
+    let (selected_profile, favorited) = match body {
+        UpdateFavoriteBody::Scoped {
+            profile,
+            scoped_favorited,
+        } => (Some(profile), scoped_favorited),
+        UpdateFavoriteBody::Unscoped { favorited } => (None, favorited),
+    };
 
     let namespace = state.profile_namespace.read().await;
     let lock = state.instance_lock(&id).await;
     let guard = lock.lock().await;
-    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
-        return response;
-    }
     let profile = {
         let instances = state.instances.read().await;
-        let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
+        let target = instances.iter().find(|instance| {
+            instance.id == id
+                && selected_profile
+                    .as_ref()
+                    .is_none_or(|profile| instance.source_profile == *profile)
+        });
+        if state.cityhall_mode && !target.is_some_and(Instance::is_structured) {
+            return crate::server::api::cityhall_response();
+        }
+        let Some(instance) = target else {
             return crate::server::api::session_not_found();
         };
         instance.source_profile.clone()
     };
-    let favorited = body.favorited;
     let persist_id = id.clone();
-    let committed = commit_profile_update(
+    let committed = commit_profile_update_with_refusal(
         &state,
         profile,
         "favorite update",
         move |instances| {
-            if let Some(instance) = instances
+            let instance = instances
                 .iter_mut()
                 .find(|instance| instance.id == persist_id)
-            {
-                if body.favorited {
-                    instance.favorite();
-                } else {
-                    instance.unfavorite();
-                }
+                .ok_or_else(crate::server::api::session_not_found)?;
+            if favorited {
+                instance.favorite();
+            } else {
+                instance.unfavorite();
             }
+            Ok(())
         },
         None,
     )
@@ -112,7 +124,13 @@ pub async fn update_session_favorite(
     tracing::info!(target: "session.sync", session = %id, field = "favorite", value = favorited, "session updated");
     drop(guard);
     drop(namespace);
-    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
+    crate::server::runtime::scoped_session_mutation_response(
+        &state,
+        &id,
+        selected_profile.as_deref(),
+        None::<()>,
+    )
+    .await
 }
 
 /// 409 for ignore refusing a sunk row. The codes stay the ones clients already
