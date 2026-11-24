@@ -193,6 +193,9 @@ pub(crate) struct PullWatch {
     /// The Start got no reply, so whether it registered is unknown until a poll says.
     start_unanswered: bool,
     cancel_armed: Option<Instant>,
+    /// Another client's pull found while an outcome waits to be acknowledged: it takes the line
+    /// once the outcome is acknowledged, so the outcome isn't lost unread.
+    behind: Option<PullLine>,
 }
 
 /// What [`PullWatch::apply`] changed, beyond the line.
@@ -236,6 +239,7 @@ impl PullWatch {
 
     /// A pull this TUI asked for runs from now, before the first answer arrives.
     pub(crate) fn start(&mut self) {
+        self.behind = None;
         self.set_line(Some(PullLine::Running(ProgressSnapshot::default())));
         self.watched = true;
         self.seen_running = false;
@@ -243,6 +247,11 @@ impl PullWatch {
     }
 
     pub(crate) fn apply(&mut self, request: PullRequest, report: PullReport) -> Applied {
+        if request == PullRequest::Poll && self.showing_outcome() {
+            if let Some(applied) = self.track_behind(&report) {
+                return applied;
+            }
+        }
         let before = self.line.clone();
         let mut applied = Applied::Changed;
         match report {
@@ -321,7 +330,7 @@ impl PullWatch {
         if self.running() {
             self.hidden = true;
         } else {
-            self.set_line(None);
+            self.acknowledge();
         }
         true
     }
@@ -371,10 +380,47 @@ impl PullWatch {
     /// acts as usual. Returns whether the line changed.
     pub(crate) fn other_key(&mut self, done_drawn: bool) -> bool {
         if done_drawn && self.line == Some(PullLine::Done) {
-            self.set_line(None);
+            self.acknowledge();
             return true;
         }
         false
+    }
+
+    fn showing_outcome(&self) -> bool {
+        matches!(
+            self.line,
+            Some(PullLine::Done | PullLine::Failed(_) | PullLine::Cancelled)
+        )
+    }
+
+    /// While an outcome is shown, a poll reports another client's pull, which waits behind it.
+    /// None when the report isn't about such a pull, so it applies as usual.
+    fn track_behind(&mut self, report: &PullReport) -> Option<Applied> {
+        match report {
+            PullReport::State(PullState::Running(snapshot)) => {
+                self.behind = Some(PullLine::Running(*snapshot));
+            }
+            PullReport::State(state) if self.behind.is_some() => {
+                self.behind = match state {
+                    PullState::Done => Some(PullLine::Done),
+                    PullState::Cancelled => Some(PullLine::Cancelled),
+                    PullState::Failed { reason, .. } => Some(PullLine::Failed(*reason)),
+                    _ => None,
+                };
+            }
+            _ => return None,
+        }
+        Some(Applied::Unchanged)
+    }
+
+    /// The shown outcome is acknowledged: a pull waiting behind it takes the line.
+    fn acknowledge(&mut self) {
+        let next = self.behind.take();
+        let running = matches!(next, Some(PullLine::Running(_)));
+        self.watched = running;
+        self.seen_running = running;
+        self.start_unanswered = false;
+        self.set_line(next);
     }
 
     fn end(&mut self, outcome: Option<PullLine>) {
@@ -602,6 +648,62 @@ mod tests {
             assert_eq!(watch.line(), line.as_ref(), "{case}");
             assert_eq!(last, applied, "{case}");
         }
+    }
+
+    /// Another client's pull found while an outcome is unacknowledged waits behind it, and
+    /// takes the line once the outcome is acknowledged; a retry here replaces both at once.
+    #[test]
+    fn an_unacknowledged_outcome_keeps_the_line_from_another_clients_pull() {
+        let failure = PullLine::Failed(image_pull::PullFailureReason::Network);
+        let other = |done| match running(done) {
+            PullReport::State(PullState::Running(snapshot)) => PullLine::Running(snapshot),
+            _ => unreachable!(),
+        };
+        // (case, the first outcome, reports after it, the line those leave, the line after the
+        // outcome is acknowledged)
+        let cases: Vec<(&str, PullReport, Vec<PullReport>, PullLine, Option<PullLine>)> = vec![
+            ("a failure, then another pull", failed(), vec![running(1)], failure.clone(), Some(other(1))),
+            (
+                "a failure, then another pull that finishes",
+                failed(),
+                vec![running(1), PullReport::State(PullState::Done)],
+                failure.clone(),
+                Some(PullLine::Done),
+            ),
+            (
+                "done, then another pull",
+                PullReport::State(PullState::Done),
+                vec![running(2)],
+                PullLine::Done,
+                Some(other(2)),
+            ),
+            ("a failure, and nothing after", failed(), vec![], failure.clone(), None),
+        ];
+        for (case, outcome, after, shown, acknowledged) in cases {
+            let mut watch = PullWatch::default();
+            watch.start();
+            watch.apply(PullRequest::Poll, outcome);
+            for report in after {
+                assert_eq!(watch.apply(PullRequest::Poll, report), Applied::Unchanged, "{case}");
+            }
+            assert_eq!(watch.line(), Some(&shown), "{case}: the outcome was replaced");
+            if shown == PullLine::Done {
+                assert!(watch.other_key(true), "{case}");
+            } else {
+                assert!(watch.dismiss(&shown), "{case}");
+            }
+            assert_eq!(watch.line(), acknowledged.as_ref(), "{case}: acknowledged");
+        }
+
+        // A retry here is this TUI's own pull: it replaces the outcome and what waited behind it.
+        let mut watch = PullWatch::default();
+        watch.start();
+        watch.apply(PullRequest::Poll, failed());
+        watch.apply(PullRequest::Poll, running(1));
+        watch.start();
+        assert_eq!(watch.line(), Some(&PullLine::Running(ProgressSnapshot::default())));
+        watch.apply(PullRequest::Poll, PullReport::State(PullState::Done));
+        assert_eq!(watch.line(), Some(&PullLine::Done), "the retry's outcome");
     }
 
     /// Ctrl+X hides a running pull, whose progress stays for the key line, until it ends;
