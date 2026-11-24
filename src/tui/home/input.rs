@@ -3952,8 +3952,8 @@ impl HomeView {
             (
                 "Switch to terminal",
                 "Switch this session back to a tmux terminal? The conversation \
-                 continues in the terminal (the agent resumes it with \
-                 `--resume`); the structured view is closed.",
+                 continues in the terminal when it can be resumed with `--resume`, \
+                 otherwise the agent starts fresh; the structured view is closed.",
             )
         } else {
             (

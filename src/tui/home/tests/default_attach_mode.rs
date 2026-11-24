@@ -469,7 +469,7 @@ fn switch_view_target_gates_by_view_and_state() {
 
 /// The terminal -> structured confirm only promises continuity conditionally for a
 /// CLI-resumable tool (the wrapper may have no transcript), and still says a fresh
-/// conversation for a tool that cannot resume.
+/// conversation for a tool that cannot resume. The terminal direction is qualified the same way.
 #[test]
 #[serial]
 fn switch_to_structured_confirm_text_follows_resumability() {
@@ -495,6 +495,25 @@ fn switch_to_structured_confirm_text_follows_resumability() {
         assert!(
             !screen.contains(absent),
             "{tool}: unexpected {absent:?}:\n{screen}"
+        );
+    }
+    for (tool, present, absent) in [
+        ("claude", "otherwise", "restarts"),
+        ("codex", "restarts", "otherwise"),
+    ] {
+        env.view.mutate_instance(&id, |inst| {
+            inst.view = crate::session::View::Structured;
+            inst.tool = tool.to_string();
+        });
+        env.view.prompt_switch_view_for_selected();
+        let screen = render_home(&mut env);
+        assert!(
+            screen.contains(present),
+            "{tool} to terminal: missing {present:?}:\n{screen}"
+        );
+        assert!(
+            !screen.contains(absent),
+            "{tool} to terminal: unexpected {absent:?}:\n{screen}"
         );
     }
 }

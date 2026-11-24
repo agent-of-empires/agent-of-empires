@@ -27,8 +27,16 @@ afterEach(cleanup);
 
 describe("SwitchViewDialog", () => {
   it.each([
-    [false, true, /Switch to terminal[\s\S]*continues in the terminal/],
-    [true, true, /Switch to structured view[\s\S]*continues in structured view/],
+    [
+      false,
+      true,
+      /Switch to terminal[\s\S]*continues in the terminal when it can be resumed with `--resume`, otherwise the agent starts fresh/,
+    ],
+    [
+      true,
+      true,
+      /Switch to structured view[\s\S]*continues in structured view when it has a saved transcript, otherwise it starts fresh/,
+    ],
     [false, false, /fresh terminal pane/],
   ])("toStructured=%s keepsContext=%s copy", (toStructured, keepsContext, copy) => {
     expect(setup({ toStructured, keepsContext }).container.textContent).toMatch(copy);
