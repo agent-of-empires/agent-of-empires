@@ -286,11 +286,12 @@ impl NativeRuntime {
             .load(std::sync::atomic::Ordering::SeqCst);
         let health = state.canonical_health.read().await.clone();
         let project_started = std::time::Instant::now();
-        let sessions = super::api::sessions::project_sessions(state).await;
+        let mut sessions = super::api::sessions::project_sessions(state).await;
         let project_ms = project_started.elapsed().as_secs_f64() * 1000.0;
         let metadata = state.canonical_metadata.read().await;
         let workspace_ordering =
             super::api::sessions::compute_merged_ordering(&sessions, &metadata.workspace_ordering);
+        super::api::sessions::rank_by_workspace(&mut sessions, &workspace_ordering);
         let contents = RuntimeContents {
             capabilities: self.capabilities(state, &health),
             health,
@@ -298,6 +299,7 @@ impl NativeRuntime {
             sessions,
             profiles: metadata.profiles.clone(),
             workspace_ordering,
+            repository_order: metadata.repository_order.clone(),
             global_projects: metadata.global_projects.clone(),
             sidebar_view: metadata.sidebar_view,
         };

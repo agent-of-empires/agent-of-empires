@@ -53,13 +53,6 @@ pub(super) async fn settle_namespace(
     let before_groups = group_snapshot(view);
     let mut respond = view.session_feed.namespace_driver_for_test();
     action(view)?;
-    let boundary_destination = match &view.pending_namespace_intent {
-        Some(super::super::NamespaceIntent::ReorderSession {
-            continuation_destination,
-            ..
-        }) => continuation_destination.clone(),
-        _ => None,
-    };
     assert_eq!(
         serde_json::to_value(view.cloned_instances()).unwrap(),
         before_rows
@@ -101,42 +94,40 @@ pub(super) async fn settle_namespace(
     );
     assert_eq!(group_snapshot(view), before_groups);
     apply_published(view, state).await;
-    // AtEdge is a completed sibling reorder; Home may now submit a canonical
-    // cross-group continuation. Keep its original driver alive through that command.
-    if view.pending_namespace_intent.is_some() {
-        if let NamespaceMutation::Reorder(crate::daemon::ReorderBody::Session {
-            id,
-            profile,
-            source_group,
-            direction,
-            ..
-        }) = &expected
-        {
-            let destination = boundary_destination.expect("captured continuation target");
-            let next = NamespaceMutation::Reorder(crate::daemon::ReorderBody::Session {
-                id: id.clone(),
-                profile: profile.clone(),
-                source_group: source_group.clone(),
-                direction: *direction,
-                destination: Some(destination),
-            });
-            let (method, path, body) = wire(&next);
-            let (status, headers, value) =
-                request_with_headers(state, method, path, body.clone()).await;
-            assert!(status.is_success(), "{status}: {value}");
-            let receipt = MutationReceipt {
-                cursor: receipt_cursor(&headers),
-                outcome: NamespaceOutcome::Reordered(serde_json::from_value(value).unwrap()),
-            };
-            let captured = respond(Ok(receipt)).expect("boundary continuation admitted");
-            assert_eq!(wire(&captured), (method, path, body));
-            view.apply_session_feed();
-            apply_published(view, state).await;
-        } else {
-            panic!("unexpected namespace continuation");
-        }
-    }
     Ok(())
+}
+
+/// Run `action`, carry each shared-order or sidebar-view write it submits to the Daemon, then
+/// apply the snapshot they publish. Returns the writes in the order they were sent.
+pub(super) async fn settle_view_writes(
+    state: &std::sync::Arc<crate::server::AppState>,
+    view: &mut HomeView,
+    action: impl FnOnce(&mut HomeView),
+) -> Vec<crate::tui::session_feed::ViewWrite> {
+    use crate::tui::session_feed::ViewWrite;
+    let mut capture = view.session_feed.view_write_driver_for_test();
+    action(view);
+    let mut writes = Vec::new();
+    while let Some(captured) = capture() {
+        let (method, path, body) = match &captured.write {
+            ViewWrite::Ordering(patch) => (
+                "PUT",
+                "/api/workspace-ordering",
+                serde_json::to_value(patch).unwrap(),
+            ),
+            ViewWrite::SidebarView(patch) => (
+                "PATCH",
+                "/api/sidebar-view",
+                serde_json::to_value(patch).unwrap(),
+            ),
+        };
+        let (status, headers, value) = request_with_headers(state, method, path, body).await;
+        assert!(status.is_success(), "{status}: {value}");
+        writes.push(captured.finish(Ok(receipt_cursor(&headers))));
+    }
+    view.apply_session_feed();
+    apply_published(view, state).await;
+    writes
 }
 
 pub(super) async fn settle_row_command(
@@ -360,12 +351,11 @@ pub(super) async fn cross_then_peer_collapse(
     let row = view.get_instance(id).unwrap();
     let profile = row.source_profile.clone();
     let body = serde_json::json!({ "target": "session", "id": id, "profile": profile,
-        "source_group": row.group_path, "direction": "down", "destination": destination });
+        "source_group": row.group_path, "destination": destination });
     view.selected_session = Some(id.into());
     view.selected_group = None;
     let mut respond = view.session_feed.namespace_driver_for_test();
-    view.submit_session_reorder(id, 1, Some(destination.to_owned()))
-        .unwrap();
+    view.move_row_at_cursor(1).unwrap();
     let (status, headers, outcome) =
         request_with_headers(state, "POST", "/api/reorder", body).await;
     assert!(status.is_success());
@@ -393,95 +383,83 @@ pub(super) async fn cross_then_peer_collapse(
     apply_published(view, state).await;
 }
 
+/// Press Ctrl+Up or Ctrl+Down on the cursor's row and settle the namespace reorder it sends: a
+/// group header among its siblings, or a session carried across its group's edge.
 pub(in crate::tui::home) async fn settle_reorder(
     state: &std::sync::Arc<crate::server::AppState>,
     view: &mut HomeView,
     delta: isize,
-    crossing: bool,
 ) -> anyhow::Result<()> {
     use crate::daemon::{GroupLocation, MoveDirection, NamespaceMutation, ReorderBody};
-    let direction = if delta < 0 {
-        MoveDirection::Up
-    } else {
-        MoveDirection::Down
-    };
     let request = if let Some(path) = view.selected_group.clone() {
         let profile = view.canonical_group_location(&path)?.profile;
         ReorderBody::Group {
             group: GroupLocation { profile, path },
-            direction,
+            direction: if delta < 0 {
+                MoveDirection::Up
+            } else {
+                MoveDirection::Down
+            },
         }
     } else {
         let id = view.selected_session.clone().expect("selected session");
         let row = view.get_instance(&id).unwrap();
-        let destination = if crossing {
-            let mut paths = Vec::<String>::new();
-            for item in &view.flat_items {
-                let path = match item {
-                    Item::Group { path, profile, .. }
-                        if profile.as_deref().is_none_or(|p| p == row.source_profile) =>
-                    {
-                        Some(path.clone())
-                    }
-                    Item::Session { id, .. } => view
-                        .get_instance(id)
-                        .filter(|peer| {
-                            peer.source_profile == row.source_profile
-                                && !peer.is_archived()
-                                && !peer.is_trashed()
-                        })
-                        .map(|peer| peer.group_path.clone()),
-                    _ => None,
-                };
-                if let Some(path) = path {
-                    if !crate::session::is_within_archived_section(&path)
-                        && !crate::session::is_within_trash_section(&path)
-                        && !paths.contains(&path)
-                    {
-                        paths.push(path);
-                    }
+        let mut paths = Vec::<String>::new();
+        for item in &view.flat_items {
+            let path = match item {
+                Item::Group { path, profile, .. }
+                    if profile.as_deref().is_none_or(|p| p == row.source_profile) =>
+                {
+                    Some(path.clone())
+                }
+                Item::Session { id, .. } => view
+                    .get_instance(id)
+                    .filter(|peer| {
+                        peer.source_profile == row.source_profile
+                            && !peer.is_archived()
+                            && !peer.is_trashed()
+                    })
+                    .map(|peer| peer.group_path.clone()),
+                _ => None,
+            };
+            if let Some(path) = path {
+                if !crate::session::is_within_archived_section(&path)
+                    && !crate::session::is_within_trash_section(&path)
+                    && !paths.contains(&path)
+                {
+                    paths.push(path);
                 }
             }
-            let at = paths
-                .iter()
-                .position(|path| path == &row.group_path)
-                .unwrap();
-            at.checked_add_signed(delta)
-                .and_then(|at| paths.get(at))
-                .cloned()
-        } else {
-            None
-        };
+        }
+        let at = paths
+            .iter()
+            .position(|path| path == &row.group_path)
+            .unwrap();
+        let destination = at
+            .checked_add_signed(delta)
+            .and_then(|at| paths.get(at))
+            .cloned()
+            .expect("a neighbouring group to carry the session into");
         ReorderBody::Session {
             id,
             profile: row.source_profile.clone(),
             source_group: row.group_path.clone(),
-            direction,
             destination,
         }
     };
-    let destination = match &request {
-        ReorderBody::Session { destination, .. } => destination.clone(),
-        ReorderBody::Group { .. } => None,
-    };
     settle_namespace(state, view, NamespaceMutation::Reorder(request), |view| {
-        if crossing {
-            let id = view.selected_session.clone().unwrap();
-            view.submit_session_reorder(&id, delta, destination)
-        } else {
-            view.handle_key(
-                KeyEvent::new(
-                    if delta < 0 {
-                        KeyCode::Up
-                    } else {
-                        KeyCode::Down
-                    },
-                    KeyModifiers::CONTROL,
-                ),
-                None,
-            );
-            Ok(())
-        }
+        view.handle_key(
+            KeyEvent::new(
+                if delta < 0 {
+                    KeyCode::Up
+                } else {
+                    KeyCode::Down
+                },
+                KeyModifiers::CONTROL,
+            ),
+            None,
+        );
+        Ok(())
     })
     .await
 }
@@ -2598,12 +2576,13 @@ fn test_all_profiles_view_loads_from_multiple_profiles() {
     assert_eq!(view.instance_at(0).source_profile, "alpha");
 }
 
-/// Ctrl+Down and Ctrl+Up move a session within its group under the Custom sort, and the move
-/// survives a rebuild because it is stored on the session rather than recomputed.
+/// Under Custom, Ctrl+Down swaps the session's workspace with the next row's in the shared
+/// order, and the list follows the snapshot that write publishes.
 #[tokio::test]
 #[serial]
 async fn test_ctrl_arrows_move_a_session_under_custom_sort() {
     use crate::session::config::SortOrder;
+    use crate::tui::session_feed::ViewWrite;
 
     let mut env = create_test_env_with_mixed_sessions();
     let profiles = crate::session::list_profiles().unwrap();
@@ -2616,107 +2595,140 @@ async fn test_ctrl_arrows_move_a_session_under_custom_sort() {
         .map(str::to_string)
         .collect();
     assert_eq!(original.len(), 3);
-
-    // Land the cursor on the first session of the work group.
-    let work_ids: Vec<String> = env
+    let workspace = |view: &HomeView, title: &str| {
+        view.get_instance(&custom_order_id_of(view, title))
+            .unwrap()
+            .workspace_id()
+    };
+    let (first, second) = (
+        workspace(&env.view, &original[0]),
+        workspace(&env.view, &original[1]),
+    );
+    let mut expected = env
+        .view
+        .session_feed
+        .applied_snapshot()
+        .unwrap()
+        .contents
+        .workspace_ordering
+        .clone();
+    let (i, j) = (
+        expected.iter().position(|w| *w == first).unwrap(),
+        expected.iter().position(|w| *w == second).unwrap(),
+    );
+    expected.swap(i, j);
+    let id = custom_order_id_of(&env.view, &original[0]);
+    env.view.cursor = env
         .view
         .flat_items
         .iter()
-        .filter_map(|i| match i {
-            Item::Session { id, .. } => Some(id.clone()),
-            _ => None,
-        })
-        .filter(|id| {
-            env.view
-                .get_instance(id)
-                .map(|s| s.group_path == "work")
-                .unwrap_or(false)
-        })
-        .collect();
-    let first = env
-        .view
-        .flat_items
-        .iter()
-        .position(|i| matches!(i, Item::Session { id, .. } if id == &work_ids[0]))
-        .expect("a session under work");
-    env.view.cursor = first;
+        .position(|i| matches!(i, Item::Session { id: row, .. } if *row == id))
+        .unwrap();
     env.view.update_selected();
 
-    settle_reorder(&state, &mut env.view, 1, false)
-        .await
-        .unwrap();
-    let moved: Vec<String> = work_group_titles(&env.view)
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    assert_eq!(
-        moved,
-        [
-            original[1].clone(),
-            original[0].clone(),
-            original[2].clone()
-        ]
-    );
-
-    env.view.rebuild_flat_items();
+    let ctrl = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
+    let writes = settle_view_writes(&state, &mut env.view, |view| {
+        view.handle_key(ctrl(KeyCode::Down), None);
+    })
+    .await;
+    match writes.as_slice() {
+        [ViewWrite::Ordering(patch)] => {
+            assert_eq!(
+                patch.order.as_ref(),
+                Some(&expected),
+                "the two rows swapped"
+            );
+            assert!(patch.repositories.is_none());
+        }
+        other => panic!("expected one shared-order write, got {other:?}"),
+    }
     assert_eq!(
         work_group_titles(&env.view),
-        moved,
-        "order is persisted, not recomputed"
+        [&original[1], &original[0], &original[2]]
+    );
+    assert_eq!(
+        crate::session::load_workspace_ordering().unwrap().order,
+        expected,
+        "the swap reached the shared store"
     );
 
-    settle_reorder(&state, &mut env.view, -1, false)
-        .await
-        .unwrap();
+    settle_view_writes(&state, &mut env.view, |view| {
+        view.handle_key(ctrl(KeyCode::Up), None);
+    })
+    .await;
     assert_eq!(work_group_titles(&env.view), original);
 }
 
-/// Outside the Custom sort the same keys leave the list alone: a computed order would
-/// discard the move on the next rebuild, so the action explains itself instead.
-#[test]
+/// Under the Name sort, Ctrl+Down starts the Custom order from the rows on screen: it sends
+/// that order with the two rows swapped and switches the shared sort to Custom.
+#[tokio::test]
 #[serial]
-fn test_ctrl_arrows_do_not_reorder_under_a_computed_sort() {
+async fn test_ctrl_arrows_under_name_start_custom_from_the_screen_order() {
     use crate::session::config::SortOrder;
+    use crate::tui::session_feed::ViewWrite;
 
     let mut env = create_test_env_with_mixed_sessions();
-    env.view.apply_sort_order(SortOrder::Name);
-    let before: Vec<String> = work_group_titles(&env.view)
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-
-    let work_ids: Vec<String> = env
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    let (status, _, _) = request_with_headers(
+        &state,
+        "PATCH",
+        "/api/sidebar-view",
+        serde_json::to_value(crate::daemon::SidebarViewPatch {
+            group_by: Some(crate::session::config::GroupByMode::Group),
+            sort: Some(SortOrder::Name),
+        })
+        .unwrap(),
+    )
+    .await;
+    assert!(status.is_success());
+    apply_published(&mut env.view, &state).await;
+    assert_eq!(env.view.sort_order, SortOrder::Name);
+    assert_eq!(work_group_titles(&env.view), ["Apple", "Mango", "Zebra"]);
+    let on_screen: Vec<String> = env
         .view
         .flat_items
         .iter()
         .filter_map(|i| match i {
-            Item::Session { id, .. } => Some(id.clone()),
+            Item::Session { id, .. } => env.view.get_instance(id).map(Instance::workspace_id),
             _ => None,
         })
-        .filter(|id| {
-            env.view
-                .get_instance(id)
-                .map(|s| s.group_path == "work")
-                .unwrap_or(false)
-        })
         .collect();
-    let first = env
+    let workspace = |view: &HomeView, title: &str| {
+        view.get_instance(&custom_order_id_of(view, title))
+            .unwrap()
+            .workspace_id()
+    };
+    let (apple, mango) = (workspace(&env.view, "Apple"), workspace(&env.view, "Mango"));
+    let mut expected = on_screen.clone();
+    let (i, j) = (
+        expected.iter().position(|w| *w == apple).unwrap(),
+        expected.iter().position(|w| *w == mango).unwrap(),
+    );
+    expected.swap(i, j);
+    let id = custom_order_id_of(&env.view, "Apple");
+    env.view.cursor = env
         .view
         .flat_items
         .iter()
-        .position(|i| matches!(i, Item::Session { id, .. } if id == &work_ids[0]))
-        .expect("a session under work");
-    env.view.cursor = first;
+        .position(|i| matches!(i, Item::Session { id: row, .. } if *row == id))
+        .unwrap();
     env.view.update_selected();
 
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
-
-    assert_eq!(work_group_titles(&env.view), before);
-    assert!(
-        env.view.status_flash.is_some(),
-        "the user is told why nothing moved"
-    );
+    let writes = settle_view_writes(&state, &mut env.view, |view| {
+        view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+    })
+    .await;
+    match writes.as_slice() {
+        [ViewWrite::Ordering(patch), ViewWrite::SidebarView(view)] => {
+            assert_eq!(patch.order.as_ref(), Some(&expected));
+            assert_eq!(view.sort, Some(SortOrder::Custom));
+            assert_eq!(view.group_by, None);
+        }
+        other => panic!("expected an order and a sort write, got {other:?}"),
+    }
+    assert_eq!(env.view.sort_order, SortOrder::Custom);
+    assert_eq!(work_group_titles(&env.view), ["Mango", "Apple", "Zebra"]);
 }
 
 /// Alt+Down and Alt+Up walk the sessions the theme paints as attention-worthy: `Running`
@@ -2775,8 +2787,7 @@ fn test_alt_arrows_jump_between_just_finished_sessions() {
     );
 }
 
-/// A session at the edge of its group keeps going into the neighbouring group, landing
-/// against the boundary it crossed rather than at a far end.
+/// Under My groups, a session at the edge of its group is carried into the neighbouring one.
 #[tokio::test]
 #[serial]
 async fn test_ctrl_arrows_carry_a_session_into_the_next_group() {
@@ -2816,27 +2827,11 @@ async fn test_ctrl_arrows_carry_a_session_into_the_next_group() {
     env.view.update_selected();
 
     // Above "work" sits the ungrouped bucket, so moving up leaves the group.
-    settle_reorder(&state, &mut env.view, -1, false)
-        .await
-        .unwrap();
+    settle_reorder(&state, &mut env.view, -1).await.unwrap();
     assert_eq!(
         env.view.get_instance(&top).map(|i| i.group_path.clone()),
         Some(String::new()),
         "the session left its group"
-    );
-
-    // And back again, landing at the top of the group it re-enters.
-    settle_reorder(&state, &mut env.view, 1, false)
-        .await
-        .unwrap();
-    assert_eq!(
-        env.view.get_instance(&top).map(|i| i.group_path.clone()),
-        Some("work".to_string())
-    );
-    assert_eq!(
-        env.view.get_instance(&top).and_then(|i| i.sort_index),
-        Some(0),
-        "it re-enters at the boundary it crossed"
     );
 }
 
@@ -2880,9 +2875,7 @@ async fn test_ctrl_arrows_move_a_group_among_its_siblings() {
     env.view.update_selected();
     assert_eq!(env.view.selected_group.as_deref(), Some("alpha"));
 
-    settle_reorder(&state, &mut env.view, 1, false)
-        .await
-        .unwrap();
+    settle_reorder(&state, &mut env.view, 1).await.unwrap();
     assert_eq!(group_names(&env.view), ["beta", "alpha", "gamma"]);
 
     env.view.rebuild_flat_items();
@@ -2938,11 +2931,11 @@ async fn test_ctrl_down_stops_at_the_last_group() {
     env.view.cursor = last.0;
     env.view.update_selected();
 
+    let mut capture = env.view.session_feed.view_write_driver_for_test();
     for _ in 0..3 {
-        settle_reorder(&state, &mut env.view, 1, false)
-            .await
-            .unwrap();
+        env.view.move_row_at_cursor(1).unwrap();
     }
+    assert!(capture().is_none(), "nothing was sent");
 
     assert_eq!(
         env.view.get_instance(&last.1).map(|i| i.group_path.clone()),
@@ -3090,12 +3083,11 @@ fn test_a_peer_regroup_keeps_palette_header_picks_and_search_selection_consisten
     assert_eq!(env.view.selected_session.as_deref(), Some(beta.as_str()));
 }
 
-/// Project and Org headers are derived from repo paths, and their rows carry a rewritten
-/// `group_path` for display. A move there would persist a manual membership the list is not
-/// showing, so it is refused and the stored groups stay put.
+/// Repository headers are derived from repo paths, so a row never crosses one: that would
+/// persist a manual membership the list is not showing.
 #[test]
 #[serial]
-fn test_row_moves_are_refused_outside_manual_grouping() {
+fn test_row_moves_never_regroup_under_repository_grouping() {
     use crate::session::config::{GroupByMode, SortOrder};
 
     let instances = [
@@ -3132,15 +3124,20 @@ fn test_row_moves_are_refused_outside_manual_grouping() {
     env.view.cursor = first.0;
     env.view.update_selected();
 
+    let mut capture = env.view.session_feed.view_write_driver_for_test();
     env.view
         .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
 
+    assert!(
+        capture().is_none(),
+        "a row alone under its header has nowhere to go"
+    );
+    assert!(env.view.pending_namespace_intent.is_none());
     assert_eq!(
         membership(&env.view),
         before,
         "manual group membership untouched"
     );
-    assert!(env.view.status_flash.is_some(), "the refusal is explained");
 }
 
 /// A group that exists only because a session names it has no `groups.json` row yet. Moving
@@ -3177,9 +3174,7 @@ async fn test_moving_a_group_without_a_stored_row_persists() {
         .expect("alpha header");
     env.view.cursor = header;
     env.view.update_selected();
-    settle_reorder(&state, &mut env.view, 1, false)
-        .await
-        .unwrap();
+    settle_reorder(&state, &mut env.view, 1).await.unwrap();
 
     let (_, stored) = Storage::open_unwatched("test")
         .unwrap()
@@ -3237,9 +3232,7 @@ async fn test_moving_a_group_does_not_resurrect_a_peer_deleted_one() {
         .expect("alpha header");
     env.view.cursor = header;
     env.view.update_selected();
-    settle_reorder(&state, &mut env.view, 1, false)
-        .await
-        .unwrap();
+    settle_reorder(&state, &mut env.view, 1).await.unwrap();
 
     let (_, stored) = Storage::open_unwatched("test")
         .unwrap()
@@ -3356,9 +3349,7 @@ async fn test_cross_group_move_lands_in_an_empty_neighbour() {
     env.view.cursor = at;
     env.view.update_selected();
 
-    settle_reorder(&state, &mut env.view, 1, false)
-        .await
-        .unwrap();
+    settle_reorder(&state, &mut env.view, 1).await.unwrap();
 
     assert_eq!(
         env.view.get_instance(&moving).map(|i| i.group_path.clone()),
@@ -3378,94 +3369,6 @@ async fn test_cross_group_move_lands_in_an_empty_neighbour() {
     assert!(
         matches!(env.view.flat_items.get(env.view.cursor), Some(Item::Session { id, .. }) if *id == moving),
         "and the cursor sits on it"
-    );
-}
-
-/// A peer reorders the same group between this view's read and its write. Computing the
-/// permutation from the locked rows keeps the indices a permutation of 0..n; computing it
-/// from a stale snapshot leaves two rows sharing one.
-#[tokio::test]
-#[serial]
-async fn test_a_peer_swap_does_not_leave_duplicate_indices() {
-    use crate::session::config::SortOrder;
-
-    let instances = [
-        instance_in("a1", "/tmp/a1", "work"),
-        instance_in("b1", "/tmp/b1", "work"),
-        instance_in("c1", "/tmp/c1", "work"),
-    ];
-    let mut env = seeded_env(test_home(), &instances, true);
-    let state = native_state(&["test"]).await;
-    apply_published(&mut env.view, &state).await;
-    env.view.apply_sort_order(SortOrder::Custom);
-
-    let by_title = |view: &HomeView, title: &str| -> String {
-        view.flat_items
-            .iter()
-            .find_map(|i| match i {
-                Item::Session { id, .. } => view
-                    .get_instance(id)
-                    .filter(|inst| inst.title == title)
-                    .map(|_| id.clone()),
-                _ => None,
-            })
-            .expect("session by title")
-    };
-    let (a, b, c) = (
-        by_title(&env.view, "a1"),
-        by_title(&env.view, "b1"),
-        by_title(&env.view, "c1"),
-    );
-
-    // Seed 0/1/2, which is what the view has read.
-    Storage::open_unwatched("test")
-        .unwrap()
-        .update(|rows, _| {
-            for (id, index) in [(&a, 0u32), (&b, 1), (&c, 2)] {
-                if let Some(row) = rows.iter_mut().find(|r| r.id == *id) {
-                    row.sort_index = Some(index);
-                }
-            }
-            Ok(())
-        })
-        .unwrap();
-    refresh_native_fixture(&state, &mut env.view).await;
-
-    // A peer swaps b and c behind this view's back; the view still believes 0/1/2.
-    Storage::open_unwatched("test")
-        .unwrap()
-        .update(|rows, _| {
-            for (id, index) in [(&b, 2u32), (&c, 1)] {
-                if let Some(row) = rows.iter_mut().find(|r| r.id == *id) {
-                    row.sort_index = Some(index);
-                }
-            }
-            Ok(())
-        })
-        .unwrap();
-
-    let at = env
-        .view
-        .flat_items
-        .iter()
-        .position(|i| matches!(i, Item::Session { id, .. } if *id == a))
-        .expect("a1 row");
-    env.view.cursor = at;
-    env.view.update_selected();
-    settle_reorder(&state, &mut env.view, 1, false)
-        .await
-        .unwrap();
-
-    let (rows, _) = Storage::open_unwatched("test")
-        .unwrap()
-        .load_with_groups()
-        .unwrap();
-    let mut indices: Vec<u32> = rows.iter().filter_map(|r| r.sort_index).collect();
-    indices.sort_unstable();
-    assert_eq!(
-        indices,
-        vec![0, 1, 2],
-        "indices stay a permutation: {indices:?}"
     );
 }
 
@@ -3533,9 +3436,7 @@ async fn test_a_move_does_not_resurrect_a_group_a_peer_deleted() {
         .expect("a1 row");
     env.view.cursor = at;
     env.view.update_selected();
-    settle_reorder(&state, &mut env.view, 1, false)
-        .await
-        .unwrap();
+    settle_reorder(&state, &mut env.view, 1).await.unwrap();
 
     let (rows, groups) = Storage::open_unwatched("test")
         .unwrap()
@@ -3570,85 +3471,6 @@ async fn test_a_move_does_not_resurrect_a_group_a_peer_deleted() {
     );
 }
 
-/// A peer moves the cursor's session to another group first. The anchor no longer sits where
-/// the list drew it, so the move is dropped and the list refreshed: taken as an edge instead,
-/// it would push the row into whichever group the stale list showed next.
-#[tokio::test]
-#[serial]
-async fn test_a_move_is_dropped_when_a_peer_regroups_the_row() {
-    use crate::session::config::SortOrder;
-
-    let instances = [
-        instance_in("a1", "/tmp/a1", "work"),
-        instance_in("x1", "/tmp/x1", "work"),
-        instance_in("c1", "/tmp/c1", "zzz"),
-    ];
-    let mut env = seeded_env(test_home(), &instances, true);
-    let profiles = crate::session::list_profiles().unwrap();
-    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
-    apply_published(&mut env.view, &state).await;
-    env.view.apply_sort_order(SortOrder::Custom);
-    let a = custom_order_id_of(&env.view, "a1");
-    let x = custom_order_id_of(&env.view, "x1");
-
-    // A known order for the work group, which the view then reads.
-    Storage::open_unwatched("test")
-        .unwrap()
-        .update(|rows, _| {
-            for (id, index) in [(&a, 0u32), (&x, 1)] {
-                if let Some(row) = rows.iter_mut().find(|r| r.id == *id) {
-                    row.sort_index = Some(index);
-                }
-            }
-            Ok(())
-        })
-        .unwrap();
-    refresh_native_fixture(&state, &mut env.view).await;
-
-    // The peer moves a1 out of work behind this view's back.
-    Storage::open_unwatched("test")
-        .unwrap()
-        .update(|rows, _| {
-            if let Some(row) = rows.iter_mut().find(|r| r.id == a) {
-                row.group_path = "other".to_string();
-            }
-            Ok(())
-        })
-        .unwrap();
-
-    let at = env
-        .view
-        .flat_items
-        .iter()
-        .position(|i| matches!(i, Item::Session { id, .. } if *id == a))
-        .expect("a1 row");
-    env.view.cursor = at;
-    env.view.update_selected();
-    settle_reorder(&state, &mut env.view, 1, false)
-        .await
-        .unwrap();
-
-    let (rows, _) = Storage::open_unwatched("test")
-        .unwrap()
-        .load_with_groups()
-        .unwrap();
-    assert_eq!(
-        rows.iter()
-            .find(|r| r.id == a)
-            .map(|r| r.group_path.clone()),
-        Some("other".to_string()),
-        "the peer's grouping stands"
-    );
-    assert_eq!(
-        env.view
-            .get_instance(&a)
-            .map(|i| i.group_path.clone())
-            .as_deref(),
-        Some("other"),
-        "and the list now shows it there"
-    );
-}
-
 /// The move is stored before the destination group is expanded, so a failed expansion write
 /// still leaves the row in its new group on disk. The list is rebuilt either way: returning
 /// early would leave the cursor on a row the store places elsewhere.
@@ -3674,9 +3496,7 @@ async fn test_failed_native_reorder_keeps_source_rows_and_explains_uncertainty()
         .unwrap();
     env.view.update_selected();
     let responder = env.view.session_feed.namespace_driver_for_test();
-    env.view
-        .submit_session_reorder(&a, 1, Some("bbb".into()))
-        .unwrap();
+    env.view.move_row_at_cursor(1).unwrap();
     let storage = Storage::open_unwatched("test").unwrap();
     let rows_before = std::fs::read(storage.sessions_path()).unwrap();
     std::fs::write(storage.sessions_path().with_file_name("groups.json"), b"{").unwrap();
@@ -3686,7 +3506,7 @@ async fn test_failed_native_reorder_keeps_source_rows_and_explains_uncertainty()
         "/api/reorder",
         serde_json::json!({
             "target": "session", "id": a, "profile": "test", "source_group": "aaa",
-            "direction": "down", "destination": "bbb",
+            "destination": "bbb",
         }),
     )
     .await;
@@ -3701,9 +3521,8 @@ async fn test_failed_native_reorder_keeps_source_rows_and_explains_uncertainty()
     assert!(env.view.confirm_dialog.is_some());
 }
 
-/// The boundary half of a move runs in a second transaction, after the first has reported
-/// the row against the edge of its group. A peer that regroups the row in between must not
-/// have its change overwritten by a membership decided from the earlier read.
+/// A peer regroups the row before this view's carry lands: the Daemon checks the anchor against
+/// the store, so the peer's change is not overwritten by a membership decided from a stale read.
 #[tokio::test]
 #[serial]
 async fn test_a_boundary_move_rechecks_the_anchor_against_the_store() {
@@ -3732,7 +3551,7 @@ async fn test_a_boundary_move_rechecks_the_anchor_against_the_store() {
 
     env.view.selected_session = Some(a.clone());
     env.view.selected_group = None;
-    settle_reorder(&state, &mut env.view, 1, true)
+    settle_reorder(&state, &mut env.view, 1)
         .await
         .expect("the boundary move is dropped, not failed");
 
@@ -3811,7 +3630,7 @@ async fn test_an_empty_group_moves_in_a_unified_single_profile_view() {
         "the displayed header is unqualified"
     );
 
-    settle_reorder(&state, &mut view, -1, false).await.unwrap();
+    settle_reorder(&state, &mut view, -1).await.unwrap();
 
     assert_eq!(
         stored_group_order("test"),
@@ -3967,9 +3786,7 @@ async fn test_a_session_moves_up_into_an_implicit_parent_group() {
         .position(|i| matches!(i, Item::Session { id: row, .. } if *row == id))
         .expect("c1 row");
     env.view.update_selected();
-    settle_reorder(&state, &mut env.view, -1, false)
-        .await
-        .unwrap();
+    settle_reorder(&state, &mut env.view, -1).await.unwrap();
 
     let (rows, _) = Storage::open_unwatched("test")
         .unwrap()

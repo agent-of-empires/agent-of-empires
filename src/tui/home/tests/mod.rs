@@ -292,6 +292,9 @@ pub(super) fn fixture_snapshot(
             sessions,
             profiles: fixture_profiles(),
             workspace_ordering: crate::session::load_workspace_ordering().unwrap().order,
+            repository_order: crate::session::load_workspace_ordering()
+                .unwrap()
+                .repositories,
             global_projects: crate::session::projects::load_global()
                 .unwrap()
                 .into_iter()

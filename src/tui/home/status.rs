@@ -355,7 +355,6 @@ impl HomeView {
                 || instance.notify_on_idle != row.notify_on_idle
                 || instance.notify_on_error != row.notify_on_error
                 || instance.project_path != row.project_path
-                || instance.sort_index != row.sort_index
                 || instance.agent_session_id != row.agent_session_id
                 || instance.parent_session_id != row.parent_session_id
                 || instance.lifecycle_generation != row.lifecycle_generation
@@ -856,6 +855,8 @@ impl HomeView {
                                     self.instances.keys().map(String::as_str).collect();
                                 self.structured_pending_approvals
                                     .retain(|id, _| ids.contains(id.as_str()));
+                                self.repository_order
+                                    .clone_from(&snapshot.contents.repository_order);
                                 self.refresh_projection_presentation();
                                 self.session_feed_reload_retry_at = None;
                                 self.session_feed_failed_cursor = None;
@@ -1159,6 +1160,10 @@ impl HomeView {
         let row_outcomes = self.session_feed.drain_session_outcomes();
         let namespace = self.session_feed.drain_namespace_result();
         let mut changed = !row_outcomes.is_empty() || namespace.is_some();
+        if let Some(Err(error)) = self.session_feed.drain_workspace_ordering_result() {
+            self.flash_status(format!("Order not saved: {error}"));
+            changed = true;
+        }
         if let Some(result) = self.session_feed.drain_sidebar_view_result() {
             if let Err(error) = result {
                 self.flash_status(format!("Grouping and sort not saved: {error}"));
@@ -1325,49 +1330,7 @@ impl HomeView {
                                 self.update_selected();
                             }
                         }
-                        ReorderOutcome::AtEdge => {
-                            if let Some(NamespaceIntent::ReorderSession {
-                                id,
-                                profile,
-                                source_group,
-                                delta,
-                                crossing: false,
-                                continuation_destination,
-                            }) = intent
-                            {
-                                // A keystroke owns both steps, but each receipt has its
-                                // own applied fence. Never retarget to the new cursor.
-                                if self.instances.get(&id).is_some_and(|row| {
-                                    row.source_profile == profile
-                                        && row.group_path == source_group
-                                        && !row.is_archived()
-                                        && !row.is_trashed()
-                                }) {
-                                    if let Some(destination) = continuation_destination {
-                                        if destination.is_empty()
-                                            || self
-                                                .group_trees
-                                                .get(&profile)
-                                                .is_some_and(|tree| tree.group_exists(&destination))
-                                        {
-                                            if let Err(error) = self.submit_session_reorder(
-                                                &id,
-                                                delta,
-                                                Some(destination),
-                                            ) {
-                                                self.record_runtime_message(format!(
-                                                    "Could not cross the group boundary: {error}"
-                                                ));
-                                            }
-                                        } else {
-                                            let _ = self.refresh_after_stale_move();
-                                        }
-                                    }
-                                } else {
-                                    let _ = self.refresh_after_stale_move();
-                                }
-                            }
-                        }
+                        ReorderOutcome::AtEdge => {}
                         ReorderOutcome::Stale => {
                             let _ = self.refresh_after_stale_move();
                         }

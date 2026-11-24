@@ -715,7 +715,7 @@ pub async fn reorder(
             destination,
             ..
         } => {
-            for path in std::iter::once(source_group).chain(destination.iter()) {
+            for path in [source_group, destination] {
                 if !path.is_empty()
                     && (crate::session::is_synthetic_project_header(path)
                         || super::validate_display_label(path, "group").is_err())
@@ -845,7 +845,6 @@ fn apply_canonical_reorder(
             id,
             profile,
             source_group,
-            direction,
             destination,
         } => {
             let Some(anchor) = rows.iter().position(|row| {
@@ -858,129 +857,32 @@ fn apply_canonical_reorder(
                 return Ok(ReorderOutcome::Stale);
             };
             check_row(&rows[anchor], cityhall)?;
-            let group = destination.as_ref().unwrap_or(source_group);
-            if let Some(destination) = destination {
-                if destination == source_group
-                    || !(destination.is_empty()
-                        || groups.iter().any(|group| &group.path == destination)
-                        || rows.iter().any(|row| {
-                            &row.source_profile == profile
-                                && belongs(&row.group_path, destination)
-                                && !row.is_archived()
-                                && !row.is_trashed()
-                        }))
-                {
-                    return Ok(ReorderOutcome::Stale);
+            if destination == source_group
+                || !(destination.is_empty()
+                    || groups.iter().any(|group| &group.path == destination)
+                    || rows.iter().any(|row| {
+                        &row.source_profile == profile
+                            && belongs(&row.group_path, destination)
+                            && !row.is_archived()
+                            && !row.is_trashed()
+                    }))
+            {
+                return Ok(ReorderOutcome::Stale);
+            }
+            rows[anchor].group_path = destination.clone();
+            // Reveal only explicit persisted ancestors; implicit paths are synthesized
+            // from the newly committed row by the normal GroupTree projection.
+            for group in groups.iter_mut() {
+                if !group.path.is_empty() && belongs(destination, &group.path) {
+                    group.collapsed = false;
                 }
             }
-            let mut order: Vec<usize> = rows
-                .iter()
-                .enumerate()
-                .filter(|(index, row)| {
-                    &row.source_profile == profile
-                        && &row.group_path == group
-                        && !row.is_archived()
-                        && !row.is_trashed()
-                        && (destination.is_none() || *index != anchor)
-                })
-                .map(|(index, _)| index)
-                .collect();
-            if cityhall {
-                for index in &order {
-                    check_structured(&rows[*index])?;
-                }
-            }
-            order.sort_by_key(|index| rows[*index].custom_order_key());
-            if destination.is_some() {
-                match direction {
-                    MoveDirection::Up => order.push(anchor),
-                    MoveDirection::Down => order.insert(0, anchor),
-                }
-            } else {
-                let at = order
-                    .iter()
-                    .position(|index| *index == anchor)
-                    .expect("current anchor is in its authoritative sibling set");
-                let to = match direction {
-                    MoveDirection::Up => at.checked_sub(1),
-                    MoveDirection::Down => at.checked_add(1).filter(|to| *to < order.len()),
-                };
-                let Some(to) = to else {
-                    return Ok(ReorderOutcome::AtEdge);
-                };
-                order.swap(at, to);
-            }
-            // Reject overflow before writing any row; no lossy usize -> u32 cast.
-            if let Some(last) = order.len().checked_sub(1) {
-                u32::try_from(last)?;
-            }
-            for (position, index) in order.into_iter().enumerate() {
-                rows[index].sort_index = Some(position as u32);
-            }
-            if let Some(destination) = destination {
-                rows[anchor].group_path = destination.clone();
-                // Reveal only explicit persisted ancestors; implicit paths are synthesized
-                // from the newly committed row by the normal GroupTree projection.
-                for group in groups.iter_mut() {
-                    if !group.path.is_empty() && belongs(destination, &group.path) {
-                        group.collapsed = false;
-                    }
-                }
-                Ok(ReorderOutcome::Moved {
-                    destination: Some(GroupLocation {
-                        profile: profile.clone(),
-                        path: destination.clone(),
-                    }),
-                })
-            } else {
-                Ok(ReorderOutcome::Moved { destination: None })
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::daemon::{MoveDirection, ReorderBody, ReorderOutcome};
-
-    /// A session move steps through the siblings in the order the TUI shows them under Custom,
-    /// where a row never moved sits above the placed ones.
-    #[test]
-    fn session_move_follows_the_displayed_custom_order() {
-        let cases = [
-            ("a", MoveDirection::Down, true, ["c", "b", "a"]),
-            ("c", MoveDirection::Down, true, ["a", "c", "b"]),
-            ("c", MoveDirection::Up, false, ["c", "a", "b"]),
-        ];
-        for (moved, direction, expect_moved, expected) in cases {
-            let mut rows: Vec<Instance> = [("a", Some(0)), ("b", Some(1)), ("c", None)]
-                .into_iter()
-                .map(|(id, sort_index)| {
-                    let mut row = Instance::new(id, "/tmp/x");
-                    row.id = id.into();
-                    row.source_profile = "p".into();
-                    row.sort_index = sort_index;
-                    row
-                })
-                .collect();
-            let body = ReorderBody::Session {
-                id: moved.into(),
-                profile: "p".into(),
-                source_group: String::new(),
-                direction,
-                destination: None,
-            };
-            let outcome =
-                apply_canonical_reorder(&mut rows, &mut Vec::new(), &body, false).unwrap();
-            assert_eq!(
-                matches!(outcome, ReorderOutcome::Moved { .. }),
-                expect_moved,
-                "{moved} {direction:?}: {outcome:?}"
-            );
-            rows.sort_by_key(|row| row.custom_order_key());
-            let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
-            assert_eq!(ids, expected, "{moved} {direction:?}");
+            Ok(ReorderOutcome::Moved {
+                destination: Some(GroupLocation {
+                    profile: profile.clone(),
+                    path: destination.clone(),
+                }),
+            })
         }
     }
 }

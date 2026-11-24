@@ -294,8 +294,18 @@ impl HomeView {
                 inst
             })
             .collect();
-        // Headers never moved by hand sit newest first, like their rows under Custom.
+        // Headers never moved by hand sit newest first, then the shared repository order.
         grouped.sort_by_key(|inst| std::cmp::Reverse(inst.created_at));
+        if self.sort_order == SortOrder::Custom {
+            let rank = |inst: &Instance| {
+                let repo = inst.repo_path().trim_end_matches('/');
+                self.repository_order.iter().position(|r| r == repo)
+            };
+            grouped.sort_by_key(|inst| {
+                let rank = rank(inst);
+                (rank.is_some(), rank)
+            });
+        }
         let live: Vec<&Instance> = grouped
             .iter()
             .filter(|i| !i.is_archived() && !i.is_trashed())

@@ -1,93 +1,224 @@
-//! Manual row ordering for the home list: move the cursor's session within its group, or its
-//! group among the group's siblings. Only meaningful under [`SortOrder::Custom`] and
-//! [`GroupByMode::Group`], where the rows carry the user's own grouping and nothing
-//! recomputes their order behind them.
+//! Moving rows by hand. A row moves within its header by rewriting the shared Custom
+//! order (`PUT /api/workspace-ordering`), the order the web dashboard's drag writes too.
+//! Under My groups a row at the edge of its group crosses into the next one.
 
 use super::*;
 use crate::session::config::{GroupByMode, SortOrder};
 
 impl HomeView {
-    /// Move the cursor's row one slot in `delta` (-1 up, 1 down). A session moves among the
-    /// sessions of its own group and profile; a group header moves among the groups sharing
-    /// its parent. Refuses where a move would be discarded or would write a membership the
-    /// list is not showing.
+    /// Move the cursor's row one slot in `delta` (-1 up, 1 down). Under the Name sort the
+    /// list switches to Custom, starting from the order on screen.
     pub(super) fn move_row_at_cursor(&mut self, delta: isize) -> anyhow::Result<()> {
-        if self.sort_order != SortOrder::Custom {
-            self.flash_status("Pick the Custom sort (o) to arrange rows by hand");
-            return Ok(());
-        }
-        if self.group_by != GroupByMode::Group {
-            self.flash_status("Rows are arranged by hand under Groups only (g)");
-            return Ok(());
-        }
+        anyhow::ensure!(delta == -1 || delta == 1, "Invalid row direction");
         if let Some(path) = self.selected_group.clone() {
-            self.move_group_row(&path, delta)?;
-        } else if let Some(id) = self.selected_session.clone() {
-            if self.hide_stopped_in_groups {
-                // A session move renumbers every sibling in the store, the hidden ones too.
-                self.flash_status(if self.hide_snoozed_with_stopped {
-                    "Show stopped and snoozed (y) to move by hand"
-                } else {
-                    "Show stopped sessions (y) to move sessions by hand"
-                });
-                return Ok(());
+            return self.move_header_row(&path, delta);
+        }
+        let Some(id) = self.selected_session.clone() else {
+            return Ok(());
+        };
+        let Some(at) = self.session_row(&id) else {
+            return Ok(());
+        };
+        match self.sibling_session(at, delta) {
+            Some(neighbour) => self.swap_workspaces(&id, &neighbour),
+            None if self.group_by == GroupByMode::Group => self.carry_session(&id, delta),
+            None => Ok(()),
+        }
+    }
+
+    /// The session row next to `at` under the same header, if any. A header's own sessions
+    /// come before its child headers, so a header at the row's depth ends the run.
+    fn sibling_session(&self, at: usize, delta: isize) -> Option<String> {
+        let depth = self.flat_items.get(at)?.depth();
+        let mut cursor = at;
+        loop {
+            cursor = cursor.checked_add_signed(delta)?;
+            match self.flat_items.get(cursor)? {
+                Item::Session { id, depth: d } if *d == depth => return Some(id.clone()),
+                Item::Session { depth: d, .. } if *d > depth => continue,
+                Item::Group { depth: d, .. } if *d > depth => continue,
+                _ => return None,
             }
-            self.move_session_row(&id, delta)?;
+        }
+    }
+
+    /// Swap two rows' workspaces in the shared order, or in the order on screen when the
+    /// list is sorted by Name, which then switches to Custom.
+    fn swap_workspaces(&mut self, id: &str, neighbour: &str) -> anyhow::Result<()> {
+        let workspace = |view: &Self, id: &str| view.get_instance(id).map(Instance::workspace_id);
+        let (Some(a), Some(b)) = (workspace(self, id), workspace(self, neighbour)) else {
+            return self.refresh_after_stale_move();
+        };
+        if a == b {
+            self.flash_status("Sessions on the same branch move together");
+            return Ok(());
+        }
+        let freeze = self.sort_order != SortOrder::Custom;
+        let mut order = if freeze {
+            self.displayed_workspace_order()
+        } else {
+            self.shared_workspace_order()
+        };
+        for id in [&a, &b] {
+            if !order.contains(id) {
+                order.push(id.clone());
+            }
+        }
+        let (i, j) = (
+            order.iter().position(|w| *w == a).unwrap(),
+            order.iter().position(|w| *w == b).unwrap(),
+        );
+        order.swap(i, j);
+        self.submit_custom_order(
+            Some(order),
+            freeze.then(|| self.displayed_repository_order()),
+        )
+    }
+
+    /// Write a Custom order, switching the sort to Custom when it came from the screen.
+    fn submit_custom_order(
+        &mut self,
+        order: Option<Vec<String>>,
+        repositories: Option<Vec<String>>,
+    ) -> anyhow::Result<()> {
+        let freeze = self.sort_order != SortOrder::Custom;
+        self.session_feed
+            .submit_workspace_ordering(crate::daemon::WorkspaceOrderingPatch {
+                order,
+                repositories,
+            })?;
+        if freeze {
+            self.session_feed
+                .submit_sidebar_view(crate::daemon::SidebarViewPatch {
+                    sort: Some(SortOrder::Custom),
+                    ..Default::default()
+                })?;
+            self.flash_status("Sort is now Custom, starting from the order on screen");
         }
         Ok(())
     }
 
-    fn move_session_row(&mut self, id: &str, delta: isize) -> anyhow::Result<()> {
-        self.submit_session_reorder(id, delta, None)
+    /// Clear the shared Custom order, so rows and headers sit newest first again.
+    pub(super) fn reset_custom_order(&mut self) -> anyhow::Result<()> {
+        self.session_feed
+            .submit_workspace_ordering(crate::daemon::WorkspaceOrderingPatch {
+                order: Some(Vec::new()),
+                repositories: Some(Vec::new()),
+            })?;
+        self.flash_status("Custom order reset to newest first");
+        Ok(())
     }
 
-    pub(super) fn submit_session_reorder(
-        &mut self,
-        id: &str,
-        delta: isize,
-        destination: Option<String>,
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(delta == -1 || delta == 1, "Invalid row direction");
+    /// The Daemon's merged order: every workspace, unmoved ones first.
+    fn shared_workspace_order(&self) -> Vec<String> {
+        self.session_feed
+            .applied_snapshot()
+            .map(|snapshot| snapshot.contents.workspace_ordering.clone())
+            .unwrap_or_default()
+    }
+
+    /// Workspaces in the order the list shows them, then any it hides, in shared order.
+    fn displayed_workspace_order(&self) -> Vec<String> {
+        let mut order: Vec<String> = Vec::new();
+        for item in &self.flat_items {
+            if let Item::Session { id, .. } = item {
+                if let Some(workspace) = self.get_instance(id).map(Instance::workspace_id) {
+                    if !order.contains(&workspace) {
+                        order.push(workspace);
+                    }
+                }
+            }
+        }
+        for workspace in self.shared_workspace_order() {
+            if !order.contains(&workspace) {
+                order.push(workspace);
+            }
+        }
+        order
+    }
+
+    /// Repository paths in the order the Repository headers show them.
+    fn displayed_repository_order(&self) -> Vec<String> {
+        let mut order: Vec<String> = Vec::new();
+        for item in &self.flat_items {
+            if let Item::Group { path, depth: 0, .. } = item {
+                if let Some(repo) = self.repository_path_for_header(path) {
+                    if !order.contains(&repo) {
+                        order.push(repo);
+                    }
+                }
+            }
+        }
+        order
+    }
+
+    /// The repository path behind a top-level Repository header, keyed by its label.
+    fn repository_path_for_header(&self, label: &str) -> Option<String> {
+        if crate::session::is_synthetic_project_header(label) || label.contains('/') {
+            return None;
+        }
+        self.instances
+            .values()
+            .find(|inst| !inst.scratch && project_group_key(inst) == label)
+            .map(|inst| inst.repo_path().trim_end_matches('/').to_string())
+            .or_else(|| {
+                self.registered_projects
+                    .iter()
+                    .find(|p| crate::session::projects::repo_label(&p.path) == label)
+                    .map(|p| p.path.trim_end_matches('/').to_string())
+            })
+    }
+
+    fn move_header_row(&mut self, path: &str, delta: isize) -> anyhow::Result<()> {
+        if self.group_by == GroupByMode::Group {
+            if self.sort_order != SortOrder::Custom {
+                self.flash_status("Pick the Custom sort (o) to arrange groups by hand");
+                return Ok(());
+            }
+            return self.move_group_row(path, delta);
+        }
+        let Some(repo) = self.repository_path_for_header(path) else {
+            self.flash_status("Only repository headers move under the Repository grouping");
+            return Ok(());
+        };
+        let mut order = self.displayed_repository_order();
+        let Some(at) = order.iter().position(|r| *r == repo) else {
+            return Ok(());
+        };
+        let Some(to) = at.checked_add_signed(delta).filter(|to| *to < order.len()) else {
+            return Ok(());
+        };
+        order.swap(at, to);
+        let rows = (self.sort_order != SortOrder::Custom).then(|| self.displayed_workspace_order());
+        self.submit_custom_order(rows, Some(order))
+    }
+
+    /// Carry a session across its group's edge into the neighbouring group on screen.
+    fn carry_session(&mut self, id: &str, delta: isize) -> anyhow::Result<()> {
         let row = self
             .instances
             .get(id)
             .ok_or_else(|| anyhow::anyhow!("The selected row changed elsewhere"))?;
         let profile = row.source_profile.clone();
         let source_group = row.group_path.clone();
-        let crossing = destination.is_some();
-        let continuation_destination = if crossing {
-            None
-        } else {
-            let groups = self.displayed_group_order(Some(&profile));
-            groups
-                .iter()
-                .position(|group| *group == source_group)
-                .and_then(|at| at.checked_add_signed(delta))
-                .and_then(|at| groups.get(at))
-                .map(|path| (*path).to_owned())
+        let groups = self.displayed_group_order(Some(&profile));
+        let Some(destination) = groups
+            .iter()
+            .position(|group| *group == source_group)
+            .and_then(|at| at.checked_add_signed(delta))
+            .and_then(|at| groups.get(at))
+            .map(|path| (*path).to_owned())
+        else {
+            return Ok(());
         };
-        let mutation =
-            crate::daemon::NamespaceMutation::Reorder(crate::daemon::ReorderBody::Session {
-                id: id.to_owned(),
-                profile: profile.clone(),
-                source_group: source_group.clone(),
-                direction: if delta < 0 {
-                    crate::daemon::MoveDirection::Up
-                } else {
-                    crate::daemon::MoveDirection::Down
-                },
-                destination,
-            });
         self.submit_namespace_intent(
-            mutation,
-            NamespaceIntent::ReorderSession {
+            crate::daemon::NamespaceMutation::Reorder(crate::daemon::ReorderBody::Session {
                 id: id.to_owned(),
                 profile,
                 source_group,
-                delta,
-                crossing,
-                continuation_destination,
-            },
+                destination,
+            }),
+            NamespaceIntent::ReorderSession { id: id.to_owned() },
         )
     }
 
@@ -197,18 +328,16 @@ mod tests {
         let storage = crate::session::Storage::new_unwatched("reorder").unwrap();
         let mut one = Instance::new("one", "/tmp/one");
         one.group_path = "aaa".into();
-        one.sort_index = Some(0);
         let mut two = Instance::new("two", "/tmp/two");
-        two.group_path = if group { "bbb" } else { "aaa" }.into();
-        two.sort_index = Some(1);
+        two.group_path = "bbb".into();
         let id = one.id.clone();
         storage
             .update(|rows, groups| {
                 *rows = vec![one.clone(), two.clone()];
-                *groups = vec![crate::session::Group::new("aaa", "aaa")];
-                if group {
-                    groups.push(crate::session::Group::new("bbb", "bbb"));
-                }
+                *groups = vec![
+                    crate::session::Group::new("aaa", "aaa"),
+                    crate::session::Group::new("bbb", "bbb"),
+                ];
                 Ok(())
             })
             .unwrap();
@@ -248,7 +377,7 @@ mod tests {
         let body = if group {
             serde_json::json!({"target":"group","group":{"profile":"reorder","path":"aaa"},"direction":"down"})
         } else {
-            serde_json::json!({"target":"session","id":id,"profile":"reorder","source_group":"aaa","direction":"down"})
+            serde_json::json!({"target":"session","id":id,"profile":"reorder","source_group":"aaa","destination":"bbb"})
         };
         let (status, headers, value) =
             request_with_headers(&state, "POST", "/api/reorder", body).await;
@@ -315,27 +444,19 @@ mod tests {
                 matches!(view.flat_items.get(view.cursor), Some(Item::Group { path, .. }) if path == "aaa")
             );
         } else {
-            assert!(
-                rows.iter().find(|row| row.id == id).unwrap().sort_index
-                    > rows.iter().find(|row| row.id == two.id).unwrap().sort_index
+            assert_eq!(
+                rows.iter().find(|row| row.id == id).unwrap().group_path,
+                "bbb"
             );
+            assert_eq!(view.get_instance(&id).unwrap().group_path, "bbb");
             assert_eq!(view.selected_session.as_deref(), Some(id.as_str()));
-            let displayed = view
-                .flat_items
-                .iter()
-                .filter_map(|item| match item {
-                    Item::Session { id, .. } => Some(id.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(displayed, [two.id.as_str(), id.as_str()]);
         }
         assert!(view.info_dialog.is_none());
     }
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_row_move_is_receipt_fenced_while_the_runtime_owns_the_rows() {
+    async fn a_session_carry_is_receipt_fenced_while_the_runtime_owns_the_rows() {
         for snapshot_first in [false, true] {
             native_move(false, snapshot_first).await;
         }

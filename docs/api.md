@@ -436,6 +436,8 @@ The response is an object, not a bare array:
 {
   "sessions": [ { "id": "…", "status": "Running" } ],
   "workspace_ordering": ["/path/to/repo::main"],
+  "repository_order": ["/path/to/repo"],
+  "sidebar_view": { "group_by": "project", "sort": "custom" },
   "trashed_count": 0
 }
 ```
@@ -444,11 +446,17 @@ The response is an object, not a bare array:
 - `trashed_count`: the trashed rows in the whole snapshot, whatever `state`
   filtered out, so a client that lists without the trash can still show its
   size.
-- `workspace_ordering`: the user's persisted manual workspace order, so a
-  client can render workspaces in place without a second request. Unknown
-  workspaces (present in `sessions`, absent from this list) follow the
-  list, newest first. A client that never issues
-  `PUT /api/workspace-ordering` always receives an empty array.
+- `workspace_ordering`: the shared Custom order of workspaces, so a client can
+  render them in place without a second request. Workspaces never moved come
+  first, newest first, then the persisted order. Each row's `sort_index` is its
+  workspace's position in this list.
+- `repository_order`: repository paths in the shared Custom order of the
+  Repository headers; headers not listed come first, newest first.
+- `sidebar_view`: the grouping and sort every Client shows (see
+  `PATCH /api/sidebar-view`).
+
+`PUT /api/workspace-ordering` takes `{"order": [...], "repositories": [...]}`;
+an omitted list keeps its value and an empty one clears it.
 
 Clients written against the historical bare-array response must be updated to
 read `sessions`; the array is never returned unwrapped.

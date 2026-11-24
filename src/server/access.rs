@@ -1210,10 +1210,11 @@ mod tests {
     #[serial_test::serial]
     async fn cityhall_reorder_preserves_native_rows_and_allows_structured_ordering() {
         use tower::ServiceExt;
+        // A carry touches only its own row, so a native peer left behind does not refuse it.
         for (structured, native_peer, group_request, expected) in [
             (true, false, false, axum::http::StatusCode::OK),
             (false, true, false, axum::http::StatusCode::FORBIDDEN),
-            (true, true, false, axum::http::StatusCode::FORBIDDEN),
+            (true, true, false, axum::http::StatusCode::OK),
             (false, true, true, axum::http::StatusCode::FORBIDDEN),
         ] {
             let _home = crate::session::test_support::isolate_app_dir();
@@ -1224,8 +1225,6 @@ mod tests {
                 row.group_path = "work".into();
                 row.status = crate::session::Status::Stopped;
             }
-            a.sort_index = Some(0);
-            b.sort_index = Some(1);
             if !native_peer {
                 a.view = crate::session::View::Structured;
             }
@@ -1251,7 +1250,7 @@ mod tests {
             let body = if group_request {
                 serde_json::json!({"target":"group","group":{"profile":"default","path":"work"},"direction":"up"})
             } else {
-                serde_json::json!({"target":"session","id":b.id,"profile":"default","source_group":"work","direction":"up"})
+                serde_json::json!({"target":"session","id":b.id,"profile":"default","source_group":"work","destination":""})
             };
             let response = test_support::build_router_for_test(state)
                 .oneshot(
@@ -1279,12 +1278,14 @@ mod tests {
                 String::from_utf8_lossy(&bytes)
             );
             if expected == axum::http::StatusCode::OK {
-                let mut rows = storage.load().unwrap();
-                rows.sort_by_key(|row| row.sort_index);
-                assert_eq!(
-                    rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
-                    [b.id.as_str(), a.id.as_str()]
-                );
+                let rows = storage.load().unwrap();
+                let group_of = |id: &str| {
+                    rows.iter()
+                        .find(|row| row.id == id)
+                        .map(|row| row.group_path.clone())
+                };
+                assert_eq!(group_of(&b.id).as_deref(), Some(""), "the carry landed");
+                assert_eq!(group_of(&a.id).as_deref(), Some("work"));
             } else {
                 assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
             }

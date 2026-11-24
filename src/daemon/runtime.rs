@@ -238,6 +238,9 @@ pub struct RuntimeContents {
     pub sessions: Vec<SessionResponse>,
     pub profiles: Vec<ProfileSnapshot>,
     pub workspace_ordering: Vec<String>,
+    /// Repository paths in the shared Custom order of the Repository headers.
+    #[serde(default)]
+    pub repository_order: Vec<String>,
     pub global_projects: Vec<ProjectResponse>,
     #[serde(default)]
     pub sidebar_view: crate::session::config::SidebarView,

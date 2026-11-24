@@ -540,6 +540,8 @@ impl serde::Serialize for SessionsView {
         struct Envelope<'a> {
             sessions: ScopedSessions<'a>,
             workspace_ordering: &'a [String],
+            repository_order: &'a [String],
+            sidebar_view: crate::session::config::SidebarView,
             trashed_count: usize,
         }
         let rows = &self.snapshot.value.contents.sessions;
@@ -549,6 +551,8 @@ impl serde::Serialize for SessionsView {
                 filter: &self.filter,
             },
             workspace_ordering: &self.snapshot.value.contents.workspace_ordering,
+            repository_order: &self.snapshot.value.contents.repository_order,
+            sidebar_view: self.snapshot.value.contents.sidebar_view,
             trashed_count: rows.iter().filter(|row| row.trashed_at.is_some()).count(),
         }
         .serialize(serializer)
@@ -651,22 +655,37 @@ pub(crate) fn compute_merged_ordering(
         .collect()
 }
 
+/// Each session's place in the shared Custom order: its workspace's index in `ordering`.
+pub(crate) fn rank_by_workspace(sessions: &mut [SessionResponse], ordering: &[String]) {
+    let rank: std::collections::HashMap<&str, u32> = ordering
+        .iter()
+        .enumerate()
+        .map(|(at, id)| (id.as_str(), u32::try_from(at).unwrap_or(u32::MAX)))
+        .collect();
+    for session in sessions {
+        session.sort_index = rank
+            .get(workspace_id_for_session(session).as_str())
+            .copied();
+    }
+}
+
 const MAX_ORDER_ENTRIES: usize = 4096;
 const MAX_ORDER_ENTRY_LEN: usize = 1024;
-
-#[derive(Deserialize)]
-pub struct UpdateWorkspaceOrderingBody {
-    pub order: Vec<String>,
-}
 
 #[derive(serde::Serialize)]
 struct WorkspaceOrderingResponse<'a> {
     order: &'a [String],
+    repositories: &'a [String],
 }
 
+/// Replace the shared Custom order of the rows, of the Repository headers, or both; an
+/// omitted list keeps its value. An empty list clears it back to newest first.
 pub async fn update_workspace_ordering(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<UpdateWorkspaceOrderingBody>, axum::extract::rejection::JsonRejection>,
+    body: Result<
+        Json<crate::daemon::WorkspaceOrderingPatch>,
+        axum::extract::rejection::JsonRejection,
+    >,
 ) -> impl IntoResponse {
     if state.read_only {
         return crate::server::api::read_only_response();
@@ -676,23 +695,25 @@ pub async fn update_workspace_ordering(
         Err(rej) => return rej.into_response(),
     };
 
-    if body.order.len() > MAX_ORDER_ENTRIES {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({
-                "message": format!("order has {} entries, max is {}", body.order.len(), MAX_ORDER_ENTRIES)
-            })),
-        )
-            .into_response();
-    }
-    if let Some(bad) = body.order.iter().find(|e| e.len() > MAX_ORDER_ENTRY_LEN) {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({
-                "message": format!("order entry is {} bytes, max is {}", bad.len(), MAX_ORDER_ENTRY_LEN)
-            })),
-        )
-            .into_response();
+    for list in [&body.order, &body.repositories].into_iter().flatten() {
+        if list.len() > MAX_ORDER_ENTRIES {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({
+                    "message": format!("order has {} entries, max is {}", list.len(), MAX_ORDER_ENTRIES)
+                })),
+            )
+                .into_response();
+        }
+        if let Some(bad) = list.iter().find(|e| e.len() > MAX_ORDER_ENTRY_LEN) {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({
+                    "message": format!("order entry is {} bytes, max is {}", bad.len(), MAX_ORDER_ENTRY_LEN)
+                })),
+            )
+                .into_response();
+        }
     }
     // A request dropped while it waits for the guards leaves nothing behind; once it holds
     // them, the spawned commit owns them through reconciliation.
@@ -700,7 +721,7 @@ pub async fn update_workspace_ordering(
     let publication = state.publication.clone().write_owned().await;
     match tokio::spawn(commit_workspace_ordering(
         state,
-        body.order,
+        body,
         namespace,
         publication,
     ))
@@ -715,7 +736,7 @@ pub async fn update_workspace_ordering(
 /// release its guards before the canonical metadata catches up with the disk.
 async fn commit_workspace_ordering(
     state: Arc<AppState>,
-    order: Vec<String>,
+    body: crate::daemon::WorkspaceOrderingPatch,
     namespace: tokio::sync::OwnedRwLockReadGuard<()>,
     publication: tokio::sync::OwnedRwLockWriteGuard<()>,
 ) -> axum::response::Response {
@@ -724,7 +745,12 @@ async fn commit_workspace_ordering(
     }
     let result = tokio::task::spawn_blocking(move || {
         crate::session::update_workspace_ordering(move |ordering| {
-            ordering.order = order;
+            if let Some(order) = body.order {
+                ordering.order = order;
+            }
+            if let Some(repositories) = body.repositories {
+                ordering.repositories = repositories;
+            }
             Ok(())
         })
     })
@@ -747,7 +773,11 @@ async fn commit_workspace_ordering(
                 .into_response();
         }
     };
-    state.canonical_metadata.write().await.workspace_ordering = ordering.order;
+    {
+        let mut metadata = state.canonical_metadata.write().await;
+        metadata.workspace_ordering = ordering.order;
+        metadata.repository_order = ordering.repositories;
+    }
     state
         .mutation_epoch
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -762,6 +792,7 @@ async fn commit_workspace_ordering(
         &snapshot.value.cursor,
         Json(WorkspaceOrderingResponse {
             order: &snapshot.value.contents.workspace_ordering,
+            repositories: &snapshot.value.contents.repository_order,
         }),
     )
 }
@@ -1053,9 +1084,9 @@ mod sidebar_view_tests {
         let write = tokio::spawn(update_sidebar_view(State(state.clone()), Ok(Json(patch))));
         let ordering = tokio::spawn(update_workspace_ordering(
             State(state.clone()),
-            Ok(Json(UpdateWorkspaceOrderingBody {
-                order: vec!["w".into()],
-            })),
+            Ok(Json(
+                serde_json::from_value(serde_json::json!({ "order": ["w"] })).unwrap(),
+            )),
         ));
         tokio::task::yield_now().await;
         write.abort();
@@ -1386,6 +1417,72 @@ mod workspace_ordering_tests {
         state.runtime.publish(&state).await?;
         let changed = get(untrashed, Some(&etag)).await;
         assert_eq!(changed.status(), StatusCode::OK, "a new revision refetches");
+        Ok(())
+    }
+
+    /// The snapshot ranks each row by its workspace's place in the shared order, unplaced
+    /// workspaces first; a write that names only the repositories keeps the row order.
+    #[tokio::test]
+    #[serial]
+    async fn the_shared_order_ranks_snapshot_rows_and_a_partial_write_keeps_the_rest(
+    ) -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let rows: Vec<Instance> = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(|name| Instance::new(name, &format!("/repo/{name}")))
+            .collect();
+        let workspace =
+            |at: usize| format!("/repo/{}::__session__::{}", rows[at].title, rows[at].id);
+        let placed = vec![workspace(1), workspace(0)];
+        let state = crate::server::test_support::build_test_app_state(rows.clone());
+        let put = |patch: crate::daemon::WorkspaceOrderingPatch| {
+            let state = state.clone();
+            async move {
+                let response = update_workspace_ordering(State(state), Ok(Json(patch)))
+                    .await
+                    .into_response();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            }
+        };
+        put(crate::daemon::WorkspaceOrderingPatch {
+            order: Some(placed.clone()),
+            repositories: None,
+        })
+        .await;
+        let response = put(crate::daemon::WorkspaceOrderingPatch {
+            order: None,
+            repositories: Some(vec!["/repo/b".into(), "/repo/a".into()]),
+        })
+        .await;
+
+        assert_eq!(crate::session::load_workspace_ordering()?.order, placed);
+        assert_eq!(
+            response["repositories"],
+            serde_json::json!(["/repo/b", "/repo/a"])
+        );
+        let snapshot = state.runtime.publish(&state).await?.value.clone();
+        assert_eq!(snapshot.contents.repository_order, ["/repo/b", "/repo/a"]);
+        assert_eq!(
+            response["order"],
+            serde_json::json!(snapshot.contents.workspace_ordering)
+        );
+        let rank = |at: usize| {
+            snapshot
+                .contents
+                .sessions
+                .iter()
+                .find(|session| session.id == rows[at].id)
+                .and_then(|session| session.sort_index)
+        };
+        // d and c are unplaced, newest first; then the persisted b, a.
+        for (at, expected) in [(3, 0), (2, 1), (1, 2), (0, 3)] {
+            assert_eq!(rank(at), Some(expected), "{}", rows[at].title);
+        }
         Ok(())
     }
 

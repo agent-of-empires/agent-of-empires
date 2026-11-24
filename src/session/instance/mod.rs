@@ -918,8 +918,10 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_branch_override: Option<String>,
 
-    /// Position within its group under `SortOrder::Custom`. `None` sorts first.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Place in the shared Custom order, derived by the Daemon from its workspace's
+    /// position in `workspace-ordering.json` and carried by the runtime snapshot. Never
+    /// stored on the row. `None` sorts first, newest first.
+    #[serde(skip)]
     pub sort_index: Option<u32>,
     /// How this session is rendered: `Structured` (ACP native rendering) or
     /// `Terminal` (raw tmux pane). When `Structured`, aoe spawns an ACP agent

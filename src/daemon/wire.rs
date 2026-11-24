@@ -318,6 +318,17 @@ pub struct MoveGroupBody {
     pub source: GroupLocation,
     pub target: GroupLocation,
 }
+/// Replace the shared Custom order of rows (workspace ids), of Repository headers
+/// (repository paths), or both; an absent list keeps its value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceOrderingPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repositories: Option<Vec<String>>,
+}
+
 /// Change the shared grouping, the sort, or both; an absent field keeps its value.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -401,12 +412,13 @@ pub enum MoveDirection {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "target", rename_all = "snake_case")]
 pub enum ReorderBody {
+    /// Carry a session into a neighbouring group, at the edge it enters from. A move
+    /// within one group rewrites the shared order instead (`PUT /api/workspace-ordering`).
     Session {
         id: String,
         profile: String,
         source_group: String,
-        direction: MoveDirection,
-        destination: Option<String>,
+        destination: String,
     },
     Group {
         group: GroupLocation,
@@ -1610,6 +1622,12 @@ pub struct SessionsEnvelope {
     pub sessions: Vec<SessionResponse>,
     #[serde(default)]
     pub workspace_ordering: Vec<String>,
+    /// Repository paths in the shared Custom order of the Repository headers.
+    #[serde(default)]
+    pub repository_order: Vec<String>,
+    /// The grouping and sort every Client shows.
+    #[serde(default)]
+    pub sidebar_view: crate::session::config::SidebarView,
     /// Trashed rows in the whole snapshot, whatever the scope filtered out.
     #[serde(default)]
     pub trashed_count: usize,

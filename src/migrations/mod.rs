@@ -75,6 +75,7 @@ mod v063_retire_color_labels;
 mod v064_builtin_sounds;
 mod v065_account_limit_estimate_rows;
 mod v066_retire_agent_update_fields;
+mod v066_shared_custom_order;
 mod v067_retire_restart_wake;
 mod v068_shared_sidebar_view;
 
@@ -117,7 +118,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 68;
+const CURRENT_VERSION: u32 = 69;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -348,6 +349,7 @@ const MIGRATIONS: &[Migration] = &[
     ),
     (67, "retire_restart_wake", v067_retire_restart_wake::run),
     (68, "shared_sidebar_view", v068_shared_sidebar_view::run),
+    (69, "shared_custom_order", v066_shared_custom_order::run),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install

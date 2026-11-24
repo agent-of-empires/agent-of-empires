@@ -375,66 +375,6 @@ fn a_session_crossing_into_or_out_of_stopped_follows_the_toggle_at_once() {
     assert!(header_text(&env.view, "util").contains("util (1/3)"));
 }
 
-/// A move renumbers every sibling in the store, hidden ones included, so it is refused while
-/// they are hidden.
-#[tokio::test]
-#[serial]
-async fn custom_moves_wait_until_stopped_sessions_are_shown() {
-    use crate::daemon::{MoveDirection, NamespaceMutation, ReorderBody};
-    let mut env = env_with_stopped(true);
-    let state = native_state(&["test"]).await;
-    apply_published(&mut env.view, &state).await;
-    env.view.apply_sort_order(SortOrder::Custom);
-    press_y(&mut env);
-    let id = select_session(&mut env, "util-live");
-    let before = payload_bytes("test");
-    env.view.move_row_at_cursor(1).unwrap();
-    assert!(env.view.pending_namespace_intent.is_none());
-    assert_eq!(payload_bytes("test"), before);
-    assert!(env
-        .view
-        .status_flash_text()
-        .is_some_and(|t| t.contains("Show stopped sessions")));
-
-    env.view.cursor = env
-        .view
-        .flat_items
-        .iter()
-        .position(|item| matches!(item, Item::Group { path, .. } if path == "util"))
-        .unwrap();
-    env.view.update_selected();
-    let group = env.view.canonical_group_location("util").unwrap();
-    super::pickers_groups_sort::settle_namespace(
-        &state,
-        &mut env.view,
-        NamespaceMutation::Reorder(ReorderBody::Group {
-            group,
-            direction: MoveDirection::Up,
-        }),
-        |view| view.move_row_at_cursor(-1),
-    )
-    .await
-    .unwrap();
-
-    press_y(&mut env);
-    select_session(&mut env, "util-live");
-    super::pickers_groups_sort::settle_namespace(
-        &state,
-        &mut env.view,
-        NamespaceMutation::Reorder(ReorderBody::Session {
-            id,
-            profile: "test".into(),
-            source_group: "util".into(),
-            direction: MoveDirection::Down,
-            destination: None,
-        }),
-        |view| view.move_row_at_cursor(1),
-    )
-    .await
-    .unwrap();
-    assert_ne!(payload_bytes("test"), before);
-}
-
 /// A parent group counts its subgroups' sessions, shown and total alike.
 #[test]
 #[serial]
