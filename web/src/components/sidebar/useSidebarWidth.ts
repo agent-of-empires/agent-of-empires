@@ -93,7 +93,8 @@ export function useSidebarWidth({
   };
 
   const onPointerDown = (e: React.PointerEvent) => {
-    if (e.button !== 0) return;
+    // A second contact cannot take over a drag; a mouse can restart its own after a lost release.
+    if (e.button !== 0 || (drag.current && drag.current.pointerId !== e.pointerId)) return;
     e.preventDefault();
     drag.current = {
       pointerId: e.pointerId,
