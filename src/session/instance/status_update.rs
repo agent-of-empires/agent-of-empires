@@ -1362,6 +1362,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             pane_current_command: Some(command.to_string()),
             pane_start_command_is_protected: false,
             pane_pid: None,
+            first_window: true,
             pane_title: None,
             window_activity,
             window_size: None,

@@ -7,7 +7,7 @@ import { emptyAcpState } from "../lib/acpTypes";
 import { STATE_TTL_MS, STORAGE_KEY_PREFIX, getLiveQueueCount } from "../lib/acpStateStorage";
 import { listServerQueue, reportAcpInteraction, type ServerQueuedPrompt } from "../lib/api";
 import type { SessionResponse } from "../lib/types";
-import { cacheGet } from "./acpSession/stateCache";
+import { cacheGet, cacheSet } from "./acpSession/stateCache";
 import { ACP_DIAL_TIMEOUT_MS, ACP_MAX_RETRIES, ACP_WS_STALE_MS, acpRetryDelayMs } from "./acpSession/useAcpConnection";
 import {
   FakeWebSocket,
@@ -21,7 +21,7 @@ import {
   type Route,
 } from "./__tests__/acpHarness";
 import { useQueuedCounts } from "./useAcpQueueCount";
-import { clearAcpCache, useAcpSession } from "./useAcpSession";
+import { clearAcpCache, pendingRowIds, pendingRowsChanged, useAcpSession } from "./useAcpSession";
 
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
@@ -590,6 +590,63 @@ describe("recent-first cold open + loadOlder (#2236)", () => {
     expect(result.current.loadingOlder).toBe(false);
     await flushAsync(20);
     expect(result.current.hasMoreOlder).toBe(true);
+  });
+});
+
+describe("persist flush on cleanup", () => {
+  const storedKey = (id: string) => `${STORAGE_KEY_PREFIX}${id}`;
+  const seed = (id: string) => cacheSet(id, { ...emptyAcpState(), lastSeq: 7 });
+
+  it("writes pending state on unmount, before the throttle expires", async () => {
+    installAcpFakes();
+    seed("sess-unmount");
+    const { unmount } = render("sess-unmount");
+    await flushAsync();
+    expect(localStorage.getItem(storedKey("sess-unmount"))).toBeNull();
+    unmount();
+    expect(JSON.parse(localStorage.getItem(storedKey("sess-unmount"))!).state.lastSeq).toBe(7);
+  });
+
+  it("persists a queue confirmation at once, so another window cannot read the row as unconfirmed", async () => {
+    const id = "sess-confirm";
+    const queuedAt = "2026-01-01T00:00:00.000Z";
+    cacheSet(id, { ...emptyAcpState(), queuedPrompts: [{ id: "u1", text: "u1", queuedAt, pending: true }] });
+    const hook = render(id, "running");
+    await flushAsync();
+    lastSocket().open();
+    await waitFor(() => expect(hook.result.current.state.queuedPrompts).toMatchObject([{ id: "u1", pending: false }]));
+    expect(JSON.parse(localStorage.getItem(storedKey(id))!).state.queuedPrompts).toMatchObject([
+      { id: "u1", pending: false },
+    ]);
+    hook.unmount();
+  });
+
+  it("writes the previous session's pending state on a session switch", async () => {
+    installAcpFakes();
+    seed("sess-a");
+    const { rerender } = renderHook(({ id }: { id: string }) => useAcpSession(id), {
+      initialProps: { id: "sess-a" },
+      wrapper: profileWrapper,
+    });
+    await flushAsync();
+    expect(localStorage.getItem(storedKey("sess-a"))).toBeNull();
+    rerender({ id: "sess-b" });
+    expect(JSON.parse(localStorage.getItem(storedKey("sess-a"))!).state.lastSeq).toBe(7);
+  });
+});
+
+describe("pendingRowsChanged", () => {
+  const queuedAt = "2026-01-01T00:00:00.000Z";
+  const row = (id: string, pending?: boolean) => ({ id, text: id, queuedAt, pending });
+  const withRows = (...rows: ReturnType<typeof row>[]) => ({ ...emptyAcpState(), queuedPrompts: rows });
+
+  it("flags an enqueue, and a confirmation by row identity even when another row is enqueued in the same render", () => {
+    const before = pendingRowIds(withRows(row("a", true)));
+    expect(pendingRowsChanged(before, withRows(row("a", false), row("b", true)))).toBe(true);
+    expect(pendingRowsChanged(before, withRows(row("a", true), row("b", true)))).toBe(true);
+    expect(pendingRowsChanged(before, withRows())).toBe(true);
+    expect(pendingRowsChanged(before, withRows(row("a", true)))).toBe(false);
+    expect(pendingRowsChanged(before, withRows(row("a", true), row("c", false)))).toBe(false);
   });
 });
 

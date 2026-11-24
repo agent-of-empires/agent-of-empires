@@ -110,11 +110,44 @@ export async function getSnippetHighlighter(opts: SnippetHighlightOpts): Promise
   return { highlighter, langId, theme };
 }
 
+const HIGHLIGHT_CACHE_CAP = 64;
+const highlightCache = new Map<string, string>();
+
+function highlightCacheKey(
+  code: string,
+  opts: SnippetHighlightOpts,
+): { key: string; langId: string; theme: string } | null {
+  const langId = langIdForHint(opts.langHint);
+  if (!langId) return null;
+  const theme = resolveSnippetTheme(opts.theme, opts.appearance);
+  return { key: `${theme}\u0000${langId}\u0000${code}`, langId, theme };
+}
+
+function cacheRead(key: string): string | undefined {
+  const html = highlightCache.get(key);
+  if (html === undefined) return undefined;
+  highlightCache.delete(key);
+  highlightCache.set(key, html);
+  return html;
+}
+
+/** Cached html for these inputs without awaiting, or undefined. */
+export function peekHighlight(code: string, opts: SnippetHighlightOpts): string | undefined {
+  const resolved = highlightCacheKey(code, opts);
+  return resolved ? cacheRead(resolved.key) : undefined;
+}
+
 /** Null for an unrecognised language, so the caller renders plain text. */
 export async function highlightSnippet(code: string, opts: SnippetHighlightOpts): Promise<string | null> {
-  const resolved = await getSnippetHighlighter(opts);
+  const resolved = highlightCacheKey(code, opts);
   if (!resolved) return null;
-  return resolved.highlighter.codeToHtml(code, { lang: resolved.langId, theme: resolved.theme });
+  const hit = cacheRead(resolved.key);
+  if (hit !== undefined) return hit;
+  const highlighter = await getSharedHighlighter({ themes: [resolved.theme], langs: [resolved.langId] });
+  const html = highlighter.codeToHtml(code, { lang: resolved.langId, theme: resolved.theme });
+  highlightCache.set(resolved.key, html);
+  if (highlightCache.size > HIGHLIGHT_CACHE_CAP) highlightCache.delete(highlightCache.keys().next().value!);
+  return html;
 }
 
 export type { ThemedToken };
