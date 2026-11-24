@@ -8,7 +8,7 @@ use super::{config_file, sessions_file};
 use anyhow::Result;
 use std::fs;
 use std::path::Path;
-use tracing::info;
+use tracing::{info, warn};
 
 const REPO_APPEARANCE_KEY: &str = "aoe-repo-appearance-v1";
 
@@ -41,9 +41,12 @@ fn drop_row_colors(path: &Path) -> Result<()> {
         path.parent().expect("session file has a parent"),
         crate::session::STORAGE_LOCK_FILENAME,
     )?;
-    let dropped = sessions_file::heal_rows(path, &fs::read_to_string(path)?, |row| {
-        row.remove("color").is_some()
-    })?;
+    // An unreadable component keeps its bytes for repair rather than aborting boot.
+    let Ok(content) = String::from_utf8(fs::read(path)?) else {
+        warn!(target: "migrations.v063", path = %path.display(), "Preserved unreadable session component; repair it and run aoe migrate");
+        return Ok(());
+    };
+    let dropped = sessions_file::heal_rows(path, &content, |row| row.remove("color").is_some())?;
     if dropped > 0 {
         info!(target: "migrations.v063", dropped, path = %path.display(), "dropped session color labels");
     }
