@@ -135,7 +135,10 @@ function canonical(p, depth = 0) {
 let args = process.argv.slice(2);
 if (args[0] === "container" && args[1] === "inspect" && args.at(-1) === fixture.name) {
   process.stdout.write(JSON.stringify({id: "fixture:" + fixture.name, mounts: fixture.mounts}) + "\n");
-} else if (args[0] === "inspect" || (args[0] === "container" && args[1] === "inspect")) {
+} else if (args[0] === "container" && args[1] === "inspect") {
+  process.stderr.write("Error: No such container: " + args.at(-1) + "\n");
+  process.exit(1);
+} else if (args[0] === "inspect") {
   process.exit(1);
 } else if (args.shift() === "exec") {
   let cwd = "/";
