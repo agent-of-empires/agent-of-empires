@@ -332,10 +332,17 @@ impl PullWatch {
             && matches!(drawn, PullLine::Failed(_) | PullLine::Cancelled)
     }
 
-    /// Ctrl+E on a running pull opens the cancel prompt, or restarts its time; it never cancels,
-    /// so a held key's repeats can't confirm. Returns whether a pull is running.
+    /// Whether a cancel may go out for this pull. After a Start with no reply, only a poll
+    /// showing it running proves it is this TUI's; a cancel, keyed by image, could otherwise
+    /// stop another client's pull.
+    fn cancellable(&self) -> bool {
+        self.running() && !self.start_unanswered
+    }
+
+    /// Ctrl+E on a cancellable pull opens the cancel prompt, or restarts its time; it never
+    /// cancels, so a held key's repeats can't confirm. Returns whether it opened.
     pub(crate) fn arm_cancel(&mut self, now: Instant) -> bool {
-        if !self.running() {
+        if !self.cancellable() {
             return false;
         }
         self.cancel_armed = Some(now);
@@ -351,7 +358,7 @@ impl PullWatch {
     /// Whether the confirming key, pressed `now` with the prompt `armed` before it, cancels.
     pub(crate) fn confirms_cancel(&self, armed: Option<Instant>, now: Instant) -> bool {
         armed.is_some_and(|at| {
-            self.running() && now.saturating_duration_since(at) <= CANCEL_CONFIRM_TTL
+            self.cancellable() && now.saturating_duration_since(at) <= CANCEL_CONFIRM_TTL
         })
     }
 

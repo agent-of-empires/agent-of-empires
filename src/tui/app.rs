@@ -75,6 +75,8 @@ type PullRunner =
 type DismissRunner = Box<dyn FnMut(String) -> tokio::sync::oneshot::Receiver<bool> + Send>;
 
 const CANCEL_UNSENT: &str = "Nothing was cancelled: the Daemon didn't answer the download's start.";
+const CANCEL_UNCONFIRMED: &str =
+    "Can't cancel yet: the Daemon hasn't confirmed the download started.";
 const DISMISS_UNSAVED: &str = "Hidden for this session: the Daemon couldn't save it";
 
 /// The cancel prompt's confirming key: not Ctrl+E, so holding Ctrl+E can't confirm it.
@@ -1890,9 +1892,10 @@ impl App {
                 self.set_status(text);
                 true
             }
+            // Repainted: the line loses its cancel prompt, and an unsent cancel says so.
             Applied::Recheck => {
                 self.next_pull_poll = std::time::Instant::now();
-                false
+                true
             }
         };
         let offered = offer.is_some_and(|offer| self.offer_image_update(offer));
@@ -2350,7 +2353,9 @@ impl App {
             && self.pull.running();
         // Ctrl+E only asks; `y` within the prompt's time cancels.
         if cancels_pull {
-            self.pull.arm_cancel(std::time::Instant::now());
+            if !self.pull.arm_cancel(std::time::Instant::now()) {
+                self.set_status(CANCEL_UNCONFIRMED);
+            }
             return Ok(());
         }
         if key.code == CONFIRM_CANCEL_PULL
@@ -5150,16 +5155,23 @@ mod tests {
     }
 
     /// Answers the `index`th request sent, then reads the answer as the event loop does.
-    fn answer_sent(app: &mut App, sent: &SentPulls, index: usize, answer: impl Into<PullAnswer>) {
+    /// Returns whether the bar asked for a repaint.
+    fn answer_sent(
+        app: &mut App,
+        sent: &SentPulls,
+        index: usize,
+        answer: impl Into<PullAnswer>,
+    ) -> bool {
         let (request, _, tx) = sent.lock().unwrap().remove(index);
         let _ = tx.send(answer.into());
         assert_eq!(app.pull_rx.as_ref().map(|(r, _)| *r), Some(request));
-        app.poll_pull();
+        app.poll_pull()
     }
 
     /// A cancel while the Start is in flight waits for it, then goes out, of the image the pull
     /// started with although the default has since changed. A Start the Daemon didn't answer
-    /// polls again at once rather than dropping the watch, and sends no cancel.
+    /// polls again at once rather than dropping the watch, and sends no cancel, deferred or
+    /// by a fresh Ctrl+E, until a poll shows the pull running.
     #[tokio::test]
     #[serial_test::serial]
     async fn a_cancel_behind_a_start_waits_for_it_and_names_the_watched_image() {
@@ -5211,7 +5223,10 @@ mod tests {
         app.next_pull_poll = std::time::Instant::now() + std::time::Duration::from_secs(60);
         app.handle_key(ctrl_e, &mut terminal).await.unwrap();
         app.handle_key(confirm, &mut terminal).await.unwrap();
-        answer_sent(&mut app, &sent, 0, PullReport::Unavailable);
+        assert!(
+            answer_sent(&mut app, &sent, 0, PullReport::Unavailable),
+            "the unsent cancel's status asked for no repaint"
+        );
         assert!(app.pull.running(), "an unanswered Start dropped the watch");
         assert!(
             sent_requests(&sent).is_empty(),
@@ -5237,6 +5252,45 @@ mod tests {
         );
         app.schedule_pull_poll(now);
         assert_eq!(sent_requests(&sent), [(PullRequest::Poll, IMAGE.into())]);
+
+        // A fresh Ctrl+E, pressed before the Start's answer or after it, cancels only once a
+        // poll shows the pull running.
+        for armed_before_answer in [true, false] {
+            sent.lock().unwrap().clear();
+            app.pull_rx = None;
+            app.pull = image_pull::PullWatch::default();
+            app.update_status = None;
+            app.start_pull(IMAGE.into());
+            if armed_before_answer {
+                app.handle_key(ctrl_e, &mut terminal).await.unwrap();
+            }
+            answer_sent(&mut app, &sent, 0, PullReport::Unavailable);
+            if !armed_before_answer {
+                app.handle_key(ctrl_e, &mut terminal).await.unwrap();
+                assert!(!app.pull.cancel_prompt(std::time::Instant::now()));
+                assert_eq!(
+                    app.update_status.as_ref().map(|s| s.text.as_str()),
+                    Some(CANCEL_UNCONFIRMED)
+                );
+            }
+            app.handle_key(confirm, &mut terminal).await.unwrap();
+            assert!(
+                sent_requests(&sent).is_empty(),
+                "armed before the answer: {armed_before_answer}: a cancel named a pull nothing showed"
+            );
+            answer_pull(
+                &mut app,
+                PullRequest::Poll,
+                PullReport::State(PullState::Running(Default::default())),
+            );
+            app.handle_key(ctrl_e, &mut terminal).await.unwrap();
+            app.handle_key(confirm, &mut terminal).await.unwrap();
+            assert_eq!(
+                sent_requests(&sent),
+                [(PullRequest::Cancel, IMAGE.into())],
+                "armed before the answer: {armed_before_answer}"
+            );
+        }
     }
 
     /// Done takes off the update the pull started for, not whatever the bar offers by then.
@@ -5502,6 +5556,16 @@ mod tests {
         );
         draw(&mut app);
         assert_eq!(app.drawn_bar, notice, "the prompt's time");
+
+        // A status set while it's open stays under it, so the prompt shows whenever `y` cancels.
+        app.handle_key(ctrl_e, &mut terminal).await.unwrap();
+        app.set_status("a newer status");
+        draw(&mut app);
+        assert_eq!(
+            app.drawn_bar,
+            Some(DrawnBar::CancelPrompt),
+            "a newer status"
+        );
     }
 
     /// One trashed row, selected, for its retained reader.
