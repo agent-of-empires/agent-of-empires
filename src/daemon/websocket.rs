@@ -103,8 +103,8 @@ pub(crate) async fn connect_with_headers(
         .max_message_size(Some(16 * 1024 * 1024))
         .max_frame_size(Some(16 * 1024 * 1024));
     tokio::time::timeout(Duration::from_secs(15), async {
-        if let Some(path) = endpoint.unix_path() {
-            let socket = super::host_transport::connect_unix(path).await?;
+        if let Some(unix) = endpoint.unix_transport() {
+            let socket = unix.connect(None).await?;
             let (stream, _) =
                 tokio_tungstenite::client_async_with_config(request, socket, Some(config)).await?;
             return Ok(NativeSocket::Unix(Box::new(stream)));
@@ -126,4 +126,34 @@ pub(crate) async fn connect_with_headers(
     })
     .await
     .map_err(|_| WsError::Daemon(DaemonClientError::Timeout))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::transport::UnixTransport;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn unix_websocket_sends_no_upgrade_to_a_rejected_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let transport = UnixTransport::new(path, |_, _| Err(DaemonClientError::PeerIdentity));
+        let endpoint = DaemonEndpoint::local_unix(transport, None);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (result, read) = tokio::join!(connect(&endpoint, "/api/runtime/ws", None), async {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                stream.read(&mut [0]).await.unwrap()
+            });
+            assert!(matches!(
+                result,
+                Err(WsError::Daemon(DaemonClientError::PeerIdentity))
+            ));
+            assert_eq!(read, 0);
+        })
+        .await
+        .expect("Unix WebSocket rejection did not complete");
+    }
 }

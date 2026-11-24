@@ -42,8 +42,8 @@ struct DevArgs {
     /// backend stays on 127.0.0.1 and is reached through Vite's proxy.
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
-    /// Watch `src/**`, `Cargo.toml`, and `Cargo.lock`; on change rebuild and
-    /// restart `aoe serve` (Vite stays up). Unix-only, same as the base command.
+    /// Watch Rust sources and Cargo manifests in the root package and Daemon
+    /// client. Rebuild and restart `aoe serve` while Vite stays up. Unix only.
     #[arg(long)]
     watch: bool,
 }
@@ -264,6 +264,9 @@ fn run_dev(args: DevArgs) {
         watcher
             .watch(Path::new("src"), RecursiveMode::Recursive)
             .expect("failed to watch src/");
+        watcher
+            .watch(Path::new("aoe-daemon-client"), RecursiveMode::Recursive)
+            .expect("failed to watch aoe-daemon-client/");
         watcher
             .watch(Path::new("."), RecursiveMode::NonRecursive)
             .expect("failed to watch project root");
@@ -796,6 +799,8 @@ mod tests {
             "Cargo.toml",
             "./Cargo.lock",
             "/abs/repo/Cargo.toml",
+            "aoe-daemon-client/src/lib.rs",
+            "aoe-daemon-client/Cargo.toml",
         ] {
             assert!(is_watch_relevant(Path::new(relevant)), "{relevant}");
         }

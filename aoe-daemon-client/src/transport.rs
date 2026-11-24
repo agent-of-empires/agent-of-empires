@@ -54,6 +54,14 @@ impl UnixTransport {
         &self.path
     }
 
+    /// Connect and authorize the peer before handing the stream to a protocol.
+    pub async fn connect(
+        &self,
+        expected_pid: Option<u32>,
+    ) -> Result<tokio::net::UnixStream, DaemonClientError> {
+        connect_unix(&self.path, self.verify_peer, expected_pid).await
+    }
+
     pub async fn execute(
         &self,
         request: reqwest::Request,
