@@ -346,10 +346,8 @@ fn capture_pane_in_session(
             "-s",
             "-t",
             &format!("={session_name}:"),
-            "-f",
-            &format!("#{{==:#{{pane_id}},{pane_id}}}"),
             "-F",
-            &format!("{nonce}:owns"),
+            &format!("{nonce}:#{{pane_id}}"),
             ";",
             "display-message",
             "-p",
@@ -367,18 +365,15 @@ fn capture_pane_in_session(
     let Some(text) = capture_output(output.status.success(), &output.stdout) else {
         return Ok(None);
     };
-    // tmux lists a pane once per link to its window, so one or more ownership lines count.
-    let owns = format!("{nonce}:owns\n");
-    let mut rest = text.as_str();
-    let mut owned = false;
-    while let Some(next) = rest.strip_prefix(&owns) {
-        rest = next;
-        owned = true;
-    }
-    Ok(rest
-        .strip_prefix(&format!("{nonce}:capture\n"))
-        .filter(|_| owned)
-        .map(str::to_owned))
+    // One line per pane per window link. Matched here, not with `list-panes -f`, which needs
+    // tmux 3.2.
+    let (listing, capture) = text
+        .split_once(&format!("{nonce}:capture\n"))
+        .unwrap_or_default();
+    let owned = listing
+        .lines()
+        .any(|line| line.strip_prefix(&nonce).and_then(|l| l.strip_prefix(':')) == Some(pane_id));
+    Ok(owned.then(|| capture.to_owned()))
 }
 
 impl Session {
