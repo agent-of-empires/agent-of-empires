@@ -830,18 +830,27 @@ pub(super) fn prove_staging_host_mount_absent(mount: &Path) -> anyhow::Result<()
         "/proc/self/fd/{}/..",
         mount.as_raw_fd()
     )))?;
-    let mount_id = |file: &fs::File| -> anyhow::Result<u64> {
-        let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
+    use std::os::fd::AsFd as _;
+    prove_same_mount(parent.as_fd(), mount.as_fd()).context("staging path remains a host mount")
+}
+
+pub(super) fn prove_same_mount(
+    parent: std::os::fd::BorrowedFd<'_>,
+    child: std::os::fd::BorrowedFd<'_>,
+) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let mount_id = |fd: std::os::fd::BorrowedFd<'_>| -> anyhow::Result<u64> {
+        let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd()))?;
         Ok(info
             .lines()
             .find_map(|line| line.strip_prefix("mnt_id:"))
-            .context("staging host mount identity unavailable")?
+            .context("host mount identity unavailable")?
             .trim()
             .parse()?)
     };
     anyhow::ensure!(
-        mount_id(&mount)? == mount_id(&parent)?,
-        "staging path remains a host mount"
+        mount_id(child)? == mount_id(parent)?,
+        "operation crosses a host mount"
     );
     Ok(())
 }

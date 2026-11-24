@@ -158,6 +158,24 @@ The previous tree stays backed up until both metadata writes commit. Restoration
 preserves the prior enabled, source, dev, grant, dismissal and settings values
 without overwriting unrelated config. A backup cleanup failure after commit is
 reported as recovery required; do not restore that backup over the committed tree.
+
+Default-mode remote installs and updates write
+`<app_dir>/.plugin-publication-active` before changing the installed tree. On
+writable Daemon startup, recovery takes the plugin operation lock. It can
+restore the prior installation if no build or metadata write could have
+started, or keep a committed installation and remove its owned backup if
+both metadata entries and descriptor-derived directory birth identities
+match the journal. Publication requires file birth and mount identity
+support. Recovery never traverses a mounted directory during cleanup.
+
+An interrupted build, a partial metadata write, or conflicting evidence
+still requires manual recovery. While the journal remains, plugin mutations
+and external worker launches are fenced. Verify that owned commands have
+exited and restore or confirm the intended tree and both metadata entries
+before removing the journal. Recovery does not scan or delete abandoned
+acquisition directories. Local sources and strict staging keep their
+existing recovery rules.
+
 Local release-binary targets must be regular executable files before publication.
 Release assets are streamed into staging and may only add files: an asset entry
 that would replace a file already in the source tree, or that is a symlink,
