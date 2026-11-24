@@ -1397,9 +1397,12 @@ impl HomeView {
                 None
             }
             "suggestion_pre_trust" => {
-                self.suggestions_feed.turn_on_pre_trust();
+                let turned = self.suggestions_feed.turn_on_pre_trust();
                 if let Some(view) = &mut self.suggestions_view {
-                    view.set_notice("Turning on pre-trust…");
+                    match turned {
+                        Ok(()) => view.set_notice("Turning on pre-trust…"),
+                        Err(reason) => view.set_error(reason),
+                    }
                 }
                 None
             }
@@ -2301,6 +2304,13 @@ impl HomeView {
             match view.handle_key(key, block, &mut self.suggestions_feed) {
                 SuggestionsAction::Continue => {}
                 SuggestionsAction::Close => self.suggestions_view = None,
+                SuggestionsAction::TurnOnPreTrust if !self.suggestions_feed.hold_pre_trust() => {
+                    if let Some(view) = &mut self.suggestions_view {
+                        view.set_error(
+                            "Suggestions are not loaded, so pre-trust was not turned on.",
+                        );
+                    }
+                }
                 SuggestionsAction::TurnOnPreTrust => {
                     self.confirm_dialog = Some(
                         ConfirmDialog::new(

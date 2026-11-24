@@ -1283,6 +1283,28 @@ fn a_prompt_blocked_on_folder_trust_turns_on_pre_trust_then_tries_again() {
     }
 }
 
+/// A pre-trust confirmation acts only on the daemon and profile it was opened for.
+#[test]
+#[serial]
+fn pre_trust_is_refused_when_the_list_changes_under_its_confirmation() {
+    let (mut env, _id, requests) = blocked_on_folder_trust();
+    let _commands = env.view.session_feed.request_driver_for_test();
+    env.view.handle_key(key(KeyCode::Char('t')), None);
+    assert!(env.view.confirm_dialog.is_some());
+    let mut other = snapshot(1, &[]);
+    other["profile"] = "other".into();
+    env.view.suggestions_feed.set_snapshot_for_test(other);
+    env.view.handle_key(key(KeyCode::Char('y')), None);
+    env.view.suggestions_feed.reload();
+    assert_eq!(
+        next_request(&requests),
+        "load",
+        "no pre-trust was sent first"
+    );
+    let error = env.view.suggestions_view.as_ref().unwrap().error.clone();
+    assert!(error.is_some_and(|e| e.contains("list changed")));
+}
+
 #[test]
 #[serial]
 fn a_failed_try_again_trash_disarms_so_a_later_trash_starts_nothing() {

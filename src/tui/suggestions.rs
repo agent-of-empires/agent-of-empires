@@ -1451,6 +1451,8 @@ pub(super) struct SuggestionsFeed {
     start_key: Option<ItemKey>,
     /// The hooks review on screen: its item, the fingerprint it shows and the origin it was issued for.
     held_trust: Option<(ItemKey, serde_json::Value, Option<Origin>)>,
+    /// The origin the pre-trust confirmation on screen was opened for.
+    held_pre_trust: Option<Origin>,
     /// The last start or prepare that failed, shown on its row on Home and in
     /// the full view until the next try.
     pub(super) failed: Option<(ItemKey, String)>,
@@ -1501,6 +1503,7 @@ impl SuggestionsFeed {
             prepare_key: None,
             start_key: None,
             held_trust: None,
+            held_pre_trust: None,
             failed: None,
             blocked_prompts: std::collections::HashMap::new(),
             hooks_changed: false,
@@ -1956,9 +1959,22 @@ impl SuggestionsFeed {
     }
 
     /// Asks the daemon to turn on pre-trust, bound to the list on screen.
-    pub(super) fn turn_on_pre_trust(&mut self) {
-        let origin = self.origin();
-        self.submit(Req::PreTrust { origin });
+    /// Binds the pre-trust confirmation about to open to the list on screen;
+    /// false when no list is loaded.
+    pub(super) fn hold_pre_trust(&mut self) -> bool {
+        self.held_pre_trust = self.origin();
+        self.held_pre_trust.is_some()
+    }
+
+    /// Turns on pre-trust for the daemon and profile the confirmation was
+    /// opened for, unless the list has changed or gone since.
+    pub(super) fn turn_on_pre_trust(&mut self) -> Result<(), &'static str> {
+        let held = self.held_pre_trust.take();
+        if held.is_none() || held != self.origin() {
+            return Err("The suggestions list changed, so pre-trust was not turned on.");
+        }
+        self.submit(Req::PreTrust { origin: held });
+        Ok(())
     }
 
     /// Remembers the hooks review shown for `key`, bound to the list on screen.
