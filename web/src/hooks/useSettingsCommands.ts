@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { fetchProfiles, fetchSettings, getSettingsSchema, updateSettings } from "../lib/api";
 import { reportError, reportInfo } from "../lib/toastBus";
 import type { CommandAction } from "../components/command-palette/types";
+import { PANEL_SETTING_FIELDS } from "../lib/panelDefaults";
 import type { SettingsFieldDescriptor } from "../lib/types";
 
 interface Args {
@@ -10,8 +11,9 @@ interface Args {
   onOpenSettingsTab: (tab: string) => void;
 }
 
-function sectionToTab(section: string): string {
-  if (section === "web") return "notifications";
+function tabFor({ section, field }: SettingsFieldDescriptor): string {
+  if (section === "web")
+    return (PANEL_SETTING_FIELDS as readonly string[]).includes(field) ? "panels" : "notifications";
   if (section === "acp") return "structured-view";
   return section;
 }
@@ -99,7 +101,7 @@ export function useSettingsCommands({ open, readOnly, onOpenSettingsTab }: Args)
         subtitle: `Opens settings · ${f.category}`,
         group: "Settings",
         keywords,
-        perform: () => onOpenSettingsTab(sectionToTab(f.section)),
+        perform: () => onOpenSettingsTab(tabFor(f)),
       });
     }
     return actions;

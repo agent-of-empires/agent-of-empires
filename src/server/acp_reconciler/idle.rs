@@ -49,7 +49,7 @@ pub(super) async fn repair_missing_terminal(state: &Arc<AppState>) {
             return;
         }
     };
-    let now_ms = chrono::Utc::now().timestamp_millis();
+    let now_ms = crate::time::Timestamp::now().as_millis();
     let grace_ms = i64::from(TERMINAL_REPAIR_GRACE_SECS) * 1000;
     for id in candidates {
         if latest_at
@@ -198,7 +198,7 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
             return;
         }
     };
-    let now_ms = chrono::Utc::now().timestamp_millis();
+    let now_ms = crate::time::Timestamp::now().as_millis();
     for (id, profile, idle_secs, lease, admissions) in live {
         // A resume is activity: its prompt is recorded only after the worker is ready.
         let last_ms = latest.get(&id).map(|&ms| ms.max(lease.idle_baseline_ms()));
@@ -263,7 +263,7 @@ mod tests {
     use super::*;
     use crate::acp::state::{SessionUsage, ToolCall, UsageCost};
     use crate::acp::Event;
-    use chrono::Utc;
+    use crate::time::Timestamp;
 
     #[test]
     fn should_auto_stop_policy() {
@@ -350,7 +350,7 @@ mod tests {
                 "[acp]\nauto_stop_idle_secs = 60\n",
             )
             .unwrap();
-            let stale_ms = Utc::now().timestamp_millis() - 3_600_000;
+            let stale_ms = Timestamp::now().as_millis() - 3_600_000;
             state
                 .acp_event_store
                 .record_at(
@@ -368,7 +368,7 @@ mod tests {
                 Worker::Starting => (Some(sup.test_hold_starting(id)), Resuming),
                 Worker::SlowStart => {
                     let lease = sup.test_hold_starting(id);
-                    lease.test_backdate_idle_baseline(Utc::now().timestamp_millis() - 3_600_000);
+                    lease.test_backdate_idle_baseline(Timestamp::now().as_millis() - 3_600_000);
                     sup.test_finish_starting(&lease);
                     (None, Running)
                 }
@@ -376,7 +376,7 @@ mod tests {
                     sup.test_insert_worker(id).await;
                     let lease = sup.running_lease(id).unwrap();
                     lease.test_backdate_idle_baseline(
-                        Utc::now().timestamp_millis() - admitted_secs_ago * 1000,
+                        Timestamp::now().as_millis() - admitted_secs_ago * 1000,
                     );
                     (None, Running)
                 }
@@ -395,7 +395,7 @@ mod tests {
                         .unwrap();
                     sup.test_insert_worker(id).await;
                     let lease = sup.running_lease(id).unwrap();
-                    lease.test_backdate_idle_baseline(Utc::now().timestamp_millis() - 3_600_000);
+                    lease.test_backdate_idle_baseline(Timestamp::now().as_millis() - 3_600_000);
                     (None, Running)
                 }
                 Worker::RunningChild => {
@@ -419,20 +419,20 @@ mod tests {
                             2,
                             &Event::SubagentUpdated {
                                 subagent: child,
-                                at: Utc::now(),
+                                at: Timestamp::now(),
                             },
                             stale_ms,
                         )
                         .unwrap();
                     sup.test_insert_worker(id).await;
                     let lease = sup.running_lease(id).unwrap();
-                    lease.test_backdate_idle_baseline(Utc::now().timestamp_millis() - 3_600_000);
+                    lease.test_backdate_idle_baseline(Timestamp::now().as_millis() - 3_600_000);
                     (None, Running)
                 }
                 Worker::PromptPending => {
                     sup.test_insert_worker(id).await;
                     let lease = sup.running_lease(id).unwrap();
-                    lease.test_backdate_idle_baseline(Utc::now().timestamp_millis() - 3_600_000);
+                    lease.test_backdate_idle_baseline(Timestamp::now().as_millis() - 3_600_000);
                     sup.test_note_admission(id);
                     (None, Running)
                 }
@@ -499,7 +499,7 @@ mod tests {
         .unwrap();
         let store = &state.acp_event_store;
         let sup = &state.acp_supervisor;
-        let stale_ms = Utc::now().timestamp_millis() - 3_600_000;
+        let stale_ms = Timestamp::now().as_millis() - 3_600_000;
         let child = |state| Event::SubagentUpdated {
             subagent: SubagentRecord {
                 session_id: "child".into(),
@@ -514,7 +514,7 @@ mod tests {
                 model: None,
                 background: true,
             },
-            at: Utc::now(),
+            at: Timestamp::now(),
         };
         let events = [
             prompt("go"),
@@ -591,7 +591,7 @@ mod tests {
                 name: "Terminal".to_string(),
                 kind: "execute".to_string(),
                 args_preview: "{}".to_string(),
-                started_at: Utc::now(),
+                started_at: Timestamp::now(),
                 parent_tool_call_id: None,
                 memory_recall: None,
                 diffs: Vec::new(),
@@ -605,6 +605,7 @@ mod tests {
                 attachments: Vec::new(),
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             }
         }
         let finished_turn = |extra: Vec<Event>, tail: Vec<Event>| {
@@ -621,7 +622,7 @@ mod tests {
                     is_error: false,
                     content: String::new(),
                     output: Vec::new(),
-                    completed_at: Utc::now(),
+                    completed_at: Timestamp::now(),
                     async_subagent: false,
                 },
                 Event::AgentMessageChunk {
@@ -643,7 +644,7 @@ mod tests {
                 options: Vec::new(),
                 choice: false,
                 plan: None,
-                requested_at: Utc::now(),
+                requested_at: Timestamp::now(),
                 resolved: None,
             },
         };
@@ -727,7 +728,7 @@ mod tests {
             let mut inst = structured_instance(id, &project.path().to_string_lossy());
             inst.status = status;
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
-            let at_ms = Utc::now().timestamp_millis() - age_secs * 1000;
+            let at_ms = Timestamp::now().as_millis() - age_secs * 1000;
             let last_seq = events.len() as u64;
             for (idx, event) in events.iter().enumerate() {
                 state

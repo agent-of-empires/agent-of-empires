@@ -603,6 +603,16 @@ describe("recent-first cold open + loadOlder (#2236)", () => {
 });
 
 describe("sendPrompt outcomes", () => {
+  it("identifies the dashboard as the prompt's origin", async () => {
+    calls = installAcpFakes(({ url }) =>
+      url.includes("/acp/prompt") ? json({ disposition: "sent" }, 202) : undefined,
+    );
+    const { result, unmount } = await openSession("s-1");
+    await act(() => result.current.sendPrompt("hello"));
+    expect(posts("/acp/prompt")[0]!.headers["X-Aoe-Prompt-Origin"]).toBe("dashboard");
+    unmount();
+  });
+
   it.each([
     ["a 500", () => new Response("boom", { status: 500 })],
     [
@@ -2104,7 +2114,7 @@ describe("live panel cancellation authority", () => {
       fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
     });
     await flushAsync();
-    expect(posts("/cancel")).toEqual([
+    expect(posts("/cancel").map(({ method, url, body }) => ({ method, url, body }))).toEqual([
       { method: "POST", url: `/api/sessions/${id}/acp/subagents/${childId}/cancel`, body: null },
     ]);
     await waitFor(() => expect(region.textContent).not.toContain("Native input is not currently confirmed"));
@@ -2130,11 +2140,11 @@ describe("live panel cancellation authority", () => {
       fireEvent.click(within(region).getByRole("button", { name: "Interrupt session" }));
     }
     await flushAsync();
-    expect(posts(`/acp/subagents/${childId}/cancel`)).toEqual([
+    expect(posts(`/acp/subagents/${childId}/cancel`).map(({ method, url, body }) => ({ method, url, body }))).toEqual([
       { method: "POST", url: `/api/sessions/${id}/acp/subagents/${childId}/cancel`, body: null },
       { method: "POST", url: `/api/sessions/${id}/acp/subagents/${childId}/cancel`, body: null },
     ]);
-    expect(posts("/acp/cancel")).toEqual([
+    expect(posts("/acp/cancel").map(({ method, url, body }) => ({ method, url, body }))).toEqual([
       { method: "POST", url: `/api/sessions/${id}/acp/cancel`, body: null },
       { method: "POST", url: `/api/sessions/${id}/acp/cancel`, body: null },
     ]);
@@ -2208,7 +2218,7 @@ describe("live panel cancellation authority", () => {
       fireEvent.click(within(region).getByTitle("Stop this sub-agent"));
       fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
       await flushAsync();
-      expect(posts("/cancel")).toEqual([
+      expect(posts("/cancel").map(({ method, url, body }) => ({ method, url, body }))).toEqual([
         { method: "POST", url: `/api/sessions/${nextId}/acp/subagents/${childId}/cancel`, body: null },
       ]);
       view.unmount();

@@ -135,9 +135,13 @@ pub fn resolve(layers: Vec<McpLayer>) -> Vec<ResolvedMcpServer> {
 
 /// Names and transports only, safe for logs.
 pub fn summarize(servers: &[ResolvedMcpServer]) -> String {
-    servers
-        .iter()
-        .map(|s| format!("{}({})", s.def.name, s.def.kind()))
+    summarize_defs(servers.iter().map(|s| &s.def))
+}
+
+/// Names and transports only, safe for logs.
+pub fn summarize_defs<'a>(defs: impl IntoIterator<Item = &'a ProjectMcpServer>) -> String {
+    defs.into_iter()
+        .map(|d| format!("{}({})", d.name, d.kind()))
         .collect::<Vec<_>>()
         .join(", ")
 }

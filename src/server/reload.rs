@@ -791,7 +791,7 @@ fn merge_process_runtime_fields(prior: Instance, fresh: &mut Instance) {
 #[derive(Debug, Clone, Default)]
 pub(super) struct PriorTickTracking {
     lifecycle_generation: u64,
-    idle_entered_at: Option<chrono::DateTime<chrono::Utc>>,
+    idle_entered_at: Option<crate::time::Timestamp>,
     ever_confirmed_present: bool,
     unknown_since: Option<std::time::Instant>,
     detection: crate::session::DetectionState,
@@ -847,12 +847,12 @@ pub(super) struct SandboxHealth {
 
 /// Committed launches use the persisted pane birth for their startup grace.
 /// Future wall-clock stamps grant no grace; ownership has its separate TTL.
-fn starting_status_in_grace(inst: &Instance, now: chrono::DateTime<chrono::Utc>) -> bool {
+fn starting_status_in_grace(inst: &Instance, now: crate::time::Timestamp) -> bool {
     let Some(started) = inst.capture_started_at else {
         return false;
     };
-    let started = chrono::DateTime::<chrono::Utc>::from(started);
-    let grace = chrono::Duration::seconds(Instance::STARTUP_GRACE_SECS as i64);
+    let started = crate::time::Timestamp::from(started);
+    let grace = crate::time::Duration::seconds(Instance::STARTUP_GRACE_SECS as i64);
     started <= now && now < started + grace
 }
 
@@ -872,7 +872,7 @@ pub(super) fn apply_tick_status_decisions(
     pane_metadata: Option<&std::collections::HashMap<String, crate::tmux::PaneMetadata>>,
     sandbox_health: &std::collections::HashMap<String, SandboxHealth>,
 ) {
-    let now = chrono::Utc::now();
+    let now = crate::time::Timestamp::now();
     for inst in instances {
         let previous = prev.get_mut(&inst.id);
         let prior_tracking = tracking.get(&inst.id);
@@ -899,7 +899,7 @@ fn apply_tick_status_decision(
     suppressed: bool,
     pane_metadata: Option<&std::collections::HashMap<String, crate::tmux::PaneMetadata>>,
     sandbox_health: Option<&std::collections::HashMap<String, SandboxHealth>>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: crate::time::Timestamp,
 ) -> Option<Status> {
     if inst.status == Status::Creating {
         return None;
@@ -951,7 +951,7 @@ fn apply_tick_status_decision(
         })
     {
         inst.status = Status::Error;
-        inst.last_error = Some("Container is not running".into());
+        inst.last_error.set("Container is not running");
         inst.idle_entered_at = None;
         inst.pane_dead_observed = false;
         inst.live_status_baseline = Some(Status::Error);
@@ -1017,7 +1017,7 @@ pub(super) fn apply_supplementary_tick(
     prior: &SupplementaryTick,
     pane_metadata: Option<&std::collections::HashMap<String, crate::tmux::PaneMetadata>>,
 ) {
-    let now = chrono::Utc::now();
+    let now = crate::time::Timestamp::now();
     for row in &mut cache.alias_only_instances {
         if row.is_structured() {
             continue;
@@ -1550,7 +1550,7 @@ pub(super) fn merge_loaded_rows(
         }
     }
     let mut changes = Vec::new();
-    let now = chrono::Utc::now();
+    let now = crate::time::Timestamp::now();
     for row in &mut merged {
         if row.is_archived() {
             row.settle_archived_status();
@@ -1615,7 +1615,7 @@ pub(super) fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [I
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use crate::time::Timestamp;
 
     #[test]
     #[serial_test::serial]
@@ -1718,9 +1718,9 @@ mod tests {
         edited.title = "renamed".into();
         edited.group_path = "team/b".into();
         edited.archive();
-        edited.trashed_at = Some(Utc::now());
+        edited.trashed_at = Some(Timestamp::now());
         let mut snoozed = gone.clone();
-        snoozed.snoozed_until = Some(Utc::now());
+        snoozed.snoozed_until = Some(Timestamp::now());
         let merged = vec![edited, added.clone(), snoozed];
         assert_eq!(
             external_session_changes(&prior, &merged),
@@ -1951,12 +1951,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn canonical_reload_and_failed_probes_keep_lifecycle_status_pairs() {
-        let old_idle = "2026-01-01T00:00:00Z"
-            .parse::<chrono::DateTime<Utc>>()
-            .unwrap();
-        let disk_idle = "2026-01-02T00:00:00Z"
-            .parse::<chrono::DateTime<Utc>>()
-            .unwrap();
+        let old_idle = crate::time::Timestamp::parse_rfc3339("2026-01-01T00:00:00Z").unwrap();
+        let disk_idle = crate::time::Timestamp::parse_rfc3339("2026-01-02T00:00:00Z").unwrap();
         let cases = [
             (
                 3,
@@ -2634,8 +2630,8 @@ mod tests {
 
     #[test]
     fn tick_distinguishes_launch_ownership_from_startup_grace() {
-        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        let born = std::time::SystemTime::from(now);
+        let now = crate::time::Timestamp::from_unix_secs(1_700_000_000).unwrap();
+        let born = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         for (case, reserved, launched_at, initial, expected) in [
             (
                 "active construction",
@@ -2859,7 +2855,7 @@ mod tests {
             row.view = view;
             row.status = status;
             row.lifecycle_generation = 4;
-            row.idle_entered_at = Some(chrono::Utc::now());
+            row.idle_entered_at = Some(crate::time::Timestamp::now());
             row.sandbox_info = Some(crate::session::SandboxInfo {
                 provider: None,
                 enabled: true,
@@ -2934,11 +2930,18 @@ mod tests {
         // converted from a terminal session: the tmux message cannot apply to
         // it any more.
         let mut inst = phantom_structured_row("acp-session");
-        inst.last_error = Some(crate::session::TMUX_SESSION_GONE_ERROR.to_string());
-
+        // An error a pane printed stays, however it begins.
+        let printed = format!("{} Exiting.", crate::session::TMUX_SESSION_GONE_LEAD);
+        inst.last_error.set(printed.as_str());
         assert!(skip_tmux_decision_for_structured(&mut inst));
+        assert_eq!(inst.last_error.as_deref(), Some(printed.as_str()));
 
-        assert_eq!(inst.last_error, None);
+        inst.last_error.latch_tmux(
+            crate::session::TmuxAbsence::Gone,
+            crate::session::TMUX_SESSION_GONE_ERROR,
+        );
+        assert!(skip_tmux_decision_for_structured(&mut inst));
+        assert_eq!(inst.last_error.as_deref(), None);
     }
 
     #[test]
@@ -2948,7 +2951,8 @@ mod tests {
         let mut inst = Instance::new("tmux-session", "/tmp/test");
         inst.status = Status::Idle;
         inst.live_status_baseline = Some(Status::Error);
-        inst.last_error = Some(crate::session::TMUX_SESSION_GONE_ERROR.to_string());
+        inst.last_error
+            .set(crate::session::TMUX_SESSION_GONE_ERROR.to_string());
 
         assert!(
             !skip_tmux_decision_for_structured(&mut inst),
@@ -3099,7 +3103,7 @@ mod tests {
         );
 
         // A stamp whose second is already past.
-        let settled = Utc::now().timestamp() - 60;
+        let settled = Timestamp::now().as_unix_secs() - 60;
         assert_eq!(tick(Some(settled)), Status::Idle);
         assert_eq!(
             tick(Some(settled)),
@@ -3108,9 +3112,7 @@ mod tests {
              re-derive one from a row it did not capture for"
         );
 
-        let old_idle = "2026-01-01T00:00:00Z"
-            .parse::<chrono::DateTime<Utc>>()
-            .unwrap();
+        let old_idle = crate::time::Timestamp::parse_rfc3339("2026-01-01T00:00:00Z").unwrap();
         on_disk.status = Status::Idle;
         on_disk.lifecycle_generation = 3;
         on_disk.idle_entered_at = Some(old_idle);
@@ -3195,9 +3197,7 @@ mod tests {
             .unwrap();
         let state = crate::server::test_support::build_test_app_state(Vec::new());
         crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
-        let old_idle = "2026-01-01T00:00:00Z"
-            .parse::<chrono::DateTime<Utc>>()
-            .unwrap();
+        let old_idle = crate::time::Timestamp::parse_rfc3339("2026-01-01T00:00:00Z").unwrap();
         {
             let mut cache = state.runtime_read_cache.write().unwrap();
             let row = &mut cache.alias_only_instances[0];
@@ -3290,7 +3290,7 @@ mod tests {
         ] {
             let mut prior = Instance::new("seed", "/tmp/seed");
             prior.status = previous_status;
-            prior.last_error = Some("launch failed".into());
+            prior.last_error.set("launch failed");
             let mut fresh = Instance::new("seed", "/tmp/seed");
             fresh.status = committed_status;
             merge_runtime_fields(prior, &mut fresh);
@@ -3655,9 +3655,7 @@ mod tests {
             let state = crate::server::test_support::build_test_app_state(Vec::new());
             crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
             let unknown = std::time::Instant::now();
-            let accessed = "2026-01-02T03:04:05Z"
-                .parse::<chrono::DateTime<Utc>>()
-                .unwrap();
+            let accessed = crate::time::Timestamp::parse_rfc3339("2026-01-02T03:04:05Z").unwrap();
             {
                 let mut cache = state.runtime_read_cache.write().unwrap();
                 let row = &mut cache.alias_only_instances[0];
@@ -3770,9 +3768,7 @@ mod tests {
             .unwrap();
         let state = crate::server::test_support::build_test_app_state(Vec::new());
         crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
-        let idle = "2026-01-01T00:00:00Z"
-            .parse::<chrono::DateTime<Utc>>()
-            .unwrap();
+        let idle = crate::time::Timestamp::parse_rfc3339("2026-01-01T00:00:00Z").unwrap();
         for source in [StatusSource::TmuxApplied, StatusSource::DiskOnly] {
             for status in [
                 Status::Stopped,
@@ -3831,9 +3827,7 @@ mod tests {
         stored.lifecycle_generation = 1;
         let mut cached = stored.clone();
         cached.status = Status::Idle;
-        let idle = "2026-01-01T00:00:00Z"
-            .parse::<chrono::DateTime<Utc>>()
-            .unwrap();
+        let idle = crate::time::Timestamp::parse_rfc3339("2026-01-01T00:00:00Z").unwrap();
         cached.idle_entered_at = Some(idle);
         cached.ever_confirmed_present = true;
         cached.detection.activity = Some(100);
@@ -3929,9 +3923,7 @@ mod tests {
             .unwrap();
         let state = crate::server::test_support::build_test_app_state(Vec::new());
         crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
-        let idle = "2026-01-01T00:00:00Z"
-            .parse::<chrono::DateTime<Utc>>()
-            .unwrap();
+        let idle = crate::time::Timestamp::parse_rfc3339("2026-01-01T00:00:00Z").unwrap();
         let unknown = std::time::Instant::now();
         for (old, fresh, generation, reuse) in [
             (Status::Idle, Status::Running, 1, true),

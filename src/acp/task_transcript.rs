@@ -19,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio::sync::mpsc::WeakSender;
 use tokio_util::sync::CancellationToken;
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 
 use crate::acp::background_agent::TailerStart;
 use crate::acp::state::{BackgroundTaskLaunch, Event};
@@ -56,7 +56,7 @@ pub(crate) type IdleHook = Arc<dyn Fn() + Send + Sync>;
 /// notifications carry the task id without a status.
 /// Returns when it ended: the entry's own time, so a resumed read does not
 /// count daemon downtime.
-fn terminal_notification(line: &str, task_id: &str, tool_call_id: &str) -> Option<DateTime<Utc>> {
+fn terminal_notification(line: &str, task_id: &str, tool_call_id: &str) -> Option<Timestamp> {
     if !line.contains(task_id) {
         return None;
     }
@@ -110,8 +110,8 @@ fn terminal_notification(line: &str, task_id: &str, tool_call_id: &str) -> Optio
         entry
             .get("timestamp")
             .and_then(serde_json::Value::as_str)
-            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
-            .map_or_else(Utc::now, |at| at.with_timezone(&Utc))
+            .and_then(|at| Timestamp::parse_rfc3339(at).ok())
+            .unwrap_or_else(Timestamp::now)
     })
 }
 
@@ -276,7 +276,7 @@ impl TaskTailer {
             });
             let ended_at = tokio::select! {
                 () = owner.cancellation.cancelled() => return,
-                () = owner.stop.cancelled() => Some(Utc::now()),
+                () = owner.stop.cancelled() => Some(Timestamp::now()),
                 ended_at = self.follow() => ended_at,
             };
             ended.cancel();
@@ -348,7 +348,7 @@ struct Cursor {
 }
 
 enum Scan {
-    Ended(DateTime<Utc>),
+    Ended(Timestamp),
     /// Nothing ended the task yet.
     Pending,
     /// The transcript cannot be read any more.
@@ -357,7 +357,7 @@ enum Scan {
 
 impl TaskTailer {
     /// Returns when the task ended, or `None` once tracking was given up.
-    async fn follow(&self) -> Option<DateTime<Utc>> {
+    async fn follow(&self) -> Option<Timestamp> {
         let tool_call_id = self.tool_call_id.as_deref()?;
         // A task start implies the session already ran a tool, so its
         // transcript exists; one that cannot be found is not trackable.
@@ -467,7 +467,7 @@ fn scan_chunk(
     chunk: &[u8],
     task_id: &str,
     tool_call_id: &str,
-) -> Option<DateTime<Utc>> {
+) -> Option<Timestamp> {
     let mut rest = chunk;
     while !rest.is_empty() {
         let Some(end) = rest.iter().position(|byte| *byte == b'\n') else {

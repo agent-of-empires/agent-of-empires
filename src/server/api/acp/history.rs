@@ -947,6 +947,7 @@ done
             prompt_id: None,
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         // More invisible events between the messages than a fixed lookback
         // would have read, within the test store's retention.
@@ -1050,6 +1051,7 @@ done
             prompt_id: None,
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let diff_prompt = Event::UserDiffCommentsPrompt {
             intro: String::new(),
@@ -1116,6 +1118,7 @@ done
             prompt_id: None,
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         for (session, head) in [("s-chunk", &chunk), ("s-prompt", &prompt)] {
             let events =
@@ -1150,6 +1153,7 @@ done
                 prompt_id: None,
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
             Event::AgentMessageChunk {
                 text: "hi".into(),

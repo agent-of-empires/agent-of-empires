@@ -23,6 +23,9 @@ use crate::plugin::ui_state::UiSnapshot;
 
 /// The daemon revives, waits for readiness and delivers before it answers a terminal send.
 const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// A spawn answers only after sandbox prep, hooks (which have no deadline) and the handshake,
+/// so the client waits like the dashboard Retry and the user aborts with Ctrl-C.
+const SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 const PLUGIN_PREVIEW_TIMEOUT: std::time::Duration =
     crate::plugin::EXECUTION_BUDGET.saturating_add(std::time::Duration::from_secs(10 * 60));
 
@@ -421,6 +424,7 @@ impl HttpClient {
         session_id: &str,
         text: &str,
         no_revive: bool,
+        origin: crate::daemon::PromptOrigin,
     ) -> Result<PromptDispatchWire, HttpError> {
         let url = format!(
             "{}/api/sessions/{}/acp/prompt",
@@ -434,7 +438,11 @@ impl HttpClient {
             no_revive,
             queued_prompt_id: None,
         };
-        let res = self.execute(self.http.post(&url).json(&body)).await?;
+        let mut request = self.http.post(&url).json(&body);
+        if let Some(origin) = origin.as_header_value() {
+            request = request.header(crate::daemon::PromptOrigin::HEADER, origin);
+        }
+        let res = self.execute(request).await?;
         let res = check_status(res, session_id)?;
         Ok(crate::daemon::decode_json::<PromptDispatchWire>(res).await?)
     }
@@ -579,6 +587,23 @@ impl HttpClient {
             path_segment(session_id)?
         );
         let res = self.execute(self.http.post(&url)).await?;
+        check_status(res, session_id)?;
+        Ok(())
+    }
+
+    /// `POST /api/sessions/{id}/acp/spawn`: start the worker, resuming the stored conversation.
+    pub async fn spawn_acp(&self, session_id: &str) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/acp/spawn",
+            self.endpoint.base_url,
+            path_segment(session_id)?
+        );
+        let request = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({}))
+            .timeout(SPAWN_TIMEOUT);
+        let res = self.execute(request).await?;
         check_status(res, session_id)?;
         Ok(())
     }
@@ -1377,7 +1402,7 @@ mod tests {
         let output = vec![ToolOutputBlock::Text {
             text: "structured output".into(),
         }];
-        let completed_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let completed_at = crate::time::Timestamp::from_unix_secs(1_700_000_000).unwrap();
         state
             .acp_event_store
             .record(
@@ -1527,7 +1552,7 @@ mod tests {
         use crate::acp::state::Event;
         use axum::{routing::get, Router};
         let mut inst = crate::session::Instance::new("retained", "/tmp");
-        inst.trashed_at = Some(chrono::Utc::now());
+        inst.trashed_at = Some(crate::time::Timestamp::now());
         let id = inst.id.clone();
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
         for seq in 10..=16 {
@@ -1566,6 +1591,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_acp_posts_an_empty_json_object() {
+        use axum::{routing::post, Router};
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+        let app = Router::new().route(
+            "/api/sessions/{id}/acp/spawn",
+            post(
+                move |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    if let Some(tx) = tx.lock().unwrap().take() {
+                        let _ = tx.send(body);
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HttpClient::new(endpoint(&base, Some("spawn-token"))).unwrap();
+        client.spawn_acp("abc").await.unwrap();
+        assert_eq!(rx.await.unwrap(), serde_json::json!({}));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn spawn_acp_waits_past_the_default_transport_timeout() {
+        use axum::{routing::post, Router};
+        let app = Router::new().route(
+            "/api/sessions/{id}/acp/spawn",
+            post(|| async { tokio::time::sleep(Duration::from_secs(16)).await }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HttpClient::new(endpoint(&base, Some("spawn-token"))).unwrap();
+        client.spawn_acp("abc").await.unwrap();
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn retained_replay_preserves_reducer_state_across_pages() {
         use crate::acp::{
             approvals::Nonce,
@@ -1577,7 +1643,7 @@ mod tests {
         let inst = crate::session::Instance::new("retained state", "/tmp");
         let id = inst.id.clone();
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
-        let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
+        let at = crate::time::Timestamp::from_unix_secs(100).unwrap();
         let completed = |tool_call_id: &str| Event::ToolCallCompleted {
             tool_call_id: tool_call_id.into(),
             is_error: false,
@@ -2426,6 +2492,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompt_names_its_client_in_the_origin_header() {
+        use crate::daemon::PromptOrigin;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let cases = [
+            (PromptOrigin::Tui, Some("tui")),
+            (PromptOrigin::Cli, Some("cli")),
+            (PromptOrigin::Mcp, None),
+        ];
+        for (origin, header) in cases {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 1024];
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        assert!(request.len() < 4096, "header section over 4 KiB");
+                        let n = stream.read(&mut chunk).await.unwrap();
+                        assert!(n > 0, "connection closed before the headers ended");
+                        request.extend_from_slice(&chunk[..n]);
+                    }
+                })
+                .await
+                .expect("timed out reading the request headers");
+                stream
+                    .write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+                String::from_utf8_lossy(&request).to_lowercase()
+            });
+            let client =
+                HttpClient::new(endpoint(&format!("http://{address}"), Some("secret"))).unwrap();
+            let _ = client.prompt("session", "hello", false, origin).await;
+            let request = server.await.unwrap();
+            let sent = request
+                .lines()
+                .find_map(|l| l.strip_prefix("x-aoe-prompt-origin: "))
+                .map(str::to_string);
+            assert_eq!(sent.as_deref(), header, "{origin:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn no_revive_refusal_explains_the_conflict_without_reading_its_body() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2441,7 +2551,7 @@ mod tests {
             HttpClient::new(endpoint(&format!("http://{address}"), Some("secret"))).unwrap();
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            client.prompt("session", "hello", true),
+            client.prompt("session", "hello", true, crate::daemon::PromptOrigin::Cli),
         )
         .await;
         server.abort();

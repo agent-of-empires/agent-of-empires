@@ -686,7 +686,7 @@ mod tests {
         let merged = merge_repo_config(base, &repo);
         let sb = &merged.sandbox;
         assert!(!sb.enabled_by_default);
-        assert_ne!(sb.default_image, "attacker/img");
+        assert_eq!(sb.default_image, None);
         assert_eq!(sb.environment, vec!["USER_KEY=$USER_KEY"]);
         assert!(sb.extra_volumes.is_empty() && !sb.mount_ssh && !sb.selinux_relabel);
         assert!(!sb.privileged && sb.cap_add.is_empty());
@@ -728,12 +728,14 @@ mod tests {
                 "auto_cleanup": false,
             },
             "updates": { "auto_update_plugins": true },
+            "session": { "plugin_staging_sandbox": false },
         }));
         let mut base = Config::default();
         base.worktree.enabled = false;
         base.worktree.path_template = "./wt/{branch}".to_string();
         base.worktree.bare_repo_path_template = "../{branch}".to_string();
         base.worktree.workspace_path_template = "../ws/{branch}".to_string();
+        base.session.plugin_staging_sandbox = true;
         let merged = merge_repo_config(base, &repo);
         assert!(!merged.worktree.enabled);
         assert_eq!(merged.worktree.path_template, "./wt/{branch}");
@@ -741,9 +743,11 @@ mod tests {
         assert_eq!(merged.worktree.workspace_path_template, "../ws/{branch}");
         assert!(!merged.worktree.auto_cleanup);
         assert!(!merged.updates.auto_update_plugins);
+        assert!(merged.session.plugin_staging_sandbox);
         assert_eq!(
             rejected(&repo),
             vec![
+                "session.plugin_staging_sandbox",
                 "updates.auto_update_plugins",
                 "worktree.bare_repo_path_template",
                 "worktree.enabled",

@@ -93,7 +93,7 @@ test("a sandboxed Session's open Host shell switches to the focused Container sh
   });
   const terminals = await recordTerminals(page);
   await openStructuredSession(page, mock);
-  await page.getByTestId("pane-tab-terminal:0").click();
+  await page.getByTestId("pane-toggle-terminal").click();
   const host = page.getByRole("button", { name: "Host", exact: true });
   const container = page.getByRole("button", { name: "Container", exact: true });
   await expect(host).toHaveAttribute("aria-pressed", "true");
@@ -117,7 +117,7 @@ test("Open Terminal reveals a collapsed dock whose active tab is the terminal", 
   });
   await recordTerminals(page);
   await openStructuredSession(page, mock);
-  await page.getByTestId("pane-tab-terminal:0").click();
+  await page.getByTestId("pane-toggle-terminal").click();
   const handle = page.getByTestId("content-split-resize-handle");
   await expect(handle).toBeVisible();
   await page.keyboard.press("ControlOrMeta+Alt+b");

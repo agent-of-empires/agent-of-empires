@@ -30,7 +30,7 @@ fn inject_reservation(h: &TuiTestHarness, title: &str, operation: &str) {
     row["lifecycle_reservation"] = serde_json::json!({
         "op": operation,
         "generation": generation,
-        "at": chrono::Utc::now().to_rfc3339(),
+        "at": agent_of_empires::time::Timestamp::now().to_rfc3339(),
     });
     write_sessions(h, &value);
 }
@@ -218,9 +218,8 @@ async fn daemon_purge_keeps_peer_retrash_when_only_identity_is_stale() {
     let mut body = DeleteSessionBody {
         expected_trash: true,
         expected_trashed_at: Some(
-            chrono::DateTime::parse_from_rfc3339(current.trashed_at.as_ref().unwrap())
-                .unwrap()
-                .with_timezone(&chrono::Utc),
+            agent_of_empires::time::Timestamp::parse_rfc3339(current.trashed_at.as_ref().unwrap())
+                .unwrap(),
         ),
         expected_generation: Some(current.lifecycle_generation),
         expected_trash_lifecycle_id: Some(original_identity),

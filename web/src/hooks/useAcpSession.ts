@@ -74,9 +74,12 @@ function acpUrl(sessionId: string, path: string): string {
   return `/api/sessions/${encodeURIComponent(sessionId)}/acp/${path}`;
 }
 
-function jsonPost(body: unknown): RequestInit {
-  return { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+function jsonPost(body: unknown, headers: Record<string, string> = {}): RequestInit {
+  return { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body) };
 }
+
+/** Self-identifies the dashboard to the daemon, which records it as the prompt's origin. */
+const PROMPT_ORIGIN_HEADERS = { "X-Aoe-Prompt-Origin": "dashboard" };
 
 async function safeText(res: Response, limit = 200): Promise<string> {
   try {
@@ -377,17 +380,20 @@ export function useAcpSession(
       try {
         const res = await fetch(
           acpUrl(sessionId, "prompt"),
-          jsonPost({
-            text,
-            prompt_id: promptId,
-            ...(queuedPromptId ? { queued_prompt_id: queuedPromptId } : {}),
-            attachments: (attachments ?? []).map((a) => ({
-              kind: a.kind,
-              mime_type: a.mimeType,
-              data: a.dataB64,
-              name: a.name,
-            })),
-          }),
+          jsonPost(
+            {
+              text,
+              prompt_id: promptId,
+              ...(queuedPromptId ? { queued_prompt_id: queuedPromptId } : {}),
+              attachments: (attachments ?? []).map((a) => ({
+                kind: a.kind,
+                mime_type: a.mimeType,
+                data: a.dataB64,
+                name: a.name,
+              })),
+            },
+            PROMPT_ORIGIN_HEADERS,
+          ),
         );
         if (!res.ok) {
           const body = await safeText(res, Infinity);

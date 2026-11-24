@@ -1,10 +1,5 @@
-//! Drain sticky poller observations through profile-bound commits.
-//!
-//! Shared by the TUI tick (`apply_session_id_updates`) and the daemon's
-//! `status_poll_loop`. Without the daemon-side caller, sessions running
-//! under `aoe serve` without an attached TUI never persist post-`/clear`
-//! sids through the channel and `sessions.json` stays stale until the
-//! next launch's resume-time verify (#2291).
+//! Drain sticky poller observations through profile-bound commits, from the
+//! daemon's `status_poll_loop` (#2291).
 //!
 //! The helper takes `&mut [Instance]` and mutates the slice's per-instance
 //! agent conversation directly. It does NOT take any tokio lock and is
@@ -57,7 +52,7 @@ impl SessionIdSyncOutcome {
 
 struct Update {
     id: String,
-    created_at: chrono::DateTime<chrono::Utc>,
+    created_at: crate::time::Timestamp,
     lifecycle_generation: u64,
     sid: String,
     expected_prior: ConversationState,
@@ -472,7 +467,7 @@ fn drain_and_persist_session_ids_inner(
                         .try_acquire_lifecycle_reservation(
                             crate::session::LifecycleOperation::Capture,
                             Instance::LIFECYCLE_RESERVATION_TTL,
-                            chrono::Utc::now(),
+                            crate::time::Timestamp::now(),
                         )
                         .map_err(anyhow::Error::from)
                 });
@@ -1772,11 +1767,11 @@ mod tests {
                     durable.lifecycle_reservation = Some(crate::session::LifecycleReservation {
                         op: crate::session::LifecycleOperation::Trash,
                         generation: 1,
-                        at: chrono::Utc::now(),
+                        at: crate::time::Timestamp::now(),
                     });
                 }
                 "completed-restart" => durable.lifecycle_generation += 1,
-                "reused-created" => durable.created_at += chrono::Duration::seconds(1),
+                "reused-created" => durable.created_at += crate::time::Duration::seconds(1),
                 "same-generation-pin" => durable.resume_intent = ResumeIntent::Use(sid.into()),
                 _ => unreachable!(),
             }

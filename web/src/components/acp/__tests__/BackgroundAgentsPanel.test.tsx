@@ -189,9 +189,9 @@ describe("BackgroundAgentsPanel shell dialog", () => {
     const buttons = stops;
     const last = buttons[buttons.length - 1]!;
     last.focus();
-    fireEvent.keyDown(window, { key: "Tab" });
+    fireEvent.keyDown(document.activeElement!, { key: "Tab" });
     expect(document.activeElement).toBe(buttons[0]);
-    fireEvent.keyDown(window, { key: "Tab", shiftKey: true });
+    fireEvent.keyDown(document.activeElement!, { key: "Tab", shiftKey: true });
     expect(document.activeElement).toBe(last);
   });
 

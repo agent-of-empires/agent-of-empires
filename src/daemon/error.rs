@@ -36,6 +36,10 @@ pub enum ApiErrorCode {
     CreationNotPending,
     CreateHookFailed,
     CreateOutcomeUnknown,
+    /// The project path is not a directory on the Daemon host.
+    WorkingDirMissing,
+    /// A worktree checkout named a branch that exists neither locally nor on a remote.
+    BranchNotFound,
     AgentHooksNotApproved,
     SmartRenameSkipped,
     SmartRenameFailed,
@@ -45,6 +49,8 @@ pub enum ApiErrorCode {
     SessionArchived,
     SessionTrashed,
     AccountSwapUnavailable,
+    ModelPinned,
+    UnknownAgent,
     TerminalSwitchRefused(TerminalSwitchReason),
 }
 
@@ -78,6 +84,8 @@ impl ApiErrorCode {
             Self::CreationNotPending => "creation_not_pending",
             Self::CreateHookFailed => "create_hook_failed",
             Self::CreateOutcomeUnknown => "create_outcome_unknown",
+            Self::WorkingDirMissing => "working_dir_missing",
+            Self::BranchNotFound => "branch_not_found",
             Self::AgentHooksNotApproved => "agent_hooks_not_approved",
             Self::SmartRenameSkipped => "smart_rename_skipped",
             Self::SmartRenameFailed => "smart_rename_failed",
@@ -87,6 +95,8 @@ impl ApiErrorCode {
             Self::SessionArchived => "session_archived",
             Self::SessionTrashed => "session_trashed",
             Self::AccountSwapUnavailable => "account_swap_unavailable",
+            Self::ModelPinned => "model_pinned",
+            Self::UnknownAgent => "unknown_agent",
             Self::TerminalSwitchRefused(reason) => reason.as_str(),
         }
     }
@@ -119,10 +129,14 @@ impl ApiErrorCode {
             | Self::SessionNotRunning
             | Self::SessionArchived
             | Self::SessionTrashed
-            | Self::AccountSwapUnavailable => StatusCode::CONFLICT,
+            | Self::AccountSwapUnavailable
+            | Self::ModelPinned => StatusCode::CONFLICT,
             Self::PendingTargetGone => StatusCode::NOT_FOUND,
             Self::TlsRequired => StatusCode::UPGRADE_REQUIRED,
-            Self::CreateHookFailed => StatusCode::BAD_REQUEST,
+            Self::CreateHookFailed
+            | Self::WorkingDirMissing
+            | Self::BranchNotFound
+            | Self::UnknownAgent => StatusCode::BAD_REQUEST,
             Self::SmartRenameSkipped => StatusCode::CONFLICT,
             Self::SmartRenameFailed | Self::PluginPreviewFailed => StatusCode::BAD_GATEWAY,
             Self::SmartRenameTimeout => StatusCode::GATEWAY_TIMEOUT,
@@ -190,6 +204,8 @@ impl ApiErrorCode {
             b"purge_failed" => Self::PurgeFailed,
             b"creation_not_pending" => Self::CreationNotPending,
             b"create_hook_failed" => Self::CreateHookFailed,
+            b"working_dir_missing" => Self::WorkingDirMissing,
+            b"branch_not_found" => Self::BranchNotFound,
             b"smart_rename_skipped" => Self::SmartRenameSkipped,
             b"smart_rename_failed" => Self::SmartRenameFailed,
             b"smart_rename_timeout" => Self::SmartRenameTimeout,
@@ -198,6 +214,8 @@ impl ApiErrorCode {
             b"session_archived" => Self::SessionArchived,
             b"session_trashed" => Self::SessionTrashed,
             b"account_swap_unavailable" => Self::AccountSwapUnavailable,
+            b"model_pinned" => Self::ModelPinned,
+            b"unknown_agent" => Self::UnknownAgent,
             other => Self::TerminalSwitchRefused(
                 TerminalSwitchReason::ALL
                     .into_iter()
@@ -325,6 +343,19 @@ mod tests {
                 Some(ApiErrorCode::CreateHookFailed),
             ),
             (
+                StatusCode::BAD_REQUEST,
+                "working_dir_missing",
+                false,
+                Some(ApiErrorCode::WorkingDirMissing),
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                "branch_not_found",
+                false,
+                Some(ApiErrorCode::BranchNotFound),
+            ),
+            (StatusCode::CONFLICT, "branch_not_found", false, None),
+            (
                 StatusCode::CONFLICT,
                 "group_not_empty",
                 false,
@@ -351,6 +382,20 @@ mod tests {
                 false,
                 Some(ApiErrorCode::AccountSwapUnavailable),
             ),
+            (
+                StatusCode::CONFLICT,
+                "model_pinned",
+                false,
+                Some(ApiErrorCode::ModelPinned),
+            ),
+            (StatusCode::BAD_REQUEST, "model_pinned", false, None),
+            (
+                StatusCode::BAD_REQUEST,
+                "unknown_agent",
+                false,
+                Some(ApiErrorCode::UnknownAgent),
+            ),
+            (StatusCode::CONFLICT, "unknown_agent", false, None),
         ] {
             let mut headers = HeaderMap::new();
             headers.insert(ERROR_CODE_HEADER, HeaderValue::from_static(value));

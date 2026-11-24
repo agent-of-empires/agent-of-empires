@@ -107,7 +107,7 @@ pub enum AcpCommands {
         #[arg(long)]
         follow: bool,
     },
-    /// Restart a wedged worker after its runner and native workers have stopped.
+    /// Restart a worker, or start a stopped one through `aoe serve`.
     Restart {
         /// Session id whose worker to restart.
         session: String,
@@ -1026,7 +1026,12 @@ fn logs(session: Option<String>, follow: bool) -> Result<()> {
 async fn restart(session: &str) -> Result<()> {
     use crate::process::worker_registry;
     let Some(record) = worker_registry::load(session)? else {
-        anyhow::bail!("No agent worker registry entry for session {session}");
+        // A cleanly stopped worker has no registry entry; start it like the dashboard's Retry.
+        let client = HttpClient::new(require_daemon().await?)?;
+        println!("Starting agent worker for {session}...");
+        client.spawn_acp(session).await.map_err(map_http)?;
+        println!("Started agent worker for {session}.");
+        return Ok(());
     };
     let native = match record.source_profile.clone() {
         Some(profile) => {
@@ -1173,7 +1178,7 @@ async fn prompt(session: &str, text: &str) -> Result<()> {
     let endpoint = require_daemon().await?;
     let client = HttpClient::new(endpoint)?;
     client
-        .prompt(session, &body, false)
+        .prompt(session, &body, false, crate::daemon::PromptOrigin::Cli)
         .await
         .map_err(map_http)?;
     println!("prompt accepted ({} bytes)", body.len());
@@ -1534,7 +1539,7 @@ mod tests {
                 .try_acquire_lifecycle_reservation(
                     LifecycleOperation::Stop,
                     Instance::LIFECYCLE_RESERVATION_TTL,
-                    chrono::Utc::now(),
+                    crate::time::Timestamp::now(),
                 )
                 .unwrap();
             crate::server::test_support::seed_instances_on_disk_for_test(
@@ -1590,7 +1595,7 @@ mod tests {
                             let generation = row.try_acquire_lifecycle_reservation(
                                 LifecycleOperation::Stop,
                                 Instance::LIFECYCLE_RESERVATION_TTL,
-                                chrono::Utc::now(),
+                                crate::time::Timestamp::now(),
                             )?;
                             row.status = Status::Stopped;
                             row.mark_idle_dormant();

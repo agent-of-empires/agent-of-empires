@@ -8,9 +8,10 @@ import { test, expect } from "./helpers/mockedTest";
 import type { Page } from "@playwright/test";
 import { installSidebarMocks, threeSessionsInOneRepo } from "./helpers/sidebarMocks";
 import { mockTerminalApis } from "./helpers/terminal-mocks";
+import { openPanelsByDefault } from "./helpers/apiMocks";
 
 const SESSION = "pinch-test";
-const PANE_LAYOUT_KEY = "aoe-pane-layout-v2";
+const PANE_LAYOUT_KEY = "aoe-pane-layout-v3";
 
 async function rightDockState(page: Page): Promise<{ tabs: string[]; collapsed: boolean } | null> {
   return page.evaluate(
@@ -18,10 +19,9 @@ async function rightDockState(page: Page): Promise<{ tabs: string[]; collapsed: 
       const raw = localStorage.getItem(key);
       if (!raw) return null;
       const store = JSON.parse(raw) as {
-        template?: { right?: { tabs?: string[] }[]; collapsed?: { right?: boolean } };
         sessions?: Record<string, { right?: { tabs?: string[] }[]; collapsed?: { right?: boolean } }>;
       };
-      const layout = store.sessions?.[session] ?? store.template;
+      const layout = store.sessions?.[session];
       if (!layout) return null;
       return {
         tabs: (layout.right ?? []).flatMap((g) => g.tabs ?? []),
@@ -80,12 +80,15 @@ test("Cmd/Ctrl+B toggles the workspace sidebar", async ({ page }) => {
 
 test("Cmd/Ctrl+Alt+B toggles the right panel and Shift+D the diff pane on a session view", async ({ page }) => {
   await mockTerminalApis(page);
+  await openPanelsByDefault(page);
   await page.setViewportSize({ width: 1280, height: 720 });
   await page.goto(`/session/${SESSION}`);
 
   const handle = page.locator('[data-testid="content-split-resize-handle"]');
   await expect(handle).toBeVisible();
-  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: false });
+  // Nothing is saved until the layout changes; the defaults show both panes.
+  await expect(page.locator('[data-pane-dock="right"] [data-testid^="pane-tab-"]')).toHaveCount(2);
+  expect(await rightDockState(page)).toBeNull();
 
   await page.keyboard.press("ControlOrMeta+Alt+b");
   await expect(handle).toBeHidden();

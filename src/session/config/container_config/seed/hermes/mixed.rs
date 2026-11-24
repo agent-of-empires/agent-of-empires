@@ -334,7 +334,8 @@ pub(in super::super) fn seed_skill_controls(
     destination: &AnchoredDir,
     retained: &HashSet<String>,
 ) -> Result<()> {
-    let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, false);
+    let created_at =
+        crate::time::Timestamp::now().to_rfc3339_opts(crate::time::SecondsFormat::Micros, false);
     for (relative, marker) in [
         ("skills/.usage.json", state::SKILLS_USAGE_MARKER),
         ("skills/.curator_state", state::SKILLS_CURATOR_MARKER),
@@ -998,9 +999,9 @@ mod tests {
             .remove("created_at")
             .unwrap();
         assert!(
-            chrono::DateTime::parse_from_rfc3339(created.as_str().unwrap())
+            crate::time::Timestamp::parse_rfc3339(created.as_str().unwrap())
                 .unwrap()
-                .timestamp()
+                .as_unix_secs()
                 > 946684800
         );
         assert_eq!(

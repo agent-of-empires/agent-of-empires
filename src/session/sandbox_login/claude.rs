@@ -454,7 +454,7 @@ mod tests {
 
     #[test]
     fn credential_state_reads_usability_and_refresh_expiry() {
-        let expires_at = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        let expires_at = crate::time::Timestamp::now().as_millis() + 3_600_000;
         let usable = format!(
             r#"{{"claudeAiOauth":{{"accessToken":"a","refreshToken":"r","expiresAt":{expires_at},"refreshTokenExpiresAt":1790000000000}}}}"#
         );

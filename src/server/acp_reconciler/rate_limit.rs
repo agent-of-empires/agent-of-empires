@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 
 use super::{is_resumable, query_store, resolve_per_profile, AppState};
 use crate::acp::state::{RateLimitInfo, RATE_LIMIT_EXHAUSTED_RETRIES_REASON};
@@ -33,14 +33,12 @@ const RATE_LIMIT_UNKNOWN_RESET_MAX_SHIFT: u32 = 4;
 const RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES: i64 = 5;
 
 /// The later of the reported reset plus grace and the minimum park floor.
-fn rate_limit_resume_at(
-    resets_at: DateTime<Utc>,
-    recorded_at_ms: i64,
-    grace_secs: u32,
-) -> DateTime<Utc> {
-    let resets_plus_grace = resets_at + chrono::Duration::seconds(i64::from(grace_secs));
-    match DateTime::from_timestamp_millis(recorded_at_ms)
-        .map(|t| t + chrono::Duration::seconds(RATE_LIMIT_MIN_PARK_SECS))
+fn rate_limit_resume_at(resets_at: Timestamp, recorded_at_ms: i64, grace_secs: u32) -> Timestamp {
+    let resets_plus_grace = resets_at
+        .checked_add(crate::time::Duration::seconds(i64::from(grace_secs)))
+        .unwrap_or(Timestamp::MAX);
+    match Timestamp::from_millis(recorded_at_ms)
+        .map(|t| t + crate::time::Duration::seconds(RATE_LIMIT_MIN_PARK_SECS))
     {
         Some(floor) if floor > resets_plus_grace => floor,
         _ => resets_plus_grace,
@@ -53,7 +51,7 @@ fn scheduled_resume_at(
     info: &crate::acp::state::RateLimitInfo,
     recorded_at_ms: i64,
     streak: i64,
-) -> DateTime<Utc> {
+) -> Timestamp {
     match info.resets_at {
         Some(resets_at) => {
             rate_limit_resume_at(resets_at, recorded_at_ms, RATE_LIMIT_AUTO_RESUME_GRACE_SECS)
@@ -62,17 +60,18 @@ fn scheduled_resume_at(
     }
 }
 
-fn rate_limit_unknown_reset_retry_at(recorded_at_ms: i64, redeliveries: i64) -> DateTime<Utc> {
+fn rate_limit_unknown_reset_retry_at(recorded_at_ms: i64, redeliveries: i64) -> Timestamp {
     let shift = redeliveries.clamp(0, i64::from(RATE_LIMIT_UNKNOWN_RESET_MAX_SHIFT)) as u32;
-    let retry_after =
-        chrono::Duration::seconds(RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS.saturating_mul(1 << shift));
-    DateTime::from_timestamp_millis(recorded_at_ms).unwrap_or_else(Utc::now) + retry_after
+    let retry_after = crate::time::Duration::seconds(
+        RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS.saturating_mul(1 << shift),
+    );
+    Timestamp::from_millis(recorded_at_ms).unwrap_or_else(Timestamp::now) + retry_after
 }
 
 fn row_minted_at_ms(entry: &crate::daemon::QueuedPromptEntry) -> Option<i64> {
-    DateTime::parse_from_rfc3339(&entry.created_at)
+    Timestamp::parse_rfc3339(&entry.created_at)
         .ok()
-        .map(|queued_at| queued_at.timestamp_millis())
+        .map(|queued_at| queued_at.as_millis())
 }
 
 /// Whether any queued prompt was minted after the limit that interrupted the
@@ -194,7 +193,7 @@ pub(crate) async fn install_rate_limit_continuation(
     }
     state
         .session_service
-        .set_pending_initial_turn(id, text, attachments)
+        .set_pending_initial_turn(id, text, attachments, crate::daemon::PromptOrigin::Aoe)
         .await;
     ContinuationOutcome::Installed
 }
@@ -256,7 +255,7 @@ pub(crate) async fn resume_rate_limited(
         .info
         .as_ref()
         .and_then(|info| info.resets_at)
-        .unwrap_or_else(Utc::now);
+        .unwrap_or_else(crate::time::Timestamp::now);
     if matches!(kind, QuotaResume::Automatic { .. }) {
         let settings = resolve_per_profile([profile.clone()].into_iter(), |config| {
             (
@@ -296,12 +295,12 @@ pub(crate) async fn resume_rate_limited(
             reported.unwrap_or_else(|| scheduled_resume_at(&info, park.recorded_at_ms, streak));
         if let Some(attempt) = park
             .last_resume_attempt_ms
-            .and_then(DateTime::from_timestamp_millis)
+            .and_then(crate::time::Timestamp::from_millis)
         {
             resume_at =
-                resume_at.max(attempt + chrono::Duration::seconds(RATE_LIMIT_MIN_PARK_SECS));
+                resume_at.max(attempt + crate::time::Duration::seconds(RATE_LIMIT_MIN_PARK_SECS));
         }
-        if Utc::now() < resume_at {
+        if crate::time::Timestamp::now() < resume_at {
             return Ok(());
         }
         if streak >= RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES {
@@ -390,7 +389,7 @@ pub(crate) async fn resume_rate_limited(
         )
     {
         if manual && park.cap_reached {
-            resume_at = Utc::now();
+            resume_at = crate::time::Timestamp::now();
         }
         state
             .acp_supervisor
@@ -486,7 +485,7 @@ pub(crate) async fn reap_rate_limit_resumes(
         })
         .await;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     for row in eligible {
         let id = row.id.clone();
         let has_queued_prompts = !row.queued_prompts.is_empty();
@@ -597,12 +596,9 @@ pub(crate) async fn reap_rate_limit_resumes(
         }
         let mut resume_at = scheduled_at;
         // A resume that fired but got no worker retries on the minimum park window.
-        if let Some(last_attempt) = park
-            .last_resume_attempt_ms
-            .and_then(DateTime::from_timestamp_millis)
-        {
-            resume_at =
-                resume_at.max(last_attempt + chrono::Duration::seconds(RATE_LIMIT_MIN_PARK_SECS));
+        if let Some(last_attempt) = park.last_resume_attempt_ms.and_then(Timestamp::from_millis) {
+            resume_at = resume_at
+                .max(last_attempt + crate::time::Duration::seconds(RATE_LIMIT_MIN_PARK_SECS));
         }
         if now < resume_at {
             skip("park window has not elapsed");
@@ -631,32 +627,30 @@ mod tests {
     };
     use super::*;
     use crate::acp::Event;
-    use chrono::TimeZone;
 
     /// #3152 / #3688: no reported reset still retries, doubling per redelivery.
     #[test]
     fn unknown_reset_backs_off_per_redelivery_spent() {
-        let recorded_at = Utc.timestamp_opt(1_500_000, 0).unwrap();
-        let at =
-            |n| rate_limit_unknown_reset_retry_at(recorded_at.timestamp_millis(), n) - recorded_at;
-        let hour = chrono::Duration::seconds(RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS);
+        let recorded_at = crate::time::Timestamp::from_unix_secs(1_500_000).unwrap();
+        let at = |n| rate_limit_unknown_reset_retry_at(recorded_at.as_millis(), n) - recorded_at;
+        let hour = crate::time::Duration::seconds(RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS);
         for (n, factor) in [(0, 1), (1, 2), (2, 4), (3, 8), (4, 16)] {
             assert_eq!(at(n), hour * factor);
         }
         let total = (0..RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES)
-            .fold(chrono::Duration::zero(), |acc, n| acc + at(n));
+            .fold(crate::time::Duration::ZERO, |acc, n| acc + at(n));
         assert_eq!(total, hour * 31);
         assert_eq!(at(RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES + 50), hour * 16);
 
-        let recorded = Utc.timestamp_opt(1_000_000, 0).unwrap();
-        let ms = recorded.timestamp_millis();
-        let secs = chrono::Duration::seconds;
+        let recorded = crate::time::Timestamp::from_unix_secs(1_000_000).unwrap();
+        let ms = recorded.as_millis();
+        let secs = crate::time::Duration::seconds;
         let cases = [
             (
                 "far future reset",
-                recorded + chrono::Duration::hours(1),
+                recorded + crate::time::Duration::hours(1),
                 15,
-                recorded + chrono::Duration::hours(1) + secs(15),
+                recorded + crate::time::Duration::hours(1) + secs(15),
             ),
             (
                 "past reset floors",
@@ -688,7 +682,7 @@ mod tests {
         let (home, state, project) = test_state(id);
         enable_auto_resume(true);
         let store = &state.acp_event_store;
-        let long_ago = Utc::now() - chrono::Duration::hours(1);
+        let long_ago = Timestamp::now() - crate::time::Duration::hours(1);
         let rate_limit = || Event::RateLimit {
             info: crate::acp::state::RateLimitInfo {
                 status: "limited".into(),
@@ -703,6 +697,7 @@ mod tests {
             prompt_id: None,
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let stopped = || Event::Stopped {
             reason: "rate_limited".into(),
@@ -717,7 +712,7 @@ mod tests {
         }
         for (seq, event) in events.iter().enumerate() {
             store
-                .record_at(id, seq as u64 + 1, event, long_ago.timestamp_millis())
+                .record_at(id, seq as u64 + 1, event, long_ago.as_millis())
                 .unwrap();
         }
         state
@@ -739,7 +734,12 @@ mod tests {
         let (home, state, project) = parked(id, redeliveries).await;
         state
             .session_service
-            .set_pending_initial_turn(id, "run the nightly task".into(), Vec::new())
+            .set_pending_initial_turn(
+                id,
+                "run the nightly task".into(),
+                Vec::new(),
+                crate::daemon::PromptOrigin::Unknown,
+            )
             .await;
         (home, state, project)
     }
@@ -841,7 +841,7 @@ mod tests {
         let (_home, state, _project) = parked_with_continuation(id, 0).await;
         state
             .acp_supervisor
-            .publish_rate_limit_auto_resumed(id, Utc::now(), false)
+            .publish_rate_limit_auto_resumed(id, Timestamp::now(), false)
             .unwrap();
         state
             .acp_supervisor
@@ -1001,7 +1001,7 @@ mod tests {
         let id = "sess-4373-continue";
         let (_home, state, _project) = test_state(id);
         enable_auto_resume(true);
-        let long_ago = Utc::now() - chrono::Duration::hours(1);
+        let long_ago = Timestamp::now() - crate::time::Duration::hours(1);
         let events = [
             Event::AgentMessageChunk {
                 text: "x".into(),
@@ -1021,7 +1021,7 @@ mod tests {
         for (seq, event) in events.iter().enumerate() {
             state
                 .acp_event_store
-                .record_at(id, seq as u64 + 1, event, long_ago.timestamp_millis())
+                .record_at(id, seq as u64 + 1, event, long_ago.as_millis())
                 .unwrap();
         }
         state
@@ -1046,26 +1046,26 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn automatic_quota_delivery_obeys_reported_reset_floor_and_unknown_backoff() {
-        let now = Utc::now();
+        let now = crate::time::Timestamp::now();
         let cases = [
             (
-                Some(now + chrono::Duration::hours(1)),
-                now - chrono::Duration::days(1),
+                Some(now + crate::time::Duration::hours(1)),
+                now - crate::time::Duration::days(1),
                 false,
             ),
             // A recorded clock ahead of now still imposes the minimum park floor.
             (
-                Some(now - chrono::Duration::hours(1)),
-                now + chrono::Duration::hours(1),
+                Some(now - crate::time::Duration::hours(1)),
+                now + crate::time::Duration::hours(1),
                 false,
             ),
-            (None, now - chrono::Duration::minutes(30), false),
+            (None, now - crate::time::Duration::minutes(30), false),
             (
-                Some(now - chrono::Duration::hours(1)),
-                now - chrono::Duration::days(1),
+                Some(now - crate::time::Duration::hours(1)),
+                now - crate::time::Duration::days(1),
                 true,
             ),
-            (None, now - chrono::Duration::days(1), true),
+            (None, now - crate::time::Duration::days(1), true),
         ];
         for (reset, recorded, due) in cases {
             let id = "quota-policy-clock";
@@ -1089,7 +1089,7 @@ mod tests {
             {
                 state
                     .acp_event_store
-                    .record_at(id, seq as u64 + 1, event, recorded.timestamp_millis())
+                    .record_at(id, seq as u64 + 1, event, recorded.as_millis())
                     .unwrap();
             }
             state
@@ -1097,7 +1097,12 @@ mod tests {
                 .hydrate_seqs([(id.into(), state.acp_event_store.highest_seq(id))]);
             state
                 .session_service
-                .set_pending_initial_turn(id, "original interrupted work".into(), Vec::new())
+                .set_pending_initial_turn(
+                    id,
+                    "original interrupted work".into(),
+                    Vec::new(),
+                    crate::daemon::PromptOrigin::Unknown,
+                )
                 .await;
             let commands = ready_worker(&state, id).await;
             let lease = state.acp_supervisor.current_lease(id).unwrap();
@@ -1231,7 +1236,7 @@ mod tests {
         let commands = ready_worker(&state, id).await;
         let lease = state.acp_supervisor.current_lease(id).unwrap();
         lease.test_backdate_idle_baseline(
-            (Utc::now() - chrono::Duration::days(1)).timestamp_millis(),
+            (crate::time::Timestamp::now() - crate::time::Duration::days(1)).as_millis(),
         );
         let frontier = state.acp_event_store.highest_seq(id);
         super::super::idle::reap_idle_workers(&state).await;
@@ -1272,7 +1277,7 @@ mod tests {
                     "newer queued intent"
                 }
                 .into();
-                queued.created_at = DateTime::from_timestamp_millis(
+                queued.created_at = crate::time::Timestamp::from_millis(
                     park.recorded_at_ms + if index == 0 { -1000 } else { 1000 },
                 )
                 .unwrap()
@@ -1416,7 +1421,7 @@ mod tests {
                 model: "test".into(),
                 output_file: String::new(),
                 workflow: None,
-                started_at: Utc::now(),
+                started_at: crate::time::Timestamp::now(),
             };
             let progress = Event::BackgroundAgentProgress {
                 agent_id: "retained-background".into(),
@@ -1425,7 +1430,7 @@ mod tests {
                 tools: Vec::new(),
                 last_tool: None,
                 last_text: None,
-                at: Utc::now(),
+                at: crate::time::Timestamp::now(),
             };
             for event in [launched, progress] {
                 state
@@ -1525,8 +1530,8 @@ mod tests {
     /// interrupted request is the older one and losing it is final.
     #[test]
     fn only_a_row_minted_after_the_limit_supersedes() {
-        let limit = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
-        let limit_ms = limit.timestamp_millis();
+        let limit = crate::time::Timestamp::from_unix_secs(1_700_000_000).unwrap();
+        let limit_ms = limit.as_millis();
         let row = |seq: u64, created_at: &str| crate::daemon::QueuedPromptEntry {
             id: format!("q-{seq}"),
             seq,
@@ -1535,9 +1540,14 @@ mod tests {
             created_at: created_at.into(),
             origin_device: None,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
-        let after = Utc.timestamp_opt(1_700_000_001, 0).unwrap().to_rfc3339();
-        let before = Utc.timestamp_opt(1_699_999_999, 0).unwrap().to_rfc3339();
+        let after = crate::time::Timestamp::from_unix_secs(1_700_000_001)
+            .unwrap()
+            .to_rfc3339();
+        let before = crate::time::Timestamp::from_unix_secs(1_699_999_999)
+            .unwrap()
+            .to_rfc3339();
         let times = |rows: &[crate::daemon::QueuedPromptEntry]| {
             rows.iter().filter_map(row_minted_at_ms).collect::<Vec<_>>()
         };
@@ -1583,8 +1593,8 @@ mod tests {
     #[serial_test::serial]
     async fn only_a_prompt_queued_after_the_park_supersedes_the_continuation() {
         // The `parked` fixture backdates the limit an hour, so these straddle it.
-        let after = Utc::now();
-        let before = Utc::now() - chrono::Duration::hours(2);
+        let after = Timestamp::now();
+        let before = Timestamp::now() - crate::time::Duration::hours(2);
         // (label, initial continuation installed, queued at, continuation chosen, breadcrumbs)
         let cases = [
             ("queued-after", false, after.to_rfc3339(), None, 0),
@@ -1604,7 +1614,12 @@ mod tests {
             if installed {
                 state
                     .session_service
-                    .set_pending_initial_turn(&id, "run the nightly task".into(), Vec::new())
+                    .set_pending_initial_turn(
+                        &id,
+                        "run the nightly task".into(),
+                        Vec::new(),
+                        crate::daemon::PromptOrigin::Unknown,
+                    )
                     .await;
             }
             state.instances.write().await[0].queued_prompts.push(
@@ -1616,6 +1631,7 @@ mod tests {
                     created_at: queued_at,
                     origin_device: None,
                     origin_plugin: None,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 },
             );
             assert!(
@@ -1678,7 +1694,7 @@ mod tests {
                     connection_ready: false,
                     native_subject: None,
                 },
-                Utc::now().timestamp_millis(),
+                Timestamp::now().as_millis(),
             )
             .unwrap();
         assert!(
@@ -1852,10 +1868,10 @@ mod tests {
         let key_b = account_key_of("claude-b");
         let weekly = crate::acp::state::RateLimitInfo {
             status: "limited".into(),
-            resets_at: Some(Utc::now() + chrono::Duration::days(7)),
+            resets_at: Some(Timestamp::now() + crate::time::Duration::days(7)),
             kind: "seven_day".into(),
         };
-        let until = Utc::now() + chrono::Duration::days(7);
+        let until = Timestamp::now() + crate::time::Duration::days(7);
 
         // The reaper pass runs while the claim is held and the row still names the target.
         let running = failover::hold_in_flight(id, "claude-b");
@@ -1901,7 +1917,7 @@ mod tests {
         let row = state.instances.read().await[0].clone();
         let claude_default = dirs::home_dir().unwrap().join(".claude");
         let claude_key = claude_default.to_string_lossy().into_owned();
-        let now_ms = Utc::now().timestamp_millis();
+        let now_ms = Timestamp::now().as_millis();
         state.acp_event_store.record_account_limit(
             &claude_key,
             now_ms + 3_600_000,
@@ -2005,9 +2021,9 @@ mod tests {
             for tool in ["claude-a", "claude-b"] {
                 state.acp_event_store.record_account_limit(
                     &account_key_of(tool),
-                    Utc::now().timestamp_millis() + 3_600_000,
+                    Timestamp::now().as_millis() + 3_600_000,
                     "usage",
-                    Utc::now().timestamp_millis(),
+                    Timestamp::now().as_millis(),
                     false,
                 );
             }
@@ -2075,7 +2091,7 @@ mod tests {
         };
         assert_eq!(listed().await.as_deref(), Some("claude-b"));
 
-        let now_ms = Utc::now().timestamp_millis();
+        let now_ms = Timestamp::now().as_millis();
         state.acp_event_store.record_account_limit(
             &account_key_of("claude-b"),
             now_ms + 3_600_000,
@@ -2105,9 +2121,9 @@ mod tests {
     async fn a_park_made_while_the_pool_was_limited_fails_over_when_an_account_frees_up() {
         let id = "sess-failover-later";
         let (_home, state, _project, _registry) = failover_session(id, 0).await;
-        let now_ms = Utc::now().timestamp_millis();
+        let now_ms = Timestamp::now().as_millis();
         // The park's own window is two hours out, and both accounts are limited that long.
-        let resets_at = Utc::now() + chrono::Duration::hours(2);
+        let resets_at = Timestamp::now() + crate::time::Duration::hours(2);
         let next = state.acp_event_store.highest_seq(id);
         for (offset, event) in [
             Event::RateLimit {
@@ -2182,7 +2198,7 @@ mod tests {
         let id = "sess-failover-undated";
         let (_home, state, _project, _registry) = failover_session(id, 0).await;
         // The park carries no reset time; it was recorded two hours ago.
-        let two_hours_ago = (Utc::now() - chrono::Duration::hours(2)).timestamp_millis();
+        let two_hours_ago = (Timestamp::now() - crate::time::Duration::hours(2)).as_millis();
         let next = state.acp_event_store.highest_seq(id);
         for (offset, event) in [
             Event::RateLimit {
@@ -2209,7 +2225,7 @@ mod tests {
             .map(|(info, _)| info.kind)
             .unwrap();
         // The weekly reset was reported on another session two days out; the pool has no room.
-        let now_ms = Utc::now().timestamp_millis();
+        let now_ms = Timestamp::now().as_millis();
         let two_days = now_ms + 2 * 24 * 3600 * 1000;
         state.acp_event_store.record_account_limit(
             &account_key_of("claude-a"),

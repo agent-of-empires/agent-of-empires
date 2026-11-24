@@ -4,7 +4,7 @@ use super::*;
 use crate::session::config::FileRead as Fingerprint;
 use crate::session::config::StructuredView;
 use crate::session::projection::SessionProjection;
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 
 /// Convert session facts with the user fullscreen setting read once per request.
 /// [`SessionResponse::claude_fullscreen`] exposes that setting only for Claude.
@@ -49,7 +49,7 @@ pub(super) fn session_response_from_instance_with_plan(
             .filter(|s| !s.is_empty())
             .unwrap_or(inst.tool.as_str()),
     );
-    let timestamp = |value: Option<DateTime<Utc>>| value.map(|t| t.to_rfc3339());
+    let timestamp = |value: Option<Timestamp>| value.map(|t| t.to_rfc3339());
     let status = if inst
         .lifecycle_reservation
         .as_ref()
@@ -88,6 +88,14 @@ pub(super) fn session_response_from_instance_with_plan(
         idle_entered_at: timestamp(row.idle_entered_at),
         last_error: row.last_error.map(str::to_string),
         last_error_evidence: row.last_error_evidence,
+        initial_prompt_error: inst
+            .pending_initial_turn
+            .as_ref()
+            .and_then(|turn| turn.error.clone()),
+        initial_prompt_error_code: inst
+            .pending_initial_turn
+            .as_ref()
+            .and_then(|turn| turn.error_code.clone()),
         branch: row.worktree.map(|w| w.branch.clone()),
         main_repo_path: row.worktree.map(|w| w.main_repo_path.clone()),
         base_branch: row.worktree.and_then(|w| w.base_branch.clone()),
@@ -110,6 +118,7 @@ pub(super) fn session_response_from_instance_with_plan(
         urgent: inst.is_urgent(),
         pinned_at: timestamp(row.pinned_at),
         archived_at: timestamp(row.archived_at),
+        ignored_at: timestamp(row.ignored_at),
         snoozed_until: timestamp(row.active_snoozed_until),
         trashed_at: timestamp(row.trashed_at),
         trash_lifecycle_id: inst.trash_lifecycle_id.clone(),

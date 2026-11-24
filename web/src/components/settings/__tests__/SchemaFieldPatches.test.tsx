@@ -41,6 +41,7 @@ const SCHEMA = [
     ["split_terminal_height_percent", "Paired terminal share of the split (%)", 1, 99],
     ["split_terminal_min_width", "Split only when at least this wide", 0, 1000],
     ["split_terminal_min_height", "Split only when at least this tall", 0, 1000],
+    ["narrow_breakpoint", "Narrow layout below this width", 0, 1000],
   ].map(([name, label, min, max]) =>
     field(
       "session",
@@ -194,6 +195,7 @@ describe("schema-driven settings field PATCH payloads", () => {
       ["split_terminal_height_percent", "Paired terminal share of the split (%)", "1", "99", "30"],
       ["split_terminal_min_width", "Split only when at least this wide", "0", "1000", "110"],
       ["split_terminal_min_height", "Split only when at least this tall", "0", "1000", "35"],
+      ["narrow_breakpoint", "Narrow layout below this width", "0", "1000", "60"],
     ]) {
       const input = numberInputByLabel(container, label);
       expect(input.min).toBe(min);

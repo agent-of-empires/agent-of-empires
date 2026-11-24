@@ -27,7 +27,7 @@ pub(super) fn plan_from_markdown(plan_text: &str) -> Option<Plan> {
         return None;
     }
     Some(Plan {
-        plan_id: format!("plan-{}", chrono::Utc::now().timestamp_millis()),
+        plan_id: format!("plan-{}", crate::time::Timestamp::now().as_millis()),
         version: 1,
         steps,
     })

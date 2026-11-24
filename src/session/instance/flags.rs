@@ -151,18 +151,20 @@ impl Instance {
     /// from any sink state. Call this on user-initiated interactions
     /// (attach, send keys, etc.); every existing call site already does.
     ///
-    /// Auto-unarchive/unsnooze: sending a message or attaching is the user
-    /// explicitly saying "I care about this now." Leaving `archived_at` or
-    /// `snoozed_until` set after such interaction is incoherent; the row
-    /// would render italic+dim at tier 99 even while live traffic flows.
+    /// Auto-unarchive/unsnooze/unignore: sending a message or attaching is the
+    /// user explicitly saying "I care about this now." Leaving `archived_at`,
+    /// `snoozed_until`, or `ignored_at` set after such interaction is
+    /// incoherent; the row would render italic+dim at tier 99 even while live
+    /// traffic flows.
     /// User rule (2026-04-23): "messaging should unarchive."
     ///
     /// `favorited_at` is preserved: fav is a positive "care more" signal,
     /// orthogonal to the sink states. A favorited session that was snoozed
     /// stays favorited when the user wakes it.
     pub fn touch_last_accessed(&mut self) {
-        self.last_accessed_at = Some(Utc::now());
+        self.last_accessed_at = Some(Timestamp::now());
         self.archived_at = None;
+        self.ignored_at = None;
         self.snoozed_until = None;
         self.idle_dormant_since = None;
     }
@@ -173,7 +175,7 @@ impl Instance {
         if self.ensure_startable().is_ok() {
             self.touch_last_accessed();
         } else {
-            self.last_accessed_at = Some(Utc::now());
+            self.last_accessed_at = Some(Timestamp::now());
         }
     }
 
@@ -187,7 +189,7 @@ impl Instance {
     /// Mark the session dormant after its structured view worker was auto-stopped
     /// for inactivity. Idempotent: re-marking refreshes the timestamp.
     pub fn mark_idle_dormant(&mut self) {
-        self.idle_dormant_since = Some(Utc::now());
+        self.idle_dormant_since = Some(Timestamp::now());
     }
 
     /// Whether this session should render as "dormant" (worker auto-stopped
@@ -214,8 +216,9 @@ impl Instance {
     /// `merge_user_action_diff` mirrors those onto disk; #3465 was a status
     /// transition reaching that mirror without a user gesture.
     ///
-    /// Mutual exclusion with `favorite`, `snooze`, and `pin`: archiving
-    /// clears `favorited_at`, `snoozed_until`, and `pinned_at`. Archive
+    /// Mutual exclusion with `favorite`, `ignore`, `snooze`, and `pin`:
+    /// archiving clears `favorited_at`, `ignored_at`, `snoozed_until`, and
+    /// `pinned_at`. Archive
     /// is the strongest dismiss; keeping any other triage flag on a row
     /// the user just sunk produces contradictory state, and the web
     /// sidebar's tier comparator already assumes the server enforces a
@@ -225,7 +228,8 @@ impl Instance {
     /// Idle. Callers can record Stopped after runtime teardown.
     pub fn archive(&mut self) {
         super::forget_before_start_resolution(&self.id);
-        self.archived_at = Some(Utc::now());
+        self.archived_at = Some(Timestamp::now());
+        self.ignored_at = None;
         self.favorited_at = None;
         self.snoozed_until = None;
         self.pinned_at = None;
@@ -261,7 +265,7 @@ impl Instance {
     pub fn trash(&mut self) {
         super::forget_before_start_resolution(&self.id);
         if self.trashed_at.is_none() {
-            self.trashed_at = Some(Utc::now());
+            self.trashed_at = Some(Timestamp::now());
             self.failed_purge = None;
             self.trash_lifecycle_id = Some(Uuid::new_v4().to_string());
         }
@@ -330,16 +334,17 @@ impl Instance {
     /// promoter. A favorited Running stays in the Running bucket but sorts
     /// above non-favorited Running peers.
     ///
-    /// Mutual exclusion with the sink states: favoriting clears `archived_at`
-    /// AND `snoozed_until`. Favorite's whole purpose is "surface this row";
+    /// Mutual exclusion with the sink states: favoriting clears `archived_at`,
+    /// `ignored_at`, and `snoozed_until`. Favorite's whole purpose is "surface this row";
     /// leaving either sink-state flag set would force the row to tier 99 and
     /// the favorite bias would be suppressed; user presses `f` and sees
     /// nothing change. The user's explicit rule: "marking as favorite
     /// unarchives," extended to snooze because snooze shares tier 99 and
     /// shares the burial outcome.
     pub fn favorite(&mut self) {
-        self.favorited_at = Some(Utc::now());
+        self.favorited_at = Some(Timestamp::now());
         self.archived_at = None;
+        self.ignored_at = None;
         self.snoozed_until = None;
     }
 
@@ -375,17 +380,17 @@ impl Instance {
     /// Read the agent-raised urgent flag from `attention.json`. Sourced
     /// on-demand from `/tmp/aoe-hooks-<euid>/{id}/attention.json` so it picks up
     /// changes the running agent makes (via the `attention-urgent` script)
-    /// without an Instance state mutation. Suppressed for archived/snoozed
-    /// rows so a sunk session can't claw its way back to the top.
+    /// without an Instance state mutation. Suppressed for archived, ignored,
+    /// or snoozed rows so a sunk session can't claw its way back to the top.
     pub fn is_urgent(&self) -> bool {
-        if self.is_archived() || self.is_snoozed() {
+        if self.is_archived() || self.is_snoozed() || self.is_ignored() {
             return false;
         }
         crate::hooks::read_hook_urgent(&self.id)
     }
 
     /// Temporarily defer this session for `minutes`; sets `snoozed_until`
-    /// to `Utc::now() + minutes`. Behaves like a timed archive: the row
+    /// to `Timestamp::now() + minutes`. Behaves like a timed archive: the row
     /// sinks to tier 99, renders italic+dim with a `z ` prefix, and shows
     /// remaining time in the age column. When the timestamp expires the
     /// row rejoins the active attention sort automatically (next render
@@ -393,18 +398,52 @@ impl Instance {
     /// snooze time, not render time, so changing the config default mid-
     /// snooze does NOT extend currently-sleeping rows.
     ///
-    /// Clears `pinned_at` for the same reason archive does: snooze is a
-    /// sink state, and a pinned-yet-snoozed row is contradictory. The
+    /// Clears `ignored_at` and `pinned_at` for the same reason archive does:
+    /// snooze is a sink state, and a pinned-yet-snoozed or ignored-yet-snoozed
+    /// row is contradictory. The
     /// existing favorite mutator is intentionally NOT touched here
     /// (favorite is the TUI within-tier signal, snoozed favorites keep
     /// their star when they wake; see field doc for `favorited_at`).
     pub fn snooze(&mut self, minutes: u32) {
-        self.snoozed_until = Some(Utc::now() + chrono::Duration::minutes(minutes as i64));
+        // Saturate: u32 minutes can pass the latest representable instant.
+        self.snoozed_until = Some(
+            Timestamp::now()
+                .checked_add(crate::time::Duration::minutes(minutes as i64))
+                .unwrap_or(Timestamp::MAX),
+        );
+        self.ignored_at = None;
         self.pinned_at = None;
     }
 
     pub fn unsnooze(&mut self) {
         self.snoozed_until = None;
+    }
+
+    /// Mark a managed session ignored: it stays live and present, but drops
+    /// out of attention without becoming archived or trashed. Ignore is a
+    /// sink state like snooze, so it clears a pin; the surface-state mutators
+    /// clear the marker, and only explicit `unignore` or `reclaim_ownership`
+    /// removes it otherwise.
+    pub fn ignore(&mut self) {
+        self.ignored_at.get_or_insert_with(Timestamp::now);
+        self.pinned_at = None;
+    }
+
+    pub fn unignore(&mut self) {
+        self.ignored_at = None;
+    }
+
+    pub fn is_ignored(&self) -> bool {
+        self.ignored_at.is_some()
+    }
+
+    /// Take ownership back from the session that manages this one. Clears the
+    /// manager link and the ignore marker atomically; the row, conversation
+    /// binding, worktree, sandbox, and every unrelated triage timestamp stay
+    /// untouched. Idempotent.
+    pub fn reclaim_ownership(&mut self) {
+        self.parent_session_id = None;
+        self.ignored_at = None;
     }
 
     /// True if the session carries the unread marker.
@@ -435,30 +474,33 @@ impl Instance {
     /// return false so the row naturally rejoins the main sort on the next
     /// render; the stale timestamp stays on disk until the next mutation
     /// rewrites the session (harmless; `snoozed_until` is always compared
-    /// against `Utc::now()`).
+    /// against `Timestamp::now()`).
     pub fn is_snoozed(&self) -> bool {
-        self.snoozed_until.map(|t| t > Utc::now()).unwrap_or(false)
+        self.snoozed_until
+            .map(|t| t > Timestamp::now())
+            .unwrap_or(false)
     }
 
     /// `snoozed_until` only while the snooze is active; a persisted past date is not one.
-    pub fn active_snoozed_until(&self) -> Option<DateTime<Utc>> {
-        self.snoozed_until.filter(|t| *t > Utc::now())
+    pub fn active_snoozed_until(&self) -> Option<Timestamp> {
+        self.snoozed_until.filter(|t| *t > Timestamp::now())
     }
 
-    /// Combined "don't bother me" sink-state check: trashed, snoozed, or
-    /// archived. Callers that walk sessions looking for something to land on
-    /// (e.g. the `w`/jump-to-next-attention passes) use this instead of the
-    /// three-call form so a row in any sink state is uniformly excluded.
+    /// Combined "don't bother me" sink-state check: trashed, snoozed,
+    /// archived, or ignored. Callers that walk sessions looking for something
+    /// to land on (e.g. the `w`/jump-to-next-attention passes) use this
+    /// instead of the per-flag calls so a row in any sink state is uniformly
+    /// excluded.
     pub fn is_dismissed(&self) -> bool {
-        self.is_trashed() || self.is_snoozed() || self.is_archived()
+        self.is_trashed() || self.is_snoozed() || self.is_archived() || self.is_ignored()
     }
 
-    /// Remaining snooze duration as a `chrono::Duration`, or `None` if the
+    /// Remaining snooze duration, or `None` if the
     /// session isn't snoozed (or the timestamp has already expired).
-    pub fn snooze_remaining(&self) -> Option<chrono::Duration> {
+    pub fn snooze_remaining(&self) -> Option<crate::time::Duration> {
         self.snoozed_until.and_then(|t| {
-            let delta = t - Utc::now();
-            if delta > chrono::Duration::zero() {
+            let delta = t - Timestamp::now();
+            if delta > crate::time::Duration::ZERO {
                 Some(delta)
             } else {
                 None
@@ -472,13 +514,14 @@ impl Instance {
     /// `favorited_at`, which drives the TUI Attention sort's within-tier
     /// pin and stays unchanged here (see #1581).
     ///
-    /// Mutual exclusion with the sink states: pinning clears
-    /// `archived_at` and `snoozed_until`. A pinned-yet-sunk row would
+    /// Mutual exclusion with the sink states: pinning clears `archived_at`,
+    /// `ignored_at`, and `snoozed_until`. A pinned-yet-sunk row would
     /// contradict the entire point of pinning (surface this), so the
     /// sinks come off, identical to how `favorite()` handles it.
     pub fn pin(&mut self) {
-        self.pinned_at = Some(Utc::now());
+        self.pinned_at = Some(Timestamp::now());
         self.archived_at = None;
+        self.ignored_at = None;
         self.snoozed_until = None;
     }
 
@@ -494,13 +537,13 @@ impl Instance {
     /// `Idle`. `None` for non-Idle sessions, sessions with a missing
     /// timestamp (legacy state), or sessions whose `idle_entered_at` is in
     /// the future (clock skew). Negative deltas are clamped away rather than
-    /// returned as `Duration` since `chrono::Duration::to_std` rejects them.
+    /// returned as `Duration` since the conversion to `std::time::Duration` rejects them.
     pub fn idle_age(&self) -> Option<std::time::Duration> {
         if self.status != Status::Idle {
             return None;
         }
         let since = self.idle_entered_at?;
-        (Utc::now() - since).to_std().ok()
+        std::time::Duration::try_from(Timestamp::now() - since).ok()
     }
 
     /// True iff this session should keep the machine awake: it is active
@@ -543,10 +586,10 @@ mod tests {
 
         // `sessions.turn.send` marks pending before the wake that follows clears these; a
         // concurrent count caught in that gap must still see it as occupying a slot.
-        i.archived_at = Some(Utc::now());
+        i.archived_at = Some(Timestamp::now());
         assert!(i.counts_toward_plugin_session_cap());
         i.archived_at = None;
-        i.snoozed_until = Some(Utc::now() + chrono::Duration::hours(1));
+        i.snoozed_until = Some(Timestamp::now() + crate::time::Duration::hours(1));
         assert!(i.counts_toward_plugin_session_cap());
         i.snoozed_until = None;
 
@@ -568,7 +611,7 @@ mod tests {
         i.plugin_revival_pending = true;
         assert!(i.counts_toward_plugin_session_cap());
 
-        i.trashed_at = Some(Utc::now());
+        i.trashed_at = Some(Timestamp::now());
         assert!(!i.counts_toward_plugin_session_cap());
     }
 
@@ -625,6 +668,101 @@ mod tests {
         inst.touch_last_accessed();
         assert!(!inst.is_archived());
         assert!(inst.last_accessed_at.is_some());
+    }
+
+    /// Ignore is a sink state of its own: the managed row stays live and is not
+    /// archived or trashed, and the surface-state mutators clear the marker.
+    #[test]
+    fn ignore_is_a_sink_state_without_archive_or_trash() {
+        let mut inst = Instance::new("managed", "/tmp/managed");
+        inst.parent_session_id = Some("manager".into());
+        inst.pin();
+        inst.ignore();
+        let first = inst.ignored_at;
+        inst.ignore();
+        assert_eq!(inst.ignored_at, first, "re-ignoring keeps the timestamp");
+        assert!(inst.is_ignored());
+        assert!(!inst.is_archived());
+        assert!(!inst.is_trashed());
+        assert!(!inst.is_snoozed());
+        assert!(
+            !inst.is_pinned(),
+            "ignore is a sink state and clears the pin"
+        );
+        assert!(inst.is_dismissed());
+
+        inst.pin();
+        assert!(
+            !inst.is_ignored(),
+            "pin surfaces the row and cancels ignore"
+        );
+
+        inst.ignore();
+        inst.favorite();
+        assert!(!inst.is_ignored(), "favorite cancels ignore");
+
+        inst.ignore();
+        inst.archive();
+        assert!(inst.is_archived());
+        assert!(!inst.is_ignored(), "archive takes precedence over ignore");
+
+        inst.unarchive();
+        inst.ignore();
+        inst.snooze(30);
+        assert!(
+            !inst.is_ignored(),
+            "snooze is a sink state and cancels ignore"
+        );
+
+        inst.ignore();
+        inst.touch_last_accessed();
+        assert!(
+            !inst.is_ignored(),
+            "direct user engagement wakes an ignored row"
+        );
+    }
+
+    /// Reclaiming ownership is the explicit way back: it clears only the
+    /// manager link and ignore marker, leaving the row and every other triage
+    /// timestamp untouched.
+    #[test]
+    fn reclaim_ownership_preserves_row_and_unrelated_triage() {
+        let mut inst = Instance::new("managed", "/tmp/managed");
+        inst.id = "row-id".into();
+        inst.parent_session_id = Some("manager".into());
+        inst.ignore();
+        inst.favorited_at = Some(Timestamp::now());
+        inst.pinned_at = Some(Timestamp::now());
+        inst.agent_session_id = Some("native-conversation".into());
+        let created_at = inst.created_at;
+
+        inst.reclaim_ownership();
+
+        assert!(inst.parent_session_id.is_none());
+        assert!(!inst.is_ignored());
+        assert_eq!(inst.id, "row-id");
+        assert_eq!(inst.created_at, created_at);
+        assert_eq!(
+            inst.agent_session_id.as_deref(),
+            Some("native-conversation")
+        );
+        assert!(inst.is_favorited());
+        assert!(inst.is_pinned());
+        assert!(!inst.is_archived());
+        assert!(!inst.is_trashed());
+    }
+
+    /// Old rows without the additive field load as not ignored.
+    #[test]
+    fn missing_ignored_at_deserializes_as_not_ignored() {
+        let row = serde_json::json!({
+            "id": "old-row",
+            "title": "old",
+            "project_path": "/repo",
+            "created_at": "2026-01-01T00:00:00Z"
+        });
+        let inst: Instance = serde_json::from_value(row).expect("legacy row loads");
+        assert!(!inst.is_ignored());
     }
 
     #[test]
@@ -967,7 +1105,7 @@ mod tests {
     fn test_idle_age_returns_none_for_non_idle() {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.status = Status::Running;
-        inst.idle_entered_at = Some(Utc::now() - chrono::Duration::seconds(60));
+        inst.idle_entered_at = Some(Timestamp::now() - crate::time::Duration::seconds(60));
         // A Running session never has an idle age, even if a stale
         // `idle_entered_at` timestamp is sitting around (e.g. a transition
         // that bumped from Idle → Running but missed the cleanup path).
@@ -986,7 +1124,7 @@ mod tests {
     fn test_idle_age_returns_positive_duration() {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.status = Status::Idle;
-        inst.idle_entered_at = Some(Utc::now() - chrono::Duration::seconds(5));
+        inst.idle_entered_at = Some(Timestamp::now() - crate::time::Duration::seconds(5));
         let age = inst.idle_age().expect("idle age should be present");
         // Allow generous slack so the test isn't flaky on slow CI.
         assert!(age.as_secs() >= 4 && age.as_secs() <= 30);
@@ -996,11 +1134,11 @@ mod tests {
     fn test_idle_age_clamps_negative_to_none() {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.status = Status::Idle;
-        // Future timestamp (clock skew, hand-crafted state). `to_std()` on a
-        // negative `chrono::Duration` returns Err, which we map to None so
+        // Future timestamp (clock skew, hand-crafted state). Converting a
+        // negative duration to `std::time::Duration` returns Err, which we map to None so
         // the freshness logic sees "fully decayed" rather than panicking
         // or treating the session as freshly stopped.
-        inst.idle_entered_at = Some(Utc::now() + chrono::Duration::seconds(60));
+        inst.idle_entered_at = Some(Timestamp::now() + crate::time::Duration::seconds(60));
         assert_eq!(inst.idle_age(), None);
     }
 
@@ -1045,7 +1183,7 @@ mod tests {
         let window = std::time::Duration::from_secs(15 * 60);
         let mut inst = Instance::new("test", "/tmp/test");
         inst.status = Status::Idle;
-        inst.idle_entered_at = Some(Utc::now() - chrono::Duration::seconds(60));
+        inst.idle_entered_at = Some(Timestamp::now() - crate::time::Duration::seconds(60));
         assert!(inst.has_recent_activity(window));
     }
 
@@ -1054,7 +1192,7 @@ mod tests {
         let window = std::time::Duration::from_secs(15 * 60);
         let mut inst = Instance::new("test", "/tmp/test");
         inst.status = Status::Idle;
-        inst.idle_entered_at = Some(Utc::now() - chrono::Duration::minutes(30));
+        inst.idle_entered_at = Some(Timestamp::now() - crate::time::Duration::minutes(30));
         assert!(!inst.has_recent_activity(window));
     }
 

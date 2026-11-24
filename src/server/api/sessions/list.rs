@@ -873,6 +873,8 @@ mod workspace_ordering_tests {
             lifecycle_generation: 0,
             dormant: false,
             idle_dormant_since: None,
+            initial_prompt_error: None,
+            initial_prompt_error_code: None,
             pane_dead_observed: false,
             yolo_mode: false,
             sort_index: None,
@@ -952,6 +954,7 @@ mod workspace_ordering_tests {
             urgent: false,
             pinned_at: None,
             archived_at: None,
+            ignored_at: None,
             snoozed_until: None,
             unread: false,
         }
@@ -1025,7 +1028,7 @@ mod workspace_ordering_tests {
             if present {
                 state.acp_supervisor.test_insert_worker(&row.id).await;
             }
-            let reset = chrono::Utc::now() + chrono::Duration::hours(1);
+            let reset = crate::time::Timestamp::now() + crate::time::Duration::hours(1);
             let mut events = vec![prompt("interrupted main")];
             if !undated {
                 events.push(Event::RateLimit {
@@ -1052,7 +1055,7 @@ mod workspace_ordering_tests {
                     model: "test".into(),
                     output_file: String::new(),
                     workflow: None,
-                    started_at: chrono::Utc::now(),
+                    started_at: crate::time::Timestamp::now(),
                 });
             }
             for (seq, event) in events.iter().enumerate() {

@@ -1,8 +1,8 @@
 //! Install id persistence in `<app_dir>/telemetry.json`, kept out of `config.toml` so it is
 //! not pasted into bug reports. Created on opt-in, deleted on opt-out.
 
+use crate::time::Timestamp;
 use anyhow::Result;
-use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -33,17 +33,17 @@ struct TelemetryState {
         alias = "last_cli_process_start",
         skip_serializing_if = "Option::is_none"
     )]
-    last_cli_usage_flush: Option<DateTime<Utc>>,
+    last_cli_usage_flush: Option<Timestamp>,
     #[serde(
         default,
         alias = "last_cli_process_start_attempt",
         skip_serializing_if = "Option::is_none"
     )]
-    last_cli_usage_flush_attempt: Option<DateTime<Utc>>,
+    last_cli_usage_flush_attempt: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     cli_command_counts: BTreeMap<String, u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    cli_usage_window_start: Option<DateTime<Utc>>,
+    cli_usage_window_start: Option<Timestamp>,
 }
 
 fn state_path() -> Result<PathBuf> {
@@ -154,6 +154,12 @@ fn try_ensure_install_id() -> Result<Option<String>> {
         return Ok(None);
     }
     update_state_locked(|state| {
+        // Reread under the lock: opting out saves the flag before deleting the id under
+        // this lock, so a caller holding an older opted-in read can neither recreate the
+        // id nor pick up one a failed delete left behind.
+        if !crate::session::get_telemetry_settings().enabled {
+            return (None, false);
+        }
         if let Some(id) = state.install_id.as_ref().filter(|s| !s.trim().is_empty()) {
             return (Some(id.clone()), false);
         }
@@ -182,9 +188,17 @@ pub fn delete_install_id() -> Result<()> {
     Ok(())
 }
 
-pub fn reset_install_id() -> Result<Option<String>> {
-    delete_install_id()?;
-    try_ensure_install_id()
+/// Replaces any id with a fresh one whatever the saved opt-in, for opt-in and `reset-id`.
+/// Everything recorded under the old id goes with it.
+pub fn rotate_install_id() -> Result<String> {
+    update_state_locked(|state| {
+        let id = uuid::Uuid::new_v4().to_string();
+        *state = TelemetryState {
+            install_id: Some(id.clone()),
+            ..TelemetryState::default()
+        };
+        (id, true)
+    })
 }
 
 pub fn record_cli_command(name: &str) {
@@ -198,7 +212,7 @@ pub fn record_cli_command(name: &str) {
             .entry(name.to_string())
             .or_insert(0) += 1;
         if state.cli_usage_window_start.is_none() {
-            state.cli_usage_window_start = Some(Utc::now());
+            state.cli_usage_window_start = Some(Timestamp::now());
         }
         ((), true)
     });
@@ -207,17 +221,19 @@ pub fn record_cli_command(name: &str) {
     }
 }
 
-pub fn cli_usage_window() -> (BTreeMap<String, u32>, Option<DateTime<Utc>>) {
+pub fn cli_usage_window() -> (BTreeMap<String, u32>, Option<Timestamp>) {
     let state = load_state();
     (state.cli_command_counts, state.cli_usage_window_start)
 }
 
 pub fn cli_usage_due(success_gap: Duration, retry_gap: Duration) -> bool {
     let state = load_state();
-    let now = Utc::now();
+    let now = Timestamp::now();
     // Negative elapsed (clock skew) counts as not fresh.
-    let fresh = |stamp: Option<DateTime<Utc>>, gap: Duration| match stamp {
-        Some(last) => matches!((now - last).to_std(), Ok(elapsed) if elapsed < gap),
+    let fresh = |stamp: Option<Timestamp>, gap: Duration| match stamp {
+        Some(last) => {
+            matches!(std::time::Duration::try_from(now - last), Ok(elapsed) if elapsed < gap)
+        }
         None => false,
     };
     !fresh(state.last_cli_usage_flush, success_gap)
@@ -227,7 +243,7 @@ pub fn cli_usage_due(success_gap: Duration, retry_gap: Duration) -> bool {
 /// A failed send keeps the counts and the daily slot for retry.
 pub fn record_cli_usage_flush(success: bool) {
     let result = update_state_locked(|state| {
-        let now = Utc::now();
+        let now = Timestamp::now();
         state.last_cli_usage_flush_attempt = Some(now);
         if success {
             state.last_cli_usage_flush = Some(now);

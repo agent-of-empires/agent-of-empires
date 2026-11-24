@@ -107,6 +107,7 @@ impl HomeView {
             show_structured_badge: resolved.session.show_structured_badge,
             sidebar_position: resolved.session.sidebar_position,
             narrow_layout: resolved.session.narrow_layout,
+            narrow_breakpoint: resolved.session.narrow_breakpoint,
             agent_clipboard_forward: resolved.tmux.clipboard
                 != crate::session::config::TmuxSettingMode::Disabled,
             hyperlink_cells: crate::tui::hyperlink::SharedHyperlinks::default(),
@@ -278,7 +279,6 @@ impl HomeView {
             structured_approval_poller: crate::tui::approval_poller::StructuredApprovalPoller::new(
             ),
             session_feed: crate::tui::session_feed::SessionFeed::new(),
-            project_registry_authoritative: false,
             pending_namespace_intent: None,
             namespace_unknown_message: None,
             runtime_outcome_messages: Vec::new(),
@@ -424,22 +424,44 @@ impl HomeView {
         available_tools: AvailableTools,
         file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
     ) -> anyhow::Result<Self> {
-        let mut view = Self::new(active_profile, available_tools, file_watch)?;
-        view.load_storage_projection()?;
+        let mut view = Self::new(active_profile, available_tools, file_watch.clone())?;
+        // Publish the disk fixtures as the Daemon would: duplicated ids are withheld.
+        let mut loads = Vec::new();
+        for profile in crate::session::list_profiles()? {
+            if view
+                .active_profile
+                .as_ref()
+                .is_none_or(|active| *active == profile)
+            {
+                let storage = Storage::open(&profile, file_watch.clone())?;
+                let mut rows = storage.load_complete_with_groups()?.0;
+                for row in &mut rows {
+                    row.source_profile.clone_from(&profile);
+                }
+                loads.push((profile, storage, rows));
+            }
+        }
+        let reports = crate::session::duplicate_reports(
+            &loads
+                .iter()
+                .map(|(name, _, rows)| (name.as_str(), rows.as_slice()))
+                .collect::<Vec<_>>(),
+            &loads
+                .iter()
+                .map(|(name, storage, _)| (name.as_str(), storage))
+                .collect::<Vec<_>>(),
+        );
+        let sessions = loads
+            .iter()
+            .flat_map(|(_, _, rows)| rows)
+            .filter(|row| reports.iter().all(|report| report.id != row.id))
+            .map(|row| crate::server::api::sessions::session_response_from_instance(row, false))
+            .collect();
         let default_profile = view
             .active_profile
             .clone()
             .unwrap_or_else(crate::session::config::resolve_default_profile);
-        let snapshot = super::tests::fixture_snapshot(
-            view.instances()
-                .map(|instance| {
-                    crate::server::api::sessions::session_response_from_instance(instance, false)
-                })
-                .collect(),
-            &default_profile,
-            "test",
-            0,
-        );
+        let snapshot = super::tests::fixture_snapshot(sessions, &default_profile, "test", 0);
         let cursor = snapshot.cursor.clone();
         view.session_feed
             .publish_for_test(crate::tui::session_feed::SessionFeedResult::Snapshot(
@@ -454,12 +476,13 @@ impl HomeView {
     }
 
     /// Refresh read-only presentation metadata, retaining the last acknowledged canonical projection.
-    pub fn reload(&mut self) -> anyhow::Result<()> {
+    pub fn reload(&mut self) {
         self.refresh_shortcut_bar_tip();
-        self.reload_storage_only()
+        self.reload_storage_only();
     }
 
-    pub(in crate::tui) fn reload_storage_only(&mut self) -> anyhow::Result<()> {
+    /// Reapplies the latest Daemon snapshot; before the first one there is nothing to show.
+    pub(in crate::tui) fn reload_storage_only(&mut self) {
         self.apply_session_feed();
         if let Some(snapshot) = self.session_feed.applied_snapshot() {
             if self
@@ -470,7 +493,7 @@ impl HomeView {
                         && failed.revision > snapshot.cursor.revision
                 })
             {
-                return Ok(());
+                return;
             }
             match self.apply_canonical_projection(&snapshot, true) {
                 Ok(()) => {
@@ -482,101 +505,7 @@ impl HomeView {
                 }
                 Err(error) => self.record_canonical_projection_failure(&snapshot.cursor, &error),
             }
-            Ok(())
-        } else if self.sidebar_source == crate::tui::session_feed::SidebarSource::Daemon {
-            Ok(())
-        } else {
-            self.load_storage_projection()
         }
-    }
-
-    /// Load a read-only preview before an acknowledged runtime frame exists.
-    pub(super) fn load_storage_projection(&mut self) -> anyhow::Result<()> {
-        let current_profiles = crate::session::list_profiles()?;
-        let scope: Vec<_> = current_profiles
-            .iter()
-            .filter(|name| {
-                self.active_profile
-                    .as_ref()
-                    .is_none_or(|active| active == *name)
-            })
-            .cloned()
-            .collect();
-        let mut opened = HashMap::new();
-        for profile in &scope {
-            if !self.storages.contains_key(profile) {
-                opened.insert(
-                    profile.clone(),
-                    Storage::open(profile, self.file_watch.clone())?,
-                );
-            }
-        }
-        let mut loads = Vec::new();
-        for profile in &scope {
-            let storage = self
-                .storages
-                .get(profile)
-                .or_else(|| opened.get(profile))
-                .expect("profile store staged");
-            let (mut rows, groups) = storage.load_complete_with_groups()?;
-            for row in &mut rows {
-                row.source_profile.clone_from(profile);
-                if let Some(previous) = self.instances.get(&row.id) {
-                    row.merge_runtime_from_reload(previous);
-                }
-            }
-            loads.push((profile.clone(), rows, groups));
-        }
-        let load_refs: Vec<_> = loads
-            .iter()
-            .map(|(name, rows, _)| (name.as_str(), rows.as_slice()))
-            .collect();
-        let stores: Vec<_> = scope
-            .iter()
-            .map(|profile| {
-                (
-                    profile.as_str(),
-                    self.storages
-                        .get(profile)
-                        .or_else(|| opened.get(profile))
-                        .unwrap(),
-                )
-            })
-            .collect();
-        let reports = crate::session::duplicate_reports(&load_refs, &stores);
-        let mut trees = HashMap::new();
-        let mut rows = Vec::new();
-        for (profile, instances, groups) in loads {
-            trees.insert(profile, GroupTree::new_with_groups(&instances, &groups));
-            rows.extend(instances);
-        }
-        let mut next = Self::build_instances_map(rows);
-        if let Some(stub) = self
-            .creating_stub_id
-            .as_ref()
-            .and_then(|id| self.instances.get(id))
-        {
-            next.insert(stub.id.clone(), stub.clone());
-        }
-        if let Some(id) = self
-            .pending_creation
-            .as_ref()
-            .filter(|pending| pending.confirmation.is_none())
-            .and_then(|pending| pending.daemon_id.as_deref())
-        {
-            next.shift_remove(id);
-        }
-        self.instances = next;
-        self.group_trees = trees;
-        self.storages.extend(opened);
-        self.storages.retain(|profile, _| scope.contains(profile));
-        log_legacy_duplicates_once(&reports);
-        self.legacy_duplicate_reports = reports;
-        self.rewire_config_subscriptions(&current_profiles);
-        self.rewire_disk_subscriptions(&scope);
-        self.refresh_registered_projects();
-        self.refresh_projection_presentation();
-        Ok(())
     }
 
     pub(super) fn refresh_projection_presentation(&mut self) {

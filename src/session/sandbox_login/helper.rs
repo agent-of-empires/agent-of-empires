@@ -98,6 +98,20 @@ pub(crate) fn supports_runtime(kind: RuntimeKind) -> bool {
     kind != RuntimeKind::AppleContainer
 }
 
+/// `-v` splits on ':', so such a path would mount the wrong place.
+fn check_mount_paths(mounts: &HelperMounts) -> Result<(), LoginError> {
+    for path in [&mounts.credential, &mounts.home_seed] {
+        if path.as_os_str().as_encoded_bytes().contains(&b':') {
+            return Err(anyhow::anyhow!(
+                "cannot mount {} into the login helper: the path contains ':'",
+                path.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// `<binary> run --rm -i ... <image> <login command>`: only the credential and the
 /// helper-private seed are mounted, and only `HOME` is set.
 pub(crate) fn helper_argv(
@@ -118,15 +132,7 @@ pub(crate) fn helper_argv(
         )
         .into());
     }
-    for path in [&mounts.credential, &mounts.home_seed] {
-        if path.as_os_str().as_encoded_bytes().contains(&b':') {
-            return Err(anyhow::anyhow!(
-                "cannot mount {} into the login helper: the path contains ':'",
-                path.display()
-            )
-            .into());
-        }
-    }
+    check_mount_paths(mounts)?;
     let z = if relabel { ":z" } else { "" };
     let label = helper_label(&mounts.credential);
     let mut argv: Vec<String> = [
@@ -322,11 +328,8 @@ impl LoginHelper {
             return Err(LoginError::AlreadyLoggedIn);
         }
         let binary = runtime.base.binary;
-        let image = if config.sandbox.default_image.is_empty() {
-            runtime.default_sandbox_image().to_string()
-        } else {
-            config.sandbox.default_image.clone()
-        };
+        let image = config.sandbox.effective_image();
+        let automatic = config.sandbox.picks_automatic_image(&image);
         let root = shared.parent().context("shared credential has no parent")?;
         let id = random_id();
         let name = format!("{HELPER_NAME_PREFIX}{id}");
@@ -339,16 +342,23 @@ impl LoginHelper {
             home_seed_in_container: format!("{CONTAINER_HOME}/{}", login.home_seed.path),
         };
         let relabel = config.sandbox.selinux_relabel && runtime.base.supports_selinux_relabel;
-        let argv = helper_argv(runtime.kind, binary, &image, &name, &mounts, login, relabel)?;
         let kind = runtime.kind;
+        // Before the sweep or any image work: a path that cannot be mounted must not hide behind a pull error.
+        check_mount_paths(&mounts)?;
         sweep_root(kind, binary, &shared).await;
-        tokio::task::spawn_blocking(move || {
+        // The automatic image may fall back to its minor tag: the helper runs what was ensured.
+        let image = tokio::task::spawn_blocking(move || {
             runtime
-                .ensure_image(&image, &tokio_util::sync::CancellationToken::new())
+                .ensure_image(
+                    &image,
+                    automatic,
+                    &tokio_util::sync::CancellationToken::new(),
+                )
                 .map_err(|e| anyhow::anyhow!("pulling the sandbox image: {e}"))
         })
         .await
         .context("the sandbox image task failed")??;
+        let argv = helper_argv(kind, binary, &image, &name, &mounts, login, relabel)?;
         write_home_seed(&mounts.home_seed, login.home_seed.content)?;
         let cleanup = Some(rm_argv(kind, binary, &[name]));
         Self::start_inner(
@@ -1231,7 +1241,7 @@ esac
 
         // `--force` over a usable credential: exit 0 without a write is no new login.
         let fake = Fake::new();
-        let expires = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        let expires = crate::time::Timestamp::now().as_millis() + 3_600_000;
         std::fs::write(
             &fake.shared,
             crate::session::sandbox_login::claude::fixtures::usable(expires as u64),
@@ -1608,6 +1618,36 @@ esac
         }
     }
 
+    /// A credential path `-v` cannot mount is reported before the sweep or any image work, so a
+    /// failing pull never hides it.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    #[serial_test::serial(sandbox_login_helper)]
+    async fn sandbox_login_helper_start_names_an_unmountable_path_before_touching_the_runtime() {
+        let home = crate::session::test_support::isolate_app_dir();
+        let (_runtime, calls) =
+            crate::session::test_support::probing_container_runtime(home.path());
+        crate::session::config::update_config(|c| {
+            c.sandbox.shared_credential = SharedCredentialMode::SeparateLogin;
+            c.session
+                .custom_agents
+                .insert("colon".to_string(), "claude".to_string());
+            c.session
+                .agent_config_dir
+                .insert("colon".to_string(), "~/.claude:x".to_string());
+        })
+        .unwrap();
+        let profile = crate::session::config::effective_profile("");
+        let error = LoginHelper::start(&profile, "colon", None, false)
+            .await
+            .err()
+            .expect("an unmountable path refuses the login");
+        assert!(error.to_string().contains("contains ':'"), "{error}");
+        let logged = std::fs::read_to_string(&calls).unwrap_or_default();
+        assert_eq!(logged, "", "the runtime was called: {logged}");
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn sandbox_login_helper_start_refuses_outside_separate_login() {
@@ -1798,7 +1838,7 @@ esac
 
         // A usable login for plain claude does not release, nor does it answer `--check`.
         std::fs::create_dir_all(plain.parent().unwrap()).unwrap();
-        let expires_at = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        let expires_at = crate::time::Timestamp::now().as_millis() + 3_600_000;
         std::fs::write(
             &plain,
             crate::session::sandbox_login::claude::fixtures::usable(expires_at as u64),

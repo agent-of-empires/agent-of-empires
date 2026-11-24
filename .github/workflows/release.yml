@@ -64,6 +64,8 @@ jobs:
     with:
       # RELEASE_REF; `env` is not available to a reusable workflow call.
       ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+      # GetMac OSS grant: 2,000 min/month, so only release builds use it.
+      macos-runner: getmac
 
   release:
     name: Create Release
