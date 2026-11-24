@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { updateSettings } from "../lib/api";
+import { copyPrompt } from "../lib/suggestionPlan";
 import type { StartedSession } from "../lib/types";
 
 const FOLDER = "agent_folder_not_trusted";
@@ -122,13 +123,10 @@ export function PromptBlockedNote({
 export function StartedPromptNote({
   session,
   onTryAgain,
-  onCopyPrompt,
   disabled,
 }: {
   session?: StartedSession;
   onTryAgain: () => Promise<unknown>;
-  /** The preset's prompt; a Start with changes Session had its own, so it gets none. */
-  onCopyPrompt: () => void;
   disabled: boolean;
 }) {
   if (!session?.initial_prompt_error) return null;
@@ -140,7 +138,12 @@ export function StartedPromptNote({
         message={session.initial_prompt_error}
         // Redoing from the preset would drop a Start with changes Session's own prompt, agent or project.
         onTryAgain={session.started_via === "start" ? onTryAgain : undefined}
-        onCopyPrompt={session.started_via === "start" ? onCopyPrompt : undefined}
+        // The prompt this Start sent, kept by the server; a later preset edit can't change it.
+        onCopyPrompt={
+          session.started_via === "start" && session.initial_prompt
+            ? () => void copyPrompt(session.initial_prompt!)
+            : undefined
+        }
         disabled={disabled}
         live="status"
       />

@@ -62,8 +62,12 @@ export function lockTitle(readOnly: boolean, offline: boolean, cityhall = false)
 export async function copySuggestionPrompt(item: Pick<SuggestionItem, "provider_id" | "id">) {
   const r = await prepareSuggestion(item.provider_id, item.id);
   if (!r.ok) return reportError(r.error);
+  await copyPrompt(r.data.initial_prompt);
+}
+
+export async function copyPrompt(text: string) {
   try {
-    await navigator.clipboard.writeText(r.data.initial_prompt);
+    await navigator.clipboard.writeText(text);
     reportInfo("Prompt copied");
   } catch {
     reportError("Could not copy the prompt.");

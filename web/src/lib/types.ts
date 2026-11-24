@@ -673,6 +673,8 @@ export interface StartedSession {
   created_at: string;
   /** How the link was claimed: one-click Start or Start with changes. Older links read as "wizard". */
   started_via?: "start" | "wizard";
+  /** The exact prompt a one-click Start sent; null for a wizard Session or an older link. */
+  initial_prompt?: string | null;
   /** From the live sessions poll, not the snapshot. */
   initial_prompt_error?: string | null;
   initial_prompt_error_code?: string | null;

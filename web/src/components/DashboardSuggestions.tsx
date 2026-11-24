@@ -1,5 +1,5 @@
 import type { SessionResponse } from "../lib/types";
-import { copySuggestionPrompt, liveSession } from "../lib/suggestionPlan";
+import { liveSession } from "../lib/suggestionPlan";
 import { StartedPromptNote } from "./PromptBlockedNote";
 import { useAgentNames } from "../hooks/useAgentNames";
 import { useSuggestionPresets } from "../hooks/useSuggestionPresets";
@@ -105,7 +105,6 @@ export function DashboardSuggestions({
               <StartedPromptNote
                 session={liveSession(item.started_session, sessions)}
                 onTryAgain={() => ctrl.retryBlocked(item)}
-                onCopyPrompt={() => void copySuggestionPrompt(item)}
                 disabled={readOnly || offline}
               />
             }
