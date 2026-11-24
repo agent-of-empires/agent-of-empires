@@ -295,7 +295,15 @@ function OutputSection({ record }: { record: SubagentRecord }) {
           <CopyMarkdownButton compact source={report} label="Copy report" className="ml-auto" />
         )}
       </div>
-      <div className="px-3 pb-2 text-xs text-text-primary">{body}</div>
+      <div className="px-3 pb-2 text-xs text-text-primary">
+        {body}
+        {record.earlierReport && (
+          <div className="mt-2 text-text-dim">
+            <p className="mb-1 text-[11px]">Output from an earlier run</p>
+            <SteppedMarkdown text={record.earlierReport} />
+          </div>
+        )}
+      </div>
     </div>
   );
 }

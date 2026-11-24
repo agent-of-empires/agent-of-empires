@@ -46,6 +46,8 @@ export interface SubagentRecord {
   /** Name of the newest call, which `tools` may not reach. */
   lastTool: string | null;
   report: string;
+  /** A resumed child's first report, kept apart because it is not the final one. */
+  earlierReport?: string;
   /** Latest assistant note while running; not the final report. */
   latestNote: string | null;
   warning: string | null;
@@ -148,6 +150,15 @@ function backgroundTool(t: BackgroundAgentTool, i: number, ended: boolean): Acti
   };
 }
 
+/** A background child's launch result is stale once the child runs again: it is active now,
+ *  or idle after a call that started past the result. */
+function resultSuperseded(result: ActivityRow, children: ToolCardProps[], roster: RosterEntry): boolean {
+  if (roster.state === "running" || roster.state === "requires_action") return true;
+  if (roster.state !== "idle") return false;
+  const end = result.at ? Date.parse(result.at) : NaN;
+  return children.some((c) => Date.parse(c.tool.started_at) > end);
+}
+
 /** A sync Task or delegation: its own call and result plus the calls it made. A background
  *  child outlives the turn that stopped its launch call, so its roster entry decides; an
  *  idle one ends the card even with no reply. */
@@ -160,12 +171,14 @@ export function fromInline(
   const args = parseJsonObject(tool.args_preview);
   const following = roster?.background && roster.state !== "unknown";
   const result = following && toolResult?.kind === "tool_stopped" ? undefined : toolResult;
-  const running = !result && roster?.state !== "idle";
+  const stale = !!(following && result && resultSuperseded(result, children, roster));
+  const settled = stale ? undefined : result;
+  const running = !settled && roster?.state !== "idle";
   const status: SubagentStatus = running
     ? roster?.state === "requires_action"
       ? "waiting"
       : "running"
-    : settledStatus(result, roster);
+    : settledStatus(settled, roster);
   const tools = children.map((c) => inlineTool(c, !running));
   const lastEnd = tools
     .map((t) => t.endedAt)
@@ -180,15 +193,16 @@ export function fromInline(
     status,
     startedAt: tool.started_at,
     // The roster has no end time, so a child settled without a reply shows no duration.
-    endedAt: result ? (result.at ?? lastEnd) : undefined,
+    endedAt: settled ? (settled.at ?? lastEnd) : stale && !running ? lastEnd : undefined,
     prompt: tool.prompt ?? taskPrompt(tool.args_preview),
     tools,
     toolCount: tools.length,
     lastTool: tools.at(-1)?.name ?? null,
-    report: status === "done" && result ? extractTaskResult(result.text ?? "") : "",
+    report: status === "done" && settled ? extractTaskResult(settled.text ?? "") : "",
+    earlierReport: (stale && result?.kind === "tool_complete" && extractTaskResult(result.text ?? "")) || undefined,
     latestNote: null,
     warning: null,
-    error: status === "failed" ? result?.text || roster?.error || "" : null,
+    error: status === "failed" ? settled?.text || roster?.error || "" : null,
   };
 }
 
