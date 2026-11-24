@@ -42,6 +42,17 @@ fn resume_failed_response(err: &SupervisorError) -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
 }
 
+/// A newer stop refused the start this prompt asked for. Unlike `worker_not_ready` it is
+/// not retryable: queueing the prompt would deliver it after a later start.
+fn stop_fenced_refused() -> Response {
+    (
+        StatusCode::CONFLICT,
+        crate::daemon::ApiErrorCode::ResumeFailed.header(),
+        "stop_fenced: the session was stopped again; start it to send this message",
+    )
+        .into_response()
+}
+
 fn worker_not_ready() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
 }
@@ -166,6 +177,7 @@ pub async fn acp_prompt(
         Err(PromptSubmitError::Ignored) => ignored_refused(),
         Err(PromptSubmitError::Attachments(code, msg))
         | Err(PromptSubmitError::Enqueue(code, msg)) => (code, msg).into_response(),
+        Err(PromptSubmitError::StopFenced) => stop_fenced_refused(),
         Err(PromptSubmitError::QueuedPromptGone) => queued_prompt_gone(),
         Err(PromptSubmitError::QueuedPromptChanged) => queued_prompt_changed(),
         Err(PromptSubmitError::QueuedAttachmentsMissing) => queued_attachments_missing(),
@@ -239,6 +251,9 @@ pub(crate) enum PromptSubmitError {
     QueuedPromptGone,
     QueuedPromptChanged,
     QueuedAttachmentsMissing,
+    /// A foreground prompt's start was refused because a newer stop won (409); the prompt
+    /// was neither sent nor queued.
+    StopFenced,
     /// The dispatch chose the queue, or the prompt was held for the login or a failed hook,
     /// and the enqueue was refused, e.g. a full queue (429).
     Enqueue(StatusCode, String),
@@ -459,6 +474,7 @@ pub(crate) async fn submit_prompt(
         }
         None => caller,
     };
+    let stop_observed = observed_stop.is_some();
     let outcome = state
         .session_service
         .send_turn_observing(
@@ -521,6 +537,13 @@ pub(crate) async fn submit_prompt(
             )
             .await?;
             return Err(PromptSubmitError::HookFailed { message, queued_id });
+        }
+        // A successful admission clears the fence, so one that survives a refused start
+        // means a stop won the race.
+        Err(SendTurnError::ResumeFailed(_))
+            if stop_observed && crate::process::worker_registry::stop_requested(id) =>
+        {
+            return Err(PromptSubmitError::StopFenced);
         }
         Err(e) => return Err(PromptSubmitError::Turn(e)),
     };

@@ -554,8 +554,9 @@ async fn stop_newer_than_the_observed_one_refuses_the_prompt_start() {
         .is_empty());
 }
 
-/// An unreadable stop intent keeps fencing: the resume is refused, nothing launches or
-/// queues, and the file is left for the operator.
+/// An unreadable stop intent keeps fencing: the resume is refused with a non-retryable
+/// 409 (the same path as a newer stop winning), nothing launches or queues, and the file
+/// is left for the operator.
 #[tokio::test]
 #[serial_test::serial]
 async fn stop_fence_unreadable_intent_refuses_the_prompt_start() {
@@ -577,7 +578,11 @@ async fn stop_fence_unreadable_intent_refuses_the_prompt_start() {
     .await
     .into_response();
 
-    assert!(!response.status().is_success(), "{}", response.status());
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        crate::daemon::ApiErrorCode::from_headers(response.status(), response.headers(), false),
+        Some(crate::daemon::ApiErrorCode::ResumeFailed)
+    );
     assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert!(stop_file.exists());
     assert!(state
