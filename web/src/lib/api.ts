@@ -1253,6 +1253,7 @@ export function updateSettings(updates: Record<string, unknown>, profile?: strin
 
 /** An Agent's default model for new Structured view Sessions in a profile, as the Daemon resolves it. */
 export interface AgentModelDefault {
+  profile: string;
   /** The `acp_defaults` key it reads from: `claude` for a legacy `claude-code` Session. */
   agent_key: string;
   /** Null when the Agent picks its own. */
@@ -1263,8 +1264,9 @@ export interface AgentModelDefault {
 const agentModelUrl = (profile: string, agent: string) =>
   `/api/profiles/${encodeURIComponent(profile)}/acp-defaults/${encodeURIComponent(agent)}/model`;
 
-export function fetchAgentModelDefault(profile: string, agent: string): Promise<AgentModelDefault | null> {
-  return fetchJson<AgentModelDefault>(agentModelUrl(profile, agent));
+/** The default a Session's next Structured view spawn reads, under the profile and Agent key the Daemon resolves for it. */
+export function fetchSessionModelDefault(sessionId: string): Promise<AgentModelDefault | null> {
+  return fetchJson<AgentModelDefault>(`/api/sessions/${encodeURIComponent(sessionId)}/acp-default-model`);
 }
 
 /** Sets only `agent`'s default model in `profile`. `pinned`: the profile's resolved settings pin it, so nothing changed. */

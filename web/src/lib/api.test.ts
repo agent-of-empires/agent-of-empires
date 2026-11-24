@@ -763,12 +763,12 @@ describe("settings saves", () => {
     expect(await api.updateSettings({ a: 1 })).toBe("rejected");
   });
 
-  it("reads one Agent's default model from the Daemon, and gives null when it can't", async () => {
-    const reply = { agent_key: "claude", model: "opus", pinned: false };
+  it("reads a Session's default model from the Daemon, and gives null when it can't", async () => {
+    const reply = { profile: "my work", agent_key: "cursor", model: "opus", pinned: false };
     fetchSpy.mockResolvedValueOnce(json(reply)).mockResolvedValueOnce(json({ error: "not_found" }, 404));
-    expect(await api.fetchAgentModelDefault("my work", "claude-code")).toEqual(reply);
-    expect(fetchSpy.mock.calls[0][0]).toBe("/api/profiles/my%20work/acp-defaults/claude-code/model");
-    expect(await api.fetchAgentModelDefault("my work", "claude-code")).toBeNull();
+    expect(await api.fetchSessionModelDefault("s/1")).toEqual(reply);
+    expect(fetchSpy.mock.calls[0][0]).toBe("/api/sessions/s%2F1/acp-default-model");
+    expect(await api.fetchSessionModelDefault("s/1")).toBeNull();
   });
 
   it.each([

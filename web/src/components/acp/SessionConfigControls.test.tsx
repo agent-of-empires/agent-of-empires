@@ -10,8 +10,12 @@ import {
 import type { AcpState, ConfigOptionDescriptor } from "../../lib/acpTypes";
 import { toastBus, type ToastApi } from "../../lib/toastBus";
 
-const defaults = vi.hoisted(() => ({ loadAgentModelDefault: vi.fn(), saveAgentModelDefault: vi.fn() }));
+const defaults = vi.hoisted(() => ({ loadSessionModelDefault: vi.fn(), saveAgentModelDefault: vi.fn() }));
 vi.mock("../../lib/agentModelDefault", () => defaults);
+const NAMES: Record<string, string> = { claude: "Claude Code", codex: "Codex", cursor: "Cursor" };
+vi.mock("../../lib/agentDisplayName", () => ({
+  useAgentDisplayNames: () => (agent: string) => NAMES[agent] ?? agent,
+}));
 
 afterEach(() => {
   cleanup();
@@ -401,13 +405,13 @@ describe("provider picker", () => {
 
 describe("model default", () => {
   const open = vi.fn();
-  const target: ModelDefaultTarget = { profile: "work", agent: "claude", agentLabel: "Claude Code", open };
+  const target: ModelDefaultTarget = { sessionId: "s1", agent: "claude", open };
   const LABEL = "Default for new Claude Code Sessions in Structured view";
   const toasts = { infoAction: vi.fn(), error: vi.fn(), action: vi.fn() };
   let resolveLoad: (value: unknown) => void = () => {};
 
   async function mountWithDefault(loaded: unknown, extra: Partial<Parameters<typeof SessionConfigControls>[0]> = {}) {
-    defaults.loadAgentModelDefault.mockReturnValue(new Promise((r) => (resolveLoad = r)));
+    defaults.loadSessionModelDefault.mockReturnValue(new Promise((r) => (resolveLoad = r)));
     toastBus.handler = toasts as unknown as ToastApi;
     const view = render(
       <SessionConfigControls
@@ -419,7 +423,9 @@ describe("model default", () => {
       />,
     );
     fireEvent.click(byId("model")!);
-    await act(async () => resolveLoad(loaded));
+    // The route's profile and key for a `claude` Session, unless the case gives its own.
+    const reply = loaded && typeof loaded === "object" ? { profile: "work", agent_key: "claude", ...loaded } : loaded;
+    await act(async () => resolveLoad(reply));
     return view;
   }
   const item = () => screen.queryByRole("menuitemcheckbox", { name: LABEL });
@@ -445,7 +451,7 @@ describe("model default", () => {
     ],
   ])("is %s", async (_label, loaded, checked, inert) => {
     await mountWithDefault(loaded);
-    expect(defaults.loadAgentModelDefault).toHaveBeenCalledWith("work", "claude");
+    expect(defaults.loadSessionModelDefault).toHaveBeenCalledWith("s1");
     expect(item()!.getAttribute("aria-checked")).toBe(checked);
     expect(item()!.getAttribute("aria-disabled")).toBe(inert ? "true" : null);
     fireEvent.click(item()!);
@@ -454,7 +460,7 @@ describe("model default", () => {
 
   it("can't be checked until the default has loaded, and is left out when it can't load", async () => {
     await mountWithDefault(undefined);
-    defaults.loadAgentModelDefault.mockReturnValue(new Promise(() => {}));
+    defaults.loadSessionModelDefault.mockReturnValue(new Promise(() => {}));
     cleanup();
     render(
       <SessionConfigControls
@@ -512,7 +518,12 @@ describe("model default", () => {
     );
     expect(toasts.infoAction).not.toHaveBeenCalled();
     expect(toasts.error).not.toHaveBeenCalled();
-    defaults.loadAgentModelDefault.mockResolvedValue({ model: "claude-sonnet-4-6", pinned: true });
+    defaults.loadSessionModelDefault.mockResolvedValue({
+      profile: "work",
+      agent_key: "claude",
+      model: "claude-sonnet-4-6",
+      pinned: true,
+    });
     fireEvent.click(byId("model")!);
     expect(await screen.findByRole("menuitem", { name: "Pinned in Agent defaults ›" })).toBeTruthy();
   });
@@ -545,23 +556,42 @@ describe("model default", () => {
 
   it("reloads for a new Agent while the menu is open, and saves for that Agent", async () => {
     const view = await mountWithDefault({ model: "claude-sonnet-4-6", pinned: false });
-    defaults.loadAgentModelDefault.mockReturnValue(new Promise((r) => (resolveLoad = r)));
+    defaults.loadSessionModelDefault.mockReturnValue(new Promise((r) => (resolveLoad = r)));
     view.rerender(
       <SessionConfigControls
         configOptions={[MODEL]}
         pendingConfigOption={null}
         onSetConfigOption={vi.fn()}
-        modelDefault={{ ...target, agent: "codex", agentLabel: "Codex" }}
+        modelDefault={{ ...target, agent: "codex" }}
       />,
     );
     const codex = screen.getByRole("menuitemcheckbox", { name: "Default for new Codex Sessions in Structured view" });
     // Claude's loaded default must not carry over to Codex.
     expect(codex.getAttribute("aria-disabled")).toBe("true");
-    expect(defaults.loadAgentModelDefault).toHaveBeenLastCalledWith("work", "codex");
+    expect(defaults.loadSessionModelDefault).toHaveBeenCalledTimes(2);
     defaults.saveAgentModelDefault.mockResolvedValue("committed");
-    await act(async () => resolveLoad({ model: "gpt-5", pinned: false }));
+    await act(async () => resolveLoad({ profile: "work", agent_key: "codex", model: "gpt-5", pinned: false }));
     await act(async () => fireEvent.click(codex));
     expect(defaults.saveAgentModelDefault).toHaveBeenCalledWith("work", "codex", "claude-opus-4-7");
+  });
+
+  // `corp-cursor` is detected as Cursor, so its spawn reads Cursor's default; the Daemon names that key.
+  it("saves under the profile and Agent the Daemon names for the Session, and names that Agent", async () => {
+    defaults.saveAgentModelDefault.mockResolvedValue("committed");
+    await mountWithDefault(
+      { profile: "team", agent_key: "cursor", model: null, pinned: false },
+      { modelDefault: { ...target, agent: "corp-cursor" } },
+    );
+    const cursor = screen.getByRole("menuitemcheckbox", { name: "Default for new Cursor Sessions in Structured view" });
+    fireEvent.click(cursor);
+    expect(defaults.saveAgentModelDefault).toHaveBeenCalledWith("team", "cursor", "claude-opus-4-7");
+    await waitFor(() =>
+      expect(toasts.infoAction).toHaveBeenCalledWith(
+        "Claude Opus 4.7 is now the default for new Cursor Sessions in Structured view",
+        "Agent defaults ›",
+        open,
+      ),
+    );
   });
 
   it("is reached with the arrow keys", async () => {
@@ -589,6 +619,6 @@ describe("model default", () => {
     mount([MODEL]);
     fireEvent.click(byId("model")!);
     expect(screen.queryByRole("menuitemcheckbox")).toBeNull();
-    expect(defaults.loadAgentModelDefault).not.toHaveBeenCalled();
+    expect(defaults.loadSessionModelDefault).not.toHaveBeenCalled();
   });
 });

@@ -4,20 +4,18 @@ import { ChevronUp } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 
 import type { ConfigOptionChoice, ConfigOptionDescriptor, AcpState } from "../../lib/acpTypes";
-import {
-  loadAgentModelDefault,
-  saveAgentModelDefault,
-  type AgentDefaultsTarget,
-  type AgentModelDefault,
-} from "../../lib/agentModelDefault";
+import { useAgentDisplayNames } from "../../lib/agentDisplayName";
+import { loadSessionModelDefault, saveAgentModelDefault, type AgentModelDefault } from "../../lib/agentModelDefault";
 import { REJECTED_ERROR, UNCERTAIN_ERROR } from "../../lib/settingsStore";
 import { toastBus } from "../../lib/toastBus";
 
-/** The Session's Agent and where its default model saves. */
-export interface ModelDefaultTarget extends AgentDefaultsTarget {
+/** The Session whose next spawn's default the picker offers; the Daemon names the profile and Agent it saves under. */
+export interface ModelDefaultTarget {
+  sessionId: string;
+  /** The Agent the Session runs as now, so a switch reloads the default. */
   agent: string;
-  /** How copy names the Agent, such as "Claude Code". */
-  agentLabel: string;
+  /** Opens Settings › Structured view at the Agent defaults row. */
+  open: () => void;
 }
 
 interface Props {
@@ -388,8 +386,8 @@ function ModelDropdown({ option, pending, onSelect, lockedReason, modelDefault }
             })}
             {modelDefault && (
               <ModelDefaultItem
-                // A new profile or Agent starts from loading, not the last one's default.
-                key={`${modelDefault.profile}\0${modelDefault.agent}`}
+                // A new Session or Agent starts from loading, not the last one's default.
+                key={`${modelDefault.sessionId}\0${modelDefault.agent}`}
                 target={modelDefault}
                 option={option}
                 onDone={(keyboard) => {
@@ -417,18 +415,21 @@ function ModelDefaultItem({
   option: ConfigOptionDescriptor;
   onDone: (keyboard: boolean) => void;
 }) {
-  const { profile, agent, agentLabel, open } = target;
+  const { sessionId, agent, open } = target;
+  const agentName = useAgentDisplayNames();
   const [state, setState] = useState<DefaultState>({ status: "loading" });
   useEffect(() => {
     let alive = true;
-    loadAgentModelDefault(profile, agent).then(
+    loadSessionModelDefault(sessionId).then(
       (value) => alive && setState(value ? { status: "ready", value } : { status: "failed" }),
       () => alive && setState({ status: "failed" }),
     );
     return () => {
       alive = false;
     };
-  }, [profile, agent]);
+  }, [sessionId, agent]);
+  // The Agent whose default changes, such as Cursor for an Agent detected as Cursor.
+  const agentLabel = agentName(state.status === "ready" ? state.value.agent_key : agent);
 
   if (state.status === "failed") return null;
   const itemClass =
@@ -455,7 +456,8 @@ function ModelDefaultItem({
   const checked = state.status === "ready" && state.value.model === picked;
   const inert = checked || state.status === "loading";
   const save = async () => {
-    const outcome = await saveAgentModelDefault(profile, agent, picked);
+    if (state.status !== "ready") return;
+    const outcome = await saveAgentModelDefault(state.value.profile, state.value.agent_key, picked);
     if (outcome === "committed") {
       const name = option.options.find((o) => o.value === picked)?.name ?? picked;
       toastBus.handler?.infoAction(

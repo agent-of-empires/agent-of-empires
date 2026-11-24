@@ -59,8 +59,6 @@ interface Props {
   rateLimitFailoverTo?: string;
   /** The profile's Structured view settings; null where Settings can't be edited. */
   settingsHref?: string | null;
-  /** The Session's profile, where the model picker saves the Agent's default. */
-  profile?: string;
   /** The profile's Agent defaults row; null where Settings can't be edited. */
   agentDefaultsHref?: string | null;
   /** Opens a Settings link in the app. */
@@ -463,20 +461,15 @@ function ComposerDock({
   // The Daemon's solo commands: they run as their own turn, never steered into one.
   const soloAliases = useMemo(() => [...clearAliases, ...compactAliases], [clearAliases, compactAliases]);
   // A send would start the Session, which rebuilds the container without Recreate's warning.
-  const { profile, agentDefaultsHref, onOpenSettings } = view;
+  const { agentDefaultsHref, onOpenSettings } = view;
   const currentAgent = state.agent ?? acpAgent;
-  const currentAgentLabel = currentAgent ? agentName(currentAgent) : "";
+  // The Daemon resolves which profile and Agent the default saves under, as the spawn does.
   const modelDefault = useMemo(
     () =>
-      profile && agentDefaultsHref && onOpenSettings && currentAgent
-        ? {
-            profile,
-            agent: currentAgent,
-            agentLabel: currentAgentLabel,
-            open: () => onOpenSettings(agentDefaultsHref),
-          }
+      agentDefaultsHref && onOpenSettings && currentAgent
+        ? { sessionId, agent: currentAgent, open: () => onOpenSettings(agentDefaultsHref) }
         : null,
-    [profile, agentDefaultsHref, onOpenSettings, currentAgent, currentAgentLabel],
+    [sessionId, agentDefaultsHref, onOpenSettings, currentAgent],
   );
   const blockedReason =
     state.startupError && state.startupCause?.kind === "container_missing"

@@ -178,7 +178,6 @@ export function MobileMainPane({
                     rateLimitAutoResume={session.rate_limit_auto_resume}
                     rateLimitFailoverTo={session.rate_limit_failover_to}
                     settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
-                    profile={session.profile}
                     agentDefaultsHref={agentDefaultsHref(session.profile, serverAbout)}
                     onOpenSettings={onOpenSettings}
                     tool={session.tool}

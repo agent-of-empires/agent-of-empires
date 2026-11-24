@@ -19,21 +19,26 @@ const model = (current: string) =>
     },
   ]);
 
-const MODEL_URL = "/api/profiles/default/acp-defaults/claude/model";
-
-/** Serves the Agent's default as the Daemon resolves it, and records its saves. `put` answers them. */
+/** Serves the Session's default as the Daemon resolves it, under `claude`, and records the saves to any
+ *  profile and Agent. `put` answers them. */
 async function mockDefaults(
   page: Page,
   current: { model: string | null; pinned: boolean },
   put: () => { status: number; json: unknown } = () => ({ status: 200, json: {} }),
 ) {
   const saves: unknown[] = [];
+  const saveUrls: string[] = [];
   const patches: string[] = [];
   await page.route(
-    (url) => url.pathname === MODEL_URL,
+    (url) => url.pathname === "/api/sessions/sess-1/acp-default-model",
+    (r) => r.fulfill({ json: { profile: "default", agent_key: "claude", ...current } }),
+  );
+  await page.route(
+    (url) => /^\/api\/profiles\/[^/]+\/acp-defaults\/[^/]+\/model$/.test(url.pathname),
     (r) => {
-      if (r.request().method() !== "PUT") return r.fulfill({ json: { agent_key: "claude", ...current } });
+      if (r.request().method() !== "PUT") return r.fallback();
       saves.push(r.request().postDataJSON());
+      saveUrls.push(new URL(r.request().url()).pathname);
       return r.fulfill(put());
     },
   );
@@ -44,14 +49,14 @@ async function mockDefaults(
       return r.fallback();
     },
   );
-  return { saves, patches };
+  return { saves, saveUrls, patches };
 }
 
-async function openSession(page: Page, current: string, about: Record<string, unknown> = {}) {
+async function openSession(page: Page, current: string, about: Record<string, unknown> = {}, agent = "claude") {
   const mock = await mockAcpSession(page, {
     title: "model-default",
     initialEvents: [model(current)],
-    sessionFields: { acp_agent: "claude" },
+    sessionFields: { acp_agent: agent, tool: agent },
     about,
   });
   await openStructuredSession(page, mock);
@@ -63,7 +68,7 @@ const checkbox = (page: Page) => page.getByRole("menuitemcheckbox", { name: LABE
 test("checking it saves only this Agent's model, and the toast's link opens Agent defaults in the app", async ({
   page,
 }) => {
-  const { saves, patches } = await mockDefaults(page, { model: "claude-sonnet-4-6", pinned: false });
+  const { saves, saveUrls, patches } = await mockDefaults(page, { model: "claude-sonnet-4-6", pinned: false });
   await openSession(page, "claude-opus-4-7");
   await expect(checkbox(page)).toHaveAttribute("aria-checked", "false");
   await checkbox(page).click();
@@ -73,12 +78,24 @@ test("checking it saves only this Agent's model, and the toast's link opens Agen
   ).toBeVisible();
   // Only the model goes to the Daemon, which writes it into this Agent's entry alone.
   expect(saves).toEqual([{ model: "claude-opus-4-7" }]);
+  expect(saveUrls).toEqual(["/api/profiles/default/acp-defaults/claude/model"]);
   expect(patches).toEqual([]);
 
   await page.evaluate(() => ((window as unknown as { sameDocument: boolean }).sameDocument = true));
   await page.getByRole("button", { name: "Agent defaults ›" }).click();
   await expect(page).toHaveURL(/\/settings\/structured-view\?profile=default&field=acp\.acp_defaults$/);
   expect(await page.evaluate(() => (window as unknown as { sameDocument?: boolean }).sameDocument)).toBe(true);
+});
+
+test("a Session detected as another Agent saves that Agent's default, the one its spawn reads", async ({ page }) => {
+  const { saves, saveUrls } = await mockDefaults(page, { model: null, pinned: false });
+  await openSession(page, "claude-opus-4-7", {}, "corp-claude");
+  await checkbox(page).click();
+  await expect(
+    page.getByText("Claude Opus 4.7 is now the default for new Claude Code Sessions in Structured view"),
+  ).toBeVisible();
+  expect(saves).toEqual([{ model: "claude-opus-4-7" }]);
+  expect(saveUrls).toEqual(["/api/profiles/default/acp-defaults/claude/model"]);
 });
 
 test("the default is checked and can't be unchecked here", async ({ page }) => {
