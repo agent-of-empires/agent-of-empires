@@ -19,6 +19,8 @@ import { FORWARD_TOUCH_GAIN, useForwardInput } from "./live-terminal/useForwardI
 import { ForwardScrollbar } from "./live-terminal/ForwardScrollbar";
 import { FORWARD_SCROLLBAR_WIDTH_PX, forwardPageNotches } from "../lib/forwardScrollbar";
 import { Row } from "./live-terminal/TermRow";
+import { rowHeight } from "./live-terminal/rowHeight";
+import { DEFAULT_TERMINAL_FONT_NAME, terminalFontStack, terminalLineRatio } from "../lib/terminalFonts";
 import { LIVE_WINDOW_SCREENS, useLiveEdgeScroll } from "./live-terminal/useLiveEdgeScroll";
 import { useTerminalInput } from "./live-terminal/useTerminalInput";
 import { InputTraceOverlay } from "./live-terminal/InputTraceOverlay";
@@ -29,7 +31,6 @@ import { StrokeIcon } from "./icons";
 
 const MIN_FONT_SIZE = 6;
 const MAX_FONT_SIZE = 28;
-const LINE_RATIO = 1.2;
 const RESIZE_DEBOUNCE_MS = 150;
 /** How long the trimmed row count must stay lower before shrinking; outlasts a stalled stream's spinner gaps. */
 const SHRINK_DELAY_MS = 1500;
@@ -148,9 +149,7 @@ export function MobileLiveTerminal({
   const coarse = useIsCoarsePointer();
   const fontKey = coarse ? "mobileFontSize" : "desktopFontSize";
   const configuredFontSize = settings[fontKey];
-  // Quotes are stripped so a stray `"` cannot produce an ignored font-family.
-  const termFontFamily = (settings.terminalFontFamily ?? "").trim().replace(/"/g, "");
-  const fontFamily = termFontFamily ? `"${termFontFamily}", var(--font-mono)` : undefined;
+  const fontFamily = terminalFontStack(settings.terminalFontFamily);
   const [focused, setFocused] = useState(false);
   const [fontSize, setFontSize] = useState(() => configuredFontSize);
   // Adopt a changed setting during render; a pinch drives fontSize live without touching the setting.
@@ -177,7 +176,7 @@ export function MobileLiveTerminal({
   );
   const { value: frame, held: selectionHeld } = useSelectionHold(streamFrame, scrollerRef, absorbExposedHistory);
 
-  const lineH = fontSize * LINE_RATIO;
+  const lineH = rowHeight(fontSize, terminalLineRatio(settings.terminalFontFamily));
   // Glyph advance measured in the scroller after fonts load, so cols sent to tmux match the real font.
   const measureRef = useRef<HTMLSpanElement>(null);
   const [charW, setCharW] = useState(() => fontSize * 0.6);
@@ -189,10 +188,25 @@ export function MobileLiveTerminal({
     remeasure();
   }, [remeasure, fontSize, fontFamily]);
   useEffect(() => {
-    const fonts = (document as Document & { fonts?: { ready: Promise<unknown> } }).fonts;
-    // No FontFaceSet in jsdom; the layout-effect measure stands.
-    fonts?.ready?.then(() => remeasure()).catch(() => {});
-  }, [remeasure]);
+    const fonts = (document as Document & { fonts?: FontFaceSet }).fonts;
+    // No FontFaceSet in jsdom; the layout-effect measure stands. A bundled face only starts loading once used, after
+    // the layout-effect measure, so wait for that face rather than `ready`, which may already have settled.
+    if (!fonts?.load) return;
+    let live = true;
+    const family = settings.terminalFontFamily || DEFAULT_TERMINAL_FONT_NAME;
+    void fonts
+      .load(`16px "${family}"`)
+      // A failed face still renders the fallback, which needs measuring too.
+      .catch(() => undefined)
+      .then(() => fonts.ready)
+      .then(() => {
+        if (live) remeasure();
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [remeasure, settings.terminalFontFamily]);
 
   const rowsRef = useRef(0);
   const readingRef = useRef(reading);

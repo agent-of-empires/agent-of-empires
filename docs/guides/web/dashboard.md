@@ -6,7 +6,7 @@ The dashboard is the home screen of the web app: a workspace sidebar on the left
 
 ## Layout
 
-- **Workspace sidebar** (left) lists every session grouped by repo, with a live status glyph per row. On phones it collapses behind a top-bar toggle. With no sessions, it shows a hint and a **New session** button.
+- **Workspace sidebar** (left) lists every session grouped by repo, with a live status glyph per row. On phones it collapses behind a top-bar toggle. On wider screens, drag its right edge to resize it: below the minimum width it snaps to a compact rail of glyphs and short titles, and further still it closes, until the top-bar toggle reopens it as it was. Focus the edge to resize it with the arrow keys, **Home** for the rail and **Enter** to collapse to or restore from the rail; double-click it to reset the width. With no sessions, it shows a hint and a **New session** button.
 - **Main pane** shows the selected session: the agent terminal (or structured view), with the diff and paired terminal reachable from the top bar.
 - **Top bar** carries the command-palette trigger, the right-panel picker, and the overflow (three-dot) **More options** menu.
 - **Home screen** (no session selected) shows the AoE logo and a count of running, waiting, and error sessions.
