@@ -44,8 +44,9 @@ rest from critical to low severity.
 ## 3. Judge each alert
 
 1. Read the code at the analyzed revision, not the checkout's `main`:
-   `git show <sha>:<path>` with the `sha` and `path` from step 1, after `git fetch origin <sha>` if the commit is
-   missing. Read the alert's instances too:
+   `git show <sha>:<path>` with the `sha` and `path` from step 1, after
+   `git fetch origin <sha>` if the commit is missing. Read the alert's
+   instances too:
    `gh api "repos/$REPO/code-scanning/alerts/<number>/instances"`. They give
    locations and the message, not the data-flow path, so trace the path from
    the code. If the revision cannot be read, call the alert **inconclusive**,
@@ -62,6 +63,11 @@ rest from critical to low severity.
    sink without a check that blocks the attack. Otherwise call it a **false
    positive** and give the `path:line` of the check or the reason the source
    is trusted.
+
+Steps 2 to 4 fit data-flow rules. A rule with no source, such as disabled
+certificate validation, a weak hash, or broad workflow permissions, is a true
+positive when the flagged code does what the rule describes on a path that
+runs, and a false positive otherwise; give the `path:line` that shows it.
 
 ## 4. Record findings
 
