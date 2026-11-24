@@ -262,10 +262,11 @@ pub async fn spawn_acp(
         );
     }
     // Past every refusal: only the launch itself can fail from here.
-    let starting = if reservation.is_some() {
-        RetryStartingGuard::begin(&state, &id).await
-    } else {
-        None
+    let starting = match &reservation {
+        Some(reservation) => {
+            RetryStartingGuard::begin(&state, &id, reservation.lease().epoch()).await
+        }
+        None => None,
     };
     drop(exclusion);
     if let Some(reservation) = reservation {
@@ -651,7 +652,7 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
     };
     // Past every refusal, capacity included, and after resume_structured_stop read the row's
     // `Stopped`.
-    let starting = RetryStartingGuard::begin(&state, &id).await;
+    let starting = RetryStartingGuard::begin(&state, &id, reservation.lease().epoch()).await;
     drop(exclusion);
     match state.acp_supervisor.spawn_inner(request, reservation).await {
         Ok(()) => {

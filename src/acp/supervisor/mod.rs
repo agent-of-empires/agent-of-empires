@@ -252,6 +252,9 @@ pub struct Supervisor<S: BroadcastSink> {
     registry: Arc<Mutex<AgentRegistry>>,
     workers: Workers,
     next_seqs: Arc<SeqMap>,
+    /// Per session, the epoch last installed and the seq its install published through for the
+    /// worker it replaced, before the new worker's own events.
+    retired_through: std::sync::Mutex<HashMap<String, (u64, u64)>>,
     /// Owner of every runner epoch. Lock order: `workers` before `lifecycle`.
     lifecycle: Arc<std::sync::Mutex<LifecycleTable>>,
     /// Explicit restart requests currently operating on each session.
@@ -558,6 +561,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             registry: Arc::new(Mutex::new(AgentRegistry::with_defaults())),
             workers: Arc::default(),
             next_seqs: Arc::default(),
+            retired_through: std::sync::Mutex::default(),
             lifecycle: Arc::new(std::sync::Mutex::new(LifecycleTable::new(
                 crate::time::Timestamp::now().as_millis().max(1) as u64,
             ))),
@@ -713,6 +717,12 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// progress, so it is safe under other locks.
     pub(crate) fn latest_seq(&self, session_id: &str) -> u64 {
         latest_seq_in(&self.next_seqs, session_id)
+    }
+
+    /// The `(epoch, seq)` the session's last install published through for the worker it
+    /// replaced. Takes only its own lock, so it is safe under other locks.
+    pub(crate) fn retired_through(&self, session_id: &str) -> Option<(u64, u64)> {
+        lock_recover(&self.retired_through).get(session_id).copied()
     }
 
     /// The running epoch, for a caller that must stop only that epoch.

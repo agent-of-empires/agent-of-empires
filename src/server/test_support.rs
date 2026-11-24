@@ -595,9 +595,20 @@ pub(crate) fn counting_failing_launcher() -> (
 /// event senders alive so the drains never see a close.
 #[cfg(test)]
 pub(crate) fn succeeding_launcher() -> crate::acp::supervisor::Launcher {
-    let senders: Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::Sender<crate::acp::state::Event>>>> =
-        Default::default();
-    Arc::new(move |_config, id| {
+    succeeding_launcher_with_senders().0
+}
+
+#[cfg(test)]
+type WorkerSenders =
+    Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::Sender<crate::acp::state::Event>>>>;
+
+/// [`succeeding_launcher`], with each launched worker's event sender, in launch order.
+#[cfg(test)]
+pub(crate) fn succeeding_launcher_with_senders() -> (crate::acp::supervisor::Launcher, WorkerSenders)
+{
+    let senders: WorkerSenders = Default::default();
+    let launched = Arc::clone(&senders);
+    let launcher: crate::acp::supervisor::Launcher = Arc::new(move |_config, id| {
         let senders = Arc::clone(&senders);
         Box::pin(async move {
             let (client, tx, _cmds) =
@@ -605,7 +616,8 @@ pub(crate) fn succeeding_launcher() -> crate::acp::supervisor::Launcher {
             senders.lock().unwrap().push(tx);
             Ok(client)
         })
-    })
+    });
+    (launcher, launched)
 }
 
 /// Fail writes to this profile's sessions file while retaining readable rows.

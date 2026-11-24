@@ -494,10 +494,8 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
         // #4127: the worker's own store is the only observation of the route
         // this launch applied. Read it for the id the worker just assigned, and
         // read it before the save so the durable row and the in-memory mirror
-        // attest the same thing. Awaited before `instances` is taken: the
-        // supervisor's worker map must never be reached under that lock.
-        // A reattach answers nothing, so such a session stays unattested until
-        // its next spawn.
+        // attest the same thing. A reattach answers nothing, so such a session
+        // stays unattested until its next spawn.
         let observed = match acp_change.as_ref() {
             Some(AcpSessionChange::Assigned(new_id)) => {
                 state
@@ -550,6 +548,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             // between. A future refactor that makes `apply_status_intent`
             // assign `status` more than once has to revisit this.
             let old_status = inst.status;
+            let retired = state.acp_supervisor.retired_through(&inst.id);
             let rolled_back_failure = live_worker
                 && status_update.is_some_and(|(_, projected)| {
                     take_rolled_back_retry(&state.retry_starting, &inst.id, frame.seq, projected)
@@ -557,7 +556,8 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             if rolled_back_failure {
                 report_failure_after_rollback(inst, &state.status_tx);
             } else if let Some((policy, projected)) = status_update.filter(|_| {
-                live_worker && !retired_before_retry(&state.retry_starting, inst, frame.seq)
+                live_worker
+                    && !retired_before_retry(&state.retry_starting, inst, frame.seq, retired)
             }) {
                 apply_status_intent(inst, policy, projected, &state.status_tx);
                 settle_retry_starting(&state.retry_starting, inst, old_status);
@@ -776,8 +776,9 @@ fn revival_pending_clears_on(status: Status) -> bool {
     )
 }
 
-/// The Retry attempt that owns a row's `Starting`, by session id. Taken after `instances` when
-/// both are held, and never across an await.
+/// The Retry attempt that owns a row's `Starting`, by session id. Never held across an await.
+/// Order: `instances`, then the supervisor's `workers`, then this map; `retired_through` is read
+/// before this map is locked.
 pub(crate) type RetryStarting = std::sync::Mutex<std::collections::HashMap<String, RetryAttempt>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -785,6 +786,8 @@ pub(crate) struct RetryAttempt {
     attempt: u64,
     /// The latest event seq when the attempt began: frames at or below it are a retired worker's.
     watermark: u64,
+    /// The launch's epoch: once its worker is installed, the attempt can no longer roll back.
+    epoch: u64,
     /// The attempt's launch failed and its rollback restored the Error. Kept until the new worker
     /// reports past `watermark`, since its startup error can arrive after the rollback.
     rolled_back: bool,
@@ -800,6 +803,7 @@ impl RetryAttempt {
         Self {
             attempt: 0,
             watermark: 0,
+            epoch: 0,
             rolled_back: true,
         }
     }
@@ -813,12 +817,25 @@ pub(crate) fn retired_before_retry(
     retry_starting: &RetryStarting,
     inst: &Instance,
     seq: u64,
+    retired: Option<(u64, u64)>,
 ) -> bool {
     retry_starting
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&inst.id)
-        .is_some_and(|owner| seq <= owner.watermark)
+        .is_some_and(|owner| seq <= owner.retired_through(retired))
+}
+
+impl RetryAttempt {
+    /// The seq through which frames are a retired worker's: the watermark, or past what this
+    /// attempt's install published for the worker it replaced (cancelled requests, detached
+    /// background work). `retired` is the supervisor's `retired_through` for the session.
+    fn retired_through(&self, retired: Option<(u64, u64)>) -> u64 {
+        match retired {
+            Some((epoch, seq)) if epoch == self.epoch => self.watermark.max(seq),
+            _ => self.watermark,
+        }
+    }
 }
 
 /// The seq a fold's projection speaks for, for [`retired_before_retry`]. While a Retry owns the
@@ -830,11 +847,12 @@ pub(crate) async fn newest_status_seq(
     id: &str,
     last_seq: u64,
 ) -> u64 {
+    let retired = service.acp_supervisor.retired_through(id);
     let watermark = retry_starting
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(id)
-        .map(|owner| owner.watermark);
+        .map(|owner| owner.retired_through(retired));
     match watermark {
         Some(watermark) if !service.reports_status_after(id, watermark, last_seq).await => {
             watermark
@@ -901,6 +919,7 @@ pub(crate) struct RetryStartingGuard {
     state: Arc<AppState>,
     id: String,
     attempt: u64,
+    epoch: u64,
     armed: bool,
 }
 
@@ -909,7 +928,8 @@ impl RetryStartingGuard {
     /// attempt left; `None` otherwise. Callers hold the session's launch admission (a spawn
     /// reservation, or a restart claim with the old worker gone), which proves no earlier attempt
     /// is still launching, so taking over is safe even before that attempt's guard has dropped.
-    pub(crate) async fn begin(state: &Arc<AppState>, id: &str) -> Option<Self> {
+    /// `epoch` is that admission's launch epoch.
+    pub(crate) async fn begin(state: &Arc<AppState>, id: &str, epoch: u64) -> Option<Self> {
         let mut instances = state.instances.write().await;
         let inst = instances.iter_mut().find(|i| i.id == id)?;
         let attempt = NEXT_RETRY_ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -941,6 +961,7 @@ impl RetryStartingGuard {
             RetryAttempt {
                 attempt,
                 watermark,
+                epoch,
                 rolled_back: false,
             },
         );
@@ -956,6 +977,7 @@ impl RetryStartingGuard {
             state: state.clone(),
             id: id.to_string(),
             attempt,
+            epoch,
             armed: true,
         })
     }
@@ -980,19 +1002,28 @@ impl Drop for RetryStartingGuard {
         }
         let state = self.state.clone();
         let id = std::mem::take(&mut self.id);
-        let attempt = self.attempt;
+        let (attempt, epoch) = (self.attempt, self.epoch);
         self.state
             .runtime
             .work
             .spawn("server.acp.retry_starting_revert", async move {
-                revert_retry_starting(&state, &id, attempt).await;
+                revert_retry_starting(&state, &id, attempt, epoch).await;
             });
     }
 }
 
-async fn revert_retry_starting(state: &AppState, id: &str, attempt: u64) {
+async fn revert_retry_starting(state: &AppState, id: &str, attempt: u64, epoch: u64) {
     #[cfg(test)]
     retry_test_gate::RevertGate::wait(id).await;
+    // Installed, the launch succeeded even if its request dropped later: the worker's frames move
+    // the row. Its handler awaited the launch inline, so no install can follow this check.
+    if state
+        .acp_supervisor
+        .is_current_worker_generation(id, epoch)
+        .await
+    {
+        return;
+    }
     let mut instances = state.instances.write().await;
     {
         let mut owners = state
@@ -1247,9 +1278,10 @@ pub(super) async fn recover_structured_unread_after_lag(
                 continue;
             }
             let old_status = inst.status;
+            let retired = service.acp_supervisor.retired_through(&id);
             if take_rolled_back_retry(retry_starting, &inst.id, newest_status_seq, projected) {
                 report_failure_after_rollback(inst, status_tx);
-            } else if !retired_before_retry(retry_starting, inst, newest_status_seq) {
+            } else if !retired_before_retry(retry_starting, inst, newest_status_seq, retired) {
                 apply_status_intent(inst, StatusPolicy::Authoritative, projected, status_tx);
                 settle_retry_starting(retry_starting, inst, old_status);
             }
@@ -1448,7 +1480,8 @@ pub(crate) mod retry_test_gate {
     static GATES: std::sync::Mutex<Vec<(String, Gate)>> = std::sync::Mutex::new(Vec::new());
 
     /// Test-only: parks a Retry for `id` until released: its rollback, before it takes
-    /// `instances`, or with `id#launched`, a spawn just past installing its worker. Dropping the
+    /// `instances`; with `id#mode`, a spawn applying its mode to an installed worker; or with
+    /// `id#launched`, a spawn past both. Dropping the
     /// gate releases a parked Retry.
     pub(crate) struct RevertGate {
         id: String,
@@ -1513,6 +1546,9 @@ mod tests {
     use super::*;
     use crate::acp::protocol::AcpBroadcastFrame;
     use crate::server::test_support;
+
+    /// An epoch no worker is installed under, for a Retry whose launch these tests never install.
+    const NO_LAUNCH: u64 = 0;
 
     /// #3741: the tally follows the decision that reached the agent, and
     /// a cancellation is not a user decision, so it counts as nothing.
@@ -2589,7 +2625,7 @@ mod tests {
             let id = inst.id.clone();
             let state = test_support::build_test_app_state(vec![inst]);
             state.acp_supervisor.hydrate_seqs([(id.clone(), 5)]);
-            let guard = RetryStartingGuard::begin(&state, &id)
+            let guard = RetryStartingGuard::begin(&state, &id, NO_LAUNCH)
                 .await
                 .expect("an Error row starts");
             guard.disarm();
@@ -2697,7 +2733,7 @@ mod tests {
                 .record(&id, 1, &stopped())
                 .expect("record");
             state.acp_supervisor.hydrate_seqs([(id.clone(), watermark)]);
-            RetryStartingGuard::begin(&state, &id)
+            RetryStartingGuard::begin(&state, &id, NO_LAUNCH)
                 .await
                 .expect("an Error row starts")
                 .disarm();
@@ -2774,7 +2810,7 @@ mod tests {
             state.acp_supervisor.hydrate_seqs([(id.clone(), 1)]);
             let mut changes = state.status_tx.subscribe();
             drop(
-                RetryStartingGuard::begin(&state, &id)
+                RetryStartingGuard::begin(&state, &id, NO_LAUNCH)
                     .await
                     .expect("the row starts"),
             );
@@ -2856,7 +2892,7 @@ mod tests {
         let state = test_support::build_test_app_state(vec![inst]);
         state.runtime.take_publish_request().await;
 
-        let guard = RetryStartingGuard::begin(&state, &id)
+        let guard = RetryStartingGuard::begin(&state, &id, NO_LAUNCH)
             .await
             .expect("an Error row starts");
         assert!(state.runtime.take_publish_request().await, "Starting");
@@ -2890,11 +2926,11 @@ mod tests {
             state.acp_supervisor.hydrate_seqs([(id.clone(), 5)]);
             let mut changes = state.status_tx.subscribe();
             let (gate, parked) = RevertGate::arm(&id);
-            let earlier = RetryStartingGuard::begin(&state, &id)
+            let earlier = RetryStartingGuard::begin(&state, &id, NO_LAUNCH)
                 .await
                 .expect("an Error row starts");
             let later = if begins_first {
-                let later = RetryStartingGuard::begin(&state, &id).await;
+                let later = RetryStartingGuard::begin(&state, &id, NO_LAUNCH).await;
                 drop(earlier);
                 later
             } else {
@@ -2903,7 +2939,7 @@ mod tests {
                     .await
                     .expect("the earlier rollback parks")
                     .expect("gate open");
-                RetryStartingGuard::begin(&state, &id).await
+                RetryStartingGuard::begin(&state, &id, NO_LAUNCH).await
             };
             let later = later.unwrap_or_else(|| panic!("{case}: the later attempt owns the row"));
             gate.release();
@@ -3021,7 +3057,7 @@ mod tests {
             state.acp_supervisor.hydrate_seqs([(id.clone(), 5)]);
             let mut changes = state.status_tx.subscribe();
             let (gate, parked) = RevertGate::arm(&id);
-            let guard = RetryStartingGuard::begin(&state, &id)
+            let guard = RetryStartingGuard::begin(&state, &id, NO_LAUNCH)
                 .await
                 .expect("the row starts");
             drop(guard);
@@ -3108,7 +3144,7 @@ mod tests {
             inst.status = Status::Error;
             let id = inst.id.clone();
             let state = test_support::build_test_app_state(vec![inst]);
-            let guard = RetryStartingGuard::begin(&state, &id)
+            let guard = RetryStartingGuard::begin(&state, &id, NO_LAUNCH)
                 .await
                 .expect("starts");
             (state, guard)

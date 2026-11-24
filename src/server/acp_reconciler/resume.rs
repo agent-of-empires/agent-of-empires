@@ -397,7 +397,12 @@ async fn seed_in_flight_status(state: &AppState, id: &str) {
     .await;
     let mut instances = state.instances.write().await;
     if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-        if !crate::server::acp_events::retired_before_retry(&state.retry_starting, inst, newest) {
+        if !crate::server::acp_events::retired_before_retry(
+            &state.retry_starting,
+            inst,
+            newest,
+            state.acp_supervisor.retired_through(&inst.id),
+        ) {
             let old_status = inst.status;
             crate::server::acp_events::apply_status_seed(
                 inst,
@@ -758,7 +763,7 @@ mod tests {
         };
         state.acp_event_store.record(&id, 1, &stopped()).unwrap();
         state.acp_supervisor.hydrate_seqs([(id.clone(), 1)]);
-        crate::server::acp_events::RetryStartingGuard::begin(&state, &id)
+        crate::server::acp_events::RetryStartingGuard::begin(&state, &id, 0)
             .await
             .expect("an Error row starts")
             .disarm();

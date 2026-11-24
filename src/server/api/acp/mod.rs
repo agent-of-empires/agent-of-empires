@@ -544,17 +544,19 @@ mod tests {
         id: &str,
     ) -> Arc<crate::server::state::AppState> {
         let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
-        errored_retry_state_with(project, id, launcher).await
+        errored_retry_state_with(project, id, launcher, None).await
     }
 
     async fn errored_retry_state_with(
         project: &std::path::Path,
         id: &str,
         launcher: crate::acp::supervisor::Launcher,
+        acp_mode_id: Option<&str>,
     ) -> Arc<crate::server::state::AppState> {
         use crate::server::test_support as support;
         let mut inst = crate::session::Instance::new("acp-5671", project.to_str().unwrap());
         inst.id = id.into();
+        inst.acp_mode_id = acp_mode_id.map(str::to_owned);
         inst.source_profile = "default".into();
         inst.view = crate::session::View::Structured;
         inst.status = crate::session::Status::Error;
@@ -675,7 +677,7 @@ mod tests {
         for held_by_another in [true, false] {
             let id = format!("sess-5921-capacity-{held_by_another}");
             let launcher = crate::server::test_support::succeeding_launcher();
-            let state = errored_retry_state_with(project.path(), &id, launcher).await;
+            let state = errored_retry_state_with(project.path(), &id, launcher, None).await;
             let _other = if held_by_another {
                 Some(
                     state
@@ -809,7 +811,8 @@ mod tests {
     }
 
     /// #5921: once a Retry's worker is installed its launch has succeeded, so a request dropped
-    /// after that leaves `Starting` for the worker's own frames rather than rolling back.
+    /// after that, while its mode is applied or past it, leaves `Starting` for the worker's own
+    /// frames rather than rolling back. A worker that then fails still turns the row Error.
     #[tokio::test]
     #[serial_test::serial]
     async fn a_retry_dropped_after_its_worker_is_installed_keeps_starting() {
@@ -817,37 +820,201 @@ mod tests {
         use crate::session::Status::{Error, Starting};
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let project = tempfile::tempdir().unwrap();
-        let id = "sess-5921-launched".to_string();
-        let launcher = crate::server::test_support::succeeding_launcher();
-        let state = errored_retry_state_with(project.path(), &id, launcher).await;
-        let (gate, parked) = RevertGate::arm(&format!("{id}#launched"));
-        let mut changes = state.status_tx.subscribe();
-        let mut launch = Box::pin(spawn_acp(
-            State(state.clone()),
-            Path(id.clone()),
-            retry_request(),
-        ));
-        tokio::select! {
-            response = &mut launch => panic!("launch ended before the gate: {}", response.into_response().status()),
-            parked = tokio::time::timeout(std::time::Duration::from_secs(10), parked) => {
-                parked.expect("the launch reaches the gate").expect("gate open");
+        for (gate_at, mode, worker_fails) in [
+            ("launched", None, false),
+            ("mode", Some("plan"), false),
+            ("mode", Some("plan"), true),
+        ] {
+            let id = format!("sess-5921-{gate_at}-{worker_fails}");
+            let (launcher, workers) =
+                crate::server::test_support::succeeding_launcher_with_senders();
+            let state = errored_retry_state_with(project.path(), &id, launcher, mode).await;
+            let listener =
+                tokio::spawn(crate::server::acp_events::acp_event_listener(state.clone()));
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while state.acp_events_tx.receiver_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("listener subscribes");
+            let (gate, parked) = RevertGate::arm(&format!("{id}#{gate_at}"));
+            let mut changes = state.status_tx.subscribe();
+            let mut launch = Box::pin(spawn_acp(
+                State(state.clone()),
+                Path(id.clone()),
+                retry_request(),
+            ));
+            tokio::select! {
+                response = &mut launch => panic!("{gate_at}: launch ended before the gate: {}", response.into_response().status()),
+                parked = tokio::time::timeout(std::time::Duration::from_secs(10), parked) => {
+                    parked.expect("the launch reaches the gate").expect("gate open");
+                }
+            }
+            assert_eq!(next_change(&mut changes).await, (Error, Starting));
+            drop(launch);
+            drop(gate);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                state.runtime.work.drain(),
+            )
+            .await
+            .expect("runtime work settles");
+            assert!(
+                matches!(
+                    changes.try_recv(),
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                ),
+                "{id}: no rollback"
+            );
+            assert_eq!(state.instances.read().await[0].status, Starting, "{id}");
+            assert_eq!(rolled_back(&state, &id), Some(false), "{id}");
+            if worker_fails {
+                let worker = workers.lock().unwrap().last().cloned().expect("a worker");
+                worker
+                    .send(crate::acp::Event::startup_error("adapter exited"))
+                    .await
+                    .expect("drain open");
+                assert_eq!(next_change(&mut changes).await, (Starting, Error), "{id}");
+                assert_eq!(
+                    rolled_back(&state, &id),
+                    None,
+                    "{id}: the failure settles it"
+                );
+            }
+            listener.abort();
+            let _ = listener.await;
+        }
+    }
+
+    /// #5921: replacing the worker publishes cancellations and detaches for the retired one,
+    /// past the Retry's watermark. Neither the listener nor lag recovery lets them settle
+    /// `Starting`; the new worker's own frames, a background one included, still do.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_retry_starting_ignores_what_its_install_publishes_for_the_retired_worker() {
+        use crate::acp::Event;
+        use crate::session::Status::{Error, Starting};
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let task = |id: &str| Event::BackgroundTaskStarted {
+            task_id: id.into(),
+            tool_call_id: None,
+            description: "sleep 60".into(),
+            workflow: None,
+            started_at: None,
+        };
+        let approval = Event::ApprovalRequested {
+            approval: crate::acp::approvals::Approval {
+                nonce: crate::acp::approvals::Nonce("orphan".into()),
+                tool_call: crate::acp::state::ToolCall {
+                    prompt: None,
+                    id: "tc-1".into(),
+                    name: "Terminal".into(),
+                    kind: "execute".into(),
+                    args_preview: "{}".into(),
+                    started_at: crate::time::Timestamp::now(),
+                    parent_tool_call_id: None,
+                    memory_recall: None,
+                    diffs: Vec::new(),
+                },
+                destructive: false,
+                options: Vec::new(),
+                choice: false,
+                plan: None,
+                requested_at: crate::time::Timestamp::now(),
+                resolved: None,
+            },
+        };
+        // (case, the retired worker's unresolved event, what the new worker sends; None runs
+        // lag recovery instead of the listener)
+        for (case, orphan, fresh) in [
+            (
+                "detach",
+                Some(task("old")),
+                Some(Event::startup_error("adapter exited")),
+            ),
+            (
+                "orphaned-approval",
+                Some(approval),
+                Some(Event::startup_error("adapter exited")),
+            ),
+            ("detach-recovery", Some(task("old")), None),
+            ("own-background", None, Some(task("new"))),
+        ] {
+            let id = format!("sess-5921-retired-{case}");
+            let (launcher, workers) =
+                crate::server::test_support::succeeding_launcher_with_senders();
+            let state = errored_retry_state_with(project.path(), &id, launcher, None).await;
+            let mut seq = 0;
+            for event in orphan.iter().chain([&Event::Stopped {
+                reason: "end_turn".into(),
+            }]) {
+                seq += 1;
+                state.acp_event_store.record(&id, seq, event).unwrap();
+            }
+            state.acp_supervisor.hydrate_seqs([(id.clone(), seq)]);
+            let listener = fresh.is_some().then(|| {
+                tokio::spawn(crate::server::acp_events::acp_event_listener(state.clone()))
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while listener.is_some() && state.acp_events_tx.receiver_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("listener subscribes");
+            let mut changes = state.status_tx.subscribe();
+            let response = spawn_acp(State(state.clone()), Path(id.clone()), retry_request())
+                .await
+                .into_response();
+            assert!(
+                response.status().is_success(),
+                "{case}: {}",
+                response.status()
+            );
+            assert_eq!(next_change(&mut changes).await, (Error, Starting), "{case}");
+            assert_eq!(
+                state.acp_supervisor.latest_seq(&id) > seq,
+                orphan.is_some(),
+                "{case}: the install published for the retired worker"
+            );
+            match fresh {
+                Some(event) => {
+                    let worker = workers.lock().unwrap().last().cloned().expect("a worker");
+                    worker.send(event).await.expect("drain open");
+                    let change = next_change(&mut changes).await;
+                    if case == "own-background" {
+                        assert_eq!(change.0, Starting, "{case}: {change:?}");
+                        assert_ne!(change.1, Starting, "{case}");
+                    } else {
+                        assert_eq!(change, (Starting, Error), "{case}");
+                    }
+                    assert_eq!(rolled_back(&state, &id), None, "{case}: settled");
+                }
+                None => {
+                    crate::server::acp_events::recover_structured_unread_after_lag(
+                        &state.instances,
+                        &state.session_service,
+                        &state.instance_locks,
+                        crate::file_watch::FileWatchService::noop(),
+                        &state.status_tx,
+                        &state.retry_starting,
+                    )
+                    .await;
+                    assert!(
+                        changes.try_recv().is_err(),
+                        "{case}: recovery left Starting"
+                    );
+                    assert_eq!(state.instances.read().await[0].status, Starting, "{case}");
+                    assert_eq!(rolled_back(&state, &id), Some(false), "{case}");
+                }
+            }
+            if let Some(listener) = listener {
+                listener.abort();
+                let _ = listener.await;
             }
         }
-        assert_eq!(next_change(&mut changes).await, (Error, Starting));
-        drop(launch);
-        drop(gate);
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            state.runtime.work.drain(),
-        )
-        .await
-        .expect("runtime work settles");
-        assert!(matches!(
-            changes.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-        assert_eq!(state.instances.read().await[0].status, Starting);
-        assert_eq!(rolled_back(&state, &id), Some(false));
     }
 
     /// #4116: a peer archive committed while the `before_session` hook runs (after the handler's

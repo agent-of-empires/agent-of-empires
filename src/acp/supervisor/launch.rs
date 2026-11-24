@@ -392,6 +392,11 @@ impl<S: BroadcastSink> Supervisor<S> {
             .await?;
 
         if req.acp_mode_id.is_some() || req.yolo_mode {
+            #[cfg(test)]
+            crate::server::acp_events::retry_test_gate::RevertGate::wait(&format!(
+                "{session_id}#mode"
+            ))
+            .await;
             let mode_id = req
                 .acp_mode_id
                 .as_deref()
@@ -685,6 +690,10 @@ impl<S: BroadcastSink> Supervisor<S> {
             self.detach_orphaned_background_agents(session_id);
             (Vec::new(), Vec::new())
         };
+        lock_recover(&self.retired_through).insert(
+            session_id.to_string(),
+            (lease.epoch(), self.latest_seq(session_id)),
+        );
         if context_reset.is_some() {
             lock_recover(&self.pending_context_resets).insert(session_id.to_string());
         }
