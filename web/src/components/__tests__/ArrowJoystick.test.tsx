@@ -152,6 +152,28 @@ describe("ArrowJoystick", () => {
     expect(j.sent()).toEqual([RIGHT, UP]);
   });
 
+  it("a fresh touch anywhere stops a gesture that never ended", () => {
+    const j = mount();
+    j.down(1);
+    j.move(30, 0);
+    // No end event for pointer 1; the user taps the terminal instead of the pad.
+    fireEvent.pointerDown(document.body, { pointerId: 2, isPrimary: true });
+    j.wait(2000);
+    expect(j.sent()).toEqual([RIGHT]);
+  });
+
+  it.each([
+    ["a second finger", { pointerId: 2, isPrimary: false }],
+    ["a primary pointer of another type", { pointerId: 2, isPrimary: true, pointerType: "mouse" }],
+  ])("keeps a held gesture when %s goes down elsewhere", (_label, init) => {
+    const j = mount();
+    j.down(1);
+    j.move(30, 0);
+    fireEvent.pointerDown(document.body, init);
+    j.wait(JOYSTICK_FIRST_REPEAT_MS);
+    expect(j.sent()).toEqual([RIGHT, RIGHT]);
+  });
+
   it("keeps a held gesture through a second finger and that finger's release", () => {
     const j = mount();
     j.down(1);
