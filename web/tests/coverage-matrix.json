@@ -2774,6 +2774,22 @@
       "notes": "Grouped badge items collapse into one chip that cycles on click. The Playwright story clicks it inside the real session-row link, which jsdom cannot cover: the click must cycle without the row selecting or the browser following the row href. Group, wrap-around and clamping logic is in PluginSlots.test.tsx, which also verifies that changing the addressed session resets a detail badge cycle."
     },
     {
+      "id": "composer.plugin-status-slot",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/composer-status-mobile.spec.ts",
+        "src/components/plugin/__tests__/PluginSlots.test.tsx",
+        "src/components/acp/Composer.test.tsx"
+      ],
+      "components": [
+        "web/src/components/plugin/PluginSlots.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/ComposerControls.tsx"
+      ],
+      "notes": "The composer-status slot renders beside the usage hint for its own session only, ordered by payload order. The Playwright story proves a long status truncates inside the footer at 360px without overflow or pushing Send off screen."
+    },
+    {
       "id": "sidebar.plugin-row-badge-link",
       "kind": "vitest",
       "risk": "medium",

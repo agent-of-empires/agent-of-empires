@@ -84,7 +84,7 @@ struct TextPayload {
     /// `Some([])` is an explicit clear and stays distinct from an absent list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     items: Option<Vec<BadgeItem>>,
-    /// Position among a chip slot's entries (`status-bar`, `header-start`, `detail-badge`), lowest first; default 0.
+    /// Position among a chip slot's entries (`status-bar`, `header-start`, `detail-badge`, `composer-status`), lowest first; default 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     order: Option<i32>,
 }
@@ -687,7 +687,7 @@ fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
         serde_json::to_value(parsed).map_err(|e| e.to_string())
     }
     match slot {
-        UiSlot::StatusBar | UiSlot::HeaderStart | UiSlot::DetailBadge => {
+        UiSlot::StatusBar | UiSlot::HeaderStart | UiSlot::DetailBadge | UiSlot::ComposerStatus => {
             let parsed: TextPayload =
                 serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
             if parsed.text.is_none() && parsed.items.is_none() {
@@ -1029,6 +1029,34 @@ mod tests {
                 Some("s1"),
                 json!({"items": [{"text": "a"}]}),
                 true,
+            ),
+            (
+                "composer status accepts text",
+                UiSlot::ComposerStatus,
+                Some("s1"),
+                json!({"text": "ctx 40%"}),
+                true,
+            ),
+            (
+                "composer status accepts items",
+                UiSlot::ComposerStatus,
+                Some("s1"),
+                json!({"items": [{"text": "a"}]}),
+                true,
+            ),
+            (
+                "composer status requires a session id",
+                UiSlot::ComposerStatus,
+                None,
+                json!({"text": "x"}),
+                false,
+            ),
+            (
+                "composer status with neither text nor items rejected",
+                UiSlot::ComposerStatus,
+                Some("s1"),
+                json!({"tone": "info"}),
+                false,
             ),
             (
                 "header start accepts text with an order",

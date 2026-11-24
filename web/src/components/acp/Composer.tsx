@@ -22,7 +22,7 @@ import {
   subscribePendingSwitchAgent,
 } from "../../lib/switchAgentTrigger";
 import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
-import { PluginComposerActions } from "../plugin/PluginSlots";
+import { PluginComposerActions, PluginComposerStatus } from "../plugin/PluginSlots";
 import { composerDraftOperation, type ComposerDraftOperation } from "../plugin/composerDraftOperation";
 import {
   AttachmentChips,
@@ -382,7 +382,14 @@ export function Composer(props: Props) {
                   providerLockedReason={turnActive ? "Switch providers once the turn finishes" : null}
                 />
                 <AuthStatusHint authStatus={props.authStatus} signIn={props.signIn} />
-                <UsageHint usage={props.sessionUsage} />
+                {/* Last in the wrapping cluster: on a narrow footer it takes its own row instead of pushing Stop and Send off screen. */}
+                <div
+                  data-testid="composer-trailing"
+                  className="ml-auto flex min-w-0 max-w-full items-center gap-2 pl-2 empty:hidden"
+                >
+                  <PluginComposerStatus sessionId={sessionId} />
+                  <UsageHint usage={props.sessionUsage} />
+                </div>
               </div>
 
               <div data-testid="composer-actions" className="flex shrink-0 items-center gap-2">
