@@ -76,6 +76,112 @@ pub(crate) fn split_at_sentinel<'a>(raw: &'a [u8], sentinel: &str) -> Option<(&'
     Some((&raw[..=at], &raw[at + 1 + line.len()..]))
 }
 
+/// Most continuation rows one capture re-reads.
+const MAX_RELINKED_ROWS: usize = 256;
+
+/// `body` rows after `wraps` rows that ended inside a link. `capture-pane -e`
+/// closes a link at every row's end and never reopens it on the continuation
+/// row, though tmux's cells there still carry it.
+fn unlinked_continuations(rows: &[&[u8]], wraps: &[u32]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut continues = false;
+    for (i, row) in rows.iter().enumerate().take(rows.len().saturating_sub(1)) {
+        let ends_linked = row.ends_with(b"\x1b]8;;\x1b\\") || row.ends_with(b"\x1b]8;;\x07");
+        continues = wraps.binary_search(&(i as u32)).is_ok() && (continues || ends_linked);
+        if continues {
+            out.push(i + 1);
+        }
+    }
+    out.truncate(MAX_RELINKED_ROWS);
+    out
+}
+
+/// Re-read the continuation rows of soft-wrapped links in `body` (a
+/// `capture-pane -e -N` of `target` whose last `pane_height` rows are the
+/// visible screen) one row per capture, which starts each row's escape state
+/// afresh, so the link is reopened there. A row whose text changed since
+/// `body` was taken is left as it was.
+pub(crate) fn relink_continuations(
+    target: &str,
+    body: &mut Vec<u8>,
+    wraps: &[u32],
+    pane_height: u16,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) {
+    let text = body.strip_suffix(b"\n").unwrap_or(body);
+    let rows: Vec<&[u8]> = text.split(|&b| b == b'\n').collect();
+    let wanted = unlinked_continuations(&rows, wraps);
+    let Some(history) = rows.len().checked_sub(usize::from(pane_height)) else {
+        return;
+    };
+    if wanted.is_empty() {
+        return;
+    }
+    let lines: Vec<String> = wanted
+        .iter()
+        .map(|&i| (i as i64 - history as i64).to_string())
+        .collect();
+    let mut command = crate::tmux::tmux_command();
+    for (n, line) in lines.iter().enumerate() {
+        if n > 0 {
+            command.arg(";");
+        }
+        command.args([
+            "capture-pane",
+            "-t",
+            target,
+            "-p",
+            "-e",
+            "-N",
+            "-S",
+            line,
+            "-E",
+            line,
+        ]);
+    }
+    let Ok(out) = deadline.run(&mut command) else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let fresh = out.stdout.strip_suffix(b"\n").unwrap_or(&out.stdout);
+    let fresh: Vec<&[u8]> = fresh.split(|&b| b == b'\n').collect();
+    if fresh.len() != wanted.len() {
+        return;
+    }
+    *body = splice_rows(&rows, &wanted, &fresh, body.ends_with(b"\n"));
+}
+
+/// `rows` with each `at` row replaced by its `fresh` twin when the two show
+/// the same text. A row capture opens from default attributes, so a reset
+/// first drops whatever the previous row left set.
+fn splice_rows(rows: &[&[u8]], at: &[usize], fresh: &[&[u8]], terminated: bool) -> Vec<u8> {
+    let plain = |row: &[u8]| crate::tmux::utils::strip_ansi(&String::from_utf8_lossy(row));
+    let mut out = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            out.push(b'\n');
+        }
+        let twin = at
+            .binary_search(&i)
+            .ok()
+            .map(|n| fresh[n])
+            .filter(|twin| plain(twin).trim_end() == plain(row).trim_end());
+        match twin {
+            Some(twin) => {
+                out.extend_from_slice(b"\x1b[0m");
+                out.extend_from_slice(twin);
+            }
+            None => out.extend_from_slice(row),
+        }
+    }
+    if terminated {
+        out.push(b'\n');
+    }
+    out
+}
+
 /// Columns vt100 gives `text`, which must hold no escapes.
 pub(crate) fn display_width(text: &str) -> usize {
     text.chars().map(|c| c.width().unwrap_or(1).min(2)).sum()
@@ -125,6 +231,58 @@ mod tests {
         for (name, body, joined, want) in cases {
             assert_eq!(soft_wraps(body, joined), *want, "{name}");
         }
+    }
+
+    #[test]
+    fn rereads_only_rows_that_continue_a_wrapped_link() {
+        let open = "\x1b]8;;https://e.co/a\x1b\\";
+        let close = "\x1b]8;;\x1b\\";
+        let linked_end = format!("{open}https://e{close}");
+        let cases: &[(&str, Vec<String>, &[u32], &[usize])] = &[
+            (
+                "a link over three rows",
+                vec![
+                    linked_end.clone(),
+                    "xample.co".into(),
+                    "/a".into(),
+                    "$".into(),
+                ],
+                &[0, 1],
+                &[1, 2],
+            ),
+            (
+                "a link closed before the wrap",
+                vec![format!("{open}ab{close} cd"), "ef".into()],
+                &[0],
+                &[],
+            ),
+            (
+                "a linked row that does not wrap",
+                vec![linked_end.clone(), "next".into()],
+                &[],
+                &[],
+            ),
+            (
+                "plain wrapped rows",
+                vec!["abc".into(), "def".into(), "gh".into()],
+                &[0, 1],
+                &[],
+            ),
+        ];
+        for (name, rows, wraps, want) in cases {
+            let rows: Vec<&[u8]> = rows.iter().map(|r| r.as_bytes()).collect();
+            assert_eq!(unlinked_continuations(&rows, wraps), *want, "{name}");
+        }
+    }
+
+    #[test]
+    fn splices_a_reread_row_only_when_its_text_still_matches() {
+        let rows: &[&[u8]] = &[b"\x1b[1mab", b"cd", b"ef"];
+        let fresh: &[&[u8]] = &[b"\x1b]8;;u\x1b\\cd\x1b]8;;\x1b\\", b"zz"];
+        assert_eq!(
+            splice_rows(rows, &[1, 2], fresh, true),
+            b"\x1b[1mab\n\x1b[0m\x1b]8;;u\x1b\\cd\x1b]8;;\x1b\\\nef\n".to_vec()
+        );
     }
 
     #[test]

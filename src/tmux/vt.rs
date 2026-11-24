@@ -46,9 +46,45 @@ fn new_parser(rows: u16, cols: u16, scrollback: usize) -> Grid {
 }
 
 /// Apply pane output to `grid`, keeping its hyperlinks on their cells.
-fn feed(grid: &mut Grid, bytes: &[u8]) {
-    let marked = grid.callbacks_mut().mark(bytes);
-    grid.process(&marked);
+fn feed(grid: &mut Grid, mut bytes: &[u8]) {
+    loop {
+        let (marked, used) = grid.callbacks_mut().mark(bytes);
+        grid.process(&marked);
+        bytes = &bytes[used..];
+        if !grid.callbacks().starved() {
+            break;
+        }
+        let live = linked_ids(grid);
+        grid.callbacks_mut().reclaim(&live);
+    }
+}
+
+/// The link ids the drawn grid's cells name, scrollback included.
+fn linked_ids(grid: &mut Grid) -> std::collections::HashSet<u16> {
+    let (rows, cols) = grid.screen().size();
+    let saved = grid.screen().scrollback();
+    grid.screen_mut().set_scrollback(usize::MAX >> 4);
+    let depth = grid.screen().scrollback();
+    let mut ids = std::collections::HashSet::new();
+    let mut offset = 0;
+    loop {
+        grid.screen_mut().set_scrollback(offset.min(depth));
+        for row in 0..rows.get() {
+            for col in 0..cols.get() {
+                let id = grid
+                    .screen()
+                    .cell(row, col)
+                    .and_then(|cell| crate::tmux::osc8::split_cell(cell.contents()).1);
+                ids.extend(id);
+            }
+        }
+        if offset >= depth {
+            break;
+        }
+        offset += usize::from(rows.get());
+    }
+    grid.screen_mut().set_scrollback(saved);
+    ids
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1340,7 +1376,14 @@ fn capture_seed_stream<S>(
     sample: impl FnMut() -> S,
 ) -> Option<(Vec<u8>, S)> {
     let (cols, rows) = size;
-    let (body, state, sampled) = capture_seed_snapshot(target, (cols, rows), deadline, sample)?;
+    let (mut body, state, sampled) = capture_seed_snapshot(target, (cols, rows), deadline, sample)?;
+    crate::tmux::wraps::relink_continuations(
+        target,
+        &mut body.rows,
+        &body.wraps,
+        state.pane_height,
+        deadline,
+    );
     let stream = assemble_seed_stream(&body.rows, &body.wraps, &state, (cols, rows));
     Some((stream, sampled))
 }
@@ -4059,6 +4102,79 @@ mod tests {
     }
 
     #[test]
+    fn a_linked_emoji_presentation_keeps_its_width() {
+        let url = "https://example.com/heart";
+        for text in ["\u{2764}\u{FE0F}", "e\u{301}\u{2764}\u{FE0F}"] {
+            let mut plain = new_parser(2, 20, 0);
+            feed(&mut plain, format!("{text}x").as_bytes());
+            let mut linked = new_parser(2, 20, 0);
+            feed(&mut linked, format!("{}x", osc8(url, text)).as_bytes());
+            assert_eq!(
+                linked.screen().cursor_position(),
+                plain.screen().cursor_position(),
+                "{text:?}"
+            );
+            assert_eq!(
+                row_to_ansi(&linked, 0, 20),
+                format!("\x1b[0m{}x", osc8(url, text)),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn osc8_ids_free_once_no_cell_names_them() {
+        let uri = |n: usize| format!("https://example.com/{n}");
+        let runs = 3 * 1024;
+        let lines: Vec<String> = (0..runs)
+            .map(|n| format!("{}\r\n", osc8(&uri(n), "x")))
+            .collect();
+        // Targets scrolled off a grid without scrollback free their ids, whether
+        // each arrives in its own read or all in one.
+        for chunked in [true, false] {
+            let mut grid = new_parser(2, 30, 0);
+            if chunked {
+                for line in &lines {
+                    feed(&mut grid, line.as_bytes());
+                }
+            } else {
+                feed(&mut grid, lines.concat().as_bytes());
+            }
+            assert_eq!(
+                row_to_ansi(&grid, 0, 30),
+                format!("\x1b[0m{}", osc8(&uri(runs - 1), "x")),
+                "chunked: {chunked}"
+            );
+        }
+
+        // A freed id never renames a cell still on either grid.
+        let kept = "https://example.com/kept";
+        let mut grid = new_parser(2, 30, 0);
+        feed(
+            &mut grid,
+            format!("{}\r\n", osc8(kept, "primary")).as_bytes(),
+        );
+        feed(&mut grid, b"\x1b[?1049h");
+        let shown = "https://example.com/shown";
+        feed(&mut grid, format!("{}\r\n", osc8(shown, "alt")).as_bytes());
+        for n in 0..runs {
+            feed(
+                &mut grid,
+                format!("\x1b[2;1H{}", osc8(&uri(n), "x")).as_bytes(),
+            );
+        }
+        assert_eq!(
+            row_to_ansi(&grid, 0, 30),
+            format!("\x1b[0m{}", osc8(shown, "alt"))
+        );
+        feed(&mut grid, b"\x1b[?1049l");
+        assert_eq!(
+            row_to_ansi(&grid, 0, 30),
+            format!("\x1b[0m{}", osc8(kept, "primary"))
+        );
+    }
+
+    #[test]
     fn a_seed_restores_the_soft_wraps_tmux_reported() {
         // (name, body, wrapped rows from the joined capture, grid rows' wraps)
         let cases: &[(&str, &str, &[u32], &[u32])] = &[
@@ -6219,6 +6335,91 @@ mod tests {
             .capture_window_with_wraps(8)
             .expect("capture");
         assert_eq!(capture.wrapped, vec![0], "{}", capture.content);
+    }
+
+    /// `capture-pane -e` drops a soft-wrapped link's target past its first
+    /// row; the seed and the capture fallback must still carry it there.
+    #[test]
+    #[serial_test::serial]
+    fn real_tmux_keeps_a_soft_wrapped_link_on_every_row() {
+        if !tmux_reemits_hyperlinks() {
+            eprintln!("Skipping test: tmux missing or older than 3.4 (no OSC 8)");
+            return;
+        }
+        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_wrapped_osc8");
+        let url = "https://example.com/a-long/path/that-wraps/twice-over";
+        let script = format!(
+            r"printf '\033[1mbold\033[0m see \033]8;;{url}\033\\{url}\033]8;;\033\\ done\n'; sleep 30"
+        );
+        let out = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                guard.name(),
+                "-x",
+                "20",
+                "-y",
+                "6",
+                &script,
+                ";",
+                "set-option",
+                "-t",
+                guard.name(),
+                "pane-base-index",
+                "0",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(out.status.success());
+        let target = crate::tmux::test_helpers::only_pane_id(guard.name());
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        let link = |text: &str| format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\");
+        let pieces = [
+            "https://exa",
+            "mple.com/a-long/path",
+            "/that-wraps/twice-ov",
+            "er",
+        ];
+        let mut content = String::new();
+        for _ in 0..50 {
+            let stream = capture_seed_stream(&target, (20, 6), &deadline, || ())
+                .map(|(stream, ())| stream)
+                .unwrap_or_default();
+            let mut grid = new_parser(6, 20, SCROLLBACK_LINES);
+            feed(&mut grid, &stream);
+            content = grid_content(&mut grid, 6, 20, 6).content;
+            if content.contains("done") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let rows: Vec<&str> = content.lines().collect();
+        for (row, piece) in pieces.iter().enumerate() {
+            assert!(rows[row].contains(&link(piece)), "row {row}:\n{content}");
+        }
+        assert!(
+            !rows[1].contains("\x1b[1m"),
+            "bold must not carry over:\n{content}"
+        );
+
+        let capture = crate::tmux::Session::from_name(guard.name())
+            .capture_window_with_wraps(6)
+            .expect("capture");
+        assert_eq!(capture.wrapped, vec![0, 1, 2], "{}", capture.content);
+        let rows: Vec<&str> = capture.content.lines().collect();
+        for (row, piece) in pieces.iter().enumerate() {
+            let found = crate::tmux::osc8::extract_links(rows[row].as_bytes());
+            assert_eq!(
+                found
+                    .iter()
+                    .map(|l| (l.text.as_str(), l.uri.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![(*piece, url)],
+                "row {row}:\n{}",
+                capture.content
+            );
+        }
     }
 
     /// The seed and the capture fallback both read `capture-pane -e`, and the
