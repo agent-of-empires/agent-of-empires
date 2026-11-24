@@ -3055,6 +3055,7 @@ mod tests {
             let metadata = std::collections::HashMap::from([(
                 session_name.clone(),
                 crate::tmux::PaneMetadata {
+                    fast_capture: true,
                     server: None,
                     session_id: "$42".into(),
                     pane_id: "%42".into(),
@@ -3128,6 +3129,7 @@ mod tests {
         let metadata = std::collections::HashMap::from([(
             session_name,
             crate::tmux::PaneMetadata {
+                fast_capture: true,
                 server: None,
                 session_id: "$42".into(),
                 pane_id: "%42".into(),
@@ -3226,12 +3228,14 @@ mod tests {
         crate::tmux::test_helpers::wait_for_pane_command(&session_name, "sleep");
         let cache_guard = crate::tmux::SessionCacheGuard::capture();
         cache_guard.force_present(&[&session_name]);
+        let pane_id = crate::tmux::first_pane_id(&session_name).expect("first pane id");
         let metadata = std::collections::HashMap::from([(
             session_name,
             crate::tmux::PaneMetadata {
+                fast_capture: true,
                 server: None,
                 session_id: "$42".into(),
-                pane_id: "%42".into(),
+                pane_id: pane_id.clone(),
                 session_kind: None,
                 tool_owner: crate::tmux::ToolPaneOwner::Unmarked,
                 pane_dead: false,
@@ -3851,6 +3855,7 @@ mod tests {
         let metadata = std::collections::HashMap::from([(
             name,
             crate::tmux::PaneMetadata {
+                fast_capture: true,
                 server: None,
                 session_id: "$42".into(),
                 pane_id: "%42".into(),

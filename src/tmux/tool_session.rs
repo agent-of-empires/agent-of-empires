@@ -995,6 +995,7 @@ mod tests {
 
     fn legacy_metadata() -> crate::tmux::PaneMetadata {
         crate::tmux::PaneMetadata {
+            fast_capture: true,
             server: None,
             session_id: "$42".into(),
             pane_id: "%42".into(),
@@ -1872,6 +1873,7 @@ mod tests {
         let mut panes = std::collections::HashMap::from([(
             sibling.clone(),
             crate::tmux::PaneMetadata {
+                fast_capture: true,
                 server: None,
                 session_id: "$42".into(),
                 pane_id: "%42".into(),

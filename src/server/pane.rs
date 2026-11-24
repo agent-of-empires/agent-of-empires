@@ -1641,6 +1641,7 @@ mod tests {
             tools: vec![("yazi".into(), ToolSession::name_prefix("yazi"))],
         };
         let metadata = PaneMetadata {
+            fast_capture: true,
             server: Some(std::sync::Arc::new(crate::session::TmuxServerIdentity {
                 socket: "/fixture-tmux.sock".into(),
                 pid: 4242,
