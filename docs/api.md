@@ -951,8 +951,9 @@ If the session's `host_hooks.before_start` hook fails while that launch is admit
 A message typed after a person's unsent text would merge with it and be
 submitted together, so the send first waits up to 3 seconds for Claude Code's
 input box to clear, then refuses with `input_line_busy`. A box showing only
-Claude Code's dimmed suggestion counts as empty. Other agents, and text in a
-colour the check cannot place, are typed into as before. The light theme's
+Claude Code's dimmed suggestion counts as empty. Other agents, text in a
+colour the check cannot place, and a box not drawn in Claude Code's usual
+layout are typed into as before. The light theme's
 suggestion styling has not been measured, so there it can only fail open.
 MCP `send` refuses a draft at once with the same code, and the TUI's send
 dialog refuses it without waiting.

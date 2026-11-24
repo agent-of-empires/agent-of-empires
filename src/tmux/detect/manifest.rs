@@ -128,7 +128,7 @@ struct RawManifest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawInputLine {
-    /// Matches the plain text of the line the person types on, up to where the typing starts.
+    /// Matches the plain text of the row the person types on, from column 0 to where typing starts.
     prompt: String,
 }
 

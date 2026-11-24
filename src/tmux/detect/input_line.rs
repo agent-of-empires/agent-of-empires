@@ -122,25 +122,28 @@ fn styled_lines(capture: &str) -> Vec<(String, Vec<Cell>)> {
     lines
 }
 
-/// Reads from the last line `prompt` matches, after the match, down to the box's bottom rule.
+/// The box is the last two rules starting at column 0, with `prompt` on the row below the top
+/// one. Every row a person types is indented, so typed text cannot pass for either; any other
+/// layout is `Unknown`.
 pub(super) fn classify(prompt: &Regex, capture: &str) -> InputLine {
     let lines = styled_lines(capture);
-    let Some(top) = lines.iter().rposition(|(text, _)| prompt.is_match(text)) else {
-        return InputLine::Unknown;
-    };
-    let Some(bottom) = lines[top + 1..]
+    let mut rules = lines
         .iter()
-        .position(|(text, _)| super::region::line_is_horizontal_rule(text.trim()))
-    else {
+        .enumerate()
+        .rev()
+        .filter(|(_, (text, _))| super::region::line_is_horizontal_rule(text.trim_end()))
+        .map(|(row, _)| row);
+    let (Some(bottom), Some(top)) = (rules.next(), rules.next()) else {
         return InputLine::Unknown;
     };
-    let (text, cells) = &lines[top];
-    let glyph = prompt
-        .find(text)
-        .map_or(0, |m| text[..m.end()].chars().count());
+    let (text, cells) = &lines[top + 1];
+    let Some(glyph) = prompt.find(text) else {
+        return InputLine::Unknown;
+    };
+    let glyph = text[..glyph.end()].chars().count();
     let cells = cells[glyph..]
         .iter()
-        .chain(lines[top + 1..top + 1 + bottom].iter().flat_map(|(_, c)| c));
+        .chain(lines[top + 2..bottom].iter().flat_map(|(_, c)| c));
     let mut coloured = false;
     for cell in cells {
         match cell {
@@ -182,6 +185,10 @@ mod tests {
             ("ghost-placeholder-one-char", InputLine::Draft),
             ("draft-cursor-start-2131", InputLine::Draft),
             ("draft-cursor-start", InputLine::Draft),
+            ("draft-ends-bare-prompt", InputLine::Draft),
+            ("draft-rule-line", InputLine::Draft),
+            ("draft-wrapped", InputLine::Draft),
+            ("ghost-after-ctrl-c", InputLine::Empty),
         ] {
             let capture = std::fs::read_to_string(format!("{FIXTURES}/claude-{fixture}.ans"))
                 .unwrap_or_else(|e| panic!("{fixture}: {e}"));
@@ -202,9 +209,18 @@ mod tests {
                 InputLine::Empty,
             ),
             (
+                format!("{RULE}\n❯\u{a0}keep this\n  ❯\u{a0}\n{RULE}"),
+                InputLine::Draft,
+            ),
+            // Not the layout the rules expect: fail open.
+            (
                 format!("{RULE}\n❯ typed, no bottom rule"),
                 InputLine::Unknown,
             ),
+            (format!("  {RULE}\n❯ typed\n  {RULE}"), InputLine::Unknown),
+            (format!("{RULE}\n  ❯ typed\n{RULE}"), InputLine::Unknown),
+            (format!("{RULE}\n\n❯ typed\n{RULE}"), InputLine::Unknown),
+            (format!("{RULE}\n{RULE}"), InputLine::Unknown),
             ("no box".to_string(), InputLine::Unknown),
         ] {
             assert_eq!(claude(&capture), want, "{capture:?}");
