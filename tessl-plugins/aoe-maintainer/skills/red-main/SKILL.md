@@ -50,8 +50,8 @@ Collect each failing test id with its job and OS:
 
 ## 3. Classify
 
-Pick one class for the commit. When jobs disagree, use the most severe:
-regression, then flake, then infra.
+Give each failure a class. The finding takes the most severe class among
+the failures left after step 5: regression, then flake, then infra.
 
 - **infra**: no test failed and the job died for reasons outside the code.
   Examples: the runner lost communication or received a shutdown signal (a
@@ -94,8 +94,8 @@ regression, then flake, then infra.
   one of them already covers: the same test with the same class, or for a
   failure with no test, the same commit. A flake finding does not cover a
   regression in the same test. If none remain, do not create a finding; end with their
-  ids. Otherwise the finding covers only the remaining failures and cites
-  those ids in `analysis`.
+  ids. Otherwise the finding covers only the remaining failures, takes its
+  class from them, and cites those ids in `analysis`.
 
 ## 6. Record one finding
 
