@@ -233,8 +233,11 @@ enum Event {
     ZeroWidth(usize),
     /// A mark code point arriving from the pane, to drop.
     Stray,
-    /// A control, escape, or OSC, after which a later zero-width code point
-    /// may land on another cell.
+    /// An SGR, OSC or ST: the cursor stays, so a zero-width code point after
+    /// it still joins the cell before it.
+    Quiet,
+    /// Any other control or escape, after which a zero-width code point may
+    /// land on another cell.
     Other,
 }
 
@@ -345,7 +348,11 @@ impl vte::Perform for LinkScan {
         _ignore: bool,
         action: char,
     ) {
-        self.event = Event::Other;
+        self.event = if action == 'm' {
+            Event::Quiet
+        } else {
+            Event::Other
+        };
         // vt100 picks its private-mode handler by the first intermediate alone.
         if intermediates.first() != Some(&b'?') || !matches!(action, 'h' | 'l') {
             return;
@@ -367,7 +374,7 @@ impl vte::Perform for LinkScan {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        self.event = Event::Other;
+        self.event = Event::Quiet;
         let [b"8", _, ..] = params else {
             return;
         };
@@ -395,7 +402,11 @@ impl vte::Perform for LinkScan {
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
-        self.event = Event::Other;
+        self.event = if intermediates.is_empty() && byte == b'\\' {
+            Event::Quiet
+        } else {
+            Event::Other
+        };
         // RIS resets the terminal, hyperlink and both grids included.
         if intermediates.is_empty() && byte == b'c' {
             self.active = None;
@@ -416,6 +427,8 @@ struct Owed {
     id: u16,
     at: usize,
     cell: usize,
+    /// A [`Event::Quiet`] escape came after `at`.
+    quiet: bool,
 }
 
 impl GridLinks {
@@ -461,6 +474,7 @@ impl GridLinks {
                 Event::ZeroWidth(len) => {
                     if let Some(o) = owed.as_mut() {
                         o.at = i + 1;
+                        o.quiet = false;
                         if o.cell < CELL_APPEND_LIMIT {
                             o.cell += len;
                         }
@@ -472,6 +486,7 @@ impl GridLinks {
                         id,
                         at: i + 1,
                         cell: len,
+                        quiet: false,
                     });
                 }
                 Event::Stray => {
@@ -481,6 +496,11 @@ impl GridLinks {
                     out.extend_from_slice(&input[flushed..(i + 1).saturating_sub(4).max(flushed)]);
                     flushed = i + 1;
                 }
+                Event::Quiet => {
+                    if let Some(o) = owed.as_mut() {
+                        o.quiet = true;
+                    }
+                }
                 Event::Other => settle(&mut out, &mut flushed, owed.take()),
             }
             if self.scan.starved.is_some() {
@@ -489,9 +509,9 @@ impl GridLinks {
             }
         }
         let consumed = used - skip;
-        // An owed mark has seen no event since its `at`, so the bytes after
-        // it are at most a partial code point when they are this few.
-        if let Some(o) = owed.take_if(|o| used == input.len() && used - o.at < 4) {
+        // An owed mark has seen no other event since its `at`, so the bytes
+        // after it are at most a partial code point when they are this few.
+        if let Some(o) = owed.take_if(|o| !o.quiet && used == input.len() && used - o.at < 4) {
             self.held = input[o.at..used].to_vec();
             used = o.at;
             self.owed = Some(Owed { at: 0, ..o });

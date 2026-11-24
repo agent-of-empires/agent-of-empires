@@ -4123,32 +4123,47 @@ mod tests {
     #[test]
     fn a_link_never_costs_its_cell_text() {
         let url = "https://example.com/cell";
-        // (text, whether its first cell still has room for the link)
+        let six = "\u{301}".repeat(6);
+        let ten = "\u{301}".repeat(10);
+        // (linked input, the same text unlinked, whether its first cell still
+        // has room for the link); each ends on a linked `x`.
         let cases = [
-            ("\u{845b}\u{E0101}", true),
-            ("e\u{301}", true),
             (
-                concat!(
-                    "e",
-                    "\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}"
-                ),
-                false,
+                osc8(url, "\u{845b}\u{E0101}x"),
+                "\u{845b}\u{E0101}x".to_string(),
+                true,
+            ),
+            (osc8(url, "e\u{301}x"), "e\u{301}x".to_string(), true),
+            (osc8(url, &format!("e{ten}x")), format!("e{ten}x"), false),
+            // Escapes that leave the cursor put, so the marks wait for the accents.
+            (
+                osc8(url, &format!("e\x1b[31m{six}x")),
+                format!("e\x1b[31m{six}x"),
+                true,
+            ),
+            (
+                format!("{}{six}{}", osc8(url, "e"), osc8(url, "x")),
+                format!("e{six}x"),
+                true,
             ),
         ];
-        for (text, linked_cell) in cases {
+        for (linked_input, plain_input, linked_cell) in cases {
             let mut plain = new_parser(2, 20, 0);
-            feed(&mut plain, format!("{text}x").as_bytes());
+            feed(&mut plain, plain_input.as_bytes());
             let mut linked = new_parser(2, 20, 0);
-            feed(&mut linked, osc8(url, &format!("{text}x")).as_bytes());
+            feed(&mut linked, linked_input.as_bytes());
             let shown = |grid: &Grid| crate::tmux::utils::strip_ansi(&row_to_ansi(grid, 0, 20));
-            assert_eq!(shown(&linked), shown(&plain), "{text:?}");
+            assert_eq!(shown(&linked), shown(&plain), "{plain_input:?}");
             let first =
                 crate::tmux::osc8::split_cell(linked.screen().cell(0, 0).unwrap().contents());
-            assert_eq!(first.1.is_some(), linked_cell, "{text:?}");
+            assert_eq!(first.1.is_some(), linked_cell, "{plain_input:?}");
             let x = plain.screen().cursor_position().1 - 1;
             let last =
                 crate::tmux::osc8::split_cell(linked.screen().cell(0, x).unwrap().contents());
-            assert!(last.1.is_some(), "{text:?}: the next cell keeps its link");
+            assert!(
+                last.1.is_some(),
+                "{plain_input:?}: the next cell keeps its link"
+            );
         }
     }
 
