@@ -64,6 +64,9 @@ the failures left after step 5: regression, then flake, then infra.
   same workflow, or an open issue already tracks it.
 - **regression**: the failure repeats across attempts or later commits, and
   the commit range below touches the failing test or the code it exercises.
+  A build, lint or other code step that fails with no test failing, for
+  example a compile error, is also a regression; treat its error's file as
+  the code under test.
 
 ## 4. Find the culprit commit
 
