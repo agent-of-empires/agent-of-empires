@@ -71,16 +71,19 @@ fn daemon_status_clears_a_stale_error_message() {
     // Canonical last_error replaces stale pane diagnostics.
     let mut env = create_test_env_empty();
     let id = structured_row(&mut env, Status::Error);
-    env.view.mutate_instance(&id, |inst| {
-        inst.last_error = Some("Container is not running".to_string())
-    });
+    env.view
+        .mutate_instance(&id, |inst| inst.last_error.set("Container is not running"));
 
     env.view
         .apply_daemon_status_update(&update(&env.view, &id, Status::Idle));
 
     let inst = env.view.get_instance(&id).expect("row still present");
     assert_eq!(inst.status, Status::Idle);
-    assert_eq!(inst.last_error, None, "the phantom container error is gone");
+    assert_eq!(
+        inst.last_error.as_deref(),
+        None,
+        "the phantom container error is gone"
+    );
 }
 
 #[test]
@@ -911,8 +914,9 @@ fn terminal_rows_take_status_and_observations_from_the_daemon_only() {
     env.view.mutate_instance(&id, |instance| {
         instance.view = crate::session::View::Terminal;
         instance.status = Status::Running;
-        instance.last_error =
-            Some("tmux session is gone. The agent process may have exited or been killed.".into());
+        instance
+            .last_error
+            .set("tmux session is gone. The agent process may have exited or been killed.");
         instance.pane_dead_observed = false;
         instance.agent_pane = PaneObservation::default();
         instance.auxiliary = vec![crate::session::AuxiliaryObservation {
@@ -947,7 +951,7 @@ fn terminal_rows_take_status_and_observations_from_the_daemon_only() {
     env.view.apply_session_feed();
     let instance = env.view.get_instance(&id).unwrap();
     assert_eq!(instance.status, Status::Idle);
-    assert_eq!(instance.last_error, None);
+    assert_eq!(instance.last_error.as_deref(), None);
     assert_eq!(instance.agent_pane.state, PanePresence::Alive);
     assert_eq!(
         instance.auxiliary_presence(&AuxiliaryTarget::Host { index: 0 }),
@@ -1185,7 +1189,7 @@ fn daemon_status_reconciles_last_error_on_a_same_status_tick() {
         let mut env = create_test_env_empty();
         let id = structured_row(&mut env, status);
         env.view
-            .mutate_instance(&id, |inst| inst.last_error = Some(seeded.to_string()));
+            .mutate_instance(&id, |inst| inst.last_error.set(seeded));
 
         let mut u = update(&env.view, &id, status);
         u.last_error = incoming.map(str::to_string);
@@ -1194,7 +1198,7 @@ fn daemon_status_reconciles_last_error_on_a_same_status_tick() {
         assert_eq!(
             env.view
                 .get_instance(&id)
-                .and_then(|i| i.last_error.clone()),
+                .and_then(|i| i.last_error.as_deref().map(str::to_owned)),
             expected.map(str::to_string),
             "status={status:?} incoming={incoming:?}"
         );
@@ -1263,7 +1267,7 @@ fn terminal_status_converges_in_one_feed_apply_without_a_local_probe() {
     env.view.mutate_instance(&id, |instance| {
         instance.view = crate::session::View::Terminal;
         instance.status = Status::Running;
-        instance.last_error = Some("stale local probe error".into());
+        instance.last_error.set("stale local probe error");
         instance.pane_dead_observed = false;
         instance.agent_pane = PaneObservation {
             state: PanePresence::Alive,
@@ -1338,7 +1342,7 @@ fn daemon_stop_result_lands_stopped_without_a_local_write() {
     let id = env.view.instance_at(0).id.clone();
     env.view.mutate_instance(&id, |inst| {
         inst.status = Status::Running;
-        inst.last_error = Some("stale local probe error".into());
+        inst.last_error.set("stale local probe error");
     });
 
     let mut respond = env.view.session_feed.command_driver_for_test();
@@ -1355,7 +1359,7 @@ fn daemon_stop_result_lands_stopped_without_a_local_write() {
     assert_eq!(
         env.view
             .get_instance(&id)
-            .and_then(|inst| inst.last_error.clone()),
+            .and_then(|inst| inst.last_error.as_deref().map(str::to_owned)),
         Some("stale local probe error".to_string())
     );
     let submitted = respond(Ok(crate::daemon::RuntimeCursor {
@@ -1378,7 +1382,7 @@ fn daemon_stop_result_lands_stopped_without_a_local_write() {
     env.view.apply_daemon_status_update(&stopped);
     let inst = env.view.get_instance(&id).expect("row still present");
     assert_eq!(inst.status, Status::Stopped);
-    assert_eq!(inst.last_error, None);
+    assert_eq!(inst.last_error.as_deref(), None);
 }
 
 /// A refused stop submit fails loudly with reconnect guidance and leaves the
@@ -1390,7 +1394,7 @@ fn daemon_unreachable_stop_fails_without_a_local_write() {
     let id = env.view.instance_at(0).id.clone();
     env.view.mutate_instance(&id, |inst| {
         inst.status = Status::Running;
-        inst.last_error = Some("stale local probe error".into());
+        inst.last_error.set("stale local probe error");
     });
 
     // No command driver: the feed has no runtime, so the submit refuses.

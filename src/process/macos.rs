@@ -85,6 +85,28 @@ pub(super) fn prove_staging_host_mount_absent(mount: &std::path::Path) -> anyhow
     Ok(())
 }
 
+pub(super) fn prove_same_mount(
+    parent: std::os::fd::BorrowedFd<'_>,
+    child: std::os::fd::BorrowedFd<'_>,
+) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let mount = |fd: std::os::fd::BorrowedFd<'_>| -> anyhow::Result<_> {
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: fd is borrowed and stat points to writable storage.
+        if unsafe { libc::fstatfs(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("inspecting host mount");
+        }
+        // SAFETY: successful fstatfs initialized stat.
+        let stat = unsafe { stat.assume_init() };
+        Ok((stat.f_mntonname, stat.f_mntfromname))
+    };
+    anyhow::ensure!(
+        mount(parent)? == mount(child)?,
+        "operation crosses a host mount"
+    );
+    Ok(())
+}
+
 impl StagingVolume {
     #[cfg(test)]
     pub(super) fn create(private_mount_path: &std::path::Path, limit: u64) -> anyhow::Result<Self> {

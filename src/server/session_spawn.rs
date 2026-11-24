@@ -8,6 +8,23 @@ use anyhow::Context;
 
 use super::session_service::SessionService;
 
+/// The Agent a structured spawn of `instance` reads its defaults and pin under, with the
+/// config it reads them from. `GET /api/sessions/{id}/acp-default-model` answers with this too.
+pub(crate) fn spawn_defaults_agent(instance: &Instance) -> (String, crate::session::Config) {
+    let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+        &instance.source_profile,
+        instance.repo_config_path(),
+    );
+    let key = crate::acp::pick_acp_agent_name(
+        &crate::acp::AgentRegistry::with_defaults(),
+        &config.session,
+        &config.acp,
+        &instance.tool,
+        instance.agent_name.as_deref(),
+    );
+    (key, config)
+}
+
 /// Validated creation inputs shared by HTTP and plugin callers.
 pub(crate) struct StructuredSessionSpec {
     pub title: Option<String>,
@@ -473,20 +490,8 @@ pub(crate) async fn spawn_structured_session(
         let created_workspace_worktrees = build_result.created_workspace_worktrees;
         let mut validation_error = None;
         let agent_effort = if provision_error.is_none() {
-            let resolved_config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
-                &instance.source_profile,
-                instance.repo_config_path(),
-            );
+            let (agent_key, resolved_config) = spawn_defaults_agent(&instance);
             let acp_registry = crate::acp::AgentRegistry::with_defaults();
-            // The defaults, and the pin, are keyed by the agent the spawn
-            // runs, resolved the way the supervisor resolves it.
-            let agent_key = crate::acp::pick_acp_agent_name(
-                &acp_registry,
-                &resolved_config.session,
-                &resolved_config.acp,
-                &instance.tool,
-                instance.agent_name.as_deref(),
-            );
             let defaults = resolved_config.acp.acp_defaults_for(&agent_key);
             // Preserve the explicit request model separately (trimmed to match the
             // resolver's normalization) so a terminal fallback below can keep it while

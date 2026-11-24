@@ -333,6 +333,7 @@ fn prune_unused_session_locks(state: &AppState, id: &str) {
     }
     drop(locks);
     state.session_service.forget_prompt_lock_blocking(id);
+    state.session_service.forget_delivered_prompts(id);
 }
 
 pub(super) async fn finish_structured_purge(
