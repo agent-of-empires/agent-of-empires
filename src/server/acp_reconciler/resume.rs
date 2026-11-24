@@ -778,10 +778,15 @@ mod tests {
         };
         state.acp_event_store.record(&id, 1, &stopped()).unwrap();
         state.acp_supervisor.hydrate_seqs([(id.clone(), 1)]);
-        crate::server::acp_events::RetryStartingGuard::begin(&state, &id, 0)
-            .await
-            .expect("an Error row starts")
-            .disarm();
+        crate::server::acp_events::RetryStartingGuard::begin(
+            &state,
+            &id,
+            crate::server::acp_events::RetryOrigin::Error,
+            0,
+        )
+        .await
+        .expect("an Error row starts")
+        .disarm();
         state.acp_event_store.record(&id, 2, &stopped()).unwrap();
         seed_in_flight_status(&state, &id).await;
         assert_ne!(

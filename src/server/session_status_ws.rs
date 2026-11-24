@@ -58,7 +58,9 @@ impl Dwells {
     }
 
     fn on_change(&mut self, change: &StatusChange, now: Instant) {
-        if !(change.new == Status::Error && change.rearms_error()) {
+        if change.resumes_a_stop() {
+            self.0.remove(&change.instance_id);
+        } else if !(change.new == Status::Error && change.rearms_error()) {
             self.track(&change.instance_id, change.new, now);
         }
     }
@@ -248,6 +250,26 @@ mod tests {
             at: Timestamp::now(),
             restores_prior: false,
         }
+    }
+
+    /// #5977: a resumed stop's Idle is no cue, however long the Retry's launch prepares.
+    #[test]
+    fn a_resumed_stop_cues_nothing() {
+        let t0 = Instant::now();
+        let mut dwells = Dwells::default();
+        for (id, old) in [("finished", Status::Running), ("resumed", Status::Stopped)] {
+            dwells.on_change(
+                &StatusChange {
+                    old,
+                    ..change(id, Status::Idle)
+                },
+                t0,
+            );
+        }
+        assert_eq!(
+            dwells.take_due(t0 + Duration::from_secs(60)),
+            vec![("finished".to_string(), NotificationEvent::Idle)]
+        );
     }
 
     #[test]

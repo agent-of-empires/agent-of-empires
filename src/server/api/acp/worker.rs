@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::acp::protocol::{
     SwitchAgentRequest, SwitchAgentResponse, SwitchProviderRequest, SwitchProviderResponse,
 };
-use crate::server::acp_events::RetryStartingGuard;
+use crate::server::acp_events::{RetryOrigin, RetryStartingGuard};
 use crate::server::acp_reconciler::install_rate_limit_continuation;
 use crate::server::api::find_instance;
 
@@ -160,6 +160,7 @@ pub async fn spawn_acp(
         }))).into_response();
     }
 
+    let origin = retry_origin(&instance);
     let instance =
         match crate::server::api::sessions::resume_structured_stop(&state, instance).await {
             Ok(instance) => instance,
@@ -264,13 +265,16 @@ pub async fn spawn_acp(
     // Past every refusal: only the launch itself can fail from here.
     let starting = match &reservation {
         Some(reservation) => {
-            RetryStartingGuard::begin(&state, &id, reservation.lease().epoch()).await
+            RetryStartingGuard::begin(&state, &id, origin, reservation.lease().epoch()).await
         }
         None => None,
     };
     drop(exclusion);
     if let Some(reservation) = reservation {
         if let Err(e) = state.acp_supervisor.spawn_inner(request, reservation).await {
+            if let Some(starting) = starting {
+                starting.fail(&agent, &e);
+            }
             return supervisor_error_response("spawn failed", &e);
         }
     }
@@ -581,6 +585,7 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
         )
             .into_response();
     }
+    let origin = retry_origin(&instance);
     let instance =
         match crate::server::api::sessions::resume_structured_stop(&state, instance).await {
             Ok(instance) => instance,
@@ -652,7 +657,8 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
     };
     // Past every refusal, capacity included, and after resume_structured_stop read the row's
     // `Stopped`.
-    let starting = RetryStartingGuard::begin(&state, &id, reservation.lease().epoch()).await;
+    let starting =
+        RetryStartingGuard::begin(&state, &id, origin, reservation.lease().epoch()).await;
     drop(exclusion);
     match state.acp_supervisor.spawn_inner(request, reservation).await {
         Ok(()) => {
@@ -666,7 +672,21 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
             })
             .into_response()
         }
-        Err(e) => supervisor_error_response("restart spawn failed", &e),
+        Err(e) => {
+            if let Some(starting) = starting {
+                starting.fail(&agent, &e);
+            }
+            supervisor_error_response("restart spawn failed", &e)
+        }
+    }
+}
+
+/// A dormant `Idle` row is resumed too, but is not a Retry from `Stopped`.
+fn retry_origin(instance: &crate::session::Instance) -> RetryOrigin {
+    if instance.status == crate::session::Status::Stopped {
+        RetryOrigin::ResumedStop
+    } else {
+        RetryOrigin::Error
     }
 }
 

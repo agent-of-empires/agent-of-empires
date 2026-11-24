@@ -618,27 +618,34 @@ mod tests {
         }
     }
 
-    /// #5921: a Retry from a Stopped row shows Idle, not Starting, through either handler:
-    /// `resume_structured_stop` resumes it before `RetryStartingGuard::begin`, which admits only
-    /// Error. A Starting glyph here is #5977.
+    /// #5977: a Retry from a Stopped row shows `Starting` through either handler, and its failed
+    /// launch lands in the log as the Agent's startup error: the row ends `Error`, boot's fold
+    /// says so, and it notifies once. A dormant `Idle` row's Retry shows no `Starting`.
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_retry_from_stopped_shows_idle_through_the_handlers() {
-        use crate::session::Status;
+    async fn a_failed_retry_from_stopped_shows_starting_then_errors_through_the_handlers() {
+        use crate::session::Status::{Error, Idle, Starting, Stopped};
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let project = tempfile::tempdir().unwrap();
         let mut got = Vec::new();
-        for endpoint in ["spawn", "restart"] {
-            let id = format!("sess-5921-stopped-{endpoint}");
+        for (endpoint, dormant) in [("spawn", false), ("restart", false), ("spawn", true)] {
+            let id = format!("sess-5977-{endpoint}-{dormant}");
             let state = errored_retry_state(project.path(), &id).await;
             {
                 let mut rows = state.instances.write().await;
-                rows[0].status = Status::Stopped;
+                if dormant {
+                    rows[0].status = Idle;
+                    rows[0].idle_dormant_since = Some(crate::time::Timestamp::now());
+                } else {
+                    rows[0].status = Stopped;
+                }
                 crate::server::test_support::seed_instances_on_disk_for_test(
                     "default",
                     rows.clone(),
                 );
             }
+            let listener =
+                tokio::spawn(crate::server::acp_events::acp_event_listener(state.clone()));
             let mut changes = state.status_tx.subscribe();
             let _ = if endpoint == "spawn" {
                 spawn_acp(State(state.clone()), Path(id.clone()), retry_request())
@@ -650,18 +657,65 @@ mod tests {
                     .into_response()
             };
             let mut sent = Vec::new();
-            while let Ok(change) = changes.try_recv() {
-                sent.push((change.old, change.new));
+            if !dormant {
+                loop {
+                    let change =
+                        tokio::time::timeout(std::time::Duration::from_secs(10), changes.recv())
+                            .await
+                            .expect("a status change")
+                            .expect("status channel open");
+                    let error = change.new == Error;
+                    sent.push(change);
+                    if error {
+                        break;
+                    }
+                }
             }
-            got.push((endpoint, sent, state.instances.read().await[0].status));
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                state.runtime.work.drain(),
+            )
+            .await
+            .expect("the rollback finishes");
+            while let Ok(change) = changes.try_recv() {
+                sent.push(change);
+            }
+            listener.abort();
+            let failures: Vec<_> = state
+                .acp_event_store
+                .replay_from(&id, 0)
+                .into_iter()
+                .filter_map(|(_, event)| match event {
+                    crate::acp::Event::AgentStartupError { message, .. } => Some(message),
+                    _ => None,
+                })
+                .collect();
+            got.push((
+                endpoint,
+                dormant,
+                sent.iter().map(|c| (c.old, c.new)).collect::<Vec<_>>(),
+                state.instances.read().await[0].status,
+                crate::server::acp_events::folded_sidebar_status(&state.session_service, &id).await,
+                failures
+                    .iter()
+                    .map(|m| m.starts_with("Failed to start structured view agent \"codex\""))
+                    .collect::<Vec<_>>(),
+                crate::server::push::pushes_for_test(sent),
+            ));
         }
+        let failed = vec![(Stopped, Idle), (Idle, Starting), (Starting, Error)];
         let want = [
-            ("spawn", vec![(Status::Stopped, Status::Idle)], Status::Idle),
             (
-                "restart",
-                vec![(Status::Stopped, Status::Idle)],
-                Status::Idle,
+                "spawn",
+                false,
+                failed.clone(),
+                Error,
+                Some(Error),
+                vec![true],
+                1,
             ),
+            ("restart", false, failed, Error, Some(Error), vec![true], 1),
+            ("spawn", true, vec![], Idle, None, vec![], 0),
         ];
         assert_eq!(got, want);
     }
