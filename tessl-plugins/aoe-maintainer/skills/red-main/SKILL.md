@@ -95,10 +95,11 @@ the failures left after step 5: regression, then flake, then infra.
   `tessl finding list --project $PROJECT --tag red-main --json`, following
   `--after` cursors, and keep those open or in progress. Drop each failure
   one of them already covers: the same test with the same class, or for a
-  failure with no test, the same commit. A flake finding does not cover a
-  regression in the same test. If none remain, do not create a finding; end with their
-  ids. Otherwise the finding covers only the remaining failures, takes its
-  class from them, and cites those ids in `analysis`.
+  failure with no test, the same commit, workflow, job, failing step and
+  class. A finding of another class covers neither. If none remain, do not
+  create a finding; end with their ids. Otherwise the finding covers only
+  the remaining failures, takes its class from them, and cites those ids in
+  `analysis`.
 
 ## 6. Record one finding
 
@@ -108,8 +109,8 @@ run `tessl finding create --project $PROJECT --file finding.json`.
 ```json
 {
   "schemaVersion": 1,
-  "title": "red main: <class> in <test or job> at <short sha>",
-  "analysis": "What failed, where, the class, and the evidence for it.",
+  "title": "red main: <class> in <test, or workflow/job/step> at <short sha>",
+  "analysis": "Each failure (its test, or its workflow, job and step), its class, and the evidence.",
   "recommendation": "The next step for a maintainer.",
   "expectedImprovement": "What changes on main once it is done.",
   "tags": ["red-main", "<infra|flake|regression>"],
