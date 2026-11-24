@@ -184,6 +184,7 @@ export function DashboardSuggestions({
           onUndo={() => void dismiss(undo, false)}
           stopLabel={kindOf(undo)}
           onStop={() => stop(undo)}
+          onResume={() => stop(undo, true)}
         />
       )}
     </section>

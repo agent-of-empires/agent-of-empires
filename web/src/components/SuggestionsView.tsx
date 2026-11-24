@@ -482,6 +482,7 @@ export function SuggestionsView({
                   ?.sources.find((src) => src.criterion === undo.criterion)
                   ?.label.toLowerCase()}
                 onStop={() => stop(undo)}
+                onResume={() => stop(undo, true)}
               />
             )}
           </>

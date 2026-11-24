@@ -368,6 +368,7 @@ export function UndoBar({
   disabled,
   onUndo,
   onStop,
+  onResume,
   stopLabel,
 }: {
   title: string;
@@ -375,13 +376,31 @@ export function UndoBar({
   onUndo: () => void;
   /** Resolves true once the kind is off. */
   onStop?: () => Promise<boolean>;
+  /** Undoes Stop; resolves true once the kind is back on. */
+  onResume?: () => Promise<boolean>;
   stopLabel?: string;
 }) {
   const [stopped, setStopped] = useState(false);
   return (
     <div className="mt-2 flex w-max max-w-full flex-wrap items-baseline gap-x-1 rounded-md bg-surface-800 px-3 py-1.5 text-[13px] text-text-secondary">
       {stopped ? (
-        <span>Stopped suggesting {stopLabel}. Turn it back on in Settings › Suggestions.</span>
+        <>
+          <span>Stopped suggesting {stopLabel}.</span>
+          {onResume && (
+            <>
+              <button
+                type="button"
+                onClick={() => void onResume().then((ok) => setStopped(!ok))}
+                disabled={disabled}
+                className="flex-none cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
+              >
+                Undo
+              </button>
+              <span aria-hidden="true">·</span>
+            </>
+          )}
+          <span>Turn it back on in Settings › Suggestions.</span>
+        </>
       ) : (
         <>
           <span className="max-w-full truncate">Dismissed &ldquo;{title}&rdquo;.</span>

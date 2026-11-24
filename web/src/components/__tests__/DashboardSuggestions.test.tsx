@@ -169,7 +169,7 @@ describe("DashboardSuggestions", () => {
     await waitFor(() => expect(screen.queryByText(/Dismissed/)).toBeNull());
   });
 
-  it("Stop suggesting turns the item's kind off, then says where to turn it back on", async () => {
+  it("Stop suggesting turns the item's kind off, says where to turn it back on, and can be undone", async () => {
     const withKind = (items: SuggestionItem[]): SuggestionsSnapshot => ({
       items,
       prefs: PREFS,
@@ -192,10 +192,13 @@ describe("DashboardSuggestions", () => {
     expect(screen.queryByText(/Settings › Suggestions/)).toBeNull();
     fireEvent.click(await screen.findByRole("button", { name: "Stop suggesting assigned issues" }));
     await waitFor(() => expect(updateSuggestionSource).toHaveBeenCalledWith("github", "assigned", false));
-    expect(
-      await screen.findByText("Stopped suggesting assigned issues. Turn it back on in Settings › Suggestions."),
-    ).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
+    expect((await screen.findByText(/^Stopped suggesting assigned issues\./)).closest("div")!.textContent).toBe(
+      "Stopped suggesting assigned issues.Undo·Turn it back on in Settings › Suggestions.",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    await waitFor(() => expect(updateSuggestionSource).toHaveBeenLastCalledWith("github", "assigned", true));
+    expect(await screen.findByRole("button", { name: "Stop suggesting assigned issues" })).toBeTruthy();
+    expect(screen.getByText(/Dismissed/)).toBeTruthy();
   });
 
   it("a failed Stop keeps the undo bar, and a new dismiss starts a fresh bar", async () => {

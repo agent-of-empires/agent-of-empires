@@ -316,8 +316,8 @@ export function useDismissUndo(act: (key: string, run: () => Promise<SuggestionR
       setUndo(null);
     }
   };
-  // Turns the item's kind off; the bar then says where to turn it back on.
-  const stop = (item: SuggestionItem) =>
-    act(`stop:${suggestionKey(item)}`, () => updateSuggestionSource(item.provider_id, item.criterion, false));
+  // Turns the item's kind off, or back on for the bar's Undo.
+  const stop = (item: SuggestionItem, enabled = false) =>
+    act(`stop:${suggestionKey(item)}`, () => updateSuggestionSource(item.provider_id, item.criterion, enabled));
   return { undo, dismiss, stop };
 }
