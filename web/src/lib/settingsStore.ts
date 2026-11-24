@@ -26,7 +26,8 @@ interface Unconfirmed {
 /** Resends of an unconfirmed edit before it is left unresolved, still on screen, for the user to settle. */
 const MAX_ATTEMPTS = 3;
 const CONFIRM_ERROR = "Could not confirm";
-const UNCERTAIN_ERROR = `${CONFIRM_ERROR} the save, please check the value`;
+export const UNCERTAIN_ERROR = `${CONFIRM_ERROR} the save, please check the value`;
+export const REJECTED_ERROR = "Failed to save, please try again";
 const PLUGIN_PREFIX = "plugin:";
 
 /** Plugin settings live under `plugins.<id>.settings` rather than a section of their own. */
@@ -271,12 +272,7 @@ export async function saveField(
   if (outcome === "uncertain" && e.fieldGen.get(key) === fieldGen) {
     e.unconfirmed.set(key, { section, field, value, send, attempts: attempts + 1, onConfirmed });
   }
-  const error =
-    outcome === "rejected"
-      ? "Failed to save, please try again"
-      : outcome === "uncertain"
-        ? UNCERTAIN_ERROR
-        : e.view.error;
+  const error = outcome === "rejected" ? REJECTED_ERROR : outcome === "uncertain" ? UNCERTAIN_ERROR : e.view.error;
   publish(e, { error });
   if (e.pending === 0) {
     if (e.needsReconcile) void loadSettings(profile);

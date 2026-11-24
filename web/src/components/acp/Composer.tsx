@@ -49,7 +49,7 @@ import {
   insertSlashCommand,
   IOS_ACCESSORY_BAR_PX,
 } from "./composerInput";
-import { SessionConfigControls } from "./SessionConfigControls";
+import { SessionConfigControls, type ModelDefaultTarget } from "./SessionConfigControls";
 import { SwitchAgentModal } from "./SwitchAgentModal";
 import {
   useAttachments,
@@ -78,6 +78,8 @@ interface Props {
   configOptions: AcpState["configOptions"];
   pendingConfigOption: AcpState["pendingConfigOption"];
   setConfigOption: (configId: string, value: string) => void | Promise<void>;
+  /** Offers the picked model as the Agent's default; absent where Settings can't be written. */
+  modelDefault?: ModelDefaultTarget | null;
   sessionUsage: AcpState["sessionUsage"];
   authStatus: AcpState["authStatus"];
   /** Feeds the Not logged in label's sign-in steps and actions. */
@@ -380,6 +382,7 @@ export function Composer(props: Props) {
                   providerPending={provider.pending}
                   onSetProvider={provider.set}
                   providerLockedReason={turnActive ? "Switch providers once the turn finishes" : null}
+                  modelDefault={props.modelDefault}
                 />
                 <AuthStatusHint authStatus={props.authStatus} signIn={props.signIn} />
                 {/* Last in the wrapping cluster: on a narrow footer it takes its own row instead of pushing Stop and Send off screen. */}

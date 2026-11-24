@@ -119,6 +119,7 @@ import {
 import type { DeleteSessionOptions, RuntimeCursor, ServerAbout, SettingsResponse } from "./lib/api";
 import { reportFeatureUse, type FeatureUse } from "./lib/featureUse";
 import { autoResumeSettingsHref } from "./lib/autoResumeSettingsHref";
+import { agentDefaultsHref } from "./lib/agentModelDefault";
 import { getClientCapabilities } from "./lib/clientCapabilities";
 import { onServerDownChange } from "./lib/connectionState";
 import { createAboutRequests } from "./lib/aboutRequests";
@@ -2106,13 +2107,11 @@ function AppContent({
     onExitFocusMode: exitFocusMode,
   });
 
-  const openSettingsTab = useCallback(
-    (tab: string) =>
-      focusNavigation(focusSessionId) === "new-window"
-        ? window.open(`/settings/${tab}`, "_blank")
-        : navigate(`/settings/${tab}`),
+  const openSettings = useCallback(
+    (href: string) => (focusNavigation(focusSessionId) === "new-window" ? window.open(href, "_blank") : navigate(href)),
     [navigate, focusSessionId],
   );
+  const openSettingsTab = useCallback((tab: string) => openSettings(`/settings/${tab}`), [openSettings]);
   const settingsCommands = useSettingsCommands({
     open: showPalette,
     readOnly: caps.readOnly,
@@ -2226,6 +2225,8 @@ function AppContent({
                           rateLimitAutoResume={session.rate_limit_auto_resume}
                           rateLimitFailoverTo={session.rate_limit_failover_to}
                           settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
+                          agentDefaultsHref={agentDefaultsHref(session.profile, serverAbout)}
+                          onOpenSettings={openSettings}
                           tool={session.tool}
                           acpAgent={session.acp_agent ?? null}
                           startedBefore={hasStartedBefore(session)}
@@ -2536,6 +2537,7 @@ function AppContent({
           onCloseSendDialog={() => setSendDialogOpen(false)}
           onClearSelectedFile={handleCloseFile}
           serverAbout={serverAbout}
+          onOpenSettings={openSettings}
         />
       );
     }

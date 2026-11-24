@@ -1252,6 +1252,44 @@ export function updateSettings(updates: Record<string, unknown>, profile?: strin
   return announceOutcome(sendSave(`/api/settings${params}`, jsonInit("PATCH", updates)));
 }
 
+/** An Agent's default model for new Structured view Sessions in a profile, as the Daemon resolves it. */
+export interface AgentModelDefault {
+  profile: string;
+  /** The `acp_defaults` key it reads from: `claude` for a legacy `claude-code` Session. */
+  agent_key: string;
+  /** Null when the Agent picks its own. */
+  model: string | null;
+  pinned: boolean;
+}
+
+const agentModelUrl = (profile: string, agent: string) =>
+  `/api/profiles/${encodeURIComponent(profile)}/acp-defaults/${encodeURIComponent(agent)}/model`;
+
+/** The default a Session's next Structured view spawn reads, under the profile and Agent key the Daemon resolves for it. */
+export function fetchSessionModelDefault(sessionId: string): Promise<AgentModelDefault | null> {
+  return fetchJson<AgentModelDefault>(`/api/sessions/${encodeURIComponent(sessionId)}/acp-default-model`);
+}
+
+/** Chains the PUTs so an earlier save still in flight can't land after, and overwrite, a later one. */
+let agentModelSaves: Promise<unknown> = Promise.resolve();
+
+/** Sets only `agent`'s default model in `profile`. `pinned`: the profile's resolved settings pin it, so nothing changed. */
+export async function putAgentModelDefault(
+  profile: string,
+  agent: string,
+  model: string,
+): Promise<SaveOutcome | "pinned"> {
+  const request = agentModelSaves.then(() =>
+    send(agentModelUrl(profile, agent), jsonInit("PUT", { model })).catch(() => null),
+  );
+  agentModelSaves = request;
+  const reply = await request;
+  if (reply?.status === 409 && stringField(reply.payload, "error") === "model_pinned") return "pinned";
+  const outcome = reply ? saveOutcome(reply) : "uncertain";
+  if (outcome !== "rejected") notifySettingsChanged();
+  return outcome;
+}
+
 /** Set the machine-wide value of every field in `updates`, for editors that
  *  set the value a profile inherits. */
 export function updateMachineSettings(updates: Record<string, unknown>): Promise<SaveOutcome> {
