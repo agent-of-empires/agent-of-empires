@@ -26,6 +26,7 @@ export HOME="$B/home" AOE_TMUX_SOCKET="$B/tmux.sock"
 export XDG_CONFIG_HOME="$B/home/.config" XDG_DATA_HOME="$B/home/.local/share" \
   XDG_STATE_HOME="$B/home/.local/state" XDG_CACHE_HOME="$B/home/.cache"
 IDS=()
+SERVE_PID=  # never inherit the caller's value
 cleanup() {
   [ -n "${SERVE_PID:-}" ] && kill "$SERVE_PID" 2>/dev/null || true
   "$REAL_TMUX" -S "$B/tmux.sock" kill-server 2>/dev/null || true
