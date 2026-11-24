@@ -160,12 +160,11 @@ pub(crate) fn relink_continuations(
     *body = splice_rows(&rows, &wanted, &fresh, body.ends_with(b"\n"));
 }
 
-/// `rows` with each `at` row replaced by its `fresh` twin when the two show
-/// the same text and the twin opens on the last target an earlier row named,
-/// so a label repainted between the captures keeps its old row. That target
-/// passes over rows naming none, a continuation left unread included. A row
-/// capture opens from default attributes, so a reset first drops whatever the
-/// previous row left set.
+/// `rows` with each `at` row's leading unlinked run linked as its `fresh`
+/// twin links it, when the two show the same text and the twin opens on the
+/// last target an earlier row named, so a label repainted between the
+/// captures keeps its old row. That target passes over rows naming none, a
+/// continuation left unread included. The row's own links stay as captured.
 fn splice_rows(rows: &[&[u8]], at: &[usize], fresh: &[&[u8]], terminated: bool) -> Vec<u8> {
     let plain = |row: &[u8]| crate::tmux::utils::strip_ansi(&String::from_utf8_lossy(row));
     let links = |row: &[u8]| crate::tmux::osc8::row_links(&String::from_utf8_lossy(row));
@@ -175,19 +174,22 @@ fn splice_rows(rows: &[&[u8]], at: &[usize], fresh: &[&[u8]], terminated: bool) 
         if i > 0 {
             out.push(b'\n');
         }
-        let twin = at
+        let relinked = at
             .binary_search(&i)
             .ok()
             .map(|n| fresh[n])
             .filter(|twin| plain(twin).trim_end() == plain(row).trim_end())
-            .filter(|twin| links(twin).first().map(|l| &l.uri) == carried.as_ref());
-        let kept = match twin {
-            Some(twin) => {
-                out.extend_from_slice(b"\x1b[0m");
-                twin
-            }
-            None => row,
-        };
+            .and_then(|twin| links(twin).into_iter().next())
+            .filter(|link| Some(&link.uri) == carried.as_ref())
+            .and_then(|link| {
+                let end = link.start + link.text.chars().count();
+                links(row)
+                    .first()
+                    .is_none_or(|own| own.start >= end)
+                    .then(|| link_columns(row, link.start, end, &link.uri))
+                    .flatten()
+            });
+        let kept = relinked.as_deref().unwrap_or(row);
         out.extend_from_slice(kept);
         if let Some(link) = crate::tmux::osc8::has_hyperlink(kept)
             .then(|| links(kept).pop())
@@ -200,6 +202,53 @@ fn splice_rows(rows: &[&[u8]], at: &[usize], fresh: &[&[u8]], terminated: bool) 
         out.push(b'\n');
     }
     out
+}
+
+/// `row` with its text columns `start..end` (escapes not counted) wrapped in
+/// an OSC 8 run naming `uri`. `None` when the row has fewer columns.
+fn link_columns(row: &[u8], start: usize, end: usize, uri: &str) -> Option<Vec<u8>> {
+    // Each text char's byte range.
+    let mut chars = Vec::new();
+    let mut i = 0;
+    while i < row.len() {
+        match (row[i], row.get(i + 1)) {
+            (0x1b, Some(b'[')) => {
+                i += 2;
+                while row.get(i).is_some_and(|b| !b.is_ascii_alphabetic()) {
+                    i += 1;
+                }
+                i += 1;
+            }
+            (0x1b, Some(b']')) => {
+                i += 2;
+                while i < row.len() && row[i] != 0x07 && !row[i..].starts_with(b"\x1b\\") {
+                    i += 1;
+                }
+                i += if row.get(i) == Some(&0x07) { 1 } else { 2 };
+            }
+            (0x1b, _) => i += 2,
+            _ => {
+                let from = i;
+                i += 1;
+                while row.get(i).is_some_and(|b| b & 0xc0 == 0x80) {
+                    i += 1;
+                }
+                chars.push(from..i);
+            }
+        }
+    }
+    let from = chars.get(start)?.start;
+    let to = chars.get(end.checked_sub(1)?)?.end;
+    if from >= to {
+        return None;
+    }
+    let mut out = Vec::with_capacity(row.len() + uri.len() + 16);
+    out.extend_from_slice(&row[..from]);
+    out.extend_from_slice(format!("\x1b]8;;{uri}\x1b\\").as_bytes());
+    out.extend_from_slice(&row[from..to]);
+    out.extend_from_slice(b"\x1b]8;;\x1b\\");
+    out.extend_from_slice(&row[to..]);
+    Some(out)
 }
 
 #[cfg(test)]
@@ -326,11 +375,36 @@ mod tests {
         // target; row 3's text changed.
         let fresh = [a("nk"), b("cd"), a("yy")];
         let fresh: Vec<&[u8]> = fresh.iter().map(|r| r.as_bytes()).collect();
-        let want = format!("\x1b[1mab {}\n\x1b[0m{}\ncd\nzz\n", a("li"), a("nk"));
+        let want = format!("\x1b[1mab {}\n{}\ncd\nzz\n", a("li"), a("nk"));
         assert_eq!(
             String::from_utf8(splice_rows(&rows, &[1, 2, 3], &fresh, true)).unwrap(),
             want
         );
+    }
+
+    #[test]
+    fn a_reread_row_adds_only_its_continuation_to_the_links_it_had() {
+        let link = |uri: &str, text: &str| format!("\x1b]8;;{uri}\x1b\\{text}\x1b]8;;\x1b\\");
+        let (a, b, c) = ("https://e.co/a", "https://e.co/b", "https://e.co/c");
+        let rows = [link(a, "li"), format!("nk \x1b[31m{}", link(b, "go"))];
+        let rows: Vec<&[u8]> = rows.iter().map(|r| r.as_bytes()).collect();
+        // The captured second link stays whether the reread's matches it or
+        // names a target repainted since.
+        let want = format!(
+            "{}\n{} \x1b[31m{}",
+            link(a, "li"),
+            link(a, "nk"),
+            link(b, "go")
+        );
+        for second in [b, c] {
+            let fresh = format!("{} {}", link(a, "nk"), link(second, "go"));
+            let out = splice_rows(&rows, &[1], &[fresh.as_bytes()], false);
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                want,
+                "reread names {second}"
+            );
+        }
     }
 
     #[test]
@@ -351,7 +425,7 @@ mod tests {
         let out = String::from_utf8(splice_rows(&body, &at, &fresh, false)).unwrap();
         let out: Vec<&str> = out.split('\n').collect();
         for &i in &at {
-            assert_eq!(out[i], format!("\x1b[0m{}", a("x")), "row {i}");
+            assert_eq!(out[i], a("x"), "row {i}");
         }
     }
 
