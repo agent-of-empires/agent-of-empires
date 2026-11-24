@@ -947,6 +947,7 @@ async fn managed_resume_refusal_does_not_reflect_private_bodies() {
                     .unwrap_err()
             };
             let message = error.to_string();
+            assert_eq!(message, expected.message());
             assert!(!format!("{error:?}").contains("secret"));
             assert!(!message.contains("secret"), "{message}");
             if expected == ManagedResumeCause::WrapperContractRequired {
