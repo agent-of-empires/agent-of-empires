@@ -42,13 +42,10 @@ async function mockDefaults(
       return r.fulfill(put());
     },
   );
-  await page.route(
-    (url) => url.pathname === "/api/settings",
-    (r) => {
-      if (r.request().method() === "PATCH") patches.push(r.request().url());
-      return r.fallback();
-    },
-  );
+  // A listener, not a route: `mockAcpSession` registers its own `/api/settings` route later, which would answer first.
+  page.on("request", (req) => {
+    if (req.method() === "PATCH" && new URL(req.url()).pathname === "/api/settings") patches.push(req.url());
+  });
   return { saves, saveUrls, patches };
 }
 
