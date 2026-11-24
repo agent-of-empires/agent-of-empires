@@ -165,6 +165,19 @@ describe("SessionGroupModal", () => {
     expect(onSave).toHaveBeenCalledWith("wor");
   });
 
+  it("closes the open list while a save is in flight and keeps it closed after a failure", async () => {
+    vi.mocked(fetchGroups).mockResolvedValue([group("work"), group("play")]);
+    const { onSave, resolve } = pending();
+    setup("work", onSave);
+    await screen.findByRole("option", { name: /^play/ });
+    fireEvent.click(screen.getByRole("button", { name: "Remove from group" }));
+    expect(onSave).toHaveBeenCalledWith("");
+    expect(screen.queryByTestId("group-combobox-popup")).toBeNull();
+    resolve(false);
+    await waitFor(() => expect(errorText()).toBe("Failed to clear group."));
+    expect(screen.queryByTestId("group-combobox-popup")).toBeNull();
+  });
+
   it("Remove from group saves a blank group and is absent without one", async () => {
     const { onSave, onClose, unmount } = setup("work");
     fireEvent.click(screen.getByRole("button", { name: "Remove from group" }));

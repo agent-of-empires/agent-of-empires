@@ -115,6 +115,12 @@ export function GroupCombobox({
       document.getElementById(`${listId}-option-${active}`)?.scrollIntoView?.({ block: "nearest" });
   }, [open, active, listId, options.length, placement.maxHeight]);
   const noGroups = groups.length === 0;
+  // Disabling a focused input does not reliably fire blur, so close the list here.
+  const [wasDisabled, setWasDisabled] = useState(disabled);
+  if (disabled !== wasDisabled) {
+    setWasDisabled(disabled);
+    if (disabled) setOpen(false);
+  }
 
   useEffect(() => {
     if (!autoFocus) return;
@@ -173,7 +179,7 @@ export function GroupCombobox({
         }}
         className={ROW_INPUT}
       />
-      {open && (
+      {open && !disabled && (
         <div
           data-testid="group-combobox-popup"
           style={inline ? undefined : { maxHeight: placement.maxHeight }}
