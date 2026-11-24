@@ -40,7 +40,9 @@ issue whose newest finding, in any state, has the tag
 of a stale finding for step 3. Order them by priority label (`P0`, `P1`,
 `P2`, `P3`, none), then by most recently updated.
 
-Retire each open or in-progress finding whose issue is not in the list: read
+Retire each open or in-progress finding whose issue the step 1 query did
+not return (closed, or now carrying an excluded label). Leave a finding alone
+when its issue was dropped only because its assessment is current. To retire, read
 `gh issue view <n> -R $REPO --json state,labels` and run
 `tessl finding update <id> --file update.json` with `"state": "resolved"` if
 the issue now has `ready-for-agent` or `tessl`, otherwise `"state": "ignored"`
