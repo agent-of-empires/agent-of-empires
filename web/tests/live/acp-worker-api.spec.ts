@@ -184,6 +184,8 @@ test.describe("config options", () => {
     await picker.click();
     const box = page.getByRole("menuitemcheckbox", { name: "Default for new Claude Code Sessions in Structured view" });
     await expect(box).toHaveAttribute("aria-checked", "false");
+    // The default's read has answered, so the pin below lands after it.
+    await expect(box).not.toHaveAttribute("aria-disabled", "true");
     // Settings, in another tab, pins the Agent while this menu is open.
     const pin = { claude: { model: "claude-sonnet-4-6", pin_model: true } };
     expect2xx(
