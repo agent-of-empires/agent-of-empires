@@ -478,9 +478,10 @@ impl Instance {
                 if is_dead {
                     self.explain_error_from_pane(&session, metadata, true);
                 } else if self.last_error.is_none() {
-                    self.last_error.set(summarize_error_from_pane(
-                        &session.capture_pane(20).unwrap_or_default(),
-                    ));
+                    self.last_error
+                        .set(summarize_error_from_pane(&capture_for_status(
+                            &session, metadata, 20,
+                        )));
                 }
             } else {
                 self.last_error.clear();
