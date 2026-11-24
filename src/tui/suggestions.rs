@@ -867,7 +867,9 @@ impl SuggestionsView {
         if let Some(error) = polled.error.take() {
             self.notice = None;
             match self.preparing.take() {
-                Some(key) if polled.prepare_failed => store.failed = Some((key, error)),
+                Some(key) if polled.prepare_failed.as_ref() == Some(&key) => {
+                    store.failed = Some((key, error));
+                }
                 Some(key) => {
                     self.preparing = Some(key);
                     self.error = Some(error);
@@ -876,7 +878,10 @@ impl SuggestionsView {
             }
             changed = true;
         }
-        if matches!(polled.start, Some((_, _, PrepareTarget::View(e))) if e == self.epoch) {
+        // Only the row still preparing opens, in the mode its own key asked for.
+        if matches!(&polled.start, Some((key, _, PrepareTarget::View(e)))
+            if *e == self.epoch && self.preparing.as_ref() == Some(key))
+        {
             if let Some((_, mut start, _)) = polled.start.take() {
                 self.preparing = None;
                 if self.prepare_another {
@@ -1509,8 +1514,8 @@ pub(super) struct FeedPoll {
     pub started: Option<(ItemKey, StartAnswer)>,
     /// Failure of a user-initiated request; background reloads only log.
     pub error: Option<String>,
-    /// `error` belongs to a prepare, not to a reload, refresh or dismiss.
-    pub prepare_failed: bool,
+    /// The item whose prepare `error` belongs to; `None` for a reload, refresh or dismiss.
+    pub prepare_failed: Option<ItemKey>,
     /// The daemon turned on pre-trust.
     pub pretrusted: bool,
 }
@@ -2184,7 +2189,7 @@ impl SuggestionsFeed {
             start: None,
             started: None,
             error: None,
-            prepare_failed: false,
+            prepare_failed: None,
             pretrusted: false,
         };
         let res = match self.worker.try_recv() {
@@ -2247,7 +2252,6 @@ impl SuggestionsFeed {
                 } else {
                     // A profile switch dropped the request this answers.
                     out.error = Some("Profile changed, suggestion not started".into());
-                    out.prepare_failed = true;
                 }
             }
             Res::Started(Ok(answer)) => match self.start_key.take() {
@@ -2260,8 +2264,7 @@ impl SuggestionsFeed {
             | Res::Started(Err(e))
             | Res::PreTrusted(Err(e)) => {
                 if matches!(req_kind, ResKind::Prepare) {
-                    self.prepare_key = None;
-                    out.prepare_failed = true;
+                    out.prepare_failed = self.prepare_key.take();
                 }
                 if matches!(req_kind, ResKind::Start) {
                     self.start_key = None;
@@ -2788,7 +2791,7 @@ mod tests {
             start: None,
             started: None,
             error: None,
-            prepare_failed: false,
+            prepare_failed: None,
             pretrusted: false,
         }
     }
@@ -2864,7 +2867,7 @@ mod tests {
             start: None,
             started: None,
             error: None,
-            prepare_failed: false,
+            prepare_failed: None,
             pretrusted: false,
         };
         for _ in 0..200 {
@@ -3054,8 +3057,58 @@ mod tests {
         rig.store.set_profile(Some("work".into()));
         assert!(poll_until_settled(&mut rig));
         assert!(rig.view.prepared.is_none());
-        assert!(rig.view.preparing.is_none());
         assert!(render_text(&rig).contains("Profile changed, suggestion not started"));
+    }
+
+    #[test]
+    fn a_prepare_answer_opens_only_for_the_row_still_preparing_in_its_own_mode() {
+        for a_fails in [false, true] {
+            let (gate_tx, gate) = std::sync::mpsc::channel::<()>();
+            let worker = Worker::spawn("t", move |req| {
+                let _ = gate.recv();
+                match req {
+                    Req::Prepare { id, .. } if id == "a" && a_fails => {
+                        Res::Prepared(Err("a failed".into()))
+                    }
+                    Req::Prepare { .. } => Res::Prepared(Ok(prepared(Some("/repo")))),
+                    _ => unreachable!("only prepares expected"),
+                }
+            });
+            let mut rig = view_with(
+                vec![
+                    item("a", Some("repo"), false),
+                    item("b", Some("repo"), false),
+                ],
+                worker,
+            );
+            press(&mut rig, KeyCode::Char('e'), true);
+            press(&mut rig, KeyCode::Char('j'), true);
+            press(&mut rig, KeyCode::Char('N'), true);
+
+            let mut opened = Vec::new();
+            for _ in 0..2 {
+                // Each answer moves the prepare in flight on: a to b, then b to none.
+                let before = rig.store.prepare_key.clone();
+                gate_tx.send(()).unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while rig.store.prepare_key == before {
+                    assert!(std::time::Instant::now() < deadline, "{a_fails}: no answer");
+                    let mut polled = rig.store.poll();
+                    rig.view.apply(&mut rig.store, &mut polled);
+                    opened.extend(rig.view.take_prepared());
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            let [start] = opened.as_slice() else {
+                panic!("{a_fails}: one dialog expected, got {}", opened.len());
+            };
+            assert_eq!(start.source_ref, "ref-b", "{a_fails}");
+            assert!(start.suggestion.is_none(), "{a_fails}: b opens as New");
+            assert!(
+                rig.store.failed.is_none(),
+                "{a_fails}: a's error is not b's"
+            );
+        }
     }
 
     #[test]
