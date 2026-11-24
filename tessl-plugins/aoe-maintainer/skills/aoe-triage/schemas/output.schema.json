@@ -21,7 +21,7 @@
       "type": "boolean"
     },
     "projectFields": {
-      "description": "written: at least one board field was written. planned: the board was reachable and fields were needed, but DRY_RUN made no writes. failed: the board was reachable but every needed write failed with a non-permission error, recorded in each issue's error. unavailable: the token could not read or write the board, so only labels were set. not_needed: no worked issue needed a board field.",
+      "description": "written: at least one board field was written. planned: the board was reachable and fields were needed, but DRY_RUN made no writes. failed: the board was reachable but every needed write failed with a non-permission error or was skipped after an incomplete board read, recorded in each issue's error. unavailable: the token could not read or write the board, so only labels were set. not_needed: no worked issue needed a board field.",
       "type": "string",
       "enum": [
         "written",

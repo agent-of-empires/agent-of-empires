@@ -166,23 +166,29 @@ Thanks for the report. To work on it we need the steps to reproduce it, what you
   `docs/agents/issue-tracker.md`, section "Exhaustive issue inventories".
   Only a command that succeeds gives a complete list; if it fails, end the
   run `failed` rather than sweep part of the list.
-- One issue's board item and its single-select values:
+- Board ID: `gh project view 1 --owner agent-of-empires --format json --jq
+  .id`. A project number is unique only per owner, so match board items by
+  this ID.
+- One issue's board item and its single-select values, keeping the item
+  whose `project.id` is the board ID:
 
   ```sh
-  gh api graphql -F n=<n> -f query='query($n:Int!){repository(owner:"agent-of-empires",name:"agent-of-empires"){issue(number:$n){projectItems(first:10){nodes{id project{number} fieldValues(first:20){nodes{... on ProjectV2ItemFieldSingleSelectValue{name field{... on ProjectV2SingleSelectField{name}}}}}}}}}}'
+  gh api graphql -F n=<n> -f query='query($n:Int!){repository(owner:"agent-of-empires",name:"agent-of-empires"){issue(number:$n){projectItems(first:20){pageInfo{hasNextPage} nodes{id project{id} fieldValues(first:50){pageInfo{hasNextPage} nodes{... on ProjectV2ItemFieldSingleSelectValue{name field{... on ProjectV2SingleSelectField{name}}}}}}}}}}'
   ```
 
+  If any `hasNextPage` is true the read is incomplete. After an incomplete
+  read, write no board field for that issue and say so in its `error`.
 - Every board item (sweep): `gh project item-list 1 --owner agent-of-empires
   --format json --limit 3000`. Keys are lowercase (`status`, `priority`,
   `size`, `roadmap state`); keep items whose `content.repository` is
-  `agent-of-empires/agent-of-empires`.
-- Board writes: project ID from `gh project view 1 --owner agent-of-empires
-  --format json --jq .id`; field and option IDs by name from `gh project
+  `agent-of-empires/agent-of-empires`. If it returns 3000 items the list may
+  be cut off: treat the board read as incomplete for every issue.
+- Board writes: field and option IDs by name from `gh project
   field-list 1 --owner agent-of-empires --format json`; add a missing item
   with `gh project item-add 1 --owner agent-of-empires --url
   https://github.com/agent-of-empires/agent-of-empires/issues/<n> --format
   json --jq .id`; set each field with `gh project item-edit --id <item>
-  --project-id <project> --field-id <field> --single-select-option-id
+  --project-id <board ID> --field-id <field> --single-select-option-id
   <option>`.
 - Labels in one call: `gh issue edit <n> --repo
   agent-of-empires/agent-of-empires --add-label <label> ... --remove-label
