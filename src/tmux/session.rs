@@ -367,11 +367,17 @@ fn capture_pane_in_session(
     let Some(text) = capture_output(output.status.success(), &output.stdout) else {
         return Ok(None);
     };
-    let Some(rest) = text.strip_prefix(&format!("{nonce}:owns\n")) else {
-        return Ok(None);
-    };
+    // tmux lists a pane once per link to its window, so one or more ownership lines count.
+    let owns = format!("{nonce}:owns\n");
+    let mut rest = text.as_str();
+    let mut owned = false;
+    while let Some(next) = rest.strip_prefix(&owns) {
+        rest = next;
+        owned = true;
+    }
     Ok(rest
         .strip_prefix(&format!("{nonce}:capture\n"))
+        .filter(|_| owned)
         .map(str::to_owned))
 }
 

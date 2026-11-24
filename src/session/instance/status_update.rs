@@ -1455,6 +1455,24 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         let out = session.capture_pane_at(&own, 20).expect("owned pane");
         assert!(out.contains("pane-id-marker"), "{out:?}");
 
+        // Two links of one window in the same session list the pane twice.
+        let relinked = crate::tmux::tmux_command()
+            .args([
+                "link-window",
+                "-a",
+                "-s",
+                &format!("={name}:^"),
+                "-t",
+                &format!("={name}:"),
+            ])
+            .output()
+            .expect("link-window");
+        assert!(relinked.status.success(), "{relinked:?}");
+        let out = session
+            .capture_pane_at(&own, 20)
+            .expect("twice-linked pane");
+        assert!(out.contains("pane-id-marker"), "{out:?}");
+
         // The previous VT channel still holds the moved pane: it is rejected, not re-selected.
         #[cfg(unix)]
         {
