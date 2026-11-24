@@ -161,6 +161,9 @@ const CELL_APPEND_LIMIT: usize = 18;
 const MARKED_CELL_LIMIT: usize = CELL_APPEND_LIMIT - 4;
 /// Bytes of an OSC kept for [`LinkScan::osc`]; a longer one names no target.
 const MAX_OSC: usize = MAX_URI + 256;
+/// Bytes after an owed mark one read may hold back for the next, room for an
+/// SGR, an OSC 8 close and the next run's opener.
+const MAX_HELD: usize = MAX_OSC + 64;
 
 fn is_mark(c: char) -> bool {
     (MARK_BASE..MARK_BASE + MARK_RADIX).contains(&u32::from(c))
@@ -234,7 +237,7 @@ enum Event {
     /// A mark code point arriving from the pane, to drop.
     Stray,
     /// An SGR, OSC or ST: the cursor stays, so a zero-width code point after
-    /// it still joins the cell before it.
+    /// it still joins the cell before it. Owed marks wait past it.
     Quiet,
     /// Any other control or escape, after which a zero-width code point may
     /// land on another cell.
@@ -427,8 +430,6 @@ struct Owed {
     id: u16,
     at: usize,
     cell: usize,
-    /// A [`Event::Quiet`] escape came after `at`.
-    quiet: bool,
 }
 
 impl GridLinks {
@@ -437,9 +438,10 @@ impl GridLinks {
     /// than all when a target found the table full: process them, then call
     /// [`Self::reclaim`] and mark the rest. Borrows when nothing needed marking.
     ///
-    /// A read ending on a linked glyph, or within a code point after it, holds
-    /// the mark (and those bytes) for the next read, since a zero-width code
-    /// point there still joins the cell ahead of it.
+    /// A read ending on a linked glyph, or on escapes that leave the cursor
+    /// after it, holds the mark (and those bytes) for the next read, since a
+    /// zero-width code point there still joins that cell. [`Self::flush`]
+    /// gives them up when no read follows.
     pub(crate) fn mark<'a>(&mut self, bytes: &'a [u8]) -> (std::borrow::Cow<'a, [u8]>, usize) {
         let held = std::mem::take(&mut self.held);
         let skip = held.len();
@@ -468,13 +470,11 @@ impl GridLinks {
                 self.scan.after_glyph = matches!(event, Event::Glyph(_));
             }
             match event {
-                Event::None => {}
                 // vt100 rechecks a cell's width on U+FE0F only when it follows
                 // the glyph directly, so the mark waits behind it.
                 Event::ZeroWidth(len) => {
                     if let Some(o) = owed.as_mut() {
                         o.at = i + 1;
-                        o.quiet = false;
                         if o.cell < CELL_APPEND_LIMIT {
                             o.cell += len;
                         }
@@ -486,7 +486,6 @@ impl GridLinks {
                         id,
                         at: i + 1,
                         cell: len,
-                        quiet: false,
                     });
                 }
                 Event::Stray => {
@@ -496,11 +495,7 @@ impl GridLinks {
                     out.extend_from_slice(&input[flushed..(i + 1).saturating_sub(4).max(flushed)]);
                     flushed = i + 1;
                 }
-                Event::Quiet => {
-                    if let Some(o) = owed.as_mut() {
-                        o.quiet = true;
-                    }
-                }
+                Event::None | Event::Quiet => {}
                 Event::Other => settle(&mut out, &mut flushed, owed.take()),
             }
             if self.scan.starved.is_some() {
@@ -509,9 +504,9 @@ impl GridLinks {
             }
         }
         let consumed = used - skip;
-        // An owed mark has seen no other event since its `at`, so the bytes
-        // after it are at most a partial code point when they are this few.
-        if let Some(o) = owed.take_if(|o| !o.quiet && used == input.len() && used - o.at < 4) {
+        // Only escapes that leave the cursor put, or partial ones, follow an
+        // owed mark's `at`, so the next read's combining marks still join it.
+        if let Some(o) = owed.take_if(|o| used == input.len() && used - o.at <= MAX_HELD) {
             self.held = input[o.at..used].to_vec();
             used = o.at;
             self.owed = Some(Owed { at: 0, ..o });
@@ -526,6 +521,16 @@ impl GridLinks {
             }
         };
         (marked, consumed)
+    }
+
+    /// The mark and bytes held for a next read, for output that may not come.
+    pub(crate) fn flush(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if let Some(o) = self.owed.take().filter(|o| o.cell < MARKED_CELL_LIMIT) {
+            push_mark(&mut out, o.id);
+        }
+        out.append(&mut self.held);
+        out
     }
 
     /// A target is waiting for [`Self::reclaim`].
