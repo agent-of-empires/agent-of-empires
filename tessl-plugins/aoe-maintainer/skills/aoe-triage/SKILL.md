@@ -184,7 +184,8 @@ Thanks for the report. To work on it we need the steps to reproduce it, what you
   --format json --limit 3000`. Keys are lowercase (`status`, `priority`,
   `size`, `roadmap state`); keep items whose `content.repository` is
   `agent-of-empires/agent-of-empires`. If it returns 3000 items the list may
-  be cut off: treat the board read as incomplete for every issue.
+  be cut off: read each issue you work with the per-issue query above
+  instead, applying its `hasNextPage` rule to that issue.
 - Board writes: field and option IDs by name from `gh project
   field-list 1 --owner agent-of-empires --format json`; add a missing item
   with `gh project item-add 1 --owner agent-of-empires --url
