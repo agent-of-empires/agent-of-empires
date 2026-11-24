@@ -184,14 +184,17 @@ describe("WorkspaceSidebar Trash control", () => {
     ]);
   });
 
-  it("puts the count right after the Trash icon, not against Settings (#2574)", () => {
-    withTrash();
+  it.each([
+    [1, "1", "Trash, 1 session"],
+    [4, "4", "Trash, 4 sessions"],
+    [120, "99+", "Trash, 120 sessions"],
+  ])("labels %i trashed sessions with an icon and a count badge, not a text label", (n, badge, name) => {
+    renderSidebar([], { trashedWorkspaces: [], trashedCount: n, trashLoaded: false });
     const toggle = screen.getByTestId("sidebar-trash-toggle");
-    const badge = screen.getByTestId("sidebar-trash-count");
-    expect(badge.textContent).toBe("1");
-    expect(toggle.contains(badge)).toBe(true);
-    const label = Array.from(toggle.querySelectorAll("span")).find((s) => s.textContent === "Trash")!;
-    expect(follows(badge, label)).toBe(true);
+    expect(toggle.getAttribute("aria-label")).toBe(name);
+    expect(toggle.getAttribute("title")).toBe(name);
+    expect(toggle.textContent).toBe(badge);
+    expect(screen.getByTestId("sidebar-trash-count").getAttribute("aria-hidden")).toBe("true");
   });
 
   it.each([
