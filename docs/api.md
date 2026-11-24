@@ -416,6 +416,14 @@ Display-update failures must not fail the migration.
 Use canonical snapshots and mutation receipts to settle the original operation;
 a disconnect does not cancel admitted work or authorize replay.
 
+## PATCH /api/sidebar-view
+
+Change the one grouping and sort that every Client shows. The body is
+`{"group_by": "project" | "group", "sort": "custom" | "name"}`; an omitted field
+keeps its value. The response is the whole value, with the mutation receipt
+headers, and every Client receives it as `sidebar_view` in the runtime snapshot.
+Refused under `--read-only` and in CityHall mode.
+
 ## GET /api/sessions
 
 List sessions. Returns every session by default, including trashed and

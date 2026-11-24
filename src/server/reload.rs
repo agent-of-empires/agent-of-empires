@@ -402,6 +402,7 @@ pub(crate) struct CanonicalMetadata {
     pub profiles: Vec<crate::daemon::ProfileSnapshot>,
     pub workspace_ordering: Vec<String>,
     pub global_projects: Vec<crate::daemon::ProjectResponse>,
+    pub sidebar_view: crate::session::config::SidebarView,
     pub status_hooks: std::collections::HashMap<String, crate::status_hooks::StatusHookConfig>,
     pub auxiliary_tools: std::collections::HashMap<String, Vec<String>>,
     pub raw_tool_names: std::collections::HashMap<String, Vec<String>>,
@@ -474,8 +475,10 @@ fn load_profiles(
         },
         source,
     })?;
-    let (default_profile, workspace_ordering, global_projects) = (|| {
-        let mut default_profile = crate::session::config::Config::load()?.default_profile;
+    let (default_profile, workspace_ordering, global_projects, sidebar_view) = (|| {
+        let config = crate::session::config::Config::load()?;
+        let sidebar_view = config.app_state.sidebar_view();
+        let mut default_profile = config.default_profile;
         if require_default {
             anyhow::ensure!(!profiles.is_empty(), "Profile catalogue is empty");
             if !default_profile.is_empty() {
@@ -495,7 +498,7 @@ fn load_profiles(
             .into_iter()
             .map(ProjectResponse::from)
             .collect();
-        Ok::<_, anyhow::Error>((default_profile, ordering, projects))
+        Ok::<_, anyhow::Error>((default_profile, ordering, projects, sidebar_view))
     })()
     .map_err(|source| ReloadFailure {
         health: RuntimeHealth::Degraded {
@@ -571,6 +574,7 @@ fn load_profiles(
             profiles: profile_metadata,
             workspace_ordering,
             global_projects,
+            sidebar_view,
             status_hooks,
             auxiliary_tools,
             raw_tool_names,
@@ -1770,6 +1774,7 @@ mod tests {
                     })
                     .collect(),
                 workspace_ordering: vec!["unrelated ordering".into()],
+                sidebar_view: Default::default(),
                 global_projects: Vec::new(),
                 status_hooks: Default::default(),
                 auxiliary_tools: Default::default(),

@@ -87,8 +87,8 @@ pub use sessions::{
     stop_auxiliary, stop_session, summarize_session, touch_session_access, trash_session,
     update_session_archive, update_session_diff_base, update_session_favorite,
     update_session_group, update_session_ignored, update_session_notifications, update_session_pin,
-    update_session_snooze, update_session_unread, update_workspace_ordering, OutputQuery,
-    SendMessageRequest,
+    update_session_snooze, update_session_unread, update_sidebar_view, update_workspace_ordering,
+    OutputQuery, SendMessageRequest,
 };
 pub(crate) use sessions::{
     lifecycle_rejection, persist_session_update, purge_expired_trash, reconcile_trashed_worktrees,
@@ -618,7 +618,7 @@ mod tests {
         (
             "sessions/list.rs",
             include_str!("sessions/list.rs"),
-            &["update_workspace_ordering"],
+            &["update_sidebar_view", "update_workspace_ordering"],
         ),
         ("git.rs", include_str!("git.rs"), &["clone_repo"]),
         (

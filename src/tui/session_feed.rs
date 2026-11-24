@@ -265,6 +265,12 @@ enum CommandRequest {
     Session { id: String, request: SessionRequest },
     Create(Box<CreateSessionBody>),
     Namespace(crate::daemon::NamespaceMutation),
+    SidebarView(crate::daemon::SidebarViewPatch),
+}
+
+enum PendingSidebarView {
+    Sent(tokio::sync::oneshot::Receiver<Result<CommandReply, CommandFailure>>),
+    Committed(RuntimeCursor),
 }
 
 struct SessionCommand {
@@ -583,6 +589,10 @@ async fn run_queued_command(
             CommandRequest::Namespace(mutation) => run_namespace(client, mutation, epoch)
                 .await
                 .map(CommandReply::Namespace),
+            CommandRequest::SidebarView(patch) => client
+                .set_sidebar_view(&patch, epoch)
+                .await
+                .map(CommandReply::Mutation),
             CommandRequest::Session { id, request } => match request {
                 SessionRequest::SmartRename => {
                     client
@@ -782,6 +792,7 @@ pub struct SessionFeed {
     pending: HashMap<String, PendingCommand>,
     pending_creations: HashMap<String, PendingCreation>,
     pending_namespace: Option<PendingNamespace>,
+    pending_sidebar_view: Option<PendingSidebarView>,
     namespace_quarantined: bool,
     row_outcomes: Vec<(String, SessionCommandOutcome)>,
     bulk_queue: VecDeque<(String, SessionRequest)>,
@@ -818,6 +829,7 @@ impl SessionFeed {
             pending: HashMap::new(),
             pending_creations: HashMap::new(),
             pending_namespace: None,
+            pending_sidebar_view: None,
             namespace_quarantined: false,
             row_outcomes: Vec::new(),
             applied: None,
@@ -1142,6 +1154,66 @@ impl SessionFeed {
         );
         self.namespace_quarantined = false;
         Ok(())
+    }
+
+    /// Send a sidebar grouping or sort change. Until it resolves, snapshots keep the local
+    /// choice rather than reverting it to the value from before the write.
+    pub(crate) fn submit_sidebar_view(
+        &mut self,
+        patch: crate::daemon::SidebarViewPatch,
+    ) -> anyhow::Result<()> {
+        let commands = self
+            .commands
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("the Daemon is not connected"))?;
+        let (result, receiver) = tokio::sync::oneshot::channel();
+        commands
+            .try_send(SessionCommand {
+                request: CommandRequest::SidebarView(patch),
+                lease: self.grant.load(Ordering::SeqCst),
+                native: None,
+                result,
+            })
+            .map_err(|_| anyhow::anyhow!("the runtime command queue is unavailable"))?;
+        self.pending_sidebar_view = Some(PendingSidebarView::Sent(receiver));
+        Ok(())
+    }
+
+    pub(crate) fn sidebar_view_pending(&self) -> bool {
+        self.pending_sidebar_view.is_some()
+    }
+
+    /// The outcome of the last sidebar view write once its snapshot is applied, or its
+    /// failure. `None` while it is in flight or when none was sent.
+    pub(crate) fn drain_sidebar_view_result(&mut self) -> Option<Result<(), String>> {
+        let failure = match self.pending_sidebar_view.as_mut()? {
+            PendingSidebarView::Sent(receiver) => match receiver.try_recv() {
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return None,
+                Ok(Ok(reply)) => {
+                    let cursor = reply.cursor().clone();
+                    self.pending_sidebar_view = Some(PendingSidebarView::Committed(cursor));
+                    return self.drain_sidebar_view_result();
+                }
+                Ok(Err(
+                    CommandFailure::Rejected(message)
+                    | CommandFailure::CreateHookFailed(message)
+                    | CommandFailure::Unknown(message),
+                )) => message,
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    "the runtime connection closed".to_string()
+                }
+            },
+            PendingSidebarView::Committed(cursor) => {
+                let cursor = cursor.clone();
+                if !self.receipt_applied(&cursor) {
+                    return None;
+                }
+                self.pending_sidebar_view = None;
+                return Some(Ok(()));
+            }
+        };
+        self.pending_sidebar_view = None;
+        Some(Err(failure))
     }
 
     pub(crate) fn submit_request(
@@ -2396,6 +2468,7 @@ impl SessionFeed {
                 profiles: vec![],
                 workspace_ordering: vec![],
                 global_projects: vec![],
+                sidebar_view: Default::default(),
             },
         }));
         let (commands, requests) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
@@ -3277,6 +3350,7 @@ mod tests {
                 profiles: vec![],
                 workspace_ordering: vec![],
                 global_projects: vec![],
+                sidebar_view: Default::default(),
             },
         })
     }

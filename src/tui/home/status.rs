@@ -861,6 +861,7 @@ impl HomeView {
                                 self.canonical_metadata_lag = None;
                                 self.reload_failure_state.record_canonical(&Ok(()));
                                 self.observed_workspace_ordering = persisted_ordering;
+                                self.adopt_sidebar_view(snapshot.contents.sidebar_view);
                                 metadata_changed |=
                                     self.session_feed.mark_snapshot_applied(snapshot);
                                 snapshot_applied = true;
@@ -1157,6 +1158,14 @@ impl HomeView {
         let row_outcomes = self.session_feed.drain_session_outcomes();
         let namespace = self.session_feed.drain_namespace_result();
         let mut changed = !row_outcomes.is_empty() || namespace.is_some();
+        if let Some(Err(error)) = self.session_feed.drain_sidebar_view_result() {
+            self.flash_status(format!("Grouping and sort not saved: {error}"));
+            if let Some(snapshot) = self.session_feed.applied_snapshot() {
+                let view = snapshot.contents.sidebar_view;
+                self.show_sidebar_view(view.group_by, view.sort);
+            }
+            changed = true;
+        }
         let mut purge_notes: Vec<(String, String)> = Vec::new();
         for (id, outcome) in row_outcomes {
             match outcome {

@@ -4037,3 +4037,37 @@ fn runtime_change_dialog_is_promoted_only_before_a_draw() {
         "the note was held, not dropped"
     );
 }
+
+#[test]
+#[serial]
+fn the_view_follows_a_daemon_sidebar_change_but_not_a_stale_snapshot() {
+    use crate::session::config::{GroupByMode, SidebarView, SortOrder};
+    let mut env = create_test_env_empty();
+    let id = structured_row(&mut env, Status::Idle);
+    let publish = |env: &mut TestEnv, view: SidebarView| {
+        let SessionFeedResult::Snapshot(mut snapshot) = daemon_snapshot(&env.view, &id, "Idle")
+        else {
+            unreachable!()
+        };
+        Arc::make_mut(&mut snapshot).contents.sidebar_view = view;
+        env.view
+            .session_feed
+            .publish_for_test(SessionFeedResult::Snapshot(snapshot));
+        env.view.apply_session_feed();
+    };
+    let changed = SidebarView {
+        group_by: GroupByMode::Group,
+        sort: SortOrder::Name,
+    };
+    publish(&mut env, SidebarView::default());
+    publish(&mut env, changed);
+    assert_eq!(
+        (env.view.group_by, env.view.sort_order),
+        (GroupByMode::Group, SortOrder::Name)
+    );
+
+    // A later snapshot still carrying the same value must not undo a newer local choice.
+    env.view.group_by = GroupByMode::Project;
+    publish(&mut env, changed);
+    assert_eq!(env.view.group_by, GroupByMode::Project);
+}

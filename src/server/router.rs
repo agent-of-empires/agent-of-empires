@@ -52,6 +52,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/workspace-ordering",
             put(api::update_workspace_ordering),
         )
+        .route("/api/sidebar-view", patch(api::update_sidebar_view))
         // Atomic multi-session workspace delete.
         .route(
             "/api/workspaces",

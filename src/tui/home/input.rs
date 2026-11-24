@@ -5145,7 +5145,25 @@ impl HomeView {
         if new_order != self.sort_order {
             crate::tui::telemetry::report_feature_use(new_order.into());
         }
-        self.sort_order = new_order;
+        self.show_sidebar_view(self.group_by, new_order);
+        self.save_sidebar_view(crate::daemon::SidebarViewPatch {
+            sort: Some(new_order),
+            ..Default::default()
+        });
+    }
+
+    pub(super) fn apply_group_by(&mut self, new_mode: GroupByMode) {
+        crate::tui::telemetry::report_feature_use(new_mode.into());
+        self.show_sidebar_view(new_mode, self.sort_order);
+        self.save_sidebar_view(crate::daemon::SidebarViewPatch {
+            group_by: Some(new_mode),
+            ..Default::default()
+        });
+    }
+
+    pub(super) fn show_sidebar_view(&mut self, group_by: GroupByMode, sort_order: SortOrder) {
+        self.group_by = group_by;
+        self.sort_order = sort_order;
         if self.search_active && !self.search_query.value().is_empty() {
             self.refresh_flat_items();
             self.update_search();
@@ -5153,25 +5171,25 @@ impl HomeView {
             self.rebuild_flat_items();
             self.reseat_cursor_after_rebuild();
         }
-        let sort_order = self.sort_order;
-        if let Err(e) = update_app_state(|state| {
-            state.sort_order = Some(sort_order);
-        }) {
-            tracing::warn!(target: "tui.input", "Failed to save sort order: {}", e);
+    }
+
+    /// The Daemon owns the choice; this view keeps it even when the write cannot be sent.
+    fn save_sidebar_view(&mut self, patch: crate::daemon::SidebarViewPatch) {
+        if let Err(error) = self.session_feed.submit_sidebar_view(patch) {
+            self.flash_status(format!("Grouping and sort not saved: {error}"));
         }
     }
 
-    pub(super) fn apply_group_by(&mut self, new_mode: GroupByMode) {
-        crate::tui::telemetry::report_feature_use(new_mode.into());
-        self.group_by = new_mode;
-        self.rebuild_flat_items();
-        self.reseat_cursor_after_rebuild();
-        let group_by = self.group_by;
-        if let Err(e) = update_app_state(|state| {
-            state.group_by = Some(group_by);
-        }) {
-            tracing::warn!(target: "tui.input", "Failed to save group_by mode: {}", e);
+    /// Follow the Daemon's grouping and sort when a snapshot changes it, unless this view's
+    /// own change is still on its way there.
+    pub(super) fn adopt_sidebar_view(&mut self, view: crate::session::config::SidebarView) {
+        if self.observed_sidebar_view.replace(view) == Some(view)
+            || self.session_feed.sidebar_view_pending()
+            || (view.group_by == self.group_by && view.sort == self.sort_order)
+        {
+            return;
         }
+        self.show_sidebar_view(view.group_by, view.sort);
     }
 
     /// Info-dialog copy for a rename/delete attempted on a header under the Repository grouping.

@@ -744,6 +744,113 @@ pub async fn update_workspace_ordering(
     )
 }
 
+/// Change the shared grouping or sort every Client shows. The change reaches every open
+/// Client in the runtime snapshot that this write publishes.
+pub async fn update_sidebar_view(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<crate::daemon::SidebarViewPatch>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return crate::server::api::read_only_response();
+    }
+    let Json(patch) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+
+    let publication = state.publication.write().await;
+    let result = tokio::task::spawn_blocking(move || {
+        crate::session::update_app_state(|app| {
+            if let Some(group_by) = patch.group_by {
+                app.group_by = Some(group_by);
+            }
+            if let Some(sort) = patch.sort {
+                app.sort_order = Some(sort);
+            }
+            app.sidebar_view()
+        })
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(std::convert::identity);
+    let view = match result {
+        Ok(view) => view,
+        Err(error) => {
+            tracing::error!(target: "http.api.sessions", %error, "sidebar view commit failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "message": "Failed to save the sidebar view" })),
+            )
+                .into_response();
+        }
+    };
+    state.canonical_metadata.write().await.sidebar_view = view;
+    state
+        .mutation_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    state.runtime.request_publish();
+    drop(publication);
+    let snapshot = match state.runtime.publish(&state).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    crate::server::runtime::mutation_response(
+        &snapshot.value.cursor,
+        Json(snapshot.value.contents.sidebar_view),
+    )
+}
+
+#[cfg(test)]
+mod sidebar_view_tests {
+    use super::*;
+    use crate::daemon::SidebarViewPatch;
+    use crate::session::config::{GroupByMode, SidebarView, SortOrder};
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_patch_changes_only_its_own_field_and_reaches_the_snapshot() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let steps = [
+            (
+                SidebarViewPatch {
+                    group_by: Some(GroupByMode::Group),
+                    sort: None,
+                },
+                SidebarView {
+                    group_by: GroupByMode::Group,
+                    sort: SortOrder::Custom,
+                },
+            ),
+            (
+                SidebarViewPatch {
+                    group_by: None,
+                    sort: Some(SortOrder::Name),
+                },
+                SidebarView {
+                    group_by: GroupByMode::Group,
+                    sort: SortOrder::Name,
+                },
+            ),
+        ];
+        for (patch, expected) in steps {
+            let response = update_sidebar_view(State(state.clone()), Ok(Json(patch)))
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            let snapshot = state.runtime.publish(&state).await.unwrap();
+            assert_eq!(snapshot.value.contents.sidebar_view, expected);
+            assert_eq!(
+                crate::session::Config::load()
+                    .unwrap()
+                    .app_state
+                    .sidebar_view(),
+                expected
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod context_resume_tests {
     use super::*;

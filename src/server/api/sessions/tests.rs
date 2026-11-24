@@ -10768,6 +10768,7 @@ fn native_runtime_frame_stays_readable_with_a_valid_full_text_queue() {
             profiles: Vec::new(),
             workspace_ordering: Vec::new(),
             global_projects: Vec::new(),
+            sidebar_view: Default::default(),
         },
     };
     let frame = serde_json::to_vec(&RuntimeFrame::Snapshot(&snapshot)).unwrap();

@@ -566,6 +566,7 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("PUT", "/api/profiles/{name}/acp-defaults/{agent}/model"),
     ("PATCH", "/api/log-level"),
     ("PUT", "/api/workspace-ordering"),
+    ("PATCH", "/api/sidebar-view"),
 ];
 
 #[cfg(test)]

@@ -297,6 +297,9 @@ pub(super) fn fixture_snapshot(
                 .into_iter()
                 .map(crate::daemon::ProjectResponse::from)
                 .collect(),
+            sidebar_view: crate::session::Config::load()
+                .map(|config| config.app_state.sidebar_view())
+                .unwrap_or_default(),
         },
     }
 }
