@@ -529,8 +529,8 @@ fn is_sha256_digest(digest: &str) -> bool {
     })
 }
 
-/// `POST /api/sandbox/image-dismiss`: snoozes the banner for this remote digest. The TUI reads
-/// and writes the same `app_state.dismissed_image_digest`.
+/// `POST /api/sandbox/image-dismiss`: snoozes the update for this remote digest, for the
+/// dashboard and the TUI alike.
 pub async fn sandbox_image_dismiss(
     State(state): State<Arc<AppState>>,
     body: Result<Json<ImageDismissBody>, JsonRejection>,
@@ -1304,7 +1304,6 @@ mod tests {
         }
         let (code, _) = json(dismiss(state.clone(), &digest).await).await;
         assert_eq!(code, StatusCode::OK);
-        // The TUI reads the same field.
         assert_eq!(
             crate::session::Config::load_or_warn()
                 .app_state

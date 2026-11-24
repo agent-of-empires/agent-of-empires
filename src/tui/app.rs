@@ -71,10 +71,22 @@ pub type TuiBackend = crate::tui::hyperlink::HyperlinkBackend<std::io::Stdout>;
 type PullRunner =
     Box<dyn FnMut(PullRequest, String) -> tokio::sync::oneshot::Receiver<PullAnswer> + Send>;
 
+/// Sends an image update's dismissal to the Daemon, which answers whether it saved it.
+type DismissRunner = Box<dyn FnMut(String) -> tokio::sync::oneshot::Receiver<bool> + Send>;
+
 const CANCEL_UNSENT: &str = "Nothing was cancelled: the Daemon didn't answer the download's start.";
+const DISMISS_UNSAVED: &str = "Hidden for this session: the Daemon couldn't save it";
 
 /// The cancel prompt's confirming key: not Ctrl+E, so holding Ctrl+E can't confirm it.
 const CONFIRM_CANCEL_PULL: KeyCode = KeyCode::Char('y');
+
+fn run_dismiss_request(digest: String) -> tokio::sync::oneshot::Receiver<bool> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _ = tx.send(PullSource::locate().await.dismiss(&digest).await);
+    });
+    rx
+}
 
 fn run_pull_request(
     request: PullRequest,
@@ -131,8 +143,10 @@ pub struct App {
     pulled_image: Option<ImageUpdate>,
     pull_runner: PullRunner,
     next_pull_poll: std::time::Instant,
-    /// Snoozed via Ctrl+x while the registry still resolves to this digest.
+    /// Hidden with Ctrl+X this session. The Daemon keeps the dismissal and offers it no more.
     dismissed_image_digest: Option<String>,
+    dismiss_runner: DismissRunner,
+    dismiss_rx: Option<tokio::sync::oneshot::Receiver<bool>>,
     /// The update bar's last drawn line: the only one its keys act on.
     drawn_bar: Option<DrawnBar>,
     /// Optional so it can be dropped before spawning children: its stdin
@@ -342,7 +356,6 @@ impl App {
             && config.app_state.last_seen_version.as_deref() != Some(env!("CARGO_PKG_VERSION"));
 
         let dismissed_update_version = config.app_state.dismissed_update_version.clone();
-        let dismissed_image_digest = config.app_state.dismissed_image_digest.clone();
 
         let mut app = Self {
             home,
@@ -371,7 +384,9 @@ impl App {
             pulled_image: None,
             pull_runner: Box::new(run_pull_request),
             next_pull_poll: std::time::Instant::now(),
-            dismissed_image_digest,
+            dismissed_image_digest: None,
+            dismiss_runner: Box::new(run_dismiss_request),
+            dismiss_rx: None,
             drawn_bar: None,
             // Crossterm's stream needs a live event reader, which tests lack.
             event_stream: (!cfg!(test)).then(EventStream::new),
@@ -1726,7 +1741,7 @@ impl App {
                     .is_some_and(|update| &update.remote_digest == digest)
                 {
                     self.dismissed_image_digest = Some(digest.clone());
-                    persist_dismissed_image_digest(Some(digest.clone()));
+                    self.dismiss_rx = Some((self.dismiss_runner)(digest.clone()));
                     self.image_update = None;
                 }
             }
@@ -1765,7 +1780,7 @@ impl App {
     /// repaint: a full clear would flash the screen.
     fn poll_banners(&mut self) -> BannerRedraw {
         BannerRedraw {
-            clear: self.poll_update_check() | self.poll_update_status(),
+            clear: self.poll_update_check() | self.poll_update_status() | self.poll_image_dismiss(),
             repaint: self.poll_pull(),
         }
     }
@@ -1809,6 +1824,26 @@ impl App {
         }
         self.next_pull_poll = now + image_pull::poll_interval(self.pull.running());
         self.request_pull(PullRequest::Poll, self.pull_image.clone());
+    }
+
+    /// A dismissal the Daemon didn't save still hides the update, until aoe restarts.
+    fn poll_image_dismiss(&mut self) -> bool {
+        let Some(mut rx) = self.dismiss_rx.take() else {
+            return false;
+        };
+        let saved = match rx.try_recv() {
+            Ok(saved) => saved,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                self.dismiss_rx = Some(rx);
+                return false;
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => false,
+        };
+        if saved {
+            return false;
+        }
+        self.set_status(DISMISS_UNSAVED);
+        true
     }
 
     fn poll_pull(&mut self) -> bool {
@@ -2052,19 +2087,6 @@ fn persist_dismissed_update_version(version: Option<String>) {
             target: "update.snooze",
             error = %e,
             "failed to persist dismissed_update_version"
-        );
-    }
-}
-
-fn persist_dismissed_image_digest(digest: Option<String>) {
-    let result = update_app_state(|state| {
-        state.dismissed_image_digest = digest;
-    });
-    if let Err(e) = result {
-        tracing::warn!(
-            target: "containers.image_update",
-            error = %e,
-            "failed to persist dismissed_image_digest"
         );
     }
 }
@@ -4900,7 +4922,7 @@ mod tests {
     }
 
     fn key_app() -> (App, Terminal<TuiBackend>) {
-        let app = App::new(
+        let mut app = App::new(
             "test",
             AvailableTools::with_tools(&[]),
             true,
@@ -4908,6 +4930,8 @@ mod tests {
             crate::file_watch::FileWatchService::noop(),
         )
         .unwrap();
+        // No test reaches a real Daemon; a dismissal stays unanswered unless a test answers it.
+        hold_dismiss_requests(&mut app);
         let backend =
             crate::tui::hyperlink::HyperlinkBackend::new(std::io::stdout(), Default::default());
         let terminal = Terminal::with_options(
@@ -5097,6 +5121,21 @@ mod tests {
         app.pull_runner = Box::new(move |request, image| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             sent.lock().unwrap().push((request, image, tx));
+            rx
+        });
+        log
+    }
+
+    type SentDismissals =
+        std::sync::Arc<std::sync::Mutex<Vec<(String, tokio::sync::oneshot::Sender<bool>)>>>;
+
+    /// Holds each dismissal the App sends, so a test answers whether the Daemon saved it.
+    fn hold_dismiss_requests(app: &mut App) -> SentDismissals {
+        let log = SentDismissals::default();
+        let sent = log.clone();
+        app.dismiss_runner = Box::new(move |digest| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            sent.lock().unwrap().push((digest, tx));
             rx
         });
         log
@@ -5755,12 +5794,75 @@ mod tests {
 
     /// The store-move line has nothing to dismiss: Ctrl+X and the pull key leave the image
     /// update behind it alone.
+    /// Ctrl+X hides the update for the session and asks the TUI's Daemon to keep the dismissal.
+    /// The TUI never writes or reads this machine's copy: with a remote Daemon it isn't that
+    /// Daemon's, and the Daemon's offer already leaves out what it dismissed.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn image_dismissal_goes_to_the_daemon() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let update = image_update();
+        let offer = || ImageOffer::Update(image_update());
+
+        // This machine's record of a dismissal doesn't hide a Daemon's offer.
+        update_app_state(|s| s.dismissed_image_digest = Some(update.remote_digest.clone()))
+            .unwrap();
+        let (mut app, _terminal) = key_app();
+        assert!(
+            app.offer_image_update(offer()),
+            "hidden by this machine's app_state"
+        );
+        update_app_state(|s| s.dismissed_image_digest = None).unwrap();
+
+        // Not saved: `PullSource::dismiss` answers false for a refusal and a transport error alike.
+        for (label, answer) in [
+            ("saved", Some(true)),
+            ("not saved", Some(false)),
+            ("runner gone", None),
+        ] {
+            let (mut app, mut terminal) = key_app();
+            let sent = hold_dismiss_requests(&mut app);
+            assert!(app.offer_image_update(offer()), "{label}");
+            draw(&mut app);
+            app.handle_key(CTRL_X, &mut terminal).await.unwrap();
+            assert_eq!(app.image_update, None, "{label}: not hidden at once");
+            let (digest, tx) = {
+                let mut sent = sent.lock().unwrap();
+                assert_eq!(sent.len(), 1, "{label}: dismissals sent");
+                sent.remove(0)
+            };
+            assert_eq!(digest, update.remote_digest, "{label}");
+            match answer {
+                Some(saved) => tx.send(saved).unwrap(),
+                None => drop(tx),
+            }
+            let saved = answer == Some(true);
+            assert_eq!(app.poll_image_dismiss(), !saved, "{label}: redraw");
+            assert_eq!(
+                app.update_status.as_ref().map(|s| s.text.as_str()),
+                (!saved).then_some(DISMISS_UNSAVED),
+                "{label}"
+            );
+            assert!(
+                !app.offer_image_update(offer()),
+                "{label}: offered again this session"
+            );
+            assert_eq!(
+                AppStateConfig::load().unwrap().dismissed_image_digest,
+                None,
+                "{label}: the TUI wrote app_state itself"
+            );
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn keys_leave_the_image_update_behind_the_store_move_line() {
         let _home = crate::session::test_support::isolate_app_dir();
         crate::session::get_profile_dir("test").unwrap();
         let (mut app, mut terminal) = key_app();
+        let dismissed = hold_dismiss_requests(&mut app);
         let _lane = app
             .home
             .session_feed
@@ -5775,7 +5877,7 @@ mod tests {
             .unwrap();
         assert_eq!(app.image_update, Some(image_update()));
         assert_eq!(app.dismissed_image_digest, None);
-        assert_eq!(AppStateConfig::load().unwrap().dismissed_image_digest, None);
+        assert!(dismissed.lock().unwrap().is_empty(), "sent a dismissal");
         assert!(app.home.confirm_dialog.is_none());
     }
 
@@ -5790,10 +5892,10 @@ mod tests {
             ("Ctrl+X", CTRL_X),
             ("pull key", KeyEvent::from(KeyCode::Char('u'))),
         ] {
-            // Its own app dir, so one key's persisted dismissal can't show up under the other.
             let _home = crate::session::test_support::isolate_app_dir();
             crate::session::get_profile_dir("test").unwrap();
             let (mut app, mut terminal) = key_app();
+            let dismissed = hold_dismiss_requests(&mut app);
             let _lane = app
                 .home
                 .session_feed
@@ -5813,13 +5915,7 @@ mod tests {
                     "set dismissed_image_digest",
                     app.dismissed_image_digest.is_some(),
                 ),
-                (
-                    "persisted dismissed_image_digest",
-                    AppStateConfig::load()
-                        .unwrap()
-                        .dismissed_image_digest
-                        .is_some(),
-                ),
+                ("sent a dismissal", !dismissed.lock().unwrap().is_empty()),
                 ("opened the pull prompt", app.home.confirm_dialog.is_some()),
             ];
             for (effect, _) in effects.iter().filter(|(_, happened)| *happened) {

@@ -545,6 +545,18 @@ impl HttpClient {
             .await
     }
 
+    /// `POST /api/sandbox/image-dismiss`: the Daemon keeps the dismissal, and its image status
+    /// then reports the update as dismissed.
+    pub async fn sandbox_image_dismiss(&self, digest: &str) -> Result<(), HttpError> {
+        let url = format!("{}/api/sandbox/image-dismiss", self.endpoint.base_url);
+        let request = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({ "digest": digest }));
+        check_global_status(self.execute(request).await?)?;
+        Ok(())
+    }
+
     async fn sandbox_pull_request(
         &self,
         path: &str,

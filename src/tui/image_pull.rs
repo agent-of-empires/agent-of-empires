@@ -101,6 +101,20 @@ impl PullSource {
             Self::Unavailable => PullReport::Unavailable.into(),
         }
     }
+
+    /// Whether the Daemon saved the dismissal of `digest`.
+    pub(crate) async fn dismiss(&self, digest: &str) -> bool {
+        let Self::Daemon(client) = self else {
+            return false;
+        };
+        match client.sandbox_image_dismiss(digest).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::debug!(target: "containers.image_update", error = %e, "the Daemon didn't save the dismissal");
+                false
+            }
+        }
+    }
 }
 
 async fn daemon(client: &HttpClient, image: &str, request: PullRequest) -> PullAnswer {
@@ -815,5 +829,103 @@ mod tests {
         }
         state.shutdown.cancel();
         server.await.unwrap();
+    }
+
+    /// Ctrl+X's dismissal through the real router, kept by the Daemon whichever transport
+    /// reaches it. A refusal and a lost Daemon both say it wasn't saved.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_daemon_keeps_a_dismissal_over_either_transport() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let digest = format!("sha256:{}", "0a".repeat(32));
+        let stored = || {
+            crate::session::config::AppStateConfig::load()
+                .unwrap()
+                .dismissed_image_digest
+        };
+        let tcp = |state: std::sync::Arc<crate::server::AppState>, token: Option<&str>| {
+            let token = token.map(str::to_string);
+            async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let base = format!("http://{}", listener.local_addr().unwrap());
+                let app = test_support::build_router_for_test(state.clone());
+                let shutdown = state.shutdown.clone();
+                let server = tokio::spawn(async move {
+                    axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(shutdown.cancelled_owned())
+                    .await
+                    .unwrap();
+                });
+                let endpoint = DaemonEndpoint::new(base, token, crate::daemon::Source::Env);
+                (
+                    PullSource::Daemon(HttpClient::new(endpoint).unwrap()),
+                    server,
+                )
+            }
+        };
+
+        // Same machine: the owner-checked Unix socket the local Daemon serves, in the app dir.
+        let socket = crate::session::get_app_dir()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .join("daemon/api.sock");
+        // The Unix client sends `Host: localhost`, which the real Daemon allows.
+        let state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vec!["localhost".into()],
+            Vec::new(),
+            None,
+        );
+        let server = test_support::serve_owner_router_for_test(
+            &socket,
+            test_support::build_router_for_test(state.clone()),
+        )
+        .await;
+        let local =
+            PullSource::Daemon(HttpClient::new(DaemonEndpoint::local_unix(socket, None)).unwrap());
+        assert!(local.dismiss(&digest).await, "same machine");
+        assert_eq!(stored(), Some(digest.clone()), "same machine");
+        server.abort();
+
+        // Remote: `AOE_DAEMON_URL` with a token.
+        crate::session::update_app_state(|s| s.dismissed_image_digest = None).unwrap();
+        let token = "dismiss-token";
+        let state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(token.into()),
+        );
+        let (remote, server) = tcp(state.clone(), Some(token)).await;
+        assert!(remote.dismiss(&digest).await, "remote");
+        assert_eq!(stored(), Some(digest.clone()), "remote");
+        state.shutdown.cancel();
+        server.await.unwrap();
+
+        crate::session::update_app_state(|s| s.dismissed_image_digest = None).unwrap();
+        let read_only =
+            test_support::build_test_app_state_configured(Vec::new(), |s| s.read_only = true);
+        let (refused, server) = tcp(read_only.clone(), None).await;
+        assert!(
+            !refused.dismiss(&digest).await,
+            "a read-only Daemon answers 403"
+        );
+        read_only.shutdown.cancel();
+        server.await.unwrap();
+
+        // Nothing listens on a port just freed.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let gone = PullSource::Daemon(
+            HttpClient::new(DaemonEndpoint::new(base, None, crate::daemon::Source::Env)).unwrap(),
+        );
+        assert!(!gone.dismiss(&digest).await, "transport error");
+        assert!(!PullSource::Unavailable.dismiss(&digest).await, "no Daemon");
+        assert_eq!(stored(), None, "a refused dismissal wrote nothing");
     }
 }
