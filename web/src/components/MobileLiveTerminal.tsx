@@ -195,6 +195,8 @@ export function MobileLiveTerminal({
     const family = settings.terminalFontFamily || DEFAULT_TERMINAL_FONT_NAME;
     void fonts
       .load(`16px "${family}"`)
+      // A failed face still renders the fallback, which needs measuring too.
+      .catch(() => undefined)
       .then(() => fonts.ready)
       .then(() => {
         if (live) remeasure();
