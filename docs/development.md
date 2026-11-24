@@ -7,9 +7,9 @@ cargo build                         # debug: TUI + daemon, no Node
 cargo build --release               # shipping build with LTO
 cargo build --profile dev-release   # optimized, without LTO
 cargo build --features web          # include the web dashboard
-cargo test
-cargo fmt
-cargo clippy
+cargo test --workspace
+cargo fmt --all
+cargo clippy --workspace
 ```
 
 Local dashboard end-to-end tests on Linux require `bubblewrap`, `iproute2`, and
