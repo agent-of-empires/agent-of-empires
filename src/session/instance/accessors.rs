@@ -308,7 +308,14 @@ impl Instance {
             .agent_acp_cmd
             .get(&self.tool)
             .is_some_and(|cmd| crate::acp::agent_registry::runs_claude_adapter(cmd));
-        if !own_cmd || config.before_session_hook {
+        // Launch exports the declared dir only for an explicit claude `agent_execution_as`.
+        let maps_to_claude = session
+            .agent_execution_as
+            .get(&self.tool)
+            .is_some_and(|base| {
+                crate::acp::agent_profiles::resolve(base).native_config_agent == Some("claude")
+            });
+        if !own_cmd || !maps_to_claude || config.before_session_hook {
             return false;
         }
         // ACP builds its environment from the profile alone, never from the terminal's saved
@@ -1451,6 +1458,13 @@ replies = true
         write_config(false, "claude-agent-acp");
         assert!(!instance("claude-work", Some(&own_store))
             .resumes_claude_under_own_acp_cmd("claude-work"));
+        // Launch exports the declared dir only under an explicit `agent_execution_as`, so a
+        // direct `claude` command alone does not qualify.
+        let mut direct = instance("claude-work", Some(&own_store));
+        direct.command = "claude --model sonnet".to_string();
+        assert!(!direct.resumes_claude_under_own_acp_cmd("claude-work"));
+        write_config(true, "claude-agent-acp");
+        assert!(direct.resumes_claude_under_own_acp_cmd("claude-work"));
 
         // An adapter not known to load Claude session ids starts fresh.
         for (cmd, expected) in [
