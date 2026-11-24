@@ -11,6 +11,8 @@ use crate::update::UpdateInfo;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum UpdateBar<'a> {
+    /// Ctrl+E's prompt, over a running pull.
+    CancelPrompt,
     /// A toast; Ctrl+X hides it.
     Status(&'a str),
     /// A sandbox image pull this TUI watched, running or ended.
@@ -55,6 +57,7 @@ impl<'a> UpdateBar<'a> {
 /// state it names is still current; otherwise the key is spent without effect.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum DrawnBar {
+    CancelPrompt,
     Status(String),
     Pull(PullLine),
     Live,
@@ -65,6 +68,7 @@ pub(crate) enum DrawnBar {
 impl From<UpdateBar<'_>> for DrawnBar {
     fn from(bar: UpdateBar<'_>) -> Self {
         match bar {
+            UpdateBar::CancelPrompt => Self::CancelPrompt,
             UpdateBar::Status(s) => Self::Status(s.to_string()),
             UpdateBar::Pull(line) => Self::Pull(line.clone()),
             UpdateBar::Live(_) => Self::Live,
@@ -150,13 +154,32 @@ impl PullLine {
                 &format!("  [{update}] update  [{hide}] dismiss"),
                 width,
             ),
-            Self::Failed(reason) => shorten(
-                &format!(" ✕ {}", reason.user_text()),
-                &format!("  [{update}] try again  [{hide}] dismiss"),
-                width,
-            ),
+            Self::Failed(reason) => {
+                let keys = format!("  [{update}] try again  [{hide}] dismiss");
+                let full = format!(" ✕ {}", reason.user_text());
+                if full.width() + keys.width() <= width {
+                    full + &keys
+                } else {
+                    shorten(
+                        &format!(" ✕ Pull failed: {}", short_reason(*reason)),
+                        &keys,
+                        width,
+                    )
+                }
+            }
             Self::Gated { command } => gated(command, &format!("  [{hide}] dismiss"), width),
         }
+    }
+}
+
+/// A failure's reason in a form that fits 80 columns beside the keys.
+fn short_reason(reason: PullFailureReason) -> &'static str {
+    match reason {
+        PullFailureReason::Timeout => "timed out after 10 min",
+        PullFailureReason::Network => "no network",
+        PullFailureReason::DiskSpace => "disk full",
+        PullFailureReason::Auth => "sign in to the registry",
+        PullFailureReason::Other => "see aoe logs",
     }
 }
 
@@ -372,11 +395,18 @@ mod tests {
                     vec!["✕ Couldn't download the sandbox image: the registry needs you to sign in.", retry.as_str(), dismiss.as_str()],
                     vec!["…"],
                 ),
+                // Too narrow for the sentence: the reason stays, in short.
                 (
                     PullLine::Failed(PullFailureReason::Auth),
                     80,
-                    vec!["✕ Couldn't download", retry.as_str(), dismiss.as_str(), "…"],
-                    vec!["sign in"],
+                    vec!["✕ Pull failed: sign in to the registry", retry.as_str(), dismiss.as_str()],
+                    vec!["…"],
+                ),
+                (
+                    PullLine::Failed(PullFailureReason::Timeout),
+                    80,
+                    vec!["✕ Pull failed: timed out after 10 min", retry.as_str(), dismiss.as_str()],
+                    vec!["…"],
                 ),
                 (
                     gated.clone(),

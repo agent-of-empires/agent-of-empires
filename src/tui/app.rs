@@ -57,13 +57,6 @@ impl UpdateStatus {
         }
     }
 
-    fn lasting(text: String, ttl: std::time::Duration) -> Self {
-        Self {
-            text,
-            expires_at: Some(std::time::Instant::now() + ttl),
-        }
-    }
-
     fn is_expired(&self) -> bool {
         match self.expires_at {
             Some(deadline) => std::time::Instant::now() >= deadline,
@@ -78,8 +71,6 @@ pub type TuiBackend = crate::tui::hyperlink::HyperlinkBackend<std::io::Stdout>;
 type PullRunner =
     Box<dyn FnMut(PullRequest, String) -> tokio::sync::oneshot::Receiver<PullAnswer> + Send>;
 
-const CANCEL_PULL_PROMPT: &str =
-    "Press y to cancel the download. To keep going, press any other key.";
 const CANCEL_UNSENT: &str = "Nothing was cancelled: the Daemon didn't answer the download's start.";
 
 /// The cancel prompt's confirming key: not Ctrl+E, so holding Ctrl+E can't confirm it.
@@ -135,8 +126,9 @@ pub struct App {
     pull_digest: Option<String>,
     /// A Cancel asked for while the Start is in flight; sent once the Start's answer shows the pull.
     cancel_after_start: bool,
-    /// The update a pull this TUI watched just installed, so a stale offer of it stays away.
-    pulled_image_digest: Option<String>,
+    /// The update a pull this TUI watched just installed, so a stale offer of it stays away. It
+    /// keeps the image: another tag can share the digest and still be out of date.
+    pulled_image: Option<ImageUpdate>,
     pull_runner: PullRunner,
     next_pull_poll: std::time::Instant,
     /// Snoozed via Ctrl+x while the registry still resolves to this digest.
@@ -376,7 +368,7 @@ impl App {
             cancel_after_start: false,
             pull: PullWatch::default(),
             pull_rx: None,
-            pulled_image_digest: None,
+            pulled_image: None,
             pull_runner: Box::new(run_pull_request),
             next_pull_poll: std::time::Instant::now(),
             dismissed_image_digest,
@@ -1581,14 +1573,19 @@ impl App {
             self.update_status = None;
         }
         let live = self.home.store_move_status_line();
-        let bar = UpdateBar::pick(
-            self.update_status.as_ref().map(|s| s.text.as_str()),
-            self.pull.line(),
-            live.as_deref(),
-            self.update_info.as_ref(),
-            self.image_update.as_ref(),
-            self.pull.holds_line(),
-        );
+        // The cancel prompt draws over every line, and leaves the status it covers in place.
+        let bar = if self.pull.cancel_prompt(std::time::Instant::now()) {
+            Some(UpdateBar::CancelPrompt)
+        } else {
+            UpdateBar::pick(
+                self.update_status.as_ref().map(|s| s.text.as_str()),
+                self.pull.line(),
+                live.as_deref(),
+                self.update_info.as_ref(),
+                self.image_update.as_ref(),
+                self.pull.holds_line(),
+            )
+        };
         self.home.hidden_pull = self.pull.hidden_progress().copied();
         // Reset so a frame that skips the preview path reports zero.
         self.home.preview_timings = Default::default();
@@ -1702,7 +1699,7 @@ impl App {
             return false;
         };
         match drawn {
-            DrawnBar::Live => {}
+            DrawnBar::Live | DrawnBar::CancelPrompt => {}
             DrawnBar::Pull(line) => {
                 self.pull.dismiss(line);
             }
@@ -1843,11 +1840,15 @@ impl App {
                 let installed = self
                     .pull_digest
                     .take()
-                    .or_else(|| self.offered_digest(&self.pull_image));
-                if self.image_update.as_ref().map(|u| &u.remote_digest) == installed.as_ref() {
+                    .or_else(|| self.offered_digest(&self.pull_image))
+                    .map(|remote_digest| ImageUpdate {
+                        image: self.pull_image.clone(),
+                        remote_digest,
+                    });
+                if self.image_update == installed {
                     self.image_update = None;
                 }
-                self.pulled_image_digest = installed;
+                self.pulled_image = installed;
                 true
             }
             Applied::Unanswered(text) => {
@@ -1893,7 +1894,7 @@ impl App {
         let update = match offer {
             ImageOffer::Update(update)
                 if self.dismissed_image_digest.as_ref() != Some(&update.remote_digest)
-                    && self.pulled_image_digest.as_ref() != Some(&update.remote_digest) =>
+                    && self.pulled_image.as_ref() != Some(&update) =>
             {
                 Some(update)
             }
@@ -1904,26 +1905,6 @@ impl App {
         }
         self.image_update = update;
         true
-    }
-
-    /// Ctrl+E on a running pull asks; the prompt's confirming key, within 3 s, cancels.
-    fn cancel_pull_key(&mut self) {
-        if self.pull.arm_cancel(std::time::Instant::now()) {
-            self.update_status = Some(UpdateStatus::lasting(
-                CANCEL_PULL_PROMPT.to_string(),
-                image_pull::CANCEL_CONFIRM_TTL,
-            ));
-        }
-    }
-
-    fn clear_cancel_pull_prompt(&mut self) {
-        if self
-            .update_status
-            .as_ref()
-            .is_some_and(|s| s.text == CANCEL_PULL_PROMPT)
-        {
-            self.update_status = None;
-        }
     }
 
     /// Only a writable tarball install can update unattended: Homebrew wants
@@ -2297,6 +2278,9 @@ impl App {
             e2e_render_ack(false)?;
             return Ok(());
         }
+        // Taken before any key is routed, so every key ends the cancel prompt; only the
+        // confirming key, reaching the pull below, can still act on it.
+        let cancel_armed = self.pull.take_cancel_arm();
         let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL;
         if !ctrl_c && self.home.retained_reader_focused() && !self.home.has_non_live_send_overlay()
         {
@@ -2342,22 +2326,23 @@ impl App {
             &key,
         ) && !self.home.has_dialog()
             && self.pull.running();
+        // Ctrl+E only asks; `y` within the prompt's time cancels.
         if cancels_pull {
-            self.cancel_pull_key();
+            self.pull.arm_cancel(std::time::Instant::now());
             return Ok(());
         }
         if key.code == CONFIRM_CANCEL_PULL
             && key.modifiers == KeyModifiers::NONE
             && !self.home.has_dialog()
-            && self.pull.confirm_cancel(std::time::Instant::now())
+            && self
+                .pull
+                .confirms_cancel(cancel_armed, std::time::Instant::now())
         {
-            self.clear_cancel_pull_prompt();
             self.request_pull(PullRequest::Cancel, self.pull_image.clone());
             return Ok(());
         }
         self.pull
             .other_key(self.drawn_bar == Some(DrawnBar::Pull(PullLine::Done)));
-        self.clear_cancel_pull_prompt();
         match (key.code, key.modifiers) {
             // Ctrl+C belongs to the agent in live-send.
             (KeyCode::Char('c'), KeyModifiers::CONTROL) if !self.home.is_live_send_capturing() => {
@@ -5247,7 +5232,7 @@ mod tests {
             Some(newer.clone()),
             "Done took off a newer update"
         );
-        assert_eq!(app.pulled_image_digest, Some(image_update().remote_digest));
+        assert_eq!(app.pulled_image, Some(image_update()));
 
         let (mut app, _terminal) = key_app();
         answer_pull(
@@ -5259,7 +5244,7 @@ mod tests {
         answer_pull(&mut app, PullRequest::Poll, poll(running(), &newer));
         answer_pull(&mut app, PullRequest::Poll, poll(PullState::Done, &newer));
         assert_eq!(app.image_update, Some(newer));
-        assert_eq!(app.pulled_image_digest, Some(image_update().remote_digest));
+        assert_eq!(app.pulled_image, Some(image_update()));
     }
 
     /// A pull's progress repaints the screen without the full clear an app update gets, which
@@ -5345,11 +5330,39 @@ mod tests {
                 "{case}: A's pull took off B"
             );
             assert_ne!(
-                app.pulled_image_digest,
-                Some(b.remote_digest.clone()),
+                app.pulled_image,
+                Some(b.clone()),
                 "{case}: B's offer is suppressed"
             );
         }
+
+        // Two tags at one digest: A's pull installs it, and B at that digest stays offered.
+        let (mut app, _terminal) = key_app();
+        let sent = hold_pull_requests(&mut app);
+        let b_at_a = ImageUpdate {
+            image: b.image.clone(),
+            remote_digest: a.remote_digest.clone(),
+        };
+        app.image_update = Some(a.clone());
+        app.start_pull(a.image.clone());
+        answer_sent(&mut app, &sent, 0, running());
+        app.image_update = Some(b_at_a.clone());
+        answer_pull(&mut app, PullRequest::Poll, done());
+        assert_eq!(app.image_update, Some(b_at_a.clone()), "Done took off B");
+        answer_pull(
+            &mut app,
+            PullRequest::Poll,
+            PullAnswer {
+                report: PullReport::State(PullState::Idle),
+                offer: Some(ImageOffer::Update(b_at_a.clone())),
+                image: Some(b.image.clone()),
+            },
+        );
+        assert_eq!(
+            app.image_update,
+            Some(b_at_a),
+            "a poll's offer of B was suppressed"
+        );
     }
 
     /// A key acknowledges Done only once a frame drew it: behind a status, it waits.
@@ -5404,6 +5417,118 @@ mod tests {
         assert_eq!(*sent.lock().unwrap(), [PullRequest::Poll]);
     }
 
+    /// Ctrl+E's prompt draws over the bar and leaves the status it covers, so the lasting
+    /// restart notice is back once the prompt ends, by another key or by its time.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_cancel_prompt_leaves_the_status_it_covers() {
+        const NOTICE: &str = "update complete. Restart aoe to use the new version.";
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let (mut app, mut terminal) = key_app();
+        let ctrl_e = bindings::key_event(bindings::ActionId::CancelImagePull, false).unwrap();
+        app.update_status = Some(UpdateStatus::persistent(NOTICE.into()));
+        app.pull.start();
+        let notice = Some(DrawnBar::Status(NOTICE.into()));
+
+        app.handle_key(ctrl_e, &mut terminal).await.unwrap();
+        draw(&mut app);
+        assert_eq!(app.drawn_bar, Some(DrawnBar::CancelPrompt));
+        app.handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut terminal,
+        )
+        .await
+        .unwrap();
+        draw(&mut app);
+        assert_eq!(app.drawn_bar, notice, "another key");
+
+        app.handle_key(ctrl_e, &mut terminal).await.unwrap();
+        app.pull.arm_cancel(
+            std::time::Instant::now() - image_pull::CANCEL_CONFIRM_TTL - Duration::from_millis(1),
+        );
+        draw(&mut app);
+        assert_eq!(app.drawn_bar, notice, "the prompt's time");
+    }
+
+    /// One trashed row, selected, for its retained reader.
+    fn retained_app() -> (App, crate::session::test_support::AppDirGuard, String) {
+        let guard = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let mut inst = crate::session::Instance::new("retained", "/tmp");
+        inst.trash();
+        inst.source_profile = "test".into();
+        crate::session::Storage::new_unwatched("test")
+            .unwrap()
+            .update(|rows, _| {
+                *rows = vec![inst.clone()];
+                Ok(())
+            })
+            .unwrap();
+        let mut app = App::new(
+            "test",
+            AvailableTools::with_tools(&["claude"]),
+            true,
+            false,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        app.home.selected_session = Some(inst.id.clone());
+        (app, guard, inst.id)
+    }
+
+    /// A key a retained reader, an embedded view, or a view still mounting takes ends the cancel
+    /// prompt as any key does, so a `y` after it doesn't cancel.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_key_routed_past_the_pull_ends_its_cancel_prompt() {
+        use crate::tui::structured_view::embedded::EmbeddedView;
+        let ctrl_e = bindings::key_event(bindings::ActionId::CancelImagePull, false).unwrap();
+        let confirm = KeyEvent::new(CONFIRM_CANCEL_PULL, KeyModifiers::NONE);
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let typed = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        for path in ["retained reader", "embedded view", "mounting view"] {
+            let (mut app, _guard, id) = if path == "retained reader" {
+                retained_app()
+            } else {
+                app_on_a_structured_row()
+            };
+            let (_, mut terminal) = key_app();
+            let sent = record_pull_requests(&mut app);
+            app.pull.start();
+            app.handle_key(ctrl_e, &mut terminal).await.unwrap();
+            assert!(app.pull.cancel_prompt(std::time::Instant::now()), "{path}");
+            match path {
+                "retained reader" => {
+                    let generation = app.home.get_instance(&id).unwrap().lifecycle_generation;
+                    app.home.retained_focus = Some((id.clone(), generation));
+                    assert!(app.home.retained_reader_focused(), "{path}");
+                    app.handle_key(esc, &mut terminal).await.unwrap();
+                    assert!(!app.home.retained_reader_focused(), "{path}: Esc closes it");
+                }
+                "embedded view" => {
+                    let mut view = EmbeddedView::for_test(&id);
+                    view.activate();
+                    app.home.structured_preview = Some(view);
+                    app.handle_key(typed, &mut terminal).await.unwrap();
+                    app.home.structured_preview = None;
+                }
+                _ => {
+                    app.structured_mount_activate = Some(id.clone());
+                    app.handle_key(typed, &mut terminal).await.unwrap();
+                    assert!(
+                        app.home.pending_paste_for_structured_view.contains_key(&id),
+                        "{path}: the key was held"
+                    );
+                    app.structured_mount_activate = None;
+                }
+            }
+            assert!(!app.pull.cancel_prompt(std::time::Instant::now()), "{path}");
+            app.handle_key(confirm, &mut terminal).await.unwrap();
+            assert!(sent.lock().unwrap().is_empty(), "{path}: y cancelled");
+        }
+    }
+
     /// The pull line's keys in both modes: Ctrl+E asks and `y` cancels, so a held Ctrl+E, as
     /// Repeat events or as repeated presses, never does; the Update key retries a cancelled
     /// pull; Done clears on the next key, which still acts; and with a dialog open, as while
@@ -5421,11 +5546,7 @@ mod tests {
             let update = bindings::key_event(bindings::ActionId::Update, strict).unwrap();
             let help = bindings::key_event(bindings::ActionId::Help, strict).unwrap();
             let confirm = KeyEvent::new(CONFIRM_CANCEL_PULL, KeyModifiers::NONE);
-            let prompt = |app: &App| {
-                app.update_status
-                    .as_ref()
-                    .is_some_and(|s| s.text == CANCEL_PULL_PROMPT)
-            };
+            let prompt = |app: &App| app.pull.cancel_prompt(std::time::Instant::now());
             app.pull.start();
 
             app.handle_key(ctrl_e, &mut terminal).await.unwrap();
@@ -5550,9 +5671,7 @@ mod tests {
                 "strict={strict}: Ctrl+E cancelled"
             );
             assert!(
-                !app.update_status
-                    .as_ref()
-                    .is_some_and(|s| s.text == CANCEL_PULL_PROMPT),
+                !app.pull.cancel_prompt(std::time::Instant::now()),
                 "strict={strict}: Ctrl+E asked"
             );
             assert_eq!(query(&app), "ab", "strict={strict}");

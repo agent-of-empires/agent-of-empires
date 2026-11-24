@@ -2112,8 +2112,9 @@ fn update_bar_live_line_shows_no_dismiss_hint() {
     assert!(!out.contains("dismiss"), "{out}");
 }
 
-/// A hidden running pull keeps its progress on the key line: with the shortcut bar shown, in
-/// Live send (beside its exit hint), and with the bar hidden, where the row is kept for it.
+/// A hidden running pull keeps its progress on the key line: with the shortcut bar shown, even
+/// when other must-show hints fill it, in Live send (beside its exit hint), and with the bar
+/// hidden, where the row is kept for it.
 #[test]
 #[serial]
 fn a_hidden_pull_shows_its_progress_on_every_key_line() {
@@ -2123,16 +2124,29 @@ fn a_hidden_pull_shows_its_progress_on_every_key_line() {
     use ratatui::Terminal;
 
     let theme = load_theme("empire");
-    // (case, shortcut bar shown, in Live send, Live send title)
-    for (case, bar, live, title) in [
-        ("shortcut bar", true, false, ""),
-        ("Live send", true, true, "live send"),
+    // (case, width, shortcut bar shown, in Live send, Live send title)
+    for (case, width, bar, live, title) in [
+        ("shortcut bar", 100, true, false, ""),
+        // Other priority-0 hints wider than the row still leave the badge its room.
+        ("paste, search and other TUIs", 40, true, false, ""),
+        ("Live send", 100, true, true, "live send"),
         // A title wide enough to fill the row still leaves the badge its room.
-        ("Live send, long title", true, true, &*"long ".repeat(30)),
-        ("bar hidden", false, false, ""),
+        (
+            "Live send, long title",
+            100,
+            true,
+            true,
+            &*"long ".repeat(30),
+        ),
+        ("bar hidden", 100, false, false, ""),
     ] {
         let mut env = create_test_env_empty();
         env.view.show_shortcut_bar = bar;
+        if width < 100 {
+            env.view.active_tui_count = 3;
+            env.view.pending_paste = Some("a buffered paste".into());
+            env.view.search_matches = vec![0];
+        }
         if live {
             env.view.enter_live_send_for_test();
             env.view.live_send.as_mut().unwrap().title = title.into();
@@ -2142,7 +2156,7 @@ fn a_hidden_pull_shows_its_progress_on_every_key_line() {
             layers_known: Some(7),
             ..ProgressSnapshot::default()
         });
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
         terminal
             .draw(|f| {
                 let area = f.area();

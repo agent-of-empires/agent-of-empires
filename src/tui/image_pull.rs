@@ -328,17 +328,27 @@ impl PullWatch {
         true
     }
 
-    /// The prompt's confirming key: whether it cancels now. Ends the prompt either way.
-    pub(crate) fn confirm_cancel(&mut self, now: Instant) -> bool {
-        self.cancel_armed.take().is_some_and(|at| {
+    /// Every key ends the cancel prompt; the key path takes it first, so a key a reader or an
+    /// embedded view takes ends it too.
+    pub(crate) fn take_cancel_arm(&mut self) -> Option<Instant> {
+        self.cancel_armed.take()
+    }
+
+    /// Whether the confirming key, pressed `now` with the prompt `armed` before it, cancels.
+    pub(crate) fn confirms_cancel(&self, armed: Option<Instant>, now: Instant) -> bool {
+        armed.is_some_and(|at| {
             self.running() && now.saturating_duration_since(at) <= CANCEL_CONFIRM_TTL
         })
     }
 
-    /// Any key but Ctrl+E or the confirming key ends a cancel prompt, and clears a Done line the
-    /// last frame `done_drawn`, so the key acts as usual. Returns whether the line changed.
+    /// The cancel prompt is open `now`: the bar draws it over any other line.
+    pub(crate) fn cancel_prompt(&self, now: Instant) -> bool {
+        self.confirms_cancel(self.cancel_armed, now)
+    }
+
+    /// A key that isn't the pull's clears a Done line the last frame `done_drawn`, so the key
+    /// acts as usual. Returns whether the line changed.
     pub(crate) fn other_key(&mut self, done_drawn: bool) -> bool {
-        self.cancel_armed = None;
         if done_drawn && self.line == Some(PullLine::Done) {
             self.set_line(None);
             return true;
@@ -611,16 +621,15 @@ mod tests {
         assert!(!watch.holds_line());
     }
 
-    /// The first Ctrl+E asks; a second within the prompt's window cancels, one after it asks
-    /// again, and any other key ends the prompt. Done clears on any key.
     /// Ctrl+E only opens the prompt, so repeating it never cancels; the confirming key cancels
-    /// within the prompt's time, and any other key ends the prompt.
+    /// within the prompt's time, and the prompt shows only while it can.
     #[test]
     fn ctrl_e_asks_and_only_the_confirming_key_cancels() {
         let at = Instant::now();
         let mut watch = PullWatch::default();
         assert!(!watch.arm_cancel(at), "nothing to cancel");
-        assert!(!watch.confirm_cancel(at), "no prompt to confirm");
+        let armed = watch.take_cancel_arm();
+        assert!(!watch.confirms_cancel(armed, at), "no prompt to confirm");
         watch.start();
         for (confirm, expected) in [
             (at + CANCEL_CONFIRM_TTL, true),
@@ -629,23 +638,21 @@ mod tests {
             for repeat in 0..5 {
                 assert!(watch.arm_cancel(at), "Ctrl+E #{repeat} didn't ask");
             }
+            assert_eq!(watch.cancel_prompt(confirm), expected, "{:?}", confirm - at);
+            let armed = watch.take_cancel_arm();
             assert_eq!(
-                watch.confirm_cancel(confirm),
+                watch.confirms_cancel(armed, confirm),
                 expected,
                 "{:?}",
                 confirm - at
             );
-            assert!(
-                !watch.confirm_cancel(confirm),
-                "the prompt outlived its answer"
-            );
+            assert!(!watch.cancel_prompt(at), "the prompt outlived its answer");
         }
         watch.arm_cancel(at);
         assert!(
             !watch.other_key(true),
             "a running pull's line changed on a key"
         );
-        assert!(!watch.confirm_cancel(at), "another key left the prompt");
 
         watch.apply(PullRequest::Poll, PullReport::State(PullState::Done));
         assert!(

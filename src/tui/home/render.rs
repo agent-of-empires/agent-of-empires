@@ -4808,9 +4808,10 @@ impl HomeView {
             index
         });
 
-        if let Some(badge) = self.hidden_pull_badge(theme) {
+        let pull_badge = self.hidden_pull_badge(theme).map(|badge| {
             groups.push((0, None, vec![badge]));
-        }
+            groups.len() - 1
+        });
 
         // Pack shortcuts and optional Tips by priority within the runtime status boundary.
         // Widths and separators use display cells, matching the painted click rectangles.
@@ -4822,8 +4823,15 @@ impl HomeView {
         let avail = (area.width as usize).saturating_sub(1);
 
         let mut order: Vec<usize> = (0..groups.len()).collect();
-        // The running server status packs before other priority-0 groups, so it is the last to drop.
-        order.sort_by_key(|&i| (groups[i].0, Some(i) != serving_status));
+        // A hidden pull's badge, its only progress, then the running server status pack before
+        // other priority-0 groups, so they are the last to drop.
+        order.sort_by_key(|&i| {
+            (
+                groups[i].0,
+                Some(i) != pull_badge,
+                Some(i) != serving_status,
+            )
+        });
 
         let mut keep = vec![false; groups.len()];
         let mut used = 0usize;
@@ -4931,6 +4939,9 @@ impl HomeView {
         let dismiss_key =
             super::bindings::label(ActionId::DismissUpdateBanner, self.strict_hotkeys);
         let text = match bar {
+            UpdateBar::CancelPrompt => {
+                " Press y to cancel the download. To keep going, press any other key.".to_string()
+            }
             UpdateBar::Status(s) => format!(" {s}  [{dismiss_key}] dismiss"),
             UpdateBar::Pull(line) => {
                 use super::update_bar::PullTone;
