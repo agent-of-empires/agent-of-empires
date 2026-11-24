@@ -188,6 +188,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/account-targets",
             get(api::session_account_targets),
         )
+        .route(
+            "/api/sessions/{id}/acp-default-model",
+            get(api::get_session_agent_default_model),
+        )
         .route("/api/sessions/{id}/start", post(api::start_session))
         .route(
             "/api/sessions/{id}/restart",

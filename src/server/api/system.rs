@@ -3053,6 +3053,7 @@ pub async fn serve_sound_file(
 /// The default an Agent's new Structured view Sessions in a profile start on.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct AgentDefaultModel {
+    profile: String,
     /// The `acp_defaults` key the Agent reads from (`claude` for a legacy `claude-code`).
     agent_key: String,
     model: Option<String>,
@@ -3060,9 +3061,10 @@ pub struct AgentDefaultModel {
 }
 
 impl AgentDefaultModel {
-    fn of(acp: &crate::session::config::AcpConfig, agent: &str) -> Self {
+    fn of(acp: &crate::session::config::AcpConfig, profile: &str, agent: &str) -> Self {
         let defaults = acp.acp_defaults_for(agent);
         Self {
+            profile: profile.to_string(),
             agent_key: acp.acp_defaults_key_for(agent).to_string(),
             model: defaults.and_then(|d| d.model()),
             pinned: defaults.and_then(|d| d.pinned_model()).is_some(),
@@ -3091,6 +3093,47 @@ fn agent_display(agent: &str) -> &str {
     crate::acp::agent_registry::display_name_for(agent).unwrap_or(agent)
 }
 
+/// 404 unless `name` is an existing profile, even on a first run with none, so a write
+/// can't mint `profiles/<name>`.
+fn require_listed_profile(name: &str) -> Result<(), axum::response::Response> {
+    match crate::session::list_profiles() {
+        Ok(known) if known.iter().any(|p| p == name) => Ok(()),
+        Ok(_) => Err(api_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            format!("Profile '{}' does not exist", name.escape_debug()),
+        )),
+        Err(e) => Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "load_failed",
+            e.to_string(),
+        )),
+    }
+}
+
+/// `GET /api/sessions/{id}/acp-default-model`: the default this Session's structured spawn
+/// reads, under the profile and Agent key the spawn uses.
+pub async fn get_session_agent_default_model(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    let Some(instance) = super::find_instance(&state, &id).await else {
+        return super::session_not_found();
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let (agent, config) = crate::server::session_spawn::spawn_defaults_agent(&instance);
+        AgentDefaultModel::of(&config.acp, &instance.effective_profile(), &agent)
+    })
+    .await;
+    match result {
+        Ok(model) => Json(model).into_response(),
+        Err(e) => {
+            tracing::error!(target: "http.api.system", error = %e, "Session Agent default model read panicked");
+            internal_error()
+        }
+    }
+}
+
 /// `GET /api/profiles/{name}/acp-defaults/{agent}/model`: the Agent's resolved default model.
 pub async fn get_agent_default_model(
     axum::extract::Path((name, agent)): axum::extract::Path<(String, String)>,
@@ -3099,11 +3142,9 @@ pub async fn get_agent_default_model(
         return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
     }
     let result = tokio::task::spawn_blocking(move || {
-        if let Err(e) = crate::session::require_known_profile(&name) {
-            return Err(api_error(StatusCode::NOT_FOUND, "not_found", e.to_string()));
-        }
+        require_listed_profile(&name)?;
         crate::session::resolve_config(&name)
-            .map(|resolved| AgentDefaultModel::of(&resolved.acp, &agent))
+            .map(|resolved| AgentDefaultModel::of(&resolved.acp, &name, &agent))
             .map_err(|e| {
                 api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -3153,21 +3194,13 @@ pub async fn set_agent_default_model(
             "model is empty",
         );
     }
-    let registered = state
-        .acp_supervisor
-        .registry_snapshot()
-        .await
-        .get(&agent)
-        .is_some();
     // Owned by the write, which outlives a cancelled handler, so a rename or delete can't move
     // the profile after the check and leave `update_profile_config` to recreate it.
     let namespace = state.profile_namespace.clone().read_owned().await;
     let gate = write_gate().await;
     let result = tokio::task::spawn_blocking(move || {
         let _guards = (namespace, gate);
-        if let Err(e) = crate::session::require_known_profile(&name) {
-            return Err(api_error(StatusCode::NOT_FOUND, "not_found", e.to_string()));
-        }
+        require_listed_profile(&name)?;
         #[cfg(test)]
         agent_default_model_pause(&AGENT_DEFAULT_MODEL_CHECKED, &name);
         crate::session::update_profile_config(&name, |profile| {
@@ -3175,10 +3208,28 @@ pub async fn set_agent_default_model(
             #[cfg(test)]
             agent_default_model_pause(&AGENT_DEFAULT_MODEL_READ, &name);
             let resolved = crate::session::merge_configs(global.clone(), profile);
-            if !registered && !resolved.session.agent_acp_cmd.contains_key(&agent) {
+            // Only a name a spawn reads defaults under: the spawn's registry or a valid command.
+            let registered = crate::acp::AgentRegistry::with_defaults()
+                .get(&agent)
+                .is_some();
+            let own_cmd = resolved
+                .session
+                .agent_acp_cmd
+                .get(&agent)
+                .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(&agent, cmd).is_ok());
+            if !registered && !own_cmd {
+                let message =
+                    match crate::acp::inherited_acp_base(&agent, &resolved.session.agent_detect_as)
+                    {
+                        Some(base) => {
+                            let base = agent_display(&base);
+                            format!("{agent} runs as {base} in Structured view, so it uses {base}'s Agent defaults.")
+                        }
+                        None => format!("unknown Agent '{agent}'"),
+                    };
                 return Err(DefaultModelRefused(
                     crate::daemon::ApiErrorCode::UnknownAgent,
-                    format!("unknown Agent '{agent}'"),
+                    message,
                 )
                 .into());
             }
@@ -3212,13 +3263,14 @@ pub async fn set_agent_default_model(
             // The machine config the checks ran against, not a later read.
             Ok(AgentDefaultModel::of(
                 &crate::session::merge_configs(global, profile).acp,
+                &name,
                 &agent,
             ))
         })
         .map_err(|e| match e.downcast_ref::<DefaultModelRefused>() {
             Some(refused) => super::api_error_with_code_header(refused.0, refused.1.clone()),
             None => {
-                tracing::warn!(target: "http.api.system", "Agent default model update failed: {e}");
+                tracing::warn!(target: "http.api.system", error = %e, "Agent default model update failed");
                 api_error(StatusCode::BAD_REQUEST, "save_failed", e.to_string())
             }
         })
@@ -3228,7 +3280,7 @@ pub async fn set_agent_default_model(
         Ok(Ok(model)) => Json(model).into_response(),
         Ok(Err(resp)) => resp,
         Err(e) => {
-            tracing::error!(target: "http.api.system", "Agent default model update panicked: {e}");
+            tracing::error!(target: "http.api.system", error = %e, "Agent default model update panicked");
             internal_error()
         }
     }
@@ -4797,7 +4849,7 @@ command = "zzzeta"
             assert_eq!(status, StatusCode::OK, "{name}: {body}");
             assert_eq!(
                 body,
-                json!({"agent_key": key, "model": "m", "pinned": false}),
+                json!({"profile": "work", "agent_key": key, "model": "m", "pinned": false}),
                 "{name}"
             );
             assert_eq!(
@@ -5000,7 +5052,7 @@ command = "zzzeta"
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(
             body,
-            json!({"agent_key": "claude", "model": "m", "pinned": false})
+            json!({"profile": "work", "agent_key": "claude", "model": "m", "pinned": false})
         );
         Ok(())
     }
@@ -5061,7 +5113,10 @@ command = "zzzeta"
         crate::session::update_profile_config("work", |p| {
             p.overrides.insert(
                 "session".to_string(),
-                serde_json::json!({"agent_acp_cmd": {"mine": "my-agent --acp"}}),
+                serde_json::json!({
+                    "agent_acp_cmd": {"mine": "my-agent --acp", "broken": "my-agent 'unclosed"},
+                    "agent_detect_as": {"corp-claude": "claude"},
+                }),
             );
             Ok(())
         })
@@ -5118,6 +5173,25 @@ command = "zzzeta"
                 StatusCode::BAD_REQUEST,
                 "unknown_agent",
             ),
+            // The spawn reads a detect-as Agent's defaults under its base, never this name.
+            (
+                "detect-as only",
+                &state,
+                "work",
+                "corp-claude",
+                "m",
+                StatusCode::BAD_REQUEST,
+                "unknown_agent",
+            ),
+            (
+                "invalid command",
+                &state,
+                "work",
+                "broken",
+                "m",
+                StatusCode::BAD_REQUEST,
+                "unknown_agent",
+            ),
             (
                 "custom Agent",
                 &state,
@@ -5137,6 +5211,85 @@ command = "zzzeta"
                 assert_eq!(body["error"], code, "{name}");
                 assert_eq!(profile_acp("work"), before, "{name}");
             }
+            if name == "detect-as only" {
+                assert_eq!(
+                    body["message"],
+                    "corp-claude runs as Claude Code in Structured view, so it uses Claude Code's Agent defaults."
+                );
+            }
         }
+
+        // A first run with no profiles has none to write to, and mints none.
+        let profiles = crate::session::get_app_dir().unwrap().join("profiles");
+        std::fs::remove_dir_all(&profiles).unwrap();
+        let (got, _, body) = put_default_model(&state, "fresh", "claude", "m").await;
+        assert_eq!(got, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"], "not_found");
+        assert!(!profiles.join("fresh").exists());
+    }
+
+    /// The Session route answers under the profile and Agent key the Session's structured spawn
+    /// reads its defaults from, so a detect-as Session reads its base's default and pin.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_agent_default_model_reads_the_key_the_spawn_reads() {
+        use serde_json::json;
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::create_profile("work").unwrap();
+        crate::session::update_config(|c| {
+            c.session
+                .agent_acp_cmd
+                .insert("mine".into(), "my-agent --acp".into());
+            c.session
+                .agent_detect_as
+                .insert("corp-claude".into(), "claude".into());
+        })
+        .unwrap();
+        set_machine_acp_defaults(json!({
+            "claude": {"model": "c", "pin_model": true},
+            "corp-claude": {"model": "never-read"},
+            "mine": {"model": "x"},
+            "codex": {"model": "o"},
+        }));
+        let project = tempfile::tempdir().unwrap();
+        let session = |id: &str, tool: &str, agent_name: Option<&str>| {
+            let mut row = crate::session::Instance::new(id, project.path().to_str().unwrap());
+            row.id = id.into();
+            row.tool = tool.into();
+            row.source_profile = "work".into();
+            row.agent_name = agent_name.map(str::to_string);
+            row
+        };
+        let state = crate::server::test_support::build_test_app_state(vec![
+            session("registry", "claude", None),
+            session("detect-as", "corp-claude", None),
+            session("custom", "mine", None),
+            session("switched", "claude", Some("codex")),
+        ]);
+        for (id, key, model, pinned) in [
+            ("registry", "claude", "c", true),
+            ("detect-as", "claude", "c", true),
+            ("custom", "mine", "x", false),
+            ("switched", "codex", "o", false),
+        ] {
+            let resp = get_session_agent_default_model(
+                State(state.clone()),
+                axum::extract::Path(id.into()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "{id}");
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(
+                body,
+                json!({"profile": "work", "agent_key": key, "model": model, "pinned": pinned}),
+                "{id}"
+            );
+        }
+        let resp =
+            get_session_agent_default_model(State(state), axum::extract::Path("missing".into()))
+                .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
