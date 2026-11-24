@@ -5,7 +5,8 @@ import { TerminalSessionStack } from "./TerminalSessionStack";
 import { PairedShellPane, type ShellMode } from "./PairedTerminal";
 import { BackgroundAgentsPanel, type AgentFocus } from "./acp/BackgroundAgentsPanel";
 import { hasStartedBefore } from "./acp/startupWait";
-import { recreateContainerTitle } from "./sidebar/sessionActionTargets";
+import { recreateContainerBlock, recreateContainerTitle } from "./sidebar/sessionActionTargets";
+import type { NewSessionLike } from "./acp/ContainerGoneBanner";
 import { FilesPane } from "./FilesPane";
 import { DiffFileList } from "./diff/DiffFileList";
 import { FileContentViewer } from "./diff/FileContentViewer";
@@ -40,6 +41,8 @@ interface Props {
   onOpenTerminal?: (sessionId: string, mode: ShellMode) => void;
   /** Whether this server lets the dashboard restart an Agent. */
   canRestartAgent: boolean;
+  /** Opens the wizard for a Session like that one; undefined on a read-only server. */
+  newSessionLike?: (session: SessionResponse) => NewSessionLike | undefined;
   /** The active Session's mode for its primary paired shell. */
   shellMode: ShellMode;
   onShellModeChange: (mode: ShellMode) => void;
@@ -96,6 +99,7 @@ export function MobileMainPane({
   onSwitchToTerminal,
   onOpenTerminal,
   canRestartAgent,
+  newSessionLike,
   shellMode,
   onShellModeChange,
   pairedMounted,
@@ -182,6 +186,7 @@ export function MobileMainPane({
                     onStartSession={onStartSession && (() => onStartSession(session.id))}
                     archivedAt={session.archived_at ?? null}
                     snoozedUntil={session.snoozed_until ?? null}
+                    queuedCount={session.queued_count}
                     trashedAt={session.trashed_at ?? null}
                     onOpenFileRef={onOpenFileRef}
                     fileRefSession={session}
@@ -189,9 +194,11 @@ export function MobileMainPane({
                     serverReadOnly={readOnly}
                     isSandboxed={session.is_sandboxed}
                     recreateContainerTitle={recreateContainerTitle(session)}
+                    recreateContainerBlock={recreateContainerBlock(session, !!session.archived_at)}
                     onSwitchToTerminal={onSwitchToTerminal ? () => onSwitchToTerminal(session.id) : undefined}
                     onOpenTerminal={onOpenTerminal ? (mode) => onOpenTerminal(session.id, mode) : undefined}
                     canRestartAgent={canRestartAgent}
+                    newSessionLike={newSessionLike?.(session)}
                   />
                 </Suspense>
               )}

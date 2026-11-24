@@ -24,12 +24,12 @@ use crate::acp::acp_client::errors::{acp_internal_error, prompt_runtime_error, A
 use crate::acp::acp_client::lifecycle::{LifecycleSignal, OffProtocolWorkKind};
 use crate::acp::acp_client::opencode::recover_opencode_prompt_error;
 use crate::acp::acp_client::rate_limit::{
-    captured_rate_limit_reset, classify_rate_limit_error, clear_captured_rejections,
-    take_rate_limit_from_captured_rejection,
+    captured_rate_limit_reset, classify_rate_limit_error, classify_rate_limit_from_message,
+    clear_captured_rejections, take_rate_limit_from_captured_rejection,
 };
 use crate::acp::acp_client::reset::ResetSessionOutcome;
 use crate::acp::acp_client::session_identity::{ordered_native_request, OrderedRequestResult};
-use crate::acp::acp_client::steer::{first_text_block, SteerOutcome, SteerRequest};
+use crate::acp::acp_client::steer::{SteerOutcome, SteerRequest};
 use crate::acp::acp_client::watchdog::{
     silent_orphan_check_interval, silent_orphan_fast_grace, silent_orphan_grace,
     terminal_stop_reason, SilentOrphanWatchdog, SilentOrphanWatchdogConfig,
@@ -125,6 +125,7 @@ struct TurnFlags {
     result_observed: bool,
     /// What the adapter reported; `None` when no `PromptResponse` arrived.
     agent_stop_reason: Option<StopReason>,
+    rejected: bool,
 }
 
 struct Turn {
@@ -136,6 +137,8 @@ struct Turn {
     result_current: bool,
     flags: TurnFlags,
     preceding: Vec<Event>,
+    retry_text: String,
+    retry_attachments: Vec<crate::daemon::PromptAttachmentRef>,
     watchdog: SilentOrphanWatchdog,
     cfg: SilentOrphanWatchdogConfig,
     orphan_check_enabled: bool,
@@ -148,8 +151,12 @@ struct Turn {
 
 impl Turn {
     fn apply(&mut self, signal: LifecycleSignal) {
-        self.watchdog
-            .apply_signal(signal, Instant::now(), chrono::Utc::now(), self.cfg);
+        self.watchdog.apply_signal(
+            signal,
+            Instant::now(),
+            crate::time::Timestamp::now(),
+            self.cfg,
+        );
     }
 
     fn start_cancel_grace(&mut self, deadline: Instant) {
@@ -232,10 +239,15 @@ impl Session {
     /// not manufacture a second `Stopped` or a peer prompt failure.
     pub(super) async fn run_prompt(&mut self, prompt: QueuedPrompt) -> AcpResult<bool> {
         let QueuedPrompt {
-            blocks,
+            input,
             scope,
             correlation,
         } = prompt;
+        let retry_text = input.text();
+        let super::super::commands::PromptInput {
+            blocks,
+            attachments,
+        } = input;
         let shared = self.shared.clone();
         let native = self.control.is_some();
         let cancellation = shared
@@ -399,6 +411,8 @@ impl Session {
             result_current: true,
             flags: TurnFlags::default(),
             preceding: Vec::new(),
+            retry_text,
+            retry_attachments: attachments,
             watchdog: SilentOrphanWatchdog::default(),
             cfg: SilentOrphanWatchdogConfig {
                 base_grace,
@@ -447,13 +461,7 @@ impl Session {
             self.settle_initial_prompt(&scope, correlation, true).await;
             return Ok(false);
         }
-        let mut prompt_fut = self
-            .send_prompt(QueuedPrompt {
-                blocks,
-                scope,
-                correlation,
-            })
-            .await;
+        let mut prompt_fut = self.send_prompt(blocks, scope, correlation).await;
         if cancellation
             .as_ref()
             .is_some_and(|cancellation| cancellation.is_cancelled())
@@ -551,13 +559,12 @@ impl Session {
         Ok(self.finish_turn(turn, prompt_started_at_ms).await)
     }
 
-    async fn send_prompt(&self, prompt: QueuedPrompt) -> PromptFut {
-        let QueuedPrompt {
-            blocks,
-            scope,
-            correlation,
-        } = prompt;
-
+    async fn send_prompt(
+        &self,
+        blocks: Vec<ContentBlock>,
+        scope: Option<NativeRequestContext>,
+        correlation: Option<NativeOperationCorrelation>,
+    ) -> PromptFut {
         if let Err(error) = require_operation(&scope, correlation, self.control.is_some()) {
             return Box::pin(std::future::ready((PromptResult::Refused(error), None)));
         }
@@ -689,7 +696,7 @@ impl Session {
         let original_capture = if native && native_correlated && evidence_matches {
             self.shared.ingress.take_original_rate_limit_reset(
                 evidence.as_deref().expect("matching Native evidence"),
-                chrono::Utc::now(),
+                crate::time::Timestamp::now(),
             )
         } else {
             None
@@ -739,7 +746,7 @@ impl Session {
                             .with_current_epoch(turn.terminal_epoch, || {
                                 take_rate_limit_from_captured_rejection(
                                     &self.shared.rate_limit_rejections,
-                                    chrono::Utc::now(),
+                                    crate::time::Timestamp::now(),
                                 )
                             })
                             .flatten()
@@ -764,7 +771,7 @@ impl Session {
                     .with_current_epoch(turn.terminal_epoch, || {
                         captured_rate_limit_reset(
                             &self.shared.rate_limit_rejections,
-                            chrono::Utc::now(),
+                            crate::time::Timestamp::now(),
                         )
                     })
                     .flatten()
@@ -776,10 +783,18 @@ impl Session {
         };
 
         if let Some(info) = correlated
-            .then(|| classify_rate_limit_error(&error, captured.as_ref()))
+            .then(|| {
+                classify_rate_limit_error(&error, captured.as_ref()).or_else(|| {
+                    classify_rate_limit_from_message(&error.to_string(), captured.as_ref())
+                })
+            })
             .flatten()
         {
             turn.flags.rate_limit = Some(info);
+            return Ok(Flow::Break);
+        }
+        if correlated && (turn.flags.cancelling || turn.flags.orphan_cancel_sent) {
+            turn.flags.prompt_cancelled = true;
             return Ok(Flow::Break);
         }
 
@@ -797,7 +812,19 @@ impl Session {
             }
         }
         turn.preceding.push(diagnostic);
-        turn.flags.prompt_failed = true;
+        if correlated {
+            turn.flags.rejected = true;
+            turn.preceding.push(Event::PromptRejected {
+                reason: "prompt_failed".into(),
+                text: std::mem::take(&mut turn.retry_text),
+                attachments: std::mem::take(&mut turn.retry_attachments),
+            });
+            if !native && turn.result_current {
+                let _ = self.send_cancel(turn.scope.clone()).await;
+            }
+        } else {
+            turn.flags.prompt_failed = true;
+        }
         Ok(Flow::Break)
     }
 
@@ -836,7 +863,12 @@ impl Session {
         .ok_or_else(|| acp_internal_error("NotIssued: cancellation turn was superseded".into()))
     }
 
-    async fn reject_busy(&self, text: String, scope: &Option<NativeRequestContext>) {
+    async fn reject_busy(
+        &self,
+        text: String,
+        attachments: Vec<crate::daemon::PromptAttachmentRef>,
+        scope: &Option<NativeRequestContext>,
+    ) {
         let native = self.control.is_some();
         let sender = scoped_sender(&self.shared, native, scope);
         publish_scoped(
@@ -847,6 +879,7 @@ impl Session {
             Event::PromptRejected {
                 reason: "agent_busy".into(),
                 text,
+                attachments,
             },
             false,
         )
@@ -950,8 +983,8 @@ impl Session {
                     return Ok(Flow::Continue);
                 }
                 if newly_armed {
-                    let escalates_at = chrono::Utc::now()
-                        + chrono::Duration::from_std(
+                    let escalates_at = crate::time::Timestamp::now()
+                        + crate::time::Duration::try_from(
                             deadline.saturating_duration_since(Instant::now()),
                         )
                         .unwrap_or_default();
@@ -1040,12 +1073,12 @@ impl Session {
                     .and_then(|control| control.original_receipt());
                 self.shared.resume_task_tailing(tasks, receipt).await;
             }
-            ClientCmd::Prompt(blocks) => {
+            ClientCmd::Prompt(input) => {
                 return Ok(self
                     .on_follow_up(
                         turn,
                         QueuedPrompt {
-                            blocks,
+                            input,
                             scope,
                             correlation,
                         },
@@ -1058,7 +1091,7 @@ impl Session {
             ClientCmd::ResetSession {
                 text, respond_to, ..
             } => {
-                self.reject_busy(text, &scope).await;
+                self.reject_busy(text, Vec::new(), &scope).await;
                 let _ = respond_to.send(ResetSessionOutcome::Failed {
                     message: "a turn is in flight; stop it before clearing the conversation".into(),
                 });
@@ -1096,7 +1129,7 @@ impl Session {
         }
 
         if turn.flags.cancelling {
-            self.reject_busy(first_text_block(&prompt.blocks), &prompt.scope)
+            self.reject_busy(prompt.input.text(), prompt.input.attachments, &prompt.scope)
                 .await;
             if current_effect(&turn.scope, native, || ()).is_ok() {
                 turn.flags.agent_unresponsive = true;
@@ -1114,7 +1147,7 @@ impl Session {
         if self.steering_capable && !compacting {
             self.steer_or_backlog(turn, prompt);
         } else {
-            self.reject_busy(first_text_block(&prompt.blocks), &prompt.scope)
+            self.reject_busy(prompt.input.text(), prompt.input.attachments, &prompt.scope)
                 .await;
         }
         Flow::Continue
@@ -1125,12 +1158,11 @@ impl Session {
             turn.steer_backlog.push_back(prompt);
             return;
         }
-
         let request = ordered_native_request(
             &self.connection,
             &self.shared.connection_state,
             prompt.scope.clone(),
-            SteerRequest::new(self.acp_session_id.clone(), prompt.blocks.clone()),
+            SteerRequest::new(self.acp_session_id.clone(), prompt.input.blocks.clone()),
         );
         turn.steer_fut = Some(Box::pin(async move {
             let result = match request {
@@ -1249,7 +1281,7 @@ impl Session {
             }
             Err(error) => {
                 warn!(target: "acp.protocol", %error, "_session/steering failed");
-                self.reject_busy(first_text_block(&prompt.blocks), &prompt.scope)
+                self.reject_busy(prompt.input.text(), prompt.input.attachments, &prompt.scope)
                     .await;
             }
         }
@@ -1278,6 +1310,7 @@ impl Session {
 
         if !native
             && !turn.flags.prompt_failed
+            && !turn.flags.rejected
             && shared.profile.key == "opencode"
             && finished
             && !turn.watchdog.saw_progress()
@@ -1301,7 +1334,9 @@ impl Session {
 
         let rate_limited = turn.flags.rate_limit.is_some();
         let flags = &turn.flags;
-        let reason = if flags.prompt_failed {
+        let reason = if flags.rejected {
+            "prompt_rejected"
+        } else if flags.prompt_failed {
             "prompt_failed"
         } else {
             terminal_stop_reason(
@@ -1314,7 +1349,7 @@ impl Session {
                 flags.orphan_cancel_sent && finished,
             )
         };
-        let failed = flags.prompt_failed || rate_limited;
+        let failed = flags.prompt_failed || flags.rejected || rate_limited;
 
         // Original local slot settlement is independent of Native row generation.
         // A later SDK terminal epoch still prevents settling somebody else's slot.

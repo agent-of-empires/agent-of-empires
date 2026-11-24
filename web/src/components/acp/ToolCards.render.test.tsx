@@ -1286,6 +1286,23 @@ describe("WorkflowToolCard", () => {
     cleanup();
     expect(renderCard(tool, launched, { toolKey: "codex" }).text()).not.toContain("workflowWorkflow");
   });
+
+  it("stays a workflow card when a permission start retitled it to the fallback name", () => {
+    const retitled = makeToolCall({
+      id: "toolu_wf",
+      name: "tool call",
+      raw_name: "Workflow",
+      kind: "other",
+      args_preview: args({ _aoe_title: "tool call", _aoe_raw_tool_name: "Workflow", script }),
+    });
+    expect(renderCard(retitled, launched, { toolKey: "claude" }).text()).toContain("workflowWorkflow");
+  });
+
+  it("says the script is being prepared until the call returns or a run appears", () => {
+    expect(renderCard(tool, undefined, { toolKey: "claude" }).text()).toContain("Preparing workflow script");
+    cleanup();
+    expect(renderCard(tool, launched, { toolKey: "claude" }).text()).not.toContain("Preparing workflow script");
+  });
 });
 
 describe("duration formatting", () => {

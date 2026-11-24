@@ -116,6 +116,167 @@ pub async fn update_session_favorite(
     crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
 }
 
+/// 409 for ignore refusing a sunk row. The codes stay the ones clients already
+/// switch on; the message names ignore instead of a start.
+fn ignore_blocked_response(blocked: crate::session::StartBlocked) -> axum::response::Response {
+    use crate::daemon::ApiErrorCode;
+    let (code, message) = match blocked {
+        crate::session::StartBlocked::Archived => (
+            ApiErrorCode::SessionArchived,
+            "An archived session cannot be ignored; unarchive it first",
+        ),
+        crate::session::StartBlocked::Trashed => (
+            ApiErrorCode::SessionTrashed,
+            "A session in trash cannot be ignored; restore it first",
+        ),
+    };
+    crate::server::api::api_error_with_code_header(code, message)
+}
+
+/// Ignore or unignore a session managed by another session. The row stays
+/// live and present; archive, snooze, and trash are untouched. Ignoring
+/// requires a manager and refuses an archived or trashed session because
+/// those states outrank it.
+pub async fn update_session_ignored(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateIgnoredBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return crate::server::api::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+
+    let namespace = state.profile_namespace.read().await;
+    let lock = state.instance_lock(&id).await;
+    let guard = lock.lock().await;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
+    }
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
+            return crate::server::api::session_not_found();
+        };
+        instance.source_profile.clone()
+    };
+    let ignored = body.ignored;
+    let persist_id = id.clone();
+    let committed = commit_profile_update_with_refusal(
+        &state,
+        profile,
+        "ignore update",
+        move |instances| {
+            let Some(instance) = instances
+                .iter_mut()
+                .find(|instance| instance.id == persist_id)
+            else {
+                return Err(crate::server::api::session_not_found());
+            };
+            if ignored {
+                // Archive and trash outrank ignore; ignoring a sunk row would persist a
+                // state the rest of the dashboard reads as archived or trashed.
+                if instance.is_trashed() {
+                    return Err(ignore_blocked_response(
+                        crate::session::StartBlocked::Trashed,
+                    ));
+                }
+                if instance.is_archived() {
+                    return Err(ignore_blocked_response(
+                        crate::session::StartBlocked::Archived,
+                    ));
+                }
+                // Only a managed row can be ignored; otherwise the marker would outlive
+                // the manager link that gives it meaning.
+                if instance.parent_session_id.is_none() {
+                    return Err(crate::server::api::api_error(
+                        axum::http::StatusCode::BAD_REQUEST,
+                        "session_not_managed",
+                        "Only a session managed by another session can be ignored",
+                    ));
+                }
+                instance.ignore();
+            } else {
+                instance.unignore();
+            }
+            Ok(())
+        },
+        None,
+    )
+    .await;
+    if let Err(response) = committed {
+        return response;
+    }
+    tracing::info!(target: "session.sync", session = %id, field = "ignored", value = ignored, "session updated");
+    drop(guard);
+    drop(namespace);
+    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
+}
+
+/// Take ownership of a managed session: clear its manager link and ignore
+/// marker while preserving the row, conversation, worktree, and every
+/// unrelated triage timestamp.
+pub async fn reclaim_session_ownership(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<ReclaimOwnershipBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return crate::server::api::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    if !body.reclaim {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "reclaim must be true",
+        );
+    }
+
+    let namespace = state.profile_namespace.read().await;
+    let lock = state.instance_lock(&id).await;
+    let guard = lock.lock().await;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
+    }
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
+            return crate::server::api::session_not_found();
+        };
+        instance.source_profile.clone()
+    };
+    let persist_id = id.clone();
+    let committed = commit_profile_update(
+        &state,
+        profile,
+        "reclaim ownership",
+        move |instances| {
+            if let Some(instance) = instances
+                .iter_mut()
+                .find(|instance| instance.id == persist_id)
+            {
+                instance.reclaim_ownership();
+            }
+        },
+        None,
+    )
+    .await;
+    if let Err(response) = committed {
+        return response;
+    }
+    tracing::info!(target: "session.sync", session = %id, field = "ownership", value = "reclaimed", "session updated");
+    drop(guard);
+    drop(namespace);
+    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
+}
+
 pub async fn update_session_color(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -249,9 +410,9 @@ mod trash_reservation_tests {
             crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
             let worker_state = state.clone();
             let worker_id = id.clone();
-            let peer_at = chrono::Utc::now()
+            let peer_at = crate::time::Timestamp::now()
                 + Instance::LIFECYCLE_RESERVATION_TTL
-                + chrono::Duration::seconds(1);
+                + crate::time::Duration::seconds(1);
             let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 let native = crate::server::session_store::NativeSessionStore::open(
                     worker_state.clone(),
@@ -278,7 +439,7 @@ mod trash_reservation_tests {
                     let generation = row.try_acquire_lifecycle_reservation(
                         LifecycleOperation::Trash,
                         Instance::LIFECYCLE_RESERVATION_TTL,
-                        chrono::Utc::now(),
+                        crate::time::Timestamp::now(),
                     )?;
                     retirement.generation = Some(generation);
                     row.trash();
@@ -335,14 +496,14 @@ mod trash_reservation_tests {
                 _ => {
                     assert_eq!(stored.lifecycle_generation, initial_generation + 1);
                     assert!(stored.has_pending_trash());
-                    assert!(!stored.has_fresh_lifecycle_reservation(chrono::Utc::now()));
+                    assert!(!stored.has_fresh_lifecycle_reservation(crate::time::Timestamp::now()));
                     let mut retry = stored;
                     assert_eq!(
                         retry
                             .try_acquire_lifecycle_reservation(
                                 LifecycleOperation::Trash,
                                 Instance::LIFECYCLE_RESERVATION_TTL,
-                                chrono::Utc::now(),
+                                crate::time::Timestamp::now(),
                             )
                             .unwrap(),
                         initial_generation + 2
@@ -369,7 +530,7 @@ mod archive_reservation_tests {
             let generation = row.try_acquire_lifecycle_reservation(
                 LifecycleOperation::Stop,
                 Instance::LIFECYCLE_RESERVATION_TTL,
-                chrono::Utc::now(),
+                crate::time::Timestamp::now(),
             )?;
             crate::server::test_support::seed_instances_on_disk_for_test(
                 "default",
@@ -409,7 +570,7 @@ mod archive_reservation_tests {
                     expected_generation = rows[0].try_acquire_lifecycle_reservation(
                         LifecycleOperation::Stop,
                         Instance::LIFECYCLE_RESERVATION_TTL,
-                        chrono::Utc::now(),
+                        crate::time::Timestamp::now(),
                     )?;
                     Ok(())
                 })?;
@@ -421,7 +582,7 @@ mod archive_reservation_tests {
                 retired_file = Some(retired.join(storage.sessions_path().file_name().unwrap()));
                 let replacement = Storage::new_unwatched("default")?;
                 row.title = "replacement must retain its matching numeric token".into();
-                row.created_at += chrono::Duration::seconds(1);
+                row.created_at += crate::time::Duration::seconds(1);
                 replacement.update(|rows, _| {
                     *rows = vec![row.clone()];
                     Ok(())
@@ -513,7 +674,7 @@ pub async fn update_session_archive(
             if row.is_trashed() {
                 return Err(LifecycleTargetError::Blocked(crate::session::StartBlocked::Trashed).into());
             }
-            let now = chrono::Utc::now();
+            let now = crate::time::Timestamp::now();
             if matches!(row.status, Status::Creating | Status::Deleting)
                 || row.has_fresh_lifecycle_reservation(now) {
                 return Err(LifecycleTargetError::Busy.into());
@@ -627,7 +788,7 @@ pub async fn update_session_archive(
             if !row.finish_lifecycle_status(LifecycleOperation::Stop, generation, status) {
                 return Err(LifecycleTargetError::Busy.into());
             }
-            if let Err(error) = &stopped { row.last_error = Some(error.to_string()); }
+            if let Err(error) = &stopped { row.last_error.set(error.to_string()); }
             Ok(())
         });
         if let Err(error) = finalized {
@@ -802,7 +963,7 @@ pub async fn touch_session_input_recency(
                             && row.lifecycle_generation == body.lifecycle_generation
                     })
                     .ok_or(crate::session::LifecycleReservationError::Superseded)?;
-                row.last_accessed_at = Some(chrono::Utc::now());
+                row.last_accessed_at = Some(crate::time::Timestamp::now());
                 Ok(())
             })
         })
@@ -901,7 +1062,7 @@ pub async fn trash_session(
             }
             let retrying = row.is_trashed();
             if retrying {
-                if row.has_fresh_lifecycle_reservation(chrono::Utc::now()) {
+                if row.has_fresh_lifecycle_reservation(crate::time::Timestamp::now()) {
                     return Err(LifecycleTargetError::Busy.into());
                 }
                 if !row.lifecycle_reservation_is_owned(LifecycleOperation::Trash, row.lifecycle_generation) {
@@ -914,7 +1075,7 @@ pub async fn trash_session(
                 )?);
             }
             row.try_acquire_lifecycle_reservation(
-                LifecycleOperation::Trash, Instance::LIFECYCLE_RESERVATION_TTL, chrono::Utc::now(),
+                LifecycleOperation::Trash, Instance::LIFECYCLE_RESERVATION_TTL, crate::time::Timestamp::now(),
             )?;
             retirement.generation = Some(row.lifecycle_generation);
             row.trash();
@@ -1040,14 +1201,14 @@ pub async fn trash_session(
                 if terminal {
                     row.release_lifecycle_reservation_if_owned(LifecycleOperation::Trash, generation);
                 } else {
-                    row.retire_trash_reservation_if_owned(generation, chrono::Utc::now());
+                    row.retire_trash_reservation_if_owned(generation, crate::time::Timestamp::now());
                 }
             }
             if let Err(error) = &stopped {
                 let row = rows.iter_mut().find(|row| row.id == worker_id)
                     .ok_or(LifecycleTargetError::Missing)?;
                 row.status = Status::Error;
-                row.last_error = Some(error.to_string());
+                row.last_error.set(error.to_string());
             }
             Ok(())
         });
@@ -1169,7 +1330,7 @@ pub async fn restore_session(
                 if worker_state.cityhall_mode && !row.is_structured() {
                     return Err(LifecycleTargetError::CityHall.into());
                 }
-                let now = chrono::Utc::now();
+                let now = crate::time::Timestamp::now();
                 if !row.is_trashed() {
                     if row.has_fresh_lifecycle_reservation(now) {
                         return Err(row.lifecycle_reservation.as_ref().map_or(
@@ -1281,6 +1442,7 @@ pub async fn restore_session(
 /// title from the first prompt, even over one already chosen. Waits for the
 /// rename: `200` once the title is saved, `409` when nothing could be applied,
 /// `502` with the agent's reason on failure, `504` past the rename deadline.
+/// A terminal session's rename runs detached, so it answers `202` with the row.
 pub async fn force_smart_rename(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1369,13 +1531,7 @@ pub async fn force_smart_rename(
                 true,
             ),
         );
-        return match state.runtime.publish(&state).await {
-            Ok(snapshot) => crate::server::runtime::mutation_response(
-                &snapshot.value.cursor,
-                StatusCode::ACCEPTED,
-            ),
-            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
+        return crate::server::runtime::accepted_session_mutation_response(&state, &id).await;
     }
 
     let Some((first_user_prompt, agent_prose)) = state
@@ -1586,6 +1742,17 @@ pub(crate) fn lifecycle_rejection(
     {
         return Some(crate::server::api::start_blocked_response(blocked));
     }
+    if let Some(login) = error.downcast_ref::<crate::session::SandboxLoginRequired>() {
+        return Some(crate::server::api::sandbox_login_required_response(login));
+    }
+    if let Some(unsupported) = error.downcast_ref::<crate::session::SandboxLoginUnsupported>() {
+        return Some(crate::server::api::sandbox_login_unsupported_response(
+            unsupported,
+        ));
+    }
+    if let Some(hook) = error.downcast_ref::<crate::session::BeforeStartHookError>() {
+        return Some(crate::server::api::before_start_hook_failed_response(hook));
+    }
     // A row a peer purged between the memory check and this write: the caller
     // is talking to a session that no longer exists, not to a busy one.
     if error.is::<crate::session::SessionGone>() {
@@ -1714,7 +1881,7 @@ fn reserve_structured_user_stop(row: &mut Instance) -> anyhow::Result<u64> {
     let generation = row.try_acquire_lifecycle_reservation(
         LifecycleOperation::Stop,
         Instance::LIFECYCLE_RESERVATION_TTL,
-        chrono::Utc::now(),
+        crate::time::Timestamp::now(),
     )?;
     // Even a row already presented as Stopped can own a live or pending worker.
     row.status = Status::Stopped;
@@ -2009,7 +2176,7 @@ async fn resume_structured_stop_inner(
             anyhow::ensure!(row.is_structured(), LifecycleTargetError::NotStructured);
             if row.terminal_handoff.is_some()
                 || matches!(row.status, Status::Creating | Status::Deleting)
-                || (row.has_fresh_lifecycle_reservation(chrono::Utc::now())
+                || (row.has_fresh_lifecycle_reservation(crate::time::Timestamp::now())
                     && !row.lifecycle_reservation_is_owned(
                         LifecycleOperation::Stop,
                         expected_generation,
@@ -2125,7 +2292,16 @@ async fn resume_structured_stop_inner(
         .reserve_spawn_with_restart(&expected.id, kind, ResumeAuthority::Explicit, restart)
         .await
         .map_err(|error| {
-            crate::server::api::acp::supervisor_error_response("resume failed", &error)
+            if restart.is_some()
+                && matches!(
+                    error,
+                    crate::acp::supervisor::SupervisorError::PurgeInProgress(_)
+                )
+            {
+                crate::server::api::acp::restart_purge_conflict()
+            } else {
+                crate::server::api::acp::supervisor_error_response("resume failed", &error)
+            }
         })?;
     if reservation.observed_stop() != Some(&observed_stop) {
         return Err(structured_lifecycle_error(
@@ -2151,7 +2327,7 @@ async fn resume_structured_stop_inner(
             anyhow::ensure!(row.is_structured(), LifecycleTargetError::NotStructured);
             if row.terminal_handoff.is_some()
                 || matches!(row.status, Status::Creating | Status::Deleting)
-                || (row.has_fresh_lifecycle_reservation(chrono::Utc::now())
+                || (row.has_fresh_lifecycle_reservation(crate::time::Timestamp::now())
                     && !row.lifecycle_reservation_is_owned(
                         LifecycleOperation::Stop,
                         expected_generation,
@@ -2282,7 +2458,7 @@ async fn stop_with_commit(
             let generation = row.try_acquire_lifecycle_reservation(
                 LifecycleOperation::Stop,
                 Instance::LIFECYCLE_RESERVATION_TTL,
-                chrono::Utc::now(),
+                crate::time::Timestamp::now(),
             )?;
             if row.status == Status::Stopped {
                 row.release_lifecycle_reservation_if_owned(LifecycleOperation::Stop, generation);
@@ -2387,7 +2563,7 @@ async fn stop_with_commit(
                 pi.apply(row);
             }
             if !stopped {
-                row.last_error = Some("Failed to stop session resources".into());
+                row.last_error.set("Failed to stop session resources");
             }
             Ok(())
         });
@@ -2873,7 +3049,7 @@ fn admit_restart(
     account_swap: bool,
     resume_policy: crate::session::ResumeAttemptPolicy,
 ) -> anyhow::Result<()> {
-    let now = chrono::Utc::now();
+    let now = crate::time::Timestamp::now();
     if let Err(blocked) = row.ensure_startable() {
         return Err(LifecycleTargetError::Blocked(blocked).into());
     }
@@ -2917,11 +3093,142 @@ fn admit_restart(
     row.touch_last_accessed();
     row.idle_dormant_since = None;
     row.idle_entered_at = None;
-    row.last_error = None;
+    row.last_error.clear();
     row.last_error_evidence = None;
     row.last_error_check = None;
     row.status = Status::Starting;
     Ok(())
+}
+
+/// Whether a restart into `tool` (under `target`, when it moves profile) swaps the account of
+/// the same agent and so keeps the row's conversation and provider, as the restart itself
+/// decides.
+fn keeps_account(row: &Instance, target: Option<&str>, tool: Option<&str>) -> bool {
+    let Some(tool) = tool.filter(|tool| *tool != row.tool) else {
+        return false;
+    };
+    matches!(
+        crate::session::conversation_carry::classify(
+            row,
+            target.unwrap_or(&row.source_profile),
+            tool
+        ),
+        crate::session::conversation_carry::ToolSwap::KeepConversation(_)
+    )
+}
+
+/// The restart's profile, tool and command over `row`, as the restart itself applies them:
+/// an account of the same agent keeps the conversation (`swap_account`), any other tool
+/// parks it (`swap_tool`). The launch the pre-lock admission decides on.
+pub(super) fn apply_restart_settings(
+    row: &mut Instance,
+    target: Option<&str>,
+    tool: Option<&str>,
+    command: Option<&str>,
+) {
+    let account_swap = keeps_account(row, target, tool);
+    if let Some(target) = target {
+        row.source_profile = target.to_owned();
+    }
+    if let Some(tool) = tool.filter(|tool| *tool != row.tool) {
+        if account_swap {
+            row.swap_account(tool);
+        } else {
+            row.swap_tool(tool);
+        }
+    }
+    if let Some(command) = command {
+        row.command = command.to_owned();
+    }
+}
+
+/// The sandbox login admission of a restart, before it takes any lock or stops or discards
+/// anything: a refusal leaves the running agent and its container as they are. It resolves a
+/// `before_start` hook the cheap decision cannot see, here and not under the locks (a hook may
+/// call `aoe` on this session), and the strict re-checks under the locks then find the result.
+/// `None` admits the restart, or leaves a refusal it cannot decide (a store that will not
+/// open) to the restart's own steps.
+async fn admit_restart_sandbox_login(
+    state: &Arc<AppState>,
+    id: &str,
+    body: &crate::daemon::RestartSessionBody,
+) -> Option<axum::response::Response> {
+    let mut row = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|row| row.id == id && row.is_sandboxed())
+        .cloned()?;
+    // A restart a cheaper check refuses never runs the hook: those checks answer first.
+    if row.ensure_startable().is_err()
+        || matches!(row.status, Status::Creating | Status::Deleting)
+        || (body.only_if_idle && row.status != Status::Idle)
+        || (state.cityhall_mode && !row.is_structured())
+        || *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy
+    {
+        return None;
+    }
+    let target = body
+        .profile
+        .as_deref()
+        .filter(|target| *target != row.source_profile)
+        .map(str::to_owned);
+    if let Some(target) = &target {
+        if !state
+            .canonical_metadata
+            .read()
+            .await
+            .profiles
+            .iter()
+            .any(|profile| profile.name == *target)
+        {
+            return None;
+        }
+    }
+    let (tool, command) = (body.tool.clone(), body.command_override.clone());
+    let native_state = state.clone();
+    let checked = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        use crate::session::SessionStore;
+        let id = row.id.clone();
+        let open = |profile: &str| {
+            let store = crate::server::session_store::NativeSessionStore::open(
+                native_state.clone(),
+                profile,
+                Some(id.clone()),
+            )?;
+            store.configuration(Some(profile))?;
+            anyhow::Ok(store)
+        };
+        // The persisted row first, then the restart's settings over it: a reload after them
+        // would undo them, and the hook and the gate decide on the launch the restart makes.
+        let source = open(&row.source_profile)?;
+        if let Err(error) = row.reconcile_from_store(&source) {
+            return match error.downcast_ref::<crate::session::LifecycleReservationError>() {
+                // The row is gone: the restart itself answers.
+                Some(crate::session::LifecycleReservationError::Superseded) => Ok(()),
+                _ => Err(error),
+            };
+        }
+        apply_restart_settings(
+            &mut row,
+            target.as_deref(),
+            tool.as_deref(),
+            command.as_deref(),
+        );
+        let launch_store = match &target {
+            Some(target) => open(target)?,
+            None => source,
+        };
+        row.resolve_before_start_for_restart(&launch_store, false)?;
+        row.ensure_sandbox_launchable_strict(&launch_store)
+    })
+    .await;
+    match checked {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => lifecycle_rejection(state, &error),
+        Err(_) => Some(StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    }
 }
 
 fn reserve_structured_restart(
@@ -2968,12 +3275,44 @@ fn reserve_structured_restart(
             .map_err(LifecycleTargetError::Blocked)?;
         return Err(LifecycleTargetError::Busy.into());
     }
+    let account_swap = keeps_account(
+        &probe,
+        body.profile
+            .as_deref()
+            .filter(|target| *target != instance.source_profile),
+        body.tool.as_deref(),
+    );
     admit_restart(
         &mut probe,
         body,
-        false,
+        account_swap,
         crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
     )?;
+    if probe.is_sandboxed() {
+        // Strictly, under the locks, before the caller stops the worker; the target
+        // profile's store when the restart moves the session.
+        let target_native = body
+            .profile
+            .as_deref()
+            .filter(|target| *target != instance.source_profile)
+            .map(|target| {
+                crate::server::session_store::NativeSessionStore::open(
+                    state.clone(),
+                    target,
+                    Some(instance.id.clone()),
+                )
+            })
+            .transpose()?;
+        let mut gated = probe.clone();
+        if let Some(target) = &target_native {
+            gated.source_profile = target.storage().profile().to_owned();
+        }
+        gated.ensure_sandbox_launchable_strict(
+            target_native
+                .as_ref()
+                .map_or(&native as &dyn SessionStore, |target| target),
+        )?;
+    }
     if let Some(target) = body
         .profile
         .as_deref()
@@ -3006,7 +3345,7 @@ fn reserve_structured_restart(
             crate::session::LifecycleReservationError::Superseded
         );
         if matches!(row.status, Status::Creating | Status::Deleting)
-            || row.has_fresh_lifecycle_reservation(chrono::Utc::now())
+            || row.has_fresh_lifecycle_reservation(crate::time::Timestamp::now())
         {
             return Err(LifecycleTargetError::Busy.into());
         }
@@ -3015,7 +3354,7 @@ fn reserve_structured_restart(
         row.try_acquire_lifecycle_reservation(
             LifecycleOperation::Launch,
             Instance::LIFECYCLE_RESERVATION_TTL,
-            chrono::Utc::now(),
+            crate::time::Timestamp::now(),
         )?;
         row.status = Status::Starting;
         row.rebase_acp_generation(native.storage())?;
@@ -3060,7 +3399,7 @@ fn reserve_structured_restart(
 
 struct PreparedQuotaRestart {
     park_seq: u64,
-    resets_at: chrono::DateTime<chrono::Utc>,
+    resets_at: crate::time::Timestamp,
     continuation: Option<crate::server::acp_reconciler::PreparedContinuation>,
 }
 
@@ -3115,7 +3454,7 @@ pub(super) async fn continue_interrupted_prompt(
     state: &Arc<AppState>,
     id: &str,
     generation: u64,
-    resets_at: chrono::DateTime<chrono::Utc>,
+    resets_at: crate::time::Timestamp,
     explicit_wake: bool,
     submission: &tokio::sync::OwnedMutexGuard<()>,
     prepared: Option<crate::server::acp_reconciler::PreparedContinuation>,
@@ -3495,6 +3834,7 @@ async fn finish_structured_restart(
                                 woke_idle_dormant: false,
                                 prompt_ids: Vec::new(),
                                 synthesized: true,
+                                    origin: crate::daemon::PromptOrigin::Aoe,
                                 no_revive: true, },
                             )
                             .await;
@@ -3636,7 +3976,7 @@ pub(super) async fn prepare_agent_session(
     preparation: AgentPreparation,
     restart: Option<Arc<crate::daemon::RestartSessionBody>>,
 ) -> axum::response::Response {
-    prepare_agent_session_inner(
+    Box::pin(prepare_agent_session_inner(
         state,
         id,
         AgentPreparationInput {
@@ -3649,7 +3989,7 @@ pub(super) async fn prepare_agent_session(
         None,
         RestartOrigin::Explicit,
         None,
-    )
+    ))
     .await
 }
 
@@ -3660,7 +4000,7 @@ pub(super) async fn prepare_captured_terminal_session(
     expected: crate::daemon::NativePreparationIdentity,
     physical: Option<Arc<crate::session::LegacyToolObservation>>,
 ) -> axum::response::Response {
-    prepare_agent_session_inner(
+    Box::pin(prepare_agent_session_inner(
         state,
         id,
         AgentPreparationInput {
@@ -3676,7 +4016,7 @@ pub(super) async fn prepare_captured_terminal_session(
         None,
         RestartOrigin::Explicit,
         None,
-    )
+    ))
     .await
 }
 
@@ -3691,8 +4031,7 @@ fn rate_limit_of(body: &serde_json::Value) -> Option<crate::acp::state::RateLimi
         status: body["status"].as_str()?.to_owned(),
         resets_at: body["resets_at"]
             .as_str()
-            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
-            .map(|at| at.with_timezone(&chrono::Utc)),
+            .and_then(|at| crate::time::Timestamp::parse_rfc3339(at).ok()),
         kind: body["kind"].as_str()?.to_owned(),
     })
 }
@@ -3961,7 +4300,7 @@ pub(crate) async fn recovery_restart(
     id: String,
     expected_generation: u64,
 ) -> axum::response::Response {
-    prepare_agent_session_inner(
+    Box::pin(prepare_agent_session_inner(
         state,
         id,
         AgentPreparationInput {
@@ -3977,7 +4316,7 @@ pub(crate) async fn recovery_restart(
         Some(expected_generation),
         RestartOrigin::StartupRecovery,
         None,
-    )
+    ))
     .await
 }
 
@@ -4010,6 +4349,14 @@ async fn prepare_agent_session_inner(
     }
     if state.read_only {
         return crate::server::api::read_only_response();
+    }
+    if let Some(body) = restart
+        .as_deref()
+        .filter(|_| matches!(restart_origin, RestartOrigin::Explicit))
+    {
+        if let Some(response) = admit_restart_sandbox_login(&state, &id, body).await {
+            return response;
+        }
     }
     #[cfg(test)]
     launch_hook_gate::pause(&id, launch_hook_gate::Stage::BeforeLocks).await;
@@ -4282,7 +4629,7 @@ async fn prepare_agent_session_inner(
                     LifecycleOperation::Launch,
                     reserved.lifecycle_generation,
                 );
-                row.idle_dormant_since = Some(chrono::Utc::now());
+                row.idle_dormant_since = Some(crate::time::Timestamp::now());
                 Ok(row.clone())
             })
         })
@@ -4446,6 +4793,18 @@ async fn prepare_agent_session_inner(
             }
             admit_terminal_recovery(&probe, &instance, native.storage(), body)?;
             admit_restart(&mut probe, body, account_swap, resume_policy)?;
+            if probe.is_sandboxed() && !instance.is_structured() {
+                // Strictly, on what the session holds under these locks (the hook was resolved
+                // before them), and before anything below stops the agent or discards its
+                // container. A structured session was checked before its worker was stopped.
+                probe.ensure_sandbox_launchable_strict(
+                    target_native
+                        .as_ref()
+                        .map_or(&native as &dyn crate::session::SessionStore, |target| {
+                            target
+                        }),
+                )?;
+            }
             if let Some(target_native) = &target_native {
                 let rows = target_native.storage().load()?;
                 if rows.iter().any(|row| row.id == outgoing.id)
@@ -4512,7 +4871,7 @@ async fn prepare_agent_session_inner(
                     row.rebase_acp_generation(native.storage())?;
                     return Ok(Some(row.clone()));
                 }
-                let now = chrono::Utc::now();
+                let now = crate::time::Timestamp::now();
                 if row.is_structured() {
                     anyhow::ensure!(
                         row.lifecycle_generation == instance.lifecycle_generation,
@@ -4602,7 +4961,7 @@ async fn prepare_agent_session_inner(
                 row.idle_dormant_since = None;
                 row.idle_entered_at = None;
                 if row.is_structured() {
-                    row.last_error = None;
+                    row.last_error.clear();
                     row.last_error_evidence = None;
                     row.status = Status::Idle;
                     row.release_lifecycle_reservation_if_owned(
@@ -4722,7 +5081,7 @@ async fn prepare_agent_session_inner(
                         crate::session::recovery::recovery_hook_timeout(),
                     )
                 });
-                let hooks = started.run_pre_launch_hooks(
+                let hooks = started.run_agent_launch_hooks(
                     restart.as_ref().is_some_and(|body| body.skip_on_launch),
                     &native,
                     None,
@@ -5002,6 +5361,7 @@ async fn prepare_agent_session_inner(
             &state.session_service,
             &id,
             crate::process::worker_registry::ResumeAuthority::Explicit,
+            crate::server::sandbox_login::LaunchOrigin::Interactive,
             Some(reservation),
         )
         .await
@@ -5042,6 +5402,7 @@ async fn prepare_agent_session_inner(
             wake_source = Some(prepared.native);
             Some(prepared.target)
         };
+        let mut wake = None;
         if matches!(
             outcome,
             Some(crate::session::StartOutcome::Fresh | crate::session::StartOutcome::Resumed)
@@ -5052,10 +5413,19 @@ async fn prepare_agent_session_inner(
                 let profile_identity = wake_source
                     .as_ref()
                     .and_then(|native| native.storage().bound_profile_identity().ok());
-                crate::session::restart::spawn_wake_worker(row, wake_message, profile_identity);
+                wake = Some((wake_message, row.clone(), profile_identity));
             }
         }
         drop(rows);
+        if let Some((wake_message, wake_row, profile_identity)) = wake {
+            let delay = wake_row.send_keys_enter_delay();
+            crate::session::restart::spawn_wake_worker(
+                &wake_row,
+                wake_message,
+                profile_identity,
+                delay,
+            );
+        }
         tracing::info!(target: "session.restart", session = %id, view = "terminal", reason, "session restarted");
         return crate::server::runtime::session_mutation_response(
             &state,
@@ -5490,7 +5860,7 @@ mod durable_stop_tests {
                     Status::Error
                 }
             );
-            assert!(current.last_error.as_ref().is_none_or(|message| {
+            assert!(current.last_error.as_deref().is_none_or(|message| {
                 !message.contains(source.to_str().unwrap())
                     && !message.contains("private-content")
                     && cause.as_ref().is_none_or(|cause| !message.contains(cause))
@@ -5566,6 +5936,7 @@ mod durable_stop_tests {
                         &scope.state.session_service,
                         &id,
                         worker_registry::ResumeAuthority::Automatic,
+                        crate::server::sandbox_login::LaunchOrigin::Unattended,
                         None,
                     )
                     .await
@@ -5983,7 +6354,7 @@ mod durable_stop_tests {
             .try_acquire_lifecycle_reservation(
                 LifecycleOperation::Stop,
                 Instance::LIFECYCLE_RESERVATION_TTL,
-                chrono::Utc::now(),
+                crate::time::Timestamp::now(),
             )
             .unwrap();
         crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
@@ -6623,7 +6994,12 @@ mod restart_wake_tests {
                 let state = live.state.clone();
                 state
                     .session_service
-                    .set_pending_initial_turn(&id, "existing pending work".into(), Vec::new())
+                    .set_pending_initial_turn(
+                        &id,
+                        "existing pending work".into(),
+                        Vec::new(),
+                        crate::daemon::PromptOrigin::Unknown,
+                    )
                     .await;
                 let (park_seq, resets_at) =
                     match crate::server::api::acp::rate_limit_resume_probe(&state, &id)
@@ -6781,6 +7157,10 @@ mod shared_recovery_admission_tests {
             text: "retained blocked input".into(),
             attachments: Vec::new(),
             synthesized: false,
+            error: None,
+            error_code: None,
+            id: crate::session::PendingInitialTurn::fresh_id(),
+            origin: crate::daemon::PromptOrigin::Unknown,
         });
         let before = serde_json::to_value(&changed).unwrap();
         let error = admit_terminal_recovery(&changed, &row, &storage, &body).unwrap_err();

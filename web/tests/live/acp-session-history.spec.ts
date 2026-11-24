@@ -1,10 +1,19 @@
 // Conversation identity: driven resets, importing Claude sessions, and keeping context across view switches.
 
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { test, expect, type ServeHandle } from "../helpers/liveTest";
-import { appDirFor, listSessions, resolveAoeBinary } from "../helpers/aoeServe";
-import { postAcp, postPrompt, replayFrames, startAcpSession, waitForReplayContains } from "../helpers/acp";
+import { test, expect, bootDashboard, type ServeHandle } from "../helpers/liveTest";
+import { appDirFor, listSessions, resolveAoeBinary, seedSessionViaAoeAdd } from "../helpers/aoeServe";
+import {
+  spawnAcpAgentAndWait,
+  postAcp,
+  postPrompt,
+  replayFrames,
+  startAcpSession,
+  sessionIdByTitle,
+  waitForReplayContains,
+} from "../helpers/acp";
 
 // A unit variant serializes as a bare string, others as a single-key object.
 type FrameEvent = string | Record<string, { acp_session_id?: string }>;
@@ -279,4 +288,60 @@ test("switch to terminal resumes the claude conversation (keep context)", async 
       intervals: [100, 200, 400],
     })
     .toContain(`"--resume","${acpSessionId}"`);
+});
+
+// #5727: the launch refuses a command's own session flag beside AoE's stored id, so the switch is
+// refused before Structured view retires instead of leaving a launch that can never start.
+test("switch to terminal is refused when the command's session flag conflicts with AoE's id", async ({
+  page,
+  spawnServe,
+}) => {
+  const title = "acp-selector-conflict";
+  const serve = await spawnServe({
+    acp: true,
+    seedFn: (seed) => {
+      seedSessionViaAoeAdd({ title, tool: "claude", structuredView: true })(seed);
+      const stop = spawnSync(resolveAoeBinary(), ["serve", "--stop"], { env: seed.env, encoding: "utf8" });
+      expect(stop.status, stop.stderr).toBe(0);
+      const profilesDir = join(appDirFor(seed.home, seed.env.XDG_CONFIG_HOME!, resolveAoeBinary()), "profiles");
+      let seeded = false;
+      for (const profile of readdirSync(profilesDir)) {
+        const path = join(profilesDir, profile, "sessions.json");
+        if (!existsSync(path)) continue;
+        const original = readFileSync(path, "utf8");
+        const titleField = /"title"\s*:\s*"acp-selector-conflict"/;
+        if (!titleField.test(original)) continue;
+        const command = /"command"\s*:\s*"(?:\\.|[^"\\])*"/;
+        const modified = command.test(original)
+          ? original.replace(command, '"command": "claude --resume old-id"')
+          : original.replace(titleField, '$&, "command": "claude --resume old-id"');
+        writeFileSync(path, modified);
+        seeded = true;
+      }
+      expect(seeded, "the conflicting row must be persisted before boot").toBe(true);
+    },
+  });
+  const sessionId = await sessionIdByTitle(serve.baseUrl, title);
+  await spawnAcpAgentAndWait(serve.baseUrl, sessionId, 30_000, serve.home);
+  const check = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/terminal-check`);
+  expect(await check.json()).toMatchObject({ context: "blocked", reason: "command_selector_conflict" });
+
+  await bootDashboard(page, serve);
+  const row = page.getByTestId("sidebar-session-row").filter({ hasText: title });
+  await expect(row).toBeVisible({ timeout: 10_000 });
+  await row.click({ button: "right" });
+  await page.getByTestId("sidebar-context-menu-switch-view").click();
+  const disable = page.waitForResponse(
+    (r) => new URL(r.url()).pathname === `/api/sessions/${sessionId}/acp/disable` && r.request().method() === "POST",
+  );
+  await page.getByTestId("switch-view-confirm").click();
+  const refused = await disable;
+  expect(refused.status()).toBe(409);
+  expect(refused.headers()["aoe-error-code"]).toBe("command_selector_conflict");
+  await expect(page.getByText(/remove the session flag from its command or arguments to switch/)).toBeVisible();
+
+  const session = (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId);
+  expect(session?.view).toBe("structured");
+  const fakeLog = join(serve.home, "fake-acp.log");
+  expect(existsSync(fakeLog) ? readFileSync(fakeLog, "utf8") : "").not.toContain('"--resume","old-id"');
 });

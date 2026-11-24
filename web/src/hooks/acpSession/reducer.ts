@@ -60,6 +60,8 @@ export type Action =
   | { kind: "settle_inflight_prompt"; id: string }
   | { kind: "rollback_optimistic_prompt"; id: string }
   | { kind: "error"; message: string; target?: NonNullable<AcpState["interactionError"]>["target"] }
+  // A launch the daemon refused and kept the prompt for: shown through the startup banner.
+  | { kind: "blocked_launch"; message: string }
   | { kind: "clear_error" }
   | { kind: "approval_resolved_locally"; nonce: string }
   | {
@@ -80,7 +82,12 @@ export type Action =
   | { kind: "dequeue_prompt"; id: string }
   | { kind: "edit_queued_prompt"; id: string; text: string }
   | { kind: "clear_queue" }
-  | { kind: "hydrate_server_queue"; rows: ServerQueuedPrompt[]; queueAtRead: QueuedPrompt[] }
+  | {
+      kind: "hydrate_server_queue";
+      rows: ServerQueuedPrompt[];
+      queueAtRead: QueuedPrompt[];
+      migrationConfirmed?: ReadonlySet<string>;
+    }
   | { kind: "confirm_queued_prompt"; id: string }
   | { kind: "dismiss_primer" }
   /** `retriedError` marks a Retry from the startup error banner, which replaces the banner with the startup line. */
@@ -274,10 +281,19 @@ export function reducer(state: AcpState, action: Action): AcpState {
       return { ...state, lagged: false };
     case "error":
       return { ...state, interactionError: { message: action.message, target: action.target } };
+    case "blocked_launch":
+      return { ...state, startupError: action.message, startupCause: null };
     case "clear_error":
       return state.interactionError
         ? { ...state, interactionError: null }
-        : { ...state, lastError: null, lastErrorEvidence: null, startupError: null, integrationLost: null };
+        : {
+            ...state,
+            lastError: null,
+            lastErrorEvidence: null,
+            startupError: null,
+            startupCause: null,
+            integrationLost: null,
+          };
     case "approval_resolved_locally": {
       // Don't wait for the broadcast, which the seq dedupe can swallow (#1821).
       const pendingApprovals = state.pendingApprovals.filter((a) => a.nonce !== action.nonce);
@@ -374,9 +390,26 @@ export function reducer(state: AcpState, action: Action): AcpState {
     case "clear_queue":
       return { ...state, queuedPrompts: [] };
     case "hydrate_server_queue":
-      // A GET begun before a local queue change cannot overwrite its outcome,
-      // even when React batches the mutation and hydration actions together.
-      return state.queuedPrompts === action.queueAtRead ? hydrateServerQueue(state, action.rows) : state;
+      // Confirmations can batch with a GET that started after the POSTs.
+      // Edits, removals and inserts still invalidate that GET.
+      return state.queuedPrompts === action.queueAtRead ||
+        (action.migrationConfirmed?.size &&
+          state.queuedPrompts.length === action.queueAtRead.length &&
+          state.queuedPrompts.some((row, index) => row !== action.queueAtRead[index]) &&
+          state.queuedPrompts.every((row, index) => {
+            const previous = action.queueAtRead[index]!;
+            return (
+              row === previous ||
+              (action.migrationConfirmed?.has(row.id) &&
+                previous.pending &&
+                !row.pending &&
+                row.id === previous.id &&
+                row.text === previous.text &&
+                row.attachments === previous.attachments)
+            );
+          }))
+        ? hydrateServerQueue(state, action.rows)
+        : state;
     case "confirm_queued_prompt":
       return mapQueued(state, action.id, (q) => ({ ...q, pending: false }));
     case "dismiss_primer":
@@ -396,7 +429,11 @@ export function reducer(state: AcpState, action: Action): AcpState {
         restartInFlight: true,
         restartStoppedSent: state.restartStoppedSent || action.stoppedSent,
         restartFailure: null,
-        ...(action.retriedError !== undefined && { startupError: null, retriedError: action.retriedError }),
+        ...(action.retriedError !== undefined && {
+          startupError: null,
+          startupCause: null,
+          retriedError: action.retriedError,
+        }),
       };
     case "restart_failed":
       if (action.epoch !== state.restartEpoch)

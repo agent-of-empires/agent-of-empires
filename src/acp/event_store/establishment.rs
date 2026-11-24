@@ -373,7 +373,7 @@ impl EventStore {
             shape.is_some_and(|(kind, required, key)| kind.eq_ignore_ascii_case("TEXT")
                 && !required
                 && key == 0),
-            "Native lifecycle metadata requires reconciliation59"
+            "Native lifecycle metadata requires ACP lineage reconciliation"
         );
         let mut statement = conn.prepare(
             "SELECT session_id FROM acp_establishment_commit WHERE autonomous_commit_json IS NOT NULL",
@@ -748,7 +748,7 @@ impl EventStore {
                 "replay append belongs to a different session"
             );
             let json = Self::encode_event(event)?;
-            let now_ms = chrono::Utc::now().timestamp_millis();
+            let now_ms = crate::time::Timestamp::now().as_millis();
             self.append_controlled(session_id, seq, event, metadata, now_ms, |tx| {
                 Ok(
                     match Self::insert_scoped_event(tx, session_id, seq, &json, now_ms, metadata)? {

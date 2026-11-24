@@ -49,7 +49,7 @@ export function workspaceIsPinned(ws: Workspace): boolean {
   return ws.sessions.some((s) => s.pinned_at != null);
 }
 
-/** Every session archived or snoozed, so one live session keeps the workspace out of the footer. */
+/** Every session archived or snoozed; one live session keeps the workspace out of the footer. Ignored rows stay in the live list: they are not archived. */
 export function workspaceIsSunk(ws: Workspace): boolean {
   if (ws.sessions.length === 0) return false;
   return ws.sessions.every((s) => s.archived_at != null || s.snoozed_until != null || s.trashed_at != null);
@@ -209,7 +209,7 @@ export function statusAttentionRank(status: SessionStatus): number {
 
 /** Lower ranks sort first. Mirrors the TUI `attention_tier`; sunk sessions take the sink rank. `pluginAttention` holds session ids with a plugin danger/warn tone. */
 export function sessionAttentionRank(s: SessionResponse, pluginAttention?: ReadonlySet<string>): number {
-  if (s.archived_at != null || s.snoozed_until != null) {
+  if (s.archived_at != null || s.ignored_at != null || s.snoozed_until != null) {
     return ATTENTION_SINK_RANK;
   }
   const rank = statusAttentionRank(s.status);
@@ -236,7 +236,7 @@ export function workspaceIsUrgent(ws: Workspace): boolean {
 
 /** A live session that is Waiting, in Error, flagged urgent, or carries a plugin danger/warn tone. Shared by badges, markers, and jump-to-next so counts match. */
 export function sessionNeedsAttention(s: SessionResponse, pluginAttention?: ReadonlySet<string>): boolean {
-  if (s.archived_at != null || s.snoozed_until != null || s.trashed_at != null) {
+  if (s.archived_at != null || s.ignored_at != null || s.snoozed_until != null || s.trashed_at != null) {
     return false;
   }
   return s.status === "Waiting" || s.status === "Error" || s.urgent === true || pluginAttention?.has(s.id) === true;

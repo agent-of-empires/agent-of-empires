@@ -1,4 +1,5 @@
 import { useCallback, useLayoutEffect, useRef, useState } from "react";
+import { useFocusTrap } from "../hooks/useFocusTrap";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 
 // Per terminal, in memory: closing keeps the draft and a delivered send clears it.
@@ -48,6 +49,9 @@ export function TerminalComposeSheet({
     ta.style.height = "auto";
     ta.style.height = `${ta.scrollHeight}px`;
   }, []);
+
+  // The terminal controls behind the sheet stay mounted, so Tab wraps instead of leaving.
+  useFocusTrap(() => dialogRef.current);
 
   // With the opener's flushSync this runs inside the tap, so iOS raises the keyboard.
   useLayoutEffect(() => {
@@ -99,16 +103,6 @@ export function TerminalComposeSheet({
     if (e.key === "Escape") {
       e.preventDefault();
       onClose(false);
-    } else if (e.key === "Tab") {
-      // The terminal controls behind the sheet stay mounted, so wrap instead of leaving.
-      const items = dialogRef.current?.querySelectorAll<HTMLElement>("textarea, button:not([disabled])") ?? [];
-      const first = items[0];
-      const last = items[items.length - 1];
-      const wrapTo = e.shiftKey ? document.activeElement === first && last : document.activeElement === last && first;
-      if (wrapTo) {
-        e.preventDefault();
-        wrapTo.focus();
-      }
     } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       deliver(true, true);

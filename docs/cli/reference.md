@@ -56,6 +56,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe plugin install`↴](#aoe-plugin-install)
 * [`aoe plugin update`↴](#aoe-plugin-update)
 * [`aoe plugin uninstall`↴](#aoe-plugin-uninstall)
+* [`aoe plugin job`↴](#aoe-plugin-job)
 * [`aoe plugin hash`↴](#aoe-plugin-hash)
 * [`aoe plugin discover`↴](#aoe-plugin-discover)
 * [`aoe plugin outdated`↴](#aoe-plugin-outdated)
@@ -72,6 +73,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe project remove`↴](#aoe-project-remove)
 * [`aoe sandbox`↴](#aoe-sandbox)
 * [`aoe sandbox reclaim`↴](#aoe-sandbox-reclaim)
+* [`aoe sandbox login`↴](#aoe-sandbox-login)
 * [`aoe worktree`↴](#aoe-worktree)
 * [`aoe worktree list`↴](#aoe-worktree-list)
 * [`aoe worktree info`↴](#aoe-worktree-info)
@@ -171,7 +173,7 @@ Run without arguments to launch the TUI dashboard.
 * `plugin` — Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `profile` — Manage profiles (separate workspaces)
 * `project` — Manage the project registry used by multi-repo session pickers
-* `sandbox` — Inspect and reclaim per-session sandbox agent stores
+* `sandbox` — Clean up sandbox agent stores and log in sandboxed agents
 * `worktree` — Manage git worktrees for parallel development
 * `tmux` — tmux integration utilities
 * `sounds` — Manage sound effects for agent state transitions
@@ -242,6 +244,8 @@ Add a new session
 * `--extra-args <EXTRA_ARGS>` — Extra arguments to append after the agent binary
 * `--cmd-override <CMD_OVERRIDE>` — Override the agent binary command
 * `--structured-view` — Render this session in the structured view (ACP-based native rendering) instead of the default terminal view. `aoe add` defaults to the terminal (raw tmux/PTY) so the CLI matches the TUI; pass this (or `--agent`) to opt into the structured rendering. Ignored for tools with no ACP adapter
+* `--prompt <PROMPT>` — First turn sent to the agent once it is ready. Needs --structured-view or --agent; delivered when `aoe serve` starts the worker. If the session falls back to the terminal view, the prompt is typed only into an agent with a ready marker; otherwise nothing is typed and the session row carries `initial_prompt_error`
+* `--prompt-file <PATH>` — Read the first turn from a file. Same rules as `--prompt`
 * `--agent <AGENT>` — Pick a specific ACP agent for the structured view (e.g., claude-code, codex)
 * `--model <MODEL>` — Override the model used by the ACP agent (e.g., claude-opus-4-7, gpt-5, gemini-2.5-pro). Forwarded to the agent at session start
 * `--effort <EFFORT>` — Reasoning effort for the ACP agent (e.g., low, medium, high). Checked against the agent's known thought-level choices when cached. Structured view only
@@ -924,6 +928,7 @@ Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `install` — Install an external plugin from a `gh:owner/repo[@ref]` slug or a local directory. With no `@ref`, installs the repo's latest release; an explicit `@ref` installs unverified, un-audited code. Community plugins run at your own risk
 * `update` — Update an installed external plugin from its recorded source and restart its worker in a running daemon. Prompts to re-approve capabilities if the update changes the capability set
 * `uninstall` — Uninstall an external plugin, removing its files and capability grant
+* `job` — Observe an accepted plugin job without submitting another operation
 * `hash` — Print the deterministic source tree hash for a plugin directory, the value a maintainer pins in the featured index
 * `discover` — Search GitHub's `aoe-plugin` topic for installable plugins
 * `outdated` — List installed external plugins that have an update available
@@ -1028,6 +1033,18 @@ Uninstall an external plugin, removing its files and capability grant
 ###### **Arguments:**
 
 * `<ID>` — Plugin id
+
+
+
+## `aoe plugin job`
+
+Observe an accepted plugin job without submitting another operation
+
+**Usage:** `aoe plugin job <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Job id returned by install, update, or uninstall
 
 
 
@@ -1225,13 +1242,14 @@ Remove a project from the registry
 
 ## `aoe sandbox`
 
-Inspect and reclaim per-session sandbox agent stores
+Clean up sandbox agent stores and log in sandboxed agents
 
 **Usage:** `aoe sandbox <COMMAND>`
 
 ###### **Subcommands:**
 
 * `reclaim` — Report per-session agent stores whose session no longer exists in any profile, and how much disk they hold. Reports only unless `--delete` is given: a store can hold a copy of that agent's credentials
+* `login` — Log an agent's sandboxes in (sandbox.shared_credential = "separate_login"): prints a sign-in link, then reads the code shown after sign-in. The login belongs to one shared credential file per profile and tool: an agent with its own `session.agent_config_dir` entry (a wrapper agent) has its own file, so a session of profile X running tool T waiting for the login needs `aoe sandbox login -p X --tool T`. The file follows the command T launches (`agent_command_override`, else `custom_agents`, else the built-in). Only agents that declare a sandbox login have one; today that is Claude
 
 
 
@@ -1244,6 +1262,21 @@ Report per-session agent stores whose session no longer exists in any profile, a
 ###### **Options:**
 
 * `--delete` — Remove the reported stores instead of only naming them
+
+
+
+## `aoe sandbox login`
+
+Log an agent's sandboxes in (sandbox.shared_credential = "separate_login"): prints a sign-in link, then reads the code shown after sign-in. The login belongs to one shared credential file per profile and tool: an agent with its own `session.agent_config_dir` entry (a wrapper agent) has its own file, so a session of profile X running tool T waiting for the login needs `aoe sandbox login -p X --tool T`. The file follows the command T launches (`agent_command_override`, else `custom_agents`, else the built-in). Only agents that declare a sandbox login have one; today that is Claude
+
+**Usage:** `aoe sandbox login [OPTIONS]`
+
+###### **Options:**
+
+* `--tool <TOOL>` — The agent whose sandboxes the login is for: the tool name of the sessions waiting for it. Defaults to the profile's default tool when it has a sandbox login, else the only agent that has one
+* `--command <COMMAND>` — The command the launch runs for `--tool` when a session overrides the profile's: the login lands in the file that launch is gated on. A session that waits for the login names it in the message it stops with; without `--command` the profile's command for the tool is used
+* `--check` — Only report whether the shared credential file needs a login: exit 0 when ok, 2 when needed, 3 when not applicable (`host_seed` mode, a tool without a shared credential file, or a login that is needed on Apple Container, which cannot run the login helper)
+* `--force` — Log in again even though the shared credential is usable
 
 
 
@@ -1397,7 +1430,7 @@ Export a built-in theme as a TOML file for customization
 
 ###### **Options:**
 
-* `-o`, `--output <OUTPUT>` — Output file path (defaults to `<name>.toml` in the themes directory)
+* `-o`, `--output <OUTPUT>` — Output file path (defaults to `custom-<name>.toml` for a built-in theme, `<name>.toml` otherwise, in the themes directory)
 
 
 
@@ -1782,11 +1815,11 @@ Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that 
 * `--host <HOST>` — Host/IP to bind to (use 0.0.0.0 for LAN/VPN access)
 
   Default value: `127.0.0.1`
-* `--auth <AUTH>` — Authentication mode: `token` (default, random URL token), `passphrase` (no token URL, passphrase login wall only), or `none` (no auth at all, loopback-only unless --behind-proxy). Mutually exclusive with --no-auth (which aliases --auth=none)
+* `--auth <AUTH>` — Authentication mode: `token` (default, random URL token), `passphrase` (no token URL, passphrase login wall only), or `none` (no auth at all, requires --behind-proxy). Mutually exclusive with --no-auth (which aliases --auth=none)
 
   Possible values: `token`, `passphrase`, `none`
 
-* `--no-auth` — Disable authentication (only allowed with localhost binding). Alias for --auth=none
+* `--no-auth` — Disable authentication (requires --behind-proxy). Alias for --auth=none
 * `--behind-proxy` — Mark this server as sitting behind a reverse proxy that terminates TLS upstream. Sets cookies as `; Secure` and trusts the `X-Forwarded-For` header from loopback peers. Does NOT auto-spawn a tunnel (unlike --remote). Required when --auth=passphrase or --auth=none is combined with a non-loopback bind
 * `--dangerously-allow-plaintext-remote` — Accept plain HTTP from non-loopback peers. By default the server answers those with 426 before authentication: bearer tokens and passphrases would cross the network in the clear. A TLS proxy or tunnel in front of a loopback listener (`--behind-proxy`, `--remote`) needs no opt-out. This applies to this bind only, is never inferred from the address, and is logged at every start
 * `--allowed-host <HOST>` — Extra `Host` header value to accept (repeatable). The DNS-rebinding gate trusts loopback, any routable IP-literal `Host` (LAN/tailnet IPs can't be rebound), and a non-wildcard `--host` by default. A browser `Origin` is accepted without `--allowed-origin` only when it is allowlisted or has the exact same authority as `Host`; add a HOSTNAME or mDNS name here when serving behind a reverse proxy, a custom tunnel, or by name when binding `0.0.0.0` (access by IP needs no flag). Auto-injected tunnel hosts (`--remote`) need no flag
@@ -1888,7 +1921,7 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 * `recover` — Retire unprovable worker ownership after external shutdown confirmation
 * `kill` — SIGKILL the runner, then settle its native workers
 * `logs` — Tail the runner's log file for an agent session
-* `restart` — Restart a wedged worker after its runner and native workers have stopped
+* `restart` — Restart a worker, or start a stopped one through `aoe serve`
 * `history` — Print the persisted transcript for an agent session
 * `status` — Print live status for an agent session: highest/lowest seq, and whether the on-disk retention window has truncated history
 * `prompt` — Send a prompt to an agent session's agent
@@ -2009,7 +2042,7 @@ Tail the runner's log file for an agent session
 
 ## `aoe acp restart`
 
-Restart a wedged worker after its runner and native workers have stopped
+Restart a worker, or start a stopped one through `aoe serve`
 
 **Usage:** `aoe acp restart <SESSION>`
 

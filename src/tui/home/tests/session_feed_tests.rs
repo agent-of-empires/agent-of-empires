@@ -71,16 +71,19 @@ fn daemon_status_clears_a_stale_error_message() {
     // Canonical last_error replaces stale pane diagnostics.
     let mut env = create_test_env_empty();
     let id = structured_row(&mut env, Status::Error);
-    env.view.mutate_instance(&id, |inst| {
-        inst.last_error = Some("Container is not running".to_string())
-    });
+    env.view
+        .mutate_instance(&id, |inst| inst.last_error.set("Container is not running"));
 
     env.view
         .apply_daemon_status_update(&update(&env.view, &id, Status::Idle));
 
     let inst = env.view.get_instance(&id).expect("row still present");
     assert_eq!(inst.status, Status::Idle);
-    assert_eq!(inst.last_error, None, "the phantom container error is gone");
+    assert_eq!(
+        inst.last_error.as_deref(),
+        None,
+        "the phantom container error is gone"
+    );
 }
 
 #[test]
@@ -145,7 +148,7 @@ pub(super) fn archived_daemon_snapshot(view: &HomeView, id: &str) -> SessionFeed
         unreachable!()
     };
     Arc::make_mut(&mut snapshot).contents.sessions[0].archived_at =
-        Some(chrono::Utc::now().to_rfc3339());
+        Some(crate::time::Timestamp::now().to_rfc3339());
     SessionFeedResult::Snapshot(snapshot)
 }
 
@@ -192,7 +195,7 @@ fn session_dialogs_follow_their_original_identity_across_snapshots() {
                         branch: "fixture".into(),
                         main_repo_path: "/tmp".into(),
                         managed_by_aoe: true,
-                        created_at: chrono::Utc::now(),
+                        created_at: crate::time::Timestamp::now(),
                         base_branch: None,
                     });
                 });
@@ -219,7 +222,8 @@ fn session_dialogs_follow_their_original_identity_across_snapshots() {
             let next = Arc::make_mut(&mut snapshot);
             match change {
                 "trash" => {
-                    next.contents.sessions[0].trashed_at = Some(chrono::Utc::now().to_rfc3339());
+                    next.contents.sessions[0].trashed_at =
+                        Some(crate::time::Timestamp::now().to_rfc3339());
                     next.contents.sessions[0].lifecycle_generation += 1;
                 }
                 "purge" => next.contents.sessions.retain(|row| row.id != id),
@@ -724,7 +728,7 @@ fn queued_send_keeps_admitted_runtime_before_terminal_writer_dispatch() {
             env.view.select_session_by_id(&id);
             let mut respond = env.view.session_feed.terminal_driver_for_test();
             let SessionFeedResult::Snapshot(mut snapshot) =
-                daemon_snapshot(&env.view, &id, "Stopped")
+                daemon_snapshot(&env.view, &id, "Running")
             else {
                 unreachable!()
             };
@@ -1261,7 +1265,8 @@ fn successful_native_send_preserves_shelving_committed_after_final_enter_ack() {
                 let row = rows.iter_mut().find(|row| row.id == id).unwrap();
                 row.status = Status::Idle;
                 row.lifecycle_generation = 7;
-                row.last_accessed_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+                row.last_accessed_at =
+                    Some(crate::time::Timestamp::now() - crate::time::Duration::hours(1));
                 Ok(())
             })
             .unwrap();
@@ -1370,7 +1375,7 @@ fn successful_native_send_preserves_shelving_committed_after_final_enter_ack() {
                     match shelving {
                         "archive" => row.archive(),
                         "snooze" => row.snooze(120),
-                        "dormancy" => row.idle_dormant_since = Some(chrono::Utc::now()),
+                        "dormancy" => row.idle_dormant_since = Some(crate::time::Timestamp::now()),
                         _ => unreachable!(),
                     }
                     Ok(())
@@ -1670,8 +1675,9 @@ fn terminal_rows_take_status_and_observations_from_the_daemon_only() {
     env.view.mutate_instance(&id, |instance| {
         instance.view = crate::session::View::Terminal;
         instance.status = Status::Running;
-        instance.last_error =
-            Some("tmux session is gone. The agent process may have exited or been killed.".into());
+        instance
+            .last_error
+            .set("tmux session is gone. The agent process may have exited or been killed.");
         instance.pane_dead_observed = false;
         instance.agent_pane = PaneObservation::default();
         instance.auxiliary = vec![crate::session::AuxiliaryObservation {
@@ -1707,7 +1713,7 @@ fn terminal_rows_take_status_and_observations_from_the_daemon_only() {
     env.view.apply_session_feed();
     let instance = env.view.get_instance(&id).unwrap();
     assert_eq!(instance.status, Status::Idle);
-    assert_eq!(instance.last_error, None);
+    assert_eq!(instance.last_error.as_deref(), None);
     assert_eq!(instance.agent_pane.state, PanePresence::Alive);
     assert_eq!(
         instance.auxiliary_presence(&AuxiliaryTarget::Host { index: 0 }),
@@ -1945,7 +1951,7 @@ fn daemon_status_reconciles_last_error_on_a_same_status_tick() {
         let mut env = create_test_env_empty();
         let id = structured_row(&mut env, status);
         env.view
-            .mutate_instance(&id, |inst| inst.last_error = Some(seeded.to_string()));
+            .mutate_instance(&id, |inst| inst.last_error.set(seeded));
 
         let mut u = update(&env.view, &id, status);
         u.last_error = incoming.map(str::to_string);
@@ -1954,7 +1960,7 @@ fn daemon_status_reconciles_last_error_on_a_same_status_tick() {
         assert_eq!(
             env.view
                 .get_instance(&id)
-                .and_then(|i| i.last_error.clone()),
+                .and_then(|i| i.last_error.as_deref().map(str::to_owned)),
             expected.map(str::to_string),
             "status={status:?} incoming={incoming:?}"
         );
@@ -1988,7 +1994,7 @@ fn daemon_update_clears_cached_approvals_when_a_row_is_sunk() {
         env.view
             .structured_pending_approvals
             .insert(id.clone(), pending_daemon_approvals());
-        let now = chrono::Utc::now();
+        let now = crate::time::Timestamp::now();
         env.view.mutate_instance(&id, |inst| {
             if label == "archived" {
                 inst.archived_at = Some(now);
@@ -2028,7 +2034,7 @@ fn terminal_status_converges_in_one_feed_apply_without_a_local_probe() {
     env.view.mutate_instance(&id, |instance| {
         instance.view = crate::session::View::Terminal;
         instance.status = Status::Running;
-        instance.last_error = Some("stale local probe error".into());
+        instance.last_error.set("stale local probe error");
         instance.pane_dead_observed = false;
         instance.agent_pane = PaneObservation {
             physical: None,
@@ -2107,7 +2113,7 @@ fn daemon_stop_result_lands_stopped_without_a_local_write() {
     let id = env.view.instance_at(0).id.clone();
     env.view.mutate_instance(&id, |inst| {
         inst.status = Status::Running;
-        inst.last_error = Some("stale local probe error".into());
+        inst.last_error.set("stale local probe error");
     });
 
     let mut respond = env.view.session_feed.command_driver_for_test();
@@ -2124,7 +2130,7 @@ fn daemon_stop_result_lands_stopped_without_a_local_write() {
     assert_eq!(
         env.view
             .get_instance(&id)
-            .and_then(|inst| inst.last_error.clone()),
+            .and_then(|inst| inst.last_error.as_deref().map(str::to_owned)),
         Some("stale local probe error".to_string())
     );
     let submitted = respond(Ok(crate::daemon::RuntimeCursor {
@@ -2147,7 +2153,7 @@ fn daemon_stop_result_lands_stopped_without_a_local_write() {
     env.view.apply_daemon_status_update(&stopped);
     let inst = env.view.get_instance(&id).expect("row still present");
     assert_eq!(inst.status, Status::Stopped);
-    assert_eq!(inst.last_error, None);
+    assert_eq!(inst.last_error.as_deref(), None);
 }
 
 /// A refused stop submit fails loudly with reconnect guidance and leaves the
@@ -2159,7 +2165,7 @@ fn daemon_unreachable_stop_fails_without_a_local_write() {
     let id = env.view.instance_at(0).id.clone();
     env.view.mutate_instance(&id, |inst| {
         inst.status = Status::Running;
-        inst.last_error = Some("stale local probe error".into());
+        inst.last_error.set("stale local probe error");
     });
 
     // No command driver: the feed has no runtime, so the submit refuses.
@@ -2221,6 +2227,15 @@ fn native_preparation_waits_for_its_receipt_and_lifecycle_generation() {
             "test",
             false,
             true,
+        ),
+        (
+            "Unknown",
+            PanePresence::Alive,
+            5,
+            Some("restarted-agent"),
+            "test",
+            false,
+            false,
         ),
         (
             "Starting",
@@ -2292,7 +2307,7 @@ fn native_preparation_waits_for_its_receipt_and_lifecycle_generation() {
             Some("prepared-agent"),
             "test",
             false,
-            true,
+            false,
         ),
         (
             "Error",
@@ -2301,7 +2316,7 @@ fn native_preparation_waits_for_its_receipt_and_lifecycle_generation() {
             Some("prepared-agent"),
             "test",
             false,
-            true,
+            false,
         ),
         (
             "Running",
@@ -2384,13 +2399,99 @@ fn native_preparation_waits_for_its_receipt_and_lifecycle_generation() {
         assert!(env.view.session_feed.can_submit(&id));
         let attachment = env.view.take_native_attachment();
         if attach {
-            let attachment = attachment.expect("committed preparation is attachable");
+            let attachment = attachment.unwrap_or_else(|| {
+                panic!("valid target refused: {reflected_status} {reflected_generation} {target_name:?}")
+            });
             assert_eq!(attachment.id, id);
             assert_eq!(attachment.terminal.tmux_session, "prepared-agent");
         } else {
             assert!(
                 attachment.is_none(),
                 "invalid target attached: {reflected_status} {presence:?} {reflected_generation} {target_name:?} {receipt_profile}"
+            );
+        }
+        assert!(env.view.take_native_attachment().is_none());
+    }
+}
+
+/// Live send into an agent whose status adapter has not classified its screen
+/// yet must attach: the daemon confirms the pane by identity, and the snapshot
+/// reports that same pane alive. A status the row is not in (stopped) still
+/// refuses the attachment.
+#[test]
+#[serial]
+fn live_send_attaches_an_agent_pane_whose_status_is_unclassified() {
+    use crate::daemon::{RuntimeCursor, TerminalTarget, TerminalTargetStatus};
+    use crate::session::{PaneObservation, PanePresence};
+    use crate::tui::home::live_send::LiveSendTarget;
+    use crate::tui::home::panes::PaneIntent;
+
+    for (reflected_status, attach) in [("Unknown", true), ("Stopped", false)] {
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        env.view.select_session_by_id(&id);
+        let mut row = daemon_row(env.view.get_instance(&id).unwrap(), "Unknown");
+        row.view = crate::session::View::Terminal;
+        row.lifecycle_generation = 4;
+        row.agent_pane = PaneObservation {
+            state: PanePresence::Alive,
+            tmux_session: Some("agent-4".into()),
+            legacy_tool: None,
+            physical: Some(native_physical_fixture()),
+        };
+        let SessionFeedResult::Snapshot(mut snapshot) = snapshot_of(vec![row]) else {
+            unreachable!()
+        };
+        env.view
+            .session_feed
+            .publish_for_test(SessionFeedResult::Snapshot(snapshot.clone()));
+        env.view.apply_session_feed();
+        let mut respond = env.view.session_feed.engagement_native_driver_for_test();
+        env.view
+            .prepare_live_send_target(&id, LiveSendTarget::Agent, None)
+            .unwrap();
+        assert!(matches!(
+            respond(
+                Ok(RuntimeCursor {
+                    epoch: "test".into(),
+                    revision: 2,
+                }),
+                Some(TerminalTarget {
+                    tmux_session: "agent-4".into(),
+                    physical: Some(native_physical_fixture()),
+                    status: TerminalTargetStatus::Alive,
+                    lifecycle_generation: 4,
+                    profile: "test".into(),
+                }),
+            ),
+            Some(crate::tui::session_feed::SessionRequest::EnsureAgent { .. })
+        ));
+        env.view.apply_session_feed();
+        assert!(
+            env.view.take_native_attachment().is_none(),
+            "{reflected_status}: the receipt alone is not canonical application"
+        );
+
+        let committed = std::sync::Arc::make_mut(&mut snapshot);
+        committed.cursor.revision = 2;
+        committed.contents.sessions[0].status = reflected_status.into();
+        env.view
+            .session_feed
+            .publish_for_test(SessionFeedResult::Snapshot(snapshot));
+        env.view.apply_session_feed();
+        let attachment = env.view.take_native_attachment();
+        if attach {
+            let attachment = attachment.expect("an unclassified but live pane must go live");
+            assert_eq!(attachment.id, id);
+            assert_eq!(attachment.terminal.tmux_session, "agent-4");
+            assert!(matches!(
+                attachment.intent,
+                PaneIntent::LiveSend(LiveSendTarget::Agent)
+            ));
+        } else {
+            assert!(
+                attachment.is_none(),
+                "{reflected_status}: a stopped row must not attach"
             );
         }
         assert!(env.view.take_native_attachment().is_none());
@@ -2506,7 +2607,7 @@ fn canonical_revision_reloads_renames_moves_and_view_changes() {
         branch: "feature".into(),
         main_repo_path: "/tmp/repo".into(),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
         base_branch: Some("main".into()),
     });
     Storage::new_unwatched("test")
@@ -3243,9 +3344,7 @@ fn disk_ahead_reload_keeps_complete_model_and_newer_frame_applies_without_waitin
             Ok(())
         })
         .unwrap();
-    env.view
-        .reload_storage_only()
-        .expect("routine disk-ahead reload is recoverable");
+    env.view.reload_storage_only();
     assert_eq!(
         serde_json::to_value(env.view.cloned_instances()).unwrap(),
         before
@@ -3310,7 +3409,7 @@ fn persistent_metadata_lag_latches_across_revisions_without_focus_theft() {
         1,
     );
     seed_profile("test", &[]);
-    env.view.reload_storage_only().unwrap();
+    env.view.reload_storage_only();
     let first = env.view.canonical_metadata_lag.as_mut().unwrap();
     first.first_seen = std::time::Instant::now() - HomeView::CANONICAL_RELOAD_RETRY_INTERVAL;
     let first_seen = first.first_seen;
@@ -3599,8 +3698,7 @@ fn snooze_refusal_preserves_target_duration_and_requires_explicit_resubmit() {
         let bytes = payload_bytes("test");
         if mouse {
             let buffer = draw(110, 40, |frame, theme| {
-                env.view
-                    .render(frame, frame.area(), theme, None, None, None)
+                env.view.render(frame, frame.area(), theme, None)
             });
             let (column, row) = find(&buffer, "2 hours");
             assert!(env.view.handle_dialog_click(column, row));
@@ -3614,8 +3712,7 @@ fn snooze_refusal_preserves_target_duration_and_requires_explicit_resubmit() {
         assert!(env.view.snooze_duration_dialog.is_some());
         assert_eq!(payload_bytes("test"), bytes);
         let buffer = draw(110, 40, |frame, theme| {
-            env.view
-                .render(frame, frame.area(), theme, None, None, None)
+            env.view.render(frame, frame.area(), theme, None)
         });
         find(&buffer, "Snooze Not Changed");
         let (submitted, _) = respond(Err("held operation rejected".into())).unwrap();
@@ -3623,8 +3720,7 @@ fn snooze_refusal_preserves_target_duration_and_requires_explicit_resubmit() {
         env.view.apply_session_feed();
         env.view.select_session_by_id(&other);
         let buffer = draw(110, 40, |frame, theme| {
-            env.view
-                .render(frame, frame.area(), theme, None, None, None)
+            env.view.render(frame, frame.area(), theme, None)
         });
         find(&buffer, "Runtime change");
         if mouse {
@@ -3639,8 +3735,7 @@ fn snooze_refusal_preserves_target_duration_and_requires_explicit_resubmit() {
         );
         assert!(env.view.snooze_duration_dialog.is_some());
         let buffer = draw(110, 40, |frame, theme| {
-            env.view
-                .render(frame, frame.area(), theme, None, None, None)
+            env.view.render(frame, frame.area(), theme, None)
         });
         find(&buffer, "Snooze Not Changed");
         if mouse {
@@ -3759,8 +3854,7 @@ fn diff_keyboard_and_mouse_refusal_are_visible_dismissible_and_keep_comparison()
             .unwrap();
         if mouse {
             draw(120, 40, |frame, theme| {
-                env.view
-                    .render(frame, frame.area(), theme, None, None, None)
+                env.view.render(frame, frame.area(), theme, None)
             });
             let rect = env
                 .view
@@ -3795,8 +3889,7 @@ fn diff_keyboard_and_mouse_refusal_are_visible_dismissible_and_keep_comparison()
             .flat_map(|hunk| &hunk.lines)
             .any(|line| line.old_line_num.is_some() && line.content.trim() == "base"));
         let buffer = draw(120, 40, |frame, theme| {
-            env.view
-                .render(frame, frame.area(), theme, None, None, None)
+            env.view.render(frame, frame.area(), theme, None)
         });
         find(&buffer, "Diff Base Not Saved");
         env.view.handle_key(key(KeyCode::Enter), None);
@@ -3808,8 +3901,7 @@ fn diff_keyboard_and_mouse_refusal_are_visible_dismissible_and_keep_comparison()
             .warning_dialog
             .is_none());
         let buffer = draw(120, 40, |frame, theme| {
-            env.view
-                .render(frame, frame.area(), theme, None, None, None)
+            env.view.render(frame, frame.area(), theme, None)
         });
         find(&buffer, "[not saved]");
         assert_eq!(payload_bytes("test"), bytes);
@@ -3828,8 +3920,9 @@ fn trash_transition_discards_diff_and_delayed_base_save() {
         .as_mut()
         .unwrap()
         .select_branch("review".into());
-    env.view
-        .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+    env.view.mutate_instance(&id, |inst| {
+        inst.trashed_at = Some(crate::time::Timestamp::now())
+    });
     env.view.drain_pending_diff_override();
     assert!(commands(Err("unexpected diff save".into())).is_none());
     env.view.enforce_trash_read_only();
@@ -3860,8 +3953,9 @@ fn trash_transition_cancels_auxiliary_stop_confirmation_and_late_submit() {
             "fixture",
             "stop_auxiliary",
         ));
-        env.view
-            .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+        env.view.mutate_instance(&id, |inst| {
+            inst.trashed_at = Some(crate::time::Timestamp::now())
+        });
         if late_submit {
             env.view.dispatch_confirm_submit("stop_auxiliary");
         } else {
@@ -3896,7 +3990,8 @@ fn trash_confirmation_rejects_a_changed_original_target() {
             let next = Arc::make_mut(&mut snapshot);
             match change {
                 "trash" => {
-                    next.contents.sessions[0].trashed_at = Some(chrono::Utc::now().to_rfc3339());
+                    next.contents.sessions[0].trashed_at =
+                        Some(crate::time::Timestamp::now().to_rfc3339());
                     next.contents.sessions[0].lifecycle_generation += 1;
                 }
                 "generation" => next.contents.sessions[0].lifecycle_generation += 1,
@@ -4001,8 +4096,7 @@ fn diff_save_uses_its_own_receipt_and_surfaces_rejection_or_unknown_in_takeover(
         assert!(diff.base_save.is_none());
         assert_eq!(diff.base_unsaved, outcome != "saved");
         let buffer = draw(120, 40, |frame, theme| {
-            env.view
-                .render(frame, frame.area(), theme, None, None, None)
+            env.view.render(frame, frame.area(), theme, None)
         });
         if outcome != "saved" {
             find(&buffer, "Diff Base Not Saved");
@@ -4306,8 +4400,7 @@ fn projects_home_dispatch_reads_current_policy_for_keyboard_mouse_and_auto_add()
                         }
                     }
                     let before = draw(120, 42, |frame, theme| {
-                        env.view
-                            .render(frame, frame.area(), theme, None, None, None)
+                        env.view.render(frame, frame.area(), theme, None)
                     });
                     let gesture = find(&before, if remove { "d remove" } else { "Enter save" });
                     let registry = crate::session::get_app_dir().unwrap().join("projects.json");
@@ -4349,8 +4442,7 @@ fn projects_home_dispatch_reads_current_policy_for_keyboard_mouse_and_auto_add()
                     assert!(env.view.projects_dialog.is_some());
                     if policy != "disconnected" {
                         let buffer = draw(120, 42, |frame, theme| {
-                            env.view
-                                .render(frame, frame.area(), theme, None, None, None)
+                            env.view.render(frame, frame.area(), theme, None)
                         });
                         find(
                             &buffer,
@@ -4398,8 +4490,7 @@ fn retained_serve_takeover_owns_keyboard_and_mouse_without_consuming_other_draft
             &mut env.view.serve_jobs,
         ));
         let foreground = draw(120, 42, |frame, theme| {
-            env.view
-                .render(frame, frame.area(), theme, None, None, None)
+            env.view.render(frame, frame.area(), theme, None)
         });
         let close = find(&foreground, "[Esc] cancel");
         if mouse {
@@ -4450,40 +4541,6 @@ fn observed_legacy_tool(
 
 #[test]
 #[serial]
-fn indeterminate_launch_refuses_attachment_without_resubmitting() {
-    use crate::tui::home::panes::{NativePane, PaneIntent};
-    let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instance_at(0).id.clone();
-    env.view.select_session_by_id(&id);
-    let mut respond = env.view.session_feed.request_driver_for_test();
-    env.view
-        .session_feed
-        .publish_for_test(daemon_snapshot(&env.view, &id, "Stopped"));
-    env.view.apply_session_feed();
-    env.view
-        .prepare_native_attachment(&id, NativePane::Agent, None, PaneIntent::Attach)
-        .unwrap();
-    let error = crate::daemon::DaemonClientError::Committed {
-        cursor: crate::daemon::RuntimeCursor {
-            epoch: "test".into(),
-            revision: 2,
-        },
-        code: crate::daemon::ApiErrorCode::LaunchIndeterminate,
-    };
-    assert_eq!(respond(Err(error.to_string())).unwrap().0, id);
-    env.view.apply_session_feed();
-    env.view.apply_restart_results();
-    assert!(env.view.take_native_attachment().is_none());
-    assert!(env.view.pending_native_attachment.is_none());
-    assert!(env.view.live_send.is_none());
-    assert!(env.view.session_feed.can_submit(&id));
-    assert!(env.view.pending_indeterminate_resolution.is_none());
-    assert!(env.view.info_dialog.is_some());
-    assert!(respond(Err("no automatic retry".into())).is_none());
-}
-
-#[test]
-#[serial]
 fn purge_dialog_rejects_stale_target_on_keyboard_and_mouse() {
     for change in [
         "restore",
@@ -4502,7 +4559,7 @@ fn purge_dialog_rejects_stale_target_on_keyboard_and_mouse() {
                 unreachable!()
             };
             let row = &mut Arc::make_mut(&mut snapshot).contents.sessions[0];
-            row.trashed_at = Some(chrono::Utc::now().to_rfc3339());
+            row.trashed_at = Some(crate::time::Timestamp::now().to_rfc3339());
             row.trash_lifecycle_id = Some(uuid::Uuid::new_v4().to_string());
             row.lifecycle_generation = 7;
             env.view
@@ -4532,8 +4589,6 @@ fn purge_dialog_rejects_stale_target_on_keyboard_and_mouse() {
                         frame,
                         frame.area(),
                         &crate::tui::styles::Theme::default(),
-                        None,
-                        None,
                         None,
                     );
                 })
@@ -4571,8 +4626,10 @@ fn purge_dialog_rejects_stale_target_on_keyboard_and_mouse() {
                     }
                     "generation" => row.lifecycle_generation += 1,
                     "timestamp" => {
-                        row.trashed_at =
-                            Some((chrono::Utc::now() + chrono::Duration::seconds(1)).to_rfc3339())
+                        row.trashed_at = Some(
+                            (crate::time::Timestamp::now() + crate::time::Duration::seconds(1))
+                                .to_rfc3339(),
+                        )
                     }
                     "uuid" => row.trash_lifecycle_id = Some(uuid::Uuid::new_v4().to_string()),
                     "selection" => {}
@@ -4618,7 +4675,7 @@ fn retained_trash_context_menu_keeps_opening_epoch() {
             row.lifecycle_reservation = Some(LifecycleReservation {
                 op: LifecycleOperation::Trash,
                 generation: 4,
-                at: chrono::Utc::now() - chrono::Duration::hours(1),
+                at: crate::time::Timestamp::now() - crate::time::Duration::hours(1),
             });
         });
         env.view.trashed_section_collapsed = false;
@@ -4688,9 +4745,9 @@ async fn keyboard_palette_recovery_executes_captured_commands_and_preserves_file
                     LifecycleOperation::Trash,
                     Instance::LIFECYCLE_RESERVATION_TTL,
                     if fresh {
-                        chrono::Utc::now()
+                        crate::time::Timestamp::now()
                     } else {
-                        chrono::Utc::now() - chrono::Duration::hours(1)
+                        crate::time::Timestamp::now() - crate::time::Duration::hours(1)
                     },
                 )
                 .unwrap();

@@ -152,6 +152,14 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/favorite",
             patch(api::update_session_favorite).layer(read_only.clone()),
         )
+        .route(
+            "/api/sessions/{id}/ignored",
+            patch(api::update_session_ignored).layer(read_only.clone()),
+        )
+        .route(
+            "/api/sessions/{id}/reclaim-ownership",
+            post(api::reclaim_session_ownership).layer(read_only.clone()),
+        )
         .route("/api/sessions/{id}/color", patch(api::update_session_color))
         .route(
             "/api/sessions/{id}/archive",
@@ -191,6 +199,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/sessions/{id}/account-targets",
             get(api::session_account_targets),
+        )
+        .route(
+            "/api/sessions/{id}/acp-default-model",
+            get(api::get_session_agent_default_model),
         )
         .route("/api/sessions/{id}/start", post(api::start_session))
         .route(
@@ -233,6 +245,12 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/profiles/{name}/settings",
             get(api::get_profile_settings).patch(api::update_profile_settings),
         )
+        .route(
+            "/api/profiles/{name}/acp-defaults/{agent}/model",
+            get(api::get_agent_default_model)
+                .put(api::set_agent_default_model)
+                .layer(read_only.clone()),
+        )
         .route("/api/profiles/{name}/rename", patch(api::rename_profile))
         .route("/api/default-profile", patch(api::default_profile))
         .route("/api/filesystem/browse", get(api::browse_filesystem))
@@ -269,6 +287,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(api::sandbox_image_pull).layer(read_only.clone()),
         )
         .route(
+            "/api/sandbox/image-pull/cancel",
+            post(api::sandbox_image_cancel).layer(read_only.clone()),
+        )
+        .route(
             "/api/sandbox/image-dismiss",
             post(api::sandbox_image_dismiss).layer(read_only.clone()),
         )
@@ -289,7 +311,8 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/app-state/tip-seen", post(api::mark_tip_seen))
         // Plugin management.
         .route("/api/plugins", get(api::list_plugins))
-        .route("/api/plugins/{id}/icon", get(api::serve_plugin_icon))
+        // A live login session needs no device binding here; see `auth::UnboundClaim`.
+        .route("/plugin-icons/{id}", get(api::serve_plugin_icon))
         .route(
             "/api/plugins/{id}/pages/{page_id}",
             get(api::serve_plugin_page),
@@ -430,6 +453,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/telemetry/reset-id", post(api::reset_telemetry_id))
         .route("/api/telemetry/seen", post(api::post_telemetry_seen))
         .route(
+            "/api/telemetry/feature-use",
+            post(api::post_telemetry_feature_use),
+        )
+        .route(
             "/api/telemetry/structured-interaction",
             post(api::post_telemetry_structured_interaction),
         )
@@ -510,6 +537,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/sessions/{id}/acp/enable", post(api::acp_enable))
         .route("/api/sessions/{id}/acp/disable", post(api::acp_disable))
+        .route(
+            "/api/sessions/{id}/acp/terminal-check",
+            get(api::acp_terminal_check),
+        )
         .route(
             "/api/sessions/{id}/queue",
             post(api::queue_enqueue)

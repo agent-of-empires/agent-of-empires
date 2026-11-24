@@ -163,10 +163,8 @@ pub struct StatusRule {
     pub regex: Option<String>,
 }
 
-/// Configuration for one plugin: whether it is enabled, its install source and
-/// capability grant (external plugins only), plus its schema-free persisted
-/// settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Persisted plugin intent, external installation identity, and schema-free settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PluginConfig {
     /// Whether the plugin is active. A disabled plugin contributes nothing to
     /// any surface.
@@ -206,12 +204,8 @@ pub struct PluginConfig {
     pub dev: bool,
 }
 
-/// A user's approval of an external plugin's requested capabilities, pinned to
-/// the exact manifest it was approved against. When the installed manifest hash
-/// later differs (an update that changed the capability set), the grant no
-/// longer applies and the plugin's runtime contributions stay inactive until
-/// re-approved.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Approved capabilities pinned to an exact external manifest hash.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapabilityGrant {
     /// `sha256:<hex>` of the manifest bytes this grant was approved against.
     pub manifest_hash: String,
@@ -219,7 +213,7 @@ pub struct CapabilityGrant {
     #[serde(default)]
     pub capabilities: Vec<String>,
     /// When the user approved the grant.
-    pub granted_at: chrono::DateTime<chrono::Utc>,
+    pub granted_at: crate::time::Timestamp,
 }
 
 fn default_enabled() -> bool {
@@ -298,12 +292,12 @@ pub struct LoggingConfig {
     pub targets: std::collections::BTreeMap<String, String>,
 
     /// Where tracing lands: file (default) or stdout. TUI / daemon child /
-    /// runner coerce to file regardless. Restart aoe for changes to take
-    /// effect.
+    /// runner coerce to file regardless.
     #[serde(default)]
     #[setting(
-        label = "Write to (restart req.)",
+        label = "Write to",
         widget = "select",
+        restart,
         options = "file:file,stdout:stdout",
         global_only,
         advanced,
@@ -312,11 +306,12 @@ pub struct LoggingConfig {
     pub output: SinkKind,
 
     /// Log file location. Relative paths resolve under the app data dir;
-    /// absolute paths are used verbatim. Restart aoe for changes.
+    /// absolute paths are used verbatim.
     #[serde(default = "default_file_path")]
     #[setting(
-        label = "File (restart req.)",
+        label = "File",
         widget = "text",
+        restart,
         global_only,
         advanced,
         summary = "A name goes in AoE's app data folder; a full path is used as is."
@@ -324,11 +319,12 @@ pub struct LoggingConfig {
     pub file_path: String,
 
     /// size rotates when the live file crosses the threshold; never disables
-    /// rotation. Restart aoe for changes.
+    /// rotation.
     #[serde(default)]
     #[setting(
-        label = "Rotation (restart req.)",
+        label = "Rotation",
         widget = "select",
+        restart,
         options = "size:size,never:never",
         global_only,
         advanced
@@ -338,8 +334,9 @@ pub struct LoggingConfig {
     /// Rotation threshold in MiB. Ignored when rotation = never.
     #[serde(default = "default_max_size_mib")]
     #[setting(
-        label = "Max size MiB (restart req.)",
+        label = "Max size MiB",
         widget = "number",
+        restart,
         min = 0,
         global_only,
         advanced
@@ -349,8 +346,9 @@ pub struct LoggingConfig {
     /// How many rotated files to retain (.1 through .keep_count).
     #[serde(default = "default_keep_count")]
     #[setting(
-        label = "Keep (restart req.)",
+        label = "Keep",
         widget = "number",
+        restart,
         min = 0,
         global_only,
         advanced,
@@ -365,8 +363,9 @@ pub struct LoggingConfig {
     /// polling endpoints. Off by default keeps the log readable.
     #[serde(default = "default_show_spans")]
     #[setting(
-        label = "Show where each line came from (restart req.)",
+        label = "Show where each line came from",
         widget = "toggle",
+        restart,
         global_only,
         advanced,
         summary = "Adds context to each line. Makes the log longer."
@@ -494,16 +493,17 @@ pub struct AcpConfig {
     )]
     pub allowed_agents: Vec<String>,
     /// Hard cap on simultaneously running acp agent subprocesses;
-    /// additional sessions queue. Takes effect when the Daemon starts.
+    /// additional sessions queue.
     #[serde(default = "default_max_workers")]
     #[setting(
         label = "Most Agents running at once",
         widget = "number",
+        restart,
         min = 1,
         validate = "range:1",
         global_only,
         advanced,
-        summary = "How many Structured view Sessions can have their Agent running at the same time. Lower it to save memory. Applies after the Daemon restarts."
+        summary = "How many Structured view Sessions can have their Agent running at the same time. Lower it to save memory."
     )]
     pub max_concurrent_workers: u32,
     /// Per-session retention cap on acp events. 0 = unlimited (default);
@@ -1169,6 +1169,21 @@ pub struct SessionConfig {
     )]
     pub pre_trust_agent_folders: bool,
 
+    /// Require native OS sandbox enforcement for remote plugin staging. Disabled
+    /// by default; enabling requires native OS sandbox support and tools and fails
+    /// closed when unavailable. Default streamed byte, archive-entry, and source
+    /// snapshot accounting cannot hard-limit Git/helper filesystem writes.
+    #[serde(default)]
+    #[setting(
+        label = "Strict plugin staging",
+        widget = "toggle",
+        advanced,
+        global_only,
+        repo = "deny",
+        web = "elevation:changes the machine-wide plugin staging filesystem security boundary"
+    )]
+    pub plugin_staging_sandbox: bool,
+
     /// Show the compact system-health strip below the session list. It reports
     /// CPU, memory pressure, and running agent and process counts. Off by
     /// default; also toggleable from the command palette.
@@ -1192,11 +1207,11 @@ pub struct SessionConfig {
     pub sidebar_position: SidebarPosition,
 
     /// What the TUI does with the list and preview once the terminal is too
-    /// narrow for them to sit side by side (below 80 columns). `Stacked` keeps
-    /// the historical list-above-preview split, `OnePane` shows only one at a
-    /// time (the list, or the preview in live mode), and `BigPreview` keeps the
-    /// split but shrinks the list to its minimum while live mode is relaying
-    /// keys.
+    /// narrow for them to sit side by side (below `narrow_breakpoint`).
+    /// `Stacked` keeps the historical list-above-preview split, `OnePane` shows
+    /// only one at a time (the list, or the preview in live mode), and
+    /// `BigPreview` keeps the split but shrinks the list to its minimum while
+    /// live mode is relaying keys.
     #[serde(default)]
     #[setting(
         label = "Narrow terminal layout",
@@ -1207,6 +1222,31 @@ pub struct SessionConfig {
         summary = "On narrow terminals: stack the list over the preview, show one at a time, or give live mode most of the screen."
     )]
     pub narrow_layout: NarrowLayout,
+
+    /// Width in columns below which the TUI switches to `narrow_layout`: the
+    /// list above the preview instead of beside it. The preview also compares
+    /// its own pane width against this value to pick its compact title over its
+    /// info header, so a narrow preview can be compact while the layout is still
+    /// side by side. Narrower than this is also where a collapsed sidebar stops
+    /// being available to `one_pane`. Values below 50
+    /// are raised to 50, the narrowest side-by-side split that keeps the
+    /// preview's 40-column floor beside a minimal 10-column list, so the range
+    /// accepts them rather than blocking a config that holds one. A value
+    /// greater than the terminal width puts every width below it, so the narrow
+    /// layout always applies, which the arrangement handles like any other
+    /// narrow height.
+    #[serde(default = "default_narrow_breakpoint")]
+    #[setting(
+        label = "Narrow layout below this width",
+        widget = "number",
+        min = 0,
+        max = 1000,
+        validate = "range:0:1000",
+        tui_only,
+        global_only,
+        summary = "Window width in columns. Narrower terminal app windows stack the list over the preview. Values under 50 are raised to 50."
+    )]
+    pub narrow_breakpoint: u16,
 
     /// Percentage of split preview rows allocated to the paired terminal.
     #[serde(default = "default_split_terminal_height_percent")]
@@ -1528,6 +1568,21 @@ pub struct SessionConfig {
     )]
     pub agent_acp_cmd: HashMap<String, String>,
 
+    /// Conversation-reset slash command for a custom ACP agent, `"/clear"` or
+    /// `"/new"` (e.g. "my-claude" = "/clear"). A custom agent has no built-in
+    /// profile, so without an entry its reset command reaches the model as an
+    /// ordinary prompt. With one, aoe drives a fresh `session/new` for it as it
+    /// does for a built-in agent. Applies only to an agent with its own `agent_acp_cmd`.
+    /// Repo-denied like `agent_acp_cmd`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[setting(
+        label = "Agent Clear Alias",
+        widget = "list",
+        web = "local_only:declares which slash command resets a custom agent's conversation",
+        category = "Agents"
+    )]
+    pub agent_clear_alias: HashMap<String, String>,
+
     /// Config directory read by the session's agent instead of its built-in
     /// default. Host sessions use the directory directly. Sandboxed sessions
     /// use a per-session `sandbox-v2/<instance id>` child of it, which AoE
@@ -1586,12 +1641,12 @@ pub struct SessionConfig {
     /// session id live; with more live sessions than this, the overflow's
     /// ids stop refreshing until another session stops. Process-wide:
     /// applied once at startup from the effective config of the profile the
-    /// process was launched with, so a change takes effect on the next
-    /// start. 0 keeps the default (50).
+    /// process was launched with. 0 keeps the default (50).
     #[serde(default = "default_session_id_poller_max_threads")]
     #[setting(
-        label = "Conversation lookup threads (restart req.)",
+        label = "Conversation lookup threads",
         widget = "number",
+        restart,
         min = 0,
         global_only,
         advanced,
@@ -1888,11 +1943,10 @@ pub struct SessionConfig {
     pub unread_indicator: bool,
 
     /// Show per-session color labels: the colored dot on sidebar rows and the
-    /// `Color` section in the session context menu. Web dashboard only; the TUI
-    /// does not render session colors. Turning this off hides them without
-    /// forbidding anything, `aoe session color` and the REST endpoint keep
-    /// working and stored values are preserved, so flipping back reveals them
-    /// again.
+    /// `Color` section in the session context menu. Turning this off hides
+    /// them without forbidding anything, `aoe session color` and the REST
+    /// endpoint keep working and stored values are preserved, so flipping back
+    /// reveals them again.
     ///
     /// `global_only`: the dashboard resolves one settings object for the whole
     /// client, not one per workspace, and the sidebar mixes sessions from
@@ -1902,6 +1956,7 @@ pub struct SessionConfig {
     #[setting(
         label = "Session colors",
         widget = "toggle",
+        web_only,
         category = "Interaction",
         global_only,
         summary = "A colored dot on each row, and Color in the Session menu."
@@ -2093,13 +2148,21 @@ impl AcpConfig {
     }
 
     pub fn acp_defaults_for(&self, agent: &str) -> Option<&AcpAgentDefaults> {
-        let non_empty = |key: &str| self.acp_defaults.get(key).filter(|d| !d.is_empty());
-        non_empty(agent).or_else(|| {
-            // `claude-code` is the legacy alias stored by older session records.
-            (agent == "claude-code")
-                .then(|| non_empty("claude"))
-                .flatten()
-        })
+        self.acp_defaults
+            .get(self.acp_defaults_key_for(agent))
+            .filter(|d| !d.is_empty())
+    }
+
+    /// The `acp_defaults` key `agent` reads from, and so the one a write for it
+    /// changes: its own entry, or `claude` for the legacy `claude-code` alias
+    /// stored by older session records when only `claude` is set.
+    pub fn acp_defaults_key_for<'a>(&self, agent: &'a str) -> &'a str {
+        let set = |key: &str| self.acp_defaults.get(key).is_some_and(|d| !d.is_empty());
+        if agent == "claude-code" && !set(agent) && set("claude") {
+            "claude"
+        } else {
+            agent
+        }
     }
 
     /// The model `agent` is pinned to (`pin_model` with a non-empty `model`).
@@ -2247,7 +2310,7 @@ pub enum SidebarPosition {
 }
 
 /// How the TUI arranges the session list and preview on a narrow terminal, below
-/// 80 columns. See `SessionConfig::narrow_layout`.
+/// `SessionConfig::narrow_breakpoint`. See `SessionConfig::narrow_layout`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NarrowLayout {
@@ -2291,9 +2354,11 @@ impl Default for SessionConfig {
             default_tool: None,
             yolo_mode_default: false,
             pre_trust_agent_folders: false,
+            plugin_staging_sandbox: false,
             show_diagnostics_pane: false,
             sidebar_position: SidebarPosition::default(),
             narrow_layout: NarrowLayout::default(),
+            narrow_breakpoint: default_narrow_breakpoint(),
             split_terminal_height_percent: default_split_terminal_height_percent(),
             split_terminal_min_width: default_split_terminal_min_width(),
             split_terminal_min_height: default_split_terminal_min_height(),
@@ -2316,6 +2381,7 @@ impl Default for SessionConfig {
             agent_detect_as: HashMap::new(),
             agent_execution_as: HashMap::new(),
             agent_acp_cmd: HashMap::new(),
+            agent_clear_alias: HashMap::new(),
             agent_config_dir: HashMap::new(),
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
@@ -2347,6 +2413,10 @@ impl Default for SessionConfig {
             tie_workdir_to_name: true,
         }
     }
+}
+
+fn default_narrow_breakpoint() -> u16 {
+    crate::tui::responsive::STACKED_BREAKPOINT
 }
 
 fn default_split_terminal_height_percent() -> u16 {
@@ -2480,6 +2550,21 @@ impl SessionConfig {
         }
     }
 
+    /// The reset profile `agent_clear_alias` declares for `agent`. Only a custom agent launched
+    /// through its own valid `agent_acp_cmd` takes one; an agent inheriting a built-in adapter
+    /// through `agent_detect_as` runs as that built-in.
+    pub fn clear_alias_profile(
+        &self,
+        agent: &str,
+    ) -> Option<&'static crate::acp::agent_profiles::AgentProfile> {
+        if crate::acp::agent_profiles::is_builtin(agent) {
+            return None;
+        }
+        let cmd = self.agent_acp_cmd.get(agent)?;
+        crate::acp::AgentSpec::from_acp_cmd(agent, cmd).ok()?;
+        crate::acp::agent_profiles::alias_profile(self.agent_clear_alias.get(agent)?)
+    }
+
     /// Log warnings for misconfigured custom agent entries.
     /// Called after config load to surface TOML editing mistakes.
     pub fn warn_custom_agent_issues(&self) {
@@ -2515,6 +2600,24 @@ impl SessionConfig {
                     name,
                     target,
                     crate::agents::agent_names().join(", ")
+                );
+            }
+        }
+        for (name, alias) in &self.agent_clear_alias {
+            if name.is_empty() || crate::acp::agent_profiles::alias_profile(alias).is_none() {
+                tracing::warn!(target: "session.store",
+                    "agent_clear_alias: '{}' = '{}' is ignored; use an agent name and \"/clear\" or \"/new\"",
+                    name, alias
+                );
+            } else if crate::acp::agent_profiles::is_builtin(name) {
+                tracing::warn!(target: "session.store",
+                    "agent_clear_alias: '{}' is a built-in agent with its own reset command; the entry is ignored",
+                    name
+                );
+            } else if !self.agent_acp_cmd.contains_key(name) {
+                tracing::warn!(target: "session.store",
+                    "agent_clear_alias: '{}' has no agent_acp_cmd entry, so it runs as another agent; the entry is ignored",
+                    name
                 );
             }
         }
@@ -2629,8 +2732,9 @@ pub struct WebConfig {
     #[setting(
         label = "Notifications for every browser",
         widget = "toggle",
+        restart,
         global_only,
-        summary = "Off stops notifications in every browser and hides the Turn on button. Applies to every Profile, after the Daemon restarts."
+        summary = "Off stops notifications in every browser and hides the Turn on button. Applies to every Profile."
     )]
     pub notifications_enabled: bool,
 
@@ -2640,8 +2744,9 @@ pub struct WebConfig {
     #[setting(
         label = "A Session needs you",
         widget = "toggle",
+        restart,
         global_only,
-        summary = "The Agent is waiting for your answer or approval. Applies after the Daemon restarts."
+        summary = "The Agent is waiting for your answer or approval."
     )]
     pub notify_on_waiting: bool,
 
@@ -2652,14 +2757,20 @@ pub struct WebConfig {
     #[setting(
         label = "A Session finishes",
         widget = "toggle",
+        restart,
         global_only,
-        summary = "The Agent is done and the Session is Idle. Applies after the Daemon restarts."
+        summary = "The Agent is done and the Session is Idle."
     )]
     pub notify_on_idle: bool,
 
     /// Default: send a push when a session errors (Running to Error).
     #[serde(default = "default_true")]
-    #[setting(label = "A Session hits an error", widget = "toggle", global_only)]
+    #[setting(
+        label = "A Session hits an error",
+        widget = "toggle",
+        restart,
+        global_only
+    )]
     pub notify_on_error: bool,
 
     /// Default: send a push when an acp session's ScheduleWakeup timer
@@ -2669,22 +2780,60 @@ pub struct WebConfig {
     #[setting(
         label = "A scheduled wake-up fires",
         widget = "toggle",
+        restart,
         global_only,
-        summary = "When an Agent set itself a timer to check back. Skipped if you were using AoE in the last 30 seconds. Applies after the Daemon restarts."
+        summary = "When an Agent set itself a timer to check back. Skipped if you were using AoE in the last 30 seconds."
     )]
     pub notify_on_wake_fire: bool,
 
     /// Serve a Model Context Protocol server at `/mcp` on the daemon so MCP
-    /// clients holding the daemon token can list sessions (read-only tools for
-    /// now). When false the route does not exist. Read at daemon startup.
+    /// clients holding the daemon token can list, create and send to sessions,
+    /// read their output, wait on them and approve requests. When false the
+    /// route does not exist. Read at daemon startup.
     #[serde(default)]
     #[setting(
         label = "Let other apps control AoE",
         widget = "toggle",
+        restart,
         global_only,
-        summary = "Apps like Claude Code can list your Sessions through MCP. Read-only for now. Works when aoe serve uses the access link without a passphrase, or --auth none. Applies after the Daemon restarts."
+        summary = "Apps like Claude Code can list, create and send to your Sessions, read their output, wait on them and approve requests. Works when aoe serve uses the access link without a passphrase, or --auth none."
     )]
     pub mcp_enabled: bool,
+
+    /// Show the diff pane when a Session opens whose pane layout the user has
+    /// not changed in this browser.
+    #[serde(default)]
+    #[setting(
+        label = "Open the diff panel in Sessions",
+        widget = "toggle",
+        web_only,
+        global_only,
+        summary = "Show the changed files beside every Session you haven't arranged yourself."
+    )]
+    pub auto_open_diff_pane: bool,
+
+    /// Show a terminal pane when a Session opens whose pane layout the user
+    /// has not changed in this browser.
+    #[serde(default)]
+    #[setting(
+        label = "Open a terminal panel in Sessions",
+        widget = "toggle",
+        web_only,
+        global_only,
+        summary = "Show a shell beside every Session you haven't arranged yourself."
+    )]
+    pub auto_open_terminal_pane: bool,
+
+    /// Add panes contributed by installed plugins as tabs when they load.
+    #[serde(default)]
+    #[setting(
+        label = "Open plugin panels automatically",
+        widget = "toggle",
+        web_only,
+        global_only,
+        summary = "Add panes from installed plugins, such as the GitHub pull-request pane, as they load."
+    )]
+    pub auto_open_plugin_panes: bool,
 }
 
 impl Default for WebConfig {
@@ -2696,6 +2845,9 @@ impl Default for WebConfig {
             notify_on_error: true,
             notify_on_wake_fire: true,
             mcp_enabled: false,
+            auto_open_diff_pane: false,
+            auto_open_terminal_pane: false,
+            auto_open_plugin_panes: false,
         }
     }
 }
@@ -2890,8 +3042,8 @@ pub enum ColorMode {
 #[setting_section(name = "theme", category = "Theme")]
 pub struct ThemeConfig {
     /// Color theme for the TUI. A global preference: one theme paints every
-    /// surface regardless of the active session profile (see
-    /// `config::resolve_theme_name`), so it is not profile-overridable.
+    /// surface regardless of the active session profile, so it is not
+    /// profile-overridable.
     #[serde(default)]
     #[setting(
         label = "Theme",
@@ -2915,7 +3067,7 @@ pub struct ThemeConfig {
     /// Idle session keeps a fresh-idle tint and an animated breathe icon for
     /// this many minutes before snapping back to the static look, and is
     /// treated as actionable by the `w` keybind. The time-since-stop column
-    /// is `session.show_activity_age`.
+    /// is the separate "Show Session age" setting.
     #[serde(default = "default_idle_decay_minutes")]
     #[setting(
         label = "Highlight Sessions that just finished",
@@ -2994,7 +3146,7 @@ pub struct UpdatesConfig {
     )]
     pub update_check_mode: UpdateCheckMode,
 
-    /// Auto-update installed external plugins at TUI and `aoe serve` startup.
+    /// Auto-update installed external plugins when the Daemon (`aoe serve`) starts.
     /// Off by default. The sweep applies only updates that need no new consent;
     /// any version that changes capabilities, build steps, or UI slots is left
     /// for a manual `aoe plugin update` so its new grant is reviewed.
@@ -3006,7 +3158,7 @@ pub struct UpdatesConfig {
         label = "Update plugins automatically",
         widget = "toggle",
         global_only,
-        summary = "When AoE starts. Installs plugin updates that don't ask for anything new. Updates that need new permissions still wait for you. Applies to every Profile."
+        summary = "When the Daemon starts. Installs plugin updates that don't ask for anything new. Updates that need new permissions still wait for you. Applies to every Profile."
     )]
     pub auto_update_plugins: bool,
 }
@@ -3234,16 +3386,18 @@ pub struct SandboxConfig {
     )]
     pub enabled_by_default: bool,
 
-    /// Container image to use for sandboxes.
-    #[serde(default = "default_sandbox_image")]
+    /// Container image to use for sandboxes. Unset uses the aoe-sandbox image
+    /// tagged with this AoE version.
+    // Unset is never written back, so a save cannot pin today's tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[setting(
         label = "Image",
-        widget = "text",
+        widget = "optional_text",
         web = "elevation:sandbox config affects host isolation",
         repo = "deny",
         summary = "The container image Sessions start from."
     )]
-    pub default_image: String,
+    pub default_image: Option<String>,
 
     /// Additional volume mounts (host:container or host:container:ro).
     #[serde(default, deserialize_with = "super::serde_helpers::string_or_vec")]
@@ -3374,6 +3528,7 @@ pub struct SandboxConfig {
     #[setting(
         label = "Folders to leave out",
         widget = "list",
+        validate = "volume_ignore_list",
         web = "elevation:sandbox config affects host isolation",
         advanced,
         summary = "Paths inside the Project the container shouldn't see, like node_modules."
@@ -3514,6 +3669,30 @@ pub struct SandboxConfig {
     )]
     pub custom_instruction: Option<String>,
 
+    /// Where the credential an agent's sandboxes share comes from. It applies
+    /// to every agent that declares a sandbox login (today Claude). Seed from
+    /// host login fills an empty shared file from the host's own login. That
+    /// copies the host's own token, so the first side to refresh logs the
+    /// other out once. Separate sandbox login never reads the host login and
+    /// leaves the file empty until you log in for the sandboxes. That is a
+    /// different login than the host's, so a host refresh can never
+    /// invalidate the sandboxes and a sandbox refresh or logout can never
+    /// invalidate the host. Separate sandbox login is not supported with
+    /// Apple Container, which cannot run the login helper: a launch that
+    /// needs the login fails there instead of waiting for it.
+    // Global-only: profiles sharing an agent config dir share one credential
+    // file, so one profile's value cannot be honored apart from another's.
+    #[serde(default)]
+    #[setting(
+        label = "Shared agent credential",
+        widget = "select",
+        options = "host_seed:Seed from host login,separate_login:Separate sandbox login",
+        web = "elevation:sandbox credential handling affects host login isolation",
+        repo = "deny",
+        global_only
+    )]
+    pub shared_credential: SharedCredentialMode,
+
     /// Container runtime for sandboxing.
     #[serde(default)]
     #[setting(
@@ -3537,6 +3716,15 @@ pub enum ContainerRuntimeName {
     Podman,
 }
 
+/// Where the credential an agent's sandboxes share comes from.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedCredentialMode {
+    #[default]
+    HostSeed,
+    SeparateLogin,
+}
+
 /// Volume mounting strategy for volume_ignores paths.
 ///
 /// On macOS with Docker Desktop's VirtioFS, anonymous volumes don't always shadow
@@ -3556,7 +3744,7 @@ impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
             enabled_by_default: false,
-            default_image: default_sandbox_image(),
+            default_image: None,
             extra_volumes: Vec::new(),
             environment: default_sandbox_environment(),
             auto_cleanup: true,
@@ -3576,13 +3764,39 @@ impl Default for SandboxConfig {
             security_opt: Vec::new(),
             extra_run_args: Vec::new(),
             custom_instruction: None,
+            shared_credential: SharedCredentialMode::default(),
             container_runtime: ContainerRuntimeName::default(),
         }
     }
 }
 
-fn default_sandbox_image() -> String {
-    "ghcr.io/agent-of-empires/aoe-sandbox:latest".to_string()
+impl SandboxConfig {
+    /// The image new sandboxes use when nothing more specific is requested.
+    pub fn effective_image(&self) -> String {
+        self.resolve_image(None)
+    }
+
+    /// The first non-blank of `requested` and `default_image`, otherwise the
+    /// automatic image for this AoE version. Every path that picks a sandbox
+    /// image resolves through here.
+    pub fn resolve_image(&self, requested: Option<&str>) -> String {
+        [requested, self.default_image.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .find(|image| !image.is_empty())
+            .unwrap_or(crate::containers::sandbox_image::automatic_sandbox_image())
+            .to_string()
+    }
+
+    /// Whether `image` is the automatic image because the config pins none.
+    /// A `default_image` naming the same tag is an explicit choice.
+    pub fn picks_automatic_image(&self, image: &str) -> bool {
+        self.default_image
+            .as_deref()
+            .is_none_or(|configured| configured.trim().is_empty())
+            && image == crate::containers::sandbox_image::automatic_sandbox_image()
+    }
 }
 
 fn default_sandbox_environment() -> Vec<String> {
@@ -3661,11 +3875,12 @@ pub struct TmuxConfig {
     /// Run aoe's sessions on a private tmux server with this socket name (tmux
     /// `-L`), so your own `tmux ls` and hand-managed sessions stay separate
     /// from aoe's. Leave empty to share the default tmux server (the current
-    /// behavior). A bare name, not a path; takes effect on the next aoe start.
+    /// behavior). A bare name, not a path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[setting(
         label = "Separate tmux server",
         widget = "optional_text",
+        restart,
         global_only,
         web = "local_only:changes which tmux server hosts your sessions on this machine",
         summary = "Keeps AoE's Sessions apart from your other tmux sessions. Enter a short name, like aoe. Change it when no Sessions are running."
@@ -3699,41 +3914,45 @@ pub fn default_systemd_slice() -> String {
 pub struct SystemdSettings {
     /// Place every new session in its own transient systemd scope. No-op when
     /// the systemd user manager is unreachable. Existing scopes are still
-    /// stopped with their sessions when off. Applies after an aoe restart.
+    /// stopped with their sessions when off.
     #[serde(default = "default_true")]
     #[setting(
         label = "Run Sessions in systemd scopes",
         widget = "toggle",
+        restart,
         global_only,
         summary = "Does nothing if systemd isn't available."
     )]
     pub enabled: bool,
 
-    /// Slice for the session scopes; must end in `.slice`. `{profile}` and `{session}` expand to the escaped profile name and session id. Applies after an aoe restart.
+    /// Slice for the session scopes; must end in `.slice`. `{profile}` and `{session}` expand to the escaped profile name and session id.
     #[serde(default = "default_systemd_slice")]
     #[setting(
         label = "Slice",
         widget = "text",
+        restart,
         validate = "systemd_slice",
         global_only,
         summary = "Must end in .slice. {profile} becomes the Profile name and {session} the Session's id."
     )]
     pub slice: String,
 
-    /// Keep sessions running when the aoe daemon service stops. Applies after an aoe restart.
+    /// Keep sessions running when the aoe daemon service stops.
     #[serde(default = "default_true")]
     #[setting(
         label = "Keep Sessions running when the Daemon restarts",
         widget = "toggle",
+        restart,
         global_only
     )]
     pub survive_daemon_restart: bool,
 
-    /// Per-session memory cap (e.g. `4G`, `512M`). Empty means unlimited. Applies after an aoe restart.
+    /// Per-session memory cap (e.g. `4G`, `512M`). Empty means unlimited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[setting(
         label = "Memory limit per Session",
         widget = "optional_text",
+        restart,
         validate = "memory_limit",
         global_only,
         advanced,
@@ -3741,11 +3960,12 @@ pub struct SystemdSettings {
     )]
     pub memory_max: Option<String>,
 
-    /// Per-session task cap. 0 means unlimited. Applies after an aoe restart.
+    /// Per-session task cap. 0 means unlimited.
     #[serde(default)]
     #[setting(
         label = "Limit processes per Session",
         widget = "number",
+        restart,
         min = 0,
         max = 4194304,
         validate = "range:0:4194304",
@@ -4193,27 +4413,46 @@ fn config_save_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-pub(super) fn read_optional_config(path: &std::path::Path) -> Result<Option<String>> {
-    match fs::read_to_string(path) {
-        Ok(content) => Ok(Some(content)),
+/// One read of a config file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FileRead {
+    /// The file's canonical directory, so a retargeted directory link reads as a change.
+    pub(crate) dir: Option<PathBuf>,
+    /// On error, whether the path itself exists: a dangling link is not an absent file.
+    pub(crate) content: std::result::Result<std::sync::Arc<[u8]>, (std::io::ErrorKind, bool)>,
+}
+
+/// How config resolution reads its files, so a caller can resolve from bytes it already holds.
+pub(crate) type ReadFile<'a> = &'a dyn Fn(&Path) -> FileRead;
+
+pub(crate) fn read_file(path: &Path) -> FileRead {
+    FileRead {
+        dir: path.parent().and_then(|dir| fs::canonicalize(dir).ok()),
+        content: fs::read(path)
+            .map(std::sync::Arc::from)
+            .map_err(|error| (error.kind(), fs::symlink_metadata(path).is_ok())),
+    }
+}
+
+pub(super) fn read_optional_config(path: &Path, read: ReadFile) -> Result<Option<String>> {
+    match read(path).content {
+        Ok(bytes) => Ok(Some(String::from_utf8(bytes.to_vec())?)),
         // A missing file is optional; a broken link or an unreadable path is not.
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound
-                && fs::symlink_metadata(path)
-                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(error.into()),
+        Err((std::io::ErrorKind::NotFound, false)) => Ok(None),
+        Err((kind, _)) => Err(std::io::Error::from(kind).into()),
     }
 }
 
 impl Config {
     /// Read config.toml without the obsolete inline app_state table.
     fn load_raw_table() -> Result<toml::Table> {
+        Self::load_raw_table_via(&read_file)
+    }
+
+    fn load_raw_table_via(read: ReadFile) -> Result<toml::Table> {
         let path = config_path()?;
         let result = (|| {
-            let mut table: toml::Table = match read_optional_config(&path)? {
+            let mut table: toml::Table = match read_optional_config(&path, read)? {
                 Some(content) => toml::from_str(&content)?,
                 None => toml::Table::new(),
             };
@@ -4225,7 +4464,11 @@ impl Config {
     }
 
     pub fn load() -> Result<Self> {
-        let table = Self::load_raw_table()?;
+        Self::load_via(&read_file)
+    }
+
+    pub(crate) fn load_via(read: ReadFile) -> Result<Self> {
+        let table = Self::load_raw_table_via(read)?;
         let mut config: Config = table.try_into().map_err(|error: toml::de::Error| {
             let error = anyhow::Error::new(error);
             match config_path() {
@@ -4233,7 +4476,7 @@ impl Config {
                 Err(_) => error,
             }
         })?;
-        config.app_state = AppStateConfig::load()?;
+        config.app_state = AppStateConfig::load_via(read)?;
         Ok(config)
     }
 
@@ -4349,9 +4592,13 @@ impl AppStateConfig {
     /// Read `state.toml` (fields at the TOML top level, not nested under an
     /// `[app_state]` table). A missing file deserializes to defaults.
     pub fn load() -> Result<Self> {
+        Self::load_via(&read_file)
+    }
+
+    fn load_via(read: ReadFile) -> Result<Self> {
         let path = state_path()?;
         let result = (|| {
-            let table: toml::Table = match read_optional_config(&path)? {
+            let table: toml::Table = match read_optional_config(&path, read)? {
                 Some(content) => toml::from_str(&content)?,
                 None => toml::Table::new(),
             };
@@ -4599,6 +4846,39 @@ mod model_value_quoting_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clear_alias_applies_only_to_a_custom_agent_with_its_own_acp_command() {
+        let mut config = SessionConfig::default();
+        // (agent, acp command)
+        let agents = [
+            ("own", Some("own-bridge acp")),
+            // Launched as its agent_detect_as base.
+            ("inherits", None),
+            ("empty", Some("")),
+            ("malformed", Some("bridge \"unterminated")),
+            // Built-in, in the registry without an ACP profile.
+            ("cursor", Some("cursor-bridge acp")),
+        ];
+        for (agent, cmd) in agents {
+            config
+                .agent_clear_alias
+                .insert(agent.into(), "/clear".into());
+            if let Some(cmd) = cmd {
+                config.agent_acp_cmd.insert(agent.into(), cmd.into());
+            }
+        }
+        config
+            .agent_detect_as
+            .insert("inherits".into(), "claude".into());
+        for (agent, _) in agents {
+            assert_eq!(
+                config.clear_alias_profile(agent).map(|p| p.key),
+                (agent == "own").then_some(crate::acp::agent_profiles::CUSTOM_CLEAR.key),
+                "{agent}"
+            );
+        }
+    }
 
     #[test]
     fn serve_config_ignores_errors_outside_serve_table() {
@@ -5093,6 +5373,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn shared_credential_is_an_elevated_repo_denied_select() {
+        let field = settings_schema::descriptor("sandbox", "shared_credential")
+            .expect("sandbox.shared_credential descriptor");
+        assert_eq!(field.label, "Shared agent credential");
+        assert!(!field.profile_overridable);
+        assert_eq!(
+            field.web_write,
+            settings_schema::WebWritePolicy::RequiresElevation {
+                reason: "sandbox credential handling affects host login isolation".to_string()
+            }
+        );
+        let settings_schema::WidgetKind::Select { options } = &field.widget else {
+            panic!("shared_credential must render as a select");
+        };
+        let options: Vec<(&str, &str)> = options
+            .iter()
+            .map(|o| (o.value.as_str(), o.label.as_str()))
+            .collect();
+        assert_eq!(
+            options,
+            [
+                ("host_seed", "Seed from host login"),
+                ("separate_login", "Separate sandbox login")
+            ]
+        );
+
+        // (config.toml, parsed)
+        for (toml_src, expected) in [
+            ("", Some(SharedCredentialMode::HostSeed)),
+            (
+                "shared_credential = \"host_seed\"",
+                Some(SharedCredentialMode::HostSeed),
+            ),
+            (
+                "shared_credential = \"separate_login\"",
+                Some(SharedCredentialMode::SeparateLogin),
+            ),
+            ("shared_credential = \"keychain\"", None),
+        ] {
+            let parsed = toml::from_str::<Config>(&format!("[sandbox]\n{toml_src}"))
+                .ok()
+                .map(|config| config.sandbox.shared_credential);
+            assert_eq!(parsed, expected, "{toml_src:?}");
+            let Some(mode) = parsed else { continue };
+            let mut config = Config::default();
+            config.sandbox.shared_credential = mode;
+            let round_tripped: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(
+                round_tripped.sandbox.shared_credential, mode,
+                "{toml_src:?}"
+            );
+        }
+    }
+
     /// Every accessor on `AcpAgentDefaults` treats a blank string as unset, and
     /// the per-model effort wins over the flat one only when it has a value.
     #[test]
@@ -5180,19 +5515,28 @@ mod tests {
             pin_model: model.is_some(),
             ..Default::default()
         };
-        let cases: [(&[(&str, Option<&str>)], Option<&str>); 4] = [
-            (&[("claude", Some("canon"))], Some("canon")),
-            (&[("claude-code", Some("alias"))], Some("alias")),
+        // The key is where a write for `claude-code` lands, so it reads back.
+        type Entries<'a> = &'a [(&'a str, Option<&'a str>)];
+        let cases: [(Entries, Option<&str>, &str); 5] = [
+            (&[("claude", Some("canon"))], Some("canon"), "claude"),
+            (
+                &[("claude-code", Some("alias"))],
+                Some("alias"),
+                "claude-code",
+            ),
             (
                 &[("claude", Some("canon")), ("claude-code", Some("alias"))],
                 Some("alias"),
+                "claude-code",
             ),
             (
                 &[("claude", Some("canon")), ("claude-code", None)],
                 Some("canon"),
+                "claude",
             ),
+            (&[], None, "claude-code"),
         ];
-        for (entries, want) in cases {
+        for (entries, want, key) in cases {
             let mut config = AcpConfig::default();
             for (key, model) in entries {
                 config.acp_defaults.insert(key.to_string(), entry(*model));
@@ -5209,6 +5553,12 @@ mod tests {
                 want,
                 "{entries:?}"
             );
+            assert_eq!(
+                config.acp_defaults_key_for("claude-code"),
+                key,
+                "{entries:?}"
+            );
+            assert_eq!(config.acp_defaults_key_for("codex"), "codex", "{entries:?}");
         }
     }
 
@@ -5556,6 +5906,124 @@ mod tests {
 
         update_app_state(|state| state.has_seen_welcome = true).unwrap();
         assert!(Config::load().unwrap().app_state.has_seen_welcome);
+    }
+
+    /// A blank or absent `default_image` is the automatic image; a request
+    /// (CLI flag, dialog, API) beats the config, and a profile value beats the
+    /// global one. A profile's blank value opts back into automatic.
+    #[test]
+    fn sandbox_image_resolution_and_profile_precedence() {
+        let automatic = crate::containers::sandbox_image::automatic_sandbox_image();
+        let sandbox = |image: Option<&str>| SandboxConfig {
+            default_image: image.map(str::to_string),
+            ..SandboxConfig::default()
+        };
+        for (configured, requested, expected) in [
+            (None, None, automatic),
+            (Some(""), None, automatic),
+            (Some("  "), None, automatic),
+            (Some(" my/img:1 "), None, "my/img:1"),
+            (Some("my/img:1"), Some("flag/img:2"), "flag/img:2"),
+            (Some("my/img:1"), Some(" "), "my/img:1"),
+            (None, Some(""), automatic),
+        ] {
+            assert_eq!(
+                sandbox(configured).resolve_image(requested),
+                expected,
+                "{configured:?} {requested:?}"
+            );
+        }
+
+        for (configured, image, expected) in [
+            (None, automatic, true),
+            (Some(" "), automatic, true),
+            (Some(automatic), automatic, false),
+            (None, "my/img:1", false),
+        ] {
+            assert_eq!(
+                sandbox(configured).picks_automatic_image(image),
+                expected,
+                "{configured:?} {image:?}"
+            );
+        }
+
+        for (global, profile, expected) in [
+            (None, serde_json::json!({}), automatic),
+            (Some("global/img:1"), serde_json::json!({}), "global/img:1"),
+            (
+                None,
+                serde_json::json!({"sandbox": {"default_image": "profile/img:1"}}),
+                "profile/img:1",
+            ),
+            (
+                Some("global/img:1"),
+                serde_json::json!({"sandbox": {"default_image": "profile/img:1"}}),
+                "profile/img:1",
+            ),
+            (
+                Some("global/img:1"),
+                serde_json::json!({"sandbox": {"default_image": ""}}),
+                automatic,
+            ),
+        ] {
+            let config = Config {
+                sandbox: sandbox(global),
+                ..Config::default()
+            };
+            let overrides: profile_config::ProfileConfig =
+                serde_json::from_value(profile.clone()).unwrap();
+            assert_eq!(
+                profile_config::merge_configs(config, &overrides)
+                    .sandbox
+                    .effective_image(),
+                expected,
+                "{global:?} {profile}"
+            );
+        }
+    }
+
+    /// The settings API, profile merge and `config.toml` all see an automatic
+    /// image as an absent key, never as the tag or null.
+    #[test]
+    fn automatic_image_serializes_as_an_absent_key() {
+        let json = serde_json::to_value(SandboxConfig::default()).unwrap();
+        assert!(json.get("default_image").is_none(), "{json}");
+        let toml = toml::Table::try_from(SandboxConfig::default()).unwrap();
+        assert!(!toml.contains_key("default_image"), "{toml}");
+
+        let custom = SandboxConfig {
+            default_image: Some("my/img:1".into()),
+            ..SandboxConfig::default()
+        };
+        assert_eq!(
+            serde_json::to_value(custom).unwrap()["default_image"],
+            serde_json::json!("my/img:1")
+        );
+    }
+
+    /// Saving any setting must not write the automatic image back, or the
+    /// first save would pin the tag of the build that wrote it.
+    #[test]
+    #[serial_test::serial]
+    fn saving_config_leaves_the_automatic_image_unset() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        fs::create_dir_all(get_app_dir().unwrap()).unwrap();
+        let saved_image = || {
+            let raw = fs::read_to_string(config_path().unwrap()).unwrap();
+            let table: toml::Table = raw.parse().unwrap();
+            table
+                .get("sandbox")
+                .and_then(|sandbox| sandbox.get("default_image"))
+                .map(|image| image.as_str().unwrap().to_string())
+        };
+
+        update_config(|config| config.default_profile = "x".to_string()).unwrap();
+        assert_eq!(saved_image(), None);
+
+        update_config(|config| config.sandbox.default_image = Some("my/img:1".into())).unwrap();
+        assert_eq!(saved_image().as_deref(), Some("my/img:1"));
+        update_config(|config| config.sandbox.default_image = None).unwrap();
+        assert_eq!(saved_image(), None);
     }
 
     #[test]

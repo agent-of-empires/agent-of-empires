@@ -818,7 +818,9 @@ commit before ACK and replacement admission; physical absence alone does not
 settle metadata debt. A stopped resume carries its existing reservation directly
 into launch rather than admitting twice. Journal or handoff ownership refuses
 checkpoint takeover, and failed foreground commits retain custody.
-A concurrent restart returns `409 restart_in_progress`; if the old
+A concurrent restart returns `409 restart_in_progress`. A permanent deletion
+fence before the restart claim or replacement admission returns
+`409 purge_in_progress`. If the old
 worker cannot settle before the bounded shutdown wait, the endpoint returns a
 `503` settlement error and leaves the replacement admission to a retry. A
 separate `409 worker_not_stopped` response is used when the worker is still
@@ -879,6 +881,10 @@ Profiles are conservative: an unverified tool surface is omitted rather than gue
 - `terminal/*`: commands run in aoe's process, in the worktree, or inside the sandbox container via `docker exec`.
 - Approval nonces are server-generated and single-use, so a compromised agent cannot synthesize one. `AOE_TOKEN` is not forwarded to the agent subprocess.
 - **Sandboxed sessions** wrap the agent argv in `docker exec` while the daemon stays on the host, and `fs/*` paths are translated from container to host before the inside-roots check. Translation covers the workspace mounts only, so config, credential, and `extra_volumes` mounts are rejected. The image must bundle the ACP adapters, or the handshake exits with status 127.
+
+## Prompt origin
+
+`UserPromptSent.origin` records where a prompt entered AoE: `dashboard`, `tui`, `cli`, `mcp`, `plugin`, `aoe` (daemon-generated turns) or `unknown`. HTTP clients self-identify with the `X-Aoe-Prompt-Origin` header and the daemon accepts only `dashboard`, `tui` and `cli` from it, never from a body. It is provenance, not proof that a human was present, and `unknown` (missing, forged or pre-origin data) must be treated as untrusted.
 
 ## Global tuning (`[acp]`)
 

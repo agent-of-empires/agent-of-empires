@@ -4,7 +4,7 @@
 use agent_of_empires::git::error::GitError;
 use agent_of_empires::git::GitWorktree;
 use agent_of_empires::session::{GroupTree, Instance, Storage, WorktreeInfo};
-use chrono::Utc;
+use agent_of_empires::time::Timestamp;
 use serial_test::serial;
 use tempfile::TempDir;
 
@@ -66,7 +66,7 @@ fn managed_info(branch: &str, repo: &std::path::Path) -> WorktreeInfo {
         branch: branch.to_string(),
         main_repo_path: repo.to_string_lossy().to_string(),
         managed_by_aoe: true,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         base_branch: None,
     }
 }

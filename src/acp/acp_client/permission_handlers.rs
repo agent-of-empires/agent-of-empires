@@ -127,7 +127,7 @@ pub(super) async fn emit_permission_denied(
             is_error: true,
             content: content.to_string(),
             output: Vec::new(),
-            completed_at: chrono::Utc::now(),
+            completed_at: crate::time::Timestamp::now(),
             async_subagent: false,
         })
         .await;
@@ -195,7 +195,7 @@ pub(super) async fn handle_permission_request(
             .map(tool_kind_str)
             .unwrap_or_else(|| "other".into()),
         args_preview,
-        started_at: chrono::Utc::now(),
+        started_at: crate::time::Timestamp::now(),
         parent_tool_call_id: profile.parent_tool_use_id_from_meta(&request.tool_call.meta),
         memory_recall: None,
         diffs: Vec::new(),
@@ -389,15 +389,16 @@ pub(super) async fn handle_elicitation_request(
     native_callback: Option<Arc<super::session_identity::CapturedCallback>>,
 ) -> Result<CreateElicitationResponse, agent_client_protocol::Error> {
     let nonce = Nonce::new();
-    let elicitation = match parse_elicitation(nonce.clone(), &request, chrono::Utc::now()) {
-        Ok(elicitation) => elicitation,
-        Err(e) => {
-            // Cancel, not Decline: the question was never shown, so "user
-            // skipped" would misrepresent it.
-            warn!(target: "acp.protocol", "unsupported elicitation, cancelling: {e}");
-            return Ok(CreateElicitationResponse::new(ElicitationAction::Cancel));
-        }
-    };
+    let elicitation =
+        match parse_elicitation(nonce.clone(), &request, crate::time::Timestamp::now()) {
+            Ok(elicitation) => elicitation,
+            Err(e) => {
+                // Cancel, not Decline: the question was never shown, so "user
+                // skipped" would misrepresent it.
+                warn!(target: "acp.protocol", "unsupported elicitation, cancelling: {e}");
+                return Ok(CreateElicitationResponse::new(ElicitationAction::Cancel));
+            }
+        };
     let event = Event::ElicitationRequested {
         elicitation: elicitation.clone(),
     };

@@ -1,6 +1,14 @@
 # Installation
 
-**Prerequisites:** [tmux](https://github.com/tmux/tmux/wiki). Docker (or another container runtime) is optional, for [sandboxing](guides/sandbox.md), and [Node.js](https://nodejs.org/) is needed only to build the web dashboard from source. Building also needs a C toolchain for native dependencies; a stock `cc` covers most platforms, and targets without pre-generated AWS-LC bindings also need CMake.
+**Prerequisites:** [tmux](https://github.com/tmux/tmux/wiki). Docker (or another container runtime) is optional, for [sandboxing](guides/sandbox.md).
+
+[Node.js](https://nodejs.org/) is needed only for:
+
+- Structured view adapters that run on Node: 22 or newer, and 22.6 or newer for adapters that ship sources (`aoe acp doctor --fix` can download a private copy). Agents with native ACP, such as `opencode acp` and `gemini --acp`, need no adapter.
+- Plugins with a Node worker.
+- Building the web dashboard from source: 22.12 or newer.
+
+Building also needs a C toolchain for native dependencies; a stock `cc` covers most platforms, and targets without pre-generated AWS-LC bindings also need CMake.
 
 ## Install
 
@@ -15,8 +23,6 @@ brew install aoe
 ```
 
 ## Nightly Channel
-
-Nightly builds are not published yet; the commands below find nothing until they are.
 
 Nightly builds are daily prereleases of `main`, versioned like `1.22.2-nightly.20261108` and tagged `nightly-20261108`. The newest seven stay available. Use them to try changes before the next stable release and to report regressions early.
 

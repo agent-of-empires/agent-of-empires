@@ -59,7 +59,7 @@ pub(super) async fn repair_missing_terminal(state: &Arc<AppState>) {
             return;
         }
     };
-    let now_ms = chrono::Utc::now().timestamp_millis();
+    let now_ms = crate::time::Timestamp::now().as_millis();
     let grace_ms = i64::from(TERMINAL_REPAIR_GRACE_SECS) * 1000;
     for id in candidates {
         if latest_at
@@ -205,7 +205,7 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
         if open_tool
             || awaiting_user
             || !should_auto_stop(
-                chrono::Utc::now().timestamp_millis(),
+                crate::time::Timestamp::now().as_millis(),
                 last_ms,
                 idle_secs,
                 !matches!(holds_live_work, Ok(Known(false))),
@@ -264,7 +264,6 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
 mod tests {
     use super::*;
     use crate::acp::Event;
-    use chrono::Utc;
 
     #[test]
     fn should_auto_stop_policy() {
@@ -333,7 +332,7 @@ mod tests {
                     if case == "fresh" {
                         live.client
                             .lease
-                            .test_backdate_idle_baseline(Utc::now().timestamp_millis());
+                            .test_backdate_idle_baseline(crate::time::Timestamp::now().as_millis());
                     } else if case == "prompt_pending" {
                         live.state.acp_supervisor.test_note_admission(&id);
                     } else if case == "unknown" {
@@ -472,7 +471,7 @@ mod tests {
             let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
             let queued_task = scope.spawn_helper(async move {
                 let queued = state.session_service.enqueue_prompt(&queue_id, "queued-after-idle-probe".into(),
-                    "keep this intent".into(), Vec::new(), None, None).await.unwrap();
+                    "keep this intent".into(), Vec::new(), None, crate::server::session_service::QueueSender::default()).await.unwrap();
                 queued_tx.send(queued).unwrap();
             });
             assert!(release.release());
@@ -614,13 +613,15 @@ mod tests {
                             .clone();
                         match change {
                             "creation" => {
-                                replacement.created_at += chrono::Duration::nanoseconds(1)
+                                replacement.created_at += crate::time::Duration::new(0, 1)
                             }
                             "generation" => replacement.lifecycle_generation += 1,
                             "wake" => replacement.idle_dormant_since = None,
                             "queue" => {
-                                replacement.idle_dormant_since =
-                                    Some(Utc::now() + chrono::Duration::seconds(1));
+                                replacement.idle_dormant_since = Some(
+                                    crate::time::Timestamp::now()
+                                        + crate::time::Duration::seconds(1),
+                                );
                                 replacement
                                     .queued_prompts
                                     .push(super::super::test_fixtures::queued_prompt());
@@ -761,7 +762,7 @@ mod tests {
         live.finish_prompt(&request, None).await;
         live.make_quota_due();
         live.client.lease.test_backdate_idle_baseline(
-            (Utc::now() - chrono::Duration::hours(1)).timestamp_millis(),
+            (crate::time::Timestamp::now() - crate::time::Duration::hours(1)).as_millis(),
         );
         live
     }

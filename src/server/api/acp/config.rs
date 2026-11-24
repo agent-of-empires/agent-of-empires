@@ -24,10 +24,7 @@ pub struct SetConfigOptionRequest {
 /// the config-option channel, and no other category uses it.
 fn count_plan_mode(state: &AppState, value: &str) {
     if value == "plan" {
-        state
-            .telemetry_structured
-            .plan_mode_seen
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::telemetry::consent::bump(&state.telemetry_structured.plan_mode_seen);
     }
 }
 
@@ -331,6 +328,7 @@ mod tests {
         parked: std::collections::HashSet<String>,
         resume_deferred:
             std::collections::HashMap<String, crate::server::acp_reconciler::ResumeDeferral>,
+        stop_notified: std::collections::HashSet<String>,
     }
 
     impl ReconcilerTick {
@@ -348,6 +346,7 @@ mod tests {
                 &mut self.respawn_history,
                 &mut self.parked,
                 &mut self.resume_deferred,
+                &mut self.stop_notified,
             )
             .await;
         }

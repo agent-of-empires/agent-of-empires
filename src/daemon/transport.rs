@@ -310,7 +310,12 @@ pub(super) async fn execute_with_peer(
     request: reqwest::Request,
     expected_peer: Option<u32>,
 ) -> Result<reqwest::Response, DaemonClientError> {
-    use futures_util::StreamExt;
+    use hyper::body::Body;
+    use hyper::header::{HeaderValue, HOST};
+    use std::future::poll_fn;
+    use std::pin::Pin;
+    use std::task::{ready, Poll};
+
     let deadline =
         tokio::time::Instant::now() + request.timeout().copied().unwrap_or(super::DEFAULT_TIMEOUT);
     let Some(path) = unix_path else {
@@ -353,32 +358,38 @@ pub(super) async fn execute_with_peer(
         tokio::spawn(async move {
             let _ = connection.await;
         });
-        let mut request: axum::http::Request<reqwest::Body> =
+        let mut request: hyper::Request<reqwest::Body> =
             request.try_into().map_err(request_error)?;
-        if !request.headers().contains_key(axum::http::header::HOST) {
-            request.headers_mut().insert(
-                axum::http::header::HOST,
-                axum::http::HeaderValue::from_static("localhost"),
-            );
+        if !request.headers().contains_key(HOST) {
+            request
+                .headers_mut()
+                .insert(HOST, HeaderValue::from_static("localhost"));
         }
         let response = sender
             .send_request(request)
             .await
             .map_err(|_| DaemonClientError::UnixTransport)?;
         let response = response.map(|body| {
-            let source = axum::body::Body::new(body).into_data_stream();
-            let chunks = futures_util::stream::try_unfold(source, move |mut source| async move {
+            let chunks = futures_util::stream::try_unfold(body, move |mut body| async move {
                 if tokio::time::Instant::now() >= deadline {
                     return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
                 }
-                let chunk = tokio::time::timeout_at(deadline, source.next())
+                let next_data = poll_fn(|cx| loop {
+                    match ready!(Pin::new(&mut body).poll_frame(cx)) {
+                        Some(Ok(frame)) => {
+                            if let Ok(data) = frame.into_data() {
+                                return Poll::Ready(Ok(Some(data)));
+                            }
+                        }
+                        Some(Err(error)) => return Poll::Ready(Err(error)),
+                        None => return Poll::Ready(Ok(None)),
+                    }
+                });
+                let data = tokio::time::timeout_at(deadline, next_data)
                     .await
-                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?;
-                match chunk {
-                    Some(Ok(chunk)) => Ok(Some((chunk, source))),
-                    Some(Err(error)) => Err(std::io::Error::other(error)),
-                    None => Ok(None),
-                }
+                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?
+                    .map_err(std::io::Error::other)?;
+                Ok(data.map(|data| (data, body)))
             });
             reqwest::Body::wrap_stream(chunks)
         });
@@ -417,6 +428,92 @@ pub(crate) fn request_error(error: reqwest::Error) -> DaemonClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unix_requests_preserve_host_and_stream_body_data() {
+        use hyper::body::Body;
+        use std::future::poll_fn;
+        use std::pin::Pin;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let http = reqwest::Client::new();
+        for (host, expected_host, truncated) in [
+            (None, "localhost", false),
+            (Some("custom.invalid"), "custom.invalid", false),
+            (None, "localhost", true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("api.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut lines = BufReader::new(&mut stream).lines();
+                let mut host = None;
+                loop {
+                    let line = lines.next_line().await.unwrap().unwrap();
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some((_, value)) = line
+                        .split_once(':')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("host"))
+                    {
+                        assert!(host.replace(value.trim().to_owned()).is_none());
+                    }
+                }
+                assert_eq!(host.as_deref(), Some(expected_host));
+                let start: &[u8] = if truncated {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\na"
+                } else {
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\
+                      Trailer: X-Checksum\r\nConnection: close\r\n\r\n1\r\na\r\n"
+                };
+                stream.write_all(start).await.unwrap();
+                released.await.unwrap();
+                if !truncated {
+                    stream
+                        .write_all(b"1\r\nb\r\n0\r\nX-Checksum: ok\r\n\r\n")
+                        .await
+                        .unwrap();
+                }
+            });
+
+            let mut request = http
+                .get("http://request.invalid/operation")
+                .timeout(Duration::from_secs(5));
+            if let Some(host) = host {
+                request = request.header(hyper::header::HOST, host);
+            }
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut response = execute(&http, Some(&path), request.build().unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.chunk().await.unwrap().unwrap().as_ref(), b"a");
+                release.send(()).unwrap();
+                let mut body = hyper::Response::<reqwest::Body>::from(response).into_body();
+                if !truncated {
+                    let frame = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(frame.into_data().unwrap().as_ref(), b"b");
+                }
+                let tail = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
+                if truncated {
+                    assert!(
+                        matches!(&tail, Some(Err(error)) if !error.is_timeout()),
+                        "{tail:?}"
+                    );
+                } else {
+                    assert!(tail.is_none(), "{tail:?}");
+                }
+                server.await.unwrap();
+            })
+            .await
+            .expect("Unix HTTP fixture did not complete");
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn unix_body_keeps_the_header_operation_deadline() {
@@ -998,9 +1095,9 @@ mod tests {
     async fn body_helpers_share_deadlines_without_shortening_long_operations() {
         for unix in [true, false] {
             for (headers_ms, chunks, chunk_ms, timeout_ms, expires) in [
-                (0, 2, 0, 1000, false),
-                (70, 1, 60, 100, true),
-                (0, 10, 20, 100, true),
+                (0, 2, 0, 5000, false),
+                (350, 1, 300, 500, true),
+                (0, 10, 100, 500, true),
             ] {
                 for consumer in 0..3 {
                     let temp = tempfile::tempdir().unwrap();

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -206,6 +206,8 @@ pub(crate) struct SessionRead {
     #[serde(deserialize_with = "deserialize_required_nullable")]
     pub archived_at: Option<String>,
     #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub ignored_at: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub trashed_at: Option<String>,
     #[serde(deserialize_with = "deserialize_required_nullable")]
     pub active_snoozed_until: Option<String>,
@@ -228,7 +230,7 @@ impl SessionRead {
     }
 
     fn from_projection(row: &SessionProjection<'_>) -> Self {
-        let timestamp = |value: Option<DateTime<Utc>>| value.map(wire_timestamp);
+        let timestamp = |value: Option<Timestamp>| value.map(wire_timestamp);
         Self {
             id: row.id.to_string(),
             title: row.title.to_string(),
@@ -246,6 +248,7 @@ impl SessionRead {
             last_error_evidence: row.last_error_evidence,
             recovery: row.recovery.clone(),
             archived_at: timestamp(row.archived_at),
+            ignored_at: timestamp(row.ignored_at),
             trashed_at: timestamp(row.trashed_at),
             active_snoozed_until: timestamp(row.active_snoozed_until),
             pinned_at: timestamp(row.pinned_at),
@@ -272,8 +275,8 @@ impl SessionRead {
     }
 }
 
-pub(crate) fn wire_timestamp(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+pub(crate) fn wire_timestamp(value: Timestamp) -> String {
+    value.to_rfc3339_opts(crate::time::SecondsFormat::AutoSi, true)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -953,6 +956,7 @@ fn validate_session(session: &SessionRead) -> Result<(), &'static str> {
         session.trashed_at.as_deref(),
         session.active_snoozed_until.as_deref(),
         session.pinned_at.as_deref(),
+        session.ignored_at.as_deref(),
     ] {
         if value.is_some_and(|value| !valid_timestamp(value)) {
             return Err("schema_invalid");
@@ -1049,7 +1053,7 @@ fn is_c1_c0(value: char) -> bool {
 }
 
 /// `YYYY-MM-DDTHH:MM:SS[.f{3,6,9}]Z`: UTC, `Z` zoned, and either a whole
-/// second or the three fractional widths chrono's `AutoSi` writes. The fixed
+/// second or the three fractional widths `SecondsFormat::AutoSi` writes. The fixed
 /// separators are checked by position and the value must parse, so a
 /// permissive length is the only thing that is relaxed: a control character, a
 /// numeric offset or a lowercase `t`/`z` is still refused.
@@ -1060,6 +1064,7 @@ fn is_c1_c0(value: char) -> bool {
 fn valid_timestamp(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() < 20
+        || !bytes[..4].iter().all(u8::is_ascii_digit)
         || bytes[4] != b'-'
         || bytes[7] != b'-'
         || bytes[10] != b'T'
@@ -1081,7 +1086,7 @@ fn valid_timestamp(value: &str) -> bool {
     if !matches!(fraction.len(), 0 | 3 | 6 | 9) || !fraction.iter().all(u8::is_ascii_digit) {
         return false;
     }
-    value.ends_with('Z') && chrono::DateTime::parse_from_rfc3339(value).is_ok()
+    value.ends_with('Z') && crate::time::Timestamp::parse_rfc3339(value).is_ok()
 }
 
 /// Canonical absolute POSIX spelling; native components may contain controls, but not NUL.
@@ -1275,6 +1280,7 @@ mod tests {
             last_error_evidence: None,
             recovery: None,
             archived_at: None,
+            ignored_at: None,
             trashed_at: None,
             active_snoozed_until: None,
             pinned_at: None,
@@ -1355,6 +1361,7 @@ mod tests {
             last_error_evidence: None,
             recovery: None,
             archived_at: None,
+            ignored_at: None,
             trashed_at: None,
             active_snoozed_until: None,
             pinned_at: None,
@@ -1522,6 +1529,8 @@ mod tests {
             "2026-01-01T00:00:00.1234567890Z", // ten
             "2026-01-01T00:00:00.12a456Z",     // a non-digit in the fraction
             "2026-01-01T00:00:0\u{1b}Z",       // a control character
+            "+999-01-01T00:00:00Z",            // a signed three-digit year
+            "-001-01-01T00:00:00Z",            // a negative year
         ] {
             assert!(!valid_timestamp(refused), "{refused} must be refused");
         }
@@ -1684,6 +1693,7 @@ mod tests {
             last_error_evidence: None,
             recovery: None,
             archived_at: None,
+            ignored_at: None,
             trashed_at: None,
             active_snoozed_until: None,
             pinned_at: None,

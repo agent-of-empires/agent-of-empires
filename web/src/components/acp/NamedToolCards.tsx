@@ -163,7 +163,15 @@ export function SkillToolCard({ tool, result, skillName }: ToolCardProps & { ski
 
 export function classifyWorkflow(tool: ToolCall, profile: AgentProfile): boolean {
   if (tool.kind !== "other") return false;
-  const title = (pickStr(parseJsonObject(tool.args_preview), "_aoe_title") ?? tool.name ?? "").trim();
+  const args = parseJsonObject(tool.args_preview);
+  // A permission start can retitle the call; the wire name survives.
+  const title = (
+    pickStr(args, "_aoe_raw_tool_name") ??
+    tool.raw_name ??
+    pickStr(args, "_aoe_title") ??
+    tool.name ??
+    ""
+  ).trim();
   return profile.specialTitles.workflowNames.includes(title);
 }
 
@@ -194,7 +202,7 @@ export function WorkflowToolCard({ tool, result }: ToolCardProps) {
       endedAt={live ? undefined : (run?.endedAt ?? lastEnd(agents) ?? result?.at)}
       icon={<Workflow className={ICON} />}
       label="workflow"
-      primary={run?.name ?? agents[0]?.workflow?.name ?? "Workflow"}
+      primary={run?.name ?? agents[0]?.workflow?.name ?? (result ? "Workflow" : "Preparing workflow script")}
       meta={
         agents.length > 0 && (
           <span className={TABULAR_META}>

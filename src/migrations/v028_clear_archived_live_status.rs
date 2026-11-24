@@ -109,7 +109,7 @@ mod tests {
         storage
             .update(|instances, _| {
                 let mut frozen = Instance::new("frozen", "/tmp/frozen");
-                frozen.archived_at = Some(chrono::Utc::now());
+                frozen.archived_at = Some(crate::time::Timestamp::now());
                 frozen.status = Status::Waiting;
                 instances.push(frozen);
                 Ok(())

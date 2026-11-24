@@ -533,7 +533,7 @@ impl OriginalQuotaCaptures {
     fn take(
         &mut self,
         evidence: &crate::acp::control_protocol::NativePromptCompletionEvidence,
-        now: chrono::DateTime<chrono::Utc>,
+        now: crate::time::Timestamp,
     ) -> Option<super::rate_limit::CapturedReset> {
         let index = self.windows.iter().position(|window| {
             window.window_id == evidence.window_id
@@ -803,7 +803,7 @@ impl SessionIngress {
     pub(super) fn take_original_rate_limit_reset(
         &self,
         evidence: &crate::acp::control_protocol::NativePromptCompletionEvidence,
-        now: chrono::DateTime<chrono::Utc>,
+        now: crate::time::Timestamp,
     ) -> Option<super::rate_limit::CapturedReset> {
         self.original_quota
             .lock()

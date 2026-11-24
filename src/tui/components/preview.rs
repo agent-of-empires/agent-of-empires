@@ -616,7 +616,7 @@ mod tests {
         use ratatui::{backend::TestBackend, Terminal};
         let mut instance = Instance::new("agent", "/tmp/agent");
         instance.status = crate::session::Status::Error;
-        instance.last_error = Some("PROVIDER_OPERATION_FAILED".into());
+        instance.last_error.set("PROVIDER_OPERATION_FAILED");
         let recovery = crate::session::SessionRecovery {
             reason: crate::session::SessionRecoveryReason::OperationFailed,
             diagnostic: "PROVIDER_OPERATION_FAILED".into(),
@@ -825,14 +825,14 @@ mod tests {
     mod agent_info_height {
         use super::super::agent_info_height;
         use crate::session::{Instance, SandboxInfo, WorktreeInfo};
-        use chrono::Utc;
+        use crate::time::Timestamp;
 
         fn worktree(base_branch: Option<&str>) -> WorktreeInfo {
             WorktreeInfo {
                 branch: "feature/x".into(),
                 main_repo_path: "/repo".into(),
                 managed_by_aoe: true,
-                created_at: Utc::now(),
+                created_at: Timestamp::now(),
                 base_branch: base_branch.map(str::to_string),
             }
         }
@@ -902,7 +902,7 @@ mod tests {
     mod terminal_info_height {
         use super::super::terminal_info_height;
         use crate::session::{Instance, SandboxInfo, WorktreeInfo};
-        use chrono::Utc;
+        use crate::time::Timestamp;
 
         fn enabled_sandbox() -> SandboxInfo {
             SandboxInfo {
@@ -950,7 +950,7 @@ mod tests {
                 branch: "feature/x".into(),
                 main_repo_path: "/repo".into(),
                 managed_by_aoe: true,
-                created_at: Utc::now(),
+                created_at: Timestamp::now(),
                 base_branch: Some("main".into()),
             });
             assert_eq!(terminal_info_height(&inst), 3);

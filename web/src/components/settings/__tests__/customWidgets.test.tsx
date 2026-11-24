@@ -12,6 +12,8 @@ import {
   type CustomWidgetProps,
 } from "../customWidgets";
 
+const ROW = { labelId: "row-label", controlId: "row-control" };
+
 const fetchThemes = vi.fn(() => Promise.resolve(["dark", "light"]));
 const dispatchThemePickerChanged = vi.fn();
 const agent = (name: string, installed: boolean, oneshot_capable: boolean) => ({
@@ -61,8 +63,15 @@ function mount(Widget: (p: CustomWidgetProps) => React.ReactElement, label: stri
     validation: { rule: "none" },
     advanced: false,
   } as SettingsFieldDescriptor;
-  const utils = render(<Widget descriptor={descriptor} value={value} save={save} />);
-  const rerender = (next: unknown) => utils.rerender(<Widget descriptor={descriptor} value={next} save={save} />);
+  // The row draws the label the widget's control is named by.
+  const view = (v: unknown) => (
+    <>
+      <span id={ROW.labelId}>{label}</span>
+      <Widget descriptor={descriptor} row={ROW} value={v} save={save} />
+    </>
+  );
+  const utils = render(view(value));
+  const rerender = (next: unknown) => utils.rerender(view(next));
   return { save, rerender, container: utils.container };
 }
 
@@ -97,6 +106,14 @@ it("LoggingTargetsWidget exposes the session lifecycle area and saves only that 
   expect(save).toHaveBeenLastCalledWith({ ...initial, "session.status_change": "info" });
 });
 
+it("LoggingTargetsWidget exposes the v058 and v061 migration targets and saves them", () => {
+  const { save } = mount(LoggingTargetsWidget, "Targets", {});
+  fireEvent.change(control("migrations.v058", "select"), { target: { value: "debug" } });
+  expect(save).toHaveBeenLastCalledWith({ "migrations.v058": "debug" });
+  fireEvent.change(control("migrations.v061", "select"), { target: { value: "info" } });
+  expect(save).toHaveBeenLastCalledWith({ "migrations.v061": "info" });
+});
+
 describe("ThemeNameWidget", () => {
   it.each([
     [true, 1],
@@ -104,7 +121,7 @@ describe("ThemeNameWidget", () => {
   ])("repaints only when the save succeeds (%s)", async (ok, repaints) => {
     const { save } = mount(ThemeNameWidget, "Theme", "dark", ok);
     await screen.findByText("light");
-    fireEvent.change(control("Theme", "select"), { target: { value: "light" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "Theme" }), { target: { value: "light" } });
     expect(save).toHaveBeenCalledWith("light");
     await Promise.resolve();
     await waitFor(() => expect(dispatchThemePickerChanged).toHaveBeenCalledTimes(repaints));
@@ -114,7 +131,7 @@ describe("ThemeNameWidget", () => {
 it("SmartRenameAgentWidget lists installed one-shot agents plus Same as session", async () => {
   const { save } = mount(SmartRenameAgentWidget, "Agent", "");
   await screen.findByText("codex");
-  const select = control("Agent", "select");
+  const select = screen.getByRole("combobox", { name: "Agent" }) as HTMLSelectElement;
   expect(Array.from(select.options).map((o) => o.value)).toEqual(["", "claude", "codex"]);
   fireEvent.change(select, { target: { value: "codex" } });
   expect(save).toHaveBeenCalledWith("codex");

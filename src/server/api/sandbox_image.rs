@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
 use super::{api_error, cityhall_block, read_only_block};
+use crate::containers::image_pull::PullState;
 use crate::containers::image_update::{self, ImageCheck};
 use crate::containers::ContainerRuntime;
 use crate::server::AppState;
@@ -103,6 +104,9 @@ impl StatusCache {
 }
 
 static STATUS: LazyLock<Mutex<StatusCache>> = LazyLock::new(Mutex::default);
+/// The flight each key's dashboard waiter waits on. One per running pull, so repeated POSTs
+/// don't each hold a blocking thread for the whole pull.
+static DASHBOARD_WAITERS: LazyLock<Mutex<HashMap<ImageKey, u64>>> = LazyLock::new(Mutex::default);
 /// One registry check per image and runtime at a time, so callers arriving together share it.
 static CHECK_TURNS: LazyLock<Mutex<HashMap<ImageKey, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(Mutex::default);
@@ -159,42 +163,12 @@ where
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum PullState {
-    Idle,
-    Running,
-    Done,
-    /// `error` carries the Container runtime's stderr.
-    Failed {
-        error: String,
-    },
-}
-
-static PULLS: LazyLock<Mutex<HashMap<ImageKey, PullState>>> = LazyLock::new(Mutex::default);
-
-/// Marks the image running unless it already is; true when the caller should start the pull.
-fn claim_pull(pulls: &mut HashMap<ImageKey, PullState>, key: &ImageKey) -> bool {
-    if pulls.get(key) == Some(&PullState::Running) {
-        return false;
-    }
-    pulls.insert(key.clone(), PullState::Running);
-    true
-}
-
-fn pull_state(key: &ImageKey) -> PullState {
-    PULLS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(key)
-        .cloned()
-        .unwrap_or(PullState::Idle)
-}
-
 /// What the Daemon would sandbox with. Only these are checked or pulled, so a request can't
 /// make the Daemon contact an arbitrary registry or pull an arbitrary image.
 struct Configured {
     default_image: String,
+    /// What each profile resolves to, for a request that names no image.
+    profile_images: HashMap<String, String>,
     images: Vec<String>,
     runtime: ContainerRuntimeName,
     checks_enabled: bool,
@@ -216,14 +190,18 @@ impl Configured {
 /// whose pull gate is open.
 fn load_configured() -> anyhow::Result<Configured> {
     let config = crate::session::Config::load()?;
-    let default_image = config.sandbox.default_image.clone();
+    let default_image = config.sandbox.effective_image();
     let mut images = vec![default_image.clone()];
+    let mut profile_images = HashMap::new();
     for profile in crate::session::list_profiles()? {
         match crate::session::resolve_config(&profile) {
-            Ok(resolved) if !images.contains(&resolved.sandbox.default_image) => {
-                images.push(resolved.sandbox.default_image);
+            Ok(resolved) => {
+                let image = resolved.sandbox.effective_image();
+                if !images.contains(&image) {
+                    images.push(image.clone());
+                }
+                profile_images.insert(profile, image);
             }
-            Ok(_) => {}
             // An unreadable profile only drops its image from what may be checked or pulled.
             Err(e) => {
                 tracing::warn!(target: "http.api.sandbox_image", %profile, "skipping profile: {e:#}")
@@ -232,6 +210,7 @@ fn load_configured() -> anyhow::Result<Configured> {
     }
     Ok(Configured {
         default_image,
+        profile_images,
         images,
         runtime: config.sandbox.container_runtime,
         checks_enabled: config.updates.update_check_mode.is_enabled(),
@@ -255,10 +234,22 @@ async fn configured() -> Result<Configured, Response> {
     })
 }
 
-fn resolve_image(configured: &Configured, requested: Option<&str>) -> Result<String, Response> {
-    match requested {
-        None => Ok(configured.default_image.clone()),
-        Some(image) if configured.images.iter().any(|i| i == image) => Ok(image.to_string()),
+/// A blank request is the automatic image, as everywhere an image resolves; with no image
+/// named the launching `profile`'s image applies, else the global one.
+fn resolve_image(
+    configured: &Configured,
+    requested: Option<&str>,
+    profile: Option<&str>,
+) -> Result<String, Response> {
+    match requested.filter(|image| !image.trim().is_empty()) {
+        None => Ok(profile
+            .and_then(|profile| configured.profile_images.get(profile))
+            .unwrap_or(&configured.default_image)
+            .clone()),
+        // The configured images are trimmed, as every sandbox image resolves.
+        Some(image) if configured.images.iter().any(|i| i == image.trim()) => {
+            Ok(image.trim().to_string())
+        }
         Some(_) => Err(api_error(
             StatusCode::BAD_REQUEST,
             "unknown_image",
@@ -293,6 +284,7 @@ fn pull_disabled() -> Response {
 pub(crate) async fn create_pull_refusal(
     state: &AppState,
     requested: Option<&str>,
+    profile: Option<&str>,
 ) -> Option<Response> {
     if let Some(resp) = read_only_block(state).or_else(|| cityhall_block(state)) {
         return Some(resp);
@@ -304,7 +296,7 @@ pub(crate) async fn create_pull_refusal(
     if pull_blocked(state, &configured).is_some() {
         return Some(pull_disabled());
     }
-    resolve_image(&configured, requested).err()
+    resolve_image(&configured, requested, profile).err()
 }
 
 fn runtime_key(runtime: &ContainerRuntime, image: &str) -> ImageKey {
@@ -334,6 +326,8 @@ pub(crate) fn status_generation_for_test(runtime: &ContainerRuntime, image: &str
 #[derive(Deserialize)]
 pub struct ImageStatusQuery {
     image: Option<String>,
+    /// The profile a blank `image` resolves for.
+    profile: Option<String>,
     /// Skip the cache, as the wizard does when it opens.
     #[serde(default)]
     fresh: bool,
@@ -366,7 +360,11 @@ pub async fn sandbox_image_status(
         Ok(configured) => configured,
         Err(resp) => return resp,
     };
-    let image = match resolve_image(&configured, query.image.as_deref()) {
+    let image = match resolve_image(
+        &configured,
+        query.image.as_deref(),
+        query.profile.as_deref(),
+    ) {
         Ok(image) => image,
         Err(resp) => return resp,
     };
@@ -388,7 +386,7 @@ pub async fn sandbox_image_status(
             .iter()
             .any(|i| i.is_sandboxed());
     Json(ImageStatusResponse {
-        pull: pull_state(&key),
+        pull: runtime.pull_state(&image),
         pull_blocked: pull_blocked(&state, &configured),
         pull_command: runtime.pull_command(&image),
         runtime: runtime.display_name(),
@@ -432,6 +430,24 @@ fn requested_image(
     }
 }
 
+/// The image a pull or cancel request names, once the dashboard may pull it.
+async fn pull_request(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> Result<(Configured, String), Response> {
+    if let Some(resp) = read_only_block(state).or_else(|| cityhall_block(state)) {
+        return Err(resp);
+    }
+    let configured = configured().await?;
+    if pull_blocked(state, &configured).is_some() {
+        return Err(pull_disabled());
+    }
+    let requested = requested_image(headers, body)?;
+    let image = resolve_image(&configured, requested.as_deref(), None)?;
+    Ok((configured, image))
+}
+
 /// `POST /api/sandbox/image-pull`: starts at most one pull per image and returns at once;
 /// `image-status` reports its progress. The pull keeps its 600 s runtime timeout.
 pub async fn sandbox_image_pull(
@@ -439,68 +455,66 @@ pub async fn sandbox_image_pull(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    if let Some(resp) = read_only_block(&state).or_else(|| cityhall_block(&state)) {
-        return resp;
-    }
-    let configured = match configured().await {
-        Ok(configured) => configured,
-        Err(resp) => return resp,
-    };
-    if pull_blocked(&state, &configured).is_some() {
-        return pull_disabled();
-    }
-    let requested = match requested_image(&headers, &body) {
-        Ok(requested) => requested,
-        Err(resp) => return resp,
-    };
-    let image = match resolve_image(&configured, requested.as_deref()) {
-        Ok(image) => image,
+    let (configured, image) = match pull_request(&state, &headers, &body).await {
+        Ok(request) => request,
         Err(resp) => return resp,
     };
     let key = configured.key(image.clone());
-    let started = claim_pull(&mut PULLS.lock().unwrap_or_else(|e| e.into_inner()), &key);
-    if started {
-        let runtime = configured.runtime;
-        tokio::spawn(async move {
-            let pulled = key.image.clone();
-            let started = std::time::Instant::now();
-            let result = tokio::task::spawn_blocking(move || {
-                ContainerRuntime::from(runtime).pull_image(&pulled)
-            })
-            .await;
-            let outcome = match result {
-                Ok(Ok(())) => PullState::Done,
-                Ok(Err(e)) => PullState::Failed {
-                    error: e.to_string(),
-                },
-                Err(e) => PullState::Failed {
-                    error: format!("pull task failed: {e}"),
-                },
-            };
-            let duration_ms = started.elapsed().as_millis();
-            match &outcome {
-                PullState::Failed { error } => {
-                    tracing::warn!(target: "containers.image", image = %key.image, ok = false, duration_ms, %error, "image pull finished")
-                }
-                _ => {
-                    tracing::info!(target: "containers.image", image = %key.image, ok = true, duration_ms, "image pull finished")
-                }
-            }
+    let runtime = ContainerRuntime::from(configured.runtime);
+    let mut waiters = DASHBOARD_WAITERS.lock().unwrap_or_else(|e| e.into_inner());
+    // Joined under the map's lock, so two POSTs can't both add a waiter to one pull. Matched by
+    // flight, so an entry left by a cancelled pull doesn't stand in for the next one.
+    let running = runtime.running_pull_id(&image);
+    if running.is_none() || waiters.get(&key) != running.as_ref() {
+        // Registered now, so the next status read already sees it running.
+        let waiter = runtime.join_pull(&image);
+        let id = waiter.flight_id();
+        waiters.insert(key.clone(), id);
+        tokio::task::spawn_blocking(move || {
+            // A pull the dashboard asked for is never cancelled by a create that joined it.
+            let _ = waiter.wait(&tokio_util::sync::CancellationToken::new());
             STATUS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .invalidate(&key);
-            PULLS
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(key, outcome);
+            let mut waiters = DASHBOARD_WAITERS.lock().unwrap_or_else(|e| e.into_inner());
+            if waiters.get(&key) == Some(&id) {
+                waiters.remove(&key);
+            }
         });
     }
+    drop(waiters);
     (
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "image": image, "pull": PullState::Running })),
+        Json(serde_json::json!({ "image": image, "pull": PullState::Running(Default::default()) })),
     )
         .into_response()
+}
+
+/// How long a Cancel waits for the killed pull to end; the kill itself takes at most 250 ms.
+const CANCEL_BACKSTOP: Duration = Duration::from_secs(5);
+
+/// `POST /api/sandbox/image-pull/cancel`, with the same body as image-pull: cancels the
+/// image's running pull for every waiter and answers with the state it ended in. With no pull
+/// running it answers the current state, so a repeat is harmless.
+pub async fn sandbox_image_cancel(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let (configured, image) = match pull_request(&state, &headers, &body).await {
+        Ok(request) => request,
+        Err(resp) => return resp,
+    };
+    let runtime = ContainerRuntime::from(configured.runtime);
+    let cancelled = tokio::task::spawn_blocking({
+        let image = image.clone();
+        move || runtime.cancel_pull(&image, CANCEL_BACKSTOP)
+    })
+    .await;
+    let pull =
+        cancelled.unwrap_or_else(|_| ContainerRuntime::from(configured.runtime).pull_state(&image));
+    Json(serde_json::json!({ "image": image, "pull": pull })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -760,6 +774,7 @@ mod tests {
     fn a_runtime_switch_keys_status_and_pulls_apart() {
         let configured = |runtime| Configured {
             default_image: "img".into(),
+            profile_images: HashMap::new(),
             images: Vec::new(),
             runtime,
             checks_enabled: true,
@@ -828,33 +843,290 @@ mod tests {
         }
     }
 
-    #[test]
-    fn only_one_pull_per_image_and_runtime_runs_at_a_time() {
-        let mut pulls = HashMap::new();
-        let docker = key("Docker", "img");
-        assert!(claim_pull(&mut pulls, &docker));
-        assert!(!claim_pull(&mut pulls, &docker), "already running");
-        assert!(claim_pull(&mut pulls, &key("Docker", "other")), "per image");
-        assert!(claim_pull(&mut pulls, &key("Podman", "img")), "per runtime");
-        for finished in [
-            PullState::Done,
-            PullState::Failed {
-                error: "denied".into(),
-            },
-        ] {
-            pulls.insert(docker.clone(), finished);
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn posts_during_a_running_pull_share_one_dashboard_waiter() {
+        use crate::containers::image_pull;
+        // An image no other test pulls, so its flight and status counter are this test's.
+        const IMAGE: &str = "aoe-test/repeated-pull-posts:latest";
+        let _app = crate::session::test_support::isolate_app_dir();
+        crate::session::update_config(|c| {
+            c.sandbox.allow_image_pull = true;
+            c.sandbox.default_image = Some(IMAGE.into());
+        })
+        .unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let runtime = ContainerRuntime::from(ContainerRuntimeName::default());
+        let pull_key = image_pull::PullKey {
+            runtime: runtime.display_name(),
+            image: IMAGE.into(),
+        };
+        let (open, gate) = std::sync::mpsc::channel::<()>();
+        let held = image_pull::join_with(pull_key.clone(), move |_| {
+            let _ = gate.recv();
+            Ok(())
+        });
+        let before = status_generation_for_test(&runtime, IMAGE);
+        for post in 0..5 {
+            let resp = sandbox_image_pull(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::new(),
+            )
+            .await;
+            let (code, body) = json(resp).await;
+            assert_eq!(code, StatusCode::ACCEPTED, "POST {post}: {body}");
+        }
+        assert_eq!(
+            image_pull::waiters_for_test(&pull_key),
+            2,
+            "this test's waiter and one dashboard waiter"
+        );
+        open.send(()).unwrap();
+        held.wait(&tokio_util::sync::CancellationToken::new())
+            .unwrap();
+        let key = runtime_key(&runtime, IMAGE);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while DASHBOARD_WAITERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&key)
+        {
             assert!(
-                claim_pull(&mut pulls, &docker),
-                "a finished pull can be retried"
+                std::time::Instant::now() < deadline,
+                "the dashboard waiter never finished"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            status_generation_for_test(&runtime, IMAGE),
+            before + 1,
+            "the status is invalidated once, when the pull ends"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_dashboard_entry_left_by_a_cancelled_pull_does_not_stop_a_post_joining_the_next() {
+        use crate::containers::image_pull;
+        const IMAGE: &str = "aoe-test/post-after-cancel:latest";
+        let _app = crate::session::test_support::isolate_app_dir();
+        crate::session::update_config(|c| {
+            c.sandbox.allow_image_pull = true;
+            c.sandbox.default_image = Some(IMAGE.into());
+        })
+        .unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let runtime = ContainerRuntime::from(ContainerRuntimeName::default());
+        let pull_key = image_pull::PullKey {
+            runtime: runtime.display_name(),
+            image: IMAGE.into(),
+        };
+        let key = runtime_key(&runtime, IMAGE);
+        let post = || {
+            sandbox_image_pull(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::new(),
+            )
+        };
+
+        let first = image_pull::join_with(pull_key.clone(), |pull| {
+            while !pull.kill.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(crate::containers::error::DockerError::Cancelled(
+                "pull".into(),
+            ))
+        });
+        assert_eq!(json(post().await).await.0, StatusCode::ACCEPTED);
+        let stale = DASHBOARD_WAITERS.lock().unwrap_or_else(|e| e.into_inner())[&key];
+        assert_eq!(
+            image_pull::cancel(&pull_key, Duration::from_secs(10)),
+            PullState::Cancelled
+        );
+        drop(first);
+        // Once the cancelled pull's dashboard task has cleaned up, put its entry back: the
+        // window where a POST arrives before that cleanup.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while DASHBOARD_WAITERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&key)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dashboard task never ended"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        DASHBOARD_WAITERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), stale);
+
+        let (open, gate) = std::sync::mpsc::channel::<()>();
+        let create = image_pull::join_with(pull_key.clone(), move |_| {
+            let _ = gate.recv();
+            Ok(())
+        });
+        assert_eq!(json(post().await).await.0, StatusCode::ACCEPTED);
+        assert_eq!(
+            image_pull::waiters_for_test(&pull_key),
+            2,
+            "the create and a dashboard waiter on the new pull"
+        );
+        open.send(()).unwrap();
+        create
+            .wait(&tokio_util::sync::CancellationToken::new())
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancel_is_gated_like_a_pull_and_answers_the_state_the_pull_ended_in() {
+        use crate::containers::image_pull;
+        use crate::containers::pull_progress::LayerUpdate;
+        const IMAGE: &str = "aoe-test/cancel-endpoint:latest";
+        let _app = crate::session::test_support::isolate_app_dir();
+        crate::session::update_config(|c| {
+            c.updates.update_check_mode = crate::session::config::UpdateCheckMode::Off;
+            c.sandbox.allow_image_pull = true;
+            c.sandbox.default_image = Some(IMAGE.into());
+        })
+        .unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let cancel = |state: Arc<AppState>| {
+            sandbox_image_cancel(
+                State(state),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::new(),
+            )
+        };
+        let pull_of = |body: serde_json::Value| body["pull"].clone();
+        let status = || {
+            let state = state.clone();
+            async move {
+                let resp = sandbox_image_status(
+                    State(state),
+                    Query(ImageStatusQuery {
+                        image: None,
+                        profile: None,
+                        fresh: false,
+                    }),
+                )
+                .await;
+                json(resp).await.1["pull"].clone()
+            }
+        };
+
+        for (state, error) in [
+            (
+                crate::server::test_support::build_test_app_state_configured(Vec::new(), |s| {
+                    s.read_only = true
+                }),
+                "read_only",
+            ),
+            (
+                crate::server::test_support::build_test_app_state_configured(Vec::new(), |s| {
+                    s.cityhall_mode = true
+                }),
+                "cityhall_mode",
+            ),
+        ] {
+            let (code, body) = json(cancel(state).await).await;
+            assert_eq!(
+                (code, body["error"].as_str()),
+                (StatusCode::FORBIDDEN, Some(error))
             );
         }
+
+        let (code, body) = json(cancel(state.clone()).await).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["image"], IMAGE);
+        assert_eq!(
+            pull_of(body),
+            serde_json::json!({"state": "idle"}),
+            "nothing to cancel"
+        );
+
+        let runtime = ContainerRuntime::from(ContainerRuntimeName::default());
+        let pull_key = image_pull::PullKey {
+            runtime: runtime.display_name(),
+            image: IMAGE.into(),
+        };
+        let (report, reported) = std::sync::mpsc::channel::<()>();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let running = image_pull::join_with(pull_key.clone(), move |pull| {
+            let _ = gate.recv();
+            for (id, done) in [("a", false), ("b", false), ("a", true)] {
+                pull.report(LayerUpdate {
+                    id: id.into(),
+                    done,
+                });
+            }
+            let _ = report.send(());
+            while !pull.kill.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(crate::containers::error::DockerError::Cancelled(
+                "pull".into(),
+            ))
+        });
+        assert_eq!(
+            status().await,
+            serde_json::json!({"state": "running"}),
+            "no counts before a line parses"
+        );
+        release.send(()).unwrap();
+        reported
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the pull reports");
+        assert_eq!(
+            status().await,
+            serde_json::json!({
+                "state": "running",
+                "phase": "downloading",
+                "layers_done": 1,
+                "layers_known": 2,
+            })
+        );
+
+        let (code, body) = json(cancel(state.clone()).await).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(pull_of(body), serde_json::json!({"state": "cancelled"}));
+        assert!(matches!(
+            running.wait(&tokio_util::sync::CancellationToken::new()),
+            Err(crate::containers::error::DockerError::PullCancelled(_))
+        ));
+        assert_eq!(status().await, serde_json::json!({"state": "cancelled"}));
+        let (code, body) = json(cancel(state.clone()).await).await;
+        assert_eq!(
+            (code, pull_of(body)),
+            (StatusCode::OK, serde_json::json!({"state": "cancelled"})),
+            "a repeat answers the same"
+        );
+
+        crate::session::update_config(|c| c.sandbox.allow_image_pull = false).unwrap();
+        let (code, body) = json(cancel(state.clone()).await).await;
+        assert_eq!(
+            (code, body["error"].as_str()),
+            (StatusCode::FORBIDDEN, Some("pull_disabled"))
+        );
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn an_unreadable_configuration_refuses_status_and_pull() {
+        // An image no other test pulls, so its pull state can only come from this test.
+        const IMAGE: &str = "aoe-test/unreadable-config:latest";
         let _app = crate::session::test_support::isolate_app_dir();
-        crate::session::update_config(|c| c.sandbox.allow_image_pull = false).unwrap();
+        crate::session::update_config(|c| {
+            c.sandbox.allow_image_pull = false;
+            c.sandbox.default_image = Some(IMAGE.into());
+        })
+        .unwrap();
+        let runtime = ContainerRuntime::from(ContainerRuntimeName::default());
         let dir = crate::session::get_app_dir().unwrap();
         let state = crate::server::test_support::build_test_app_state(Vec::new());
         // (file made unreadable, what it breaks)
@@ -881,6 +1153,7 @@ mod tests {
                 State(state.clone()),
                 Query(ImageStatusQuery {
                     image: None,
+                    profile: None,
                     fresh: false,
                 }),
             )
@@ -890,12 +1163,9 @@ mod tests {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "{label}"
             );
-            assert!(
-                PULLS
-                    .lock()
-                    .unwrap()
-                    .values()
-                    .all(|p| *p != PullState::Running),
+            assert_eq!(
+                runtime.pull_state(IMAGE),
+                PullState::Idle,
                 "{label}: no pull started"
             );
             std::fs::write(&path, original).unwrap();
@@ -917,6 +1187,7 @@ mod tests {
                 State(state.clone()),
                 Query(ImageStatusQuery {
                     image: image.map(String::from),
+                    profile: None,
                     fresh: false,
                 }),
             )
@@ -924,7 +1195,9 @@ mod tests {
 
         let (code, body) = json(status(None).await).await;
         assert_eq!(code, StatusCode::OK);
-        let default_image = crate::session::Config::load_or_warn().sandbox.default_image;
+        let default_image = crate::session::Config::load_or_warn()
+            .sandbox
+            .effective_image();
         assert_eq!(body["image"], default_image.as_str());
         // Checks off: no registry request, and never "current".
         assert_eq!(body["state"], "unknown");
@@ -997,5 +1270,54 @@ mod tests {
                 .as_deref(),
             Some(digest.as_str())
         );
+    }
+
+    #[test]
+    fn a_requested_image_matches_the_configured_one_without_its_surrounding_whitespace() {
+        let configured = Configured {
+            default_image: "ubuntu:latest".to_string(),
+            profile_images: HashMap::new(),
+            images: vec!["ubuntu:latest".to_string()],
+            runtime: ContainerRuntimeName::Docker,
+            checks_enabled: true,
+            enabled_by_default: true,
+            allow_image_pull: true,
+            dismissed_digest: None,
+        };
+        assert_eq!(
+            resolve_image(&configured, Some(" ubuntu:latest "), None).ok(),
+            Some("ubuntu:latest".to_string())
+        );
+        assert!(resolve_image(&configured, Some("ubuntu:other"), None).is_err());
+    }
+
+    #[test]
+    fn a_blank_request_is_the_launching_profiles_image() {
+        let configured = Configured {
+            default_image: "global:1".to_string(),
+            profile_images: HashMap::from([("work".to_string(), "work:2".to_string())]),
+            images: vec!["global:1".to_string(), "work:2".to_string()],
+            runtime: ContainerRuntimeName::Docker,
+            checks_enabled: true,
+            enabled_by_default: true,
+            allow_image_pull: true,
+            dismissed_digest: None,
+        };
+        for (requested, profile, expected) in [
+            (Some(""), None, "global:1"),
+            (Some("  "), Some("work"), "work:2"),
+            (None, Some("work"), "work:2"),
+            (None, Some("gone"), "global:1"),
+            (Some(""), Some("work"), "work:2"),
+            (Some("global:1"), Some("work"), "global:1"),
+        ] {
+            assert_eq!(
+                resolve_image(&configured, requested, profile)
+                    .ok()
+                    .as_deref(),
+                Some(expected),
+                "{requested:?} for {profile:?}"
+            );
+        }
     }
 }

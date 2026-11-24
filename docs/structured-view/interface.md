@@ -8,7 +8,7 @@ The structured view renders in both the TUI and the web dashboard. This page cov
 
 Both surfaces consume the same `aoe serve` daemon over the same HTTP and WebSocket API, so the conversation log, pending approvals, and worker state stay in sync.
 
-- Structured sessions show a `[structured]` badge in the TUI session list, and Enter opens the native view. `session.show_structured_badge = false` hides the badge and returns its width to the title and plugin row badges. The local TUI starts a same-host Daemon without a web listener during bootstrap or explicit reconnect, unless `--no-autostart` or `AOE_NO_AUTOSTART=1` is set. It reuses an existing daemon and reports unavailable runtimes without opening TCP. An explicit `AOE_DAEMON_URL` selects the remote daemon instead.
+- Structured sessions show a `[structured]` badge in the TUI session list, and Enter opens the native view. `session.show_structured_badge = false` hides the badge and returns its width to the title and plugin row badges. The local TUI starts a same-host Daemon without a web listener at launch or on an explicit reconnect, unless `--no-autostart` or `AOE_NO_AUTOSTART=1` is set, and does not open without one. It reuses an existing daemon and never opens TCP. An explicit `AOE_DAEMON_URL` selects the remote daemon instead.
 - Terminal sessions work in both surfaces: the TUI attaches to the pane and the dashboard streams it (see [Terminal view](../guides/web/terminal.md)).
 - Switching views keeps the worktree, files, and commits. Claude can resume its native transcript in terminal view only when AoE can bind the ACP ID to a shared native store. An explicit [native-store assertion](../guides/session-resume.md#pinning-or-resetting-a-conversation) can name another store. An ACP ID alone is not store provenance: an unresolved or unshared store is refused before worker teardown. Switching back can reload the Claude transcript. Other agents start fresh under the new view.
 - A healthy structured session shows Idle or Active in the session list, observed through the ACP event stream rather than tmux pane probing.
@@ -21,6 +21,8 @@ Both surfaces consume the same `aoe serve` daemon over the same HTTP and WebSock
 
 The view opens with the composer ready. The transcript stays scrollable from the composer, a pending authorization opens a focused approval shelf above it, and the status line keeps the worker state and primary controls visible. The active session's agent, directory, and permission mode sit in a compact card in the upper left; user turns use a `›` gutter and agent replies a `•` gutter, so only modal decisions get a full-width border.
 
+The approval shelf shows the request itself above its buttons: the command or path, which the title has to elide to one line, then the other arguments as `key: value` lines. A command that runs over several lines keeps them. The body is capped at five rows, or fewer on a short terminal, and anything dropped is counted in a `+N more` footer, so read the full request in the dashboard when that footer appears. The question popup shows the lead-in and the question's own detail above the options, plus the highlighted answer's description, so a question reads without opening the dashboard.
+
 | Focus       | Key             | Action                                                |
 | ----------- | --------------- | ----------------------------------------------------- |
 | Composer    | `Enter`         | Send, or queue if the session cannot accept it yet |
@@ -31,24 +33,31 @@ The view opens with the composer ready. The transcript stays scrollable from the
 | Composer    | `↑` / `↓`       | Recall queued prompts to edit (caret at start), or move the picker highlight |
 | Composer    | `Ctrl+n` / `Ctrl+p` | Move the picker highlight |
 | Composer    | `Enter` / `Tab` | Insert the highlighted command or file |
-| Composer    | `Esc`           | Dismiss the picker, or return focus to the transcript |
+| Composer    | `Shift+Tab`     | Open the permission-mode picker |
+| Composer    | `PgDn` / `PgUp` | Scroll the transcript ten lines |
+| Composer    | `Esc`           | Dismiss the picker or queue recall; otherwise interrupt a running turn (no effect when idle) |
 | Transcript  | `j` / `k`, arrows | Scroll a line |
 | Transcript  | `PgDn` / `PgUp` | Scroll ten lines |
 | Transcript  | `g` / `G`       | Jump to top / bottom |
 | Transcript  | `i`             | Focus the composer |
-| Transcript  | `Tab`           | Cycle to a pending approval card |
+| Transcript  | `Tab`           | Focus a pending approval card, or the composer when there is none |
 | Transcript  | `m`             | Open the permission-mode picker |
 | Transcript  | `t`             | Flip Fast mode or Ultracode, when the agent offers them |
+| Transcript  | `e`             | Show every thought in full, or collapse to one preview line |
 | Transcript  | `a`             | Answer a pending question (single-select forms) |
 | Transcript  | `s` / `c`       | Skip / cancel a pending question |
 | Transcript  | `o`             | Open this session in the web dashboard |
-| Transcript  | `Esc`           | Close the structured view |
+| Transcript  | `p`             | Open the plugin pane; `Esc` or `p` closes it |
+| Transcript  | `x`             | Dismiss the oldest session notice |
+| Transcript  | `Esc`           | Return focus to the composer |
 | Approval    | `a` / `Shift+A` / `d` | Allow once / allow always / deny |
 | Approval    | `Esc`           | Stop the in-flight turn |
 | Any         | `Ctrl+C`        | Cancel the in-flight prompt |
+| Any         | `Ctrl+Q`        | Leave the structured view |
 | Any         | `Ctrl+O`        | Open the session in the web dashboard |
 | Any         | `Ctrl+X`        | Clear every queued prompt |
 | Any         | `Ctrl+T`        | Stop the newest running subagent; the turn continues |
+| Any         | Click the transcript | Focus the transcript |
 
 Approval keys resolve only while the approval card has focus, so typing "always allow" into the composer can never approve a tool.
 
@@ -78,7 +87,7 @@ The web composer sends attachments alongside the prompt when the active agent ad
 
 The paperclip is disabled with a tooltip when the agent accepts no attachments, and the picker offers only the kinds it does accept. `claude-agent-acp` advertises images and embedded resources; others vary. The server re-checks the capability and enforces size, count, and MIME limits, so an unsupported attachment comes back as an error rather than reaching the agent.
 
-Attachments persist with the transcript and queue alongside the prompt text, so sending one mid-turn parks the whole message until the session resumes. A full page reload drops a queued row carrying an attachment (reattach and resend). Audio and embedded resources are stored and sent but render as a labelled chip.
+Attachments persist with the transcript and queue alongside the prompt text, so sending one mid-turn parks the whole message until the session resumes. Audio and embedded resources are stored and sent but render as a labelled chip.
 
 ### Queued prompts
 
@@ -90,7 +99,7 @@ The composer keeps messages the session cannot accept yet:
 2. **Inactive session.** While the WebSocket is reconnecting or the worker is stopped, submissions are still accepted and parked, and drain once both are back.
 3. **Idle-dormant session.** The POST itself is the wake path: the server respawns the worker, holds the request until it is ready, then delivers it.
 
-Web queue entries persist in per-origin local storage, so a reload keeps them across the reconnect window; there is no server-side durability. The TUI queue is in-memory only and does not survive leaving the view.
+The daemon owns the queue, so any client reads the same entries and they survive a page reload, a reconnect, and leaving the view. Queued attachment bytes become eligible for periodic cleanup 24 hours after queueing; a drain batch is dropped unsent only when it has neither text nor remaining attachments, otherwise it is sent without the cleaned-up ones.
 
 Click a queued row to edit it inline, or, with the composer empty and the caret at the start, press `↑` to pull the most recent queued prompt back in; `↑` and `↓` walk the queue and restore your draft once you step past the newest. A banner (TUI: the composer border title) reads **Editing queued message N of M** while you recall, `Esc` abandons the edit, and sending updates that entry in place rather than queueing a duplicate.
 

@@ -21,7 +21,13 @@ import {
 } from "../../lib/acpDrafts";
 import { MAX_ATTACHMENTS } from "./composerInput";
 import { isVisiblyBusy, nativeInputAvailable } from "../../lib/acpTypes";
-import type { AcpState, ApprovalDecision, ElicitationResolution, PromptAttachmentInput } from "../../lib/acpTypes";
+import type {
+  AcpState,
+  ApprovalDecision,
+  ElicitationResolution,
+  PromptAttachmentInput,
+  RejectedPrompt,
+} from "../../lib/acpTypes";
 import { useAgentProfile } from "../../lib/agentProfileContext";
 import { canOfferEarlier, earlierAction } from "../../lib/historyScroll";
 import { activityToThreadMessages, clearFoldGeneration } from "./activityMessages";
@@ -37,6 +43,8 @@ interface Props {
   /** Snoozed sessions auto-wake on send; archived ones refuse it. */
   archivedAt?: string | null;
   snoozedUntil?: string | null;
+  /** The session list's `queued_count`, so a queue changed elsewhere is re-listed. */
+  queuedCount?: number;
   /** Render rows before the latest `/clear` instead of folding them. */
   showClearedTurns?: boolean;
   children: (ctx: AcpContext) => ReactNode;
@@ -63,6 +71,7 @@ export interface AcpContext {
   cancelOperationRetry: () => void;
   compositionControlRef: React.RefObject<ComposerCompositionControl | null>;
   attachmentReadGenerationRef: React.RefObject<number>;
+  retryRejectedPrompt: (prompt: RejectedPrompt) => Promise<void>;
   /** The composer's Stop, escalating a cancel the Agent ignores. */
   stopTurn: () => void;
   canForceEndTurn: boolean;
@@ -174,10 +183,11 @@ export function AcpRuntime({
   acpWorkerState = "running",
   archivedAt = null,
   snoozedUntil = null,
+  queuedCount,
   showClearedTurns = false,
   children,
 }: Props) {
-  const acp = useAcpSession(sessionId, acpWorkerState, archivedAt, snoozedUntil);
+  const acp = useAcpSession(sessionId, acpWorkerState, archivedAt, snoozedUntil, queuedCount);
   const agentProfile = useAgentProfile();
   const {
     pendingAttachments,
@@ -346,6 +356,7 @@ export function AcpRuntime({
         cancelOperationRetry,
         compositionControlRef,
         attachmentReadGenerationRef,
+        retryRejectedPrompt: acp.retryRejectedPrompt,
         stopTurn: () => void onCancel(),
         canForceEndTurn,
         pendingAttachments,

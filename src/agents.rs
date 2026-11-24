@@ -403,7 +403,9 @@ pub struct AgentDef<'a> {
     pub host_only: bool,
     /// Delay before Enter, for agents whose paste-burst detection swallows a fast Enter.
     pub send_keys_enter_delay_ms: u64,
-    pub ready_marker: Option<&'a str>,
+    /// Case-insensitive screen text that shows the agent's input box is up;
+    /// any one suffices. Empty means readiness cannot be told from a dialog.
+    pub ready_markers: &'a [&'a str],
     pub install_hint: &'a str,
     pub permission_response: Option<PermissionResponse<'a>>,
     pub lifecycle: AgentLifecycle,
@@ -623,7 +625,7 @@ const fn agent(
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
-        ready_marker: None,
+        ready_markers: &[],
         install_hint,
         permission_response: None,
         lifecycle: AgentLifecycle::Active,
@@ -653,6 +655,9 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             SessionCaptureContext::PaneScoped,
         ),
         fork_strategy: ForkStrategy::ClaudeFork,
+        // The mode line under the input box, which varies with the permission
+        // mode and the build. The trust dialog shows none of these.
+        ready_markers: &["shift+tab to cycle", "manual mode on", "for shortcuts", "for agents"],
         // Claude's 100ms paste completion window swallows an earlier Enter.
         send_keys_enter_delay_ms: 150,
         permission_response: Some(PermissionResponse {
@@ -690,7 +695,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             current: &ForkStrategy::ServeFork,
         },
         spans_agent_generations: true,
-        ready_marker: Some("ask anything"),
+        ready_markers: &["ask anything"],
         permission_response: Some(PermissionResponse {
             allow: &[KeyToken::Named("Enter")],
             allow_always: Some(&[
@@ -711,6 +716,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
         )
     },
     AgentDef {
+        oneshot_flag: Some("-p"),
         aliases: &["mistral-vibe"],
         detection: DetectionMethod::RunWithArg("vibe", "--version"),
         yolo: Some(YoloMode::CliFlag("--agent auto-approve")),
@@ -1036,13 +1042,15 @@ impl AgentDef<'_> {
     pub fn oneshot_trailing_args(&self) -> &'static [&'static str] {
         match self.name {
             "copilot" => &["-s", "--allow-all-tools", "--no-ask-user"],
+            // Programmatic mode inherits the configured agent, which may edit files unasked.
+            "vibe" => &["--disabled-tools", "*"],
             _ => &[],
         }
     }
 
     pub fn oneshot_model_flag(&self) -> Option<&str> {
         self.model_flag.or(match self.name {
-            "claude" | "copilot" | "prime-agent" => Some("--model"),
+            "claude" | "copilot" | "prime-agent" | "vibe" => Some("--model"),
             "codex" | "gemini" | "opencode" | "kimi" => Some("-m"),
             _ => None,
         })
@@ -1056,10 +1064,10 @@ impl AgentDef<'_> {
         }
     }
 
-    /// Value-binding `-p` (copilot, gemini, kimi) takes the prompt as its value, so model args
-    /// must trail the prompt.
+    /// Value-binding `-p` (copilot, gemini, kimi, vibe) takes the prompt as its value, so model
+    /// args must trail the prompt.
     pub fn oneshot_flag_binds_prompt(&self) -> bool {
-        matches!(self.name, "copilot" | "gemini" | "kimi")
+        matches!(self.name, "copilot" | "gemini" | "kimi" | "vibe")
     }
 
     /// Documented flag naming the agent's own session at launch. Gated by
@@ -1731,14 +1739,18 @@ fn is_safe_agent_name(name: &str) -> bool {
         && !name.contains('\\')
 }
 
+/// The built-in pause for `tool` between typing and Enter.
+///
+/// A declared integration paces through `Instance::send_keys_enter_delay`,
+/// which keeps this table as the fallback for every program it does not own.
 pub fn send_keys_enter_delay(tool: &str) -> u64 {
     get_agent(tool)
         .map(|a| a.send_keys_enter_delay_ms)
         .unwrap_or(0)
 }
 
-pub fn ready_marker(tool: &str) -> Option<&'static str> {
-    get_agent(tool).and_then(|a| a.ready_marker)
+pub fn ready_markers(tool: &str) -> &'static [&'static str] {
+    get_agent(tool).map_or(&[], |a| a.ready_markers)
 }
 
 pub fn agent_names() -> Vec<&'static str> {
@@ -1825,6 +1837,44 @@ pub fn oneshot_capable_names() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real Claude Code 2.1.326 footer as `capture-pane -e` returns it: every
+    /// word carries its own color escape, so a raw substring match misses it.
+    #[test]
+    fn claude_ready_markers_match_a_colored_footer_once_escapes_are_stripped() {
+        let capture = "\x1b[39m  \x1b[38;5;211m\u{23f5}\u{23f5}\x1b[39m \x1b[38;5;211mbypass\x1b[39m \x1b[38;5;211mpermissions\x1b[39m \x1b[38;5;211mon\x1b[38;5;246m (shift+tab\x1b[39m \x1b[38;5;246mto\x1b[39m \x1b[38;5;246mcycle)\x1b[39m \x1b[38;5;246m\u{b7}\x1b[39m \x1b[38;5;246mPR\x1b[39m\n";
+        let shows = |screen: &str| {
+            let screen = screen.to_lowercase();
+            ready_markers("claude").iter().any(|m| screen.contains(m))
+        };
+        assert!(!shows(capture));
+        assert!(shows(&crate::tmux::utils::strip_ansi(capture)));
+    }
+
+    /// A Terminal-view Claude session is only typed into once its input box is
+    /// up, which shows a mode line that differs by permission mode, and never
+    /// at the first-run trust dialog.
+    #[test]
+    fn claude_ready_markers_match_every_mode_line_but_not_the_trust_dialog() {
+        let markers = ready_markers("claude");
+        let matches = |screen: &str| {
+            let screen = screen.to_lowercase();
+            markers.iter().any(|m| screen.contains(m))
+        };
+        for footer in [
+            "  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle) \u{b7} PR #1 \u{b7} \u{2190} for agents",
+            "  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} \u{2190} for agents",
+            "  \u{23f8} manual mode on \u{b7} \u{2190} for agents",
+            "  \u{23f8} plan mode on (shift+tab to cycle) \u{b7} \u{2190} for agents",
+            "  \u{23f5}\u{23f5} accept edits on (shift+tab to cycle) \u{b7} \u{2190} for agents",
+            "  ? for shortcuts",
+        ] {
+            assert!(matches(footer), "not ready on: {footer}");
+        }
+        assert!(!matches(
+            " \u{276f} No, exit\n   Yes, I trust this folder\n Enter to confirm \u{b7} Esc to cancel"
+        ));
+    }
 
     /// A structured session on the host OMP adapter can return to its terminal
     /// while a declaration holds the listing; unknown identities still cannot.

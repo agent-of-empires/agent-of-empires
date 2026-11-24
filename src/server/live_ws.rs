@@ -277,15 +277,18 @@ fn deliver_paste(
     text: &str,
     submit: bool,
     enter_delay_ms: u64,
+    body_delivered: impl FnOnce(),
 ) -> anyhow::Result<()> {
     if session.live_input_mode().is_none() {
         return if submit {
-            session.send_keys_with_delay(text, enter_delay_ms)
+            session.send_keys_with_delivery(text, enter_delay_ms, body_delivered)
         } else {
-            session.paste_live_text(text)
+            session.paste_live_text(text)?;
+            body_delivered();
+            Ok(())
         };
     }
-    deliver_paste_via_channel(session, text, submit, || {
+    deliver_paste_via_channel(session, text, submit, body_delivered, || {
         if enter_delay_ms > 0 {
             std::thread::sleep(Duration::from_millis(enter_delay_ms));
         }
@@ -296,6 +299,7 @@ fn deliver_paste_via_channel(
     session: &crate::tmux::Session,
     text: &str,
     submit: bool,
+    body_delivered: impl FnOnce(),
     wait_before_enter: impl FnOnce(),
 ) -> anyhow::Result<()> {
     match (submit, crate::tmux::submit_text(text)) {
@@ -304,6 +308,7 @@ fn deliver_paste_via_channel(
         }
         _ => session.paste_live_text(text)?,
     }
+    body_delivered();
     if submit {
         wait_before_enter();
         session.send_live_raw_bytes(b"\r")?;
@@ -869,10 +874,12 @@ pub async fn live_terminal_ws(
     let shutdown = state.shutdown.clone();
     let work = state.runtime.work.clone();
 
+    // Input into the pane is the operator typing in this session, which wakes it.
+    let wake = Some((state.clone(), id.clone()));
     match target {
         Some(inst) => {
             let tmux_name = crate::tmux::Session::resolve_name(&inst.id, &inst.title);
-            let enter_delay_ms = crate::agents::send_keys_enter_delay(&inst.tool);
+            let enter_delay_ms = inst.send_keys_enter_delay();
             if query.observe {
                 let (Some(expected), Some(observe_expected)) =
                     (query.expected, query.observe_expected)
@@ -931,7 +938,10 @@ pub async fn live_terminal_ws(
                                     socket,
                                     tmux_name,
                                     Ok(input),
-                                    true,
+                                    LiveInput {
+                                        read_only: true,
+                                        wake: None,
+                                    },
                                     shutdown,
                                     LiveCaptureOptions {
                                         transport: LiveTransport::Snapshot,
@@ -962,7 +972,7 @@ pub async fn live_terminal_ws(
                                 socket,
                                 tmux_name,
                                 input,
-                                read_only,
+                                LiveInput { read_only, wake },
                                 shutdown,
                                 LiveTransport::Grid,
                                 enter_delay_ms,
@@ -1154,6 +1164,7 @@ async fn live_shell_ws(
     let read_only = state.read_only;
     let shutdown = state.shutdown.clone();
     let work = state.runtime.work.clone();
+    let wake = Some((state.clone(), id.clone()));
     ws.protocols(["aoe-auth"])
         .on_upgrade(move |socket| async move {
             let _ = work
@@ -1163,7 +1174,7 @@ async fn live_shell_ws(
                         socket,
                         tmux_name,
                         input,
-                        read_only,
+                        LiveInput { read_only, wake },
                         shutdown,
                         LiveTransport::Snapshot,
                         0,
@@ -1174,12 +1185,48 @@ async fn live_shell_ws(
         .into_response()
 }
 
+/// Where a pane's input goes: whether this viewer may type, and the session it belongs to,
+/// so accepted input clears that row's Ignore marker.
+struct LiveInput {
+    read_only: bool,
+    wake: Option<(Arc<AppState>, String)>,
+}
+
+struct InputWake {
+    requests: tokio::sync::mpsc::Sender<()>,
+    worker: tokio::task::JoinHandle<()>,
+}
+
+impl InputWake {
+    fn spawn((state, id): (Arc<AppState>, String)) -> Self {
+        let (requests, mut queued) = tokio::sync::mpsc::channel(1);
+        let worker = tokio::spawn(async move {
+            while queued.recv().await.is_some() {
+                if let Err(error) = state.session_service.touch_after_direct_input(&id).await {
+                    warn!(target: "terminal.ws", session = %id, %error,
+                        "failed to wake an ignored session after input");
+                }
+            }
+        });
+        Self { requests, worker }
+    }
+
+    fn request(&self) {
+        let _ = self.requests.try_send(());
+    }
+
+    async fn stop(self) {
+        drop(self.requests);
+        let _ = self.worker.await;
+    }
+}
+
 /// `enter_delay_ms` is the agent's paste-burst guard before a submitting Enter; 0 for shells.
 async fn handle_live_ws(
     socket: WebSocket,
     tmux_name: String,
     input: anyhow::Result<crate::tmux::Session>,
-    read_only: bool,
+    policy: LiveInput,
     shutdown: tokio_util::sync::CancellationToken,
     transport: LiveTransport,
     enter_delay_ms: u64,
@@ -1188,7 +1235,7 @@ async fn handle_live_ws(
         socket,
         tmux_name,
         input,
-        read_only,
+        policy,
         shutdown,
         LiveCaptureOptions {
             transport,
@@ -1221,7 +1268,7 @@ async fn handle_live_ws_inner(
     mut socket: WebSocket,
     tmux_name: String,
     input: anyhow::Result<crate::tmux::Session>,
-    read_only: bool,
+    policy: LiveInput,
     shutdown: tokio_util::sync::CancellationToken,
     capture: LiveCaptureOptions,
     enter_delay_ms: u64,
@@ -1254,6 +1301,8 @@ async fn handle_live_ws_inner(
             }
         }
     }
+    let LiveInput { read_only, wake } = policy;
+    let wake = wake.map(InputWake::spawn);
 
     let settings = Arc::new(LiveSettings::new());
     // Identifies this connection in the cross-process size-owner lock (shared
@@ -2019,6 +2068,9 @@ async fn handle_live_ws_inner(
                             reject_live_input(&out_tx, &capture_stop, &tmux_name, error).await;
                             break;
                         }
+                        if let Some(wake) = &wake {
+                            wake.request();
+                        }
                         // Capture the echo promptly rather than waiting out
                         // the current sleep.
                         nudge.notify_one();
@@ -2171,9 +2223,14 @@ async fn handle_live_ws_inner(
                                     continue;
                                 }
                                 let session = Arc::clone(&input);
+                                let requests = wake.as_ref().map(|wake| wake.requests.clone());
                                 // Awaited like binary input, so it lands after earlier keystrokes.
                                 let result = tokio::task::spawn_blocking(move || {
-                                    deliver_paste(&session, &text, submit, enter_delay_ms)
+                                    deliver_paste(&session, &text, submit, enter_delay_ms, || {
+                                        if let Some(requests) = requests {
+                                            let _ = requests.try_send(());
+                                        }
+                                    })
                                 })
                                 .await
                                 .unwrap_or_else(|error| Err(error.into()));
@@ -2204,6 +2261,9 @@ async fn handle_live_ws_inner(
     let _ = capture_task.await;
     drop(out_tx);
     let _ = send_task.await;
+    if let Some(wake) = wake {
+        wake.stop().await;
+    }
 
     // Release only this viewer's size lease. The last owner restores
     // window-size latest; another viewer's lease remains untouched.
@@ -2393,7 +2453,7 @@ mod tests {
             instance.lifecycle_generation = 7;
             instance.view = crate::session::View::Structured;
             instance.status = crate::session::Status::Stopped;
-            instance.archived_at = Some(chrono::Utc::now());
+            instance.archived_at = Some(crate::time::Timestamp::now());
             storage.update(|rows, _| {
                 rows.push(instance.clone());
                 Ok(())
@@ -2962,10 +3022,10 @@ mod tests {
             input.send_live_raw_bytes(b"LIVE\0\x1b[D")?;
             expected.extend_from_slice(b"LIVE\0\x1b[D");
             fixture.wait_for_bytes(&expected);
-            deliver_paste(&input, "line\nnext", false, 0)?;
+            deliver_paste(&input, "line\nnext", false, 0, || {})?;
             expected.extend_from_slice(b"line\rnext");
             fixture.wait_for_bytes(&expected);
-            deliver_paste(&input, "/go", true, 0)?;
+            deliver_paste(&input, "/go", true, 0, || {})?;
             expected.extend_from_slice(b"/go \r");
             fixture.wait_for_bytes(&expected);
 
@@ -2975,7 +3035,10 @@ mod tests {
             })?;
             fixture.instance.lifecycle_generation += 1;
             assert!(input.send_live_raw_bytes(b"STALE-RAW").is_err());
-            assert!(deliver_paste(&input, "STALE-PASTE", true, 0).is_err());
+            assert!(deliver_paste(&input, "STALE-PASTE", true, 0, || panic!(
+                "stale paste delivered"
+            ))
+            .is_err());
             let fresh = capture_live_input(&fixture.instance, fixture.pane.name(), None)?
                 .capture_input_channel();
             fresh.send_live_raw_bytes(b"FRESH-BARRIER")?;
@@ -3009,7 +3072,10 @@ mod tests {
             let target = crate::tmux::test_helpers::only_pane_id(fixture.pane.name());
             crate::tmux::test_helpers::wait_for_pane_command(&target, "cat");
             assert!(retired.send_live_raw_bytes(b"RETIRED-RAW").is_err());
-            assert!(deliver_paste(&retired, "RETIRED-PASTE", true, 0).is_err());
+            assert!(deliver_paste(&retired, "RETIRED-PASTE", true, 0, || panic!(
+                "retired paste delivered"
+            ))
+            .is_err());
             let replacement = capture_live_input(&fixture.instance, fixture.pane.name(), None)?
                 .capture_input_channel();
             replacement.send_live_raw_bytes(b"REPLACEMENT-BARRIER")?;
@@ -3073,24 +3139,38 @@ mod tests {
         original_peer.read_exact(&mut got_cursor)?;
         assert_eq!(&got_cursor, b"\x1bOA");
 
-        let delayed = deliver_paste_via_channel(&input, "BODY", true, || {
-            let mut body = [0; 4];
-            original_peer
-                .read_exact(&mut body)
-                .expect("paste body before delay");
-            assert_eq!(&body, b"BODY");
-            fixture
-                .storage
-                .update(|rows, _| {
-                    rows[0].lifecycle_generation += 1;
-                    Ok(())
-                })
-                .expect("generation changes during paste delay");
-        });
+        let delivered = std::cell::Cell::new(false);
+        let delayed = deliver_paste_via_channel(
+            &input,
+            "BODY",
+            true,
+            || delivered.set(true),
+            || {
+                assert!(
+                    delivered.get(),
+                    "accepted body must trigger wake before Enter"
+                );
+                let mut body = [0; 4];
+                original_peer
+                    .read_exact(&mut body)
+                    .expect("paste body before delay");
+                assert_eq!(&body, b"BODY");
+                fixture
+                    .storage
+                    .update(|rows, _| {
+                        rows[0].lifecycle_generation += 1;
+                        Ok(())
+                    })
+                    .expect("generation changes during paste delay");
+            },
+        );
         assert!(delayed.is_err(), "Enter must revalidate native generation");
         fixture.instance.lifecycle_generation += 1;
         assert!(input.send_live_raw_bytes(b"STALE-RAW").is_err());
-        assert!(deliver_paste(&input, "STALE-PASTE", true, 0).is_err());
+        assert!(deliver_paste(&input, "STALE-PASTE", true, 0, || panic!(
+            "stale paste delivered"
+        ))
+        .is_err());
         original_peer.set_nonblocking(true)?;
         let mut unexpected = [0; 1];
         assert_eq!(
@@ -3108,7 +3188,10 @@ mod tests {
         assert_eq!(&barrier, b"FRESH-BARRIER");
 
         drop(replacement_peer);
-        assert!(deliver_paste(&fresh, "NO-REPLAY", false, 0).is_err());
+        assert!(deliver_paste(&fresh, "NO-REPLAY", false, 0, || panic!(
+            "stale paste replayed"
+        ))
+        .is_err());
         crate::tmux::vt::unregister_for_test(fixture.pane.name());
         let fallback = capture_live_input(&fixture.instance, fixture.pane.name(), None)?
             .capture_input_channel();
@@ -3134,7 +3217,7 @@ mod tests {
         let mut fixture = NativeLiveInputFixture::new("observe-error", false)?;
         fixture.instance.view = crate::session::View::Terminal;
         fixture.instance.status = crate::session::Status::Error;
-        fixture.instance.last_error = Some("RETAINED_DIAGNOSTIC".into());
+        fixture.instance.last_error.set("RETAINED_DIAGNOSTIC");
         fixture.storage.update(|rows, _| {
             rows[0] = fixture.instance.clone();
             Ok(())
@@ -3336,7 +3419,10 @@ mod tests {
                             socket,
                             name,
                             Ok(input),
-                            false,
+                            LiveInput {
+                                read_only: false,
+                                wake: None,
+                            },
                             shutdown,
                             LiveTransport::Snapshot,
                             0,
@@ -3505,7 +3591,10 @@ mod tests {
                                 socket,
                                 name,
                                 Ok(input),
-                                true,
+                                LiveInput {
+                                    read_only: true,
+                                    wake: None,
+                                },
                                 shutdown,
                                 LiveCaptureOptions {
                                     transport: LiveTransport::Grid,
@@ -3736,7 +3825,10 @@ mod tests {
                                 socket,
                                 name,
                                 Ok(input),
-                                false,
+                                LiveInput {
+                                    read_only: false,
+                                    wake: None,
+                                },
                                 shutdown,
                                 LiveCaptureOptions {
                                     transport: LiveTransport::Grid,
@@ -3923,6 +4015,39 @@ mod tests {
                 "grid={grid} owned={owned} panes={panes:?} lines={lines}"
             );
         }
+    }
+
+    /// Closing the tab right after the pane accepts input must not drop the wake that
+    /// clears a peer's Ignore. The worker is only polled when the test awaits, so a queued
+    /// request that survives `stop` is one this test can see land.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_accepted_input_wake_survives_disconnect() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut managed = crate::session::Instance::new("typed", "/tmp/aoe-typed");
+        managed.id = "typed".into();
+        managed.source_profile = "default".into();
+        managed.parent_session_id = Some("manager".into());
+        managed.ignore();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![managed.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![managed]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        let wake = InputWake::spawn((Arc::clone(&state), "typed".into()));
+        wake.request();
+        wake.stop().await;
+
+        assert!(
+            !state
+                .session_service
+                .is_ignored_on_disk("typed")
+                .await
+                .unwrap(),
+            "accepted input must clear the canonical marker even if the tab closed"
+        );
     }
 
     #[test]

@@ -54,8 +54,8 @@ pub(super) fn decide_passive_transition(
     // make the sampled row look Error/Stopped, but the poller has no authority
     // to overwrite either the pre-launch status or a row with a fresh durable
     // lifecycle reservation.
-    let lifecycle_owned =
-        inst.status == Status::Starting || inst.has_fresh_lifecycle_reservation(chrono::Utc::now());
+    let lifecycle_owned = inst.status == Status::Starting
+        || inst.has_fresh_lifecycle_reservation(crate::time::Timestamp::now());
     let patch = (!inst.is_structured() && !lifecycle_owned)
         .then(|| crate::session::PassiveStatusPatch::from_instance(inst));
     // Structured rows are excluded for the same reason as the patch: the poll
@@ -203,7 +203,7 @@ async fn sample_sandbox_health(
                     row.status,
                     Status::Starting | Status::Creating | Status::Deleting
                 )
-                && !row.has_fresh_lifecycle_reservation(chrono::Utc::now())
+                && !row.has_fresh_lifecycle_reservation(crate::time::Timestamp::now())
         })
         .filter_map(|row| {
             row.sandbox_info.as_ref().map(|sandbox| {
@@ -304,7 +304,7 @@ async fn refresh_sandbox_stores(state: &Arc<AppState>) {
                     row.status,
                     Status::Starting | Status::Creating | Status::Deleting
                 )
-                || row.has_fresh_lifecycle_reservation(chrono::Utc::now())
+                || row.has_fresh_lifecycle_reservation(crate::time::Timestamp::now())
                 || row.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION
             {
                 return Ok(());
@@ -359,6 +359,7 @@ pub(super) async fn maintenance_loop(
         std::collections::HashMap::new();
     let mut acp_parked: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut acp_resume_deferred = std::collections::HashMap::new();
+    let mut acp_stop_notified = std::collections::HashSet::new();
     let mut last_container_check: Option<std::time::Instant> = None;
     let mut last_credential_refresh = std::time::Instant::now();
     let mut last_purge_recovery = std::time::Instant::now() - std::time::Duration::from_secs(30);
@@ -407,6 +408,7 @@ pub(super) async fn maintenance_loop(
             &mut acp_respawn_history,
             &mut acp_parked,
             &mut acp_resume_deferred,
+            &mut acp_stop_notified,
         )
         .await;
         if rate_limit_parked {
@@ -620,9 +622,12 @@ pub(super) async fn status_poll_loop_observed(
             .await;
             drop(reload_lane);
             drop(namespace);
-            if let Err(error) = state.runtime.publish(&state).await {
-                tracing::error!(target: "server.status", %error, "terminal snapshot publication failed");
-                continue;
+            // A status move must be published before the next tick so status hooks see every
+            // transition; idle ticks only request a publish.
+            if !changes.is_empty() {
+                if let Err(error) = state.runtime.publish(&state).await {
+                    tracing::error!(target: "server.status", %error, "terminal snapshot publication failed");
+                }
             }
             for change in changes {
                 if change.old == Status::Running && change.new == Status::Idle {
@@ -863,7 +868,7 @@ mod tests {
             .try_acquire_lifecycle_reservation(
                 crate::session::LifecycleOperation::Launch,
                 Instance::LIFECYCLE_RESERVATION_TTL,
-                chrono::Utc::now(),
+                crate::time::Timestamp::now(),
             )
             .unwrap();
         // Model the delayed pane-absent observation: the in-memory sample has
@@ -878,8 +883,8 @@ mod tests {
     fn decide_passive_transition_patches_plain_tmux_session() {
         let mut inst = Instance::new("tmux-session", "/tmp/test");
         inst.status = Status::Idle;
-        inst.idle_entered_at = Some(chrono::Utc::now());
-        inst.last_accessed_at = Some(chrono::Utc::now());
+        inst.idle_entered_at = Some(crate::time::Timestamp::now());
+        inst.last_accessed_at = Some(crate::time::Timestamp::now());
 
         let decision = decide_passive_transition(&inst, Status::Running, false);
 
@@ -1001,8 +1006,8 @@ mod tests {
     async fn flush_passive_transition_routes_patches_per_profile() {
         let _app_dir = crate::session::test_support::isolate_app_dir();
 
-        let old = chrono::Utc::now() - chrono::Duration::minutes(1);
-        let new_ts = chrono::Utc::now();
+        let old = crate::time::Timestamp::now() - crate::time::Duration::minutes(1);
+        let new_ts = crate::time::Timestamp::now();
 
         let mut a1 = Instance::new("session-a", "/tmp/a");
         a1.source_profile = "flush-a".to_string();

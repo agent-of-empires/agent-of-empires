@@ -404,7 +404,7 @@ pub(super) async fn publish_auxiliary_after_ensure(
             row.id == id
                 && row.lifecycle_generation == expected.0
                 && row.profile == expected.1
-                && row.created_at.parse::<chrono::DateTime<chrono::Utc>>().ok() == Some(created_at)
+                && crate::time::Timestamp::parse_rfc3339(&row.created_at).ok() == Some(created_at)
         })
         .ok_or(crate::session::LifecycleReservationError::Superseded)?;
     row.auxiliary
@@ -828,13 +828,22 @@ pub(crate) async fn ensure_native_container_terminal(
             index,
             size,
             &native,
-            |instance, config| {
-                minted_env = true;
-                drop(scope.take());
-                let result = instance.mint_before_start_env(config);
-                scope = Some(acquire_scope());
-                result
-            },
+            // The namespace and instance guards are given up around the hook and taken back
+            // once the session's slot is free.
+            crate::session::Releasing::new(
+                &mut scope,
+                |scope, instance, config| {
+                    minted_env = true;
+                    drop(scope.take());
+                    instance.mint_before_start_env(config)
+                },
+                |scope, _| {
+                    if scope.is_none() {
+                        **scope = Some(acquire_scope());
+                    }
+                    Ok(())
+                },
+            ),
         )?;
         let SampledAuxiliary {
             _ownership,

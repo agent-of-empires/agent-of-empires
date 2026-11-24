@@ -119,7 +119,7 @@ pub struct EstablishmentAttempt {
     pub(crate) id: AttemptId,
     pub(crate) profile: String,
     pub(crate) session_id: String,
-    pub(crate) created_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) created_at: crate::time::Timestamp,
     pub(crate) source_context: NativeEventContext,
     pub(crate) context: NativeEventContext,
     pub(crate) generation: u64,
@@ -409,8 +409,8 @@ pub struct NativeOperationPermission {
 
 impl NativeOperationPermission {
     pub(crate) async fn capture_owned(
-        receipt: &NativeEstablishmentReceipt,
-        owner: &crate::acp::runner_lifecycle::RunnerIdentity,
+        receipt: &std::sync::Arc<NativeEstablishmentReceipt>,
+        owner: crate::acp::runner_lifecycle::RunnerIdentity,
         correlation: NativeOperationCorrelation,
         deadline: tokio::time::Instant,
     ) -> anyhow::Result<Self> {
@@ -418,49 +418,60 @@ impl NativeOperationPermission {
             Lifecycle,
             Registry,
         }
-        let storage = Storage::open_reference(&receipt.attempt.profile)?;
+        let mut storage = Storage::open_reference(&receipt.attempt.profile)?;
         let mut candidate: Option<NativeSessionPermission> = None;
         loop {
             anyhow::ensure!(
                 tokio::time::Instant::now() < deadline,
                 crate::process::worker_registry::RegistryBusy
             );
-            let wait = {
-                if let Some(_native) =
-                    storage.try_acquire_instance_lifecycle_lock(&receipt.attempt.session_id)?
-                {
-                    storage.verify_bound_profile()?;
-                    let row = storage
-                        .load_instances_complete()?
-                        .into_iter()
-                        .find(|row| row.id == receipt.attempt.session_id)
-                        .ok_or(crate::session::SessionGone)?;
-                    if candidate.is_none() {
-                        candidate = Some(NativeSessionPermission::capture(
-                            receipt, &row, &storage, owner,
-                        )?);
-                    }
-                    let permission = candidate
-                        .as_ref()
-                        .expect("captured under lifecycle exclusion");
-                    anyhow::ensure!(
-                        permission.matches(receipt, &row, &storage)?,
-                        EstablishmentRefusal::Superseded
-                    );
-                    if let Some(registry) = crate::process::worker_registry::try_registry_lock(
-                        &receipt.attempt.session_id,
-                    )? {
-                        permission.check_owner(receipt, &registry)?;
+            let receipt_for_probe = receipt.clone();
+            let (returned_storage, returned_candidate, wait) =
+                tokio::task::spawn_blocking(move || {
+                    let receipt = &receipt_for_probe;
+                    let wait = if let Some(_native) =
+                        storage.try_acquire_instance_lifecycle_lock(&receipt.attempt.session_id)?
+                    {
                         storage.verify_bound_profile()?;
-                        return Ok(Self {
-                            correlation,
-                            session: candidate.expect("validated original candidate"),
-                        });
-                    }
-                    Wait::Registry
-                } else {
-                    Wait::Lifecycle
-                }
+                        let row = storage
+                            .load_instances_complete()?
+                            .into_iter()
+                            .find(|row| row.id == receipt.attempt.session_id)
+                            .ok_or(crate::session::SessionGone)?;
+                        if candidate.is_none() {
+                            candidate = Some(NativeSessionPermission::capture(
+                                receipt, &row, &storage, &owner,
+                            )?);
+                        }
+                        let permission = candidate
+                            .as_ref()
+                            .expect("captured under lifecycle exclusion");
+                        anyhow::ensure!(
+                            permission.matches(receipt, &row, &storage)?,
+                            EstablishmentRefusal::Superseded
+                        );
+                        if let Some(registry) = crate::process::worker_registry::try_registry_lock(
+                            &receipt.attempt.session_id,
+                        )? {
+                            permission.check_owner(receipt, &registry)?;
+                            storage.verify_bound_profile()?;
+                            None
+                        } else {
+                            Some(Wait::Registry)
+                        }
+                    } else {
+                        Some(Wait::Lifecycle)
+                    };
+                    anyhow::Ok((storage, candidate, wait))
+                })
+                .await??;
+            storage = returned_storage;
+            candidate = returned_candidate;
+            let Some(wait) = wait else {
+                return Ok(Self {
+                    correlation,
+                    session: candidate.expect("validated original candidate"),
+                });
             };
             match wait {
                 Wait::Lifecycle => {
@@ -1423,7 +1434,7 @@ pub(crate) struct NativeResourceWitness {
     pub(crate) origin: crate::acp::state::NativeEventOrigin,
     pub(crate) profile: String,
     pub(crate) session_id: String,
-    pub(crate) created_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) created_at: crate::time::Timestamp,
     pub(crate) native_session_id: agent_client_protocol::v1::schema::SessionId,
     pub(crate) postimage: std::sync::Arc<EstablishmentPostimage>,
     pub(crate) admitted: NativeSessionStamp,
@@ -2036,7 +2047,7 @@ impl NativeSessionPermission {
                         | crate::session::Status::Deleting
                         | crate::session::Status::Stopped
                 )
-                && !row.has_fresh_lifecycle_reservation(chrono::Utc::now()),
+                && !row.has_fresh_lifecycle_reservation(crate::time::Timestamp::now()),
             EstablishmentRefusal::Superseded
         );
         Ok(())

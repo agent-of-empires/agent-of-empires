@@ -1,72 +1,68 @@
 // @vitest-environment jsdom
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { renderHook, act } from "@testing-library/react";
 
-import { useQueuedCountForSessions } from "../useAcpQueueCount";
-import { STORAGE_KEY_PREFIX, clearQueueCount, getQueuedCount, setQueueCount } from "../../lib/acpStateStorage";
+import { useQueuedCounts } from "../useAcpQueueCount";
+import { STORAGE_KEY_PREFIX, getLiveQueueCount, setLiveQueueCount } from "../../lib/acpStateStorage";
+import type { SessionResponse } from "../../lib/types";
 
-function entry(id: string, queued: number, savedAt = Date.now()): string {
-  const queuedPrompts = Array.from({ length: queued }, (_, i) => ({ id: `${id}-${i}`, text: `q${i}`, queuedAt: "t" }));
-  return JSON.stringify({ savedAt, state: { lastSeq: 0, activity: [], queuedPrompts } });
-}
+const row = (id: string, queued_count?: number) => ({ id, queued_count }) as SessionResponse;
 
-function dispatchStorage(id: string, queued: number): void {
-  act(() => {
-    window.dispatchEvent(
-      new StorageEvent("storage", {
-        key: `${STORAGE_KEY_PREFIX}${id}`,
-        newValue: entry(id, queued),
-        storageArea: localStorage,
-      }),
-    );
-  });
-}
-
-const render = (ids: string[]) => renderHook(() => useQueuedCountForSessions(ids));
-
-beforeEach(() => {
-  localStorage.clear();
-  clearQueueCount();
-});
+const render = (initial: SessionResponse[]) =>
+  renderHook(({ sessions }) => useQueuedCounts(sessions), { initialProps: { sessions: initial } });
 
 afterEach(() => {
   localStorage.clear();
-  clearQueueCount();
+  for (const id of ["a", "b"]) setLiveQueueCount(id, null);
 });
 
-describe("useQueuedCountForSessions", () => {
-  it.each([
-    ["no entries", {}, 0],
-    ["the sum across sessions", { a: entry("a", 2), b: entry("b", 1) }, 3],
-    ["a TTL-expired entry", { a: entry("a", 5, Date.now() - 8 * 24 * 60 * 60 * 1000) }, 0],
-    ["a corrupt entry", { a: "{not json" }, 0],
-  ] as [string, Record<string, string>, number][])("reads %s lazily from storage", (_label, stored, expected) => {
-    for (const [id, raw] of Object.entries(stored)) localStorage.setItem(`${STORAGE_KEY_PREFIX}${id}`, raw);
-    expect(render(["a", "b"]).result.current).toBe(expected);
+describe("useQueuedCounts", () => {
+  it("takes the Daemon's count for a session this browser never opened, whatever is persisted", () => {
+    const stale = {
+      savedAt: Date.now(),
+      state: { lastSeq: 0, activity: [], queuedPrompts: [{ id: "x" }, { id: "y" }] },
+    };
+    localStorage.setItem(`${STORAGE_KEY_PREFIX}a`, JSON.stringify(stale));
+    const { result } = render([row("a", 1), row("b")]);
+    expect(result.current).toEqual([1, 0]);
   });
 
-  it("follows same-tab writes", () => {
-    const { result } = render(["a"]);
-    for (const n of [2, 1, 0]) {
-      act(() => setQueueCount("a", n));
-      expect(result.current).toBe(n);
-    }
+  it("takes this browser's count while it holds the live queue, and the Daemon's again once it doesn't", () => {
+    const { result } = render([row("a", 1), row("b", 3)]);
+    // Live, with an optimistic row the Daemon hasn't confirmed yet.
+    act(() => setLiveQueueCount("a", 2));
+    expect(result.current).toEqual([2, 3]);
+    // The connection closes: nothing stays stuck at the live value.
+    act(() => setLiveQueueCount("a", null));
+    expect(result.current).toEqual([1, 3]);
+    // A reconnect that lists the queue again is live again.
+    act(() => setLiveQueueCount("a", 0));
+    expect(result.current).toEqual([0, 3]);
   });
 
-  it("follows cross-tab storage events for subscribed sessions only", () => {
-    const { result } = render(["a"]);
-    dispatchStorage("b", 1);
-    expect(result.current).toBe(0);
-    dispatchStorage("a", 2);
-    expect(result.current).toBe(2);
+  it("follows a new Daemon count from the next poll", () => {
+    const { result, rerender } = render([row("a", 1)]);
+    rerender({ sessions: [row("a", 4)] });
+    expect(result.current).toEqual([4]);
   });
 
-  it("removes its storage listener on unmount", () => {
-    const { unmount } = render(["a"]);
-    act(() => setQueueCount("a", 2));
+  it("re-renders only for its own sessions and stops listening on unmount", () => {
+    let renders = 0;
+    const { unmount } = renderHook(() => {
+      renders += 1;
+      return useQueuedCounts([row("a", 1)]);
+    });
+    const before = renders;
+    act(() => setLiveQueueCount("b", 5));
+    expect(renders).toBe(before);
     unmount();
-    dispatchStorage("a", 1);
-    expect(getQueuedCount("a")).toBe(2);
+    act(() => setLiveQueueCount("a", 2));
+    expect(getLiveQueueCount("a")).toBe(2);
+    expect(renders).toBe(before);
+  });
+
+  it("is empty for a row with no sessions", () => {
+    expect(render([]).result.current).toEqual([]);
   });
 });

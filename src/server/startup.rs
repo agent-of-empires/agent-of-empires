@@ -238,6 +238,16 @@ async fn run_shutdown_sequence<R, F>(
     }
 }
 
+/// The daemon's profile and every session, whose shared credential files may have login
+/// helpers.
+async fn login_helper_scopes(state: &AppState) -> Vec<super::sandbox_login::LoginScope> {
+    use super::sandbox_login::LoginScope;
+    let instances = state.instances.read().await;
+    std::iter::once(LoginScope::profile(state.served_profile().clone()))
+        .chain(instances.iter().flat_map(LoginScope::of_session))
+        .collect()
+}
+
 /// Raise the soft `RLIMIT_NOFILE` so the server can sustain many WS
 /// terminals at once. macOS's default soft cap of 256 is exhausted
 /// quickly: each WS terminal consumes ~3 file descriptors (PTY master +
@@ -510,6 +520,12 @@ pub(crate) async fn start_server(
     crate::process::systemd::mark_daemon();
     raise_fd_limit();
 
+    if !read_only {
+        if let Err(error) = crate::plugin::install::recover_stale_publication() {
+            tracing::warn!(target: "plugin.install", %error, "plugin publication recovery is fenced");
+        }
+    }
+
     // Single live `FileWatchService` per daemon.
     let file_watch = FileWatchService::new().unwrap_or_else(|e| {
         tracing::warn!(
@@ -587,6 +603,7 @@ pub(crate) async fn start_server(
         token_lifetime,
         token_grace,
     ));
+    super::token::register_daemon_tokens(Arc::clone(&token_manager));
     let config = crate::session::config::profile_config::resolve_config_or_warn(profile);
     // Feed the unread-feature gate from this daemon's resolved config.
     crate::session::set_unread_enabled(config.session.unread_indicator);
@@ -739,6 +756,8 @@ pub(crate) async fn start_server(
             control_cache: acp_control_cache.clone(),
         },
     ));
+    // Before any producer of a hold (plugin workers, the reconcilers) can run.
+    let login_notices = session_service.sandbox_login.subscribe();
 
     // the daemon serves fine without plugin workers.
     // The host API includes mutating session.meta.set/cas, so a read-only
@@ -788,6 +807,8 @@ pub(crate) async fn start_server(
             }
         }
     };
+
+    install_mcp_rewriter(plugin_host.clone());
 
     // Telemetry (opt-in, no-op otherwise).
     crate::telemetry::spawn_process_start(crate::telemetry::Surface::Serve);
@@ -964,7 +985,7 @@ pub(crate) async fn start_server(
                     );
                 } else {
                     println!(
-                        "Open the localhost URL in a browser. Other devices get 426 until you front aoe with HTTPS, or pass --dangerously-allow-plaintext-remote."
+                        "Open the localhost URL in a browser. Other devices are refused until you front aoe with HTTPS, or pass --dangerously-allow-plaintext-remote."
                     );
                 }
             }
@@ -1101,6 +1122,7 @@ pub(crate) async fn start_server(
         idempotency_locks,
         create_progress: Default::default(),
         list_sessions_resolver_misses: std::sync::atomic::AtomicUsize::new(0),
+        session_cfg_store: Default::default(),
         smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_semaphore: tokio::sync::Semaphore::new(
@@ -1350,6 +1372,18 @@ pub(crate) async fn start_server(
     }
 
     push::spawn_consumer(state.clone()).await;
+    push::spawn_login_required_consumer(state.clone(), login_notices).await;
+    {
+        let profile = state.served_profile().clone();
+        let scopes = login_helper_scopes(&state).await;
+        state
+            .runtime
+            .work
+            .spawn("server.sandbox_login_sweep", async move {
+                super::sandbox_login::log_login_status(profile).await;
+                super::sandbox_login::sweep_stale_login_helpers(scopes).await;
+            });
+    }
     callback::spawn_consumer(state.clone()).await;
 
     // Report this process's own session commits exactly; the disk consumer covers the rest.
@@ -1606,6 +1640,14 @@ async fn remote_rotation_loop(
     }
 }
 
+/// Always installed, read-only serve included: it still resumes and respawns agents, and with no
+/// host a rewriter fails closed for sessions a hook applies to.
+fn install_mcp_rewriter(plugin_host: Option<std::sync::Arc<crate::plugin::host::PluginHost>>) {
+    crate::acp::mcp_rewrite::set_rewriter(Some(std::sync::Arc::new(
+        crate::plugin::mcp_rewrite::PluginMcpRewriter::new(plugin_host),
+    )));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1711,6 +1753,17 @@ mod tests {
             let n = socket.recv(&mut buf).unwrap();
             assert_eq!(&buf[..n], b"STOPPING=1\n");
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn install_mcp_rewriter_sets_the_slot_without_a_plugin_host() {
+        use crate::acp::mcp_rewrite::test_support::{slot_is_set, SlotGuard};
+
+        let _slot = SlotGuard::clear_on_drop();
+        assert!(!slot_is_set());
+        install_mcp_rewriter(None);
+        assert!(slot_is_set());
     }
 
     /// The sweep fires at its interval, not the next recheck, and a window
@@ -1937,7 +1990,7 @@ mod tests {
                 auth: "auth".into(),
                 owner_token_hash: push::sha256_token("old_token"),
                 user_agent: "UA".into(),
-                created_at: chrono::Utc::now(),
+                created_at: crate::time::Timestamp::now(),
                 generation: 0,
                 origin: "https://aoe.example.test".into(),
             })

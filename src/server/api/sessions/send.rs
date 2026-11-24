@@ -25,6 +25,7 @@ pub(crate) enum SendKeysError {
     NotRunning,
     Transient(Status),
     StructuredView,
+    Ignored,
     Blocked(crate::session::StartBlocked),
     Gone,
     Tmux(anyhow::Error),
@@ -46,14 +47,22 @@ pub(crate) async fn send_terminal_message(
     id: &str,
     message: String,
     revive: bool,
+    refuse_if_ignored: bool,
 ) -> Result<bool, TerminalSendError> {
     let mut committed_cursor = None;
-    send_terminal_message_inner(service, id, message, revive, &mut committed_cursor)
-        .await
-        .map_err(|error| TerminalSendError {
-            error,
-            committed_cursor: committed_cursor.map(Box::new),
-        })
+    Box::pin(send_terminal_message_inner(
+        service,
+        id,
+        message,
+        revive,
+        refuse_if_ignored,
+        &mut committed_cursor,
+    ))
+    .await
+    .map_err(|error| TerminalSendError {
+        error,
+        committed_cursor: committed_cursor.map(Box::new),
+    })
 }
 
 async fn send_terminal_message_inner(
@@ -61,6 +70,7 @@ async fn send_terminal_message_inner(
     id: &str,
     message: String,
     revive: bool,
+    refuse_if_ignored: bool,
     committed_cursor: &mut Option<(axum::http::HeaderValue, axum::http::HeaderValue)>,
 ) -> Result<bool, SendKeysError> {
     let state = service.native_state().map_err(SendKeysError::Tmux)?;
@@ -102,6 +112,9 @@ async fn send_terminal_message_inner(
                 .into_iter()
                 .find(|row| row.id == initial_id)
                 .ok_or(SendKeysError::NotFound)?;
+            if refuse_if_ignored && before.is_ignored() {
+                return Err(SendKeysError::Ignored);
+            }
             before.ensure_startable().map_err(SendKeysError::Blocked)?;
             if before.is_structured() {
                 return Err(SendKeysError::StructuredView);
@@ -232,18 +245,17 @@ async fn send_terminal_message_inner(
         super::tests::terminal_custody::Boundary::SendAdmitted,
     )
     .await;
-    let namespace = state.profile_namespace.read().await;
+    let namespace = Arc::clone(&state.profile_namespace).read_owned().await;
     if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
         return Err(SendKeysError::Tmux(
             crate::session::NativeStoreUnavailable.into(),
         ));
     }
-    let _submission = service
+    let submission = service
         .prompt_submission_for_session(id)
         .await
         .ok_or(SendKeysError::NotFound)?;
-    let lock = service.instance_lock(id).await;
-    let guard = lock.lock().await;
+    let guard = service.instance_lock(id).await.lock_owned().await;
     let expected = crate::daemon::NativePreparationIdentity {
         created_at: initial_identity.created_at,
         lifecycle_generation: target.lifecycle_generation,
@@ -269,6 +281,7 @@ async fn send_terminal_message_inner(
             expected.matches(&instance),
             crate::session::LifecycleReservationError::Superseded
         );
+        anyhow::ensure!(!refuse_if_ignored || !instance.is_ignored(), IgnoredSession);
         instance.ensure_startable()?;
         anyhow::ensure!(
             !instance.is_structured(),
@@ -293,45 +306,48 @@ async fn send_terminal_message_inner(
     .await
     .map_err(anyhow::Error::from)
     .and_then(|result| result);
-    // Captured native/physical scope now owns admission. User after-send hooks
-    // must be able to re-enter lifecycle operations through this daemon too.
-    drop(guard);
-    drop(_submission);
-    drop(namespace);
     let result = match prepared {
         Ok((native, instance, session)) => {
-            tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
-                use crate::session::SessionStore;
-                session.send_keys_with_delay(
-                    &message,
-                    crate::agents::send_keys_enter_delay(&instance.tool),
-                )?;
-                let _lifecycle = native
-                    .storage()
-                    .acquire_instance_lifecycle_lock(&instance.id)?;
-                let recency = (&native as &dyn SessionStore).update(|rows, _| {
-                    let row = rows
-                        .iter_mut()
-                        .find(|row| row.id == instance.id)
-                        .ok_or(crate::session::SessionGone)?;
-                    anyhow::ensure!(
-                        row.created_at == instance.created_at
-                            && row.lifecycle_generation == instance.lifecycle_generation,
-                        crate::session::LifecycleReservationError::Superseded
-                    );
-                    row.last_accessed_at = Some(chrono::Utc::now());
-                    Ok(())
-                });
-                if let Err(error) = recency {
-                    if error.is::<crate::session::SessionCommitApplied>()
-                        || !(error.is::<crate::session::SessionGone>()
-                            || error.downcast_ref::<crate::session::LifecycleReservationError>()
-                                == Some(&crate::session::LifecycleReservationError::Superseded))
-                    {
-                        return Err(error);
+            let service = Arc::clone(&state.session_service);
+            tokio::spawn(async move {
+                let _guards = (namespace, submission, guard);
+                let (native, instance) = tokio::task::spawn_blocking(move || {
+                    session.send_keys_with_delay(&message, instance.send_keys_enter_delay())?;
+                    anyhow::Ok((native, instance))
+                })
+                .await??;
+                service.clear_pending_initial_turn(&instance.id).await;
+                tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+                    use crate::session::SessionStore;
+                    let _lifecycle = native
+                        .storage()
+                        .acquire_instance_lifecycle_lock(&instance.id)?;
+                    let recency = (&native as &dyn SessionStore).update(|rows, _| {
+                        let row = rows
+                            .iter_mut()
+                            .find(|row| row.id == instance.id)
+                            .ok_or(crate::session::SessionGone)?;
+                        anyhow::ensure!(
+                            row.created_at == instance.created_at
+                                && row.lifecycle_generation == instance.lifecycle_generation,
+                            crate::session::LifecycleReservationError::Superseded
+                        );
+                        row.last_accessed_at = Some(crate::time::Timestamp::now());
+                        Ok(())
+                    });
+                    if let Err(error) = recency {
+                        if error.is::<crate::session::SessionCommitApplied>()
+                            || !(error.is::<crate::session::SessionGone>()
+                                || error
+                                    .downcast_ref::<crate::session::LifecycleReservationError>()
+                                    == Some(&crate::session::LifecycleReservationError::Superseded))
+                        {
+                            return Err(error);
+                        }
                     }
-                }
-                Ok(revived)
+                    Ok(revived)
+                })
+                .await?
             })
             .await
             .map_err(anyhow::Error::from)
@@ -345,6 +361,8 @@ async fn send_terminal_message_inner(
 fn terminal_send_failure(state: &crate::server::AppState, error: anyhow::Error) -> SendKeysError {
     if let Some(blocked) = error.downcast_ref::<crate::session::StartBlocked>() {
         SendKeysError::Blocked(*blocked)
+    } else if error.is::<IgnoredSession>() {
+        SendKeysError::Ignored
     } else if error.is::<crate::session::SessionGone>() {
         SendKeysError::Gone
     } else if error.is::<TerminalNotRunning>() {
@@ -371,6 +389,10 @@ fn terminal_send_failure(state: &crate::server::AppState, error: anyhow::Error) 
 #[error("Terminal session is not running")]
 struct TerminalNotRunning;
 
+#[derive(Debug, thiserror::Error)]
+#[error("Session is ignored")]
+struct IgnoredSession;
+
 impl IntoResponse for TerminalSendError {
     fn into_response(self) -> axum::response::Response {
         let mut response = match self.error {
@@ -392,6 +414,11 @@ impl IntoResponse for TerminalSendError {
                 Json(serde_json::json!({"error": "acp_mode_unsupported"})),
             )
                 .into_response(),
+            SendKeysError::Ignored => crate::server::api::api_error(
+                StatusCode::CONFLICT,
+                "ignored",
+                "The session is ignored because another session manages it",
+            ),
             SendKeysError::Blocked(blocked) => crate::server::api::start_blocked_response(blocked),
             SendKeysError::Tmux(error) => {
                 tracing::warn!(target: "http.api.sessions", %error, "terminal send failed");
@@ -454,7 +481,7 @@ pub async fn send_message(
     }
 
     let revive = req.revive;
-    match send_terminal_message(&state.session_service, &id, req.message, revive).await {
+    match send_terminal_message(&state.session_service, &id, req.message, revive, false).await {
         Ok(_) => {
             tracing::info!(target: "session.lifecycle", session = %id, len, revive, "terminal message sent");
             match state.runtime.publish(&state).await {

@@ -115,6 +115,23 @@ pub struct WsHandle {
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(200);
 
 impl WsHandle {
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let (tx, rx) = mpsc::channel(1);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let token = shutdown.clone();
+        let task = tokio::spawn(async move {
+            token.cancelled().await;
+            drop(tx);
+        });
+        Self {
+            rx,
+            task,
+            _drop_guard: shutdown.clone().drop_guard(),
+            shutdown,
+        }
+    }
+
     pub async fn recv(&mut self) -> Option<Result<WsMessage, WsError>> {
         self.rx.recv().await
     }

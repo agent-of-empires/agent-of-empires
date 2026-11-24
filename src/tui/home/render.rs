@@ -1,6 +1,6 @@
 //! Rendering for HomeView
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
@@ -9,13 +9,13 @@ use std::time::{Duration, Instant};
 use rattles::presets::prelude as spinners;
 
 use super::bindings::ActionId;
+use super::update_bar::UpdateBar;
 use super::{
     get_indent, live_send, DragKind, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION,
     ICON_COLLAPSED, ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_FAVORITE,
     ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_TERMINAL, ICON_TRASH_SECTION, ICON_UNKNOWN,
     ICON_UNREAD,
 };
-use crate::containers::image_update::ImageUpdate;
 use crate::session::config::{GroupByMode, NarrowLayout, RowTagMode, SidebarPosition, SortOrder};
 use crate::session::{Item, Status};
 use crate::tui::components::preview::{self, CachedPreview};
@@ -25,12 +25,11 @@ use crate::tui::components::{
 };
 use crate::tui::responsive;
 use crate::tui::styles::{has_min_contrast, Theme};
-use crate::update::UpdateInfo;
 
 /// Derive a frame offset from a session's creation timestamp so that
 /// sessions started at different times show visually distinct spinner positions.
-fn session_offset(created_at: &DateTime<Utc>) -> usize {
-    created_at.timestamp_millis() as usize
+fn session_offset(created_at: &Timestamp) -> usize {
+    created_at.as_millis() as usize
 }
 
 /// Build the list-pane title. `prefix` is the leading label ("aoe", "Terminals",
@@ -405,21 +404,21 @@ fn clamp_scroll_to_capture(
     scroll_offset.min(real_max)
 }
 
-fn spinner_running(created_at: &DateTime<Utc>) -> &'static str {
+fn spinner_running(created_at: &Timestamp) -> &'static str {
     spinners::dots()
         .set_interval(Duration::from_millis(220))
         .offset(session_offset(created_at))
         .current_frame()
 }
 
-fn spinner_waiting(created_at: &DateTime<Utc>) -> &'static str {
+fn spinner_waiting(created_at: &Timestamp) -> &'static str {
     spinners::orbit()
         .set_interval(Duration::from_millis(400))
         .offset(session_offset(created_at))
         .current_frame()
 }
 
-fn spinner_starting(created_at: &DateTime<Utc>) -> &'static str {
+fn spinner_starting(created_at: &Timestamp) -> &'static str {
     spinners::breathe()
         .set_interval(Duration::from_millis(180))
         .offset(session_offset(created_at))
@@ -429,10 +428,7 @@ fn spinner_starting(created_at: &DateTime<Utc>) -> &'static str {
 /// Slow `breathe` rattle for a freshly-stopped Idle session, the same animation as
 /// Starting but slower and colored `theme.fresh_idle`, so it reads as a gentle reminder.
 /// The phase offset uses `idle_entered_at` so sessions don't all sync to one frame.
-fn spinner_idle_fresh(
-    created_at: &DateTime<Utc>,
-    idle_entered_at: Option<DateTime<Utc>>,
-) -> &'static str {
+fn spinner_idle_fresh(created_at: &Timestamp, idle_entered_at: Option<Timestamp>) -> &'static str {
     let offset_ts = idle_entered_at.unwrap_or(*created_at);
     spinners::breathe()
         .set_interval(Duration::from_millis(280))
@@ -440,8 +436,8 @@ fn spinner_idle_fresh(
         .current_frame()
 }
 
-/// Structured view row icon for a session. Centralizes the archive/snooze override that
-/// kills the live spinner for sunk rows so the list reads as parked. Crate-visible so
+/// Structured view row icon for a session. Centralizes the archive/snooze/ignore override
+/// that kills the live spinner for sunk rows so the list reads as parked. Crate-visible so
 /// tests can pin the override without the full render pipeline.
 pub(crate) fn agent_row_icon(inst: &crate::session::Instance) -> &'static str {
     // A dormant (idle-reaped, resumable) structured worker gets its own glyph, taking
@@ -465,7 +461,7 @@ pub(crate) fn agent_row_icon(inst: &crate::session::Instance) -> &'static str {
     if matches!(inst.status, Status::Error | Status::Deleting) {
         return icon;
     }
-    if inst.is_archived() || inst.is_snoozed() || inst.is_trashed() {
+    if inst.is_archived() || inst.is_snoozed() || inst.is_ignored() || inst.is_trashed() {
         ICON_STOPPED
     } else {
         icon
@@ -519,9 +515,9 @@ fn decorate_row(
         // is the textual cue, so this is a dim color with no italic modifier.
         icon = sunk_icon;
         style = Style::default().fg(theme.dimmed);
-    } else if in_attention && inst.is_snoozed() {
-        // Snooze decoration is Attention-only; elsewhere the row paints its real state
-        // and the timer keeps running.
+    } else if in_attention && (inst.is_snoozed() || inst.is_ignored()) {
+        // Snooze and ignore decoration is Attention-only; elsewhere the row paints its
+        // real state. Ignored rows stay present and live, unlike archive and trash.
         icon = sunk_icon;
         style = Style::default()
             .fg(theme.dimmed)
@@ -536,12 +532,15 @@ fn decorate_row(
             .add_modifier(Modifier::RAPID_BLINK);
     }
 
-    // Prefix priority: archive (none) > snooze (`z `) > urgent (`! `). Both are
-    // Attention-only so other sorts show no decoration for state the user did not opt into.
+    // Prefix priority: archive (none) > snooze (`z `) > ignore (`i `) > urgent (`! `).
+    // Snooze, ignore and urgent are Attention-only so other sorts show no decoration
+    // for state the user did not opt into.
     let title_text = if inst.is_archived() || inst.is_trashed() {
         Cow::Owned(inst.title.clone())
     } else if in_attention && inst.is_snoozed() {
         Cow::Owned(format!("z {}", inst.title))
+    } else if in_attention && inst.is_ignored() {
+        Cow::Owned(format!("i {}", inst.title))
     } else if in_attention && inst.is_urgent() {
         Cow::Owned(format!("! {}", inst.title))
     } else {
@@ -697,12 +696,17 @@ pub(crate) fn compute_row_tag(
     }
 }
 
+/// A single-repo branch tag that only repeats the session title is dropped.
 fn branch_row_tag(inst: &crate::session::Instance) -> Option<RowTag> {
     if let Some(ws) = &inst.workspace_info {
+        if ws.repos.len() <= 1 && ws.branch == inst.title {
+            return None;
+        }
         workspace_branch_row_tag(&ws.branch, ws.repos.len())
     } else {
         inst.worktree_info
             .as_ref()
+            .filter(|w| w.branch != inst.title)
             .and_then(|w| plain_branch_row_tag(&w.branch))
     }
 }
@@ -785,12 +789,12 @@ pub(crate) fn profile_short_code(profile: &str) -> String {
 
 /// Format a timestamp as a compact relative age (`3m`, `2h`, `4d`, `2mo`), empty for
 /// `None` so callers can substitute unconditionally.
-fn format_relative_age(ts: Option<DateTime<Utc>>) -> String {
+fn format_relative_age(ts: Option<Timestamp>) -> String {
     let Some(ts) = ts else {
         return String::new();
     };
-    let now = Utc::now();
-    let secs = (now - ts).num_seconds();
+    let now = Timestamp::now();
+    let secs = (now - ts).whole_seconds();
     if secs <= 0 {
         return "<1m".to_string();
     }
@@ -816,8 +820,8 @@ fn format_relative_age(ts: Option<DateTime<Utc>>) -> String {
 /// Format a remaining snooze as a compact countdown that fits `LAST_ACTIVITY_SLOT` (`23m`,
 /// `1h`, `5d`), falling back to `<1m` so a sub-minute remainder reads as "about to wake".
 /// The validator caps at 30 days, which the day branch covers.
-fn format_snooze_remaining(delta: chrono::Duration) -> String {
-    let secs = delta.num_seconds();
+fn format_snooze_remaining(delta: crate::time::Duration) -> String {
+    let secs = delta.whole_seconds();
     if secs < 60 {
         return "<1m".to_string();
     }
@@ -1055,9 +1059,7 @@ impl HomeView {
         frame: &mut Frame,
         area: Rect,
         theme: &Theme,
-        update_info: Option<&UpdateInfo>,
-        update_status: Option<&str>,
-        image_update: Option<&ImageUpdate>,
+        update_bar: Option<UpdateBar<'_>>,
     ) {
         if let Some(dialog) = &mut self.restart_dialog {
             let transport_available = self
@@ -1075,6 +1077,7 @@ impl HomeView {
         // Hidden bars and takeover views must not retain clickable regions.
         self.footer_buttons.clear();
         self.tips_badge_rect = None;
+        self.update_bar_drawn = false;
         if !self.show_shortcut_bar {
             self.footer_hover = None;
             self.tips_badge_hovered = false;
@@ -1195,8 +1198,7 @@ impl HomeView {
         let has_status_bar = self.show_shortcut_bar
             || self.status_flash_text().is_some()
             || (self.live_send.is_some() && self.live_send_pending_leader);
-        let has_update_bar =
-            update_info.is_some() || update_status.is_some() || image_update.is_some();
+        let has_update_bar = update_bar.is_some();
         let mut constraints = vec![Constraint::Min(0)];
         if last_prompt.is_some() {
             constraints.push(Constraint::Length(1)); // last-prompt footer
@@ -1234,8 +1236,8 @@ impl HomeView {
         // `one_pane` already gives the narrow screen to a single pane, so a collapsed
         // sidebar there would only shrink it to a three-column strip plus preview.
         let narrow_layout = self.narrow_layout;
-        let single_pane_narrow = available_width < responsive::STACKED_BREAKPOINT
-            && matches!(narrow_layout, NarrowLayout::OnePane);
+        let narrow = responsive::is_narrow(available_width, self.narrow_breakpoint);
+        let single_pane_narrow = narrow && matches!(narrow_layout, NarrowLayout::OnePane);
         // A collapsed strip leaves enough preview space even on narrow terminals.
         if self.sidebar_collapsed && !single_pane_narrow {
             self.divider_col = None;
@@ -1251,7 +1253,7 @@ impl HomeView {
             let strip_col = self.diagnostics_dock(frame, strip_area, theme);
             self.render_collapsed_strip(frame, strip_col, theme);
             self.render_preview(frame, preview_area, theme);
-        } else if available_width < responsive::STACKED_BREAKPOINT {
+        } else if narrow {
             self.divider_col = None;
             match responsive::narrow_arrangement(
                 narrow_layout,
@@ -1337,15 +1339,11 @@ impl HomeView {
             self.render_status_bar(frame, row, theme);
         }
 
-        if let Some(idx) = update_bar_idx {
-            self.render_update_bar(
-                frame,
-                main_chunks[idx],
-                theme,
-                update_info,
-                update_status,
-                image_update,
-            );
+        if let (Some(idx), Some(bar)) = (update_bar_idx, update_bar) {
+            let row = main_chunks[idx];
+            self.render_update_bar(frame, row, theme, bar);
+            // A terminal too small for every footer row can leave this one empty.
+            self.update_bar_drawn = !row.is_empty();
         }
 
         // Render dialogs on top
@@ -2081,6 +2079,7 @@ impl HomeView {
                             let unread_resting = crate::session::unread_enabled()
                                 && inst.is_unread()
                                 && !inst.is_archived()
+                                && !inst.is_ignored()
                                 && !inst.is_snoozed()
                                 && matches!(inst.status, Status::Idle | Status::Unknown);
                             let color = if is_shown_dormant && !unread_resting {
@@ -3307,7 +3306,7 @@ impl HomeView {
             );
             return;
         }
-        let compact = area.width < responsive::STACKED_BREAKPOINT;
+        let compact = responsive::is_narrow(area.width, self.narrow_breakpoint);
         let (border_color, title_color) = match self.view_mode {
             ViewMode::Structured => (theme.border, theme.title),
             ViewMode::Terminal | ViewMode::Tool(_) => {
@@ -4937,37 +4936,26 @@ impl HomeView {
         }
     }
 
-    fn render_update_bar(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        theme: &Theme,
-        info: Option<&UpdateInfo>,
-        status: Option<&str>,
-        image_update: Option<&ImageUpdate>,
-    ) {
+    fn render_update_bar(&self, frame: &mut Frame, area: Rect, theme: &Theme, bar: UpdateBar<'_>) {
         let update_style = Style::default().fg(theme.waiting).bold();
         // Pull the keys from the binding registry so these hints can't drift from the
         // dispatcher.
         let update_key = super::bindings::label(ActionId::Update, self.strict_hotkeys);
         let dismiss_key =
             super::bindings::label(ActionId::DismissUpdateBanner, self.strict_hotkeys);
-        // Precedence: transient status, app update, then sandbox-image update. Only one
-        // banner shows at a time so its keys are unambiguous; a lower-priority banner
-        // surfaces once the ones above clear.
-        let text = if let Some(s) = status {
-            format!(" {s}  [{dismiss_key}] dismiss")
-        } else if let Some(info) = info {
+        let text = match bar {
+            UpdateBar::Status(s) => format!(" {s}  [{dismiss_key}] dismiss"),
+            UpdateBar::Live(s) => format!(" {s}"),
             // Reassure users (#2220) that updating never tears down running sessions.
             // Kept after the keys so the action hints stay visible on narrow terminals.
-            format!(
+            UpdateBar::AppUpdate(info) => format!(
                 " update available {} → {}  [{update_key}] update  [{dismiss_key}] dismiss  ·  running sessions stay safe",
                 info.current_version, info.latest_version
-            )
-        } else if image_update.is_some() {
-            format!(" sandbox image update available  [u] pull  [{dismiss_key}] dismiss")
-        } else {
-            return;
+            ),
+            // The pull key is the Update binding: this line only shows with no AoE update pending.
+            UpdateBar::ImageUpdate(_) => {
+                format!(" sandbox image update available  [{update_key}] pull  [{dismiss_key}] dismiss")
+            }
         };
         let bar = Paragraph::new(Line::from(Span::styled(text, update_style)))
             .style(Style::default().bg(theme.selection));
@@ -5498,15 +5486,15 @@ mod tests {
 
     #[test]
     fn format_relative_age_buckets() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let cases = [
             (None, ""),
-            (Some(now + chrono::Duration::hours(1)), "<1m"),
-            (Some(now - chrono::Duration::seconds(30)), "<1m"),
-            (Some(now - chrono::Duration::minutes(5)), "5m"),
-            (Some(now - chrono::Duration::hours(3)), "3h"),
-            (Some(now - chrono::Duration::days(7)), "7d"),
-            (Some(now - chrono::Duration::days(60)), "2mo"),
+            (Some(now + crate::time::Duration::hours(1)), "<1m"),
+            (Some(now - crate::time::Duration::seconds(30)), "<1m"),
+            (Some(now - crate::time::Duration::minutes(5)), "5m"),
+            (Some(now - crate::time::Duration::hours(3)), "3h"),
+            (Some(now - crate::time::Duration::days(7)), "7d"),
+            (Some(now - crate::time::Duration::days(60)), "2mo"),
         ];
         for (ts, expected) in cases {
             assert_eq!(format_relative_age(ts), expected, "{ts:?}");
@@ -5691,7 +5679,7 @@ mod tests {
 
     #[test]
     fn row_age_only_on_resting_or_snoozed_rows() {
-        let five_min_ago = Some(Utc::now() - chrono::Duration::minutes(5));
+        let five_min_ago = Some(Timestamp::now() - crate::time::Duration::minutes(5));
         let mut inst = crate::session::Instance::new("a", "/tmp/a");
         inst.idle_entered_at = five_min_ago;
         inst.last_accessed_at = five_min_ago;
@@ -5757,6 +5745,24 @@ mod tests {
             rendered_width(&rendered),
             BRANCH_TAG_WIDTH + 2,
             "a wide branch name must cap at the tag contract, got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn branch_row_tag_is_dropped_when_it_repeats_the_title() {
+        let mut inst = crate::session::Instance::new("feat/x", "/tmp/a");
+        inst.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "feat/x".into(),
+            main_repo_path: "/tmp".into(),
+            managed_by_aoe: true,
+            created_at: crate::time::Timestamp::now(),
+            base_branch: None,
+        });
+        assert!(branch_row_tag(&inst).is_none());
+        inst.title = "Teutons".into();
+        assert_eq!(
+            branch_row_tag(&inst).map(|tag| tag.content),
+            Some("x".into())
         );
     }
 

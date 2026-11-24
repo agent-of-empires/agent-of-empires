@@ -46,9 +46,10 @@ pub(super) fn queued_prompt() -> crate::daemon::QueuedPromptEntry {
         seq: 1,
         text: "queued while busy".to_string(),
         attachments: Vec::new(),
-        created_at: chrono::Utc::now().to_rfc3339(),
+        created_at: crate::time::Timestamp::now().to_rfc3339(),
         origin_device: None,
         origin_plugin: None,
+        origin: crate::daemon::PromptOrigin::Unknown,
     }
 }
 
@@ -59,6 +60,7 @@ pub(super) struct Tick {
     pub(super) respawn_history: HashMap<String, Vec<Instant>>,
     pub(super) parked: HashSet<String>,
     pub(super) resume_deferred: HashMap<String, super::ResumeDeferral>,
+    pub(super) stop_notified: HashSet<String>,
 }
 
 impl Tick {
@@ -77,6 +79,7 @@ impl Tick {
             &mut self.respawn_history,
             &mut self.parked,
             &mut self.resume_deferred,
+            &mut self.stop_notified,
         )
         .await;
     }

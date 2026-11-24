@@ -37,16 +37,16 @@ pub use prompt::{
     acp_prompt_diff_comments, resolve_approval, resolve_elicitation,
 };
 pub(crate) use prompt::{submit_prompt, PromptSubmission, PromptSubmitError, PromptSubmitted};
-pub use view::{acp_disable, acp_enable};
+pub use view::{acp_disable, acp_enable, acp_terminal_check};
 pub(crate) use view::{
     publish_startup_error_if_current, recover_pending_terminal_handoffs, HandoffRecovery,
 };
-pub(in crate::server::api) use worker::rate_limit_resume_probe;
 pub(crate) use worker::restart_session_recovery;
 pub use worker::{
     get_option_catalog, list_acp_agents, restart_acp, shutdown_acp, spawn_acp, switch_acp_agent,
     switch_acp_provider,
 };
+pub(in crate::server::api) use worker::{rate_limit_resume_probe, restart_purge_conflict};
 
 /// Startup-error banner text for a failed detached structured-view spawn.
 /// `CapacityFull` is surfaced verbatim so the UI shows the capacity banner.
@@ -92,6 +92,7 @@ pub(super) fn supervisor_error_response(context: &str, err: &SupervisorError) ->
         ),
         SupervisorError::CapacityFull { .. }
         | SupervisorError::TeardownPending(_)
+        | SupervisorError::PurgeInProgress(_)
         | SupervisorError::EventStoreUnavailable(_)
         | SupervisorError::NativeStoreUnavailable
         | SupervisorError::RegistryBusy
@@ -216,6 +217,7 @@ pub(crate) fn spawn_request_for(
         fork_from: instance.fork_pending.clone(),
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
         sandbox_info,
+        workspace_info: instance.workspace_info.clone(),
         // Passed even without sandboxing so agent_acp_cmd and worker env
         // resolve from the session's profile.
         source_profile: Some(instance.source_profile.clone()),
@@ -254,6 +256,16 @@ async fn launch_store_for(
 fn launch_error_response(context: &str, error: &anyhow::Error) -> Response {
     if let Some(blocked) = error.downcast_ref::<crate::session::StartBlocked>() {
         return crate::server::api::start_blocked_response(*blocked);
+    }
+    if let Some(login) = error.downcast_ref::<crate::session::SandboxLoginRequired>() {
+        return crate::server::api::sandbox_login_required_response(login);
+    }
+    if let Some(unsupported) = error.downcast_ref::<crate::session::SandboxLoginUnsupported>() {
+        return crate::server::api::sandbox_login_unsupported_response(unsupported);
+    }
+    if let Some(hook) = error.downcast_ref::<crate::session::BeforeStartHookError>() {
+        // The hook's own failure, in fixed words; a switch queues nothing.
+        return crate::server::api::before_start_hook_failed_response(hook);
     }
     if error.is::<crate::session::SessionGone>() {
         return session_not_found();
@@ -469,6 +481,21 @@ mod tests {
         .await;
     }
 
+    #[test]
+    fn spawn_request_for_carries_the_workspace_layout() {
+        let instance = crate::server::test_support::workspace_instance(
+            "ws-spawn-request",
+            std::path::Path::new("/tmp/aoe-ws-spawn-request"),
+        );
+        let req = spawn_request_for(&instance, "claude".into(), None);
+        crate::server::test_support::assert_carries_workspace(
+            req.workspace_info.as_ref(),
+            &instance,
+            "spawn_request_for",
+        );
+        assert_eq!(req.cwd, PathBuf::from(&instance.project_path));
+    }
+
     #[tokio::test]
     async fn agent_exited_maps_to_the_retryable_status_not_a_fault() {
         let cases = [
@@ -537,7 +564,9 @@ mod tests {
                 .await
                 .into_response(),
                 "enable" => acp_enable(state_arg, id).await.into_response(),
-                _ => acp_disable(state_arg, id).await.into_response(),
+                _ => acp_disable(state_arg, id, Default::default())
+                    .await
+                    .into_response(),
             };
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{which}");
             assert!(state.instance_locks.read().await.is_empty(), "{which}");
@@ -778,7 +807,12 @@ mod tests {
                     vec![inst.clone()],
                 );
             }
-            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            // A real switch launch dials the host's `codex-acp`, if any, for up to 10s.
+            let (launcher, _) = crate::server::test_support::counting_failing_launcher();
+            let state = crate::server::test_support::build_test_app_state_with_launcher(
+                vec![inst],
+                launcher,
+            );
             crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
 
             let delivering = state.session_service.prompt_submission(&id).await;
@@ -799,7 +833,9 @@ mod tests {
                         )
                         .await
                         .into_response(),
-                        _ => acp_disable(state, id).await.into_response(),
+                        _ => acp_disable(state, id, Default::default())
+                            .await
+                            .into_response(),
                     }
                 }
             };
@@ -877,7 +913,7 @@ mod tests {
                 })
                 .unwrap();
 
-            let response = acp_disable(State(state.clone()), Path(id.clone()))
+            let response = acp_disable(State(state.clone()), Path(id.clone()), Default::default())
                 .await
                 .into_response();
             assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -941,7 +977,11 @@ mod tests {
                     });
                     entered_rx.await.unwrap();
                     let lock = state.instance_lock(&id).await;
-                    let mut handler = Box::pin(acp_disable(State(state.clone()), Path(id.clone())));
+                    let mut handler = Box::pin(acp_disable(
+                        State(state.clone()),
+                        Path(id.clone()),
+                        Default::default(),
+                    ));
                     std::future::poll_fn(|cx| {
                         assert!(handler.as_mut().poll(cx).is_pending());
                         Poll::Ready(())
@@ -1080,7 +1120,11 @@ mod tests {
             handler = Some(tokio::spawn({
                 let state = state.clone();
                 let id = id.clone();
-                async move { acp_disable(State(state), Path(id)).await.into_response() }
+                async move {
+                    acp_disable(State(state), Path(id), Default::default())
+                        .await
+                        .into_response()
+                }
             }));
             tokio::time::timeout(Duration::from_secs(2), contended_rx)
                 .await

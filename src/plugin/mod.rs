@@ -7,6 +7,9 @@ pub(crate) mod bundled_agents;
 pub mod changelog;
 pub mod contributions;
 pub mod discover;
+mod execution;
+pub(crate) const EXECUTION_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(2 * 60 * 60);
 pub mod featured;
 pub mod fetch;
 pub mod install;
@@ -21,10 +24,12 @@ pub mod worker_logs;
 pub(crate) mod automation_policy;
 pub mod host;
 pub mod host_api;
+pub mod mcp_rewrite;
 pub mod protocol;
 pub mod sandbox;
 pub mod session_api;
 pub mod ui_state;
+pub(crate) mod worker_requests;
 
 pub mod launch;
 

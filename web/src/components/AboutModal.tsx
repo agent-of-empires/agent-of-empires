@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useFocusTrap } from "../hooks/useFocusTrap";
 import { fetchAbout } from "../lib/api";
 import { writeClipboard } from "../lib/clipboard";
 import { reportError, reportInfo } from "../lib/toastBus";
@@ -68,17 +69,7 @@ export function AboutModal({ onClose, sessionId }: Props) {
   }, []);
 
   // Tab and Shift+Tab wrap instead of leaving for the dialogs behind.
-  const trapTab = (e: ReactKeyboardEvent) => {
-    if (e.key !== "Tab") return;
-    const items = dialogRef.current?.querySelectorAll<HTMLElement>("button:not([disabled]), a[href]");
-    const first = items?.[0];
-    const last = items?.[items.length - 1];
-    const wrapTo = e.shiftKey ? document.activeElement === first && last : document.activeElement === last && first;
-    if (wrapTo) {
-      e.preventDefault();
-      wrapTo.focus();
-    }
-  };
+  useFocusTrap(() => dialogRef.current);
 
   return (
     <div
@@ -86,7 +77,6 @@ export function AboutModal({ onClose, sessionId }: Props) {
       role="dialog"
       aria-modal="true"
       aria-labelledby="about-modal-title"
-      onKeyDown={trapTab}
       className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 animate-fade-in"
       onClick={onClose}
     >

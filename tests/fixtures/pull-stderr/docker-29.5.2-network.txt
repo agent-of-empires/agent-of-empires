@@ -1,0 +1,6 @@
+# runtime: docker 29.5.2
+# command: docker pull aoe-capture.invalid/aoe-capture-1794863764/none:latest
+# captured: 2026-11-16T21:16:04Z
+# exit and stderr follow
+Error response from daemon: failed to resolve reference "aoe-capture.invalid/aoe-capture-1794863764/none:latest": failed to do request: Head "https://aoe-capture.invalid/v2/aoe-capture-1794863764/none/manifests/latest": dial tcp: lookup aoe-capture.invalid on 192.168.5.1:53: no such host
+# exit: 1

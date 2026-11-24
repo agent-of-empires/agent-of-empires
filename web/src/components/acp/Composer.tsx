@@ -94,6 +94,8 @@ interface Props {
   canSubmit: boolean;
   /** For a Session that has never started: the Agent it waits for. */
   waitingFor?: string | null;
+  /** Why nothing may be sent; shown as the placeholder while typing and sending are off. */
+  blockedReason?: string | null;
   /** The Worker is running; only the connection is down. */
   connecting?: boolean;
   /** Mid-turn the textarea stays editable and sends go through the queue. */
@@ -167,11 +169,12 @@ export function Composer(props: Props) {
       if (compositionControlRef.current === control) compositionControlRef.current = null;
     };
   }, [invalidateReads, loadText, compositionControlRef, applyRecall, captureOwnership]);
-  const canSend = canSubmit && (composerText.trim().length > 0 || attachments.supported.length > 0);
+  const canSend =
+    canSubmit && !props.blockedReason && (composerText.trim().length > 0 || attachments.supported.length > 0);
   const provider = useProviderSwitch(sessionId, props.currentAgent, props.currentProvider);
 
   const submitComposer = useCallback(() => {
-    if (!canSubmit) return;
+    if (!canSubmit || props.blockedReason) return;
     const cur = recall.recallRef.current;
     if (cur && !props.operationRetryActive) {
       recall.applyRecall(null);
@@ -330,12 +333,14 @@ export function Composer(props: Props) {
               unstable_insertNewlineOnTouchEnter
               // Cancel stays behind the Stop button; a stray Escape must not abort a turn.
               cancelOnEscape={false}
+              disabled={!!props.blockedReason}
               placeholder={
-                turnActive
+                props.blockedReason ??
+                (turnActive
                   ? connected && promptCapabilities?.steering
                     ? "Add to the current turn… (the agent picks it up mid-work)"
                     : "Queue a follow-up… (sent when current turn ends)"
-                  : "Send a message…  Type @ for files, / for commands"
+                  : "Send a message…  Type @ for files, / for commands")
               }
               onInput={(e) => fitTextarea(e.currentTarget)}
               onFocus={() => {

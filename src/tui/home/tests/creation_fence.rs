@@ -32,19 +32,19 @@ fn saving_during_creation_never_persists_the_display_placeholder() {
     let creations = crate::session::config::AppStateConfig::load()
         .unwrap()
         .sessions_created;
-    view.reload().unwrap();
+    view.reload();
     assert!(!storage.load().unwrap().iter().any(|row| row.id == stub));
     assert!(
         view.get_instance(&stub).is_some(),
         "saving must preserve the pending display"
     );
-    view.reload().unwrap();
+    view.reload();
     assert!(
         view.get_instance(&stub).is_some(),
         "reload must preserve the pending display"
     );
     view.cancel_creation();
-    view.reload().unwrap();
+    view.reload();
     assert_eq!(payload_bytes("default"), before);
     assert!(!storage.load().unwrap().iter().any(|row| row.id == stub));
     assert!(view.get_instance(&stub).is_none());
@@ -480,7 +480,7 @@ fn retrying_a_snapshot_preserves_one_creation_stub_and_never_resubmits_or_cancel
     existing.source_profile = "default".into();
     existing.status = Status::Idle;
     seed_profile("default", std::slice::from_ref(&existing));
-    view.reload().unwrap();
+    view.reload();
     view.session_feed.publish_for_test(creation_snapshot(
         vec![crate::server::api::sessions::session_response_from_instance(&existing, false)],
         "test",
@@ -860,7 +860,31 @@ fn a_resubmit_reviews_trust_again_once_the_hooks_change() {
                 .as_ref()
                 .map(|d| d.title.as_str());
             assert_eq!(kept, Some("Hooked"), "{change}");
+            // An answer refused before it is sent returns to the setup-failed dialog,
+            // with the request, its new review and the Create-without-setup choice.
+            view.session_feed.set_mutation_permission_for_test(false);
             view.handle_key(key(KeyCode::Char('y')), None);
+            let (_, now) = creation_trust_review(&data()).unwrap();
+            let kept = view.create_hook_failed.as_ref().map(|(_, r)| {
+                (
+                    r.data.title.clone(),
+                    r.trust_review.clone(),
+                    r.skip_on_create,
+                )
+            });
+            assert_eq!(
+                kept,
+                Some((
+                    "Hooked".to_string(),
+                    Some(now),
+                    key_code == KeyCode::Char('s')
+                )),
+                "{change}"
+            );
+            view.handle_key(key(KeyCode::Esc), None);
+            view.session_feed.set_mutation_permission_for_test(true);
+            view.handle_key(key(key_code), None);
+            assert!(view.create_hook_failed.is_none(), "{change}");
         }
         let second = fail(CommandFailure::Rejected("done".into()));
         let (_, now) = creation_trust_review(&data()).unwrap();

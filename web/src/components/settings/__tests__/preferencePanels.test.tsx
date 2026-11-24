@@ -37,29 +37,14 @@ describe("DiffSettings localStorage contract", () => {
 });
 
 describe("PanelsSettings localStorage contract", () => {
-  it("editing and plugins default off; each preference writes its own key", () => {
+  it("file editing defaults off and writes its own key", () => {
     const { container } = render(<PanelsSettings />);
-    const [editing, diff, terminal, plugins] = boxes(container);
-    expect(boxes(container)).toHaveLength(4);
+    const [editing] = boxes(container);
+    expect(boxes(container)).toHaveLength(1);
     expect(editing!.checked).toBe(false);
     fireEvent.click(editing!);
     expect(readStored().fileEditing).toBe(true);
     fireEvent.click(editing!);
     expect(readStored().fileEditing).toBe(false);
-    expect([diff!.checked, terminal!.checked, plugins!.checked]).toEqual([true, true, false]);
-
-    fireEvent.click(diff!);
-    expect(readStored().autoOpenDiffPane).toBe(false);
-    expect(readStored().autoOpenTerminalPane).not.toBe(false);
-    expect(readStored().autoOpenPluginPanes).toBe(false);
-
-    fireEvent.click(terminal!);
-    expect(readStored().autoOpenTerminalPane).toBe(false);
-
-    fireEvent.click(plugins!);
-    expect(readStored().autoOpenPluginPanes).toBe(true);
-
-    fireEvent.click(diff!);
-    expect(readStored().autoOpenDiffPane).toBe(true);
   });
 });

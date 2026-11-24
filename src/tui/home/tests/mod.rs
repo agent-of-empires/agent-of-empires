@@ -435,7 +435,7 @@ fn render_geometry(view: &mut HomeView) {
     terminal
         .draw(|f| {
             let area = f.area();
-            view.render(f, area, &theme, None, None, None);
+            view.render(f, area, &theme, None);
         })
         .unwrap();
 }
@@ -932,7 +932,7 @@ fn render_home_to_string(view: &mut HomeView, width: u16, height: u16) -> String
     terminal
         .draw(|f| {
             let area = f.area();
-            view.render(f, area, &theme, None, None, None);
+            view.render(f, area, &theme, None);
         })
         .unwrap();
     let buf = terminal.backend().buffer().clone();
@@ -1149,7 +1149,7 @@ fn with_canonical_group_archive(env: &mut TestEnv, action: impl FnOnce(&mut Test
 /// Publish the view's rows with the daemon's archive stamps for this commit.
 fn publish_canonical_rows(env: &mut TestEnv, stamps: &[(String, bool)], revision: u64) {
     use crate::tui::session_feed::SessionFeedResult;
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = crate::time::Timestamp::now().to_rfc3339();
     let sessions = env
         .view
         .instances()

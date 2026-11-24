@@ -60,13 +60,20 @@ const LEGACY_REPO_CONFIG_PATH: &str = ".aoe/config.toml";
 /// macOS/Windows, where the app dir is `~/.agent-of-empires`). Directories are
 /// compared canonicalized because the save target need not exist yet.
 fn resolves_to_global_config(candidate: &Path) -> bool {
+    resolves_to_global_config_in(candidate, None)
+}
+
+/// [`resolves_to_global_config`] with the candidate's canonical directory, when already read.
+fn resolves_to_global_config_in(candidate: &Path, canonical_dir: Option<&Path>) -> bool {
     let Ok(app_dir) = crate::session::get_app_dir_path() else {
         return false;
     };
-    candidate.file_name() == Some("config.toml".as_ref())
-        && candidate
-            .parent()
-            .is_some_and(|dir| normalize_path(dir) == normalize_path(&app_dir))
+    let dir = match (canonical_dir, candidate.parent()) {
+        (Some(dir), _) => dir.to_string_lossy().to_string(),
+        (None, Some(dir)) => normalize_path(dir),
+        (None, None) => return false,
+    };
+    candidate.file_name() == Some("config.toml".as_ref()) && dir == normalize_path(&app_dir)
 }
 
 /// The file [`load_repo_config`] reads: `.agent-of-empires/config.toml`, else
@@ -85,31 +92,29 @@ fn resolved_repo_config_path(project_path: &Path) -> Option<PathBuf> {
 /// Loads `.agent-of-empires/config.toml`, falling back to the legacy
 /// `.aoe/config.toml`. `None` when absent, empty, or for the empty (scratch) path.
 pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
+    load_repo_config_via(project_path, &super::read_file)
+}
+
+fn load_repo_config_via(project_path: &Path, read: super::ReadFile) -> Result<Option<RepoConfig>> {
     // An empty path would resolve relative to the launch directory.
     if project_path.as_os_str().is_empty() {
         return Ok(None);
     }
     let config_path = project_path.join(REPO_CONFIG_PATH);
-    let (config_path, is_legacy) = match fs::symlink_metadata(&config_path) {
-        Ok(_) => (config_path, false),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    let absent =
+        |file: &super::FileRead| file.content == Err((std::io::ErrorKind::NotFound, false));
+    let (config_path, is_legacy, file) = match read(&config_path) {
+        primary if absent(&primary) => {
             let legacy_path = project_path.join(LEGACY_REPO_CONFIG_PATH);
-            match fs::symlink_metadata(&legacy_path) {
-                Ok(_) => (legacy_path, true),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("Failed to inspect {}", legacy_path.display()))
-                }
+            match read(&legacy_path) {
+                legacy if absent(&legacy) => return Ok(None),
+                legacy => (legacy_path, true, legacy),
             }
         }
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("Failed to inspect {}", config_path.display()))
-        }
+        primary => (config_path, false, primary),
     };
 
-    if resolves_to_global_config(&config_path) {
+    if resolves_to_global_config_in(&config_path, file.dir.as_deref()) {
         tracing::debug!(target: "session.store",
             path = %config_path.display(),
             "Skipping repo config: this project path resolves to the global config.toml"
@@ -122,7 +127,10 @@ pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
         );
     }
 
-    let content = fs::read_to_string(&config_path)
+    let content = file
+        .content
+        .map_err(|(kind, _)| anyhow::Error::from(std::io::Error::from(kind)))
+        .and_then(|bytes| Ok(String::from_utf8(bytes.to_vec())?))
         .with_context(|| format!("Failed to read {}", config_path.display()))?;
     if content.trim().is_empty() {
         return Ok(None);
@@ -282,16 +290,19 @@ pub fn profile_to_repo_config(profile: &ProfileConfig) -> RepoConfig {
 /// Worktree sessions read repo config from the main repo. Only probed when the
 /// path itself has `.git`, so discovery never walks up into an unrelated repo.
 pub fn repo_config_source_path(project_path: &Path) -> PathBuf {
+    discover_repo_config_source(project_path).unwrap_or_else(|| project_path.to_path_buf())
+}
+
+/// [`repo_config_source_path`], or `None` when `.git` exists but its repo cannot be opened.
+pub(crate) fn discover_repo_config_source(project_path: &Path) -> Option<PathBuf> {
     // The empty (scratch) path would probe the launch directory.
     if project_path.as_os_str().is_empty() {
-        return PathBuf::new();
+        return Some(PathBuf::new());
     }
     if project_path.join(".git").exists() {
-        if let Ok(main_repo) = crate::git::GitWorktree::find_main_repo(project_path) {
-            return main_repo;
-        }
+        return crate::git::GitWorktree::find_main_repo(project_path).ok();
     }
-    project_path.to_path_buf()
+    Some(project_path.to_path_buf())
 }
 
 /// Global, then profile, then repo; CityHall overrides are re-pinned last.
@@ -308,15 +319,28 @@ pub fn resolve_config_with_repo(profile: &str, project_path: &Path) -> Result<Co
 /// Like [`resolve_config_with_repo`], degrading a bad repo config to the
 /// profile config and a bad profile config to defaults.
 pub fn resolve_config_with_repo_or_warn(profile: &str, project_path: &Path) -> Config {
-    let base = profile_config::resolve_config_or_warn(profile);
-    let config_path = repo_config_source_path(project_path);
-    let mut merged = match load_repo_config(&config_path) {
+    resolve_config_with_repo_source_or_warn(
+        profile,
+        &repo_config_source_path(project_path),
+        &super::read_file,
+    )
+}
+
+/// [`resolve_config_with_repo_or_warn`] for an already discovered repo config
+/// source, reading every config file through `read`.
+pub(crate) fn resolve_config_with_repo_source_or_warn(
+    profile: &str,
+    source: &Path,
+    read: super::ReadFile,
+) -> Config {
+    let base = profile_config::resolve_config_or_warn_via(profile, read);
+    let mut merged = match load_repo_config_via(source, read) {
         Ok(Some(repo_config)) => merge_repo_config(base, &repo_config),
         Ok(None) => base,
         Err(e) => {
             tracing::warn!(target: "session.store",
                 "Failed to load repo config at '{}', falling back to profile config: {e}",
-                config_path.display()
+                source.display()
             );
             base
         }
@@ -407,6 +431,57 @@ mod tests {
         let allowed = repo.allowed_overrides();
         for section in ["host_hooks", "tmux", "sound"] {
             assert!(allowed.get(section).is_none(), "{section}");
+        }
+    }
+
+    /// The session config cache stores a resolve under the bytes it fingerprinted (#5665),
+    /// so every config file must come through `read`, none from disk.
+    #[test]
+    #[serial_test::serial]
+    fn resolve_with_repo_source_reads_only_through_the_reader() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        let repo = tempfile::tempdir().unwrap();
+        let global = crate::session::config::config_path().unwrap();
+        let repo_config = repo.path().join(REPO_CONFIG_PATH);
+        let read = |path: &Path| super::super::FileRead {
+            dir: None,
+            content: if path == global {
+                Ok(b"[acp]\nstructured_view = \"off\"\n".as_slice().into())
+            } else if path == repo_config {
+                Ok(b"[worktree]\nauto_cleanup = false\n".as_slice().into())
+            } else {
+                Err((std::io::ErrorKind::NotFound, false))
+            },
+        };
+
+        let config = resolve_config_with_repo_source_or_warn("default", repo.path(), &read);
+
+        assert_eq!(
+            config.acp.structured_view,
+            super::super::StructuredView::Off
+        );
+        assert!(!config.worktree.auto_cleanup);
+    }
+
+    /// The global-config exclusion follows the directory the read recorded, so a cache that
+    /// fingerprints it notices a retargeted directory link.
+    #[test]
+    #[serial_test::serial]
+    fn repo_config_is_skipped_only_when_its_read_dir_is_the_app_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        let app_dir = std::fs::canonicalize(crate::session::get_app_dir().unwrap()).unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        for (dir, skipped) in [(app_dir.clone(), true), (repo.path().to_path_buf(), false)] {
+            let read = |_: &Path| super::super::FileRead {
+                dir: Some(dir.clone()),
+                content: Ok(b"[session.agent_detect_as]\nx = \"claude\"\n"
+                    .as_slice()
+                    .into()),
+            };
+            let loaded = load_repo_config_via(repo.path(), &read).unwrap();
+            assert_eq!(loaded.is_none(), skipped, "{}", dir.display());
         }
     }
 
@@ -531,6 +606,7 @@ mod tests {
             ("sandbox", "default_image", false),
             ("sandbox", "container_runtime", false),
             ("sandbox", "selinux_relabel", false),
+            ("sandbox", "shared_credential", false),
             ("sandbox", "privileged", false),
             ("sandbox", "cap_add", false),
             ("sandbox", "cap_drop", false),
@@ -599,15 +675,18 @@ mod tests {
             memory_limit = "16g"
             cpu_limit = "8"
             volume_ignores = ["node_modules"]
+            shared_credential = "host_seed"
         "#,
         )
         .unwrap();
         let mut base = Config::default();
         base.sandbox.environment = vec!["USER_KEY=$USER_KEY".to_string()];
+        base.sandbox.shared_credential =
+            crate::session::config::SharedCredentialMode::SeparateLogin;
         let merged = merge_repo_config(base, &repo);
         let sb = &merged.sandbox;
         assert!(!sb.enabled_by_default);
-        assert_ne!(sb.default_image, "attacker/img");
+        assert_eq!(sb.default_image, None);
         assert_eq!(sb.environment, vec!["USER_KEY=$USER_KEY"]);
         assert!(sb.extra_volumes.is_empty() && !sb.mount_ssh && !sb.selinux_relabel);
         assert!(!sb.privileged && sb.cap_add.is_empty());
@@ -615,6 +694,10 @@ mod tests {
         assert_eq!(sb.memory_limit.as_deref(), Some("16g"));
         assert_eq!(sb.cpu_limit.as_deref(), Some("8"));
         assert_eq!(sb.volume_ignores, vec!["node_modules"]);
+        assert_eq!(
+            sb.shared_credential,
+            crate::session::config::SharedCredentialMode::SeparateLogin
+        );
         assert_eq!(
             rejected(&repo),
             vec![
@@ -629,6 +712,7 @@ mod tests {
                 "sandbox.privileged",
                 "sandbox.security_opt",
                 "sandbox.selinux_relabel",
+                "sandbox.shared_credential",
             ]
         );
     }
@@ -644,12 +728,14 @@ mod tests {
                 "auto_cleanup": false,
             },
             "updates": { "auto_update_plugins": true },
+            "session": { "plugin_staging_sandbox": false },
         }));
         let mut base = Config::default();
         base.worktree.enabled = false;
         base.worktree.path_template = "./wt/{branch}".to_string();
         base.worktree.bare_repo_path_template = "../{branch}".to_string();
         base.worktree.workspace_path_template = "../ws/{branch}".to_string();
+        base.session.plugin_staging_sandbox = true;
         let merged = merge_repo_config(base, &repo);
         assert!(!merged.worktree.enabled);
         assert_eq!(merged.worktree.path_template, "./wt/{branch}");
@@ -657,9 +743,11 @@ mod tests {
         assert_eq!(merged.worktree.workspace_path_template, "../ws/{branch}");
         assert!(!merged.worktree.auto_cleanup);
         assert!(!merged.updates.auto_update_plugins);
+        assert!(merged.session.plugin_staging_sandbox);
         assert_eq!(
             rejected(&repo),
             vec![
+                "session.plugin_staging_sandbox",
                 "updates.auto_update_plugins",
                 "worktree.bare_repo_path_template",
                 "worktree.enabled",

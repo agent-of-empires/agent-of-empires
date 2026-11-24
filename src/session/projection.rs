@@ -3,7 +3,7 @@
 //! Borrowed and typed so each surface formats timestamps and names fields to
 //! its own contract without a second derivation from the `Instance`.
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 
 use super::{Instance, SessionBucket, Status, WorkspaceRepo, WorktreeInfo};
 
@@ -136,7 +136,7 @@ impl SessionRecovery {
             && row.ensure_startable().is_ok()
             && row.terminal_handoff.is_none()
             && row.launch_is_finalized()
-            && !row.has_fresh_lifecycle_reservation(Utc::now())
+            && !row.has_fresh_lifecycle_reservation(Timestamp::now())
             && !matches!(
                 row.status,
                 Status::Creating | Status::Deleting | Status::Starting
@@ -416,16 +416,17 @@ pub(crate) struct SessionProjection<'a> {
     pub profile: &'a str,
     pub status: Status,
     pub bucket: SessionBucket,
-    pub created_at: DateTime<Utc>,
-    pub last_accessed_at: Option<DateTime<Utc>>,
-    pub idle_entered_at: Option<DateTime<Utc>>,
+    pub created_at: Timestamp,
+    pub last_accessed_at: Option<Timestamp>,
+    pub idle_entered_at: Option<Timestamp>,
     pub last_error: Option<&'a str>,
     pub last_error_evidence: Option<super::OperationErrorEvidence>,
     pub recovery: Option<SessionRecovery>,
-    pub archived_at: Option<DateTime<Utc>>,
-    pub trashed_at: Option<DateTime<Utc>>,
-    pub active_snoozed_until: Option<DateTime<Utc>>,
-    pub pinned_at: Option<DateTime<Utc>>,
+    pub archived_at: Option<Timestamp>,
+    pub ignored_at: Option<Timestamp>,
+    pub trashed_at: Option<Timestamp>,
+    pub active_snoozed_until: Option<Timestamp>,
+    pub pinned_at: Option<Timestamp>,
     pub agent_session_id: Option<&'a str>,
     pub parent_session_id: Option<&'a str>,
     pub worktree: Option<&'a WorktreeInfo>,
@@ -479,6 +480,7 @@ impl<'a> SessionProjection<'a> {
             parent_session_id: inst.parent_session_id.as_deref(),
             worktree: inst.worktree_info.as_ref(),
             workspace_repos: inst.all_repos(),
+            ignored_at: inst.ignored_at,
         }
     }
 
@@ -549,7 +551,7 @@ mod recovery_tests {
         let mut row = Instance::new("unknown recovery", "/tmp/project");
         row.agent_session_id = Some("raw-id".into());
         row.status = Status::Error;
-        row.last_error = Some("operation failed".into());
+        row.last_error.set("operation failed");
         let mut evidence = OperationErrorEvidence::new(
             ErrorEvidenceSource::LocalPromptResult,
             ErrorOperation::Prompt,

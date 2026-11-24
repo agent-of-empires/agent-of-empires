@@ -646,8 +646,8 @@ pub(super) fn blocking_io<T>(f: impl FnOnce() -> T) -> T {
 /// Reset time a fresh rejection inherits from the previous one, while still ahead of `now`.
 fn inheritable_rate_limit_reset(
     previous: Option<RateLimitInfo>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Option<chrono::DateTime<chrono::Utc>> {
+    now: crate::time::Timestamp,
+) -> Option<crate::time::Timestamp> {
     previous?.resets_at.filter(|resets_at| *resets_at > now)
 }
 
@@ -774,7 +774,7 @@ impl Persister {
                             None
                         }
                     },
-                    chrono::Utc::now(),
+                    crate::time::Timestamp::now(),
                 )
                 .map(|resets_at| {
                     Arc::new(Event::RateLimit {
@@ -1092,8 +1092,8 @@ mod tests {
 
     #[test]
     fn inheritable_reset_takes_only_a_future_previous_reset() {
-        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("now");
-        let future = now + chrono::Duration::hours(2);
+        let now = crate::time::Timestamp::from_unix_secs(1_800_000_000).expect("now");
+        let future = now + crate::time::Duration::hours(2);
         let info = |resets_at| RateLimitInfo {
             status: "usage limit reached".into(),
             resets_at,
@@ -1104,7 +1104,10 @@ mod tests {
             Some(future)
         );
         assert_eq!(
-            inheritable_rate_limit_reset(Some(info(Some(now - chrono::Duration::minutes(1)))), now),
+            inheritable_rate_limit_reset(
+                Some(info(Some(now - crate::time::Duration::minutes(1)))),
+                now
+            ),
             None
         );
         assert_eq!(inheritable_rate_limit_reset(Some(info(None)), now), None);
@@ -1120,7 +1123,7 @@ mod tests {
         };
         use crate::acp::state::NativeEventOrigin;
         let (sink, event_store, _rx, _tmp) = channel_sink();
-        let resets_at = chrono::Utc::now() + chrono::Duration::hours(3);
+        let resets_at = crate::time::Timestamp::now() + crate::time::Duration::hours(3);
         let info = |resets_at| RateLimitInfo {
             status: "usage limit reached".into(),
             resets_at,

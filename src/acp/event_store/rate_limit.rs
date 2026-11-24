@@ -185,14 +185,16 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON;
-    use chrono::Utc;
+    use crate::time::Timestamp;
     use ControlKnowledge::{Indeterminate, Known};
 
     fn rate_limit_event(secs_until_reset: i64) -> Event {
         Event::RateLimit {
             info: RateLimitInfo {
                 status: "usage limit reached".into(),
-                resets_at: Some(Utc::now() + chrono::Duration::seconds(secs_until_reset)),
+                resets_at: Some(
+                    Timestamp::now() + crate::time::Duration::seconds(secs_until_reset),
+                ),
                 kind: "rate_limit".into(),
             },
         }
@@ -200,7 +202,7 @@ mod tests {
 
     fn resume(manual: bool) -> Event {
         Event::RateLimitAutoResumed {
-            resets_at: Utc::now(),
+            resets_at: Timestamp::now(),
             manual,
         }
     }
@@ -358,6 +360,7 @@ mod tests {
                     attachments: vec![attachment.clone()],
                     synthesized: false,
                     origin_plugin: None,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 },
                 "image",
                 vec![attachment],
@@ -400,7 +403,7 @@ mod tests {
     #[test]
     fn latest_quota_is_result_option_and_preserves_recording_time() {
         let (_tmp, store) = open_store(0);
-        let before = Utc::now().timestamp_millis();
+        let before = Timestamp::now().as_millis();
         let latest = rate_limit_event(120);
         let Event::RateLimit { info: expected } = &latest else {
             unreachable!()
@@ -418,7 +421,7 @@ mod tests {
                 latest,
             ],
         );
-        let after = Utc::now().timestamp_millis();
+        let after = Timestamp::now().as_millis();
         let (info, at) = store
             .latest_rate_limit_event("s")
             .unwrap()

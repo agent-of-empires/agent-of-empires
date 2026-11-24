@@ -238,6 +238,22 @@ describe("canonical session receipts", () => {
     expect(result.current.observedById.A).toEqual(cursor(13n));
   });
 
+  it("keeps the polled queue reason across row updates until the next poll drops it", async () => {
+    const queued = envelope(["A"]);
+    queued.sessions[0]!.queue_reason = "compacting";
+    vi.mocked(fetchSessions).mockResolvedValueOnce(queued);
+    const { result } = renderHook(() => useSessions());
+    await settle();
+    const row = result.current.sessions[0]!;
+    const { queue_reason: _, ...bare } = row;
+    act(() => result.current.applySession({ ...bare, color: "green" }));
+    act(() => result.current.applySessionMutation({ session: { ...bare, color: "red" }, cursor: cursor(11n) }));
+    expect(result.current.sessions[0]).toMatchObject({ color: "red", queue_reason: "compacting" });
+    vi.mocked(fetchSessions).mockResolvedValueOnce(envelope(["A"], 12n));
+    await settle(GAP);
+    expect(result.current.sessions[0]!.queue_reason).toBeUndefined();
+  });
+
   it("restarts epochs explicitly, drops abandoned responses, and removes observations for deleted ids", async () => {
     vi.mocked(fetchSessions).mockResolvedValueOnce(envelope(["A", "B"], 100n, "old"));
     const { result } = renderHook(() => useSessions());

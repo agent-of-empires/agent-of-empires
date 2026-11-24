@@ -4,7 +4,7 @@ AoE forwards your configured [MCP](https://modelcontextprotocol.io) servers to s
 
 ## Configuration
 
-Create `mcp.json` in the AoE app directory (`$XDG_CONFIG_HOME/agent-of-empires/mcp.json` on Linux, `~/.agent-of-empires/mcp.json` otherwise). It uses the standard `mcpServers` shape for the fields AoE forwards:
+Manage AoE-owned servers with `aoe mcp add`, `aoe mcp edit` and `aoe mcp remove` (see the [CLI reference](../cli/reference.md#aoe-mcp)), or edit `mcp.json` directly. Create `mcp.json` in the AoE app directory (`$XDG_CONFIG_HOME/agent-of-empires/mcp.json` on Linux, `~/.agent-of-empires/mcp.json` otherwise). It uses the standard `mcpServers` shape for the fields AoE forwards:
 
 ```json
 {
@@ -25,7 +25,7 @@ Create `mcp.json` in the AoE app directory (`$XDG_CONFIG_HOME/agent-of-empires/m
 
 Each entry is **stdio** (the default; `command` required, `args` and `env` optional), **http**, or **sse** (`url` required, `headers` optional). The same list is forwarded for fresh and resumed sessions, but only the agent-native layer of a resumed conversation is read from the store it recorded rather than from the current entry.
 
-For remote servers, AoE expands `${NAME}` in header values from the effective session environment (profile environment and `before_session` hook values), then forwards the resulting URL and headers through ACP. It does not inherit the daemon environment wholesale. Sandboxed sessions pass no host environment to this expansion step, so their references remain unresolved. If a reference is missing, AoE logs only the server, header, and variable names; an unresolved `Authorization` header is omitted so the receiving agent can use URL-based auth, while unresolved non-Authorization placeholders remain literal. Project-local `.mcp.json` headers are not expanded because repo trust review shows header names, not referenced environment variables; the server remains configured and its unresolved `Authorization` header is omitted.
+For remote servers, AoE expands `${NAME}` in header values from the effective session environment (profile environment and `before_session` hook values), then forwards the resulting URL and headers through ACP. It does not inherit the daemon environment wholesale. Sandboxed sessions pass no host environment to this expansion step, so their references remain unresolved. Sandboxed sessions also never receive servers on a loopback host or the daemon's own address, or carrying the daemon token (see [Controlling AoE over MCP](mcp-control.md)). If a reference is missing, AoE logs only the server, header, and variable names; an unresolved `Authorization` header is omitted so the receiving agent can use URL-based auth, while unresolved non-Authorization placeholders remain literal. Project-local `.mcp.json` headers are not expanded because repo trust review shows header names, not referenced environment variables; the server remains configured and its unresolved `Authorization` header is omitted.
 
 ACP has no field for an MCP server's OAuth grant, refresh token, or credential-store reference, so AoE does not transfer OAuth credentials from a native CLI config or store. The receiving agent may authenticate independently; otherwise configure a valid static header (for example, `Authorization: Bearer <token>`).
 
@@ -42,6 +42,10 @@ agent-native  <  mcp.json (global)  <  profile mcp.json  <  project-local .mcp.j
 - **Project-local `.mcp.json`** at the repository root is highest, but only after you trust the repo (see below).
 
 Each override is logged.
+
+## Rewriting the forwarded set
+
+A plugin holding the `mcp.rewrite` capability can drop and replace servers per session, usually to route host credentials through a gateway instead of handing them to a sandbox. The hook is documented in [Plugin API](../plugin-api.md#hooks). AoE does not copy host MCP definitions into a Claude sandbox's agent store (`.mcp.json` files inside the copied Claude `plugins/` directory are copied as they are), but other agents' MCP-bearing config files are still copied into their sandbox stores verbatim, so the hook alone does not keep host MCP secrets out of those sandboxes.
 
 ## Project-local servers need repo trust
 
@@ -63,7 +67,9 @@ aoe mcp list --json
 
 Each row shows the server name, transport, its winning provenance (`agent-native:claude`, `global`, `profile:<name>`, `project-local`), and which layers it shadowed.
 
-The dashboard's **MCP servers** settings tab shows the same merged set plus two things the CLI does not:
+`aoe mcp list` prints the same merged set, plus conflicts and servers kept after removal.
+
+Resolve conflicts and kept servers in the dashboard's **MCP servers** settings tab; in [CityHall client mode](web-dashboard.md#cityhall-client-mode) the tab is read-only, listing conflicts and kept servers without the resolve, keep and drop actions:
 
 - **Conflicts.** AoE remembers the last definition it saw in an agent's native config. If that file changes on disk, the changed server is flagged and you pick a side. Keeping AoE's version stores it in the global `mcp.json`, which outranks the native layer; choosing the native version accepts the new definition. AoE never writes back to an agent-native config.
 - **Kept after removal.** A server that disappears from a native config is kept in view with a warning, so you can **keep** it (promoting it into the global `mcp.json`) or **drop** it.

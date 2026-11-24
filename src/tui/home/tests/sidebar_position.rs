@@ -13,8 +13,6 @@ fn render(view: &mut HomeView, width: u16) -> Buffer {
                 Rect::new(4, 2, width, 32),
                 &load_theme("empire"),
                 None,
-                None,
-                None,
             );
         })
         .unwrap();
@@ -176,6 +174,26 @@ fn sidebar_divider_drag_ends_when_the_divider_disappears() {
     }
 }
 
+/// The configured breakpoint moves the boundary: a viewport exactly at it stays side by
+/// side, and one column below it stacks.
+#[test]
+#[serial]
+fn narrow_breakpoint_moves_the_stacked_boundary() {
+    let mut env = create_test_env_with_sessions(3);
+    env.view.narrow_breakpoint = 60;
+    env.view.list_width = 20;
+
+    render(&mut env.view, 60);
+    assert!(env.view.divider_col.is_some(), "60 is at the breakpoint");
+    assert_eq!(env.view.divider_row, None, "60 is at the breakpoint");
+    assert_ne!(env.view.preview_outer_area, Rect::default());
+
+    render(&mut env.view, 59);
+    assert_eq!(env.view.divider_col, None, "59 is below the breakpoint");
+    assert_ne!(env.view.divider_row, None, "59 is below the breakpoint");
+    assert_ne!(env.view.list_area, Rect::default());
+}
+
 /// `one_pane` gives the list the whole narrow screen instead of stacking a preview under
 /// it, and the list closes all four borders since no preview owns the bottom seam.
 #[test]
@@ -273,7 +291,8 @@ fn narrow_one_pane_swaps_to_an_interactive_structured_session() {
         "a read-only transcript does not take the screen"
     );
 
-    let mut structured = crate::tui::structured_view::embedded::EmbeddedView::for_test(&inst.id);
+    let mut structured =
+        crate::tui::structured_view::embedded::EmbeddedView::offline_for_test(&inst.id);
     structured.activate();
     env.view.structured_preview = Some(structured);
     render(&mut env.view, width);

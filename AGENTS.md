@@ -64,6 +64,20 @@ Settings are declared once on their `Config` field with `#[setting(...)]`.
 Read `docs/development/adding-settings.md` before adding one; do not create
 parallel field registries or override structs.
 
+## Daemon and Clients
+
+The Daemon is becoming the single owner of Session runtime state and of the
+config it reads; the TUI, CLI and Web dashboard are Clients that reach it only
+through its API (#2734, terms in `CONTEXT.md`). Build toward that:
+
+- Put a new Session state change or Daemon-read config write behind a Daemon
+  endpoint, and have each Client call it.
+- In a Client, tell errors apart by status and `AoE-Error-Code`; when a Client
+  needs to name a refusal, add an `ApiErrorCode` on the Daemon.
+- Read ADRs [0003](docs/adr/0003-local-transport-uds-service-and-disk-fallback.md)
+  and [0004](docs/adr/0004-cli-writes-through-the-daemon.md) before changing how
+  a Client reaches the Daemon.
+
 ## Tests
 
 Use in-module unit tests for pure logic and `tests/` for integration behavior.
@@ -109,10 +123,18 @@ template, and [MAINTAINERS.md](MAINTAINERS.md) for review and merge rules.
   `--features web` when relevant.
 - For `web/` changes also run its format, lint, type, and applicable test checks
   from `web/AGENTS.md`, including the coverage matrix requirement.
-- Do not request reviewers; CODEOWNERS routes each PR.
+- Update the documentation a change makes materially wrong or incomplete in the
+  same PR: `docs/`, `CONTEXT.md`, ADRs, and generated references such as
+  `docs/cli/reference.md`. Do not add docs for unchanged behavior; correcting
+  documentation that is already wrong is in scope for any PR, docs-only ones
+  included.
+- Do not add reviewers; CODEOWNERS routes each PR. When a review asks for
+  changes on a head you have since fixed, dismiss that stale review and
+  re-request the same reviewer, leaving the CODEOWNERS request in place.
 - Keep a PR within one owner area where possible; split changes that cross
   areas.
-- When reviewing, follow the [rubric](CONTRIBUTING.md#review-rubric).
+- When reviewing, follow the [rubric](CONTRIBUTING.md#review-rubric), and treat
+  documentation a PR leaves materially stale as a finding worth raising.
 
 Codecov gates web changes at 75% patch coverage and prevents a project drop
 beyond its threshold. Do not add tautological tests merely to move coverage.

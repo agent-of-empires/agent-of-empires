@@ -289,7 +289,7 @@ mod tests {
             name: "Write".into(),
             kind: "edit".into(),
             args_preview: args_preview.into(),
-            started_at: chrono::Utc::now(),
+            started_at: crate::time::Timestamp::now(),
             parent_tool_call_id: None,
             memory_recall: if recall.is_empty() {
                 None
@@ -306,7 +306,7 @@ mod tests {
                     path: p.into(),
                     old_text: None,
                     new_text: None,
-                    created_at: chrono::Utc::now(),
+                    created_at: crate::time::Timestamp::now(),
                 })
                 .collect(),
         }
@@ -343,7 +343,7 @@ mod tests {
                         path: "/tmp/diff-late.rs".into(),
                         old_text: None,
                         new_text: None,
-                        created_at: chrono::Utc::now(),
+                        created_at: crate::time::Timestamp::now(),
                     }]),
                 },
             ),

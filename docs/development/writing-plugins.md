@@ -20,7 +20,7 @@ Every plugin declares identity, what it contributes, and, with a worker, how to 
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 19
+api_version = 24
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 
@@ -47,7 +47,7 @@ A worker requests only the grants it uses. `runtime.worker` is required to run a
 
 Agent integrations are optional contributions, not worker RPCs. They require `api_version >= 19`; launch, detection, and reply-fallback extensions require API 21 and a host that implements them. Provider-native status and replies also require `session.integration`. When declared, `session.integration` requires valid, nonempty `provider_versions` on every integration entry. See [Agent integrations](../plugin-api.md#agent-integrations) for the launch grammar, supported capture declarations, and communication contract.
 
-An active provider owns terminal status: an unavailable or invalid report produces Unknown. When the provider is disabled or absent, normal pane detection remains available.
+An active provider owns terminal status: an unavailable or invalid report produces Unknown. A provider that keeps reporting while its `provider_version` is outside, or unparseable against, the declaration's `provider_versions` is the one case that steps aside: its report is not consumed, the session keeps its pane rules, and the host logs the reported version and the declared ranges. When the provider is disabled or absent, normal pane detection remains available.
 
 The install approval lists each declared tool, launch command, and agent declaration. Updates that add or change an integration require approval again; removals alone do not. The command runs as the host user only when a user launches that agent.
 
@@ -56,11 +56,10 @@ The install approval lists each declared tool, launch command, and agent declara
 The host spawns the worker, sends one JSON-RPC request per line on stdin, and reads one response per line on stdout; the worker exits when stdin reaches EOF.
 
 ```json
-{"jsonrpc": "2.0", "id": 1, "method": "my-plugin.status", "params": {}}
-{"jsonrpc": "2.0", "id": 1, "result": {"ok": true, "message": "running"}}
+{"jsonrpc": "2.0", "method": "plugin.command.invoke", "params": {"command": "plugin.dev.example.my-plugin.status", "session_id": "abc123"}}
 ```
 
-The host maps a command id to a fully namespaced method, `plugin.<id>.<command-id>`, so a worker for `dev.example.my-plugin` actually receives `plugin.dev.example.my-plugin.status`. Dispatch on the trailing segment so either form works, return a JSON-RPC error with code `-32601` for an unknown method, and never respond to a message with no `id`.
+The host delivers a command that has no client [`action`](../plugin-api.md#commands) as a `plugin.command.invoke` notification with params `{ "command": "plugin.<id>.<command-id>", "session_id": "..." }`. It has no `id`, so never reply; act on the commands you know and ignore the rest.
 
 The host also pushes notifications that carry no `id`, such as `session.status.changed` (`api_version >= 14`) and `session.lifecycle.changed` (`api_version >= 19`) for plugins that hold `session.read`. Ignore methods you do not handle and never reply. See [Session status events](../plugin-api.md#session-driving-rpcs) in the Plugin API reference.
 
@@ -83,6 +82,12 @@ platforms = ["linux", "macos"]
 ```
 
 Build steps run once, at install and update, in the user's interactive shell, where `PATH` is reliable. A compiled plugin can instead ship a release asset with `kind = "release-binary"`.
+
+Git and approved build commands share a fixed two-hour budget for each
+preparation/application. On exhaustion the host settles its owned process group
+before rollback; closing an observer does not cancel accepted work. Commands
+remain unsandboxed, and escaping processes or arbitrary filesystem stalls are
+not covered by a malicious-code containment guarantee.
 
 ## Install and test locally
 
