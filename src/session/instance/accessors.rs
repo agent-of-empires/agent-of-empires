@@ -299,7 +299,7 @@ impl Instance {
         {
             return false;
         }
-        let Some(pin) = self.selected_claude_store_pin() else {
+        let Some(bound_store) = self.selected_claude_bound_store() else {
             return false;
         };
         let config = config();
@@ -317,7 +317,7 @@ impl Instance {
             .filter(|home| home.is_absolute())
             .and_then(|home| session.agent_config_dir_for(&self.tool, &home));
         launcher_store
-            .is_some_and(|dir| crate::session::capture::same_claude_store(&dir, &pin.store))
+            .is_some_and(|dir| crate::session::capture::same_claude_store(&dir, &bound_store))
             && self.acp_transcript_cli_resumable_with("claude", session)
     }
 
@@ -1068,6 +1068,13 @@ impl Instance {
         }
         let execution = binding.execution.as_ref()?;
         (execution.agent == "claude" && execution.filesystem == "host").then_some((sid, execution))
+    }
+
+    /// The bound store of [`Self::selected_claude_store_pin`], without resolving the legacy
+    /// route marker, so callers holding their own resolved config read no config from disk.
+    pub(crate) fn selected_claude_bound_store(&self) -> Option<std::path::PathBuf> {
+        let (_, execution) = self.selected_claude_conversation()?;
+        execution.stores.first().cloned()
     }
 
     /// Legacy route markers follow current launch configuration so alias changes stay visible.

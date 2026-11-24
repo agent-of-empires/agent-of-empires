@@ -5113,7 +5113,7 @@ async fn list_sessions_derives_keeps_context_from_the_cached_config() {
 
 // Bound own-command rows sharing a profile preview the launcher's store from the cached
 // environment, so the whole list still costs one resolution, and each row is judged by its
-// own binding.
+// own binding, legacy (unmarked) bindings included.
 #[tokio::test]
 #[serial_test::serial]
 async fn list_sessions_previews_own_command_stores_from_the_cached_config() {
@@ -5158,12 +5158,24 @@ async fn list_sessions_previews_own_command_stores_from_the_cached_config() {
         });
         inst
     };
+    // Bindings from before the route marker existed.
+    let legacy = |store: &std::path::Path| {
+        let mut inst = bound_to(store);
+        inst.agent_session_binding
+            .as_mut()
+            .and_then(|binding| binding.execution.as_mut())
+            .unwrap()
+            .exported_default_store = None;
+        inst
+    };
     let mismatched = tmp_home.path().join("stores/work");
     let sessions = vec![
         bound_to(&own_store),
         bound_to(&mismatched),
         bound_to(&own_store),
         bound_to(&own_store),
+        legacy(&own_store),
+        legacy(&mismatched),
     ];
     let expected: Vec<(String, bool)> = sessions
         .iter()
