@@ -921,7 +921,7 @@ function AppContent({
   const [showPalette, setShowPalette] = useState(false);
   // Warm the palette chunk 2 s after mount so the first shortcut press opens it at once.
   useEffect(() => {
-    const id = window.setTimeout(() => void loadCommandPalette(), 2000);
+    const id = window.setTimeout(() => void loadCommandPalette().catch(() => {}), 2000);
     return () => window.clearTimeout(id);
   }, []);
   // Palette content-search query (#2515); declared here so the keyboard
