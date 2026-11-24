@@ -1,20 +1,17 @@
 //! OSC 8 hyperlinks: [`GridLinks`] keeps them on a vt100 grid's cells, which
-//! vt100 itself cannot, and [`extract_links`] pairs each target in a frame's
-//! text with the visible text it wraps.
+//! vt100 itself cannot, and [`row_links`] finds each run a frame's rows carry.
 
+/// One OSC 8 run on a frame row, positioned by `char` offset into the row's
+/// text with escapes removed, so it matches the rendered row cell for cell.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PaneLink {
-    /// Styling escapes removed so it matches the rendered row cell for cell.
+pub(crate) struct RowLink {
+    pub(crate) row: usize,
+    pub(crate) start: usize,
     pub(crate) text: String,
     pub(crate) uri: String,
 }
 
 const OSC8_OPEN: &[u8] = b"\x1b]8;";
-
-/// Every visible row is searched for each link on every frame.
-pub(crate) const MAX_PANE_LINKS: usize = 64;
-
-const MAX_PENDING: usize = 8192;
 
 const MAX_URI: usize = 2048;
 
@@ -22,10 +19,6 @@ const MAX_URI: usize = 2048;
 /// unopenable one never takes a table slot; a control byte could inject escapes.
 fn usable_uri(uri: &str) -> bool {
     crate::session::preview_link_openable(uri) && !uri.chars().any(char::is_control)
-}
-
-struct Osc8Scanner {
-    buf: Vec<u8>,
 }
 
 enum Seq {
@@ -38,77 +31,47 @@ enum Seq {
     },
 }
 
-impl Osc8Scanner {
-    fn new() -> Self {
-        Self { buf: Vec::new() }
-    }
-
-    fn feed(&mut self, chunk: &[u8]) -> Vec<PaneLink> {
-        self.buf.extend_from_slice(chunk);
-        let mut out = Vec::new();
+/// The OSC 8 runs in `content`, by row (rows split on `\n`), in order. A run
+/// still open at a row's end carries onto the next row, as on a terminal.
+pub(crate) fn row_links(content: &str) -> Vec<RowLink> {
+    let mut out = Vec::new();
+    let mut active: Option<String> = None;
+    for (row, line) in content.split('\n').enumerate() {
+        let mut rest = line.as_bytes();
+        let mut col = 0;
         loop {
-            let Some(start) = find(&self.buf, OSC8_OPEN) else {
-                let keep = self.buf.len().min(OSC8_OPEN.len() - 1);
-                self.buf.drain(..self.buf.len() - keep);
-                break;
-            };
-            self.buf.drain(..start);
-            let (uri, consumed) = match parse_seq(&self.buf) {
-                Seq::Incomplete => {
-                    if self.buf.len() > MAX_PENDING {
-                        self.buf.clear();
-                    }
-                    break;
-                }
-                Seq::Skip(n) => {
-                    self.buf.drain(..n);
-                    continue;
-                }
-                Seq::Found { uri, consumed } => (uri, consumed),
-            };
-            if uri.is_empty() {
-                self.buf.drain(..consumed);
-                continue;
-            }
-            // The link text runs to the next OSC 8: its own close or the next open.
-            let Some(next) = find(&self.buf[consumed..], OSC8_OPEN) else {
-                if self.buf.len() - consumed > MAX_PENDING {
-                    self.buf.drain(..consumed);
-                    continue;
-                }
-                break;
-            };
+            let at = find(rest, OSC8_OPEN);
             let text = crate::tmux::utils::strip_ansi(&String::from_utf8_lossy(
-                &self.buf[consumed..consumed + next],
+                &rest[..at.unwrap_or(rest.len())],
             ));
-            if !text.trim().is_empty() && usable_uri(&uri) {
-                out.push(PaneLink { text, uri });
+            if let Some(uri) = active.as_ref().filter(|uri| usable_uri(uri)) {
+                let trimmed = text.trim_start();
+                let lead = text.len() - trimmed.len();
+                let trimmed = trimmed.trim_end();
+                if !trimmed.is_empty() {
+                    out.push(RowLink {
+                        row,
+                        start: col + text[..lead].chars().count(),
+                        text: trimmed.to_string(),
+                        uri: uri.clone(),
+                    });
+                }
             }
-            self.buf.drain(..consumed + next);
+            col += text.chars().count();
+            let Some(at) = at else {
+                break;
+            };
+            rest = &rest[at..];
+            match parse_seq(rest) {
+                Seq::Found { uri, consumed } => {
+                    active = (!uri.is_empty()).then_some(uri);
+                    rest = &rest[consumed..];
+                }
+                Seq::Skip(n) => rest = &rest[n..],
+                Seq::Incomplete => break,
+            }
         }
-        out
     }
-
-    /// Emit a link whose close never arrived, for one-shot (non-streaming) input.
-    fn finish(&mut self) -> Option<PaneLink> {
-        let start = find(&self.buf, OSC8_OPEN)?;
-        self.buf.drain(..start);
-        let Seq::Found { uri, consumed } = parse_seq(&self.buf) else {
-            return None;
-        };
-        if uri.is_empty() || !usable_uri(&uri) {
-            return None;
-        }
-        let text = crate::tmux::utils::strip_ansi(&String::from_utf8_lossy(&self.buf[consumed..]));
-        self.buf.clear();
-        (!text.trim().is_empty()).then_some(PaneLink { text, uri })
-    }
-}
-
-pub(crate) fn extract_links(content: &[u8]) -> Vec<PaneLink> {
-    let mut scanner = Osc8Scanner::new();
-    let mut out = scanner.feed(content);
-    out.extend(scanner.finish());
     out
 }
 
@@ -181,8 +144,8 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// naming the run's target. vt100 keeps them as part of the cell's contents,
 /// so the target moves with the cell through scrolling, erasure, insertion and
 /// scrollback without a parallel position table. Variation Selectors
-/// Supplement: zero width, and meaningless outside ideographic variation
-/// sequences, which pane output does not carry (stray ones are dropped).
+/// Supplement: zero width, and a cell holds at most one of the pane's own,
+/// right after its base, so a cell's last two name its link.
 const MARK_BASE: u32 = 0xE0100;
 const MARK_RADIX: u32 = 240;
 /// Distinct targets one grid names at once; a run past this prints as plain
@@ -191,9 +154,13 @@ const MAX_GRID_LINKS: usize = 1024;
 /// A reclaim that frees fewer ids than this skips the next this many
 /// reclaims, so a flood of new targets cannot rescan the grid per link.
 const RECLAIM_COOLDOWN: usize = MAX_GRID_LINKS / 16;
-/// vt100 stops appending to a cell at 18 of its 22 bytes, and both marks
-/// (8 bytes) must still fit behind the zero-width code points they follow.
-const MARKED_CELL_LIMIT: usize = 14;
+/// vt100 stops appending to a cell at this many bytes.
+const CELL_APPEND_LIMIT: usize = 18;
+/// Both marks (8 bytes) fit only in a cell holding fewer bytes than this; a
+/// fuller cell keeps its text and goes unlinked.
+const MARKED_CELL_LIMIT: usize = CELL_APPEND_LIMIT - 4;
+/// vte's OSC parameter slots; a payload with more `;` loses its tail.
+const MAX_OSC_PARAMS: usize = 16;
 
 fn is_mark(c: char) -> bool {
     (MARK_BASE..MARK_BASE + MARK_RADIX).contains(&u32::from(c))
@@ -210,20 +177,25 @@ fn push_mark(out: &mut Vec<u8>, id: u16) {
 
 /// A cell's visible text and the link id its marks name, if any.
 pub(crate) fn split_cell(contents: &str) -> (std::borrow::Cow<'_, str>, Option<u16>) {
-    if !contents.chars().any(is_mark) {
+    let marks = contents.chars().filter(|&c| is_mark(c)).count();
+    // None, or the pane's own selector.
+    if marks < 2 {
         return (std::borrow::Cow::Borrowed(contents), None);
     }
-    let digits: Vec<u32> = contents
-        .chars()
-        .filter(|&c| is_mark(c))
-        .map(|c| u32::from(c) - MARK_BASE)
-        .collect();
-    let id = match digits[..] {
-        [.., hi, lo] => u16::try_from(hi * MARK_RADIX + lo).ok(),
-        _ => None,
-    };
-    let text: String = contents.chars().filter(|&c| !is_mark(c)).collect();
-    (std::borrow::Cow::Owned(text), id)
+    let mut seen = 0;
+    let mut text = String::with_capacity(contents.len());
+    let mut id = 0;
+    for c in contents.chars() {
+        if is_mark(c) {
+            seen += 1;
+            if seen > marks - 2 {
+                id = id * MARK_RADIX + (u32::from(c) - MARK_BASE);
+                continue;
+            }
+        }
+        text.push(c);
+    }
+    (std::borrow::Cow::Owned(text), u16::try_from(id).ok())
 }
 
 /// OSC 8 state for one vt100 grid, stored as the parser's callbacks so a
@@ -237,6 +209,11 @@ pub(crate) fn split_cell(contents: &str) -> (std::borrow::Cow<'_, str>, Option<u
 pub(crate) struct GridLinks {
     vte: vte::Parser,
     scan: LinkScan,
+    /// The last read ended on a linked cell zero-width code points from the
+    /// next read may still join (U+FE0F must follow its glyph directly).
+    owed: Option<Owed>,
+    /// The bytes after `owed`'s glyph, not yet given to the grid.
+    held: Vec<u8>,
 }
 
 struct Target {
@@ -273,6 +250,10 @@ struct LinkScan {
     starved: Option<String>,
     cooldown: usize,
     event: Event,
+    /// The last event was a glyph, so a selector arriving now is the pane's.
+    after_glyph: bool,
+    /// Bytes fed since the last event, so an OSC knows its own length.
+    since_event: usize,
 }
 
 impl LinkScan {
@@ -312,7 +293,12 @@ impl LinkScan {
 impl vte::Perform for LinkScan {
     fn print(&mut self, c: char) {
         if is_mark(c) {
-            self.event = Event::Stray;
+            // One selector may follow its base; any other could forge a mark.
+            self.event = if self.after_glyph {
+                Event::ZeroWidth(c.len_utf8())
+            } else {
+                Event::Stray
+            };
             return;
         }
         // Mirrors which code points vt100 draws into a new cell.
@@ -346,7 +332,8 @@ impl vte::Perform for LinkScan {
         action: char,
     ) {
         self.event = Event::Other;
-        if intermediates != b"?" || !matches!(action, 'h' | 'l') {
+        // vt100 picks its private-mode handler by the first intermediate alone.
+        if intermediates.first() != Some(&b'?') || !matches!(action, 'h' | 'l') {
             return;
         }
         // The modes vt100 switches grids on; 1049 clears the alternate grid.
@@ -370,6 +357,13 @@ impl vte::Perform for LinkScan {
         let [b"8", _, uri @ ..] = params else {
             return;
         };
+        // `ESC ]`, the payload, and the byte ending it: anything more means
+        // vte ran out of parameter slots and dropped the target's tail.
+        let payload = params.iter().map(|p| p.len()).sum::<usize>() + params.len() - 1;
+        if params.len() == MAX_OSC_PARAMS && self.since_event != payload + 3 {
+            self.active = None;
+            return;
+        }
         // vte splits on every `;`, including any inside the URI.
         let uri = uri.join(&b';');
         self.active = match std::str::from_utf8(&uri) {
@@ -385,6 +379,7 @@ impl vte::Perform for LinkScan {
         if intermediates.is_empty() && byte == b'c' {
             self.active = None;
             self.alt = false;
+            self.cooldown = 0;
             for target in self.targets.iter_mut().flatten() {
                 target.on = [false; 2];
             }
@@ -403,36 +398,54 @@ struct Owed {
 }
 
 impl GridLinks {
-    /// The leading `.1` bytes of `bytes` with a mark after each glyph printed
-    /// inside a hyperlink, ready for the grid's own `process`. Fewer than all
-    /// bytes when a target found the table full: process them, then call
+    /// `bytes` with a mark after each glyph printed inside a hyperlink, ready
+    /// for the grid's own `process`, and how many of `bytes` it covers. Fewer
+    /// than all when a target found the table full: process them, then call
     /// [`Self::reclaim`] and mark the rest. Borrows when nothing needed marking.
+    ///
+    /// A read ending on a linked glyph, or within a code point after it, holds
+    /// the mark (and those bytes) for the next read, since a zero-width code
+    /// point there still joins the cell ahead of it.
     pub(crate) fn mark<'a>(&mut self, bytes: &'a [u8]) -> (std::borrow::Cow<'a, [u8]>, usize) {
+        let held = std::mem::take(&mut self.held);
+        let skip = held.len();
+        let input: std::borrow::Cow<'a, [u8]> = if held.is_empty() {
+            std::borrow::Cow::Borrowed(bytes)
+        } else {
+            std::borrow::Cow::Owned([held.as_slice(), bytes].concat())
+        };
         let mut out: Option<Vec<u8>> = None;
         let mut flushed = 0;
-        let mut owed: Option<Owed> = None;
+        let mut owed = self.owed.take();
         let settle = |out: &mut Option<Vec<u8>>, flushed: &mut usize, owed: Option<Owed>| {
-            if let Some(owed) = owed {
-                let out = out.get_or_insert_with(|| Vec::with_capacity(bytes.len() + 64));
-                out.extend_from_slice(&bytes[*flushed..owed.at]);
+            if let Some(owed) = owed.filter(|o| o.cell < MARKED_CELL_LIMIT) {
+                let out = out.get_or_insert_with(|| Vec::with_capacity(input.len() + 64));
+                out.extend_from_slice(&input[*flushed..owed.at]);
                 push_mark(out, owed.id);
                 *flushed = owed.at;
             }
         };
-        let mut used = bytes.len();
-        for i in 0..bytes.len() {
-            self.vte.advance(&mut self.scan, &bytes[i..=i]);
-            match std::mem::take(&mut self.scan.event) {
+        let mut used = input.len();
+        for i in skip..input.len() {
+            self.scan.since_event += 1;
+            self.vte.advance(&mut self.scan, &input[i..=i]);
+            let event = std::mem::take(&mut self.scan.event);
+            if !matches!(event, Event::None) {
+                self.scan.after_glyph = matches!(event, Event::Glyph(_));
+                self.scan.since_event = 0;
+            }
+            match event {
                 Event::None => {}
                 // vt100 rechecks a cell's width on U+FE0F only when it follows
                 // the glyph directly, so the mark waits behind it.
-                Event::ZeroWidth(len) => match owed.as_mut() {
-                    Some(o) if o.cell + len < MARKED_CELL_LIMIT => {
+                Event::ZeroWidth(len) => {
+                    if let Some(o) = owed.as_mut() {
                         o.at = i + 1;
-                        o.cell += len;
+                        if o.cell < CELL_APPEND_LIMIT {
+                            o.cell += len;
+                        }
                     }
-                    _ => settle(&mut out, &mut flushed, owed.take()),
-                },
+                }
                 Event::Glyph(len) => {
                     settle(&mut out, &mut flushed, owed.take());
                     owed = self.scan.active.map(|id| Owed {
@@ -443,9 +456,9 @@ impl GridLinks {
                 }
                 Event::Stray => {
                     settle(&mut out, &mut flushed, owed.take());
-                    let out = out.get_or_insert_with(|| Vec::with_capacity(bytes.len() + 64));
+                    let out = out.get_or_insert_with(|| Vec::with_capacity(input.len() + 64));
                     // A mark is four UTF-8 bytes; one split across reads stays.
-                    out.extend_from_slice(&bytes[flushed..(i + 1).saturating_sub(4).max(flushed)]);
+                    out.extend_from_slice(&input[flushed..(i + 1).saturating_sub(4).max(flushed)]);
                     flushed = i + 1;
                 }
                 Event::Other => settle(&mut out, &mut flushed, owed.take()),
@@ -455,15 +468,24 @@ impl GridLinks {
                 break;
             }
         }
+        let consumed = used - skip;
+        // An owed mark has seen no event since its `at`, so the bytes after
+        // it are at most a partial code point when they are this few.
+        if let Some(o) = owed.take_if(|o| used == input.len() && used - o.at < 4) {
+            self.held = input[o.at..used].to_vec();
+            used = o.at;
+            self.owed = Some(Owed { at: 0, ..o });
+        }
         settle(&mut out, &mut flushed, owed);
         let marked = match out {
-            None => std::borrow::Cow::Borrowed(&bytes[..used]),
+            None if skip == 0 => std::borrow::Cow::Borrowed(&bytes[..used]),
+            None => std::borrow::Cow::Owned(input[..used].to_vec()),
             Some(mut out) => {
-                out.extend_from_slice(&bytes[flushed..used]);
+                out.extend_from_slice(&input[flushed..used]);
                 std::borrow::Cow::Owned(out)
             }
         };
-        (marked, used)
+        (marked, consumed)
     }
 
     /// A target is waiting for [`Self::reclaim`].
@@ -509,57 +531,69 @@ impl GridLinks {
 mod tests {
     use super::*;
 
-    fn link(text: &str, uri: &str) -> PaneLink {
-        PaneLink {
-            text: text.to_string(),
-            uri: uri.to_string(),
-        }
+    fn found(content: &str) -> Vec<(usize, usize, String, String)> {
+        row_links(content)
+            .into_iter()
+            .map(|l| (l.row, l.start, l.text, l.uri))
+            .collect()
+    }
+
+    fn owned(want: &[(usize, usize, &str, &str)]) -> Vec<(usize, usize, String, String)> {
+        want.iter()
+            .map(|&(row, start, text, uri)| (row, start, text.into(), uri.into()))
+            .collect()
     }
 
     #[test]
     #[serial_test::serial]
-    fn extracts_across_forms_and_neighbours() {
-        let cases: Vec<(&str, Vec<PaneLink>)> = vec![
+    fn finds_each_run_at_its_row_and_column() {
+        type Case = (
+            &'static str,
+            Vec<(usize, usize, &'static str, &'static str)>,
+        );
+        let cases: Vec<Case> = vec![
             (
                 "\x1b]8;;https://example.com\x1b\\Click Here\x1b]8;;\x1b\\",
-                vec![link("Click Here", "https://example.com")],
+                vec![(0, 0, "Click Here", "https://example.com")],
             ),
-            // A link whose close never arrives is still emitted at the end.
+            // A run whose close never arrives still counts.
             (
                 "\x1b]8;;https://example.com\x1b\\Click Here",
-                vec![link("Click Here", "https://example.com")],
+                vec![(0, 0, "Click Here", "https://example.com")],
             ),
             ("\x1b]8;;https://example.com", vec![]),
             (
                 "before \x1b]8;;https://a.com\x1b\\text\x1b]8;;\x1b\\ after",
-                vec![link("text", "https://a.com")],
-            ),
-            (
-                "\x1b]8;;https://a.com\x1b\\A\x1b]8;;\x1b\\ and \x1b]8;;https://b.com\x1b\\B\x1b]8;;\x1b\\",
-                vec![link("A", "https://a.com"), link("B", "https://b.com")],
+                vec![(0, 7, "text", "https://a.com")],
             ),
             (
                 "\x1b]8;id=abc;https://a.com\x1b\\A\x1b]8;;\x1b\\",
-                vec![link("A", "https://a.com")],
+                vec![(0, 0, "A", "https://a.com")],
             ),
             (
                 "\x1b]8;;https://a.com\x07A\x1b]8;;\x07",
-                vec![link("A", "https://a.com")],
+                vec![(0, 0, "A", "https://a.com")],
             ),
             (
-                "\x1b]8;;https://a.com\x1b\\\x1b[32mgreen\x1b[0m\x1b]8;;\x1b\\",
-                vec![link("green", "https://a.com")],
+                "\x1b[1m>\x1b[0m \x1b]8;;https://a.com\x1b\\\x1b[32m green\x1b[0m\x1b]8;;\x1b\\",
+                vec![(0, 3, "green", "https://a.com")],
             ),
             (
                 "\x1b]8;;https://a.com\x1b\\A\x1b]8;;https://b.com\x1b\\B\x1b]8;;\x1b\\",
-                vec![link("A", "https://a.com"), link("B", "https://b.com")],
+                vec![(0, 0, "A", "https://a.com"), (0, 1, "B", "https://b.com")],
+            ),
+            // The same label on two rows is two runs, each with its own target.
+            (
+                "\x1b]8;;https://a.com\x1b\\docs\x1b]8;;\x1b\\\n  \x1b]8;;https://b.com\x1b\\docs\x1b]8;;\x1b\\",
+                vec![(0, 0, "docs", "https://a.com"), (1, 2, "docs", "https://b.com")],
+            ),
+            // Columns count characters, not bytes.
+            (
+                "\u{6f22}\u{5b57} \x1b]8;;https://a.com\x1b\\x\x1b]8;;\x1b\\",
+                vec![(0, 3, "x", "https://a.com")],
             ),
             // With no `session.preview_link_prefixes`, only web targets are kept.
             ("\x1b]8;;file:///etc/passwd\x1b\\pw\x1b]8;;\x1b\\", vec![]),
-            (
-                "\x1b]8;;vscode://file/Users/x/notes/a.md:12\x1b\\notes/a.md\x1b]8;;\x1b\\",
-                vec![],
-            ),
             (
                 "\x1b]8;;javascript:alert(1)\x1b\\click\x1b]8;;\x1b\\",
                 vec![],
@@ -570,12 +604,12 @@ mod tests {
             ("\x1b]0;Window Title\x07text", vec![]),
         ];
         for (input, expected) in cases {
-            assert_eq!(extract_links(input.as_bytes()), expected, "{input:?}");
+            assert_eq!(found(input), owned(&expected), "{input:?}");
         }
     }
 
     #[test]
-    fn extracts_real_claude_code_hyperlinks() {
+    fn finds_real_claude_code_hyperlinks() {
         let cases = [
             (
                 concat!(
@@ -583,7 +617,9 @@ mod tests {
                     "\x1b]8;id=1nl9mmd;https://github.com/agent-of-empires/agent-of-empires\x1b\\",
                     "the AoE repo\x1b[39m\x1b]8;;\x1b\\"
                 ),
-                link(
+                (
+                    0,
+                    2,
                     "the AoE repo",
                     "https://github.com/agent-of-empires/agent-of-empires",
                 ),
@@ -593,43 +629,26 @@ mod tests {
                     " \x1b[38;5;246m\x1b]8;id=zaxmda;https://code.claude.com/docs/en/security\x1b\\",
                     "Security guide\x1b[39m\x1b]8;;\x1b\\"
                 ),
-                link("Security guide", "https://code.claude.com/docs/en/security"),
+                (
+                    0,
+                    1,
+                    "Security guide",
+                    "https://code.claude.com/docs/en/security",
+                ),
             ),
         ];
         for (row, expected) in cases {
-            assert_eq!(extract_links(row.as_bytes()), vec![expected], "{row:?}");
+            assert_eq!(found(row), owned(&[expected]), "{row:?}");
         }
     }
 
     #[test]
-    fn extracts_link_split_across_chunks() {
-        let raw = b"\x1b]8;;https://example.com\x1b\\Click Here\x1b]8;;\x1b\\";
-        for split in 1..raw.len() {
-            let mut scanner = Osc8Scanner::new();
-            let mut out = scanner.feed(&raw[..split]);
-            out.extend(scanner.feed(&raw[split..]));
-            assert_eq!(
-                out,
-                vec![link("Click Here", "https://example.com")],
-                "split at {split}"
-            );
-        }
-    }
-
-    #[test]
-    fn unbounded_link_text_is_dropped_rather_than_buffered() {
-        let mut scanner = Osc8Scanner::new();
-        assert!(scanner.feed(b"\x1b]8;;https://a.com\x1b\\").is_empty());
-        assert!(scanner.feed(&vec![b'x'; MAX_PENDING + 1]).is_empty());
-        assert!(scanner.buf.len() < OSC8_OPEN.len());
-    }
-
-    #[test]
-    fn plain_output_does_not_grow_the_buffer() {
-        let mut scanner = Osc8Scanner::new();
-        for _ in 0..64 {
-            assert!(scanner.feed(&vec![b'x'; 4096]).is_empty());
-        }
-        assert!(scanner.buf.len() < OSC8_OPEN.len());
+    fn a_pane_selector_stays_text_beside_a_link_mark() {
+        let ideograph = "\u{845b}\u{E0101}";
+        assert_eq!(split_cell(ideograph), (ideograph.into(), None));
+        let mut marked = ideograph.as_bytes().to_vec();
+        push_mark(&mut marked, 300);
+        let marked = String::from_utf8(marked).unwrap();
+        assert_eq!(split_cell(&marked), (ideograph.into(), Some(300)));
     }
 }

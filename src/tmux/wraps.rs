@@ -4,8 +4,6 @@
 //! joins exactly the flagged rows instead. Comparing a row capture with a
 //! joined capture of the same instant recovers the flags.
 
-use unicode_width::UnicodeWidthChar;
-
 /// Lines of a capture, each terminated by `\n` (the last one included).
 fn terminated_lines(text: &str) -> impl Iterator<Item = &str> {
     text.strip_suffix('\n').unwrap_or(text).split('\n')
@@ -39,7 +37,11 @@ pub(crate) fn soft_wraps(body: &str, joined: &str) -> Vec<u32> {
             };
             rest = after;
             i += 1;
-            if rest.trim_end().is_empty() {
+            // Leftover whitespace is padding unless the next row prints it.
+            let next_prints_it = rows.get(i).is_some_and(|r| {
+                !r.is_empty() && r.trim().is_empty() && rest.starts_with(r.as_str())
+            });
+            if rest.trim_end().is_empty() && !next_prints_it {
                 break;
             }
             wrapped.push((i - 1) as u32);
@@ -81,8 +83,10 @@ const MAX_RELINKED_ROWS: usize = 256;
 
 /// `body` rows after `wraps` rows that ended inside a link. `capture-pane -e`
 /// closes a link at every row's end and never reopens it on the continuation
-/// row, though tmux's cells there still carry it.
-fn unlinked_continuations(rows: &[&[u8]], wraps: &[u32]) -> Vec<usize> {
+/// row, though tmux's cells there still carry it. Rows from `history` on are
+/// the visible screen and come first; the rest of the budget goes to the
+/// newest history rows.
+fn unlinked_continuations(rows: &[&[u8]], wraps: &[u32], history: usize) -> Vec<usize> {
     let mut out = Vec::new();
     let mut continues = false;
     for (i, row) in rows.iter().enumerate().take(rows.len().saturating_sub(1)) {
@@ -92,6 +96,9 @@ fn unlinked_continuations(rows: &[&[u8]], wraps: &[u32]) -> Vec<usize> {
             out.push(i + 1);
         }
     }
+    let visible = out.len() - out.partition_point(|&i| i < history);
+    let dropped = out.len().saturating_sub(MAX_RELINKED_ROWS.max(visible));
+    out.drain(..dropped);
     out.truncate(MAX_RELINKED_ROWS);
     out
 }
@@ -110,10 +117,10 @@ pub(crate) fn relink_continuations(
 ) {
     let text = body.strip_suffix(b"\n").unwrap_or(body);
     let rows: Vec<&[u8]> = text.split(|&b| b == b'\n').collect();
-    let wanted = unlinked_continuations(&rows, wraps);
     let Some(history) = rows.len().checked_sub(usize::from(pane_height)) else {
         return;
     };
+    let wanted = unlinked_continuations(&rows, wraps, history);
     if wanted.is_empty() {
         return;
     }
@@ -154,12 +161,16 @@ pub(crate) fn relink_continuations(
 }
 
 /// `rows` with each `at` row replaced by its `fresh` twin when the two show
-/// the same text. A row capture opens from default attributes, so a reset
-/// first drops whatever the previous row left set.
+/// the same text and the twin opens on the target the row before it ended
+/// on, so a label repainted between the captures keeps its old row. A row
+/// capture opens from default attributes, so a reset first drops whatever the
+/// previous row left set.
 fn splice_rows(rows: &[&[u8]], at: &[usize], fresh: &[&[u8]], terminated: bool) -> Vec<u8> {
     let plain = |row: &[u8]| crate::tmux::utils::strip_ansi(&String::from_utf8_lossy(row));
+    let links = |row: &[u8]| crate::tmux::osc8::row_links(&String::from_utf8_lossy(row));
     let mut out = Vec::new();
-    for (i, row) in rows.iter().enumerate() {
+    let mut prev: &[u8] = &[];
+    for (i, &row) in rows.iter().enumerate() {
         if i > 0 {
             out.push(b'\n');
         }
@@ -167,24 +178,26 @@ fn splice_rows(rows: &[&[u8]], at: &[usize], fresh: &[&[u8]], terminated: bool) 
             .binary_search(&i)
             .ok()
             .map(|n| fresh[n])
-            .filter(|twin| plain(twin).trim_end() == plain(row).trim_end());
+            .filter(|twin| plain(twin).trim_end() == plain(row).trim_end())
+            .filter(|twin| {
+                links(twin).first().map(|l| l.uri.clone()) == links(prev).pop().map(|l| l.uri)
+            });
         match twin {
             Some(twin) => {
                 out.extend_from_slice(b"\x1b[0m");
                 out.extend_from_slice(twin);
+                prev = twin;
             }
-            None => out.extend_from_slice(row),
+            None => {
+                out.extend_from_slice(row);
+                prev = row;
+            }
         }
     }
     if terminated {
         out.push(b'\n');
     }
     out
-}
-
-/// Columns vt100 gives `text`, which must hold no escapes.
-pub(crate) fn display_width(text: &str) -> usize {
-    text.chars().map(|c| c.width().unwrap_or(1).min(2)).sum()
 }
 
 #[cfg(test)]
@@ -218,6 +231,12 @@ mod tests {
                 "abcd\nef\n\n\n",
                 "abcdef\n\n\n",
                 &[0],
+            ),
+            (
+                "a continuation row of whitespace",
+                "https://e\nxample.co\n \n$\n",
+                "https://example.co \n$\n",
+                &[0, 1],
             ),
             (
                 "the joined capture raced output",
@@ -271,17 +290,44 @@ mod tests {
         ];
         for (name, rows, wraps, want) in cases {
             let rows: Vec<&[u8]> = rows.iter().map(|r| r.as_bytes()).collect();
-            assert_eq!(unlinked_continuations(&rows, wraps), *want, "{name}");
+            assert_eq!(unlinked_continuations(&rows, wraps, 0), *want, "{name}");
         }
     }
 
     #[test]
-    fn splices_a_reread_row_only_when_its_text_still_matches() {
-        let rows: &[&[u8]] = &[b"\x1b[1mab", b"cd", b"ef"];
-        let fresh: &[&[u8]] = &[b"\x1b]8;;u\x1b\\cd\x1b]8;;\x1b\\", b"zz"];
+    fn the_visible_screen_takes_the_reread_budget_first() {
+        let open = "\x1b]8;;https://e.co/a\x1b\\x\x1b]8;;\x1b\\";
+        let rows = MAX_RELINKED_ROWS * 2 + 4;
+        // Every row ends linked and wraps, so every row but the first continues.
+        let body: Vec<&[u8]> = vec![open.as_bytes(); rows];
+        let wraps: Vec<u32> = (0..rows as u32 - 1).collect();
+        let history = rows - 3;
+        let got = unlinked_continuations(&body, &wraps, history);
+        assert_eq!(got.len(), MAX_RELINKED_ROWS);
+        assert_eq!(got.last(), Some(&(rows - 1)), "the screen's last row");
+        assert_eq!(got[0], rows - MAX_RELINKED_ROWS, "then the newest history");
+        assert!(got.windows(2).all(|w| w[0] < w[1]), "ascending");
+    }
+
+    #[test]
+    fn splices_a_reread_row_only_when_its_text_and_target_still_match() {
+        let a = |text: &str| format!("\x1b]8;;https://e.co/a\x1b\\{text}\x1b]8;;\x1b\\");
+        let b = |text: &str| format!("\x1b]8;;https://e.co/b\x1b\\{text}\x1b]8;;\x1b\\");
+        let rows = [
+            format!("\x1b[1mab {}", a("li")),
+            "nk".into(),
+            "cd".into(),
+            "zz".into(),
+        ];
+        let rows: Vec<&[u8]> = rows.iter().map(|r| r.as_bytes()).collect();
+        // Row 1 continues the link; row 2 was repainted against another
+        // target; row 3's text changed.
+        let fresh = [a("nk"), b("cd"), a("yy")];
+        let fresh: Vec<&[u8]> = fresh.iter().map(|r| r.as_bytes()).collect();
+        let want = format!("\x1b[1mab {}\n\x1b[0m{}\ncd\nzz\n", a("li"), a("nk"));
         assert_eq!(
-            splice_rows(rows, &[1, 2], fresh, true),
-            b"\x1b[1mab\n\x1b[0m\x1b]8;;u\x1b\\cd\x1b]8;;\x1b\\\nef\n".to_vec()
+            String::from_utf8(splice_rows(&rows, &[1, 2, 3], &fresh, true)).unwrap(),
+            want
         );
     }
 

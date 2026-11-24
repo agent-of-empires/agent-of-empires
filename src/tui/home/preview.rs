@@ -1,7 +1,5 @@
 //! The preview pane's text view, its selection, and the cache behind it.
 
-use std::collections::HashSet;
-
 use ratatui::layout::{Position, Rect};
 
 /// The output pane's text layout, captured at render time so input handlers can map screen
@@ -120,9 +118,9 @@ pub(in crate::tui) struct PreviewCache {
     /// Parsed `content`, cleared by `store_capture` so ANSI parsing runs at
     /// most once per content change instead of on every render.
     pub(in crate::tui) parsed_text: Option<ratatui::text::Text<'static>>,
-    /// OSC 8 targets in `content`, kept beside the text because a ratatui
-    /// cell cannot carry a hyperlink.
-    pub(in crate::tui) links: Vec<crate::tmux::osc8::PaneLink>,
+    /// OSC 8 runs in `content` by row, kept beside the text because a
+    /// ratatui cell cannot carry a hyperlink.
+    pub(in crate::tui) links: Vec<crate::tmux::osc8::RowLink>,
 }
 
 impl PreviewCache {
@@ -143,24 +141,10 @@ impl PreviewCache {
         self.links = self.collect_links();
     }
 
-    /// The OSC 8 links `content` carries. Each row re-emits its own, so a
-    /// link wrapped over two rows yields one entry per row, each with the
-    /// whole target.
-    fn collect_links(&self) -> Vec<crate::tmux::osc8::PaneLink> {
+    fn collect_links(&self) -> Vec<crate::tmux::osc8::RowLink> {
         use crate::tmux::osc8;
 
-        let mut links = Vec::new();
-        // Dedupe on (text, uri): two texts pointing at one URL are separate
-        // clickable runs.
-        let mut seen: HashSet<(String, String)> = HashSet::new();
-        for link in osc8::extract_links(self.content.as_bytes()) {
-            if links.len() >= osc8::MAX_PANE_LINKS {
-                break;
-            }
-            if seen.insert((link.text.clone(), link.uri.clone())) {
-                links.push(link);
-            }
-        }
+        let links = osc8::row_links(&self.content);
         let pane = self.capture_target.as_deref().unwrap_or("<none>");
         if links.is_empty() {
             if osc8::has_hyperlink(self.content.as_bytes()) {
@@ -180,6 +164,13 @@ impl PreviewCache {
             );
         }
         links
+    }
+
+    /// The OSC 8 runs on content line `row`.
+    pub(in crate::tui) fn links_on(&self, row: usize) -> &[crate::tmux::osc8::RowLink] {
+        let from = self.links.partition_point(|l| l.row < row);
+        let to = self.links.partition_point(|l| l.row <= row);
+        &self.links[from..to]
     }
 
     /// Whether no frame has landed yet for session `id`.
