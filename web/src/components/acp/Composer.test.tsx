@@ -358,6 +358,30 @@ describe("slash command popover", () => {
     expect(textarea().value).toBe("/mcp ");
   });
 
+  // assistant-ui marks the highlighted item with a bare `data-highlighted=""`, which a
+  // `data-[highlighted=true]:` variant (`[data-highlighted="true"]`) never matches.
+  it("styles the highlighted item through a variant that matches assistant-ui's attribute", async () => {
+    const highlightSelectors = (el: Element) =>
+      [...el.classList].flatMap((cls) => {
+        const m = /^data-(?:\[([\w-]+)(?:=([^\]]+))?\]|([\w-]+)):bg-/.exec(cls);
+        if (!m || (m[1] ?? m[3]) !== "highlighted") return [];
+        return [m[2] === undefined ? "[data-highlighted]" : `[data-highlighted="${m[2]}"]`];
+      });
+    const { textarea } = mount({ availableCommands: COMMANDS });
+    await typeAt(textarea(), "/", 1);
+    const [first, second] = [option(/address-pr-comments/)[0]!, option(/\/help/)[0]!];
+    fireEvent.mouseMove(second);
+    await flush();
+
+    expect(second.hasAttribute("data-highlighted")).toBe(true);
+    const selectors = highlightSelectors(second);
+    expect(selectors.length).toBeGreaterThan(0);
+    for (const sel of selectors) {
+      expect(second.matches(sel), `${sel} must match the highlighted item`).toBe(true);
+      expect(first.matches(sel), `${sel} must not match an unhighlighted item`).toBe(false);
+    }
+  });
+
   it("badges a skill-backed command and leaves a plain one unbadged", async () => {
     skillIndexRef.current = buildSkillIndex({
       roots: [

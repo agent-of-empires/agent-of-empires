@@ -106,7 +106,7 @@ fn park_on_armed_rate_limit(state: &AppState, id: &str) {
             &Event::RateLimit {
                 info: crate::acp::state::RateLimitInfo {
                     status: "limited".into(),
-                    resets_at: Some(chrono::Utc::now() + chrono::Duration::days(3)),
+                    resets_at: Some(crate::time::Timestamp::now() + crate::time::Duration::days(3)),
                     kind: "usage".into(),
                 },
             },
@@ -149,7 +149,7 @@ async fn failing_start_state(
             Err::<crate::acp::acp_client::AcpClient, _>(if rate_limited {
                 AcpError::RateLimited(Box::new(crate::acp::state::RateLimitInfo {
                     status: "limited".into(),
-                    resets_at: Some(chrono::Utc::now() + chrono::Duration::days(3)),
+                    resets_at: Some(crate::time::Timestamp::now() + crate::time::Duration::days(3)),
                     kind: "usage".into(),
                 }))
             } else {
@@ -175,9 +175,13 @@ async fn wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker(
     let id = "sess-3172".to_string();
     let state = structured_state(&id, false).await;
     let seeded = crate::session::PendingInitialTurn {
+        error: None,
+        error_code: None,
         text: "queued before the park".to_string(),
         attachments: Vec::new(),
         synthesized: true,
+        id: String::new(),
+        origin: crate::daemon::PromptOrigin::Unknown,
     };
     state.instances.write().await[0].pending_initial_turn = Some(seeded.clone());
     seed_native_row(&state).await;
@@ -200,9 +204,14 @@ async fn wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker(
         let state = Arc::clone(&state);
         let id = id.clone();
         async move {
-            acp_prompt(State(state), Path(id), prompt_req("lgtm"))
-                .await
-                .into_response()
+            acp_prompt(
+                State(state),
+                Path(id),
+                axum::http::HeaderMap::new(),
+                prompt_req("lgtm"),
+            )
+            .await
+            .into_response()
         }
     });
     assert_eq!(
@@ -252,9 +261,13 @@ async fn a_rejected_enqueue_keeps_the_pending_turn_and_an_accepted_one_clears_it
         .expect("seed a running turn");
     state.acp_supervisor.hydrate_seqs([(id.clone(), 1)]);
     let seeded = crate::session::PendingInitialTurn {
+        error: None,
+        error_code: None,
         text: "queued before the park".to_string(),
         attachments: Vec::new(),
         synthesized: true,
+        id: String::new(),
+        origin: crate::daemon::PromptOrigin::Unknown,
     };
     state.instances.write().await[0].pending_initial_turn = Some(seeded.clone());
     seed_native_row(&state).await;
@@ -263,6 +276,7 @@ async fn a_rejected_enqueue_keeps_the_pending_turn_and_an_accepted_one_clears_it
     let response = acp_prompt(
         State(Arc::clone(&state)),
         Path(id.clone()),
+        axum::http::HeaderMap::new(),
         prompt_req(&oversized),
     )
     .await
@@ -277,6 +291,7 @@ async fn a_rejected_enqueue_keeps_the_pending_turn_and_an_accepted_one_clears_it
     let response = acp_prompt(
         State(Arc::clone(&state)),
         Path(id.clone()),
+        axum::http::HeaderMap::new(),
         prompt_req("follow up"),
     )
     .await
@@ -360,9 +375,14 @@ async fn prompt_handlers_claim_the_submission_guard_before_they_wake() {
                         .await
                         .into_response()
                 } else {
-                    acp_prompt(State(state), Path(id), prompt_req("think about this"))
-                        .await
-                        .into_response()
+                    acp_prompt(
+                        State(state),
+                        Path(id),
+                        axum::http::HeaderMap::new(),
+                        prompt_req("think about this"),
+                    )
+                    .await
+                    .into_response()
                 }
             }
         });
@@ -439,6 +459,10 @@ async fn no_revive_refuses_a_stopped_or_dormant_worker_without_side_effects() {
                 text: "queued before the park".to_string(),
                 attachments: Vec::new(),
                 synthesized: true,
+                error: None,
+                error_code: None,
+                id: String::new(),
+                origin: crate::daemon::PromptOrigin::Unknown,
             });
         }
         seed_native_row(&state).await;
@@ -446,6 +470,7 @@ async fn no_revive_refuses_a_stopped_or_dormant_worker_without_side_effects() {
         let response = acp_prompt(
             State(Arc::clone(&state)),
             Path(id.clone()),
+            axum::http::HeaderMap::new(),
             no_revive_prompt_req("hello"),
         )
         .await
@@ -516,6 +541,7 @@ async fn turn_on_a_park_resumes_instead_of_queueing() {
                     acp_prompt(
                         State(Arc::clone(&state)),
                         Path(id.clone()),
+                        axum::http::HeaderMap::new(),
                         prompt_req("switch me to a model that still has quota"),
                     )
                     .await
@@ -583,12 +609,17 @@ async fn no_revive_refuses_a_prompt_on_a_rate_limit_park() {
                 text: "queued before the park".to_string(),
                 attachments: Vec::new(),
                 synthesized: true,
+                error: None,
+                error_code: None,
+                id: String::new(),
+                origin: crate::daemon::PromptOrigin::Unknown,
             });
         seed_native_row(&state).await;
 
         let response = acp_prompt(
             State(Arc::clone(&state)),
             Path(id.clone()),
+            axum::http::HeaderMap::new(),
             no_revive_prompt_req("hello"),
         )
         .await
@@ -642,6 +673,10 @@ async fn no_revive_refuses_a_workerless_rate_limit_park_with_a_stale_turn() {
             text: "queued before the park".to_string(),
             attachments: Vec::new(),
             synthesized: true,
+            error: None,
+            error_code: None,
+            id: String::new(),
+            origin: crate::daemon::PromptOrigin::Unknown,
         });
     seed_native_row(&state).await;
 
@@ -658,6 +693,7 @@ async fn no_revive_refuses_a_workerless_rate_limit_park_with_a_stale_turn() {
     let response = acp_prompt(
         State(Arc::clone(&state)),
         Path(id.clone()),
+        axum::http::HeaderMap::new(),
         no_revive_prompt_req("hello"),
     )
     .await
@@ -708,7 +744,7 @@ async fn a_direct_prompt_and_the_queue_drain_cannot_both_own_the_same_turn() {
             "queued follow-up".into(),
             vec![],
             None,
-            None,
+            crate::server::session_service::QueueSender::default(),
         )
         .await
         .expect("session exists");
@@ -719,9 +755,14 @@ async fn a_direct_prompt_and_the_queue_drain_cannot_both_own_the_same_turn() {
         let state = Arc::clone(&state);
         let id = id.clone();
         async move {
-            acp_prompt(State(state), Path(id), prompt_req("typed mid-delivery"))
-                .await
-                .into_response()
+            acp_prompt(
+                State(state),
+                Path(id),
+                axum::http::HeaderMap::new(),
+                prompt_req("typed mid-delivery"),
+            )
+            .await
+            .into_response()
         }
     };
     tokio::pin!(handler);
@@ -790,6 +831,7 @@ async fn queued_explicit_work_follows_a_failed_prompt_but_not_a_failed_runtime()
         let first = acp_prompt(
             State(state.clone()),
             Path(id.clone()),
+            axum::http::HeaderMap::new(),
             prompt_req("first explicit request"),
         )
         .await
@@ -798,6 +840,7 @@ async fn queued_explicit_work_follows_a_failed_prompt_but_not_a_failed_runtime()
         let second = acp_prompt(
             State(state.clone()),
             Path(id.clone()),
+            axum::http::HeaderMap::new(),
             prompt_req("second explicit request"),
         )
         .await
@@ -826,7 +869,7 @@ async fn queued_explicit_work_follows_a_failed_prompt_but_not_a_failed_runtime()
                         name: "shell".into(),
                         kind: "execute".into(),
                         args_preview: "{}".into(),
-                        started_at: chrono::Utc::now(),
+                        started_at: crate::time::Timestamp::now(),
                         parent_tool_call_id: None,
                         memory_recall: None,
                         diffs: Vec::new(),
@@ -853,7 +896,7 @@ async fn queued_explicit_work_follows_a_failed_prompt_but_not_a_failed_runtime()
                             description: None,
                             tool_call_id: None,
                             questions: Vec::new(),
-                            requested_at: chrono::Utc::now(),
+                            requested_at: crate::time::Timestamp::now(),
                             resolved: None,
                         },
                     }),
@@ -983,7 +1026,14 @@ async fn queue_drain_publishes_row_ids_as_prompt_and_merged_ids() {
     for (row, text) in [("q1", "first"), ("q2", "second")] {
         state
             .session_service
-            .enqueue_prompt(id, row.into(), text.into(), vec![], None, None)
+            .enqueue_prompt(
+                id,
+                row.into(),
+                text.into(),
+                vec![],
+                None,
+                crate::server::session_service::QueueSender::default(),
+            )
             .await
             .expect("session exists");
     }
@@ -1028,12 +1078,10 @@ async fn diff_comments_refuse_to_open_a_turn_another_submission_started() {
         .acp_supervisor
         .publish_user_prompt_with_attachments(
             &id,
-            "the winning turn".into(),
-            &[],
-            Vec::new(),
-            false,
-            None,
-            None,
+            crate::acp::supervisor::UserPrompt {
+                text: "the winning turn".into(),
+                ..Default::default()
+            },
         )
         .await;
     drop(winner);
@@ -1056,8 +1104,8 @@ async fn diff_comments_refuse_to_open_a_turn_another_submission_started() {
 /// which is what makes B queue rather than dispatch.
 fn seed_elapsed_rate_limit_park(state: &AppState, id: &str, busy: bool) {
     let store = &state.acp_event_store;
-    let long_ago = chrono::Utc::now() - chrono::Duration::hours(1);
-    let at = long_ago.timestamp_millis();
+    let long_ago = crate::time::Timestamp::now() - crate::time::Duration::hours(1);
+    let at = long_ago.as_millis();
     let mut events = vec![
         Event::UserPromptSent {
             merged_prompt_ids: Vec::new(),
@@ -1066,6 +1114,7 @@ fn seed_elapsed_rate_limit_park(state: &AppState, id: &str, busy: bool) {
             prompt_id: None,
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         },
         Event::RateLimit {
             info: crate::acp::state::RateLimitInfo {
@@ -1144,7 +1193,12 @@ async fn a_manual_prompt_cannot_overtake_a_continuation_install() {
         // Causal precondition: the durable read this test ends on is live.
         state
             .session_service
-            .set_pending_initial_turn(&id, "probe".into(), Vec::new())
+            .set_pending_initial_turn(
+                &id,
+                "probe".into(),
+                Vec::new(),
+                crate::daemon::PromptOrigin::Unknown,
+            )
             .await;
         assert_eq!(
             persisted_pending_turn(&state, &id).await.map(|t| t.text),
@@ -1195,9 +1249,14 @@ async fn a_manual_prompt_cannot_overtake_a_continuation_install() {
             let state = Arc::clone(&state);
             let id = id.clone();
             async move {
-                acp_prompt(State(state), Path(id), prompt_req("manual prompt B"))
-                    .await
-                    .into_response()
+                acp_prompt(
+                    State(state),
+                    Path(id),
+                    axum::http::HeaderMap::new(),
+                    prompt_req("manual prompt B"),
+                )
+                .await
+                .into_response()
             }
         };
         tokio::pin!(prompt);
@@ -1246,20 +1305,27 @@ async fn a_manual_prompt_cannot_overtake_a_continuation_install() {
 #[test]
 fn prompt_persist_tiers() {
     // The recency-only tier does not clear a peer's archive by itself.
+    // Neither tier clears a peer's archive, but both are direct engagement and
+    // clear Ignore.
     let mut disk = crate::session::Instance::new("s", "/tmp/x");
     disk.view = crate::session::View::Structured;
-    disk.last_accessed_at = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
-    disk.archived_at = Some(chrono::Utc::now() - chrono::Duration::seconds(30));
+    disk.last_accessed_at =
+        Some(crate::time::Timestamp::now() - crate::time::Duration::seconds(60));
+    disk.archived_at = Some(crate::time::Timestamp::now() - crate::time::Duration::seconds(30));
+    disk.ignored_at = Some(crate::time::Timestamp::now());
     crate::server::session_service::apply_prompt_persist_to_disk(&mut disk, false);
     assert!(disk.archived_at.is_some());
+    assert!(disk.ignored_at.is_none());
     assert!(disk.last_accessed_at > disk.archived_at);
 
     // A wake persist lifts a sunk row.
     let mut disk = crate::session::Instance::new("s", "/tmp/x");
     disk.view = crate::session::View::Structured;
-    disk.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::minutes(10));
+    disk.snoozed_until = Some(crate::time::Timestamp::now() + crate::time::Duration::minutes(10));
+    disk.ignored_at = Some(crate::time::Timestamp::now());
     crate::server::session_service::apply_prompt_persist_to_disk(&mut disk, true);
     assert!(disk.snoozed_until.is_none());
+    assert!(disk.ignored_at.is_none());
     assert!(disk.last_accessed_at.is_some());
 }
 
@@ -1282,7 +1348,10 @@ async fn sending_a_queued_plugin_row_now_keeps_its_stored_sender() {
             "PR #7 was merged".into(),
             vec![],
             None,
-            Some("cron".into()),
+            crate::server::session_service::QueueSender {
+                plugin: Some("cron".into()),
+                origin: crate::daemon::PromptOrigin::Unknown,
+            },
         )
         .await
         .expect("session exists");
@@ -1290,6 +1359,7 @@ async fn sending_a_queued_plugin_row_now_keeps_its_stored_sender() {
     let response = acp_prompt(
         State(Arc::clone(&state)),
         Path(id.to_string()),
+        axum::http::HeaderMap::new(),
         send_now_req("PR #7 was merged", "q1"),
     )
     .await
@@ -1308,11 +1378,194 @@ async fn sending_a_queued_plugin_row_now_keeps_its_stored_sender() {
     let again = acp_prompt(
         State(Arc::clone(&state)),
         Path(id.to_string()),
+        axum::http::HeaderMap::new(),
         send_now_req("PR #7 was merged", "q1"),
     )
     .await
     .into_response();
     assert_eq!(again.status(), StatusCode::CONFLICT);
+}
+
+/// A human-edited plugin row keeps its `Plugin` origin but delivers as a user turn, by
+/// queue drain and by send now alike.
+#[tokio::test]
+async fn an_edited_plugin_row_delivers_as_a_user_turn() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    for send_now in [false, true] {
+        let id = format!("sess-edited-plugin-{send_now}");
+        let state = structured_state(&id, true).await;
+        let _cmds = state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(&id)
+            .await;
+        let _live = crate::acp::supervisor::test_support::save_agent_record(&id, "claude", true);
+        let row = state.instances.read().await[0].clone();
+        let storage =
+            Arc::new(crate::session::Storage::open_reference(&row.source_profile).unwrap());
+        let scope = crate::acp::state::NativeObservationScope::capture(&row, &storage).unwrap();
+        state
+            .acp_supervisor
+            .current_lease(&id)
+            .unwrap()
+            .set_admission(Some(crate::acp::supervisor::LaunchAdmission {
+                store: storage,
+                generation: row.lifecycle_generation,
+                namespace: Some(state.profile_namespace.clone()),
+                native_scope: Some(scope),
+            }));
+        state.acp_supervisor.test_observe_native_ready(&id).await;
+        state
+            .session_service
+            .enqueue_prompt(
+                &id,
+                "q1".into(),
+                "from the plugin".into(),
+                vec![],
+                None,
+                crate::server::session_service::QueueSender {
+                    plugin: Some("cron".into()),
+                    origin: crate::daemon::PromptOrigin::Plugin,
+                },
+            )
+            .await
+            .expect("session exists");
+        state
+            .session_service
+            .edit_queued_prompt(&id, "q1".into(), "reworded".into())
+            .await;
+
+        if send_now {
+            let response = acp_prompt(
+                State(Arc::clone(&state)),
+                Path(id.clone()),
+                axum::http::HeaderMap::new(),
+                send_now_req("reworded", "q1"),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        } else {
+            state.session_service.drain_queued_prompts_once(&id).await;
+        }
+
+        let sent: Vec<_> = state
+            .acp_event_store
+            .replay_from(&id, 0)
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                Event::UserPromptSent {
+                    text,
+                    origin,
+                    origin_plugin,
+                    ..
+                } => Some((text, origin, origin_plugin)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            [(
+                "reworded".to_string(),
+                crate::daemon::PromptOrigin::Plugin,
+                None
+            )],
+            "send_now={send_now}"
+        );
+        assert!(state
+            .session_service
+            .queued_prompts_snapshot(&id)
+            .await
+            .is_empty());
+    }
+}
+
+/// The recorded origin is the header's client value; a forged, missing or body-supplied one
+/// is `Unknown`. A queued row keeps the origin it was stored with, whatever the send-now
+/// request claims.
+#[tokio::test]
+async fn the_recorded_origin_is_server_derived() {
+    use crate::daemon::PromptOrigin;
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let recorded = |state: &AppState, id: &str| {
+        state
+            .acp_event_store
+            .replay_from(id, 0)
+            .into_iter()
+            .find_map(|(_, e)| match e {
+                Event::UserPromptSent { origin, .. } => Some(origin),
+                _ => None,
+            })
+    };
+    let cases = [
+        (Some("dashboard"), PromptOrigin::Dashboard),
+        (Some("tui"), PromptOrigin::Tui),
+        (Some("cli"), PromptOrigin::Cli),
+        (Some("mcp"), PromptOrigin::Unknown),
+        (Some("plugin"), PromptOrigin::Unknown),
+        (None, PromptOrigin::Unknown),
+    ];
+    for (n, (header, want)) in cases.into_iter().enumerate() {
+        let id = format!("sess-origin-{n}");
+        let state = structured_state(&id, true).await;
+        let _cmds = state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(&id)
+            .await;
+        let mut headers = axum::http::HeaderMap::new();
+        if let Some(value) = header {
+            headers.insert(PromptOrigin::HEADER, value.parse().unwrap());
+        }
+        let response = acp_prompt(
+            State(Arc::clone(&state)),
+            Path(id.clone()),
+            headers,
+            Ok(Json(
+                serde_json::from_value(serde_json::json!({
+                    "text": "hello",
+                    "origin": "cli",
+                }))
+                .unwrap(),
+            )),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED, "{header:?}");
+        assert_eq!(recorded(&state, &id), Some(want), "{header:?}");
+    }
+
+    let id = "sess-origin-send-now";
+    let state = structured_state(id, true).await;
+    let _cmds = state
+        .acp_supervisor
+        .test_insert_worker_cmd_recording(id)
+        .await;
+    state
+        .session_service
+        .enqueue_prompt(
+            id,
+            "q1".into(),
+            "queued".into(),
+            vec![],
+            None,
+            crate::server::session_service::QueueSender {
+                plugin: None,
+                origin: PromptOrigin::Dashboard,
+            },
+        )
+        .await
+        .expect("session exists");
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(PromptOrigin::HEADER, "cli".parse().unwrap());
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.to_string()),
+        headers,
+        send_now_req("queued", "q1"),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(recorded(&state, id), Some(PromptOrigin::Dashboard));
 }
 
 /// Another tab's optimistic row carries the queued row id, so it must settle too.
@@ -1329,6 +1582,7 @@ async fn send_now_publishes_the_request_id_then_the_queued_row_id() {
     let response = acp_prompt(
         State(Arc::clone(&state)),
         Path(id.to_string()),
+        axum::http::HeaderMap::new(),
         Ok(Json(PromptRequest {
             text: "PR #7 was merged".to_string(),
             attachments: Vec::new(),
@@ -1357,7 +1611,10 @@ async fn state_with_queued_plugin_row(id: &str, idle: bool) -> Arc<AppState> {
             "PR #7 was merged".into(),
             vec![],
             None,
-            Some("cron".into()),
+            crate::server::session_service::QueueSender {
+                plugin: Some("cron".into()),
+                origin: crate::daemon::PromptOrigin::Unknown,
+            },
         )
         .await
         .expect("session exists");
@@ -1378,6 +1635,7 @@ async fn send_now_refuses_text_that_differs_from_the_stored_plugin_row() {
     let response = acp_prompt(
         State(Arc::clone(&state)),
         Path(id.to_string()),
+        axum::http::HeaderMap::new(),
         send_now_req("something the plugin never said", "q1"),
     )
     .await
@@ -1410,13 +1668,21 @@ async fn send_now_refuses_text_that_differs_from_a_user_row_too() {
         .await;
     state
         .session_service
-        .enqueue_prompt(id, "q1".into(), "stored".into(), vec![], None, None)
+        .enqueue_prompt(
+            id,
+            "q1".into(),
+            "stored".into(),
+            vec![],
+            None,
+            crate::server::session_service::QueueSender::default(),
+        )
         .await
         .expect("session exists");
 
     let response = acp_prompt(
         State(Arc::clone(&state)),
         Path(id.to_string()),
+        axum::http::HeaderMap::new(),
         send_now_req("edited elsewhere", "q1"),
     )
     .await
@@ -1482,6 +1748,7 @@ async fn a_failed_repost_keeps_the_rows_attachment_bytes() {
                 origin_device: None,
                 origin_plugin: None,
                 supersede_pending_turn: true,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
         )
         .await;
@@ -1509,7 +1776,7 @@ async fn state_with_attachment_row(id: &str, store_bytes: bool) -> Arc<AppState>
             "caption".into(),
             vec![shot_ref()],
             None,
-            None,
+            crate::server::session_service::QueueSender::default(),
         )
         .await
         .expect("session exists");
@@ -1545,6 +1812,7 @@ async fn send_now_delivers_the_rows_stored_attachments_not_the_requests() {
     let response = acp_prompt(
         State(Arc::clone(&state)),
         Path(id.to_string()),
+        axum::http::HeaderMap::new(),
         Ok(Json(PromptRequest {
             text: "caption".into(),
             attachments: vec![crate::acp::protocol::PromptAttachmentUpload {
@@ -1594,6 +1862,7 @@ async fn send_now_keeps_a_row_whose_attachment_bytes_are_gone() {
     let response = acp_prompt(
         State(Arc::clone(&state)),
         Path(id.to_string()),
+        axum::http::HeaderMap::new(),
         send_now_req("caption", "q1"),
     )
     .await
@@ -1620,6 +1889,7 @@ async fn a_refused_send_now_keeps_the_queued_row() {
     let response = acp_prompt(
         State(Arc::clone(&state)),
         Path(id.to_string()),
+        axum::http::HeaderMap::new(),
         Ok(Json(PromptRequest {
             text: "PR #7 was merged".into(),
             attachments: Vec::new(),
@@ -1650,18 +1920,17 @@ async fn send_now_behind_a_busy_agent_keeps_the_one_queued_row() {
         .acp_supervisor
         .publish_user_prompt_with_attachments(
             id,
-            "the user's turn".into(),
-            &[],
-            Vec::new(),
-            false,
-            None,
-            None,
+            crate::acp::supervisor::UserPrompt {
+                text: "the user's turn".into(),
+                ..Default::default()
+            },
         )
         .await;
 
     let response = acp_prompt(
         State(Arc::clone(&state)),
         Path(id.to_string()),
+        axum::http::HeaderMap::new(),
         send_now_req("PR #7 was merged", "q1"),
     )
     .await
@@ -1692,11 +1961,16 @@ async fn native_loss_and_legacy_refusal_precede_prompt_touch_queue_or_launch() {
         {
             let mut rows = state.instances.write().await;
             rows[0].mark_idle_dormant();
-            rows[0].snoozed_until = Some(chrono::Utc::now() + chrono::Duration::days(3));
+            rows[0].snoozed_until =
+                Some(crate::time::Timestamp::now() + crate::time::Duration::days(3));
             rows[0].pending_initial_turn = Some(crate::session::PendingInitialTurn {
                 text: "existing continuation".into(),
                 attachments: Vec::new(),
                 synthesized: true,
+                error: None,
+                error_code: None,
+                id: crate::session::PendingInitialTurn::fresh_id(),
+                origin: crate::daemon::PromptOrigin::Unknown,
             });
         }
         seed_native_row(&state).await;
@@ -1708,11 +1982,13 @@ async fn native_loss_and_legacy_refusal_precede_prompt_touch_queue_or_launch() {
                 "existing queued intent".into(),
                 vec![],
                 None,
-                None,
+                crate::server::session_service::QueueSender::default(),
             )
             .await
             .unwrap();
-        state.instances.write().await[0].last_error = Some("retained operation diagnostic".into());
+        state.instances.write().await[0]
+            .last_error
+            .set("retained operation diagnostic".to_owned());
         let row = state.instances.read().await[0].clone();
         let socket = worker_registry::socket_path_for(id).unwrap();
         let mut record = WorkerRecord::new(
@@ -1773,6 +2049,7 @@ async fn native_loss_and_legacy_refusal_precede_prompt_touch_queue_or_launch() {
                 acp_prompt(
                     State(state.clone()),
                     Path(id.into()),
+                    axum::http::HeaderMap::new(),
                     prompt_req("must not wake"),
                 )
                 .await
@@ -1957,6 +2234,7 @@ async fn readable_known_worker_down_keeps_explicit_queue_admission_without_nativ
     let response = acp_prompt(
         State(state.clone()),
         Path(id.into()),
+        axum::http::HeaderMap::new(),
         prompt_req("explicit queued intent"),
     )
     .await
@@ -1994,6 +2272,7 @@ async fn readable_known_worker_down_keeps_explicit_queue_admission_without_nativ
     let response = acp_prompt(
         State(state.clone()),
         Path(id.into()),
+        axum::http::HeaderMap::new(),
         prompt_req("must not become known absence"),
     )
     .await
@@ -2036,6 +2315,10 @@ async fn native_loss_after_publication_consumes_pending_but_preserves_named_queu
                 text: "existing governed continuation".into(),
                 attachments: vec![],
                 synthesized: true,
+                error: None,
+                error_code: None,
+                id: crate::session::PendingInitialTurn::fresh_id(),
+                origin: crate::daemon::PromptOrigin::Unknown,
             });
         }
         seed_native_row(&state).await;
@@ -2060,7 +2343,14 @@ async fn native_loss_after_publication_consumes_pending_but_preserves_named_queu
         state.acp_supervisor.test_observe_native_ready(id).await;
         state
             .session_service
-            .enqueue_prompt(id, "retained".into(), text.into(), vec![], None, None)
+            .enqueue_prompt(
+                id,
+                "retained".into(),
+                text.into(),
+                vec![],
+                None,
+                crate::server::session_service::QueueSender::default(),
+            )
             .await
             .unwrap();
         let current = state
@@ -2076,6 +2366,7 @@ async fn native_loss_after_publication_consumes_pending_but_preserves_named_queu
                 acp_prompt(
                     State(state),
                     Path(id.into()),
+                    axum::http::HeaderMap::new(),
                     send_now_req(text, "retained"),
                 )
                 .await
@@ -2147,6 +2438,7 @@ async fn a_prompt_reports_its_dispatch_and_the_seq_it_was_recorded_at() {
         prompt_id: None,
         synthesized: false,
         origin_plugin: None,
+        origin: crate::daemon::PromptOrigin::Unknown,
     };
     // (case, events already on disk, disposition)
     let cases = [
@@ -2183,6 +2475,7 @@ async fn a_prompt_reports_its_dispatch_and_the_seq_it_was_recorded_at() {
         let response = acp_prompt(
             State(Arc::clone(&state)),
             Path(id.to_string()),
+            axum::http::HeaderMap::new(),
             prompt_req("the new prompt"),
         )
         .await
@@ -2301,6 +2594,10 @@ async fn sandbox_login_queue_keeps_http_prompt() {
         text: "run the nightly task".to_string(),
         attachments: Vec::new(),
         synthesized: false,
+        error: None,
+        error_code: None,
+        id: String::new(),
+        origin: crate::daemon::PromptOrigin::Unknown,
     });
     crate::session::test_support::sandbox_needing_login(app_dir.path(), &mut inst);
     let state = crate::server::test_support::build_native_test_app_state(vec![inst]).await;
@@ -2332,6 +2629,7 @@ async fn sandbox_login_queue_keeps_http_prompt() {
     let response = acp_prompt(
         State(Arc::clone(&state)),
         Path(id.clone()),
+        axum::http::HeaderMap::new(),
         Ok(Json(PromptRequest {
             text: "caption".into(),
             attachments: vec![crate::acp::protocol::PromptAttachmentUpload {
@@ -2403,6 +2701,7 @@ async fn sandbox_login_queue_keeps_http_prompt() {
     let response = acp_prompt(
         State(Arc::clone(&state)),
         Path(id.clone()),
+        axum::http::HeaderMap::new(),
         send_now_req("caption", "p-login"),
     )
     .await
@@ -2465,7 +2764,7 @@ async fn sandbox_login_queue_respects_the_queue_caps() {
                     format!("row {n}"),
                     Vec::new(),
                     None,
-                    None,
+                    crate::server::session_service::QueueSender::default(),
                 )
                 .await
                 .expect("the row is queued");
@@ -2475,6 +2774,7 @@ async fn sandbox_login_queue_respects_the_queue_caps() {
         let response = acp_prompt(
             State(state),
             Path(id),
+            axum::http::HeaderMap::new(),
             Ok(Json(PromptRequest {
                 text,
                 attachments: Vec::new(),
@@ -2593,6 +2893,7 @@ async fn buffer_and_enqueue_applies_every_cap_before_buffering() {
                     origin_device: None,
                     origin_plugin: None,
                     supersede_pending_turn: false,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 },
             )
             .await
@@ -2649,6 +2950,7 @@ async fn buffer_and_enqueue_applies_every_cap_before_buffering() {
             origin_device: None,
             origin_plugin: None,
             supersede_pending_turn: false,
+            origin: crate::daemon::PromptOrigin::Unknown,
         },
     )
     .await
@@ -2694,10 +2996,15 @@ async fn a_refused_enqueue_keeps_the_pending_initial_turn_and_a_queued_one_super
     use crate::server::session_service::{MAX_QUEUED_PROMPTS_PER_SESSION, MAX_QUEUED_TEXT_BYTES};
     let _app = crate::session::test_support::isolate_app_dir();
     let post = |state: Arc<AppState>, id: String, text: String| async move {
-        acp_prompt(State(state), Path(id), prompt_req(&text))
-            .await
-            .into_response()
-            .status()
+        acp_prompt(
+            State(state),
+            Path(id),
+            axum::http::HeaderMap::new(),
+            prompt_req(&text),
+        )
+        .await
+        .into_response()
+        .status()
     };
     let seed = |label: &str| {
         let id = format!("sess-refused-enqueue-{label}");
@@ -2727,7 +3034,12 @@ async fn a_refused_enqueue_keeps_the_pending_initial_turn_and_a_queued_one_super
         crate::server::test_support::seed_native_rows_for_test(&state).await;
         state
             .session_service
-            .set_pending_initial_turn(&id, "continuation".into(), Vec::new())
+            .set_pending_initial_turn(
+                &id,
+                "continuation".into(),
+                Vec::new(),
+                crate::daemon::PromptOrigin::Unknown,
+            )
             .await;
         if fill {
             for n in 0..MAX_QUEUED_PROMPTS_PER_SESSION {
@@ -2739,7 +3051,7 @@ async fn a_refused_enqueue_keeps_the_pending_initial_turn_and_a_queued_one_super
                         format!("row {n}"),
                         Vec::new(),
                         None,
-                        None,
+                        crate::server::session_service::QueueSender::default(),
                     )
                     .await
                     .expect("the row is queued");
@@ -2789,7 +3101,12 @@ async fn a_refused_enqueue_keeps_the_pending_initial_turn_and_a_queued_one_super
     crate::server::test_support::seed_native_rows_for_test(&state).await;
     state
         .session_service
-        .set_pending_initial_turn(&id, "continuation".into(), Vec::new())
+        .set_pending_initial_turn(
+            &id,
+            "continuation".into(),
+            Vec::new(),
+            crate::daemon::PromptOrigin::Unknown,
+        )
         .await;
     assert_eq!(
         post(Arc::clone(&state), id.clone(), "hello".to_string()).await,
@@ -2851,9 +3168,14 @@ async fn sandbox_login_send_resolves_the_before_start_hook_once_and_queues_on_re
         (id, state)
     };
     let post = |state: Arc<AppState>, id: String, text: &'static str| async move {
-        let response = acp_prompt(State(state), Path(id), prompt_req(text))
-            .await
-            .into_response();
+        let response = acp_prompt(
+            State(state),
+            Path(id),
+            axum::http::HeaderMap::new(),
+            prompt_req(text),
+        )
+        .await
+        .into_response();
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), 8192)
             .await
@@ -2867,7 +3189,12 @@ async fn sandbox_login_send_resolves_the_before_start_hook_once_and_queues_on_re
     crate::server::test_support::seed_native_rows_for_test(&state).await;
     state
         .session_service
-        .set_pending_initial_turn(&id, "continuation".into(), Vec::new())
+        .set_pending_initial_turn(
+            &id,
+            "continuation".into(),
+            Vec::new(),
+            crate::daemon::PromptOrigin::Unknown,
+        )
         .await;
     let (status, body) = post(Arc::clone(&state), id.clone(), "hello").await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
@@ -2934,12 +3261,18 @@ async fn sandbox_login_send_keeps_the_turn_when_the_before_start_hook_fails() {
     let state = crate::server::test_support::build_native_test_app_state(vec![inst]).await;
     state
         .session_service
-        .set_pending_initial_turn(&id, "continuation".into(), Vec::new())
+        .set_pending_initial_turn(
+            &id,
+            "continuation".into(),
+            Vec::new(),
+            crate::daemon::PromptOrigin::Unknown,
+        )
         .await;
 
     let response = acp_prompt(
         State(Arc::clone(&state)),
         Path(id.clone()),
+        axum::http::HeaderMap::new(),
         prompt_req("hello"),
     )
     .await

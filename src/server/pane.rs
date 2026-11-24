@@ -404,7 +404,7 @@ pub(super) async fn publish_auxiliary_after_ensure(
             row.id == id
                 && row.lifecycle_generation == expected.0
                 && row.profile == expected.1
-                && row.created_at.parse::<chrono::DateTime<chrono::Utc>>().ok() == Some(created_at)
+                && crate::time::Timestamp::parse_rfc3339(&row.created_at).ok() == Some(created_at)
         })
         .ok_or(crate::session::LifecycleReservationError::Superseded)?;
     row.auxiliary

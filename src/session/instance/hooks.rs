@@ -318,17 +318,19 @@ impl Instance {
     /// Run the pre-launch hooks. `progress` selects live streamed output for a
     /// caller that displays it (the daemon create path); without one the hooks
     /// keep their terminal attached and their output captured, so a CLI user
-    /// can still answer an interactive prompt.
+    /// can still answer an interactive prompt. `cancel` stops the sandbox's
+    /// container setup, and kills its image pull.
     pub(crate) fn run_pre_launch_hooks(
         &mut self,
         skip_on_launch: bool,
         store: &dyn SessionStore,
         progress: Option<&dyn Fn(crate::session::config::repo_config::HookProgress)>,
         launch_generation: Option<u64>,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         let config = store.configuration(Some(store.storage().profile()))?;
         self.mint_host_session_env(&config)?;
-        self.run_launch_hooks(skip_on_launch, store, progress, launch_generation)
+        self.run_launch_hooks(skip_on_launch, store, progress, launch_generation, cancel)
     }
 
     /// [`Self::run_pre_launch_hooks`] for a launch of the agent: a sandboxed session first
@@ -345,7 +347,13 @@ impl Instance {
         if self.is_sandboxed() {
             self.ensure_sandbox_launchable(store)?;
         }
-        self.run_pre_launch_hooks(skip_on_launch, store, progress, launch_generation)
+        self.run_pre_launch_hooks(
+            skip_on_launch,
+            store,
+            progress,
+            launch_generation,
+            &tokio_util::sync::CancellationToken::new(),
+        )
     }
 
     fn run_launch_hooks(
@@ -354,6 +362,7 @@ impl Instance {
         store: &dyn SessionStore,
         progress: Option<&dyn Fn(crate::session::config::repo_config::HookProgress)>,
         launch_generation: Option<u64>,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         if self.tool == "omp" && !self.has_command_override() {
             reject_omp_secret_args(&crate::session::config::quote_model_value_in_args(
@@ -379,7 +388,12 @@ impl Instance {
         };
 
         if self.is_sandboxed() {
-            self.ensure_container_in(store, launch_generation)?;
+            self.ensure_container_with_hook_in(
+                store,
+                cancel,
+                launch_generation,
+                Self::mint_before_start_env,
+            )?;
             if let (Some((hook_cmds, from_repo)), Some(sandbox)) =
                 (on_launch_hooks.as_ref(), self.sandbox_info.as_ref())
             {
@@ -2056,7 +2070,7 @@ mod tests {
                 let stored = storage.load().unwrap().remove(0);
                 assert!(stored.ensure_startable() == Err(want), "{label}");
                 assert_eq!(stored.lifecycle_reservation, None, "{label}");
-                assert_eq!(stored.last_error, None, "{label}");
+                assert_eq!(stored.last_error.as_deref(), None, "{label}");
                 let parked = if restart {
                     Status::Idle
                 } else {

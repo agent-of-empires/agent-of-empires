@@ -74,7 +74,7 @@ thiserror = "2.0"
 anyhow = "1.0"
 
 # Time handling
-chrono = { version = "0.4", features = ["serde"] }
+time = { version = "0.3.55", features = ["parsing"] }
 
 # UUID generation
 uuid = { version = "1.23", features = ["v4", "serde"] }
@@ -181,8 +181,8 @@ agent-client-protocol = { version = "5", features = ["unstable_end_turn_token_us
 semver = "1"
 
 # Tar stream handling: the structured view's bundled-Node fallback (with xz2
-# for tar.xz) and external plugin install (with flate2 for tar.gz). xz2 needs
-# system liblzma.
+# for tar.xz) and external plugin install (with flate2 for tar.gz). The
+# `vendored` feature builds liblzma from source and links it statically.
 tar = "0.4"
 flate2 = "1"
 xz2 = "0.1"
@@ -195,7 +195,7 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["r
 # escape the intended root.
 cap-std = "4.0.2"
 rmcp = { version = "3.5.1", features = ["transport-streamable-http-server"] }
-schemars = { version = "1", features = ["chrono04"] }
+schemars = "1"
 
 # Unix-only: O_NOFOLLOW for capability-safe filesystem operations.
 [target.'cfg(unix)'.dependencies]
@@ -212,8 +212,8 @@ core-foundation-sys = "0.8.7"
 # dashboard bundle, which is what invokes npm; released binaries are built
 # `--features web`, so every distributed binary ships the dashboard.
 default = ["default-plugins", "vendored"]
-# OpenSSL and SQLite vendoring for portable builds.
-vendored = ["git2/vendored-openssl", "rusqlite/bundled"]
+# OpenSSL, SQLite and liblzma vendoring for portable builds.
+vendored = ["git2/vendored-openssl", "rusqlite/bundled", "xz2/static"]
 # Compatibility flag for default plugin selection.
 default-plugins = []
 # Gates the `e2e` test target (tests/e2e/main.rs). Off by default so CI can run

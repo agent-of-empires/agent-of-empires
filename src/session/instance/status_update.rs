@@ -15,6 +15,16 @@ fn detection_content<'a>(
     fresh.or(reuse.map(|(reused, _)| reused))
 }
 
+/// What ended a pane, as a sentence the remedy can follow: the adapter's diagnostic when it saw
+/// one, else that the terminal ended.
+fn ended_sentence(diagnostic: Option<&str>) -> String {
+    match diagnostic {
+        Some(line) if line.ends_with(['.', '!', '?', '…']) => line.to_string(),
+        Some(line) => format!("{line}."),
+        None => "The terminal ended.".to_string(),
+    }
+}
+
 /// Whether this poll can reuse the last verdict instead of capturing the pane.
 fn skip_capture(
     activity: Option<i64>,
@@ -80,7 +90,7 @@ impl Instance {
                 // Only a plain Idle is ever held, so there is no error explanation to keep or
                 // derive.
                 self.status = pending;
-                self.last_error = None;
+                self.last_error.clear();
                 self.last_error_evidence = None;
             }
         }
@@ -88,7 +98,7 @@ impl Instance {
             if prev != self.status {
                 self.log_status_transition(prev);
                 // last_accessed_at is deliberately NOT restamped here.
-                let now = Utc::now();
+                let now = Timestamp::now();
                 self.idle_entered_at = if self.status == Status::Idle {
                     Some(now)
                 } else {
@@ -113,12 +123,12 @@ impl Instance {
         );
     }
 
-    /// Drop a [`TMUX_SESSION_GONE_ERROR`] left on a row that no longer has a tmux pane to speak for
-    /// it, so the UI stops showing a message that cannot apply to it any more (a session converted
-    /// to, or restarted in, the structured view).
+    /// Drop a gone-pane error ([`reports_tmux_session_gone`]) left on a row that no longer has a
+    /// tmux pane to speak for it, so the UI stops showing a message that cannot apply to it any more
+    /// (a session converted to, or restarted in, the structured view).
     pub(crate) fn clear_stale_tmux_error(&mut self) {
-        if self.last_error.as_deref() == Some(TMUX_SESSION_GONE_ERROR) {
-            self.last_error = None;
+        if reports_tmux_session_gone(&self.last_error) {
+            self.last_error.clear();
             self.last_error_evidence = None;
         }
     }
@@ -127,7 +137,7 @@ impl Instance {
     fn latch_tmux_error(&mut self, message: &str) {
         self.status = Status::Error;
         if self.last_error.is_none() {
-            self.last_error = Some(message.to_string());
+            self.last_error.set(message.to_string());
         }
         self.last_error_check = Some(std::time::Instant::now());
         self.record_terminal_error(
@@ -137,11 +147,18 @@ impl Instance {
     }
 
     /// Explain a pane failure from what the pane last printed, keeping any explanation already
-    /// recorded.
-    fn explain_error_from_pane(&mut self, session: &tmux::Session) {
-        if self.last_error.is_none() {
-            let pane_content = session.capture_pane(20).unwrap_or_default();
-            self.last_error = Some(summarize_error_from_pane(&pane_content));
+    /// recorded. A pane that `ended` also names the remedy its restart needs, after what it printed.
+    fn explain_error_from_pane(&mut self, session: &tmux::Session, ended: bool) {
+        let pane_content = self
+            .last_error
+            .is_none()
+            .then(|| session.capture_pane(20).unwrap_or_default());
+        if ended {
+            self.name_refused_restart(None, pane_content.as_deref().and_then(pane_error_line));
+        }
+        if let Some(pane_content) = pane_content.filter(|_| self.last_error.is_none()) {
+            self.last_error
+                .set(summarize_error_from_pane(&pane_content));
         }
     }
 
@@ -177,6 +194,132 @@ impl Instance {
         }
     }
 
+    /// Latch an Error for a pane tmux can't show: `message`, or when every launch of this row is
+    /// refused, `lead` and the remedy. An explanation already recorded stays, and a confirmed
+    /// absence marks it gone, so the Session still reads as terminated.
+    fn latch_missing_pane(&mut self, absence: TmuxAbsence, message: &str, lead: &str) {
+        if absence == TmuxAbsence::Gone {
+            self.gone_after_unreachable();
+        }
+        self.name_refused_restart(Some((absence, lead)), None);
+        if self.last_error.is_none() {
+            self.last_error.latch_tmux(absence, message);
+        } else if absence == TmuxAbsence::Gone {
+            self.last_error.confirm_gone();
+        }
+        self.latch_tmux_error(message);
+    }
+
+    /// For a pane that ended while every launch of this row is refused: what ended it, then the
+    /// fix a restart needs first. What ended it is `lead` (the pane itself is gone) followed by the
+    /// diagnostic, else the diagnostic alone. The diagnostic is the one already recorded, such as
+    /// a live error the agent showed, else `seen`. The remedy itself isn't stored, so after a
+    /// reload or a daemon restart this is how it comes back. Once the row can launch again, a
+    /// remedy already named is dropped and what ended the pane stays.
+    fn name_refused_restart(&mut self, lead: Option<(TmuxAbsence, &str)>, seen: Option<String>) {
+        if self.drop_remedy_if_launchable() {
+            return;
+        }
+        let remedy = Self::command_selector_remedy(&self.id);
+        let named = format!(" {REFUSED_RESTART} {remedy}");
+        // A pane confirmed gone stays gone when tmux later can't be reached.
+        let lead = match lead {
+            Some(_) if self.last_error.absence() == Some(TmuxAbsence::Gone) => {
+                Some((TmuxAbsence::Gone, TMUX_SESSION_GONE_LEAD))
+            }
+            lead => lead,
+        };
+        if self.without_named_remedy().is_some() {
+            return;
+        }
+        let diagnostic = self.last_error.diagnostic().map(str::to_owned).or(seen);
+        let ended = match (lead.map(|(_, lead)| lead), diagnostic.as_deref()) {
+            (Some(lead), Some(diagnostic)) => {
+                format!("{lead} {}", ended_sentence(Some(diagnostic)))
+            }
+            (Some(lead), None) => lead.to_string(),
+            (None, diagnostic) => ended_sentence(diagnostic),
+        };
+        let message = format!("{ended}{named}");
+        match lead {
+            Some((absence, _)) => self.last_error.latch_tmux(absence, message),
+            None => self.last_error.set(message),
+        }
+    }
+
+    /// An unreachable latch's text, now that tmux confirms the pane gone: the plain message, or
+    /// the lead before a diagnostic and remedy. Only that latch vouches the text is AoE's own, so
+    /// any other error is left as written.
+    fn gone_after_unreachable(&mut self) {
+        if self.last_error.absence() != Some(TmuxAbsence::Unreachable) {
+            return;
+        }
+        let Some(error) = self.last_error.as_deref() else {
+            return;
+        };
+        let gone = if error == TMUX_SERVER_UNREACHABLE_ERROR {
+            TMUX_SESSION_GONE_ERROR.to_owned()
+        } else if let Some(rest) = error.strip_prefix(TMUX_SERVER_UNREACHABLE_LEAD) {
+            format!("{TMUX_SESSION_GONE_LEAD}{rest}")
+        } else {
+            return;
+        };
+        self.last_error.latch_tmux(TmuxAbsence::Gone, gone);
+    }
+
+    /// The remedy reconcile a tmux latch's own poll makes ([`Self::latch_missing_pane`]).
+    fn reconcile_latched_remedy(&mut self) {
+        let lead = match self.last_error.absence() {
+            Some(absence @ TmuxAbsence::Gone) => (absence, TMUX_SESSION_GONE_LEAD),
+            Some(absence @ TmuxAbsence::Unreachable) => (absence, TMUX_SERVER_UNREACHABLE_LEAD),
+            None => {
+                self.drop_remedy_if_launchable();
+                return;
+            }
+        };
+        self.name_refused_restart(Some(lead), None);
+    }
+
+    /// Whether the row can launch again, having dropped a remedy already named if so. The latch
+    /// stays.
+    fn drop_remedy_if_launchable(&mut self) -> bool {
+        if self.command_selector_refuses_launch() {
+            return false;
+        }
+        if let Some(ended) = self.without_named_remedy() {
+            self.last_error.rewrite(ended);
+        }
+        true
+    }
+
+    /// The `last_error` of a Terminal handoff that ended because its launch is refused.
+    pub(crate) fn handoff_refused(session_id: &str) -> String {
+        format!(
+            "{HANDOFF_ENDED}: {}",
+            Self::command_selector_remedy(session_id)
+        )
+    }
+
+    /// What ended the row, when its error names the remedy in either form AoE writes: a poll's
+    /// [`Self::name_refused_restart`] or an ended handoff's [`Self::handoff_refused`]. A bare tmux
+    /// lead reads as that latch's own message.
+    fn without_named_remedy(&self) -> Option<String> {
+        let error = self.last_error.as_deref()?;
+        if error == Self::handoff_refused(&self.id) {
+            return Some(format!("{HANDOFF_ENDED}."));
+        }
+        let remedy = Self::command_selector_remedy(&self.id);
+        let ended = error.strip_suffix(&format!(" {REFUSED_RESTART} {remedy}"))?;
+        Some(
+            match ended {
+                TMUX_SESSION_GONE_LEAD => TMUX_SESSION_GONE_ERROR,
+                TMUX_SERVER_UNREACHABLE_LEAD => TMUX_SERVER_UNREACHABLE_ERROR,
+                ended => ended,
+            }
+            .to_owned(),
+        )
+    }
+
     pub(super) fn update_status_with_metadata_inner(
         &mut self,
         metadata: Option<&tmux::PaneMetadata>,
@@ -208,7 +351,7 @@ impl Instance {
 
         // A peer process is launching this row and has not created its pane yet; the owner's
         // commit or failure write decides the outcome.
-        if self.has_fresh_launch_reservation(Utc::now()) {
+        if self.has_fresh_launch_reservation(Timestamp::now()) {
             self.status = Status::Starting;
             return;
         }
@@ -216,6 +359,8 @@ impl Instance {
         if self.status == Status::Error && self.last_error.is_some() {
             if let Some(last_check) = self.last_error_check {
                 if last_check.elapsed().as_secs() < 30 {
+                    // Throttles tmux probes only; the remedy follows the row's own command.
+                    self.reconcile_latched_remedy();
                     return;
                 }
             }
@@ -253,7 +398,11 @@ impl Instance {
                     session.name()
                 );
                 self.unknown_since = None;
-                self.latch_tmux_error(TMUX_SESSION_GONE_ERROR);
+                self.latch_missing_pane(
+                    TmuxAbsence::Gone,
+                    TMUX_SESSION_GONE_ERROR,
+                    TMUX_SESSION_GONE_LEAD,
+                );
                 return;
             }
             tmux::SessionExistence::Unknown => {
@@ -285,12 +434,24 @@ impl Instance {
                     window,
                     self.ever_confirmed_present
                 );
-                self.latch_tmux_error(TMUX_SERVER_UNREACHABLE_ERROR);
+                self.latch_missing_pane(
+                    TmuxAbsence::Unreachable,
+                    TMUX_SERVER_UNREACHABLE_ERROR,
+                    TMUX_SERVER_UNREACHABLE_LEAD,
+                );
                 return;
             }
             tmux::SessionExistence::Present => {
                 self.unknown_since = None;
                 self.ever_confirmed_present = true;
+                // tmux shows the pane again, so it explains itself, from a fresh capture.
+                if self.last_error.absence().is_some() {
+                    self.last_error.clear();
+                    self.detection.activity = None;
+                    self.detection.captured_at = None;
+                    self.detection.observation_key = None;
+                    self.detection.ended = false;
+                }
             }
         }
 
@@ -319,6 +480,7 @@ impl Instance {
             self.detection.activity = None;
             self.detection.captured_at = None;
             self.detection.observation_key = None;
+            self.detection.ended = false;
             self.detection.rule = Some(if reported {
                 crate::plugin::agent_integration::OWNED_RULE
             } else {
@@ -326,14 +488,14 @@ impl Instance {
             });
             if self.status == Status::Error {
                 if is_dead {
-                    self.explain_error_from_pane(&session);
+                    self.explain_error_from_pane(&session, true);
                 } else if self.last_error.is_none() {
-                    self.last_error = Some(summarize_error_from_pane(
+                    self.last_error.set(summarize_error_from_pane(
                         &session.capture_pane(20).unwrap_or_default(),
                     ));
                 }
             } else {
-                self.last_error = None;
+                self.last_error.clear();
             }
             return;
         }
@@ -363,7 +525,7 @@ impl Instance {
         // reported hooks at all: a hookless agent's pane is allowed to end.
         if is_dead && hook.is_some() {
             self.status = Status::Error;
-            self.explain_error_from_pane(&session);
+            self.explain_error_from_pane(&session, true);
             self.record_terminal_error(
                 ErrorEvidenceSource::TmuxObservation,
                 Self::observed_pane_runtime(metadata, true),
@@ -399,13 +561,13 @@ impl Instance {
                 self.status = hook.status;
                 // An Error keeps its explanation, as the manifest path does.
                 if hook.status == Status::Error {
-                    self.explain_error_from_pane(&session);
+                    self.explain_error_from_pane(&session, false);
                     self.record_terminal_error(
                         ErrorEvidenceSource::TerminalText,
                         Self::observed_pane_runtime(metadata, is_dead),
                     );
                 } else {
-                    self.last_error = None;
+                    self.last_error.clear();
                     self.last_error_evidence = None;
                 }
                 return;
@@ -466,15 +628,19 @@ impl Instance {
         tracing::trace!(target: "session.store", "status '{}': final={:?}", self.title, self.status);
 
         if self.status == Status::Error {
+            if is_dead || shell_stale {
+                self.name_refused_restart(None, pane_error_line(&pane_content));
+            }
             if self.last_error.is_none() {
-                self.last_error = Some(summarize_error_from_pane(&pane_content));
+                self.last_error
+                    .set(summarize_error_from_pane(&pane_content));
             }
             self.record_terminal_error(
                 ErrorEvidenceSource::TerminalText,
                 Self::observed_pane_runtime(metadata, is_dead),
             );
         } else {
-            self.last_error = None;
+            self.last_error.clear();
             self.last_error_evidence = None;
         }
     }
@@ -588,6 +754,15 @@ impl Instance {
         hook: Option<tmux::detect::HookObservation>,
         is_dead: bool,
     ) {
+        // An edited command can make a named remedy stale, or due again, without moving the
+        // screen, so this runs before the returns below that reuse or keep the last verdict.
+        if self.status == Status::Error {
+            if is_dead || self.detection.ended {
+                self.name_refused_restart(None, None);
+            } else {
+                self.drop_remedy_if_launchable();
+            }
+        }
         let activity = metadata.and_then(|m| m.window_activity);
         let plan = tmux::DetectionPlan::for_manifest(&self.source_profile, rules_tool, agent)
             .expect("manifest was resolved before polling");
@@ -623,7 +798,7 @@ impl Instance {
         }
 
         // Stamped before the capture, never after.
-        let captured_at = Utc::now().timestamp();
+        let captured_at = Timestamp::now().as_unix_secs();
         let pane_content = session
             .capture_pane(policy.scope.lines())
             .unwrap_or_default();
@@ -664,13 +839,17 @@ impl Instance {
         let confirmed = self.confirm_detection(candidate, detection.visible);
         if let Some(status) = confirmed {
             self.status = status;
+            self.detection.ended = status == Status::Error && (is_dead || shell_stale);
             if status == Status::Error {
+                let diagnostic = detection
+                    .diagnostic
+                    .map(pane_status::summarize_error_diagnostic);
+                if self.detection.ended {
+                    self.name_refused_restart(None, diagnostic.clone());
+                }
                 if self.last_error.is_none() {
-                    self.last_error = Some(
-                        detection
-                            .diagnostic
-                            .map(pane_status::summarize_error_diagnostic)
-                            .unwrap_or_else(|| summarize_error_from_pane(&pane_content)),
+                    self.last_error.set(
+                        diagnostic.unwrap_or_else(|| summarize_error_from_pane(&pane_content)),
                     );
                 }
                 self.record_terminal_error(
@@ -678,7 +857,7 @@ impl Instance {
                     Self::observed_pane_runtime(metadata, is_dead),
                 );
             } else {
-                self.last_error = None;
+                self.last_error.clear();
                 self.last_error_evidence = None;
             }
         }
@@ -801,7 +980,7 @@ mod tests {
         let entries: [(&str, Settle); 2] = [
             ("archive", |inst| inst.archive()),
             ("archived poll", |inst| {
-                inst.archived_at = Some(Utc::now());
+                inst.archived_at = Some(Timestamp::now());
                 inst.update_status_with_metadata(None, None);
             }),
         ];
@@ -827,11 +1006,14 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.archive();
         inst.update_status_with_metadata(None, None);
-        assert_eq!((inst.status, inst.last_error.clone()), (Status::Idle, None));
+        assert_eq!(
+            (inst.status, inst.last_error.as_deref()),
+            (Status::Idle, None)
+        );
 
         // A genuine failure survives archive and unarchive.
         inst.status = Status::Error;
-        inst.last_error = Some("agent crashed".to_string());
+        inst.last_error.set("agent crashed".to_string());
         inst.update_status_with_metadata(None, None);
         assert_eq!(inst.status, Status::Error);
         inst.unarchive();
@@ -967,7 +1149,9 @@ mod tests {
         for (label, reachable, status, error, ever, streak, want_status, want_error) in cases {
             let mut inst = Instance::new("existence", "/tmp/existence");
             inst.status = status;
-            inst.last_error = error.map(str::to_string);
+            if let Some(error) = error {
+                inst.last_error.set(error);
+            }
             inst.ever_confirmed_present = ever;
             inst.unknown_since = streak.map(|age| Instant::now() - age);
             let guard = crate::tmux::SessionCacheGuard::capture();
@@ -1002,7 +1186,7 @@ mod tests {
     #[serial_test::serial]
     fn reserved_launch_without_a_pane_reads_starting() {
         let _cache = force_session_absent();
-        let now = Utc::now();
+        let now = Timestamp::now();
         for (op, at, want) in [
             (LifecycleOperation::Launch, now, Status::Starting),
             (
@@ -1044,6 +1228,8 @@ mod tests {
         untold.update_status_with_metadata_inner(None, None);
         assert_eq!(untold.status, Status::Error);
         assert_eq!(untold.last_error.as_deref(), Some(TMUX_SESSION_GONE_ERROR));
+        // Nothing on disk carries the latch, so a fresh row's poll makes it.
+        assert_eq!(untold.last_error.absence(), Some(TmuxAbsence::Gone));
     }
 
     /// A passive poll re-anchors `idle_entered_at` only on a transition from a live baseline and
@@ -1051,7 +1237,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn status_poll_bookkeeping_never_restamps_user_touch() {
-        let stale = Some(Utc::now() - chrono::Duration::hours(2));
+        let stale = Some(Timestamp::now() - crate::time::Duration::hours(2));
         let _cache = force_session_absent();
         // (baseline, disk status, expected idle_entered_at after the Error detection)
         for (baseline, status, idle_after) in [
@@ -1086,7 +1272,7 @@ mod tests {
         inst.archive();
         inst.live_status_baseline = Some(Status::Idle);
         inst.status = Status::Unknown;
-        let user_touch = Some(Utc::now() - chrono::Duration::hours(2));
+        let user_touch = Some(Timestamp::now() - crate::time::Duration::hours(2));
         inst.last_accessed_at = user_touch;
 
         inst.update_status_with_metadata(None, None);
@@ -1328,7 +1514,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         inst.source_profile = PROFILE.to_string();
         inst.tool = "settl".to_string();
         inst.status = Status::Running;
-        inst.last_error = None;
+        inst.last_error.clear();
         write_hook_status(&inst.id, "error");
 
         let name = tmux::Session::generate_name(&inst.id, &inst.title);
@@ -1346,13 +1532,779 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
 
         // A standing explanation is the better one: it came from whatever
         // first diagnosed the failure.
-        inst.last_error = Some("agent crashed".to_string());
+        inst.last_error.set("agent crashed".to_string());
         inst.last_error_check = None;
         inst.update_status_with_metadata_inner(Some(&metadata), None);
         crate::hooks::cleanup_hook_status_dir(&inst.id);
 
         assert_eq!(inst.status, Status::Error);
         assert_eq!(inst.last_error.as_deref(), Some("agent crashed"));
+    }
+
+    /// A Terminal row whose command picks its own conversation beside AoE's can never start again,
+    /// so a gone or ended pane says what happened to it and how to fix the command (#5829).
+    #[test]
+    #[serial_test::serial]
+    fn an_ended_pane_whose_restart_is_refused_names_the_remedy() {
+        let refused = |inst: &Instance, ended: &str| {
+            format!(
+                "{ended} Terminal view can't start this Session again: {}",
+                Instance::command_selector_remedy(&inst.id)
+            )
+        };
+        let conflicting = || {
+            let mut inst = Instance::new("selector", "/tmp/selector");
+            inst.tool = "claude".into();
+            inst.command = "claude --resume external".into();
+            inst.agent_session_id = Some("sid-aoe".into());
+            inst.status = Status::Running;
+            inst
+        };
+        let flag_removed = || {
+            let mut inst = conflicting();
+            inst.command = "claude".into();
+            inst
+        };
+        let id_cleared = || {
+            let mut inst = conflicting();
+            inst.resume_intent = ResumeIntent::Cleared;
+            inst
+        };
+
+        let mut latched = conflicting();
+        let gone = refused(&latched, TMUX_SESSION_GONE_LEAD);
+        {
+            let _cache = force_session_absent();
+            latched.update_status_with_metadata_inner(None, None);
+            assert_eq!(latched.last_error.as_deref(), Some(gone.as_str()));
+            for mut inst in [flag_removed(), id_cleared()] {
+                inst.update_status_with_metadata_inner(None, None);
+                assert_eq!(inst.status, Status::Error, "{}", inst.command);
+                assert_eq!(
+                    inst.last_error.as_deref(),
+                    Some(TMUX_SESSION_GONE_ERROR),
+                    "{}",
+                    inst.command
+                );
+            }
+        }
+
+        // Once the last pane is gone the tmux server exits, so a later poll can't reach it. The
+        // gone pane's explanation stays, so `aoe session wait` still sees the Session terminated,
+        // and a switch to the structured view still clears it.
+        {
+            let guard = crate::tmux::SessionCacheGuard::capture();
+            guard.force_unreachable();
+            latched.unknown_since = Some(std::time::Instant::now() - Duration::from_secs(60));
+            latched.update_status_with_metadata_inner(None, None);
+            assert_eq!(latched.last_error.as_deref(), Some(gone.as_str()));
+            assert!(crate::cli::session::is_terminated(
+                latched.status,
+                &latched.last_error,
+                false,
+                crate::tmux::SessionExistence::Unknown,
+            ));
+            latched.clear_stale_tmux_error();
+            assert_eq!(latched.last_error.as_deref(), None);
+        }
+
+        // Inside the 30 s Error throttle, which spares tmux, the remedy still follows the command:
+        // either fix drops it on the next poll, and undoing the fix names it again.
+        {
+            let mut mismatches = Vec::new();
+            let remedies: [(&str, fn(&mut Instance)); 2] = [
+                ("flag removed", |inst| inst.command = "claude".into()),
+                ("AoE's id cleared", |inst| {
+                    inst.resume_intent = ResumeIntent::Cleared
+                }),
+            ];
+            for (absence, bare) in [
+                (TmuxAbsence::Gone, TMUX_SESSION_GONE_ERROR),
+                (TmuxAbsence::Unreachable, TMUX_SERVER_UNREACHABLE_ERROR),
+            ] {
+                for (fix, apply) in remedies {
+                    let guard = crate::tmux::SessionCacheGuard::capture();
+                    match absence {
+                        TmuxAbsence::Gone => guard.force_present(&["aoe_some_other_session"]),
+                        TmuxAbsence::Unreachable => guard.force_unreachable(),
+                    }
+                    let mut inst = conflicting();
+                    let refused_by = (inst.command.clone(), inst.resume_intent.clone());
+                    inst.unknown_since = Some(std::time::Instant::now() - Duration::from_secs(60));
+                    inst.update_status_with_metadata_inner(None, None);
+                    let named = inst.last_error.as_deref().map(str::to_owned);
+                    let poll = |inst: &mut Instance| {
+                        inst.last_error_check = Some(std::time::Instant::now());
+                        inst.update_status_with_metadata_inner(None, None);
+                        (
+                            inst.last_error.as_deref().map(str::to_owned),
+                            inst.last_error.absence(),
+                        )
+                    };
+                    apply(&mut inst);
+                    let fixed = poll(&mut inst);
+                    (inst.command, inst.resume_intent) = refused_by;
+                    let undone = poll(&mut inst);
+                    let seen = (fixed, undone);
+                    let want = (
+                        (Some(bare.to_owned()), Some(absence)),
+                        (named, Some(absence)),
+                    );
+                    if seen != want {
+                        mismatches.push(format!("{absence:?}, {fix}: {seen:?}, want {want:?}"));
+                    }
+                }
+            }
+            assert!(mismatches.is_empty(), "{mismatches:#?}");
+        }
+
+        // No tmux server, as after the last pane ended, past the window that waits for one.
+        {
+            let guard = crate::tmux::SessionCacheGuard::capture();
+            guard.force_unreachable();
+            let mut inst = conflicting();
+            inst.unknown_since = Some(std::time::Instant::now() - Duration::from_secs(60));
+            inst.update_status_with_metadata_inner(None, None);
+            assert_eq!(inst.status, Status::Error);
+            let unreachable = refused(&inst, "The tmux server could not be reached.");
+            assert_eq!(inst.last_error.as_deref(), Some(unreachable.as_str()));
+        }
+
+        // An agent that crashed in its pane: the pane's end leads, then the remedy. A live pane
+        // explains nothing.
+        for dead in [true, false] {
+            let mut inst = conflicting();
+            write_hook_status(&inst.id, "running");
+            let name = tmux::Session::generate_name(&inst.id, &inst.title);
+            let guard = crate::tmux::SessionCacheGuard::capture();
+            guard.force_present(&[name.as_str()]);
+            let metadata = tmux::PaneMetadata {
+                pane_dead: dead,
+                ..agent_pane_metadata("claude", None)
+            };
+            inst.update_status_with_metadata_inner(Some(&metadata), None);
+            crate::hooks::cleanup_hook_status_dir(&inst.id);
+            if dead {
+                assert_eq!(inst.status, Status::Error);
+                let ended = refused(&inst, "The terminal ended.");
+                assert_eq!(inst.last_error.as_deref(), Some(ended.as_str()));
+            } else {
+                assert_ne!(inst.status, Status::Error);
+                assert_eq!(inst.last_error.as_deref(), None);
+            }
+        }
+
+        // A live error the agent showed stays first when its pane then ends; a gone pane still
+        // leads with that, so a later poll that can't reach tmux still reads it as terminated.
+        let live = "API Error: 401";
+        {
+            let mut inst = conflicting();
+            inst.status = Status::Error;
+            inst.last_error.set(live);
+            let _cache = force_session_absent();
+            inst.update_status_with_metadata_inner(None, None);
+            let gone = refused(&inst, &format!("{TMUX_SESSION_GONE_LEAD} {live}."));
+            assert_eq!(inst.last_error.as_deref(), Some(gone.as_str()));
+            drop(_cache);
+            let guard = crate::tmux::SessionCacheGuard::capture();
+            guard.force_unreachable();
+            inst.unknown_since = Some(std::time::Instant::now() - Duration::from_secs(60));
+            inst.update_status_with_metadata_inner(None, None);
+            assert_eq!(inst.last_error.as_deref(), Some(gone.as_str()));
+            assert!(crate::cli::session::is_terminated(
+                inst.status,
+                &inst.last_error,
+                false,
+                crate::tmux::SessionExistence::Unknown,
+            ));
+        }
+        {
+            let mut inst = conflicting();
+            inst.status = Status::Error;
+            inst.last_error.set(live);
+            write_hook_status(&inst.id, "running");
+            let name = tmux::Session::generate_name(&inst.id, &inst.title);
+            let guard = crate::tmux::SessionCacheGuard::capture();
+            guard.force_present(&[name.as_str()]);
+            let metadata = tmux::PaneMetadata {
+                pane_dead: true,
+                ..agent_pane_metadata("claude", None)
+            };
+            inst.update_status_with_metadata_inner(Some(&metadata), None);
+            crate::hooks::cleanup_hook_status_dir(&inst.id);
+            let dead = refused(&inst, &format!("{live}."));
+            assert_eq!(inst.last_error.as_deref(), Some(dead.as_str()));
+        }
+
+        // A pane tmux shows again drops its latch, so the pane explains itself: an Error it
+        // reports gets its own explanation, and a refused restart's remedy follows how it ended.
+        // Every case runs before the assertion, so each one shows on its own.
+        {
+            const PROFILE: &str = "pane-back-hook-test";
+            let _registry = install_status_rules(PROFILE, "settl", Vec::new());
+            let settl = || {
+                let mut inst = Instance::new("pane-back", "/tmp/pane-back");
+                inst.source_profile = PROFILE.to_string();
+                inst.tool = "settl".into();
+                inst.status = Status::Running;
+                inst
+            };
+            let mut mismatches = Vec::new();
+            for (label, mut inst, agent, hook, dead) in [
+                (
+                    "an Error the pane reports",
+                    settl(),
+                    "settl",
+                    "error",
+                    false,
+                ),
+                (
+                    "a refused row whose pane ended",
+                    conflicting(),
+                    "claude",
+                    "running",
+                    true,
+                ),
+            ] {
+                let want = if dead {
+                    refused(&inst, "The terminal ended.")
+                } else {
+                    summarize_error_from_pane("")
+                };
+                {
+                    let _cache = force_session_absent();
+                    inst.update_status_with_metadata_inner(None, None);
+                }
+                assert_eq!(
+                    inst.last_error.absence(),
+                    Some(TmuxAbsence::Gone),
+                    "{label}"
+                );
+                inst.last_error_check = None;
+                write_hook_status(&inst.id, hook);
+                let name = tmux::Session::generate_name(&inst.id, &inst.title);
+                let guard = crate::tmux::SessionCacheGuard::capture();
+                guard.force_present(&[name.as_str()]);
+                let metadata = tmux::PaneMetadata {
+                    pane_dead: dead,
+                    ..agent_pane_metadata(agent, None)
+                };
+                inst.update_status_with_metadata_inner(Some(&metadata), None);
+                crate::hooks::cleanup_hook_status_dir(&inst.id);
+                let seen = (
+                    inst.status,
+                    inst.last_error.as_deref().map(str::to_owned),
+                    inst.last_error.absence(),
+                );
+                let expected = (Status::Error, Some(want), None);
+                if seen != expected {
+                    mismatches.push(format!("{label}: {seen:?}, want {expected:?}"));
+                }
+            }
+            assert!(mismatches.is_empty(), "{mismatches:#?}");
+        }
+
+        // A live pane's Error hook keeps the pane's own explanation. A `detect_as` alias whose
+        // target has no manifest (settl) takes such a row down the hook path.
+        {
+            const PROFILE: &str = "selector-alias-hook-test";
+            let _registry = install_status_rules(PROFILE, "settl", Vec::new());
+            let mut inst = conflicting();
+            inst.source_profile = PROFILE.to_string();
+            inst.detect_as = "settl".to_string();
+            assert!(!crate::tmux::detect::has_manifest("settl"));
+            assert!(inst.command_selector_refuses_launch());
+            write_hook_status(&inst.id, "error");
+            let name = tmux::Session::generate_name(&inst.id, &inst.title);
+            let guard = crate::tmux::SessionCacheGuard::capture();
+            guard.force_present(&[name.as_str()]);
+            let metadata = agent_pane_metadata("claude", None);
+            inst.update_status_with_metadata_inner(Some(&metadata), None);
+            crate::hooks::cleanup_hook_status_dir(&inst.id);
+            assert_eq!(inst.status, Status::Error);
+            assert_eq!(
+                inst.last_error.as_deref(),
+                Some(summarize_error_from_pane("").as_str())
+            );
+        }
+
+        // tmux confirming the pane gone marks the explanation already recorded as that absence,
+        // whether it names the remedy or not, so a later unreachable poll still reads the Session
+        // as terminated; a pane tmux shows again drops it. A Gone recorded before the row started
+        // refusing stays Gone. Every row runs before the assertion.
+        {
+            let terminated = |inst: &Instance| {
+                crate::cli::session::is_terminated(
+                    inst.status,
+                    &inst.last_error,
+                    false,
+                    crate::tmux::SessionExistence::Unknown,
+                )
+            };
+            let poll_absent = |inst: &mut Instance| {
+                inst.last_error_check = None;
+                let _cache = force_session_absent();
+                inst.update_status_with_metadata_inner(None, None);
+            };
+            let poll_unreachable = |inst: &mut Instance| {
+                inst.last_error_check = None;
+                let guard = crate::tmux::SessionCacheGuard::capture();
+                guard.force_unreachable();
+                inst.unknown_since = Some(std::time::Instant::now() - Duration::from_secs(60));
+                inst.update_status_with_metadata_inner(None, None);
+            };
+            let mut mismatches = Vec::new();
+            let mut check = |label: &str, inst: &Instance, want: Option<String>, gone: bool| {
+                let seen = (
+                    inst.last_error.as_deref().map(str::to_owned),
+                    inst.last_error.absence() == Some(TmuxAbsence::Gone),
+                    terminated(inst),
+                );
+                if seen != (want.clone(), gone, gone) {
+                    mismatches.push(format!("{label}: {seen:?}, want {:?}", (want, gone, gone)));
+                }
+            };
+
+            // 4660778712: dead, then absent, then unreachable.
+            let mut ended = conflicting();
+            write_hook_status(&ended.id, "running");
+            let name = tmux::Session::generate_name(&ended.id, &ended.title);
+            {
+                let guard = crate::tmux::SessionCacheGuard::capture();
+                guard.force_present(&[name.as_str()]);
+                let metadata = tmux::PaneMetadata {
+                    pane_dead: true,
+                    ..agent_pane_metadata("claude", None)
+                };
+                ended.update_status_with_metadata_inner(Some(&metadata), None);
+            }
+            crate::hooks::cleanup_hook_status_dir(&ended.id);
+            let text = refused(&ended, "The terminal ended.");
+            check("dead", &ended, Some(text.clone()), false);
+            poll_absent(&mut ended);
+            check("dead, then absent", &ended, Some(text.clone()), true);
+            poll_unreachable(&mut ended);
+            check("dead, absent, then unreachable", &ended, Some(text), true);
+
+            // Katie's widening: a row that doesn't refuse keeps its own error, now as gone.
+            let mut plain = flag_removed();
+            plain.status = Status::Error;
+            plain.last_error.set(live);
+            poll_absent(&mut plain);
+            check(
+                "a plain error, then absent",
+                &plain,
+                Some(live.to_owned()),
+                true,
+            );
+            poll_unreachable(&mut plain);
+            check(
+                "a plain error, absent, then unreachable",
+                &plain,
+                Some(live.to_owned()),
+                true,
+            );
+            // The outside-diff comment on :205: that kept error then leads the remedy, after the
+            // gone lead, once the row starts refusing.
+            plain.command = conflicting().command;
+            poll_absent(&mut plain);
+            check(
+                "a plain error, gone, then refusing",
+                &plain,
+                Some(refused(
+                    &plain,
+                    &format!("{TMUX_SESSION_GONE_LEAD} {live}."),
+                )),
+                true,
+            );
+
+            // 4660763979: a published launch refusal, then absent, then the pane back.
+            let mut handoff = conflicting();
+            handoff.status = Status::Error;
+            handoff
+                .last_error
+                .set(refused(&handoff, "The terminal ended."));
+            poll_absent(&mut handoff);
+            let published = refused(&handoff, "The terminal ended.");
+            check(
+                "handoff refusal, then absent",
+                &handoff,
+                Some(published),
+                true,
+            );
+            handoff.last_error_check = None;
+            write_hook_status(&handoff.id, "running");
+            let name = tmux::Session::generate_name(&handoff.id, &handoff.title);
+            {
+                let guard = crate::tmux::SessionCacheGuard::capture();
+                guard.force_present(&[name.as_str()]);
+                handoff.update_status_with_metadata_inner(
+                    Some(&agent_pane_metadata("claude", None)),
+                    None,
+                );
+            }
+            crate::hooks::cleanup_hook_status_dir(&handoff.id);
+            check(
+                "handoff refusal, absent, then the pane back",
+                &handoff,
+                None,
+                false,
+            );
+
+            // 4660763983: gone before the row refused, then refusing, then unreachable.
+            let mut edited = flag_removed();
+            poll_absent(&mut edited);
+            check(
+                "gone",
+                &edited,
+                Some(TMUX_SESSION_GONE_ERROR.to_owned()),
+                true,
+            );
+            edited.command = conflicting().command;
+            poll_unreachable(&mut edited);
+            check(
+                "gone, then refusing and unreachable",
+                &edited,
+                Some(refused(&edited, TMUX_SESSION_GONE_LEAD)),
+                true,
+            );
+
+            // Either remedy applied: the next poll drops it and keeps what ended the pane.
+            let mut cleared = conflicting();
+            poll_absent(&mut cleared);
+            cleared.resume_intent = ResumeIntent::Cleared;
+            poll_absent(&mut cleared);
+            check(
+                "refused and gone, then AoE's id cleared",
+                &cleared,
+                Some(TMUX_SESSION_GONE_ERROR.to_owned()),
+                true,
+            );
+            let mut unflagged = conflicting();
+            unflagged.status = Status::Error;
+            unflagged.last_error.set(live);
+            poll_absent(&mut unflagged);
+            unflagged.command = flag_removed().command;
+            poll_absent(&mut unflagged);
+            check(
+                "a live error, refused and gone, then the flag removed",
+                &unflagged,
+                Some(format!("{TMUX_SESSION_GONE_LEAD} {live}.")),
+                true,
+            );
+            unflagged.command = conflicting().command;
+            poll_absent(&mut unflagged);
+            check(
+                "a live error, refused and gone, the flag removed, then back",
+                &unflagged,
+                Some(refused(
+                    &unflagged,
+                    &format!("{TMUX_SESSION_GONE_LEAD} {live}."),
+                )),
+                true,
+            );
+
+            // 4660985739: unreachable, then absent. Under its own latch the unreachable lead
+            // becomes the gone one, keeping any diagnostic and the remedy once.
+            let mut refusing = conflicting();
+            poll_unreachable(&mut refusing);
+            poll_absent(&mut refusing);
+            check(
+                "refused, unreachable, then absent",
+                &refusing,
+                Some(refused(&refusing, TMUX_SESSION_GONE_LEAD)),
+                true,
+            );
+            let mut diagnosed = conflicting();
+            diagnosed.status = Status::Error;
+            diagnosed.last_error.set(live);
+            poll_unreachable(&mut diagnosed);
+            poll_absent(&mut diagnosed);
+            check(
+                "a live error, refused, unreachable, then absent",
+                &diagnosed,
+                Some(refused(
+                    &diagnosed,
+                    &format!("{TMUX_SESSION_GONE_LEAD} {live}."),
+                )),
+                true,
+            );
+            let mut lost = flag_removed();
+            poll_unreachable(&mut lost);
+            poll_absent(&mut lost);
+            check(
+                "unreachable, then absent",
+                &lost,
+                Some(TMUX_SESSION_GONE_ERROR.to_owned()),
+                true,
+            );
+            // Printed text that reads like the lead carries no latch, so it stays as written.
+            let printed = format!("{TMUX_SERVER_UNREACHABLE_LEAD} retrying in 5s");
+            let mut echoed = flag_removed();
+            echoed.status = Status::Error;
+            echoed.last_error.set(printed.as_str());
+            poll_absent(&mut echoed);
+            check(
+                "printed unreachable text, then absent",
+                &echoed,
+                Some(printed.clone()),
+                true,
+            );
+            // Kept as the pane printed it, so none of it is taken for AoE's lead.
+            echoed.command = conflicting().command;
+            poll_absent(&mut echoed);
+            check(
+                "printed unreachable text, gone, then refusing",
+                &echoed,
+                Some(refused(
+                    &echoed,
+                    &format!("{TMUX_SESSION_GONE_LEAD} {printed}."),
+                )),
+                true,
+            );
+            assert!(mismatches.is_empty(), "{mismatches:#?}");
+        }
+
+        // What ended the pane leads, then the remedy: the adapter's diagnostic when it saw one.
+        for (diagnostic, sentence) in [
+            (None, "The terminal ended."),
+            (Some("API Error: 401"), "API Error: 401."),
+            (Some("Login expired."), "Login expired."),
+        ] {
+            assert_eq!(ended_sentence(diagnostic), sentence);
+        }
+
+        // Without a hook, a pane that ended goes through detection, which reads its last frame as
+        // Idle, and gets the same explanation.
+        if !tmux_available() {
+            eprintln!("skipping the hookless pane: tmux not available");
+            return;
+        }
+        let home = crate::session::test_support::isolate_app_dir();
+        let frame = home.path().join("idle.txt");
+        std::fs::write(&frame, format!("{}turn over\n", "\n".repeat(150))).expect("write frame");
+        for (mut inst, remedy) in [(conflicting(), true), (flag_removed(), false)] {
+            let name = tmux::Session::generate_name(&inst.id, &inst.title);
+            let _pane = spawn_pane(&name, &format!("cat {}; sleep 300", shell_quote(&frame)));
+            assert!(
+                wait_for_pane(&name, "turn over"),
+                "idle frame never painted"
+            );
+            let guard = crate::tmux::SessionCacheGuard::capture();
+            guard.force_present(&[name.as_str()]);
+            let metadata = tmux::PaneMetadata {
+                pane_dead: true,
+                ..agent_pane_metadata("claude", None)
+            };
+            inst.update_status_with_metadata_inner(Some(&metadata), Some(&name));
+            assert_eq!(inst.status, Status::Error, "{}", inst.command);
+            let ended = refused(&inst, "The terminal ended.");
+            assert_eq!(
+                inst.last_error.as_deref() == Some(ended.as_str()),
+                remedy,
+                "{}: {:?}",
+                inst.command,
+                inst.last_error
+            );
+        }
+
+        // 4664722975: every return before the remedy reconcile. Either remedy applied drops the
+        // remedy on a poll that reuses the last verdict, and on one that reads an agent-owned
+        // viewer, and undoing it names the remedy again on the next such poll. Each case first
+        // shows its return taken with the remedy still named. A pane back at a shell prompt ended
+        // too, though tmux reports it alive; only a row whose selector is in its arguments gets
+        // there, since a command naming one is an override, which never reads as a stale shell.
+        let viewer = home.path().join("viewer.txt");
+        std::fs::write(
+            &viewer,
+            format!(
+                "{}showing detailed transcript · ctrl+o to toggle\n",
+                "\n".repeat(150)
+            ),
+        )
+        .expect("write viewer");
+        let prompt = home.path().join("prompt.txt");
+        std::fs::write(
+            &prompt,
+            format!("{}turn over\nuser@host:~$\n", "\n".repeat(150)),
+        )
+        .expect("write prompt");
+        let mut mismatches = Vec::new();
+        let before = crate::time::Timestamp::now().as_unix_secs() - 100;
+        let remedies: [(&str, fn(&mut Instance)); 2] = [
+            ("flag removed", |inst| {
+                inst.command = "claude".into();
+                inst.extra_args.clear();
+            }),
+            ("AoE's id cleared", |inst| {
+                inst.resume_intent = ResumeIntent::Cleared
+            }),
+        ];
+        for ((label, rule, ended_by), (fix, apply)) in [
+            ("unchanged screen", "screen_unchanged", "dead"),
+            ("agent-owned viewer", "transcript_viewer", "dead"),
+            ("shell prompt", "screen_unchanged", "shell"),
+        ]
+        .into_iter()
+        .flat_map(|case| remedies.map(|remedy| (case, remedy)))
+        {
+            let mut inst = conflicting();
+            if ended_by == "shell" {
+                inst.command = "claude".into();
+                inst.extra_args = "--resume external".into();
+            }
+            let refused_by = (
+                inst.command.clone(),
+                inst.extra_args.clone(),
+                inst.resume_intent.clone(),
+            );
+            let name = tmux::Session::generate_name(&inst.id, &inst.title);
+            let shown = format!("{name}_shown");
+            let painted = if ended_by == "shell" { &prompt } else { &frame };
+            let _pane = spawn_pane(&name, &format!("cat {}; sleep 300", shell_quote(painted)));
+            let _shown = spawn_pane(&shown, &format!("cat {}; sleep 300", shell_quote(&viewer)));
+            assert!(wait_for_pane(&name, "turn over"), "{label}: never painted");
+            assert!(
+                wait_for_pane(&shown, "showing detailed transcript"),
+                "{label}: viewer never painted"
+            );
+            let guard = crate::tmux::SessionCacheGuard::capture();
+            guard.force_present(&[name.as_str(), shown.as_str()]);
+            let ended_at = |activity| match ended_by {
+                "shell" => agent_pane_metadata("bash", Some(activity)),
+                _ => tmux::PaneMetadata {
+                    pane_dead: true,
+                    ..agent_pane_metadata("claude", Some(activity))
+                },
+            };
+            // The viewer's polls each see a new activity second, so none reuses the cache.
+            let (pane, at): (&str, fn(i64, i64) -> i64) = if rule == "screen_unchanged" {
+                (name.as_str(), |before, _| before)
+            } else {
+                (shown.as_str(), |before, step| before + step)
+            };
+            let poll = |inst: &mut Instance, pane: &str, activity| {
+                inst.update_status_with_metadata_inner(Some(&ended_at(activity)), Some(pane));
+                (
+                    inst.status,
+                    inst.last_error.as_deref().map(str::to_owned),
+                    inst.detection.rule,
+                )
+            };
+            poll(&mut inst, &name, before);
+            let named = refused(&inst, "The terminal ended.");
+            let taken = poll(&mut inst, pane, at(before, 1));
+            if taken != (Status::Error, Some(named.clone()), Some(rule)) {
+                mismatches.push(format!("{label}, {fix}, still refused: {taken:?}"));
+            }
+            apply(&mut inst);
+            let seen = poll(&mut inst, pane, at(before, 2));
+            let want = (
+                Status::Error,
+                Some("The terminal ended.".to_owned()),
+                Some(rule),
+            );
+            if seen != want {
+                mismatches.push(format!("{label}, {fix}: {seen:?}, want {want:?}"));
+            }
+            (inst.command, inst.extra_args, inst.resume_intent) = refused_by;
+            let restored = poll(&mut inst, pane, at(before, 3));
+            let want = (Status::Error, Some(named), Some(rule));
+            if restored != want {
+                mismatches.push(format!(
+                    "{label}, {fix} undone: {restored:?}, want {want:?}"
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+
+        // The outside-diff comment on :387: a hookless pane whose tmux server went away and came
+        // back, its screen unchanged throughout, gets a status read from a fresh capture rather
+        // than an Error with nothing to explain it. The stuck Error predates #5930, which emptied
+        // its explanation.
+        {
+            let mut inst = flag_removed();
+            // Idle already, so the first read publishes without waiting to be confirmed.
+            inst.status = Status::Idle;
+            let name = tmux::Session::generate_name(&inst.id, &inst.title);
+            let _pane = spawn_pane(&name, &format!("cat {}; sleep 300", shell_quote(&frame)));
+            assert!(
+                wait_for_pane(&name, "turn over"),
+                "idle frame never painted"
+            );
+            let metadata = agent_pane_metadata("claude", Some(before));
+            let present = |inst: &mut Instance| {
+                let guard = crate::tmux::SessionCacheGuard::capture();
+                guard.force_present(&[name.as_str()]);
+                inst.last_error_check = None;
+                inst.update_status_with_metadata_inner(Some(&metadata), Some(&name));
+                (
+                    inst.status,
+                    inst.last_error.as_deref().map(str::to_owned),
+                    inst.detection.rule,
+                )
+            };
+            present(&mut inst);
+            let (live, explained, rule) = present(&mut inst);
+            assert_eq!(rule, Some("screen_unchanged"), "the cache must be in play");
+            {
+                let guard = crate::tmux::SessionCacheGuard::capture();
+                guard.force_unreachable();
+                inst.unknown_since = Some(std::time::Instant::now() - Duration::from_secs(60));
+                inst.update_status_with_metadata_inner(Some(&metadata), Some(&name));
+            }
+            assert_eq!(
+                inst.last_error.as_deref(),
+                Some(TMUX_SERVER_UNREACHABLE_ERROR)
+            );
+            let (status, error, rule) = present(&mut inst);
+            assert_ne!(rule, Some("screen_unchanged"), "tmux back must recapture");
+            assert_eq!((status, &error), (live, &explained));
+            assert!(status != Status::Error || error.is_some(), "{error:?}");
+        }
+
+        // What a dead pane printed leads the remedy: with a hook (4660763982), and on the
+        // hand-written detector path a `detect_as` alias without a manifest takes (4660763985).
+        const PROFILE: &str = "selector-dead-pane-test";
+        let _registry = install_status_rules(
+            PROFILE,
+            "settl",
+            vec![crate::session::config::StatusRule {
+                status: crate::agents::HookStatus::Idle,
+                contains: Some("turn over".to_string()),
+                regex: None,
+            }],
+        );
+        let printed = home.path().join("printed.txt");
+        std::fs::write(&printed, "API Error: 401\nturn over\n").expect("write printed");
+        let mut mismatches = Vec::new();
+        for (label, hooked) in [("hooked", true), ("detect_as settl, hookless", false)] {
+            let mut inst = conflicting();
+            if !hooked {
+                inst.source_profile = PROFILE.to_string();
+                inst.detect_as = "settl".to_string();
+            }
+            let name = tmux::Session::generate_name(&inst.id, &inst.title);
+            let _pane = spawn_pane(&name, &format!("cat {}; sleep 300", shell_quote(&printed)));
+            assert!(wait_for_pane(&name, "turn over"), "{label}: never painted");
+            if hooked {
+                write_hook_status(&inst.id, "running");
+            }
+            let guard = crate::tmux::SessionCacheGuard::capture();
+            guard.force_present(&[name.as_str()]);
+            let metadata = tmux::PaneMetadata {
+                pane_dead: true,
+                ..agent_pane_metadata("claude", None)
+            };
+            inst.update_status_with_metadata_inner(Some(&metadata), Some(&name));
+            crate::hooks::cleanup_hook_status_dir(&inst.id);
+            let want = (Status::Error, Some(refused(&inst, "API Error: 401.")));
+            let seen = (inst.status, inst.last_error.as_deref().map(str::to_owned));
+            if seen != want {
+                mismatches.push(format!("{label}: {seen:?}, want {want:?}"));
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
     }
 
     #[test]
@@ -1364,7 +2316,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         inst.status = Status::Running;
         inst.agent_session_id = Some("native-history".into());
         inst.lifecycle_generation = 7;
-        inst.last_error = Some("earlier operation failed".into());
+        inst.last_error.set("earlier operation failed".to_owned());
         inst.record_terminal_error(
             ErrorEvidenceSource::TerminalText,
             RuntimeEvidence::PaneAlive,
@@ -1639,7 +2591,8 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             assert_eq!(evidence.retryable, None);
             assert_eq!(inst.agent_session_id.as_deref(), Some("durable-history"));
             assert!(inst.resume_probe_failed_sid.is_none());
-            inst.last_error = Some("Earlier failure remains latched".to_owned());
+            inst.last_error
+                .set("Earlier failure remains latched".to_owned());
             inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
             assert_eq!(
                 inst.last_error.as_deref(),
@@ -1686,7 +2639,8 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             inst.tool = "omp".to_owned();
             inst.source_profile = format!("omp-error-cleared-{}", inst.id);
             inst.status = Status::Error;
-            inst.last_error = Some("Earlier provider request denied".to_owned());
+            inst.last_error
+                .set("Earlier provider request denied".to_owned());
             let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
             let _guard = spawn_pane(
                 &session_name,
@@ -1701,7 +2655,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
 
             assert_eq!(inst.status, expected, "{current}");
-            assert_eq!(inst.last_error, None, "{current}");
+            assert_eq!(inst.last_error.as_deref(), None, "{current}");
             assert!(
                 inst.last_error_evidence.is_none(),
                 "new activity retires heuristic error evidence"
@@ -1756,8 +2710,11 @@ HISTORY_READY",
             Status::Error,
         ] {
             inst.status = status;
-            inst.last_error =
-                (status == Status::Error).then(|| "Provider denied request".to_owned());
+            if status == Status::Error {
+                inst.last_error.set("Provider denied request");
+            } else {
+                inst.last_error.clear();
+            }
             let diagnostic = inst.last_error.clone();
             for _ in 0..2 {
                 poll(&mut inst, &metadata);
@@ -1766,7 +2723,7 @@ HISTORY_READY",
             }
         }
         inst.status = Status::Running;
-        inst.last_error = None;
+        inst.last_error.clear();
         metadata.pane_current_command = Some("bash".to_owned());
         poll(&mut inst, &metadata);
         poll(&mut inst, &metadata);
@@ -1775,7 +2732,7 @@ HISTORY_READY",
             Status::Idle,
             "history cannot retain Running after ownership loss"
         );
-        inst.last_error = None;
+        inst.last_error.clear();
         metadata.pane_start_command_is_protected = true;
         inst.status = Status::Waiting;
         poll(&mut inst, &metadata);

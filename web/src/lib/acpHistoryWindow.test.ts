@@ -123,6 +123,16 @@ describe("initialHistoryWindow", () => {
     expect(initialHistoryWindow(rows)).toBe(201);
   });
 
+  it("honors a custom base window and still widens to the last turn", () => {
+    const rows = transcript(100, 1);
+    expect(initialHistoryWindow(rows, 50)).toBe(50);
+    expect(initialHistoryWindow(rows, 1000)).toBe(1000);
+    const long = transcript(2, 1);
+    long.push(row("user_prompt", 99));
+    for (let i = 0; i < 80; i += 1) long.push(row("tool_complete", i));
+    expect(initialHistoryWindow(long, 50)).toBe(81);
+  });
+
   it("falls back to the default when the transcript has no user turn", () => {
     const rows: ActivityRow[] = [];
     for (let i = 0; i < 500; i += 1) rows.push(row("message", i));

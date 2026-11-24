@@ -3,11 +3,13 @@
 import { test, expect } from "./helpers/mockedTest";
 import type { Page } from "@playwright/test";
 import { mockTerminalApis } from "./helpers/terminal-mocks";
+import { openPanelsByDefault } from "./helpers/apiMocks";
 
 const SESSION = "pinch-test";
 
 async function openSession(page: Page) {
   await mockTerminalApis(page);
+  await openPanelsByDefault(page);
   await page.setViewportSize({ width: 1280, height: 720 });
 }
 
@@ -154,7 +156,7 @@ test.describe("Dockable pane system", () => {
     await expect
       .poll(() =>
         page.evaluate((session) => {
-          const saved = JSON.parse(localStorage.getItem("aoe-pane-layout-v2") ?? "null") as {
+          const saved = JSON.parse(localStorage.getItem("aoe-pane-layout-v3") ?? "null") as {
             sessions?: Record<string, { right: { tabs: string[] }[] }>;
           } | null;
           return saved?.sessions?.[session]?.right.flatMap((group) => group.tabs);

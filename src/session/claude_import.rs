@@ -96,9 +96,9 @@ pub fn sessions_under_paths(
 impl From<ClaudeSessionSummary> for crate::session::import::ImportableSession {
     fn from(s: ClaudeSessionSummary) -> Self {
         let updated_at = (s.last_modified_ms > 0)
-            .then(|| chrono::DateTime::from_timestamp_millis(s.last_modified_ms as i64))
+            .then(|| crate::time::Timestamp::from_millis(s.last_modified_ms as i64))
             .flatten()
-            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+            .map(|t| t.to_rfc3339_opts(crate::time::SecondsFormat::Millis, true));
         let binding = crate::session::ConversationBinding {
             session_id: s.session_id.clone(),
             execution: Some(crate::session::ExecutionBinding {

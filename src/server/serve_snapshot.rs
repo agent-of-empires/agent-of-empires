@@ -11,6 +11,7 @@ use super::state::AppState;
 /// All sends are best-effort and swallow errors; nothing leaves the box unless
 /// the user opted in and an endpoint is configured.
 pub(super) async fn spawn_serve_snapshot_loop(state: Arc<AppState>) {
+    register_serve_counters(&state);
     let work = state.runtime.work.clone();
     work.spawn("server.usage_snapshot", async move {
         // Jittered period (4h + up to 30m) so installs that boot together don't
@@ -24,6 +25,7 @@ pub(super) async fn spawn_serve_snapshot_loop(state: Arc<AppState>) {
         let mut sample = tokio::time::interval(std::time::Duration::from_secs(30 * 60));
         sample.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut aggregator = crate::telemetry::aggregate::UsageAggregator::default();
+        let mut window = None;
         loop {
             tokio::select! {
                 biased;
@@ -32,14 +34,14 @@ pub(super) async fn spawn_serve_snapshot_loop(state: Arc<AppState>) {
                     // periodic ticks would otherwise emit the initial first-tick
                     // snapshot and an identical shutdown snapshot seconds apart.
                     // We exit after this, so the aggregate is dropped; no reset.
-                    if let Some(snapshot) = build_serve_snapshot(&state, &mut aggregator).await {
+                    if let Some(snapshot) = build_serve_snapshot(&state, &mut aggregator, &mut window).await {
                         let outcome = crate::telemetry::flush_snapshot_if_changed(snapshot).await;
                         clear_reported_serve_signals(&state, outcome);
                     }
                     break;
                 }
                 _ = interval.tick() => {
-                    if let Some(snapshot) = build_serve_snapshot(&state, &mut aggregator).await {
+                    if let Some(snapshot) = build_serve_snapshot(&state, &mut aggregator, &mut window).await {
                         // Awaited (not detached) so the reported signals are
                         // cleared only after a confirmed send. A failed send
                         // retains the usage_seen counts / the create counter
@@ -60,11 +62,36 @@ pub(super) async fn spawn_serve_snapshot_loop(state: Arc<AppState>) {
                 }
                 _ = sample.tick() => {
                     let instances = state.instances.read().await.clone();
-                    aggregator.sample(&instances);
+                    sample_in_window(&instances, &mut aggregator, &mut window);
                 }
             }
         }
     });
+}
+
+/// Folds one sample into the window aggregate, first resetting it when consent changed
+/// since the last sample or build, so every sample in it shares one consent window.
+fn sample_in_window(
+    instances: &[crate::session::Instance],
+    aggregator: &mut crate::telemetry::aggregate::UsageAggregator,
+    window: &mut Option<crate::telemetry::consent::Bound>,
+) {
+    let (bound, ()) = crate::telemetry::consent::capture(|| ());
+    enter_window(bound, aggregator, window);
+    aggregator.sample(instances);
+}
+
+fn enter_window(
+    bound: crate::telemetry::consent::Bound,
+    aggregator: &mut crate::telemetry::aggregate::UsageAggregator,
+    window: &mut Option<crate::telemetry::consent::Bound>,
+) {
+    if window
+        .replace(bound.clone())
+        .is_some_and(|prev| !prev.same_window(&bound))
+    {
+        *aggregator = crate::telemetry::aggregate::UsageAggregator::default();
+    }
 }
 
 /// Per-form-factor open counters for one web surface (dashboard or acp).
@@ -95,8 +122,14 @@ impl FormFactorCounters {
 
     /// Record one classified open of the given client class.
     pub fn increment(&self, ff: crate::telemetry::WebClientFormFactor) {
-        self.field(ff)
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::telemetry::consent::bump(self.field(ff));
+    }
+
+    fn zero(&self) {
+        for ff in crate::telemetry::WebClientFormFactor::ALL {
+            self.field(ff)
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Point-in-time read of every class count, so the snapshot loop can later
@@ -189,11 +222,46 @@ pub struct StructuredTelemetryCounters {
     pub prompts_queued: std::sync::atomic::AtomicU32,
 }
 
+impl StructuredTelemetryCounters {
+    fn zero(&self) {
+        for counter in [
+            &self.approvals_allow,
+            &self.approvals_allow_always,
+            &self.approvals_deny,
+            &self.agent_switches,
+            &self.plan_mode_seen,
+            &self.prompts_queued,
+        ] {
+            counter.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Zeroes the daemon's counters on every consent change, for as long as `state` lives.
+pub(super) fn register_serve_counters(state: &Arc<AppState>) {
+    let state = Arc::downgrade(state);
+    crate::telemetry::consent::register(move || {
+        let Some(state) = state.upgrade() else {
+            return false;
+        };
+        state.telemetry_usage_seen.zero();
+        state.telemetry_web_clients.zero();
+        state.telemetry_structured_clients.zero();
+        state
+            .telemetry_session_creates
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        state.telemetry_structured.zero();
+        true
+    });
+}
+
 /// What a serve snapshot reported, so the originating signals can be cleared
 /// only after the send is confirmed. The clear is deferred (rather than reset at
 /// build time) so a failed send retains the signals for the next snapshot.
 pub(super) struct ReportedServeSignals {
+    bound: crate::telemetry::consent::Bound,
     usage_seen: std::collections::BTreeMap<String, u32>,
+    feature_uses: std::collections::BTreeMap<String, u32>,
     web_clients: FormFactorCounts,
     structured_clients: FormFactorCounts,
     session_creates: u32,
@@ -228,21 +296,33 @@ pub(super) struct ReportedAcpCounts {
 pub(super) async fn build_serve_snapshot(
     state: &AppState,
     aggregator: &mut crate::telemetry::aggregate::UsageAggregator,
+    window: &mut Option<crate::telemetry::consent::Bound>,
 ) -> Option<crate::telemetry::UsageSnapshot> {
     use std::sync::atomic::Ordering;
-    let usage_seen = state.telemetry_usage_seen.snapshot();
-    let web_clients = state.telemetry_web_clients.read();
-    let structured_clients = state.telemetry_structured_clients.read();
-    let session_creates = state.telemetry_session_creates.load(Ordering::Relaxed);
-    let c = &state.telemetry_structured;
-    let reported_acp = ReportedAcpCounts {
-        approvals_allow: c.approvals_allow.load(Ordering::Relaxed),
-        approvals_allow_always: c.approvals_allow_always.load(Ordering::Relaxed),
-        approvals_deny: c.approvals_deny.load(Ordering::Relaxed),
-        agent_switches: c.agent_switches.load(Ordering::Relaxed),
-        plan_mode: c.plan_mode_seen.load(Ordering::Relaxed),
-        prompts_queued: c.prompts_queued.load(Ordering::Relaxed),
-    };
+    let instances = state.instances.read().await.clone();
+    let (
+        bound,
+        (usage_seen, web_clients, structured_clients, session_creates, feature_uses, reported_acp),
+    ) = crate::telemetry::consent::capture(|| {
+        let c = &state.telemetry_structured;
+        (
+            state.telemetry_usage_seen.snapshot(),
+            state.telemetry_web_clients.read(),
+            state.telemetry_structured_clients.read(),
+            state.telemetry_session_creates.load(Ordering::Relaxed),
+            crate::telemetry::feature_use::snapshot(),
+            ReportedAcpCounts {
+                approvals_allow: c.approvals_allow.load(Ordering::Relaxed),
+                approvals_allow_always: c.approvals_allow_always.load(Ordering::Relaxed),
+                approvals_deny: c.approvals_deny.load(Ordering::Relaxed),
+                agent_switches: c.agent_switches.load(Ordering::Relaxed),
+                plan_mode: c.plan_mode_seen.load(Ordering::Relaxed),
+                prompts_queued: c.prompts_queued.load(Ordering::Relaxed),
+            },
+        )
+    });
+    enter_window(bound.clone(), aggregator, window);
+    aggregator.sample(&instances);
     let acp = crate::telemetry::StructuredInteractionCounts {
         approvals_allow: reported_acp.approvals_allow,
         approvals_allow_always: reported_acp.approvals_allow_always,
@@ -251,31 +331,46 @@ pub(super) async fn build_serve_snapshot(
         plan_mode_seen: reported_acp.plan_mode > 0,
         prompts_queued: reported_acp.prompts_queued,
     };
-    let instances = state.instances.read().await.clone();
-    aggregator.sample(&instances);
-    let mut snapshot = crate::telemetry::build_usage_snapshot(
-        crate::telemetry::Surface::Serve,
-        &instances,
-        usage_seen.clone(),
-        session_creates,
-        Some(state.auth_mode),
-        Some(state.serve_mode),
-        &acp,
-    )?;
-    // Layer the per-form-factor was-seen maps onto the snapshot.
-    snapshot.web_clients_seen = web_clients.seen_map();
-    snapshot.structured_clients_seen = structured_clients.seen_map();
-    snapshot.peak_concurrent_sessions = aggregator.peak_concurrent_sessions();
-    snapshot.distinct_sessions_by_agent = aggregator.distinct_by_agent();
-    snapshot.distinct_sessions_by_model_bucket = aggregator.distinct_by_model();
     *state.telemetry_last_reported.lock().unwrap() = Some(ReportedServeSignals {
-        usage_seen,
+        bound: bound.clone(),
+        usage_seen: usage_seen.clone(),
+        feature_uses: feature_uses.clone(),
         web_clients,
         structured_clients,
         session_creates,
         acp: reported_acp,
     });
+    let mut snapshot = crate::telemetry::build_usage_snapshot(
+        crate::telemetry::Surface::Serve,
+        &instances,
+        usage_seen,
+        session_creates,
+        Some(state.auth_mode),
+        Some(state.serve_mode),
+        &acp,
+    )?;
+    snapshot.feature_uses = feature_uses;
+    // Layer the per-form-factor was-seen maps onto the snapshot.
+    snapshot.web_clients_seen = web_clients.seen_map();
+    snapshot.structured_clients_seen = structured_clients.seen_map();
+    apply_window(&bound, aggregator, &mut snapshot);
     Some(snapshot)
+}
+
+/// Layers the window aggregate onto a snapshot sent under the window's consent. Under
+/// any other consent the window is discarded and the point-in-time values stand.
+fn apply_window(
+    bound: &crate::telemetry::consent::Bound,
+    aggregator: &mut crate::telemetry::aggregate::UsageAggregator,
+    snapshot: &mut crate::telemetry::UsageSnapshot,
+) {
+    if !bound.bind(snapshot) {
+        *aggregator = crate::telemetry::aggregate::UsageAggregator::default();
+        return;
+    }
+    snapshot.peak_concurrent_sessions = aggregator.peak_concurrent_sessions();
+    snapshot.distinct_sessions_by_agent = aggregator.distinct_by_agent();
+    snapshot.distinct_sessions_by_model_bucket = aggregator.distinct_by_model();
 }
 
 /// Clear the signals a serve snapshot reported, but only when the send was
@@ -295,7 +390,14 @@ pub(super) fn clear_reported_serve_signals(
     if outcome != crate::telemetry::SendOutcome::Sent {
         return;
     }
+    reported
+        .bound
+        .clear_reported(|| decrement_reported(state, &reported));
+}
+
+fn decrement_reported(state: &AppState, reported: &ReportedServeSignals) {
     state.telemetry_usage_seen.decrement(&reported.usage_seen);
+    crate::telemetry::feature_use::clear_reported(&reported.feature_uses);
     state.telemetry_web_clients.decrement(&reported.web_clients);
     state
         .telemetry_structured_clients
@@ -338,6 +440,101 @@ pub(super) fn decrement_reported_count(counter: &std::sync::atomic::AtomicU32, r
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Counts recorded while opted out never reach an opted-in snapshot, while counts
+    /// recorded after opt-in but before the first opted-in build do.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snapshots_report_only_counts_recorded_under_their_consent() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["DO_NOT_TRACK"]);
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let state = crate::server::test_support::build_test_app_state(vec![]);
+        register_serve_counters(&state);
+        let mut aggregator = crate::telemetry::aggregate::UsageAggregator::default();
+        let mut window = None;
+        let record = |times: u32| {
+            for _ in 0..times {
+                state.telemetry_usage_seen.record("web");
+                crate::telemetry::consent::bump(&state.telemetry_session_creates);
+                crate::telemetry::consent::bump(&state.telemetry_structured.agent_switches);
+                crate::telemetry::feature_use::record_name("search");
+            }
+        };
+
+        record(1);
+        assert!(build_serve_snapshot(&state, &mut aggregator, &mut window)
+            .await
+            .is_none());
+        record(2);
+
+        crate::telemetry::consent::set_consent(true).unwrap();
+        record(3);
+        let first = build_serve_snapshot(&state, &mut aggregator, &mut window)
+            .await
+            .expect("opted in");
+        assert_eq!(first.usage_seen["web"], 3);
+        assert_eq!(first.session_creates_since_last_snapshot, 3);
+        assert_eq!(first.agent_switches, 3);
+        assert_eq!(first.feature_uses["search"], 3);
+
+        record(1);
+        clear_reported_serve_signals(&state, crate::telemetry::SendOutcome::Sent);
+        let next = build_serve_snapshot(&state, &mut aggregator, &mut window)
+            .await
+            .expect("opted in");
+        assert_eq!(
+            next.usage_seen["web"], 1,
+            "a confirmed send keeps later counts"
+        );
+        assert_eq!(next.feature_uses["search"], 1);
+
+        crate::telemetry::consent::set_consent(false).unwrap();
+    }
+
+    /// A sample taken after a consent change survives the next build even when its session
+    /// has ended; a snapshot that lands under a different id drops the window aggregate.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn window_aggregates_stay_inside_one_consent_window() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["DO_NOT_TRACK"]);
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        crate::telemetry::consent::set_consent(true).unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![]);
+        let mut aggregator = crate::telemetry::aggregate::UsageAggregator::default();
+        let mut window = None;
+        assert!(build_serve_snapshot(&state, &mut aggregator, &mut window)
+            .await
+            .is_some());
+
+        crate::telemetry::consent::reset_install_id().unwrap();
+        let short_lived = [crate::session::Instance::new("short", "/tmp/short")];
+        sample_in_window(&short_lived, &mut aggregator, &mut window);
+        let snapshot = build_serve_snapshot(&state, &mut aggregator, &mut window)
+            .await
+            .expect("opted in");
+        assert_eq!(snapshot.peak_concurrent_sessions, 1);
+        assert_eq!(snapshot.distinct_sessions_by_agent.values().sum::<u32>(), 1);
+
+        sample_in_window(&short_lived, &mut aggregator, &mut window);
+        let (bound, ()) = crate::telemetry::consent::capture(|| ());
+        crate::telemetry::consent::reset_install_id().unwrap();
+        let mut moved = crate::telemetry::build_usage_snapshot(
+            crate::telemetry::Surface::Serve,
+            &[],
+            Default::default(),
+            0,
+            None,
+            None,
+            &Default::default(),
+        )
+        .expect("opted in");
+        apply_window(&bound, &mut aggregator, &mut moved);
+        assert_eq!(moved.peak_concurrent_sessions, 0, "point-in-time value");
+        assert!(moved.distinct_sessions_by_agent.is_empty());
+        assert_eq!(aggregator.peak_concurrent_sessions(), 0, "window discarded");
+
+        crate::telemetry::consent::set_consent(false).unwrap();
+    }
 
     /// #1874 / #1875 / #1888: a confirmed send clears only the increments it
     /// reported, so one that lands mid-flight survives, a zero report touches

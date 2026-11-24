@@ -48,9 +48,10 @@ pub(super) fn queued_prompt() -> crate::daemon::QueuedPromptEntry {
         seq: 1,
         text: "queued while busy".to_string(),
         attachments: Vec::new(),
-        created_at: chrono::Utc::now().to_rfc3339(),
+        created_at: crate::time::Timestamp::now().to_rfc3339(),
         origin_device: None,
         origin_plugin: None,
+        origin: crate::daemon::PromptOrigin::Unknown,
     }
 }
 

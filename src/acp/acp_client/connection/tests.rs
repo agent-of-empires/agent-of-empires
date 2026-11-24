@@ -653,7 +653,7 @@ async fn rate_limit_on_an_agent_initiated_turn_preserves_the_connection() {
     .expect("session commits");
 
     // Accounting for a turn nobody prompted, carrying a rejected window.
-    let resets_at = chrono::Utc::now().timestamp() + 3600;
+    let resets_at = crate::time::Timestamp::now().as_unix_secs() + 3600;
     write_line(
         &fake.agent_write,
         &format!(
@@ -677,7 +677,7 @@ async fn rate_limit_on_an_agent_initiated_turn_preserves_the_connection() {
     .expect("the agent-initiated quota turn must end");
 
     let limit = seen.iter().position(|e| {
-        matches!(e, Event::RateLimit { info } if info.resets_at.map(|t| t.timestamp()) == Some(resets_at))
+        matches!(e, Event::RateLimit { info } if info.resets_at.map(|t| t.as_unix_secs()) == Some(resets_at))
     });
     let stopped = seen
         .iter()
@@ -913,7 +913,7 @@ async fn adapter_started_idle_compaction_ends_without_a_prompt() {
 /// usage covers does not.
 #[tokio::test]
 async fn prompted_turn_ending_on_a_rejected_window_parks() {
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::time::Timestamp::now().as_unix_secs();
     for (stop_reason, resets_at, overage, parks) in [
         ("end_turn", now + 3600, "", true),
         ("cancelled", now + 3600, "", false),
@@ -972,7 +972,7 @@ async fn prompted_turn_ending_on_a_rejected_window_parks() {
         .await
         .expect("the turn must reach a terminal event");
         let limit = seen.iter().position(|e| {
-            matches!(e, Event::RateLimit { info } if info.resets_at.map(|t| t.timestamp()) == Some(resets_at))
+            matches!(e, Event::RateLimit { info } if info.resets_at.map(|t| t.as_unix_secs()) == Some(resets_at))
         });
         let stopped_reason = match seen.last() {
             Some(Event::Stopped { reason }) => reason.as_str(),

@@ -168,7 +168,7 @@ pub(crate) fn spawn_wake_worker(
         .spawn(move || {
             session.wait_until_ready(
                 std::time::Duration::from_secs(5),
-                crate::agents::ready_marker(&tool),
+                crate::agents::ready_markers(&tool),
             );
             let delivered = session
                 .admit_agent_input(expects_shell)
@@ -247,7 +247,7 @@ mod tests {
                 instance.lifecycle_reservation = Some(LifecycleReservation {
                     op: LifecycleOperation::Launch,
                     generation: 1,
-                    at: chrono::Utc::now(),
+                    at: crate::time::Timestamp::now(),
                 });
             }
             storage

@@ -1,6 +1,6 @@
 //! Per-session ownership of a structured-view runner.
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -117,7 +117,7 @@ pub enum ResumeKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerStart {
     pub first_start: bool,
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
 }
 
 /// Authority token for one epoch of one session.
@@ -182,7 +182,7 @@ impl Default for Construction {
             retire_previous: std::sync::atomic::AtomicBool::new(false),
             spawn_attestor: Mutex::default(),
             idle_baseline_ms: std::sync::atomic::AtomicI64::new(
-                chrono::Utc::now().timestamp_millis(),
+                crate::time::Timestamp::now().as_millis(),
             ),
             admissions: std::sync::atomic::AtomicU64::new(0),
             constructor_finished: std::sync::atomic::AtomicBool::new(false),
@@ -689,14 +689,14 @@ enum Phase {
         kind: ResumeKind,
         /// Wall clock, so it survives a client reload. A daemon restart that
         /// re-adopts a starting worker admits again and resets it.
-        started_at: DateTime<Utc>,
+        started_at: Timestamp,
         cancel: Option<String>,
     },
     Running {
         identity: Option<RunnerIdentity>,
     },
     Respawning {
-        started_at: DateTime<Utc>,
+        started_at: Timestamp,
         cancel: Option<String>,
     },
     Stopping {
@@ -983,7 +983,7 @@ impl LifecycleTable {
                 epoch,
                 phase: Phase::Starting {
                     kind,
-                    started_at: Utc::now(),
+                    started_at: Timestamp::now(),
                     cancel: None,
                 },
                 delete_adapter_state: false,
@@ -1036,7 +1036,7 @@ impl LifecycleTable {
         lease.claim_runner_ownership();
         entry.phase = Phase::Running { identity };
         lease.construction.idle_baseline_ms.store(
-            chrono::Utc::now().timestamp_millis(),
+            crate::time::Timestamp::now().as_millis(),
             std::sync::atomic::Ordering::Relaxed,
         );
         if let Some(identity) = identity {
@@ -1417,7 +1417,7 @@ impl LifecycleTable {
             .expect("entry checked above");
         entry.epoch = epoch;
         entry.phase = Phase::Respawning {
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             cancel: None,
         };
         entry.journal_ack_required = false;
@@ -1582,7 +1582,7 @@ impl LifecycleTable {
     pub(crate) fn note_admission(&self, session_id: &str) {
         if let Some((lease, _)) = self.running(session_id) {
             lease.construction.idle_baseline_ms.fetch_max(
-                chrono::Utc::now().timestamp_millis(),
+                crate::time::Timestamp::now().as_millis(),
                 std::sync::atomic::Ordering::Relaxed,
             );
             lease

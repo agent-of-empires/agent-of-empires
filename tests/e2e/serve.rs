@@ -651,9 +651,8 @@ async fn daemon_group_move_preserves_live_terminal_and_restarts_in_target_profil
 async fn native_creation_hooks_preserve_borrowed_scratch_resources() {
     use agent_of_empires::daemon::{
         ApiErrorCode, CreateSessionBody, CreationTrustRequest, DaemonClient, DaemonClientError,
-        RUNTIME_EPOCH_HEADER,
+        PromptOrigin, RUNTIME_EPOCH_HEADER,
     };
-    use std::os::unix::fs::PermissionsExt;
     require_tmux!();
     if std::process::Command::new("curl")
         .arg("--version")
@@ -664,6 +663,19 @@ async fn native_creation_hooks_preserve_borrowed_scratch_resources() {
         return;
     }
     let real_git = which::which("git").expect("git is available");
+    // Host git never runs repo hooks, so a `git` shim stands in for the
+    // checkout: it runs `probe` around `git worktree add`.
+    let add_shim = |probe: &std::path::Path, after: bool| {
+        let run = format!("[ \"$is_add\" = 7 ] && sh {probe:?}");
+        let body = if after {
+            format!("{real_git:?} \"$@\"; rc=$?; {run}; exit $rc")
+        } else {
+            format!("{run}; exec {real_git:?} \"$@\"")
+        };
+        format!(
+            "#!/bin/sh\n( while [ \"$1\" = -c ]; do shift 2; done; [ \"$1\" = worktree ] && [ \"$2\" = add ] && exit 7 ); is_add=$?\n{body}\n"
+        )
+    };
     for stage in [
         "on_create",
         "post_checkout",
@@ -690,8 +702,17 @@ async fn native_creation_hooks_preserve_borrowed_scratch_resources() {
         if stage == "checkout_failure" {
             let git = h.install_path_command("git").join("git");
             std::fs::write(&git, format!(
-            "#!/bin/sh\nif [ \"$1\" = worktree ] && [ \"$2\" = add ]; then mkdir -p \"$3\"; printf preserved > \"$3/foreign-file\"; printf '%s' \"$3\" > {failed_checkout:?}; echo checkout-refused >&2; exit 1; fi\nexec {real_git:?} \"$@\"\n"
+            "#!/bin/sh\n( while [ \"$1\" = -c ]; do shift 2; done; if [ \"$1\" = worktree ] && [ \"$2\" = add ]; then mkdir -p \"$3\"; printf preserved > \"$3/foreign-file\"; printf '%s' \"$3\" > {failed_checkout:?}; echo checkout-refused >&2; exit 1; fi ) || exit 1\nexec {real_git:?} \"$@\"\n"
         )).unwrap();
+        }
+        if matches!(stage, "post_checkout" | "trust_before_git") {
+            let probe = h.home_path().join(if stage == "post_checkout" {
+                "purge-owner.sh"
+            } else {
+                "trust-probe.sh"
+            });
+            let git = h.install_path_command("git").join("git");
+            std::fs::write(&git, add_shim(&probe, stage == "post_checkout")).unwrap();
         }
         let daemon = h.run_cli(&["serve", "--core-only", "--daemon"]);
         assert!(
@@ -708,7 +729,7 @@ async fn native_creation_hooks_preserve_borrowed_scratch_resources() {
         }))
         .unwrap();
         let owner = sdk
-            .create_session(&owner_body, &epoch)
+            .create_session(&owner_body, &epoch, PromptOrigin::Unknown)
             .await
             .unwrap()
             .outcome;
@@ -752,10 +773,6 @@ curl --max-time 5 -fsS --unix-socket "{socket}" -H '{header}: {epoch}' -H 'Conte
                 serde_json::to_string(&format!("sh {hook:?}")).unwrap()
             ));
             std::fs::write(&config_path, config).unwrap();
-        } else if stage == "post_checkout" {
-            let git_hook = PathBuf::from(&owner.project_path).join(".git/hooks/post-checkout");
-            std::fs::copy(&hook, &git_hook).unwrap();
-            std::fs::set_permissions(&git_hook, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         let trust_seen = h.home_path().join("trust-seen");
         if stage == "trust_before_git" {
@@ -769,11 +786,9 @@ curl --max-time 5 -fsS --unix-socket "{socket}" -H '{header}: {epoch}' -H 'Conte
             };
             let hash = agent_of_empires::session::config::repo_config::compute_hooks_hash(&hooks);
             let trust = app.join("trusted_repos.toml");
-            let git_hook = source.join(".git/hooks/post-checkout");
-            std::fs::write(&git_hook, format!(r#"#!/bin/sh
+            std::fs::write(h.home_path().join("trust-probe.sh"), format!(r#"#!/bin/sh
 if grep -Fq 'hooks_hash = "{hash}"' {trust:?}; then printf approved > {trust_seen:?}; else printf missing > {trust_seen:?}; fi
 "#)).unwrap();
-            std::fs::set_permissions(git_hook, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         let mut borrower_body: CreateSessionBody = serde_json::from_value(serde_json::json!({
             "title":"scratch borrower", "path":owner.project_path, "tool":"creation-agent",
@@ -811,10 +826,12 @@ if grep -Fq 'hooks_hash = "{hash}"' {trust:?}; then printf approved > {trust_see
                 mcp.replace("secret-before-review", "secret-after-review"),
             )
             .unwrap();
-            assert!(matches!(sdk.create_session(&borrower_body, &epoch).await,
+            assert!(
+                matches!(sdk.create_session(&borrower_body, &epoch, PromptOrigin::Unknown).await,
                 Err(DaemonClientError::Status { code: Some(ApiErrorCode::CreationTrustChanged), body, .. })
                     if !["secret-before-review", "secret-after-review", "secret-header"]
-                        .iter().any(|secret| body.contains(secret))));
+                        .iter().any(|secret| body.contains(secret)))
+            );
             assert!(!app.join("trusted_repos.toml").exists());
             let repo = git2::Repository::open(&source).unwrap();
             assert!(repo
@@ -846,14 +863,18 @@ if grep -Fq 'hooks_hash = "{hash}"' {trust:?}; then printf approved > {trust_see
                 sdk.cancel_creation(&pending.id, &epoch).await.unwrap();
                 std::fs::write(&release, "continue").unwrap();
             };
-            let (result, ()) = tokio::join!(sdk.create_session(&borrower_body, &epoch), cancel);
+            let (result, ()) = tokio::join!(
+                sdk.create_session(&borrower_body, &epoch, PromptOrigin::Unknown),
+                cancel
+            );
             assert!(
                 matches!(&result, Err(DaemonClientError::Status { status, code: Some(ApiErrorCode::CreationCancelled), .. }) if *status == reqwest::StatusCode::CONFLICT),
                 "{result:?}"
             );
             result
         } else {
-            sdk.create_session(&borrower_body, &epoch).await
+            sdk.create_session(&borrower_body, &epoch, PromptOrigin::Unknown)
+                .await
         };
         if matches!(
             stage,
@@ -909,7 +930,8 @@ if grep -Fq 'hooks_hash = "{hash}"' {trust:?}; then printf approved > {trust_see
 #[parallel]
 async fn cancelled_creation_is_gone_from_the_first_read_after_the_failure() {
     use agent_of_empires::daemon::{
-        ApiErrorCode, CreateSessionBody, DaemonClient, DaemonClientError, RuntimeSnapshot,
+        ApiErrorCode, CreateSessionBody, DaemonClient, DaemonClientError, PromptOrigin,
+        RuntimeSnapshot,
     };
     require_tmux!();
     let mut h = TuiTestHarness::new_in_tmp("cancelled_creation_publish");
@@ -952,7 +974,7 @@ async fn cancelled_creation_is_gone_from_the_first_read_after_the_failure() {
     }))
     .unwrap();
     let owner = sdk
-        .create_session(&owner_body, &epoch)
+        .create_session(&owner_body, &epoch, PromptOrigin::Unknown)
         .await
         .unwrap()
         .outcome;
@@ -994,7 +1016,10 @@ async fn cancelled_creation_is_gone_from_the_first_read_after_the_failure() {
         sdk.cancel_creation(&pending.id, &epoch).await.unwrap();
         std::fs::write(&release, "continue").unwrap();
     };
-    let (result, ()) = tokio::join!(sdk.create_session(&body, &epoch), cancel);
+    let (result, ()) = tokio::join!(
+        sdk.create_session(&body, &epoch, PromptOrigin::Unknown),
+        cancel
+    );
     assert!(
         matches!(
             &result,
@@ -1633,7 +1658,7 @@ async fn daemon_trash_restore_purge_preserves_collisions_and_allows_retry() {
         branch: "feature/restore".into(),
         main_repo_path: repo.to_string_lossy().into_owned(),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        created_at: agent_of_empires::time::Timestamp::now(),
         base_branch: None,
     });
     let id = row.id.clone();
@@ -1812,9 +1837,10 @@ async fn daemon_trash_restore_purge_preserves_collisions_and_allows_retry() {
                 delete_worktree: true,
                 expected_trash: true,
                 expected_trashed_at: Some(
-                    chrono::DateTime::parse_from_rfc3339(row.trashed_at.as_ref().unwrap())
-                        .unwrap()
-                        .with_timezone(&chrono::Utc),
+                    agent_of_empires::time::Timestamp::parse_rfc3339(
+                        row.trashed_at.as_ref().unwrap(),
+                    )
+                    .unwrap(),
                 ),
                 expected_generation: Some(row.lifecycle_generation),
                 expected_trash_lifecycle_id: row.trash_lifecycle_id.clone(),
@@ -1867,9 +1893,10 @@ async fn daemon_trash_restore_purge_preserves_collisions_and_allows_retry() {
                 force_failed: true,
                 expected_trash: true,
                 expected_trashed_at: Some(
-                    chrono::DateTime::parse_from_rfc3339(retained.trashed_at.as_ref().unwrap())
-                        .unwrap()
-                        .with_timezone(&chrono::Utc),
+                    agent_of_empires::time::Timestamp::parse_rfc3339(
+                        retained.trashed_at.as_ref().unwrap(),
+                    )
+                    .unwrap(),
                 ),
                 expected_generation: Some(retained.lifecycle_generation),
                 expected_trash_lifecycle_id: retained.trash_lifecycle_id.clone(),
@@ -2007,7 +2034,7 @@ async fn daemon_terminal_commands_apply_dimensions_archive_and_abandon_policy() 
         branch: "feature/native-terminal".into(),
         main_repo_path: repo.to_string_lossy().into_owned(),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        created_at: agent_of_empires::time::Timestamp::now(),
         base_branch: None,
     });
     let id = row.id.clone();

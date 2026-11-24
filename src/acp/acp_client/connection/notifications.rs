@@ -39,7 +39,7 @@ use crate::acp::acp_client::watchdog::classify_watchdog_notification_signals;
 use crate::acp::acp_client::SessionState;
 
 pub(super) fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
+    crate::time::Timestamp::now().as_millis()
 }
 
 pub(super) struct Shared {
@@ -407,7 +407,7 @@ impl Shared {
                                 Some(Event::RateLimit { mut info }) => {
                                     if let Some(captured) = take_rate_limit_from_captured_rejection(
                                         &self.rate_limit_rejections,
-                                        chrono::Utc::now(),
+                                        crate::time::Timestamp::now(),
                                     ) {
                                         info.kind = captured.kind;
                                         info.resets_at = captured.resets_at;
@@ -421,7 +421,7 @@ impl Shared {
                                 {
                                     take_rate_limit_from_captured_rejection(
                                         &self.rate_limit_rejections,
-                                        chrono::Utc::now(),
+                                        crate::time::Timestamp::now(),
                                     )
                                     .map(|info| {
                                         adopted.reason = "rate_limited".into();

@@ -358,8 +358,9 @@ fn hover_never_reaches_a_stale_preview_before_repaint() {
         assert!(env.view.forward_hover_to_preview(50, 10));
         match change {
             "trash" => {
-                env.view
-                    .mutate_instance(&id, |row| row.trashed_at = Some(chrono::Utc::now()));
+                env.view.mutate_instance(&id, |row| {
+                    row.trashed_at = Some(crate::time::Timestamp::now())
+                });
                 env.view.enforce_trash_read_only();
             }
             "selection" => {

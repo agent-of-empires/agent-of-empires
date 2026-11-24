@@ -9,9 +9,9 @@ const features = [
   { n: '01', title: 'Session dashboard', description: 'Every AI coding session in one list with live status. Jump between agents, groups, and repos without leaving the keyboard.' },
   { n: '02', title: 'Keyboard-first', description: 'Launch, attach, rename, and kill agents with single keystrokes. Built for people who never reach for the mouse.' },
   { n: '03', title: 'Status detection', description: 'See when an agent is working, waiting for input, or idle, so you always know which session needs you next.' },
-  { n: '04', title: 'Git worktrees', description: 'Spin up an isolated worktree per agent and clean it up automatically when the work is merged or dropped.' },
+  { n: '04', title: 'Git worktrees', description: 'Spin up an isolated worktree per agent. Deleting the session offers to remove the worktree.' },
   { n: '05', title: 'Docker sandboxing', description: 'Run agents in isolated containers with configurable mounts and persistent auth, managed for you.' },
-  { n: '06', title: 'tmux persistence', description: 'Sessions live in tmux. Close aoe anytime and your agents keep running; reattach whenever you come back.' },
+  { n: '06', title: 'tmux persistence', description: 'Terminal sessions live in tmux; structured sessions run under a persistent worker. Close aoe anytime and your agents keep running; reattach whenever you come back.' },
 ];
 ---
 
@@ -33,7 +33,7 @@ const features = [
       </h1>
       <p class="text-lg md:text-xl text-gray-300 max-w-2xl leading-relaxed mb-8">
         See every AI coding session at a glance, launch and kill agents with a keystroke, and never lose
-        your place. The TUI is the native front-end to Agent of Empires. The
+        your place. The TUI is the native front-end to Agent of Empires. The{' '}
         <a href="/web/" class="text-brand-400 hover:text-brand-300">web dashboard</a> drives the very
         same sessions from a browser, so you can pick whichever fits where you are.
       </p>
@@ -55,7 +55,7 @@ const features = [
         </div>
         <img
           src="/assets/demo.gif"
-          alt="Agent of Empires TUI showing session management with Claude Code, git worktree creation, and Docker container status indicators"
+          alt="Agent of Empires TUI: creating a Claude Code session and prompting it in live mode"
           class="block w-full"
           width="960"
           height="576"
