@@ -1305,6 +1305,32 @@ fn pre_trust_is_refused_when_the_list_changes_under_its_confirmation() {
     assert!(error.is_some_and(|e| e.contains("list changed")));
 }
 
+/// While one retry waits for its Trash, a second is refused before its Trash.
+#[test]
+#[serial]
+fn a_second_try_again_is_refused_while_one_is_in_flight() {
+    let (mut env, _id, _requests) = blocked_on_folder_trust();
+    crate::session::config::update_config(|c| c.session.pre_trust_agent_folders = true).unwrap();
+    env.view.open_suggestions_view();
+    let mut commands = env.view.session_feed.request_driver_for_test();
+    let pending = crate::tui::home::RetryAfterTrash {
+        session_id: "other".into(),
+        key: ("gh".into(), "other".into()),
+        epoch: "test".into(),
+        origin: None,
+    };
+    env.view.start_after_trash = Some(pending);
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(
+        commands(Ok(trashed_at("test"))).is_none(),
+        "no second Trash"
+    );
+    let retry = env.view.start_after_trash.as_ref().unwrap();
+    assert_eq!(retry.session_id, "other", "the first retry is kept");
+    let error = env.view.suggestions_view.as_ref().unwrap().error.clone();
+    assert!(error.is_some_and(|e| e.contains("still moving to Trash")));
+}
+
 #[test]
 #[serial]
 fn a_failed_try_again_trash_disarms_so_a_later_trash_starts_nothing() {

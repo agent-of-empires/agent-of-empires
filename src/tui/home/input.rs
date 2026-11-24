@@ -2322,6 +2322,14 @@ impl HomeView {
                         .buttons("Turn on pre-trust", "Cancel"),
                     );
                 }
+                // One retry continues at a time: a second would replace the first's.
+                SuggestionsAction::TryAgain(..) if self.start_after_trash.is_some() => {
+                    if let Some(view) = &mut self.suggestions_view {
+                        view.set_error(
+                            "Another Session is still moving to Trash. Try again once it has started.",
+                        );
+                    }
+                }
                 SuggestionsAction::TryAgain(key, session_id) => {
                     let epoch = self.session_feed.applied_epoch().map(str::to_owned);
                     let origin = self.suggestions_feed.origin();
