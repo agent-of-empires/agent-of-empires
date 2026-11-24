@@ -2007,8 +2007,8 @@ mod tests {
             selected.push(due.len());
             due.into_iter().for_each(|due| put_back(&mut dwell, due));
         }
-        // 4664770203: a discarded candidate sent nothing, so it leaves no cooldown behind, and the
-        // change's own candidate is selected at the same instant.
+        // A discarded candidate sent nothing, so it leaves no cooldown behind: the change's own
+        // candidate is selected at the same instant.
         handle_status_change(&mut dwell, change(Status::Error, Status::Error));
         selected.push(due_events(&mut dwell, &watch, later).len());
         assert_eq!(selected, [1, 1, 0, 1]);
