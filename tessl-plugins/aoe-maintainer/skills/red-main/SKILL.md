@@ -6,9 +6,11 @@ description: "Classify a failed GitHub Actions check suite on main in agent-of-e
 # Red main
 
 Explain the red check suites of one commit on `main` of
-`agent-of-empires/agent-of-empires` and record exactly one Tessl finding. The
-trigger gathers every suite of a commit into one run. This runs unattended with a read-only
-GitHub token. Do not comment, label, rerun jobs, or push.
+`agent-of-empires/agent-of-empires` and record at most one Tessl finding. The
+trigger gathers the suites of a commit that fail within 15 minutes into one
+run and queues another run for a later failure; step 5 keeps the second from
+repeating the first. This runs unattended with a read-only GitHub token. Do
+not comment, label, rerun jobs, or push.
 
 ```sh
 REPO=agent-of-empires/agent-of-empires

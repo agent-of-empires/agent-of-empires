@@ -525,7 +525,7 @@
           "red-main-{{ event.check_suite.head_sha }}"
         ],
         "debounce": "15m",
-        "mode": "skip"
+        "mode": "queue"
       }
     }
   },
