@@ -9,37 +9,44 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-/// Format printing the settings that decide what PID 1 does on stop: the
-/// image ENTRYPOINT, `--init` and `--stop-timeout`, as `|`-separated JSON.
-const STOP_SETTINGS_FORMAT: &str =
-    "{{json .Config.Entrypoint}}|{{json .HostConfig.Init}}|{{json .Config.StopTimeout}}";
+/// Format printing what decides PID 1 on stop: the image ENTRYPOINT, `--init`,
+/// `--stop-timeout` and the host PID of PID 1, as `|`-separated JSON.
+const STOP_SETTINGS_FORMAT: &str = "{{json .Config.Entrypoint}}|{{json .HostConfig.Init}}|{{json .Config.StopTimeout}}|{{json .State.Pid}}";
 
-/// Stop args for a container whose settings printed as `settings`. `sleep`
-/// as PID 1 ignores SIGTERM, so waiting out the grace only delays SIGKILL.
-/// A set ENTRYPOINT, init or timeout, or an unreadable answer, keeps the grace.
-fn stop_args(settings: Option<&str>) -> &'static [&'static str] {
-    let mut fields = settings.unwrap_or_default().split('|');
-    match (fields.next(), fields.next(), fields.next(), fields.next()) {
-        (Some("null" | "[]" | "\"\""), Some("null" | "false"), Some("null"), None) => {
-            &["stop", "-t", "0"]
+/// The host PID of PID 1 when `settings` show no ENTRYPOINT, init or explicit
+/// timeout, so it can only be the appended `sleep`, or whatever the daemon
+/// defaulted init to. `None` for any other setup or an unreadable answer.
+fn bare_pid1(settings: Option<&str>) -> Option<&str> {
+    let mut fields = settings?.split('|');
+    match (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) {
+        (Some("null" | "[]" | "\"\""), Some("null" | "false"), Some("null"), Some(pid), None)
+            if pid != "0" && pid.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            Some(pid)
         }
-        _ => &["stop"],
+        _ => None,
     }
 }
 
-/// Whether `top -eo pid,comm` output lists `sleep` as the container's first process. The
-/// daemon may default init on, which `inspect` cannot show, so PID 1 is read.
-fn pid1_is_sleep(top_stdout: &str) -> bool {
-    top_stdout
-        .lines()
-        .nth(1)
-        .and_then(|row| row.split_whitespace().last())
-        == Some("sleep")
+/// Whether `top -eo pid,comm` output lists host process `pid` as `sleep`.
+fn pid_is_sleep(top_stdout: &str, pid: &str) -> bool {
+    top_stdout.lines().skip(1).any(|row| {
+        let mut columns = row.split_whitespace();
+        (columns.next(), columns.next(), columns.next()) == (Some(pid), Some("sleep"), None)
+    })
 }
 
 /// Full `stop` arguments for container `name`. `run` runs the given runtime
-/// arguments and returns the output, or `None` when it cannot run. `-t 0` needs
-/// the settings gate and `sleep` as PID 1; anything else keeps the grace.
+/// arguments and returns the output, or `None` when it cannot run. `sleep` as
+/// PID 1 ignores SIGTERM, so waiting out the grace only delays SIGKILL: `-t 0`
+/// needs the settings gate and `top` showing PID 1 is `sleep`. Anything else,
+/// including a failed probe, keeps the runtime's grace.
 pub(crate) fn stop_args_for(
     name: &str,
     mut run: impl FnMut(&[String]) -> Option<std::process::Output>,
@@ -49,14 +56,16 @@ pub(crate) fn stop_args_for(
             .filter(|output| output.status.success())
             .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
     };
-    let mut args =
-        stop_args(stdout(&["inspect", "--format", STOP_SETTINGS_FORMAT, name]).as_deref());
-    if args.len() > 1
-        && !stdout(&["top", name, "-eo", "pid,comm"]).is_some_and(|top| pid1_is_sleep(&top))
-    {
-        args = &["stop"];
-    }
-    args.iter()
+    let settings = stdout(&["inspect", "--format", STOP_SETTINGS_FORMAT, name]);
+    let immediate = bare_pid1(settings.as_deref()).is_some_and(|pid| {
+        stdout(&["top", name, "-eo", "pid,comm"]).is_some_and(|top| pid_is_sleep(&top, pid))
+    });
+    let stop: &[&str] = if immediate {
+        &["stop", "-t", "0"]
+    } else {
+        &["stop"]
+    };
+    stop.iter()
         .map(|arg| (*arg).to_owned())
         .chain([name.to_owned()])
         .collect()
@@ -1036,36 +1045,42 @@ mod tests {
     }
 
     #[test]
-    fn stop_skips_the_grace_only_for_a_bare_sleep() {
-        const NOW: &[&str] = &["stop", "-t", "0"];
-        const GRACE: &[&str] = &["stop"];
+    fn bare_pid1_needs_no_entrypoint_init_or_timeout() {
         for (settings, expected) in [
-            (Some("null|null|null"), NOW),
-            (Some("[]|false|null"), NOW),
-            (Some("\"\"|null|null"), NOW),
-            (Some("[\"/entry.sh\"]|null|null"), GRACE),
-            (Some("null|true|null"), GRACE),
-            (Some("null|null|30"), GRACE),
-            (Some("null|null|10"), GRACE),
-            (Some("null"), GRACE),
-            (Some(""), GRACE),
-            (None, GRACE),
+            (Some("null|null|null|123"), Some("123")),
+            (Some("[]|false|null|123"), Some("123")),
+            (Some("\"\"|null|null|123"), Some("123")),
+            (Some("[\"/entry.sh\"]|null|null|123"), None),
+            (Some("null|true|null|123"), None),
+            (Some("null|null|30|123"), None),
+            (Some("null|null|null|0"), None),
+            (Some("null|null|null|abc"), None),
+            (Some("null|null|null"), None),
+            (Some(""), None),
+            (None, None),
         ] {
-            assert_eq!(stop_args(settings), expected, "{settings:?}");
+            assert_eq!(bare_pid1(settings), expected, "{settings:?}");
         }
     }
 
     #[test]
-    fn pid1_is_sleep_reads_the_first_listed_process() {
-        for (top, expected) in [
-            ("PID COMMAND\n91483 sleep", true),
-            ("PID COMMAND\n91483 sleep\n91500 sh", true),
-            ("PID COMMAND\n91570 docker-init\n91584 sleep", false),
-            ("PID COMMAND\n91659 sh\n91675 sleep", false),
-            ("PID COMMAND", false),
-            ("", false),
+    fn pid_is_sleep_matches_the_exact_row() {
+        const INIT: &str = "PID COMMAND\n91570 docker-init\n91584 sleep";
+        for (top, pid, expected) in [
+            ("PID COMMAND\n91483 sleep", "91483", true),
+            ("PID COMMAND\n91483 sleep\n91500 sh", "91483", true),
+            (INIT, "91570", false),
+            (INIT, "91584", true),
+            (
+                "PID COMMAND\n91584 sleep\n91570 docker-init",
+                "91570",
+                false,
+            ),
+            ("PID COMMAND\n914830 sleep", "91483", false),
+            ("PID COMMAND", "91483", false),
+            ("", "91483", false),
         ] {
-            assert_eq!(pid1_is_sleep(top), expected, "{top:?}");
+            assert_eq!(pid_is_sleep(top, pid), expected, "{top:?} {pid}");
         }
     }
 
@@ -1086,20 +1101,22 @@ mod tests {
         };
         let now = ["stop", "-t", "0", "c1"];
         let grace = ["stop", "c1"];
+        let bare = Some("null|null|null|91483");
+        assert_eq!(stop(bare, Some("PID COMMAND\n91483 sleep")), now);
         assert_eq!(
-            stop(Some("null|null|null"), Some("PID COMMAND\n91483 sleep")),
-            now
-        );
-        assert_eq!(
-            stop(
-                Some("null|null|null"),
-                Some("PID COMMAND\n91570 docker-init\n91584 sleep")
-            ),
+            stop(bare, Some("PID COMMAND\n91483 docker-init\n91484 sleep")),
             grace
         );
-        assert_eq!(stop(Some("null|null|null"), None), grace);
         assert_eq!(
-            stop(Some("null|true|null"), Some("PID COMMAND\n91483 sleep")),
+            stop(bare, Some("PID COMMAND\n91484 sleep\n91483 docker-init")),
+            grace
+        );
+        assert_eq!(stop(bare, None), grace);
+        assert_eq!(
+            stop(
+                Some("null|true|null|91483"),
+                Some("PID COMMAND\n91483 sleep")
+            ),
             grace
         );
         assert_eq!(stop(None, Some("PID COMMAND\n91483 sleep")), grace);
