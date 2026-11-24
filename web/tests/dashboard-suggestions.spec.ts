@@ -102,3 +102,36 @@ test("a failed start and the undo bar fit a 375px phone", async ({ page }) => {
   expect((await bar.getByText(/^Dismissed/).boundingBox())!.width).toBeGreaterThan(100);
   await fits();
 });
+
+test("the sidebar's Start options menu stays in view and takes a pointer click on desktop", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await mockHome(page);
+  await page.route("**/api/suggestions", (route) =>
+    route.fulfill({ json: { providers: [provider], items, prefs: { ...prefs, sidebar: true } } }),
+  );
+  let dismissed: unknown = null;
+  await page.route("**/api/suggestions/dismiss", (route) => {
+    dismissed = route.request().postDataJSON();
+    return route.fulfill({ json: {} });
+  });
+  await page.goto("/");
+  await page.getByTestId("sidebar-suggested-toggle").click();
+  const section = page.getByTestId("sidebar-suggested-section");
+  await section.getByRole("button", { name: "Start options" }).first().click();
+  const menu = section.getByRole("menu", { name: "Start options" });
+  const box = (await menu.boundingBox())!;
+  expect(box.x).toBeGreaterThanOrEqual(0);
+  expect(box.x + box.width).toBeLessThanOrEqual(1280);
+  expect(box.y + box.height).toBeLessThanOrEqual(800);
+  // Nothing clips or covers it: the item's centre hits the item itself.
+  const item = menu.getByRole("menuitem", { name: "Dismiss" });
+  const ib = (await item.boundingBox())!;
+  expect(
+    await item.evaluate(
+      (el, [x, y]) => el.contains(document.elementFromPoint(x!, y!)),
+      [ib.x + ib.width / 2, ib.y + ib.height / 2],
+    ),
+  ).toBe(true);
+  await page.mouse.click(ib.x + ib.width / 2, ib.y + ib.height / 2);
+  await expect.poll(() => dismissed).toEqual({ provider_id: "github", id: "i1" });
+});

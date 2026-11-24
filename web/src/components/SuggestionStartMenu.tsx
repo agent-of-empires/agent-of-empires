@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { ChevronDown } from "lucide-react";
 import { fetchSuggestionProjects } from "../lib/api";
 import type { SuggestionProject } from "../lib/types";
@@ -10,6 +10,17 @@ export const CHEVRON_BUTTON =
   "relative inline-flex h-8 items-center justify-center gap-1 rounded-md border border-surface-700 bg-surface-800 text-text-primary hover:bg-surface-700/50 disabled:opacity-50 after:absolute after:left-1/2 after:top-1/2 after:h-11 after:w-11 after:-translate-x-1/2 after:-translate-y-1/2 after:content-[''] md:after:hidden";
 
 const ENABLED_ITEMS = '[role="menuitem"]:not(:disabled)';
+const MENU_WIDTH = 270;
+const GUTTER = 8;
+
+/** Fixed coordinates beside the trigger, kept in the window; a clipped sidebar can't hide them. */
+function placeMenu(trigger: DOMRect, height: number, align: "left" | "right") {
+  const x = align === "right" ? trigger.right - MENU_WIDTH : trigger.left;
+  const left = Math.min(Math.max(GUTTER, x), window.innerWidth - MENU_WIDTH - GUTTER);
+  const below = trigger.bottom + 4;
+  const top = below + height <= window.innerHeight - GUTTER ? below : Math.max(GUTTER, trigger.top - 4 - height);
+  return { top, left };
+}
 
 /**
  * A popover on desktop and a bottom sheet on a phone. Opening focuses the first item, arrow keys
@@ -35,6 +46,23 @@ export function MenuPopover({
     if (refocus) document.querySelector<HTMLElement>(`[data-menu="${id}"] [aria-haspopup]`)?.focus();
   };
   const menu = useRef<HTMLDivElement>(null);
+  // Desktop only: a phone gets the bottom sheet.
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
+  useLayoutEffect(() => {
+    if (!open) return;
+    const place = () => {
+      const trigger = box.current?.querySelector("[aria-haspopup]")?.getBoundingClientRect();
+      const desktop = window.matchMedia?.("(min-width: 768px)").matches;
+      setPos(desktop && trigger ? placeMenu(trigger, menu.current?.offsetHeight ?? 0, align) : null);
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [open, align]);
   // Once per open, on the first render that has an item: Start in… loads its Projects after opening.
   const focused = useRef(false);
   useEffect(() => {
@@ -79,7 +107,8 @@ export function MenuPopover({
             role="menu"
             aria-label={label}
             onKeyDown={onMenuKey}
-            className={`fixed inset-x-0 bottom-0 z-40 max-h-[70vh] overflow-y-auto rounded-t-xl border border-surface-700 bg-surface-800 py-2 shadow-lg md:absolute md:inset-x-auto md:bottom-auto ${align === "right" ? "md:right-0" : "md:left-0"} md:mt-1 md:max-h-72 md:w-[270px] md:rounded-md md:py-1`}
+            style={pos ?? undefined}
+            className="fixed inset-x-0 bottom-0 z-40 max-h-[70vh] overflow-y-auto rounded-t-xl border border-surface-700 bg-surface-800 py-2 shadow-lg md:inset-x-auto md:bottom-auto md:max-h-72 md:w-[270px] md:rounded-md md:py-1"
           >
             {children(close)}
           </div>
