@@ -5,7 +5,8 @@
 # prints the URLs to use in PR comments.
 set -euo pipefail
 src=$1 sub=$2 branch=e2e-recordings
-repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+# Name the repository the push goes to, not whatever gh defaults to.
+repo=$(gh repo view "$(git remote get-url origin)" --json nameWithOwner --jq .nameWithOwner)
 
 entries=""
 for f in "$src"/*; do
@@ -16,7 +17,7 @@ subtree=$(printf '%s' "$entries" | git mktree)
 
 if git fetch -q origin "$branch" 2>/dev/null; then
   parent=$(git rev-parse FETCH_HEAD)
-  root=$( (git ls-tree "$parent" | grep -v "	$sub\$"; printf '040000 tree %s\t%s\n' "$subtree" "$sub") | git mktree)
+  root=$( (git ls-tree "$parent" | awk -F '\t' -v s="$sub" '$2 != s'; printf '040000 tree %s\t%s\n' "$subtree" "$sub") | git mktree)
   commit=$(git commit-tree "$root" -p "$parent" -m "docs: demo recordings for $sub")
 else
   readme=$(printf 'Demo recordings referenced from PR comments.\n' | git hash-object -w --stdin)
