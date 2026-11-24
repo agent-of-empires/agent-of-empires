@@ -11,7 +11,7 @@
 //! previews. The channel tears down (disables the pipe, stops the forwarder)
 //! when the last `Arc` drops. Unix-only; the whole module is `#[cfg(unix)]`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::Read;
 use std::num::NonZeroU16;
 use std::os::fd::AsRawFd;
@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 
-use crate::tmux::osc8::{Osc8Scanner, PaneLink};
+use crate::tmux::osc8::GridLinks;
 use crate::tmux::session::OwnerClaim;
 use crate::tmux::PaneCursor;
 
@@ -33,12 +33,22 @@ use crate::tmux::PaneCursor;
 /// grow it forever).
 const OSC52_MAX_PAYLOAD: usize = 2 * 1024 * 1024;
 
-fn new_parser(rows: u16, cols: u16, scrollback: usize) -> vt100::Parser {
-    vt100::Parser::new(
+/// A pane grid plus the OSC 8 targets its cells name (see [`GridLinks`]).
+type Grid = vt100::Parser<GridLinks>;
+
+fn new_parser(rows: u16, cols: u16, scrollback: usize) -> Grid {
+    vt100::Parser::new_with_callbacks(
         NonZeroU16::new(rows).unwrap_or(NonZeroU16::MIN),
         NonZeroU16::new(cols).unwrap_or(NonZeroU16::MIN),
         scrollback,
+        GridLinks::default(),
     )
+}
+
+/// Apply pane output to `grid`, keeping its hyperlinks on their cells.
+fn feed(grid: &mut Grid, bytes: &[u8]) {
+    let marked = grid.callbacks_mut().mark(bytes);
+    grid.process(&marked);
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1223,10 +1233,9 @@ struct DrainedSeedGuard<'a> {
 /// The channel state one seed writes into. Bundled because they always travel
 /// together and are the same four handles the reader thread holds.
 struct SeedSink<'a> {
-    parser: &'a Mutex<vt100::Parser>,
+    parser: &'a Mutex<Grid>,
     app_cursor: &'a AtomicBool,
     grid_gen: &'a AtomicU64,
-    links: &'a LinkTable,
 }
 
 /// Only a landed swap may move the channel's recorded geometry: a Busy or
@@ -1332,7 +1341,8 @@ fn capture_seed_stream<S>(
 ) -> Option<(Vec<u8>, S)> {
     let (cols, rows) = size;
     let (body, state, sampled) = capture_seed_snapshot(target, (cols, rows), deadline, sample)?;
-    Some((assemble_seed_stream(&body, &state, rows), sampled))
+    let stream = assemble_seed_stream(&body.rows, &body.wraps, &state, (cols, rows));
+    Some((stream, sampled))
 }
 
 fn pipe_has_unread_bytes(pipe: &UnixStream) -> bool {
@@ -1369,7 +1379,6 @@ fn swap_seeded_parser(
         parser,
         app_cursor,
         grid_gen,
-        links,
     } = sink;
     let Ok(mut p) = parser.lock() else {
         return VtRefreshResult::Failed;
@@ -1385,10 +1394,8 @@ fn swap_seeded_parser(
     }
     let (cols, rows) = size;
     *p = new_parser(rows, cols, SCROLLBACK_LINES);
-    p.process(stream);
+    feed(&mut p, stream);
     app_cursor.store(p.screen().application_cursor(), Ordering::Relaxed);
-    // Under the parser lock so the grid and its links are installed together.
-    reconcile_links(links, crate::tmux::osc8::extract_links(stream));
     grid_gen.fetch_add(1, Ordering::Relaxed);
     VtRefreshResult::Refreshed
 }
@@ -1449,9 +1456,10 @@ fn capture_seed_snapshot<S>(
     want: (u16, u16),
     deadline: &crate::tmux::TmuxCommandDeadline,
     mut sample: impl FnMut() -> S,
-) -> Option<(Vec<u8>, PaneSeedState, S)> {
+) -> Option<(SeedBody, PaneSeedState, S)> {
     let seed_start = format!("-{SCROLLBACK_LINES}");
-    let mut last: Option<(Vec<u8>, PaneSeedState, S)> = None;
+    let joined_mark = crate::tmux::wraps::sentinel();
+    let mut last: Option<(SeedBody, PaneSeedState, S)> = None;
     for attempt in 0..SEED_PROBE_ATTEMPTS {
         if attempt > 0 {
             std::thread::sleep(SEED_RETRY_SETTLE);
@@ -1461,10 +1469,23 @@ fn capture_seed_snapshot<S>(
             break;
         };
         // The alternate screen has no scrollback; `-N` keeps styled trailing fills.
-        let mut args = vec!["capture-pane", "-t", target, "-p", "-e", "-N"];
+        let mut capture = vec!["capture-pane", "-t", target, "-p", "-e", "-N"];
         if !pre.alt {
-            args.extend_from_slice(&["-S", &seed_start]);
+            capture.extend_from_slice(&["-S", &seed_start]);
         }
+        // The same window again with wrapped rows joined, for the wrap flags.
+        let mut args = capture.clone();
+        args.extend_from_slice(&[
+            ";",
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            &joined_mark,
+            ";",
+        ]);
+        capture[4] = "-J";
+        args.extend_from_slice(&capture);
         args.extend_from_slice(&[
             ";",
             "display-message",
@@ -1485,16 +1506,31 @@ fn capture_seed_snapshot<S>(
         if !out.status.success() {
             break;
         }
-        let (body, probe_line) = split_seed_capture(&out.stdout);
+        let (captured, probe_line) = split_seed_capture(&out.stdout);
         // A chained invocation can exit 0 with the probe dropped.
         if !is_probe_line(probe_line) {
             break;
         }
+        let Some((body, joined)) = crate::tmux::wraps::split_at_sentinel(captured, &joined_mark)
+        else {
+            break;
+        };
+        let wraps = crate::tmux::wraps::soft_wraps(
+            &String::from_utf8_lossy(body),
+            &String::from_utf8_lossy(joined),
+        );
         let post = parse_seed_state(probe_line);
         let agreed = pre == post;
         // A capture at the wanted geometry is worth one more probe.
         let at_want = (post.pane_width, post.pane_height) == want;
-        last = Some((body.to_vec(), post, sampled));
+        last = Some((
+            SeedBody {
+                rows: body.to_vec(),
+                wraps,
+            },
+            post,
+            sampled,
+        ));
         if agreed && at_want {
             return last;
         }
@@ -1509,6 +1545,12 @@ fn capture_seed_snapshot<S>(
         );
     }
     last
+}
+
+/// A seed's `capture-pane -e` rows and which of them soft-wrap.
+struct SeedBody {
+    rows: Vec<u8>,
+    wraps: Vec<u32>,
 }
 
 /// Whether a chained-output line is plausibly the [`SEED_STATE_FMT`] probe
@@ -1566,7 +1608,12 @@ fn split_seed_capture(raw: &[u8]) -> (&[u8], &str) {
 /// Without it the parser's cursor lands after the last replayed glyph,
 /// bottom-right for a full-screen app, until the first live chunk carries the
 /// app's own escapes (issue #2902).
-fn assemble_seed_stream(body: &[u8], state: &PaneSeedState, rows: u16) -> Vec<u8> {
+fn assemble_seed_stream(
+    body: &[u8],
+    wraps: &[u32],
+    state: &PaneSeedState,
+    (cols, rows): (u16, u16),
+) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(body.len() + 32);
     if state.alt {
         out.extend_from_slice(b"\x1b[?1049h");
@@ -1588,7 +1635,7 @@ fn assemble_seed_stream(body: &[u8], state: &PaneSeedState, rows: u16) -> Vec<u8
     if state.app_cursor {
         out.extend_from_slice(b"\x1b[?1h");
     }
-    out.extend_from_slice(&lf_to_crlf(strip_trailing_row_terminator(body)));
+    out.extend_from_slice(&seed_rows(body, wraps, cols));
     // 1-based CUP, clamped to the grid.
     let cy = seeded_cursor_row(body, state, rows).min(rows.saturating_sub(1)) + 1;
     let cx = state.cursor_x + 1;
@@ -1598,6 +1645,35 @@ fn assemble_seed_stream(body: &[u8], state: &PaneSeedState, rows: u16) -> Vec<u8
     } else {
         b"\x1b[?25l"
     });
+    out
+}
+
+/// `body`'s rows as CRLF lines, except that a soft-wrapped row filling the grid
+/// runs straight into the next one: the parser then wraps it itself and flags
+/// the row as tmux had. A wrapped row that does not fill `cols` (a capture at
+/// another width) keeps its line break, so the layout never shifts.
+fn seed_rows(body: &[u8], wraps: &[u32], cols: u16) -> Vec<u8> {
+    let body = strip_trailing_row_terminator(body);
+    if wraps.is_empty() {
+        return lf_to_crlf(body);
+    }
+    let cols = usize::from(cols);
+    let rows: Vec<&[u8]> = body.split(|&b| b == b'\n').collect();
+    let text = |row: &[u8]| crate::tmux::utils::strip_ansi(&String::from_utf8_lossy(row));
+    let mut out = Vec::with_capacity(body.len() + rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        out.extend_from_slice(row);
+        if i + 1 == rows.len() {
+            break;
+        }
+        // tmux, like vt100, does not flag a row a wide glyph left a column
+        // short, so a flagged row fills the pane it was captured from.
+        let fills = wraps.binary_search(&(i as u32)).is_ok()
+            && crate::tmux::wraps::display_width(&text(row)) == cols;
+        if !fills {
+            out.extend_from_slice(b"\r\n");
+        }
+    }
     out
 }
 
@@ -1819,9 +1895,9 @@ fn cell_sgr(cell: &vt100::Cell) -> String {
 /// cursor movement, so every gap of padding collapsed and aligned TUIs rendered
 /// with their spaces stripped (#2433 regression). Emitting literal spaces keeps
 /// the column layout intact while preserving color and intensity.
-fn row_to_ansi(screen: &vt100::Screen, row: u16, cols: u16) -> String {
-    let last = row_last_col(screen, row, cols);
-    row_to_ansi_upto(screen, row, last)
+fn row_to_ansi(grid: &Grid, row: u16, cols: u16) -> String {
+    let last = row_last_col(grid.screen(), row, cols);
+    row_to_ansi_upto(grid, row, last)
 }
 
 /// Columns of `row` that carry content, i.e. the trim point past which only
@@ -1853,12 +1929,16 @@ fn row_last_col(screen: &vt100::Screen, row: u16, cols: u16) -> u16 {
 /// Serialize columns `0..last` of `row`. Split out of [`row_to_ansi`] so the
 /// pane compositor can ask for a row rendered to its pane's full width rather
 /// than to the trim point.
-fn row_to_ansi_upto(screen: &vt100::Screen, row: u16, last: u16) -> String {
+fn row_to_ansi_upto(grid: &Grid, row: u16, last: u16) -> String {
+    let screen = grid.screen();
+    let links = grid.callbacks();
     let mut out = String::new();
     let mut cur_sgr: Option<String> = None;
+    let mut cur_link: Option<&str> = None;
     let mut col = 0u16;
     while col < last {
         let Some(cell) = screen.cell(row, col) else {
+            set_link(&mut out, &mut cur_link, None);
             out.push(' ');
             col += 1;
             continue;
@@ -1876,14 +1956,29 @@ fn row_to_ansi_upto(screen: &vt100::Screen, row: u16, last: u16) -> String {
             out.push_str(&sgr);
             cur_sgr = Some(sgr);
         }
+        let (text, link) = crate::tmux::osc8::split_cell(cell.contents());
+        set_link(&mut out, &mut cur_link, link.and_then(|id| links.uri(id)));
         if cell.has_contents() {
-            out.push_str(cell.contents());
+            out.push_str(&text);
         } else {
             out.push(' ');
         }
         col += if cell.is_wide() { 2 } else { 1 };
     }
+    // Every row closes its own link, so a row stands alone in a patch.
+    set_link(&mut out, &mut cur_link, None);
     out
+}
+
+/// Emit the OSC 8 transition from `cur` to `next`.
+fn set_link<'a>(out: &mut String, cur: &mut Option<&'a str>, next: Option<&'a str>) {
+    if *cur == next {
+        return;
+    }
+    out.push_str("\x1b]8;;");
+    out.push_str(next.unwrap_or(""));
+    out.push_str("\x1b\\");
+    *cur = next;
 }
 
 /// Render `raw` (one pane's `capture-pane -e -p` output) as exactly `rows`
@@ -1903,13 +1998,12 @@ pub(crate) fn capture_rows_padded(raw: &[u8], cols: u16, rows: u16) -> Vec<Strin
     // `capture-pane` joins rows with a bare LF, which staircases each row off
     // the previous one's end column unless it is promoted to CRLF first (the
     // same seeding fix the live channel applies).
-    parser.process(&lf_to_crlf(strip_trailing_row_terminator(raw)));
+    feed(&mut parser, &lf_to_crlf(strip_trailing_row_terminator(raw)));
 
-    let screen = parser.screen();
     (0..rows)
         .map(|row| {
-            let last = row_last_col(screen, row, cols);
-            let mut out = row_to_ansi_upto(screen, row, last);
+            let last = row_last_col(parser.screen(), row, cols);
+            let mut out = row_to_ansi_upto(&parser, row, last);
             if last < cols {
                 // Reset before padding so a styled final cell (a background
                 // fill) does not bleed its color across the gap.
@@ -1921,19 +2015,24 @@ pub(crate) fn capture_rows_padded(raw: &[u8], cols: u16, rows: u16) -> Vec<Strin
         .collect()
 }
 
+/// One serialized window of the grid.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct GridWindow {
+    content: String,
+    /// Full scrollback depth.
+    history: usize,
+    /// Window rows whose line continues on the next row (vt100's
+    /// `row_wrapped`), ascending.
+    wrapped: Vec<u32>,
+}
+
 /// Assemble the last `max_lines` rows of (scrollback + visible screen) as
-/// per-row ANSI, and return that plus the full scrollback depth. vt100 only
-/// formats the *visible* window, so we read it at successive scrollback offsets
-/// (steps of one screen height) and stitch by absolute row index, then restore
-/// the live-edge offset. Mirrors `capture-pane -S -<lines>`: history lines
-/// first, the live screen as the last `rows` lines, `history` = total
-/// scrollback.
-fn grid_content(
-    parser: &mut vt100::Parser,
-    max_lines: usize,
-    cols: u16,
-    rows: u16,
-) -> (String, usize) {
+/// per-row ANSI. vt100 only formats the *visible* window, so we read it at
+/// successive scrollback offsets (steps of one screen height) and stitch by
+/// absolute row index, then restore the live-edge offset. Mirrors
+/// `capture-pane -S -<lines>`: history lines first, the live screen as the
+/// last `rows` lines.
+fn grid_content(parser: &mut Grid, max_lines: usize, cols: u16, rows: u16) -> GridWindow {
     let h = (rows as usize).max(1);
     let saved = parser.screen().scrollback();
     // Clamp to the maximum to discover how much scrollback actually exists.
@@ -1944,17 +2043,18 @@ fn grid_content(
     let target_low = total - want;
 
     // Absolute row index (0 = oldest scrollback, total-1 = bottom of screen).
-    let mut buf: Vec<Option<String>> = vec![None; total];
+    let mut buf: Vec<Option<(String, bool)>> = vec![None; total];
     let mut offset = 0usize;
     loop {
         let real = offset.min(total_sb);
         parser.screen_mut().set_scrollback(real);
         let base = total_sb - real; // absolute index of this window's top row
-        let screen = parser.screen();
         for r in 0..h {
             let g = base + r;
             if g < total {
-                buf[g] = Some(row_to_ansi(screen, r as u16, cols));
+                let row = r as u16;
+                let wrapped = parser.screen().row_wrapped(row);
+                buf[g] = Some((row_to_ansi(parser, row, cols), wrapped));
             }
         }
         if real >= total_sb || base <= target_low {
@@ -1964,15 +2064,22 @@ fn grid_content(
     }
     parser.screen_mut().set_scrollback(saved);
 
-    let mut content = String::new();
-    for line in buf[target_low..total].iter() {
-        if let Some(line) = line {
-            content.push_str(line);
+    let mut out = GridWindow {
+        history: total_sb,
+        ..GridWindow::default()
+    };
+    for (i, line) in buf[target_low..total].iter().enumerate() {
+        if let Some((line, wrapped)) = line {
+            out.content.push_str(line);
+            // The window's last row has no next row to continue on.
+            if *wrapped && i + 1 < want {
+                out.wrapped.push(i as u32);
+            }
         }
         // Reset between rows so no SGR state bleeds across the newline.
-        content.push_str("\x1b[0m\n");
+        out.content.push_str("\x1b[0m\n");
     }
-    (content, total_sb)
+    out
 }
 
 /// Shared state the reader thread owns for a channel's lifetime. A named
@@ -1982,7 +2089,7 @@ fn grid_content(
 struct ReaderCtx {
     #[cfg(test)]
     snapshot_contended: Option<std::sync::mpsc::Sender<()>>,
-    parser: Arc<Mutex<vt100::Parser>>,
+    parser: Arc<Mutex<Grid>>,
     stop: Arc<AtomicBool>,
     seeded: Arc<AtomicBool>,
     snapshot: Arc<Mutex<()>>,
@@ -2010,8 +2117,6 @@ struct ReaderCtx {
     /// from `chunk_seq`: initial seeds bump this too, and the debounce's
     /// first-chunk special case must not see seed bumps.
     grid_gen: Arc<AtomicU64>,
-    /// OSC 8 hyperlinks seen in the stream (see [`VtChannel::links`]).
-    links: Arc<LinkTable>,
     signals: Arc<ViewerSignals>,
 }
 
@@ -2026,119 +2131,6 @@ fn run_drain_listener(
     if !stop.load(Ordering::Relaxed) {
         control.lock().unwrap().stream = Some(conn);
     }
-}
-
-/// Fold newly scanned links into a channel's table, newest last. A repeat of a
-/// target already held moves to the end rather than duplicating, so a prompt
-/// that reprints the same link does not evict the rest of the table.
-fn record_links(slot: &LinkTable, found: Vec<PaneLink>) {
-    if found.is_empty() {
-        return;
-    }
-    let Ok(mut table) = slot.table.lock() else {
-        return;
-    };
-    let before: Vec<PaneLink> = table.iter().cloned().collect();
-    for link in found {
-        table.retain(|held| *held != link);
-        table.push_back(link);
-        while table.len() > crate::tmux::osc8::MAX_PANE_LINKS {
-            table.pop_front();
-        }
-    }
-    // Reordering counts as a change: the newest entry wins overlaps.
-    if before.iter().ne(table.iter()) {
-        slot.generation.fetch_add(1, Ordering::Release);
-    }
-}
-
-/// Replace a channel's table with the links an accepted snapshot advertises.
-///
-/// A seed covers the whole scrollback the grid keeps, so it is the complete set
-/// of what the pane is currently offering, including links the reader never saw
-/// (seed bytes are replayed into a fresh parser, not fed through `run_reader`).
-/// Merging into the table instead would leave a target behind for a label the
-/// pane has since reprinted as plain text, and the text matcher would keep that
-/// label actionable against an obsolete URI.
-///
-/// Only an ACCEPTED seed reaches here, under the parser lock beside the grid it
-/// describes, so the table and the frame it speaks for are installed together.
-/// The install holds the snapshot fence across all of that, and `run_reader`
-/// holds the same fence from before `recv` through its own parse, which is what
-/// stops a replacement landing between a target being recorded and the label
-/// that needs it reaching the grid (#3818). The parser lock pairs the table
-/// with its frame; the fence is what orders the two writers.
-fn reconcile_links(slot: &LinkTable, found: Vec<PaneLink>) {
-    let Ok(mut table) = slot.table.lock() else {
-        return;
-    };
-    let mut next: VecDeque<PaneLink> = VecDeque::new();
-    for link in found {
-        if !next.contains(&link) {
-            next.push_back(link);
-        }
-    }
-    while next.len() > crate::tmux::osc8::MAX_PANE_LINKS {
-        next.pop_front();
-    }
-    if table.iter().ne(next.iter()) {
-        *table = next;
-        slot.generation.fetch_add(1, Ordering::Release);
-    }
-}
-
-/// A channel's link table plus a counter that moves whenever it does.
-///
-/// The counter exists because the grid can be byte-identical across a target
-/// change: vt100 strips both sequences, the sampled content dedupes, and a
-/// consumer keyed on the rendered text alone would keep serving the old target.
-#[derive(Debug, Default)]
-pub(crate) struct LinkTable {
-    table: Mutex<VecDeque<PaneLink>>,
-    generation: AtomicU64,
-}
-
-/// Hyperlinks `session`'s pane has advertised via OSC 8, oldest first. Empty
-/// when no channel is armed; the capture fallback carries the sequences in the
-/// frame text instead, so the TUI reads those straight off the content.
-///
-/// Only a live channel answers. A channel whose forwarder died no longer
-/// describes what is on screen, and with no reader left, its table froze at
-/// teardown while the pane kept moving.
-///
-/// The damage is to labels the frame can no longer speak for. Where the pane
-/// still advertises a target, `Preview::collect_links` offers both and
-/// `resolve_overlaps` prefers the capture-derived one on rank, so that case
-/// resolves correctly either way. But a label reprinted as plain text, or one
-/// whose sequence scrolled out of the captured window, leaves no fresh
-/// candidate at all, and the frozen entry is still `advertised`, so it beats
-/// a bare-URL match and keeps the label clickable against a URI the pane has
-/// stopped offering. Falling silent hands the capture fallback the same clean
-/// slate it gets when no channel ever armed.
-pub(crate) fn pane_links(session: &str) -> Vec<PaneLink> {
-    lookup(session)
-        .filter(|c| c.lifecycle() == VtLifecycle::Live)
-        .and_then(|c| {
-            c.links
-                .table
-                .lock()
-                .ok()
-                .map(|t| t.iter().cloned().collect())
-        })
-        .unwrap_or_default()
-}
-
-/// How many times `session`'s link table has changed. Cheaper than cloning the
-/// table to find out, so a consumer can watch it every frame.
-///
-/// Gated with [`pane_links`], so a dead channel drops it back to the no-channel
-/// zero. That change is itself the signal: a consumer holding a non-zero copy
-/// re-collects once at the transition, and from there the capture path's own
-/// sequences move the frame text whenever a target changes.
-pub(crate) fn pane_links_generation(session: &str) -> u64 {
-    lookup(session)
-        .filter(|c| c.lifecycle() == VtLifecycle::Live)
-        .map_or(0, |c| c.links.generation.load(Ordering::Acquire))
 }
 
 impl ReaderCtx {
@@ -2190,7 +2182,6 @@ fn run_reader_with_wait(
     VtLifecycle::Live.store(&ctx.lifecycle);
     let mut buf = [0u8; 8192];
     let mut osc52 = Osc52Scanner::new();
-    let mut osc8 = Osc8Scanner::new();
     let mut sync = SyncOutputScanner::new();
     let mut sync_events: Vec<bool> = Vec::new();
     while !ctx.stop.load(Ordering::Relaxed) {
@@ -2256,10 +2247,8 @@ fn run_reader_with_wait(
                     }
                     continue;
                 }
-                // After the seed gate and inside the fence, so links match accepted bytes.
-                record_links(&ctx.links, osc8.feed(&buf[..n]));
                 if let Ok(mut p) = ctx.parser.lock() {
-                    p.process(&buf[..n]);
+                    feed(&mut p, &buf[..n]);
                     ctx.app_cursor
                         .store(p.screen().application_cursor(), Ordering::Relaxed);
                     // Bump under the parser lock so guarded swaps see it.
@@ -2316,7 +2305,7 @@ pub(crate) struct VtChannel {
     /// Server-unique pane ID, fixed for this channel generation.
     target: String,
     server_pid: String,
-    parser: Arc<Mutex<vt100::Parser>>,
+    parser: Arc<Mutex<Grid>>,
     /// Writable half of the socket, `Some` once the forwarder connects. Shared
     /// with the reader thread, which fills it after `accept`.
     stream: Arc<Mutex<Option<UnixStream>>>,
@@ -2335,9 +2324,6 @@ pub(crate) struct VtChannel {
     /// Latest decoded OSC 52 clipboard write from the pane, filled by the
     /// reader thread, drained by [`Self::take_clipboard`].
     clipboard: Arc<Mutex<Option<String>>>,
-    /// OSC 8 hyperlinks the reader thread has seen, oldest first and capped at
-    /// `MAX_LINKS`. Read through [`pane_links`].
-    links: Arc<LinkTable>,
     /// Number of chunks the reader has parsed. `0` means none yet, so
     /// `chunk_timing` reports `None` and the caller leaves pacing untouched.
     chunk_seq: Arc<AtomicU64>,
@@ -2489,7 +2475,7 @@ struct SampleCache {
     max_lines: usize,
     cols: u16,
     rows: u16,
-    content: String,
+    window: GridWindow,
     cursor: PaneCursor,
 }
 
@@ -2497,6 +2483,8 @@ struct SampleCache {
 pub(crate) struct VtSample {
     pub(crate) content: String,
     pub(crate) cursor: Option<PaneCursor>,
+    /// Rows of `content` that soft-wrap onto the next row, ascending.
+    pub(crate) wrapped: Vec<u32>,
     /// True when `content` was serialized from a grid inside an unclosed
     /// synchronized-output bracket, i.e. a half-drawn frame. Decided under the
     /// same parser lock that assembled `content`, so a caller's publish
@@ -2507,10 +2495,11 @@ pub(crate) struct VtSample {
 }
 
 impl VtSample {
-    fn whole(content: String, cursor: Option<PaneCursor>) -> Self {
+    fn whole(window: GridWindow, cursor: Option<PaneCursor>) -> Self {
         Self {
-            content,
+            content: window.content,
             cursor,
+            wrapped: window.wrapped,
             incomplete: false,
         }
     }
@@ -2661,7 +2650,6 @@ impl VtChannel {
         let app_cursor = Arc::new(AtomicBool::new(false));
         let lifecycle = Arc::new(AtomicU8::new(VtLifecycle::Starting as u8));
         let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        let links: Arc<LinkTable> = Arc::new(LinkTable::default());
         // Owner-only directory: other users must not reach the pane socket (on BSDs
         // the socket's own mode is ignored).
         let n = SOCK_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -2712,7 +2700,6 @@ impl VtChannel {
                 lifecycle: lifecycle.clone(),
                 wakeup: wakeup.clone(),
                 clipboard: clipboard.clone(),
-                links: links.clone(),
                 chunk_seq: chunk_seq.clone(),
                 settled_chunk_seq: settled_chunk_seq.clone(),
                 last_chunk_ms: last_chunk_ms.clone(),
@@ -2788,7 +2775,6 @@ impl VtChannel {
                     parser: &parser,
                     app_cursor: &app_cursor,
                     grid_gen: &grid_gen,
-                    links: &links,
                 },
                 false,
                 (cols, rows),
@@ -2839,7 +2825,6 @@ impl VtChannel {
             lifecycle,
             wakeup,
             clipboard,
-            links,
             chunk_seq,
             last_chunk_ms,
             prev_gap_ms,
@@ -2994,7 +2979,6 @@ impl VtChannel {
                     parser: &self.parser,
                     app_cursor: &self.app_cursor,
                     grid_gen: &self.grid_gen,
-                    links: &self.links,
                 },
                 guarded,
                 (cols, rows),
@@ -3062,7 +3046,7 @@ impl VtChannel {
         let rows = self.rows.load(Ordering::Relaxed);
         let mut p = match self.parser.lock() {
             Ok(p) => p,
-            Err(_) => return VtSample::whole(String::new(), None),
+            Err(_) => return VtSample::whole(GridWindow::default(), None),
         };
         // Under the parser lock, where the reader applies chunks and releases brackets.
         let grid_gen = self.grid_gen.load(Ordering::Relaxed);
@@ -3072,13 +3056,13 @@ impl VtChannel {
                 let same_window = (c.max_lines, c.cols, c.rows) == (max_lines, cols, rows);
                 // Mid-bracket: serve the last complete frame.
                 if same_window && (c.grid_gen == grid_gen || incomplete) {
-                    return VtSample::whole(c.content.clone(), Some(c.cursor));
+                    return VtSample::whole(c.window.clone(), Some(c.cursor));
                 }
             }
         }
-        let (content, history) = grid_content(&mut p, max_lines, cols, rows);
+        let window = grid_content(&mut p, max_lines, cols, rows);
         let mut cursor = cursor_from_screen(p.screen(), rows, cols);
-        cursor.history_size = history as u32;
+        cursor.history_size = window.history as u32;
         drop(p);
         // Never cache a half-drawn frame.
         if !incomplete {
@@ -3088,14 +3072,15 @@ impl VtChannel {
                     max_lines,
                     cols,
                     rows,
-                    content: content.clone(),
+                    window: window.clone(),
                     cursor,
                 });
             }
         }
         VtSample {
-            content,
+            content: window.content,
             cursor: Some(cursor),
+            wrapped: window.wrapped,
             incomplete,
         }
     }
@@ -3149,7 +3134,7 @@ impl VtChannel {
                     return " ".repeat(want_cols as usize);
                 }
                 let last = row_last_col(screen, row, readable_cols);
-                let mut line = row_to_ansi_upto(screen, row, last);
+                let mut line = row_to_ansi_upto(&p, row, last);
                 if last < want_cols {
                     line.push_str("\x1b[0m");
                     line.extend(std::iter::repeat_n(' ', (want_cols - last) as usize));
@@ -3745,7 +3730,6 @@ pub(crate) fn dummy_channel_with_input(
         lifecycle: lifecycle.clone(),
         wakeup: Arc::new(Mutex::new(None)),
         clipboard: Arc::new(Mutex::new(None)),
-        links: Arc::new(LinkTable::default()),
         chunk_seq: Arc::new(AtomicU64::new(0)),
         settled_chunk_seq: Arc::new(AtomicU64::new(0)),
         snapshot: Arc::new(Mutex::new(())),
@@ -3960,6 +3944,159 @@ mod tests {
         }
     }
 
+    fn osc8(uri: &str, text: &str) -> String {
+        format!("\x1b]8;;{uri}\x1b\\{text}\x1b]8;;\x1b\\")
+    }
+
+    fn rows_of(grid: &mut Grid, cols: u16, rows: u16) -> (Vec<String>, Vec<u32>) {
+        let window = grid_content(grid, usize::from(rows) + 100, cols, rows);
+        let lines = window
+            .content
+            .lines()
+            .map(|l| l.trim_end_matches("\x1b[0m").to_string())
+            .collect();
+        (lines, window.wrapped)
+    }
+
+    #[test]
+    fn osc8_targets_ride_their_cells_through_the_grid() {
+        let url = "https://example.com/a/very/long/path";
+        let link = |text: &str| format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\");
+        // (name, pane output, rows of a 20x3 grid, wrapped rows)
+        let cases: Vec<(&str, String, Vec<String>, Vec<u32>)> = vec![
+            (
+                "a soft wrap keeps the target on both rows",
+                format!("ab {}\r\n", osc8(url, url)),
+                vec![
+                    format!("\x1b[0mab {}", link("https://example.c")),
+                    format!("\x1b[0m{}", link("om/a/very/long/path")),
+                    String::new(),
+                ],
+                vec![0],
+            ),
+            (
+                "an app's own hard wrap, re-opening the link per row",
+                format!(
+                    "{}\r\n  {}\r\n",
+                    osc8(url, "https://example.com"),
+                    osc8(url, "/a/very/long/path")
+                ),
+                vec![
+                    format!("\x1b[0m{}", link("https://example.com")),
+                    format!("\x1b[0m  {}", link("/a/very/long/path")),
+                    String::new(),
+                ],
+                vec![],
+            ),
+            (
+                "scrolling carries the target with the row",
+                format!("{}\r\n1\r\n2\r\n3", osc8(url, "docs")),
+                vec![
+                    format!("\x1b[0m{}", link("docs")),
+                    "\x1b[0m1".into(),
+                    "\x1b[0m2".into(),
+                    "\x1b[0m3".into(),
+                ],
+                vec![],
+            ),
+            (
+                "erasing a linked cell drops its target",
+                format!("{} tail\r\x1b[2C\x1b[K", osc8(url, "docs")),
+                vec![
+                    format!("\x1b[0m{}", link("do")),
+                    String::new(),
+                    String::new(),
+                ],
+                vec![],
+            ),
+            (
+                "overprinting a linked cell drops its target",
+                format!("{}\rX", osc8(url, "docs")),
+                vec![
+                    format!("\x1b[0mX{}", link("ocs")),
+                    String::new(),
+                    String::new(),
+                ],
+                vec![],
+            ),
+            (
+                "a target no client may open stays plain text",
+                osc8("javascript:alert(1)", "click"),
+                vec!["\x1b[0mclick".into(), String::new(), String::new()],
+                vec![],
+            ),
+            (
+                "stray selector code points never name a link",
+                "a\u{E0100}\u{E0101}b".into(),
+                vec!["\x1b[0mab".into(), String::new(), String::new()],
+                vec![],
+            ),
+        ];
+        for (name, output, want_rows, want_wrapped) in cases {
+            let mut grid = new_parser(3, 20, 100);
+            feed(&mut grid, output.as_bytes());
+            let (rows, wrapped) = rows_of(&mut grid, 20, 3);
+            assert_eq!(rows, want_rows, "{name}");
+            assert_eq!(wrapped, want_wrapped, "{name}");
+        }
+    }
+
+    #[test]
+    fn osc8_split_across_reads_still_marks_its_cells() {
+        let url = "https://example.com/x";
+        let raw = format!("{}\r\n", osc8(url, "link"));
+        let raw = raw.as_bytes();
+        for split in 1..raw.len() {
+            let mut grid = new_parser(2, 20, 0);
+            feed(&mut grid, &raw[..split]);
+            feed(&mut grid, &raw[split..]);
+            assert_eq!(
+                row_to_ansi(&grid, 0, 20),
+                format!("\x1b[0m{}", osc8(url, "link")),
+                "split at {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_seed_restores_the_soft_wraps_tmux_reported() {
+        // (name, body, wrapped rows from the joined capture, grid rows' wraps)
+        let cases: &[(&str, &str, &[u32], &[u32])] = &[
+            ("a full row continues", "abcdefghij\nkl\n$\n", &[0], &[0]),
+            ("no wraps", "abc\ndef\n", &[], &[]),
+            // A capture at another width: joining would shift the layout.
+            (
+                "a row short of the grid keeps its break",
+                "abcdef\ngh\n",
+                &[0],
+                &[],
+            ),
+            (
+                "a row a wide glyph left short keeps its break",
+                "abcdefghi\n\u{4e2d}x\n",
+                &[0],
+                &[],
+            ),
+        ];
+        for (name, body, wraps, want) in cases {
+            let mut grid = new_parser(4, 10, 100);
+            feed(
+                &mut grid,
+                &assemble_seed_stream(body.as_bytes(), wraps, &PaneSeedState::default(), (10, 4)),
+            );
+            let window = grid_content(&mut grid, 4, 10, 4);
+            assert_eq!(window.wrapped, *want, "{name}");
+            let texts: Vec<String> = window
+                .content
+                .lines()
+                .map(crate::tmux::utils::strip_ansi)
+                .map(|l| l.trim_end().to_string())
+                .collect();
+            let expect: Vec<&str> = body.lines().collect();
+            assert_eq!(&texts[..expect.len()], &expect[..], "{name}: rows stay put");
+        }
+    }
+
     #[test]
     fn grid_content_preserves_interior_padding() {
         // A TUI lays a row out by positioning the cursor, not by writing runs of
@@ -3971,7 +4108,7 @@ mod tests {
         // must emit those columns as real spaces.
         let mut p = new_parser(2, 20, 0);
         p.process(b"A\x1b[12GB");
-        let (content, _) = grid_content(&mut p, 2, 20, 2);
+        let content = grid_content(&mut p, 2, 20, 2).content;
         assert!(
             content.contains("A          B"),
             "interior padding collapsed:\n{content:?}"
@@ -4049,7 +4186,6 @@ mod tests {
                     parser: &parser,
                     app_cursor: &app_cursor,
                     grid_gen: &grid_gen,
-                    links: &LinkTable::default(),
                 },
                 None,
                 b"STALE-SNAPSHOT",
@@ -4067,7 +4203,6 @@ mod tests {
                     parser: &parser,
                     app_cursor: &app_cursor,
                     grid_gen: &grid_gen,
-                    links: &LinkTable::default(),
                 },
                 None,
                 b"STALE-SNAPSHOT",
@@ -4093,7 +4228,6 @@ mod tests {
                     parser: &parser,
                     app_cursor: &app_cursor,
                     grid_gen: &grid_gen,
-                    links: &LinkTable::default(),
                 },
                 false,
                 (80, 24),
@@ -4193,7 +4327,12 @@ mod tests {
                 ..Default::default()
             };
             let mut p = new_parser(rows, 20, SCROLLBACK_LINES);
-            p.process(&assemble_seed_stream(body.as_bytes(), &state, rows));
+            p.process(&assemble_seed_stream(
+                body.as_bytes(),
+                &[],
+                &state,
+                (20, rows),
+            ));
             let screen = p.screen();
             assert_eq!(screen.cursor_position(), position, "{}", screen.contents());
             assert_eq!(screen.hide_cursor(), !cursor_visible, "{body:?}");
@@ -4430,52 +4569,6 @@ mod tests {
         // No tmux pane backs this name, so the re-arm fails and yields None;
         // the point is that it was attempted rather than short-circuited.
         assert!(VtChannel::acquire(&name).is_none());
-
-        REGISTRY.lock().unwrap().remove(&name);
-    }
-
-    /// A channel whose forwarder disconnected no longer describes the screen,
-    /// and `reconcile_links` cannot revisit its table without a reader. Where
-    /// the pane still advertises a target the capture-derived entry wins on
-    /// rank anyway, so the case that bites is a label reprinted as plain text:
-    /// no fresh candidate, and the frozen entry still `advertised`. It must
-    /// fall silent, and the generation drop to the no-channel zero is the
-    /// consumer's re-collect signal.
-    #[test]
-    fn only_a_live_channel_answers_for_pane_links() {
-        let name = format!("aoe_test_vt_links_{}", std::process::id());
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (channel, lifecycle) = dummy_channel(&name, dir.path());
-        record_links(
-            &channel.links,
-            vec![PaneLink {
-                text: "docs".to_string(),
-                uri: "https://example.com/old".to_string(),
-            }],
-        );
-        REGISTRY
-            .lock()
-            .unwrap()
-            .insert(name.clone(), Arc::downgrade(&channel));
-
-        VtLifecycle::Live.store(&lifecycle);
-        assert_eq!(pane_links(&name).len(), 1, "a live channel still answers");
-        let live_generation = pane_links_generation(&name);
-        assert_ne!(live_generation, 0, "a recorded link moved the generation");
-
-        {
-            let gone = VtLifecycle::Failed;
-            VtLifecycle::fail(&lifecycle);
-            assert!(
-                pane_links(&name).is_empty(),
-                "{gone:?} must not serve the table it froze at teardown",
-            );
-            assert_eq!(
-                pane_links_generation(&name),
-                0,
-                "{gone:?} must drop to the no-channel zero so consumers re-collect",
-            );
-        }
 
         REGISTRY.lock().unwrap().remove(&name);
     }
@@ -4829,7 +4922,7 @@ mod tests {
             ..Default::default()
         };
         let mut p = new_parser(4, 10, 0);
-        p.process(&assemble_seed_stream(b"hi\n", &on, 4));
+        p.process(&assemble_seed_stream(b"hi\n", &[], &on, (80, 4)));
         assert!(
             p.screen().application_cursor(),
             "keypad_cursor_flag=1 must seed DECCKM"
@@ -4837,7 +4930,7 @@ mod tests {
 
         let off = PaneSeedState::default();
         let mut p = new_parser(4, 10, 0);
-        p.process(&assemble_seed_stream(b"hi\n", &off, 4));
+        p.process(&assemble_seed_stream(b"hi\n", &[], &off, (80, 4)));
         assert!(
             !p.screen().application_cursor(),
             "keypad_cursor_flag=0 must leave DECCKM off"
@@ -4867,7 +4960,6 @@ mod tests {
             lifecycle: Arc::new(AtomicU8::new(VtLifecycle::Starting as u8)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
-            links: Arc::new(LinkTable::default()),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
@@ -4909,7 +5001,6 @@ mod tests {
             lifecycle: Arc::new(AtomicU8::new(VtLifecycle::Starting as u8)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
-            links: Arc::new(LinkTable::default()),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
@@ -4964,7 +5055,6 @@ mod tests {
             lifecycle: lifecycle.clone(),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
-            links: Arc::new(LinkTable::default()),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
@@ -5087,7 +5177,6 @@ mod tests {
             lifecycle: Arc::new(AtomicU8::new(VtLifecycle::Starting as u8)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
-            links: Arc::new(LinkTable::default()),
             chunk_seq: chunk_seq.clone(),
             settled_chunk_seq: settled_chunk_seq.clone(),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
@@ -5108,14 +5197,14 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
 
-        let seed = assemble_seed_stream(b"snapshot-body\n", &PaneSeedState::default(), 24);
+        let seed =
+            assemble_seed_stream(b"snapshot-body\n", &[], &PaneSeedState::default(), (80, 24));
         assert_eq!(
             swap_seeded_parser(
                 SeedSink {
                     parser: &parser,
                     app_cursor: &app_cursor,
                     grid_gen: &grid_gen,
-                    links: &LinkTable::default(),
                 },
                 Some(since),
                 &seed,
@@ -5143,7 +5232,6 @@ mod tests {
                     parser: &parser,
                     app_cursor: &app_cursor,
                     grid_gen: &grid_gen,
-                    links: &LinkTable::default(),
                 },
                 Some(quiet),
                 &seed,
@@ -5195,7 +5283,6 @@ mod tests {
             lifecycle: Arc::new(AtomicU8::new(VtLifecycle::Starting as u8)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
-            links: Arc::new(LinkTable::default()),
             chunk_seq: chunk_seq.clone(),
             settled_chunk_seq: settled_chunk_seq.clone(),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
@@ -5205,7 +5292,6 @@ mod tests {
         };
         let reader = std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms));
         let mut conn = UnixStream::connect(&sock).expect("connect");
-        let links = LinkTable::default();
         let wait_settled = |n: u64| {
             let deadline = Instant::now() + Duration::from_secs(5);
             while settled_chunk_seq.load(Ordering::Acquire) < n {
@@ -5222,7 +5308,6 @@ mod tests {
             parser: &parser,
             app_cursor: &app_cursor,
             grid_gen: &grid_gen,
-            links: &links,
         };
 
         let result = seed_parser_with(
@@ -5235,7 +5320,12 @@ mod tests {
                 conn.write_all(b"probe-window-chunk").expect("write");
                 wait_settled(1);
                 let sampled = sample();
-                let body = assemble_seed_stream(b"snapshot-body\n", &PaneSeedState::default(), 24);
+                let body = assemble_seed_stream(
+                    b"snapshot-body\n",
+                    &[],
+                    &PaneSeedState::default(),
+                    (80, 24),
+                );
                 Some((body, sampled))
             },
         );
@@ -5260,7 +5350,12 @@ mod tests {
                 let sampled = sample();
                 conn.write_all(b"capture-window-chunk").expect("write");
                 wait_settled(2);
-                let body = assemble_seed_stream(b"stale-snapshot\n", &PaneSeedState::default(), 24);
+                let body = assemble_seed_stream(
+                    b"stale-snapshot\n",
+                    &[],
+                    &PaneSeedState::default(),
+                    (80, 24),
+                );
                 Some((body, sampled))
             },
         );
@@ -5296,7 +5391,7 @@ mod tests {
             cursor_x: b"UNREAD-MARKER".len() as u16,
             ..PaneSeedState::default()
         };
-        let seed = assemble_seed_stream(b"UNREAD-MARKER\n", &seed_state, 24);
+        let seed = assemble_seed_stream(b"UNREAD-MARKER\n", &[], &seed_state, (80, 24));
 
         assert_eq!(
             swap_seeded_parser(
@@ -5304,7 +5399,6 @@ mod tests {
                     parser: &parser,
                     app_cursor: &app_cursor,
                     grid_gen: &grid_gen,
-                    links: &LinkTable::default(),
                 },
                 None,
                 &seed,
@@ -5328,7 +5422,6 @@ mod tests {
                     parser: &parser,
                     app_cursor: &app_cursor,
                     grid_gen: &grid_gen,
-                    links: &LinkTable::default(),
                 },
                 None,
                 &seed,
@@ -5397,7 +5490,6 @@ mod tests {
                     parser: &parser,
                     app_cursor: &app_cursor,
                     grid_gen: &grid_gen,
-                    links: &LinkTable::default(),
                 },
                 None,
                 b"FORWARDER-MARKER\r\n",
@@ -5451,7 +5543,6 @@ mod tests {
                     parser: &parser,
                     app_cursor: &app_cursor,
                     grid_gen: &grid_gen,
-                    links: &LinkTable::default(),
                 },
                 None,
                 b"INPUT-MUTEX-SEED\r\n",
@@ -5568,7 +5659,6 @@ mod tests {
                 parser: &parser,
                 app_cursor: &app_cursor,
                 grid_gen: &grid_gen,
-                links: &LinkTable::default(),
             },
             None,
             b"RETRY-MARKER\r\n",
@@ -5640,7 +5730,6 @@ mod tests {
                     parser: &parser,
                     app_cursor: &app_cursor,
                     grid_gen: &grid_gen,
-                    links: &LinkTable::default(),
                 },
                 None,
                 b"RETRY-MARKER\r\n",
@@ -5671,7 +5760,7 @@ mod tests {
         // cursor move, so color survives into the preview.
         let mut p = new_parser(2, 20, 0);
         p.process(b"\x1b[31mX\x1b[0m");
-        let (content, _) = grid_content(&mut p, 2, 20, 2);
+        let content = grid_content(&mut p, 2, 20, 2).content;
         assert!(content.contains('X'), "glyph missing:\n{content:?}");
         assert!(
             content.contains("\x1b[31m") || content.contains("31m"),
@@ -5687,7 +5776,7 @@ mod tests {
         // colored spaces, not be trimmed as if blank.
         let mut p = new_parser(2, 10, 0);
         p.process(b"Hi\x1b[44m\x1b[K");
-        let (content, _) = grid_content(&mut p, 2, 10, 2);
+        let content = grid_content(&mut p, 2, 10, 2).content;
         let first = content.split('\n').next().unwrap_or("");
         assert!(
             first.contains("44m"),
@@ -5728,7 +5817,6 @@ mod tests {
             lifecycle: lifecycle.clone(),
             wakeup: wakeup_slot.clone(),
             clipboard: Arc::new(Mutex::new(None)),
-            links: Arc::new(LinkTable::default()),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
@@ -5850,7 +5938,6 @@ mod tests {
             lifecycle: lifecycle.clone(),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: clipboard.clone(),
-            links: Arc::new(LinkTable::default()),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
@@ -5898,18 +5985,14 @@ mod tests {
     }
 
     #[test]
-    fn reader_records_osc8_targets_the_grid_drops() {
+    fn reader_keeps_osc8_targets_on_the_grid() {
         use std::io::Write;
 
-        // vt100 routes OSC 8 to its unhandled-sequence hook and keeps nothing,
-        // so the link text reaches the grid with no target attached (#3735).
-        // The reader's tap is what preserves it.
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("s.sock");
         let listener = UnixListener::bind(&sock).expect("bind");
         let parser = Arc::new(Mutex::new(new_parser(24, 80, 0)));
         let stop = Arc::new(AtomicBool::new(false));
-        let links: Arc<LinkTable> = Arc::new(LinkTable::default());
         let ctx = ReaderCtx {
             snapshot_contended: None,
             parser: parser.clone(),
@@ -5921,7 +6004,6 @@ mod tests {
             lifecycle: Arc::new(AtomicU8::new(VtLifecycle::Starting as u8)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
-            links: links.clone(),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
@@ -5935,12 +6017,7 @@ mod tests {
             .expect("write pane output");
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !parser
-            .lock()
-            .unwrap()
-            .screen()
-            .contents()
-            .contains("see the repo now")
+        while !parser.lock().unwrap().screen().contents().contains(" now")
             && Instant::now() < deadline
         {
             std::thread::sleep(Duration::from_millis(5));
@@ -5948,22 +6025,9 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         drop(conn);
         reader.join().expect("reader thread");
-        let recorded: Vec<PaneLink> = links.table.lock().unwrap().iter().cloned().collect();
         assert_eq!(
-            recorded,
-            vec![PaneLink {
-                text: "the repo".to_string(),
-                uri: "https://example.com/repo".to_string(),
-            }]
-        );
-        assert!(
-            parser
-                .lock()
-                .unwrap()
-                .screen()
-                .contents()
-                .contains("see the repo now"),
-            "the grid keeps the visible text and none of the sequence"
+            row_to_ansi(&parser.lock().unwrap(), 0, 80),
+            "\x1b[0msee \x1b]8;;https://example.com/repo\x1b\\the repo\x1b]8;;\x1b\\ now"
         );
     }
 
@@ -5999,10 +6063,6 @@ mod tests {
         )
     }
 
-    /// What an accepted seed swap does to the table, without the swap.
-    fn record_seed_links(slot: &LinkTable, stream: &[u8]) {
-        reconcile_links(slot, crate::tmux::osc8::extract_links(stream));
-    }
     /// The unit tests hand-build a `PaneSeedState`; this drives the real
     /// probe/capture/seed path against a live pane whose height differs from
     /// the grid being seeded, which is the shape #3824 turned on. Skips when
@@ -6083,6 +6143,84 @@ mod tests {
         );
     }
 
+    /// The seed and the capture fallback against a real tmux: a URL the pane
+    /// soft-wrapped comes back flagged on both, and a link an app hard-wrapped
+    /// itself keeps its whole target on every row it covers.
+    #[test]
+    #[serial_test::serial]
+    fn real_tmux_keeps_wraps_and_wrapped_links() {
+        if !tmux_reemits_hyperlinks() {
+            eprintln!("Skipping test: tmux missing or older than 3.4 (no OSC 8)");
+            return;
+        }
+        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_wraps");
+        let url = "https://example.com/a-long/path/that-wraps";
+        let script = format!(
+            concat!(
+                r"printf 'see {url} done\n'; ",
+                r"printf '\033]8;;{url}\033\\https://example.com/a-long\033]8;;\033\\\n'; ",
+                r"printf '  \033]8;;{url}\033\\/path/that-wraps\033]8;;\033\\\n'; ",
+                "sleep 30",
+            ),
+            url = url
+        );
+        let out = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                guard.name(),
+                "-x",
+                "30",
+                "-y",
+                "8",
+                &script,
+                ";",
+                "set-option",
+                "-t",
+                guard.name(),
+                "pane-base-index",
+                "0",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(out.status.success());
+        let target = crate::tmux::test_helpers::only_pane_id(guard.name());
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        let link = |text: &str| format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\");
+        let mut seen = (Vec::new(), String::new());
+        for _ in 0..50 {
+            let stream = capture_seed_stream(&target, (30, 8), &deadline, || ())
+                .map(|(stream, ())| stream)
+                .unwrap_or_default();
+            let mut grid = new_parser(8, 30, SCROLLBACK_LINES);
+            feed(&mut grid, &stream);
+            let window = grid_content(&mut grid, 8, 30, 8);
+            seen = (window.wrapped, window.content);
+            if seen.1.contains(&link("/path/that-wraps")) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let (wrapped, content) = seen;
+        let rows: Vec<&str> = content.lines().collect();
+        assert_eq!(
+            wrapped,
+            vec![0],
+            "the soft-wrapped URL spans rows 0 and 1:\n{content}"
+        );
+        assert!(
+            rows[2].contains(&link("https://example.com/a-long")),
+            "{content}"
+        );
+        assert!(rows[3].contains(&link("/path/that-wraps")), "{content}");
+
+        let capture = crate::tmux::Session::from_name(guard.name())
+            .capture_window_with_wraps(8)
+            .expect("capture");
+        assert_eq!(capture.wrapped, vec![0], "{}", capture.content);
+    }
+
     /// The seed and the capture fallback both read `capture-pane -e`, and the
     /// whole fix rests on tmux re-emitting a stored hyperlink there. Assert it
     /// against a real tmux rather than a hand-built fixture, so a change in how
@@ -6090,7 +6228,7 @@ mod tests {
     /// preview link inert.
     #[test]
     #[serial_test::serial]
-    fn real_tmux_capture_carries_hyperlinks_into_the_link_table() {
+    fn real_tmux_seed_keeps_hyperlinks_on_the_grid() {
         if !tmux_reemits_hyperlinks() {
             eprintln!("Skipping test: tmux missing or older than 3.4 (no OSC 8)");
             return;
@@ -6125,11 +6263,11 @@ mod tests {
             .expect("tmux new-session");
         assert!(out.status.success());
         let expected = vec![
-            PaneLink {
+            crate::tmux::osc8::PaneLink {
                 text: "mid link".to_string(),
                 uri: "https://example.com/mid".to_string(),
             },
-            PaneLink {
+            crate::tmux::osc8::PaneLink {
                 text: "eol link".to_string(),
                 uri: "https://example.com/eol".to_string(),
             },
@@ -6147,444 +6285,13 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
 
-        let slot = LinkTable::default();
-        record_seed_links(&slot, &stream);
-        let held: Vec<PaneLink> = slot.table.lock().unwrap().iter().cloned().collect();
+        let mut grid = new_parser(24, 80, SCROLLBACK_LINES);
+        feed(&mut grid, &stream);
+        let window = grid_content(&mut grid, 24, 80, 24);
         assert_eq!(
-            held, expected,
+            crate::tmux::osc8::extract_links(window.content.as_bytes()),
+            expected,
             "capture-pane -e must round-trip both hyperlink shapes"
-        );
-    }
-
-    #[test]
-    fn seed_records_links_already_on_screen() {
-        // `capture-pane -e` replays into a fresh parser without passing through
-        // `run_reader`, so a link printed before the channel armed would
-        // otherwise stay targetless until the pane reprinted it.
-        let slot = LinkTable::default();
-        record_seed_links(
-            &slot,
-            b"\x1b[32msee \x1b]8;;https://example.com/repo\x1b\\the repo\x1b]8;;\x1b\\ now\x1b[0m",
-        );
-        assert_eq!(
-            slot.table
-                .lock()
-                .unwrap()
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>(),
-            vec![PaneLink {
-                text: "the repo".to_string(),
-                uri: "https://example.com/repo".to_string(),
-            }]
-        );
-        // A reseed of the same screen re-records rather than duplicating, so a
-        // link that stays on screen survives every healing pass.
-        record_seed_links(
-            &slot,
-            b"\x1b]8;;https://example.com/repo\x1b\\the repo\x1b]8;;\x1b\\",
-        );
-        assert_eq!(slot.table.lock().unwrap().len(), 1);
-    }
-
-    /// An accepted snapshot is the whole of what the pane is offering, so it
-    /// replaces the table. Merging would leave a target behind for a label the
-    /// pane has since reprinted as plain text, and the text matcher would keep
-    /// that label actionable against an obsolete URI.
-    #[test]
-    fn an_accepted_snapshot_replaces_rather_than_merges_links() {
-        let slot = LinkTable::default();
-        record_links(
-            &slot,
-            vec![PaneLink {
-                text: "docs".to_string(),
-                uri: "https://example.com/old".to_string(),
-            }],
-        );
-        let after_record = slot.generation.load(Ordering::Acquire);
-
-        // The accepted frame still shows `docs`, now pointing somewhere else.
-        record_seed_links(
-            &slot,
-            b"see \x1b]8;;https://example.com/new\x1b\\docs\x1b]8;;\x1b\\ now",
-        );
-        let held: Vec<PaneLink> = slot.table.lock().unwrap().iter().cloned().collect();
-        assert_eq!(held.len(), 1, "the obsolete target is gone: {held:?}");
-        assert_eq!(held[0].uri, "https://example.com/new");
-        assert!(slot.generation.load(Ordering::Acquire) > after_record);
-
-        // The pane reprints the same label as plain text: nothing is advertised
-        // any more, so nothing may stay actionable.
-        record_seed_links(&slot, b"see docs now");
-        assert!(
-            slot.table.lock().unwrap().is_empty(),
-            "a snapshot with no sequences must leave no targets"
-        );
-    }
-
-    /// A seed that loses its race describes no accepted frame, so it must not
-    /// touch the targets either.
-    #[test]
-    fn a_rejected_swap_leaves_the_links_alone() {
-        let slot = LinkTable::default();
-        record_links(
-            &slot,
-            vec![PaneLink {
-                text: "docs".to_string(),
-                uri: "https://example.com/live".to_string(),
-            }],
-        );
-        let parser = Mutex::new(new_parser(24, 80, 0));
-        let app_cursor = AtomicBool::new(false);
-        let grid_gen = AtomicU64::new(7);
-        assert_eq!(
-            swap_seeded_parser(
-                SeedSink {
-                    parser: &parser,
-                    app_cursor: &app_cursor,
-                    grid_gen: &grid_gen,
-                    links: &slot,
-                },
-                // A generation that no longer matches: the swap stands down.
-                Some(1),
-                b"\x1b]8;;https://example.com/stale\x1b\\docs\x1b]8;;\x1b\\",
-                (80, 24),
-                SeedGuard {
-                    chunk: None,
-                    pipe: None,
-                },
-            ),
-            VtRefreshResult::Busy
-        );
-        let held: Vec<PaneLink> = slot.table.lock().unwrap().iter().cloned().collect();
-        assert_eq!(held.len(), 1);
-        assert_eq!(held[0].uri, "https://example.com/live");
-    }
-
-    /// Observe the snapshot fence before the native drain deadline and again
-    /// inside the swap, while link reconciliation is held.
-    #[test]
-    fn an_install_holds_the_snapshot_fence_across_its_swap() {
-        use std::io::Write;
-
-        let (_data_reader, data_forwarder) = UnixStream::pair().expect("data pair");
-        let (parent_control, mut forwarder_control) = UnixStream::pair().expect("control pair");
-        let snapshot = Arc::new(Mutex::new(()));
-        let (before_deadline, entered, resume) = TestRendezvous::new();
-
-        let socket = Arc::new(Mutex::new(Some(data_forwarder)));
-        let control = Mutex::new(DrainControl {
-            stream: Some(parent_control),
-            next_generation: 0,
-            before_deadline: Some(before_deadline),
-            next_now: Some(Instant::now()),
-        });
-        let parser = Mutex::new(new_parser(6, 40, 0));
-        let app_cursor = AtomicBool::new(false);
-        let grid_gen = AtomicU64::new(0);
-        let links = LinkTable::default();
-
-        let (result, entered, ack, resumed, reached_swap, fenced_at_drain, fenced_in_swap) =
-            std::thread::scope(|scope| {
-                // These guards must unwind before scope joins a blocked install.
-                let resume = resume;
-                let in_swap = links.table.lock().expect("hold the link table");
-                let install = scope.spawn(|| {
-                    install_seeded_parser(
-                        SeedSink {
-                            parser: &parser,
-                            app_cursor: &app_cursor,
-                            grid_gen: &grid_gen,
-                            links: &links,
-                        },
-                        None,
-                        b"\x1b]8;;https://example.com/seeded\x1b\\docs\x1b]8;;\x1b\\\r\n",
-                        (40, 6),
-                        SeedGuard {
-                            chunk: None,
-                            pipe: None,
-                        },
-                        SeedInstallFence {
-                            snapshot: Some(&snapshot),
-                            socket: Some(&socket),
-                            control: Some(&control),
-                        },
-                    )
-                });
-                let entered = entered.recv_timeout(Duration::from_secs(5));
-                let fenced_at_drain = snapshot.try_lock().is_err();
-                let ack = forwarder_control.write_all(&drain_frame(DRAIN_ACK, 0));
-                let resumed = resume.send(());
-                drop(resume);
-                let arrival = Instant::now() + Duration::from_secs(5);
-                while parser.try_lock().is_ok()
-                    && Instant::now() < arrival
-                    && !install.is_finished()
-                {
-                    std::thread::yield_now();
-                }
-                let reached_swap = parser.try_lock().is_err();
-                let fenced = snapshot.try_lock().is_err();
-                drop(in_swap);
-                (
-                    install.join(),
-                    entered,
-                    ack,
-                    resumed,
-                    reached_swap,
-                    fenced_at_drain,
-                    fenced,
-                )
-            });
-
-        entered.expect("install reached native drain");
-        ack.expect("prequeue native ACK");
-        resumed.expect("release drain");
-        assert!(reached_swap, "the install never reached the swap");
-        let result = result.expect("install thread");
-
-        assert_eq!(result, VtRefreshResult::Refreshed);
-        assert!(
-            fenced_at_drain,
-            "the install must hold the fence across its drain"
-        );
-        assert!(
-            fenced_in_swap,
-            "and still hold it inside the swap, where the link table is replaced"
-        );
-        // The accepted snapshot's targets landed with the grid they describe.
-        assert_eq!(
-            links
-                .table
-                .lock()
-                .unwrap()
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>(),
-            vec![PaneLink {
-                text: "docs".to_string(),
-                uri: "https://example.com/seeded".to_string(),
-            }]
-        );
-    }
-
-    /// #3818: a reseed replaces the link table wholesale from its snapshot, so
-    /// a target the reader recorded after that snapshot was captured must not
-    /// be dropped between being recorded and its label reaching the grid.
-    ///
-    /// Both halves run behind one mutex: `run_reader` holds `snapshot` from
-    /// before `recv` through the parse, and `install_seeded_parser` holds it
-    /// from before its drain through the table replacement. Park a real
-    /// install on its drain ACK to hold that window open, and deliver the
-    /// sequence into it.
-    #[test]
-    fn a_reseed_cannot_erase_a_link_recorded_inside_its_fence() {
-        use std::io::Write;
-        use std::sync::mpsc;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let sock = dir.path().join("s.sock");
-        let listener = UnixListener::bind(&sock).expect("bind");
-        let parser = Arc::new(Mutex::new(new_parser(24, 80, 0)));
-        let app_cursor = Arc::new(AtomicBool::new(false));
-        let grid_gen = Arc::new(AtomicU64::new(0));
-        let links: Arc<LinkTable> = Arc::new(LinkTable::default());
-        let chunk_seq = Arc::new(AtomicU64::new(0));
-        let settled_chunk_seq = Arc::new(AtomicU64::new(0));
-        let snapshot = Arc::new(Mutex::new(()));
-        let stream: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
-        let stop = Arc::new(AtomicBool::new(false));
-        let (contended_tx, contended_rx) = mpsc::channel();
-        let ctx = ReaderCtx {
-            snapshot_contended: Some(contended_tx),
-            parser: parser.clone(),
-            stop: stop.clone(),
-            seeded: Arc::new(AtomicBool::new(true)),
-            snapshot: snapshot.clone(),
-            stream: stream.clone(),
-            app_cursor: app_cursor.clone(),
-            lifecycle: Arc::new(AtomicU8::new(VtLifecycle::Starting as u8)),
-            wakeup: Arc::new(Mutex::new(None)),
-            clipboard: Arc::new(Mutex::new(None)),
-            links: links.clone(),
-            chunk_seq: chunk_seq.clone(),
-            settled_chunk_seq: settled_chunk_seq.clone(),
-            last_chunk_ms: Arc::new(AtomicU64::new(0)),
-            prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
-            grid_gen: grid_gen.clone(),
-            signals: Arc::new(ViewerSignals::new()),
-        };
-        let reader = std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms));
-        let mut conn = UnixStream::connect(&sock).expect("connect");
-
-        // The screen the reseed's snapshot was taken from. Waiting for it also
-        // proves the reader is in its loop with its socket published, which is
-        // what the install reads the pending queue through.
-        conn.write_all(b"see docs now").expect("write pane output");
-        let ready = Instant::now() + Duration::from_secs(5);
-        while !parser
-            .lock()
-            .unwrap()
-            .screen()
-            .contents()
-            .contains("see docs now")
-        {
-            assert!(
-                Instant::now() < ready,
-                "reader never applied the first chunk"
-            );
-            std::thread::sleep(Duration::from_millis(2));
-        }
-
-        // A forwarder that answers the install's drain as a live one would.
-        let (parent_control, mut forwarder_control) = UnixStream::pair().expect("control pair");
-        let (probed_tx, probed_rx) = mpsc::channel();
-        let forwarder = std::thread::spawn(move || {
-            let (kind, generation) =
-                read_drain_frame(&mut forwarder_control).expect("receive drain probe");
-            assert_eq!(kind, DRAIN_PROBE);
-            probed_tx.send(()).expect("signal the probe arrived");
-            let _ = forwarder_control.write_all(&drain_frame(DRAIN_ACK, generation));
-        });
-        let control = Arc::new(Mutex::new(DrainControl {
-            stream: Some(parent_control),
-            next_generation: 0,
-            before_deadline: None,
-            next_now: None,
-        }));
-
-        let expected_chunk_seq = chunk_seq.load(Ordering::Acquire);
-        // The snapshot: the same screen, advertising nothing. Accepting it
-        // after the reader has recorded the sequence below is the erase.
-        let seed = assemble_seed_stream(b"see docs now\n", &PaneSeedState::default(), 24);
-
-        // Stand in for the install's own hold on the fence, so the window it
-        // occupies from before its drain through the table replacement is open
-        // for as long as this test needs (its drain deadline is 100 ms).
-        let fence = snapshot.lock().expect("hold the fence");
-        // The pane advertises a new target into that window.
-        conn.write_all(b"\r\n\x1b]8;;https://example.com/new\x1b\\docs\x1b]8;;\x1b\\ added")
-            .expect("write pane output");
-        let install = {
-            let (parser, app_cursor, grid_gen, links) = (
-                parser.clone(),
-                app_cursor.clone(),
-                grid_gen.clone(),
-                links.clone(),
-            );
-            let (chunk_seq, settled_chunk_seq) = (chunk_seq.clone(), settled_chunk_seq.clone());
-            let (snapshot, stream, control) = (snapshot.clone(), stream.clone(), control.clone());
-            std::thread::spawn(move || {
-                install_seeded_parser(
-                    SeedSink {
-                        parser: &parser,
-                        app_cursor: &app_cursor,
-                        grid_gen: &grid_gen,
-                        links: &links,
-                    },
-                    None,
-                    &seed,
-                    (80, 24),
-                    SeedGuard {
-                        chunk: Some((&chunk_seq, &settled_chunk_seq, expected_chunk_seq)),
-                        pipe: None,
-                    },
-                    SeedInstallFence {
-                        snapshot: Some(&snapshot),
-                        socket: Some(&stream),
-                        control: Some(&control),
-                    },
-                )
-            })
-        };
-
-        let contention = contended_rx.recv_timeout(Duration::from_secs(5));
-        let fenced_seq = chunk_seq.load(Ordering::Acquire);
-        let fenced_links_empty = links.table.lock().unwrap().is_empty();
-
-        drop(fence);
-        probed_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the install proceeds once the fence clears");
-        assert_eq!(
-            install.join().expect("install thread"),
-            VtRefreshResult::Busy,
-            "whichever side wins the released fence, the snapshot is stale: the chunk is either unread on the socket or already past the baseline it captured at"
-        );
-
-        let landed = Instant::now() + Duration::from_secs(5);
-        while !parser
-            .lock()
-            .unwrap()
-            .screen()
-            .contents()
-            .contains("docs added")
-            && Instant::now() < landed
-        {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        stop.store(true, Ordering::Relaxed);
-        drop(conn);
-        reader.join().expect("reader thread");
-        forwarder.join().expect("forwarder thread");
-        contention.expect("reader attempted the held snapshot fence");
-        assert_eq!(
-            fenced_seq, expected_chunk_seq,
-            "the held fence excludes recv"
-        );
-        assert!(fenced_links_empty);
-        let recorded: Vec<PaneLink> = links.table.lock().unwrap().iter().cloned().collect();
-        assert_eq!(
-            recorded,
-            vec![PaneLink {
-                text: "docs".to_string(),
-                uri: "https://example.com/new".to_string(),
-            }],
-            "the newly advertised target must survive the reseed"
-        );
-        assert!(
-            parser
-                .lock()
-                .unwrap()
-                .screen()
-                .contents()
-                .contains("docs added"),
-            "and the label it describes must be on the grid"
-        );
-    }
-
-    #[test]
-    fn record_links_dedupes_and_caps() {
-        let slot = LinkTable::default();
-        let link = |n: usize| PaneLink {
-            text: format!("link {n}"),
-            uri: format!("https://example.com/{n}"),
-        };
-        // A reprint moves the link to the newest slot instead of duplicating.
-        record_links(&slot, vec![link(0), link(1), link(0)]);
-        assert_eq!(
-            slot.table
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|l| l.uri.clone())
-                .collect::<Vec<_>>(),
-            vec!["https://example.com/1", "https://example.com/0"]
-        );
-        record_links(
-            &slot,
-            (2..crate::tmux::osc8::MAX_PANE_LINKS + 8)
-                .map(link)
-                .collect(),
-        );
-        let held = slot.table.lock().unwrap();
-        assert_eq!(held.len(), crate::tmux::osc8::MAX_PANE_LINKS);
-        assert_eq!(
-            held.back().unwrap().uri,
-            format!(
-                "https://example.com/{}",
-                crate::tmux::osc8::MAX_PANE_LINKS + 7
-            )
         );
     }
 
@@ -6682,7 +6389,6 @@ mod tests {
             lifecycle: Arc::new(AtomicU8::new(VtLifecycle::Starting as u8)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
-            links: Arc::new(LinkTable::default()),
             chunk_seq,
             settled_chunk_seq: settled_chunk_seq.clone(),
             last_chunk_ms: last_chunk_ms.clone(),
@@ -6747,7 +6453,9 @@ mod tests {
         }
 
         // A wide window returns history + screen, history_size > 0.
-        let (content, history) = grid_content(&mut p, 100, 20, 4);
+        let GridWindow {
+            content, history, ..
+        } = grid_content(&mut p, 100, 20, 4);
         assert!(history > 0, "expected scrollback depth, got {history}");
         assert!(
             content.contains("LINE01"),
@@ -6760,7 +6468,7 @@ mod tests {
 
         // A screen-sized window returns only the live screen (no old history),
         // and the offset is restored to the live edge afterward.
-        let (screen_only, _) = grid_content(&mut p, 4, 20, 4);
+        let screen_only = grid_content(&mut p, 4, 20, 4).content;
         assert!(
             !screen_only.contains("LINE01"),
             "screen-only window should not include scrollback:\n{screen_only}"
@@ -6801,7 +6509,6 @@ mod tests {
             lifecycle: Arc::new(AtomicU8::new(VtLifecycle::Starting as u8)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: clipboard.clone(),
-            links: Arc::new(LinkTable::default()),
             chunk_seq: chunk_seq.clone(),
             settled_chunk_seq: settled_chunk_seq.clone(),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
@@ -6882,7 +6589,6 @@ mod tests {
                     parser: &swap_parser,
                     app_cursor: &swap_cursor,
                     grid_gen: &swap_grid_gen,
-                    links: &LinkTable::default(),
                 },
                 None,
                 b"POST-SEED-OUTPUT\r\n",
@@ -7306,7 +7012,6 @@ mod tests {
             lifecycle: Arc::new(AtomicU8::new(VtLifecycle::Starting as u8)),
             wakeup: Arc::new(Mutex::new(Some(wakeup.clone()))),
             clipboard: Arc::new(Mutex::new(None)),
-            links: Arc::new(LinkTable::default()),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
@@ -7390,7 +7095,6 @@ mod tests {
             lifecycle: Arc::new(AtomicU8::new(VtLifecycle::Starting as u8)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
-            links: Arc::new(LinkTable::default()),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             settled_chunk_seq: settled.clone(),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),

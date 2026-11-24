@@ -1,5 +1,6 @@
-//! OSC 8 hyperlink extraction. `vt100` drops OSC 8, so targets are kept beside
-//! the grid, paired with the visible text they wrapped.
+//! OSC 8 hyperlinks: [`GridLinks`] keeps them on a vt100 grid's cells, which
+//! vt100 itself cannot, and [`extract_links`] pairs each target in a frame's
+//! text with the visible text it wraps.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PaneLink {
@@ -23,7 +24,7 @@ fn usable_uri(uri: &str) -> bool {
     crate::session::preview_link_openable(uri) && !uri.chars().any(char::is_control)
 }
 
-pub(crate) struct Osc8Scanner {
+struct Osc8Scanner {
     buf: Vec<u8>,
 }
 
@@ -38,11 +39,11 @@ enum Seq {
 }
 
 impl Osc8Scanner {
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self { buf: Vec::new() }
     }
 
-    pub(crate) fn feed(&mut self, chunk: &[u8]) -> Vec<PaneLink> {
+    fn feed(&mut self, chunk: &[u8]) -> Vec<PaneLink> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
         loop {
@@ -89,7 +90,7 @@ impl Osc8Scanner {
     }
 
     /// Emit a link whose close never arrived, for one-shot (non-streaming) input.
-    pub(crate) fn finish(&mut self) -> Option<PaneLink> {
+    fn finish(&mut self) -> Option<PaneLink> {
         let start = find(&self.buf, OSC8_OPEN)?;
         self.buf.drain(..start);
         let Seq::Found { uri, consumed } = parse_seq(&self.buf) else {
@@ -174,6 +175,161 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         from = start + 1;
     }
     None
+}
+
+/// Zero-width code points appended to every cell printed inside an OSC 8 run,
+/// naming the run's target. vt100 keeps them as part of the cell's contents,
+/// so the target moves with the cell through scrolling, erasure, insertion and
+/// scrollback without a parallel position table. Variation Selectors
+/// Supplement: zero width, and meaningless outside ideographic variation
+/// sequences, which pane output does not carry (stray ones are dropped).
+const MARK_BASE: u32 = 0xE0100;
+const MARK_RADIX: u32 = 240;
+/// Distinct targets one grid can name; a run past this prints as plain text.
+const MAX_GRID_LINKS: usize = 1024;
+
+fn is_mark(c: char) -> bool {
+    (MARK_BASE..MARK_BASE + MARK_RADIX).contains(&u32::from(c))
+}
+
+fn push_mark(out: &mut Vec<u8>, id: u16) {
+    let id = u32::from(id);
+    let mut buf = [0u8; 4];
+    for digit in [id / MARK_RADIX, id % MARK_RADIX] {
+        let c = char::from_u32(MARK_BASE + digit).expect("mark range is valid");
+        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    }
+}
+
+/// A cell's visible text and the link id its marks name, if any.
+pub(crate) fn split_cell(contents: &str) -> (std::borrow::Cow<'_, str>, Option<u16>) {
+    if !contents.chars().any(is_mark) {
+        return (std::borrow::Cow::Borrowed(contents), None);
+    }
+    let digits: Vec<u32> = contents
+        .chars()
+        .filter(|&c| is_mark(c))
+        .map(|c| u32::from(c) - MARK_BASE)
+        .collect();
+    let id = match digits[..] {
+        [.., hi, lo] => u16::try_from(hi * MARK_RADIX + lo).ok(),
+        _ => None,
+    };
+    let text: String = contents.chars().filter(|&c| !is_mark(c)).collect();
+    (std::borrow::Cow::Owned(text), id)
+}
+
+/// OSC 8 state for one vt100 grid, stored as the parser's callbacks so a
+/// reseed that replaces the parser replaces this with it.
+///
+/// [`Self::mark`] runs the stream through its own `vte` parser to find each
+/// glyph printed inside a hyperlink and appends that link's mark right after
+/// the glyph's bytes. vt100 then stores the mark in the same cell.
+#[derive(Default)]
+pub(crate) struct GridLinks {
+    vte: vte::Parser,
+    scan: LinkScan,
+}
+
+#[derive(Default)]
+struct LinkScan {
+    active: Option<u16>,
+    uris: Vec<String>,
+    ids: std::collections::HashMap<String, u16>,
+    /// The byte just fed completed a glyph to mark.
+    printed: bool,
+    /// The byte just fed completed a stray mark code point to drop.
+    stray: bool,
+}
+
+impl LinkScan {
+    fn intern(&mut self, uri: &str) -> Option<u16> {
+        if let Some(&id) = self.ids.get(uri) {
+            return Some(id);
+        }
+        if self.uris.len() >= MAX_GRID_LINKS {
+            return None;
+        }
+        let id = u16::try_from(self.uris.len()).ok()?;
+        self.uris.push(uri.to_string());
+        self.ids.insert(uri.to_string(), id);
+        Some(id)
+    }
+}
+
+impl vte::Perform for LinkScan {
+    fn print(&mut self, c: char) {
+        if is_mark(c) {
+            self.stray = true;
+            return;
+        }
+        // Mirrors which code points vt100 draws into a new cell.
+        let draws = c != '\u{fffd}'
+            && !('\u{80}'..'\u{a0}').contains(&c)
+            && unicode_width::UnicodeWidthChar::width(c).unwrap_or(1) > 0;
+        self.printed = draws && self.active.is_some();
+    }
+
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        let [b"8", _, uri @ ..] = params else {
+            return;
+        };
+        // vte splits on every `;`, including any inside the URI.
+        let uri = uri.join(&b';');
+        self.active = match std::str::from_utf8(&uri) {
+            Ok("") => None,
+            Ok(uri) if uri.len() <= MAX_URI && usable_uri(uri) => self.intern(uri),
+            _ => None,
+        };
+    }
+
+    fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        // RIS resets the terminal, hyperlink included.
+        if intermediates.is_empty() && byte == b'c' {
+            self.active = None;
+        }
+    }
+}
+
+impl vt100::Callbacks for GridLinks {}
+
+impl GridLinks {
+    /// `bytes` with a mark after each glyph printed inside a hyperlink, ready
+    /// for the grid's own `process`. Borrows when nothing needed marking.
+    pub(crate) fn mark<'a>(&mut self, bytes: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        let mut out: Option<Vec<u8>> = None;
+        let mut flushed = 0;
+        for i in 0..bytes.len() {
+            self.vte.advance(&mut self.scan, &bytes[i..=i]);
+            let printed = std::mem::take(&mut self.scan.printed);
+            let stray = std::mem::take(&mut self.scan.stray);
+            if !printed && !stray {
+                continue;
+            }
+            let out = out.get_or_insert_with(|| Vec::with_capacity(bytes.len() + 64));
+            if printed {
+                out.extend_from_slice(&bytes[flushed..=i]);
+                if let Some(id) = self.scan.active {
+                    push_mark(out, id);
+                }
+            } else {
+                // A mark is four UTF-8 bytes; one split across reads stays.
+                out.extend_from_slice(&bytes[flushed..(i + 1).saturating_sub(4).max(flushed)]);
+            }
+            flushed = i + 1;
+        }
+        match out {
+            None => std::borrow::Cow::Borrowed(bytes),
+            Some(mut out) => {
+                out.extend_from_slice(&bytes[flushed..]);
+                std::borrow::Cow::Owned(out)
+            }
+        }
+    }
+
+    pub(crate) fn uri(&self, id: u16) -> Option<&str> {
+        self.scan.uris.get(usize::from(id)).map(String::as_str)
+    }
 }
 
 #[cfg(test)]

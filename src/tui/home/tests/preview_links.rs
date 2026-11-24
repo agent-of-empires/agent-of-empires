@@ -217,11 +217,9 @@ fn hovering_a_link_reveals_its_target_before_the_click() {
 
 #[test]
 #[serial]
-fn a_generation_change_re_collects_targets_for_an_unchanged_grid() {
-    // vt100 strips both sequences, so a pane that reprints the same label against a new
-    // target leaves the grid byte-identical: keying on the rendered text would keep serving
-    // the old target. Driven through `ensure_parsed` and `collect_links` so the branch under
-    // test is the production one.
+fn a_repointed_label_re_collects_targets_for_unchanged_cells() {
+    // The frame text carries each target, so a label repointed with no visible change still
+    // changes the frame and re-collects its targets.
     let mut env = create_test_env_empty();
     let advertised = "see \x1b]8;;https://example.com/a\x1b\\the docs\x1b]8;;\x1b\\ now\n";
     env.view.preview_cache.store_capture(
@@ -247,12 +245,21 @@ fn a_generation_change_re_collects_targets_for_an_unchanged_grid() {
         Some("https://example.com/a")
     );
 
-    // The pane repoints the label. The visible cells do not move, so `parsed_text` stays
-    // valid and only the advertised target changed, which the generation reports.
-    env.view.preview_cache.content =
-        "see \x1b]8;;https://example.com/b\x1b\\the docs\x1b]8;;\x1b\\ now\n".to_string();
-    env.view.preview_cache.links_generation = 99;
-    env.view.preview_cache.ensure_parsed();
+    let restore = |env: &mut TestEnv, content: &str| {
+        env.view.preview_cache.store_capture(
+            content.to_string(),
+            "s1".to_string(),
+            "aoe_s1".to_string(),
+            1,
+            (40, 4),
+            None,
+        );
+        env.view.preview_cache.ensure_parsed();
+    };
+    restore(
+        &mut env,
+        "see \x1b]8;;https://example.com/b\x1b\\the docs\x1b]8;;\x1b\\ now\n",
+    );
     assert_eq!(
         env.view.preview_cache.parsed_text.as_ref().unwrap().lines[0].to_string(),
         "see the docs now",
@@ -266,9 +273,7 @@ fn a_generation_change_re_collects_targets_for_an_unchanged_grid() {
 
     // The pane reprints the label as plain text. Nothing is advertised any
     // more, so the label must stop being actionable.
-    env.view.preview_cache.content = "see the docs now\n".to_string();
-    env.view.preview_cache.links_generation = 100;
-    env.view.preview_cache.ensure_parsed();
+    restore(&mut env, "see the docs now\n");
     assert_eq!(
         env.view.preview_link_at(PANE.x + 4, PANE.y),
         None,
