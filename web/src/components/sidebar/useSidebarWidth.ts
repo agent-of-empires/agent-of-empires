@@ -58,7 +58,7 @@ function loadSavedWidth(): number {
   return DEFAULT_WIDTH;
 }
 
-type DragStart = { left: number; width: number; compact: boolean; last: SidebarSnap | null };
+type DragStart = { pointerId: number; left: number; width: number; compact: boolean; last: SidebarSnap | null };
 
 /**
  * Drag-resizable sidebar, published as `--aoe-sidebar-width` for the TopBar. A drag follows the pointer down to
@@ -95,23 +95,20 @@ export function useSidebarWidth({
   const onPointerDown = (e: React.PointerEvent) => {
     if (e.button !== 0) return;
     e.preventDefault();
-    drag.current = { left: panelRef.current?.getBoundingClientRect().left ?? 0, width, compact, last: null };
+    drag.current = {
+      pointerId: e.pointerId,
+      left: panelRef.current?.getBoundingClientRect().left ?? 0,
+      width,
+      compact,
+      last: null,
+    };
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
   };
 
-  const onDragMove = useEffectEvent((e: PointerEvent) => {
+  const onDragEnd = useEffectEvent((e: PointerEvent) => {
     const d = drag.current;
-    if (!d) return;
-    const snap = snapForPointer(e.clientX - d.left);
-    d.last = snap;
-    if (snap.mode === "closed") apply({ compact: d.compact, width: d.width, open: false });
-    else apply({ compact: snap.mode === "compact", width: snap.mode === "full" ? snap.width : d.width, open: true });
-  });
-
-  const onDragEnd = useEffectEvent(() => {
-    const d = drag.current;
-    if (!d) return;
+    if (!d || e.pointerId !== d.pointerId) return;
     drag.current = null;
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
@@ -120,9 +117,20 @@ export function useSidebarWidth({
     safeSetItem(WIDTH_KEY, String(saved));
   });
 
+  const onDragMove = useEffectEvent((e: PointerEvent) => {
+    const d = drag.current;
+    if (!d || e.pointerId !== d.pointerId) return;
+    // A mouse released outside the window sends no pointerup.
+    if (e.pointerType === "mouse" && e.buttons === 0) return onDragEnd(e);
+    const snap = snapForPointer(e.clientX - d.left);
+    d.last = snap;
+    if (snap.mode === "closed") apply({ compact: d.compact, width: d.width, open: false });
+    else apply({ compact: snap.mode === "compact", width: snap.mode === "full" ? snap.width : d.width, open: true });
+  });
+
   useEffect(() => {
     const onMove = (e: PointerEvent) => onDragMove(e);
-    const onUp = () => onDragEnd();
+    const onUp = (e: PointerEvent) => onDragEnd(e);
     document.addEventListener("pointermove", onMove);
     document.addEventListener("pointerup", onUp);
     document.addEventListener("pointercancel", onUp);

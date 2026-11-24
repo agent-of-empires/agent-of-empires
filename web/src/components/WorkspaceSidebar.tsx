@@ -15,7 +15,8 @@ import {
 } from "../lib/sidebarGroups";
 import type { RepoAppearanceUpdate } from "../lib/repoAppearance";
 import { useWebSettings } from "../hooks/useWebSettings";
-import { SidebarCompactContext, useSidebarInFlow } from "../lib/sidebarCompact";
+import { SidebarCompactContext } from "../lib/sidebarCompact";
+import { useMediaQuery } from "../hooks/useMediaQuery";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { useServerDown } from "../lib/connectionState";
 import type { SidebarSortMode } from "../lib/sidebarSort";
@@ -123,7 +124,8 @@ export function WorkspaceSidebar(props: Props) {
   } = props;
   const { settings: webSettings, update: updateWebSettings } = useWebSettings();
   const rightSide = webSettings.sidebarSide === "right";
-  const inFlow = useSidebarInFlow();
+  // Only the in-flow sidebar has the handle that leaves the rail, so the phone drawer ignores a saved rail.
+  const inFlow = useMediaQuery("(min-width: 768px)");
   const compact = webSettings.sidebarCompact && inFlow;
   const offline = useServerDown();
   const { effectiveWidth, panelRef, handleProps } = useSidebarWidth({
@@ -499,7 +501,7 @@ export function WorkspaceSidebar(props: Props) {
       <div
         data-testid="sidebar-resize-handle"
         {...handleProps}
-        className={`${open ? "hidden md:block" : "hidden"} relative z-10 w-1 cursor-col-resize shrink-0 touch-none bg-surface-800 hover:bg-brand-600/50 focus-visible:bg-brand-600/50 focus-visible:outline-none pointer-coarse:before:absolute pointer-coarse:before:inset-y-0 pointer-coarse:before:left-0 pointer-coarse:before:-right-5 pointer-coarse:before:content-[''] transition-colors duration-75`}
+        className={`${open ? "hidden md:block" : "hidden"} relative z-10 w-1 cursor-col-resize shrink-0 touch-none bg-surface-800 hover:bg-brand-600/50 focus-visible:bg-brand-600/50 focus-visible:outline-none pointer-coarse:before:absolute pointer-coarse:before:inset-y-0 pointer-coarse:before:left-0 pointer-coarse:before:-right-2 pointer-coarse:before:content-[''] transition-colors duration-75`}
       />
     </SidebarCompactContext.Provider>
   );
