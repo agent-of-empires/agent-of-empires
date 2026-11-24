@@ -147,9 +147,10 @@ fn stale_pending_vt_arm_is_fenced_after_disconnect() {
     wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
         let pipe = tmux_field(&h, &target, "#{pane_pipe}")?;
         let installed_owner = tmux_field(&h, &target, "#{@aoe_vt_pipe_owner}")?;
-        (pipe != "0" && installed_owner == owner)
+        let adopted = std::fs::read_to_string(gate.join("adopted-owner")).ok();
+        (adopted.as_deref() == Some(owner) && pipe != "0" && installed_owner == owner)
             .then_some(())
-            .ok_or("reconnected VT input pipe is not installed".into())
+            .ok_or("reconnected VT input pipe is not installed and adopted".into())
     });
     assert_eq!(tmux_field(&h, &target, "#{pane_id}").unwrap(), pane_id);
     assert_ne!(

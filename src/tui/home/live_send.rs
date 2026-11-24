@@ -1543,6 +1543,13 @@ impl LiveCaptureWorker {
                     last_vt_arm = None;
                     next_authoritative_capture = None;
                 }
+                #[cfg(all(unix, feature = "e2e-tests"))]
+                if let Some(source) = vt_source.as_ref().filter(|_| e2e_vt_arm_consumed) {
+                    if let Some(gate) = e2e_vt_arm_gate() {
+                        let (_, owner) = source.e2e_arm_result();
+                        let _ = e2e_publish_vt_arm(&gate, "adopted-owner", owner);
+                    }
+                }
                 #[cfg(unix)]
                 if !clipboard_capture_enabled {
                     shutdown_osc52_source(&mut osc52_source, &command_deadline);
