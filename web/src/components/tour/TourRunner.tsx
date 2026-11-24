@@ -1,7 +1,8 @@
 // The only module importing react-joyride; lazy-loaded when a tour first runs.
 import { useCallback, useMemo, useRef, useState } from "react";
 import { ACTIONS, Joyride, EVENTS, STATUS, type EventData, type Step } from "react-joyride";
-import { type TourShortcutHint, type TourStep, tourSelector } from "../../lib/tourSteps";
+import { installHint } from "../../lib/platform";
+import { INSTALL_STEPS, type TourShortcutHint, type TourStep, tourSelector } from "../../lib/tourSteps";
 import { SHORTCUTS_BY_ID, formatTourShortcut } from "../../lib/shortcuts";
 import { TOUR_RUNNER_OPTIONS, TOUR_RUNNER_STYLES } from "./tourRunnerStyles";
 
@@ -14,10 +15,19 @@ export interface TourRunnerProps {
 
 const LOCALE = { skip: "Skip tour", last: "Done", next: "Next", back: "Back" };
 
-function StepBody({ body, shortcutHints }: { body: string; shortcutHints?: readonly TourShortcutHint[] }) {
+function StepBody({
+  body,
+  shortcutHints,
+  installLine,
+}: {
+  body: string;
+  shortcutHints?: readonly TourShortcutHint[];
+  installLine?: string;
+}) {
   return (
     <div>
       <p>{body}</p>
+      {installLine && <p className="mt-2">{installLine}</p>}
       {shortcutHints && shortcutHints.length > 0 && (
         <ul className="mt-2 space-y-0.5 text-[11px] text-text-muted">
           {shortcutHints.map((hint) => (
@@ -31,18 +41,28 @@ function StepBody({ body, shortcutHints }: { body: string; shortcutHints?: reado
   );
 }
 
-function toJoyrideStep(step: TourStep): Step {
+function toJoyrideStep(step: TourStep, installLine: string | undefined): Step {
   return {
     id: step.id,
     target: tourSelector(step.anchor),
     title: step.title,
-    content: <StepBody body={step.body} shortcutHints={step.shortcutHints} />,
+    content: (
+      <StepBody
+        body={step.body}
+        shortcutHints={step.shortcutHints}
+        installLine={step.installHint ? installLine : undefined}
+      />
+    ),
     placement: "auto",
   };
 }
 
 export default function TourRunner({ run, steps, onFinish }: TourRunnerProps) {
-  const joyrideSteps = useMemo(() => steps.map(toJoyrideStep), [steps]);
+  const joyrideSteps = useMemo(() => {
+    const platformHint = installHint();
+    const installLine = platformHint ? INSTALL_STEPS[platformHint].tour : undefined;
+    return steps.map((step) => toJoyrideStep(step, installLine));
+  }, [steps]);
   const [stepIndex, setStepIndex] = useState(0);
 
   // Joyride can report the end more than once; latch the first.

@@ -1,5 +1,6 @@
 import { useEffect, useSyncExternalStore } from "react";
-import { isIOS, isStandalone } from "../lib/platform";
+import { onDaemonChanged } from "../lib/connectionState";
+import { isIOS, isSecureOrigin, isStandalone, supportsPush } from "../lib/platform";
 import {
   classifyPushHealth,
   hasFreshGoneFailure,
@@ -24,17 +25,6 @@ export type PushState =
     }
   | { kind: "disabled-by-server" }
   | { kind: "error"; message: string };
-
-const supportsPush = (): boolean =>
-  typeof window !== "undefined" && "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
-
-// Push needs a secure context; plain http is allowed only on loopback.
-const isSecureOrigin = (): boolean => {
-  if (typeof window === "undefined") return false;
-  if (window.isSecureContext) return true;
-  const host = window.location.hostname;
-  return host === "localhost" || host === "127.0.0.1" || host === "[::1]";
-};
 
 const iosTab = () => isIOS() && !isStandalone();
 
@@ -125,6 +115,8 @@ let snapshot = INITIAL;
 const listeners = new Set<() => void>();
 // A refresh must not run over an action in flight, and actions do not overlap.
 let busy = false;
+// A refresh asked for during an action, such as a reconnect while permission is pending, runs once it settles.
+let refreshQueued = false;
 // Bumped by every refresh and action; writes from an older generation are dropped.
 let generation = 0;
 // Every pending refresh re-registration POST; actions wait for all so none lands after them.
@@ -133,6 +125,7 @@ let registration: Promise<unknown> = Promise.resolve();
 function reset() {
   generation++;
   busy = false;
+  refreshQueued = false;
   snapshot = INITIAL;
 }
 
@@ -151,7 +144,10 @@ function publish(gen: number, next: Partial<Snapshot>) {
 }
 
 async function refresh() {
-  if (busy) return;
+  if (busy) {
+    refreshQueued = true;
+    return;
+  }
   const gen = ++generation;
   const live = () => gen === generation;
   const unsupported = unsupportedState();
@@ -205,7 +201,11 @@ function beginAction(): number | null {
 function endAction(gen: number) {
   if (gen !== generation) return;
   busy = false;
-  if (listeners.size === 0) reset();
+  if (listeners.size === 0) return reset();
+  if (refreshQueued) {
+    refreshQueued = false;
+    void refresh();
+  }
 }
 
 // Also the repair path: iOS only allows requestPermission and a first subscribe inside a
@@ -323,9 +323,12 @@ export function usePushSubscription() {
       if (document.visibilityState === "visible") void refresh();
     };
     document.addEventListener("visibilitychange", onVisibility);
+    // A restarted Daemon may have turned push on or off.
+    const offDaemonChanged = onDaemonChanged(() => void refresh());
     return () => {
       clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisibility);
+      offDaemonChanged();
     };
   }, []);
 

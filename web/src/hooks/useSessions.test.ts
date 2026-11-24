@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 
 import { act, renderHook, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { useSessions } from "./useSessions";
 import * as api from "../lib/api";
+import { onDaemonChanged, setServerDown } from "../lib/connectionState";
 import { restoreSessions } from "../lib/trashActions";
 import type { SessionResponse } from "../lib/types";
 
@@ -55,6 +56,22 @@ describe("useSessions / pushed status", () => {
   }
 
   const cursor = (revision: bigint, epoch = "boot") => ({ epoch, revision });
+
+  it.each([
+    { name: "a read from a new Daemon epoch, with no disconnect between", epoch: "boot-2", changed: 1 },
+    { name: "a newer read of the same epoch", epoch: "boot", changed: 0 },
+  ])("signals a Daemon change for $name", async ({ epoch, changed }) => {
+    // An earlier failed read may have left the flag down, which would make the first read a reconnect.
+    setServerDown(false);
+    const seen = vi.fn();
+    onTestFinished(onDaemonChanged(seen));
+    const { result, resolvers, row, envelope } = mountWithReads();
+    await act(async () => resolvers[0]!(envelope([row("a", "Running")], 1n)));
+    expect(seen).not.toHaveBeenCalled();
+    act(() => result.current.refresh());
+    await act(async () => resolvers[1]!(envelope([row("a", "Running")], 2n, epoch)));
+    expect(seen).toHaveBeenCalledTimes(changed);
+  });
 
   it("keeps a push over an older read that lands after it, until a newer read supersedes it", async () => {
     const { result, resolvers, row, envelope } = mountWithReads();

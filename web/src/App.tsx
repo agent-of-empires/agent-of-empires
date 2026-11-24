@@ -2785,7 +2785,10 @@ function AppContent({
             />
           </CollapsibleRegion>
 
-          <BannerStack onRetryServerSettings={serverAbout ? undefined : () => void recoverServerAbout()} />
+          <BannerStack
+            onRetryServerSettings={serverAbout ? undefined : () => void recoverServerAbout()}
+            tourActive={tour.isTourActive}
+          />
           {focusMode && focusSession.title !== null && !focusSession.gone && (
             <FocusModeNote title={focusSession.title} />
           )}
