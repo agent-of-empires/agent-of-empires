@@ -123,6 +123,7 @@ export function SidebarToolbar({
       <SidebarLegend />
       <button
         onClick={onClose}
+        aria-label="Close sidebar"
         className="md:hidden w-8 h-8 flex items-center justify-center text-text-dim hover:text-text-secondary cursor-pointer rounded-md hover:bg-surface-800 ml-1"
       >
         &times;
