@@ -191,11 +191,7 @@ impl Instance {
             }
             lead => lead,
         };
-        if self
-            .last_error
-            .as_deref()
-            .is_some_and(|error| error.contains(&remedy))
-        {
+        if self.without_named_remedy().is_some() {
             return;
         }
         let diagnostic = self.last_error.diagnostic().map(str::to_owned).or(seen);
@@ -233,33 +229,44 @@ impl Instance {
         self.last_error.latch_tmux(TmuxAbsence::Gone, gone);
     }
 
-    /// Whether the row can launch again, having dropped a remedy already named if so.
+    /// Whether the row can launch again, having dropped a remedy already named if so. The latch
+    /// stays.
     fn drop_remedy_if_launchable(&mut self) -> bool {
         if self.command_selector_refuses_launch() {
             return false;
         }
-        let remedy = Self::command_selector_remedy(&self.id);
-        self.drop_applied_remedy(&format!(" {REFUSED_RESTART} {remedy}"));
+        if let Some(ended) = self.without_named_remedy() {
+            self.last_error.rewrite(ended);
+        }
         true
     }
 
-    /// Drop `named`, the remedy [`Self::name_refused_restart`] appended, from the recorded error,
-    /// keeping its latch. A bare tmux lead left behind reads as that latch's own message.
-    fn drop_applied_remedy(&mut self, named: &str) {
-        let Some(ended) = self
-            .last_error
-            .as_deref()
-            .and_then(|error| error.strip_suffix(named))
-        else {
-            return;
-        };
-        let ended = match ended {
-            TMUX_SESSION_GONE_LEAD => TMUX_SESSION_GONE_ERROR,
-            TMUX_SERVER_UNREACHABLE_LEAD => TMUX_SERVER_UNREACHABLE_ERROR,
-            ended => ended,
+    /// The `last_error` of a Terminal handoff that ended because its launch is refused.
+    pub(crate) fn handoff_refused(session_id: &str) -> String {
+        format!(
+            "{HANDOFF_ENDED}: {}",
+            Self::command_selector_remedy(session_id)
+        )
+    }
+
+    /// What ended the row, when its error names the remedy in either form AoE writes: a poll's
+    /// [`Self::name_refused_restart`] or an ended handoff's [`Self::handoff_refused`]. A bare tmux
+    /// lead reads as that latch's own message.
+    fn without_named_remedy(&self) -> Option<String> {
+        let error = self.last_error.as_deref()?;
+        if error == Self::handoff_refused(&self.id) {
+            return Some(format!("{HANDOFF_ENDED}."));
         }
-        .to_owned();
-        self.last_error.rewrite(ended);
+        let remedy = Self::command_selector_remedy(&self.id);
+        let ended = error.strip_suffix(&format!(" {REFUSED_RESTART} {remedy}"))?;
+        Some(
+            match ended {
+                TMUX_SESSION_GONE_LEAD => TMUX_SESSION_GONE_ERROR,
+                TMUX_SERVER_UNREACHABLE_LEAD => TMUX_SERVER_UNREACHABLE_ERROR,
+                ended => ended,
+            }
+            .to_owned(),
+        )
     }
 
     pub(super) fn update_status_with_metadata_inner(

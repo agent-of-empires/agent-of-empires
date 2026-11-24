@@ -186,7 +186,9 @@ use launch_command::{
 use omp::{gate_omp_launch, wrap_omp_host_launch, wrap_omp_launch};
 use pane_status::{pane_error_line, resolve_detected_status, summarize_error_from_pane};
 
-use status::{UNKNOWN_ERROR_WINDOW_CONFIRMED_PRESENT, UNKNOWN_ERROR_WINDOW_NEVER_PRESENT};
+use status::{
+    HANDOFF_ENDED, UNKNOWN_ERROR_WINDOW_CONFIRMED_PRESENT, UNKNOWN_ERROR_WINDOW_NEVER_PRESENT,
+};
 use tmux_session::tmux_env_session_name_for_instance_id;
 use types::{deserialize_session_id, is_zero_u64, is_zero_u8};
 

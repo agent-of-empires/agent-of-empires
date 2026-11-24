@@ -589,10 +589,7 @@ const COMMAND_SELECTOR_CONFLICT: &str = "This Session's command picks a conversa
 /// Ends a handoff owed from before the refusal above: its launch can never start. Clearing AoE's
 /// id is a way out only here, in Terminal view; Structured view refuses that clear.
 fn command_selector_ended(session_id: &str) -> String {
-    format!(
-        "Terminal view couldn't start this Session: {}",
-        Instance::command_selector_remedy(session_id)
-    )
+    Instance::handoff_refused(session_id)
 }
 
 /// A handoff whose launch the command's own session selector refused; it ended in Terminal view.
@@ -5665,10 +5662,35 @@ mod tests {
                 // The ended switch is in Terminal view, so a retry just reports that.
                 assert_eq!(switch().await.into_response().status(), StatusCode::OK);
             } else {
-                assert_eq!(
-                    cached.last_error.as_deref(),
-                    Some(command_selector_ended(&held.id).as_str())
-                );
+                let ended = command_selector_ended(&held.id);
+                assert_eq!(cached.last_error.as_deref(), Some(ended.as_str()));
+                // Either way out drops the ended text's remedy on the next poll; until then the
+                // poll keeps it as written, without naming the remedy twice.
+                let remedies: [(&str, fn(&mut Instance)); 3] = [
+                    ("still refused", |_| {}),
+                    ("flag removed", |row| row.command = "claude".into()),
+                    ("AoE's id cleared", |row| {
+                        row.resume_intent = ResumeIntent::Cleared
+                    }),
+                ];
+                for (fix, apply) in remedies {
+                    let mut row = cached.clone();
+                    apply(&mut row);
+                    crate::tmux::refresh_session_cache();
+                    row.unknown_since =
+                        Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+                    row.update_status_with_metadata(None, None);
+                    let want = if fix == "still refused" {
+                        ended.clone()
+                    } else {
+                        "Terminal view couldn't start this Session.".to_owned()
+                    };
+                    assert_eq!(
+                        (row.status, row.last_error.as_deref()),
+                        (Status::Error, Some(want.as_str())),
+                        "{fix}"
+                    );
+                }
             }
             // A daemon restart loads the row without the remedy too, and its first poll puts it
             // back.

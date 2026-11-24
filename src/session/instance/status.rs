@@ -100,6 +100,9 @@ pub(crate) const TMUX_SERVER_UNREACHABLE_LEAD: &str = "The tmux server could not
 /// Introduces the remedy a refused restart needs.
 pub(crate) const REFUSED_RESTART: &str = "Terminal view can't start this Session again:";
 
+/// Opens the `last_error` of a Terminal handoff that ended because its launch is refused.
+pub(crate) const HANDOFF_ENDED: &str = "Terminal view couldn't start this Session";
+
 /// Whether `last_error` is the latch for a confirmed-absent pane. Its text can't tell: a pane can
 /// print anything.
 pub(crate) fn reports_tmux_session_gone(last_error: &LastError) -> bool {
