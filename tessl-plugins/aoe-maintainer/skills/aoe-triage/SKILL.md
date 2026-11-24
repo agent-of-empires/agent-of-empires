@@ -96,13 +96,14 @@ and an `error` that says what you found, and write nothing to it.
 
 ### The board
 
-7. Try the board once per run. The first board read is the test: in `issue`
-   mode the issue's `projectItems` query, in `sweep` mode `gh project
-   item-list`. If it fails with a permission error (`Resource not accessible
-   by integration`, `INSUFFICIENT_SCOPES`, HTTP 401 or 403), or the first
-   write fails that way, set `projectFields` to `unavailable`, put the exact
-   error in `projectError`, make no further board calls this run, and treat
-   board fields as not required when judging done. Labels are still written.
+7. Try the board once per run. The first board reads are the test: the
+   board ID lookup, then in `issue` mode the issue's `projectItems` query, in
+   `sweep` mode `gh project item-list`. If one fails with a permission error
+   (`Resource not accessible by integration`, `INSUFFICIENT_SCOPES`, HTTP 401
+   or 403), or the first write fails that way, set `projectFields` to
+   `unavailable`, put the exact error in `projectError`, make no further
+   board calls this run, and treat board fields as not required when judging
+   done. Labels are still written.
 8. Any other failed board write is recorded in that issue's `error`. Do not
    undo the issue's labels or other issues' writes.
 
