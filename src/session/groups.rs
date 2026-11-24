@@ -224,6 +224,16 @@ impl GroupTree {
         parent.children = children;
     }
 
+    /// Add `group` after every existing one, keeping its display name. No-op if it exists.
+    pub fn append_group(&mut self, group: Group) {
+        if self.groups_by_path.contains_key(&group.path) {
+            return;
+        }
+        self.insertion_order.push(group.path.clone());
+        self.groups_by_path.insert(group.path.clone(), group);
+        self.rebuild_tree();
+    }
+
     pub fn create_group(&mut self, path: &str) {
         self.ensure_group_exists(path);
         self.rebuild_tree();
@@ -433,21 +443,6 @@ impl Item {
     }
 }
 
-fn sort_by_name<T, F>(items: &mut [T], sort_order: SortOrder, key: F)
-where
-    F: Fn(&T) -> &str,
-{
-    match sort_order {
-        SortOrder::AZ => items.sort_by_key(|a| key(a).to_lowercase()),
-        SortOrder::ZA => items.sort_by_key(|b| std::cmp::Reverse(key(b).to_lowercase())),
-        SortOrder::Newest
-        | SortOrder::Oldest
-        | SortOrder::LastActivity
-        | SortOrder::Attention
-        | SortOrder::Custom => {}
-    }
-}
-
 /// Sort a slice of session references by `sort_order`, reading the
 /// favorites-first preference from config.
 fn sort_sessions(sessions: &mut [&Instance], sort_order: SortOrder) {
@@ -458,39 +453,29 @@ fn sort_sessions(sessions: &mut [&Instance], sort_order: SortOrder) {
 /// to mutate the process-global atomic, which would race with tests running in parallel.
 fn sort_sessions_inner(sessions: &mut [&Instance], sort_order: SortOrder, favorites_first: bool) {
     match sort_order {
-        SortOrder::Oldest => sessions.sort_by_key(|i| i.created_at),
-        SortOrder::Newest => sessions.sort_by_key(|i| Reverse(i.created_at)),
-        SortOrder::LastActivity => sessions.sort_by_key(|i| last_activity_session_key(i)),
-        SortOrder::Attention => {
-            sessions.sort_by_key(|i| attention_session_key(i));
-            return;
-        }
-        SortOrder::AZ | SortOrder::ZA => sort_by_name(sessions, sort_order, |i| &i.title),
         SortOrder::Custom => {
-            // The user placed these rows by hand; nothing else may reorder them,
-            // not even the favorites pass. Sessions never moved sort last, newest first.
-            sessions.sort_by_key(|i| (i.sort_index.unwrap_or(u32::MAX), Reverse(i.created_at)));
+            // The user placed these rows by hand; nothing else may reorder them, not even the
+            // favorites pass. Rows never moved sit on top, newest first.
+            sessions.sort_by_key(|i| (i.sort_index.is_some(), i.sort_index, Reverse(i.created_at)));
             return;
         }
+        SortOrder::Name => sessions.sort_by_key(|i| i.title.to_lowercase()),
     }
     if favorites_first {
         sessions.sort_by_key(|i| !is_live_favorite(i));
     }
 }
 
-/// Sort a slice of group references by `sort_order`, using `instances` for timestamp-based
-/// orderings.
-fn sort_groups<T, N, P, A>(
+/// Sort group references by `sort_order`. Under Custom they keep the order they arrive in.
+fn sort_groups<T, N, P>(
     items: &mut [T],
     sort_order: SortOrder,
     instances: &[Instance],
     name: N,
     path: P,
-    archived: A,
 ) where
     N: Fn(&T) -> &str,
     P: Fn(&T) -> &str,
-    A: Fn(&T) -> Option<Timestamp>,
 {
     sort_groups_inner(
         items,
@@ -498,43 +483,26 @@ fn sort_groups<T, N, P, A>(
         instances,
         name,
         path,
-        archived,
         crate::session::favorites_first(),
     );
 }
 
 /// Pure core of [`sort_groups`]. See [`sort_sessions_inner`] for why the
 /// favorites bias is a second stable pass and why the flag is a parameter.
-fn sort_groups_inner<T, N, P, A>(
+fn sort_groups_inner<T, N, P>(
     items: &mut [T],
     sort_order: SortOrder,
     instances: &[Instance],
     name: N,
     path: P,
-    archived: A,
     favorites_first: bool,
 ) where
     N: Fn(&T) -> &str,
     P: Fn(&T) -> &str,
-    A: Fn(&T) -> Option<Timestamp>,
 {
     match sort_order {
-        SortOrder::Oldest => {
-            items.sort_by_key(|g| created_at_bounds(path(g), instances).1);
-        }
-        SortOrder::Newest => {
-            items.sort_by_key(|g| Reverse(created_at_bounds(path(g), instances).0));
-        }
-        SortOrder::LastActivity => {
-            items.sort_by_key(|g| last_activity_group_key(path(g), instances));
-        }
-        SortOrder::Attention => {
-            items.sort_by_key(|g| attention_group_key(path(g), archived(g), instances));
-            return;
-        }
-        SortOrder::AZ | SortOrder::ZA => sort_by_name(items, sort_order, name),
-        // Groups arrive in `groups.json` order, which is what the user arranged.
         SortOrder::Custom => return,
+        SortOrder::Name => items.sort_by_key(|g| name(g).to_lowercase()),
     }
     if favorites_first {
         items.sort_by_key(|g| !has_live_favorite(path(g), instances));
@@ -568,199 +536,6 @@ pub(crate) fn is_live_favorite(inst: &Instance) -> bool {
 /// member.
 fn has_live_favorite(path: &str, instances: &[Instance]) -> bool {
     group_members(path, instances).any(is_live_favorite)
-}
-
-/// Newest and oldest `created_at` in a group, defaulted so an empty group sinks to
-/// the bottom of either ordering.
-fn created_at_bounds(path: &str, instances: &[Instance]) -> (Timestamp, Timestamp) {
-    let stamps = || group_members(path, instances).map(|i| i.created_at);
-    (
-        stamps().max().unwrap_or(Timestamp::MIN),
-        stamps().min().unwrap_or(Timestamp::MAX),
-    )
-}
-
-/// Most recent `last_accessed_at` among all sessions (direct and nested) in a group.
-fn max_last_accessed_in_group(path: &str, instances: &[Instance]) -> Option<Timestamp> {
-    group_members(path, instances)
-        .filter_map(|i| i.last_accessed_at)
-        .max()
-}
-
-/// Key used to sort sessions by LastActivity in descending order, pushing sessions with no recorded
-/// activity to the bottom.
-fn last_activity_session_key(inst: &Instance) -> (bool, Reverse<Option<Timestamp>>) {
-    (
-        inst.last_accessed_at.is_none(),
-        Reverse(inst.last_accessed_at),
-    )
-}
-
-/// Key used to sort groups by LastActivity in descending order. Groups with no
-/// activity sort to the bottom.
-fn last_activity_group_key(
-    path: &str,
-    instances: &[Instance],
-) -> (bool, Reverse<Option<Timestamp>>) {
-    let ts = max_last_accessed_in_group(path, instances);
-    (ts.is_none(), Reverse(ts))
-}
-
-/// Priority tier for the Attention sort. The per-status ranks live on
-/// [`crate::session::Status::attention_tier`].
-fn attention_tier(inst: &Instance) -> u8 {
-    if inst.is_archived()
-        || inst.is_ignored()
-        || inst.is_snoozed()
-        || inst.is_trashed()
-        || inst.pane_dead_observed
-    {
-        // Tier 99 sinks: archived, ignored, and snoozed (snoozed = temporary archive that wakes
-        // automatically when its timer expires).
-        return 99;
-    }
-    inst.status.attention_tier()
-}
-
-/// Attention bucket rank with the unread promoter folded in.
-fn attention_rank(tier: u8, unread: bool, unread_enabled: bool) -> u8 {
-    if tier == 99 {
-        return 99;
-    }
-    if unread_enabled {
-        if tier == 0 {
-            0
-        } else if unread {
-            1
-        } else {
-            tier.saturating_add(1)
-        }
-    } else {
-        tier
-    }
-}
-
-/// Key used to sort sessions by Attention.
-#[allow(clippy::type_complexity)]
-fn attention_session_key(
-    inst: &Instance,
-) -> (
-    bool,
-    u8,
-    bool,
-    bool,
-    std::cmp::Reverse<Option<Timestamp>>,
-    Option<Timestamp>,
-) {
-    let tier = attention_tier(inst);
-    // Urgent is the cross-tier promoter: an agent that has flagged itself urgent rises above all
-    // non-urgent rows regardless of status tier.
-    let urgent_bias = tier != 99 && inst.is_urgent();
-    // Favorite pins to the top of its category; tier stays primary so a fav'd Running never leaps
-    // above a plain Waiting.
-    let favorite_bias = tier != 99 && inst.is_favorited();
-    if tier == 99 {
-        // Tier 99 unifies archived, snoozed, and pane-dead rows.
-        let ts = inst
-            .archived_at
-            .or(inst.snoozed_until)
-            .or(inst.last_accessed_at);
-        return (
-            !urgent_bias,
-            tier,
-            !favorite_bias,
-            ts.is_none(),
-            Reverse(ts),
-            None,
-        );
-    }
-    let rank = attention_rank(tier, inst.is_unread(), crate::session::unread_enabled());
-    // Non-archived: "longest aging" = oldest last_accessed_at first (ASC).
-    (
-        !urgent_bias,
-        rank,
-        !favorite_bias,
-        inst.last_accessed_at.is_none(),
-        Reverse(None),
-        inst.last_accessed_at,
-    )
-}
-
-/// Key used to sort groups by Attention.
-#[allow(clippy::type_complexity)]
-fn attention_group_key(
-    path: &str,
-    group_archived_at: Option<Timestamp>,
-    instances: &[Instance],
-) -> (
-    bool,
-    u8,
-    bool,
-    bool,
-    Reverse<Option<Timestamp>>,
-    Option<Timestamp>,
-) {
-    let prefix = format!("{}/", path);
-    let members: Vec<&Instance> = instances
-        .iter()
-        .filter(|i| i.group_path == path || i.group_path.starts_with(&prefix))
-        .collect();
-
-    if members.is_empty() {
-        // Empty group: if marked archived, sink to tier 99 with the group's
-        // own archived_at; otherwise leave at u8::MAX (existing behavior).
-        if let Some(ts) = group_archived_at {
-            return (true, 99, true, false, Reverse(Some(ts)), None);
-        }
-        return (true, u8::MAX, true, true, Reverse(None), None);
-    }
-
-    let min_tier = members
-        .iter()
-        .map(|i| attention_tier(i))
-        .min()
-        .unwrap_or(u8::MAX);
-
-    // Group-level urgent bias: any non-sunk member with the urgent flag promotes the entire group
-    // above non-urgent peers across all tiers.
-    let urgent_bias = min_tier != 99 && members.iter().any(|i| i.is_urgent());
-
-    // Group-level favorite bias: within its min_tier bucket, a group with any live favorited member
-    // pins above peers.
-    let favorite_bias = min_tier != 99 && has_live_favorite(path, instances);
-
-    if min_tier == 99 {
-        // All members archived: sort archived block by latest archived_at.
-        let max_arch = members.iter().filter_map(|i| i.archived_at).max();
-        let ts = max_arch.or(group_archived_at);
-        return (
-            !urgent_bias,
-            99,
-            !favorite_bias,
-            ts.is_none(),
-            Reverse(ts),
-            None,
-        );
-    }
-
-    // Non-archived: "longest aging" = oldest max(last_accessed_at) first.
-    let max_last = members.iter().filter_map(|i| i.last_accessed_at).max();
-    // Fold the unread promoter in at the group level too, so a project containing an unread session
-    // floats up just like the flat Attention view does (a group with an unread Idle outranks a
-    // group whose best member is a read Error).
-    let unread = members
-        .iter()
-        .filter(|i| attention_tier(i) != 99)
-        .any(|i| i.is_unread());
-    let rank = attention_rank(min_tier, unread, crate::session::unread_enabled());
-    (
-        !urgent_bias,
-        rank,
-        !favorite_bias,
-        max_last.is_none(),
-        Reverse(None),
-        max_last,
-    )
 }
 
 /// Flatten instances from multiple profiles into a single flat list.
@@ -803,34 +578,13 @@ pub fn flatten_tree_all_profiles(
         }
     }
 
-    // Sort using the per-profile instances stored in each tuple (element 2), not the global
-    // instances slice, so groups from different profiles with the same name get sort keys scoped to
-    // their own profile's sessions.
-    match sort_order {
-        SortOrder::Oldest => {
-            all_roots.sort_by_key(|(_, g, insts)| created_at_bounds(&g.path, insts).1);
+    // Favorites are scoped to each root's own profile, so same-named groups in two profiles
+    // never borrow each other's members.
+    if sort_order == SortOrder::Name {
+        all_roots.sort_by_key(|(_, g, _)| g.name.to_lowercase());
+        if crate::session::favorites_first() {
+            all_roots.sort_by_key(|(_, g, insts)| !has_live_favorite(&g.path, insts));
         }
-        SortOrder::Newest => {
-            all_roots.sort_by_key(|(_, g, insts)| Reverse(created_at_bounds(&g.path, insts).0));
-        }
-        SortOrder::LastActivity => {
-            all_roots.sort_by_key(|(_, g, insts)| last_activity_group_key(&g.path, insts));
-        }
-        SortOrder::Attention => {
-            all_roots
-                .sort_by_key(|(_, g, insts)| attention_group_key(&g.path, g.archived_at, insts));
-        }
-        SortOrder::AZ | SortOrder::ZA => {
-            sort_by_name(&mut all_roots, sort_order, |(_, g, _)| &*g.name)
-        }
-        // Groups keep the order the user arranged; see `sort_groups_inner`.
-        SortOrder::Custom => {}
-    }
-    // Favorites-first second pass, matching `sort_groups_inner`.
-    if !matches!(sort_order, SortOrder::Attention | SortOrder::Custom)
-        && crate::session::favorites_first()
-    {
-        all_roots.sort_by_key(|(_, g, insts)| !has_live_favorite(&g.path, insts));
     }
 
     for (profile_name, root, profile_instances) in &all_roots {
@@ -845,23 +599,6 @@ pub fn flatten_tree_all_profiles(
     }
 
     items
-}
-
-/// Flat session list for the Attention sort: skip group hierarchy entirely.
-pub fn flatten_sessions_by_attention(instances: &[Instance]) -> Vec<Item> {
-    // Archived rows are excluded from the natural attention flow; the caller appends them under the
-    // synthetic "Archived" section via `append_archived_section`.
-    let mut refs: Vec<&Instance> = instances
-        .iter()
-        .filter(|i| !i.is_archived() && !i.is_trashed())
-        .collect();
-    refs.sort_by_key(|i| attention_session_key(i));
-    refs.into_iter()
-        .map(|inst| Item::Session {
-            id: inst.id.clone(),
-            depth: 0,
-        })
-        .collect()
 }
 
 pub fn flatten_tree(
@@ -895,7 +632,6 @@ pub fn flatten_tree(
         instances,
         |g| &g.name,
         |g| &g.path,
-        |g| g.archived_at,
     );
 
     for root in roots_to_iterate {
@@ -952,7 +688,6 @@ fn flatten_group(
         instances,
         |g| &g.name,
         |g| &g.path,
-        |g| g.archived_at,
     );
 
     for child in children_to_iterate {
@@ -1031,7 +766,6 @@ pub fn append_archived_section_by_project(
     instances: &[Instance],
     section_collapsed: bool,
     project_collapsed: &HashMap<String, bool>,
-    sort_order: SortOrder,
 ) {
     let archived: Vec<&Instance> = instances
         .iter()
@@ -1064,7 +798,7 @@ pub fn append_archived_section_by_project(
     }
 
     let mut buckets: Vec<(String, Vec<&Instance>)> = by_project.into_iter().collect();
-    sort_archived_project_buckets(&mut buckets, sort_order);
+    sort_archived_project_buckets(&mut buckets);
 
     for (project_name, mut sessions) in buckets {
         sessions.sort_by_key(|i| Reverse(i.archived_at));
@@ -1091,64 +825,27 @@ pub fn append_archived_section_by_project(
     }
 }
 
-/// Ordering helper for archived project sub-folders.
-fn sort_archived_project_buckets(buckets: &mut [(String, Vec<&Instance>)], sort_order: SortOrder) {
-    match sort_order {
-        SortOrder::AZ => {
-            buckets.sort_by_key(|b| project_group_display_name(&b.0).to_lowercase());
-        }
-        SortOrder::ZA => {
-            buckets.sort_by_key(|b| Reverse(project_group_display_name(&b.0).to_lowercase()));
-        }
-        SortOrder::Oldest => {
-            buckets.sort_by_key(|(_, sessions)| {
-                sessions
-                    .iter()
-                    .filter_map(|i| i.archived_at)
-                    .min()
-                    .unwrap_or(Timestamp::MAX)
-            });
-        }
-        SortOrder::Custom | SortOrder::Newest | SortOrder::Attention => {
-            buckets.sort_by_key(|(_, sessions)| {
-                Reverse(
-                    sessions
-                        .iter()
-                        .filter_map(|i| i.archived_at)
-                        .max()
-                        .unwrap_or(Timestamp::MIN),
-                )
-            });
-        }
-        SortOrder::LastActivity => {
-            buckets.sort_by_key(|(_, sessions)| {
-                Reverse(
-                    sessions
-                        .iter()
-                        .filter_map(|i| i.last_accessed_at)
-                        .max()
-                        .unwrap_or(Timestamp::MIN),
-                )
-            });
-        }
-    }
+/// Archived project sub-folders, most recently archived first under every sort.
+fn sort_archived_project_buckets(buckets: &mut [(String, Vec<&Instance>)]) {
+    buckets.sort_by_key(|(_, sessions)| {
+        Reverse(
+            sessions
+                .iter()
+                .filter_map(|i| i.archived_at)
+                .max()
+                .unwrap_or(Timestamp::MIN),
+        )
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::Status;
     use crate::time::Duration;
 
     fn inst(title: &str, group: &str) -> Instance {
         let mut inst = Instance::new(title, &format!("/tmp/{title}"));
         inst.group_path = group.to_string();
-        inst
-    }
-
-    fn with_status(title: &str, group: &str, status: Status) -> Instance {
-        let mut inst = inst(title, group);
-        inst.status = status;
         inst
     }
 
@@ -1186,22 +883,27 @@ mod tests {
         sessions.iter().map(|i| i.title.as_str()).collect()
     }
 
-    /// Under `SortOrder::Custom` a session's stored `sort_index` is the whole order, and a
-    /// session that was never moved sorts behind every session that was.
+    /// Under `SortOrder::Custom` a session's stored `sort_index` is the order, and sessions never
+    /// moved sit above every placed one, newest first. Favorites do not reorder either.
     #[test]
-    fn custom_sort_follows_sort_index_then_unplaced() {
+    fn custom_sort_puts_unplaced_first_then_sort_index() {
+        let now = Timestamp::now();
         let mut placed_second = inst("b", "work");
         placed_second.sort_index = Some(1);
         let mut placed_first = inst("a", "work");
         placed_first.sort_index = Some(0);
-        let unplaced = inst("c", "work");
-        let instances = [placed_second, placed_first, unplaced];
+        placed_first.created_at = now;
+        let mut unplaced_old = inst("old", "work");
+        unplaced_old.created_at = now - Duration::days(2);
+        unplaced_old.favorite();
+        let mut unplaced_new = inst("new", "work");
+        unplaced_new.created_at = now - Duration::days(1);
+        let instances = [placed_second, unplaced_old, placed_first, unplaced_new];
 
         let mut refs: Vec<&Instance> = instances.iter().collect();
         sort_sessions_inner(&mut refs, SortOrder::Custom, true);
 
-        let titles: Vec<&str> = refs.iter().map(|i| i.title.as_str()).collect();
-        assert_eq!(titles, ["a", "b", "c"]);
+        assert_eq!(titles(&refs), ["new", "old", "a", "b"]);
     }
 
     /// Moving a group swaps it with the sibling on that side and leaves every other group
@@ -1286,7 +988,7 @@ mod tests {
                 .count()
         };
 
-        let items = flatten_tree(&tree, &instances, SortOrder::Oldest);
+        let items = flatten_tree(&tree, &instances, SortOrder::Custom);
         assert_eq!(group_names(&items), ["parent", "child"]);
         assert_eq!(count_sessions(&items), 2);
         let Item::Group {
@@ -1305,7 +1007,7 @@ mod tests {
         ));
 
         tree.toggle_collapsed("parent");
-        let items = flatten_tree(&tree, &instances, SortOrder::Oldest);
+        let items = flatten_tree(&tree, &instances, SortOrder::Custom);
         assert_eq!(group_names(&items), ["parent"]);
         assert_eq!(count_sessions(&items), 0);
         assert!(matches!(
@@ -1325,7 +1027,7 @@ mod tests {
         let mut instances = vec![inst("a", "work"), inst("b", "work")];
         let group_count = |instances: &[Instance]| {
             let tree = GroupTree::new_with_groups(instances, &[]);
-            let items = flatten_tree(&tree, instances, SortOrder::Oldest);
+            let items = flatten_tree(&tree, instances, SortOrder::Custom);
             match group_item(&items, "work") {
                 Item::Group { session_count, .. } => *session_count,
                 _ => unreachable!(),
@@ -1371,19 +1073,14 @@ mod tests {
         let nested_tree = GroupTree::new_with_groups(&nested, &[]);
         for (order, want_groups, want_children) in [
             (
-                SortOrder::Oldest,
+                SortOrder::Custom,
                 ["zebra", "apple", "Mango"],
                 ["zeta", "alpha"],
             ),
             (
-                SortOrder::AZ,
+                SortOrder::Name,
                 ["apple", "Mango", "zebra"],
                 ["alpha", "zeta"],
-            ),
-            (
-                SortOrder::ZA,
-                ["zebra", "Mango", "apple"],
-                ["zeta", "alpha"],
             ),
         ] {
             let items = flatten_tree(&tree, &groups, order);
@@ -1399,212 +1096,13 @@ mod tests {
                 inst("Zebra", group),
             ];
             let tree = GroupTree::new_with_groups(&sessions, &[]);
-            for (order, want) in [
-                (SortOrder::Oldest, ["Mango", "Apple", "Zebra"]),
-                (SortOrder::AZ, ["Apple", "Mango", "Zebra"]),
-                (SortOrder::ZA, ["Zebra", "Mango", "Apple"]),
-            ] {
-                let items = flatten_tree(&tree, &sessions, order);
-                assert_eq!(
-                    session_titles(&items, &sessions),
-                    want,
-                    "{group:?} {order:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn last_activity_sorts_descending_with_none_last() {
-        let now = Timestamp::now();
-        let mut recent = inst("recent", "");
-        recent.last_accessed_at = Some(now);
-        let mut older = inst("older", "");
-        older.last_accessed_at = Some(now - Duration::hours(1));
-        let instances = vec![inst("never", ""), older, recent];
-        let tree = GroupTree::new_with_groups(&instances, &[]);
-        let items = flatten_tree(&tree, &instances, SortOrder::LastActivity);
-        assert_eq!(
-            session_titles(&items, &instances),
-            ["recent", "older", "never"]
-        );
-    }
-
-    #[test]
-    fn attention_tiers_archive_snooze_and_ignore() {
-        let mut waiting = with_status("w", "", Status::Waiting);
-        assert_eq!(attention_tier(&waiting), 0);
-        waiting.archive();
-        assert_eq!(attention_tier(&waiting), 99);
-
-        let mut errored = with_status("e", "", Status::Error);
-        assert_eq!(attention_tier(&errored), 1);
-        errored.archive();
-        assert_eq!(attention_tier(&errored), 99);
-        errored.unarchive();
-        assert_eq!(attention_tier(&errored), 1);
-
-        let mut snoozed = with_status("s", "", Status::Waiting);
-        snoozed.snooze(30);
-        assert!(snoozed.is_snoozed() && snoozed.snooze_remaining().is_some());
-        assert_eq!(attention_tier(&snoozed), 99);
-        snoozed.archive();
-        assert_eq!(attention_tier(&snoozed), 99);
-        // `archive` clears the snooze and settles the live status, so restore
-        // both before checking what an expired snooze alone does.
-        assert!(snoozed.snoozed_until.is_none());
-        snoozed.unarchive();
-        snoozed.status = Status::Waiting;
-        snoozed.snoozed_until = Some(Timestamp::now() - Duration::seconds(1));
-        assert!(!snoozed.is_snoozed() && snoozed.snooze_remaining().is_none());
-        assert_eq!(
-            attention_tier(&snoozed),
-            0,
-            "an expired snooze releases the tier"
-        );
-        snoozed.snooze(30);
-        snoozed.unsnooze();
-        assert!(snoozed.snoozed_until.is_none());
-
-        let mut ignored = with_status("g", "", Status::Waiting);
-        ignored.ignore();
-        assert_eq!(attention_tier(&ignored), 99, "ignore sinks a live row");
-        ignored.unignore();
-        assert_eq!(attention_tier(&ignored), 0, "unignore releases the tier");
-    }
-
-    #[test]
-    fn attention_session_sort() {
-        let now = Timestamp::now();
-        let idle_at = |title: &str, ago: Option<Duration>| {
-            let mut i = with_status(title, "", Status::Idle);
-            i.last_accessed_at = ago.map(|ago| now - ago);
-            i
-        };
-        let fresh = idle_at("fresh", Some(Duration::minutes(5)));
-        let stale = idle_at("stale", Some(Duration::hours(11)));
-        let middle = idle_at("middle", Some(Duration::minutes(40)));
-        let untouched = idle_at("untouched", None);
-        let mut sessions = vec![&fresh, &middle, &stale, &untouched];
-        sort_sessions(&mut sessions, SortOrder::Attention);
-        assert_eq!(titles(&sessions), ["stale", "middle", "fresh", "untouched"]);
-
-        let waiting = with_status("w", "", Status::Waiting);
-        let errored = with_status("e", "", Status::Error);
-        let mut archived = with_status("aw", "", Status::Waiting);
-        archived.archive();
-        let idle = with_status("i", "", Status::Idle);
-        let mut ignored = with_status("iw", "", Status::Waiting);
-        ignored.ignore();
-        let mut sessions = vec![&waiting, &errored, &archived, &ignored, &idle];
-        sort_sessions(&mut sessions, SortOrder::Attention);
-        assert_eq!(titles(&sessions), ["w", "e", "i", "aw", "iw"]);
-    }
-
-    #[test]
-    fn attention_rank_unread_promoter() {
-        assert!(attention_rank(0, false, true) < attention_rank(2, true, true));
-        assert!(attention_rank(2, true, true) < attention_rank(1, false, true));
-        assert!(attention_rank(2, true, true) < attention_rank(4, false, true));
-        for tier in [0, 2, 4] {
+            let items = flatten_tree(&tree, &sessions, SortOrder::Name);
             assert_eq!(
-                attention_rank(tier, true, false),
-                tier,
-                "indicator disabled"
+                session_titles(&items, &sessions),
+                ["Apple", "Mango", "Zebra"],
+                "{group:?}"
             );
         }
-        assert_eq!(
-            attention_rank(99, true, true),
-            99,
-            "unread must not promote sunk rows"
-        );
-        assert_eq!(attention_rank(99, false, true), 99);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn attention_group_key_cases() {
-        let now = Timestamp::now();
-        let mut fresh = with_status("f", "fresh", Status::Idle);
-        fresh.last_accessed_at = Some(now - Duration::minutes(5));
-        let mut stale = with_status("s", "stale", Status::Idle);
-        stale.last_accessed_at = Some(now - Duration::hours(11));
-        let instances = vec![fresh, stale];
-        assert!(
-            attention_group_key("stale", None, &instances)
-                < attention_group_key("fresh", None, &instances)
-        );
-
-        let archived = |title: &str, status: Status| {
-            let mut i = with_status(title, "work", status);
-            i.archive();
-            i
-        };
-        let all_archived = [archived("a", Status::Waiting), archived("b", Status::Idle)];
-        assert_eq!(attention_group_key("work", None, &all_archived).1, 99);
-        let one_active = [
-            archived("aw", Status::Waiting),
-            with_status("ai", "work", Status::Idle),
-        ];
-        assert_eq!(attention_group_key("work", None, &one_active).1, 3);
-
-        let err = with_status("err", "a", Status::Error);
-        let mut unread_idle = with_status("ui", "b", Status::Idle);
-        unread_idle.mark_unread();
-        assert!(
-            attention_group_key("b", None, &[unread_idle]) < attention_group_key("a", None, &[err]),
-            "an unread Idle group outranks a read Error group"
-        );
-
-        let active_read = with_status("ar", "work", Status::Idle);
-        let mut archived_unread = with_status("au", "work", Status::Idle);
-        archived_unread.mark_unread();
-        archived_unread.archive();
-        let key = attention_group_key("work", None, &[active_read.clone(), archived_unread]);
-        let baseline =
-            attention_group_key("work", None, &[active_read, archived("o", Status::Idle)]);
-        assert_eq!(
-            key.1, baseline.1,
-            "an archived unread member must not promote"
-        );
-
-        assert_eq!(attention_group_key("empty", Some(now), &[]).1, 99);
-        assert_eq!(attention_group_key("empty", None, &[]).1, u8::MAX);
-    }
-
-    #[test]
-    fn favorite_pins_within_attention_tier_only() {
-        for status in [Status::Waiting, Status::Running, Status::Stopped] {
-            let mut fav = with_status("fav", "", status);
-            fav.favorite();
-            let plain = with_status("plain", "", status);
-            assert!(
-                attention_session_key(&fav) < attention_session_key(&plain),
-                "{status:?}"
-            );
-        }
-        let mut fav_idle = with_status("fav_idle", "", Status::Idle);
-        fav_idle.favorite();
-        let plain_waiting = with_status("plain_waiting", "", Status::Waiting);
-        assert!(attention_session_key(&plain_waiting) < attention_session_key(&fav_idle));
-
-        let instances = [fav_idle, plain_waiting];
-        for favorites_first in [true, false] {
-            let mut refs: Vec<&Instance> = instances.iter().collect();
-            sort_sessions_inner(&mut refs, SortOrder::Attention, favorites_first);
-            assert_eq!(titles(&refs), ["plain_waiting", "fav_idle"]);
-        }
-
-        let mut archived = with_status("t", "", Status::Waiting);
-        archived.favorite();
-        archived.archive();
-        assert!(!archived.is_favorited(), "archive clears the favorite");
-        let key = attention_session_key(&archived);
-        assert_eq!(
-            (key.1, key.2),
-            (99, true),
-            "sunk tier without favorite bias"
-        );
     }
 
     #[test]
@@ -1663,10 +1161,10 @@ mod tests {
             aged("apple", 1, false),
         ];
         for (order, favorites_first, want) in [
-            (SortOrder::Newest, false, ["yak", "apple", "zebra"]),
-            (SortOrder::Newest, true, ["yak", "zebra", "apple"]),
-            (SortOrder::AZ, false, ["apple", "yak", "zebra"]),
-            (SortOrder::AZ, true, ["yak", "zebra", "apple"]),
+            (SortOrder::Custom, false, ["yak", "apple", "zebra"]),
+            (SortOrder::Custom, true, ["yak", "apple", "zebra"]),
+            (SortOrder::Name, false, ["apple", "yak", "zebra"]),
+            (SortOrder::Name, true, ["yak", "zebra", "apple"]),
         ] {
             let mut refs: Vec<&Instance> = instances.iter().collect();
             sort_sessions_inner(&mut refs, order, favorites_first);
@@ -1677,7 +1175,7 @@ mod tests {
         snoozed.snooze(60);
         let pair = [snoozed, aged("new_plain", 0, false)];
         let mut refs: Vec<&Instance> = pair.iter().collect();
-        sort_sessions_inner(&mut refs, SortOrder::Newest, true);
+        sort_sessions_inner(&mut refs, SortOrder::Name, true);
         assert_eq!(refs[0].title, "new_plain", "snooze outranks the star");
     }
 
@@ -1692,11 +1190,10 @@ mod tests {
             let mut items = vec![Group::new("old", "old"), Group::new("new", "new")];
             sort_groups_inner(
                 &mut items,
-                SortOrder::Newest,
+                SortOrder::Name,
                 instances,
                 |g: &Group| g.name.as_str(),
                 |g: &Group| g.path.as_str(),
-                |_: &Group| None,
                 favorites_first,
             );
             items[0].path.clone()
@@ -1736,7 +1233,7 @@ mod tests {
         let instances = vec![old_fav, new_plain];
         for (enabled, want) in [(false, "new"), (true, "old")] {
             crate::session::set_favorites_first(enabled);
-            let items = flatten_tree_all_profiles(&instances, &trees, SortOrder::Newest);
+            let items = flatten_tree_all_profiles(&instances, &trees, SortOrder::Name);
             assert_eq!(group_names(&items)[0], want, "favorites_first={enabled}");
         }
     }
@@ -1762,29 +1259,5 @@ mod tests {
             "interaction wakes the session"
         );
         assert!(inst.is_favorited() && inst.last_accessed_at.is_some());
-    }
-
-    #[test]
-    fn archived_project_buckets_name_sort_uses_display_label() {
-        let myrepo = Instance::new("a", "/repos/myrepo");
-        let throwaway = Instance::new("b", "/app/scratch/x");
-        let zeta = Instance::new("c", "/repos/zeta");
-        let cases = [
-            (SortOrder::AZ, ["myrepo", SCRATCH_GROUP_NAME, "zeta"]),
-            (SortOrder::ZA, ["zeta", SCRATCH_GROUP_NAME, "myrepo"]),
-        ];
-        for (order, expected) in cases {
-            let mut buckets: Vec<(String, Vec<&Instance>)> = vec![
-                ("myrepo".to_string(), vec![&myrepo]),
-                (SCRATCH_GROUP_PATH.to_string(), vec![&throwaway]),
-                ("zeta".to_string(), vec![&zeta]),
-            ];
-            sort_archived_project_buckets(&mut buckets, order);
-            let labels: Vec<&str> = buckets
-                .iter()
-                .map(|b| project_group_display_name(&b.0))
-                .collect();
-            assert_eq!(labels, expected, "{order:?}");
-        }
     }
 }

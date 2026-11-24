@@ -37,11 +37,9 @@ pub type GroupPickerDialog = OptionPickerDialog<GroupByMode>;
 
 impl SortPickerDialog {
     pub fn new(current: SortOrder) -> Self {
-        use SortOrder::*;
-        const OPTIONS: &[SortOrder] = &[Newest, Attention, LastActivity, Oldest, AZ, ZA, Custom];
         Self::with_options(
             " Sort Order ",
-            OPTIONS,
+            &[SortOrder::Custom, SortOrder::Name],
             SortOrder::label,
             SortOrder::mnemonic,
             current,
@@ -51,10 +49,9 @@ impl SortPickerDialog {
 
 impl GroupPickerDialog {
     pub fn new(current: GroupByMode) -> Self {
-        use GroupByMode::*;
         Self::with_options(
             " Group By ",
-            &[Manual, Project, Org, Status],
+            &[GroupByMode::Project, GroupByMode::Group],
             GroupByMode::label,
             GroupByMode::mnemonic,
             current,
@@ -201,22 +198,21 @@ mod tests {
 
     #[test]
     fn selects_current_and_submits_navigated_option() {
-        assert_eq!(SortPickerDialog::new(SortOrder::LastActivity).selected, 2);
-        assert_eq!(GroupPickerDialog::new(GroupByMode::Org).selected, 2);
+        assert_eq!(SortPickerDialog::new(SortOrder::Name).selected, 1);
+        assert_eq!(GroupPickerDialog::new(GroupByMode::Group).selected, 1);
 
-        let mut dialog = SortPickerDialog::new(SortOrder::Newest);
+        let mut dialog = SortPickerDialog::new(SortOrder::Custom);
         assert!(matches!(
             dialog.handle_key(key(KeyCode::Esc)),
             DialogResult::Cancel
         ));
         dialog.handle_key(key(KeyCode::Down));
-        dialog.handle_key(key(KeyCode::Down));
         assert!(matches!(
             dialog.handle_key(key(KeyCode::Enter)),
-            DialogResult::Submit(SortOrder::LastActivity)
+            DialogResult::Submit(SortOrder::Name)
         ));
 
-        let mut dialog = GroupPickerDialog::new(GroupByMode::Manual);
+        let mut dialog = GroupPickerDialog::new(GroupByMode::Group);
         dialog.handle_key(key(KeyCode::Up));
         assert_eq!(dialog.selected, 0);
         for _ in 0..5 {
@@ -224,7 +220,7 @@ mod tests {
         }
         assert!(matches!(
             dialog.handle_key(key(KeyCode::Enter)),
-            DialogResult::Submit(GroupByMode::Status)
+            DialogResult::Submit(GroupByMode::Group)
         ));
     }
 
@@ -234,12 +230,18 @@ mod tests {
     fn a_mnemonic_letter_submits_its_option() {
         for (letter, expected) in [
             ('c', SortOrder::Custom),
-            ('t', SortOrder::Attention),
-            ('a', SortOrder::AZ),
-            ('z', SortOrder::ZA),
-            ('N', SortOrder::Newest),
+            ('a', SortOrder::Name),
+            ('C', SortOrder::Custom),
         ] {
-            let mut dialog = SortPickerDialog::new(SortOrder::Oldest);
+            let mut dialog = SortPickerDialog::new(SortOrder::Name);
+            assert_eq!(
+                dialog.handle_key(key(KeyCode::Char(letter))),
+                DialogResult::Submit(expected),
+                "{letter}"
+            );
+        }
+        for (letter, expected) in [('p', GroupByMode::Project), ('m', GroupByMode::Group)] {
+            let mut dialog = GroupPickerDialog::new(GroupByMode::Group);
             assert_eq!(
                 dialog.handle_key(key(KeyCode::Char(letter))),
                 DialogResult::Submit(expected),
@@ -247,7 +249,7 @@ mod tests {
             );
         }
 
-        let mut dialog = SortPickerDialog::new(SortOrder::Oldest);
+        let mut dialog = SortPickerDialog::new(SortOrder::Name);
         let before = dialog.selected;
         assert_eq!(
             dialog.handle_key(key(KeyCode::Char('q'))),

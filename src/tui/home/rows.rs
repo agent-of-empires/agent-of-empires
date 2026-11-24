@@ -29,16 +29,23 @@ pub(super) fn project_group_key(inst: &Instance) -> String {
     crate::session::projects::repo_label(inst.repo_path())
 }
 
-/// Header label the synthetic "no resolvable owner" bucket renders under in
-/// org view. This is a display label; a hosted remote whose owner is literally
-/// "No organization" would share it, but that collision is vanishingly unlikely
-/// (unlike `scratch`, a plausible real repo basename), so org does not give it a
-/// sentinel identity the way project mode does for scratch (#3237).
-pub(super) const NO_ORG_GROUP_LABEL: &str = "No organization";
+/// Repository-mode tree path: the repository header, then the session's own Group nested
+/// inside it. Repository labels are basenames, so the first segment is always the repository.
+pub(super) fn project_view_path(inst: &Instance) -> String {
+    let key = project_group_key(inst);
+    if inst.scratch || inst.group_path.is_empty() {
+        key
+    } else {
+        format!("{key}/{}", inst.group_path)
+    }
+}
 
-/// Status-mode group key: the status's API spelling, so collapse keys stay stable.
-pub(super) fn status_group_key(inst: &Instance) -> String {
-    inst.status.wire_str().to_string()
+/// Split a Repository-mode header path into its repository label and nested Group path.
+pub(super) fn split_project_view_path(path: &str) -> (&str, Option<&str>) {
+    match path.split_once('/') {
+        Some((repo, group)) => (repo, Some(group)),
+        None => (path, None),
+    }
 }
 
 impl HomeView {
@@ -208,10 +215,8 @@ impl HomeView {
     /// Whether hiding could take `inst` out of the list once it is stopped.
     fn could_hide(&self, inst: &Instance) -> bool {
         let grouped = match self.group_by {
-            GroupByMode::Manual => {
-                !inst.group_path.is_empty() && self.sort_order != SortOrder::Attention
-            }
-            GroupByMode::Project | GroupByMode::Org | GroupByMode::Status => true,
+            GroupByMode::Group => !inst.group_path.is_empty(),
+            GroupByMode::Project => true,
         };
         grouped && !inst.is_archived() && !inst.is_trashed()
     }
@@ -241,26 +246,12 @@ impl HomeView {
     }
 
     fn build_flat_items_hiding(&self, hide_stopped: bool) -> Vec<Item> {
-        // Project/org grouping keeps headers under every sort order, Attention included.
-        match self.group_by {
-            GroupByMode::Project => return self.build_flat_items_by_project(hide_stopped),
-            GroupByMode::Org => return self.build_flat_items_by_org(hide_stopped),
-            GroupByMode::Status => return self.build_flat_items_by_status(hide_stopped),
-            GroupByMode::Manual => {}
+        if self.group_by == GroupByMode::Project {
+            return self.build_flat_items_by_project(hide_stopped);
         }
 
-        let pool = self.cloned_instances_in_active_view();
-        // Manual grouping under Attention sort is flat, so it has no groups to hide in.
-        let pool = if self.sort_order == SortOrder::Attention {
-            pool
-        } else {
-            shown_in_groups(pool, hide_stopped)
-        };
-        // Manual grouping + Attention sort is a flat priority view so tiers
-        // interleave across groups.
-        let mut items = if self.sort_order == SortOrder::Attention {
-            flatten_sessions_by_attention(&pool)
-        } else if let Some(profile) = &self.active_profile {
+        let pool = shown_in_groups(self.cloned_instances_in_active_view(), hide_stopped);
+        let mut items = if let Some(profile) = &self.active_profile {
             self.group_trees
                 .get(profile)
                 .map_or_else(Vec::new, |tree| flatten_tree(tree, &pool, self.sort_order))
@@ -277,172 +268,65 @@ impl HomeView {
         items
     }
 
-    /// Instances in the active view with `group_path` rewritten by `key`, plus the live
-    /// subset that seeds the tree. An archived-only group must not seed a header: it would
-    /// render as an empty, undeletable phantom in the main flow.
-    fn regrouped_instances(
-        &self,
-        key: impl Fn(&Instance) -> String,
-        hide_stopped: bool,
-    ) -> (Vec<Instance>, Vec<Instance>) {
-        let grouped: Vec<Instance> = self
+    /// Repository mode: one header per repository with the session's Groups nested inside.
+    /// Archived rows keep only their repository, which buckets the Archived section.
+    fn build_flat_items_by_project(&self, hide_stopped: bool) -> Vec<Item> {
+        let mut grouped: Vec<Instance> = self
             .cloned_instances_in_active_view()
             .into_iter()
             .map(|mut inst| {
-                inst.group_path = key(&inst);
+                inst.group_path = if inst.is_archived() || inst.is_trashed() {
+                    project_group_key(&inst)
+                } else {
+                    project_view_path(&inst)
+                };
                 inst
             })
             .collect();
-        let tree_seed = grouped
+        // Headers never moved by hand sit newest first, like their rows under Custom.
+        grouped.sort_by_key(|inst| std::cmp::Reverse(inst.created_at));
+        let live: Vec<&Instance> = grouped
             .iter()
             .filter(|i| !i.is_archived() && !i.is_trashed())
-            .cloned()
             .collect();
-        // Seeded before hiding, so a group whose sessions are all hidden keeps its header.
-        (shown_in_groups(grouped, hide_stopped), tree_seed)
-    }
-
-    /// Flatten a derived (project or org) grouping with its collapse state,
-    /// the per-group Archived section, and the flat Trash shelf.
-    fn flatten_derived_groups(
-        &self,
-        grouped: &[Instance],
-        tree_seed: &[Instance],
-        seed_groups: &[crate::session::Group],
-        collapsed: &HashMap<String, bool>,
-    ) -> Vec<Item> {
-        let mut tree = GroupTree::new_with_groups(tree_seed, seed_groups);
-        for (path, _) in collapsed.iter().filter(|(_, &c)| c) {
-            tree.set_collapsed(path, true);
-        }
-        let mut items = flatten_tree(&tree, grouped, self.sort_order);
-        append_archived_section_by_project(
-            &mut items,
-            grouped,
-            self.archived_section_collapsed,
-            collapsed,
-            self.sort_order,
-        );
-        append_trash_section(&mut items, grouped, self.trashed_section_collapsed);
-        items
-    }
-
-    fn build_flat_items_by_project(&self, hide_stopped: bool) -> Vec<Item> {
-        let (grouped, tree_seed) = self.regrouped_instances(project_group_key, hide_stopped);
-        let populated_labels: HashSet<String> = tree_seed
+        let populated_labels: HashSet<String> = live
             .iter()
-            .map(|i| i.group_path.clone())
-            .filter(|p| !p.is_empty())
+            .map(|i| split_project_view_path(&i.group_path).0.to_string())
             .collect();
+        // An archived-only repository must not seed a header: it would render as an empty,
+        // undeletable phantom in the main flow.
+        let mut tree = GroupTree::new_with_group_paths(
+            live.iter()
+                .filter(|i| i.group_path != crate::session::SCRATCH_GROUP_PATH)
+                .map(|i| i.group_path.as_str()),
+            &[],
+        );
         // Pinned registered projects with no live session render as empty headers.
-        let mut seed_groups: Vec<Group> = crate::session::projects::unpopulated_projects(
+        for project in crate::session::projects::unpopulated_projects(
             &populated_labels,
             &self.registered_projects,
-        )
-        .into_iter()
-        .map(|p| Group::new(&p.label, &p.label))
-        .collect();
+        ) {
+            tree.append_group(Group::new(&project.label, &project.label));
+        }
         if populated_labels.contains(crate::session::SCRATCH_GROUP_PATH) {
-            seed_groups.push(Group::new(
+            tree.append_group(Group::new(
                 crate::session::SCRATCH_GROUP_NAME,
                 crate::session::SCRATCH_GROUP_PATH,
             ));
         }
-        self.flatten_derived_groups(
-            &grouped,
-            &tree_seed,
-            &seed_groups,
-            &self.project_group_collapsed,
-        )
-    }
-
-    /// Resolve `inst`'s org `(display owner, host-scoped key)`, memoized per
-    /// repo path so grouping doesn't reopen a git repo on every rebuild.
-    fn resolve_org(&self, inst: &Instance) -> (String, String) {
-        let repo_path = inst.repo_path();
-        let cached = self.remote_owner_cache.borrow().get(repo_path).cloned();
-        let resolved = cached.unwrap_or_else(|| {
-            let resolved = crate::git::get_remote_owner_with_key(std::path::Path::new(repo_path));
-            self.remote_owner_cache
-                .borrow_mut()
-                .insert(repo_path.to_string(), resolved.clone());
-            resolved
-        });
-        resolved.unwrap_or_else(|| {
-            (
-                NO_ORG_GROUP_LABEL.to_string(),
-                NO_ORG_GROUP_LABEL.to_string(),
-            )
-        })
-    }
-
-    /// The org group's identity key ("owner@host"), host-scoped so same-named
-    /// owners on different hosts never merge. Not the display name.
-    pub(super) fn org_group_key(&self, inst: &Instance) -> String {
-        self.resolve_org(inst).1
-    }
-
-    fn build_flat_items_by_org(&self, hide_stopped: bool) -> Vec<Item> {
-        let (grouped, tree_seed) =
-            self.regrouped_instances(|inst| self.org_group_key(inst), hide_stopped);
-        // The key is not a display name, so seed each group with its owner name.
-        let mut seen_keys = HashSet::new();
-        let org_groups: Vec<Group> = tree_seed
-            .iter()
-            .filter(|i| !i.group_path.is_empty() && seen_keys.insert(i.group_path.clone()))
-            .map(|i| Group::new(&self.resolve_org(i).0, &i.group_path))
-            .collect();
-        self.flatten_derived_groups(&grouped, &tree_seed, &org_groups, &self.org_group_collapsed)
-    }
-
-    /// One header per status, in the fixed attention order; sessions keep the current
-    /// sort order inside their status.
-    fn build_flat_items_by_status(&self, hide_stopped: bool) -> Vec<Item> {
-        let pool: Vec<Instance> = self
-            .cloned_instances_in_active_view()
-            .into_iter()
-            .map(|mut inst| {
-                inst.group_path = status_group_key(&inst);
-                inst
-            })
-            .collect();
-        let archived: Vec<Instance> = pool
-            .iter()
-            .filter(|i| i.is_archived() || i.is_trashed())
-            .cloned()
-            .collect();
-
-        let mut items = Vec::new();
-        for status in crate::session::Status::attention_order() {
-            let key = status.wire_str();
-            let mut members: Vec<Instance> = pool
-                .iter()
-                .filter(|i| i.group_path == key && !i.is_archived() && !i.is_trashed())
-                .cloned()
-                .collect();
-            // Seed from the unfiltered members, so a status whose sessions are all hidden
-            // keeps its header like the other derived groupings.
-            let present = !members.is_empty();
-            if hide_stopped && status == crate::session::Status::Stopped {
-                members.clear();
-            }
-            if !present {
-                continue;
-            }
-            let mut tree = GroupTree::new_with_groups(&members, &[Group::new(key, key)]);
-            if self
-                .status_group_collapsed
-                .get(key)
-                .copied()
-                .unwrap_or(false)
-            {
-                tree.set_collapsed(key, true);
-            }
-            items.extend(flatten_tree(&tree, &members, self.sort_order));
+        for (path, _) in self.project_group_collapsed.iter().filter(|(_, &c)| c) {
+            tree.set_collapsed(path, true);
         }
-
-        append_archived_section(&mut items, &archived, self.archived_section_collapsed);
-        append_trash_section(&mut items, &pool, self.trashed_section_collapsed);
+        // Seeded before hiding, so a header whose sessions are all hidden keeps its place.
+        let grouped = shown_in_groups(grouped, hide_stopped);
+        let mut items = flatten_tree(&tree, &grouped, self.sort_order);
+        append_archived_section_by_project(
+            &mut items,
+            &grouped,
+            self.archived_section_collapsed,
+            &self.project_group_collapsed,
+        );
+        append_trash_section(&mut items, &grouped, self.trashed_section_collapsed);
         items
     }
 }

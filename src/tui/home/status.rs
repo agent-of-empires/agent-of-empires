@@ -681,7 +681,6 @@ impl HomeView {
         if let Some(reports) = duplicate_reports {
             log_legacy_duplicates_once(&reports);
             self.legacy_duplicate_reports = reports;
-            self.remote_owner_cache.borrow_mut().clear();
             let mut disk_profiles: Vec<_> = self.storages.keys().cloned().collect();
             disk_profiles.sort();
             self.rewire_disk_subscriptions(&disk_profiles);

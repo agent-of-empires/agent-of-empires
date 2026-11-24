@@ -345,17 +345,12 @@ impl HomeView {
             return Ok(());
         }
 
-        // Skip transient rows. Snoozed rows only skip when the user is
-        // in Attention sort; see method doc.
-        let in_attention = self.sort_order == crate::session::config::SortOrder::Attention;
+        // Skip transient rows; starting a snoozed row wakes it.
         let (skip, wake_snooze) = match self.get_instance(&id) {
-            Some(inst) => {
-                let snoozed = inst.is_snoozed();
-                let skip = matches!(inst.status, Status::Creating | Status::Deleting)
-                    || (snoozed && in_attention);
-                let wake_snooze = snoozed && !in_attention;
-                (skip, wake_snooze)
-            }
+            Some(inst) => (
+                matches!(inst.status, Status::Creating | Status::Deleting),
+                inst.is_snoozed(),
+            ),
             None => return Ok(()),
         };
         if skip {
@@ -691,9 +686,6 @@ impl HomeView {
                 minutes: Some(minutes),
             }),
         )?;
-        if self.sort_order == crate::session::config::SortOrder::Attention {
-            self.select_top_attention(Some(id));
-        }
         Ok(())
     }
 
@@ -810,11 +802,8 @@ impl HomeView {
         }
 
         // Decide where the cursor lands BEFORE the row sinks, against the
-        // pre-archive list the user is actually looking at. Only the
-        // non-Attention branch consumes it; Attention re-picks from the top.
-        let successor = (self.sort_order != crate::session::config::SortOrder::Attention)
-            .then(|| self.archive_successor_session(&id))
-            .flatten();
+        // pre-archive list the user is actually looking at.
+        let successor = self.archive_successor_session(&id);
 
         // The daemon tears the panes down (#1868) and stamps `archived_at`; the
         // row, the section counts and the cursor placement follow from the
@@ -1038,53 +1027,31 @@ impl HomeView {
             return Vec::new();
         };
         match self.group_by {
-            // Project headers are derived from each session's repo name and unified
+            // Repository headers are derived from each session's repo name and unified
             // across profiles, narrowed only by the active profile filter, exactly as
-            // `build_flat_items_by_project` builds them.
-            crate::session::config::GroupByMode::Project => self
-                .instances
-                .values()
-                .filter(|i| !i.is_archived() && !i.is_trashed())
-                .filter(|i| {
-                    self.active_profile
-                        .as_ref()
-                        .is_none_or(|p| &i.source_profile == p)
-                })
-                .filter(|i| super::project_group_key(i) == group_path)
-                .map(|i| i.id.clone())
-                .collect(),
-            // Org headers key on the host-scoped owner so same-named owners on
-            // different hosts stay separate; same cross-profile unification as Project.
-            crate::session::config::GroupByMode::Org => self
-                .instances
-                .values()
-                .filter(|i| !i.is_archived() && !i.is_trashed())
-                .filter(|i| {
-                    self.active_profile
-                        .as_ref()
-                        .is_none_or(|p| &i.source_profile == p)
-                })
-                .filter(|i| self.org_group_key(i) == group_path)
-                .map(|i| i.id.clone())
-                .collect(),
-            // Status headers key on the status's API spelling, the same key
-            // `build_flat_items_by_status` rewrites `group_path` to.
-            crate::session::config::GroupByMode::Status => self
-                .instances
-                .values()
-                .filter(|i| !i.is_archived() && !i.is_trashed())
-                .filter(|i| {
-                    self.active_profile
-                        .as_ref()
-                        .is_none_or(|p| &i.source_profile == p)
-                })
-                .filter(|i| super::rows::status_group_key(i) == group_path)
-                .map(|i| i.id.clone())
-                .collect(),
+            // `build_flat_items_by_project` builds them. A nested Group header holds the
+            // sessions at or beneath its `repo/group` path.
+            crate::session::config::GroupByMode::Project => {
+                let prefix = format!("{group_path}/");
+                self.instances
+                    .values()
+                    .filter(|i| !i.is_archived() && !i.is_trashed())
+                    .filter(|i| {
+                        self.active_profile
+                            .as_ref()
+                            .is_none_or(|p| &i.source_profile == p)
+                    })
+                    .filter(|i| {
+                        let path = super::rows::project_view_path(i);
+                        path == group_path || path.starts_with(&prefix)
+                    })
+                    .map(|i| i.id.clone())
+                    .collect()
+            }
             // Manual groups nest, so a session belongs when its path matches exactly or
             // sits beneath the group; scoped to the owning profile the same way
             // `delete_selected_group` does.
-            crate::session::config::GroupByMode::Manual => {
+            crate::session::config::GroupByMode::Group => {
                 let prefix = format!("{}/", group_path);
                 let is_member =
                     group_membership(group_path, &prefix, self.selected_group_profile.as_deref());

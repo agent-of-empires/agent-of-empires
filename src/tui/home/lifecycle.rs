@@ -43,21 +43,10 @@ impl HomeView {
             .as_ref()
             .and_then(|c| c.app_state.sort_order)
             .unwrap_or_default();
-        // New users (who haven't dismissed the welcome screen) default to Project grouping
-        // so they see the web dashboard's layout; existing users keep Manual unless they
-        // toggle with `g`.
-        let is_new_user = user_config
-            .as_ref()
-            .is_none_or(|c| !c.app_state.has_seen_welcome);
-        let default_group_by = if is_new_user {
-            GroupByMode::Project
-        } else {
-            GroupByMode::Manual
-        };
         let group_by = user_config
             .as_ref()
             .and_then(|c| c.app_state.group_by)
-            .unwrap_or(default_group_by);
+            .unwrap_or_default();
         let tips_unseen = user_config.as_ref().map_or_else(
             || tips_unseen_count(&crate::session::Config::default()),
             tips_unseen_count,
@@ -123,27 +112,6 @@ impl HomeView {
                         .collect()
                 })
                 .unwrap_or_default(),
-            org_group_collapsed: user_config
-                .as_ref()
-                .map(|c| {
-                    c.app_state
-                        .org_group_collapsed
-                        .iter()
-                        .map(|path| (path.clone(), true))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            status_group_collapsed: user_config
-                .as_ref()
-                .map(|c| {
-                    c.app_state
-                        .status_group_collapsed
-                        .iter()
-                        .map(|path| (path.clone(), true))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            remote_owner_cache: std::cell::RefCell::new(HashMap::new()),
             registered_projects: Vec::new(),
             show_help: false,
             help_scroll: 0,
@@ -509,8 +477,6 @@ impl HomeView {
     }
 
     pub(super) fn refresh_projection_presentation(&mut self) {
-        self.remote_owner_cache.borrow_mut().clear();
-
         let prev_selected_session = self.selected_session.clone();
 
         self.rebuild_flat_items_keeping_cursor();

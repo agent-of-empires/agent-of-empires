@@ -72,6 +72,7 @@ mod v060_terminal_handoff_outcome;
 mod v061_unpin_default_sandbox_image;
 mod v062_plugin_staging_evidence;
 mod v063_retire_color_labels;
+mod v064_shared_sidebar_view;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -112,7 +113,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 63;
+const CURRENT_VERSION: u32 = 64;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -330,6 +331,7 @@ const MIGRATIONS: &[Migration] = &[
         v062_plugin_staging_evidence::run,
     ),
     (63, "retire_color_labels", v063_retire_color_labels::run),
+    (64, "shared_sidebar_view", v064_shared_sidebar_view::run),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install
@@ -720,13 +722,13 @@ mod tests {
         let app = crate::session::get_app_dir().unwrap();
         fs::create_dir_all(&app).unwrap();
         fs::write(app.join(VERSION_FILE), "34").unwrap();
-        let state = "sort_order = \"oldest\"\n";
+        let state = "sort_order = \"name\"\n";
         fs::write(app.join("state.toml"), state).unwrap();
         assert_eq!(
             crate::session::config::AppStateConfig::load()
                 .unwrap()
                 .sort_order,
-            Some(crate::session::config::SortOrder::Oldest),
+            Some(crate::session::config::SortOrder::Name),
             "the fixture holds a non-default order the previous schema can read"
         );
 
@@ -738,7 +740,7 @@ mod tests {
             crate::session::config::AppStateConfig::load()
                 .unwrap()
                 .sort_order,
-            Some(crate::session::config::SortOrder::Oldest)
+            Some(crate::session::config::SortOrder::Name)
         );
         let migrated_state = fs::read_to_string(app.join("state.toml")).unwrap();
 

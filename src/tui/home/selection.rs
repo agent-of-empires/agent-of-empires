@@ -64,30 +64,6 @@ impl HomeView {
             None => {}
         }
     }
-    pub fn sort_order(&self) -> SortOrder {
-        self.sort_order
-    }
-
-    /// Move the cursor to the first session row, skipping `returning_id` unless it is the only one.
-    pub fn select_top_attention(&mut self, returning_id: Option<&str>) {
-        let mut sessions =
-            self.flat_items
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, item)| match item {
-                    Item::Session { id, .. } => Some((idx, returning_id == Some(id.as_str()))),
-                    _ => None,
-                });
-        let first = sessions.next();
-        let pick = match first {
-            Some((_, true)) => sessions.find(|(_, returning)| !returning).or(first),
-            other => other,
-        };
-        if let Some((idx, _)) = pick {
-            self.cursor = idx;
-            self.update_selected();
-        }
-    }
 
     /// Reveal the original session through profile-qualified canonical expansion.
     pub fn select_and_reveal_session(&mut self, session_id: &str) {
@@ -151,21 +127,16 @@ impl HomeView {
         };
         match self.group_by {
             GroupByMode::Project => {
-                let key = project_group_key(instance);
-                self.project_group_collapsed.insert(key, false);
+                // Expand the repository header and every Group nested under it.
+                let path = project_view_path(instance);
+                for (at, _) in path.match_indices('/') {
+                    self.project_group_collapsed
+                        .insert(path[..at].to_string(), false);
+                }
+                self.project_group_collapsed.insert(path, false);
                 self.save_project_group_collapsed();
             }
-            GroupByMode::Org => {
-                let key = self.org_group_key(instance);
-                self.org_group_collapsed.insert(key, false);
-                self.save_org_group_collapsed();
-            }
-            GroupByMode::Status => {
-                let key = super::rows::status_group_key(instance);
-                self.status_group_collapsed.insert(key, false);
-                self.save_status_group_collapsed();
-            }
-            GroupByMode::Manual => {
+            GroupByMode::Group => {
                 let path = self.session_feed.applied_snapshot().and_then(|snapshot| {
                     snapshot
                         .contents

@@ -115,14 +115,7 @@ fn shortcuts(strict: bool, live_on_enter: bool) -> Vec<(&'static str, Vec<(Strin
     } else {
         "Actions"
     };
-    // Favorite is an Attention-section shortcut, but it also works outside the
-    // Attention sort while `favorites_first` is on, so the heading lists it as
-    // an exception only then. Archive is always an exception.
-    let attention_title = if crate::session::favorites_first() {
-        "Attention (Attention sort only, except Archive and Favorite)"
-    } else {
-        "Attention (Attention sort only, except Archive)"
-    };
+    let attention_title = "Attention";
     vec![
         ("Navigation", navigation),
         (actions_title, actions_rows),
@@ -563,7 +556,7 @@ mod tests {
         assert_eq!(lens, [2, 1, 1]);
 
         // That split keeps the tallest real column within the top-two sum.
-        let sections = build_sections(false, SortOrder::Newest, false);
+        let sections = build_sections(false, SortOrder::Custom, false);
         let heights: Vec<usize> = sections.iter().map(section_height).collect();
         let max_h = distribute_sections(sections.len(), 3)
             .iter()
@@ -585,7 +578,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                HelpOverlay::render(frame, area, &theme, SortOrder::Newest, false, false, scroll);
+                HelpOverlay::render(frame, area, &theme, SortOrder::Custom, false, false, scroll);
             })
             .unwrap();
         terminal.backend().buffer().clone()

@@ -24,7 +24,7 @@ mod tests {
                 r#"[{"id":"retained"},{"id":"trashed","trashed_at":"2026-01-01"}]"#,
             )?;
             update_app_state(|state| {
-                state.sort_order = Some(SortOrder::Oldest);
+                state.sort_order = Some(SortOrder::Name);
                 state.sessions_created_seeded = seeded;
                 state.sessions_created = count;
                 state.tips_seen.push("retained-tip".into());
@@ -50,7 +50,7 @@ mod tests {
             let state = AppStateConfig::load()?;
             assert_eq!(state.sessions_created, expected_count, "schema {version}");
             assert!(state.sessions_created_seeded);
-            assert_eq!(state.sort_order, Some(SortOrder::Oldest));
+            assert_eq!(state.sort_order, Some(SortOrder::Name));
             assert_eq!(state.tips_seen, ["retained-tip"]);
             let journal = std::fs::read(&journal_path)?;
             match existing_journal {

@@ -57,24 +57,6 @@ impl HomeView {
         Self::persist_app_state("list height", |s| s.home_list_height = height);
     }
 
-    /// Group paths that currently exist under `key`, across all profiles so
-    /// switching profile never prunes another profile's collapse state.
-    fn known_group_paths(&self, key: impl Fn(&Instance) -> String) -> HashSet<String> {
-        self.instances
-            .values()
-            .filter_map(|inst| {
-                let group = key(inst);
-                if group.is_empty() {
-                    None
-                } else if inst.is_archived() {
-                    Some(crate::session::archived_project_sub_path(&group))
-                } else {
-                    Some(group)
-                }
-            })
-            .collect()
-    }
-
     /// Sorted collapsed paths, pruned to `known` so the persisted set can't grow unbounded.
     fn collapsed_known_paths(
         collapsed: &HashMap<String, bool>,
@@ -90,7 +72,22 @@ impl HomeView {
     }
 
     pub(super) fn save_project_group_collapsed(&self) {
-        let mut known = self.known_group_paths(project_group_key);
+        // Across all profiles, so switching profile never prunes another profile's state. A
+        // nested `repo/group` header keeps its ancestors' paths known too.
+        let mut known = HashSet::new();
+        for inst in self.instances.values() {
+            if inst.is_archived() {
+                known.insert(crate::session::archived_project_sub_path(
+                    &project_group_key(inst),
+                ));
+                continue;
+            }
+            let path = project_view_path(inst);
+            for (at, _) in path.match_indices('/') {
+                known.insert(path[..at].to_string());
+            }
+            known.insert(path);
+        }
         // Pinned registered projects surface as empty headers keyed by repo label.
         known.extend(
             self.registered_projects
@@ -101,25 +98,6 @@ impl HomeView {
         let collapsed = Self::collapsed_known_paths(&self.project_group_collapsed, known);
         Self::persist_app_state("project group collapsed", |s| {
             s.project_group_collapsed = collapsed
-        });
-    }
-
-    pub(super) fn save_org_group_collapsed(&self) {
-        let known = self.known_group_paths(|inst| self.org_group_key(inst));
-        let collapsed = Self::collapsed_known_paths(&self.org_group_collapsed, known);
-        Self::persist_app_state("org group collapsed", |s| s.org_group_collapsed = collapsed);
-    }
-
-    pub(super) fn save_status_group_collapsed(&self) {
-        // Status groups are the fixed status set, so a bucket whose sessions all
-        // archived keeps its collapse state instead of reloading expanded.
-        let known = crate::session::Status::attention_order()
-            .into_iter()
-            .map(|status| status.wire_str().to_string())
-            .collect();
-        let collapsed = Self::collapsed_known_paths(&self.status_group_collapsed, known);
-        Self::persist_app_state("status group collapsed", |s| {
-            s.status_group_collapsed = collapsed
         });
     }
 

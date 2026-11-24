@@ -23,17 +23,11 @@ macro_rules! feature_uses {
 }
 
 feature_uses! {
-    SortNewest => "sort_newest",
-    SortAttention => "sort_attention",
-    SortLastActivity => "sort_last_activity",
-    SortOldest => "sort_oldest",
+    // Names predate the Name sort and the My groups label; kept so counts stay comparable.
     SortAz => "sort_az",
-    SortZa => "sort_za",
     SortCustom => "sort_custom",
     GroupByManual => "group_by_manual",
     GroupByProject => "group_by_project",
-    GroupByOrg => "group_by_org",
-    GroupByStatus => "group_by_status",
     ArchiveToggle => "archive_toggle",
     FavoriteToggle => "favorite_toggle",
     SnoozeToggle => "snooze_toggle",
@@ -78,12 +72,7 @@ const WEB_ONLY: &[&str] = &[
 impl From<SortOrder> for FeatureUse {
     fn from(order: SortOrder) -> Self {
         match order {
-            SortOrder::Newest => FeatureUse::SortNewest,
-            SortOrder::Attention => FeatureUse::SortAttention,
-            SortOrder::LastActivity => FeatureUse::SortLastActivity,
-            SortOrder::Oldest => FeatureUse::SortOldest,
-            SortOrder::AZ => FeatureUse::SortAz,
-            SortOrder::ZA => FeatureUse::SortZa,
+            SortOrder::Name => FeatureUse::SortAz,
             SortOrder::Custom => FeatureUse::SortCustom,
         }
     }
@@ -92,10 +81,8 @@ impl From<SortOrder> for FeatureUse {
 impl From<GroupByMode> for FeatureUse {
     fn from(mode: GroupByMode) -> Self {
         match mode {
-            GroupByMode::Manual => FeatureUse::GroupByManual,
+            GroupByMode::Group => FeatureUse::GroupByManual,
             GroupByMode::Project => FeatureUse::GroupByProject,
-            GroupByMode::Org => FeatureUse::GroupByOrg,
-            GroupByMode::Status => FeatureUse::GroupByStatus,
         }
     }
 }
@@ -136,13 +123,10 @@ mod tests {
                 "{name}"
             );
         }
+        assert_eq!(FeatureUse::from(SortOrder::Name).as_str(), "sort_az");
         assert_eq!(
-            FeatureUse::from(SortOrder::Attention).as_str(),
-            "sort_attention"
-        );
-        assert_eq!(
-            FeatureUse::from(GroupByMode::Status).as_str(),
-            "group_by_status"
+            FeatureUse::from(GroupByMode::Group).as_str(),
+            "group_by_manual"
         );
     }
 }

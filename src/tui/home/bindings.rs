@@ -24,7 +24,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::ViewMode;
-use crate::session::config::SortOrder;
 use crate::tui::dialogs::PaletteGroup;
 
 /// Logical action. Each variant is dispatched by `HomeView::run_action`.
@@ -251,11 +250,9 @@ const fn shift_code(code: KeyCode) -> Chord {
 pub enum Context {
     Always,
     TerminalView,
-    AttentionSort,
-    /// Favorites are actionable: either the Attention sort is active, where
-    /// favorite is a within-tier tiebreak, or `session.favorites_first` is on,
-    /// where it pins in every sort order. With neither, toggling a favorite
-    /// would have no visible effect, so the key stays inert.
+    /// Favorites are actionable: `session.favorites_first` is on, where they pin under
+    /// the Name sort. Otherwise toggling a favorite would have no visible effect, so the
+    /// key stays inert.
     FavoritesUsable,
     SearchActive,
     /// The cursor is on a real (non-synthetic) project header in project view.
@@ -306,7 +303,6 @@ pub struct Binding {
 /// Runtime state the guards consult.
 pub struct Ctx {
     pub view_mode: ViewMode,
-    pub sort_order: SortOrder,
     pub has_search: bool,
     /// True when the cursor sits on a real project header in project view, so
     /// the pin toggle can claim its chord ahead of the projects-dialog binding.
@@ -331,10 +327,7 @@ fn context_holds(context: Context, ctx: &Ctx) -> bool {
     match context {
         Context::Always => true,
         Context::TerminalView => ctx.view_mode == ViewMode::Terminal,
-        Context::AttentionSort => ctx.sort_order == SortOrder::Attention,
-        Context::FavoritesUsable => {
-            ctx.sort_order == SortOrder::Attention || crate::session::favorites_first()
-        }
+        Context::FavoritesUsable => crate::session::favorites_first(),
         Context::SearchActive => ctx.has_search,
         Context::ProjectGroupSelected => ctx.project_group_selected,
         Context::UnreadEnabled => crate::session::unread_enabled(),
@@ -651,10 +644,10 @@ pub static BINDINGS: &[Binding] = &[
         id: ActionId::ToggleSnooze,
         non_strict: &[k('h')],
         strict: &[k('H')],
-        context: Context::AttentionSort,
+        context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Attention,
-            desc: "Snooze (toggle, Attention sort)",
+            desc: "Snooze (toggle)",
         }),
         palette: Some(PaletteMeta {
             title: "Toggle snooze",
@@ -1411,7 +1404,6 @@ mod tests {
     fn ctx() -> Ctx {
         Ctx {
             view_mode: ViewMode::Structured,
-            sort_order: SortOrder::Newest,
             has_search: false,
             project_group_selected: false,
             preview_scroll: false,
@@ -1627,28 +1619,19 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn context_guards_gate_attention_and_terminal_actions() {
-        // Snooze resolves only in the Attention sort. Favorite resolves there regardless
-        // of `session.favorites_first`, which only opens it outside Attention.
+    fn context_guards_gate_favorite_and_terminal_actions() {
+        // Favorite resolves only with `session.favorites_first` on; snooze always resolves.
         let original = crate::session::favorites_first();
         crate::session::set_favorites_first(false);
 
-        let mut c = ctx();
+        let c = ctx();
         assert_eq!(resolve(&key('f'), false, &c), None);
-        assert_eq!(resolve(&key('h'), false, &c), None);
+        assert_eq!(resolve(&key('h'), false, &c), Some(ActionId::ToggleSnooze));
         crate::session::set_favorites_first(true);
-        assert_eq!(
-            resolve(&key('f'), false, &c),
-            Some(ActionId::ToggleFavorite),
-            "favorites-first on: 'f' must work outside the Attention sort"
-        );
-        crate::session::set_favorites_first(false);
-        c.sort_order = SortOrder::Attention;
         assert_eq!(
             resolve(&key('f'), false, &c),
             Some(ActionId::ToggleFavorite)
         );
-        assert_eq!(resolve(&key('h'), false, &c), Some(ActionId::ToggleSnooze));
 
         crate::session::set_favorites_first(original);
 

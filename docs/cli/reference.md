@@ -451,10 +451,10 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `set-base` — Set or clear the per-session diff base branch. The diff view compares the worktree against this ref instead of the auto-detected default. Useful when the PR target differs from the project default (stacked PRs, hotfix off `release/*`, renamed default branch). See #970
 * `snooze` — Snooze a session for a duration (temporary archive, auto wakes)
 * `unsnooze` — Wake a snoozed session immediately
-* `favorite` — Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope in every sort order; with it off, they pin within their status tier in the Attention sort only. Either way the row shows a `✦` in the session list gutter wherever the pin applies. Snoozing a favorite suspends the pin until it wakes
+* `favorite` — Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope under the Name sort and show a `✦` in the session list gutter; Custom keeps the order you arranged. Snoozing a favorite suspends the pin until it wakes
 * `unfavorite` — Clear the favorite flag on a session
-* `archive` — Archive a session: sink it in the Attention sort and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
-* `unarchive` — Unarchive a session (restores it to its tier in the Attention sort)
+* `archive` — Archive a session: move it to the Archived section and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
+* `unarchive` — Unarchive a session, returning it to its place in the list
 * `restore` — Restore a trashed session, returning it to its prior bucket with its transcript and metadata intact. See #2489
 * `import` — Import existing Claude Code sessions from disk. Scans the given path(s) (default: current directory) for Claude Code conversations whose working directory is at or under a path, and creates an AoE session for each: a terminal/tmux session that resumes the conversation with `claude --resume <id>` (default), or a structured-view session with `--structured`
 * `list-trash` — List the sessions currently in the trash
@@ -724,7 +724,7 @@ Wake a snoozed session immediately
 
 ## `aoe session favorite`
 
-Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope in every sort order; with it off, they pin within their status tier in the Attention sort only. Either way the row shows a `✦` in the session list gutter wherever the pin applies. Snoozing a favorite suspends the pin until it wakes
+Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope under the Name sort and show a `✦` in the session list gutter; Custom keeps the order you arranged. Snoozing a favorite suspends the pin until it wakes
 
 **Usage:** `aoe session favorite <IDENTIFIER>`
 
@@ -748,7 +748,7 @@ Clear the favorite flag on a session
 
 ## `aoe session archive`
 
-Archive a session: sink it in the Attention sort and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
+Archive a session: move it to the Archived section and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
 
 **Usage:** `aoe session archive [OPTIONS] <IDENTIFIER>`
 
@@ -764,7 +764,7 @@ Archive a session: sink it in the Attention sort and tear down its tmux sessions
 
 ## `aoe session unarchive`
 
-Unarchive a session (restores it to its tier in the Attention sort)
+Unarchive a session, returning it to its place in the list
 
 **Usage:** `aoe session unarchive <IDENTIFIER>`
 

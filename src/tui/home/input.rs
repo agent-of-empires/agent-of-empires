@@ -1600,14 +1600,11 @@ impl HomeView {
         }
         // Pin the set the count describes: status buckets reshuffle while the dialog is open.
         self.pending_archive_group_ids = Some(ids);
-        // Project/Org group by repo or owner and Manual by assigned path, so name the
-        // scope and show the full path, or nested groups sharing a leaf segment
+        // Name the scope and show the full path, or nested groups sharing a leaf segment
         // would be ambiguous.
         let (title, scope) = match self.group_by {
-            crate::session::config::GroupByMode::Project => ("Archive project", "project"),
-            crate::session::config::GroupByMode::Org => ("Archive org", "org"),
-            crate::session::config::GroupByMode::Status => ("Archive status", "status"),
-            crate::session::config::GroupByMode::Manual => ("Archive group", "group"),
+            crate::session::config::GroupByMode::Project => ("Archive repository", "repository"),
+            crate::session::config::GroupByMode::Group => ("Archive group", "group"),
         };
         let noun = if count == 1 { "session" } else { "sessions" };
         self.confirm_dialog = Some(
@@ -3248,17 +3245,7 @@ impl HomeView {
                     return Some(action);
                 }
             }
-            KeyCode::Left | KeyCode::Char('h') => {
-                if let Some(Item::Group {
-                    path, collapsed, ..
-                }) = self.flat_items.get(self.cursor)
-                {
-                    if !collapsed {
-                        let path = path.clone();
-                        self.toggle_group_collapsed(&path);
-                    }
-                }
-            }
+            KeyCode::Left | KeyCode::Char('h') => self.collapse_group_at_cursor(),
             KeyCode::Right | KeyCode::Char('l') => {
                 if let Some(Item::Group {
                     path, collapsed, ..
@@ -3535,6 +3522,12 @@ impl HomeView {
                         Some(InfoDialog::new("Favorite not changed", &e.to_string()));
                 }
             }
+            // Snooze shares non-strict `h` with the vim-style collapse, which a header keeps.
+            ActionId::ToggleSnooze
+                if matches!(self.flat_items.get(self.cursor), Some(Item::Group { .. })) =>
+            {
+                self.collapse_group_at_cursor();
+            }
             ActionId::ToggleSnooze => {
                 if let Err(e) = self.toggle_snooze_at_cursor() {
                     self.info_dialog = Some(InfoDialog::new("Snooze not changed", &e.to_string()));
@@ -3630,10 +3623,14 @@ impl HomeView {
                 }
             })
             .or_else(|| {
-                // Status headers name a state, not a group, so prefilling the field
-                // would create a manual group called "Waiting".
-                if self.group_by == GroupByMode::Status {
-                    return None;
+                // A Repository header is not a Group; a Group nested under one prefills
+                // only its own path.
+                if self.group_by == GroupByMode::Project {
+                    return self
+                        .selected_group
+                        .as_deref()
+                        .and_then(|g| super::rows::split_project_view_path(g).1)
+                        .map(str::to_string);
                 }
                 // The scratch bucket's group_path is an internal sentinel; show
                 // its display label in the Group field, not the raw sentinel (#3237).
@@ -3978,9 +3975,11 @@ impl HomeView {
         self.instances
             .values()
             .find(|inst| match self.group_by {
-                GroupByMode::Project => super::project_group_key(inst) == group_path,
-                GroupByMode::Org | GroupByMode::Status => false,
-                GroupByMode::Manual => {
+                GroupByMode::Project => {
+                    super::project_group_key(inst)
+                        == super::rows::split_project_view_path(group_path).0
+                }
+                GroupByMode::Group => {
                     inst.group_path == group_path
                         || inst.group_path.starts_with(&format!("{group_path}/"))
                 }
@@ -3993,7 +3992,10 @@ impl HomeView {
                 if self.group_by == GroupByMode::Project {
                     self.registered_projects
                         .iter()
-                        .find(|p| crate::session::projects::repo_label(&p.path) == group_path)
+                        .find(|p| {
+                            crate::session::projects::repo_label(&p.path)
+                                == super::rows::split_project_view_path(group_path).0
+                        })
                         .map(|p| p.path.clone())
                 } else {
                     None
@@ -4389,7 +4391,6 @@ impl HomeView {
     fn bindings_ctx(&self, live_send: bool) -> bindings::Ctx {
         bindings::Ctx {
             view_mode: self.view_mode.clone(),
-            sort_order: self.sort_order,
             has_search: !self.search_matches.is_empty(),
             project_group_selected: self.project_group_at_cursor().is_some(),
             preview_scroll: live_send || (self.selected_is_trashed() && !self.system_health_open),
@@ -4988,23 +4989,30 @@ impl HomeView {
         }
     }
 
-    /// Info-dialog copy for a rename/delete attempted on a header derived automatically
-    /// (Project/Org/Status), where there is no user-owned group to act on. `None` for `Manual`,
-    /// where the caller proceeds with its normal flow.
+    /// Info-dialog copy for a rename/delete attempted on a header the Repository grouping
+    /// derives, where there is no user-owned group to act on. `None` under My groups, where
+    /// the caller proceeds with its normal flow.
     fn automatic_group_hint(&self) -> Option<(String, String)> {
-        let mode_label = match self.group_by {
-            GroupByMode::Manual => return None,
-            GroupByMode::Project => "Project",
-            GroupByMode::Org => "Org",
-            GroupByMode::Status => "Status",
-        };
+        if self.group_by == GroupByMode::Group {
+            return None;
+        }
         let toggle = if self.strict_hotkeys { "Ctrl+G" } else { "'g'" };
         Some((
-            format!("Cannot Modify {mode_label} Groups"),
-            format!(
-                "{mode_label} groups are automatic. Press {toggle} and pick Manual to manage groups."
-            ),
+            "Cannot Modify Repository Headers".to_string(),
+            format!("Repository headers are automatic. Press {toggle} and pick My groups to manage groups."),
         ))
+    }
+
+    fn collapse_group_at_cursor(&mut self) {
+        if let Some(Item::Group {
+            path,
+            collapsed: false,
+            ..
+        }) = self.flat_items.get(self.cursor)
+        {
+            let path = path.clone();
+            self.toggle_group_collapsed(&path);
+        }
     }
 
     fn toggle_group_collapsed(&mut self, path: &str) {
@@ -5028,26 +5036,6 @@ impl HomeView {
                 .insert(path.to_string(), !collapsed);
             self.rebuild_flat_items();
             self.save_project_group_collapsed();
-            return;
-        }
-        if self.group_by == GroupByMode::Org {
-            let collapsed = self.org_group_collapsed.get(path).copied().unwrap_or(false);
-            self.org_group_collapsed
-                .insert(path.to_string(), !collapsed);
-            self.rebuild_flat_items();
-            self.save_org_group_collapsed();
-            return;
-        }
-        if self.group_by == GroupByMode::Status {
-            let collapsed = self
-                .status_group_collapsed
-                .get(path)
-                .copied()
-                .unwrap_or(false);
-            self.status_group_collapsed
-                .insert(path.to_string(), !collapsed);
-            self.rebuild_flat_items();
-            self.save_status_group_collapsed();
             return;
         }
         let result = (|| -> anyhow::Result<()> {
@@ -5546,12 +5534,7 @@ impl HomeView {
                         .unwrap_or((false, false, false)),
                     super::Item::Group { .. } => (false, false, false),
                 };
-                // Snooze is an Attention-sort triage primitive: the `'h'`
-                // keybinding only fires in Attention sort, so the menu omits
-                // the Snooze row everywhere else to keep the mouse and keyboard
-                // paths in step.
-                let snooze = (self.sort_order == crate::session::config::SortOrder::Attention)
-                    .then_some(is_snoozed);
+                let snooze = Some(is_snoozed);
                 // The unread toggle is always-on (any sort), so it shows
                 // whenever the feature is enabled.
                 let unread = crate::session::unread_enabled().then_some(is_unread);

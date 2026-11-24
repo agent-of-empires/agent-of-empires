@@ -43,8 +43,8 @@ use tui_input::Input;
 use crate::session::{
     append_archived_section, append_archived_section_by_project, append_trash_section,
     config::{load_config, update_app_state, update_config, GroupByMode, SortOrder},
-    flatten_sessions_by_attention, flatten_tree, flatten_tree_all_profiles, resolve_config_or_warn,
-    DefaultTerminalMode, Group, GroupTree, Instance, Item, Storage,
+    flatten_tree, flatten_tree_all_profiles, resolve_config_or_warn, DefaultTerminalMode, Group,
+    GroupTree, Instance, Item, Storage,
 };
 use crate::tmux::AvailableTools;
 
@@ -66,7 +66,7 @@ use self::icons::{
     ICON_UNKNOWN, ICON_UNREAD, UNREAD_DWELL,
 };
 use self::preview::{PreviewCache, PreviewSelection, PreviewTextView, PreviewTimings};
-use self::rows::project_group_key;
+use self::rows::{project_group_key, project_view_path};
 pub(super) use self::watchers::{
     log_legacy_duplicates_once, tips_unseen_count, ConfigRefreshOrigin, ConfigWatchState,
     DiskWatchState, ReloadFailureState,
@@ -146,7 +146,7 @@ pub(super) struct CreatingHookProgress {
 pub(super) struct PendingArchiveCursor {
     pub(super) id: String,
     pub(super) archived: bool,
-    /// Where the cursor lands when the row sinks (non-Attention sorts).
+    /// Where the cursor lands when the row sinks.
     pub(super) successor: Option<String>,
 }
 
@@ -332,9 +332,6 @@ pub struct HomeView {
     pub(super) vt_live_enabled: bool,
     pub(super) profile_default_attach_mode: crate::session::AttachMode,
     pub(super) project_group_collapsed: HashMap<String, bool>,
-    pub(super) org_group_collapsed: HashMap<String, bool>,
-    pub(super) status_group_collapsed: HashMap<String, bool>,
-    pub(super) remote_owner_cache: std::cell::RefCell<HashMap<String, Option<(String, String)>>>,
     pub(super) registered_projects: Vec<crate::session::Project>,
 
     pub(super) show_help: bool,

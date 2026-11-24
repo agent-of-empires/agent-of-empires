@@ -87,7 +87,7 @@ fn a_clicked_hint_closes_its_dialog_through_the_key_path() {
         ),
         (
             "Esc close",
-            |v| v.sort_picker_dialog = Some(SortPickerDialog::new(SortOrder::Newest)),
+            |v| v.sort_picker_dialog = Some(SortPickerDialog::new(SortOrder::Custom)),
             |v| v.sort_picker_dialog.is_some(),
         ),
     ];
