@@ -75,7 +75,7 @@ describe("DashboardSuggestions", () => {
       providers: [{ id: "github", name: "GitHub", status: "error", error: "gh is not signed in", sources: [] }],
     });
     renderIt();
-    expect(await screen.findByText(/GitHub: couldn't refresh, gh is not signed in/)).toBeTruthy();
+    expect(await screen.findByText(/GitHub · couldn't refresh, gh is not signed in/)).toBeTruthy();
     expect(screen.queryByText(/Nothing to suggest right now/)).toBeNull();
   });
 
@@ -306,12 +306,31 @@ describe("DashboardSuggestions", () => {
     expect((screen.getByRole("button", { name: "Start" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it("warns when a mutation succeeds but the reload fails", async () => {
-    fetchSuggestions.mockResolvedValueOnce(snap([mk(1)])).mockResolvedValue(null);
+  it("a reload that fails with rows showing keeps Try again", async () => {
+    fetchSuggestions
+      .mockResolvedValueOnce(snap([mk(1), mk(2)]))
+      .mockResolvedValueOnce(null)
+      .mockResolvedValue(snap([mk(2)]));
     dismissSuggestion.mockResolvedValue(ok);
     renderIt();
-    fireEvent.click(await screen.findByRole("button", { name: "Dismiss" }));
-    expect((await screen.findByRole("alert")).textContent).toBe("Could not load suggestions.");
+    fireEvent.click((await screen.findAllByRole("button", { name: "Dismiss" }))[0]!);
+    expect((await screen.findByRole("alert")).textContent).toBe("Could not load suggestions. Try again");
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+    expect(screen.getAllByRole("button", { name: "Start" })).toHaveLength(1);
+  });
+
+  it("a failed refresh keeps Try again, which refreshes again", async () => {
+    fetchSuggestions.mockResolvedValue({
+      ...snap([]),
+      providers: [{ id: "github", name: "GitHub", status: "error", error: "gh is not signed in", sources: [] }],
+    });
+    refreshSuggestions.mockResolvedValue({ ok: false, error: "Refresh failed." });
+    renderIt();
+    fireEvent.click(await screen.findByRole("button", { name: "Refresh" }));
+    expect((await screen.findByRole("alert")).textContent).toBe("Refresh failed. Try again");
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(refreshSuggestions).toHaveBeenCalledTimes(2));
   });
 
   it("keeps the undo bar when the restore fails", async () => {
@@ -331,7 +350,7 @@ describe("DashboardSuggestions", () => {
       .mockResolvedValueOnce(ok);
     renderIt();
     fireEvent.click(await screen.findByRole("button", { name: "Refresh" }));
-    expect((await screen.findByRole("alert")).textContent).toBe("refresh failed");
+    expect((await screen.findByRole("alert")).textContent).toBe("refresh failed Try again");
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
   });

@@ -55,6 +55,8 @@ export function useSuggestions(
   const [refreshing, setRefreshing] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // A failed refresh's error, so Try again can tell it from any later notice.
+  const [refreshError, setRefreshError] = useState<string | null>(null);
   const [failures, setFailures] = useState<Record<string, StartFailure>>({});
   // Rows being started; the others stay usable meanwhile.
   const [starting, setStarting] = useState<string[]>([]);
@@ -121,6 +123,7 @@ export function useSuggestions(
     const result = await refreshSuggestions();
     if (!mounted.current) return;
     if (!result.ok) setNotice(result.error);
+    setRefreshError(result.ok ? null : result.error);
     await load();
     if (mounted.current) setRefreshing(false);
   };
@@ -281,6 +284,7 @@ export function useSuggestions(
     busy,
     starting,
     notice,
+    refreshFailed: notice !== null && notice === refreshError,
     failures,
     offline,
     hooksReview,

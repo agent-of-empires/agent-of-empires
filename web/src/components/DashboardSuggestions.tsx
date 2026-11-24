@@ -35,7 +35,7 @@ export function DashboardSuggestions({
 }: Props) {
   const wide = useIsWideViewport();
   const ctrl = useSuggestions(onPrepare, onOpenSession);
-  const { snapshot, loadFailed, busy, refreshing, notice, failures, offline, act, refresh } = ctrl;
+  const { snapshot, loadFailed, busy, refreshing, notice, refreshFailed, failures, offline, act, refresh } = ctrl;
   const agentName = useAgentNames();
   const presetOf = useSuggestionPresets();
   const { undo, dismiss, stop } = useDismissUndo(act);
@@ -136,7 +136,7 @@ export function DashboardSuggestions({
         )}
         {errored.map((p) => (
           <li key={p.id} className={`${SUGGESTION_NOTE_CLASS} text-status-error`}>
-            {p.name}: couldn&apos;t refresh, {p.error ?? "provider error"}
+            {p.name} · couldn&apos;t refresh, {p.error ?? "provider error"}
           </li>
         ))}
         {rows.length === 0 && pending.length === 0 && (
@@ -159,6 +159,19 @@ export function DashboardSuggestions({
       {alert && (
         <p role="alert" className="mt-2 px-1 text-xs text-status-error">
           {alert}
+          {(loadFailed || refreshFailed) && !readOnly && !offline && (
+            <>
+              {" "}
+              <button
+                type="button"
+                onClick={() => void (loadFailed ? ctrl.load() : refresh())}
+                disabled={busy !== null || refreshing}
+                className="cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
+              >
+                Try again
+              </button>
+            </>
+          )}
         </p>
       )}
       <SuggestionHooksReview ctrl={ctrl} />
