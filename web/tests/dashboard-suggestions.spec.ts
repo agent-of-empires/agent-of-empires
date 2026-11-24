@@ -117,9 +117,14 @@ test("the sidebar's Start options menu stays in view and takes a pointer click o
   await page.goto("/");
   await page.getByTestId("sidebar-suggested-toggle").click();
   const section = page.getByTestId("sidebar-suggested-section");
-  await section.getByRole("button", { name: "Start options" }).first().click();
-  const menu = section.getByRole("menu", { name: "Start options" });
+  const trigger = section.getByRole("button", { name: "Start options" }).first();
+  await trigger.click();
+  const menu = page.getByRole("menu", { name: "Start options" });
   const box = (await menu.boundingBox())!;
+  // Right under its button, not offset by the sidebar's own position.
+  const tb = (await trigger.boundingBox())!;
+  expect(Math.abs(box.y - (tb.y + tb.height + 4))).toBeLessThanOrEqual(1);
+  expect(Math.abs(box.x - tb.x)).toBeLessThanOrEqual(1);
   expect(box.x).toBeGreaterThanOrEqual(0);
   expect(box.x + box.width).toBeLessThanOrEqual(1280);
   expect(box.y + box.height).toBeLessThanOrEqual(800);

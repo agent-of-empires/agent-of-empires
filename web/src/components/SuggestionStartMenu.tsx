@@ -1,4 +1,5 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { ChevronDown } from "lucide-react";
 import { fetchSuggestionProjects } from "../lib/api";
 import type { SuggestionProject } from "../lib/types";
@@ -40,12 +41,12 @@ export function MenuPopover({
   const [open, setOpen] = useState(false);
   const id = useId();
   const box = useRef<HTMLDivElement>(null);
-  useOutsideDismiss(open, [box], () => setOpen(false));
+  const menu = useRef<HTMLDivElement>(null);
+  useOutsideDismiss(open, [box, menu], () => setOpen(false));
   const close = (refocus = true) => {
     setOpen(false);
     if (refocus) document.querySelector<HTMLElement>(`[data-menu="${id}"] [aria-haspopup]`)?.focus();
   };
-  const menu = useRef<HTMLDivElement>(null);
   // Desktop only: a phone gets the bottom sheet.
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
   useLayoutEffect(() => {
@@ -99,21 +100,28 @@ export function MenuPopover({
       }}
     >
       {trigger({ open, toggle: () => setOpen((v) => !v) })}
-      {open && (
-        <>
-          <div aria-hidden="true" className="fixed inset-0 z-30 bg-black/40 md:hidden" onClick={() => setOpen(false)} />
-          <div
-            ref={menu}
-            role="menu"
-            aria-label={label}
-            onKeyDown={onMenuKey}
-            style={pos ?? undefined}
-            className="fixed inset-x-0 bottom-0 z-40 max-h-[70vh] overflow-y-auto rounded-t-xl border border-surface-700 bg-surface-800 py-2 shadow-lg md:inset-x-auto md:bottom-auto md:max-h-72 md:w-[270px] md:rounded-md md:py-1"
-          >
-            {children(close)}
-          </div>
-        </>
-      )}
+      {/* In <body>: a transformed or clipped ancestor such as the sidebar would move or hide a fixed menu. */}
+      {open &&
+        createPortal(
+          <>
+            <div
+              aria-hidden="true"
+              className="fixed inset-0 z-30 bg-black/40 md:hidden"
+              onClick={() => setOpen(false)}
+            />
+            <div
+              ref={menu}
+              role="menu"
+              aria-label={label}
+              onKeyDown={onMenuKey}
+              style={pos ?? undefined}
+              className="fixed inset-x-0 bottom-0 z-40 max-h-[70vh] overflow-y-auto rounded-t-xl border border-surface-700 bg-surface-800 py-2 shadow-lg md:inset-x-auto md:bottom-auto md:max-h-72 md:w-[270px] md:rounded-md md:py-1"
+            >
+              {children(close)}
+            </div>
+          </>,
+          document.body,
+        )}
     </div>
   );
 }
