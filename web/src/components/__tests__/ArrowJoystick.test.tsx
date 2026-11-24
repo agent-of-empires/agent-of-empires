@@ -122,7 +122,7 @@ describe("ArrowJoystick", () => {
       () => {
         Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
         fireEvent(document, new Event("visibilitychange"));
-        Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+        Reflect.deleteProperty(document, "visibilityState");
       },
     ],
     ["the window loses focus", () => fireEvent(window, new Event("blur"))],
@@ -150,6 +150,17 @@ describe("ArrowJoystick", () => {
     j.up(2);
     j.wait(2000);
     expect(j.sent()).toEqual([RIGHT, UP]);
+  });
+
+  it("keeps a held gesture through a second finger and that finger's release", () => {
+    const j = mount();
+    j.down(1);
+    j.move(30, 0);
+    const pad = screen.getByRole("group", { name: "Arrow keys joystick" });
+    fireEvent.pointerDown(pad, { pointerId: 2, isPrimary: false, clientX: 0, clientY: 0 });
+    fireEvent.pointerUp(window, { pointerId: 2 });
+    j.wait(JOYSTICK_FIRST_REPEAT_MS);
+    expect(j.sent()).toEqual([RIGHT, RIGHT]);
   });
 
   it("stops repeating on unmount", () => {
