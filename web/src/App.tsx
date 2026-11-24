@@ -1,12 +1,11 @@
 import {
-  lazy,
-  Suspense,
   useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  type ComponentProps,
   type ReactNode,
 } from "react";
 import { Puzzle } from "lucide-react";
@@ -21,6 +20,8 @@ import type { NavigateOptions, To } from "react-router-dom";
 import { Navigate, useLocation, useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
+import { lazyView } from "./lib/lazyView";
+import { CloseOnEscape } from "./components/diff/comments/CloseOnEscape";
 import { useSessions } from "./hooks/useSessions";
 import { useAttentionCounts } from "./hooks/useAttentionCounts";
 import { useStatusSounds } from "./hooks/useStatusSounds";
@@ -63,8 +64,8 @@ import { getAttentionBadgeColors } from "./lib/attentionBadgeColors";
 import { useWebSettings } from "./hooks/useWebSettings";
 import { useDiffFiles } from "./hooks/useDiffFiles";
 import { useDiffComments } from "./hooks/useDiffComments";
+import { usePrefetchWhen } from "./hooks/usePrefetchWhen";
 import { clearStoredComments } from "./components/diff/comments/storage";
-import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
 import { useCommandActions, buildConversationActions, type SessionStateAction } from "./hooks/useCommandActions";
 import { usePluginCommands } from "./hooks/usePluginCommands";
 import { useSettingsCommands } from "./hooks/useSettingsCommands";
@@ -157,19 +158,41 @@ import { TerminalSessionStack } from "./components/TerminalSessionStack";
 // Lazy-load the acp surface so non-acp users never download
 // the @assistant-ui/react, shiki, and in-house StringDiff/DiffLine
 // dependency tree. Cuts ~hundreds of KB off the cold-start bundle
-// for the (currently default) tmux-only flow. The Suspense fallback
-// below covers the brief load while the chunk arrives.
-const StructuredView = lazy(() =>
-  import("./components/acp/StructuredView").then((m) => ({
-    default: m.StructuredView,
-  })),
+// for the (currently default) tmux-only flow. The fallback covers the brief
+// load while the chunk arrives.
+const StructuredView = lazyView(
+  () => import("./components/acp/StructuredView").then((m) => m.StructuredView),
+  <LazyFallback label="Loading acp…" />,
 );
+const BackgroundAgentsPanel = lazyView(
+  () => import("./components/acp/BackgroundAgentsPanel").then((m) => m.BackgroundAgentsPanel),
+  <LazyFallback label="Loading agents…" />,
+);
+const DiffFileViewer = lazyView(
+  () => import("./components/diff/DiffFileViewer").then((m) => m.DiffFileViewer),
+  <LazyFallback label="Loading diff…" />,
+);
+const SettingsView = lazyView(
+  () => import("./components/SettingsView").then((m) => m.SettingsView),
+  <LazyFallback label="Loading settings…" />,
+);
+const loadSendCommentsDialog = () => import("./components/diff/comments/SendCommentsDialog");
+const SendCommentsDialog = lazyView(
+  () => loadSendCommentsDialog().then((m) => m.SendCommentsDialog),
+  (p) => <CloseOnEscape onClose={p.onClose} />,
+);
+const loadCommandPalette = () => import("./components/command-palette/CommandPalette");
+const LazyCommandPalette = lazyView(() => loadCommandPalette().then((m) => m.CommandPalette), null);
+// Mounted only while open; the chunk is prefetched 2 s after mount.
+function CommandPalette(props: ComponentProps<typeof LazyCommandPalette>) {
+  return props.open ? <LazyCommandPalette {...props} /> : null;
+}
 import { type PaneDisplay } from "./components/Dock";
 import { DockGroups, type DockGroupView } from "./components/DockGroups";
 import { BottomDock } from "./components/BottomDock";
 import { PaneDndController } from "./components/PaneDndController";
 import { visibleToFullIndex, type DropTarget } from "./components/paneDnd";
-import { BackgroundAgentsPanel, type AgentFocus } from "./components/acp/BackgroundAgentsPanel";
+import type { AgentFocus } from "./components/acp/BackgroundAgentsPanel";
 import { hasStartedBefore } from "./components/acp/startupWait";
 import { DiffPane } from "./components/DiffPane";
 import { FilesPane } from "./components/FilesPane";
@@ -181,8 +204,6 @@ import { BUILTIN_PANES, isTerminalTabId, terminalIndexOf, terminalTabId, type Do
 import { MobileRightPanelPicker } from "./components/MobileRightPanelPicker";
 import { MobileMainPane } from "./components/MobileMainPane";
 import { ChromeCollapseHandle, CollapsibleRegion } from "./components/CollapsibleChrome";
-import { DiffFileViewer } from "./components/diff/DiffFileViewer";
-import { SettingsView } from "./components/SettingsView";
 import { ProjectFormModal } from "./components/ProjectFormModal";
 import { ScratchOverridesModal } from "./components/ScratchOverridesModal";
 import { HelpOverlay } from "./components/HelpOverlay";
@@ -203,7 +224,6 @@ import { LOGIN_REQUIRED_EVENT, TOKEN_EXPIRED_EVENT, resetTokenExpired } from "./
 import { AboutModal } from "./components/AboutModal";
 import { TipsModal } from "./components/TipsModal";
 import { useTips, shouldAutoPopTips } from "./hooks/useTips";
-import { CommandPalette } from "./components/command-palette/CommandPalette";
 import { useConversationSearch } from "./hooks/useConversationSearch";
 import { BannerStack } from "./components/BannerStack";
 import { ElevationPrompt } from "./components/ElevationPrompt";
@@ -899,6 +919,11 @@ function AppContent({
   // unit-tested directly.
   const tips = useTips();
   const [showPalette, setShowPalette] = useState(false);
+  // Warm the palette chunk 2 s after mount so the first shortcut press opens it at once.
+  useEffect(() => {
+    const id = window.setTimeout(() => void loadCommandPalette().catch(() => {}), 2000);
+    return () => window.clearTimeout(id);
+  }, []);
   // Palette content-search query (#2515); declared here so the keyboard
   // handlers below can clear it on close/toggle. Consumed lower down by
   // useConversationSearch.
@@ -963,6 +988,8 @@ function AppContent({
   // banner lives in the diff pane while the inline UI lives inside
   // DiffFileViewer, so the store is lifted here and threaded to both.
   const diffComments = useDiffComments(activeSessionId);
+  // Load the dialog chunk before it can be opened, so Escape works the moment it appears.
+  usePrefetchWhen(diffComments.count > 0, loadSendCommentsDialog);
   const commentsEnabled = !!activeSession;
   // A dormant structured worker wakes on send; archived and trashed sessions cannot start.
   const commentSendEnabled =
@@ -2191,48 +2218,46 @@ function AppContent({
                       persistent={webSettings.persistentStructuredViews}
                       maxPersistentViews={webSettings.maxPersistentStructuredViews}
                       renderSession={(session, active, selected) => (
-                        <Suspense fallback={<AcpLoadingFallback />}>
-                          <StructuredView
-                            active={active}
-                            selected={selected}
-                            sessionId={session.id}
-                            acpWorkerState={session.acp_worker_state ?? "absent"}
-                            rateLimitAutoResume={session.rate_limit_auto_resume}
-                            rateLimitFailoverTo={session.rate_limit_failover_to}
-                            settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
-                            tool={session.tool}
-                            acpAgent={session.acp_agent ?? null}
-                            startedBefore={hasStartedBefore(session)}
-                            acpProvider={session.acp_provider ?? null}
-                            clearAliases={session.clear_aliases}
-                            compactAliases={session.compact_aliases}
-                            onStartSession={() => void handleStartSession(session.id)}
-                            archivedAt={session.archived_at ?? null}
-                            snoozedUntil={session.snoozed_until ?? null}
-                            queuedCount={session.queued_count}
-                            trashedAt={session.trashed_at ?? null}
-                            onRestore={
-                              session.trashed_at
-                                ? () => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, session.id))
-                                : undefined
-                            }
-                            onOpenFileRef={handleOpenFileRef}
-                            fileRefSession={session}
-                            onOpenAgentsPane={openAgentsPane}
-                            serverReadOnly={caps.readOnly}
-                            isSandboxed={session.is_sandboxed}
-                            recreateContainerTitle={recreateContainerTitle(session)}
-                            recreateContainerBlock={recreateContainerBlock(session, !!session.archived_at)}
-                            onSwitchToTerminal={
-                              canSwitchToTerminal ? () => handleSwitchView(session.id, false) : undefined
-                            }
-                            onOpenTerminal={
-                              canSwitchToTerminal ? (mode) => handleOpenPairedTerminal(session.id, mode) : undefined
-                            }
-                            canRestartAgent={canRestartAgent}
-                            newSessionLike={newSessionLike(session)}
-                          />
-                        </Suspense>
+                        <StructuredView
+                          active={active}
+                          selected={selected}
+                          sessionId={session.id}
+                          acpWorkerState={session.acp_worker_state ?? "absent"}
+                          rateLimitAutoResume={session.rate_limit_auto_resume}
+                          rateLimitFailoverTo={session.rate_limit_failover_to}
+                          settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
+                          tool={session.tool}
+                          acpAgent={session.acp_agent ?? null}
+                          startedBefore={hasStartedBefore(session)}
+                          acpProvider={session.acp_provider ?? null}
+                          clearAliases={session.clear_aliases}
+                          compactAliases={session.compact_aliases}
+                          onStartSession={() => void handleStartSession(session.id)}
+                          archivedAt={session.archived_at ?? null}
+                          snoozedUntil={session.snoozed_until ?? null}
+                          queuedCount={session.queued_count}
+                          trashedAt={session.trashed_at ?? null}
+                          onRestore={
+                            session.trashed_at
+                              ? () => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, session.id))
+                              : undefined
+                          }
+                          onOpenFileRef={handleOpenFileRef}
+                          fileRefSession={session}
+                          onOpenAgentsPane={openAgentsPane}
+                          serverReadOnly={caps.readOnly}
+                          isSandboxed={session.is_sandboxed}
+                          recreateContainerTitle={recreateContainerTitle(session)}
+                          recreateContainerBlock={recreateContainerBlock(session, !!session.archived_at)}
+                          onSwitchToTerminal={
+                            canSwitchToTerminal ? () => handleSwitchView(session.id, false) : undefined
+                          }
+                          onOpenTerminal={
+                            canSwitchToTerminal ? (mode) => handleOpenPairedTerminal(session.id, mode) : undefined
+                          }
+                          canRestartAgent={canRestartAgent}
+                          newSessionLike={newSessionLike(session)}
+                        />
                       )}
                     />
                   ) : (
@@ -3020,10 +3045,10 @@ function AppContent({
   );
 }
 
-function AcpLoadingFallback() {
+function LazyFallback({ label }: { label: string }) {
   return (
     <div className="flex h-full items-center justify-center bg-surface-900 text-text-dim">
-      <div className="text-xs font-mono uppercase tracking-wide">Loading acp…</div>
+      <div className="text-xs font-mono uppercase tracking-wide">{label}</div>
     </div>
   );
 }

@@ -4,6 +4,7 @@ import { ChevronUp } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 
 import type { ConfigOptionChoice, ConfigOptionDescriptor, AcpState } from "../../lib/acpTypes";
+import { isImeComposing } from "../../lib/ime";
 
 interface Props {
   configOptions: AcpState["configOptions"];
@@ -180,10 +181,9 @@ function ModelDropdown({ option, pending, onSelect, lockedReason }: SubProps) {
 
   const onMenuKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
     if (!searchable) return;
-    // Composition keys belong to the IME, not the menu. Safari ends the composition before the Enter that
-    // commits it, leaving isComposing false, so keyCode 229 is the only marker left on that event. Escape
-    // additionally has to be kept from the document listener below, which would close the picker.
-    if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) {
+    // Composition keys belong to the IME, not the menu. Escape additionally has to be kept from the
+    // document listener below, which would close the picker.
+    if (isImeComposing(e)) {
       if (e.key === "Escape") e.stopPropagation();
       return;
     }

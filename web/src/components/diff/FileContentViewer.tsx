@@ -7,8 +7,9 @@ import { fileDraftKey, getFileDraft } from "../../lib/fileEditGuard";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { extensionToLanguage } from "./comments/language";
 import { BinaryFileView } from "./BinaryFileView";
-import { FullFileViewer } from "./FullFileViewer";
-import { MarkdownFileView } from "./MarkdownFileView";
+import { lazyView } from "../../lib/lazyView";
+const FullFileViewer = lazyView(() => import("./FullFileViewer").then((m) => m.FullFileViewer), null);
+const MarkdownFileView = lazyView(() => import("./MarkdownFileView").then((m) => m.MarkdownFileView), null);
 import { BackButton, Centered, MarkdownToggle, TooLarge } from "./viewerChrome";
 
 interface Props {
@@ -153,10 +154,12 @@ function SessionFileViewer({ sessionId, filePath, onBack, structured }: Props) {
         <BinaryFileView sessionId={sessionId} filePath={filePath} />
       ) : data?.truncated ? (
         <TooLarge what="File too large to display inline" hint="Open it in your editor instead." />
-      ) : data && showRendered ? (
-        <MarkdownFileView content={data.content} />
       ) : data ? (
-        <FullFileViewer content={data.content} filePath={filePath} />
+        showRendered ? (
+          <MarkdownFileView content={data.content} />
+        ) : (
+          <FullFileViewer content={data.content} filePath={filePath} />
+        )
       ) : null}
     </div>
   );

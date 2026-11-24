@@ -3,6 +3,7 @@ import { useCallback, useId, useLayoutEffect, useRef, useState } from "react";
 import type { GroupInfo } from "../../../lib/types";
 import { ROW_INPUT } from "../WizardRows";
 import { groupOptions, optionLabel, type GroupOption } from "./groupOptions";
+import { isImeComposing } from "../../../lib/ime";
 
 const LIST_MAX = 288;
 
@@ -116,7 +117,7 @@ export function GroupCombobox({
               options.length - 1,
             );
             setHighlight(keyOf(options[next]!));
-          } else if (e.key === "Enter" && open) {
+          } else if (e.key === "Enter" && !isImeComposing(e) && open) {
             e.preventDefault();
             if (active >= 0) pick(options[active]!);
             else setOpen(false);

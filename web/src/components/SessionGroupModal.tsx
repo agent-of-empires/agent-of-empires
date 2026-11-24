@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import { CancelButton, ConfirmButton, Dialog } from "./Dialog";
 import { useDialogFocus } from "./dialogHooks";
+import { isImeComposing } from "../lib/ime";
 
 const DIALOG_ID = "session-group-modal";
 const PROMPT_ID = `${DIALOG_ID}-prompt`;
@@ -65,7 +66,7 @@ export function SessionGroupModal({ sessionTitle, currentGroup, onSave, onClose 
           setError(null);
         }}
         onKeyDown={(e) => {
-          if (e.key === "Enter") {
+          if (e.key === "Enter" && !isImeComposing(e)) {
             e.preventDefault();
             if (!saving) void handleSave();
           }

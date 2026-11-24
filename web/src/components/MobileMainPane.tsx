@@ -1,18 +1,14 @@
-import { lazy, Suspense } from "react";
-
 import { StructuredSessionStack } from "./StructuredSessionStack";
 import { TerminalSessionStack } from "./TerminalSessionStack";
 import { PairedShellPane, type ShellMode } from "./PairedTerminal";
-import { BackgroundAgentsPanel, type AgentFocus } from "./acp/BackgroundAgentsPanel";
+import type { AgentFocus } from "./acp/BackgroundAgentsPanel";
 import { hasStartedBefore } from "./acp/startupWait";
 import { recreateContainerBlock, recreateContainerTitle } from "./sidebar/sessionActionTargets";
 import type { NewSessionLike } from "./acp/ContainerGoneBanner";
 import { FilesPane } from "./FilesPane";
 import { DiffFileList } from "./diff/DiffFileList";
 import { FileContentViewer } from "./diff/FileContentViewer";
-import { DiffFileViewer } from "./diff/DiffFileViewer";
 import { CommentsBanner } from "./diff/comments/CommentsBanner";
-import { SendCommentsDialog } from "./diff/comments/SendCommentsDialog";
 import { PluginPaneBody } from "./plugin/PluginPane";
 import type { RightPanelView } from "../lib/rightPanelView";
 import { isPluginPaneId, type PluginPane } from "../lib/pluginPanes";
@@ -22,8 +18,19 @@ import type { WebSettings } from "../hooks/useWebSettings";
 import type { FileRef } from "../lib/fileRef";
 import type { ServerAbout } from "../lib/api";
 import { autoResumeSettingsHref } from "../lib/autoResumeSettingsHref";
+import { lazyView } from "../lib/lazyView";
+import { CloseOnEscape } from "./diff/comments/CloseOnEscape";
 
-const StructuredView = lazy(() => import("./acp/StructuredView").then((m) => ({ default: m.StructuredView })));
+const BackgroundAgentsPanel = lazyView(
+  () => import("./acp/BackgroundAgentsPanel").then((m) => m.BackgroundAgentsPanel),
+  null,
+);
+const DiffFileViewer = lazyView(() => import("./diff/DiffFileViewer").then((m) => m.DiffFileViewer), null);
+const SendCommentsDialog = lazyView(
+  () => import("./diff/comments/SendCommentsDialog").then((m) => m.SendCommentsDialog),
+  (p) => <CloseOnEscape onClose={p.onClose} />,
+);
+const StructuredView = lazyView(() => import("./acp/StructuredView").then((m) => m.StructuredView), null);
 
 interface Props {
   /** Start a Session, for a queued row's "Start and send". */
@@ -165,39 +172,37 @@ export function MobileMainPane({
               persistent={webSettings.persistentStructuredViews}
               maxPersistentViews={webSettings.maxPersistentStructuredViews}
               renderSession={(session, active, selected) => (
-                <Suspense fallback={null}>
-                  <StructuredView
-                    active={active}
-                    selected={selected}
-                    sessionId={session.id}
-                    acpWorkerState={session.acp_worker_state ?? "absent"}
-                    rateLimitAutoResume={session.rate_limit_auto_resume}
-                    rateLimitFailoverTo={session.rate_limit_failover_to}
-                    settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
-                    tool={session.tool}
-                    acpAgent={session.acp_agent ?? null}
-                    startedBefore={hasStartedBefore(session)}
-                    acpProvider={session.acp_provider ?? null}
-                    clearAliases={session.clear_aliases}
-                    compactAliases={session.compact_aliases}
-                    onStartSession={onStartSession && (() => onStartSession(session.id))}
-                    archivedAt={session.archived_at ?? null}
-                    snoozedUntil={session.snoozed_until ?? null}
-                    queuedCount={session.queued_count}
-                    trashedAt={session.trashed_at ?? null}
-                    onOpenFileRef={onOpenFileRef}
-                    fileRefSession={session}
-                    onOpenAgentsPane={onOpenAgentsPane}
-                    serverReadOnly={readOnly}
-                    isSandboxed={session.is_sandboxed}
-                    recreateContainerTitle={recreateContainerTitle(session)}
-                    recreateContainerBlock={recreateContainerBlock(session, !!session.archived_at)}
-                    onSwitchToTerminal={onSwitchToTerminal ? () => onSwitchToTerminal(session.id) : undefined}
-                    onOpenTerminal={onOpenTerminal ? (mode) => onOpenTerminal(session.id, mode) : undefined}
-                    canRestartAgent={canRestartAgent}
-                    newSessionLike={newSessionLike?.(session)}
-                  />
-                </Suspense>
+                <StructuredView
+                  active={active}
+                  selected={selected}
+                  sessionId={session.id}
+                  acpWorkerState={session.acp_worker_state ?? "absent"}
+                  rateLimitAutoResume={session.rate_limit_auto_resume}
+                  rateLimitFailoverTo={session.rate_limit_failover_to}
+                  settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
+                  tool={session.tool}
+                  acpAgent={session.acp_agent ?? null}
+                  startedBefore={hasStartedBefore(session)}
+                  acpProvider={session.acp_provider ?? null}
+                  clearAliases={session.clear_aliases}
+                  compactAliases={session.compact_aliases}
+                  onStartSession={onStartSession && (() => onStartSession(session.id))}
+                  archivedAt={session.archived_at ?? null}
+                  snoozedUntil={session.snoozed_until ?? null}
+                  queuedCount={session.queued_count}
+                  trashedAt={session.trashed_at ?? null}
+                  onOpenFileRef={onOpenFileRef}
+                  fileRefSession={session}
+                  onOpenAgentsPane={onOpenAgentsPane}
+                  serverReadOnly={readOnly}
+                  isSandboxed={session.is_sandboxed}
+                  recreateContainerTitle={recreateContainerTitle(session)}
+                  recreateContainerBlock={recreateContainerBlock(session, !!session.archived_at)}
+                  onSwitchToTerminal={onSwitchToTerminal ? () => onSwitchToTerminal(session.id) : undefined}
+                  onOpenTerminal={onOpenTerminal ? (mode) => onOpenTerminal(session.id, mode) : undefined}
+                  canRestartAgent={canRestartAgent}
+                  newSessionLike={newSessionLike?.(session)}
+                />
               )}
             />
           ) : (

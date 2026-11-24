@@ -471,7 +471,7 @@ describe("ToolCard expanded bodies", () => {
     const { getByTestId, toggle } = renderCard(tool);
     toggle();
     const body = getByTestId("memory-recall-synthesized");
-    expect(body.querySelector("img")?.getAttribute("onerror")).toBeNull();
+    expect(body.querySelector("img")).toBeNull();
     expect(body.innerHTML).not.toContain("onerror");
     expect(body.innerHTML).not.toContain("javascript:");
   });

@@ -1393,8 +1393,9 @@
       "id": "profiles.lifecycle",
       "kind": "mocked-playwright",
       "risk": "high",
-      "specs": ["tests/profile-lifecycle.spec.ts"],
-      "components": ["web/src/components/settings/ProfileSelector.tsx"]
+      "specs": ["tests/profile-lifecycle.spec.ts", "src/components/settings/__tests__/ProfileSelector.test.tsx"],
+      "components": ["web/src/components/settings/ProfileSelector.tsx"],
+      "notes": "Enter is ignored while an IME composes."
     },
     {
       "id": "profiles.page",
@@ -2888,12 +2889,17 @@
       "id": "session.group-edit",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": ["tests/live/session-actions.spec.ts", "src/lib/api.test.ts"],
+      "specs": [
+        "tests/live/session-actions.spec.ts",
+        "src/lib/api.test.ts",
+        "src/components/__tests__/SessionGroupModal.test.tsx"
+      ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/SessionGroupModal.tsx",
         "web/src/lib/api.ts"
-      ]
+      ],
+      "notes": "Enter is ignored while an IME composes."
     },
     {
       "id": "session.delete-dialog-keyboard",
@@ -3149,6 +3155,7 @@
       "specs": ["tests/diff-comments.spec.ts"],
       "components": [
         "web/src/components/diff/comments/SendCommentsDialog.tsx",
+        "web/src/components/diff/comments/CloseOnEscape.tsx",
         "web/src/components/diff/comments/CommentsBanner.tsx",
         "web/src/components/diff/comments/CommentForm.tsx",
         "web/src/components/diff/comments/CommentCard.tsx"
@@ -3330,7 +3337,8 @@
         "web/src/components/diff/find/FindBar.tsx",
         "web/src/lib/snippetHighlighter.ts",
         "web/src/components/diff/pierre/DiffWorkerPoolProvider.tsx"
-      ]
+      ],
+      "notes": "The find bar ignores Enter while an IME composes."
     },
     {
       "id": "settings.diff-section",
@@ -3555,14 +3563,20 @@
       "id": "acp.memory-recall",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": ["tests/live/acp-transcript.spec.ts", "tests/acp-structured-view.spec.ts"],
+      "specs": [
+        "tests/live/acp-transcript.spec.ts",
+        "tests/acp-structured-view.spec.ts",
+        "src/components/acp/ToolCards.render.test.tsx"
+      ],
       "components": [
         "web/src/components/acp/ToolCards.tsx",
+        "web/src/components/acp/NamedToolCards.tsx",
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/AcpRuntime.tsx",
         "web/src/lib/memoryClassify.ts",
         "web/src/lib/memoryRecall.ts"
-      ]
+      ],
+      "notes": "Synthesized memory renders as markdown; raw HTML is dropped and javascript: links are blocked."
     },
     {
       "id": "acp.attachments",
