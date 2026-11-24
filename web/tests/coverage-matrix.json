@@ -452,6 +452,14 @@
       ]
     },
     {
+      "id": "terminal.arrow-joystick-gesture",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/__tests__/ArrowJoystick.test.tsx"],
+      "components": ["web/src/components/ArrowJoystick.tsx"],
+      "notes": "A held repeat stops on pad release, an off-pad pointerup or pointercancel, window blur, pagehide, a hidden page, and unmount. A fresh primary press of the same pointer type ends a gesture whose release was lost, including one reusing the lost pointer's ID, and the new drag moves from its own origin. A second finger, its release, or a primary pointer of another type leaves the held gesture repeating."
+    },
+    {
       "id": "terminal.mobile-ctrl-consumption",
       "kind": "live-playwright",
       "risk": "high",
