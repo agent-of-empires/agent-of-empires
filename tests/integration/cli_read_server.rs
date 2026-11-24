@@ -320,7 +320,7 @@ async fn a_failed_host_hook_does_not_poison_runtime_reads() {
     failed.tool = "claude".into();
     failed.source_profile = "main".into();
     failed.status = Status::Error;
-    failed.last_error = Some(failure.clone());
+    failed.last_error.set(failure.clone());
     let mut healthy = Instance::new("healthy independent row", "/healthy-repo");
     healthy.id = "healthy-row".into();
     healthy.tool = "claude".into();
@@ -334,7 +334,7 @@ async fn a_failed_host_hook_does_not_poison_runtime_reads() {
         let mut rows = state.instances.write().await;
         let failed = rows.iter_mut().find(|row| row.id == "failed-hook").unwrap();
         failed.status = Status::Error;
-        failed.last_error = Some(failure.clone());
+        failed.last_error.set(failure.clone());
     }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

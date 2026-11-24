@@ -7617,7 +7617,7 @@ async fn failed_delete_notifies_plugins_of_the_error() {
                     .find(|row| row.id == "sess-delete-error")
                     .unwrap();
                 row.status = Status::Error;
-                row.last_error = Some("boom".into());
+                row.last_error.set("boom");
                 Ok(())
             })
             .unwrap();
@@ -15260,6 +15260,94 @@ async fn create_with_a_parent_joins_its_group_one_level_deep() {
             state
                 .acp_event_store
                 .replay_from(id, 0)
+                .iter()
+                .any(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
+        })
+        .await;
+    }
+}
+
+/// A structured spawn starts on the default its Session route reports, so a detect-as Session
+/// starts on its base's default and never on an entry saved under its own name.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_structured_spawn_starts_on_the_default_its_session_route_reports() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    crate::session::config::update_config(|config| {
+        config
+            .session
+            .custom_agents
+            .insert("corp-claude".into(), "claude".into());
+        config
+            .session
+            .agent_detect_as
+            .insert("corp-claude".into(), "claude".into());
+        config.acp.acp_defaults = serde_json::from_value(serde_json::json!({
+            "claude": {"model": "base"},
+            "corp-claude": {"model": "never-read"},
+        }))
+        .unwrap();
+    })
+    .unwrap();
+    crate::session::Storage::new_unwatched("test").unwrap();
+    let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+    let state = crate::server::test_support::build_test_app_state_impl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |_| {},
+        |supervisor| supervisor.with_launcher(launcher),
+    );
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+    for tool in ["claude", "corp-claude"] {
+        let (status, session) = post_create(
+            &state,
+            serde_json::json!({
+                "title": tool, "path": "", "tool": tool, "scratch": true,
+                "view": "structured", "profile": "test",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{tool}: {session}");
+        let id = session["id"].as_str().unwrap().to_string();
+        let row = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id)
+            .cloned()
+            .unwrap();
+        assert_eq!(row.view, crate::session::View::Structured, "{tool}");
+        let resp = crate::server::api::get_session_agent_default_model(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(id.clone()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "{tool}");
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["agent_key"], "claude", "{tool}");
+        assert_eq!(body["model"], "base", "{tool}");
+        assert_eq!(row.agent_model.as_deref(), Some("base"), "{tool}");
+        wait_for("launcher-rejected startup", || {
+            state
+                .acp_event_store
+                .replay_from(&id, 0)
                 .iter()
                 .any(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
         })

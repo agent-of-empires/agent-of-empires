@@ -249,7 +249,7 @@ impl Instance {
         self.status = Status::Idle;
         self.idle_dormant_since = None;
         self.idle_entered_at = None;
-        self.last_error = None;
+        self.last_error.clear();
         self.last_error_evidence = None;
         self.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
         Ok(generation)
@@ -790,7 +790,7 @@ impl Instance {
         });
         let scope_failure = cleanup.and_then(|probe| self.clean_failed_launch_runtime(probe).err());
         self.last_error_evidence = None;
-        self.last_error = Some(
+        self.last_error.set(
             if let Some(refusal) = error.downcast_ref::<ManagedResumeRefused>() {
                 tracing::warn!(
                     target: "session.store",

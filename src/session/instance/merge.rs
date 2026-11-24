@@ -941,19 +941,19 @@ mod tests {
         live.lifecycle_generation = 7;
         live.status = Status::Starting;
         live.idle_entered_at = Some(Timestamp::now() - crate::time::Duration::minutes(5));
-        live.last_error = Some("stale pane observation".to_string());
+        live.last_error.set("stale pane observation".to_string());
         live.capture_started_at = floor(1_000_000);
         let mut disk = live.clone();
         disk.lifecycle_generation = 8;
         disk.status = Status::Stopped;
         disk.idle_entered_at = None;
-        disk.last_error = None;
+        disk.last_error.clear();
         disk.capture_started_at = floor(2_000_000);
         live.merge_post_start(&disk);
         assert_eq!(live.lifecycle_generation, 8);
         assert_eq!(live.status, Status::Stopped);
         assert_eq!(
-            (live.idle_entered_at, live.last_error.clone()),
+            (live.idle_entered_at, live.last_error.as_deref()),
             (None, None)
         );
         assert_eq!(live.capture_started_at, floor(2_000_000));
@@ -994,7 +994,9 @@ mod tests {
         previous.lifecycle_generation = 3;
         previous.status = Status::Error;
         previous.idle_entered_at = Some(Timestamp::now());
-        previous.last_error = Some(TMUX_SESSION_GONE_ERROR.to_string());
+        previous
+            .last_error
+            .latch_tmux(TmuxAbsence::Gone, TMUX_SESSION_GONE_ERROR);
         previous.capture_started_at = floor(1_000_000);
         previous.acp_load_session_capable = Some(true);
         previous.ever_confirmed_present = true;
@@ -1018,8 +1020,11 @@ mod tests {
             (Status::Stopped, None)
         );
         assert_eq!(
-            reloaded.last_error.as_deref(),
-            Some(TMUX_SESSION_GONE_ERROR)
+            (
+                reloaded.last_error.as_deref(),
+                reloaded.last_error.absence()
+            ),
+            (Some(TMUX_SESSION_GONE_ERROR), Some(TmuxAbsence::Gone))
         );
         assert_eq!(reloaded.capture_started_at, floor(2_000_000));
         assert_eq!(reloaded.acp_load_session_capable, Some(true));
@@ -1970,7 +1975,9 @@ mod tests {
     fn terminal_error_metadata_is_transient_and_does_not_cross_generations() {
         let mut observed = Instance::new("error-evidence", "/tmp");
         observed.lifecycle_generation = 3;
-        observed.last_error = Some("provider request failed".into());
+        observed
+            .last_error
+            .set("provider request failed".to_owned());
         let mut evidence = OperationErrorEvidence::new(
             ErrorEvidenceSource::TerminalText,
             ErrorOperation::TerminalObservation,

@@ -3330,7 +3330,8 @@ mod tests {
             let id = inst.id.clone();
             seed_profile_store(profile, vec![inst.clone()]);
             inst.status = cached_status;
-            inst.last_error = Some("earlier operation diagnostic".into());
+            inst.last_error
+                .set("earlier operation diagnostic".to_owned());
             let state = test_support::build_test_app_state(vec![inst]);
             test_support::refresh_canonical_metadata_for_test(&state).await;
 
@@ -3542,7 +3543,7 @@ mod tests {
             seed_profile_store(profile, vec![inst.clone()]);
             let mut cached = inst.clone();
             cached.status = Status::Error;
-            cached.last_error = Some("operation A failed".into());
+            cached.last_error.set("operation A failed".to_owned());
             let state = test_support::build_test_app_state(vec![cached]);
             test_support::refresh_canonical_metadata_for_test(&state).await;
             let assigned = if case == "import_same" {
@@ -3642,7 +3643,7 @@ mod tests {
             }
             let mut cached = chosen.clone();
             cached.status = Status::Error;
-            cached.last_error = Some("operation A failed".into());
+            cached.last_error.set("operation A failed".to_owned());
             *state
                 .instances
                 .write()

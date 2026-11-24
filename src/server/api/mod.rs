@@ -92,12 +92,13 @@ pub use skills::{
 
 pub use system::{
     apply_cityhall_bundle, browse_filesystem, create_profile, default_profile, delete_profile,
-    dismiss_update, docker_status, filesystem_home, get_about, get_cityhall_bundle,
-    get_current_theme, get_profile_settings, get_resolved_theme, get_settings,
-    get_settings_resolved, get_settings_schema, get_tips, get_update_status, get_web_ui_state,
-    list_agents, list_groups, list_profiles, list_sounds, list_themes, mark_tip_seen,
-    mark_volume_ignores_globs_acknowledged, mark_web_tour_seen, patch_web_ui_state,
-    post_dashboard_presence, rename_profile, serve_sound_file, set_show_tips, system_health,
+    dismiss_update, docker_status, filesystem_home, get_about, get_agent_default_model,
+    get_cityhall_bundle, get_current_theme, get_profile_settings, get_resolved_theme,
+    get_session_agent_default_model, get_settings, get_settings_resolved, get_settings_schema,
+    get_tips, get_update_status, get_web_ui_state, list_agents, list_groups, list_profiles,
+    list_sounds, list_themes, mark_tip_seen, mark_volume_ignores_globs_acknowledged,
+    mark_web_tour_seen, patch_web_ui_state, post_dashboard_presence, rename_profile,
+    serve_sound_file, set_agent_default_model, set_show_tips, system_health,
     update_profile_settings, update_settings, update_theme,
 };
 pub use telemetry::{
@@ -542,6 +543,10 @@ mod tests {
             (Method::POST, "/api/sessions/missing/purge/abandon"),
             (Method::POST, "/api/sessions/missing/start"),
             (Method::POST, "/api/sessions/missing/send"),
+            (
+                Method::PUT,
+                "/api/profiles/default/acp-defaults/claude/model",
+            ),
             (Method::POST, "/api/sessions/missing/restart"),
             (Method::POST, "/api/sessions/missing/restart-for-update"),
             (Method::POST, "/api/sessions/missing/tools/ensure"),

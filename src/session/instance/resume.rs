@@ -705,7 +705,7 @@ impl Instance {
         options.restart |= promoted_restart;
         if options.restart && self.status == Status::Error {
             self.status = Status::Idle;
-            self.last_error = None;
+            self.last_error.clear();
             self.last_error_evidence = None;
             self.last_error_check = None;
         }
@@ -804,7 +804,7 @@ impl Instance {
         sandbox_prior: Option<&LaunchSandboxSnapshot>,
         cause: LaunchIndeterminateCause,
     ) -> Result<StartOutcome> {
-        self.last_error = Some(cause.message().to_owned());
+        self.last_error.set(cause.message().to_owned());
         if self.lifecycle_generation == generation {
             self.record_terminal_error(
                 ErrorEvidenceSource::TmuxObservation,
@@ -1431,7 +1431,7 @@ impl Instance {
             ErrorEvidenceSource::TmuxObservation,
             RuntimeEvidence::PaneExited { exit_code: None },
         );
-        self.last_error = Some(format!(
+        self.last_error.set(format!(
             "resume failed for sid {}; preserved for explicit retry",
             stale_sid
         ));
@@ -3541,6 +3541,13 @@ mod tests {
             assert_eq!(inst.agent_session_id.as_deref(), Some(stale_sid));
             assert_eq!(inst.resume_probe_failed_sid.as_deref(), Some(stale_sid));
             assert_eq!(inst.status, Status::Error);
+            assert_eq!(
+                inst.last_error.as_deref(),
+                Some(
+                    format!("resume failed for sid {stale_sid}; preserved for explicit retry")
+                        .as_str()
+                )
+            );
             assert!(inst.last_error_check.is_some());
             let loaded = storage.load().unwrap();
             let row = loaded.iter().find(|i| i.id == inst.id).expect("instance");

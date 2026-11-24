@@ -29,7 +29,7 @@ async fn reload_state_instances_from_disk_disk_only_preserves_prior_status() {
     let mut prior = Instance::new("seed", "/tmp/seed");
     prior.status = Status::Running;
     prior.last_error_check = Some(probe);
-    prior.last_error = Some("boom".to_string());
+    prior.last_error.set("boom".to_string());
     prior.last_accessed_at = Some(Timestamp::parse_rfc3339("2024-06-01T00:00:00Z").unwrap());
     let prior_id = prior.id.clone();
     let state = build_test_app_state(vec![prior]);
@@ -56,7 +56,8 @@ async fn reload_state_instances_from_disk_disk_only_preserves_prior_status() {
         "runtime field preserved unconditionally"
     );
     assert_eq!(
-        row.last_error, None,
+        row.last_error.as_deref(),
+        None,
         "healthy merged status drops the stale last_error (#1271)"
     );
     assert_eq!(
@@ -75,7 +76,7 @@ async fn reload_state_instances_from_disk_tmux_applied_takes_fresh_status() {
     let mut prior = Instance::new("seed", "/tmp/seed");
     prior.status = Status::Idle;
     prior.last_error_check = Some(probe);
-    prior.last_error = Some("prev".to_string());
+    prior.last_error.set("prev".to_string());
     prior.last_accessed_at = Some(Timestamp::parse_rfc3339("2024-06-01T00:00:00Z").unwrap());
     let prior_id = prior.id.clone();
     let state = build_test_app_state(vec![prior]);
@@ -101,7 +102,8 @@ async fn reload_state_instances_from_disk_tmux_applied_takes_fresh_status() {
          the fresh sampler owns last_error_check"
     );
     assert_eq!(
-        row.last_error, None,
+        row.last_error.as_deref(),
+        None,
         "healthy merged status drops the stale last_error (#1271)"
     );
     assert_eq!(

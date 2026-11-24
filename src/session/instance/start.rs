@@ -1035,7 +1035,7 @@ impl Instance {
                 physical: Some(std::sync::Arc::clone(&pane)),
                 legacy_tool: None,
             };
-            self.last_error = None;
+            self.last_error.clear();
             self.last_error_evidence = None;
             self.last_error_check = None;
             let receipt = handoff_key.map(|_| std::sync::Arc::clone(&pane));
