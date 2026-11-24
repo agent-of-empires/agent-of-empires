@@ -466,10 +466,19 @@ pub(super) fn block_note(block: MutationBlock) -> &'static str {
 
 const STALE_NOTE: &str = "No longer open at the source. Dismiss it, or wait for the next refresh.";
 
-/// A working provider's status for the divider: when it last updated.
+/// A provider's status for the divider: when it last updated, and whether
+/// its last refresh failed.
 fn provider_status(provider: &Provider, any_items: bool) -> String {
     let name = &provider.name;
-    if provider.refreshing {
+    if provider.error.is_some() {
+        let ago = provider.updated_at.map_or_else(String::new, |at| {
+            format!(
+                " · updated {}",
+                ago_label(crate::time::Timestamp::now().as_unix_secs() - at)
+            )
+        });
+        format!("{name} · couldn't refresh{ago}")
+    } else if provider.refreshing {
         format!("⠙ {name} · refreshing…")
     } else if provider.updated_at.is_none() {
         format!("{name} · waiting for first results")
@@ -1045,14 +1054,14 @@ impl SuggestionsView {
         lines
     }
 
-    /// The divider's text: each working provider's status.
+    /// The divider's text: each enabled provider's status.
     fn divider_status(store: &SuggestionsFeed) -> String {
         let items = store.snapshot.iter().flat_map(|s| &s.items);
         let statuses: Vec<String> = store
             .snapshot
             .iter()
             .flat_map(|s| &s.providers)
-            .filter(|p| p.enabled && p.error.is_none())
+            .filter(|p| p.enabled)
             .map(|p| {
                 let any = items.clone().any(|i| i.provider_id == p.id);
                 plain_line(&provider_status(p, any))
@@ -3104,6 +3113,10 @@ mod tests {
         );
         assert!(
             lines[3].contains("Shown from the last refresh. r retries."),
+            "{text}"
+        );
+        assert!(
+            text.contains("├─ GitHub · couldn't refresh · updated 2 min ago ─"),
             "{text}"
         );
         rig.store.snapshot.as_mut().unwrap().providers[0].error = None;
