@@ -3193,6 +3193,20 @@
       "notes": "Tool input and output, tool errors, edit diffs, todo lists, the plan, answers, review prompts, sub-agent prompt and result, and install commands each copy their own content. Prompt, diff and error copies are pinned in a mocked browser; the rest are unit tests."
     },
     {
+      "id": "acp.resumed-subagent-status",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/acp/subagents/model.test.ts",
+        "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx"
+      ],
+      "components": [
+        "web/src/components/acp/subagents/model.ts",
+        "web/src/components/acp/subagents/SubagentDetail.tsx"
+      ],
+      "notes": "A resumed background sub-agent shows running or waiting with Stop, and a second finish shows its stop reason with the first report under earlier output. Foreground and never-resumed cards are unchanged."
+    },
+    {
       "id": "acp.tool-group-chunking",
       "kind": "vitest",
       "risk": "medium",
