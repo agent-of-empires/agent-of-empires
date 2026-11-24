@@ -385,7 +385,7 @@ export function Composer(props: Props) {
                 {/* Last in the wrapping cluster: on a narrow footer it takes its own row instead of pushing Stop and Send off screen. */}
                 <div
                   data-testid="composer-trailing"
-                  className="ml-auto flex min-w-0 max-w-full items-center gap-2 pl-2"
+                  className="ml-auto flex min-w-0 max-w-full items-center gap-2 pl-2 empty:hidden"
                 >
                   <PluginComposerStatus sessionId={sessionId} />
                   <UsageHint usage={props.sessionUsage} />

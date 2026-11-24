@@ -170,6 +170,13 @@ describe("toolbar and send", () => {
     expect(trailing.contains(screen.getByTestId("composer-usage"))).toBe(true);
   });
 
+  it("leaves the trailing cluster empty, so it hides, with no status and no usage", () => {
+    mount();
+    const trailing = screen.getByTestId("composer-trailing");
+    expect(trailing.childNodes.length).toBe(0);
+    expect(trailing.className).toContain("empty:hidden");
+  });
+
   it("stages pasted image files and leaves text paste alone", async () => {
     const setPendingAttachments = vi.fn();
     const { textarea } = mount({
