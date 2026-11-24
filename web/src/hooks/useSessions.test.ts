@@ -199,6 +199,25 @@ describe("useSessions / on-demand trash", () => {
     expect(trashed).toHaveBeenCalledTimes(2);
   });
 
+  it("flags a trash read that throws before the fetch starts and lets a later sync retry", async () => {
+    vi.spyOn(api, "fetchSessions").mockResolvedValue(envelope([row("a")], 1n, 1));
+    const trashed = vi.spyOn(api, "fetchTrashedSessions").mockResolvedValue(envelope([row("t", true)], 1n, 1));
+    vi.spyOn(AbortSignal, "timeout").mockImplementationOnce(() => {
+      throw new TypeError("unsupported");
+    });
+
+    const { result } = renderHook(() => useSessions());
+    await waitFor(() => expect(result.current.loaded).toBe(true));
+    act(() => result.current.loadTrash());
+    await waitFor(() => expect(result.current.trashError).toBe(true));
+    expect(trashed).not.toHaveBeenCalled();
+
+    act(() => result.current.loadTrash());
+    await waitFor(() => expect(result.current.trashLoaded).toBe(true));
+    expect(result.current.trashError).toBe(false);
+    expect(trashed).toHaveBeenCalledTimes(1);
+  });
+
   it("ignores a trash read of another epoch", async () => {
     vi.spyOn(api, "fetchSessions").mockResolvedValue(envelope([row("a")], 5n, 1));
     const trashed = vi.spyOn(api, "fetchTrashedSessions").mockResolvedValue({

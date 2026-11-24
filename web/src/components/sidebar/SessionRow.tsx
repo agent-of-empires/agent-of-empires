@@ -21,6 +21,7 @@ import { SessionActionsMenu, type SessionActionHandlers, type SessionMenuState }
 import { useSessionRowModel } from "./useSessionRowModel";
 import type { ClickModifiers, RowActivate, RowBulkApi, RowContextScope } from "./types";
 import { useLongPress } from "./useLongPress";
+import { isImeComposing } from "../../lib/ime";
 
 // A sibling row always navigates and never consults the group's selection.
 const NAVIGATE_ONLY: ClickModifiers = { metaKey: false, ctrlKey: false, shiftKey: false };
@@ -111,7 +112,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
           onChange={(e) => setRenameValue(e.target.value)}
           onBlur={commitRename}
           onKeyDown={(e) => {
-            if (e.key === "Enter") commitRename();
+            if (e.key === "Enter" && !isImeComposing(e)) commitRename();
             if (e.key === "Escape") setRenaming(false);
           }}
           data-testid="sidebar-rename-input"

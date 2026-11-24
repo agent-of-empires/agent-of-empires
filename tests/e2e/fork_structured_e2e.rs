@@ -24,6 +24,10 @@
 //!   3. the fork's one-shot `fork_pending` marker is cleared after the child id
 //!      lands.
 //!
+//! A refused `session/fork` is the other half: the spawn fails, the child keeps
+//! its `fork_pending` seed (so a later start forks again instead of opening an
+//! empty conversation), and retries stop at the reconciler's respawn budget.
+//!
 //! Run via:
 //!
 //! ```sh
@@ -34,7 +38,9 @@ use std::time::{Duration, Instant};
 
 use serial_test::parallel;
 
-use crate::harness::{pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness};
+use crate::harness::{
+    app_dir_in, pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness,
+};
 
 /// The `acp_session_id` of the session titled `title`, if it is present and
 /// non-empty on disk right now.
@@ -304,17 +310,15 @@ fn structured_fork_mints_distinct_child_id_and_preserves_parent() {
 }
 
 /// A structured fork whose `session/fork` handshake fails (the agent rejects it,
-/// simulated by `FAKE_ACP_FORK_FAIL`) must fail the spawn cleanly and clear the
-/// one-shot `fork_pending` marker so the fork is not silently downgraded to a
-/// `session/new`. Without the reset on the Err path (PR-review Required #3), the
-/// child would wedge re-issuing the same failing fork; here we assert the
-/// observable end state: the marker clears, the child never captures a forked
-/// id, and the parent is untouched. (This asserts the settled state, not the
-/// attempt count; the no-re-fork-loop guard is unit-tested at the
-/// supervisor/reducer level.)
+/// simulated by `FAKE_ACP_FORK_FAIL`) fails the spawn without a context reset:
+/// the child keeps its one-shot `fork_pending` seed, so a later start forks
+/// again rather than opening an empty conversation in the fork row. It never
+/// captures an id (no `session/new` fallback), the parent is untouched, and the
+/// failing fork is not retried forever: attempts stop at the reconciler's
+/// respawn budget, after which the session is parked until an explicit retry.
 #[test]
 #[parallel]
-fn structured_fork_failure_clears_fork_pending_and_fails_cleanly() {
+fn structured_fork_failure_keeps_fork_pending_and_stops_retrying() {
     require_tmux!();
     require_node!();
 
@@ -379,7 +383,14 @@ fn structured_fork_failure_clears_fork_pending_and_fails_cleanly() {
     let parent_acp_id = wait_for_acp_id(&h, "FailParent", Duration::from_secs(45));
 
     // Request the structured fork; the child's worker will issue session/fork,
-    // which the fake rejects.
+    // which the fake rejects. The parent's own session/new is counted first.
+    let news_before = std::fs::read_to_string(app_dir_in(h.home_path()).join("fake-acp.log"))
+        .map(|log| {
+            log.lines()
+                .filter(|l| l.contains("handleRequest method=session/new "))
+                .count()
+        })
+        .unwrap_or(0);
     let project_str = project.to_str().unwrap().to_string();
     let parent_acp_for_post = parent_acp_id.clone();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -409,25 +420,57 @@ fn structured_fork_failure_clears_fork_pending_and_fails_cleanly() {
     });
     post.expect("structured fork create");
 
-    // The Err path emits SessionContextReset, which the daemon consumes to clear
-    // fork_pending. Poll until the child's marker clears (bounded), proving the
-    // reconciler is not stuck re-forking.
-    let deadline = Instant::now() + Duration::from_secs(45);
-    let child = loop {
-        if let Some(child) = session_by_title(&h, "FailChild") {
-            if child["fork_pending"].is_null() {
-                break child;
-            }
+    // Attempts are read off the fake's request log, which every worker shares.
+    let fake_log = app_dir_in(h.home_path()).join("fake-acp.log");
+    let count = |method: &str| -> usize {
+        std::fs::read_to_string(&fake_log)
+            .map(|log| {
+                log.lines()
+                    .filter(|l| l.contains(&format!("handleRequest method={method} ")))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    // The spawn fails, and the reconciler retries it under its budget (5 per 60s,
+    // then parked): wait until the attempts stop, bounded.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let (mut seen, mut since) = (0, Instant::now());
+    loop {
+        let now = count("session/fork");
+        if now != seen {
+            (seen, since) = (now, Instant::now());
+        } else if seen > 0 && since.elapsed() >= Duration::from_secs(20) {
+            break;
         }
         if Instant::now() >= deadline {
             panic!(
-                "FailChild.fork_pending never cleared after a failed session/fork (retry-loop \
-                 regression). sessions.json: {}",
+                "session/fork attempts never settled ({seen} so far): the failing fork is \
+                 retried without end. sessions.json: {}",
                 h.read_sessions()
             );
         }
         std::thread::sleep(Duration::from_millis(250));
-    };
+    }
+    // The create's own spawn plus the reconciler's budget, with room for one
+    // retry racing the park.
+    assert!(
+        seen <= 7,
+        "a refused fork must stop at the respawn budget, saw {seen} session/fork attempts"
+    );
+    assert_eq!(
+        count("session/new"),
+        news_before,
+        "a refused fork must not fall back to session/new"
+    );
+
+    // The seed survives the failure, so the next start forks the same parent.
+    let child = session_by_title(&h, "FailChild").expect("FailChild row");
+    assert_eq!(
+        child["fork_pending"].as_str(),
+        Some(parent_acp_id.as_str()),
+        "a refused fork must keep its fork_pending seed, got: {:?}",
+        child["fork_pending"]
+    );
 
     // The failed fork never captured a child acp id (no session/new fallback
     // that would masquerade as a fork).

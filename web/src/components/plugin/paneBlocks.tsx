@@ -7,7 +7,8 @@ import { invokePluginAction, type PluginUiTone } from "../../lib/api";
 import { usePluginUiPoke, usePluginUiRevision } from "../../lib/pluginUiContext";
 import { accentStyle, lucideIcon, toneTextClass, validTone } from "../../lib/pluginUi";
 import { isInternalHref } from "../../lib/pluginHref";
-import { BlockMarkdown } from "./BlockMarkdown";
+import { lazyView } from "../../lib/lazyView";
+const BlockMarkdown = lazyView(() => import("./BlockMarkdown").then((m) => m.BlockMarkdown), null);
 import { BadgeChip, Spinner } from "./SlotChrome";
 import { isObject, objectList, pluginLinkProps, renderIcon, safeHref, str, type Obj } from "./slotPayload";
 

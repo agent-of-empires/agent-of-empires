@@ -57,6 +57,20 @@ describe("SessionGroupModal", () => {
   });
 
   it.each([
+    ["keyCode 229", { key: "Enter", keyCode: 229 }],
+    ["isComposing", { key: "Enter", isComposing: true }],
+  ] as const)("ignores Enter while an IME composes (%s)", async (_n, init) => {
+    const { input, onSave, onClose } = setup("old");
+    fireEvent.change(input, { target: { value: "new" } });
+    fireEvent.keyDown(input, init);
+    expect(onSave).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onSave).toHaveBeenCalledWith("new");
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+  });
+
+  it.each([
     ["", "work", "Failed to update group."],
     ["work", "", "Failed to clear group."],
   ])("from %j to %j a failed save shows %j and stays open", async (current, typed, message) => {

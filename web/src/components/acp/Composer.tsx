@@ -12,6 +12,7 @@ import { useSkillIndex } from "../../hooks/useSkillIndex";
 import { consumeComposerPrefill, subscribeComposerPrefill } from "../../lib/composerPrefill";
 import { clearDraft } from "../../lib/acpDrafts";
 import type { AcpState, PromptAttachmentInput, PromptCapabilities, QueuedPrompt } from "../../lib/acpTypes";
+import { isImeComposing } from "../../lib/ime";
 import { isIOS, isStandalone } from "../../lib/platform";
 import { sessionEntries } from "../../lib/pluginUi";
 import { usePluginUiEntries } from "../../lib/pluginUiContext";
@@ -41,7 +42,7 @@ import {
   decideArrowRecall,
   decideBeforeInputAction,
   decideEnterAction,
-  fitTextarea,
+  fitTextareaFallback,
   insertAtCaret,
   insertNewlineAtCaret,
   insertRawTextAtCaret,
@@ -186,7 +187,7 @@ export function Composer(props: Props) {
       ctrlKey: e.ctrlKey,
       metaKey: e.metaKey,
       altKey: e.altKey,
-      isComposing: e.nativeEvent.isComposing,
+      isComposing: isImeComposing(e),
     };
     const recallAction = decideArrowRecall(keys, {
       caretAtStart: !!el && el.selectionStart === 0 && el.selectionEnd === 0,
@@ -254,7 +255,9 @@ export function Composer(props: Props) {
               <PopoverItems trigger="/" skillIndex={skillIndex} />
             </ComposerPrimitive.Unstable_TriggerPopover>
 
+            {/* asChild: the default TextareaAutosize writes inline heights that override field-sizing. */}
             <ComposerPrimitive.Input
+              asChild
               ref={taRef}
               rows={2}
               // Touch-primary Enter inserts a newline; sending is the Send button's job.
@@ -270,7 +273,7 @@ export function Composer(props: Props) {
                     : "Queue a follow-up… (sent when current turn ends)"
                   : "Send a message…  Type @ for files, / for commands")
               }
-              onInput={(e) => fitTextarea(e.currentTarget)}
+              onInput={(e) => fitTextareaFallback(e.currentTarget)}
               onFocus={() => {
                 // Belt and braces for UAs that lag the keyboard's layout-viewport update.
                 if (!isMobile) return;
@@ -308,11 +311,13 @@ export function Composer(props: Props) {
               }}
               autoFocus={!isMobile}
               className={[
-                "min-h-[56px] max-h-[200px] resize-none bg-transparent",
+                "field-sizing-content min-h-[56px] max-h-[200px] resize-none bg-transparent",
                 "px-4 pt-3 pb-1 text-sm leading-6 text-text-primary",
                 "placeholder:text-text-dim focus:outline-none",
               ].join(" ")}
-            />
+            >
+              <textarea />
+            </ComposerPrimitive.Input>
 
             <AttachmentChips attachments={attachments.supported} onRemove={attachments.remove} />
 
@@ -450,7 +455,7 @@ function usePluginDraftOperations(
           if (!el) return;
           el.focus();
           el.setSelectionRange(operation.text.length, operation.text.length);
-          fitTextarea(el);
+          fitTextareaFallback(el);
         });
       } else if (!ta) {
         client.setText(`${client.getState().text}${operation.text}`);
