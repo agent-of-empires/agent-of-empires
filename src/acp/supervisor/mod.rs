@@ -135,6 +135,9 @@ pub enum SupervisorError {
     Superseded(String),
     #[error(transparent)]
     Blocked(crate::session::StartBlocked),
+    /// A newer stop fence refused an explicit resume.
+    #[error("session {0:?} was stopped again; resume refused")]
+    StopSuperseded(String),
     #[error("session {0:?} no longer exists")]
     SessionGone(String),
     #[error("native session authority unavailable")]

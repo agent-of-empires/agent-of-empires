@@ -474,7 +474,6 @@ pub(crate) async fn submit_prompt(
         }
         None => caller,
     };
-    let stop_observed = observed_stop.is_some();
     let outcome = state
         .session_service
         .send_turn_observing(
@@ -538,11 +537,8 @@ pub(crate) async fn submit_prompt(
             .await?;
             return Err(PromptSubmitError::HookFailed { message, queued_id });
         }
-        // A successful admission clears the fence, so one that survives a refused start
-        // means a stop won the race.
-        Err(SendTurnError::ResumeFailed(_))
-            if stop_observed && crate::process::worker_registry::stop_requested(id) =>
-        {
+        // Admission refused the start because a newer stop won the race.
+        Err(SendTurnError::ResumeFailed(SupervisorError::StopSuperseded(_))) => {
             return Err(PromptSubmitError::StopFenced);
         }
         Err(e) => return Err(PromptSubmitError::Turn(e)),

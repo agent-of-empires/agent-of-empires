@@ -166,8 +166,13 @@ impl<S: BroadcastSink> Supervisor<S> {
             return Err(SupervisorError::RestartInProgress(session_id.to_string()));
         }
         drop(restart_requests);
-        worker_registry::admit_resume(session_id, authority, &observed_stop)
-            .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?;
+        worker_registry::admit_resume(session_id, authority, &observed_stop).map_err(|error| {
+            if error.is::<worker_registry::StopSuperseded>() {
+                SupervisorError::StopSuperseded(session_id.to_string())
+            } else {
+                SupervisorError::Acp(AcpError::Spawn(error.to_string()))
+            }
+        })?;
         // Freeze the observed runner under the same gate as stop and installation.
         // Later registry contents may describe a replacement, not this attach.
         let attach_record = if kind == ResumeKind::Attach {

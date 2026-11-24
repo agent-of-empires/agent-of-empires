@@ -544,7 +544,12 @@ async fn stop_newer_than_the_observed_one_refuses_the_prompt_start() {
         )
         .await;
 
-    assert!(matches!(result, Err(SendTurnError::ResumeFailed(_))));
+    assert!(matches!(
+        result,
+        Err(SendTurnError::ResumeFailed(
+            crate::acp::supervisor::SupervisorError::StopSuperseded(_)
+        ))
+    ));
     assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_eq!(worker_registry::stop_intent(&id).unwrap(), newer);
     assert!(state
