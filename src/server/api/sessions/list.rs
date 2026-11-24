@@ -152,7 +152,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
         let needs_identity = inst.tool != "claude"
             && matches!(resp.acp_agent.as_deref(), Some("claude" | "claude-code"));
         if !resp.acp_capable || needs_identity {
-            let cfg = session_cfg_cache.resolve(
+            let (cfg, launch) = session_cfg_cache.resolve_with_launch(
                 &inst.source_profile,
                 &inst.repo_config_path().to_string_lossy(),
             );
@@ -171,13 +171,10 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
             resp.keeps_context = inst.acp_transcript_cli_resumable_with(&agent, cfg)
                 || (!inst.is_structured()
                     && inst.resumes_claude_under_own_acp_cmd_with(&agent, || {
-                        let config = crate::session::config::profile_config::resolve_config_or_warn(
-                            &inst.effective_profile(),
-                        );
                         crate::session::OwnCmdConfig {
                             session: cfg,
-                            profile_environment: config.environment,
-                            before_session_hook: !config.host_hooks.before_session.is_empty(),
+                            profile_environment: launch.environment.clone(),
+                            before_session_hook: launch.before_session_hook,
                         }
                     }));
         }

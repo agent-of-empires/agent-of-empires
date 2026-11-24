@@ -5111,6 +5111,128 @@ async fn list_sessions_derives_keeps_context_from_the_cached_config() {
     );
 }
 
+// Bound own-command rows sharing a profile preview the launcher's store from the cached
+// environment, so the whole list still costs one resolution, and each row is judged by its
+// own binding.
+#[tokio::test]
+#[serial_test::serial]
+async fn list_sessions_previews_own_command_stores_from_the_cached_config() {
+    use std::sync::atomic::Ordering;
+
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+    let project = tempfile::tempdir().expect("tempdir project");
+    let launch_home = tmp_home.path().join("launch-home");
+    let own_store = launch_home.join("stores/work");
+    crate::session::config::update_config(|c| {
+        let tool = || "claude-work".to_string();
+        c.session.agent_execution_as.insert(tool(), "claude".into());
+        c.session
+            .agent_acp_cmd
+            .insert(tool(), "claude-agent-acp".into());
+        c.session
+            .agent_config_dir
+            .insert(tool(), "~/stores/work".into());
+        c.environment = vec![format!("HOME={}", launch_home.display())];
+    })
+    .unwrap();
+
+    let bound_to = |store: &std::path::Path| {
+        let mut inst = Instance::new("test-session", project.path().to_str().unwrap());
+        inst.tool = "claude-work".to_string();
+        inst.source_profile = "default".to_string();
+        inst.agent_session_id = Some("sid".into());
+        inst.agent_session_binding = Some(crate::session::ConversationBinding {
+            session_id: "sid".into(),
+            execution: Some(crate::session::ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec![store.to_path_buf()],
+                configuration: Vec::new(),
+                cwd: project.path().to_path_buf(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: Some(true),
+            }),
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+        inst
+    };
+    let mismatched = tmp_home.path().join("stores/work");
+    let sessions = vec![
+        bound_to(&own_store),
+        bound_to(&mismatched),
+        bound_to(&own_store),
+        bound_to(&own_store),
+    ];
+    let expected: Vec<(String, bool)> = sessions
+        .iter()
+        .map(|inst| {
+            (
+                inst.id.clone(),
+                inst.agent_session_binding
+                    .as_ref()
+                    .unwrap()
+                    .execution
+                    .as_ref()
+                    .unwrap()
+                    .stores[0]
+                    == own_store,
+            )
+        })
+        .collect();
+    let state = crate::server::test_support::build_test_app_state(sessions);
+
+    let response = list_sessions(
+        axum::extract::State(state.clone()),
+        axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::http::HeaderMap::new(),
+    )
+    .await
+    .into_response();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let envelope: crate::daemon::SessionsEnvelope = serde_json::from_slice(&body).unwrap();
+
+    for (id, keeps) in expected {
+        let row = envelope.sessions.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(row.keeps_context, keeps, "{id}");
+    }
+    let misses = state.list_sessions_resolver_misses.load(Ordering::Relaxed);
+    assert_eq!(
+        misses, 1,
+        "rows sharing a profile and repo must share one resolution; got {misses}",
+    );
+}
+
+// The cache hands out the environment and hook flag the launch preview needs from the same
+// single resolution as the session config.
+#[test]
+#[serial_test::serial]
+fn session_cfg_cache_serves_the_launch_inputs_from_one_resolution() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+    crate::session::config::update_config(|c| {
+        c.environment = vec!["HOME=/launch-home".into()];
+        c.host_hooks.before_session = vec!["true".into()];
+    })
+    .unwrap();
+    let path = tmp_home.path().to_str().unwrap();
+
+    let misses = AtomicUsize::new(0);
+    let mut store = super::SessionCfgStore::default();
+    let mut cache = super::model::SessionCfgCache::new(&mut store, &misses);
+    for _ in 0..3 {
+        let (_, launch) = cache.resolve_with_launch("default", path);
+        assert_eq!(launch.environment, ["HOME=/launch-home"]);
+        assert!(launch.before_session_hook);
+    }
+    assert_eq!(misses.load(Ordering::Relaxed), 1);
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn list_sessions_flags_only_terminal_sessions_when_structured_view_is_off() {
