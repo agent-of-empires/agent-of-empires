@@ -9,6 +9,8 @@ import { useClampedMenuPosition } from "../../lib/menuPosition";
  */
 export function InfoPopover({ title, children }: { title: string; children: ReactNode }) {
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
+  // Inside the modal around the icon, such as the wizard, so its focus trap counts the link as its own.
+  const [host, setHost] = useState<HTMLElement>(() => document.body);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const panelId = useId();
@@ -67,6 +69,7 @@ export function InfoPopover({ title, children }: { title: string; children: Reac
   const toggle = () => {
     if (open) return close(false);
     const rect = buttonRef.current?.getBoundingClientRect();
+    setHost(buttonRef.current?.closest<HTMLElement>('[aria-modal="true"]') ?? document.body);
     setPos({ x: rect?.left ?? 0, y: (rect?.bottom ?? 0) + 4 });
   };
 
@@ -108,7 +111,7 @@ export function InfoPopover({ title, children }: { title: string; children: Reac
             </p>
             {children}
           </div>,
-          document.body,
+          host,
         )}
     </>
   );

@@ -1,8 +1,10 @@
 // @vitest-environment jsdom
 // Keyboard opening and Tab order need a real browser: tests/wizard-worktree-info.spec.ts.
+import { useRef } from "react";
 import { afterEach, describe, expect, it } from "vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { InfoPopover } from "../InfoPopover";
+import { useFocusTrap } from "../../../hooks/useFocusTrap";
 
 afterEach(cleanup);
 
@@ -21,6 +23,19 @@ function renderPopover() {
 
 const dialog = () => screen.queryByRole("dialog", { name: "What's a worktree?" });
 
+function TrappedModal() {
+  const ref = useRef<HTMLDivElement>(null);
+  useFocusTrap(() => ref.current);
+  return (
+    <div ref={ref} role="dialog" aria-modal="true" aria-label="New session">
+      <button type="button">first field</button>
+      <InfoPopover title="What's a worktree?">
+        <a href="/settings/worktree">Worktree settings ›</a>
+      </InfoPopover>
+    </div>
+  );
+}
+
 describe("InfoPopover", () => {
   it("closes when focus moves outside it, leaving focus there, and stays open for the link", () => {
     fireEvent.click(renderPopover());
@@ -30,6 +45,18 @@ describe("InfoPopover", () => {
     act(() => field.focus());
     expect(dialog()).toBeNull();
     expect(document.activeElement).toBe(field);
+  });
+
+  // The wizard traps Tab: a panel outside its root would send Tab back to the first field and close.
+  it("stays inside a modal's focus trap, so Tab goes on from it", () => {
+    render(<TrappedModal />);
+    fireEvent.click(screen.getByRole("button", { name: "What's a worktree?" }));
+    expect(document.activeElement).toBe(dialog());
+    expect(screen.getByRole("dialog", { name: "New session" }).contains(dialog())).toBe(true);
+    // Not cancelled: the browser moves on to the link.
+    expect(fireEvent.keyDown(dialog()!, { key: "Tab" })).toBe(true);
+    expect(dialog()).not.toBeNull();
+    expect(document.activeElement).toBe(dialog());
   });
 
   it("opens a dialog that takes focus, and a second click closes it", () => {
