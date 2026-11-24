@@ -15,7 +15,8 @@ import {
 } from "../lib/sidebarGroups";
 import type { RepoAppearanceUpdate } from "../lib/repoAppearance";
 import { useWebSettings } from "../hooks/useWebSettings";
-import { SidebarCompactContext, useSidebarInFlow } from "../lib/sidebarCompact";
+import { SidebarCompactContext } from "../lib/sidebarCompact";
+import { useMediaQuery } from "../hooks/useMediaQuery";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { useServerDown } from "../lib/connectionState";
 import type { SidebarSortMode } from "../lib/sidebarSort";
@@ -123,7 +124,8 @@ export function WorkspaceSidebar(props: Props) {
   } = props;
   const { settings: webSettings, update: updateWebSettings } = useWebSettings();
   const rightSide = webSettings.sidebarSide === "right";
-  const inFlow = useSidebarInFlow();
+  // Only the in-flow sidebar has the handle that leaves the rail, so the phone drawer ignores a saved rail.
+  const inFlow = useMediaQuery("(min-width: 768px)");
   const compact = webSettings.sidebarCompact && inFlow;
   const offline = useServerDown();
   const { effectiveWidth, panelRef, handleProps } = useSidebarWidth({

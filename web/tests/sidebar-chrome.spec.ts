@@ -195,24 +195,60 @@ test.describe("resize handle and compact rail (#2288)", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await expect(panel).toHaveAttribute("data-compact", "true");
   });
+
+  test("a mouse released outside the window ends the drag at its last width", async ({ page }) => {
+    await openSidebar(page, SESSIONS);
+    const width = panelWidth(page);
+    const box = (await page.getByTestId("sidebar-resize-handle").boundingBox())!;
+    const y = box.y + box.height / 2;
+    await page.mouse.move(box.x + box.width / 2, y);
+    await page.mouse.down();
+    await page.mouse.move(350, y, { steps: 4 });
+    // The release lands outside the window, so the page only sees the next move, with no button held.
+    await page.evaluate(() =>
+      document.dispatchEvent(
+        new PointerEvent("pointermove", {
+          clientX: 420,
+          buttons: 0,
+          pointerId: 1,
+          pointerType: "mouse",
+          bubbles: true,
+        }),
+      ),
+    );
+    await expect.poll(width).toBe(350);
+    expect(await page.evaluate(() => localStorage.getItem("aoe-sidebar-width"))).toBe("350");
+    await page.mouse.up();
+  });
 });
 
 test.describe("resize handle on a touch tablet (#2288)", () => {
   test.use({ hasTouch: true, viewport: { width: 1024, height: 768 } });
 
-  test("a touch drag snaps the in-flow sidebar to the rail", async ({ page }) => {
+  test("a touch drag snaps the in-flow sidebar to the rail, and a second finger does not steer it", async ({
+    page,
+  }) => {
     await installSidebarMocks(page, { sessions: threeSessionsInOneRepo() });
     await page.goto("/");
+    const panel = page.locator('[data-tour="sidebar"]');
     const box = (await page.getByTestId("sidebar-resize-handle").boundingBox())!;
     const y = box.y + box.height / 2;
     // Playwright's touchscreen only taps, so the drag goes through CDP.
     const cdp = await page.context().newCDPSession(page);
-    const touch = (type: string, x: number) =>
-      cdp.send("Input.dispatchTouchEvent", { type, touchPoints: type === "touchEnd" ? [] : [{ x, y }] });
+    const touch = (type: string, x: number, other?: number) =>
+      cdp.send("Input.dispatchTouchEvent", {
+        type,
+        touchPoints:
+          type === "touchEnd" ? [] : [{ x, y, id: 1 }, ...(other === undefined ? [] : [{ x: other, y: 400, id: 2 }])],
+      });
     await touch("touchStart", box.x + box.width / 2);
-    for (const x of [250, 200, 150, 100]) await touch("touchMove", x);
+    await touch("touchStart", box.x + box.width / 2, 700);
+    await touch("touchMove", box.x + box.width / 2, 20);
+    await expect(panel).toBeVisible();
+    await expect(panel).not.toHaveAttribute("data-compact", "true");
+    for (const x of [250, 200, 150, 100]) await touch("touchMove", x, 20);
     await touch("touchEnd", 100);
-    await expect(page.locator('[data-tour="sidebar"]')).toHaveAttribute("data-compact", "true");
+    await expect(panel).toHaveAttribute("data-compact", "true");
   });
 });
 
