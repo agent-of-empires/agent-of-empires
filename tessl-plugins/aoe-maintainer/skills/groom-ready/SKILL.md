@@ -35,15 +35,15 @@ Skip issues already judged: list
 `tessl finding list --project $PROJECT --tag groom-ready --json` in every
 state, following `--after` cursors. A finding is for issue `<n>` when its
 title starts with `groom-ready: #<n> ` (trailing space included). Drop each
-issue with an open or in-progress finding, and each whose newest finding is
-newer than the issue's `updatedAt`; an issue edited since its last finding is
-assessed again. Order the rest by priority label (`P0`, `P1`,
+issue with an open or in-progress finding, and each whose newest finding has
+the tag `updated:<the issue's updatedAt>`; an issue edited since the
+assessment behind its last finding is assessed again. Order the rest by priority label (`P0`, `P1`,
 `P2`, `P3`, none), then by most recently updated.
 
 ## 2. Assess each issue
 
 Read the body and comments with
-`gh issue view <n> -R $REPO --json body,comments,labels`. An issue is ready
+`gh issue view <n> -R $REPO --json body,comments,labels,updatedAt`. An issue is ready
 when all of these hold:
 
 1. **Problem**: current and expected behavior are stated.
@@ -76,7 +76,7 @@ Build the JSON with `jq -n --arg ...` and run
   "analysis": "Which readiness criteria hold, with the evidence for each, and the files to change.",
   "recommendation": "Add <label> to #<number>. Before that, add: <missing information, or none>.",
   "expectedImprovement": "An agent can implement #<number> without asking a person.",
-  "tags": ["groom-ready", "<priority label>", "<area label>"],
+  "tags": ["groom-ready", "updated:<updatedAt read in step 2>", "<priority label>", "<area label>"],
   "observations": [
     {
       "observedAt": "<date -u +%Y-%m-%dT%H:%M:%SZ>",
