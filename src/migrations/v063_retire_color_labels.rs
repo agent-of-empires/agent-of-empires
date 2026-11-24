@@ -43,7 +43,7 @@ fn drop_row_colors(path: &Path) -> Result<()> {
     )?;
     // An unreadable component keeps its bytes for repair rather than aborting boot.
     let Ok(content) = String::from_utf8(fs::read(path)?) else {
-        warn!(target: "migrations.v063", path = %path.display(), "Preserved unreadable session component; repair it and run aoe migrate");
+        warn!(target: "migrations.v063", path = %path.display(), "Preserved unreadable session component; its color labels are ignored once it is repaired");
         return Ok(());
     };
     let dropped = sessions_file::heal_rows(path, &content, |row| row.remove("color").is_some())?;
