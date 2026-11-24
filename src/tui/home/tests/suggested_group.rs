@@ -714,7 +714,7 @@ fn a_home_prepare_answered_after_the_full_view_opened_is_dropped() {
         .error
         .as_deref()
         .unwrap()
-        .contains("Press Enter on it again"));
+        .contains("Press N on it again here."));
 }
 
 #[test]

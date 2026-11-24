@@ -129,7 +129,12 @@ impl HomeView {
         {
             if let Some(view) = &mut self.suggestions_view {
                 // The full view owns suggestion starts now, so say why nothing opened.
-                view.set_error("Suggestion ready. Press Enter on it again to start it.");
+                let key = match (target, self.strict_hotkeys) {
+                    (PrepareTarget::Home, _) => "Enter",
+                    (_, false) => "N",
+                    (_, true) => "Ctrl+N",
+                };
+                view.set_error(format!("Suggestion ready. Press {key} on it again here."));
             } else if self.cursor_suggestion().as_ref() == Some(&key) && self.new_dialog.is_none() {
                 if target == PrepareTarget::HomeAnother {
                     start.suggestion = None;
