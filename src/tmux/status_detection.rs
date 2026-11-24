@@ -1074,7 +1074,11 @@ run this command? (y/n)
         assert_all(
             detect_droid_status,
             Status::Idle,
-            &["file saved", "random output text"],
+            &[
+                "file saved",
+                "random output text",
+                "Yes, allow it only after review\nNo, cancel the job if it hangs",
+            ],
         );
         assert_all(
             detect_hermes_status,
@@ -2372,6 +2376,10 @@ Allow once
         for (screen, want) in [
             (droid_dialog, true),
             ("Pick Yes, allow to run it, or No, cancel to stop.", false),
+            (
+                "Yes, allow it only after review\nNo, cancel the job if it hangs",
+                false,
+            ),
         ] {
             assert_eq!(
                 super::super::detect::rule_matches("droid", "permission_choice", screen, "", None),

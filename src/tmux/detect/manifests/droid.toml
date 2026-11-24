@@ -31,7 +31,7 @@ id = "approval_choice"
 priority = 950
 
 # The permission dialog's options, which name no prompt of their own. Each
-# label must start its own row.
+# label must fill its own row, so prose starting with a label does not match.
 [[rules]]
 id = "permission_choice"
 state = "waiting"
@@ -39,8 +39,8 @@ priority = 945
 region = "whole_recent"
 visible = true
 line_regex = [
-  '(?i)^\s*(?:\x{276F}\s*)?yes, allow\b',
-  '(?i)^\s*(?:\x{276F}\s*)?no, cancel\b',
+  '(?i)^\s*(?:\x{276F}\s*)?yes, allow\s*$',
+  '(?i)^\s*(?:\x{276F}\s*)?no, cancel\s*$',
 ]
 
 [[rules]]
