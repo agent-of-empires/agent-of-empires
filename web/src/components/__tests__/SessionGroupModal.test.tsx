@@ -151,6 +151,20 @@ describe("SessionGroupModal", () => {
     expect(onSave).toHaveBeenCalledWith("play");
   });
 
+  it("Save with the list open saves the current value without picking a row; Escape closes the list first", async () => {
+    vi.mocked(fetchGroups).mockResolvedValue([group("work"), group("play")]);
+    const { input, saveBtn, onSave, onClose } = setup("work");
+    await screen.findByRole("option", { name: /^play/ });
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    fireEvent.focus(input);
+    screen.getByRole("listbox");
+    fireEvent.change(input, { target: { value: "wor" } });
+    fireEvent.click(saveBtn);
+    expect(onSave).toHaveBeenCalledWith("wor");
+  });
+
   it("Remove from group saves a blank group and is absent without one", async () => {
     const { onSave, onClose, unmount } = setup("work");
     fireEvent.click(screen.getByRole("button", { name: "Remove from group" }));

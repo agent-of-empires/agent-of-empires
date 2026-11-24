@@ -102,7 +102,7 @@ export function SessionGroupModal({ sessionTitle, currentGroup, profile, onSave,
           id="session-group-modal-field"
           testId="session-group-modal-input"
           autoFocus
-          dropUp
+          inline
           showAllUntilEdited
           disabled={saving}
           openOnFocus={!error}

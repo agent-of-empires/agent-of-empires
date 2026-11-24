@@ -6,8 +6,6 @@ import { groupOptions, optionLabel, type GroupOption } from "./groupOptions";
 import { isImeComposing } from "../../../lib/ime";
 
 const LIST_MAX = 288;
-/** Least room above (about three rows) for `dropUp` to force upward. */
-const DROP_UP_MIN = 132;
 
 const keyOf = (option: GroupOption) => (option.kind === "group" ? `group:${option.group.path}` : "create");
 
@@ -21,7 +19,7 @@ export function GroupCombobox({
   testId,
   disabled,
   openOnFocus = true,
-  dropUp,
+  inline,
   showAllUntilEdited = false,
 }: {
   id: string;
@@ -34,8 +32,8 @@ export function GroupCombobox({
   disabled?: boolean;
   /** False keeps the list closed on focus, e.g. for a programmatic refocus. */
   openOnFocus?: boolean;
-  /** Always open upward, e.g. where the list would cover the controls below. */
-  dropUp?: boolean;
+  /** Render the list in the page flow, pushing what is below instead of floating over it. */
+  inline?: boolean;
   /** List every group, with the current value highlighted, until the user types. */
   showAllUntilEdited?: boolean;
 }) {
@@ -68,13 +66,13 @@ export function GroupCombobox({
     const bottom = viewport ? Math.min(area.bottom, viewport.offsetTop + viewport.height) : area.bottom;
     const below = bottom - field.bottom - 8;
     const above = field.top - top - 8;
-    const up = (dropUp && above >= DROP_UP_MIN) || below < Math.min(LIST_MAX, above);
+    const up = below < Math.min(LIST_MAX, above);
     setPlacement({ up, maxHeight: Math.max(0, Math.min(LIST_MAX, up ? above : below)) });
-  }, [dropUp]);
+  }, []);
 
   // Before paint, so the list never shows a frame at its default size.
   useLayoutEffect(() => {
-    if (!open) return;
+    if (!open || inline) return;
     place();
     const scroller = inputRef.current?.closest<HTMLElement>("[data-wizard-scroll]");
     const viewport = window.visualViewport;
@@ -89,7 +87,7 @@ export function GroupCombobox({
       viewport?.removeEventListener("scroll", place);
       window.removeEventListener("resize", place);
     };
-  }, [open, place]);
+  }, [open, inline, place]);
 
   const show = (next: string, isEdited = edited) => {
     setOpen(true);
@@ -178,13 +176,20 @@ export function GroupCombobox({
       {open && (
         <div
           data-testid="group-combobox-popup"
-          style={{ maxHeight: placement.maxHeight }}
-          className={`absolute left-0 right-0 z-20 flex flex-col overflow-hidden rounded-lg border border-surface-700/60 bg-surface-900 shadow-lg ${
-            placement.up ? "bottom-full mb-1" : "top-full mt-1"
+          style={inline ? undefined : { maxHeight: placement.maxHeight }}
+          className={`flex flex-col overflow-hidden rounded-lg border border-surface-700/60 bg-surface-900 ${
+            inline
+              ? "relative mt-1"
+              : `absolute left-0 right-0 z-20 shadow-lg ${placement.up ? "bottom-full mb-1" : "top-full mt-1"}`
           }`}
         >
           {/* In a cramped popup the help yields first, so at least one row stays usable. */}
-          <ul id={listId} role="listbox" aria-label="Groups" className="min-h-11 flex-1 overflow-y-auto">
+          <ul
+            id={listId}
+            role="listbox"
+            aria-label="Groups"
+            className={`min-h-11 flex-1 overflow-y-auto ${inline ? "max-h-40" : ""}`}
+          >
             {options.map((option, i) => (
               <li
                 key={keyOf(option)}
