@@ -892,6 +892,24 @@ impl AnchoredDir {
         }
     }
 
+    pub(crate) fn rename_child_exclusive(
+        &self,
+        from: &Path,
+        destination: &Self,
+        to: &Path,
+    ) -> Result<()> {
+        let (source, from) = self.open_parent(from)?;
+        let (destination, to) = destination.open_parent(to)?;
+        crate::process::rename_exclusive(&source, &from, &destination, &to)
+            .context("renaming anchored entry without replacement")
+    }
+
+    pub(crate) fn remove_empty_dir(&self, relative: &Path) -> Result<()> {
+        let (parent, leaf) = self.open_parent(relative)?;
+        unlinkat(&parent, leaf.as_os_str(), UnlinkatFlags::RemoveDir)
+            .context("removing empty anchored directory")
+    }
+
     pub(crate) fn remove_file(&self, relative: &Path) -> Result<()> {
         let (parent, leaf) = self.open_parent(relative)?;
         match unlinkat(&parent, leaf.as_os_str(), UnlinkatFlags::NoRemoveDir) {

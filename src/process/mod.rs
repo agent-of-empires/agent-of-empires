@@ -198,6 +198,21 @@ pub(crate) fn prove_staging_host_mount_absent(
     }
 }
 
+pub(crate) fn prove_same_mount(
+    parent: std::os::fd::BorrowedFd<'_>,
+    child: std::os::fd::BorrowedFd<'_>,
+) -> anyhow::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        platform::prove_same_mount(parent, child)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (parent, child);
+        anyhow::bail!("mount identity unavailable on this platform")
+    }
+}
+
 /// A private filesystem with an enforced allocation ceiling. Unsupported hosts fail closed.
 pub(crate) struct StagingVolume {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
