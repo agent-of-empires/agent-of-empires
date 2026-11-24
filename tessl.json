@@ -38,6 +38,10 @@
             "include": [
               "src/cli/**/*.rs",
               "src/tui/**/*.rs"
+            ],
+            "exclude": [
+              "src/**/tests/**",
+              "src/**/tests.rs"
             ]
           },
           "persisted-change-has-migration": {
