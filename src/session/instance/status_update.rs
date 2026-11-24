@@ -690,6 +690,26 @@ impl Instance {
         Some((detection.status, detection.rule))
     }
 
+    /// Whether the agent's own screen reads as idle by its manifest's rules, with no pane title
+    /// or hook file (a predecessor launch can leave either behind) and not by the idle default.
+    /// `None` when the agent has no manifest.
+    pub(crate) fn screen_reads_idle(&self, session: &tmux::Session) -> Option<bool> {
+        let profile = &self.source_profile;
+        let alias = tmux::status_rules::effective_detect_as(profile, &self.tool, &self.detect_as);
+        let manifest_tool: &str = if alias.is_empty() { &self.tool } else { &alias };
+        let rules_tool = tmux::status_rules::detection_tool(profile, &self.tool, &self.detect_as);
+        let plan = tmux::DetectionPlan::for_manifest(profile, &rules_tool, manifest_tool)?;
+        let Ok(content) = session.try_capture_pane(plan.capture_policy().scope.lines()) else {
+            return Some(false);
+        };
+        let clean = tmux::utils::strip_ansi(&content);
+        let detection = plan.detect(&clean, &tmux::Observation::new("", None, true));
+        Some(
+            detection.status == Some(Status::Idle)
+                && detection.rule != tmux::detect::Detection::idle_by_default().rule,
+        )
+    }
+
     pub(crate) fn live_pane_owned(
         &self,
         session: &tmux::Session,
