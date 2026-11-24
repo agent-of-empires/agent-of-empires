@@ -291,17 +291,30 @@ impl Instance {
         acp_agent: &str,
         config: impl FnOnce() -> OwnCmdConfig<C>,
     ) -> bool {
+        self.own_acp_cmd_stores_with(acp_agent, config)
+            .is_some_and(|(launcher, bound)| {
+                crate::session::capture::same_claude_store(&launcher, &bound)
+            })
+    }
+
+    /// The `(launcher store, bound store)` pair whose equality admits
+    /// [`Self::resumes_claude_under_own_acp_cmd_with`], so a caller can probe it later and once.
+    pub(crate) fn own_acp_cmd_stores_with<
+        C: std::borrow::Borrow<crate::session::config::SessionConfig>,
+    >(
+        &self,
+        acp_agent: &str,
+        config: impl FnOnce() -> OwnCmdConfig<C>,
+    ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
         if self.tool == "claude"
             || acp_agent != self.tool
             || crate::session::fork::builtin_acp_registry()
                 .get(&self.tool)
                 .is_some()
         {
-            return false;
+            return None;
         }
-        let Some(bound_store) = self.selected_claude_bound_store() else {
-            return false;
-        };
+        let bound_store = self.selected_claude_bound_store()?;
         let config = config();
         let session = config.session.borrow();
         let own_cmd = session
@@ -316,16 +329,15 @@ impl Instance {
                 crate::acp::agent_profiles::resolve(base).native_config_agent == Some("claude")
             });
         if !own_cmd || !maps_to_claude || config.before_session_hook {
-            return false;
+            return None;
         }
         // ACP builds its environment from the profile alone, never from the terminal's saved
         // hook output. As launch does, an unresolvable HOME yields no store.
         let launcher_store = super::hooks::host_home(&config.profile_environment)
             .filter(|home| home.is_absolute())
-            .and_then(|home| session.agent_config_dir_for(&self.tool, &home));
-        launcher_store
-            .is_some_and(|dir| crate::session::capture::same_claude_store(&dir, &bound_store))
-            && self.acp_transcript_cli_resumable_with("claude", session)
+            .and_then(|home| session.agent_config_dir_for(&self.tool, &home))?;
+        self.acp_transcript_cli_resumable_with("claude", session)
+            .then_some((launcher_store, bound_store))
     }
 
     /// The ACP agent a structured switch launches; resolves config at the repo

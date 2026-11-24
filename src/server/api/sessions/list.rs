@@ -37,6 +37,22 @@ pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
     Json(RecentProjectsResponse { projects })
 }
 
+/// Rows whose `(launcher store, bound store)` pair names one store, probing each distinct pair once.
+fn rows_on_same_store(
+    rows: Vec<(usize, (std::path::PathBuf, std::path::PathBuf))>,
+    mut same: impl FnMut(&std::path::Path, &std::path::Path) -> bool,
+) -> Vec<usize> {
+    let mut probed = std::collections::HashMap::new();
+    rows.into_iter()
+        .filter(|(_, (launcher, bound))| {
+            *probed
+                .entry((launcher.clone(), bound.clone()))
+                .or_insert_with(|| same(launcher, bound))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
 pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionResponse> {
     let instances = state.instances.read().await;
     let probes = crate::json_probe::Memo::default();
@@ -148,7 +164,12 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
     // Overlay custom-agent ACP and fork capability; built-ins were resolved in
     // the constructor. Distinct `(profile, project_path)` pairs resolve once via
     // the shared cache.
-    for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
+    let mut own_cmd_stores = Vec::new();
+    for (i, (resp, inst)) in sessions
+        .iter_mut()
+        .zip(scoped_instances.iter().copied())
+        .enumerate()
+    {
         let needs_identity = inst.tool != "claude"
             && matches!(resp.acp_agent.as_deref(), Some("claude" | "claude-code"));
         if !resp.acp_capable || needs_identity {
@@ -168,15 +189,17 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                     crate::session::fork::custom_structured_fork_capable(agent_key, None, cfg);
             }
             let agent = inst.effective_acp_agent_with(|| cfg);
-            resp.keeps_context = inst.acp_transcript_cli_resumable_with(&agent, cfg)
-                || (!inst.is_structured()
-                    && inst.resumes_claude_under_own_acp_cmd_with(&agent, || {
-                        crate::session::OwnCmdConfig {
-                            session: cfg,
-                            profile_environment: launch.environment.clone(),
-                            before_session_hook: launch.before_session_hook,
-                        }
-                    }));
+            resp.keeps_context = inst.acp_transcript_cli_resumable_with(&agent, cfg);
+            // The store probe touches the filesystem, so it runs once the config lock is released.
+            if !resp.keeps_context && !inst.is_structured() {
+                let stores =
+                    inst.own_acp_cmd_stores_with(&agent, || crate::session::OwnCmdConfig {
+                        session: cfg,
+                        profile_environment: launch.environment.clone(),
+                        before_session_hook: launch.before_session_hook,
+                    });
+                own_cmd_stores.extend(stores.map(|stores| (i, stores)));
+            }
         }
         // The solo commands of the agent that classifies this session's prompts, resolved as the
         // queue and publication resolve it, so a custom agent's declared reset is advertised.
@@ -381,6 +404,16 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
     // session registry unlocked rather than holding writers behind it.
     drop(scoped_instances);
     drop(instances);
+    if !own_cmd_stores.is_empty() {
+        let matching = tokio::task::spawn_blocking(move || {
+            rows_on_same_store(own_cmd_stores, crate::session::capture::same_claude_store)
+        })
+        .await
+        .unwrap_or_default();
+        for i in matching {
+            sessions[i].keeps_context = true;
+        }
+    }
     if !park_probes.is_empty() {
         let store = Arc::clone(&state.acp_event_store);
         let overlays = tokio::task::spawn_blocking(move || {
@@ -812,6 +845,31 @@ mod context_resume_tests {
                 reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod own_cmd_store_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn rows_sharing_a_store_pair_are_probed_once() {
+        let pair = |a: &str, b: &str| (PathBuf::from(a), PathBuf::from(b));
+        let rows = vec![
+            (0, pair("/w", "/w")),
+            (1, pair("/w", "/other")),
+            (2, pair("/w", "/w")),
+            (3, pair("/w", "/other")),
+            (4, pair("/w", "/w")),
+        ];
+        let mut probes = 0;
+        let matching = rows_on_same_store(rows, |a, b| {
+            probes += 1;
+            a == b
+        });
+        assert_eq!(matching, vec![0, 2, 4]);
+        assert_eq!(probes, 2);
     }
 }
 
