@@ -2306,9 +2306,12 @@ impl App {
         // Taken before any key is routed, so every key ends the cancel prompt; only the
         // confirming key, reaching the pull below, can still act on it.
         let cancel_armed = self.pull.take_cancel_arm();
+        // A key routed away below still acknowledges a Done line that was on screen.
+        let done_drawn = self.drawn_bar == Some(DrawnBar::Pull(PullLine::Done));
         let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL;
         if !ctrl_c && self.home.retained_reader_focused() && !self.home.has_non_live_send_overlay()
         {
+            self.pull.other_key(done_drawn);
             let _ = self.home.handle_key(key, self.update_info.as_ref());
             return Ok(());
         }
@@ -2319,6 +2322,7 @@ impl App {
             .as_ref()
             .is_some_and(|v| v.is_active())
         {
+            self.pull.other_key(done_drawn);
             let result = self
                 .home
                 .structured_preview
@@ -2343,6 +2347,7 @@ impl App {
         // Enter returned while the mount it asked for connects: Home would read
         // the next keys as commands (`q` quits), so hold them for that composer.
         if !ctrl_c && !self.home.has_dialog() && self.hold_key_for_pending_structured_view(&key) {
+            self.pull.other_key(done_drawn);
             return Ok(());
         }
         let cancels_pull = bindings::is_bound(
@@ -2368,8 +2373,7 @@ impl App {
             self.request_pull(PullRequest::Cancel, self.pull_image.clone());
             return Ok(());
         }
-        self.pull
-            .other_key(self.drawn_bar == Some(DrawnBar::Pull(PullLine::Done)));
+        self.pull.other_key(done_drawn);
         match (key.code, key.modifiers) {
             // Ctrl+C belongs to the agent in live-send.
             (KeyCode::Char('c'), KeyModifiers::CONTROL) if !self.home.is_live_send_capturing() => {
@@ -5595,7 +5599,7 @@ mod tests {
     }
 
     /// A key a retained reader, an embedded view, or a view still mounting takes ends the cancel
-    /// prompt as any key does, so a `y` after it doesn't cancel.
+    /// prompt as any key does, so a `y` after it doesn't cancel, and acknowledges a drawn Done.
     #[tokio::test]
     #[serial_test::serial]
     async fn a_key_routed_past_the_pull_ends_its_cancel_prompt() {
@@ -5604,7 +5608,12 @@ mod tests {
         let confirm = KeyEvent::new(CONFIRM_CANCEL_PULL, KeyModifiers::NONE);
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         let typed = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
-        for path in ["retained reader", "embedded view", "mounting view"] {
+        let paths = ["retained reader", "embedded view", "mounting view"];
+        // The cancel prompt, a Done line on screen, and one not drawn yet, which stays.
+        for (path, case) in paths
+            .into_iter()
+            .flat_map(|path| ["prompt", "drawn done", "undrawn done"].map(|case| (path, case)))
+        {
             let (mut app, _guard, id) = if path == "retained reader" {
                 retained_app()
             } else {
@@ -5613,8 +5622,16 @@ mod tests {
             let (_, mut terminal) = key_app();
             let sent = record_pull_requests(&mut app);
             app.pull.start();
-            app.handle_key(ctrl_e, &mut terminal).await.unwrap();
-            assert!(app.pull.cancel_prompt(std::time::Instant::now()), "{path}");
+            if case == "prompt" {
+                app.handle_key(ctrl_e, &mut terminal).await.unwrap();
+                assert!(app.pull.cancel_prompt(std::time::Instant::now()), "{path}");
+            } else {
+                app.pull
+                    .apply(PullRequest::Poll, PullReport::State(PullState::Done));
+                if case == "drawn done" {
+                    app.drawn_bar = Some(DrawnBar::Pull(PullLine::Done));
+                }
+            }
             match path {
                 "retained reader" => {
                     let generation = app.home.get_instance(&id).unwrap().lifecycle_generation;
@@ -5640,9 +5657,15 @@ mod tests {
                     app.structured_mount_activate = None;
                 }
             }
-            assert!(!app.pull.cancel_prompt(std::time::Instant::now()), "{path}");
-            app.handle_key(confirm, &mut terminal).await.unwrap();
-            assert!(sent.lock().unwrap().is_empty(), "{path}: y cancelled");
+            match case {
+                "prompt" => {
+                    assert!(!app.pull.cancel_prompt(std::time::Instant::now()), "{path}");
+                    app.handle_key(confirm, &mut terminal).await.unwrap();
+                    assert!(sent.lock().unwrap().is_empty(), "{path}: y cancelled");
+                }
+                "drawn done" => assert_eq!(app.pull.line(), None, "{path}: Done stayed"),
+                _ => assert_eq!(app.pull.line(), Some(&PullLine::Done), "{path}"),
+            }
         }
     }
 

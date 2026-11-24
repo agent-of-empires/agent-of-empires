@@ -148,7 +148,14 @@ impl PullLine {
                     shorten(&short, &keys, width)
                 }
             }
-            Self::Done => " ✓ Sandbox image updated. Applies to new Sessions.".to_string(),
+            Self::Done => [
+                " ✓ Sandbox image updated. Applies to new Sessions.",
+                " ✓ Sandbox image updated.",
+            ]
+            .into_iter()
+            .find(|text| text.width() <= width)
+            .unwrap_or(" ✓ Image updated.")
+            .to_string(),
             Self::Cancelled => shorten(
                 " Update cancelled. Sessions keep the current image.",
                 &format!("  [{update}] update  [{hide}] dismiss"),
@@ -382,6 +389,19 @@ mod tests {
                     80,
                     vec!["✓ Sandbox image updated. Applies to new Sessions."],
                     vec!["["],
+                ),
+                // Too narrow for the whole sentence: the first one, never cut mid-word.
+                (
+                    PullLine::Done,
+                    40,
+                    vec!["✓ Sandbox image updated."],
+                    vec!["Applies", "…"],
+                ),
+                (
+                    PullLine::Done,
+                    24,
+                    vec!["✓ Image updated."],
+                    vec!["Sandbox", "…"],
                 ),
                 (
                     PullLine::Cancelled,
