@@ -17,8 +17,10 @@ import {
   type Elicitation,
   type ReducedState,
   type TranscriptRow,
+  type ActivityRow,
   type ToolCall,
 } from "./acpTypes";
+import { fromInline } from "../components/acp/subagents/model";
 import { workflowRunning } from "../components/acp/backgroundAgentsContext";
 
 const ev = (state: AcpState, seq: number, event: AcpEvent) => applyEvent(state, { session_id: "s-1", seq, event });
@@ -394,6 +396,36 @@ describe("applyEvent / subagent roster", () => {
       ["t4", "t4"],
       ["t4", "t5"],
     ]);
+  });
+
+  it("settles a text-only resume at its last update through the real reducer", () => {
+    const launch: ToolCall = { id: "task-1", name: "Explore", kind: "think", args_preview: "{}", started_at: "t0" };
+    const first: ActivityRow = { id: "r", kind: "tool_complete", text: "first report", at: "2026-01-01T00:02:00Z" };
+    const roster = (...events: AcpEvent[]) => run(...events).subagents[0]!;
+    const idle = { stop_reason: "end_turn", background: true };
+    const t = (m: number) => `2026-01-01T00:0${m}:00Z`;
+
+    const resumed = fromInline(
+      launch,
+      first,
+      [],
+      roster(
+        update("running", t(1), { background: true }),
+        update("idle", t(2), idle),
+        update("running", t(4), { background: true }),
+        update("idle", t(5), idle),
+      ),
+    );
+    expect(resumed).toMatchObject({ status: "done", report: "", earlierReport: "first report", endedAt: t(5) });
+
+    const once = fromInline(
+      launch,
+      first,
+      [],
+      roster(update("running", t(1), { background: true }), update("idle", t(2), idle)),
+    );
+    expect(once).toMatchObject({ status: "done", report: "first report", endedAt: t(2) });
+    expect(once.earlierReport).toBeUndefined();
   });
 
   it("maps the state onto the matching background agent, including idle then running again", () => {
