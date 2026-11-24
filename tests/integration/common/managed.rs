@@ -1650,6 +1650,7 @@ socket.on('error', error => { console.error(error); process.exit(1); });
                 Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
                 None,
                 None,
+                axum::http::HeaderMap::new(),
                 Ok(Json(body)),
             )
             .await
@@ -2130,13 +2131,25 @@ socket.on('error', error => { console.error(error); process.exit(1); });
             .clone()
             .expect("original returned native SID");
         assert_eq!(stopped.acp_session_id.as_deref(), Some(sid.as_str()));
-        let (row, reservation) = crate::server::api::sessions::resume_structured_stop(
+        let resumed = crate::server::api::sessions::resume_structured_stop(
             &self.state,
             stopped,
             Some(crate::acp::supervisor::ResumeKind::Spawn),
         )
-        .await
-        .expect("real explicit resume of the settled original Stop");
+        .await;
+        let (row, reservation) = match resumed {
+            Ok(resumed) => resumed,
+            Err(response) => {
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                panic!(
+                    "explicit resume of settled Stop returned {status}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+            }
+        };
         let reservation =
             reservation.expect("stopped original needs its actual resume reservation");
         assert_eq!(row.acp_session_id.as_deref(), Some(sid.as_str()));

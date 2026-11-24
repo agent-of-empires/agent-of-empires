@@ -64,7 +64,7 @@ enum ControlPayload<'a> {
     },
     RateLimitAutoResumed {
         #[serde(rename = "resets_at")]
-        _resets_at: chrono::DateTime<chrono::Utc>,
+        _resets_at: crate::time::Timestamp,
         #[serde(default)]
         manual: bool,
     },
@@ -480,8 +480,9 @@ impl ControlProjection {
                 if self.autonomous_open == Known(false) {
                     self.stopped_through = Known(row.seq);
                 }
-                self.unsuccessful_main =
-                    Known(matches!(reason, "prompt_failed" | "rate_limited") || cap);
+                self.unsuccessful_main = Known(
+                    matches!(reason, "prompt_failed" | "prompt_rejected" | "rate_limited") || cap,
+                );
                 if reason != "rate_limited" && row.effect != ControlEffect::Companion {
                     self.advance_budget(BudgetStep::Reset)?;
                 }

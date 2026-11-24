@@ -10,7 +10,10 @@ use toml_edit::{ArrayOfTables, DocumentMut, Item};
 use crate::agents::ResolvedHookEvent;
 
 use super::command::{hook_command, is_aoe_hook_command};
-use super::config_io::{log_installed, log_removed, log_unchanged, with_config_lock, write_file};
+use super::config_io::{
+    log_installed, log_removed, log_unchanged, with_config_lock, with_config_lock_policy,
+    SymlinkPolicy,
+};
 use super::HookInstallTarget;
 
 fn remove_aoe_hooks(hooks: &mut ArrayOfTables) {
@@ -30,13 +33,13 @@ pub fn install_kimi_hooks_with_events(
     if events.is_empty() && !config_path.exists() {
         return Ok(());
     }
-    with_config_lock(config_path, "toml.lock", || {
-        let mut config = if config_path.exists() {
-            std::fs::read_to_string(config_path)?
+    let policy = SymlinkPolicy::for_target(target);
+    with_config_lock_policy(config_path, "toml.lock", policy, || {
+        let mut config = match policy.read(config_path)? {
+            Some(content) => content
                 .parse::<DocumentMut>()
-                .with_context(|| format!("Failed to parse {}", config_path.display()))?
-        } else {
-            DocumentMut::new()
+                .with_context(|| format!("Failed to parse {}", config_path.display()))?,
+            None => DocumentMut::new(),
         };
         let before = config.to_string();
 
@@ -59,7 +62,7 @@ pub fn install_kimi_hooks_with_events(
             log_unchanged(config_path);
             return Ok(());
         }
-        write_file(config_path, config.to_string().as_bytes())?;
+        policy.write(config_path, config.to_string().as_bytes())?;
         log_installed(config_path);
         Ok(())
     })

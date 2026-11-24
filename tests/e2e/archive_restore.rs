@@ -686,12 +686,12 @@ fn trash_retained_transcript_is_read_only() {
     h.append_config("[session]\nlive_send_on_view_switch = true\nshow_diagnostics_pane = true");
     let project = h.project_path();
     let mut retained = Instance::new("TrashRetained", project.to_str().unwrap());
-    retained.trashed_at = Some(chrono::Utc::now());
+    retained.trashed_at = Some(agent_of_empires::time::Timestamp::now());
     retained.status = Status::Stopped;
     retained.mark_unread();
     let id = retained.id.clone();
     let mut empty = Instance::new("TrashEmpty", project.to_str().unwrap());
-    empty.trashed_at = Some(chrono::Utc::now());
+    empty.trashed_at = Some(agent_of_empires::time::Timestamp::now());
     empty.archived_at = empty.trashed_at;
     empty.status = Status::Stopped;
     let empty_id = empty.id.clone();
@@ -712,7 +712,7 @@ fn trash_retained_transcript_is_read_only() {
             id,
             seq,
             &serde_json::to_string(event).unwrap(),
-            chrono::Utc::now().timestamp_millis(),
+            agent_of_empires::time::Timestamp::now().as_millis(),
         )
     };
     let store = agent_of_empires::events::open(&database, &schema).unwrap();
@@ -736,7 +736,7 @@ fn trash_retained_transcript_is_read_only() {
                 kind: "execute".into(),
                 args_preview: "{}".into(),
                 prompt: None,
-                started_at: chrono::Utc::now(),
+                started_at: agent_of_empires::time::Timestamp::now(),
                 parent_tool_call_id: None,
                 memory_recall: None,
                 diffs: Vec::new(),
@@ -770,7 +770,7 @@ fn trash_retained_transcript_is_read_only() {
             is_error: false,
             content: String::new(),
             output: Vec::new(),
-            completed_at: chrono::Utc::now(),
+            completed_at: agent_of_empires::time::Timestamp::now(),
             async_subagent: false,
         },
     )
@@ -797,7 +797,7 @@ fn trash_retained_transcript_is_read_only() {
             is_error: true,
             content: String::new(),
             output: Vec::new(),
-            completed_at: chrono::Utc::now(),
+            completed_at: agent_of_empires::time::Timestamp::now(),
             async_subagent: false,
         },
     )
@@ -840,7 +840,7 @@ fn trash_retained_transcript_is_read_only() {
                 data: None,
                 uri: None,
             }],
-            completed_at: chrono::Utc::now(),
+            completed_at: agent_of_empires::time::Timestamp::now(),
             async_subagent: false,
         },
     )
@@ -1226,7 +1226,7 @@ fn trash_reader_ctrl_c_exits() {
     let mut h = TuiTestHarness::new("trash_ctrl_c");
     h.stop_daemon_on_drop();
     let mut row = Instance::new("TrashQuit", h.project_path().to_str().unwrap());
-    row.trashed_at = Some(chrono::Utc::now());
+    row.trashed_at = Some(agent_of_empires::time::Timestamp::now());
     row.status = Status::Stopped;
     std::fs::write(h.sessions_path(), serde_json::to_vec(&[row]).unwrap()).unwrap();
     h.start_daemon();
@@ -1269,7 +1269,9 @@ fn trash_retry_ignores_permanent_delete_policy() {
         .try_acquire_lifecycle_reservation(
             LifecycleOperation::Trash,
             Instance::LIFECYCLE_RESERVATION_TTL,
-            chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+            agent_of_empires::time::Timestamp::now()
+                - Instance::LIFECYCLE_RESERVATION_TTL
+                - agent_of_empires::time::Duration::seconds(1),
         )
         .unwrap();
     row.trash();
@@ -1335,14 +1337,16 @@ fn pending_trash_row(
             branch: "unverified".into(),
             main_repo_path: h.project_path().to_string_lossy().into_owned(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: agent_of_empires::time::Timestamp::now(),
             base_branch: None,
         });
     }
     row.try_acquire_lifecycle_reservation(
         LifecycleOperation::Trash,
         Instance::LIFECYCLE_RESERVATION_TTL,
-        chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+        agent_of_empires::time::Timestamp::now()
+            - Instance::LIFECYCLE_RESERVATION_TTL
+            - agent_of_empires::time::Duration::seconds(1),
     )
     .unwrap();
     row.trash();
@@ -1524,6 +1528,9 @@ fn trash_retry_menu_rejects_old_epoch_and_accepts_fresh_consent() {
             "--port",
             &port.to_string(),
             "--no-auth",
+            "--behind-proxy",
+            "--allowed-host",
+            "127.0.0.1",
         ]);
         assert!(crate::harness::wait_for_port(port, Duration::from_secs(10)));
         h.wait_for("Reconnect");

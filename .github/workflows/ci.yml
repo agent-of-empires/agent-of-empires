@@ -13,7 +13,9 @@ on:
 # Queue generations have distinct refs; cancel-obsolete-queue-runs handles them.
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # A push to main runs to completion so macOS results and kache seeds land;
+  # a newer push waits as the single pending run.
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -120,7 +122,7 @@ jobs:
         id: msrv
         run: |
           python3 -c 'import tomllib; print("version=" + tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])' >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: ./.github/actions/rust-toolchain
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: ./.github/actions/kache
@@ -233,7 +235,8 @@ jobs:
     # Toolchain-free self-tests for the scripts other workflows rely on:
     # verify-shared-target.sh (kache verify), select-internal-pr.py
     # (nix-npm-hash.yml), check-dependabot-pr.py (dependabot-auto-merge.yml),
-    # classify-cachix-failure.py (cachix-push.yml) and release-pr-fresh.sh.
+    # classify-cachix-failure.py (cachix-push.yml), nightly-notes.py (nightly.yml)
+    # and release-pr-fresh.sh.
     name: Script Self-Tests
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
     runs-on: ubuntu-latest
@@ -246,6 +249,7 @@ jobs:
       - run: python3 .github/scripts/select-internal-pr.py --self-test
       - run: python3 .github/scripts/check-dependabot-pr.py --self-test
       - run: python3 .github/scripts/classify-cachix-failure.py --self-test
+      - run: python3 .github/scripts/nightly-notes.py --self-test
       - run: .github/scripts/release-pr-fresh.sh --self-test
       - run: python3 scripts/check-no-claude-in-core.py --self-test
       # Disabled until C25 to C29 remove Claude from core on

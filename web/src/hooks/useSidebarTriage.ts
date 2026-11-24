@@ -1,6 +1,14 @@
 import { useCallback, useState } from "react";
 
-import { setSessionArchive, setSessionPin, setSessionSnooze, setSessionUnread } from "../lib/api";
+import {
+  reclaimSessionOwnership,
+  setSessionArchive,
+  setSessionIgnored,
+  setSessionPin,
+  setSessionSnooze,
+  setSessionUnread,
+} from "../lib/api";
+import { reportFeatureUse, type FeatureUse } from "../lib/featureUse";
 import { reportError } from "../lib/toastBus";
 import {
   makeOptimisticSnoozedUntil,
@@ -48,6 +56,7 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
 
   const triage = useCallback(
     async (
+      feature: FeatureUse,
       ws: Workspace,
       optimistic: Partial<OptimisticTriage>,
       revert: Partial<OptimisticTriage>,
@@ -55,6 +64,7 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
     ): Promise<TriageResult> => {
       const sessionId = ws.sessions[0]?.id;
       if (!sessionId) return { workspaceId: ws.id, ok: false, skipped: true };
+      reportFeatureUse(feature);
       setOverride(ws.id, sessionId, optimistic);
       if (await call(sessionId)) return { workspaceId: ws.id, ok: true };
       setOverride(ws.id, sessionId, revert);
@@ -64,19 +74,21 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
   );
 
   const pin = useCallback(
-    (ws: Workspace, pinned: boolean) => triage(ws, { pinned }, { pinned: null }, (id) => setSessionPin(id, pinned)),
+    (ws: Workspace, pinned: boolean) =>
+      triage("pin_toggle", ws, { pinned }, { pinned: null }, (id) => setSessionPin(id, pinned)),
     [triage],
   );
 
   const archive = useCallback(
     (ws: Workspace, archived: boolean) =>
-      triage(ws, { archived }, { archived: null }, (id) => setSessionArchive(id, archived)),
+      triage("archive_toggle", ws, { archived }, { archived: null }, (id) => setSessionArchive(id, archived)),
     [triage],
   );
 
   const snooze = useCallback(
     (ws: Workspace, minutes: number | null) =>
       triage(
+        "snooze_toggle",
         ws,
         { snoozedUntil: minutes == null ? null : makeOptimisticSnoozedUntil(minutes) },
         { snoozedUntil: undefined },
@@ -87,9 +99,21 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
 
   const unread = useCallback(
     (ws: Workspace, markUnread: boolean) =>
-      triage(ws, { unread: markUnread }, { unread: null }, (id) => setSessionUnread(id, markUnread)),
+      triage("unread_toggle", ws, { unread: markUnread }, { unread: null }, (id) => setSessionUnread(id, markUnread)),
     [triage],
   );
+
+  const ignoreToggle = useCallback((sessionId: string, ignored: boolean) => {
+    void setSessionIgnored(sessionId, ignored).then((row) => {
+      if (row == null) reportError(ignored ? "Failed to ignore session" : "Failed to unignore session");
+    });
+  }, []);
+
+  const reclaimOwnership = useCallback((sessionId: string) => {
+    void reclaimSessionOwnership(sessionId).then((row) => {
+      if (row == null) reportError("Failed to take ownership");
+    });
+  }, []);
 
   const pinToggle = useCallback(
     (ws: Workspace, pinned: boolean) => {
@@ -151,6 +175,8 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
     archiveToggle,
     snooze: snoozeOne,
     unreadToggle,
+    ignoreToggle,
+    reclaimOwnership,
     bulkPin,
     bulkArchive,
     bulkSnooze,

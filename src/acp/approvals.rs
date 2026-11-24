@@ -1,6 +1,6 @@
 //! Server-side approval nonces.
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use rand::TryRng;
 use serde::{Deserialize, Serialize};
 
@@ -57,7 +57,7 @@ pub enum ApprovalDecision {
 
 /// One option the agent offered on `session/request_permission`, kept in
 /// the order it sent them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ApprovalOption {
     pub option_id: String,
     pub name: String,
@@ -66,7 +66,7 @@ pub struct ApprovalOption {
 
 /// Mirror of ACP `PermissionOptionKind`, owned here so the wire type the
 /// clients see does not depend on the protocol crate's enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalOptionKind {
     AllowOnce,
@@ -100,7 +100,7 @@ pub struct Approval {
     /// Full ExitPlanMode markdown, which `tool_call.args_preview` may truncate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
-    pub requested_at: DateTime<Utc>,
+    pub requested_at: Timestamp,
     pub resolved: Option<ResolvedApproval>,
 }
 
@@ -108,7 +108,7 @@ pub struct Approval {
 pub struct ResolvedApproval {
     pub decision: ApprovalDecision,
     pub message: Option<String>,
-    pub resolved_at: DateTime<Utc>,
+    pub resolved_at: Timestamp,
 }
 
 /// Heuristic for "this tool call is destructive enough that mobile UI

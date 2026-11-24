@@ -234,7 +234,7 @@ async fn serve(mut socket: WebSocket, state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use crate::time::Timestamp;
 
     fn change(id: &str, new: Status) -> StatusChange {
         StatusChange {
@@ -243,7 +243,7 @@ mod tests {
             effective_profile: "default".to_string(),
             old: Status::Running,
             new,
-            at: Utc::now(),
+            at: Timestamp::now(),
         }
     }
 
@@ -346,6 +346,8 @@ mod tests {
         );
     }
 
+    /// The session list carries paths under the app dir, so both publishes must read the same
+    /// one: a test that isolates the app dir meanwhile would otherwise change the second.
     #[tokio::test]
     #[serial_test::serial]
     async fn queued_moves_sharing_a_snapshot_all_report_the_status_that_snapshot_has() {

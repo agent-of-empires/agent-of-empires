@@ -477,15 +477,15 @@ impl Session {
         queued: QueuedClientCmd,
     ) -> Option<QueuedClientCmd> {
         let QueuedClientCmd {
-            command: ClientCmd::InitialPromptIntent(intent),
+            command: ClientCmd::InitialPromptIntent(mut intent),
             ..
         } = queued
         else {
             return Some(queued);
         };
-        match intent.into_native().await {
+        match intent.prepare_native().await {
             Ok(command) => Some(command),
-            Err((error, intent)) => {
+            Err(error) => {
                 if !intent.cancellation.is_cancelled()
                     && self.shared.connection_state.loss().is_none()
                     && !self.shared.connection_state.is_stopping()
@@ -496,20 +496,17 @@ impl Session {
                         )
                     )
                 {
-                    if let Some(agent_client_protocol::v1::schema::ContentBlock::Text(text)) =
-                        intent.blocks.into_iter().next()
-                    {
-                        let event = Event::PromptRejected {
-                            reason: error.to_string(),
-                            text: text.text,
-                        };
-                        let _ = self
-                            .shared
-                            .event_tx
-                            .with_metadata(crate::acp::event_sender::EventMetadata::host(&event))
-                            .send(event)
-                            .await;
-                    }
+                    let event = Event::PromptRejected {
+                        reason: error.to_string(),
+                        text: intent.input.text(),
+                        attachments: intent.input.attachments,
+                    };
+                    let _ = self
+                        .shared
+                        .event_tx
+                        .with_metadata(crate::acp::event_sender::EventMetadata::host(&event))
+                        .send(event)
+                        .await;
                 }
                 None
             }
@@ -555,11 +552,11 @@ impl Session {
                 .flatten()
             {
                 Some(QueuedPrompt {
-                    blocks,
+                    input,
                     scope,
                     correlation,
                 }) => Some(QueuedClientCmd {
-                    command: ClientCmd::Prompt(blocks),
+                    command: ClientCmd::Prompt(input),
                     scope,
                     correlation,
                 }),
@@ -680,10 +677,10 @@ impl Session {
                     unreachable!("host intent resolved before Native dispatch");
                 }
                 ClientCmd::CancelInitialPrompt { .. } => {}
-                ClientCmd::Prompt(blocks) => {
+                ClientCmd::Prompt(prompt) => {
                     if self
                         .run_prompt(QueuedPrompt {
-                            blocks,
+                            input: prompt,
                             scope,
                             correlation,
                         })
@@ -728,8 +725,8 @@ impl Session {
                     }
                     if let Some((deadline, newly_armed)) = grace {
                         if newly_armed {
-                            let escalates_at = chrono::Utc::now()
-                                + chrono::Duration::from_std(
+                            let escalates_at = crate::time::Timestamp::now()
+                                + crate::time::Duration::try_from(
                                     deadline.saturating_duration_since(tokio::time::Instant::now()),
                                 )
                                 .unwrap_or_default();
@@ -886,7 +883,7 @@ impl Session {
         let adopted = shared.adopted_turn_active.swap(false, Ordering::Relaxed);
         let captured = take_rate_limit_from_captured_rejection(
             &shared.rate_limit_rejections,
-            chrono::Utc::now(),
+            crate::time::Timestamp::now(),
         );
         if let Some(info) = captured {
             if !shared.terminal_claim.claim_failed() {
@@ -932,10 +929,23 @@ impl Session {
         let refusal = if tokio::time::Instant::now() >= deadline {
             Some("reset deadline expired before admission".to_owned())
         } else {
-            require_operation(&original_scope, correlation, true)
-                .and_then(|()| current_effect(&original_scope, true, || ()))
-                .err()
-                .map(|error| public_error_message(&error))
+            match require_operation(&original_scope, correlation, true) {
+                Err(error) => Some(public_error_message(&error)),
+                Ok(()) => match tokio::time::timeout_at(
+                    deadline,
+                    current_effect_wait(
+                        original_scope.as_ref(),
+                        true,
+                        &self.shared.connection_state,
+                        || (),
+                    ),
+                )
+                .await
+                {
+                    Ok(result) => result.err().map(|error| public_error_message(&error)),
+                    Err(_) => Some("reset deadline expired before admission".to_owned()),
+                },
+            }
         };
 
         if let Some(message) = refusal {
@@ -965,6 +975,7 @@ impl Session {
                 Event::PromptRejected {
                     reason: "agent_busy".into(),
                     text,
+                    attachments: Vec::new(),
                 },
                 false,
             )
@@ -994,6 +1005,7 @@ impl Session {
                 Event::PromptRejected {
                     reason: "agent_busy".into(),
                     text,
+                    attachments: Vec::new(),
                 },
                 false,
             )
@@ -1300,6 +1312,7 @@ impl Session {
                     Event::PromptRejected {
                         reason: "agent_busy".into(),
                         text: pending.text,
+                        attachments: Vec::new(),
                     },
                     false,
                 )
@@ -1361,16 +1374,30 @@ impl Session {
                         let admission = if let Err(message) = &clear_after_seq {
                             Err(message.clone())
                         } else if projected && ready && pending.proposal.current().await {
-                            current_effect(&scope, native, || {
-                                self.acp_session_id = response.session_id.clone();
-                                self.channels = SessionChannels::new(
-                                    response.modes.as_ref(),
-                                    response.config_options.as_deref(),
-                                );
-                                shared.terminal_claim.clear_failed_outcome();
-                                shared.connection_state.record_usable();
-                            })
-                            .map_err(|error| public_error_message(&error))
+                            match tokio::time::timeout_at(
+                                pending.deadline,
+                                current_effect_wait(
+                                    scope.as_ref(),
+                                    native,
+                                    &shared.connection_state,
+                                    || {
+                                        self.acp_session_id = response.session_id.clone();
+                                        self.channels = SessionChannels::new(
+                                            response.modes.as_ref(),
+                                            response.config_options.as_deref(),
+                                        );
+                                        shared.terminal_claim.clear_failed_outcome();
+                                        shared.connection_state.record_usable();
+                                    },
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(result) => result.map_err(|error| public_error_message(&error)),
+                                Err(_) => {
+                                    Err("reset deadline expired before channel admission".into())
+                                }
+                            }
                         } else {
                             Err("native reset was superseded or its channel is unavailable".into())
                         };
@@ -1777,8 +1804,12 @@ mod tests {
                 assert!(actual.connection_state.test_fresh_write_pending.lock().unwrap().replace(waiting).is_none());
                 let reset = actual.reset_session("/clear", proposal, deadline, deadline + Duration::from_secs(5));
                 tokio::pin!(reset);
-                assert!(futures_util::poll!(reset.as_mut()).is_pending());
-                tokio::time::timeout(Duration::from_secs(10), entered).await.unwrap().unwrap();
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    tokio::select! {
+                        entered = entered => entered.unwrap(),
+                        result = reset.as_mut() => panic!("reset settled before the write fence: {result:?}"),
+                    }
+                }).await.expect("reset reaches the write fence");
                 assert_eq!(ingress.current(), Some(old.clone()));
                 assert_eq!(received.lock().unwrap().iter().filter(|request| request["method"] == "session/new").count(), 1);
                 let later = Arc::clone(&actual.connection_state.callback_duration).read_owned();

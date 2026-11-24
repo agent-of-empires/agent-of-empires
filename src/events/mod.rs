@@ -56,6 +56,7 @@ impl Schema {
 pub enum SeqBound {
     After(u64),
     Before(u64),
+    AfterThrough(u64, u64),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -85,6 +86,35 @@ fn not_like_clauses(prefixes: &[&str]) -> (String, Vec<String>) {
     (fragment, patterns)
 }
 
+fn create_owner_only(path: &Path) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(_) => Ok(()),
+        // Reopening a database already open in this process would drop its SQLite locks.
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => create_dangling_target(path),
+        Err(err) => Err(err),
+    }
+}
+
+/// `create_new` also reports `AlreadyExists` for a symlink whose target is missing; create that
+/// target owner-only so SQLite does not create it with the default mode.
+fn create_dangling_target(path: &Path) -> std::io::Result<()> {
+    match std::fs::metadata(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let link = std::fs::read_link(path)?;
+            create_owner_only(&path.parent().unwrap_or(Path::new("")).join(link))
+        }
+        Err(err) => Err(err),
+        Ok(_) => Ok(()),
+    }
+}
+
 pub fn open(db_path: &Path, schema: &Schema) -> Result<Connection> {
     let conn = connect(db_path)?;
     initialize_schema(&conn, schema)?;
@@ -98,6 +128,12 @@ pub(crate) fn connect(db_path: &Path) -> Result<Connection> {
                 format!("create parent dir for event log at {}", parent.display())
             })?;
         }
+    }
+    // SQLite gives the -wal and -shm files the main file's mode, so create it owner-only first.
+    // Private memory and temporary databases have no file to create.
+    if !matches!(db_path.to_str(), Some("" | ":memory:")) {
+        create_owner_only(db_path)
+            .with_context(|| format!("create event log at {}", db_path.display()))?;
     }
     let conn = Connection::open(db_path)
         .with_context(|| format!("open event log at {}", db_path.display()))?;
@@ -382,10 +418,11 @@ pub(crate) fn scan_projected<T>(
         order,
         limit,
     } = window;
-    let (op, value) = match bound {
-        SeqBound::After(value) => (">", value),
-        SeqBound::Before(value) if value > i64::MAX as u64 => ("<=", value),
-        SeqBound::Before(value) => ("<", value),
+    let (predicate, value, upper) = match bound {
+        SeqBound::After(value) => ("seq > ?2", value, None),
+        SeqBound::AfterThrough(after, through) => ("seq > ?2 AND seq <= ?3", after, Some(through)),
+        SeqBound::Before(value) if value > i64::MAX as u64 => ("seq <= ?2", value, None),
+        SeqBound::Before(value) => ("seq < ?2", value, None),
     };
     let value_i64 = i64::try_from(value).unwrap_or(i64::MAX);
     let order_sql = match order {
@@ -393,27 +430,24 @@ pub(crate) fn scan_projected<T>(
         Order::Desc => "DESC",
     };
     let events = schema.events_table();
-    let sql = match limit {
-        Some(_) => format!(
-            "SELECT {columns} FROM {events}
-             WHERE session_id = ?1 AND seq {op} ?2
-             ORDER BY seq {order_sql} LIMIT ?3"
-        ),
-        None => format!(
-            "SELECT {columns} FROM {events}
-             WHERE session_id = ?1 AND seq {op} ?2
-             ORDER BY seq {order_sql}"
-        ),
-    };
+    let limit_sql = if limit.is_some() { " LIMIT ?" } else { "" };
+    let sql = format!(
+        "SELECT {columns} FROM {events}
+         WHERE session_id = ?1 AND {predicate}
+         ORDER BY seq {order_sql}{limit_sql}"
+    );
     let mut statement = conn
         .prepare(&sql)
         .with_context(|| format!("prepare scan for {topic}"))?;
-    let rows = match limit {
-        Some(limit) => statement.query_map(
-            params![topic, value_i64, i64::try_from(limit).unwrap_or(i64::MAX)],
-            map_row,
-        ),
-        None => statement.query_map(params![topic, value_i64], map_row),
+    let limit = limit.map(|n| i64::try_from(n).unwrap_or(i64::MAX));
+    let upper = upper.map(|n| i64::try_from(n).unwrap_or(i64::MAX));
+    let rows = match (upper, limit) {
+        (Some(upper), Some(limit)) => {
+            statement.query_map(params![topic, value_i64, upper, limit], map_row)
+        }
+        (Some(upper), None) => statement.query_map(params![topic, value_i64, upper], map_row),
+        (None, Some(limit)) => statement.query_map(params![topic, value_i64, limit], map_row),
+        (None, None) => statement.query_map(params![topic, value_i64], map_row),
     }
     .with_context(|| format!("query scan for {topic}"))?;
     rows.filter_map(|row| row.transpose())
@@ -813,6 +847,39 @@ mod tests {
         ))
         .unwrap();
         conn
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_creates_owner_only_db_and_sidecars() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("e.db");
+        let schema = Schema::new("demo").unwrap();
+        let conn = open(&db, &schema).unwrap();
+        insert_event(&conn, &schema, "a", 1, "\"x\"", 1).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let path = dir.path().join(format!("e.db{suffix}"));
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", path.display());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_through_a_dangling_symlink_creates_the_target_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("e.db");
+        std::os::unix::fs::symlink("history.sqlite", &link).unwrap();
+        let schema = Schema::new("demo").unwrap();
+        let conn = open(&link, &schema).unwrap();
+        insert_event(&conn, &schema, "a", 1, "\"x\"", 1).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let path = dir.path().join(format!("history.sqlite{suffix}"));
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", path.display());
+        }
     }
 
     #[test]

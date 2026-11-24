@@ -16,12 +16,16 @@ aoe refuses to start a session whose adapter is below the version floor and repo
 
 The dashboard shows the same thing inline, as a screen that names the Agent, the installed and required versions, and numbered steps that follow what this dashboard can do:
 
-- **An npm adapter, with installs allowed:** **Update & restart** runs the agent's `npm install -g` on the host as the daemon user and respawns, queueing every other session blocked on that adapter for a respawn too. In a sandboxed session the button is **Update in Sandbox & restart** and installs inside the session's container instead. That fixes this session only; refresh the sandbox image so new sessions don't hit it.
+- **An npm adapter, with installs allowed:** **Update & restart** runs the agent's `npm install -g` on the host as the daemon user and respawns, queueing every other session blocked on that adapter for a respawn too. In a sandboxed session the same button installs inside the session's container instead. That fixes this session only; refresh the sandbox image so new sessions don't hit it. If the install fails, the screen shows npm's exit code, or why there is none, with **Try again**, the command to run by hand, and npm's output under **Details**.
 - **Installs not allowed yet:** step 1 is to turn on `acp.allow_agent_install`, and the button stays disabled until it's on. The setting is **off by default**, because a global install runs the package's lifecycle scripts as the daemon user. It is `local_only`, so the dashboard can't turn it on: enable it from the TUI settings (Advanced) or the config file. The screen notices the change when you come back to the tab.
 - **A sandbox container that isn't running:** for an npm adapter, **Start the container** first; the update comes back once it runs. For an adapter you install by hand, step 1 is **Check again**, which starts the container so the command can run inside it.
 - **Not installable from here:** the command to run by hand, with **Copy**, then **Check again**, which respawns the worker and re-runs the version check.
 - **A sandboxed session, in any of these states:** **Recreate container** restarts the session on a new container from the current local image, after the same confirmation as **More > Recreate container** in its context menu. Anything outside the working directory and the mounted folders is lost. See [Sandbox](../guides/sandbox.md#available-images).
 - **Read-only and CityHall dashboards** show the command only. Restart the agent from the TUI.
+
+### A sandboxed session's container is gone
+
+When a sandboxed session's container was removed, its agent can't restart in it, so the session stops with a screen saying the container is gone. **Recreate container** builds a new one from the current local image, after the same confirmation as **More > Recreate container**, and the session starts again. **New Session in** _Project_ opens the new session dialog for the same Project, Agent and Group instead. Sending is blocked until then, because a send would start the session on a new container without that warning. Read-only and CityHall dashboards ask you to have the owner recreate it. Recreate isn't offered for an archived or trashed session, or one that's being created or deleted, so the screen says to unarchive it from the sidebar, restore it from Trash, or wait first.
 
 ### "Failed to start structured view agent" while the adapter is installed
 

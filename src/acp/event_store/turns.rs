@@ -95,6 +95,14 @@ const UNRESOLVED_BACKGROUND_TASKS_SQL: &str =
        )
      ORDER BY started.seq ASC";
 
+const LATER_PLAN_DROP_SQL: &str = "SELECT EXISTS(
+     SELECT 1 FROM acp_events
+     WHERE session_id = ?1
+       AND seq > ?2
+       AND (discriminant IN ('SessionCleared', 'AgentSwitched')
+            OR (discriminant = 'PlanRemoved'
+                AND json_extract(event_json, '$.PlanRemoved.plan_id') = ?3)))";
+
 /// Each subagent's latest snapshot, where it is still working. An
 /// `AgentSwitched` drops the children announced before it. SQLite takes the
 /// bare `event_json` from the `MAX(seq)` row of each group.
@@ -240,13 +248,25 @@ fn launch_witness(
 }
 
 impl EventStore {
+    /// The plan the strip shows: `None` once a later clear, agent switch, or
+    /// matching removal dropped it, as `AcpState` folds them.
     pub fn latest_plan(&self, session_id: &str) -> Option<Plan> {
-        let (_, json) =
-            events::latest_by_discriminant(&self.conn(), &self.schema, session_id, "PlanUpdated")?;
-        match decode_logged(&json, session_id, "latest_plan")? {
-            Event::PlanUpdated { plan } => Some(plan),
-            _ => None,
-        }
+        let conn = self.conn();
+        let (seq, json) =
+            events::latest_by_discriminant(&conn, &self.schema, session_id, "PlanUpdated")?;
+        let Event::PlanUpdated { plan } = decode_logged(&json, session_id, "latest_plan")? else {
+            return None;
+        };
+        let dropped = logged(
+            conn.query_row(
+                LATER_PLAN_DROP_SQL,
+                params![session_id, seq as i64, plan.plan_id],
+                |row| row.get::<_, bool>(0),
+            ),
+            "latest_plan",
+            session_id,
+        )?;
+        (!dropped).then_some(plan)
     }
 
     /// Latest advertised `(image, audio, embedded_context)` prompt capabilities.
@@ -631,6 +651,24 @@ impl EventStore {
         .collect()
     }
 
+    /// Whether a turn ended (`Stopped` or `AgentStartupError`) after `seq`. `None` when the
+    /// query failed.
+    pub fn turn_ended_after(&self, session_id: &str, seq: u64) -> Option<bool> {
+        logged(
+            self.conn().query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM acp_events
+                     WHERE session_id = ?1
+                       AND seq > ?2
+                       AND discriminant IN ('Stopped', 'AgentStartupError'))",
+                params![session_id, seq as i64],
+                |row| row.get::<_, bool>(0),
+            ),
+            "turn_ended_after query",
+            session_id,
+        )
+    }
+
     /// Elicitation nonces whose responders remain available.
     pub fn unresolved_elicitation_nonces(&self, session_id: &str) -> Vec<Nonce> {
         query_strings(
@@ -712,7 +750,8 @@ impl EventStore {
 
     fn has_unhandled_finish(&self, session_id: &str) -> Result<ControlKnowledge<bool>> {
         use ControlKnowledge::{Indeterminate, Known};
-        let stale_cutoff = chrono::Utc::now().timestamp_millis() - BACKGROUND_AGENT_STALE_AFTER_MS;
+        let stale_cutoff =
+            crate::time::Timestamp::now().as_millis() - BACKGROUND_AGENT_STALE_AFTER_MS;
         self.with_control_snapshot(session_id, |conn, cursor| {
             let stopped = match cursor.projection.stopped_through {
                 Known(seq) => Some(i64::try_from(seq)?),
@@ -761,7 +800,8 @@ impl EventStore {
             return Ok(main);
         }
         let conn = self.reader();
-        let stale_cutoff = chrono::Utc::now().timestamp_millis() - BACKGROUND_AGENT_STALE_AFTER_MS;
+        let stale_cutoff =
+            crate::time::Timestamp::now().as_millis() - BACKGROUND_AGENT_STALE_AFTER_MS;
         let bg_in_flight: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM (
                      SELECT aid, MAX(created_at) AS last_at FROM (
@@ -978,7 +1018,7 @@ mod tests {
             tools: vec![],
             last_tool: None,
             last_text: None,
-            at: chrono::Utc::now(),
+            at: crate::time::Timestamp::now(),
         };
         for (events, main, any) in [
             (
@@ -1048,7 +1088,7 @@ mod tests {
             tools: vec![],
             result: None,
             warning: None,
-            ended_at: chrono::Utc::now(),
+            ended_at: crate::time::Timestamp::now(),
         };
         store
             .record("s", 3, &completed, &EventMetadata::history())
@@ -1056,7 +1096,7 @@ mod tests {
         assert_eq!(store.has_in_flight_turn("s").unwrap(), Indeterminate);
         // A stale progress record does not turn unknown main state into known idle.
         let stale =
-            chrono::Utc::now().timestamp_millis() - BACKGROUND_AGENT_STALE_AFTER_MS - 60_000;
+            crate::time::Timestamp::now().as_millis() - BACKGROUND_AGENT_STALE_AFTER_MS - 60_000;
         store.record_at("stale", 2, &progress(), stale).unwrap();
         assert_eq!(store.has_in_flight_turn("stale").unwrap(), Indeterminate);
     }
@@ -1066,6 +1106,7 @@ mod tests {
         use ControlKnowledge::Known;
         for reason in [
             "prompt_failed",
+            "prompt_rejected",
             "rate_limited",
             crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
         ] {
@@ -1234,7 +1275,7 @@ mod tests {
                 model: None,
                 background: true,
             },
-            at: chrono::Utc::now(),
+            at: crate::time::Timestamp::now(),
         };
         let switched = Event::AgentSwitched {
             from: "claude".into(),
@@ -1422,7 +1463,7 @@ mod tests {
     fn an_old_unhandled_finish_no_longer_holds_live_work() {
         let (_tmp, store) = open_store(1000);
         let old =
-            chrono::Utc::now().timestamp_millis() - (BACKGROUND_AGENT_STALE_AFTER_MS + 60_000);
+            crate::time::Timestamp::now().as_millis() - (BACKGROUND_AGENT_STALE_AFTER_MS + 60_000);
         let finished = Event::BackgroundTaskFinished {
             task_id: "t".into(),
             ended_at: None,
@@ -1540,7 +1581,7 @@ mod tests {
                 options: Vec::new(),
                 choice: false,
                 plan: None,
-                requested_at: chrono::Utc::now(),
+                requested_at: crate::time::Timestamp::now(),
                 resolved: None,
             },
         };
@@ -1552,7 +1593,7 @@ mod tests {
                 description: None,
                 tool_call_id: None,
                 questions: Vec::new(),
-                requested_at: chrono::Utc::now(),
+                requested_at: crate::time::Timestamp::now(),
                 resolved: None,
             },
         };
@@ -1733,7 +1774,7 @@ mod tests {
                     tools: Vec::new(),
                     result: None,
                     warning: None,
-                    ended_at: chrono::Utc::now(),
+                    ended_at: crate::time::Timestamp::now(),
                 },
                 bg_launched("bg-b", "/tmp/b.jsonl"),
                 bg_launched("bg-c", ""),
@@ -1849,7 +1890,7 @@ mod tests {
             tools: Vec::new(),
             result: None,
             warning: None,
-            ended_at: chrono::Utc::now(),
+            ended_at: crate::time::Timestamp::now(),
         });
         // Enough events for the periodic sweep of completed work to run.
         for _ in 0..150 {
@@ -2206,7 +2247,7 @@ mod tests {
                     tools: Vec::new(),
                     result: None,
                     warning: None,
-                    ended_at: chrono::Utc::now(),
+                    ended_at: crate::time::Timestamp::now(),
                 },
             ],
         );
@@ -2242,7 +2283,7 @@ mod tests {
             7,
             [Event::BackgroundTaskFinished {
                 task_id: "wfx".into(),
-                ended_at: Some(chrono::Utc::now()),
+                ended_at: Some(crate::time::Timestamp::now()),
             }],
         );
         assert!(store
@@ -2273,7 +2314,7 @@ mod tests {
                 description: None,
                 tool_call_id: None,
                 questions: Vec::new(),
-                requested_at: chrono::Utc::now(),
+                requested_at: crate::time::Timestamp::now(),
                 resolved: None,
             },
         };
@@ -2282,7 +2323,7 @@ mod tests {
             is_error: false,
             content: String::new(),
             output: Vec::new(),
-            completed_at: chrono::Utc::now(),
+            completed_at: crate::time::Timestamp::now(),
             async_subagent: false,
         };
         record_projection(
@@ -2376,7 +2417,7 @@ mod tests {
             prompt: "do it".into(),
             model: "claude-opus-4-8".into(),
             output_file: output_file.into(),
-            started_at: chrono::Utc::now(),
+            started_at: crate::time::Timestamp::now(),
             workflow: None,
         }
     }

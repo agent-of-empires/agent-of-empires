@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 
 use super::{Instance, Status, Storage};
 use crate::file_watch::FileWatchService;
@@ -21,7 +21,7 @@ pub struct IdleReapCandidate {
 /// Select the plain (non-structured view) sessions eligible for idle auto-stop.
 pub fn idle_reap_candidates(
     instances: &[Instance],
-    now: DateTime<Utc>,
+    now: Timestamp,
     attached: &HashSet<String>,
     resolve_threshold: impl Fn(&str) -> u32,
 ) -> Vec<IdleReapCandidate> {
@@ -59,10 +59,10 @@ pub fn idle_reap_candidates(
 
 /// Decide whether a plain (non-structured view) session should be auto-stopped for inactivity.
 pub fn should_auto_stop_session(
-    now: DateTime<Utc>,
+    now: Timestamp,
     status: Status,
-    idle_entered_at: Option<DateTime<Utc>>,
-    last_accessed_at: Option<DateTime<Utc>>,
+    idle_entered_at: Option<Timestamp>,
+    last_accessed_at: Option<Timestamp>,
     is_attached: bool,
     threshold_secs: u32,
 ) -> bool {
@@ -82,7 +82,7 @@ pub fn should_auto_stop_session(
         Some(accessed) if accessed > entered => accessed,
         _ => entered,
     };
-    match (now - anchor).to_std() {
+    match std::time::Duration::try_from(now - anchor) {
         Ok(elapsed) => elapsed.as_secs() >= threshold_secs as u64,
         // Negative duration (anchor in the future / clock skew): not eligible.
         Err(_) => false,
@@ -90,13 +90,12 @@ pub fn should_auto_stop_session(
 }
 
 /// Atomically claim an idle session for auto-stop, under the per-profile storage file lock so
-/// concurrent reapers (a standalone TUI and an `aoe serve` daemon against the same on-disk state)
-/// cannot double-stop it.
+/// concurrent reapers against the same on-disk state cannot double-stop it.
 pub fn claim_idle_stop(
     profile: &str,
     file_watch: Arc<FileWatchService>,
     session_id: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
     threshold_secs: u32,
 ) -> anyhow::Result<Option<Instance>> {
     let storage = Storage::new(profile, file_watch)?;
@@ -129,10 +128,10 @@ pub fn claim_idle_stop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration;
+    use crate::time::Duration;
 
-    fn now() -> DateTime<Utc> {
-        Utc::now()
+    fn now() -> Timestamp {
+        Timestamp::now()
     }
 
     #[test]
@@ -177,7 +176,7 @@ mod tests {
     fn idle_instance(title: &str) -> Instance {
         let mut inst = Instance::new(title, "/tmp/idle-reap-test");
         inst.status = Status::Idle;
-        inst.idle_entered_at = Some(Utc::now() - Duration::seconds(120));
+        inst.idle_entered_at = Some(Timestamp::now() - Duration::seconds(120));
         inst
     }
 
@@ -215,7 +214,7 @@ mod tests {
             })
             .unwrap();
 
-        let now = Utc::now();
+        let now = Timestamp::now();
         let first =
             claim_idle_stop("test-profile", FileWatchService::noop(), &id, now, 60).unwrap();
         assert!(first.is_some(), "first claim should win");

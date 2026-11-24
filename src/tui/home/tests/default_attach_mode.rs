@@ -382,7 +382,7 @@ fn render_home(env: &mut TestEnv) -> String {
     terminal
         .draw(|f| {
             let area = f.area();
-            env.view.render(f, area, &theme, None, None, None);
+            env.view.render(f, area, &theme, None);
         })
         .unwrap();
     let buf = terminal.backend().buffer();
@@ -618,7 +618,8 @@ fn a_takeover_names_the_live_key_in_a_flash_or_the_footer() {
 }
 
 /// A takeover in a structured Session's Terminal pane, then the view toggle: in Structured
-/// view neither key enters live mode, so the footer keeps the status and names no key.
+/// view there is no pane to relay into, so both keys attach the native view and the footer
+/// names no key.
 #[test]
 #[serial]
 fn a_takeover_names_no_key_where_neither_key_takes_control() {
@@ -649,17 +650,15 @@ fn a_takeover_names_no_key_where_neither_key_takes_control() {
         );
         assert!(!footer.contains("take control"), "{mode:?}: {footer}");
         assert!(footer.contains("↵ Attach"), "{mode:?}: {footer}");
-        // Neither key takes control: Enter opens the structured view and Tab is refused.
-        let enter = env.view.handle_key(key(KeyCode::Enter), None);
-        assert!(
-            matches!(&enter, Some(Action::OpenStructuredView(opened)) if opened == &id),
-            "{mode:?}: {enter:?}"
-        );
-        let tab = env.view.handle_key(key(KeyCode::Tab), None);
-        assert!(
-            matches!(tab, Some(Action::SetTransientStatus(_))),
-            "{mode:?}: {tab:?}"
-        );
+        // Neither key takes control: both open the structured view, which is this
+        // session's live form.
+        for key_code in [KeyCode::Enter, KeyCode::Tab] {
+            let action = env.view.handle_key(key(key_code), None);
+            assert!(
+                matches!(&action, Some(Action::OpenStructuredView(opened)) if opened == &id),
+                "{mode:?} {key_code:?}: {action:?}"
+            );
+        }
     }
 }
 
@@ -707,8 +706,11 @@ fn send_message_drains_pending_paste_for_structured_view() {
         "pending_paste must be drained when routing to structured view"
     );
     assert_eq!(
-        env.view.pending_paste_for_structured_view.get(&id),
-        Some(&"cached text".to_string()),
+        env.view
+            .pending_paste_for_structured_view
+            .get(&id)
+            .map(crate::tui::home::PendingStructuredInput::text),
+        Some("cached text".to_string()),
         "drained text must land in pending_paste_for_structured_view, bound to the selected session"
     );
 }
@@ -724,10 +726,26 @@ fn send_message_merges_buffered_paste_for_same_session() {
     env.view.pending_paste = Some("second".to_string());
     env.view.handle_key(key(KeyCode::Char('m')), None);
     assert_eq!(
-        env.view.pending_paste_for_structured_view.get(&id),
-        Some(&"first second".to_string()),
+        env.view
+            .pending_paste_for_structured_view
+            .get(&id)
+            .map(crate::tui::home::PendingStructuredInput::text),
+        Some("first second".to_string()),
         "same-target paste must merge into the buffered text"
     );
+}
+
+/// A whitespace-only Enter freezes nothing: the composer trims the text and
+/// sends nothing, so a frozen segment of spaces would stop the replay on every
+/// mount and hold back the segments after it.
+#[test]
+fn a_whitespace_only_enter_freezes_no_segment() {
+    let mut pending = crate::tui::home::PendingStructuredInput::default();
+    pending.push_str("   ");
+    pending.submit();
+    let (completed, draft) = pending.into_parts();
+    assert!(completed.is_empty(), "no segment for what submits nothing");
+    assert_eq!(draft, "   ", "the text stays the draft the reader can edit");
 }
 
 /// A paste captured for another structured session gets its own entry, so the earlier
@@ -748,13 +766,19 @@ fn send_message_keeps_buffered_paste_per_session() {
     env.view.select_session_by_id(&other);
     env.view.handle_key(key(KeyCode::Char('m')), None);
     assert_eq!(
-        env.view.pending_paste_for_structured_view.get(&other),
-        Some(&"session b draft".to_string()),
+        env.view
+            .pending_paste_for_structured_view
+            .get(&other)
+            .map(crate::tui::home::PendingStructuredInput::text),
+        Some("session b draft".to_string()),
         "the new target owns its own draft"
     );
     assert_eq!(
-        env.view.pending_paste_for_structured_view.get(&id_a),
-        Some(&"session a draft".to_string()),
+        env.view
+            .pending_paste_for_structured_view
+            .get(&id_a)
+            .map(crate::tui::home::PendingStructuredInput::text),
+        Some("session a draft".to_string()),
         "the previous target's unsent draft must survive the switch"
     );
 }

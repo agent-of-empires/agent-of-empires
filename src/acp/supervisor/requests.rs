@@ -397,13 +397,35 @@ impl<S: BroadcastSink> Supervisor<S> {
     ) -> Result<(), SupervisorError> {
         let started = tokio::time::Instant::now();
         let deadline = started + crate::acp::acp_client::SESSION_RESET_IN_TASK_TIMEOUT;
-        let outer_deadline = started + crate::acp::acp_client::SESSION_RESET_TIMEOUT;
         let client = tokio::time::timeout_at(deadline, self.ready_client(session_id))
             .await
             .map_err(|_| crate::acp::establishment::EstablishmentRefusal::Unconfirmed)??;
+        let agent_key = self.agent_key_for_session(session_id).await;
+        self.reset_client_context(
+            &client,
+            session_id,
+            &agent_key,
+            text,
+            (acp_mode_id, yolo_mode),
+            started,
+        )
+        .await
+    }
+
+    pub(crate) async fn reset_client_context(
+        &self,
+        client: &Arc<AcpClient>,
+        session_id: &str,
+        agent_key: &str,
+        text: &str,
+        mode: (Option<&str>, bool),
+        started: tokio::time::Instant,
+    ) -> Result<(), SupervisorError> {
+        let deadline = started + crate::acp::acp_client::SESSION_RESET_IN_TASK_TIMEOUT;
+        let outer_deadline = started + crate::acp::acp_client::SESSION_RESET_TIMEOUT;
         let proposal = tokio::time::timeout_at(
             deadline,
-            self.prepare_live_fresh(session_id, &client, deadline),
+            self.prepare_live_fresh(session_id, client, deadline),
         )
         .await
         .map_err(|_| crate::acp::establishment::EstablishmentRefusal::Unconfirmed)?
@@ -431,24 +453,16 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         }
         // An explicit persisted mode wins over the yolo bool, as on spawn.
-        let mode_id = match (acp_mode_id, yolo_mode) {
+        let mode_id = match mode {
             (Some(id), _) => Some(id.to_string()),
-            (None, true) => {
-                let agent_key = self.agent_key_for_session(session_id).await;
-                crate::acp::agent_profiles::resolve(&agent_key)
-                    .yolo_mode_id
-                    .map(str::to_string)
-            }
+            (None, true) => crate::acp::agent_profiles::resolve(agent_key)
+                .yolo_mode_id
+                .map(str::to_string),
             (None, false) => None,
         };
         let _ = tokio::time::timeout_at(
             outer_deadline,
-            apply_mode(
-                &client,
-                session_id,
-                mode_id.as_deref(),
-                "conversation reset",
-            ),
+            apply_mode(client, session_id, mode_id.as_deref(), "conversation reset"),
         )
         .await;
         Ok(())

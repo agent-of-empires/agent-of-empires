@@ -43,8 +43,8 @@ impl ImportableSession {
         }
     }
 
-    pub fn updated_at_parsed(&self) -> Option<chrono::DateTime<chrono::FixedOffset>> {
-        chrono::DateTime::parse_from_rfc3339(self.updated_at.as_deref()?).ok()
+    pub fn updated_at_parsed(&self) -> Option<crate::time::Timestamp> {
+        crate::time::Timestamp::parse_rfc3339(self.updated_at.as_deref()?).ok()
     }
 }
 

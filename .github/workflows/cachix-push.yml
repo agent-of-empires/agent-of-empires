@@ -34,6 +34,12 @@ jobs:
   cachix:
     name: Build and push (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Job level: the matrix context is not available at workflow level.
+    concurrency:
+      group: cachix-push-${{ matrix.os }}-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -82,9 +88,10 @@ jobs:
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
-          PREVIOUS=$(gh run list --repo "$REPO" --workflow cachix-push.yml --branch main \
-            --status completed --limit 5 --json databaseId,conclusion \
-            --jq "[.[] | select(.databaseId != $RUN_ID)][0].conclusion // \"\"")
+          # No earlier non-cancelled push run in the window is inconclusive: alert.
+          PREVIOUS=$(gh run list --repo "$REPO" --workflow cachix-push.yml --branch main --event push \
+            --status completed --limit 100 --json databaseId,conclusion \
+            --jq "[.[] | select(.databaseId < $RUN_ID and .conclusion != \"cancelled\")][0].conclusion // \"failure\"")
           # --build-step must match the build step's `name:` above.
           gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
             | python3 .github/scripts/classify-cachix-failure.py \

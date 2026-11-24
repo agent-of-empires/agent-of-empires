@@ -34,7 +34,7 @@ pub(super) fn repair_startup_profile_ownership(
     let _identity = crate::session::acquire_session_identity_lock()?;
     for (_, storage) in &storages {
         let instances = storage.load_complete_with_groups()?.0;
-        let now = chrono::Utc::now();
+        let now = crate::time::Timestamp::now();
         // Purge and Trash owners survive until their teardown completes.
         let mut expired: Vec<String> = instances
             .iter()
@@ -557,11 +557,11 @@ mod migrated_tui_ownership_tests {
             row.status = Status::Starting;
             row.lifecycle_generation = 1;
             let at = if expired {
-                chrono::Utc::now()
+                crate::time::Timestamp::now()
                     - Instance::LIFECYCLE_RESERVATION_TTL
-                    - chrono::Duration::seconds(1)
+                    - crate::time::Duration::seconds(1)
             } else {
-                chrono::Utc::now()
+                crate::time::Timestamp::now()
             };
             row.lifecycle_reservation = Some(LifecycleReservation {
                 op: LifecycleOperation::Launch,
@@ -917,7 +917,7 @@ mod tests {
                                     "preserve this explicit input".into(),
                                     Vec::new(),
                                     None,
-                                    None,
+                                    crate::server::session_service::QueueSender::default(),
                                 )
                                 .await
                                 .unwrap();
@@ -929,7 +929,7 @@ mod tests {
                                 .find(|row| row.id == candidate.id)
                                 .unwrap()
                                 .clone();
-                            candidate.last_error = Some("previous diagnostic".into());
+                            candidate.last_error.set("previous diagnostic");
                             // Establish the candidate before the concurrent shelf.
                             // Structured rows retain their actual stopped Native selection.
                             let mut shelved = candidate.clone();

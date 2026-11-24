@@ -232,7 +232,7 @@ async fn sensitive_routes_are_blocked() {
         (Method::GET, "/api/skills/claude-user/review", ""),
         (Method::GET, "/api/mcp/servers?agent=claude", ""),
         (Method::GET, "/api/plugins", ""),
-        (Method::GET, "/api/plugins/x/icon", ""),
+        (Method::GET, "/plugin-icons/x", ""),
         (Method::GET, "/api/plugins/commands", ""),
         (Method::GET, "/api/plugins/ui-state", ""),
         (Method::GET, "/api/plugins/updates", ""),

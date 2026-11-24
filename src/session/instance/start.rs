@@ -241,7 +241,7 @@ impl Instance {
         drop(lifecycle_lock);
         drop(title_lock);
         let hook_result =
-            self.run_pre_launch_hooks(skip_on_launch, storage, None, Some(generation));
+            self.run_agent_launch_hooks(skip_on_launch, storage, None, Some(generation));
         let (_title_lock, _lifecycle_lock) =
             self.reacquire_launch_locks_after_hooks(storage, generation, hook_result)?;
         let current = crate::tmux::unique_agent_session_presence(&self.id).and_then(|presence| {
@@ -316,7 +316,7 @@ impl Instance {
                     return Err(error);
                 }
             };
-            if let Err(error) = self.commit_lifecycle_launch(storage, generation, false) {
+            if let Err(error) = self.commit_lifecycle_launch(storage, generation, false, None) {
                 failed_birth = Some((probe, None));
                 return Err(error);
             }
@@ -543,7 +543,7 @@ impl Instance {
             row.terminal_handoff
                 .as_mut()
                 .expect("validated handoff")
-                .terminal = Some(target.clone());
+                .set_terminal(Some(target.clone()));
             Ok(())
         })?;
         self.adopt_conversation_state(target);
@@ -587,7 +587,7 @@ impl Instance {
             row.lifecycle_reservation = Some(LifecycleReservation {
                 op: LifecycleOperation::Launch,
                 generation,
-                at: Utc::now(),
+                at: Timestamp::now(),
             });
             row.status = Status::Starting;
             row.idle_entered_at = None;
@@ -725,7 +725,7 @@ impl Instance {
             self.maybe_start_poller_since_in(CaptureStorage::Scoped(storage))?;
         }
         if self.lifecycle_reservation_is_owned(LifecycleOperation::Launch, key.generation) {
-            self.commit_lifecycle_launch(storage, key.generation, false)?;
+            self.commit_lifecycle_launch(storage, key.generation, false, None)?;
         }
         Ok(())
     }
@@ -1038,7 +1038,7 @@ impl Instance {
                 physical: Some(std::sync::Arc::clone(&pane)),
                 legacy_tool: None,
             };
-            self.last_error = None;
+            self.last_error.clear();
             self.last_error_evidence = None;
             self.last_error_check = None;
             let receipt = handoff_key.map(|_| std::sync::Arc::clone(&pane));
@@ -1392,7 +1392,7 @@ impl Instance {
 
         self.status = Status::Starting;
         self.last_start_time = Some(std::time::Instant::now());
-        self.started_at = Some(Utc::now());
+        self.started_at = Some(Timestamp::now());
 
         // Apply status bar options in a background thread to avoid blocking
         // the TUI on the multiple tmux subprocess calls they require.
@@ -1635,7 +1635,7 @@ mod tests {
                                 Some(row.try_acquire_lifecycle_reservation(
                                     LifecycleOperation::Launch,
                                     Instance::LIFECYCLE_RESERVATION_TTL,
-                                    chrono::Utc::now(),
+                                    Timestamp::now(),
                                 )?)
                             } else {
                                 None

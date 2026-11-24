@@ -13,7 +13,8 @@ const LOCKOUT_DURATION: std::time::Duration = std::time::Duration::from_secs(15 
 const WINDOW_DURATION: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 const CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_TRACKED_IPS: usize = 10_000;
-// Failures within this window of the last recorded failure collapse into one.
+// Failures within this window of the last counted failure collapse into it. The
+// window is fixed: a collapsed failure never extends it.
 const COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Successful authentication clears only its own credential's failure budget.
@@ -140,7 +141,6 @@ impl RateLimiter {
 
         // Coalesce bursts.
         if record.count > 0 && now.duration_since(record.last_failure) < COALESCE_WINDOW {
-            record.last_failure = now;
             return false;
         }
 
@@ -331,6 +331,20 @@ mod tests {
                 "the burst consumes exactly one attempt, not zero or twenty",
             );
         }
+    }
+
+    /// Failures arriving faster than the coalesce window must still lock out:
+    /// a merged failure must not push the window forward.
+    #[test]
+    fn steady_sub_window_failures_still_lock_out() {
+        let mut failures = HashMap::new();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let base = Instant::now();
+        let step = std::time::Duration::from_millis(400);
+        let locked = (0..=12u32).any(|n| {
+            RateLimiter::record_failure_at(&mut failures, (ip, PASSPHRASE), base + step * n)
+        });
+        assert!(locked, "5 s of failures every 400 ms must lock the IP out");
     }
 
     /// A full table must not turn a new source address into an unlimited one:

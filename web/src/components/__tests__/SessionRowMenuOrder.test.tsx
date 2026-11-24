@@ -97,6 +97,14 @@ describe("Session menu tiers", () => {
       ],
       // Read-only hides every write action and leaves no stray separator; the window entries stay.
       ["read-only", [{ status: "Idle" }], { readOnly: true }, "Idle · Terminal view", `${more} notify`],
+      // Ignore and reclaim mutate, so read-only hides them even on a managed row.
+      [
+        "read-only managed",
+        [{ status: "Idle", parent_session_id: "manager" }],
+        { readOnly: true },
+        "Idle · Terminal view",
+        `${more} notify`,
+      ],
     ];
     for (const [state, sessions, options, header, expected] of cases) {
       open(sessions, options);
@@ -136,6 +144,23 @@ describe("Session menu tiers", () => {
       for (const old of ["Restart to apply update (keeps conversation)", "Edit group", "Edit workdir name", "Delete"]) {
         expect(screen.queryByRole("button", { name: old }), old).toBeNull();
       }
+      cleanup();
+    }
+  });
+
+  it("labels ignore and ownership by the selected session's state", () => {
+    const cases: [Partial<SessionResponse>, string, string][] = [
+      [{ status: "Idle", parent_session_id: "manager" }, "Ignore managed session", "Take ownership back"],
+      [
+        { status: "Idle", parent_session_id: "manager", ignored_at: "2025-01-01T00:00:00Z" },
+        "Unignore session",
+        "Take ownership back",
+      ],
+    ];
+    for (const [session, ignoreLabel, reclaimLabel] of cases) {
+      open([session]);
+      expect(screen.getByRole("button", { name: ignoreLabel }), ignoreLabel).toBeTruthy();
+      expect(screen.getByRole("button", { name: reclaimLabel }), reclaimLabel).toBeTruthy();
       cleanup();
     }
   });

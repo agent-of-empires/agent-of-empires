@@ -12,7 +12,7 @@
 //! `docs/plans/web-push-notifications.md`.
 
 use crate::session::Status;
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -30,7 +30,7 @@ pub struct StatusChange {
     pub effective_profile: String,
     pub old: Status,
     pub new: Status,
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
 }
 
 /// Publish once after the authoritative status commit; unchanged rows emit nothing.
@@ -50,7 +50,7 @@ pub fn publish_status_change(
             effective_profile: inst.effective_profile(),
             old,
             new: inst.status,
-            at: Utc::now(),
+            at: Timestamp::now(),
         },
     );
 }
@@ -102,7 +102,7 @@ const TEST_DELAY_MS: u64 = 3_000;
 pub struct VapidKeypairFile {
     pub private_pem: String,
     pub public_b64url: String,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 pub struct VapidKeypair {
@@ -195,7 +195,7 @@ impl VapidKeypair {
         let file = VapidKeypairFile {
             private_pem: self.private_pem.clone(),
             public_b64url: self.public_b64url.clone(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         };
         let body = serde_json::to_string_pretty(&file)?;
 
@@ -226,7 +226,7 @@ pub struct Subscription {
     /// current (or grace-period) token.
     pub owner_token_hash: [u8; 32],
     pub user_agent: String,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Monotonic counter for optimistic-lock GC: the send path snapshots
     /// the generation before sending; the GC path removes only if the
     /// counter still matches. Prevents wiping a freshly re-subscribed
@@ -253,8 +253,8 @@ pub struct SubscriptionStore {
 /// Most recent delivery results for one endpoint, reported by `/api/push/status`.
 #[derive(Clone, Default, Serialize, Debug, PartialEq)]
 pub struct DeliveryRecord {
-    pub last_success_at: Option<DateTime<Utc>>,
-    pub last_failure_at: Option<DateTime<Utc>>,
+    pub last_success_at: Option<Timestamp>,
+    pub last_failure_at: Option<Timestamp>,
     pub last_failure: Option<&'static str>,
 }
 
@@ -280,7 +280,7 @@ impl SubscriptionStore {
     pub fn record_delivery(&self, endpoint: &str, outcome: super::push_send::SendOutcome) {
         let mut map = self.delivery.lock().unwrap_or_else(|e| e.into_inner());
         let rec = map.entry(endpoint.to_string()).or_default();
-        let now = Utc::now();
+        let now = Timestamp::now();
         if outcome == super::push_send::SendOutcome::Delivered {
             rec.last_success_at = Some(now);
         } else {
@@ -917,6 +917,120 @@ pub async fn fire_wake_fired_push(
     }
 }
 
+/// Pushes each "sandbox login required" notice (at most one per episode). `notices` is
+/// subscribed before the startup producers run, so no hold's notice is missed.
+pub(crate) async fn spawn_login_required_consumer(
+    state: std::sync::Arc<super::AppState>,
+    notices: tokio::sync::mpsc::UnboundedReceiver<super::sandbox_login::LoginRequiredNotice>,
+) {
+    if state.push.is_none() {
+        return;
+    }
+    let work = state.runtime.work.clone();
+    work.spawn("server.sandbox_login_push_consumer", async move {
+        let shutdown = state.shutdown.clone();
+        super::sandbox_login::forward_notices(notices, &shutdown, |notice| {
+            let state = state.clone();
+            async move { fire_sandbox_login_push(state, &notice.session_id, &notice.tool).await }
+        })
+        .await;
+    });
+}
+
+/// What the "sandbox login required" push shows and where it leads.
+#[derive(Debug, PartialEq, Eq)]
+struct SandboxLoginPush {
+    title: &'static str,
+    body: String,
+    path: String,
+    tag: &'static str,
+}
+
+impl SandboxLoginPush {
+    /// Names the agent and the session; the session by its id when it has no title (or is gone).
+    fn new(session_id: &str, tool: &str, session_title: Option<&str>) -> Self {
+        let name = session_title
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .unwrap_or(session_id);
+        Self {
+            title: "Sandbox login required",
+            body: format!("Log in {tool} to continue: {name}"),
+            path: format!("/session/{session_id}"),
+            tag: "sandbox-login",
+        }
+    }
+}
+
+/// Fire the one push of a login-needed episode for the unattended session `session_id`.
+pub async fn fire_sandbox_login_push(
+    state: std::sync::Arc<super::AppState>,
+    session_id: &str,
+    tool: &str,
+) {
+    let Some(push) = state.push.as_ref().cloned() else {
+        return;
+    };
+    if !state.web_config.notifications_enabled {
+        return;
+    }
+    if crate::session::is_tui_active(std::time::Duration::from_secs(30)) {
+        tracing::debug!(target: "push.sandbox_login", session = %session_id, "suppressed: TUI is active");
+        return;
+    }
+    if state
+        .web_watch_within(std::time::Duration::from_secs(30))
+        .covers(session_id)
+    {
+        tracing::debug!(target: "push.sandbox_login", session = %session_id, "suppressed: web dashboard is active");
+        return;
+    }
+    let subs = push.store.snapshot().await;
+    if subs.is_empty() {
+        return;
+    }
+    let client = match super::push_send::build_client() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(target: "push.sandbox_login", "failed to build reqwest client: {e}");
+            return;
+        }
+    };
+    let title = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|i| i.id == session_id)
+        .map(|i| i.title.clone());
+    let content = SandboxLoginPush::new(session_id, tool, title.as_deref());
+
+    for sub in subs {
+        let Some(url) = build_push_url(&sub, &content.path) else {
+            continue;
+        };
+        let client = client.clone();
+        let push = push.clone();
+        let permit_sem = push.send_semaphore.clone();
+        let payload = super::push_send::PushPayload {
+            title: content.title.to_string(),
+            body: content.body.clone(),
+            url,
+            tag: content.tag.to_string(),
+            session_id: session_id.to_string(),
+        };
+        state
+            .runtime
+            .work
+            .spawn("server.sandbox_login_push", async move {
+                let Ok(_permit) = permit_sem.acquire_owned().await else {
+                    return;
+                };
+                deliver(&push, &client, &sub, &payload, PUSH_TTL_SECS).await;
+            });
+    }
+}
+
 /// Build an absolute URL for a push payload by joining the
 /// subscription's recorded origin with a leading-slash path. Returns
 /// `None` for legacy subscriptions with no origin recorded (predate
@@ -1156,7 +1270,7 @@ pub async fn subscribe(
         auth: body.keys.auth,
         owner_token_hash: auth.0,
         user_agent,
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         generation: 0,
         origin,
     };
@@ -1364,7 +1478,7 @@ mod tests {
             auth: "auth".into(),
             owner_token_hash: [1u8; 32],
             user_agent: "UA".into(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             generation: 0,
             origin: "http://localhost:8080".into(),
         };
@@ -1399,7 +1513,7 @@ mod tests {
                 auth: "auth".into(),
                 owner_token_hash: [1u8; 32],
                 user_agent: "UA".into(),
-                created_at: Utc::now(),
+                created_at: Timestamp::now(),
                 generation: 0,
                 origin: String::new(),
             };
@@ -1441,7 +1555,7 @@ mod tests {
             auth: "auth".into(),
             owner_token_hash: hash,
             user_agent: "UA".into(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             generation: 0,
             origin: "http://localhost:8080".into(),
         };
@@ -1480,7 +1594,7 @@ mod tests {
             auth: "auth".into(),
             owner_token_hash: [owner; 32],
             user_agent: "UA".into(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             generation: 0,
             origin: "http://localhost:8080".into(),
         };
@@ -1517,7 +1631,7 @@ mod tests {
             auth: "auth".into(),
             owner_token_hash: [1u8; 32],
             user_agent: "UA".into(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             generation: 0,
             origin: "http://localhost:8080".into(),
         };
@@ -1607,7 +1721,7 @@ mod tests {
             auth: "auth".into(),
             owner_token_hash: [1u8; 32],
             user_agent: "UA".into(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             generation: 0,
             origin: "http://localhost:42041".into(),
         };
@@ -1625,7 +1739,7 @@ mod tests {
             auth: "auth".into(),
             owner_token_hash: [1u8; 32],
             user_agent: "UA".into(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             generation: 0,
             origin: "https://aoe.example.com/".into(),
         };
@@ -1643,7 +1757,7 @@ mod tests {
             auth: "auth".into(),
             owner_token_hash: [1u8; 32],
             user_agent: "UA".into(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             generation: 0,
             origin: String::new(),
         };
@@ -1664,7 +1778,7 @@ mod tests {
                 effective_profile: "default".into(),
                 old: Status::Running,
                 new: Status::Waiting,
-                at: Utc::now(),
+                at: Timestamp::now(),
             },
         );
         assert!(dwell.get(&id).unwrap().waiting_since.is_some());
@@ -1680,7 +1794,7 @@ mod tests {
                 effective_profile: "default".into(),
                 old: Status::Waiting,
                 new: Status::Running,
-                at: Utc::now(),
+                at: Timestamp::now(),
             },
         );
         assert!(dwell.get(&id).unwrap().waiting_since.is_none());
@@ -1740,7 +1854,7 @@ mod tests {
             effective_profile: "default".into(),
             old: Status::Running,
             new,
-            at: Utc::now(),
+            at: Timestamp::now(),
         };
 
         handle_status_change(&mut dwell, ev(Status::Waiting));
@@ -1836,7 +1950,7 @@ mod tests {
                 effective_profile: "default".into(),
                 old: Status::Running,
                 new: Status::Waiting,
-                at: Utc::now(),
+                at: Timestamp::now(),
             },
         );
         assert!(dwell.contains_key(&id));
@@ -1848,9 +1962,31 @@ mod tests {
                 effective_profile: "default".into(),
                 old: Status::Waiting,
                 new: Status::Stopped,
-                at: Utc::now(),
+                at: Timestamp::now(),
             },
         );
         assert!(!dwell.contains_key(&id));
+    }
+
+    #[test]
+
+    fn sandbox_login_push_content_names_the_agent_and_the_session() {
+        let expected = |body: &str| SandboxLoginPush {
+            title: "Sandbox login required",
+            body: body.to_string(),
+            path: "/session/sess-1".to_string(),
+            tag: "sandbox-login",
+        };
+        assert_eq!(
+            SandboxLoginPush::new("sess-1", "codex", Some("nightly")),
+            expected("Log in codex to continue: nightly")
+        );
+        for missing in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                SandboxLoginPush::new("sess-1", "codex", missing),
+                expected("Log in codex to continue: sess-1"),
+                "{missing:?}"
+            );
+        }
     }
 }

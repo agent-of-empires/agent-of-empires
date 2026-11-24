@@ -338,7 +338,7 @@ fn passive_split_follows_captured_cursor_without_discarding_history_or_clear_fra
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                env.view.render(frame, area, &theme, None, None, None);
+                env.view.render(frame, area, &theme, None);
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
@@ -373,7 +373,7 @@ fn split_hides_info_headers_so_output_owns_each_half() {
         branch: "feature/foo".to_string(),
         main_repo_path: "/tmp/tree-main".to_string(),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
         base_branch: None,
     });
     let agent = crate::tmux::Session::generate_name(&inst.id, &inst.title);

@@ -22,6 +22,7 @@ pub mod event_store;
 pub mod fs_handler;
 pub mod install_hints;
 pub mod mcp_config;
+pub mod mcp_rewrite;
 pub mod node;
 pub(crate) mod operation_effect;
 /// Recall cache of per-agent ACP config options, consumed by the dashboard's

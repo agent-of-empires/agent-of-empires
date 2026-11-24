@@ -55,14 +55,14 @@ pub(super) fn web_plugin_disabled() -> bool {
         .is_some_and(|p| !p.enabled)
 }
 
-/// Persist the first-run intro picks: theme name to `config.theme.name`, attach mode to
-/// `default_attach_mode`, telemetry opt-in to `config.telemetry.enabled`. Failures are
-/// logged and swallowed so a config write hiccup cannot block startup.
+/// Persist the first-run intro picks: theme name to `config.theme.name` and attach mode to
+/// `default_attach_mode`; the telemetry answer goes to the Daemon, which owns consent.
+/// Failures are logged and swallowed so a config write hiccup cannot block startup.
 fn apply_intro_outcome(outcome: &IntroOutcome) {
-    if outcome.final_theme.is_none()
-        && outcome.final_attach_mode.is_none()
-        && outcome.telemetry_opt_in.is_none()
-    {
+    if let Some(opt_in) = outcome.telemetry_opt_in {
+        crate::tui::telemetry::set_consent(opt_in);
+    }
+    if outcome.final_theme.is_none() && outcome.final_attach_mode.is_none() {
         return;
     }
     let result = update_config(|config| {
@@ -72,41 +72,10 @@ fn apply_intro_outcome(outcome: &IntroOutcome) {
         if let Some(mode) = outcome.final_attach_mode {
             config.session.default_attach_mode = mode;
         }
-        if let Some(opt_in) = outcome.telemetry_opt_in {
-            config.telemetry.enabled = opt_in;
-        }
     });
     if let Err(e) = result {
         tracing::warn!(target: "tui.input", "Failed to persist intro outcome: {e}");
     }
-    if outcome.telemetry_opt_in.is_some() {
-        if let Err(e) = update_app_state(|state| {
-            state.has_responded_to_telemetry = true;
-        }) {
-            tracing::warn!(target: "tui.input", "Failed to persist intro outcome: {e}");
-        }
-    }
-    // Sync the install id with the saved opt-in choice (no-op under
-    // DO_NOT_TRACK). Done after save so telemetry.json matches config.
-    if let Some(opt_in) = outcome.telemetry_opt_in {
-        crate::telemetry::apply_opt_in_change(opt_in);
-    }
-}
-
-/// Persist the answer to the telemetry consent popup: set the opt-in flag, mark the
-/// prompt answered so it never returns, and reconcile the install id.
-fn persist_telemetry_consent(opt_in: bool) {
-    if let Err(e) = update_config(|config| {
-        config.telemetry.enabled = opt_in;
-    }) {
-        tracing::warn!(target: "tui.input", "Failed to persist telemetry consent: {e}");
-    }
-    if let Err(e) = update_app_state(|state| {
-        state.has_responded_to_telemetry = true;
-    }) {
-        tracing::warn!(target: "tui.input", "Failed to persist telemetry consent: {e}");
-    }
-    crate::telemetry::apply_opt_in_change(opt_in);
 }
 
 /// Decompose pasted text into `TmuxKey`s safe for the live-send worker.
@@ -520,9 +489,8 @@ impl HomeView {
         let trashed_at = row
             .trashed_at
             .as_deref()
-            .map(chrono::DateTime::parse_from_rfc3339)
-            .transpose()?
-            .map(|stamp| stamp.with_timezone(&chrono::Utc));
+            .map(crate::time::Timestamp::parse_rfc3339)
+            .transpose()?;
         anyhow::ensure!(
             trashed_at == instance.trashed_at,
             "Trash identity changed; reopen the delete confirmation"
@@ -585,8 +553,7 @@ impl HomeView {
                 && row
                     .trashed_at
                     .as_deref()
-                    .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
-                    .map(|stamp| stamp.with_timezone(&chrono::Utc))
+                    .and_then(|stamp| crate::time::Timestamp::parse_rfc3339(stamp).ok())
                     == pending.request.expected_trashed_at)
     }
 
@@ -1818,26 +1785,9 @@ impl HomeView {
             if let Some(result) = dialog.handle_click(col, row) {
                 match result {
                     DialogResult::Continue => {}
-                    DialogResult::Cancel => {
-                        self.repo_trust_dialog = None;
-                        self.pending_repo_trust_data = None;
-                        self.pending_repo_trust_fingerprint = None;
-                        self.pending_repo_trust_skip_on_create = false;
-                    }
+                    DialogResult::Cancel => self.cancel_repo_trust(),
                     DialogResult::Submit(action) => {
-                        self.repo_trust_dialog = None;
-                        let fingerprint = self.pending_repo_trust_fingerprint.take();
-                        let skip = std::mem::take(&mut self.pending_repo_trust_skip_on_create);
-                        if let Some(data) = self.pending_repo_trust_data.take() {
-                            let decision = match action {
-                                RepoTrustAction::Trust { .. } => {
-                                    RepoTrustDecision::Approve(fingerprint)
-                                }
-                                RepoTrustAction::Skip { .. } => RepoTrustDecision::Refuse,
-                            };
-                            let emit = self.create_session_with_hooks(data, decision, skip);
-                            self.pending_dialog_click_action = emit;
-                        }
+                        self.pending_dialog_click_action = self.submit_repo_trust(action);
                     }
                 }
             }
@@ -1963,7 +1913,7 @@ impl HomeView {
                 };
                 if let Some(opt_in) = opt_in {
                     self.telemetry_consent_dialog = None;
-                    persist_telemetry_consent(opt_in);
+                    crate::tui::telemetry::set_consent(opt_in);
                 }
             }
             return true;
@@ -2471,13 +2421,13 @@ impl HomeView {
                 DialogResult::Continue => {}
                 DialogResult::Submit(opt_in) => {
                     self.telemetry_consent_dialog = None;
-                    persist_telemetry_consent(opt_in);
+                    crate::tui::telemetry::set_consent(opt_in);
                 }
                 // Cancel can't be produced by this dialog (Esc maps to a
                 // decline), but treat it as a decline for completeness.
                 DialogResult::Cancel => {
                     self.telemetry_consent_dialog = None;
-                    persist_telemetry_consent(false);
+                    crate::tui::telemetry::set_consent(false);
                 }
             }
             return None;
@@ -2513,12 +2463,15 @@ impl HomeView {
         }
 
         if let Some(view) = &mut self.connections_view {
-            match view.handle_key(key) {
+            match view.handle_key(key, self.strict_hotkeys, std::time::Instant::now()) {
                 DialogResult::Continue => {}
                 DialogResult::Cancel => self.connections_view = None,
                 DialogResult::Submit(()) => {
                     self.connections_view = None;
                     self.open_serve();
+                    if let Some(serve) = &mut self.serve_view {
+                        serve.opened_by(&key);
+                    }
                 }
             }
             return None;
@@ -2655,26 +2608,8 @@ impl HomeView {
         if let Some(dialog) = &mut self.repo_trust_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
-                DialogResult::Cancel => {
-                    self.repo_trust_dialog = None;
-                    self.pending_repo_trust_data = None;
-                    self.pending_repo_trust_fingerprint = None;
-                    self.pending_repo_trust_skip_on_create = false;
-                }
-                DialogResult::Submit(action) => {
-                    self.repo_trust_dialog = None;
-                    let fingerprint = self.pending_repo_trust_fingerprint.take();
-                    let skip = std::mem::take(&mut self.pending_repo_trust_skip_on_create);
-                    if let Some(data) = self.pending_repo_trust_data.take() {
-                        let decision = match action {
-                            RepoTrustAction::Trust { .. } => {
-                                RepoTrustDecision::Approve(fingerprint)
-                            }
-                            RepoTrustAction::Skip { .. } => RepoTrustDecision::Refuse,
-                        };
-                        return self.create_session_with_hooks(data, decision, skip);
-                    }
-                }
+                DialogResult::Cancel => self.cancel_repo_trust(),
+                DialogResult::Submit(action) => return self.submit_repo_trust(action),
             }
             return None;
         }
@@ -3298,13 +3233,12 @@ impl HomeView {
                     return None;
                 }
                 let live_key = self.selected_session.as_deref().map(|id| self.live_key(id));
-                // A structured session has no tmux pane to attach or live-send into, so
-                // both Tab meanings are vacuous; say so instead of ignoring the press.
+                // Neither Tab meaning has a pane to reach in a structured view, so the
+                // press takes the session's native view through the same activation as
+                // Enter: that dismisses System Health, which would otherwise leave the
+                // composer it focuses behind a panel the next key cannot reach.
                 if live_key == Some(None) {
-                    return Some(Action::SetTransientStatus(
-                        "Structured sessions have no tmux pane; press Enter to open the structured view."
-                            .to_string(),
-                    ));
+                    return self.activate_selected_session();
                 }
                 if live_key == Some(Some(LiveKey::Enter)) {
                     if let Some(action) = self.tab_attach_action() {
@@ -3472,6 +3406,9 @@ impl HomeView {
             )
         {
             return None;
+        }
+        if let Some(feature) = id.feature_use() {
+            crate::tui::telemetry::report_feature_use(feature);
         }
         match id {
             ActionId::Quit => return Some(Action::Quit),
@@ -4292,10 +4229,10 @@ impl HomeView {
     /// R: the Connections hub. Its Web dashboard row reaches [`Self::open_serve`].
     fn open_connections(&mut self) {
         let web = self.connections_web_state(None);
-        self.connections_view = Some(crate::tui::dialogs::ConnectionsView::new(
-            self.daemon_attention(),
-            web,
-        ));
+        self.connections_view = Some(
+            crate::tui::dialogs::ConnectionsView::new(self.daemon_attention(), web)
+                .opened_by_serve(std::time::Instant::now()),
+        );
     }
 
     /// The hub's Web dashboard row. `known` keeps a transport already read, so a refresh
@@ -4458,6 +4395,9 @@ impl HomeView {
     }
 
     fn open_command_palette(&mut self) {
+        crate::tui::telemetry::report_feature_use(
+            crate::telemetry::feature_use::FeatureUse::CommandPalette,
+        );
         let mut entries: Vec<PaletteCommand> = builtin_commands(self.strict_hotkeys);
 
         // Quit lives in the registry but is excluded from `builtin_commands` (no palette
@@ -4743,7 +4683,7 @@ impl HomeView {
 
         // A collapsed group may hide an idle session from `flat_items`. Keep
         // the existing most-recently-accessed selection for hidden rows.
-        let mut best_hidden: Option<(String, Option<chrono::DateTime<chrono::Utc>>)> = None;
+        let mut best_hidden: Option<(String, Option<crate::time::Timestamp>)> = None;
         for inst in self.instances.values() {
             if visible_sessions.contains(&inst.id)
                 || current_session.as_deref() == Some(inst.id.as_str())
@@ -5000,6 +4940,9 @@ impl HomeView {
     }
 
     pub(super) fn apply_sort_order(&mut self, new_order: SortOrder) {
+        if new_order != self.sort_order {
+            crate::tui::telemetry::report_feature_use(new_order.into());
+        }
         self.sort_order = new_order;
         if self.search_active && !self.search_query.value().is_empty() {
             self.refresh_flat_items();
@@ -5017,6 +4960,7 @@ impl HomeView {
     }
 
     pub(super) fn apply_group_by(&mut self, new_mode: GroupByMode) {
+        crate::tui::telemetry::report_feature_use(new_mode.into());
         self.group_by = new_mode;
         self.rebuild_flat_items();
         self.reseat_cursor_after_rebuild();
@@ -5732,6 +5676,9 @@ impl HomeView {
             self.flash_status("Still creating this session; it has no runtime yet");
             return;
         }
+        if let Some(feature) = action.feature_use() {
+            crate::tui::telemetry::report_feature_use(feature);
+        }
         match action {
             ContextMenuAction::Rename => self.open_rename_for_selected(),
             ContextMenuAction::Delete => self.open_delete_for_selected(),
@@ -5851,6 +5798,7 @@ impl HomeView {
     /// and the badge. Always opens, even with nothing eligible, so an explicit "Show tips"
     /// gives an empty state rather than silence.
     pub(super) fn open_tips_dialog(&mut self) {
+        crate::tui::telemetry::report_feature_use(crate::telemetry::feature_use::FeatureUse::Tips);
         let config = load_config().ok().flatten().unwrap_or_default();
         let signals = crate::tips::TipSignals::from(&config);
         let eligible = crate::tips::eligible(crate::tips::TipSurface::Tui, &signals);
@@ -6429,6 +6377,19 @@ impl HomeView {
                         self.exit_live_send_and_restore_sizing(&state);
                     }
                     None
+                } else if self.structured_view_selected(&id) {
+                    // The live form of a structured row is its native view, which
+                    // only Enter or the live-send chord opens: a click selects it.
+                    // A relay aimed at another session ends, so keystrokes follow
+                    // the selection instead of reaching the row left behind.
+                    if self
+                        .live_send
+                        .as_ref()
+                        .is_some_and(|state| state.session_id != id)
+                    {
+                        self.exit_live_send_if_active();
+                    }
+                    None
                 } else {
                     self.start_live_send()
                 }
@@ -6923,7 +6884,8 @@ impl HomeView {
     ///
     /// Still a no-op on group headers, empty lists and Creating rows, and on a session
     /// that is already the live-send target, so clicking the same row twice does not
-    /// re-run ensure_pane_ready or drop the live worker.
+    /// re-run ensure_pane_ready or drop the live worker. A structured session in
+    /// Structured view has no pane to relay into, so this opens its view instead.
     pub(super) fn start_live_send(&mut self) -> Option<Action> {
         let id = self.selected_session.clone()?;
         if self.live_send.as_ref().is_some_and(|s| s.session_id == id) {
@@ -6936,6 +6898,15 @@ impl HomeView {
         if matches!(inst.status, Status::Creating | Status::Deleting) {
             return None;
         }
+        // A structured agent has no pane to relay keystrokes into, so its live form
+        // is the native view: the chord attaches the way Enter does.
+        if self.structured_view_selected(&id) {
+            self.exit_live_send_if_active();
+            // The native view replaces whatever the preview showed, so the health
+            // panel must not stay painted over the composer it focuses.
+            self.system_health_open = false;
+            return Some(Action::OpenStructuredView(id));
+        }
         // A structured agent has no tmux target, but its auxiliary terminal/tool panes do.
         self.live_key(&id)?;
         // Pick the target from the pane being previewed: Structured view to the agent
@@ -6947,6 +6918,15 @@ impl HomeView {
             ViewMode::Tool(name) => live_send::LiveSendTarget::Tool(name.clone()),
         };
         Some(Action::EnterLiveSend(id))
+    }
+
+    /// Whether `id` is a structured session with the native structured view on
+    /// screen, where live send has no pane to relay into.
+    fn structured_view_selected(&self, id: &str) -> bool {
+        matches!(self.view_mode, ViewMode::Structured)
+            && self
+                .get_instance(id)
+                .is_some_and(|inst| inst.is_structured())
     }
 
     /// The paired terminal live send reaches for `inst`: the container shell when a
@@ -7358,7 +7338,8 @@ impl HomeView {
 
     /// The key that enters live mode on this Session's row, shared by Tab, `start_live_send`
     /// and the takeover footer. None for a structured Session in Structured view, which has
-    /// no tmux pane there; its Terminal and Tool panes go live.
+    /// no pane there: `start_live_send` attaches its native view instead. Its Terminal and
+    /// Tool panes still go live.
     pub(super) fn live_key(&self, id: &str) -> Option<LiveKey> {
         if matches!(self.view_mode, ViewMode::Structured)
             && self
@@ -7852,6 +7833,7 @@ impl HomeView {
         skip_on_create: bool,
     ) -> Option<Action> {
         use crate::session::TrustSurface;
+        self.pending_repo_trust_recovery = None;
         // A fingerprint we cannot build can only refuse.
         let (trust, fingerprint) = match creation_trust_review(&data) {
             Ok(review) => review,
@@ -7924,6 +7906,42 @@ impl HomeView {
         None
     }
 
+    pub(super) fn cancel_repo_trust(&mut self) {
+        self.repo_trust_dialog = None;
+        self.pending_repo_trust_data = None;
+        self.pending_repo_trust_fingerprint = None;
+        self.pending_repo_trust_skip_on_create = false;
+        self.pending_repo_trust_recovery = None;
+    }
+
+    /// Applies the answer to the open trust prompt. A prompt a setup-failed resubmit reopened
+    /// returns to that dialog when the send is refused.
+    pub(super) fn submit_repo_trust(&mut self, action: RepoTrustAction) -> Option<Action> {
+        self.repo_trust_dialog = None;
+        let fingerprint = self.pending_repo_trust_fingerprint.take();
+        let skip_on_create = std::mem::take(&mut self.pending_repo_trust_skip_on_create);
+        let recovery = self.pending_repo_trust_recovery.take();
+        let data = self.pending_repo_trust_data.take()?;
+        let decision = match action {
+            RepoTrustAction::Trust { .. } => RepoTrustDecision::Approve(fingerprint),
+            RepoTrustAction::Skip { .. } => RepoTrustDecision::Refuse,
+        };
+        let Some(dialog) = recovery else {
+            return self.create_session_with_hooks(data, decision, skip_on_create);
+        };
+        let (trust_hooks, trust_review) = decision.into_request();
+        let request = super::CreationRequest {
+            data,
+            trust_hooks,
+            trust_review,
+            skip_on_create,
+        };
+        if let Err(request) = self.submit_creation(request) {
+            self.create_hook_failed = Some((dialog, *request));
+        }
+        None
+    }
+
     /// Hand the trust answer to the daemon, which owns session creation: this
     /// process only submits the request and lets the runtime report the id.
     pub(super) fn create_session_with_hooks(
@@ -7941,7 +7959,7 @@ impl HomeView {
     /// taps of one key while a stray keystroke is harmless. The key is read off the binding
     /// table so the hint can't drift from it; a chord that isn't a bare character falls
     /// back to the dialog's own y/Enter.
-    fn confirm_by_repeating(
+    pub(super) fn confirm_by_repeating(
         &self,
         opener: ActionId,
         title: &str,

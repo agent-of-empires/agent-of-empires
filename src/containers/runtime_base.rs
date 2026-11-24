@@ -2,6 +2,8 @@ use super::container_interface::{
     docker_env_args, ContainerConfig, RunFlag, TargetEnvFile, CGROUP_PARENT_LABEL,
 };
 use super::error::{sanitize_stderr, DockerError, Result};
+use super::image_pull::{PullContext, PullFailureReason};
+use super::pull_progress::{LayerUpdate, LineBuffer};
 use std::collections::HashSet;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -60,11 +62,15 @@ fn joins_user_slice(output: &str, rootless_marker: &str) -> bool {
         && words.any(|word| word.trim_matches(['[', ']']) == rootless_marker)
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct RuntimeBase {
     pub binary: &'static str,
     pub name: &'static str,
     pub daemon_check_args: &'static [&'static str],
     pub pull_prefix: &'static [&'static str],
+    /// Reads a pull's layer lines. `None` until the runtime's non-TTY output is captured, so
+    /// its pulls show a spinner.
+    pub pull_progress: Option<fn(&str) -> Option<LayerUpdate>>,
     pub remove_subcommand: &'static str,
     pub supports_read_only_volumes: bool,
     pub supports_remove_volumes: bool,
@@ -97,6 +103,7 @@ impl RuntimeBase {
         name: "Docker",
         daemon_check_args: &["info"],
         pull_prefix: &["pull"],
+        pull_progress: Some(super::pull_progress::docker_layer),
         remove_subcommand: "rm",
         supports_read_only_volumes: true,
         supports_remove_volumes: true,
@@ -107,10 +114,16 @@ impl RuntimeBase {
         cgroup_probe: Some(("{{.CgroupDriver}} {{.SecurityOptions}}", "name=rootless")),
         supported_run_flags: ALL_RUN_FLAGS,
         not_found_markers: &["no such container"],
-        daemon_down_markers: &["Cannot connect to the Docker daemon"],
-        // Scoped to "docker daemon socket" so unrelated permission errors are not misclassified.
+        // Older CLIs say "daemon", current ones "API".
+        daemon_down_markers: &[
+            "Cannot connect to the Docker daemon",
+            "failed to connect to the docker API",
+        ],
+        // Scoped to the daemon connection (older CLIs say "daemon socket", current ones "API")
+        // so unrelated permission errors are not misclassified.
         permission_denied_markers: &[
             "permission denied while trying to connect to the docker daemon socket",
+            "permission denied while trying to connect to the docker api",
         ],
     };
 
@@ -119,6 +132,8 @@ impl RuntimeBase {
         name: "Apple Container",
         daemon_check_args: &["system", "status"],
         pull_prefix: &["image", "pull"],
+        // `auto` already picks plain without a TTY; this keeps it from depending on that.
+        pull_progress: None,
         remove_subcommand: "delete",
         supports_read_only_volumes: false,
         supports_remove_volumes: false,
@@ -139,6 +154,7 @@ impl RuntimeBase {
         name: "Podman",
         daemon_check_args: &["info"],
         pull_prefix: &["pull"],
+        pull_progress: None,
         remove_subcommand: "rm",
         supports_read_only_volumes: true,
         supports_remove_volumes: true,
@@ -166,6 +182,26 @@ impl RuntimeBase {
         self.permission_denied_markers
             .iter()
             .any(|m| lower.contains(m))
+    }
+
+    /// A failed pull's socket problem. Only a daemon-down marker or a permission error that
+    /// names the socket qualifies: the broad permission markers alone could match a registry
+    /// refusal, which must stay a failed pull. Podman's socket-permission stderr also carries
+    /// its daemon-down marker, so permission wins there.
+    pub fn pull_socket_error(&self, stderr: &str) -> Option<DockerError> {
+        let lower = stderr.to_lowercase();
+        let names_socket = self.is_permission_denied(stderr)
+            && ["socket", ".sock", "connect to the docker api"]
+                .iter()
+                .any(|name| lower.contains(name));
+        if !self.is_daemon_down(stderr) && !names_socket {
+            return None;
+        }
+        Some(if self.is_permission_denied(stderr) {
+            DockerError::PermissionDenied
+        } else {
+            DockerError::DaemonNotRunning
+        })
     }
 
     pub fn is_not_found(&self, stderr: &str) -> bool {
@@ -303,18 +339,44 @@ impl RuntimeBase {
         self.probe_succeeds(&["image", "inspect", image])
     }
 
-    pub fn pull_image(&self, image: &str) -> Result<()> {
-        self.pull_until_cancelled(image, &CancellationToken::new())
+    pub(crate) fn pull_until_cancelled(&self, image: &str, pull: &PullContext) -> Result<()> {
+        self.pull_with_timeout(image, pull, PULL_TIMEOUT)
     }
 
-    pub fn pull_until_cancelled(&self, image: &str, cancel: &CancellationToken) -> Result<()> {
+    fn pull_with_timeout(&self, image: &str, pull: &PullContext, timeout: Duration) -> Result<()> {
+        let cancel = pull.kill;
         let mut cmd = self.command();
         cmd.args(self.pull_prefix);
         cmd.arg(image);
         cmd.stdin(Stdio::null());
         let start = Instant::now();
         tracing::info!(target: "containers.image", runtime = %self.name, %image, "pulling image");
-        let output = match crate::process::run_until_cancelled(&mut cmd, PULL_TIMEOUT, cancel)? {
+        let ran = match self.pull_progress {
+            // A runtime with no parser is not observed, so its output isn't split into lines.
+            None => crate::process::run_until_cancelled_process_group(&mut cmd, timeout, cancel),
+            Some(parse) => {
+                let (mut stdout_lines, mut stderr_lines) =
+                    (LineBuffer::default(), LineBuffer::default());
+                let mut on_output = |stream: crate::process::OutputStream, bytes: &[u8]| {
+                    let lines = match stream {
+                        crate::process::OutputStream::Stdout => &mut stdout_lines,
+                        crate::process::OutputStream::Stderr => &mut stderr_lines,
+                    };
+                    lines.push(bytes, |line| {
+                        if let Some(update) = parse(line) {
+                            pull.report(update);
+                        }
+                    });
+                };
+                crate::process::run_until_cancelled_process_group_observed(
+                    &mut cmd,
+                    timeout,
+                    cancel,
+                    &mut on_output,
+                )
+            }
+        };
+        let output = match ran? {
             Some(output) => output,
             None if cancel.is_cancelled() => {
                 tracing::info!(target: "containers.image", runtime = %self.name, %image, "image pull cancelled");
@@ -327,13 +389,14 @@ impl RuntimeBase {
                     runtime = %self.name,
                     %image,
                     duration_ms = dur_ms,
-                    timeout_s = PULL_TIMEOUT.as_secs(),
+                    timeout_s = timeout.as_secs(),
                     "image pull timed out; killed",
                 );
                 return Err(DockerError::ImagePullFailed {
                     runtime: self.name,
                     image: image.to_string(),
-                    detail: format!("timed out after {}s", PULL_TIMEOUT.as_secs()),
+                    detail: format!("timed out after {}s", timeout.as_secs()),
+                    reason: PullFailureReason::Timeout,
                 });
             }
         };
@@ -349,10 +412,14 @@ impl RuntimeBase {
                 stderr_summary = %stderr.trim().chars().take(200).collect::<String>(),
                 "image pull failed"
             );
+            if let Some(error) = self.pull_socket_error(&stderr) {
+                return Err(error);
+            }
             return Err(DockerError::ImagePullFailed {
                 runtime: self.name,
                 image: image.to_string(),
                 detail: sanitize_stderr(&stderr),
+                reason: PullFailureReason::classify(&stderr),
             });
         }
 
@@ -364,27 +431,6 @@ impl RuntimeBase {
             "image pull completed"
         );
         Ok(())
-    }
-
-    pub fn ensure_image(&self, image: &str, cancel: &CancellationToken) -> Result<()> {
-        if self.image_exists_locally(image) {
-            tracing::info!(target: "containers.runtime", "Using local {} image '{}'", self.name, image);
-            return Ok(());
-        }
-
-        tracing::info!(target: "containers.runtime", "Pulling {} image '{}'", self.name, image);
-        self.pull_until_cancelled(image, cancel)
-    }
-
-    pub fn default_sandbox_image(&self) -> &'static str {
-        "ghcr.io/agent-of-empires/aoe-sandbox:latest"
-    }
-
-    pub fn effective_default_image(&self) -> String {
-        crate::session::Config::load()
-            .ok()
-            .map(|c| c.sandbox.default_image)
-            .unwrap_or_else(|| self.default_sandbox_image().to_string())
     }
 
     pub fn build_create_args(
@@ -1001,6 +1047,86 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_pull_tells_a_socket_permission_error_from_a_stopped_daemon() {
+        let kind = |error: Option<DockerError>| match error {
+            None => "pull_failed".to_string(),
+            Some(DockerError::DaemonNotRunning) => "daemon_down".to_string(),
+            Some(DockerError::PermissionDenied) => "permission_denied".to_string(),
+            Some(other) => format!("other:{other}"),
+        };
+        for (base, stderr, expected) in [
+            (
+                &PODMAN,
+                "Error: unable to connect to Podman socket: Connection refused",
+                "daemon_down",
+            ),
+            (
+                &PODMAN,
+                "Error: unable to connect to Podman socket: dial unix \
+                 /run/user/1000/podman/podman.sock: connect: permission denied",
+                "permission_denied",
+            ),
+            (
+                &DOCKER,
+                "Cannot connect to the Docker daemon at unix:///var/run/docker.sock.",
+                "daemon_down",
+            ),
+            (
+                &DOCKER,
+                "failed to connect to the docker API at unix:///var/run/docker.sock; check if \
+                 the path is correct and if the daemon is running: dial unix \
+                 /var/run/docker.sock: connect: no such file or directory",
+                "daemon_down",
+            ),
+            // Docker's own wording has no daemon-down marker.
+            (
+                &DOCKER,
+                "permission denied while trying to connect to the Docker daemon socket at \
+                 unix:///var/run/docker.sock: Post \"http://%2Fvar%2Frun%2Fdocker.sock/v1.47/images/create\"",
+                "permission_denied",
+            ),
+            // The current CLI names the API endpoint, with `.sock` but not "socket".
+            (
+                &DOCKER,
+                "permission denied while trying to connect to the docker API at \
+                 unix:///var/run/docker.sock",
+                "permission_denied",
+            ),
+            (
+                &APPLE,
+                "Error: permission denied accessing container socket",
+                "permission_denied",
+            ),
+            (
+                &DOCKER,
+                "Error response from daemon: pull access denied for example/img, repository does \
+                 not exist or may require 'docker login': denied: requested access to the \
+                 resource is denied",
+                "pull_failed",
+            ),
+            (
+                &DOCKER,
+                "Error response from daemon: Get \"https://registry.example/v2/\": permission \
+                 denied by registry policy",
+                "pull_failed",
+            ),
+            // A registry refusal is a failed pull, never a socket problem.
+            (
+                &PODMAN,
+                "Error: initializing source docker://example/img:1: permission denied by registry",
+                "pull_failed",
+            ),
+        ] {
+            assert_eq!(
+                kind(base.pull_socket_error(stderr)),
+                expected,
+                "{}: {stderr}",
+                base.name
+            );
+        }
+    }
+
+    #[test]
     fn stderr_markers_do_not_bleed_across_runtimes() {
         let runtimes = [&DOCKER, &PODMAN, &APPLE];
         let daemon_down = [
@@ -1024,6 +1150,9 @@ mod tests {
         assert!(runtimes
             .iter()
             .all(|base| base.is_permission_denied(docker_pd)));
+        assert!(DOCKER.is_permission_denied(
+            "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock"
+        ));
         let podman_only = "Error: unable to connect to Podman socket: connect: permission denied";
         assert!(!DOCKER.is_permission_denied(podman_only));
         assert!(PODMAN.is_permission_denied(podman_only));
@@ -1054,6 +1183,127 @@ mod tests {
             &DOCKER.probe_output_with_timeout(&mut slow, Duration::from_millis(10)),
             Err(DockerError::IoError(error)) if error.kind() == std::io::ErrorKind::TimedOut
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::parallel]
+    fn a_running_pull_reports_the_layers_its_runtime_prints() {
+        use super::super::pull_progress::{Progress, PullPhase};
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Arc, Mutex};
+        const DEADLINE: Duration = Duration::from_secs(10);
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let (binary, gate) = (dir.path().join("docker"), dir.path().join("gate"));
+        nix::unistd::mkfifo(&gate, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\n\
+                 echo '6458fc480f83: Pulling fs layer'\n\
+                 read _ < '{gate}'\n\
+                 echo '6458fc480f83: Pull complete'\n",
+                gate = gate.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = RuntimeBase {
+            binary: Box::leak(binary.to_string_lossy().into_owned().into_boxed_str()),
+            ..RuntimeBase::DOCKER
+        };
+        let progress = Arc::new(Mutex::new(Progress::default()));
+        let pulling = {
+            let progress = progress.clone();
+            std::thread::spawn(move || {
+                let pull = PullContext {
+                    kill: &CancellationToken::new(),
+                    progress: &progress,
+                };
+                runtime.pull_with_timeout("img", &pull, DEADLINE)
+            })
+        };
+        let snapshot = || progress.lock().unwrap().snapshot();
+        let deadline = Instant::now() + DEADLINE;
+        while snapshot().layers_known != Some(1) {
+            assert!(
+                Instant::now() < deadline,
+                "the first line never reached the progress"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(snapshot().phase, Some(PullPhase::Downloading));
+
+        crate::process::test_support::open_fifo_writer(&gate, deadline)
+            .write_all(b"go\n")
+            .unwrap();
+        pulling.join().unwrap().unwrap();
+        let end = snapshot();
+        assert_eq!(
+            (end.phase, end.layers_done),
+            (Some(PullPhase::Unpacking), Some(1))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial_test::parallel]
+    fn a_pull_timeout_kills_a_runtime_that_ignores_sigterm_and_its_children() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let (shell, child) = (dir.path().join("shell"), dir.path().join("child"));
+        let binary = dir.path().join("docker");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\ntrap '' TERM\necho $$ > '{}'\nsleep 300 &\necho $! > '{}'\nwait\n",
+                shell.display(),
+                child.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = RuntimeBase {
+            binary: Box::leak(binary.to_string_lossy().into_owned().into_boxed_str()),
+            ..RuntimeBase::DOCKER
+        };
+
+        let progress = std::sync::Mutex::default();
+        let pull = PullContext {
+            kill: &CancellationToken::new(),
+            progress: &progress,
+        };
+        let result = runtime.pull_with_timeout("img", &pull, Duration::from_secs(1));
+        assert!(matches!(
+            result,
+            Err(DockerError::ImagePullFailed {
+                reason: PullFailureReason::Timeout,
+                ..
+            })
+        ));
+        // Dead or a zombie: this sandbox's PID 1 never reaps orphans.
+        let gone = |pid_file: &std::path::Path| {
+            let pid = std::fs::read_to_string(pid_file).unwrap();
+            std::fs::read_to_string(format!("/proc/{}/stat", pid.trim())).map_or(true, |stat| {
+                stat.rsplit(')')
+                    .next()
+                    .unwrap()
+                    .trim_start()
+                    .starts_with('Z')
+            })
+        };
+        assert!(gone(&shell), "the runtime process");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !gone(&child) {
+            assert!(
+                Instant::now() < deadline,
+                "the runtime's child outlived the kill"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn create_args(base: &RuntimeBase, config: ContainerConfig) -> Vec<String> {

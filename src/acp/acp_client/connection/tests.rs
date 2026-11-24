@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::acp::acp_client::commands::ClientCmd;
+use crate::acp::acp_client::commands::PromptInput;
 use crate::acp::acp_client::reset::ResetSessionOutcome;
 use crate::acp::acp_client::{SdkTaskObservation, SdkTestOptions};
 use crate::acp::approvals::ApprovalDecision;
@@ -170,9 +171,9 @@ async fn cancel_under_flood(scope: &mut ManagedScope) -> Pin<Box<dyn Future<Outp
     let connection = actual.observe_sdk_task();
     Box::pin(async move {
         cmd_tx
-            .send(ClientCmd::Prompt(vec![ContentBlock::Text(
-                TextContent::new("hi"),
-            )]))
+            .send(ClientCmd::Prompt(
+                vec![ContentBlock::Text(TextContent::new("hi"))].into(),
+            ))
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(30), prompt_seen)
@@ -684,15 +685,15 @@ tokio::time::timeout(Duration::from_secs(10), async {
 .await
 .expect("session commits");
 
-// Accounting for a turn nobody prompted, carrying a rejected window.
-let resets_at = chrono::Utc::now().timestamp() + 3600;
-write_line(
-    &fake.agent_write,
-    &format!(
-        r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s-limit","update":{{"sessionUpdate":"usage_update","used":10,"size":100,"cost":{{"amount":0.1,"currency":"USD"}},"_meta":{{"_claude/rateLimit":{{"status":"rejected","rateLimitType":"five_hour","resetsAt":{resets_at}}}}}}}}}}}"#
-    ),
-)
-.await;
+    // Accounting for a turn nobody prompted, carrying a rejected window.
+    let resets_at = crate::time::Timestamp::now().as_unix_secs() + 3600;
+    write_line(
+        &fake.agent_write,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s-limit","update":{{"sessionUpdate":"usage_update","used":10,"size":100,"cost":{{"amount":0.1,"currency":"USD"}},"_meta":{{"_claude/rateLimit":{{"status":"rejected","rateLimitType":"five_hour","resetsAt":{resets_at}}}}}}}}}}}"#
+        ),
+    )
+    .await;
 
 // A later physical-source chunk is the ingress barrier. Ambient accounting
 // cannot own a main terminal or park a turn that was never issued.
@@ -716,7 +717,7 @@ assert!(!seen.iter().any(|event| matches!(event,
 )));
 // Ambient accounting supplies no cancellable main. Issue a genuine Native
 // prompt before exercising the unchanged positive cancellation assertion.
-fake.cmd_tx.send(ClientCmd::Prompt(Vec::new())).await.unwrap();
+fake.cmd_tx.send(ClientCmd::Prompt(PromptInput::default())).await.unwrap();
 let native_prompt = tokio::time::timeout(Duration::from_secs(10), async {
     loop {
         let id = fake.native_prompt_id.load(Ordering::Acquire);
@@ -739,7 +740,7 @@ write_line(&fake.agent_write, &serde_json::json!({
 let cancelled = collect_terminal(&mut fake).await;
 assert!(matches!(cancelled.last(), Some(Event::Stopped { reason }) if reason == "cancelled"));
 fake.cmd_tx
-    .send(ClientCmd::Prompt(Vec::new()))
+    .send(ClientCmd::Prompt(PromptInput::default()))
     .await
     .unwrap();
 let next = collect_terminal(&mut fake).await;
@@ -766,7 +767,7 @@ let _ = fake.agent.await; })).await;
 /// windows cannot turn a successful or cancelled result into a quota failure.
 #[tokio::test]
 async fn native_rate_limit_error_parks_but_ambient_rejection_does_not() {
-    crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move { let now = chrono::Utc::now().timestamp();
+    crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move { let now = crate::time::Timestamp::now().as_unix_secs();
 for (stop_reason, resets_at, overage, parks) in [
     ("end_turn", now + 3600, "", true),
     ("cancelled", now + 3600, "", false),
@@ -815,7 +816,7 @@ for (stop_reason, resets_at, overage, parks) in [
     fake.cmd_tx
         .send(ClientCmd::Prompt(vec![ContentBlock::Text(
             TextContent::new("hi"),
-        )]))
+        )].into()))
         .await
         .unwrap();
 
@@ -832,7 +833,7 @@ for (stop_reason, resets_at, overage, parks) in [
     .await
     .expect("the turn must reach a terminal event");
     let limit = seen.iter().position(|e| {
-        matches!(e, Event::RateLimit { info } if info.resets_at.map(|t| t.timestamp()) == Some(resets_at))
+        matches!(e, Event::RateLimit { info } if info.resets_at.map(|t| t.as_unix_secs()) == Some(resets_at))
     });
     let stopped_reason = match seen.last() {
         Some(Event::Stopped { reason }) => reason.as_str(),
@@ -853,7 +854,7 @@ for (stop_reason, resets_at, overage, parks) in [
     }
     fake.cmd_tx.send(ClientCmd::Cancel).await.unwrap();
     fake.cmd_tx
-        .send(ClientCmd::Prompt(Vec::new()))
+        .send(ClientCmd::Prompt(Vec::new().into()))
         .await
         .unwrap();
     let next = collect_terminal(&mut fake).await;
@@ -963,7 +964,7 @@ for (message, kind, parks) in [
         }
     }).await;
     fake.cmd_tx
-        .send(ClientCmd::Prompt(Vec::new()))
+        .send(ClientCmd::Prompt(Vec::new().into()))
         .await
         .unwrap();
     let mut events = collect_terminal(&mut fake).await;
@@ -995,13 +996,13 @@ for (message, kind, parks) in [
         assert_eq!(evidence.blocking_scope, Some(ErrorBlockingScope::Operation));
         assert_eq!(evidence.reported_code, Some(-32603));
         assert!(
-            matches!(events.last(), Some(Event::Stopped { reason }) if reason == "prompt_failed")
+            matches!(events.last(), Some(Event::Stopped { reason }) if reason == "prompt_rejected")
         );
     }
     assert!(!fake.connection.is_finished());
     fake.cmd_tx.send(ClientCmd::Cancel).await.unwrap();
     fake.cmd_tx
-        .send(ClientCmd::Prompt(Vec::new()))
+        .send(ClientCmd::Prompt(Vec::new().into()))
         .await
         .unwrap();
     let next = collect_terminal(&mut fake).await;
@@ -1067,7 +1068,7 @@ async fn transport_and_protocol_failure_remain_fatal_across_turn_ownership() {
     .await;
     if !matches!(mode, "idle" | "adopted") {
         fake.cmd_tx
-            .send(ClientCmd::Prompt(Vec::new()))
+            .send(ClientCmd::Prompt(PromptInput::default()))
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(10), prompts.recv())
@@ -1115,7 +1116,7 @@ async fn transport_and_protocol_failure_remain_fatal_across_turn_ownership() {
                 .count(),
             1
         );
-        assert_eq!(events.iter().filter(|event| matches!(event, Event::Stopped { reason } if reason == "prompt_failed")).count(), 1);
+        assert_eq!(events.iter().filter(|event| matches!(event, Event::Stopped { reason } if reason == "prompt_rejected")).count(), 1);
         assert!(!events.iter().any(
             |event| matches!(event, Event::Stopped { reason } if reason == "prompt_complete")
         ));
@@ -1164,17 +1165,17 @@ move |id| {
 },)
 .await;
 fake.cmd_tx
-    .send(ClientCmd::Prompt(Vec::new()))
+    .send(ClientCmd::Prompt(PromptInput::default()))
     .await
     .unwrap();
 let mut events = collect_terminal(&mut fake).await;
-assert!(matches!(events.last(), Some(Event::Stopped { reason }) if reason == "prompt_failed"));
+assert!(matches!(events.last(), Some(Event::Stopped { reason }) if reason == "prompt_rejected"));
 assert!(events
     .iter()
     .any(|event| matches!(event, Event::PromptRuntimeError { .. })));
 assert!(!fake.connection.is_finished());
 fake.cmd_tx
-    .send(ClientCmd::Prompt(Vec::new()))
+    .send(ClientCmd::Prompt(PromptInput::default()))
     .await
     .unwrap();
 let next = collect_terminal(&mut fake).await;
@@ -1230,7 +1231,7 @@ for kind in ["permission", "elicitation"] {
         vec![serde_json::json!({"jsonrpc":"2.0","id":"pending-interaction","method":method,"params":params}).to_string()]
     }).await;
     fake.cmd_tx
-        .send(ClientCmd::Prompt(Vec::new()))
+        .send(ClientCmd::Prompt(Vec::new().into()))
         .await
         .unwrap();
     let mut events = Vec::new();
@@ -1284,7 +1285,7 @@ for kind in ["permission", "elicitation"] {
     assert!(progress < diagnostic);
     assert!(fake.pending_responders.lock().await.contains_key(&nonce));
     assert!(
-        matches!(events.last(), Some(Event::Stopped { reason }) if reason == "prompt_failed")
+        matches!(events.last(), Some(Event::Stopped { reason }) if reason == "prompt_rejected")
     );
     assert!(!events.iter().any(|event| matches!(
         event,
@@ -1365,7 +1366,7 @@ for kind in ["permission", "elicitation"] {
     assert!(state.pending_approvals.is_empty() && state.pending_elicitations.is_empty());
     assert!(!fake.connection.is_finished());
     fake.cmd_tx
-        .send(ClientCmd::Prompt(Vec::new()))
+        .send(ClientCmd::Prompt(PromptInput::default()))
         .await
         .unwrap();
     collect_terminal(&mut fake).await;
@@ -1390,7 +1391,7 @@ async fn request_error_then_eof_survives_public_event_backpressure() {
             })
             .await;
             fake.cmd_tx
-                .send(ClientCmd::Prompt(Vec::new()))
+                .send(ClientCmd::Prompt(PromptInput::default()))
                 .await
                 .unwrap();
             let id = tokio::time::timeout(Duration::from_secs(10), prompts.recv())
@@ -1458,7 +1459,7 @@ async fn request_error_then_eof_survives_public_event_backpressure() {
             let terminal = events
                 .iter()
                 .position(
-                    |event| matches!(event, Event::Stopped { reason } if reason == "prompt_failed"),
+                    |event| matches!(event, Event::Stopped { reason } if reason == "prompt_rejected"),
                 )
                 .unwrap();
             let closure = events
@@ -1516,7 +1517,7 @@ assert!(
     "SDK replies to malformed input instead of closing transport"
 );
 fake.cmd_tx
-    .send(ClientCmd::Prompt(Vec::new()))
+    .send(ClientCmd::Prompt(PromptInput::default()))
     .await
     .unwrap();
 let events = collect_terminal(&mut fake).await;
@@ -1546,11 +1547,11 @@ let mut fake = spawn_fake_connection(scope, "s-reset-failure", None, false, move
     }
 }).await;
 fake.cmd_tx
-    .send(ClientCmd::Prompt(Vec::new()))
+    .send(ClientCmd::Prompt(PromptInput::default()))
     .await
     .unwrap();
 let failed = collect_terminal(&mut fake).await;
-assert!(matches!(failed.last(), Some(Event::Stopped { reason }) if reason == "prompt_failed"));
+assert!(matches!(failed.last(), Some(Event::Stopped { reason }) if reason == "prompt_rejected"));
 let (respond_to, response) = oneshot::channel();
 let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
 let proposal = fake.event_rx.prepare_reset(deadline).await;
@@ -1579,7 +1580,7 @@ write_line(&fake.agent_write, &serde_json::json!({
     }
 }).to_string()).await;
 fake.cmd_tx
-    .send(ClientCmd::Prompt(Vec::new()))
+    .send(ClientCmd::Prompt(PromptInput::default()))
     .await
     .unwrap();
 tokio::time::timeout(Duration::from_secs(10), async {
@@ -1829,7 +1830,7 @@ async fn parked_callback_refuses_clear_until_a_new_explicit_reset() {
             .unwrap()
             .unwrap();
         fake.cmd_tx
-            .send(ClientCmd::Prompt(Vec::new()))
+            .send(ClientCmd::Prompt(Vec::new().into()))
             .await
             .unwrap();
         collect_connection_events_until(
@@ -1893,7 +1894,7 @@ async fn parked_callback_refuses_clear_until_a_new_explicit_reset() {
             matches!(event, Event::AgentMessageChunk { text, .. } if text == "fresh after explicit reset")
         }).await;
         fake.cmd_tx
-            .send(ClientCmd::Prompt(Vec::new()))
+            .send(ClientCmd::Prompt(Vec::new().into()))
             .await
             .unwrap();
         collect_connection_events_until(
@@ -1974,7 +1975,7 @@ async fn transport_eof_cancels_unanswered_callbacks_after_intervening_progress()
         })
         .await;
         fake.cmd_tx
-            .send(ClientCmd::Prompt(Vec::new()))
+            .send(ClientCmd::Prompt(Vec::new().into()))
             .await
             .unwrap();
         let nonce = registered_interaction(&mut fake, &mut Vec::new()).await;
@@ -2162,9 +2163,9 @@ async fn default_mode_reaches_the_live_mode_option_only_when_configured() {
                 )
                 .await;
                 fake.cmd_tx
-                    .send(ClientCmd::Prompt(vec![ContentBlock::Text(
-                        TextContent::new("hi"),
-                    )]))
+                    .send(ClientCmd::Prompt(
+                        vec![ContentBlock::Text(TextContent::new("hi"))].into(),
+                    ))
                     .await
                     .unwrap();
                 tokio::time::timeout(Duration::from_secs(10), prompted_rx.recv())
@@ -2273,7 +2274,7 @@ async fn adapter_started_idle_compaction_ends_without_a_prompt() {
     );
     fake.cmd_tx.send(ClientCmd::Cancel).await.unwrap();
     fake.cmd_tx
-        .send(ClientCmd::Prompt(Vec::new()))
+        .send(ClientCmd::Prompt(PromptInput::default()))
         .await
         .unwrap();
     let mut next = collect_terminal(&mut fake).await;
@@ -2383,7 +2384,7 @@ async fn child_cancel_targets_the_child_and_requires_the_capability() {
     })
     .await
     .expect("both subagents announced");
-    cmd_tx.send(ClientCmd::Prompt(vec![ContentBlock::Text(TextContent::new("hold the actual root turn"))]))
+    cmd_tx.send(ClientCmd::Prompt(vec![ContentBlock::Text(TextContent::new("hold the actual root turn"))].into()))
         .await.unwrap();
     let native_prompt = tokio::time::timeout(Duration::from_secs(30), native_prompts.recv())
         .await.unwrap().expect("actual native root prompt");
@@ -2507,9 +2508,9 @@ async fn reset_waits_for_a_running_subagent() {
 
     // The agent reports the child idle before it ends the turn.
     cmd_tx
-        .send(ClientCmd::Prompt(vec![ContentBlock::Text(
-            TextContent::new("go"),
-        )]))
+        .send(ClientCmd::Prompt(PromptInput::from(vec![
+            ContentBlock::Text(TextContent::new("go")),
+        ])))
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(30), async {

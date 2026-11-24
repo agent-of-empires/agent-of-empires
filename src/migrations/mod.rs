@@ -70,7 +70,12 @@ mod v056_launch_resolved_executable;
 mod v056_native_prompt_publication;
 mod v057_acp_budget_knowledge;
 mod v057_worker_launch_executable;
-mod v059_reconcile_acp_lineages;
+mod v058_account_limits_window_shape;
+mod v059_owner_only_event_logs;
+mod v060_terminal_handoff_outcome;
+mod v061_unpin_default_sandbox_image;
+mod v062_plugin_staging_evidence;
+mod v063_reconcile_acp_lineages;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -111,7 +116,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 59;
+const CURRENT_VERSION: u32 = 63;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -308,9 +313,30 @@ const MIGRATIONS: &[Migration] = &[
         v057_worker_launch_executable::run,
     ),
     (
-        59,
+        58,
+        "account_limits_window_shape",
+        v058_account_limits_window_shape::run,
+    ),
+    (59, "owner_only_event_logs", v059_owner_only_event_logs::run),
+    (
+        60,
+        "terminal_handoff_outcome",
+        v060_terminal_handoff_outcome::run,
+    ),
+    (
+        61,
+        "unpin_default_sandbox_image",
+        v061_unpin_default_sandbox_image::run,
+    ),
+    (
+        62,
+        "plugin_staging_evidence",
+        v062_plugin_staging_evidence::run,
+    ),
+    (
+        63,
         "reconcile_acp_lineages",
-        v059_reconcile_acp_lineages::run,
+        v063_reconcile_acp_lineages::run,
     ),
 ];
 
@@ -327,7 +353,7 @@ pub fn has_pending_migrations() -> bool {
     let current = get_current_version();
     current < CURRENT_VERSION
         || (current == CURRENT_VERSION
-            && v059_reconcile_acp_lineages::autonomous_pending().unwrap_or(true))
+            && v063_reconcile_acp_lineages::autonomous_pending().unwrap_or(true))
 }
 
 /// Check compatibility before changing or stopping a managed daemon.
@@ -345,7 +371,7 @@ pub(crate) fn ensure_schema_supported() -> Result<u32> {
 pub fn assert_schema_current() -> Result<()> {
     let current = ensure_schema_supported()?;
     anyhow::ensure!(
-        current == CURRENT_VERSION && !v059_reconcile_acp_lineages::autonomous_pending()?,
+        current == CURRENT_VERSION && !v063_reconcile_acp_lineages::autonomous_pending()?,
         "data schema version {current} is behind this build ({CURRENT_VERSION}); \
          the parent `aoe serve` must migrate before launching the daemon child"
     );
@@ -443,9 +469,12 @@ fn run_migrations_inner(
     let _installed = progress::install(reporter);
     let _announced = progress::install_announced(announce);
     let current = ensure_schema_supported()?;
-    let requires_exclusion = current < CURRENT_VERSION
-        || announce
-        || (current == CURRENT_VERSION && v059_reconcile_acp_lineages::autonomous_pending()?);
+    let needs_exclusion = |current| -> Result<bool> {
+        Ok(announce
+            || current < CURRENT_VERSION
+            || v063_reconcile_acp_lineages::autonomous_pending()?)
+    };
+    let requires_exclusion = needs_exclusion(current)?;
     // Older daemons know serve.lock but not the lifecycle transaction. Hold
     // both before the first schema write; standalone callers include the TUI.
     let owned_transaction;
@@ -461,6 +490,7 @@ fn run_migrations_inner(
     };
     // Another migrator may have completed while we acquired its transaction.
     let current = ensure_schema_supported()?;
+    let requires_exclusion = requires_exclusion && needs_exclusion(current)?;
     let owned_serve;
     let serve = if requires_exclusion && serve.is_none() {
         owned_serve = crate::cli::serve::try_lock_serve()?.ok_or(DaemonBlocksMigration(
@@ -485,7 +515,7 @@ fn run_migrations_inner(
     }
     debug!("Current schema version: {}", current);
     if current == CURRENT_VERSION {
-        v059_reconcile_acp_lineages::reconcile_autonomous_metadata()?;
+        v063_reconcile_acp_lineages::reconcile_autonomous_metadata()?;
         v027_isolate_sandbox_stores::reconcile_pending(announce)?;
         v033_isolate_sandbox_content::reconcile_pending(announce)?;
     } else {
@@ -549,7 +579,9 @@ fn run_explicit_recovery(
         }
     };
     crate::cli::serve::with_inactive_serve_state(transaction, Some(serve), |_| {
-        recovery::reconcile_repaired_components()
+        recovery::reconcile_repaired_components()?;
+        // Not in the helper: registered v046 calls it, and an upgrade must reach v060 in order.
+        v060_terminal_handoff_outcome::run()
     })?;
     legacy_scope_recovery::run_under_exclusion(transaction, serve)
 }

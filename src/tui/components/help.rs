@@ -91,7 +91,6 @@ fn shortcuts(strict: bool, live_on_enter: bool) -> Vec<(&'static str, Vec<(Strin
     // (it is palette / badge driven), so `?` would not document it otherwise.
     views.push(("< >".to_string(), "Resize list panel".to_string()));
     other.extend(owned([
-        ("n", "Next match (after search)"),
         ("Shift+drag", "Select text in preview"),
         ("Drag", "Select + copy preview (live mode)"),
         ("Click link", "Open underlined preview link or URL"),
@@ -428,7 +427,7 @@ mod tests {
                 if cfg!(feature = "web") {
                     "Web dashboard"
                 } else {
-                    "Connections: API server"
+                    "API server"
                 },
                 "R",
                 "Ctrl+R",

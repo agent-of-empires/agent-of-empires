@@ -542,7 +542,10 @@ async fn admit_and_create(
         plugin_create_idempotency: None,
         // Set here (not just inside the service) so the idempotency probe below
         // hashes the same payload the create will.
-        pending_initial_turn: req.initial_turn.as_ref().map(|t| t.text.clone()),
+        pending_initial_turn: req
+            .initial_turn
+            .as_ref()
+            .map(|t| (t.text.clone(), crate::daemon::PromptOrigin::Plugin)),
         parent_session_id: None,
         acp_mode_id: req.mode_id.clone(),
         view: crate::session::View::Structured,
@@ -595,14 +598,17 @@ async fn admit_and_create(
     // cannot overshoot the cap.
     let _reservation = deps.policy.admit_create(plugin_id, active_sessions)?;
 
-    let initial_turn_text = req.initial_turn.as_ref().map(|t| t.text.as_str());
+    let initial_turn = req
+        .initial_turn
+        .as_ref()
+        .map(|t| (t.text.as_str(), crate::daemon::PromptOrigin::Plugin));
     let (outcome, created) = deps
         .session_service
         .create_structured_session(
             spec,
             Some(plugin_id),
             req.idempotency_key.as_deref(),
-            initial_turn_text,
+            initial_turn,
         )
         .await
         .map_err(map_create_error)?;
@@ -720,7 +726,7 @@ async fn sessions_turn_send(
 
         let (woke_idle_dormant, resume_reservation) = match deps
             .session_service
-            .touch_and_wake_on_prompt(&req.session_id, false)
+            .touch_and_wake_on_prompt_refusing_ignored(&req.session_id, false)
             .await
         {
             PromptTouch::Touched { idle_dormant, resume_reservation } => (idle_dormant, resume_reservation),
@@ -765,6 +771,16 @@ async fn sessions_turn_send(
                     codes::FAILED_PRECONDITION,
                     blocked.code(),
                     blocked.to_string(),
+                ));
+            }
+            PromptTouch::Ignored => {
+                if marked_pending {
+                    clear_revival_pending(&deps.session_service, &req.session_id).await;
+                }
+                return Err(DispatchError::with_kind(
+                    codes::FAILED_PRECONDITION,
+                    "ignored",
+                    "The session is ignored because another session manages it",
                 ));
             }
         };
@@ -820,9 +836,43 @@ async fn sessions_turn_send(
                 woke_idle_dormant,
                 prompt_ids: Vec::new(),
                 synthesized: false,
+                origin: crate::daemon::PromptOrigin::Plugin,
                 no_revive: false, },
             )
             .await;
+        if let Err(SendTurnError::LoginRequired(blocked)) = &sent {
+            // The kept turn revives the session after the login, so its cap reservation
+            // stays: the resume's first status report clears it (`apply_status_intent`), as
+            // do a user stop and a daemon restart (the mark is not persisted).
+            let kept =
+                keep_for_login(&deps.session_service, &req.session_id, &req.text, None).await;
+            let queued_id = match kept {
+                Ok(queued_id) => queued_id,
+                // Nothing was kept, so there is no resume to hold the reservation for.
+                Err(refusal) => {
+                    if marked_pending {
+                        clear_revival_pending(&deps.session_service, &req.session_id).await;
+                    }
+                    return Err(refusal);
+                }
+            };
+            return Err(login_required_queued(blocked, &queued_id));
+        }
+        if let Err(SendTurnError::HookFailed(message)) = &sent {
+            // The message is kept and delivered on the next revival, and the pending turn
+            // stays. No hold is registered (a failing hook is not a login that arrives by
+            // itself), so nothing would clear the cap reservation the revival attempt made:
+            // clear it here.
+            let kept =
+                keep_for_login(&deps.session_service, &req.session_id, &req.text, None).await;
+            if marked_pending {
+                clear_revival_pending(&deps.session_service, &req.session_id).await;
+            }
+            return Err(match kept {
+                Ok(queued_id) => hook_failed_queued(message, &queued_id),
+                Err(refusal) => refusal,
+            });
+        }
         if sent.is_err() && marked_pending {
             clear_revival_pending(&deps.session_service, &req.session_id).await;
         }
@@ -831,17 +881,23 @@ async fn sessions_turn_send(
     }
     .await;
 
-    deps.policy.audit(
-        &plugin_id,
-        serde_json::json!({
-            "op": "sessions.turn.send",
-            "session": req.session_id,
-            "decision": if result.is_ok() { "ok" } else { "denied" },
-            "kind": result.as_ref().err().and_then(|e| {
-                e.data.as_ref().and_then(|d| d.get("kind")).cloned()
-            }),
+    let mut audit = serde_json::json!({
+        "op": "sessions.turn.send",
+        "session": req.session_id,
+        "decision": if result.is_ok() { "ok" } else { "denied" },
+        "kind": result.as_ref().err().and_then(|e| {
+            e.data.as_ref().and_then(|d| d.get("kind")).cloned()
         }),
-    );
+    });
+    if result
+        .as_ref()
+        .err()
+        .and_then(|e| e.data.as_ref())
+        .is_some_and(|d| d.get("queued_id").is_some())
+    {
+        audit["queued"] = Value::Bool(true);
+    }
+    deps.policy.audit(&plugin_id, audit);
     result?;
     Ok(serde_json::json!({}))
 }
@@ -956,6 +1012,7 @@ async fn deliver_message(
         &req.session_id,
         req.message.clone(),
         true,
+        true,
     )
     .await
     .map_err(|error| map_terminal_error(error.error))?;
@@ -982,7 +1039,7 @@ async fn deliver_structured(
         .await
         .map_err(|e| map_send_error(e.into()))?;
     let (woke_idle_dormant, resume_reservation) = match service
-        .touch_and_wake_on_prompt(id, false)
+        .touch_and_wake_on_prompt_refusing_ignored(id, false)
         .await
     {
         PromptTouch::Touched {
@@ -1008,6 +1065,13 @@ async fn deliver_structured(
             return Err(map_send_error(SendTurnError::ControlStateUnavailable))
         }
         PromptTouch::Blocked(blocked) => return Err(blocked_error(blocked)),
+        PromptTouch::Ignored => {
+            return Err(DispatchError::with_kind(
+                codes::FAILED_PRECONDITION,
+                "ignored",
+                "The session is ignored because another session manages it",
+            ))
+        }
     };
     let prepared_resume = resume_reservation.is_some();
     let was_running = service.acp_supervisor.is_running(id).await;
@@ -1025,14 +1089,20 @@ async fn deliver_structured(
     // A stopped worker is resumed by `send_turn` below, not queued behind a drain nothing starts.
     if let PromptDispatch::Queued { reason } = dispatch {
         if reason != QueueReason::WorkerDown {
+            let prompt_id = uuid::Uuid::new_v4().to_string();
+            // Under the submission guard held above, so the room found stays.
+            queue_room(service, id, &prompt_id, &req.message).await?;
             service
                 .enqueue_prompt_superseding_continuation(
                     id,
-                    uuid::Uuid::new_v4().to_string(),
+                    prompt_id,
                     req.message.clone(),
                     Vec::new(),
                     None,
-                    Some(plugin_id.to_string()),
+                    crate::server::session_service::QueueSender {
+                        plugin: Some(plugin_id.to_string()),
+                        origin: crate::daemon::PromptOrigin::Plugin,
+                    },
                 )
                 .await
                 .map_err(|_| DispatchError::internal("the message could not be saved; retry"))?
@@ -1042,6 +1112,7 @@ async fn deliver_structured(
                     service,
                     id,
                     crate::process::worker_registry::ResumeAuthority::Explicit,
+                    crate::server::sandbox_login::LaunchOrigin::Unattended,
                     Some(reservation),
                 )
                 .await
@@ -1068,10 +1139,22 @@ async fn deliver_structured(
                 woke_idle_dormant,
                 prompt_ids: Vec::new(),
                 synthesized: false,
+                origin: crate::daemon::PromptOrigin::Plugin,
                 no_revive: false,
             },
         )
         .await;
+    if let Err(SendTurnError::LoginRequired(blocked)) = &sent {
+        // A pending turn (a rate-limit continuation) stays as for a `no_revive` refusal:
+        // after the login it and the kept message are both delivered.
+        let queued_id = keep_for_login(service, id, &req.message, Some(plugin_id)).await?;
+        return Err(login_required_queued(blocked, &queued_id));
+    }
+    if let Err(SendTurnError::HookFailed(message)) = &sent {
+        // As for the login: the message is kept and the pending turn stays.
+        let queued_id = keep_for_login(service, id, &req.message, Some(plugin_id)).await?;
+        return Err(hook_failed_queued(message, &queued_id));
+    }
     if sent.as_ref().err().is_none_or(SendTurnError::published) {
         service.clear_pending_initial_turn(id).await;
     }
@@ -1084,6 +1167,104 @@ async fn deliver_structured(
         },
         revived: woke_idle_dormant || prepared_resume || !was_running,
     })
+}
+
+/// `Ok` when the session's queue can take `text`, else the refusal every plugin enqueue path
+/// answers with. Never names the message as queued: it was not kept.
+async fn queue_room(
+    service: &Arc<SessionService>,
+    id: &str,
+    prompt_id: &str,
+    text: &str,
+) -> Result<(), DispatchError> {
+    use crate::server::session_service::{
+        QueueRoom, MAX_QUEUED_PROMPTS_PER_SESSION, MAX_QUEUED_TEXT_BYTES,
+    };
+    match service.check_queue_room(id, prompt_id, text).await {
+        QueueRoom::Available => Ok(()),
+        QueueRoom::TextTooLarge => Err(DispatchError::with_kind(
+            codes::INVALID_PARAMS,
+            "message_too_long",
+            format!(
+                "the message exceeds the {} KiB limit and was not kept",
+                MAX_QUEUED_TEXT_BYTES / 1024
+            ),
+        )),
+        QueueRoom::Full => Err(DispatchError::with_kind(
+            codes::RATE_LIMITED,
+            "queue_full",
+            format!(
+                "the session already holds {MAX_QUEUED_PROMPTS_PER_SESSION} waiting prompts; the message was not kept, retry when it drains"
+            ),
+        )),
+    }
+}
+
+/// Queues a turn refused for the sandbox login and returns its queue id; the drain
+/// delivers it once the held session is resumed after the login.
+async fn keep_for_login(
+    service: &Arc<SessionService>,
+    id: &str,
+    text: &str,
+    origin_plugin: Option<&str>,
+) -> Result<String, DispatchError> {
+    let prompt_id = uuid::Uuid::new_v4().to_string();
+    // Under the submission guard the caller holds, so the room found stays. A refusal is
+    // not the login-required answer: that one says the message is queued.
+    queue_room(service, id, &prompt_id, text).await?;
+    service
+        .enqueue_prompt(
+            id,
+            prompt_id,
+            text.to_string(),
+            Vec::new(),
+            None,
+            crate::server::session_service::QueueSender {
+                plugin: origin_plugin.map(str::to_string),
+                origin: crate::daemon::PromptOrigin::Plugin,
+            },
+        )
+        .await
+        .map(|entry| entry.id)
+        .ok_or_else(session_not_found)
+}
+
+/// The refusal for a turn [`keep_for_login`] kept: retrying would queue it twice.
+fn login_required_queued(
+    blocked: &crate::session::SandboxLoginRequired,
+    queued_id: &str,
+) -> DispatchError {
+    let mut error = map_send_error(SendTurnError::LoginRequired(blocked.clone()));
+    if let Some(data) = error.data.as_mut() {
+        data["queued_id"] = Value::String(queued_id.to_string());
+    }
+    error
+}
+
+/// The refusal for a launch whose `host_hooks.before_start` hook failed: the hook's own
+/// error, with the id the kept message is queued under.
+fn hook_failed_queued(message: &str, queued_id: &str) -> DispatchError {
+    let mut error = DispatchError::with_kind(
+        codes::FAILED_PRECONDITION,
+        "before_start_hook_failed",
+        message.to_string(),
+    );
+    if let Some(data) = error.data.as_mut() {
+        data["queued_id"] = Value::String(queued_id.to_string());
+    }
+    error
+}
+
+/// The refusal for a launch that needs the sandbox login, naming the tool it is for.
+fn login_required_error(
+    blocked: &crate::session::SandboxLoginRequired,
+    consequence: &str,
+) -> DispatchError {
+    DispatchError::with_kind(
+        codes::FAILED_PRECONDITION,
+        crate::session::SandboxLoginRequired::CODE,
+        format!("{blocked}; {consequence}"),
+    )
 }
 
 fn map_terminal_error(e: SendKeysError) -> DispatchError {
@@ -1107,7 +1288,15 @@ fn map_terminal_error(e: SendKeysError) -> DispatchError {
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or("start_failed");
-            let mut error = DispatchError::with_kind(code, kind, "Terminal preparation failed");
+            // The login refusal names the tool and what to do; a terminal session has no
+            // queue, so the message is not kept.
+            let message = match detail.get("message").and_then(Value::as_str) {
+                Some(login) if kind == crate::session::SandboxLoginRequired::CODE => {
+                    format!("{login}; terminal sessions have no queue, retry after the login")
+                }
+                _ => "Terminal preparation failed".to_string(),
+            };
+            let mut error = DispatchError::with_kind(code, kind, message);
             if let Some(sid) = detail.get("resume_session_id").and_then(Value::as_str) {
                 error.data.as_mut().expect("typed error data")["resume_session_id"] = sid.into();
             }
@@ -1121,6 +1310,11 @@ fn map_terminal_error(e: SendKeysError) -> DispatchError {
         SendKeysError::StructuredView => {
             DispatchError::internal("terminal send reached a structured session")
         }
+        SendKeysError::Ignored => DispatchError::with_kind(
+            codes::FAILED_PRECONDITION,
+            "ignored",
+            "the session is ignored because another session manages it",
+        ),
         SendKeysError::Tmux(error) => {
             tracing::warn!(target: "plugin.host", %error, "plugin terminal send failed");
             DispatchError::internal("terminal send failed")
@@ -1156,13 +1350,13 @@ fn map_send_error(e: SendTurnError) -> DispatchError {
             "control_state_unavailable",
             "session control state could not be read",
         ),
-        SendTurnError::WorkerNotReady | SendTurnError::WorkerLostAfterPublish => {
-            DispatchError::with_kind(
-                codes::SERVICE_UNAVAILABLE,
-                "worker_not_ready",
-                "worker not ready; retry",
-            )
-        }
+        SendTurnError::WorkerNotReady
+        | SendTurnError::AgentChanged
+        | SendTurnError::WorkerLostAfterPublish => DispatchError::with_kind(
+            codes::SERVICE_UNAVAILABLE,
+            "worker_not_ready",
+            "worker not ready; retry",
+        ),
         SendTurnError::Unavailable(unavailability)
         | SendTurnError::UnavailableAfterPublish(unavailability) => DispatchError::with_kind(
             codes::FAILED_PRECONDITION,
@@ -1174,6 +1368,16 @@ fn map_send_error(e: SendTurnError) -> DispatchError {
             codes::FAILED_PRECONDITION,
             "no_revive",
             "reviving a stopped worker is required",
+        ),
+        // Both callers keep the message and add its id (`login_required_queued`).
+        SendTurnError::LoginRequired(blocked) => login_required_error(
+            &blocked,
+            "the message is queued and is delivered after the login",
+        ),
+        SendTurnError::HookFailed(message) => DispatchError::with_kind(
+            codes::FAILED_PRECONDITION,
+            "before_start_hook_failed",
+            message,
         ),
         SendTurnError::Send(e) => DispatchError::internal(format!("prompt forward failed: {e}")),
     }
@@ -1196,7 +1400,7 @@ mod tests {
         row.view = crate::session::View::Structured;
         row.status = Status::Stopped;
         row.lifecycle_generation = 27;
-        row.idle_dormant_since = Some(chrono::Utc::now());
+        row.idle_dormant_since = Some(crate::time::Timestamp::now());
         row.acp_session_id = Some("retained-native-plugin".into());
         row.agent_name = Some("claude".into());
         row.created_by_plugin = Some("cron".into());
@@ -1282,6 +1486,22 @@ mod tests {
             deep_link_pages: Default::default(),
             ui_generation: 1,
         }
+    }
+
+    /// [`test_deps`] for rows a launch opens from the store.
+    async fn test_deps_native(
+        mut prior: Vec<Instance>,
+    ) -> (
+        Arc<SessionRpcDeps>,
+        Arc<crate::server::AppState>,
+        tempfile::TempDir,
+    ) {
+        for row in &mut prior {
+            row.source_profile = "default".to_string();
+        }
+        let (deps, state, dir) = test_deps(prior);
+        crate::server::test_support::seed_native_rows_for_test(&state).await;
+        (deps, state, dir)
     }
 
     fn test_deps(
@@ -1730,9 +1950,13 @@ mod tests {
     async fn message_send_reports_missing_and_shelved_sessions_with_stable_kinds() {
         let _home = crate::session::test_support::isolate_app_dir();
         type Shelve = (&'static str, fn(&mut Instance));
-        let shelves: [Shelve; 2] = [
+        let shelves: [Shelve; 3] = [
             ("session_archived", Instance::archive),
             ("session_trashed", Instance::trash),
+            ("ignored", |row| {
+                row.parent_session_id = Some("manager".into());
+                row.ignore();
+            }),
         ];
         let mut prior = Vec::new();
         for (want, shelve) in shelves {
@@ -1747,13 +1971,15 @@ mod tests {
                 prior.push(inst);
             }
         }
-        let (deps, state, _dir) = test_deps(prior.clone());
+        let (deps, state, _dir) = test_deps_native(prior.clone()).await;
         let ctx = ctx_with(&["session.message"]);
         for inst in &prior {
             let want = if inst.is_archived() {
                 "session_archived"
-            } else {
+            } else if inst.is_trashed() {
                 "session_trashed"
+            } else {
+                "ignored"
             };
             let err = dispatch(
                 &deps,
@@ -1903,7 +2129,8 @@ mod tests {
         let parks: Vec<Park> = vec![
             ("idle-dormant", |i| i.mark_idle_dormant()),
             ("snoozed", |i| {
-                i.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1))
+                i.snoozed_until =
+                    Some(crate::time::Timestamp::now() + crate::time::Duration::hours(1))
             }),
             ("stopped, nothing to clear", |_| {}),
         ];
@@ -1956,6 +2183,10 @@ mod tests {
             text: "queued before the park".to_string(),
             attachments: Vec::new(),
             synthesized: true,
+            error: None,
+            error_code: None,
+            id: String::new(),
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         parked.pending_initial_turn = Some(seeded.clone());
         let (deps, state, _dir) = test_deps(vec![parked]);
@@ -2084,6 +2315,18 @@ mod tests {
             .expect("delivery completed");
     }
 
+    /// The refusal a revive for a sandbox needing its login comes back as: the lifecycle
+    /// command's 409 and its body.
+    fn login_required_preparation() -> SendKeysError {
+        use axum::response::IntoResponse;
+        SendKeysError::Preparation {
+            response: Box::new(axum::http::StatusCode::CONFLICT.into_response()),
+            detail: crate::server::api::sandbox_login_required_body(
+                &crate::session::test_support::login_required("claude"),
+            ),
+        }
+    }
+
     #[test]
     fn terminal_send_errors_map_to_documented_kinds() {
         use axum::response::IntoResponse;
@@ -2110,6 +2353,7 @@ mod tests {
                 },
                 "resume_failed",
             ),
+            (login_required_preparation(), "sandbox_login_required"),
         ];
         for (err, want) in cases {
             assert_eq!(kind(&map_terminal_error(err)), want);
@@ -2125,6 +2369,15 @@ mod tests {
         });
         assert_eq!(forbidden.code, codes::FORBIDDEN);
         assert_eq!(kind(&forbidden), "read_only");
+        let login = map_terminal_error(login_required_preparation());
+        assert_eq!(login.code, codes::FAILED_PRECONDITION);
+        assert_eq!(
+            login.message,
+            format!(
+                "{}; terminal sessions have no queue, retry after the login",
+                crate::session::test_support::login_required("claude")
+            )
+        );
         let secret = map_terminal_error(SendKeysError::Tmux(anyhow::anyhow!(
             "credential=private-value"
         )));
@@ -2239,6 +2492,7 @@ mod tests {
                             woke_idle_dormant: false,
                             prompt_ids: Vec::new(),
                             synthesized: false,
+                            origin: crate::daemon::PromptOrigin::Unknown,
                             no_revive: false,
                         },
                     )
@@ -2350,7 +2604,8 @@ mod tests {
         let parks: Vec<Park> = vec![
             ("idle-dormant", |i| i.mark_idle_dormant()),
             ("snoozed", |i| {
-                i.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1))
+                i.snoozed_until =
+                    Some(crate::time::Timestamp::now() + crate::time::Duration::hours(1))
             }),
             ("stopped by the user, nothing to clear", |_| {}),
         ];
@@ -2401,7 +2656,8 @@ mod tests {
         type Park = (&'static str, fn(&mut Instance));
         let parks: Vec<Park> = vec![
             ("snoozed", |i| {
-                i.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1))
+                i.snoozed_until =
+                    Some(crate::time::Timestamp::now() + crate::time::Duration::hours(1))
             }),
             ("idle-dormant", |i| i.mark_idle_dormant()),
             ("idle", |i| i.status = Status::Idle),
@@ -2652,5 +2908,626 @@ mod tests {
                 "a successful revival stays pending until a real status lands"
             ),
         }
+    }
+
+    /// One reconciler tick with the cadence-gated passes sitting out.
+    #[cfg(unix)]
+    async fn reconciler_tick(state: &Arc<crate::server::AppState>) {
+        let now = Some(std::time::Instant::now());
+        crate::server::acp_reconciler::reconcile_acp_workers(
+            state,
+            &mut Default::default(),
+            &mut crate::server::acp_reconciler::ReapCadence {
+                idle: now,
+                rate_limit: now,
+                terminal_repair: now,
+            },
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+        )
+        .await;
+    }
+
+    fn login_required_queued_message() -> String {
+        format!(
+            "{}; the message is queued and is delivered after the login",
+            crate::session::test_support::login_required("claude")
+        )
+    }
+
+    /// A message kept after a failing `before_start` hook leaves no cap reservation behind:
+    /// sessions whose revival was refused for the hook do not use up the plugin's
+    /// `MAX_ACTIVE_PLUGIN_SESSIONS`.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_failing_hook_leaves_no_plugin_cap_reservation() {
+        let home = crate::session::test_support::isolate_app_dir();
+        let (_runtime, _calls) =
+            crate::session::test_support::failing_container_runtime(home.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ]);
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::session::config::update_config(|c| {
+            c.host_hooks.before_start = vec!["exit 3".into()]
+        })
+        .unwrap();
+        let mut rows = Vec::new();
+        let ids: Vec<String> = (0..MAX_ACTIVE_PLUGIN_SESSIONS + 2)
+            .map(|n| format!("sess-cap-{n}"))
+            .collect();
+        for id in &ids {
+            let mut row = Instance::new("cap", project.to_str().unwrap());
+            row.id = id.clone();
+            row.created_by_plugin = Some("cron".to_string());
+            row.view = crate::session::View::Structured;
+            crate::server::test_support::select_retained_for_test(&mut row);
+            crate::session::test_support::sandbox_needing_login(home.path(), &mut row);
+            rows.push(row);
+        }
+        let (deps, state, _dir) = test_deps_native(rows).await;
+
+        for id in &ids {
+            let err = dispatch(
+                &deps,
+                &ctx_with(&["session.prompt"]),
+                "sessions.turn.send",
+                &serde_json::json!({ "session_id": id, "text": "hi" }),
+            )
+            .await
+            .expect_err("the hook fails");
+            assert_eq!(kind(&err), "before_start_hook_failed", "{id}: {err:?}");
+        }
+        assert!(
+            state
+                .instances
+                .read()
+                .await
+                .iter()
+                .all(|i| !i.plugin_revival_pending),
+            "no reservation is left behind"
+        );
+    }
+
+    /// A message for a stopped sandbox whose `before_start` hook supplies no auth route is
+    /// refused for the login and kept, and the hook runs once; a hook that supplies the key
+    /// lets the message through to the launch.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_plugin_message_resolves_the_before_start_hook_once() {
+        let home = crate::session::test_support::isolate_app_dir();
+        let (_runtime, _calls) =
+            crate::session::test_support::failing_container_runtime(home.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ]);
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let counter = home.path().join("hook-runs");
+        let runs = || {
+            std::fs::read_to_string(&counter)
+                .map(|r| r.lines().count())
+                .unwrap_or(0)
+        };
+        for (n, (tail, refused)) in [
+            ("echo FOO=bar", true),
+            ("echo ANTHROPIC_API_KEY=sk-hook", false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let hook = format!(
+                "echo run >> {}; {tail}",
+                crate::session::environment::shell_escape(&counter.to_string_lossy())
+            );
+            crate::session::config::update_config(|c| c.host_hooks.before_start = vec![hook])
+                .unwrap();
+            let _ = std::fs::remove_file(&counter);
+            let id = format!("sess-hook-msg-{n}");
+            let mut row = Instance::new("login", project.to_str().unwrap());
+            row.id = id.clone();
+            row.view = crate::session::View::Structured;
+            crate::server::test_support::select_retained_for_test(&mut row);
+            crate::session::test_support::sandbox_needing_login(home.path(), &mut row);
+            let (deps, _state, _dir) = test_deps_native(vec![row]).await;
+
+            let result = dispatch(
+                &deps,
+                &ctx_with(&["session.message"]),
+                "sessions.message.send",
+                &message_params(&id, "PR #7 was merged"),
+            )
+            .await;
+            if refused {
+                let err = result.expect_err("the hook supplies no auth route");
+                assert_eq!(kind(&err), "sandbox_login_required");
+                assert_eq!(
+                    deps.session_service
+                        .queued_prompts_snapshot(&id)
+                        .await
+                        .len(),
+                    1
+                );
+            } else if let Err(err) = result {
+                assert_ne!(kind(&err), "sandbox_login_required", "{err:?}");
+            }
+            assert_eq!(runs(), 1, "{tail}: the hook ran once");
+        }
+
+        // A hook that fails: its own error, the message kept like a login refusal.
+        let hook = format!(
+            "echo run >> {}; echo sekret-token >&2; exit 3",
+            crate::session::environment::shell_escape(&counter.to_string_lossy())
+        );
+        crate::session::config::update_config(|c| c.host_hooks.before_start = vec![hook]).unwrap();
+        let id = "sess-hook-msg-fails".to_string();
+        let mut row = Instance::new("login", project.to_str().unwrap());
+        row.id = id.clone();
+        row.view = crate::session::View::Structured;
+        crate::server::test_support::select_retained_for_test(&mut row);
+        crate::session::test_support::sandbox_needing_login(home.path(), &mut row);
+        let (deps, _state, _dir) = test_deps_native(vec![row]).await;
+        let err = dispatch(
+            &deps,
+            &ctx_with(&["session.message"]),
+            "sessions.message.send",
+            &message_params(&id, "PR #7 was merged"),
+        )
+        .await
+        .expect_err("the hook fails");
+        assert_eq!(kind(&err), "before_start_hook_failed");
+        assert_eq!(err.message, "the before_start hook failed");
+        assert!(
+            !format!("{err:?}").contains("sekret-token"),
+            "no hook output reaches the plugin error"
+        );
+        let queue = deps.session_service.queued_prompts_snapshot(&id).await;
+        assert_eq!(queue.len(), 1, "the message is kept");
+        assert_eq!(err.data.as_ref().unwrap()["queued_id"], queue[0].id);
+    }
+
+    /// A message for a stopped sandbox that needs the login is kept, and the session
+    /// gets it exactly once after the login.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_queue_keeps_plugin_message() {
+        use crate::acp::state::Event;
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        use std::os::unix::fs::PermissionsExt as _;
+        with_managed(|scope| Box::pin(async move {
+        let home = dirs::home_dir().unwrap();
+        let _auth = crate::session::test_support::unset_claude_auth_routes();
+        let runtime = scope.tempdir();
+        let docker = runtime.path().join("docker");
+        let calls = runtime.path().join("calls");
+        std::fs::write(&docker, format!(r#"#!/bin/sh
+set -eu
+case "${{1-}}:${{2-}}" in
+    --version:|info:) exit 0 ;;
+    container:inspect) echo 'No such container' >&2; exit 1 ;;
+    image:inspect) exit 0 ;;
+    run:-d) echo run >> {calls}; echo fake-login-container; exit 0 ;;
+    exec:-i)
+        echo exec >> {calls}
+        shift 2
+        while [ "$#" -gt 0 ]; do
+            case "$1" in -w|-e|--env-file) shift 2 ;; *) break ;; esac
+        done
+        [ "$1" = fake-login-container ]
+        shift
+        exec "$@"
+        ;;
+esac
+exit 1
+"#, calls = crate::session::environment::shell_escape(calls.to_str().unwrap()))).unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _runtime = crate::session::test_support::path_prepended(runtime.path());
+        crate::session::config::update_config(|config| {
+            config.sandbox.container_runtime = crate::session::ContainerRuntimeName::Docker;
+        }).unwrap();
+        let project = scope.tempdir();
+        let id = "sess-login-msg";
+        let mut row = Instance::new("login", project.path().to_str().unwrap());
+        row.id = id.to_string();
+        row.view = crate::session::View::Structured;
+        crate::server::test_support::select_retained_for_test(&mut row);
+        row.source_profile = "test".into();
+        let crate::session::ResumeIntent::Use(sid) = row.resume_intent.clone() else {
+            panic!("retained selection missing");
+        };
+        let shared = crate::session::test_support::sandbox_needing_login(&home, &mut row);
+        let state = scope.state.clone();
+        state.instances.write().await.push(row);
+        crate::server::test_support::seed_native_rows_for_test(&state).await;
+        let deps = Arc::new(SessionRpcDeps {
+            session_service: state.session_service.clone(),
+            policy: Arc::new(AutomationPolicy::open(&runtime.path().join("plugin_events.db")).unwrap()),
+            profile: "test".into(),
+            cityhall_mode: false,
+        });
+        let service = &deps.session_service;
+
+        let err = dispatch(
+            &deps,
+            &ctx_with(&["session.message"]),
+            "sessions.message.send",
+            &message_params(id, "PR #7 was merged"),
+        )
+        .await
+        .expect_err("the login is missing");
+        assert_eq!(err.code, codes::FAILED_PRECONDITION);
+        assert_eq!(kind(&err), "sandbox_login_required");
+        assert_eq!(err.message, login_required_queued_message());
+        let queue = service.queued_prompts_snapshot(id).await;
+        assert_eq!(
+            queue
+                .iter()
+                .map(|q| (q.text.as_str(), q.origin_plugin.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![("PR #7 was merged", Some("cron"))]
+        );
+        assert_eq!(err.data.as_ref().unwrap()["queued_id"], queue[0].id);
+        assert!(service.sandbox_login.is_held(id));
+        let expected_sid = sid.clone();
+        let (sent, mut prompts) = tokio::sync::mpsc::unbounded_channel();
+        let (config, peer) = scope.native_peer(project.path().into(), "claude", "claude", move |request| {
+            let result = match request["method"].as_str().unwrap() {
+                "initialize" => serde_json::json!({"protocolVersion":1,"agentCapabilities":{"loadSession":true}}),
+                "session/load" => {
+                    assert_eq!(request["params"]["sessionId"], expected_sid);
+                    serde_json::json!({})
+                }
+                "session/prompt" => { sent.send(request.clone()).unwrap(); return None; }
+                "session/cancel" => return None,
+                other => panic!("unexpected ACP method: {other}"),
+            };
+            Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result}))
+        });
+        let events = scope.bind_external_launch(id, config);
+
+        crate::session::test_support::write_fake_shared_credential(&shared);
+        reconciler_tick(&state).await;
+        assert!(!service.sandbox_login.is_held(id));
+        assert!(
+            !std::fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .is_empty(),
+            "the resume after the login passed the gate"
+        );
+
+        let mut resumed = scope.observe_external_resume(id.to_owned(), events).await;
+        resumed.ready().await;
+        service.drain_queued_prompts_once(id).await;
+        service.drain_queued_prompts_once(id).await;
+        let request = tokio::time::timeout(std::time::Duration::from_secs(10), prompts.recv())
+            .await.expect("the queued turn reaches the resumed Native").unwrap();
+        assert_eq!(request["params"]["sessionId"], sid);
+        assert_eq!(request["params"]["prompt"][0]["text"], "PR #7 was merged");
+        peer.send(serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":{"stopReason":"end_turn"}})).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !matches!(resumed.next_event().await.expect("resumed observer"), Event::Stopped { reason } if reason == "prompt_complete") {}
+        }).await.unwrap();
+
+        assert!(service.queued_prompts_snapshot(id).await.is_empty());
+        let delivered: Vec<(String, Option<String>)> = state
+            .acp_event_store
+            .replay_from(id, 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|stored| match stored.event.as_ref() {
+                Event::UserPromptSent {
+                    text,
+                    origin_plugin,
+                    ..
+                } => Some((text.clone(), origin_plugin.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            delivered,
+            vec![("PR #7 was merged".to_string(), Some("cron".to_string()))]
+        );
+        assert_eq!(
+            peer.requests()
+                .iter()
+                .filter(|method| *method == "session/prompt")
+                .count(),
+            1
+        );
+        })).await;
+    }
+
+    /// Fills `id`'s queue to the depth cap.
+    async fn fill_queue(service: &Arc<SessionService>, id: &str) {
+        for n in 0..crate::server::session_service::MAX_QUEUED_PROMPTS_PER_SESSION {
+            service
+                .enqueue_prompt(
+                    id,
+                    format!("fill-{n}"),
+                    format!("row {n}"),
+                    Vec::new(),
+                    None,
+                    crate::server::session_service::QueueSender::default(),
+                )
+                .await
+                .expect("the row is queued");
+        }
+    }
+
+    fn assert_refusal_is_not_a_kept_message(err: &DispatchError, expected_kind: &str) {
+        assert_eq!(kind(err), expected_kind);
+        assert_ne!(kind(err), "sandbox_login_required");
+        assert!(
+            !err.message.contains("queued"),
+            "a refusal must not claim the message is queued: {}",
+            err.message
+        );
+        assert!(
+            err.data
+                .as_ref()
+                .is_none_or(|d| d.get("queued_id").is_none()),
+            "no queued id for a message that was not kept"
+        );
+    }
+
+    /// A session held for the login keeps no more than the queue cap, whichever plugin call
+    /// the message arrives by: the refusal says it was not kept.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_hold_respects_the_queue_caps_for_plugin_calls() {
+        let home = crate::session::test_support::isolate_app_dir();
+        let _auth = crate::session::test_support::unset_claude_auth_routes();
+        let (_runtime, _calls) =
+            crate::session::test_support::failing_container_runtime(home.path());
+        let cases = [
+            ("sessions.message.send", "session.message"),
+            ("sessions.turn.send", "session.prompt"),
+        ];
+        for (n, (method, capability)) in cases.into_iter().enumerate() {
+            let id = format!("sess-login-cap-{n}");
+            let mut row = Instance::new("login", "/tmp/aoe-login-cap");
+            row.id = id.clone();
+            row.view = crate::session::View::Structured;
+            crate::server::test_support::select_retained_for_test(&mut row);
+            row.created_by_plugin = Some("cron".to_string());
+            crate::session::test_support::sandbox_needing_login(home.path(), &mut row);
+            let (deps, _state, _dir) = test_deps_native(vec![row]).await;
+            let service = &deps.session_service;
+            fill_queue(service, &id).await;
+            let params = match method {
+                "sessions.turn.send" => serde_json::json!({ "session_id": id, "text": "and then" }),
+                _ => message_params(&id, "and then"),
+            };
+
+            let err = dispatch(&deps, &ctx_with(&[capability]), method, &params)
+                .await
+                .expect_err(method);
+            assert_eq!(err.code, codes::RATE_LIMITED, "{method}");
+            assert_refusal_is_not_a_kept_message(&err, "queue_full");
+            assert_eq!(
+                service.queued_prompts_snapshot(&id).await.len(),
+                crate::server::session_service::MAX_QUEUED_PROMPTS_PER_SESSION,
+                "{method}"
+            );
+        }
+
+        // The text cap: only a turn can be longer than a message's own limit.
+        let id = "sess-login-cap-text";
+        let mut row = Instance::new("login", "/tmp/aoe-login-cap-text");
+        row.id = id.to_string();
+        row.view = crate::session::View::Structured;
+        crate::server::test_support::select_retained_for_test(&mut row);
+        row.created_by_plugin = Some("cron".to_string());
+        crate::session::test_support::sandbox_needing_login(home.path(), &mut row);
+        let (deps, _state, _dir) = test_deps_native(vec![row]).await;
+        let long = "x".repeat(crate::server::session_service::MAX_QUEUED_TEXT_BYTES + 1);
+        let err = dispatch(
+            &deps,
+            &ctx_with(&["session.prompt"]),
+            "sessions.turn.send",
+            &serde_json::json!({ "session_id": id, "text": long }),
+        )
+        .await
+        .expect_err("a turn over the text cap");
+        assert_eq!(err.code, codes::INVALID_PARAMS);
+        assert_refusal_is_not_a_kept_message(&err, "message_too_long");
+        assert!(deps
+            .session_service
+            .queued_prompts_snapshot(id)
+            .await
+            .is_empty());
+    }
+
+    /// The queue branch of a message to a live, busy session answers a full queue the same
+    /// way: refused, not kept.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn message_send_refuses_a_busy_session_whose_queue_is_full() {
+        crate::acp::supervisor::test_support::managed::with_managed(|scope| {
+            Box::pin(async move {
+                let mut live = crate::server::test_support::managed_control_session(
+                    scope,
+                    "plugin-message-full",
+                    "claude",
+                    None,
+                )
+                .await;
+                let id = live.id().to_owned();
+                let dir = scope.tempdir();
+                let deps = Arc::new(SessionRpcDeps {
+                    session_service: live.state.session_service.clone(),
+                    policy: Arc::new(
+                        AutomationPolicy::open(&dir.path().join("plugin_events.db")).unwrap(),
+                    ),
+                    profile: "test".into(),
+                    cityhall_mode: false,
+                });
+                let active = live.start_prompt("the user's turn").await;
+                fill_queue(&deps.session_service, &id).await;
+                let err = dispatch(
+                    &deps,
+                    &ctx_with(&["session.message"]),
+                    "sessions.message.send",
+                    &message_params(&id, "PR #7 was merged"),
+                )
+                .await
+                .expect_err("the queue is full");
+                assert_eq!(err.code, codes::RATE_LIMITED);
+                assert_refusal_is_not_a_kept_message(&err, "queue_full");
+                assert_eq!(
+                    deps.session_service
+                        .queued_prompts_snapshot(&id)
+                        .await
+                        .len(),
+                    crate::server::session_service::MAX_QUEUED_PROMPTS_PER_SESSION,
+                );
+                live.finish_prompt(&active, None).await;
+            })
+        })
+        .await;
+    }
+
+    /// A plugin-created session whose auto-spawn hit the login gate keeps its pending initial
+    /// turn when a later message is refused for the same reason.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_queue_keeps_pending_initial_turn() {
+        let home = crate::session::test_support::isolate_app_dir();
+        let _auth = crate::session::test_support::unset_claude_auth_routes();
+        let (_runtime, _calls) =
+            crate::session::test_support::failing_container_runtime(home.path());
+        let cases = [
+            ("sessions.message.send", "session.message", Some("cron")),
+            ("sessions.turn.send", "session.prompt", None),
+        ];
+        for (n, (method, capability, origin_plugin)) in cases.into_iter().enumerate() {
+            let id = format!("sess-login-pending-{n}");
+            let mut row = Instance::new("login", "/tmp/aoe-login-pending");
+            row.id = id.clone();
+            row.view = crate::session::View::Structured;
+            crate::server::test_support::select_retained_for_test(&mut row);
+            row.created_by_plugin = Some("cron".to_string());
+            row.pending_initial_turn = Some(crate::session::PendingInitialTurn {
+                text: "run the nightly task".to_string(),
+                attachments: Vec::new(),
+                synthesized: false,
+                error: None,
+                error_code: None,
+                id: String::new(),
+                origin: crate::daemon::PromptOrigin::Unknown,
+            });
+            crate::session::test_support::sandbox_needing_login(home.path(), &mut row);
+            let (deps, state, _dir) = test_deps_native(vec![row]).await;
+            let service = &deps.session_service;
+            // The refused auto-spawn after the create.
+            service.sandbox_login.hold(
+                &id,
+                crate::server::sandbox_login::LaunchOrigin::Unattended,
+                &crate::session::test_support::login_required("claude"),
+            );
+
+            let params = match method {
+                "sessions.turn.send" => serde_json::json!({ "session_id": id, "text": "and then" }),
+                _ => message_params(&id, "and then"),
+            };
+            let err = dispatch(&deps, &ctx_with(&[capability]), method, &params)
+                .await
+                .expect_err(method);
+            assert_eq!(kind(&err), "sandbox_login_required", "{method}");
+            assert_eq!(err.message, login_required_queued_message(), "{method}");
+
+            let instances = state.instances.read().await;
+            assert_eq!(
+                instances[0]
+                    .pending_initial_turn
+                    .as_ref()
+                    .map(|t| t.text.as_str()),
+                Some("run the nightly task"),
+                "{method}"
+            );
+            drop(instances);
+            let queue = service.queued_prompts_snapshot(&id).await;
+            assert_eq!(
+                queue
+                    .iter()
+                    .map(|q| (q.text.as_str(), q.origin_plugin.as_deref()))
+                    .collect::<Vec<_>>(),
+                vec![("and then", origin_plugin)],
+                "{method}"
+            );
+            assert_eq!(
+                err.data.as_ref().unwrap()["queued_id"],
+                queue[0].id,
+                "{method}"
+            );
+        }
+    }
+
+    /// A turn kept for the login keeps its cap reservation: it revives the session after the
+    /// login, so further revivals past the cap are still refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_queue_keeps_the_revival_reservation() {
+        use crate::plugin::automation_policy::MAX_ACTIVE_PLUGIN_SESSIONS;
+        let home = crate::session::test_support::isolate_app_dir();
+        let _auth = crate::session::test_support::unset_claude_auth_routes();
+        let (_runtime, _calls) =
+            crate::session::test_support::failing_container_runtime(home.path());
+        let rows: Vec<Instance> = (0..=MAX_ACTIVE_PLUGIN_SESSIONS)
+            .map(|n| {
+                let mut row = Instance::new("login", "/tmp/aoe-login-cap");
+                row.id = format!("sess-login-cap-{n}");
+                row.view = crate::session::View::Structured;
+                crate::server::test_support::select_retained_for_test(&mut row);
+                row.created_by_plugin = Some("cron".to_string());
+                row.mark_idle_dormant();
+                crate::session::test_support::sandbox_needing_login(home.path(), &mut row);
+                row
+            })
+            .collect();
+        let (deps, state, _dir) = test_deps_native(rows).await;
+        let ctx = ctx_with(&["session.prompt"]);
+
+        for n in 0..=MAX_ACTIVE_PLUGIN_SESSIONS {
+            let err = dispatch(
+                &deps,
+                &ctx,
+                "sessions.turn.send",
+                &serde_json::json!({ "session_id": format!("sess-login-cap-{n}"), "text": "go" }),
+            )
+            .await
+            .expect_err("no turn starts");
+            let want = if n < MAX_ACTIVE_PLUGIN_SESSIONS {
+                "sandbox_login_required"
+            } else {
+                "concurrency_limited"
+            };
+            assert_eq!(kind(&err), want, "turn {n}");
+        }
+        let reserved = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .filter(|i| i.plugin_revival_pending)
+            .count();
+        assert_eq!(reserved, MAX_ACTIVE_PLUGIN_SESSIONS);
     }
 }

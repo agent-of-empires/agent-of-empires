@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "agent-of-empires"
-version = "1.24.0"
+version = "1.25.0"
 dependencies = [
  "aes-gcm",
  "agent-client-protocol",
@@ -100,7 +100,6 @@ dependencies = [
  "base64 0.23.1",
  "cap-std",
  "cargo-husky",
- "chrono",
  "clap",
  "clap_complete",
  "core-foundation",
@@ -155,6 +154,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror 2.0.21",
+ "time",
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tokio-util",
@@ -306,7 +306,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "aoe-plugin-api"
-version = "1.24.0"
+version = "1.25.0"
 dependencies = [
  "semver",
  "serde",
@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "aoe-settings-derive"
-version = "1.24.0"
+version = "1.25.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -819,10 +819,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
- "js-sys",
  "num-traits",
  "serde",
- "wasm-bindgen",
  "windows-link",
 ]
 
@@ -1618,9 +1616,9 @@ checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
 ]
@@ -2627,9 +2625,9 @@ dependencies = [
 
 [[package]]
 name = "libz-sys"
-version = "1.1.31"
+version = "1.1.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff20308ecabd635a2dc1dd5834a86c462cca20efba1d5d3ddab1f8aea3455cb2"
+checksum = "fee3f59f4321dab0c78d828942e7aa09d0bd8ad6e78a501977e6bf3d02938045"
 dependencies = [
  "cc",
  "libc",
@@ -4965,7 +4963,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -5597,9 +5595,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "url"
-version = "2.5.8"
+version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
 dependencies = [
  "form_urlencoded",
  "idna",
@@ -6362,7 +6360,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "1.24.0"
+version = "1.25.0"
 dependencies = [
  "agent-of-empires",
  "aoe-plugin-api",

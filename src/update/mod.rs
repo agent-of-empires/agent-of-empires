@@ -44,7 +44,7 @@ fn is_nightly(version: &str) -> bool {
     version.contains("-nightly.")
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct UpdateInfo {
     pub available: bool,
     pub current_version: String,
@@ -81,7 +81,7 @@ pub struct ReleaseInfo {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct UpdateCache {
-    checked_at: chrono::DateTime<chrono::Utc>,
+    checked_at: crate::time::Timestamp,
     latest_version: String,
     #[serde(default)]
     releases: Vec<ReleaseInfo>,
@@ -129,8 +129,8 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
 
     if !force {
         if let Some(cache) = load_cache_for(current_version) {
-            let age = chrono::Utc::now() - cache.checked_at;
-            let max_age = chrono::Duration::hours(UPDATE_CHECK_INTERVAL_HOURS as i64);
+            let age = crate::time::Timestamp::now() - cache.checked_at;
+            let max_age = crate::time::Duration::hours(UPDATE_CHECK_INTERVAL_HOURS as i64);
 
             // The user upgraded past the cached latest, so the cache is stale.
             let current_is_newer = is_newer_version(current_version, &cache.latest_version);
@@ -138,7 +138,7 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
             if age < max_age && !current_is_newer {
                 tracing::debug!(
                     target: "update.cache",
-                    age_hours = age.num_hours(),
+                    age_hours = age.whole_hours(),
                     latest = %cache.latest_version,
                     "update cache hit"
                 );
@@ -151,7 +151,7 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
             }
             tracing::info!(
                 target: "update.cache",
-                age_hours = age.num_hours(),
+                age_hours = age.whole_hours(),
                 current_is_newer,
                 "update cache miss; refetching"
             );
@@ -186,7 +186,7 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
         let version = release_info.version.clone();
 
         let cache = UpdateCache {
-            checked_at: chrono::Utc::now(),
+            checked_at: crate::time::Timestamp::now(),
             latest_version: version.clone(),
             releases: vec![release_info],
             nightly: false,
@@ -203,7 +203,7 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
     }
 
     let cache = UpdateCache {
-        checked_at: chrono::Utc::now(),
+        checked_at: crate::time::Timestamp::now(),
         latest_version: latest_version.clone(),
         releases,
         nightly: is_nightly(current_version),
@@ -460,7 +460,7 @@ mod tests {
                 ("AOE_UPDATE_API_BASE", std::ffi::OsStr::new(&base)),
             ]);
             save_cache(&UpdateCache {
-                checked_at: chrono::Utc::now(),
+                checked_at: crate::time::Timestamp::now(),
                 latest_version: cached_latest.to_string(),
                 releases: vec![],
                 nightly: cached_nightly,

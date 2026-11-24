@@ -2,12 +2,12 @@
 
 use std::collections::BTreeMap;
 
+use crate::time::Timestamp;
 use agent_client_protocol::v1::schema::{
     CreateElicitationRequest, CreateElicitationResponse, ElicitationAcceptAction,
     ElicitationAction, ElicitationContentValue, ElicitationMode, ElicitationPropertySchema,
     ElicitationSchema, ElicitationScope, EnumOption, MultiSelectItems, StringFormat,
 };
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::approvals::Nonce;
@@ -27,7 +27,7 @@ pub struct Elicitation {
     /// one.
     pub tool_call_id: Option<String>,
     pub questions: Vec<ElicitationQuestion>,
-    pub requested_at: DateTime<Utc>,
+    pub requested_at: Timestamp,
     pub resolved: Option<ResolvedElicitation>,
 }
 
@@ -97,7 +97,7 @@ pub struct ElicitationOption {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedElicitation {
     pub outcome: ElicitationOutcome,
-    pub resolved_at: DateTime<Utc>,
+    pub resolved_at: Timestamp,
 }
 
 /// One answered question, rendered for the transcript.
@@ -415,7 +415,7 @@ fn parse_field(
 pub fn parse_elicitation(
     nonce: Nonce,
     request: &CreateElicitationRequest,
-    requested_at: DateTime<Utc>,
+    requested_at: Timestamp,
 ) -> Result<Elicitation, ElicitationParseError> {
     let ElicitationMode::Form(form) = &request.mode else {
         return Err(ElicitationParseError::NotFormMode);
@@ -663,7 +663,7 @@ mod tests {
             ElicitationFormMode::new(ElicitationSessionScope::new("sess-1"), schema),
             "Pick one?",
         );
-        parse_elicitation(Nonce::new(), &request, Utc::now()).unwrap()
+        parse_elicitation(Nonce::new(), &request, Timestamp::now()).unwrap()
     }
 
     fn preview_meta(preview: &str) -> agent_client_protocol::v1::schema::Meta {
@@ -692,7 +692,7 @@ mod tests {
             description: None,
             tool_call_id: None,
             questions,
-            requested_at: Utc::now(),
+            requested_at: Timestamp::now(),
             resolved: None,
         }
     }

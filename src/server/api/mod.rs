@@ -28,10 +28,10 @@ pub(crate) use acp::structured_spawn_error_message;
 pub use acp::{
     acp_attachment, acp_cancel, acp_cancel_subagent, acp_context_primer, acp_disable, acp_enable,
     acp_files, acp_force_end_turn, acp_prompt, acp_prompt_diff_comments, acp_replay,
-    acp_set_config_option, acp_set_mode, acp_task_output, acp_worker_log, agent_install_info,
-    get_option_catalog, install_agent, list_acp_agents, list_importable_sessions, resolve_approval,
-    resolve_elicitation, restart_acp, shutdown_acp, spawn_acp, switch_acp_agent,
-    switch_acp_provider,
+    acp_set_config_option, acp_set_mode, acp_task_output, acp_terminal_check, acp_worker_log,
+    agent_install_info, get_option_catalog, install_agent, list_acp_agents,
+    list_importable_sessions, resolve_approval, resolve_elicitation, restart_acp, shutdown_acp,
+    spawn_acp, switch_acp_agent, switch_acp_provider,
 };
 pub(crate) use acp::{
     publish_startup_error_if_current, recover_pending_terminal_handoffs, HandoffRecovery,
@@ -62,21 +62,24 @@ pub(crate) use sandbox_image::status_generation_for_test as sandbox_image_status
 pub(crate) use sandbox_image::{
     create_pull_refusal, invalidate_status as invalidate_sandbox_image_status,
 };
-pub use sandbox_image::{sandbox_image_dismiss, sandbox_image_pull, sandbox_image_status};
+pub use sandbox_image::{
+    sandbox_image_cancel, sandbox_image_dismiss, sandbox_image_pull, sandbox_image_status,
+};
 pub use sessions::{
     abandon_purge, attach_session_project, cancel_creation, create_session,
     create_session_progress, delete_session, delete_workspace, empty_trash,
     ensure_container_terminal, ensure_session, ensure_terminal, ensure_tool, force_smart_rename,
     get_recent_projects, kill_terminal, list_sessions, paste_image, preview_volume_ignores_globs,
-    read_output, recreate_container, rename_session, restart_for_update, restart_session,
-    restore_session, review_creation_trust, save_session_file, search_sessions, send_message,
-    serve_session_artifact, session_account_targets, session_diff_file, session_diff_file_raw,
-    session_diff_files, session_file, session_file_raw, set_worktree_name, start_session,
-    stop_auxiliary, stop_session, summarize_session, touch_session_access,
+    read_output, reclaim_session_ownership, recreate_container, rename_session, restart_for_update,
+    restart_session, restore_session, review_creation_trust, save_session_file, search_sessions,
+    send_message, serve_session_artifact, session_account_targets, session_diff_file,
+    session_diff_file_raw, session_diff_files, session_file, session_file_raw, set_worktree_name,
+    start_session, stop_auxiliary, stop_session, summarize_session, touch_session_access,
     touch_session_input_recency, trash_session, update_session_archive, update_session_color,
     update_session_diff_base, update_session_favorite, update_session_group,
-    update_session_notifications, update_session_pin, update_session_snooze, update_session_unread,
-    update_workspace_ordering, OutputQuery, SendMessageRequest,
+    update_session_ignored, update_session_notifications, update_session_pin,
+    update_session_snooze, update_session_unread, update_workspace_ordering, OutputQuery,
+    SendMessageRequest,
 };
 pub(crate) use sessions::{
     lifecycle_rejection, persist_session_update, purge_expired_trash, reconcile_trashed_worktrees,
@@ -89,17 +92,19 @@ pub use skills::{
 
 pub use system::{
     apply_cityhall_bundle, browse_filesystem, create_profile, default_profile, delete_profile,
-    dismiss_update, docker_status, filesystem_home, get_about, get_cityhall_bundle,
-    get_current_theme, get_profile_settings, get_resolved_theme, get_settings,
-    get_settings_resolved, get_settings_schema, get_tips, get_update_status, get_web_ui_state,
-    list_agents, list_groups, list_profiles, list_sounds, list_themes, mark_tip_seen,
-    mark_volume_ignores_globs_acknowledged, mark_web_tour_seen, patch_web_ui_state,
-    post_dashboard_presence, rename_profile, serve_sound_file, set_show_tips, system_health,
+    dismiss_update, docker_status, filesystem_home, get_about, get_agent_default_model,
+    get_cityhall_bundle, get_current_theme, get_profile_settings, get_resolved_theme,
+    get_session_agent_default_model, get_settings, get_settings_resolved, get_settings_schema,
+    get_tips, get_update_status, get_web_ui_state, list_agents, list_groups, list_profiles,
+    list_sounds, list_themes, mark_tip_seen, mark_volume_ignores_globs_acknowledged,
+    mark_web_tour_seen, patch_web_ui_state, post_dashboard_presence, rename_profile,
+    serve_sound_file, set_agent_default_model, set_show_tips, system_health,
     update_profile_settings, update_settings, update_theme,
 };
 pub use telemetry::{
-    get_telemetry_status, post_telemetry_seen, post_telemetry_structured_interaction,
-    reset_telemetry_id, set_telemetry_consent, TelemetryMutation,
+    get_telemetry_status, post_telemetry_feature_use, post_telemetry_seen,
+    post_telemetry_structured_interaction, reset_telemetry_id, set_telemetry_consent,
+    TelemetryMutation,
 };
 
 /// A clone of the live instance with this id.
@@ -181,6 +186,71 @@ pub(crate) fn start_blocked_response(
     api_error_with_code_header(code, blocked.to_string())
 }
 
+/// The 409 body for a sandbox launch that needs the sandbox login first: the code, the
+/// instruction, the tool the login is for, and the `profile` and `command` its recovery needs.
+pub(crate) fn sandbox_login_required_body(
+    err: &crate::session::SandboxLoginRequired,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "error": crate::session::SandboxLoginRequired::CODE,
+        "message": err.to_string(),
+        "tool": err.tool,
+    });
+    if let Some(command) = &err.command {
+        body["command"] = serde_json::Value::String(command.clone());
+    }
+    if let Some(profile) = &err.profile {
+        body["profile"] = serde_json::Value::String(profile.clone());
+    }
+    body
+}
+
+/// 409 for a sandbox launch that needs the sandbox login first.
+pub(crate) fn sandbox_login_required_response(
+    err: &crate::session::SandboxLoginRequired,
+) -> Response {
+    use axum::response::IntoResponse as _;
+    (
+        StatusCode::CONFLICT,
+        axum::Json(sandbox_login_required_body(err)),
+    )
+        .into_response()
+}
+
+/// 409 for a sandbox launch refused because it needs a sandbox login the active container
+/// runtime cannot perform; nothing is held, the setting or the runtime has to change.
+pub(crate) fn sandbox_login_unsupported_response(
+    err: &crate::session::SandboxLoginUnsupported,
+) -> Response {
+    api_error(
+        StatusCode::CONFLICT,
+        crate::session::SandboxLoginUnsupported::CODE,
+        err.to_string(),
+    )
+}
+
+/// 502 for a launch whose `host_hooks.before_start` hook produced no environment. The
+/// message is the error's fixed words, never the command or its output.
+pub(crate) fn before_start_hook_failed_response(
+    err: &crate::session::BeforeStartHookError,
+) -> Response {
+    api_error(
+        StatusCode::BAD_GATEWAY,
+        "before_start_hook_failed",
+        err.to_string(),
+    )
+}
+
+/// The origin a client claims with the prompt-origin header. Only the dashboard, TUI and
+/// CLI values are accepted; anything else, and any body field, is `Unknown`.
+pub(crate) fn prompt_origin(headers: &axum::http::HeaderMap) -> crate::daemon::PromptOrigin {
+    crate::daemon::PromptOrigin::from_header_value(
+        headers
+            .get(crate::daemon::PromptOrigin::HEADER)
+            .and_then(|v| v.to_str().ok()),
+    )
+}
+
 pub(crate) fn api_error(
     status: axum::http::StatusCode,
     code: &str,
@@ -202,11 +272,27 @@ pub(crate) fn api_error_with_code_header(
     message: impl Into<String>,
 ) -> axum::response::Response {
     let mut response = api_error(code.status(), code.as_str(), message);
+    insert_code_header(&mut response, code);
+    response
+}
+
+/// The code header with a plain-text body, for an endpoint whose existing
+/// clients show the body as it is.
+pub(crate) fn text_error_with_code_header(
+    code: crate::daemon::ApiErrorCode,
+    message: impl Into<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let mut response = (code.status(), message.into()).into_response();
+    insert_code_header(&mut response, code);
+    response
+}
+
+fn insert_code_header(response: &mut axum::response::Response, code: crate::daemon::ApiErrorCode) {
     let (name, value) = code.header()[0];
     if let Ok(value) = axum::http::HeaderValue::from_str(value) {
         response.headers_mut().insert(name, value);
     }
-    response
 }
 
 pub(crate) fn read_only_block(state: &AppState) -> Option<axum::response::Response> {
@@ -410,6 +496,28 @@ pub(super) fn validate_profile_name(name: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// The 409 body of the queue endpoint names `profile` and `command` only when set.
+    #[tokio::test]
+    async fn sandbox_login_required_response_names_profile_and_command_only_when_set() {
+        let body = |response: Response| async move {
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let mut blocked = crate::session::test_support::login_required("claude");
+        let plain = body(sandbox_login_required_response(&blocked)).await;
+        assert_eq!(plain.get("profile"), None);
+        assert_eq!(plain.get("command"), None);
+
+        blocked.profile = Some("work".to_string());
+        blocked.command = Some("claude".to_string());
+        let named = body(sandbox_login_required_response(&blocked)).await;
+        assert_eq!(named["profile"], "work");
+        assert_eq!(named["command"], "claude");
+        assert_eq!(named["tool"], "claude");
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn native_mutation_admission_preserves_body_and_elevation_precedence() {
@@ -435,6 +543,10 @@ mod tests {
             (Method::POST, "/api/sessions/missing/purge/abandon"),
             (Method::POST, "/api/sessions/missing/start"),
             (Method::POST, "/api/sessions/missing/send"),
+            (
+                Method::PUT,
+                "/api/profiles/default/acp-defaults/claude/model",
+            ),
             (Method::POST, "/api/sessions/missing/restart"),
             (Method::POST, "/api/sessions/missing/restart-for-update"),
             (Method::POST, "/api/sessions/missing/tools/ensure"),
@@ -460,6 +572,7 @@ mod tests {
             (Method::POST, "/api/plugins/missing/update/dismiss"),
             (Method::PATCH, "/api/theme"),
             (Method::POST, "/api/sandbox/image-pull"),
+            (Method::POST, "/api/sandbox/image-pull/cancel"),
             (Method::POST, "/api/sandbox/image-dismiss"),
             (Method::PUT, "/api/sessions/missing/file"),
         ] {

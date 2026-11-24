@@ -3446,6 +3446,15 @@ impl ConversationState {
         };
         (self.intent == instance.resume_intent || confirmed) && self.matches_context(instance)
     }
+
+    /// Whether a launch from this state resumes a conversation, as `Instance::conversation_target` decides.
+    pub(crate) fn resumes(&self) -> bool {
+        match self.intent {
+            ResumeIntent::Cleared => false,
+            ResumeIntent::Use(_) | ResumeIntent::Fork { .. } => true,
+            ResumeIntent::Default => self.session_id.is_some(),
+        }
+    }
 }
 
 impl Instance {
@@ -4446,7 +4455,7 @@ sandbox = "unsupported"
                             manifest.as_bytes(),
                         ),
                         capabilities: Vec::new(),
-                        granted_at: chrono::Utc::now(),
+                        granted_at: crate::time::Timestamp::now(),
                     }),
                     ..Default::default()
                 },

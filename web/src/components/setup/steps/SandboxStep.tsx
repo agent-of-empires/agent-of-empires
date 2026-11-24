@@ -100,6 +100,7 @@ export function SandboxStep({ schema, values, onSaveField }: Props) {
           values={values}
           onSaveField={onSaveField}
           onlyFields={none ? ["enabled_by_default"] : ["enabled_by_default", "default_image"]}
+          hideKeys
         />
       </div>
     </>

@@ -55,6 +55,8 @@
                 ./assets
                 ./docker
                 ./tests/fixtures/cli-read
+                ./tests/fixtures/pull-progress
+                ./tests/fixtures/pull-stderr
                 ./web/tests/helpers/fakeAcpAgent.mjs
               ];
             };
@@ -105,7 +107,7 @@
             pname = "agent-of-empires-web";
             version = "0";
             src = ./web;
-            npmDepsHash = "sha256-IxD/dCMYudp6oWUUvyHGwqA/jscs4TG1yzcWR61yuwE=";
+            npmDepsHash = "sha256-IARZcNnjqdH91/te0JREz3qwpieprf4gfUzYmLhOyBM=";
             # tsc -b && vite build; output goes to web/dist
             installPhase = ''
               mkdir $out

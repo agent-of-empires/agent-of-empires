@@ -61,7 +61,8 @@ pub use resolve_command::{
     is_bare_command, on_agent_path, resolve_agent_command, ResolvedAgentCommand, Unresolved,
 };
 pub(crate) use runner::wrap_in_scope;
-pub use session_sandbox::SessionSandbox;
+pub use session_sandbox::{effective_launch_env, SessionSandbox};
+pub(crate) use session_sandbox::{known_container_workdir, SandboxLayout};
 pub(crate) use spawn::host_environment_denyreason;
 pub use spawn::SpawnConfig;
 
@@ -87,7 +88,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::Instrument;
 
-use self::commands::{ClientCmd, ConnectMode, QueuedClientCmd};
+use self::commands::{ClientCmd, ConnectMode, PromptInput, QueuedClientCmd};
 pub(crate) use self::connection::ConnectionState;
 use self::connection::{run_connection_task, ConnectionParams, RunnerLink};
 use self::control::{connect_runner_control, wait_runner_registration, ShutdownControlOnDrop};
@@ -1425,7 +1426,7 @@ impl AcpClient {
                 return Err(AcpError::NotRunning);
             }
             captured = tokio::time::timeout_at(deadline,
-                NativeOperationPermission::capture_owned(&receipt, &owner, correlation, deadline),
+                NativeOperationPermission::capture_owned(&receipt, owner, correlation, deadline),
             ) => captured.map_err(|_| AcpError::RegistryBusy)?
                 .map_err(|error| {
                     if error.is::<crate::process::worker_registry::RegistryBusy>() {
@@ -1526,7 +1527,9 @@ impl AcpClient {
     fn prompt_blocks(text: &str, attachments: &[AttachmentBlob]) -> Vec<ContentBlock> {
         use base64::Engine as _;
         let mut blocks = Vec::with_capacity(1 + attachments.len());
-        blocks.push(ContentBlock::Text(TextContent::new(text)));
+        if !text.is_empty() || attachments.is_empty() {
+            blocks.push(ContentBlock::Text(TextContent::new(text)));
+        }
         for att in attachments {
             let data = base64::engine::general_purpose::STANDARD.encode(&att.data);
             let mime = att.mime_type.clone();
@@ -1597,7 +1600,10 @@ impl AcpClient {
                 expected,
                 owner,
                 cancellation,
-                blocks: Self::prompt_blocks(text, attachments),
+                input: PromptInput {
+                    blocks: Self::prompt_blocks(text, attachments),
+                    attachments: attachments.iter().map(AttachmentBlob::to_ref).collect(),
+                },
             }),
             scope: None,
             correlation: None,
@@ -1691,8 +1697,8 @@ impl AcpClient {
         Ok(InitialPromptCancellation::Issued)
     }
 
-    /// Attachments follow the text block. Callers gate kinds on the agent's
-    /// prompt capabilities (#1000).
+    /// Attachments follow the text block, which an attachment-only prompt
+    /// omits. Callers gate kinds on the agent's prompt capabilities (#1000).
     pub async fn send_prompt(
         &self,
         text: &str,
@@ -1703,9 +1709,16 @@ impl AcpClient {
             return Err(AcpError::NotRunning);
         }
         let blocks = Self::prompt_blocks(text, attachments);
-        self.send_cmd(ClientCmd::Prompt(blocks), None)
-            .await
-            .map(|_| ())
+
+        self.send_cmd(
+            ClientCmd::Prompt(PromptInput {
+                blocks,
+                attachments: attachments.iter().map(AttachmentBlob::to_ref).collect(),
+            }),
+            None,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Best-effort `session/cancel`; Ok even with no turn in flight.

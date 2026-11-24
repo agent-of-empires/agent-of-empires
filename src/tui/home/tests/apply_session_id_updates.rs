@@ -37,7 +37,7 @@ async fn canonical_identity_updates_never_install_a_tui_poller_or_write_payloads
         .capture_poller
         .handle()
         .is_none());
-    view.reload().unwrap();
+    view.reload();
     assert_eq!(payload_bytes("test"), bytes);
 }
 
@@ -70,7 +70,7 @@ fn settings_repo_scope_saves_where_a_workspace_runtime_reads() {
         inst.workspace_info = Some(crate::session::WorkspaceInfo {
             branch: "feat".into(),
             workspace_dir,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             cleanup_on_delete: false,
             repos: vec![crate::session::WorkspaceRepo {
                 name: "repo".into(),
@@ -160,7 +160,7 @@ fn settings_mouse_discard_reverts_theme_preview() {
     terminal
         .draw(|f| {
             let area = f.area();
-            view.render(f, area, &theme, None, None, None);
+            view.render(f, area, &theme, None);
         })
         .unwrap();
 

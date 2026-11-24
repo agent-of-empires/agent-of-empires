@@ -55,12 +55,12 @@ pub struct ServeArgs {
 
     /// Authentication mode: `token` (default, random URL token),
     /// `passphrase` (no token URL, passphrase login wall only),
-    /// or `none` (no auth at all, loopback-only unless --behind-proxy).
+    /// or `none` (no auth at all, requires --behind-proxy).
     /// Mutually exclusive with --no-auth (which aliases --auth=none).
     #[arg(long, value_enum, conflicts_with = "no_auth")]
     pub auth: Option<AuthMode>,
 
-    /// Disable authentication (only allowed with localhost binding).
+    /// Disable authentication (requires --behind-proxy).
     /// Alias for --auth=none.
     #[arg(long)]
     pub no_auth: bool,
@@ -395,6 +395,18 @@ fn validate_auth_combination(
         );
     }
 
+    // A TCP loopback peer may be a sandbox container or another local user,
+    // so only an operator-declared proxy can vouch for unauthenticated callers.
+    if matches!(auth_mode, AuthMode::None) && !behind_proxy {
+        bail!(
+            "Refusing to start with --auth=none without --behind-proxy.\n\
+             Any process that can reach the TCP port, including sandbox containers\n\
+             on Docker Desktop, OrbStack or Podman machine, would get full control.\n\
+             Use the default token auth or --auth=passphrase. CLI access over the\n\
+             owner-only Unix socket needs no token."
+        );
+    }
+
     Ok(())
 }
 
@@ -612,7 +624,12 @@ impl ServeStartup {
 }
 
 /// Establish lifecycle authority and serve/migrate exclusion before migrations.
-pub async fn lock_for_startup(profile: &str, args: &mut ServeArgs) -> Result<Option<ServeStartup>> {
+/// `announce` is false when the TUI owns the terminal.
+pub async fn lock_for_startup(
+    profile: &str,
+    args: &mut ServeArgs,
+    announce: bool,
+) -> Result<Option<ServeStartup>> {
     if args.stop || args.status || args.restart || args.rollback {
         return Ok(None);
     }
@@ -646,7 +663,10 @@ pub async fn lock_for_startup(profile: &str, args: &mut ServeArgs) -> Result<Opt
                 old_pid = pid,
                 "replacing core-only daemon with full daemon"
             );
-            stop_daemon_locked(&transaction, true).await?;
+            if announce {
+                println!("Replacing the background aoe daemon (PID {pid}) with the web dashboard");
+            }
+            stop_daemon_locked(&transaction, false).await?;
         }
         DaemonStatus::Unverified => {
             bail!("Cannot verify the existing daemon; refusing replacement")
@@ -1450,14 +1470,17 @@ async fn validate_launch_args(profile: &str, args: &ServeArgs) -> Result<AuthMod
     } else {
         resolve_auth_mode(args.auth, args.no_auth)
     };
-    validate_auth_combination(
-        auth_mode,
-        args.passphrase.is_some(),
-        host_is_localhost(&args.host),
-        args.behind_proxy,
-        args.remote,
-        &args.host,
-    )?;
+    // Core-only serves the owner-only Unix socket and has no TCP listener to guard.
+    if !args.core_only {
+        validate_auth_combination(
+            auth_mode,
+            args.passphrase.is_some(),
+            host_is_localhost(&args.host),
+            args.behind_proxy,
+            args.remote,
+            &args.host,
+        )?;
+    }
     validate_behind_proxy_allowlist(args.behind_proxy, args.remote, &args.allowed_host)?;
     validate_allowed_hosts(&args.allowed_host)?;
     validate_allowed_origins(&args.allowed_origin)?;
@@ -1521,7 +1544,7 @@ pub async fn run_control(args: &ServeArgs) -> Option<Result<()>> {
 pub async fn run(profile: &str, mut args: ServeArgs, startup: Option<ServeStartup>) -> Result<()> {
     let startup = match startup {
         Some(startup) => startup,
-        None => lock_for_startup(profile, &mut args)
+        None => lock_for_startup(profile, &mut args, true)
             .await?
             .context("serve startup guard missing")?,
     };
@@ -1891,7 +1914,7 @@ pub(crate) async fn start_dashboard_for_tui(
         let launch = if let Some(lease) = restart {
             lease.restart(args).await?
         } else {
-            let startup = lock_for_startup(profile, &mut args)
+            let startup = lock_for_startup(profile, &mut args, false)
                 .await?
                 .context("Dashboard startup guard is unavailable")?;
             let startup = tokio::task::spawn_blocking(move || {
@@ -3327,11 +3350,15 @@ mod tests {
     }
 
     #[test]
-    fn validate_none_loopback_ok() {
-        // Regression: --no-auth (== --auth=none) on loopback must still
-        // start, matching the legacy --no-auth behavior.
+    fn validate_none_needs_behind_proxy_even_on_loopback() {
+        // A loopback peer is not proof of a host process: Docker Desktop,
+        // OrbStack and Podman machine forward container traffic to host
+        // 127.0.0.1, so TCP no-auth would hand owner authority to sandboxes.
+        let err = validate_auth_combination(AuthMode::None, false, true, false, false, "127.0.0.1")
+            .unwrap_err();
+        assert!(err.to_string().contains("--behind-proxy"));
         assert!(
-            validate_auth_combination(AuthMode::None, false, true, false, false, "127.0.0.1")
+            validate_auth_combination(AuthMode::None, false, true, true, false, "127.0.0.1")
                 .is_ok()
         );
     }
@@ -4511,7 +4538,7 @@ mod tests {
                                 manifest.as_bytes(),
                             ),
                             capabilities: vec![],
-                            granted_at: chrono::Utc::now(),
+                            granted_at: crate::time::Timestamp::now(),
                         }),
                         ..PluginConfig::default()
                     },
@@ -4524,8 +4551,14 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn remote_exposure_is_refused_only_while_a_dev_plugin_is_active() {
-            let _guard = crate::session::test_support::isolate_app_dir();
             let _reload = crate::plugin::ReloadRegistryOnDrop;
+            let _guard = crate::session::test_support::isolate_app_dir();
+            std::fs::create_dir_all(
+                crate::session::get_app_dir()
+                    .unwrap()
+                    .join("profiles/default"),
+            )
+            .unwrap();
             let remote = serve_args(&["aoe", "serve", "--remote", "--passphrase", "pw"]);
             let local = serve_args(&["aoe", "serve"]);
 

@@ -1046,7 +1046,8 @@ impl DaemonControlClient {
         }
     }
 
-    /// Registers the completion waiter before sending the `Prompt` frame.
+    /// Registers the completion waiter before sending the `Prompt` frame. A
+    /// waiter already pending is refused locally, without a frame.
     pub(super) async fn prompt(
         &self,
         request: serde_json::Value,
@@ -2383,7 +2384,7 @@ pub(super) async fn publish_adopted_completion(
     terminal: &TerminalClaim,
     calendar_hint: impl FnOnce(
         &control_protocol::NativePromptCompletionEvidence,
-    ) -> Option<(String, chrono::DateTime<chrono::Utc>)>,
+    ) -> Option<(String, crate::time::Timestamp)>,
     publication: Option<tokio::sync::OwnedMutexGuard<()>>,
 ) -> AdoptedCompletionPublication {
     use crate::acp::event_sender::EventMetadata;
@@ -3059,7 +3060,7 @@ mod tests {
                             assert_eq!(quotas.len(), 1);
                             assert!(quotas[0].0 < events.len() - 1);
                             assert!(matches!(quotas[0].1, Event::RateLimit { info }
-                            if info.resets_at.is_some_and(|at| at.timestamp() == 4_102_444_800)));
+                            if info.resets_at.is_some_and(|at| at.as_unix_secs() == 4_102_444_800)));
                         }
                     }
                     assert_eq!(terminal.current_turn(), turn);
@@ -3839,7 +3840,7 @@ mod tests {
                 client.ready().await;
                 tokio::time::timeout(Duration::from_secs(10), async {
                     for (text, expected_reason) in [
-                        ("continue", "prompt_failed"),
+                        ("continue", "prompt_rejected"),
                         ("explicit next request", "prompt_complete"),
                     ] {
                         client.send_prompt(text, &[]).await.unwrap();
@@ -3852,13 +3853,13 @@ mod tests {
                                 Event::AgentStartupError { message, .. } => panic!("{message}"),
                                 Event::AcpConnectionUnavailable { .. } => panic!("peer data is not an EOF observation"),
                                 Event::PromptRuntimeError { message: error, .. } => {
-                                    assert_eq!(expected_reason, "prompt_failed");
+                                    assert_eq!(expected_reason, "prompt_rejected");
                                     assert_eq!(error, message);
                                     diagnostics += 1;
                                 }
                                 Event::Stopped { reason } => {
                                     assert_eq!(reason, expected_reason);
-                                    assert_eq!(diagnostics, usize::from(expected_reason == "prompt_failed"));
+                                    assert_eq!(diagnostics, usize::from(expected_reason == "prompt_rejected"));
                                     break;
                                 }
                                 _ => {}
@@ -4288,7 +4289,7 @@ mod tests {
                     if limited {
                         assert!(usage < quotas[0].0 && quotas[0].0 < stopped);
                         assert!(matches!(quotas[0].1, Event::RateLimit { info }
-                            if info.resets_at.is_some_and(|at| at.timestamp() == 4_102_444_800)));
+                            if info.resets_at.is_some_and(|at| at.as_unix_secs() == 4_102_444_800)));
                     }
                     let expected = if limited { "rate_limited" } else { "prompt_complete" };
                     assert!(matches!(&events[stopped], Event::Stopped { reason } if reason == expected));
@@ -5043,7 +5044,7 @@ mod tests {
                 }).collect();
                 assert_eq!(original_quotas.len(), 1);
                 assert_eq!(original_quotas[0].kind, "weekly");
-                assert_eq!(original_quotas[0].resets_at.unwrap().timestamp(), 4_102_444_800);
+                assert_eq!(original_quotas[0].resets_at.unwrap().as_unix_secs(), 4_102_444_800);
                 assert_eq!(terminal.current_turn(), next_turn);
                 assert!(!terminal.claimed());
                 assert!(in_flight.load(AtomicOrdering::Acquire));
@@ -5098,7 +5099,7 @@ mod tests {
                 assert_eq!(next_quotas.len(), 1);
                 if report_next {
                     assert_eq!(next_quotas[0].kind, "five_hour");
-                    assert_eq!(next_quotas[0].resets_at.unwrap().timestamp(), 4_102_444_900);
+                    assert_eq!(next_quotas[0].resets_at.unwrap().as_unix_secs(), 4_102_444_900);
                 } else {
                     assert_eq!(next_quotas[0].kind, "rate_limit");
                     assert_eq!(next_quotas[0].resets_at, None);
@@ -5209,7 +5210,7 @@ mod tests {
                                 .collect();
                             assert_eq!(quotas.len(), 1);
                             assert_eq!(quotas[0].kind, if named { "weekly" } else { "rate_limit" });
-                            assert_eq!(quotas[0].resets_at.unwrap().timestamp(), 4_102_444_800);
+                            assert_eq!(quotas[0].resets_at.unwrap().as_unix_secs(), 4_102_444_800);
                             assert_one_real_stopped(
                                 &fixture,
                                 before,

@@ -489,6 +489,8 @@ const requestCases: RequestCase[] = [
     { respond: json(session), result: { ok: true, session } },
   ],
   ["PATCH /api/sessions/s1/snooze", () => api.setSessionSnooze("s1", 60), { body: { minutes: 60 } }],
+  ["PATCH /api/sessions/s1/ignored", () => api.setSessionIgnored("s1", true), { body: { ignored: true } }],
+  ["POST /api/sessions/s1/reclaim-ownership", () => api.reclaimSessionOwnership("s1"), { body: { reclaim: true } }],
   ["PATCH /api/sessions/s1/unread", () => api.setSessionUnread("s1", true), { body: { unread: true } }],
   [
     "POST /api/sessions/s1/projects",
@@ -800,7 +802,7 @@ const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ],
   ["verifyToken", () => api.verifyToken(), false],
   ["enqueueServerPrompt", () => api.enqueueServerPrompt("s1", { id: "q", text: "t" }), null],
-  ["listServerQueue", () => api.listServerQueue("s1"), []],
+  ["listServerQueue", () => api.listServerQueue("s1"), null],
   ["renameSession", () => api.renameSession("s1", "x"), { ok: false }],
   ["smartRenameSession", () => api.smartRenameSession("s1"), { ok: false }],
   ["attachSessionProject", () => api.attachSessionProject("s1", "p", { epoch: "boot" }), { ok: false }],
@@ -1209,6 +1211,12 @@ describe("fetchSandboxImageStatus", () => {
       "ghcr.io/x/sb:1",
       { fresh: true },
       "/api/sandbox/image-status?image=ghcr.io%2Fx%2Fsb%3A1&fresh=true",
+    ],
+    [
+      "the launching profile's automatic image",
+      undefined,
+      { profile: "work" },
+      "/api/sandbox/image-status?profile=work",
     ],
   ] as const)("asks for %s", async (_name, image, opts, url) => {
     fetchSpy.mockResolvedValueOnce(json({ state: "current" }));

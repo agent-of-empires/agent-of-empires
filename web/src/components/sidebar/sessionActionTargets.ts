@@ -6,6 +6,8 @@ export type SessionAction =
   | "stop"
   | "start"
   | "restartUpdate"
+  | "ignore"
+  | "reclaimOwnership"
   | "recreateContainer"
   | "fork"
   | "switchAgent"
@@ -18,9 +20,21 @@ export type SessionAction =
 
 const isStructured = (s: SessionResponse) => s.view === "structured";
 
+/** Why the dashboard can't recreate a Session's container, or null when it can. Trash wins, as in the stopped banners. */
+export type RecreateContainerBlock = "not_sandboxed" | "trashed" | "archived" | "creating" | "deleting";
+
+export function recreateContainerBlock(s: SessionResponse, archived: boolean): RecreateContainerBlock | null {
+  if (!s.is_sandboxed) return "not_sandboxed";
+  if (s.trashed_at) return "trashed";
+  if (archived) return "archived";
+  if (s.status === "Creating") return "creating";
+  if (s.status === "Deleting") return "deleting";
+  return null;
+}
+
 /** Whether a Session has a container the dashboard may recreate: the Session menu and the startup error screen. */
 export const canRecreateContainer = (s: SessionResponse, archived: boolean) =>
-  s.is_sandboxed && !archived && !s.trashed_at && !["Creating", "Deleting"].includes(s.status);
+  recreateContainerBlock(s, archived) === null;
 
 /** The title the startup error screen's Recreate container needs, or undefined when it isn't offered. */
 export const recreateContainerTitle = (s: SessionResponse) =>
@@ -28,6 +42,11 @@ export const recreateContainerTitle = (s: SessionResponse) =>
 
 const ELIGIBLE: Record<SessionAction, (s: SessionResponse, archived: boolean) => boolean> = {
   stop: (s) => !["Stopped", "Deleting", "Creating"].includes(s.status),
+  // Ignore is for a managed row that is not already sunk or deleted; an ignored row keeps the
+  // action so it can be unignored. Reclaim may clear a leftover manager link even when the row
+  // is no longer ignored.
+  ignore: (s) => !s.trashed_at && !s.archived_at && (s.parent_session_id != null || s.ignored_at != null),
+  reclaimOwnership: (s) => !s.trashed_at && (s.parent_session_id != null || s.ignored_at != null),
   // Archived and trashed sessions must be unarchived or restored before they start (#4116).
   start: (s, archived) => s.status === "Stopped" && !archived && !s.trashed_at,
   restartUpdate: (s) => !!s.update_restart,
@@ -57,6 +76,8 @@ export function resolveActionTargets(sessions: SessionResponse[], optimistic: Ro
     stop: targets("stop"),
     start: targets("start"),
     restartUpdate: targets("restartUpdate"),
+    ignore: targets("ignore"),
+    reclaimOwnership: targets("reclaimOwnership"),
     recreateContainer: targets("recreateContainer"),
     fork: targets("fork"),
     switchAgent: targets("switchAgent"),
