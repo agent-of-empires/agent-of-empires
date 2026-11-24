@@ -178,6 +178,11 @@ enum Req {
     PreTrust {
         origin: Option<Origin>,
     },
+    /// Sets the "Show in the sidebar" pref, which also shows the Home group.
+    ShowOnHome {
+        shown: bool,
+        origin: Option<Origin>,
+    },
 }
 
 impl Req {
@@ -186,7 +191,8 @@ impl Req {
             Req::Dismiss { origin, .. }
             | Req::Prepare { origin, .. }
             | Req::Start { origin, .. }
-            | Req::PreTrust { origin } => origin.as_ref(),
+            | Req::PreTrust { origin }
+            | Req::ShowOnHome { origin, .. } => origin.as_ref(),
             _ => None,
         }
     }
@@ -253,7 +259,7 @@ fn failed(req: &Req, message: String) -> Res {
         Req::Start { .. } => Res::Started(Err(message)),
         Req::Refresh => Res::Refreshed(Err(message)),
         Req::PreTrust { .. } => Res::PreTrusted(Err(message)),
-        Req::Load | Req::Dismiss { .. } => Res::Snapshot(Err(message)),
+        Req::Load | Req::Dismiss { .. } | Req::ShowOnHome { .. } => Res::Snapshot(Err(message)),
     }
 }
 
@@ -314,6 +320,15 @@ async fn run(req: &Req) -> Res {
                 .await
                 .map_err(|e| format!("Couldn't turn on pre-trust: {e}")),
         ),
+        Req::ShowOnHome { shown, .. } => {
+            match client
+                .set_suggestion_prefs(&serde_json::json!({ "sidebar": shown }))
+                .await
+            {
+                Ok(()) => Res::Snapshot(load(&client, &daemon).await),
+                Err(e) => Res::Snapshot(Err(format!("Couldn't change the Home group: {e}"))),
+            }
+        }
         Req::Dismiss {
             provider_id,
             id,
@@ -698,6 +713,23 @@ impl SuggestionsView {
                 }
                 store.reload();
             }
+            KeyCode::Char('h') => match block {
+                Some(block) => self.error = Some(block_note(block).to_string()),
+                None if store.snapshot.is_some() => {
+                    let shown = !store.shown_on_home();
+                    self.begin();
+                    self.notice = Some(
+                        if shown {
+                            "Showing the group on Home…"
+                        } else {
+                            "Hiding the group from Home…"
+                        }
+                        .into(),
+                    );
+                    store.show_on_home(shown);
+                }
+                None => {}
+            },
             KeyCode::Char('t') => {
                 let untrusted = self.item_at(store, self.selected).is_some_and(|i| {
                     store
@@ -769,10 +801,10 @@ impl SuggestionsView {
             KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Some(KeyCode::Char('N'))
             }
-            KeyCode::Char(c @ ('E' | 'D' | 'R' | 'T' | 'Z')) => {
+            KeyCode::Char(c @ ('E' | 'D' | 'H' | 'R' | 'T' | 'Z')) => {
                 Some(KeyCode::Char(c.to_ascii_lowercase()))
             }
-            KeyCode::Char('e' | 'd' | 'r' | 't' | 'z' | 'N') => None,
+            KeyCode::Char('e' | 'd' | 'h' | 'r' | 't' | 'z' | 'N') => None,
             code => Some(code),
         }
     }
@@ -891,7 +923,7 @@ impl SuggestionsView {
     }
 
     /// Every key of the view, for the `?` overlay.
-    fn help_lines(&self) -> Vec<(String, &'static str)> {
+    fn help_lines(&self, store: &SuggestionsFeed) -> Vec<(String, &'static str)> {
         let dismissed = if self.show_dismissed {
             "hide dismissed"
         } else {
@@ -918,6 +950,14 @@ impl SuggestionsView {
                 "turn on pre-trust for a Session blocked on it",
             ),
             (self.key_label('r'), "refresh the providers, then reload"),
+            (
+                self.key_label('h'),
+                if store.shown_on_home() {
+                    "hide the Suggested group from Home"
+                } else {
+                    "show the Suggested group on Home"
+                },
+            ),
             ("PgUp/PgDn".to_string(), "scroll the detail"),
             ("Ctrl+K".to_string(), "open in the provider"),
             ("Esc".to_string(), "back"),
@@ -964,6 +1004,15 @@ impl SuggestionsView {
             };
             notes.push((
                 format!("{shown}{} retries.", self.key_label('r')),
+                Style::default().fg(theme.dimmed),
+            ));
+        }
+        if store.snapshot.is_some() && !store.shown_on_home() {
+            notes.push((
+                format!(
+                    "Not shown on Home. {} shows the Suggested group there.",
+                    self.key_label('h')
+                ),
                 Style::default().fg(theme.dimmed),
             ));
         }
@@ -1084,7 +1133,7 @@ impl SuggestionsView {
 
         if self.help {
             let key_width = self
-                .help_lines()
+                .help_lines(store)
                 .iter()
                 .map(|(k, _)| rendered_width(k))
                 .max()
@@ -1093,7 +1142,7 @@ impl SuggestionsView {
                 "Keys",
                 Style::default().add_modifier(Modifier::BOLD),
             ))];
-            lines.extend(self.help_lines().into_iter().map(|(key, what)| {
+            lines.extend(self.help_lines(store).into_iter().map(|(key, what)| {
                 Line::from(vec![
                     Span::styled(
                         format!("  {}", fixed_width(&key, key_width)),
@@ -1691,6 +1740,12 @@ impl SuggestionsFeed {
         self.snapshot.as_ref().is_some_and(|s| s.prefs.sidebar)
     }
 
+    /// Sets that pref through the daemon, then reloads the list.
+    pub(super) fn show_on_home(&mut self, shown: bool) {
+        let origin = self.origin();
+        self.submit(Req::ShowOnHome { shown, origin });
+    }
+
     /// `(provider_id, id)` of every suggestion of a listed provider that is
     /// open, not started and undismissed, or dismissed within the undo window,
     /// in snapshot order. A started one is listed as its Session.
@@ -1907,6 +1962,10 @@ impl SuggestionsFeed {
                 Req::PreTrust { .. } => {
                     let _ = sink.send("pre-trust".into());
                     Res::PreTrusted(Ok(()))
+                }
+                Req::ShowOnHome { shown, .. } => {
+                    let _ = sink.send(format!("show on home {shown}"));
+                    Res::Snapshot(parse())
                 }
             }
         });
@@ -2252,6 +2311,14 @@ mod tests {
         store: SuggestionsFeed,
     }
 
+    /// Prefs with the Home group shown, so renders carry no notice about it.
+    fn shown_prefs() -> Prefs {
+        Prefs {
+            sidebar: true,
+            ..Prefs::default()
+        }
+    }
+
     fn view_with(items: Vec<Item>, worker: Worker<Req, Res>) -> Rig {
         let mut store = SuggestionsFeed::with_worker(worker);
         store.snapshot = Some(Snapshot {
@@ -2269,7 +2336,7 @@ mod tests {
                 checks: vec![],
             }],
             items,
-            prefs: Prefs::default(),
+            prefs: shown_prefs(),
         });
         let view = SuggestionsView::new(&mut store);
         Rig { view, store }
@@ -2383,7 +2450,7 @@ mod tests {
                 checks: vec![],
             }],
             items: vec![it],
-            prefs: Prefs::default(),
+            prefs: shown_prefs(),
         };
         let mut prep = prepared(Some("/repo"));
         prep.title = hostile("a\nb");
@@ -2435,7 +2502,7 @@ mod tests {
                 item("a", Some("p1"), false),
                 item("b", Some("p2"), false),
             ],
-            prefs: Prefs::default(),
+            prefs: shown_prefs(),
         });
         rig.view.sync(&rig.store);
         assert_eq!(rig.view.selected_key().unwrap().1, "b");
@@ -2667,7 +2734,7 @@ mod tests {
             profile: None,
             providers: vec![],
             items: vec![item("a", None, dismissed)],
-            prefs: Prefs::default(),
+            prefs: shown_prefs(),
         });
     }
 
@@ -2722,7 +2789,7 @@ mod tests {
             profile: None,
             providers: vec![],
             items: vec![item("a", None, a), item("b", None, b)],
-            prefs: Prefs::default(),
+            prefs: shown_prefs(),
         };
         // The first answer shows only A; B still waits for its own.
         rig.store.snapshot = Some(snapshot(true, false));
@@ -3352,7 +3419,7 @@ mod tests {
             profile: Some(profile.into()),
             providers: vec![],
             items: vec![item("a", None, false)],
-            prefs: Prefs::default(),
+            prefs: shown_prefs(),
         };
         let worker = Worker::seeded_for_test("t", Res::Snapshot(Ok(published("default"))));
         let mut rig = view_with(vec![], worker);
@@ -3416,7 +3483,7 @@ mod tests {
                     profile: Some("B".into()),
                     providers: Vec::new(),
                     items: vec![item("a", None, false)],
-                    prefs: Prefs::default(),
+                    prefs: shown_prefs(),
                 }))
             }
             _ => {

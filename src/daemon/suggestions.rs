@@ -295,6 +295,22 @@ impl DaemonClient {
         .await
     }
 
+    /// `PATCH /api/suggestions/prefs` with a partial prefs object.
+    pub async fn set_suggestion_prefs(
+        &self,
+        patch: &serde_json::Value,
+    ) -> Result<(), DaemonClientError> {
+        let url = self.suggestions_url("suggestions/prefs")?;
+        let response = self
+            .send_suggestion_request(self.http.patch(url).json(patch))
+            .await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::suggestion_refusal(response).await)
+        }
+    }
+
     /// `POST /api/suggestions/prepare`. The New Session prefill for one item.
     pub async fn prepare_suggestion(
         &self,
@@ -382,6 +398,23 @@ mod tests {
         let (client, server) = serve(app).await;
         let patch = serde_json::json!({ "session": { "pre_trust_agent_folders": true } });
         client.patch_settings(&patch).await.unwrap();
+        server.abort();
+        assert_eq!(received.recv().await.unwrap(), patch);
+    }
+
+    #[tokio::test]
+    async fn the_home_group_pref_is_patched_through_the_suggestions_api() {
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/api/suggestions/prefs",
+            axum::routing::patch(move |Json(body): Json<serde_json::Value>| async move {
+                sent.send(body).unwrap();
+                Json(serde_json::json!({}))
+            }),
+        );
+        let (client, server) = serve(app).await;
+        let patch = serde_json::json!({ "sidebar": true });
+        client.set_suggestion_prefs(&patch).await.unwrap();
         server.abort();
         assert_eq!(received.recv().await.unwrap(), patch);
     }

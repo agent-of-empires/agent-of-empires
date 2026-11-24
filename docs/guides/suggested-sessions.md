@@ -95,7 +95,7 @@ Change any proposal with its select, then **Link N repos** stores every checked 
 
 > The TUI keys below are provisional until #4597 settles the key bindings.
 
-**Home.** With **Show in the sidebar** on, a collapsed **Suggested (N)** group sits above Trash and is absent when there are no open suggestions, unless a provider failed: the group stays and its preview leads with the error, the provider's own fix when it reports one, and how to retry (`r` in the full view). Enter expands it to 3 items and a "View all" row. Rows show the title with the source reference after it, and the preview names what Enter starts ("Starts with Claude Code · Structured · worktree") with the prompt it will send. On an item, Enter starts it with its kind's [preset](#presets) and the status line says "Started <title>"; the row then leaves the group, since the Session is listed under its Project. `z` (`Z` in strict mode) dismisses it, and `Ctrl+K` lists "Open in <provider>". `N` (`Ctrl+N`) opens the New session dialog prefilled from the item, without linking it.
+**Home.** With **Show in the sidebar** on (off by default; `h` in the full view turns it on or off), a collapsed **Suggested (N)** group sits above Trash and is absent when there are no open suggestions, unless a provider failed: the group stays and its preview leads with the error, the provider's own fix when it reports one, and how to retry (`r` in the full view). Enter expands it to 3 items and a "View all" row. Rows show the title with the source reference after it, and the preview names what Enter starts ("Starts with Claude Code · Structured · worktree") with the prompt it will send. On an item, Enter starts it with its kind's [preset](#presets) and the status line says "Started <title>"; the row then leaves the group, since the Session is listed under its Project. `z` (`Z` in strict mode) dismisses it, and `Ctrl+K` lists "Open in <provider>". `N` (`Ctrl+N`) opens the New session dialog prefilled from the item, without linking it.
 
 **Full view.** `S` opens it (`Ctrl+S` in strict mode). Items are grouped under their repo or Project. The divider shows when each provider last updated, and a provider that failed to refresh is named at the top of the list with its fix. Below the divider are what Enter starts, the prompt, and the item's source text. The key line shows only the keys for the selected item.
 
@@ -110,6 +110,7 @@ Strict mode moves the letters by Home's rule: a bare letter takes Shift, and a S
 | `z` | `Z` | Dismiss or restore |
 | `d` | `D` | Show or hide dismissed items |
 | `t` | `T` | Turn on pre-trust, on a Session blocked on folder trust |
+| `h` | `H` | Show or hide the Suggested group on Home (the **Show in the sidebar** setting) |
 | `r` | `R` | Ask providers to refresh, then reload the list. On a read-only dashboard it only reloads |
 | PgUp / PgDn | PgUp / PgDn | Scroll the detail: the prompt, then the item's source text |
 | `?` | `?` | List every key; any key closes the list |

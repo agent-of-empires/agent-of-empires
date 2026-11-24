@@ -73,6 +73,26 @@ fn group_is_absent_without_providers_and_collapsed_by_default() {
     assert!(suggested_rows(&env).is_empty());
 }
 
+/// With the Home group off, the full view says so and `h` turns it on.
+#[test]
+#[serial]
+fn h_in_the_full_view_turns_the_home_group_on() {
+    let (mut env, requests) = expanded_env(2);
+    let mut hidden = snapshot(2, &[]);
+    hidden["prefs"]["sidebar"] = false.into();
+    env.view.suggestions_feed.set_snapshot_for_test(hidden);
+    env.view.open_suggestions_view();
+    let text = render_home_to_string(&mut env.view, 120, 40);
+    assert!(
+        text.contains("Not shown on Home. h shows the Suggested group there."),
+        "{text}"
+    );
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Char('h')), None);
+    });
+    assert_eq!(next_request(&requests), "show on home true");
+}
+
 /// The dashboard's "Show in the sidebar" pref also hides the Home group.
 #[test]
 #[serial]
