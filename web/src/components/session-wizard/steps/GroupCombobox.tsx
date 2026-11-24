@@ -22,6 +22,7 @@ export function GroupCombobox({
   disabled,
   openOnFocus = true,
   dropUp,
+  showAllUntilEdited = false,
 }: {
   id: string;
   value: string;
@@ -35,6 +36,8 @@ export function GroupCombobox({
   openOnFocus?: boolean;
   /** Always open upward, e.g. where the list would cover the controls below. */
   dropUp?: boolean;
+  /** List every group, with the current value highlighted, until the user types. */
+  showAllUntilEdited?: boolean;
 }) {
   const listId = useId();
   const inputRef = useRef<HTMLInputElement>(null);
@@ -42,7 +45,14 @@ export function GroupCombobox({
   // By option identity, so groups arriving after typing don't move it onto another row.
   const [highlight, setHighlight] = useState<string | null>(null);
   const [placement, setPlacement] = useState<{ up: boolean; maxHeight: number }>({ up: true, maxHeight: LIST_MAX });
-  const { options, highlight: defaultHighlight } = groupOptions(groups, value);
+  const [edited, setEdited] = useState(!showAllUntilEdited);
+  const listFor = (text: string, isEdited: boolean) => {
+    const result = groupOptions(groups, isEdited ? text : "");
+    if (isEdited) return result;
+    const current = result.options.findIndex((o) => o.kind === "group" && o.group.path === text);
+    return { options: result.options, highlight: current };
+  };
+  const { options, highlight: defaultHighlight } = listFor(value, edited);
 
   // Opens upward unless there is room below inside the wizard's scroll area, and never
   // taller than the room it opens into, so the sheet can't clip it.
@@ -81,9 +91,9 @@ export function GroupCombobox({
     };
   }, [open, place]);
 
-  const show = (next: string) => {
+  const show = (next: string, isEdited = edited) => {
     setOpen(true);
-    const { options: nextOptions, highlight: i } = groupOptions(groups, next);
+    const { options: nextOptions, highlight: i } = listFor(next, isEdited);
     setHighlight(i >= 0 ? keyOf(nextOptions[i]!) : null);
   };
   const pick = (option: GroupOption) => {
@@ -91,7 +101,15 @@ export function GroupCombobox({
     setOpen(false);
   };
   const kept = highlight === null ? -1 : options.findIndex((o) => keyOf(o) === highlight);
-  const active = !open ? -1 : highlight === null ? -1 : kept >= 0 ? kept : defaultHighlight;
+  const active = !open
+    ? -1
+    : highlight === null
+      ? edited
+        ? -1
+        : defaultHighlight
+      : kept >= 0
+        ? kept
+        : defaultHighlight;
   const optionId = (i: number) => `${listId}-option-${i}`;
   // Also when rows arrive above the highlighted one or the popup resizes around it.
   useLayoutEffect(() => {
@@ -129,7 +147,8 @@ export function GroupCombobox({
         placeholder="Optional"
         onChange={(e) => {
           onChange(e.target.value);
-          show(e.target.value);
+          setEdited(true);
+          show(e.target.value, true);
         }}
         onFocus={() => openOnFocus && show(value)}
         onBlur={() => setOpen(false)}

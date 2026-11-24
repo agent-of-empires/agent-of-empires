@@ -140,6 +140,17 @@ describe("SessionGroupModal", () => {
     expect(onSave).toHaveBeenCalledWith("work/api");
   });
 
+  it("lists every group with the current one active until the text is edited", async () => {
+    vi.mocked(fetchGroups).mockResolvedValue([group("work"), group("play")]);
+    const { saveBtn, onSave } = setup("work");
+    const current = await screen.findByRole("option", { name: /^work/ });
+    const other = await screen.findByRole("option", { name: /^play/ });
+    expect(current.getAttribute("aria-selected")).toBe("true");
+    fireEvent.mouseDown(other);
+    fireEvent.click(saveBtn);
+    expect(onSave).toHaveBeenCalledWith("play");
+  });
+
   it("Remove from group saves a blank group and is absent without one", async () => {
     const { onSave, onClose, unmount } = setup("work");
     fireEvent.click(screen.getByRole("button", { name: "Remove from group" }));
