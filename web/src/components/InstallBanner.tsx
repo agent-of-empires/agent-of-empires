@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { Bell } from "lucide-react";
 import { usePushSubscription } from "../hooks/usePushSubscription";
-import { onServerDownChange } from "../lib/connectionState";
+import { onDaemonChanged } from "../lib/connectionState";
 import { installHint } from "../lib/platform";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import { INSTALL_STEPS } from "../lib/tourSteps";
@@ -11,18 +11,12 @@ export const INSTALL_BANNER_DISMISSED_KEY = "aoe-install-banner-dismissed";
 export const INSTALL_BANNER_HIDE_LABEL = "Hide notification steps";
 export const INSTALL_BANNER_HIDE_TIP = "Hide. The steps stay in Settings › Notifications.";
 
-/** Whether the server sends push at all; null until it answers, and asked again on each reconnect, since a
- *  restarted Daemon may have changed it. A failed request counts as on, so an outage doesn't hide the steps. */
+/** Whether the server sends push at all; null until it answers, and asked again whenever the Daemon may have
+ *  changed (a reconnect, or a restart between two polls). A failed request counts as on, so an outage doesn't hide the steps. */
 function useServerPushEnabled(ask: boolean): boolean | null {
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [reconnects, setReconnects] = useState(0);
-  useEffect(
-    () =>
-      onServerDownChange((down) => {
-        if (!down) setReconnects((n) => n + 1);
-      }),
-    [],
-  );
+  useEffect(() => onDaemonChanged(() => setReconnects((n) => n + 1)), []);
   useEffect(() => {
     if (!ask) return;
     let alive = true;

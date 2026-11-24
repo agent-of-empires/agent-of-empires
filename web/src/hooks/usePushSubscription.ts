@@ -1,5 +1,5 @@
 import { useEffect, useSyncExternalStore } from "react";
-import { onServerDownChange } from "../lib/connectionState";
+import { onDaemonChanged } from "../lib/connectionState";
 import { isIOS, isSecureOrigin, isStandalone, supportsPush } from "../lib/platform";
 import {
   classifyPushHealth,
@@ -314,13 +314,11 @@ export function usePushSubscription() {
     };
     document.addEventListener("visibilitychange", onVisibility);
     // A restarted Daemon may have turned push on or off.
-    const offReconnect = onServerDownChange((down) => {
-      if (!down) void refresh();
-    });
+    const offDaemonChanged = onDaemonChanged(() => void refresh());
     return () => {
       clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisibility);
-      offReconnect();
+      offDaemonChanged();
     };
   }, []);
 

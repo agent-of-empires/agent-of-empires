@@ -7,7 +7,7 @@ import {
   type SessionMutation,
   type SessionsEnvelope,
 } from "../lib/api";
-import { setServerDown } from "../lib/connectionState";
+import { noteDaemonChanged, setServerDown } from "../lib/connectionState";
 
 const POLL_INTERVAL = 3000;
 const POLL_DEADLINE_MS = 15000;
@@ -95,8 +95,10 @@ export function useSessions() {
         const floor = floorGet.current;
         if (abandonedEpochs.current.has(cursor.epoch)) return;
         if (floor?.epoch === cursor.epoch && cursor.revision < floor.revision) return;
-        if (floor && floor.epoch !== cursor.epoch) abandonedEpochs.current.add(floor.epoch);
+        const newEpoch = !!floor && floor.epoch !== cursor.epoch;
+        if (newEpoch) abandonedEpochs.current.add(floor.epoch);
         floorGet.current = cursor;
+        if (newEpoch) noteDaemonChanged();
         const pushed = pushedRef.current;
         const present = new Set(data.sessions.map((s) => s.id));
         const absent = absentRef.current;
