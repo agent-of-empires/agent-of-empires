@@ -623,6 +623,48 @@ async fn non_foreground_prompt_to_a_stop_fenced_session_stays_queued() {
     assert_eq!(queued[0].text, "automated");
 }
 
+/// A named "Send now" row never starts a stop-fenced session: it keeps its stored sender
+/// and a stale click after a Stop must not clear the fence.
+#[tokio::test]
+#[serial_test::serial]
+async fn send_now_on_a_stop_fenced_session_stays_behind_the_fence() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-stop-fence-send-now".to_string();
+    let (state, launches) = failing_start_state(&id, false).await;
+    state
+        .session_service
+        .enqueue_prompt(
+            &id,
+            "q1".into(),
+            "PR #7 was merged".into(),
+            vec![],
+            None,
+            crate::server::session_service::QueueSender {
+                plugin: Some("cron".into()),
+                origin: crate::daemon::PromptOrigin::Unknown,
+            },
+        )
+        .await
+        .expect("session exists");
+    settle_stop_fence(&id);
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        dashboard_headers(),
+        send_now_req("PR #7 was merged", "q1"),
+    )
+    .await
+    .into_response();
+
+    assert!(response.status().is_success(), "{}", response.status());
+    assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(crate::process::worker_registry::stop_requested(&id));
+    let queued = state.session_service.queued_prompts_snapshot(&id).await;
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].id, "q1");
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn no_revive_prompt_to_a_stop_fenced_session_stays_fenced() {

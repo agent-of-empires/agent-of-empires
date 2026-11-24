@@ -352,6 +352,7 @@ pub(crate) async fn submit_prompt(
     // refuses the prompt. MCP, plugin and automated prompts keep waiting behind the fence.
     let mut observed_stop = None;
     let dispatch = if !req.no_revive
+        && req.queued_prompt_id.is_none()
         && matches!(
             req.origin,
             crate::daemon::PromptOrigin::Dashboard
