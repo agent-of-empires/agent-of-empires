@@ -1407,6 +1407,7 @@ impl Session {
         let target = self.live_pane_target_with_deadline(deadline)?;
         let start = format!("-{}", lines);
         const HEADER_FMT: &str = CURSOR_FMT;
+        let joined_mark = crate::tmux::wraps::sentinel();
         let mut command = crate::tmux::tmux_command();
         command.args([
             "display-message",
@@ -1423,6 +1424,21 @@ impl Session {
             "-e",
             // Keep trailing bg fills, matching the VT path.
             "-N",
+            "-S",
+            &start,
+            ";",
+            // The same rows joined, for which ones soft-wrap.
+            "display-message",
+            "-p",
+            "-t",
+            &target,
+            &joined_mark,
+            ";",
+            "capture-pane",
+            "-t",
+            &target,
+            "-p",
+            "-J",
             "-S",
             &start,
             ";",
@@ -1462,7 +1478,24 @@ impl Session {
         };
         let before = PaneCursor::parse(cursor_line);
         let after = PaneCursor::parse(after_line);
-        Ok((content.to_string(), merge_cursor_probes(before, after)))
+        // The joined half went missing; its bytes must not render.
+        let Some((rows, joined)) =
+            crate::tmux::wraps::split_at_sentinel(content.as_bytes(), &joined_mark)
+        else {
+            return Ok((String::new(), None));
+        };
+        let mut rows = rows.to_vec();
+        if let Some(height) = after.or(before).map(|c| c.pane_height) {
+            let wraps = crate::tmux::wraps::soft_wraps(
+                &String::from_utf8_lossy(&rows),
+                &String::from_utf8_lossy(joined),
+            );
+            crate::tmux::wraps::relink_continuations(&target, &mut rows, &wraps, height, deadline);
+        }
+        Ok((
+            String::from_utf8_lossy(&rows).into_owned(),
+            merge_cursor_probes(before, after),
+        ))
     }
 
     /// Deliver raw bytes to the session's agent pane via `tmux send-keys

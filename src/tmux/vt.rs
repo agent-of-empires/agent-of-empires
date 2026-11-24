@@ -1700,9 +1700,21 @@ fn seed_rows(body: &[u8], wraps: &[u32], cols: u16) -> Vec<u8> {
     if wraps.is_empty() {
         return lf_to_crlf(body);
     }
-    let cols = usize::from(cols);
     let rows: Vec<&[u8]> = body.split(|&b| b == b'\n').collect();
-    let text = |row: &[u8]| crate::tmux::utils::strip_ansi(&String::from_utf8_lossy(row));
+    // Measured on a grid of its own, so a glyph a selector widens counts as
+    // the seeded grid will draw it.
+    let mut probe = vt100::Parser::new(
+        NonZeroU16::new(2).expect("nonzero"),
+        NonZeroU16::new(cols).unwrap_or(NonZeroU16::MIN),
+        0,
+    );
+    let mut fills = |row: &[u8]| {
+        probe.process(b"\x1bc");
+        probe.process(row);
+        let screen = probe.screen();
+        let last = screen.cell(0, cols.saturating_sub(1));
+        !screen.row_wrapped(0) && last.is_some_and(|c| c.has_contents() || c.is_wide_continuation())
+    };
     let mut out = Vec::with_capacity(body.len() + rows.len());
     for (i, row) in rows.iter().enumerate() {
         out.extend_from_slice(row);
@@ -1711,9 +1723,7 @@ fn seed_rows(body: &[u8], wraps: &[u32], cols: u16) -> Vec<u8> {
         }
         // tmux, like vt100, does not flag a row a wide glyph left a column
         // short, so a flagged row fills the pane it was captured from.
-        let fills = wraps.binary_search(&(i as u32)).is_ok()
-            && crate::tmux::wraps::display_width(&text(row)) == cols;
-        if !fills {
+        if !(wraps.binary_search(&(i as u32)).is_ok() && fills(row)) {
             out.extend_from_slice(b"\r\n");
         }
     }
@@ -4052,9 +4062,9 @@ mod tests {
                 vec![],
             ),
             (
-                "stray selector code points never name a link",
+                "a pane's selector stays text and a second never names a link",
                 "a\u{E0100}\u{E0101}b".into(),
-                vec!["\x1b[0mab".into(), String::new(), String::new()],
+                vec!["\x1b[0ma\u{E0100}b".into(), String::new(), String::new()],
                 vec![],
             ),
         ];
@@ -4090,18 +4100,72 @@ mod tests {
         for text in ["\u{2764}\u{FE0F}", "e\u{301}\u{2764}\u{FE0F}"] {
             let mut plain = new_parser(2, 20, 0);
             feed(&mut plain, format!("{text}x").as_bytes());
+            let linked = format!("{}x", osc8(url, text));
+            // Whole, and split at every byte, including before and within U+FE0F.
+            for split in 0..linked.len() {
+                let mut grid = new_parser(2, 20, 0);
+                feed(&mut grid, &linked.as_bytes()[..split]);
+                feed(&mut grid, &linked.as_bytes()[split..]);
+                assert_eq!(
+                    grid.screen().cursor_position(),
+                    plain.screen().cursor_position(),
+                    "{text:?} split at {split}"
+                );
+                assert_eq!(
+                    row_to_ansi(&grid, 0, 20),
+                    format!("\x1b[0m{}x", osc8(url, text)),
+                    "{text:?} split at {split}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_link_never_costs_its_cell_text() {
+        let url = "https://example.com/cell";
+        // (text, whether its first cell still has room for the link)
+        let cases = [
+            ("\u{845b}\u{E0101}", true),
+            ("e\u{301}", true),
+            (
+                concat!(
+                    "e",
+                    "\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}"
+                ),
+                false,
+            ),
+        ];
+        for (text, linked_cell) in cases {
+            let mut plain = new_parser(2, 20, 0);
+            feed(&mut plain, format!("{text}x").as_bytes());
             let mut linked = new_parser(2, 20, 0);
-            feed(&mut linked, format!("{}x", osc8(url, text)).as_bytes());
-            assert_eq!(
-                linked.screen().cursor_position(),
-                plain.screen().cursor_position(),
-                "{text:?}"
-            );
-            assert_eq!(
-                row_to_ansi(&linked, 0, 20),
-                format!("\x1b[0m{}x", osc8(url, text)),
-                "{text:?}"
-            );
+            feed(&mut linked, osc8(url, &format!("{text}x")).as_bytes());
+            let shown = |grid: &Grid| crate::tmux::utils::strip_ansi(&row_to_ansi(grid, 0, 20));
+            assert_eq!(shown(&linked), shown(&plain), "{text:?}");
+            let first =
+                crate::tmux::osc8::split_cell(linked.screen().cell(0, 0).unwrap().contents());
+            assert_eq!(first.1.is_some(), linked_cell, "{text:?}");
+            let x = plain.screen().cursor_position().1 - 1;
+            let last =
+                crate::tmux::osc8::split_cell(linked.screen().cell(0, x).unwrap().contents());
+            assert!(last.1.is_some(), "{text:?}: the next cell keeps its link");
+        }
+    }
+
+    #[test]
+    fn an_osc8_target_vte_truncated_is_dropped() {
+        // vte keeps 16 parameters: `8`, the params field, then the target's pieces.
+        for (semicolons, kept) in [(13, true), (15, false)] {
+            let url = format!("https://example.com/a{}", ";x".repeat(semicolons));
+            let mut grid = new_parser(2, 20, 0);
+            feed(&mut grid, osc8(&url, "go").as_bytes());
+            let row = row_to_ansi(&grid, 0, 20);
+            let want = if kept {
+                format!("\x1b[0m{}", osc8(&url, "go"))
+            } else {
+                "\x1b[0mgo".to_string()
+            };
+            assert_eq!(row, want, "{semicolons} semicolons");
         }
     }
 
@@ -4130,30 +4194,50 @@ mod tests {
             );
         }
 
-        // A freed id never renames a cell still on either grid.
-        let kept = "https://example.com/kept";
-        let mut grid = new_parser(2, 30, 0);
-        feed(
-            &mut grid,
-            format!("{}\r\n", osc8(kept, "primary")).as_bytes(),
-        );
-        feed(&mut grid, b"\x1b[?1049h");
-        let shown = "https://example.com/shown";
-        feed(&mut grid, format!("{}\r\n", osc8(shown, "alt")).as_bytes());
-        for n in 0..runs {
+        // A freed id never renames a cell still on either grid, however the
+        // private mode spells its intermediates.
+        for (enter, leave) in [
+            (&b"\x1b[?1049h"[..], &b"\x1b[?1049l"[..]),
+            (b"\x1b[?1049$h", b"\x1b[?1049$l"),
+        ] {
+            let kept = "https://example.com/kept";
+            let mut grid = new_parser(2, 30, 0);
             feed(
                 &mut grid,
-                format!("\x1b[2;1H{}", osc8(&uri(n), "x")).as_bytes(),
+                format!("{}\r\n", osc8(kept, "primary")).as_bytes(),
+            );
+            feed(&mut grid, enter);
+            let shown = "https://example.com/shown";
+            feed(&mut grid, format!("{}\r\n", osc8(shown, "alt")).as_bytes());
+            for n in 0..runs {
+                feed(
+                    &mut grid,
+                    format!("\x1b[2;1H{}", osc8(&uri(n), "x")).as_bytes(),
+                );
+            }
+            assert_eq!(
+                row_to_ansi(&grid, 0, 30),
+                format!("\x1b[0m{}", osc8(shown, "alt"))
+            );
+            feed(&mut grid, leave);
+            assert_eq!(
+                row_to_ansi(&grid, 0, 30),
+                format!("\x1b[0m{}", osc8(kept, "primary")),
+                "{enter:?}"
             );
         }
+
+        // A reset clears both grids, so a full table that just failed to
+        // reclaim links the next target at once.
+        let mut grid = new_parser(2, 30, 2 * runs);
+        for n in 0..=1024 {
+            feed(&mut grid, format!("{}\r\n", osc8(&uri(n), "x")).as_bytes());
+        }
+        feed(&mut grid, b"\x1bc");
+        feed(&mut grid, osc8(&uri(runs), "fresh").as_bytes());
         assert_eq!(
             row_to_ansi(&grid, 0, 30),
-            format!("\x1b[0m{}", osc8(shown, "alt"))
-        );
-        feed(&mut grid, b"\x1b[?1049l");
-        assert_eq!(
-            row_to_ansi(&grid, 0, 30),
-            format!("\x1b[0m{}", osc8(kept, "primary"))
+            format!("\x1b[0m{}", osc8(&uri(runs), "fresh"))
         );
     }
 
@@ -4169,6 +4253,12 @@ mod tests {
                 "abcdef\ngh\n",
                 &[0],
                 &[],
+            ),
+            (
+                "a selector widening the last glyph fills the row",
+                "abcdefgh\u{2764}\u{FE0F}\nkl\n",
+                &[0],
+                &[0],
             ),
             (
                 "a row a wide glyph left short keeps its break",
@@ -6386,22 +6476,23 @@ mod tests {
             "bold must not carry over:\n{content}"
         );
 
-        let capture = crate::tmux::Session::from_name(guard.name())
-            .capture_window_with_wraps(6)
-            .expect("capture");
+        let session = crate::tmux::Session::from_name(guard.name());
+        let capture = session.capture_window_with_wraps(6).expect("capture");
         assert_eq!(capture.wrapped, vec![0, 1, 2], "{}", capture.content);
-        let rows: Vec<&str> = capture.content.lines().collect();
-        for (row, piece) in pieces.iter().enumerate() {
-            let found = crate::tmux::osc8::extract_links(rows[row].as_bytes());
-            assert_eq!(
-                found
-                    .iter()
-                    .map(|l| (l.text.as_str(), l.uri.as_str()))
-                    .collect::<Vec<_>>(),
-                vec![(*piece, url)],
-                "row {row}:\n{}",
-                capture.content
-            );
+        // The TUI's capture fallback, with no VT channel armed.
+        let (single, _) = session.capture_pane_with_cursor(6).expect("capture");
+        for content in [&capture.content, &single] {
+            let want: Vec<(usize, String, String)> = pieces
+                .iter()
+                .enumerate()
+                .map(|(row, piece)| (row, piece.to_string(), url.to_string()))
+                .collect();
+            let found: Vec<(usize, String, String)> = crate::tmux::osc8::row_links(content)
+                .into_iter()
+                .filter(|l| l.row < pieces.len())
+                .map(|l| (l.row, l.text, l.uri))
+                .collect();
+            assert_eq!(found, want, "{content}");
         }
     }
 
@@ -6447,15 +6538,21 @@ mod tests {
             .expect("tmux new-session");
         assert!(out.status.success());
         let expected = vec![
-            crate::tmux::osc8::PaneLink {
-                text: "mid link".to_string(),
-                uri: "https://example.com/mid".to_string(),
-            },
-            crate::tmux::osc8::PaneLink {
-                text: "eol link".to_string(),
-                uri: "https://example.com/eol".to_string(),
-            },
+            (
+                "mid link".to_string(),
+                "https://example.com/mid".to_string(),
+            ),
+            (
+                "eol link".to_string(),
+                "https://example.com/eol".to_string(),
+            ),
         ];
+        let links_of = |content: &[u8]| -> Vec<(String, String)> {
+            crate::tmux::osc8::row_links(&String::from_utf8_lossy(content))
+                .into_iter()
+                .map(|l| (l.text, l.uri))
+                .collect()
+        };
         let target = crate::tmux::test_helpers::only_pane_id(guard.name());
         let deadline = crate::tmux::TmuxCommandDeadline::new();
         let mut stream = Vec::new();
@@ -6463,7 +6560,7 @@ mod tests {
             stream = capture_seed_stream(&target, (80, 24), &deadline, || ())
                 .map(|(stream, ())| stream)
                 .unwrap_or_default();
-            if crate::tmux::osc8::extract_links(&stream) == expected {
+            if links_of(&stream) == expected {
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -6473,7 +6570,7 @@ mod tests {
         feed(&mut grid, &stream);
         let window = grid_content(&mut grid, 24, 80, 24);
         assert_eq!(
-            crate::tmux::osc8::extract_links(window.content.as_bytes()),
+            links_of(window.content.as_bytes()),
             expected,
             "capture-pane -e must round-trip both hyperlink shapes"
         );
