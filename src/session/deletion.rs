@@ -35,32 +35,20 @@ pub struct DeletionRequest {
     pub keep_scratch: bool,
 }
 
-/// What the caller asked to keep or remove; the daemon fills the rest from config.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct CleanupIntent {
-    #[serde(default)]
-    pub delete_worktree: bool,
-    #[serde(default)]
-    pub delete_branch: bool,
-    #[serde(default)]
-    pub keep_container: bool,
-}
+pub use aoe_daemon_client::CleanupIntent;
 
-impl CleanupIntent {
-    /// Returns `(delete_worktree, delete_branch, delete_sandbox)`.
-    fn resolve(
-        &self,
-        config: &crate::session::config::Config,
-        managed: bool,
-        sandboxed: bool,
-    ) -> (bool, bool, bool) {
-        let delete_worktree = self.delete_worktree && managed;
-        let delete_branch = managed
-            && (self.delete_branch
-                || (delete_worktree && config.worktree.delete_branch_on_cleanup));
-        let delete_sandbox = sandboxed && !self.keep_container && config.sandbox.auto_cleanup;
-        (delete_worktree, delete_branch, delete_sandbox)
-    }
+/// Returns `(delete_worktree, delete_branch, delete_sandbox)`.
+fn resolve_cleanup(
+    intent: &CleanupIntent,
+    config: &crate::session::config::Config,
+    managed: bool,
+    sandboxed: bool,
+) -> (bool, bool, bool) {
+    let delete_worktree = intent.delete_worktree && managed;
+    let delete_branch = managed
+        && (intent.delete_branch || (delete_worktree && config.worktree.delete_branch_on_cleanup));
+    let delete_sandbox = sandboxed && !intent.keep_container && config.sandbox.auto_cleanup;
+    (delete_worktree, delete_branch, delete_sandbox)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -419,7 +407,10 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                     let retained = instances.iter().find(|instance| instance.id == id).cloned();
                     rejected = Some((
                         DeletionDisposition::Busy,
-                        format!("Session {}", holder.already_in_progress_reason()),
+                        format!(
+                            "Session {}",
+                            super::instance::lifecycle_in_progress_reason(holder)
+                        ),
                         retained,
                     ));
                     return Ok(());
@@ -507,7 +498,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
             .as_ref()
             .is_some_and(|sandbox| sandbox.enabled);
         let (delete_worktree, delete_branch, delete_sandbox) =
-            intent.resolve(&config, managed, sandboxed);
+            resolve_cleanup(intent, &config, managed, sandboxed);
         let request = self.request.as_mut().expect("active purge request");
         request.delete_worktree = delete_worktree;
         request.delete_branch = delete_branch;
@@ -2461,7 +2452,7 @@ fn run_destroy_hooks(instance: &Instance, detach: bool, config: &crate::session:
 const BEFORE_DESTROY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Client wait for a purge RPC: several `before_destroy` hooks plus teardown.
-pub const PURGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+pub use aoe_daemon_client::deadlines::PURGE_DEADLINE;
 
 /// Host-side on every session kind, so it never targets the container.
 fn run_before_destroy_hooks(instance: &Instance, detach: bool, commands: &[String]) {
@@ -2576,9 +2567,12 @@ mod tests {
         let effective = repo_config::merge_repo_config(profile.clone(), &repo);
 
         let intent = CleanupIntent::default();
-        assert_eq!(intent.resolve(&profile, true, true), (false, false, true));
         assert_eq!(
-            intent.resolve(&effective, true, true),
+            resolve_cleanup(&intent, &profile, true, true),
+            (false, false, true)
+        );
+        assert_eq!(
+            resolve_cleanup(&intent, &effective, true, true),
             (false, false, false)
         );
 
@@ -2588,10 +2582,13 @@ mod tests {
             keep_container: true,
             ..Default::default()
         };
-        assert_eq!(intent.resolve(&profile, true, true), (true, true, false));
+        assert_eq!(
+            resolve_cleanup(&intent, &profile, true, true),
+            (true, true, false)
+        );
         // Nothing to delete without a managed worktree or an enabled sandbox.
         assert_eq!(
-            intent.resolve(&profile, false, false),
+            resolve_cleanup(&intent, &profile, false, false),
             (false, false, false)
         );
     }

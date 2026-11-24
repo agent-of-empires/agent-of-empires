@@ -104,7 +104,7 @@ pub(crate) async fn connect_with_headers(
         .max_frame_size(Some(16 * 1024 * 1024));
     tokio::time::timeout(Duration::from_secs(15), async {
         if let Some(path) = endpoint.unix_path() {
-            let socket = super::transport::connect_unix(path).await?;
+            let socket = super::host_transport::connect_unix(path).await?;
             let (stream, _) =
                 tokio_tungstenite::client_async_with_config(request, socket, Some(config)).await?;
             return Ok(NativeSocket::Unix(Box::new(stream)));

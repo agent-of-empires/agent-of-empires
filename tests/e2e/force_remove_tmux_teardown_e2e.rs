@@ -3,8 +3,7 @@
 
 use agent_of_empires::{
     daemon::{
-        CreateSessionBody, DaemonClient, DeleteSessionBody, PromptOrigin, RuntimeSnapshot,
-        SessionMutation,
+        CreateSessionBody, DeleteSessionBody, PromptOrigin, RuntimeSnapshot, SessionMutation,
     },
     session::{LifecycleOperation, PanePresence},
 };
@@ -71,7 +70,7 @@ async fn test_force_remove_session_kills_agent_tmux_session() {
     init_git_repo(&repo);
     h.run_cli_ok(&["serve", "--core-only", "--daemon"]);
     let socket = app.join("daemon/api.sock");
-    let sdk = DaemonClient::new_unix(&socket).unwrap();
+    let sdk = agent_of_empires::daemon::local_unix_client(&socket).unwrap();
     let epoch = sdk.runtime_info().await.unwrap().epoch;
     let http = reqwest::Client::builder()
         .unix_socket(socket.as_path())

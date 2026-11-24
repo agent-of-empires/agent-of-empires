@@ -592,7 +592,7 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         crate::session::claim::RestoreClaimDecision::Busy(holder) => anyhow::bail!(
             "Session {} is {}, so it was not restored",
             inst.title,
-            holder.busy_reason()
+            crate::session::lifecycle_busy_reason(holder)
         ),
         crate::session::claim::RestoreClaimDecision::Claimed(generation) => generation,
     };

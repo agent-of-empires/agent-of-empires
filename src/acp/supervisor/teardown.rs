@@ -1956,7 +1956,7 @@ mod tests {
         let identity = RunnerIdentity {
             pid,
             generation: lease.epoch(),
-            birth_fingerprint: Some(birth.fingerprint()),
+            birth_fingerprint: Some(crate::process::process_birth_fingerprint(&birth)),
         };
         assert_eq!(
             lock_recover(&sup.lifecycle).install(&lease, Some(identity)),
@@ -1976,7 +1976,10 @@ mod tests {
             let attested = lease.spawned_runner() == Some(identity);
             let reaped = crate::process::process_birth_identity(pid)
                 .unwrap()
-                .is_none_or(|current| current.fingerprint() != birth.fingerprint());
+                .is_none_or(|current| {
+                    crate::process::process_birth_fingerprint(&current)
+                        != crate::process::process_birth_fingerprint(&birth)
+                });
             if attested && reaped {
                 break;
             }
@@ -3490,7 +3493,7 @@ mod tests {
         control.alive(4343);
         let gate = Gate::default();
         let birth = attested_test_birth(4343, 1);
-        let fingerprint = birth.fingerprint();
+        let fingerprint = crate::process::process_birth_fingerprint(&birth);
         let (launcher, deleted) =
             recording_gated_launcher(&gate, 4343, "s-wait", "native-keep-id", Some(birth));
         let sup = Arc::new(

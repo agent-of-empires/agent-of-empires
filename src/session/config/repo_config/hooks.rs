@@ -23,36 +23,7 @@ pub struct HookTimeout {
     pub timeout_secs: u64,
 }
 
-/// Lifecycle hook commands; each accepts a string or an array in TOML.
-/// `on_create` failures abort creation; `on_launch` and `on_destroy` failures
-/// only warn, and `on_destroy` runs before worktree/sandbox cleanup.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct HooksConfig {
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "crate::session::serde_helpers::string_or_vec"
-    )]
-    pub on_create: Vec<String>,
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "crate::session::serde_helpers::string_or_vec"
-    )]
-    pub on_launch: Vec<String>,
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "crate::session::serde_helpers::string_or_vec"
-    )]
-    pub on_destroy: Vec<String>,
-}
-
-impl HooksConfig {
-    pub fn is_empty(&self) -> bool {
-        self.on_create.is_empty() && self.on_launch.is_empty() && self.on_destroy.is_empty()
-    }
-}
+pub use aoe_daemon_client::HooksConfig;
 
 /// Host-side hooks, profile/global only (never from a repo). The launch hooks
 /// print `KEY=VALUE` lines that are injected into the launch; stdout is never

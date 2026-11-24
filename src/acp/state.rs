@@ -132,24 +132,7 @@ pub struct ThinkingSignal {
     pub started_at: Timestamp,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct RateLimitInfo {
-    pub status: String,
-    /// When the quota window clears, if the agent reported it.
-    pub resets_at: Option<Timestamp>,
-    pub kind: String,
-}
-
-impl RateLimitInfo {
-    /// A park whose reporting `RateLimit` event was pruned: a limit with no reset time.
-    pub fn undated() -> Self {
-        Self {
-            status: "limited".into(),
-            resets_at: None,
-            kind: "rate_limit".into(),
-        }
-    }
-}
+pub use aoe_daemon_client::RateLimitInfo;
 
 /// A live advisory the agent pushed outside the turn flow (approaching a rate
 /// limit, a model fallback), per the ACP session-notices extension. Each

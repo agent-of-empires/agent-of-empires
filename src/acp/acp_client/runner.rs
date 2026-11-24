@@ -543,7 +543,7 @@ pub(super) async fn spawn_runner_detached(
                     birth_fingerprint: crate::process::process_birth_identity(pid)
                         .ok()
                         .flatten()
-                        .map(|identity| identity.fingerprint()),
+                        .map(|identity| crate::process::process_birth_fingerprint(&identity)),
                 },
             );
         } else {

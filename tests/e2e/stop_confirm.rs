@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use agent_of_empires::{
-    daemon::{DaemonClient, StartSessionBody, TerminalTargetStatus},
+    daemon::{StartSessionBody, TerminalTargetStatus},
     session::{AuxiliaryTarget, PanePresence, Status},
     tmux::{Session, TerminalSession, ToolSession},
 };
@@ -85,7 +85,10 @@ async fn second_x_confirms_stop_in_terminal_and_agent_views() {
     let agent_pane = owned_pane(&h, &agent, "agent");
     let terminal = TerminalSession::generate_name(&id, TITLE);
 
-    let sdk = DaemonClient::new_unix(app_dir_in(h.home_path()).join("daemon/api.sock")).unwrap();
+    let sdk = agent_of_empires::daemon::local_unix_client(
+        app_dir_in(h.home_path()).join("daemon/api.sock"),
+    )
+    .unwrap();
     let epoch = sdk.runtime_info().await.unwrap().epoch;
     let receipt = sdk
         .ensure_terminal(&id, 0, &StartSessionBody::default(), &epoch)

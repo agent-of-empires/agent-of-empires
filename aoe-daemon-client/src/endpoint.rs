@@ -1,6 +1,7 @@
 //! Resolved Daemon transport and dashboard coordinates, independent of host discovery.
 
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use crate::transport::UnixTransport;
 
 use super::{DaemonClient, DaemonClientError};
 
@@ -11,7 +12,8 @@ pub struct DaemonEndpoint {
     pub base_url: String,
     token: Option<String>,
     pub source: Source,
-    unix_path: Option<PathBuf>,
+    #[cfg(unix)]
+    unix: Option<UnixTransport>,
 }
 
 impl std::fmt::Debug for DaemonEndpoint {
@@ -26,44 +28,52 @@ impl std::fmt::Debug for DaemonEndpoint {
 impl DaemonEndpoint {
     /// Local Unix transport with an already-resolved dashboard origin, if any.
     /// Peer ownership authorizes it, so it carries no bearer token.
-    pub fn local_unix(path: PathBuf, dashboard_url: Option<String>) -> Self {
+    #[cfg(unix)]
+    pub fn local_unix(unix: UnixTransport, dashboard_url: Option<String>) -> Self {
         Self {
             // HTTP request targets use this placeholder, not the dashboard origin.
             base_url: "http://localhost".to_owned(),
             dashboard_url,
             token: None,
             source: Source::LocalDaemon,
-            unix_path: Some(path),
+            unix: Some(unix),
         }
     }
 
-    pub(crate) fn unix_path(&self) -> Option<&Path> {
-        self.unix_path.as_deref()
+    #[cfg(unix)]
+    pub fn unix_path(&self) -> Option<&std::path::Path> {
+        self.unix.as_ref().map(UnixTransport::path)
     }
 
-    pub(crate) fn new(base_url: String, token: Option<String>, source: Source) -> Self {
+    #[cfg(unix)]
+    pub fn unix_transport(&self) -> Option<&UnixTransport> {
+        self.unix.as_ref()
+    }
+
+    pub fn new(base_url: String, token: Option<String>, source: Source) -> Self {
         Self {
             base_url,
             dashboard_url: None,
             token,
             source,
-            unix_path: None,
+            #[cfg(unix)]
+            unix: None,
         }
     }
 
     pub fn daemon_client(&self) -> Result<DaemonClient, DaemonClientError> {
-        if let Some(path) = &self.unix_path {
-            DaemonClient::new_unix(path)
-        } else {
-            DaemonClient::new(&self.base_url, self.bearer_token())
+        #[cfg(unix)]
+        if let Some(unix) = &self.unix {
+            return DaemonClient::new_unix(unix.clone());
         }
+        DaemonClient::new(&self.base_url, self.bearer_token())
     }
 
-    pub(crate) fn bearer_token(&self) -> Option<&str> {
+    pub fn bearer_token(&self) -> Option<&str> {
         self.token.as_deref()
     }
 
-    pub(crate) fn has_token(&self) -> bool {
+    pub fn has_token(&self) -> bool {
         self.token.is_some()
     }
 
@@ -72,7 +82,7 @@ impl DaemonEndpoint {
         self.dashboard_url.as_deref()
     }
 
-    pub(crate) fn with_dashboard_url(mut self, url: Option<String>) -> Self {
+    pub fn with_dashboard_url(mut self, url: Option<String>) -> Self {
         self.dashboard_url = url;
         self
     }
@@ -99,8 +109,9 @@ mod tests {
             .with_dashboard_url(Some(
                 "https://private-dashboard.example/?token=private-link".into(),
             )),
+            #[cfg(unix)]
             DaemonEndpoint::local_unix(
-                PathBuf::from("/private-socket/api.sock"),
+                UnixTransport::new("/private-socket/api.sock", crate::tests::verify_test_peer),
                 Some("https://private-dashboard.example".into()),
             ),
         ];

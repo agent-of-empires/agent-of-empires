@@ -444,10 +444,7 @@ hotkey = "Alt+t"
 #[tokio::test]
 #[parallel]
 async fn native_auxiliary_ensure_uses_fresh_context_and_refuses_purge() {
-    use agent_of_empires::{
-        daemon::DaemonClient,
-        session::{Instance, LifecycleOperation, Status},
-    };
+    use agent_of_empires::session::{Instance, LifecycleOperation, Status};
     require_tmux!();
     let mut h = TuiTestHarness::new_in_tmp("native_tool_ensure");
     h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
@@ -481,7 +478,7 @@ async fn native_auxiliary_ensure_uses_fresh_context_and_refuses_purge() {
         "{}",
         String::from_utf8_lossy(&started.stderr)
     );
-    let sdk = DaemonClient::new_unix(app.join("daemon/api.sock")).unwrap();
+    let sdk = agent_of_empires::daemon::local_unix_client(app.join("daemon/api.sock")).unwrap();
     let epoch = sdk.runtime_info().await.unwrap().epoch;
     let http = reqwest::Client::builder()
         .unix_socket(app.join("daemon/api.sock"))

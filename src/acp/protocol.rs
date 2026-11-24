@@ -276,66 +276,7 @@ pub enum TerminalContext {
     CommandDecides,
 }
 
-/// Why a switch to Terminal view starts fresh, can't happen yet, or continues a
-/// conversation other than the one in Structured view. Also the `AoE-Error-Code`
-/// of a refused switch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TerminalSwitchReason {
-    AgentNotResumable,
-    NoConversationYet,
-    /// With `continues`: Structured view has no conversation yet, so the switch
-    /// resumes the Session's earlier one, from before Structured view.
-    EarlierConversation,
-    ConversationNotBound,
-    Sandboxed,
-    HandoffPending,
-    NoTerminalTool,
-    ContextUnconfirmed,
-    /// Refusal only: the Session changed during the switch.
-    SessionChanged,
-    /// Check only: the Session isn't in Structured view.
-    NotStructured,
-    /// With `command_decides`: the launch command carries a native session selector.
-    CommandSelectsConversation,
-    /// With `blocked`: the command's native session selector and AoE's own conversation
-    /// would both reach the launch, which refuses them together.
-    CommandSelectorConflict,
-}
-
-impl TerminalSwitchReason {
-    pub const ALL: [Self; 12] = [
-        Self::AgentNotResumable,
-        Self::NoConversationYet,
-        Self::EarlierConversation,
-        Self::ConversationNotBound,
-        Self::Sandboxed,
-        Self::HandoffPending,
-        Self::NoTerminalTool,
-        Self::ContextUnconfirmed,
-        Self::SessionChanged,
-        Self::NotStructured,
-        Self::CommandSelectsConversation,
-        Self::CommandSelectorConflict,
-    ];
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::AgentNotResumable => "agent_not_resumable",
-            Self::NoConversationYet => "no_conversation_yet",
-            Self::EarlierConversation => "earlier_conversation",
-            Self::ConversationNotBound => "conversation_not_bound",
-            Self::Sandboxed => "sandboxed",
-            Self::HandoffPending => "handoff_pending",
-            Self::NoTerminalTool => "no_terminal_tool",
-            Self::ContextUnconfirmed => "context_unconfirmed",
-            Self::SessionChanged => "session_changed",
-            Self::NotStructured => "not_structured",
-            Self::CommandSelectsConversation => "command_selects_conversation",
-            Self::CommandSelectorConflict => "command_selector_conflict",
-        }
-    }
-}
+pub use aoe_daemon_client::TerminalSwitchReason;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

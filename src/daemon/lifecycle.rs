@@ -17,9 +17,9 @@ pub(crate) struct Lifetime {
 }
 
 fn lock_path(name: &str) -> Result<std::path::PathBuf> {
-    let socket = super::transport::local_socket_path()?;
+    let socket = super::host_transport::local_socket_path()?;
     let parent = socket.parent().context("Daemon socket has no directory")?;
-    super::transport::prepare_runtime_directory(parent)?;
+    super::host_transport::prepare_runtime_directory(parent)?;
     Ok(parent.join(name))
 }
 

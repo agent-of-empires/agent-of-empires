@@ -1546,7 +1546,7 @@ mod tests {
             birth_fingerprint: record(41, 7)
                 .runner_identity
                 .as_ref()
-                .map(|identity| identity.fingerprint()),
+                .map(crate::process::process_birth_fingerprint),
             prime: PrimeOwnership::NotPrime,
             scopes: vec![crate::process::worker_registry::ScopeOwnership::Unscoped],
         };

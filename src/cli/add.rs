@@ -933,7 +933,7 @@ mod tests {
                 }));
             let socket = home.path().join("daemon.sock");
             let server = support::serve_owner_router_for_test(&socket, router).await;
-            let client = DaemonClient::new_unix(&socket).unwrap();
+            let client = crate::daemon::local_unix_client(&socket).unwrap();
             let epoch = client.runtime_info().await.unwrap().epoch;
             let key = "cli-post-commit-write-failure";
             let body: CreateSessionBody = serde_json::from_value(serde_json::json!({

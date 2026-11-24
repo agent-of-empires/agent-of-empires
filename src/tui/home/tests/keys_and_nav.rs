@@ -1135,7 +1135,7 @@ async fn test_b_opens_project_add_flow_when_no_projects() {
         test_support::build_router_for_test(state.clone()),
     )
     .await;
-    let endpoint = crate::daemon::DaemonEndpoint::local_unix(socket.clone(), None);
+    let endpoint = crate::daemon::local_unix_endpoint(socket.clone(), None);
     let connection = crate::daemon::RuntimeConnection::connect(&endpoint, Some("test"))
         .await
         .unwrap();
@@ -1147,7 +1147,7 @@ async fn test_b_opens_project_add_flow_when_no_projects() {
         connection.snapshot().contents.health,
         crate::daemon::RuntimeHealth::Healthy
     ));
-    let client = crate::daemon::DaemonClient::new_unix(socket).unwrap();
+    let client = crate::daemon::local_unix_client(socket).unwrap();
     env.view
         .session_feed
         .connect_prepared(profile.clone(), Some((connection, client)));

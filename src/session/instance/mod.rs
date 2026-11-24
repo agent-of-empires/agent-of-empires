@@ -88,6 +88,7 @@ pub use flags::{
     is_valid_session_color, SandboxLoginRequired, SandboxLoginUnsupported, SessionBucket,
     StartBlocked, SESSION_COLORS,
 };
+pub(crate) use lifecycle::{lifecycle_busy_reason, lifecycle_in_progress_reason};
 pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
 
 #[cfg(test)]

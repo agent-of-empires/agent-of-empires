@@ -1,7 +1,7 @@
 //! Group tree management
 
 use crate::time::Timestamp;
-use serde::{Deserialize, Serialize};
+pub use aoe_daemon_client::Group;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 
@@ -73,34 +73,6 @@ pub fn project_group_display_name(key: &str) -> &str {
         SCRATCH_GROUP_NAME
     } else {
         key
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Group {
-    pub name: String,
-    pub path: String,
-    #[serde(default)]
-    pub collapsed: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub archived_at: Option<Timestamp>,
-    #[serde(skip)]
-    pub children: Vec<Group>,
-}
-
-impl Group {
-    pub fn new(name: &str, path: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            path: path.to_string(),
-            collapsed: false,
-            archived_at: None,
-            children: Vec::new(),
-        }
-    }
-
-    pub fn is_archived(&self) -> bool {
-        self.archived_at.is_some()
     }
 }
 

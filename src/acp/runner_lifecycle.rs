@@ -30,7 +30,7 @@ impl RunnerIdentity {
             birth_fingerprint: record
                 .runner_identity
                 .as_ref()
-                .map(|identity| identity.fingerprint()),
+                .map(crate::process::process_birth_fingerprint),
         }
     }
 
@@ -41,7 +41,7 @@ impl RunnerIdentity {
                 == record
                     .runner_identity
                     .as_ref()
-                    .map(|identity| identity.fingerprint())
+                    .map(crate::process::process_birth_fingerprint)
     }
     pub fn disowns_record(&self, record: &crate::process::worker_registry::WorkerRecord) -> bool {
         !self.matches_record(record.pid, record.generation)
@@ -51,7 +51,7 @@ impl RunnerIdentity {
                     record
                         .runner_identity
                         .as_ref()
-                        .map(|identity| identity.fingerprint()),
+                        .map(crate::process::process_birth_fingerprint),
                 )
                 .is_some_and(|(expected, current)| expected != current)
     }
@@ -399,7 +399,7 @@ impl Lease {
                     .map(|birth| RunnerIdentity {
                         pid: identity.pid,
                         generation: identity.generation,
-                        birth_fingerprint: Some(birth.fingerprint()),
+                        birth_fingerprint: Some(crate::process::process_birth_fingerprint(&birth)),
                     })
                     .is_some_and(|candidate| owner.commit_owned_child_attestation(candidate));
                 let _ = reply.send(attested);
@@ -1801,7 +1801,7 @@ mod tests {
             let identity = RunnerIdentity {
                 pid,
                 generation: 1,
-                birth_fingerprint: Some(birth.fingerprint()),
+                birth_fingerprint: Some(crate::process::process_birth_fingerprint(&birth)),
             };
             control.with_guard(identity, |_| Ok(()))?;
             leader.kill()?;

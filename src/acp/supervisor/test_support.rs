@@ -544,7 +544,9 @@ pub(crate) fn attested_test_identity(pid: u32, generation: u64) -> RunnerIdentit
     RunnerIdentity {
         pid,
         generation,
-        birth_fingerprint: Some(attested_test_birth(pid, generation).fingerprint()),
+        birth_fingerprint: Some(crate::process::process_birth_fingerprint(
+            &attested_test_birth(pid, generation),
+        )),
     }
 }
 

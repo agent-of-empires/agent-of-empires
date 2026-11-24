@@ -688,7 +688,7 @@ impl HttpClient {
             path_segment(session_id)?
         );
         let timeout =
-            crate::session::smart_rename::RENAME_DEADLINE + std::time::Duration::from_secs(15);
+            crate::daemon::deadlines::RENAME_DEADLINE + std::time::Duration::from_secs(15);
         let res = self.execute(self.http.post(&url).timeout(timeout)).await?;
         check_status(res, session_id)?;
         Ok(())
@@ -871,8 +871,8 @@ impl HttpClient {
         force_session: bool,
     ) -> Result<crate::daemon::DaemonClient, HttpError> {
         let base_url = &self.endpoint.base_url;
-        if let Some(path) = self.endpoint.unix_path() {
-            return Ok(crate::daemon::DaemonClient::new_unix(path)?);
+        if let Some(unix) = self.endpoint.unix_transport() {
+            return Ok(crate::daemon::DaemonClient::new_unix(unix.clone())?);
         }
         match self.credential(force_session) {
             Credential::Bearer => Ok(crate::daemon::DaemonClient::new(
@@ -1141,10 +1141,10 @@ impl HttpClient {
         force_session: bool,
     ) -> Result<reqwest::Response, HttpError> {
         self.attach_credential(&mut request, force_session).await?;
-        Ok(
-            crate::daemon::transport::execute(&self.http, self.endpoint.unix_path(), request)
-                .await?,
-        )
+        if let Some(unix) = self.endpoint.unix_transport() {
+            return Ok(unix.execute(request, None).await?);
+        }
+        Ok(crate::daemon::transport::execute(&self.http, request).await?)
     }
 
     fn credential(&self, force_session: bool) -> Credential {
@@ -2186,7 +2186,7 @@ mod tests {
                     let (stream, _) = listener.accept().await.unwrap();
                     serve_stalled_replay(stream, r#"{"frames":["#).await;
                 });
-                (DaemonEndpoint::local_unix(path, None), server)
+                (crate::daemon::local_unix_endpoint(path, None), server)
             } else {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let address = listener.local_addr().unwrap();

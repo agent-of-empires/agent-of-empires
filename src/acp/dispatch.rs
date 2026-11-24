@@ -16,26 +16,7 @@ pub enum PromptDispatch {
     Queued { reason: QueueReason },
 }
 
-/// Why a prompt was parked, or why a session's server queue is still waiting.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum QueueReason {
-    /// A running turn that cannot take this prompt: the agent is not
-    /// steerable, or the prompt is a command that must run on its own.
-    TurnActive,
-    /// A cancel is pending on the running turn.
-    Cancelling,
-    /// A `/compact` is running.
-    Compacting,
-    /// No live worker, and not a case this POST would wake (idle dormancy or a
-    /// rate-limit park).
-    WorkerDown,
-    /// The agent's proxy broke the `_meta.aoe` contract, so core discards its
-    /// output; the queue drains once a new connection restores the integration.
-    IntegrationLost,
-}
+pub use aoe_daemon_client::QueueReason;
 
 /// Worker-liveness inputs the endpoint already computes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

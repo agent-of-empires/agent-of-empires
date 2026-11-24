@@ -101,7 +101,7 @@ pub(super) async fn bind_private(
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Daemon socket has no directory"))?;
-    crate::daemon::transport::prepare_runtime_directory(parent)?;
+    crate::daemon::host_transport::prepare_runtime_directory(parent)?;
     let owner = nix::unistd::geteuid().as_raw();
     match std::fs::symlink_metadata(path) {
         Ok(meta) => {

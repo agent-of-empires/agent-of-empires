@@ -1,8 +1,7 @@
 //! Fixed error discriminators shared by native clients and daemon handlers.
 
-use crate::acp::protocol::TerminalSwitchReason;
-use crate::session::ManagedResumeCause;
 use reqwest::{header::HeaderMap, StatusCode};
+use serde::{Deserialize, Serialize};
 
 pub const ERROR_CODE_HEADER: &str = "aoe-error-code";
 pub const MANAGED_RESUME_CAUSE_HEADER: &str = "aoe-managed-resume-cause";
@@ -145,7 +144,7 @@ impl ApiErrorCode {
         }
     }
 
-    pub(crate) const fn sandbox_migration_message(self) -> Option<&'static str> {
+    pub const fn sandbox_migration_message(self) -> Option<&'static str> {
         match self {
             Self::SandboxMigrationDeferred => Some(
                 "Sandbox migration is pending. Stop other sandbox users, then retry. For bulk migration, stop the daemon and run `aoe migrate`.",
@@ -235,6 +234,178 @@ fn managed_resume_cause(headers: &HeaderMap) -> ManagedResumeCause {
             _ => ManagedResumeCause::ExecutionContextUnattested,
         },
         _ => ManagedResumeCause::ExecutionContextUnattested,
+    }
+}
+
+macro_rules! fresh_recovery_footer {
+    () => {
+        concat!(
+            "Or choose fresh (abandons this AoE association):\n",
+            "aoe session set-session-id <session> \"\"\n",
+            "Then start/restart; old history is not deleted or recovered."
+        )
+    };
+}
+
+macro_rules! recovery_message {
+    ($reason:literal) => {
+        concat!(
+            $reason,
+            "\nConversation preserved. Restore original context, then retry:\n",
+            "aoe session set-session-id <session> <native-id>\n",
+            "Use --store with the exact store/transcript where required.\n",
+            fresh_recovery_footer!()
+        )
+    };
+}
+
+macro_rules! transcript_recovery_message {
+    ($agent:literal) => {
+        concat!(
+            "Managed resume refused: ",
+            $agent,
+            " transcript file is not bound.\n",
+            "The native session ID alone is not enough to authorize resume.\n",
+            "This refusal does not delete the saved conversation.\n",
+            "Manual transcript rebinding is not supported for sandboxed sessions.\n",
+            "If store routing changed, restore the original store configuration.\n",
+            "For host sessions, bind the exact existing transcript file:\n",
+            "aoe session set-session-id <session> <native-id> --store /absolute/path/to/transcript.jsonl\n",
+            "For ",
+            $agent,
+            ", --store must name the file, not its directory.\n",
+            fresh_recovery_footer!()
+        )
+    };
+}
+
+/// Finite reasons safe to present without exposing native diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ManagedResumeCause {
+    #[error("wrapper execution contract is missing")]
+    WrapperContractRequired,
+    #[error("managed command or arguments cannot be attested")]
+    UnsupportedManagedArguments,
+    #[error("OpenCode session schema cannot be attested")]
+    OpenCodeSchemaUnattested,
+    #[error("Pi exact transcript binding is missing")]
+    PiTranscriptBindingRequired,
+    #[error("OMP exact transcript binding is missing")]
+    OmpTranscriptBindingRequired,
+    #[error("Codex conversation cannot be verified in this context")]
+    CodexConversationUnverified,
+    #[error("native execution context cannot be attested")]
+    ExecutionContextUnattested,
+}
+
+impl ManagedResumeCause {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WrapperContractRequired => "wrapper_contract_required",
+            Self::UnsupportedManagedArguments => "unsupported_managed_arguments",
+            Self::OpenCodeSchemaUnattested => "opencode_schema_unattested",
+            Self::PiTranscriptBindingRequired => "pi_transcript_binding_required",
+            Self::OmpTranscriptBindingRequired => "omp_transcript_binding_required",
+            Self::CodexConversationUnverified => "codex_conversation_unverified",
+            Self::ExecutionContextUnattested => "execution_context_unattested",
+        }
+    }
+
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::WrapperContractRequired => recovery_message!(
+                "Managed resume refused: wrapper contract missing.\n\
+                 Restore truthful session.agent_execution_as and\n\
+                 session.agent_config_dir in trusted global/profile config.\n\
+                 Both must match the original agent and store."
+            ),
+            Self::UnsupportedManagedArguments => recovery_message!(
+                "Managed resume refused: unsupported command or arguments.\n\
+                 Remove native selectors and unsupported context overrides."
+            ),
+            Self::OpenCodeSchemaUnattested => recovery_message!(
+                "Managed resume refused: OpenCode schema cannot be attested.\n\
+                 Restore a verified release/build and its original database."
+            ),
+            Self::PiTranscriptBindingRequired => transcript_recovery_message!("Pi"),
+            Self::OmpTranscriptBindingRequired => transcript_recovery_message!("OMP"),
+            Self::CodexConversationUnverified => concat!(
+                "Managed resume refused: cannot verify this Codex conversation here.\n",
+                "It needs a rollout recording this ID and project, in a sandbox's private store\n",
+                "or on a host session with no session.agent_config_dir, Codex profile, or\n",
+                "alternate store routing. A store over AoE's scan limit cannot be verified.\n",
+                "Conversation preserved. Restore that context, then retry.\n",
+                "Or copy agent_session_id from aoe session show <session> --json and\n",
+                "continue inside Codex (AoE drops this association):\n",
+                "aoe session set-session-id <session> \"\"\n",
+                "Restart, then run /resume <native-id> once Codex is idle."
+            ),
+            Self::ExecutionContextUnattested => recovery_message!(
+                "Managed resume refused: execution context cannot be attested.\n\
+                 Restore the original agent configuration and store."
+            ),
+        }
+    }
+}
+
+/// Why a switch to Terminal view starts fresh, can't happen yet, or continues a
+/// conversation other than the one in Structured view. Also the `AoE-Error-Code`
+/// of a refused switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalSwitchReason {
+    AgentNotResumable,
+    NoConversationYet,
+    /// With `continues`: Structured view has no conversation yet, so the switch
+    /// resumes the Session's earlier one, from before Structured view.
+    EarlierConversation,
+    ConversationNotBound,
+    Sandboxed,
+    HandoffPending,
+    NoTerminalTool,
+    ContextUnconfirmed,
+    /// Refusal only: the Session changed during the switch.
+    SessionChanged,
+    /// Check only: the Session isn't in Structured view.
+    NotStructured,
+    /// With `command_decides`: the launch command carries a native session selector.
+    CommandSelectsConversation,
+    /// With `blocked`: the command's native session selector and AoE's own conversation
+    /// would both reach the launch, which refuses them together.
+    CommandSelectorConflict,
+}
+
+impl TerminalSwitchReason {
+    pub const ALL: [Self; 12] = [
+        Self::AgentNotResumable,
+        Self::NoConversationYet,
+        Self::EarlierConversation,
+        Self::ConversationNotBound,
+        Self::Sandboxed,
+        Self::HandoffPending,
+        Self::NoTerminalTool,
+        Self::ContextUnconfirmed,
+        Self::SessionChanged,
+        Self::NotStructured,
+        Self::CommandSelectsConversation,
+        Self::CommandSelectorConflict,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentNotResumable => "agent_not_resumable",
+            Self::NoConversationYet => "no_conversation_yet",
+            Self::EarlierConversation => "earlier_conversation",
+            Self::ConversationNotBound => "conversation_not_bound",
+            Self::Sandboxed => "sandboxed",
+            Self::HandoffPending => "handoff_pending",
+            Self::NoTerminalTool => "no_terminal_tool",
+            Self::ContextUnconfirmed => "context_unconfirmed",
+            Self::SessionChanged => "session_changed",
+            Self::NotStructured => "not_structured",
+            Self::CommandSelectsConversation => "command_selects_conversation",
+            Self::CommandSelectorConflict => "command_selector_conflict",
+        }
     }
 }
 

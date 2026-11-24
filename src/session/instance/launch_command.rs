@@ -1035,7 +1035,7 @@ impl Instance {
                 if !matches!(self.resume_intent, ResumeIntent::Default) {
                     return Err(error);
                 }
-                let cause = ManagedResumeCause::from_error(&error);
+                let cause = super::resume::managed_resume_cause(&error);
                 let recovery = if cause == ManagedResumeCause::CodexConversationUnverified {
                     format!("restore a verifiable context, or clear it with aoe session set-session-id {} \"\", restart, and run /resume {sid} in Codex", self.id)
                 } else {

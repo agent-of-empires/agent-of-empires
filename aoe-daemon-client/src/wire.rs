@@ -3,7 +3,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::session::SessionScope;
+use crate::SessionScope;
 
 #[derive(Serialize, Deserialize)]
 pub struct InstallPreviewBody {
@@ -104,8 +104,8 @@ pub struct CreationTrustFingerprint {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreationTrustReview {
     pub fingerprint: CreationTrustFingerprint,
-    pub merged_hooks: crate::session::HooksConfig,
-    pub repo_hooks: crate::session::HooksConfig,
+    pub merged_hooks: crate::HooksConfig,
+    pub repo_hooks: crate::HooksConfig,
     pub mcp_summaries: Vec<String>,
     pub hooks_need_trust: bool,
     pub mcp_need_trust: bool,
@@ -193,7 +193,7 @@ pub struct CreateSessionBody {
     pub profile: Option<String>,
     /// Structured view requires an ACP-capable agent.
     #[serde(default)]
-    pub view: crate::session::View,
+    pub view: crate::View,
     #[serde(default)]
     pub agent_name: Option<String>,
     #[serde(default)]
@@ -434,7 +434,7 @@ pub struct DeleteProfileQuery {
 pub struct CreateProjectBody {
     /// Profile placement or cross-scope conflict-check context, even for global writes.
     pub profile: String,
-    pub scope: crate::session::ProjectScope,
+    pub scope: crate::ProjectScope,
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -444,11 +444,8 @@ pub struct CreateProjectBody {
     pub default_base_branch: Option<String>,
     #[serde(default)]
     pub pinned: bool,
-    #[serde(
-        default,
-        skip_serializing_if = "crate::session::ProjectOverrides::is_empty"
-    )]
-    pub overrides: crate::session::ProjectOverrides,
+    #[serde(default, skip_serializing_if = "crate::ProjectOverrides::is_empty")]
+    pub overrides: crate::ProjectOverrides,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -499,9 +496,9 @@ pub struct RestartOutcome {
 #[derive(Debug, Clone, Serialize)]
 pub struct StopAuxiliaryBody {
     #[serde(flatten)]
-    pub target: crate::session::AuxiliaryTarget,
+    pub target: crate::AuxiliaryTarget,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub adoption: Option<crate::session::LegacyToolAdoption>,
+    pub adoption: Option<crate::LegacyToolAdoption>,
 }
 
 impl<'de> Deserialize<'de> for StopAuxiliaryBody {
@@ -518,10 +515,10 @@ impl<'de> Deserialize<'de> for StopAuxiliaryBody {
             Tool {
                 tool_name: String,
                 #[serde(default)]
-                adoption: Option<crate::session::LegacyToolAdoption>,
+                adoption: Option<crate::LegacyToolAdoption>,
             },
         }
-        use crate::session::AuxiliaryTarget;
+        use crate::AuxiliaryTarget;
         let (target, adoption) = match Body::deserialize(deserializer)? {
             Body::Host { index } => (AuxiliaryTarget::Host { index }, None),
             Body::Container { index } => (AuxiliaryTarget::Container { index }, None),
@@ -541,20 +538,15 @@ pub struct EnsureToolBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<TerminalSize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub adoption: Option<crate::session::LegacyToolAdoption>,
+    pub adoption: Option<crate::LegacyToolAdoption>,
 }
 
 #[cfg(test)]
 mod prompt_origin_tests {
     use super::*;
-    use crate::acp::state::Event;
 
     #[test]
     fn data_without_a_known_origin_decodes_as_unknown() {
-        let event = |extra: &str| -> Event {
-            serde_json::from_str(&format!(r#"{{"UserPromptSent":{{"text":"hi"{extra}}}}}"#))
-                .unwrap()
-        };
         let row = |extra: &str| -> QueuedPromptEntry {
             serde_json::from_str(&format!(
                 r#"{{"id":"q","seq":0,"text":"hi","created_at":"t"{extra}}}"#
@@ -562,13 +554,6 @@ mod prompt_origin_tests {
             .unwrap()
         };
         for extra in ["", r#","origin":"from_a_newer_daemon""#] {
-            assert!(matches!(
-                event(extra),
-                Event::UserPromptSent {
-                    origin: PromptOrigin::Unknown,
-                    ..
-                }
-            ));
             assert_eq!(row(extra).origin, PromptOrigin::Unknown);
         }
         assert_eq!(row(r#","origin":"cli""#).origin, PromptOrigin::Cli);
@@ -628,10 +613,7 @@ mod legacy_tool_body_tests {
         }
         let plain: StopAuxiliaryBody =
             serde_json::from_value(serde_json::json!({"kind":"host", "index":0})).unwrap();
-        assert_eq!(
-            plain.target,
-            crate::session::AuxiliaryTarget::Host { index: 0 }
-        );
+        assert_eq!(plain.target, crate::AuxiliaryTarget::Host { index: 0 });
         assert!(plain.adoption.is_none());
     }
 }
@@ -735,7 +717,7 @@ pub struct DeleteSessionBody {
     pub use_cleanup_defaults: bool,
     /// Resolve cleanup on the daemon from the reserved row, keeping this caller intent.
     #[serde(default)]
-    pub cleanup_intent: Option<crate::session::deletion::CleanupIntent>,
+    pub cleanup_intent: Option<crate::CleanupIntent>,
     /// Consent is bound to the trash lifecycle selected by the client.
     #[serde(default)]
     pub expected_trashed_at: Option<crate::time::Timestamp>,
@@ -1123,7 +1105,7 @@ pub struct SessionResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lifecycle_reservation: Option<crate::session::LifecycleReservation>,
+    pub lifecycle_reservation: Option<crate::LifecycleReservation>,
     #[serde(default)]
     pub lifecycle_generation: u64,
     /// True when the session's structured-view worker was auto-stopped for
@@ -1138,9 +1120,9 @@ pub struct SessionResponse {
     #[serde(default)]
     pub pane_dead_observed: bool,
     #[serde(default)]
-    pub agent_pane: crate::session::PaneObservation,
+    pub agent_pane: crate::PaneObservation,
     #[serde(default)]
-    pub auxiliary: Vec<crate::session::AuxiliaryObservation>,
+    pub auxiliary: Vec<crate::AuxiliaryObservation>,
     #[serde(default)]
     pub yolo_mode: bool,
     #[serde(default)]
@@ -1287,7 +1269,7 @@ pub struct SessionResponse {
     /// by `list_sessions`; single-session responses leave it `inactive`. See
     /// `session::smart_rename`.
     #[serde(default)]
-    pub smart_rename: crate::session::smart_rename::SmartRenameState,
+    pub smart_rename: crate::SmartRenameState,
     /// Whether the session still carries its auto-generated civilization name.
     /// The sidebar gates the manual "Auto-name now" action on this (it only
     /// targets a still-default session, never overwriting a chosen title), and
@@ -1321,8 +1303,8 @@ pub struct SessionResponse {
     /// How this session is rendered: `structured` (ACP native rendering) or
     /// `terminal` (tmux-backed PTY). The web dashboard branches on this to
     /// pick the structured panels vs the terminal view.
-    #[serde(default, skip_serializing_if = "crate::session::View::is_terminal")]
-    pub view: crate::session::View,
+    #[serde(default, skip_serializing_if = "crate::View::is_terminal")]
+    pub view: crate::View,
     /// Whether the daemon can preserve this agent's context across a future
     /// lifecycle transition. This does not report current start eligibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1346,7 +1328,7 @@ pub struct SessionResponse {
     /// daemon's durable park rather than a browser-side mirror, so the
     /// sidebar badge clears when a resume lands with no tab open (#3514).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rate_limit: Option<crate::acp::state::RateLimitInfo>,
+    pub rate_limit: Option<crate::RateLimitInfo>,
     /// Whether `[acp] rate_limit_auto_resume` is on for this session's
     /// profile, so the rate-limit banner can say whether the park ends by
     /// itself. Set by the list handler; omitted by single-session responses,
@@ -1365,7 +1347,7 @@ pub struct SessionResponse {
     /// What the queue is waiting on, as a prompt sent now would be told. Absent when the
     /// queue is empty or nothing holds it. Set by the list handler.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub queue_reason: Option<crate::acp::dispatch::QueueReason>,
+    pub queue_reason: Option<crate::QueueReason>,
     /// True when this session's agent can run in structured view: a built-in
     /// with an ACP adapter, or a custom agent whose profile config
     /// declares a valid `agent_acp_cmd`. The web terminal view reads
@@ -1397,7 +1379,7 @@ pub struct SessionResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_provider: Option<String>,
     /// True when this session's agent can run a structured ACP `session/fork`,
-    /// per `crate::session::fork::structured_fork_capable`. Resume-only ACP
+    /// as reported by the Daemon. Resume-only ACP
     /// agents (e.g. `aoe-agent`) are ACP-capable yet not forkable, so the web
     /// gates "Fork" on this AND `acp_session_id` rather than on a captured id
     /// alone. Omitted (read as not-forkable) for terminal sessions and
@@ -1539,7 +1521,7 @@ pub struct SessionsEnvelope {
 }
 
 /// Query params for `GET /api/sessions`. `state` shares its vocabulary with
-/// the CLI's `aoe list --state` via [`crate::session::SessionScope`] so a
+/// the CLI's `aoe list --state` via [`crate::SessionScope`] so a
 /// future third caller cannot drift.
 #[derive(Serialize, Deserialize)]
 pub struct ListSessionsQuery {
@@ -1558,7 +1540,7 @@ mod tests {
         let row: SessionResponse = serde_json::from_str(r#"{"id":"a"}"#).unwrap();
         assert_eq!(row.id, "a");
         assert_eq!(row.status, "");
-        assert_eq!(row.view, crate::session::View::Terminal);
+        assert_eq!(row.view, crate::View::Terminal);
         assert_eq!(row.acp_worker_state, AcpWorkerState::Absent);
         assert_eq!(row.acp_worker_start, None);
         assert!(!serde_json::to_string(&row)

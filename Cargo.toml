@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
+members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api", "aoe-daemon-client"]
 
 [package]
 name = "agent-of-empires"
@@ -45,6 +45,7 @@ aoe-settings-derive = { path = "aoe-settings-derive" }
 
 # Plugin manifest and capability types (#268)
 aoe-plugin-api = { path = "aoe-plugin-api" }
+aoe-daemon-client = { path = "aoe-daemon-client" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive", "rc"] }
@@ -73,8 +74,6 @@ indexmap = "2"
 thiserror = "2.0"
 anyhow = "1.0"
 
-# Time handling
-time = { version = "0.3.55", features = ["parsing"] }
 
 # UUID generation
 uuid = { version = "1.23", features = ["v4", "serde"] }
@@ -144,9 +143,6 @@ which = "8.0"
 rusqlite = "0.41"
 
 axum = { version = "0.8", features = ["ws"] }
-# hyper/TokioIo reuse the UID/PID-verified UnixStream, including builds without `web`.
-hyper = { version = "1", features = ["client", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
 # Cross-platform browser launcher: `aoe serve --open`, the plugin host's
 # `ui.open_url`, and structured-view link activation.
 webbrowser = "1"
@@ -238,6 +234,7 @@ serve = ["web"]
 typescript = ["dep:ts-rs"]
 
 [dev-dependencies]
+hyper = { version = "1", features = ["http1"] }
 serial_test = "4.0"
 jsonschema = { version = "0.59.0", default-features = false }
 syn = { version = "3.0", features = ["full", "visit"] }

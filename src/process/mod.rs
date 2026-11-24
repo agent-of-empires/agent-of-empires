@@ -458,7 +458,7 @@ pub fn exec_post_login_opencode_yolo() -> anyhow::Result<()> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) use platform::unix_peer_uid;
+pub(crate) use platform::{unix_peer_pid, unix_peer_uid};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use unix::detach_daemon_stdin;
 
@@ -1397,13 +1397,7 @@ pub(crate) fn prime_processes(
     }
 }
 
-#[derive(
-    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
-)]
-pub struct ProcessBirthIdentity {
-    pub boot_id: String,
-    pub start_id: String,
-}
+pub use aoe_daemon_client::ProcessBirthIdentity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ProcessBirthFingerprint {
@@ -1411,13 +1405,13 @@ pub struct ProcessBirthFingerprint {
     process: [u8; 32],
 }
 
-impl ProcessBirthIdentity {
-    pub(crate) fn fingerprint(&self) -> ProcessBirthFingerprint {
-        use sha2::{Digest, Sha256};
-        ProcessBirthFingerprint {
-            boot: Sha256::digest(self.boot_id.as_bytes()).into(),
-            process: Sha256::digest(self.start_id.as_bytes()).into(),
-        }
+pub(crate) fn process_birth_fingerprint(
+    identity: &ProcessBirthIdentity,
+) -> ProcessBirthFingerprint {
+    use sha2::{Digest, Sha256};
+    ProcessBirthFingerprint {
+        boot: Sha256::digest(identity.boot_id.as_bytes()).into(),
+        process: Sha256::digest(identity.start_id.as_bytes()).into(),
     }
 }
 
@@ -1596,7 +1590,7 @@ impl RunnerProcessGuard {
         };
         let obsolete = obsolete_boot
             || before.as_ref().is_some_and(|birth| {
-                Some(birth.fingerprint()) != fingerprint && fingerprint.is_some()
+                Some(process_birth_fingerprint(birth)) != fingerprint && fingerprint.is_some()
             });
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
@@ -1648,7 +1642,7 @@ impl RunnerProcessGuard {
         let before = runner_birth_identity(self.pid)?;
         let root_attested = before
             .as_ref()
-            .is_some_and(|birth| Some(birth.fingerprint()) == self.fingerprint);
+            .is_some_and(|birth| Some(process_birth_fingerprint(birth)) == self.fingerprint);
         anyhow::ensure!(
             self.fingerprint.is_some() || before.is_none(),
             "runner birth identity is unattested; confirm external settlement before recovery"
