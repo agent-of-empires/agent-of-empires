@@ -665,3 +665,27 @@ async fn restoring_a_session_the_filter_hides_selects_its_own_header() {
         assert_eq!(env.view.selected_group.as_deref(), Some("util"));
     }
 }
+
+/// Headers count the rows that need you, and the "Needs you" filter keeps only those rows,
+/// in their usual places and under their own headers.
+#[test]
+#[serial]
+fn needs_you_counts_on_headers_and_filters_the_list() {
+    let mut env = env_with_stopped(true);
+    let waiting = select_session(&mut env, "util-stopped-a");
+    let error = select_session(&mut env, "ops-stopped-b");
+    publish_statuses(
+        &mut env.view,
+        &[(&waiting, Status::Waiting), (&error, Status::Error)],
+    );
+    assert!(header_text(&env.view, "util").contains("util (3) \u{25cf}1"));
+    assert!(header_text(&env.view, "ops").contains("ops (2) \u{25cf}1"));
+
+    env.view.toggle_needs_you_only();
+    let mut shown = session_titles(&env.view);
+    shown.sort();
+    assert_eq!(shown, ["ops-stopped-b", "util-stopped-a"]);
+
+    env.view.toggle_needs_you_only();
+    assert_eq!(session_titles(&env.view).len(), 6);
+}

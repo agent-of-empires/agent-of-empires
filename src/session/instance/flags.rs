@@ -491,6 +491,16 @@ impl Instance {
     /// to land on (e.g. the `w`/jump-to-next-attention passes) use this
     /// instead of the per-flag calls so a row in any sink state is uniformly
     /// excluded.
+    /// Waiting on a person, in Error, or flagged urgent, and not put away. The web
+    /// dashboard's `sessionNeedsAttention` reads the same states.
+    pub fn needs_you(&self) -> bool {
+        !self.is_dismissed()
+            && (matches!(
+                self.status,
+                crate::session::Status::Waiting | crate::session::Status::Error
+            ) || self.is_urgent())
+    }
+
     pub fn is_dismissed(&self) -> bool {
         self.is_trashed() || self.is_snoozed() || self.is_archived() || self.is_ignored()
     }

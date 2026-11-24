@@ -3712,6 +3712,7 @@ impl HomeView {
             ActionId::TogglePreviewInfo => self.toggle_preview_info(),
             ActionId::ToggleSplitTerminal => self.toggle_split_terminal(),
             ActionId::ToggleHideStopped => self.toggle_hide_stopped_in_groups(),
+            ActionId::ToggleNeedsYou => self.toggle_needs_you_only(),
             ActionId::ToggleDiagnostics => self.toggle_diagnostics(),
             ActionId::OpenSystemHealth => self.open_system_health(),
             ActionId::SortPicker => self.show_sort_picker(),
@@ -4854,7 +4855,8 @@ impl HomeView {
                 // survived (#2489). Snoozed and archived rows are the same explicit
                 // "don't bother me" sink states.
                 let is_actionable = !inst.is_dismissed()
-                    && (inst.status == Status::Waiting
+                    && (inst.needs_you()
+                        || inst.status == Status::Waiting
                         || matches!(inst.idle_age(), Some(age) if age < window)
                         || (crate::session::unread_enabled() && inst.is_unread()));
                 if is_actionable {

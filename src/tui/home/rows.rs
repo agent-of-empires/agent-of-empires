@@ -183,6 +183,35 @@ impl HomeView {
         self.end_live_send_if_hidden();
     }
 
+    pub(super) fn toggle_needs_you_only(&mut self) {
+        self.needs_you_only = !self.needs_you_only;
+        self.rebuild_flat_items_keeping_cursor();
+        self.update_selected();
+        self.flash_status(if self.needs_you_only {
+            "Showing only sessions that need you"
+        } else {
+            "Showing every session"
+        });
+    }
+
+    /// Sessions under the header at `path` that need you. Under Repository a header
+    /// holds the rows at or beneath its `repo/group` path; under My groups, its own
+    /// profile's rows at or beneath its group path.
+    pub(super) fn needs_you_under(&self, path: &str, profile: Option<&str>) -> usize {
+        let prefix = format!("{path}/");
+        let within = |p: &str| p == path || p.starts_with(&prefix);
+        self.cloned_instances_in_active_view()
+            .iter()
+            .filter(|inst| inst.needs_you())
+            .filter(|inst| match self.group_by {
+                GroupByMode::Project => within(&project_view_path(inst)),
+                GroupByMode::Group => {
+                    within(&inst.group_path) && profile.is_none_or(|p| inst.source_profile == p)
+                }
+            })
+            .count()
+    }
+
     pub(super) fn toggle_hide_stopped_in_groups(&mut self) {
         self.hide_stopped_in_groups = !self.hide_stopped_in_groups;
         self.rebuild_flat_items_keeping_cursor();
@@ -260,7 +289,10 @@ impl HomeView {
             return self.build_flat_items_by_project(hide_stopped);
         }
 
-        let pool = self.shown_in_groups(self.cloned_instances_in_active_view(), hide_stopped);
+        let mut pool = self.shown_in_groups(self.cloned_instances_in_active_view(), hide_stopped);
+        if self.needs_you_only {
+            pool.retain(Instance::needs_you);
+        }
         let mut items = if let Some(profile) = &self.active_profile {
             self.group_trees
                 .get(profile)
@@ -285,6 +317,7 @@ impl HomeView {
         let mut grouped: Vec<Instance> = self
             .cloned_instances_in_active_view()
             .into_iter()
+            .filter(|inst| !self.needs_you_only || inst.needs_you())
             .map(|mut inst| {
                 inst.group_path = if inst.is_archived() || inst.is_trashed() {
                     project_group_key(&inst)
@@ -334,10 +367,15 @@ impl HomeView {
                 headers.push((rank(inst.repo_path()), Group::new(label, label)));
             }
         }
-        for project in crate::session::projects::unpopulated_projects(
-            &populated_labels,
-            &self.registered_projects,
-        ) {
+        let unpopulated = if self.needs_you_only {
+            Vec::new()
+        } else {
+            crate::session::projects::unpopulated_projects(
+                &populated_labels,
+                &self.registered_projects,
+            )
+        };
+        for project in unpopulated {
             headers.push((
                 rank(&project.path),
                 Group::new(&project.label, &project.label),

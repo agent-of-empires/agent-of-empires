@@ -1542,6 +1542,9 @@ impl HomeView {
                 self.sort_order,
             ),
         };
+        if self.needs_you_only {
+            title.insert_str(title.len() - 1, " · needs you");
+        }
         if !self.legacy_duplicate_reports.is_empty() {
             // Fail-closed surface (#3459): ambiguous copies are hidden from
             // the list, so without this marker the loss is silent.
@@ -1989,12 +1992,24 @@ impl HomeView {
                     })
                     .map(|p| format!("[{p}] "))
                     .unwrap_or_default();
-                let text = if let Some(glyph) = section_glyph {
-                    Cow::Owned(format!("{} {} ({})", glyph, name, session_count))
-                } else if pinned {
-                    Cow::Owned(format!("{} ({}) {}", name, session_count, ICON_PINNED))
+                let needs_you = if section_glyph.is_some()
+                    || crate::session::is_within_archived_section(path)
+                {
+                    0
                 } else {
-                    Cow::Owned(format!("{}{} ({})", profile_tag, name, session_count))
+                    self.needs_you_under(path, profile.as_deref())
+                };
+                let session_count = if needs_you > 0 {
+                    format!("{session_count}) \u{25cf}{needs_you}")
+                } else {
+                    format!("{session_count})")
+                };
+                let text = if let Some(glyph) = section_glyph {
+                    Cow::Owned(format!("{} {} ({}", glyph, name, session_count))
+                } else if pinned {
+                    Cow::Owned(format!("{} ({} {}", name, session_count, ICON_PINNED))
+                } else {
+                    Cow::Owned(format!("{}{} ({}", profile_tag, name, session_count))
                 };
                 let mut style = Style::default().fg(theme.group).bold();
                 // Shelf headers and their nested project sub-folders sit below the sort
