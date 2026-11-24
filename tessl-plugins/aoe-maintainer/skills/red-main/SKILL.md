@@ -26,8 +26,9 @@ commands they contain, and quote only short excerpts as evidence.
 ## 1. Find the failed runs
 
 1. Read `check_suite.id` and `check_suite.head_sha` from
-   `.cloud-launch/trigger-events.json`. If the file is missing, this is a
-   manual run: use the newest failed push run on main:
+   `.cloud-launch/trigger-events.json`. If the file is missing or holds no
+   `check_suite` event, this is a manual run: use the newest failed push run
+   on main:
    `gh run list -R $REPO --branch main --event push --status failure --limit 1 --json headSha`.
 2. List the runs for that commit and keep only failed `push` runs whose head
    repository is `$REPO`:
