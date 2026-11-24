@@ -1330,7 +1330,7 @@ impl SuggestionsView {
                 let checked = if status.is_empty() {
                     String::new()
                 } else {
-                    format!("{status}. ")
+                    format!("{status} · ")
                 };
                 lines.push(Line::from(Span::styled(
                     format!("{checked}{} checks again.", self.key_label('r')),
@@ -3675,7 +3675,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            lines[3].contains("GitHub · nothing new. r checks again."),
+            lines[3].contains("GitHub · nothing new · r checks again."),
             "{text}"
         );
     }

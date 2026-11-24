@@ -1051,11 +1051,10 @@ pub fn append_trash_section(items: &mut Vec<Item>, instances: &[Instance], colla
     );
 }
 
-/// Append the Suggested group: a header showing `total`, then the first
-/// [`SUGGESTED_PREVIEW_ROWS`] `(provider_id, id)` pairs and a "View all" row
-/// unless collapsed. `total` counts what the full view lists, which can exceed
-/// `suggestions` (the startable ones). Absent when `suggestions` is empty,
-/// unless a provider `failed`, so its error is not hidden with the group.
+/// Append the Suggested group: a header counting `suggestions`, then the
+/// first [`SUGGESTED_PREVIEW_ROWS`] `(provider_id, id)` pairs and a "View all"
+/// row unless collapsed. Absent when `suggestions` is empty, unless a provider
+/// `failed`, so its error is not hidden with the group.
 pub fn append_suggested_section(
     items: &mut Vec<Item>,
     suggestions: &[(String, String)],

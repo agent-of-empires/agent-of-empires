@@ -345,11 +345,6 @@ impl HomeView {
                     super::bindings::ActionId::ToggleArchive,
                     self.strict_hotkeys,
                 );
-                let enter = if entry.started_session.is_some() {
-                    "open"
-                } else {
-                    "start"
-                };
                 let dismiss_verb = if entry.dismissed {
                     "restore"
                 } else {
@@ -358,11 +353,11 @@ impl HomeView {
                 let keys = if frame.area().width >= WIDE_KEY_LINE_COLS && entry.source_url.is_some()
                 {
                     format!(
-                        "↵ {enter}  {dismiss} {dismiss_verb}  ^K open in {}",
+                        "↵ start  {dismiss} {dismiss_verb}  ^K open in {}",
                         entry.provider
                     )
                 } else {
-                    format!("↵ {enter}  {dismiss} {dismiss_verb}  ^K more")
+                    format!("↵ start  {dismiss} {dismiss_verb}  ^K more")
                 };
                 lines.push(Line::from(Span::styled(keys, dim)));
                 ("Suggestion".to_string(), lines)
