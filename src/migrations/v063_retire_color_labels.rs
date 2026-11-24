@@ -14,13 +14,7 @@ const REPO_APPEARANCE_KEY: &str = "aoe-repo-appearance-v1";
 
 pub fn run() -> Result<()> {
     run_in(&crate::session::get_app_dir()?)?;
-    let dropped = crate::session::config::update_app_state(|state| {
-        state.web_ui_state.remove(REPO_APPEARANCE_KEY).is_some()
-    })?;
-    if dropped {
-        info!(target: "migrations.v063", "dropped web UI repo appearance state");
-    }
-    Ok(())
+    drop_repo_appearance(&crate::session::config::state_path()?)
 }
 
 fn run_in(app_dir: &Path) -> Result<()> {
@@ -49,6 +43,35 @@ fn drop_row_colors(path: &Path) -> Result<()> {
     let dropped = sessions_file::heal_rows(path, &content, |row| row.remove("color").is_some())?;
     if dropped > 0 {
         info!(target: "migrations.v063", dropped, path = %path.display(), "dropped session color labels");
+    }
+    Ok(())
+}
+
+/// Edits `state.toml` as plain TOML so an unrelated invalid value cannot block the
+/// upgrade; a file that is not TOML keeps its bytes.
+fn drop_repo_appearance(path: &Path) -> Result<()> {
+    let outcome = crate::session::LockedDataFile::open(path)?.update(
+        |content| match content.parse::<toml::Table>() {
+            Ok(table) => Ok(Some(table)),
+            Err(error) => {
+                warn!(target: "migrations.v063", path = %path.display(), %error, "Preserved unparseable state.toml; its repo appearance entry is ignored");
+                Ok(None)
+            }
+        },
+        |state: &Option<toml::Table>| match state {
+            Some(table) => Ok(toml::to_string_pretty(table)?),
+            None => Ok(String::new()),
+        },
+        |state| -> std::result::Result<bool, std::convert::Infallible> {
+            Ok(state
+                .as_mut()
+                .and_then(|table| table.get_mut("web_ui_state"))
+                .and_then(toml::Value::as_table_mut)
+                .is_some_and(|ui| ui.remove(REPO_APPEARANCE_KEY).is_some()))
+        },
+    )?;
+    if let Ok((true, _)) = outcome {
+        info!(target: "migrations.v063", "dropped web UI repo appearance state");
     }
     Ok(())
 }
@@ -109,6 +132,23 @@ mod tests {
                     Some("[web]\nmcp_enabled = true\n"),
                 ),
                 (Some(kept), Some(kept)),
+                (None, None),
+            ],
+        );
+    }
+
+    #[test]
+    fn repo_appearance_cleanup_tolerates_a_damaged_state_file() {
+        let invalid = "has_seen_welcome = \"true\"\n\n[web_ui_state]\naoe-repo-appearance-v1 = \"{}\"\nkept = \"1\"\n";
+        assert_rewrites(
+            "state.toml",
+            drop_repo_appearance,
+            &[
+                (
+                    Some(invalid),
+                    Some("has_seen_welcome = \"true\"\n\n[web_ui_state]\nkept = \"1\"\n"),
+                ),
+                (Some("not = [toml"), Some("not = [toml")),
                 (None, None),
             ],
         );
