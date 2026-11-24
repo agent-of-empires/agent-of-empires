@@ -1,33 +1,23 @@
 // @vitest-environment jsdom
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import type { RepoGroup, SessionResponse, SessionStatus, Workspace } from "../types";
 import {
-  SIDEBAR_SORT_MODE_KEY,
-  compareWorkspacesByAttention,
-  compareWorkspacesByLastActivityDesc,
+  compareWorkspacesByCustomOrder,
+  compareWorkspacesByName,
   compareWorkspacesByPluginSort,
-  compareWorkspacesForComputedSortMode,
   repoGroupPluginSortValue,
   workspacePluginSortValue,
-  loadSidebarSortMode,
   nextAttentionSessionId,
-  repoGroupAttentionRank,
   repoGroupHasLiveWorkspace,
-  repoGroupIsUrgent,
   repoGroupLastActivityMs,
-  saveSidebarSortMode,
-  sessionAttentionRank,
   sessionNeedsAttention,
   snoozeTimestampCloseEnough,
   triageMenuShape,
   triageStateOf,
   workspaceAttentionCount,
-  workspaceAttentionRank,
-  workspaceIsFavorited,
   workspaceIsPinned,
   workspaceIsSunk,
-  workspaceIsUrgent,
   workspaceLastActivityMs,
   workspaceTriageTier,
 } from "../sidebarSort";
@@ -197,123 +187,37 @@ describe("triage", () => {
   });
 });
 
-describe("compareWorkspacesByLastActivityDesc", () => {
+describe("Name sort", () => {
+  const titled = (id: string, title: string, over: Partial<SessionResponse> = {}) => ws1(id, { title, ...over });
   it.each<[string, Workspace[], string[]]>([
-    ["newer first", [ws1("older"), ws1("newer", { created_at: "2025-09-01T00:00:00Z" })], ["newer", "older"]],
-    ["id tie-break", [ws1("b"), ws1("a"), ws1("c")], ["a", "b", "c"]],
-    ["id tie-break without timestamps", [ws1("b", noTimestamp), ws1("a", noTimestamp)], ["a", "b"]],
+    ["A to Z ignoring case", [titled("1", "beta"), titled("2", "Alpha"), titled("3", "gamma")], ["2", "1", "3"]],
+    ["id when titles tie", [titled("b", "same"), titled("a", "Same")], ["a", "b"]],
     [
-      "archived sinks despite activity",
-      [ws1("archived", { created_at: "2025-09-01T00:00:00Z", ...archived }), ws1("live")],
-      ["live", "archived"],
+      "pinned first, sunk last",
+      [titled("z", "zeta", { pinned_at: TS }), titled("a", "alpha", archived), titled("m", "mu")],
+      ["z", "m", "a"],
     ],
-    [
-      "pinned floats despite activity",
-      [ws1("live", { created_at: "2025-09-01T00:00:00Z" }), ws1("pinned", { pinned_at: TS })],
-      ["pinned", "live"],
-    ],
-  ])("%s", (_name, list, expected) => {
-    expect(ids([...list].sort(compareWorkspacesByLastActivityDesc))).toEqual(expected);
+  ])("orders %s", (_name, list, expected) => {
+    expect(ids([...list].sort(compareWorkspacesByName))).toEqual(expected);
+  });
+
+  it("orders a multi-session workspace by its branch", () => {
+    const multi = { ...workspace("m", [session({ id: "m1", title: "zzz" }), session({ id: "m2" })]), branch: "aaa" };
+    expect(ids([titled("b", "bbb"), multi].sort(compareWorkspacesByName))).toEqual(["m", "b"]);
   });
 });
 
-describe("attention sort (#1640)", () => {
-  it.each<[SessionStatus, number]>([
-    ["Waiting", 0],
-    ["Error", 1],
-    ["Idle", 2],
-    ["Unknown", 3],
-    ["Running", 4],
-    ["Stopped", 5],
-    ["Starting", 6],
-  ])("sessionAttentionRank(%s) is %s", (status, rank) => {
-    expect(sessionAttentionRank(session({ status }))).toBe(rank);
-  });
-
-  it("sinks archived and snoozed sessions to rank 99", () => {
-    expect(sessionAttentionRank(session({ status: "Waiting", ...archived }))).toBe(99);
-    expect(sessionAttentionRank(session({ status: "Error", ...snoozed }))).toBe(99);
-  });
-
-  it("aggregates the best rank, ignoring sunk sessions", () => {
-    const statuses = (list: [SessionStatus, Partial<SessionResponse>?][]) =>
-      workspace(
-        "w",
-        list.map(([status, over], i) => session({ id: `s${i}`, status, ...over })),
-      );
-    expect(workspaceAttentionRank(statuses([["Running"], ["Waiting"], ["Idle"]]))).toBe(0);
-    expect(workspaceAttentionRank(statuses([["Running"], ["Waiting", snoozed]]))).toBe(4);
-    expect(repoGroupAttentionRank([ws1("a", { status: "Running" }), ws1("b", { status: "Waiting" })])).toBe(0);
-  });
-
-  it("urgent and favorited flags aggregate across sessions and workspaces", () => {
-    expect(workspaceIsUrgent(workspace("w", [session({ id: "a" }), session({ id: "b", urgent: true })]))).toBe(true);
-    expect(workspaceIsUrgent(ws1("w"))).toBe(false);
-    expect(workspaceIsFavorited(ws1("w", { favorited: true }))).toBe(true);
-    expect(workspaceIsFavorited(ws1("w"))).toBe(false);
-    expect(repoGroupIsUrgent([ws1("a"), ws1("b", { urgent: true })])).toBe(true);
-    expect(repoGroupIsUrgent([ws1("a")])).toBe(false);
-  });
-
-  const status = (id: string, s: SessionStatus, over: Partial<SessionResponse> = {}) =>
-    ws1(id, { status: s, created_at: TS, ...over });
-
-  it.each<[string, Workspace[], string[]]>([
-    [
-      "status rank",
-      [
-        status("stopped", "Stopped"),
-        status("running", "Running"),
-        status("idle", "Idle"),
-        status("error", "Error"),
-        status("waiting", "Waiting"),
-      ],
-      ["waiting", "error", "idle", "running", "stopped"],
-    ],
-    [
-      "urgent across ranks",
-      [status("waiting", "Waiting"), status("urgent", "Running", { urgent: true })],
-      ["urgent", "waiting"],
-    ],
-    ["favorite within a rank", [status("plain", "Idle"), status("fav", "Idle", { favorited: true })], ["fav", "plain"]],
-    [
-      "newest within a rank",
-      [
-        status("older", "Idle", { created_at: "2025-01-01T00:00:00Z" }),
-        status("newer", "Idle", { created_at: "2025-07-01T00:00:00Z" }),
-      ],
-      ["newer", "older"],
-    ],
-    [
-      "pinned and sunk tiers",
-      [
-        status("waiting", "Waiting"),
-        status("sunk", "Waiting", archived),
-        status("pinned", "Stopped", { pinned_at: TS }),
-      ],
-      ["pinned", "waiting", "sunk"],
-    ],
-    ["id without timestamps", [status("b", "Idle", noTimestamp), status("a", "Idle", noTimestamp)], ["a", "b"]],
-  ])("orders by %s", (_name, list, expected) => {
-    expect(ids([...list].sort(compareWorkspacesByAttention))).toEqual(expected);
-  });
-
-  it("uses the attention comparator only for attention mode", () => {
-    const list = [status("idle", "Idle"), status("waiting", "Waiting")];
-    expect(ids([...list].sort(compareWorkspacesForComputedSortMode("attention")))).toEqual(["waiting", "idle"]);
-    expect(compareWorkspacesForComputedSortMode("lastActivity")).toBe(compareWorkspacesByLastActivityDesc);
-    expect(compareWorkspacesForComputedSortMode("manual")).toBe(compareWorkspacesByLastActivityDesc);
-  });
-});
-
-describe("sort mode storage", () => {
-  beforeEach(() => window.localStorage.clear());
-
-  it.each(["attention", "manual"] as const)("round-trips %s", (mode) => {
-    saveSidebarSortMode(mode === "manual" ? "lastActivity" : "manual");
-    saveSidebarSortMode(mode);
-    expect(window.localStorage.getItem(SIDEBAR_SORT_MODE_KEY)).toBe(mode);
-    expect(loadSidebarSortMode()).toBe(mode);
+describe("Custom sort", () => {
+  it("follows the shared order, with workspaces it does not list yet on top, newest first", () => {
+    const list = [
+      ws1("ranked-b"),
+      ws1("ranked-a"),
+      ws1("new-old", { created_at: "2025-01-01T00:00:00Z" }),
+      ws1("new-new", { created_at: "2025-09-01T00:00:00Z" }),
+      ws1("pinned", { pinned_at: TS }),
+    ];
+    const compare = compareWorkspacesByCustomOrder(["ranked-a", "pinned", "ranked-b"]);
+    expect(ids([...list].sort(compare))).toEqual(["pinned", "new-new", "new-old", "ranked-a", "ranked-b"]);
   });
 });
 
@@ -400,24 +304,20 @@ describe("plugin tone attention (#4446)", () => {
     }) as PluginUiEntry;
   const attentionOf = (...entries: PluginUiEntry[]) => pluginAttentionSessionIds(entries);
 
-  it.each<[string, unknown, SessionStatus, Partial<SessionResponse>, boolean, number]>([
-    ["danger on an idle session", "danger", "Idle", {}, true, 1],
-    ["warn on an idle session", "warn", "Idle", {}, true, 1],
-    ["danger on a running session", "danger", "Running", {}, true, 1],
-    ["danger on an errored session", "danger", "Error", {}, true, 1],
-    ["danger keeps Waiting ahead", "danger", "Waiting", {}, true, 0],
-    ["info", "info", "Idle", {}, false, 2],
-    ["success", "success", "Idle", {}, false, 2],
-    ["neutral", "neutral", "Idle", {}, false, 2],
-    ["a missing tone", undefined, "Idle", {}, false, 2],
-    ["an unknown tone", "purple", "Idle", {}, false, 2],
-    ["danger but archived", "danger", "Idle", archived, false, 99],
-    ["warn but snoozed", "warn", "Running", snoozed, false, 99],
-  ])("plugin tone: %s", (_name, tone, status, over, needs, rank) => {
+  it.each<[string, unknown, SessionStatus, Partial<SessionResponse>, boolean]>([
+    ["danger on an idle session", "danger", "Idle", {}, true],
+    ["warn on an idle session", "warn", "Idle", {}, true],
+    ["danger on a running session", "danger", "Running", {}, true],
+    ["info", "info", "Idle", {}, false],
+    ["success", "success", "Idle", {}, false],
+    ["neutral", "neutral", "Idle", {}, false],
+    ["a missing tone", undefined, "Idle", {}, false],
+    ["an unknown tone", "purple", "Idle", {}, false],
+    ["danger but archived", "danger", "Idle", archived, false],
+    ["warn but snoozed", "warn", "Running", snoozed, false],
+  ])("plugin tone: %s", (_name, tone, status, over, needs) => {
     const s = session({ id: "s1", status, ...over });
-    const attention = attentionOf(entry("s1", tone));
-    expect(sessionNeedsAttention(s, attention)).toBe(needs);
-    expect(sessionAttentionRank(s, attention)).toBe(rank);
+    expect(sessionNeedsAttention(s, attentionOf(entry("s1", tone)))).toBe(needs);
   });
 
   it("only counts a session-scoped row-column entry for that session", () => {
@@ -458,57 +358,5 @@ describe("plugin tone attention (#4446)", () => {
     );
     expect(workspaceAttentionCount(workspace("w", sessions), attention)).toBe(2);
     expect(workspaceAttentionCount(workspace("w", sessions))).toBe(0);
-  });
-
-  const sortWith = (list: Workspace[], attention: ReadonlySet<string>) =>
-    ids([...list].sort(compareWorkspacesForComputedSortMode("attention", attention)));
-  const idle = (id: string, over: Partial<SessionResponse> = {}) => ws1(id, { created_at: TS, ...over });
-
-  it.each<[string, Workspace[], PluginUiEntry[], string[]]>([
-    [
-      "ahead of an otherwise equal session",
-      [idle("plain"), idle("toned")],
-      [entry("toned-s", "danger")],
-      ["toned", "plain"],
-    ],
-    ["ahead for warn too", [idle("plain"), idle("toned")], [entry("toned-s", "warn")], ["toned", "plain"]],
-    [
-      "ahead of Running, behind Waiting",
-      [idle("running", { status: "Running" }), idle("toned"), idle("waiting", { status: "Waiting" })],
-      [entry("toned-s", "danger")],
-      ["waiting", "toned", "running"],
-    ],
-    [
-      "behind urgent",
-      [idle("toned"), idle("urgent", { status: "Running", urgent: true })],
-      [entry("toned-s", "danger")],
-      ["urgent", "toned"],
-    ],
-    [
-      "tied with Error, then newest first",
-      [idle("error", { status: "Error", created_at: "2025-01-01T00:00:00Z" }), idle("toned")],
-      [entry("toned-s", "danger")],
-      ["toned", "error"],
-    ],
-    [
-      "unchanged for calm tones",
-      [idle("a", { status: "Running" }), idle("b")],
-      [entry("a-s", "info"), entry("b-s", "neutral")],
-      ["b", "a"],
-    ],
-    [
-      "below the pinned tier and above the sunk tier",
-      [idle("toned-sunk", archived), idle("toned"), idle("pinned", { pinned_at: TS, status: "Stopped" })],
-      [entry("toned-sunk-s", "danger"), entry("toned-s", "danger")],
-      ["pinned", "toned", "toned-sunk"],
-    ],
-  ])("sorts a toned session %s", (_name, list, entries, expected) => {
-    expect(sortWith(list, attentionOf(...entries))).toEqual(expected);
-  });
-
-  it("ranks a repo group by its toned session", () => {
-    const group = [ws1("a", { status: "Running" }), ws1("b", { status: "Idle" })];
-    expect(repoGroupAttentionRank(group)).toBe(2);
-    expect(repoGroupAttentionRank(group, attentionOf(entry("a-s", "warn")))).toBe(1);
   });
 });

@@ -341,7 +341,6 @@ test.describe("scratch sessions", () => {
           id: "alpha",
           title: "alpha-session",
           project_path: "/home/user/repo-alpha",
-          group_path: "/home/user",
         }),
         scratch("scr-1", "scratch-one"),
         scratch("scr-2", "scratch-two"),

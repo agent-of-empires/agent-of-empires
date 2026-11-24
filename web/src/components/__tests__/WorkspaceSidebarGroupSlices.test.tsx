@@ -5,15 +5,14 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 
 import { WorkspaceSidebar } from "../WorkspaceSidebar";
 import { SessionActionProvider } from "../sidebar/SessionActionProvider";
-import { buildSessionGroups } from "../../lib/sidebarGroups";
 import type { SessionResponse, Workspace } from "../../lib/types";
-import { makeSession, makeWorkspace, stubFetch } from "./fixtures";
+import { makeSession, makeWorkspace, sidebarProps, stubFetch } from "./fixtures";
 
 type Props = React.ComponentProps<typeof WorkspaceSidebar>;
 const noop = () => {};
 const PAST = "2026-01-01T00:00:00Z";
 
-/** One worktree whose sessions the group axis splits across two groups under the same workspace id. */
+/** One worktree whose sessions My groups splits across two groups under the same workspace id. */
 const split = (secondPinned: string | null): Workspace =>
   makeWorkspace(
     "w",
@@ -29,44 +28,7 @@ const split = (secondPinned: string | null): Workspace =>
 
 const sidebar = (ws: Workspace, onNew: Props["onNew"] = noop) => (
   <SessionActionProvider sessions={ws.sessions} runtimeEpoch="boot" observedById={{}} onSessionMutation={noop}>
-    <WorkspaceSidebar
-      {...({
-        observedById: {},
-        runtimeEpoch: "boot",
-        onSessionMutation: noop,
-        groups: buildSessionGroups([ws], {
-          idleDecayWindowMs: 60_000,
-          sortMode: "lastActivity",
-          isCollapsed: () => false,
-        }),
-        nestedGroups: [],
-        orgGroups: [],
-        onToggleSubgroup: noop,
-        onToggleOrg: noop,
-        onToggleOrgRepo: noop,
-        onReorderWorkspaces: noop,
-        onReorderGroups: noop,
-        activeId: null,
-        activeSessionId: null,
-        open: true,
-        onOpenChange: noop,
-        onSelect: vi.fn(),
-        onToggleGroup: noop,
-        onNew,
-        onCreateSession: noop,
-        savedProjects: [],
-        onAddProject: noop,
-        onEditProject: noop,
-        onRemoveProject: noop,
-        onSettings: noop,
-        sortMode: "lastActivity",
-        onSortModeChange: noop,
-        pluginSortRef: null,
-        onPluginSortChange: noop,
-        axis: "group",
-        onAxisChange: noop,
-      } satisfies Props)}
-    />
+    <WorkspaceSidebar {...sidebarProps([ws], { onNew })} />
   </SessionActionProvider>
 );
 
@@ -104,7 +66,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("expanded rows when the group axis splits one workspace across groups", () => {
+describe("expanded rows when My groups splits one workspace across groups", () => {
   it("reconciles a pin on a later slice's child, so a later canonical unpin is not masked", async () => {
     const { rerender } = render(sidebar(split(null)));
     // Only the beta slice ([s2, s3]) is expandable; alpha holds s1 alone.

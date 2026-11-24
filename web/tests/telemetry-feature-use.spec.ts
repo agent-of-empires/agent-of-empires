@@ -17,8 +17,9 @@ async function recordFeatureUses(page: Page): Promise<string[]> {
 }
 
 test.describe("Feature-use telemetry", () => {
-  test("sort picker, attention shortcut and cheat code post their registry names", async ({ page }) => {
+  test("view menu, attention shortcut and cheat code post their registry names", async ({ page }) => {
     await mockStaticApis(page);
+    await page.route("**/api/sidebar-view", (r) => r.fulfill({ json: { group_by: "project", sort: "name" } }));
     await page.route(/\/api\/sessions(\?.*)?$/, (r) =>
       r.fulfill({
         headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
@@ -42,9 +43,9 @@ test.describe("Feature-use telemetry", () => {
 
     const toggle = page.locator("[data-testid='sidebar-view-toggle']");
     await toggle.click();
-    await page.locator("[data-testid='sidebar-sort-option-attention']").click();
-    await expect(toggle).toHaveAttribute("data-sort-mode", "attention");
-    await expect.poll(() => sent).toContain("sort_attention");
+    await page.locator("[data-testid='sidebar-view-sort-name']").click();
+    await expect(toggle).toHaveAttribute("data-sort", "name");
+    await expect.poll(() => sent).toContain("sort_az");
 
     await page.locator("body").press("a");
     await expect.poll(() => sent).toContain("attention_jump");

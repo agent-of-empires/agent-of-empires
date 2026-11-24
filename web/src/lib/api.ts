@@ -194,9 +194,18 @@ export type SessionSettingOutcome =
   | { outcome: "committed"; mutation: SessionMutation }
   | { outcome: Exclude<SaveOutcome, "committed"> };
 
+/** The one grouping and sort every Client shows, owned by the Daemon. */
+export interface SidebarView {
+  group_by: "project" | "group";
+  sort: "custom" | "name";
+}
+
 export interface SessionsEnvelope {
   sessions: SessionResponse[];
   workspace_ordering: string[];
+  /** Repository paths in the shared Custom order of the Repository headers. */
+  repository_order?: string[];
+  sidebar_view?: SidebarView;
   /** Trashed rows in the whole snapshot; the list itself omits them. */
   trashed_count?: number;
   cursor: RuntimeCursor;
@@ -297,12 +306,28 @@ export function fetchRecentProjects(): Promise<RecentProjectsEnvelope | null> {
   return fetchJson<RecentProjectsEnvelope>("/api/recent-projects");
 }
 
-export async function updateWorkspaceOrdering(order: string[]): Promise<boolean> {
+/** An omitted list keeps its value on the Daemon; an empty one clears it. */
+export interface WorkspaceOrderingPatch {
+  order?: string[];
+  repositories?: string[];
+}
+
+/** The receipt cursor of a committed write, or null when it failed or carried none. */
+async function writeReceipt(url: string, init: RequestInit): Promise<RuntimeCursor | null> {
   try {
-    return await fetchOk("/api/workspace-ordering", jsonInit("PUT", { order }));
+    const res = await fetch(url, init);
+    return res.ok ? runtimeCursor(res) : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+export function updateWorkspaceOrdering(patch: WorkspaceOrderingPatch): Promise<RuntimeCursor | null> {
+  return writeReceipt("/api/workspace-ordering", jsonInit("PUT", patch));
+}
+
+export function updateSidebarView(patch: Partial<SidebarView>): Promise<RuntimeCursor | null> {
+  return writeReceipt("/api/sidebar-view", jsonInit("PATCH", patch));
 }
 
 export interface EnsureSessionResult {

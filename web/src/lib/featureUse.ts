@@ -2,15 +2,11 @@
 // Accessory dashboard features the daemon counts on `/api/telemetry/feature-use`.
 // Mirrors the registry in `src/telemetry/feature_use.rs`; off-list names get a 400.
 export type FeatureUse =
-  | "sort_manual"
-  | "sort_last_activity"
-  | "sort_attention"
+  | "sort_custom"
+  | "sort_az"
   | "sort_plugin"
-  | "axis_repo"
-  | "axis_org"
-  | "axis_group"
-  | "axis_repo_group"
-  | "axis_status"
+  | "group_by_project"
+  | "group_by_manual"
   | "pin_toggle"
   | "archive_toggle"
   | "snooze_toggle"

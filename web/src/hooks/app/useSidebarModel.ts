@@ -1,106 +1,169 @@
-// Sidebar grouping, sort, and ordering for the dashboard's workspaces.
+// Sidebar grouping, sort, and ordering for the dashboard's workspaces. The grouping, the sort and the Custom
+// order are the Daemon's, shared with every Client; a plugin sort is this browser's alone.
 
 import { useCallback, useMemo, useState } from "react";
-import { updateWorkspaceOrdering } from "../../lib/api";
+import type { RuntimeCursor, SidebarView, WorkspaceOrderingPatch } from "../../lib/api";
+import { reportFeatureUse } from "../../lib/featureUse";
 import { buildSortValueMap, pluginSortSpecs } from "../../lib/pluginUi";
-import { usePluginAttention, usePluginUiEntries } from "../../lib/pluginUiContext";
-import { repoGroupToSidebarGroup } from "../../lib/sidebarGroups";
-import type { PluginSortContext, SidebarSortMode } from "../../lib/sidebarSort";
+import { usePluginUiEntries } from "../../lib/pluginUiContext";
+import { moveId, orderStartingWith } from "../../lib/sidebarReorder";
+import { workspaceComparator, type PluginSortContext } from "../../lib/sidebarSort";
+import { GROUP_BY_FEATURE, SORT_FEATURE, type SidebarGroupBy, type SidebarSort } from "../../lib/sidebarView";
 import type { ProjectInfo, Workspace } from "../../lib/types";
 import { useAttentionJump } from "../useAttentionJump";
 import { useNestedSidebarGroups } from "../useNestedSidebarGroups";
-import { useOrgGroups } from "../useOrgGroups";
-import { useRepoGroups } from "../useRepoGroups";
+import { isSyntheticGroup, useRepoGroups } from "../useRepoGroups";
 import { useSessionGroups } from "../useSessionGroups";
-import { useStatusGroups } from "../useStatusGroups";
-import { useSidebarAxis, useSidebarSortMode } from "../useSidebarPrefs";
+
+export type PluginSortRef = { pluginId: string; entryId: string };
 
 interface Options {
   workspaces: Workspace[];
-  workspaceOrdering: string[];
-  setWorkspaceOrdering: (order: string[]) => void;
-  markLocalOrderingUpdate: () => void;
   projects: ProjectInfo[];
+  view: SidebarView;
+  workspaceOrdering: string[];
+  repositoryOrder: string[];
+  changeOrdering: (patch: WorkspaceOrderingPatch) => Promise<RuntimeCursor | null>;
+  changeSidebarView: (patch: Partial<SidebarView>, after?: Promise<unknown>) => Promise<void>;
 }
 
 export function useSidebarModel({
   workspaces,
-  workspaceOrdering,
-  setWorkspaceOrdering,
-  markLocalOrderingUpdate,
   projects,
+  view,
+  workspaceOrdering,
+  repositoryOrder,
+  changeOrdering,
+  changeSidebarView,
 }: Options) {
-  const [sortMode, setSortMode] = useSidebarSortMode();
-  const [axis, setAxis] = useSidebarAxis();
-
   const pluginUiEntries = usePluginUiEntries();
-  const pluginAttention = usePluginAttention();
-  const [pluginSortRef, setPluginSortRef] = useState<{ pluginId: string; entryId: string } | null>(null);
-  const pluginSort = useMemo<PluginSortContext | undefined>(() => {
-    const spec =
-      pluginSortRef &&
-      pluginSortSpecs(pluginUiEntries).find(
-        (s) => s.pluginId === pluginSortRef.pluginId && s.entryId === pluginSortRef.entryId,
-      );
-    return spec
-      ? { direction: spec.direction, values: buildSortValueMap(pluginUiEntries, spec.pluginId, spec.column) }
-      : undefined;
-  }, [pluginUiEntries, pluginSortRef]);
+  // Plugin entries die with the Daemon, so the pick is not persisted. A ref whose entry is gone is inert and the
+  // shared sort applies; if the entry reappears the pick resumes.
+  const [pluginSortRef, setPluginSortRef] = useState<PluginSortRef | null>(null);
+  const activePluginSort = useMemo(
+    () =>
+      (pluginSortRef &&
+        pluginSortSpecs(pluginUiEntries).find(
+          (s) => s.pluginId === pluginSortRef.pluginId && s.entryId === pluginSortRef.entryId,
+        )) ||
+      null,
+    [pluginUiEntries, pluginSortRef],
+  );
+  const pluginSort = useMemo<PluginSortContext | undefined>(
+    () =>
+      activePluginSort
+        ? {
+            direction: activePluginSort.direction,
+            values: buildSortValueMap(pluginUiEntries, activePluginSort.pluginId, activePluginSort.column),
+          }
+        : undefined,
+    [activePluginSort, pluginUiEntries],
+  );
 
-  const selectSortMode = useCallback(
-    (mode: SidebarSortMode) => {
+  const groupBy = view.group_by;
+  const sort = view.sort;
+  const compareWorkspace = useMemo(
+    () => workspaceComparator(sort, workspaceOrdering, pluginSort),
+    [sort, workspaceOrdering, pluginSort],
+  );
+  const repo = useRepoGroups(workspaces, {
+    sort,
+    workspaceOrdering,
+    repositoryOrder,
+    projects,
+    pluginSort,
+    drawsRepoHeaders: groupBy === "project",
+  });
+  const session = useSessionGroups(workspaces, compareWorkspace);
+  const nested = useNestedSidebarGroups(repo.groups, compareWorkspace);
+
+  // The rendered groups in display order, so jump-to-next and drags follow what the user sees.
+  const displayGroups = useMemo(
+    () => (groupBy === "project" ? nested.groups.flatMap((n) => n.subgroups) : session.groups),
+    [groupBy, nested.groups, session.groups],
+  );
+  const attentionJump = useAttentionJump(displayGroups);
+
+  const selectGroupBy = useCallback(
+    (next: SidebarGroupBy) => {
+      reportFeatureUse(GROUP_BY_FEATURE[next]);
+      if (next !== groupBy) void changeSidebarView({ group_by: next });
+    },
+    [groupBy, changeSidebarView],
+  );
+  const selectSort = useCallback(
+    (next: SidebarSort) => {
+      reportFeatureUse(SORT_FEATURE[next]);
       setPluginSortRef(null);
-      setSortMode(mode);
+      if (next !== sort) void changeSidebarView({ sort: next });
     },
-    [setSortMode],
+    [sort, changeSidebarView],
+  );
+  const selectPluginSort = useCallback((ref: PluginSortRef) => {
+    reportFeatureUse("sort_plugin");
+    setPluginSortRef(ref);
+  }, []);
+  const resetCustomOrder = useCallback(() => void changeOrdering({ order: [], repositories: [] }), [changeOrdering]);
+
+  // Under Name a drag switches to Custom starting from the order on screen, so nothing else moves.
+  const frozen = sort === "name" && !pluginSort;
+  const onScreenOrder = useCallback(
+    (): WorkspaceOrderingPatch => ({
+      order: orderStartingWith(
+        displayGroups.flatMap((g) => g.workspaces.map((v) => v.workspace.id)),
+        workspaceOrdering,
+      ),
+      ...(groupBy === "project" && {
+        repositories: repo.groups.map((g) => g.id).filter((id) => !isSyntheticGroup(id)),
+      }),
+    }),
+    [displayGroups, workspaceOrdering, groupBy, repo.groups],
+  );
+  const commit = useCallback(
+    (patch: WorkspaceOrderingPatch) => {
+      const write = changeOrdering(patch);
+      if (frozen) void changeSidebarView({ sort: "custom" }, write);
+    },
+    [frozen, changeOrdering, changeSidebarView],
   );
 
-  const repo = useRepoGroups(workspaces, workspaceOrdering, sortMode, projects, pluginSort, pluginAttention);
-  const session = useSessionGroups(workspaces, sortMode, pluginSort, pluginAttention);
-  const status = useStatusGroups(workspaces, sortMode, pluginSort, pluginAttention);
-  const nested = useNestedSidebarGroups(repo.groups, sortMode, pluginSort, pluginAttention);
-  const org = useOrgGroups(repo.groups);
-
-  const groups = useMemo(() => {
-    if (axis === "status") return status.groups;
-    if (axis === "group") return session.groups;
-    return repo.groups.map(repoGroupToSidebarGroup);
-  }, [axis, status.groups, session.groups, repo.groups]);
-
-  const reorderWorkspaces = useCallback(
-    (newOrder: string[]) => {
-      setWorkspaceOrdering(newOrder);
-      markLocalOrderingUpdate();
-      void updateWorkspaceOrdering(newOrder);
+  /** Moves a row next to `overId`, after it when the drag went down. */
+  const moveWorkspace = useCallback(
+    (activeId: string, overId: string, after: boolean) => {
+      reportFeatureUse("row_reorder");
+      const base = frozen ? onScreenOrder() : { order: workspaceOrdering };
+      commit({ ...base, order: moveId(base.order ?? [], activeId, overId, after) });
     },
-    [setWorkspaceOrdering, markLocalOrderingUpdate],
+    [frozen, workspaceOrdering, onScreenOrder, commit],
   );
 
-  // Sessions in sidebar order, plus those needing attention, for the jump-to-attention shortcut.
-  const attentionJump = useAttentionJump(groups);
+  /** Moves a Repository header next to `overId`, after it when the drag went down. */
+  const moveRepository = useCallback(
+    (activeId: string, overId: string, after: boolean) => {
+      const headers = repo.groups.map((g) => g.id);
+      const repositories = moveId(headers, activeId, overId, after).filter((id) => !isSyntheticGroup(id));
+      commit(frozen ? { ...onScreenOrder(), repositories } : { repositories });
+    },
+    [repo.groups, frozen, onScreenOrder, commit],
+  );
 
   return {
-    sortMode,
-    selectSortMode,
-    axis,
-    setAxis,
-    pluginSortRef,
-    setPluginSortRef,
-    groups,
-    toggleGroup:
-      axis === "status"
-        ? status.toggleGroupCollapsed
-        : axis === "group"
-          ? session.toggleGroupCollapsed
-          : repo.toggleRepoCollapsed,
+    groupBy,
+    sort,
+    pluginSortRef: activePluginSort ? pluginSortRef : null,
+    selectGroupBy,
+    selectSort,
+    selectPluginSort,
+    resetCustomOrder,
+    repoGroups: repo.groups,
+    savedProjects: repo.savedProjects,
+    toggleRepoCollapsed: repo.toggleRepoCollapsed,
+    groups: session.groups,
+    toggleGroupCollapsed: session.toggleGroupCollapsed,
     nestedGroups: nested.groups,
     toggleSubgroupCollapsed: nested.toggleSubgroupCollapsed,
-    orgGroups: org.groups,
-    toggleOrgCollapsed: org.toggleOrgCollapsed,
-    toggleOrgRepoCollapsed: org.toggleRepoCollapsed,
-    savedProjects: repo.savedProjects,
-    reorderRepoGroups: repo.reorderRepoGroups,
-    reorderWorkspaces,
+    moveWorkspace,
+    moveRepository,
     attentionJump,
   };
 }

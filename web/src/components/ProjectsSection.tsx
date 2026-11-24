@@ -12,7 +12,7 @@ import { usePersistedFlag } from "./usePersistedFlag";
 interface ProjectsSectionProps {
   // Registered projects to list, one entry per path (`unpinnedSavedProjects`).
   projects: RepoGroup[];
-  // Whether the sidebar axis draws repository headers. Without them the section lists every Project, not
+  // Whether the sidebar grouping draws repository headers. Without them the section lists every Project, not
   // only those without a session (#5065), and its label says so.
   drawsRepoHeaders?: boolean;
   // Lowercased, trimmed filter query; empty means no filter.
@@ -157,7 +157,7 @@ const ProjectRow = memo(function ProjectRow({
         }
         className="group flex items-center gap-2 px-3 py-1.5 text-text-secondary hover:bg-surface-800/50 transition-colors focus:outline-none focus:ring-2 focus:ring-brand-600 select-none [-webkit-touch-callout:none]"
       >
-        {/* Listed here when the axis draws no pinned header (#5065), so the row carries the pin itself. */}
+        {/* Listed here when the grouping draws no pinned header (#5065), so the row carries the pin itself. */}
         <Tooltip text={meaningText(pinned ? MARK_MEANING.pinnedProject : MARK_MEANING.project)}>
           <span className="shrink-0 text-[10px] leading-none text-text-dim" aria-hidden>
             {pinned ? "◆" : "◇"}

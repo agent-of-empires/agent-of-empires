@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import type { NestedSidebarGroup, OrgNestedGroup, SidebarGroup, SidebarWorkspaceView } from "../../lib/sidebarGroups";
+import type { NestedSidebarGroup, SidebarGroup, SidebarWorkspaceView } from "../../lib/sidebarGroups";
 import type { Workspace } from "../../lib/types";
-import { renderedOrder, sunkViews, visibleOrgRepos, visibleSubgroups } from "./filterGroups";
+import { renderedOrder, sunkViews, visibleSubgroups } from "./filterGroups";
 
 type SessionStub = {
   id: string;
@@ -21,7 +21,7 @@ const archived = (status: string, workspaceId: string, sessionId: string): Sideb
 });
 
 describe("sunkViews", () => {
-  it("lists a workspace sliced across status buckets once, with every archived session", () => {
+  it("lists a workspace sliced across Groups once, with every archived session", () => {
     const groups = [
       group("status:Idle", [archived("Idle", "w1", "s-idle")]),
       group("status:Running", [archived("Running", "w1", "s-running")]),
@@ -100,19 +100,12 @@ describe("renderedOrder", () => {
 });
 
 describe("visible parents", () => {
-  it("drops the children a collapsed repo or org hides", () => {
+  it("drops the children a collapsed repo hides", () => {
     const nested = [
       { repo: group("/a", []), subgroups: [group("feature", [live("a")])] },
       { repo: { ...group("/b", []), collapsed: true }, subgroups: [group("fix", [live("b")])] },
     ] as NestedSidebarGroup[];
     expect(visibleSubgroups(nested, false).map((g) => g.id)).toEqual(["feature"]);
     expect(visibleSubgroups(nested, true).map((g) => g.id)).toEqual(["feature", "fix"]);
-
-    const orgs = [
-      { org: { ...group("acme", []), collapsed: true }, repos: [group("/a", [])] },
-      { org: group("other", []), repos: [group("/b", [])] },
-    ] as OrgNestedGroup[];
-    expect(visibleOrgRepos(orgs, false).map((g) => g.id)).toEqual(["/b"]);
-    expect(visibleOrgRepos(orgs, true).map((g) => g.id)).toEqual(["/a", "/b"]);
   });
 });

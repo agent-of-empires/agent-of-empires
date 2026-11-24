@@ -20,7 +20,7 @@ export function SortableSessionRow({
   const { listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: rowKey ?? props.workspace.id,
     disabled: dragOff,
-    data: { type: "workspace" },
+    data: { type: "workspace", workspaceId: props.workspace.id },
   });
   return (
     // Only `listeners`: dnd-kit's `attributes` would add a second focusable button role.

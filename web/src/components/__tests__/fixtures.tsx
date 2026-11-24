@@ -12,6 +12,9 @@ import { UnreadIndicatorContext } from "../../lib/unreadIndicator";
 import { SessionRow } from "../sidebar/SessionRow";
 import type { RowActivate, RowBulkApi } from "../sidebar/types";
 import { SessionActionProvider } from "../sidebar/SessionActionProvider";
+import type { WorkspaceSidebar } from "../WorkspaceSidebar";
+import { buildSessionGroups } from "../../lib/sidebarGroups";
+import { compareWorkspacesByCustomOrder } from "../../lib/sidebarSort";
 
 export function makeSession(over: Partial<SessionResponse> = {}): SessionResponse {
   return {
@@ -201,4 +204,48 @@ export function openRowMenu(ws: Workspace, options: RowOptions & { expandMore?: 
   const more = screen.queryByTestId("sidebar-context-menu-more");
   if (more && options.expandMore !== false) fireEvent.click(more);
   return screen.getByTestId("sidebar-context-menu");
+}
+
+type SidebarProps = React.ComponentProps<typeof WorkspaceSidebar>;
+
+/** Every WorkspaceSidebar prop with a no-op default, grouped by My groups over `workspaces`. */
+export function sidebarProps(workspaces: Workspace[], over: Partial<SidebarProps> = {}): SidebarProps {
+  const noop = () => {};
+  return {
+    observedById: {},
+    runtimeEpoch: "boot",
+    onSessionMutation: noop,
+    groupBy: "group",
+    sort: "custom",
+    onGroupByChange: noop,
+    onSortChange: noop,
+    onResetCustomOrder: noop,
+    groups: buildSessionGroups(workspaces, {
+      idleDecayWindowMs: 60_000,
+      compareWorkspace: compareWorkspacesByCustomOrder(workspaces.map((w) => w.id)),
+      isCollapsed: () => false,
+    }),
+    nestedGroups: [],
+    onToggleRepo: noop,
+    onToggleSubgroup: noop,
+    onMoveWorkspace: noop,
+    onMoveRepository: noop,
+    activeId: null,
+    activeSessionId: null,
+    open: true,
+    onOpenChange: noop,
+    onSelect: vi.fn(),
+    onToggleGroup: noop,
+    onNew: noop,
+    onCreateSession: noop,
+    savedProjects: [],
+    onAddProject: noop,
+    onEditProject: noop,
+    onRemoveProject: noop,
+    onSettings: noop,
+    onRetryTrash: vi.fn(async () => {}),
+    pluginSortRef: null,
+    onPluginSortChange: noop,
+    ...over,
+  };
 }

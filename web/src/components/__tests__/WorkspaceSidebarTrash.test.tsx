@@ -5,9 +5,8 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 
 import { WorkspaceSidebar } from "../WorkspaceSidebar";
 import { TrashMenu } from "../sidebar/TrashMenu";
-import { buildSessionGroups } from "../../lib/sidebarGroups";
 import type { SessionResponse, Workspace } from "../../lib/types";
-import { makeSession, makeWorkspace } from "./fixtures";
+import { makeSession, makeWorkspace, sidebarProps } from "./fixtures";
 import { SessionActionProvider } from "../sidebar/SessionActionProvider";
 
 type Props = React.ComponentProps<typeof WorkspaceSidebar>;
@@ -28,46 +27,12 @@ const trashed = (id: string, ...ids: string[]) =>
 
 /** `groups` holds the workspaces for navigation; the Trash list is passed separately, as App computes it. */
 function renderSidebar(workspaces: Workspace[], over: Partial<Props> = {}) {
-  const props: Props = {
-    observedById: {},
-    runtimeEpoch: "boot",
-    onSessionMutation: noop,
-    groups: buildSessionGroups(workspaces, {
-      idleDecayWindowMs: 60_000,
-      sortMode: "lastActivity",
-      isCollapsed: () => false,
-    }),
-    nestedGroups: [],
-    orgGroups: [],
-    onToggleSubgroup: noop,
-    onToggleOrg: noop,
-    onToggleOrgRepo: noop,
-    onReorderWorkspaces: noop,
-    onReorderGroups: noop,
-    activeId: null,
-    open: true,
-    onOpenChange: noop,
-    onSelect: vi.fn(),
-    onToggleGroup: noop,
-    onNew: noop,
-    onCreateSession: noop,
-    savedProjects: [],
-    onAddProject: noop,
-    onEditProject: noop,
-    onRemoveProject: noop,
-    onSettings: noop,
+  const props = sidebarProps(workspaces, {
     onRestoreSession: vi.fn(),
     onDeleteSession: vi.fn(),
     onEmptyTrash: vi.fn(),
-    onRetryTrash: vi.fn(async () => {}),
-    sortMode: "lastActivity",
-    onSortModeChange: noop,
-    pluginSortRef: null,
-    onPluginSortChange: noop,
-    axis: "group",
-    onAxisChange: noop,
     ...over,
-  };
+  });
   render(
     <SessionActionProvider
       sessions={workspaces.flatMap((ws) => ws.sessions)}

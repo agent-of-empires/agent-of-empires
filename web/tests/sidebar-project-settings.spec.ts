@@ -34,7 +34,6 @@ async function mockApis(page: Page, sessions: MockSession[], projects: MockProje
           id: s.id,
           title: s.title,
           project_path: s.project_path,
-          group_path: s.project_path,
           scratch: s.scratch ?? false,
           tool: "claude",
           status: "Idle",

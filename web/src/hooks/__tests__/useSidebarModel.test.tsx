@@ -1,61 +1,245 @@
 // @vitest-environment jsdom
 
-import { act, renderHook } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { PluginUiEntry } from "../../lib/api";
-import { PluginUiProvider } from "../../lib/pluginUiContext";
-import { nextAttentionSessionId } from "../../lib/sidebarSort";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { http, HttpResponse } from "msw";
+import { setupServer } from "msw/node";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import type { SidebarView } from "../../lib/api";
+import { reportFeatureUse } from "../../lib/featureUse";
+import type { SessionResponse } from "../../lib/types";
 import { useSidebarModel } from "../app/useSidebarModel";
-import { session, workspace } from "./fixtures";
+import { useSessions } from "../useSessions";
+import { useWorkspaces } from "../useWorkspaces";
+import { session } from "./fixtures";
 
-const { entriesRef } = vi.hoisted(() => ({ entriesRef: { current: [] as PluginUiEntry[] } }));
-vi.mock("../usePluginUiState", () => ({
-  usePluginUiState: () => ({ entries: entriesRef.current, revisions: {}, isRefreshing: false, poke: () => {} }),
-}));
-
-const workspaces = [
-  workspace("w-running", "/repo", [session({ id: "running", status: "Running" })]),
-  workspace("w-stopped", "/repo", [session({ id: "stopped", status: "Stopped" })]),
-];
-const toned = (sessionId: string): PluginUiEntry => ({
-  plugin_id: "gh",
-  slot: "row-column",
-  id: "pr",
-  session_id: sessionId,
-  payload: { text: "PR", tone: "danger" },
-});
-
-function mountModel() {
-  return renderHook(
-    () =>
-      useSidebarModel({
-        workspaces,
-        workspaceOrdering: workspaces.map((w) => w.id),
-        setWorkspaceOrdering: () => {},
-        markLocalOrderingUpdate: () => {},
-        projects: [],
-      }),
-    { wrapper: PluginUiProvider },
-  );
+/** What the Daemon serves; each write bumps the revision like a published snapshot. */
+interface Daemon {
+  revision: number;
+  sessions: SessionResponse[];
+  workspace_ordering: string[];
+  repository_order: string[];
+  sidebar_view: SidebarView;
 }
 
-beforeEach(() => localStorage.clear());
+const row = (id: string, repo: string, title: string, created_at = "2025-01-01T00:00:00Z") =>
+  session({ id, title, project_path: repo, branch: id, group_path: "", created_at });
+const wsId = (s: SessionResponse) => `${s.project_path}::${s.branch}`;
 
-describe("useSidebarModel plugin attention (#4446)", () => {
-  it("sorts a toned workspace first under attention sort and offers it to jump-to-next", () => {
-    entriesRef.current = [toned("stopped")];
-    const { result } = mountModel();
-    act(() => result.current.selectSortMode("attention"));
-    expect(result.current.groups[0]!.workspaces.map((v) => v.workspace.id)).toEqual(["w-stopped", "w-running"]);
-    const { orderedIds, attention } = result.current.attentionJump;
-    expect(nextAttentionSessionId(orderedIds, attention, "running")).toBe("stopped");
+let daemon: Daemon;
+const writes: { method: string; body: unknown }[] = [];
+const runtime = (revision: number) => ({ "aoe-runtime-epoch": "boot", "aoe-runtime-revision": String(revision) });
+const server = setupServer(
+  http.get("*/api/sessions", () =>
+    HttpResponse.json(
+      {
+        sessions: daemon.sessions,
+        workspace_ordering: daemon.workspace_ordering,
+        repository_order: daemon.repository_order,
+        sidebar_view: daemon.sidebar_view,
+      },
+      { headers: runtime(daemon.revision) },
+    ),
+  ),
+  http.patch("*/api/sidebar-view", async ({ request }) => {
+    const body = (await request.json()) as Partial<SidebarView>;
+    writes.push({ method: "PATCH", body });
+    daemon.sidebar_view = { ...daemon.sidebar_view, ...body };
+    daemon.revision += 1;
+    return HttpResponse.json(daemon.sidebar_view, { headers: runtime(daemon.revision) });
+  }),
+  http.put("*/api/workspace-ordering", async ({ request }) => {
+    const body = (await request.json()) as { order?: string[]; repositories?: string[] };
+    writes.push({ method: "PUT", body });
+    if (body.order) daemon.workspace_ordering = body.order;
+    if (body.repositories) daemon.repository_order = body.repositories;
+    daemon.revision += 1;
+    return HttpResponse.json({ order: daemon.workspace_ordering }, { headers: runtime(daemon.revision) });
+  }),
+);
+beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
+afterEach(() => server.resetHandlers());
+afterAll(() => server.close());
+
+beforeEach(() => {
+  localStorage.clear();
+  writes.length = 0;
+  vi.mocked(reportFeatureUse).mockClear();
+  const sessions = [
+    row("b2", "/r/beta", "zulu", "2025-01-02T00:00:00Z"),
+    row("b1", "/r/beta", "alpha"),
+    row("a1", "/r/Alpha", "mike"),
+  ];
+  daemon = {
+    revision: 1,
+    sessions,
+    workspace_ordering: sessions.map(wsId),
+    repository_order: ["/r/beta", "/r/Alpha"],
+    sidebar_view: { group_by: "project", sort: "custom" },
+  };
+});
+
+function mount() {
+  return renderHook(() => {
+    const sessions = useSessions();
+    const workspaces = useWorkspaces(sessions.sessions);
+    const model = useSidebarModel({
+      workspaces,
+      projects: [],
+      view: sessions.sidebarView,
+      workspaceOrdering: sessions.workspaceOrdering,
+      repositoryOrder: sessions.repositoryOrder,
+      changeOrdering: sessions.changeOrdering,
+      changeSidebarView: sessions.changeSidebarView,
+    });
+    return { sessions, model };
+  });
+}
+type Mounted = ReturnType<typeof mount>["result"];
+
+const headers = (r: Mounted) => r.current.model.nestedGroups.map((n) => n.repo.id);
+const rows = (r: Mounted) =>
+  r.current.model.nestedGroups.flatMap((n) => n.subgroups.flatMap((g) => g.workspaces.map((v) => v.workspace.id)));
+
+/** Reads the Daemon at `revision`, as the next poll would, and waits for that read to land. */
+async function pollAt(r: Mounted, revision: number) {
+  daemon.revision = revision;
+  const seen = vi.fn();
+  server.events.on("response:mocked", seen);
+  await act(async () => r.current.sessions.refresh());
+  await waitFor(() => expect(seen).toHaveBeenCalled());
+  server.events.removeListener("response:mocked", seen);
+  // One more turn so the response body is applied.
+  await act(async () => {});
+}
+
+describe("the shared sidebar view", () => {
+  it("adopts a grouping and sort another Client picks on the next poll", async () => {
+    const { result } = mount();
+    await waitFor(() => expect(headers(result)).toEqual(["/r/beta", "/r/Alpha"]));
+    daemon.sidebar_view = { group_by: "group", sort: "name" };
+    await pollAt(result, 2);
+    await waitFor(() => expect(result.current.model.groupBy).toBe("group"));
+    expect(result.current.model.sort).toBe("name");
   });
 
-  it("leaves the order and jump set alone without a toned session", () => {
-    entriesRef.current = [];
-    const { result } = mountModel();
-    act(() => result.current.selectSortMode("attention"));
-    expect(result.current.groups[0]!.workspaces.map((v) => v.workspace.id)).toEqual(["w-running", "w-stopped"]);
-    expect(result.current.attentionJump.attention.size).toBe(0);
+  it("shows a pick at once, sends it, and lets no poll older than its receipt undo it", async () => {
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    server.use(
+      http.patch("*/api/sidebar-view", async ({ request }) => {
+        writes.push({ method: "PATCH", body: await request.json() });
+        await held;
+        return HttpResponse.json({ group_by: "project", sort: "name" }, { headers: runtime(5) });
+      }),
+    );
+    act(() => result.current.model.selectSort("name"));
+    expect(result.current.model.sort).toBe("name");
+    expect(reportFeatureUse).toHaveBeenCalledWith("sort_az");
+    await waitFor(() => expect(writes).toEqual([{ method: "PATCH", body: { sort: "name" } }]));
+
+    // A poll while the write is in flight still carries Custom.
+    await pollAt(result, 2);
+    expect(result.current.model.sort).toBe("name");
+
+    await act(async () => release());
+    // A read older than the receipt is not adopted either.
+    await pollAt(result, 4);
+    expect(result.current.model.sort).toBe("name");
+
+    // Once the Daemon has moved past the receipt, its value wins again.
+    daemon.sidebar_view = { group_by: "group", sort: "custom" };
+    await pollAt(result, 6);
+    await waitFor(() => expect(result.current.model.sort).toBe("custom"));
+    expect(result.current.model.groupBy).toBe("group");
+  });
+
+  it("puts a failed pick back on the next poll", async () => {
+    server.use(http.patch("*/api/sidebar-view", () => new HttpResponse(null, { status: 500 })));
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    await act(async () => result.current.model.selectGroupBy("group"));
+    expect(reportFeatureUse).toHaveBeenCalledWith("group_by_manual");
+    await pollAt(result, 2);
+    await waitFor(() => expect(result.current.model.groupBy).toBe("project"));
+  });
+});
+
+describe("sorts", () => {
+  it("orders rows by title and headers by name under Name, ignoring case", async () => {
+    daemon.sidebar_view = { group_by: "project", sort: "name" };
+    const { result } = mount();
+    await waitFor(() => expect(headers(result)).toEqual(["/r/Alpha", "/r/beta"]));
+    expect(rows(result)).toEqual(["/r/Alpha::a1", "/r/beta::b1", "/r/beta::b2"]);
+  });
+
+  it("follows the shared Custom order and puts a never-moved header on top, newest first", async () => {
+    daemon.repository_order = ["/r/Alpha"];
+    daemon.workspace_ordering = ["/r/beta::b1", "/r/beta::b2", "/r/Alpha::a1"];
+    const { result } = mount();
+    await waitFor(() => expect(headers(result)).toEqual(["/r/beta", "/r/Alpha"]));
+    expect(rows(result)).toEqual(["/r/beta::b1", "/r/beta::b2", "/r/Alpha::a1"]);
+  });
+});
+
+describe("the shared Custom order", () => {
+  it("moves a row next to its target in the shared order under Custom", async () => {
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toEqual(["/r/beta::b2", "/r/beta::b1", "/r/Alpha::a1"]));
+    await act(async () => result.current.model.moveWorkspace("/r/beta::b2", "/r/beta::b1", true));
+    expect(writes).toEqual([{ method: "PUT", body: { order: ["/r/beta::b1", "/r/beta::b2", "/r/Alpha::a1"] } }]);
+    expect(rows(result)).toEqual(["/r/beta::b1", "/r/beta::b2", "/r/Alpha::a1"]);
+    expect(reportFeatureUse).toHaveBeenCalledWith("row_reorder");
+  });
+
+  it("under Name, a row drag freezes the order on screen and switches to Custom without moving anything else", async () => {
+    daemon.sidebar_view = { group_by: "project", sort: "name" };
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toEqual(["/r/Alpha::a1", "/r/beta::b1", "/r/beta::b2"]));
+    await act(async () => result.current.model.moveWorkspace("/r/beta::b2", "/r/beta::b1", false));
+    await waitFor(() => expect(writes).toHaveLength(2));
+    expect(writes).toEqual([
+      {
+        method: "PUT",
+        body: { order: ["/r/Alpha::a1", "/r/beta::b2", "/r/beta::b1"], repositories: ["/r/Alpha", "/r/beta"] },
+      },
+      { method: "PATCH", body: { sort: "custom" } },
+    ]);
+    expect(result.current.model.sort).toBe("custom");
+    expect(headers(result)).toEqual(["/r/Alpha", "/r/beta"]);
+    expect(rows(result)).toEqual(["/r/Alpha::a1", "/r/beta::b2", "/r/beta::b1"]);
+  });
+
+  it("under Name, a header drag freezes the rows too and moves only that header", async () => {
+    daemon.sidebar_view = { group_by: "project", sort: "name" };
+    const { result } = mount();
+    await waitFor(() => expect(headers(result)).toEqual(["/r/Alpha", "/r/beta"]));
+    await act(async () => result.current.model.moveRepository("/r/beta", "/r/Alpha", false));
+    await waitFor(() => expect(writes).toHaveLength(2));
+    expect(writes[0]!.body).toEqual({
+      order: ["/r/Alpha::a1", "/r/beta::b1", "/r/beta::b2"],
+      repositories: ["/r/beta", "/r/Alpha"],
+    });
+    expect(headers(result)).toEqual(["/r/beta", "/r/Alpha"]);
+    expect(rows(result)).toEqual(["/r/beta::b1", "/r/beta::b2", "/r/Alpha::a1"]);
+  });
+
+  it("a header drag under Custom writes only the repository order", async () => {
+    const { result } = mount();
+    await waitFor(() => expect(headers(result)).toEqual(["/r/beta", "/r/Alpha"]));
+    await act(async () => result.current.model.moveRepository("/r/Alpha", "/r/beta", false));
+    expect(writes).toEqual([{ method: "PUT", body: { repositories: ["/r/Alpha", "/r/beta"] } }]);
+    expect(headers(result)).toEqual(["/r/Alpha", "/r/beta"]);
+  });
+
+  it("resets the Custom order to newest first", async () => {
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    await act(async () => result.current.model.resetCustomOrder());
+    expect(writes).toEqual([{ method: "PUT", body: { order: [], repositories: [] } }]);
+    // Nothing is listed, so headers and rows sit newest first until the Daemon's merged order arrives.
+    expect(headers(result)).toEqual(["/r/beta", "/r/Alpha"]);
+    expect(rows(result)).toEqual(["/r/beta::b2", "/r/beta::b1", "/r/Alpha::a1"]);
   });
 });

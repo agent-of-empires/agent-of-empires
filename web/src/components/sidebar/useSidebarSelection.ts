@@ -45,8 +45,8 @@ export function useSidebarSelection({
   // A status slice holds one session, so an active row must match it, not just the workspace id.
   const displayedActiveSessionId = optimisticActive && hintApplies ? optimisticActive.sessionId : activeSessionId;
 
-  // Selection is keyed by the rendered row: the status axis slices one workspace into a row per
-  // status, and each row's actions belong to its own session.
+  // Selection is keyed by the rendered row: My groups slices one workspace into a row per
+  // Group, and each row's actions belong to its own session.
   const byKey = useMemo(() => new Map(rows.map((row) => [row.key, row])), [rows]);
   const existingIds = useMemo(() => new Set(byKey.keys()), [byKey]);
   // Prune only vanished rows; collapsing or filtering keeps the selection.

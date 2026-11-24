@@ -47,17 +47,30 @@ export function workspaceId(s: { project_path: string; branch: string | null; id
   return s.branch ? `${s.project_path}::${s.branch}` : `${s.project_path}::__session__::${s.id}`;
 }
 
+export interface SidebarView {
+  group_by: "project" | "group";
+  sort: "custom" | "name";
+}
+
 export interface SidebarMockHandle {
-  puts: Array<{ order?: string[] }>;
+  puts: Array<{ order?: string[]; repositories?: string[] }>;
+  /** `PATCH /api/sidebar-view` bodies, in arrival order. */
+  viewPatches: Array<Partial<SidebarView>>;
   /** One-shot override for the next PUT's response. */
   nextPutResponse: { status?: number; body?: string } | null;
   readOnly: boolean;
+  /** What the next read serves, as another Client's change would leave it. */
+  view: SidebarView;
 }
 
 export interface SidebarMockOptions {
   sessions: MockSessionInput[];
   /** Defaults to the input order. */
   ordering?: string[];
+  /** The shared Repository header order; defaults to none moved. */
+  repositoryOrder?: string[];
+  /** Defaults to Repository and Custom. */
+  view?: SidebarView;
   readOnly?: boolean;
   /** A successful PUT replaces the served ordering, like the real server. */
   persistPutOrdering?: boolean;
@@ -67,33 +80,51 @@ export async function installSidebarMocks(page: Page, opts: SidebarMockOptions):
   const filled = opts.sessions.map((s, i) => fillCreatedAt(s, i));
   const handle: SidebarMockHandle = {
     puts: [],
+    viewPatches: [],
     nextPutResponse: null,
     readOnly: !!opts.readOnly,
+    view: opts.view ?? { group_by: "project", sort: "custom" },
   };
 
   let ordering = opts.ordering ?? filled.map((s) => workspaceId(s));
+  let repositoryOrder = opts.repositoryOrder ?? [];
+  // Each write publishes a newer snapshot, so its receipt and later reads line up like the Daemon's.
+  let revision = 1;
+  const runtime = (write = false) => {
+    if (write) revision += 1;
+    return { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": String(revision) };
+  };
 
   await page.route("**/api/login/status*", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   await page.route(/\/api\/sessions(\?.*)?$/, (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({
-      headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
+      headers: runtime(),
       json: {
         sessions: filled.map(toResponse),
         workspace_ordering: ordering,
+        repository_order: repositoryOrder,
+        sidebar_view: handle.view,
       },
     });
   });
   await page.route("**/api/workspace-ordering", (r: Route) => {
     if (r.request().method() === "PUT") {
-      const body = r.request().postDataJSON() as { order?: string[] };
+      const body = r.request().postDataJSON() as { order?: string[]; repositories?: string[] };
       handle.puts.push(body ?? {});
       const override = handle.nextPutResponse;
       handle.nextPutResponse = null;
       if (override) return r.fulfill(override);
       if (opts.persistPutOrdering && body?.order) ordering = body.order;
+      if (opts.persistPutOrdering && body?.repositories) repositoryOrder = body.repositories;
     }
-    return r.fulfill({ json: { order: [] } });
+    return r.fulfill({ headers: runtime(true), json: { order: ordering, repositories: repositoryOrder } });
+  });
+  await page.route("**/api/sidebar-view", (r: Route) => {
+    const body = (r.request().postDataJSON() ?? {}) as Partial<SidebarView>;
+    handle.viewPatches.push(body);
+    handle.view = { ...handle.view, ...body };
+    return r.fulfill({ headers: runtime(true), json: handle.view });
   });
   await page.route("**/api/about", (r) =>
     r.fulfill({

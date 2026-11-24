@@ -1,24 +1,6 @@
-import type { RepoGroup, SessionResponse, SessionStatus, Workspace } from "./types";
-import { safeGetItem, safeSetItem } from "./safeStorage";
+import type { RepoGroup, SessionResponse, Workspace } from "./types";
 import { compareSortValues, type PluginSortValue } from "./pluginUi";
-
-export type SidebarSortMode = "manual" | "lastActivity" | "attention";
-
-export const SIDEBAR_SORT_MODE_KEY = "aoe-sidebar-sort-mode";
-
-const VALID_MODES: readonly SidebarSortMode[] = ["manual", "lastActivity", "attention"];
-
-export function loadSidebarSortMode(): SidebarSortMode {
-  const raw = safeGetItem(SIDEBAR_SORT_MODE_KEY);
-  if (raw && (VALID_MODES as readonly string[]).includes(raw)) {
-    return raw as SidebarSortMode;
-  }
-  return "manual";
-}
-
-export function saveSidebarSortMode(mode: SidebarSortMode): void {
-  safeSetItem(SIDEBAR_SORT_MODE_KEY, mode);
-}
+import type { SidebarSort } from "./sidebarView";
 
 function epochOr(ts: string | null | undefined): number {
   if (!ts) return Number.NEGATIVE_INFINITY;
@@ -47,6 +29,47 @@ export function repoGroupLastActivityMs(workspaces: readonly Workspace[]): numbe
 
 export function workspaceIsPinned(ws: Workspace): boolean {
   return ws.sessions.some((s) => s.pinned_at != null);
+}
+
+/** The row title the sidebar shows, which the Name sort orders by. */
+export function workspaceLabel(ws: Workspace): string {
+  const title = ws.sessions[0]?.title.trim() ?? "";
+  return (ws.sessions.length === 1 ? title || ws.branch : ws.branch || title) || "default";
+}
+
+/** Newest session creation in epoch ms; a header never moved by hand sorts by it. */
+export function workspacesNewestMs(workspaces: readonly Workspace[]): number {
+  let best = Number.NEGATIVE_INFINITY;
+  for (const ws of workspaces) for (const s of ws.sessions) best = Math.max(best, epochOr(s.created_at));
+  return best;
+}
+
+export const compareNames = (a: string, b: string) => a.toLowerCase().localeCompare(b.toLowerCase());
+
+/** Tier, then A to Z by title ignoring case, then id. */
+export function compareWorkspacesByName(a: Workspace, b: Workspace): number {
+  return (
+    workspaceTriageTier(a) - workspaceTriageTier(b) ||
+    compareNames(workspaceLabel(a), workspaceLabel(b)) ||
+    a.id.localeCompare(b.id)
+  );
+}
+
+/** Tier, then the shared Custom order. A workspace the order does not list yet sits on top, newest first, as the
+ *  Daemon places it. */
+export function compareWorkspacesByCustomOrder(order: readonly string[]): (a: Workspace, b: Workspace) => number {
+  const rank = new Map(order.map((id, i) => [id, i] as const));
+  return (a, b) => {
+    const tier = workspaceTriageTier(a) - workspaceTriageTier(b);
+    if (tier !== 0) return tier;
+    const ar = rank.get(a.id);
+    const br = rank.get(b.id);
+    if (ar === undefined || br === undefined) {
+      if (ar !== br) return ar === undefined ? -1 : 1;
+      return workspacesNewestMs([b]) - workspacesNewestMs([a]) || a.id.localeCompare(b.id);
+    }
+    return ar - br;
+  };
 }
 
 /** Every session archived or snoozed; one live session keeps the workspace out of the footer. Ignored rows stay in the live list: they are not archived. */
@@ -162,78 +185,6 @@ export function triageMenuShape(state: TriageState): TriageMenuShape {
   }
 }
 
-/** Tier first, then last activity descending, then id. Compared with `<`/`>` since missing timestamps are -Infinity. */
-export function compareWorkspacesByLastActivityDesc(a: Workspace, b: Workspace): number {
-  const aTier = workspaceTriageTier(a);
-  const bTier = workspaceTriageTier(b);
-  if (aTier !== bTier) return aTier - bTier;
-  const aMs = workspaceLastActivityMs(a);
-  const bMs = workspaceLastActivityMs(b);
-  if (aMs < bMs) return 1;
-  if (aMs > bMs) return -1;
-  return a.id.localeCompare(b.id);
-}
-
-/** Mirrors the TUI's tier-99 sink (`attention_tier`, src/session/groups.rs). */
-const ATTENTION_SINK_RANK = 99;
-
-/** Plugin attention ranks with Error: behind Waiting, which needs input right now. */
-const PLUGIN_ATTENTION_RANK = 1;
-
-/** Sidebar attention order for a bare status: Waiting, Error, Idle, Unknown, Running,
- *  Stopped, then the transients. The Attention sort and the status grouping axis both
- *  read it, and it matches the Board's within-column card order. */
-export function statusAttentionRank(status: SessionStatus): number {
-  switch (status) {
-    case "Waiting":
-      return 0;
-    case "Error":
-      return 1;
-    case "Idle":
-      return 2;
-    case "Unknown":
-      return 3;
-    case "Running":
-      return 4;
-    case "Stopped":
-      return 5;
-    case "Starting":
-    case "Creating":
-    case "Deleting":
-      return 6;
-    default:
-      // Unknown statuses from a newer server rank like Unknown rather than sinking.
-      return 3;
-  }
-}
-
-/** Lower ranks sort first. Mirrors the TUI `attention_tier`; sunk sessions take the sink rank. `pluginAttention` holds session ids with a plugin danger/warn tone. */
-export function sessionAttentionRank(s: SessionResponse, pluginAttention?: ReadonlySet<string>): number {
-  if (s.archived_at != null || s.ignored_at != null || s.snoozed_until != null) {
-    return ATTENTION_SINK_RANK;
-  }
-  const rank = statusAttentionRank(s.status);
-  return pluginAttention?.has(s.id) ? Math.min(rank, PLUGIN_ATTENTION_RANK) : rank;
-}
-
-export function workspaceAttentionRank(ws: Workspace, pluginAttention?: ReadonlySet<string>): number {
-  let best = ATTENTION_SINK_RANK;
-  for (const s of ws.sessions) {
-    const rank = sessionAttentionRank(s, pluginAttention);
-    if (rank < best) best = rank;
-  }
-  return best;
-}
-
-export function workspaceIsFavorited(ws: Workspace): boolean {
-  return ws.sessions.some((s) => s.favorited);
-}
-
-/** The server clears urgent for sunk sessions, so they never float above live rows. */
-export function workspaceIsUrgent(ws: Workspace): boolean {
-  return ws.sessions.some((s) => s.urgent === true);
-}
-
 /** A live session that is Waiting, in Error, flagged urgent, or carries a plugin danger/warn tone. Shared by badges, markers, and jump-to-next so counts match. */
 export function sessionNeedsAttention(s: SessionResponse, pluginAttention?: ReadonlySet<string>): boolean {
   if (s.archived_at != null || s.ignored_at != null || s.snoozed_until != null || s.trashed_at != null) {
@@ -281,64 +232,6 @@ export function nextAttentionSessionId(
   return null;
 }
 
-/** Tier, urgent, attention rank, favorited, last activity, then id. */
-export function compareWorkspacesByAttention(
-  a: Workspace,
-  b: Workspace,
-  pluginAttention?: ReadonlySet<string>,
-): number {
-  const aTier = workspaceTriageTier(a);
-  const bTier = workspaceTriageTier(b);
-  if (aTier !== bTier) return aTier - bTier;
-
-  const aUrgent = workspaceIsUrgent(a);
-  const bUrgent = workspaceIsUrgent(b);
-  if (aUrgent !== bUrgent) return aUrgent ? -1 : 1;
-
-  const aRank = workspaceAttentionRank(a, pluginAttention);
-  const bRank = workspaceAttentionRank(b, pluginAttention);
-  if (aRank !== bRank) return aRank - bRank;
-
-  const aFav = workspaceIsFavorited(a);
-  const bFav = workspaceIsFavorited(b);
-  if (aFav !== bFav) return aFav ? -1 : 1;
-
-  const aMs = workspaceLastActivityMs(a);
-  const bMs = workspaceLastActivityMs(b);
-  if (aMs < bMs) return 1;
-  if (aMs > bMs) return -1;
-  return a.id.localeCompare(b.id);
-}
-
-/** For axes without a manual order, where `manual` means last activity. */
-export function compareWorkspacesForComputedSortMode(
-  mode: SidebarSortMode,
-  pluginAttention?: ReadonlySet<string>,
-): (a: Workspace, b: Workspace) => number {
-  if (mode === "attention") return (a, b) => compareWorkspacesByAttention(a, b, pluginAttention);
-  return compareWorkspacesByLastActivityDesc;
-}
-
-export function repoGroupAttentionRank(
-  workspaces: readonly Workspace[],
-  pluginAttention?: ReadonlySet<string>,
-): number {
-  let best = ATTENTION_SINK_RANK;
-  for (const ws of workspaces) {
-    const rank = workspaceAttentionRank(ws, pluginAttention);
-    if (rank < best) best = rank;
-  }
-  return best;
-}
-
-export function repoGroupIsUrgent(workspaces: readonly Workspace[]): boolean {
-  return workspaces.some(workspaceIsUrgent);
-}
-
-export function repoGroupIsFavorited(workspaces: readonly Workspace[]): boolean {
-  return workspaces.some(workspaceIsFavorited);
-}
-
 /** Plugin sort direction plus `session_id -> sort_value`, built at the component boundary. */
 export interface PluginSortContext {
   direction: "asc" | "desc";
@@ -383,4 +276,14 @@ export function compareWorkspacesByPluginSort(ctx: PluginSortContext): (a: Works
     if (aMs > bMs) return -1;
     return a.id.localeCompare(b.id);
   };
+}
+
+/** Row order inside every header: an active plugin sort, else the shared sort. */
+export function workspaceComparator(
+  sort: SidebarSort,
+  customOrder: readonly string[],
+  pluginSort?: PluginSortContext,
+): (a: Workspace, b: Workspace) => number {
+  if (pluginSort) return compareWorkspacesByPluginSort(pluginSort);
+  return sort === "name" ? compareWorkspacesByName : compareWorkspacesByCustomOrder(customOrder);
 }

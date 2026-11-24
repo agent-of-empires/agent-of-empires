@@ -18,7 +18,8 @@ export function sessionResponse({ id, title, project_path, ...rest }: SessionInp
     id,
     title: title ?? id,
     project_path: projectPath,
-    group_path: projectPath,
+    // In no Group, as the Daemon creates a session, so Repository shows no Group header of its own.
+    group_path: "",
     tool,
     agent_profile: profileFor(tool),
     status: "Idle",

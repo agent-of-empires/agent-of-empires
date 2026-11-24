@@ -72,7 +72,7 @@ A Session that is trashed, snoozed, archived or ignored. The "do not bother me" 
 Forcing a Session to the top of the dashboard. Pinning cancels Archive, Ignore and Snooze.
 
 **Favorite**:
-A user mark on a Session. Favoriting cancels Archive, Ignore and Snooze, like Pin. In the TUI, favorites-first (on by default) lifts favorites to the top of their scope under the Name and Newest first sorts, while the Custom sort keeps the order the user arranged; the web sidebar uses favorite only as a tiebreak within its attention tier.
+A user mark on a Session. Favoriting cancels Archive, Ignore and Snooze, like Pin. In the TUI, favorites-first (on by default) lifts favorites to the top of their scope under the Name and Newest first sorts; Custom keeps the order set by hand. The web sidebar does not order by favorite.
 _Avoid_: star, pin (different concept)
 
 **Unread**:

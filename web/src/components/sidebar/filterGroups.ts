@@ -1,8 +1,8 @@
 import type { Workspace } from "../../lib/types";
 import {
   sidebarGroupHasLiveWorkspace,
+  UNGROUPED_GROUP_ID,
   type NestedSidebarGroup,
-  type OrgNestedGroup,
   type SidebarGroup,
   type SidebarWorkspaceView,
 } from "../../lib/sidebarGroups";
@@ -18,19 +18,30 @@ function workspaceMatchesQuery(ws: Workspace, q: string): boolean {
   );
 }
 
-/** A row survives when it or any enclosing header name matches `q`, and it passes the facet filter. */
-export function makeRowFilter(q: string, matchesFacets: (ws: Workspace) => boolean) {
+/** A row survives when it or any enclosing header name matches `q`, and it passes the facet and Needs you
+ *  filters. */
+export function makeRowFilter(
+  q: string,
+  matchesFacets: (ws: Workspace) => boolean,
+  needsYou?: (ws: Workspace) => boolean,
+) {
   return (v: SidebarWorkspaceView, ...groupNames: string[]) =>
     (!q || workspaceMatchesQuery(v.workspace, q) || groupNames.some((n) => n.toLowerCase().includes(q))) &&
-    matchesFacets(v.workspace);
+    matchesFacets(v.workspace) &&
+    (!needsYou || needsYou(v.workspace));
 }
 
 type RowFilter = ReturnType<typeof makeRowFilter>;
 
-/** Filters each group's rows and drops groups left empty. */
+/** Filters each group's rows and drops groups left empty. Under a repository the ungrouped rows have no header
+ *  of their own, so no "Ungrouped" name to match. */
 function filterLevel<G extends SidebarGroup>(groups: G[], keep: RowFilter, ...parentNames: string[]): G[] {
   return groups
-    .map((g) => ({ ...g, workspaces: g.workspaces.filter((v) => keep(v, g.displayName, ...parentNames)) }))
+    .map((g) => {
+      const names =
+        parentNames.length > 0 && g.id === UNGROUPED_GROUP_ID ? parentNames : [g.displayName, ...parentNames];
+      return { ...g, workspaces: g.workspaces.filter((v) => keep(v, ...names)) };
+    })
     .filter((g) => g.workspaces.length > 0);
 }
 
@@ -44,20 +55,9 @@ export function filterNested(groups: NestedSidebarGroup[], keep: RowFilter): Nes
     .filter((ng) => ng.subgroups.length > 0);
 }
 
-export function filterOrg(groups: OrgNestedGroup[], keep: RowFilter): OrgNestedGroup[] {
-  return groups
-    .map((og) => ({ org: og.org, repos: filterLevel(og.repos, keep, og.org.displayName) }))
-    .filter((og) => og.repos.length > 0);
-}
-
-/** The subgroups a nested axis renders: a collapsed repo hides every subgroup under it. */
+/** The subgroups the Repository grouping renders: a collapsed repo hides every subgroup under it. */
 export function visibleSubgroups(groups: NestedSidebarGroup[], expandAll: boolean): SidebarGroup[] {
   return groups.flatMap((ng) => (expandAll || !ng.repo.collapsed ? ng.subgroups : []));
-}
-
-/** The repos an org axis renders: a collapsed org hides every repo under it. */
-export function visibleOrgRepos(groups: OrgNestedGroup[], expandAll: boolean): SidebarGroup[] {
-  return groups.flatMap((og) => (expandAll || !og.org.collapsed ? og.repos : []));
 }
 
 function sinkTimeMs(ws: Workspace): number {
@@ -70,8 +70,8 @@ function sinkTimeMs(ws: Workspace): number {
   return best;
 }
 
-// Deduped by workspace: the status axis slices one workspace into a bucket per status, so the
-// footer lists it once with every archived session from those buckets. First bucket wins for
+// Deduped by workspace: My groups slices one workspace into a Group per session group, so the
+// footer lists it once with every archived session from those slices. First slice wins for
 // the row identity. Rows sort newest sunk first across groups, whatever the sidebar sort, matching
 // the TUI's Archived section.
 export const sunkViews = (groups: SidebarGroup[]) => {

@@ -10,7 +10,7 @@ import { describe, expect, it } from "vitest";
 import { mergeRegisteredProjects, normalizeProjectPathKey, unpinnedSavedProjects } from "../registeredProjects";
 import { repoGroupToSidebarGroup, sidebarGroupShouldRender } from "../sidebarGroups";
 import { MULTI_REPO_GROUP_ID } from "../../hooks/useRepoGroups";
-import { axisDrawsRepoHeaders, type SidebarAxis } from "../sidebarAxis";
+import type { SidebarGroupBy } from "../sidebarView";
 import type { ProjectInfo, RepoGroup, Workspace } from "../types";
 
 function workspace(repoPath: string): Workspace {
@@ -151,14 +151,12 @@ describe("unpinnedSavedProjects (#2212)", () => {
     expect(summary(unpinnedSavedProjects(groups, projects))).toEqual(expected);
   });
 
-  // #5065: By group draws no repository headers, so a Project with live Sessions, or a pinned one, has nowhere
+  // #5065: My groups draws no repository headers, so a Project with live Sessions, or a pinned one, has nowhere
   // else to appear; it lists every registered Project, each once.
-  it.each<[SidebarAxis, string[]]>([
-    ["repo", ["/work/saved"]],
-    ["org", ["/work/saved"]],
-    ["repo+group", ["/work/saved"]],
+  it.each<[SidebarGroupBy, string[]]>([
+    ["project", ["/work/saved"]],
     ["group", ["/work/alpha", "/work/pinned", "/work/saved"]],
-  ])("on the %s axis lists %j", (axis, expected) => {
+  ])("grouped by %s lists %j", (groupBy, expected) => {
     const projects = [
       unpinned("/work/alpha"),
       project("/work/pinned"),
@@ -167,7 +165,7 @@ describe("unpinnedSavedProjects (#2212)", () => {
       unpinned("/work/saved"),
     ];
     const listed = unpinnedSavedProjects([repoGroup("/work/alpha")], projects, {
-      drawsRepoHeaders: axisDrawsRepoHeaders(axis),
+      drawsRepoHeaders: groupBy === "project",
     });
     expect(listed.map((g) => g.repoPath)).toEqual(expected);
   });

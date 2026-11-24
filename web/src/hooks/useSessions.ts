@@ -3,15 +3,22 @@ import type { SessionResponse } from "../lib/types";
 import {
   fetchSessions,
   fetchTrashedSessions,
+  updateSidebarView,
+  updateWorkspaceOrdering,
   type RuntimeCursor,
   type SessionMutation,
   type SessionsEnvelope,
+  type SidebarView,
+  type WorkspaceOrderingPatch,
 } from "../lib/api";
 import { noteDaemonChanged, setServerDown } from "../lib/connectionState";
+import { DEFAULT_SIDEBAR_VIEW, holdSettled, holdStarted, newWriteHold, pollMayReplace } from "../lib/sidebarView";
 
 const POLL_INTERVAL = 3000;
 const POLL_DEADLINE_MS = 15000;
-const LOCAL_ORDERING_WINDOW_MS = 4000;
+
+const sameList = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
+const keepIfSame = (next: string[]) => (prev: string[]) => (sameList(prev, next) ? prev : next);
 
 interface SessionState {
   sessions: SessionResponse[];
@@ -47,6 +54,12 @@ function withPushedStatus(row: SessionResponse, observed: RuntimeCursor, held: P
 export function useSessions() {
   const [state, setState] = useState<SessionState>({ sessions: [], observedById: {}, epoch: null });
   const [workspaceOrdering, setWorkspaceOrdering] = useState<string[]>([]);
+  const [repositoryOrder, setRepositoryOrder] = useState<string[]>([]);
+  const [sidebarView, setSidebarView] = useState<SidebarView>(DEFAULT_SIDEBAR_VIEW);
+  // This Client's own writes of each shared value, so a poll that predates one cannot undo it.
+  const orderHold = useRef(newWriteHold());
+  const repositoryHold = useRef(newWriteHold());
+  const viewHold = useRef(newWriteHold());
   const [error, setError] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [trashedCount, setTrashedCount] = useState(0);
@@ -67,7 +80,6 @@ export function useSessions() {
     if (!held || held.epoch !== cursor.epoch || held.revision < cursor.revision) seenRef.current.set(id, cursor);
   }, []);
 
-  const lastLocalOrderingAtRef = useRef<number>(0);
   // GET admission is global; only installed rows attest individual mutation receipts.
   const floorGet = useRef<RuntimeCursor | null>(null);
   const abandonedEpochs = useRef(new Set<string>());
@@ -81,8 +93,29 @@ export function useSessions() {
     );
   }, []);
 
-  const markLocalOrderingUpdate = useCallback(() => {
-    lastLocalOrderingAtRef.current = Date.now();
+  /** Applies an ordering write at once and sends it; resolves with its receipt, or null when it failed. */
+  const changeOrdering = useCallback(async (patch: WorkspaceOrderingPatch) => {
+    const holds = [];
+    if (patch.order) {
+      setWorkspaceOrdering(patch.order);
+      holds.push(orderHold.current);
+    }
+    if (patch.repositories) {
+      setRepositoryOrder(patch.repositories);
+      holds.push(repositoryHold.current);
+    }
+    holds.forEach(holdStarted);
+    const receipt = await updateWorkspaceOrdering(patch);
+    for (const hold of holds) holdSettled(hold, receipt);
+    return receipt;
+  }, []);
+
+  /** Applies a grouping or sort pick at once; the write waits for `after`, which the hold already covers. */
+  const changeSidebarView = useCallback(async (patch: Partial<SidebarView>, after?: Promise<unknown>) => {
+    setSidebarView((prev) => ({ ...prev, ...patch }));
+    holdStarted(viewHold.current);
+    await after;
+    holdSettled(viewHold.current, await updateSidebarView(patch));
   }, []);
 
   const applyResult = useCallback(
@@ -154,9 +187,13 @@ export function useSessions() {
           }
           return { sessions: [...rows, ...carried], observedById, epoch: cursor.epoch };
         });
-        // Ignore server ordering while a local drag's PUT may still be landing.
-        if (Date.now() - lastLocalOrderingAtRef.current > LOCAL_ORDERING_WINDOW_MS) {
-          setWorkspaceOrdering(data.workspace_ordering);
+        if (pollMayReplace(orderHold.current, cursor)) setWorkspaceOrdering(keepIfSame(data.workspace_ordering));
+        if (pollMayReplace(repositoryHold.current, cursor)) {
+          setRepositoryOrder(keepIfSame(data.repository_order ?? []));
+        }
+        if (pollMayReplace(viewHold.current, cursor)) {
+          const view = data.sidebar_view ?? DEFAULT_SIDEBAR_VIEW;
+          setSidebarView((prev) => (prev.group_by === view.group_by && prev.sort === view.sort ? prev : view));
         }
       } else {
         setError(true);
@@ -381,8 +418,10 @@ export function useSessions() {
     observedById: state.observedById,
     runtimeEpoch: state.epoch,
     workspaceOrdering,
-    setWorkspaceOrdering,
-    markLocalOrderingUpdate,
+    repositoryOrder,
+    sidebarView,
+    changeOrdering,
+    changeSidebarView,
     error,
     loaded,
     trashedCount,
