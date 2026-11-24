@@ -9,7 +9,7 @@ export const TOUR_ANCHORS = {
   sidebar: "sidebar",
   sidebarSettings: "sidebar-settings",
   dashboardNewSession: "dashboard-new-session",
-  rightPanel: "right-panel",
+  diffToggle: "diff-toggle",
   composer: "acp-composer",
   modePicker: "acp-mode-picker",
   queueSend: "acp-queue-send",
@@ -89,10 +89,10 @@ export const TOUR_STEPS: readonly TourStep[] = [
   },
   {
     id: "right-panel",
-    anchor: TOUR_ANCHORS.rightPanel,
+    anchor: TOUR_ANCHORS.diffToggle,
     scopes: ["session", "structured-view"],
     title: "Diff and review",
-    body: "Review the agent's file changes and send comments back without leaving the session.",
+    body: "Open the diff here to review the agent's file changes and send comments back without leaving the session.",
     shortcutHints: [
       { id: "diff", verb: "toggles the diff" },
       { id: "rightPanel", verb: "toggles the panel" },

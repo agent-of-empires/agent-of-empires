@@ -570,7 +570,7 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         let decision = crate::session::claim::decide_restore_claim(
             instances,
             &restore_id,
-            chrono::Utc::now(),
+            crate::time::Timestamp::now(),
         )?;
         let fresh = if matches!(
             decision,
@@ -1555,18 +1555,20 @@ fn wait_decision(
     }
 }
 
-/// Confirmed absence only. An unreachable tmux server leaves a plain `Error`, and a launch that
-/// holds the reservation has not created its pane yet.
-fn is_terminated(
+/// Confirmed absence only: a gone pane's latch, unless tmux now reports the session present. An
+/// unreachable tmux server leaves a plain `Error`, and a launch that holds the reservation has not
+/// created its pane yet.
+pub(crate) fn is_terminated(
     status: Status,
-    last_error: Option<&str>,
+    last_error: &crate::session::LastError,
     launching: bool,
     existence: crate::tmux::SessionExistence,
 ) -> bool {
     !launching
         && (status == Status::Stopped
             || (status == Status::Error
-                && last_error == Some(crate::session::TMUX_SESSION_GONE_ERROR))
+                && existence != crate::tmux::SessionExistence::Present
+                && crate::session::reports_tmux_session_gone(last_error))
             // A capture that loses a vanishing pane reads as Idle, so recheck the pane itself.
             || existence == crate::tmux::SessionExistence::Absent)
 }
@@ -1577,8 +1579,8 @@ fn confirmed_terminated(inst: &Instance) -> bool {
         .map_or(crate::tmux::SessionExistence::Unknown, |s| s.existence());
     is_terminated(
         inst.status,
-        inst.last_error.as_deref(),
-        inst.has_fresh_launch_reservation(chrono::Utc::now()),
+        &inst.last_error,
+        inst.has_fresh_launch_reservation(crate::time::Timestamp::now()),
         existence,
     )
 }
@@ -2110,7 +2112,7 @@ mod rename_tests {
             branch: "agent-old".into(),
             main_repo_path: repo.to_str().unwrap().into(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: Some("main".into()),
         });
         let id = target.id.clone();
@@ -2364,7 +2366,7 @@ mod rename_tests {
             branch: "drifted".to_string(),
             main_repo_path: "/tmp/repo".to_string(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: None,
         });
         let tied_id = tied.id.clone();
@@ -2399,7 +2401,7 @@ mod rename_tests {
             branch: "main-branch".to_string(),
             main_repo_path: "/tmp/repo".to_string(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: None,
         });
         let active_id = active.id.clone();
@@ -2462,7 +2464,7 @@ mod rename_tests {
             branch: "agent-old".into(),
             main_repo_path: dir.path().join("repo").to_str().unwrap().into(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: None,
         });
         let id = target.id.clone();
@@ -3167,7 +3169,7 @@ mod set_base_target_tests {
                     base_branch_override: None,
                 })
                 .collect(),
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             cleanup_on_delete: true,
         });
         inst
@@ -3406,7 +3408,7 @@ mod start_blocked_tests {
             let profile = "archive-trashed";
             let project = temp.path().join("project");
             let mut inst = Instance::new("trashed", project.to_str().unwrap());
-            inst.pinned_at = Some(chrono::Utc::now());
+            inst.pinned_at = Some(crate::time::Timestamp::now());
             inst.trash();
             let id = inst.id.clone();
             let storage = Storage::new_unwatched(profile).unwrap();
@@ -3481,7 +3483,9 @@ mod session_mutation_tests {
         row.try_acquire_lifecycle_reservation(
             crate::session::LifecycleOperation::Trash,
             Instance::LIFECYCLE_RESERVATION_TTL,
-            chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+            crate::time::Timestamp::now()
+                - Instance::LIFECYCLE_RESERVATION_TTL
+                - crate::time::Duration::seconds(1),
         )
         .unwrap();
         row.trash();
@@ -3841,8 +3845,8 @@ mod import_tests {
 mod wait_decision_tests {
     use super::{adopt_stored, is_terminated, wait_decision, WaitDecision};
     use crate::session::{
-        Instance, LifecycleOperation, Status, TMUX_SERVER_UNREACHABLE_ERROR,
-        TMUX_SESSION_GONE_ERROR,
+        Instance, LastError, LifecycleOperation, Status, TmuxAbsence,
+        TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR, TMUX_SESSION_GONE_LEAD,
     };
     use std::time::Duration;
 
@@ -3899,35 +3903,41 @@ mod wait_decision_tests {
     #[test]
     fn only_confirmed_absence_is_termination() {
         use crate::tmux::SessionExistence::{Absent, Present, Unknown};
+        let latched = |absence, message: &str| {
+            let mut error = LastError::default();
+            error.latch_tmux(absence, message);
+            error
+        };
+        let gone = latched(TmuxAbsence::Gone, TMUX_SESSION_GONE_ERROR);
+        // What a live pane printed, however it begins, is no latch.
+        let printed = {
+            let mut error = LastError::default();
+            error.set(format!("{TMUX_SESSION_GONE_LEAD} Exiting."));
+            error
+        };
+        let none = LastError::default();
         let cases = [
-            (Status::Stopped, None, false, Present, true),
+            (Status::Stopped, &none, false, Present, true),
+            // tmux reports the session again, so its pane is no longer gone
+            (Status::Error, &gone, false, Present, false),
+            // the tmux server exits with its last session, so a later poll can't reach it
+            (Status::Error, &gone, false, Unknown, true),
             (
                 Status::Error,
-                Some(TMUX_SESSION_GONE_ERROR),
-                false,
-                Present,
-                true,
-            ),
-            (
-                Status::Error,
-                Some(TMUX_SERVER_UNREACHABLE_ERROR),
+                &latched(TmuxAbsence::Unreachable, TMUX_SERVER_UNREACHABLE_ERROR),
                 false,
                 Unknown,
                 false,
             ),
-            (Status::Error, None, false, Unknown, false),
-            (
-                Status::Idle,
-                Some(TMUX_SESSION_GONE_ERROR),
-                false,
-                Present,
-                false,
-            ),
+            (Status::Error, &printed, false, Present, false),
+            (Status::Error, &printed, false, Unknown, false),
+            (Status::Error, &none, false, Unknown, false),
+            (Status::Idle, &gone, false, Unknown, false),
             // a capture that lost the pane reads Idle; the pane check still catches it
-            (Status::Idle, None, false, Absent, true),
+            (Status::Idle, &none, false, Absent, true),
             // a launch holding its reservation has no pane yet
-            (Status::Starting, None, true, Absent, false),
-            (Status::Stopped, None, true, Absent, false),
+            (Status::Starting, &none, true, Absent, false),
+            (Status::Stopped, &none, true, Absent, false),
         ];
         for (status, last_error, launching, existence, want) in cases {
             assert_eq!(
@@ -3940,7 +3950,7 @@ mod wait_decision_tests {
 
     #[test]
     fn adopt_stored_sees_a_launch_commit_and_keeps_detection_state() {
-        let now = chrono::Utc::now();
+        let now = crate::time::Timestamp::now();
         let mut live = Instance::new("t", "/p");
         live.try_acquire_lifecycle_reservation(
             LifecycleOperation::Launch,

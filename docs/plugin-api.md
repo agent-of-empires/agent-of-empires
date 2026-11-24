@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `23`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `24`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -19,7 +19,7 @@ Each key below notes the `api_version` it needs. Target the newest schema your p
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 23
+api_version = 24
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 capabilities = ["runtime.worker"]
@@ -30,7 +30,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `23`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `24`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). A manifest with `[runtime]` must declare `runtime.worker`. Static contributions need none; provider-native agent status and replies require `session.integration`. |
@@ -176,12 +176,13 @@ Capabilities gate plugin resource access and host interactions. They are prompte
 | `session.unattended` | Creating a session in a host-classified *unattended* approval mode. A distinct, high-severity grant, never implied by `session.create` or `session.prompt` (`api_version >= 9`). See [Session-driving RPCs](#session-driving-rpcs). |
 | `session.message` | Pushing a text message into **any** session, including ones the plugin did not create, via `sessions.message.send`. A structured session shows the message as sent by the plugin, and the call reaches sessions the plugin did not create, so it is a separate grant, never implied by `session.prompt` (`api_version >= 15`). |
 | `session.integration` | Provider-native status and user-requested replies for an agent (`api_version >= 19`). Launch-only agent metadata does not require this capability. |
+| `mcp.rewrite` | Serving the `mcp.rewrite` hook. The worker receives each session's resolved MCP server definitions **including secret env and header values**, and returns the set AoE forwards to the agent (`api_version >= 24`). A distinct, high-severity grant, never implied by another. See [Hooks](#hooks). |
 
 A capability this host version does not recognize is rejected, not granted.
 
 ## Commands
 
-Palette and CLI entries, namespaced by the host as `plugin.<id>.<command-id>`.
+Palette entries, namespaced by the host as `plugin.<id>.<command-id>`. A command with no `action` is delivered to the worker as a `plugin.command.invoke` notification. The CLI lists them in `aoe --help` but cannot run them yet. A command whose name a core subcommand or an earlier plugin already uses is not listed.
 
 ```toml
 [[commands]]
@@ -364,7 +365,7 @@ With `api_version >= 9` a worker can discover ACP capabilities and create host-o
 
 **Ownership.** `sessions.turn.send` reaches only a session the calling plugin created. To reach any other session, use `sessions.message.send`.
 
-**Busy sessions.** A turn aimed at an agent already running a non-steerable turn (or cancelling, or compacting) is refused with a retryable `agent_busy` rather than dropped. So is a `/compact` or `/clear` aimed at any running turn, steerable or not, since such a command runs on its own turn. A stopped or dormant session is not busy: the host wakes it the way a user prompt does, closes any turn the previous worker left open, resumes the worker, and waits. An archived or trashed session is never woken; the turn fails with `session_archived` or `session_trashed`.
+**Busy sessions.** A turn aimed at an agent already running a non-steerable turn (or cancelling, or compacting) is refused with a retryable `agent_busy` rather than dropped. So is a `/compact` or `/clear` aimed at any running turn, steerable or not, since such a command runs on its own turn. A stopped or dormant session is not busy: the host wakes it the way a user prompt does, closes any turn the previous worker left open, resumes the worker, and waits. An archived or trashed session is never woken; the turn fails with `session_archived` or `session_trashed`. An ignored session fails with `ignored` and keeps its marker.
 
 **Idempotency.** `sessions.create` takes a plugin-scoped `idempotency_key`: retrying with the same key and payload returns the existing session (`created: false`), while a different payload under that key is a conflict.
 
@@ -397,6 +398,7 @@ Status notifications follow canonical row adoption. Rejected or stale operations
 | `session_not_found` | No such session, which is also what a hard-deleted session looks like. |
 | `session_archived` | The session is archived; it is never woken. Skip it and keep the registration. |
 | `session_trashed` | The session is in the trash; it is never woken. |
+| `ignored` | The session is managed by another session and ignored; a plugin send is never delivered or allowed to clear the marker. A person must unignore it or reclaim ownership first. |
 | `rate_limited` | More than 600 messages per rolling hour for this plugin. A bucket of its own, separate from turns. |
 | `resume_failed` | A terminal session's agent could not resume. `data.resume_session_id` holds the preserved session id. |
 | `session_not_running` | A terminal pane vanished between the revive and the send. |
@@ -409,6 +411,55 @@ Status notifications follow canonical row adoption. Rejected or stale operations
 | `capability_missing` | The manifest lacks, or the user has not approved, `session.message`. |
 
 **Timing.** The call is synchronous. It returns, or fails with `delivery_timeout`, within 25 seconds (a 10 second worker-ready wait plus 15 seconds for a terminal resume), so a worker may call it from a scheduler loop.
+
+## Hooks
+
+### `[hooks.mcp_rewrite]` (`api_version >= 24`)
+
+Lets a worker rewrite the MCP servers AoE forwards to a session's agent. Requires the `mcp.rewrite` capability and a `[runtime]` worker. The hook runs only while the plugin is active: enabled, loaded, and with a grant covering the current manifest hash. While it is inactive (disabled, failed to load, or awaiting re-approval after an update changed its manifest) no hook runs and sandboxes get the full resolved set.
+
+```toml
+[hooks.mcp_rewrite]
+applies_to = "sandbox"   # "sandbox" (default) or "all"
+timeout_ms = 5000        # 1..=30000
+order = 0                # lower runs first; ties break by plugin id
+```
+
+Plugins that inject servers should keep the default or a negative `order`. A plugin that must see everything the others add, such as a security proxy, should declare a high `order` (for example `1000`) so it runs last.
+
+After AoE merges the MCP layers and before it hands the set to the agent, on every launch and respawn, the host sends the worker a `mcp.rewrite` request. It is a host-initiated JSON-RPC request whose `id` is a string of the form `h-<n>`. The worker answers with a JSON-RPC response carrying the same string `id` and either a `result` (the edit below) or an `error` object. A worker that is still starting is waited for until `timeout_ms` elapses.
+
+```json
+{
+  "session_id": "…", "agent": "…", "sandboxed": true,
+  "profile": null, "cwd": "/path",
+  "sandbox": {
+    "container_workdir": "/workspace/foo",
+    "mounts": [ { "host": "/abs/host/foo", "container": "/workspace/foo", "read_only": false } ]
+  },
+  "servers": [
+    { "name": "docs", "type": "http", "url": "https://…", "headers": { "Authorization": "Bearer …" } },
+    { "name": "fs", "type": "stdio", "command": "…", "args": [], "env": { "K": "V" } }
+  ]
+}
+```
+
+`sandbox` is present only when `sandboxed` is true. `mounts` are the volumes AoE creates the container with, so a plugin can map container paths back to the host: a linked worktree lists both the worktree and its main repo, and a workspace (multi-repo) session lists the workspace directory plus every main repo outside it. Host paths are sent as they are: not redacted, and not secret. `container_workdir` is the directory the agent runs in, or `null` when AoE cannot determine it. When AoE cannot compute the mounts, `mounts` is empty and the session is still reported as sandboxed.
+
+The `result` is an edit; unknown fields are rejected:
+
+```json
+{
+  "drop": ["fs"],
+  "add": [ { "name": "docs", "type": "http", "url": "http://gateway/mcp/docs" } ]
+}
+```
+
+`drop` is a list of names or `"*"`. `add` entries use the standard `mcpServers` shape plus `name`; an added server replaces any server of the same name, and a later duplicate in `add` wins. Plugins run in ascending `order`, ties broken by plugin id, each seeing the previous result.
+
+A sandboxed session whose hook fails (no worker within the timeout, error reply, invalid reply) is given **no** MCP servers, and AoE raises a notification attributed to the plugin. A sandboxed session with an applicable hook also gets no servers when the plugin host could not start. An `error` reply is reported as a rejection without the worker's text, so a worker cannot write into AoE's logs or notifications through it. Other sessions keep their resolved set.
+
+AoE does not copy host MCP definitions into a Claude sandbox's agent store, though `.mcp.json` files inside the copied Claude `plugins/` directory are copied as they are. Other agents' MCP-bearing config files are still copied into their sandbox stores verbatim, so for those agents the hook alone does not keep host MCP secrets out of the sandbox.
 
 ## Plugin storage
 
@@ -738,7 +789,7 @@ An `href` renders as a link only when it is an `http(s)` URL or a path starting 
 
 #### Pane actions
 
-Clicking an `action` block, or a `row` carrying a `method`, POSTs to `/api/plugins/{id}/action` with `{ method, params, session_id }`. `params` is the block's own `params` object, forwarded verbatim, so one method can serve every row in a list:
+Clicking an `action` block, or a `row` carrying a `method`, POSTs to `/api/plugins/{id}/action` with `{ method, params, session_id }`. `params` is the block's own `params` object, forwarded as given apart from the host-owned `session_id` and `origin`. The host also removes `composer` unless the plugin declares the composer-read capability. One method can serve every row in a list:
 
 ```json
 { "kind": "row", "label": "warn when daemon is stale", "prefix": "#3231",
@@ -746,6 +797,14 @@ Clicking an `action` block, or a `row` carrying a `method`, POSTs to `/api/plugi
 ```
 
 The host merges in the authoritative `session_id` (a plugin cannot spoof it) and delivers the call as a **fire-and-forget JSON-RPC notification**: no reply, no return value. The worker does its work and re-pushes its UI state, and the clicked control spins until the plugin's UI revision moves, with a 15s timeout. Actions are read-write-mode only and are not passphrase gated, so treat every method as reachable by anyone who can use the dashboard.
+
+The host also sets `params.origin`, overwriting any client value. It is session provenance, not proof of human intent:
+
+- `dashboard`: the request carried a signed-in browser login. Programmatic callers holding that session can send it too.
+- `socket`: a process on the daemon's Unix socket (same user, such as a coding agent).
+- `token`: any other caller (access token, or `--auth none`).
+
+A plugin that needs a person to approve something must not rely on `origin` alone; it needs its own trusted confirmation step. `params` must be a JSON object, `null` or omitted; anything else gets `400`.
 
 The TUI renders panes read-only: it draws the text of every kind (dropping icons, hrefs, and tooltips, and stacking `columns`) but cannot fire an action, so `action` blocks appear as inert `[action] <label>` labels.
 
@@ -792,7 +851,7 @@ To mutate the draft, include a `draft_operation` in the pushed payload, which re
 
 ## Status
 
-Status segments the plugin contributes, consumed by the status surface. Requires `api_version >= 4`.
+Reserved. The manifest accepts `[[status]]` (with `api_version >= 4`) but no host surface reads it yet; use a `status-bar` [UI slot](#ui-slots) for visible status.
 
 ```toml
 [[status]]

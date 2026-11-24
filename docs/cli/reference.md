@@ -1428,7 +1428,7 @@ Export a built-in theme as a TOML file for customization
 
 ###### **Options:**
 
-* `-o`, `--output <OUTPUT>` — Output file path (defaults to `<name>.toml` in the themes directory)
+* `-o`, `--output <OUTPUT>` — Output file path (defaults to `custom-<name>.toml` for a built-in theme, `<name>.toml` otherwise, in the themes directory)
 
 
 
@@ -1919,7 +1919,7 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 * `recover` — Retire unprovable worker ownership after external shutdown confirmation
 * `kill` — SIGKILL the runner, then settle its native workers
 * `logs` — Tail the runner's log file for an agent session
-* `restart` — Restart a wedged worker after its runner and native workers have stopped
+* `restart` — Restart a worker, or start a stopped one through `aoe serve`
 * `history` — Print the persisted transcript for an agent session
 * `status` — Print live status for an agent session: highest/lowest seq, and whether the on-disk retention window has truncated history
 * `prompt` — Send a prompt to an agent session's agent
@@ -2040,7 +2040,7 @@ Tail the runner's log file for an agent session
 
 ## `aoe acp restart`
 
-Restart a wedged worker after its runner and native workers have stopped
+Restart a worker, or start a stopped one through `aoe serve`
 
 **Usage:** `aoe acp restart <SESSION>`
 

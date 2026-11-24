@@ -76,7 +76,7 @@ Variables are read from the process that creates the worktree. For sessions crea
 
 ### Bare repos
 
-Bare repos are auto-detected and use `bare_repo_path_template` instead, so worktrees land as siblings inside the project directory. A sandboxed session needs this layout to reach the repo's git directory from the container.
+Bare repos are auto-detected and use `bare_repo_path_template` instead, so worktrees land as siblings inside the project directory.
 
 ### Submodules
 

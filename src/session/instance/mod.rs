@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use crate::time::Timestamp;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -54,6 +54,7 @@ pub(crate) use hooks::HostHookApprovalRequired;
 pub(crate) use status_update::CAPTURE_FAILED_RULE;
 mod identity_sidecar;
 mod kill;
+mod last_error;
 mod launch_command;
 mod prime_capture;
 
@@ -91,6 +92,8 @@ pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservati
 
 #[cfg(test)]
 pub(crate) use identity_sidecar::FAIL_PI_PATH_WRITES;
+pub use last_error::LastError;
+pub(crate) use last_error::TmuxAbsence;
 pub use polling::PollerStart;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome, SessionGone};
 pub use resume::ManagedResumeCause;
@@ -103,6 +106,10 @@ pub(crate) use sid_persist::{
 };
 pub use start::{LaunchSidOutcome, StartOutcome};
 pub(crate) use status::PassiveStatusPatch;
+pub(crate) use status::{
+    reports_tmux_session_gone, REFUSED_RESTART, TMUX_SERVER_UNREACHABLE_LEAD,
+    TMUX_SESSION_GONE_LEAD,
+};
 pub use status::{Status, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR};
 pub(crate) use terminal::ToolLaunchUnavailable;
 #[cfg(test)]
@@ -177,9 +184,11 @@ use launch_command::{
     splice_subcommand_or_append, PreparedLaunch,
 };
 use omp::{gate_omp_launch, wrap_omp_host_launch, wrap_omp_launch};
-use pane_status::{resolve_detected_status, summarize_error_from_pane};
+use pane_status::{pane_error_line, resolve_detected_status, summarize_error_from_pane};
 
-use status::{UNKNOWN_ERROR_WINDOW_CONFIRMED_PRESENT, UNKNOWN_ERROR_WINDOW_NEVER_PRESENT};
+use status::{
+    HANDOFF_ENDED, UNKNOWN_ERROR_WINDOW_CONFIRMED_PRESENT, UNKNOWN_ERROR_WINDOW_NEVER_PRESENT,
+};
 use tmux_session::tmux_env_session_name_for_instance_id;
 use types::{deserialize_session_id, is_zero_u64, is_zero_u8};
 
@@ -217,6 +226,9 @@ pub struct DetectionState {
     /// flipped parked sessions between Idle and Running every few seconds.
     pub pending: Option<Status>,
     pub observation_key: Option<tmux::ObservationKey>,
+    /// Whether the last verdict was an Error for a pane that ended, so a poll that reuses it can
+    /// still reconcile the remedy a refused restart needs.
+    pub ended: bool,
 }
 
 /// A turn queued for delivery once the (resumed) worker is live. See
@@ -250,6 +262,12 @@ pub struct PendingInitialTurn {
     /// it existed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub id: String,
+    /// Carried onto the resulting `Event::UserPromptSent`.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::daemon::PromptOrigin::is_unknown"
+    )]
+    pub origin: crate::daemon::PromptOrigin,
 }
 
 impl PendingInitialTurn {
@@ -278,7 +296,7 @@ impl PendingInitialTurn {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct FailedPurge {
     lifecycle_generation: u64,
-    trashed_at: DateTime<Utc>,
+    trashed_at: Timestamp,
     trash_lifecycle_id: String,
     forced: bool,
 }
@@ -539,9 +557,9 @@ pub struct Instance {
     pub yolo_mode: bool,
     #[serde(default)]
     pub status: Status,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_accessed_at: Option<DateTime<Utc>>,
+    pub last_accessed_at: Option<Timestamp>,
     /// Wall-clock time of the most recent transition into `Idle`. Used by
     /// the TUI and web dashboard to highlight a freshly-stopped session
     /// for the duration of the configured idle-decay window
@@ -556,10 +574,10 @@ pub struct Instance {
     /// in-process `Instant` for push-notification dwell timing, a
     /// different concept with a different type and lifetime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idle_entered_at: Option<DateTime<Utc>>,
+    pub idle_entered_at: Option<Timestamp>,
     /// Wall-clock launch of the current agent process; `None` until the first launch after upgrade.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<DateTime<Utc>>,
+    pub started_at: Option<Timestamp>,
     /// The absolute agent program the last host launch ran, when native launch resolved it. It is
     /// a path only; hook output is never recorded here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -569,7 +587,17 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_resolved_executable: Option<std::path::PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub archived_at: Option<DateTime<Utc>>,
+    pub archived_at: Option<Timestamp>,
+
+    /// Managed-session ignore marker. A session driven by another session may
+    /// be ignored without being archived or trashed. Ignore is a sink state:
+    /// pin, favorite, archive and snooze clear it, and direct user engagement
+    /// (`touch_last_accessed`) wakes it. MCP routine access and sends refuse
+    /// an ignored managed session instead of quietly clearing the marker.
+    /// Additive: absent in older `sessions.json` rows, so no migration is
+    /// needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored_at: Option<Timestamp>,
 
     /// Favorite marker; sibling of archive. When set AND the session is in
     /// a "needs help" status (Waiting, Error, Idle, Unknown), the session
@@ -578,7 +606,7 @@ pub struct Instance {
     /// statuses the flag is visible (⭐ glyph + bold) but does NOT re-rank
     /// since live work isn't interrupted by a decoration. Opposite of archive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub favorited_at: Option<DateTime<Utc>>,
+    pub favorited_at: Option<Timestamp>,
 
     /// Snooze marker, a "temporary archive." When `snoozed_until` is in the
     /// future, the session sorts to tier 99 alongside archived rows and
@@ -591,7 +619,7 @@ pub struct Instance {
     /// Archive wins over snooze (archiving a snoozed session clears nothing
     /// but renders as archive since is_archived() is checked first).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snoozed_until: Option<DateTime<Utc>>,
+    pub snoozed_until: Option<Timestamp>,
 
     /// Unread marker: a session that needs attention. Set automatically when a
     /// turn finishes (`Running -> Idle`) and also by the manual `u` toggle;
@@ -615,7 +643,7 @@ pub struct Instance {
     /// and `archived_at` (user-facing hide): dormancy is invisible to
     /// the UI sort and exists only to suppress auto-respawn. See #1689.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idle_dormant_since: Option<DateTime<Utc>>,
+    pub idle_dormant_since: Option<Timestamp>,
 
     /// Web-only pin marker. Distinct from `favorited_at`: favorite is the
     /// TUI attention-sort within-tier pin, while pin is a hard top-of-sort
@@ -628,7 +656,7 @@ pub struct Instance {
     /// because it is an explicit persistent surfacing signal, not a sink
     /// state that "user is engaging" implicitly contradicts. See #1581.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pinned_at: Option<DateTime<Utc>>,
+    pub pinned_at: Option<Timestamp>,
 
     /// Trash marker: the session is soft-deleted. A trashed row is hidden
     /// from every normal and archived view (trash is its own bucket, see
@@ -645,7 +673,7 @@ pub struct Instance {
     /// preserved, so a restored favorite comes back a favorite. Additive:
     /// absent in older `sessions.json` rows, so no migration is needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trashed_at: Option<DateTime<Utc>>,
+    pub trashed_at: Option<Timestamp>,
     /// UUID of the current trash lifecycle. Unlike the timestamp, it cannot
     /// collide across restore/retrash; v037 and v043 initialize older rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1072,7 +1100,7 @@ pub struct Instance {
     pub(crate) pi_session_path: Option<String>,
 
     #[serde(skip)]
-    pub last_error: Option<String>,
+    pub last_error: LastError,
     #[serde(skip)]
     pub(crate) capture_poller: capture_slot::CapturePollerSlot,
     /// Session IDs invalidated at a fresh-generation boundary. Persisting this

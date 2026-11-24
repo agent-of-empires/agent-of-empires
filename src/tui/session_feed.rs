@@ -58,6 +58,22 @@ pub(crate) enum SidebarSource {
 
 const COMMAND_CAPACITY: usize = 32;
 
+pub(crate) type Prepared = (RuntimeConnection, crate::daemon::DaemonClient);
+
+/// Opens the runtime feed and command client on a reached Daemon. `profile` is empty in
+/// all-profiles mode.
+pub(crate) async fn prepare(
+    endpoint: crate::daemon::DaemonEndpoint,
+    profile: &str,
+) -> anyhow::Result<Prepared> {
+    let connection =
+        RuntimeConnection::connect(&endpoint, (!profile.is_empty()).then_some(profile)).await?;
+    let client = crate::acp::client::HttpClient::new(endpoint)?
+        .daemon_client()
+        .await?;
+    Ok((connection, client))
+}
+
 pub(crate) enum SessionRequest {
     Mutation(SessionMutation),
     Trash {
@@ -494,7 +510,7 @@ async fn run_command_writer(
             let epoch = epoch.clone();
             creations.spawn(async move {
                 let outcome = client
-                    .create_session(&body, &epoch)
+                    .create_session(&body, &epoch, crate::daemon::PromptOrigin::Tui)
                     .await
                     .map(|receipt| CommandReply::Created(Box::new(receipt)))
                     .map_err(CommandFailure::creation);
@@ -802,10 +818,6 @@ impl SessionFeed {
         }
     }
 
-    pub fn connect(&mut self, profile: String) {
-        self.connect_prepared(profile, None);
-    }
-
     pub(crate) fn suspend_for_dashboard(&mut self) {
         set_grant(&self.grant, false);
         set_grant(&self.native_grant, false);
@@ -816,11 +828,7 @@ impl SessionFeed {
         self.commands = None;
     }
 
-    pub(crate) fn connect_prepared(
-        &mut self,
-        profile: String,
-        prepared: Option<(RuntimeConnection, crate::daemon::DaemonClient)>,
-    ) {
+    pub(crate) fn connect_prepared(&mut self, profile: String, prepared: Option<Prepared>) {
         set_grant(&self.grant, false);
         set_grant(&self.native_grant, false);
         self.quit_control.send_replace(None);
@@ -855,15 +863,7 @@ impl SessionFeed {
                         let endpoint =
                             crate::acp::client::daemon_manager::ensure_native_daemon(&profile)
                                 .await?;
-                        let connection = RuntimeConnection::connect(
-                            &endpoint,
-                            (!profile.is_empty()).then_some(profile.as_str()),
-                        )
-                        .await?;
-                        let client = crate::acp::client::HttpClient::new(endpoint)?
-                            .daemon_client()
-                            .await?;
-                        (connection, client)
+                        prepare(endpoint, &profile).await?
                     }
                 };
                 let epoch = connection.info().epoch.clone();
@@ -2557,7 +2557,7 @@ mod tests {
         assert!(!errors[0].outcome_unknown);
         assert!(feed.can_submit("refused"));
 
-        feed.connect("test".into());
+        feed.connect_prepared("test".into(), None);
         feed.task.take().unwrap().abort();
         set_grant(&feed.grant, true);
         assert!(!feed.can_submit("unknown"));
@@ -4326,7 +4326,7 @@ mod tests {
         feed.create_session("pending".into(), body).unwrap();
         let pending = requests.try_recv().unwrap();
 
-        feed.connect("test".into());
+        feed.connect_prepared("test".into(), None);
         feed.task.take().unwrap().abort();
         old_sender.send_replace(Some(SessionFeedResult::Snapshot(snapshot("old", 99))));
         assert!(matches!(feed.try_recv(), Err(TryRecvError::Empty)));

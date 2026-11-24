@@ -23,18 +23,9 @@ fn group_membership<'a>(
 }
 
 impl HomeView {
-    /// Why this process may not write `projects.json`, or `None` when it may.
-    ///
-    /// The runtime republishes the registry in every snapshot
-    /// (`global_projects`), so once it owns the rows a local write diverges
-    /// from the state it will send back next. No runtime route exists for a
-    /// client-side pin: the daemon's own project mutations map to
-    /// `POST /api/projects` / `PATCH /api/projects/{name}` /
-    /// Project registry has an independent local-write policy; sessions/groups never write locally.
+    /// Why this process may not write `projects.json`, or `None` when it may: only while a
+    /// writable Daemon is attached, since it republishes the registry in every snapshot.
     pub(super) fn project_write_block(&self) -> Option<&'static str> {
-        if !self.project_registry_authoritative {
-            return None;
-        }
         if self.session_feed.cityhall_mode() {
             return Some("The attached runtime serves a City Hall client, whose policy does not allow this process to write the project registry locally");
         }
@@ -1012,8 +1003,7 @@ impl HomeView {
             let Some(stamp) = row
                 .trashed_at
                 .as_ref()
-                .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
-                .map(|stamp| stamp.with_timezone(&chrono::Utc))
+                .and_then(|stamp| crate::time::Timestamp::parse_rfc3339(stamp).ok())
             else {
                 continue;
             };
@@ -1179,7 +1169,7 @@ mod tests {
             branch: "old".into(),
             main_repo_path: repo_dir.path().to_string_lossy().into_owned(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: None,
         });
         if sandboxed {

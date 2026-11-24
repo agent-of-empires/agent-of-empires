@@ -73,11 +73,12 @@ export async function setupDiffSession(
   if (opts.contents !== undefined) await mockDiffFileContents(page, opts.contents);
 }
 
-/** Load the app and open a session's changes panel. */
+/** Load the app and open a session's changes panel, which starts closed. */
 export async function openDiffSession(page: Page, title = "pinch-test") {
   await page.goto("/");
   await expect(page.locator("header")).toBeVisible();
   await clickSidebarSession(page, title);
+  await page.getByTestId("pane-toggle-diff").click();
 }
 
 /** Click a row in the file list once it has rendered. */

@@ -11,6 +11,10 @@ The dashboard is the home screen of the web app: a workspace sidebar on the left
 - **Top bar** carries the command-palette trigger, the right-panel picker, and the overflow (three-dot) **More options** menu.
 - **Home screen** (no session selected) shows the AoE logo and a count of running, waiting, and error sessions.
 
+### Side panels
+
+The diff and terminal panels start closed. Open one from its top-bar icon; a closed diff icon shows how many files had changed when you opened the Session. A Session keeps the panels you open or close in it, in that browser. **Settings > Panels** sets the defaults; they apply to every Session whose panels you haven't changed.
+
 ### Status glyphs
 
 Each sidebar row carries an animated braille glyph encoding the session's state: a spinner of dots while **Running**, an orbiting dot while **Waiting** or **Creating**, a slow breathe while **Starting** or freshly idle. Errors render in the error color. The frame is offset by each session's creation time so rows don't pulse in lockstep.
@@ -106,13 +110,14 @@ Accepted color and notification picks also survive collapse, filtering and
 navigation to Settings. They retain exact sessions and runtime epoch, never
 replay against replacement sessions or a replacement daemon.
 
-## Triage: pin, archive, snooze
+## Triage: pin, archive, snooze, ignore
 
-The right-click (long-press on touch) context menu on any session row exposes three triage primitives:
+The right-click (long-press on touch) context menu on any session row exposes these triage primitives:
 
 - **Pin**: floats the workspace to the top in every sort mode. Pin is web-only and distinct from the favorite mark. Favorites keep their `✦` marker in both normal and compact sidebars. On the web, favorite stays a within-tier Attention signal; in the TUI it pins to the top of its sibling scope in every sort order while `session.favorites_first` is on (the default).
 - **Archive**: tears down every tmux session the workspace owns (agent, web terminal, container terminal, and tool sub-sessions; pass `kill_pane: false` in the API body, or `--no-kill` on the CLI, to skip the tmux teardown) and shuts down the structured-view worker for ACP sessions, then sinks the row into the collapsible "Snoozed & archived" footer. Daemon restarts skip archived sessions. An archived session never starts or resumes, whether from a message, **Start**, attaching, or a daemon restart; unarchive it first. See #1868.
 - **Snooze**: sinks the row for a chosen duration (presets: 1h, 2h, 3h, 4h, 5h, 6h, 1d, 1w). Wakes when the timer expires; sending a message wakes it early.
+- **Ignore managed session**: for a session another session created or drives, hides it from the attention sort and badges while keeping it live and in the list. It is neither archived nor trashed, so it still starts and accepts direct user input, which clears the marker; non-user sends (MCP `send_to`, plugin messages and turns) return an `ignored` error until it is unignored or reclaimed. Pinning, favoriting, archiving, or snoozing also clears the marker. **Take ownership back** in the same menu clears the manager link and the ignore marker together, leaving the session, its conversation, and its other triage marks untouched.
 
 ### Showing one session
 
@@ -120,7 +125,7 @@ Under **More** in the same menu, **Show only this Session** reloads the window t
 
 Trashed sessions live behind the **Trash** control in the sidebar footer. Right-click a trashed row for **Open**, **Restore**, or **Delete permanently**. Like an archived session, a trashed one cannot start until it is restored.
 
-A session is never pinned and sunk at once, but the transitions are one-step in either direction: pinning a sunk row surfaces it, and a pinned row's menu still offers Archive and Snooze, either of which removes the pin (matching the TUI, no unpin-first needed). Bulk Archive and Snooze include pinned rows in the selection for the same reason. The "Snoozed & archived" section sits at the bottom and aggregates every sunk workspace; collapsed by default, its state persists in localStorage. The three menu entries are hidden in read-only mode.
+A session is never pinned and sunk at once, but the transitions are one-step in either direction: pinning a sunk row surfaces it, and a pinned row's menu still offers Archive, Snooze, and Ignore, any of which removes the pin (matching the TUI, no unpin-first needed). Bulk Archive and Snooze include pinned rows in the selection for the same reason. The "Snoozed & archived" section sits at the bottom and aggregates every sunk workspace; collapsed by default, its state persists in localStorage. The triage menu entries are hidden in read-only mode.
 
 ### Multi-select and bulk triage
 

@@ -118,6 +118,158 @@ pub(crate) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<s
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("staging filesystem acquisition cleanup is unproven: {0}")]
+pub(crate) struct StagingAcquisitionUncertain(pub String);
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StagingProcess {
+    pub(crate) pid: u32,
+    pub(crate) birth: ProcessBirthIdentity,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) use linux::StagingRecoveryScope;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", deny_unknown_fields)]
+pub(crate) enum StagingCustody {
+    Prepared,
+    LinuxPidNamespace {
+        holder: StagingProcess,
+        init: StagingProcess,
+    },
+    Uncertain,
+}
+
+pub(crate) fn prove_staging_custody_gone(
+    custody: &StagingCustody,
+    writers: &[StagingProcess],
+    previous_boot: bool,
+) -> anyhow::Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = previous_boot;
+    match custody {
+        StagingCustody::Prepared if writers.is_empty() => Ok(()),
+        #[cfg(target_os = "linux")]
+        StagingCustody::LinuxPidNamespace { holder, init } => {
+            let valid = |process: &StagingProcess| {
+                process.pid > 1
+                    && process.pid <= i32::MAX as u32
+                    && !process.birth.boot_id.is_empty()
+                    && process
+                        .birth
+                        .start_id
+                        .strip_prefix("proc:")
+                        .is_some_and(|start| start.parse::<u64>().is_ok_and(|start| start > 0))
+            };
+            anyhow::ensure!(
+                valid(holder)
+                    && valid(init)
+                    && holder.pid != init.pid
+                    && holder.birth.boot_id == init.birth.boot_id
+                    && writers
+                        .iter()
+                        .all(|writer| valid(writer) && writer.birth.boot_id == init.birth.boot_id),
+                "invalid staging namespace custody"
+            );
+            if previous_boot {
+                return Ok(());
+            }
+            linux::prove_staging_pid_namespace_gone(holder, init, writers)
+        }
+        _ => anyhow::bail!("plugin staging native resource absence is unproven"),
+    }
+}
+
+pub(crate) fn prove_staging_host_mount_absent(mount: &Path) -> anyhow::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        platform::prove_staging_host_mount_absent(mount)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = mount;
+        anyhow::bail!("staging mount absence unsupported on this platform")
+    }
+}
+
+pub(crate) fn prove_same_mount(
+    parent: std::os::fd::BorrowedFd<'_>,
+    child: std::os::fd::BorrowedFd<'_>,
+) -> anyhow::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        platform::prove_same_mount(parent, child)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (parent, child);
+        anyhow::bail!("mount identity unavailable on this platform")
+    }
+}
+
+/// A private filesystem with an enforced allocation ceiling. Unsupported hosts fail closed.
+pub(crate) struct StagingVolume {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    inner: platform::StagingVolume,
+}
+
+impl StagingVolume {
+    pub(crate) fn create(mount: &Path, limit: u64) -> anyhow::Result<Self> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            Ok(Self {
+                inner: platform::StagingVolume::create_recorded(mount, limit, |custody| {
+                    crate::plugin::install::record_staging_custody(mount, custody)
+                })?,
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (mount, limit);
+            anyhow::bail!("strict plugin staging filesystems are unavailable on this platform")
+        }
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.inner.root()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        unreachable!("unsupported platforms cannot acquire a staging volume")
+    }
+
+    pub(crate) fn limit(&self) -> u64 {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.inner.limit()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        unreachable!("unsupported platforms cannot acquire a staging volume")
+    }
+
+    pub(crate) fn git_command(&self) -> Command {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.inner.git_command()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        unreachable!("unsupported platforms cannot acquire a staging volume")
+    }
+
+    pub(crate) fn close(&mut self) -> anyhow::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.inner.close()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        unreachable!("unsupported platforms cannot acquire a staging volume")
+    }
+}
+
 pub(crate) const LIVE_PANE_ENV_KEYS: [&str; 3] = ["TERM", "TMUX", "TMUX_PANE"];
 
 #[derive(serde::Serialize, serde::Deserialize)]

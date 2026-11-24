@@ -91,6 +91,24 @@ impl Status {
 pub const TMUX_SESSION_GONE_ERROR: &str =
     "tmux session is gone. The agent process may have exited or been killed.";
 
+/// Opens the `last_error` of a confirmed-absent pane whose restart is refused, ahead of its remedy.
+pub(crate) const TMUX_SESSION_GONE_LEAD: &str = "The tmux session is gone.";
+
+/// The same lead for a tmux server that couldn't be reached.
+pub(crate) const TMUX_SERVER_UNREACHABLE_LEAD: &str = "The tmux server could not be reached.";
+
+/// Introduces the remedy a refused restart needs.
+pub(crate) const REFUSED_RESTART: &str = "Terminal view can't start this Session again:";
+
+/// Opens the `last_error` of a Terminal handoff that ended because its launch is refused.
+pub(crate) const HANDOFF_ENDED: &str = "Terminal view couldn't start this Session";
+
+/// Whether `last_error` is the latch for a confirmed-absent pane. Its text can't tell: a pane can
+/// print anything.
+pub(crate) fn reports_tmux_session_gone(last_error: &LastError) -> bool {
+    last_error.absence() == Some(TmuxAbsence::Gone)
+}
+
 /// `last_error` for a sustained unreachable tmux server; not evidence the pane is gone.
 pub const TMUX_SERVER_UNREACHABLE_ERROR: &str =
     "tmux server could not be reached. It may be busy or have crashed.";
@@ -108,9 +126,9 @@ pub(super) const UNKNOWN_ERROR_WINDOW_CONFIRMED_PRESENT: std::time::Duration =
 pub(crate) struct PassiveStatusPatch {
     pub status: Status,
     pub lifecycle_generation: u64,
-    pub idle_entered_at: Option<DateTime<Utc>>,
+    pub idle_entered_at: Option<Timestamp>,
     /// Stays `None` for a never-touched row; idle-reap and freshness sort rely on it.
-    pub last_accessed_at: Option<DateTime<Utc>>,
+    pub last_accessed_at: Option<Timestamp>,
 }
 
 impl PassiveStatusPatch {

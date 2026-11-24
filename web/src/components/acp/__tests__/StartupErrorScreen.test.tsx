@@ -128,21 +128,28 @@ describe("StartupErrorScreen", () => {
       "out of date",
       incompatible(),
       info(),
-      "The Claude ACP adapter needs an update",
-      "@agentclientprotocol/claude-agent-acp 0.55.0 installed · needs 0.82.0 or newer",
+      "Claude needs an update",
+      "claude-agent-acp 0.55.0 · needs 0.82.0 or newer",
+    ],
+    [
+      "out of date, Sandbox",
+      incompatible(),
+      info(sandbox),
+      "Claude needs an update in this sandbox",
+      "claude-agent-acp 0.55.0 · needs 0.82.0 or newer",
     ],
     [
       "OpenCode",
       { ...incompatible(false, OPENCODE), package_name: "opencode-acp" },
       opencode,
-      "The OpenCode ACP adapter needs an update",
-      "opencode-acp 0.55.0 installed · needs 0.82.0 or newer",
+      "OpenCode needs an update",
+      "opencode-acp 0.55.0 · needs 0.82.0 or newer",
     ],
     [
       "no version",
       { kind: "missing_agent_info", expected_package: "pkg", install_command: CLAUDE_NPM, auto_install: true },
       info(),
-      "The Claude ACP adapter didn't report its version",
+      "Claude didn't report its version",
       "pkg · no version reported",
     ],
     [
@@ -155,7 +162,7 @@ describe("StartupErrorScreen", () => {
         auto_install: true,
       },
       info(),
-      "The Claude ACP adapter isn't the package aoe expects",
+      "Claude's adapter isn't the package AoE expects",
       "wrapper reported · expected pkg",
     ],
     [
@@ -169,21 +176,21 @@ describe("StartupErrorScreen", () => {
         auto_install: true,
       },
       info(),
-      "The Claude ACP adapter reported a version aoe can't read",
+      "Claude reported a version AoE can't read",
       'pkg "not-semver" · needs 0.82.0 or newer',
     ],
     [
       "protocol",
       { kind: "unsupported_protocol_version", expected: "V1", received: "V2" },
       info(),
-      "The Claude ACP adapter speaks an ACP protocol aoe doesn't support",
+      "Claude uses a protocol this AoE doesn't support",
       "protocol V2 · needs V1",
     ],
     [
       "proxy hello",
       { kind: "invalid_proxy_hello", reason: "unsupported proxy protocol_version 9" },
       info(),
-      "The Claude ACP adapter's proxy isn't compatible with this aoe",
+      "Claude's plugin isn't compatible with this AoE",
       "unsupported proxy protocol_version 9",
     ],
   ])("%s: names the Agent and what is wrong", async (_label, detail, answer, headline, version) => {
@@ -213,10 +220,15 @@ describe("StartupErrorScreen", () => {
     expect(body).not.toContain("contract version");
   });
 
-  it("names no Agent until install-info answers", () => {
+  it.each([
+    [false, "The Agent needs an update"],
+    [true, "The Agent needs an update in this sandbox"],
+  ])("names no Agent until install-info answers (sandboxed=%s)", (isSandboxed, headline) => {
     fetchAgentInstallInfo.mockReturnValue(new Promise(() => {}));
-    const { getByRole } = render(<StartupErrorScreen detail={incompatible()} sessionId="s1" />);
-    expect(getByRole("heading").textContent).toBe("The ACP adapter needs an update");
+    const { getByRole } = render(
+      <StartupErrorScreen detail={incompatible()} sessionId="s1" isSandboxed={isSandboxed} />,
+    );
+    expect(getByRole("heading").textContent).toBe(headline);
   });
 
   it.each<{
@@ -237,42 +249,46 @@ describe("StartupErrorScreen", () => {
       detail: incompatible(),
       answer: info(),
       eyebrow: "Adapter out of date",
-      steps: ["Allow installs from the Web dashboard", "Click Update & restart"],
+      steps: ["Allow installs from the Web dashboard", "Update Claude"],
       stepOneDone: false,
       buttons: ["Update & restart", "Check again"],
       locked: true,
       command: CLAUDE_NPM,
+      text: "AoE installs it where the Daemon runs, then restarts the Agent.",
     },
     {
       label: "host, installs allowed",
       detail: incompatible(),
       answer: info(allowed),
       eyebrow: "Adapter out of date",
-      steps: ["Allow installs from the Web dashboardDone", "Click Update & restart"],
+      steps: ["Installs from the Web dashboard are allowed", "Update Claude"],
       stepOneDone: true,
       buttons: ["Update & restart", "Check again"],
       command: CLAUDE_NPM,
+      text: "AoE installs it where the Daemon runs, then restarts the Agent.",
     },
     {
       label: "Sandbox, installs off",
       detail: incompatible(),
       answer: info(sandbox),
       eyebrow: "Adapter out of date",
-      steps: ["Allow installs from the Web dashboard", "Click Update in Sandbox & restart"],
+      steps: ["Allow installs from the Web dashboard", "Update Claude in this sandbox"],
       stepOneDone: false,
-      buttons: ["Update in Sandbox & restart", "Check again"],
+      buttons: ["Update & restart", "Check again"],
       locked: true,
       command: IN_CONTAINER,
+      text: "AoE installs it in this Session's container, then restarts the Agent.",
     },
     {
       label: "Sandbox, installs allowed",
       detail: incompatible(),
       answer: info({ ...sandbox, ...allowed }),
       eyebrow: "Adapter out of date",
-      steps: ["Allow installs from the Web dashboardDone", "Click Update in Sandbox & restart"],
+      steps: ["Installs from the Web dashboard are allowed", "Update Claude in this sandbox"],
       stepOneDone: true,
-      buttons: ["Update in Sandbox & restart", "Check again"],
+      buttons: ["Update & restart", "Check again"],
       command: IN_CONTAINER,
+      text: "AoE installs it in this Session's container, then restarts the Agent.",
     },
     {
       label: "host, adapter npm can't install",
@@ -330,7 +346,10 @@ describe("StartupErrorScreen", () => {
     expectStepsNameRenderedButtons(screen, titles);
     expect(buttons(screen)).toEqual(c.buttons);
     if (c.stepOneDone !== undefined) {
-      expect(getByTestId("startup-error-step-1").hasAttribute("data-done")).toBe(c.stepOneDone);
+      const stepOne = getByTestId("startup-error-step-1");
+      expect(stepOne.hasAttribute("data-done")).toBe(c.stepOneDone);
+      // Done, it is its title alone: no settings path, no note about the Daemon's user.
+      if (c.stepOneDone) expect(stepOne.textContent).toBe("✓Installs from the Web dashboard are allowed");
     }
     const update = queryByTestId("startup-error-update-restart") as HTMLButtonElement | null;
     if (update) {
@@ -405,16 +424,24 @@ describe("StartupErrorScreen", () => {
     expectValidatedText(screen);
   });
 
-  it("installing: the primary button shows progress and every action waits", async () => {
+  it.each([
+    ["Sandbox", info({ ...sandbox, ...allowed }), "Updating inside the container"],
+    ["host", info(allowed), "Updating Claude"],
+  ])("installing, %s: only the update shows and every action waits", async (_label, answer, title) => {
     installAcpAgent.mockReturnValue(new Promise(() => {}));
-    const { getByTestId } = await renderScreen(incompatible(), info({ ...sandbox, ...allowed }), {
+    const { getByTestId, queryByTestId } = await renderScreen(incompatible(), answer, {
       recreateContainerTitle: "api-server",
     });
+    expect(queryByTestId("startup-error-fallback")).not.toBeNull();
     fireEvent.click(getByTestId("startup-error-update-restart"));
     await waitFor(() => expect(getByTestId("startup-error-update-restart").textContent).toBe("Updating…"));
-    for (const id of ["startup-error-update-restart", "startup-error-restart", "startup-error-recreate-container"]) {
-      expect((getByTestId(id) as HTMLButtonElement).disabled, id).toBe(true);
-    }
+    expect(stepTitles(getByTestId)).toEqual(["Installs from the Web dashboard are allowed", title]);
+    expect(getByTestId("startup-error-step-2").textContent).toBe(`2${title}Claude restarts when it's done.`);
+    expect(queryByTestId("startup-error-fallback")).toBeNull();
+    expect(queryByTestId("startup-error-install-command")).toBeNull();
+    const ids = ["startup-error-update-restart", "startup-error-restart"];
+    if (answer.sandboxed) ids.push("startup-error-recreate-container");
+    for (const id of ids) expect((getByTestId(id) as HTMLButtonElement).disabled, id).toBe(true);
   });
 
   it("a successful install respawns and reports Sessions queued for recovery", async () => {
@@ -426,18 +453,147 @@ describe("StartupErrorScreen", () => {
     await waitFor(() => expect(container.textContent).toContain("3 other Sessions"));
   });
 
-  it("install failed: the exit code, npm output and command stay outside Details", async () => {
-    installAcpAgent.mockResolvedValue({ ...installOk(), success: false, exit_code: 243, stderr: "npm ERR! EACCES" });
-    const { getByTestId, findByTestId, queryByTestId } = await renderScreen(
-      incompatible(),
+  it.each<[string, AgentInstallInfo, () => void, string, string, string | null]>([
+    [
+      "npm exits non-zero in a Sandbox",
       info({ ...sandbox, ...allowed }),
+      () =>
+        installAcpAgent.mockResolvedValue({
+          ...installOk(),
+          success: false,
+          exit_code: 243,
+          stderr: "npm ERR! EACCES",
+        }),
+      "Claude couldn't be updated in this sandbox",
+      "npm exited with code 243",
+      "added 1 package\nnpm ERR! EACCES",
+    ],
+    [
+      "npm exits non-zero on the host",
+      info(allowed),
+      () => installAcpAgent.mockResolvedValue({ ...installOk(), success: false, exit_code: 1, stdout: "npm ERR! 404" }),
+      "Claude couldn't be updated",
+      "npm exited with code 1",
+      "npm ERR! 404",
+    ],
+    [
+      "npm is killed, so there's no code",
+      info(allowed),
+      () => installAcpAgent.mockResolvedValue({ ...installOk(), success: false, exit_code: null, stdout: "" }),
+      "Claude couldn't be updated",
+      "npm stopped before it exited",
+      null,
+    ],
+    [
+      "the Daemon refuses the request",
+      info({ ...sandbox, ...allowed }),
+      () => installAcpAgent.mockRejectedValue(new InstallAgentError("npm is not on PATH", "npm_missing")),
+      "Claude couldn't be updated in this sandbox",
+      "npm isn't on the Daemon's PATH. Restart aoe serve from a shell where `which npm` works, or run the install command yourself.",
+      null,
+    ],
+    [
+      "npm fails to start",
+      info(allowed),
+      () => installAcpAgent.mockRejectedValue(new InstallAgentError("failed to run npm: EACCES", "npm_start_failed")),
+      "Claude couldn't be updated",
+      "failed to run npm: EACCES",
+      null,
+    ],
+  ])(
+    "update failed, %s: its own card, with Try again and the command",
+    async (_l, answer, fail, headline, line, output) => {
+      fail();
+      const { getByTestId, getByRole, getByText, queryByTestId, queryByText } = await renderScreen(
+        incompatible(),
+        answer,
+      );
+      fireEvent.click(getByTestId("startup-error-update-restart"));
+      await waitFor(() => expect(getByRole("heading").textContent).toBe(headline));
+      const screen = getByTestId("startup-error-screen");
+      getByText("Update failed");
+      expect(queryByTestId("startup-error-steps")).toBeNull();
+      expect(getByTestId("startup-error-version").textContent).toBe(line);
+      expect(queryByTestId("adapter-install-error")).toBeNull();
+      expect(buttons(screen)).toEqual(["Try again", "Check again"]);
+      expectStepsNameRenderedButtons(screen, []);
+      expect(getByTestId("startup-error-fallback").textContent).toContain(
+        "Try again, or run this where the Daemon runs, then Check again:",
+      );
+      expect(getByTestId("startup-error-install-command").textContent).toBe(
+        answer.sandboxed ? IN_CONTAINER : CLAUDE_NPM,
+      );
+
+      // npm's output is under Details, not under the buttons.
+      if (output) expect(screen.textContent).not.toContain(output);
+      fireEvent.click(getByTestId("startup-error-details"));
+      expect(queryByTestId("startup-error-install-output")?.textContent ?? null).toBe(output);
+      expectValidatedText(screen);
+      expect(fetch).not.toHaveBeenCalled();
+
+      // Try again runs the install again, and the card gives way to the update while it does.
+      installAcpAgent.mockReset().mockReturnValue(new Promise(() => {}));
+      fireEvent.click(getByTestId("startup-error-update-restart"));
+      expect(installAcpAgent).toHaveBeenCalledTimes(1);
+      await waitFor(() => expect(getByTestId("startup-error-update-restart").textContent).toBe("Updating…"));
+      expect(queryByText("Update failed")).toBeNull();
+    },
+  );
+
+  /** Fails the install with npm's exit code 1, then lets install-info answer `next` on the next focus. */
+  async function failThenRefresh(answer: AgentInstallInfo, next: AgentInstallInfo) {
+    installAcpAgent.mockResolvedValue({ ...installOk(), success: false, exit_code: 1, stdout: "npm ERR! 404" });
+    const view = await renderScreen(incompatible(), answer);
+    fireEvent.click(view.getByTestId("startup-error-update-restart"));
+    await waitFor(() => view.getByText("Update failed"));
+    fetchAgentInstallInfo.mockResolvedValue(next);
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    return view;
+  }
+
+  it("an npm failure, then install-info reports the container stopped: the stopped-container steps replace the card", async () => {
+    const view = await failThenRefresh(
+      info({ ...sandbox, ...allowed }),
+      info({ ...sandbox, install_allowed: false, install_blocked: "container_not_running" }),
     );
-    fireEvent.click(getByTestId("startup-error-update-restart"));
-    expect((await findByTestId("adapter-install-error")).textContent).toBe("Install exited with code 243.");
-    expect(getByTestId("startup-error-screen").textContent).toContain("npm ERR! EACCES");
-    expect(getByTestId("startup-error-install-command").textContent).toBe(IN_CONTAINER);
-    expect(queryByTestId("startup-error-details-body")).toBeNull();
-    expect(fetch).not.toHaveBeenCalled();
+    const { getByTestId, findByTestId, queryByTestId, queryByText, getByRole } = view;
+    await findByTestId("startup-error-container-down");
+    const screen = getByTestId("startup-error-screen");
+    expect(queryByText("Update failed")).toBeNull();
+    expect(getByRole("heading").textContent).toBe("Claude needs an update in this sandbox");
+    expect(buttons(screen)).toEqual(["Start the container"]);
+    expect(stepTitles(getByTestId)).toEqual(["Click Start the container", "Then update the adapter"]);
+    expectStepsNameRenderedButtons(screen, stepTitles(getByTestId));
+    // The earlier npm failure doesn't sit under Start the container.
+    expect(queryByTestId("adapter-install-error")).toBeNull();
+    expect(screen.textContent).not.toContain("npm ERR! 404");
+    expect(screen.textContent).not.toContain("Try again");
+  });
+
+  it("an npm failure, then installs turned off: Try again is disabled and described by the permission step", async () => {
+    const view = await failThenRefresh(info(allowed), info());
+    const { getByTestId, getByText, queryByTestId } = view;
+    const update = getByTestId("startup-error-update-restart") as HTMLButtonElement;
+    await waitFor(() => expect(update.disabled).toBe(true));
+    const screen = getByTestId("startup-error-screen");
+    getByText("Update failed");
+    expect(update.textContent).toBe("Try again");
+    expect(buttons(screen)).toEqual(["Try again", "Check again"]);
+    const stepOne = getByTestId("startup-error-step-1");
+    expect(stepOne.textContent).toContain(
+      'Allow installs from the Web dashboardTurn on TUI › Settings › Global › Acp › Advanced › "Let the Web dashboard install Agents".',
+    );
+    const describedBy = update.getAttribute("aria-describedby");
+    expect(describedBy ? document.getElementById(describedBy) : null).toBe(stepOne);
+    // npm's failure stays on the version line and its output under Details, apart from the action's description.
+    expect(getByTestId("startup-error-version").textContent).toBe("npm exited with code 1");
+    expect(stepOne.textContent).not.toContain("exited");
+    expect(getByTestId("startup-error-install-command").textContent).toBe(CLAUDE_NPM);
+    fireEvent.click(getByTestId("startup-error-details"));
+    expect(queryByTestId("startup-error-install-output")?.textContent).toBe("npm ERR! 404");
+    expectValidatedText(screen);
   });
 
   it("container not running: its own steps, then Update returns once the container runs", async () => {
@@ -458,7 +614,7 @@ describe("StartupErrorScreen", () => {
     spawnCall();
     // The started container runs the adapter, which fails the version check again.
     view.rerender(<StartupErrorScreen detail={incompatible()} sessionId="s1" />);
-    await waitFor(() => expect(buttons(screen)).toEqual(["Update in Sandbox & restart", "Check again"]));
+    await waitFor(() => expect(buttons(screen)).toEqual(["Update & restart", "Check again"]));
     expect(queryByTestId("startup-error-container-down")).toBeNull();
     expect(queryByTestId("startup-error-fails-again")).toBeNull();
     expect(queryByTestId("adapter-install-error")).toBeNull();
@@ -485,7 +641,7 @@ describe("StartupErrorScreen", () => {
       spawnCall();
       fetchAgentInstallInfo.mockResolvedValue(started);
       view.rerender(<StartupErrorScreen detail={incompatible()} sessionId="s1" />);
-      await waitFor(() => expect(buttons(screen)).toEqual(["Update in Sandbox & restart", "Check again"]));
+      await waitFor(() => expect(buttons(screen)).toEqual(["Update & restart", "Check again"]));
       expect(queryByTestId("startup-error-container-down")).toBeNull();
       expect(getByTestId("startup-error-step-1").getAttribute("data-done")).toBe(done);
     },
@@ -534,15 +690,9 @@ describe("StartupErrorScreen", () => {
         incompatible(),
         info({ ...sandbox, ...allowed }),
         title,
-        ["Update in Sandbox & restart", "Check again", "Recreate container"],
+        ["Update & restart", "Check again", "Recreate container"],
       ],
-      [
-        "installs off",
-        incompatible(),
-        info(sandbox),
-        title,
-        ["Update in Sandbox & restart", "Check again", "Recreate container"],
-      ],
+      ["installs off", incompatible(), info(sandbox), title, ["Update & restart", "Check again", "Recreate container"]],
       ["stopped container", incompatible(), info(stopped), title, ["Start the container", "Recreate container"]],
       [
         "manual only",
@@ -621,6 +771,9 @@ describe("StartupErrorScreen", () => {
     const { getByTestId, queryByTestId } = await renderScreen(incompatible(), info(sandboxed ? sandbox : {}));
     const toggle = getByTestId("startup-error-details");
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    // Neutral: the card's red border already marks the error.
+    expect(toggle.parentElement!.className).toContain("border-surface-700");
+    expect(toggle.parentElement!.className).not.toContain("status-error");
     expect(queryByTestId("startup-error-details-body")).toBeNull();
     fireEvent.click(toggle);
     const body = getByTestId("startup-error-details-body").textContent ?? "";

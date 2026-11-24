@@ -5,6 +5,7 @@ mod agents;
 mod drain;
 mod launch;
 mod publish;
+pub use publish::UserPrompt;
 mod requests;
 mod sink;
 mod teardown;
@@ -478,6 +479,8 @@ pub struct SpawnRequest {
     pub fork_from: Option<String>,
     pub sandbox_continuation: SandboxContinuation,
     pub sandbox_info: Option<SandboxInfo>,
+    /// `Instance.workspace_info`; a sandboxed workspace container mounts its main repos too.
+    pub workspace_info: Option<crate::session::WorkspaceInfo>,
     /// The stored row's profile. Every production launch sets it, and the launch rechecks that
     /// row before and after the handshake (#4116).
     pub source_profile: Option<String>,
@@ -521,7 +524,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             workers: Arc::default(),
             next_seqs: Arc::default(),
             lifecycle: Arc::new(std::sync::Mutex::new(LifecycleTable::new(
-                chrono::Utc::now().timestamp_millis().max(1) as u64,
+                crate::time::Timestamp::now().as_millis().max(1) as u64,
             ))),
             restart_requests: Arc::default(),
             next_restart_request_id: AtomicU64::new(1),

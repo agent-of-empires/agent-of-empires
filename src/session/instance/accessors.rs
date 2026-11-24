@@ -34,10 +34,11 @@ impl Instance {
             detect_as: String::new(),
             yolo_mode: false,
             status: Status::Idle,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             last_accessed_at: None,
             idle_entered_at: None,
             archived_at: None,
+            ignored_at: None,
             favorited_at: None,
             snoozed_until: None,
             unread: false,
@@ -114,7 +115,7 @@ impl Instance {
             pi_extension_launched: false,
             identity_publisher_launched: false,
             pi_session_path: None,
-            last_error: None,
+            last_error: LastError::default(),
             capture_poller: Default::default(),
             retroactive_capture_excludes: HashSet::new(),
             pane_dead_observed: false,
@@ -1112,7 +1113,7 @@ mod tests {
             branch: "feature/abc".to_string(),
             main_repo_path: main_repo_path.to_string(),
             managed_by_aoe: true,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             base_branch: None,
         }
     }
@@ -1338,7 +1339,7 @@ mod tests {
             .insert(ConversationBinding::unknown("stale-sid"));
         inst.last_error_check = Some(std::time::Instant::now());
         inst.last_start_time = Some(std::time::Instant::now());
-        inst.last_error = Some("test error".to_string());
+        inst.last_error.set("test error".to_string());
         inst.acp_load_session_capable = Some(true);
 
         let json = serde_json::to_string(&inst).unwrap();
@@ -1421,7 +1422,7 @@ mod tests {
                 base_branch: None,
                 base_branch_override: None,
             }],
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             cleanup_on_delete: true,
         });
         assert!(ws.has_managed_worktree_or_workspace());

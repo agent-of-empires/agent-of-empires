@@ -11,6 +11,7 @@ async function openSession(page: Page, serve: ServeHandle) {
   const row = page.getByRole("link").filter({ hasText: TITLE }).first();
   await expect(row).toBeVisible({ timeout: 10_000 });
   await row.click();
+  await page.getByTestId("pane-toggle-diff").first().click();
   await expect(page.getByText("1 file", { exact: true }).first()).toBeVisible({ timeout: 15_000 });
   await page
     .getByRole("button", { name: /notes\.md/ })

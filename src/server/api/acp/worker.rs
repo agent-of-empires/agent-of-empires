@@ -1,6 +1,6 @@
 //! Worker spawn, shutdown, and agent switching.
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::acp::protocol::{
@@ -49,8 +49,8 @@ fn not_structured_response() -> Response {
 /// rate-limit park. A cap park has no schedule, so it uses the fallback.
 fn rate_limit_resume_marker_resets_at(
     park: Option<&crate::acp::event_store::RateLimitPark>,
-    fallback_resets_at: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
+    fallback_resets_at: Timestamp,
+) -> Option<Timestamp> {
     let park = park?;
     if park.cap_reached {
         return Some(fallback_resets_at);
@@ -66,12 +66,12 @@ fn rate_limit_resume_marker_resets_at(
 pub(in crate::server::api) async fn rate_limit_resume_probe(
     state: &AppState,
     id: &str,
-) -> Option<DateTime<Utc>> {
+) -> Option<Timestamp> {
     let store = Arc::clone(&state.acp_event_store);
     let id_for_probe = id.to_string();
     tokio::task::spawn_blocking(move || {
         let park = store.rate_limit_park(&id_for_probe);
-        rate_limit_resume_marker_resets_at(park.as_ref(), Utc::now())
+        rate_limit_resume_marker_resets_at(park.as_ref(), Timestamp::now())
     })
     .await
     .unwrap_or_else(|e| {
@@ -1052,10 +1052,7 @@ pub async fn switch_acp_agent(
             }
             Err(error) => return launch_error_response("agent switch completion", &error),
         };
-    state
-        .telemetry_structured
-        .agent_switches
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::telemetry::consent::bump(&state.telemetry_structured.agent_switches);
 
     let reason = req
         .reason
@@ -1386,7 +1383,7 @@ mod tests {
                 base_branch: None,
                 base_branch_override: None,
             }],
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             cleanup_on_delete: true,
         });
         let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
@@ -1669,7 +1666,7 @@ mod tests {
                 .try_acquire_lifecycle_reservation(
                     LifecycleOperation::Launch,
                     Instance::LIFECYCLE_RESERVATION_TTL,
-                    Utc::now(),
+                    Timestamp::now(),
                 )
                 .unwrap();
             let state = durable_stop_state(row.clone()).await;
@@ -2059,7 +2056,7 @@ mod tests {
                 .try_acquire_lifecycle_reservation(
                     LifecycleOperation::Stop,
                     Instance::LIFECYCLE_RESERVATION_TTL,
-                    Utc::now(),
+                    Timestamp::now(),
                 )
                 .unwrap();
             crate::server::test_support::seed_instances_on_disk_for_test(
@@ -3478,10 +3475,11 @@ mod tests {
                     attachments: Vec::new(),
                     synthesized: false,
                     origin_plugin: None,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 };
                 state
                     .acp_event_store
-                    .record_at(&id, 1, &prompt, Utc::now().timestamp_millis())
+                    .record_at(&id, 1, &prompt, Timestamp::now().as_millis())
                     .unwrap();
             } else {
                 state.acp_supervisor.test_hold_stopping(&id);
@@ -3566,11 +3564,7 @@ mod tests {
     #[test]
     fn rate_limit_resume_marker_follows_the_durable_park() {
         use crate::acp::event_store::RateLimitPark;
-        let ts = |raw| {
-            DateTime::parse_from_rfc3339(raw)
-                .unwrap()
-                .with_timezone(&Utc)
-        };
+        let ts = |raw| Timestamp::parse_rfc3339(raw).unwrap();
         let fallback = ts("2099-01-01T00:00:00Z");
         let resets_at = ts("2099-02-03T04:05:06Z");
         let info = |resets_at| RateLimitInfo {
@@ -4454,7 +4448,7 @@ mod tests {
             .test_insert_worker_cmd_recording(&ordinary_id)
             .await;
 
-        let resets_at = Utc::now() - chrono::Duration::minutes(30);
+        let resets_at = Timestamp::now() - crate::time::Duration::minutes(30);
         let prompt = || crate::acp::Event::UserPromptSent {
             merged_prompt_ids: Vec::new(),
             text: "continue the interrupted work".into(),
@@ -4462,6 +4456,7 @@ mod tests {
             prompt_id: None,
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let rate_limit = || crate::acp::Event::RateLimit {
             info: RateLimitInfo {
@@ -4485,8 +4480,8 @@ mod tests {
             rate_limit(),
             stopped(),
         ];
-        let recorded_at_ms =
-            Utc::now().timestamp_millis() - chrono::Duration::hours(1).num_milliseconds();
+        let recorded_at_ms = Timestamp::now().as_millis()
+            - crate::time::Duration::hours(1).whole_milliseconds() as i64;
         for (index, event) in events.iter().enumerate() {
             state
                 .acp_event_store

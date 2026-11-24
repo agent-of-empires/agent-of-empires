@@ -213,7 +213,7 @@ pub struct CapabilityGrant {
     #[serde(default)]
     pub capabilities: Vec<String>,
     /// When the user approved the grant.
-    pub granted_at: chrono::DateTime<chrono::Utc>,
+    pub granted_at: crate::time::Timestamp,
 }
 
 fn default_enabled() -> bool {
@@ -1168,6 +1168,21 @@ pub struct SessionConfig {
         summary = "Pre-trusts each host Session's folder when it starts, worktree or not. This also turns on the repository's own Agent settings file."
     )]
     pub pre_trust_agent_folders: bool,
+
+    /// Require native OS sandbox enforcement for remote plugin staging. Disabled
+    /// by default; enabling requires native OS sandbox support and tools and fails
+    /// closed when unavailable. Default streamed byte, archive-entry, and source
+    /// snapshot accounting cannot hard-limit Git/helper filesystem writes.
+    #[serde(default)]
+    #[setting(
+        label = "Strict plugin staging",
+        widget = "toggle",
+        advanced,
+        global_only,
+        repo = "deny",
+        web = "elevation:changes the machine-wide plugin staging filesystem security boundary"
+    )]
+    pub plugin_staging_sandbox: bool,
 
     /// Show the compact system-health strip below the session list. It reports
     /// CPU, memory pressure, and running agent and process counts. Off by
@@ -2339,6 +2354,7 @@ impl Default for SessionConfig {
             default_tool: None,
             yolo_mode_default: false,
             pre_trust_agent_folders: false,
+            plugin_staging_sandbox: false,
             show_diagnostics_pane: false,
             sidebar_position: SidebarPosition::default(),
             narrow_layout: NarrowLayout::default(),
@@ -2783,6 +2799,41 @@ pub struct WebConfig {
         summary = "Apps like Claude Code can list, create and send to your Sessions, read their output, wait on them and approve requests. Works when aoe serve uses the access link without a passphrase, or --auth none."
     )]
     pub mcp_enabled: bool,
+
+    /// Show the diff pane when a Session opens whose pane layout the user has
+    /// not changed in this browser.
+    #[serde(default)]
+    #[setting(
+        label = "Open the diff panel in Sessions",
+        widget = "toggle",
+        web_only,
+        global_only,
+        summary = "Show the changed files beside every Session you haven't arranged yourself."
+    )]
+    pub auto_open_diff_pane: bool,
+
+    /// Show a terminal pane when a Session opens whose pane layout the user
+    /// has not changed in this browser.
+    #[serde(default)]
+    #[setting(
+        label = "Open a terminal panel in Sessions",
+        widget = "toggle",
+        web_only,
+        global_only,
+        summary = "Show a shell beside every Session you haven't arranged yourself."
+    )]
+    pub auto_open_terminal_pane: bool,
+
+    /// Add panes contributed by installed plugins as tabs when they load.
+    #[serde(default)]
+    #[setting(
+        label = "Open plugin panels automatically",
+        widget = "toggle",
+        web_only,
+        global_only,
+        summary = "Add panes from installed plugins, such as the GitHub pull-request pane, as they load."
+    )]
+    pub auto_open_plugin_panes: bool,
 }
 
 impl Default for WebConfig {
@@ -2794,6 +2845,9 @@ impl Default for WebConfig {
             notify_on_error: true,
             notify_on_wake_fire: true,
             mcp_enabled: false,
+            auto_open_diff_pane: false,
+            auto_open_terminal_pane: false,
+            auto_open_plugin_panes: false,
         }
     }
 }
@@ -3092,7 +3146,7 @@ pub struct UpdatesConfig {
     )]
     pub update_check_mode: UpdateCheckMode,
 
-    /// Auto-update installed external plugins at TUI and `aoe serve` startup.
+    /// Auto-update installed external plugins when the Daemon (`aoe serve`) starts.
     /// Off by default. The sweep applies only updates that need no new consent;
     /// any version that changes capabilities, build steps, or UI slots is left
     /// for a manual `aoe plugin update` so its new grant is reviewed.
@@ -3104,7 +3158,7 @@ pub struct UpdatesConfig {
         label = "Update plugins automatically",
         widget = "toggle",
         global_only,
-        summary = "When AoE starts. Installs plugin updates that don't ask for anything new. Updates that need new permissions still wait for you. Applies to every Profile."
+        summary = "When the Daemon starts. Installs plugin updates that don't ask for anything new. Updates that need new permissions still wait for you. Applies to every Profile."
     )]
     pub auto_update_plugins: bool,
 }
@@ -3332,16 +3386,18 @@ pub struct SandboxConfig {
     )]
     pub enabled_by_default: bool,
 
-    /// Container image to use for sandboxes.
-    #[serde(default = "default_sandbox_image")]
+    /// Container image to use for sandboxes. Unset uses the aoe-sandbox image
+    /// tagged with this AoE version.
+    // Unset is never written back, so a save cannot pin today's tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[setting(
         label = "Image",
-        widget = "text",
+        widget = "optional_text",
         web = "elevation:sandbox config affects host isolation",
         repo = "deny",
         summary = "The container image Sessions start from."
     )]
-    pub default_image: String,
+    pub default_image: Option<String>,
 
     /// Additional volume mounts (host:container or host:container:ro).
     #[serde(default, deserialize_with = "super::serde_helpers::string_or_vec")]
@@ -3688,7 +3744,7 @@ impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
             enabled_by_default: false,
-            default_image: default_sandbox_image(),
+            default_image: None,
             extra_volumes: Vec::new(),
             environment: default_sandbox_environment(),
             auto_cleanup: true,
@@ -3714,8 +3770,33 @@ impl Default for SandboxConfig {
     }
 }
 
-fn default_sandbox_image() -> String {
-    "ghcr.io/agent-of-empires/aoe-sandbox:latest".to_string()
+impl SandboxConfig {
+    /// The image new sandboxes use when nothing more specific is requested.
+    pub fn effective_image(&self) -> String {
+        self.resolve_image(None)
+    }
+
+    /// The first non-blank of `requested` and `default_image`, otherwise the
+    /// automatic image for this AoE version. Every path that picks a sandbox
+    /// image resolves through here.
+    pub fn resolve_image(&self, requested: Option<&str>) -> String {
+        [requested, self.default_image.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .find(|image| !image.is_empty())
+            .unwrap_or(crate::containers::sandbox_image::automatic_sandbox_image())
+            .to_string()
+    }
+
+    /// Whether `image` is the automatic image because the config pins none.
+    /// A `default_image` naming the same tag is an explicit choice.
+    pub fn picks_automatic_image(&self, image: &str) -> bool {
+        self.default_image
+            .as_deref()
+            .is_none_or(|configured| configured.trim().is_empty())
+            && image == crate::containers::sandbox_image::automatic_sandbox_image()
+    }
 }
 
 fn default_sandbox_environment() -> Vec<String> {
@@ -5825,6 +5906,124 @@ mod tests {
 
         update_app_state(|state| state.has_seen_welcome = true).unwrap();
         assert!(Config::load().unwrap().app_state.has_seen_welcome);
+    }
+
+    /// A blank or absent `default_image` is the automatic image; a request
+    /// (CLI flag, dialog, API) beats the config, and a profile value beats the
+    /// global one. A profile's blank value opts back into automatic.
+    #[test]
+    fn sandbox_image_resolution_and_profile_precedence() {
+        let automatic = crate::containers::sandbox_image::automatic_sandbox_image();
+        let sandbox = |image: Option<&str>| SandboxConfig {
+            default_image: image.map(str::to_string),
+            ..SandboxConfig::default()
+        };
+        for (configured, requested, expected) in [
+            (None, None, automatic),
+            (Some(""), None, automatic),
+            (Some("  "), None, automatic),
+            (Some(" my/img:1 "), None, "my/img:1"),
+            (Some("my/img:1"), Some("flag/img:2"), "flag/img:2"),
+            (Some("my/img:1"), Some(" "), "my/img:1"),
+            (None, Some(""), automatic),
+        ] {
+            assert_eq!(
+                sandbox(configured).resolve_image(requested),
+                expected,
+                "{configured:?} {requested:?}"
+            );
+        }
+
+        for (configured, image, expected) in [
+            (None, automatic, true),
+            (Some(" "), automatic, true),
+            (Some(automatic), automatic, false),
+            (None, "my/img:1", false),
+        ] {
+            assert_eq!(
+                sandbox(configured).picks_automatic_image(image),
+                expected,
+                "{configured:?} {image:?}"
+            );
+        }
+
+        for (global, profile, expected) in [
+            (None, serde_json::json!({}), automatic),
+            (Some("global/img:1"), serde_json::json!({}), "global/img:1"),
+            (
+                None,
+                serde_json::json!({"sandbox": {"default_image": "profile/img:1"}}),
+                "profile/img:1",
+            ),
+            (
+                Some("global/img:1"),
+                serde_json::json!({"sandbox": {"default_image": "profile/img:1"}}),
+                "profile/img:1",
+            ),
+            (
+                Some("global/img:1"),
+                serde_json::json!({"sandbox": {"default_image": ""}}),
+                automatic,
+            ),
+        ] {
+            let config = Config {
+                sandbox: sandbox(global),
+                ..Config::default()
+            };
+            let overrides: profile_config::ProfileConfig =
+                serde_json::from_value(profile.clone()).unwrap();
+            assert_eq!(
+                profile_config::merge_configs(config, &overrides)
+                    .sandbox
+                    .effective_image(),
+                expected,
+                "{global:?} {profile}"
+            );
+        }
+    }
+
+    /// The settings API, profile merge and `config.toml` all see an automatic
+    /// image as an absent key, never as the tag or null.
+    #[test]
+    fn automatic_image_serializes_as_an_absent_key() {
+        let json = serde_json::to_value(SandboxConfig::default()).unwrap();
+        assert!(json.get("default_image").is_none(), "{json}");
+        let toml = toml::Table::try_from(SandboxConfig::default()).unwrap();
+        assert!(!toml.contains_key("default_image"), "{toml}");
+
+        let custom = SandboxConfig {
+            default_image: Some("my/img:1".into()),
+            ..SandboxConfig::default()
+        };
+        assert_eq!(
+            serde_json::to_value(custom).unwrap()["default_image"],
+            serde_json::json!("my/img:1")
+        );
+    }
+
+    /// Saving any setting must not write the automatic image back, or the
+    /// first save would pin the tag of the build that wrote it.
+    #[test]
+    #[serial_test::serial]
+    fn saving_config_leaves_the_automatic_image_unset() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        fs::create_dir_all(get_app_dir().unwrap()).unwrap();
+        let saved_image = || {
+            let raw = fs::read_to_string(config_path().unwrap()).unwrap();
+            let table: toml::Table = raw.parse().unwrap();
+            table
+                .get("sandbox")
+                .and_then(|sandbox| sandbox.get("default_image"))
+                .map(|image| image.as_str().unwrap().to_string())
+        };
+
+        update_config(|config| config.default_profile = "x".to_string()).unwrap();
+        assert_eq!(saved_image(), None);
+
+        update_config(|config| config.sandbox.default_image = Some("my/img:1".into())).unwrap();
+        assert_eq!(saved_image().as_deref(), Some("my/img:1"));
+        update_config(|config| config.sandbox.default_image = None).unwrap();
+        assert_eq!(saved_image(), None);
     }
 
     #[test]
