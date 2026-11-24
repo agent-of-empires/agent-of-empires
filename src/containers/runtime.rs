@@ -148,17 +148,27 @@ impl ContainerRuntime {
         image_pull::state(&self.pull_key(image))
     }
 
+    /// [`Self::pull_state`], with the running pull's id from the same lookup.
+    pub(crate) fn pull_state_and_flight(
+        &self,
+        image: &str,
+    ) -> (image_pull::PullState, Option<u64>) {
+        image_pull::state_and_flight(&self.pull_key(image))
+    }
+
     pub(crate) fn running_pull_id(&self, image: &str) -> Option<u64> {
         image_pull::running_flight_id(&self.pull_key(image))
     }
 
-    /// Cancels this process's running pull of `image` for every waiter; see [`image_pull::cancel`].
+    /// Cancels this process's running pull of `image`, or only flight `expected`, for every
+    /// waiter; see [`image_pull::cancel`].
     pub(crate) fn cancel_pull(
         &self,
         image: &str,
+        expected: Option<u64>,
         backstop: std::time::Duration,
-    ) -> image_pull::PullState {
-        image_pull::cancel(&self.pull_key(image), backstop)
+    ) -> std::result::Result<image_pull::PullState, image_pull::Replaced> {
+        image_pull::cancel(&self.pull_key(image), expected, backstop)
     }
 
     fn pull_key(&self, image: &str) -> image_pull::PullKey {

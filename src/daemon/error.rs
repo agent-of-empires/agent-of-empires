@@ -52,6 +52,8 @@ pub enum ApiErrorCode {
     AccountSwapUnavailable,
     ModelPinned,
     UnknownAgent,
+    /// A sandbox image cancel named a pull that has ended; another pull of the image runs.
+    PullReplaced,
     TerminalSwitchRefused(TerminalSwitchReason),
 }
 
@@ -98,6 +100,7 @@ impl ApiErrorCode {
             Self::AccountSwapUnavailable => "account_swap_unavailable",
             Self::ModelPinned => "model_pinned",
             Self::UnknownAgent => "unknown_agent",
+            Self::PullReplaced => "pull_replaced",
             Self::TerminalSwitchRefused(reason) => reason.as_str(),
         }
     }
@@ -130,7 +133,8 @@ impl ApiErrorCode {
             | Self::SessionArchived
             | Self::SessionTrashed
             | Self::AccountSwapUnavailable
-            | Self::ModelPinned => StatusCode::CONFLICT,
+            | Self::ModelPinned
+            | Self::PullReplaced => StatusCode::CONFLICT,
             Self::PendingTargetGone => StatusCode::NOT_FOUND,
             Self::TlsRequired => StatusCode::UPGRADE_REQUIRED,
             Self::CreateHookFailed
@@ -217,6 +221,7 @@ impl ApiErrorCode {
             b"account_swap_unavailable" => Self::AccountSwapUnavailable,
             b"model_pinned" => Self::ModelPinned,
             b"unknown_agent" => Self::UnknownAgent,
+            b"pull_replaced" => Self::PullReplaced,
             other => Self::TerminalSwitchRefused(
                 TerminalSwitchReason::ALL
                     .into_iter()
@@ -397,6 +402,13 @@ mod tests {
                 Some(ApiErrorCode::ModelPinned),
             ),
             (StatusCode::BAD_REQUEST, "model_pinned", false, None),
+            (
+                StatusCode::CONFLICT,
+                "pull_replaced",
+                false,
+                Some(ApiErrorCode::PullReplaced),
+            ),
+            (StatusCode::BAD_REQUEST, "pull_replaced", false, None),
             (
                 StatusCode::BAD_REQUEST,
                 "unknown_agent",

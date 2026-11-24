@@ -71,9 +71,12 @@ impl UpdateStatus {
 
 pub type TuiBackend = crate::tui::hyperlink::HyperlinkBackend<std::io::Stdout>;
 
-/// Sends a pull request to the Daemon. Replaceable so tests can answer requests themselves.
-type PullRunner =
-    Box<dyn FnMut(PullRequest, String) -> tokio::sync::oneshot::Receiver<PullAnswer> + Send>;
+/// Sends a pull request to the Daemon, with a cancel's flight. Replaceable so tests can answer
+/// requests themselves.
+type PullRunner = Box<
+    dyn FnMut(PullRequest, String, Option<u64>) -> tokio::sync::oneshot::Receiver<PullAnswer>
+        + Send,
+>;
 
 /// Sends an image update's dismissal to the Daemon, which answers whether it saved it.
 type DismissRunner = Box<dyn FnMut(String) -> tokio::sync::oneshot::Receiver<bool> + Send>;
@@ -97,10 +100,14 @@ fn run_dismiss_request(digest: String) -> tokio::sync::oneshot::Receiver<bool> {
 fn run_pull_request(
     request: PullRequest,
     image: String,
+    flight: Option<u64>,
 ) -> tokio::sync::oneshot::Receiver<PullAnswer> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let answer = PullSource::locate().await.run(&image, request).await;
+        let answer = PullSource::locate()
+            .await
+            .run(&image, request, flight)
+            .await;
         let _ = tx.send(answer);
     });
     rx
@@ -1840,7 +1847,10 @@ impl App {
             }
             _ => {}
         }
-        self.pull_rx = Some((request, (self.pull_runner)(request, image)));
+        let flight = (request == PullRequest::Cancel)
+            .then(|| self.pull.cancel_flight())
+            .flatten();
+        self.pull_rx = Some((request, (self.pull_runner)(request, image, flight)));
     }
 
     /// Reads the Daemon's pull state and offer on an interval, whatever this TUI's update
@@ -1881,6 +1891,7 @@ impl App {
             report,
             offer,
             image,
+            flight,
         } = match rx.try_recv() {
             Ok(answer) => answer,
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
@@ -1892,6 +1903,8 @@ impl App {
             }
         };
         let applied = self.pull.apply(request, report);
+        // A new id is another pull: a cancel prompt for the one shown ends, and repaints.
+        let replaced = self.pull.note_flight(flight);
         // A Start the Daemon didn't answer may never have reached it, so a running pull it then
         // polls may be another client's, which a cancel would stop.
         let start_unanswered = request == PullRequest::Start && applied == Applied::Recheck;
@@ -1947,7 +1960,7 @@ impl App {
                 self.request_pull(PullRequest::Cancel, self.pull_image.clone());
             }
         }
-        offered || changed
+        offered || changed || replaced
     }
 
     /// A Daemon's offer replaces the update on the bar, so one dismissed or pulled from the web
@@ -5030,6 +5043,7 @@ mod tests {
             report: PullReport::State(pull),
             offer: Some(offer),
             image: None,
+            flight: None,
         };
         let offered =
             |update: &ImageUpdate| answer(PullState::Idle, ImageOffer::Update(update.clone()));
@@ -5131,7 +5145,7 @@ mod tests {
     fn record_pull_requests(app: &mut App) -> std::sync::Arc<std::sync::Mutex<Vec<PullRequest>>> {
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sent = log.clone();
-        app.pull_runner = Box::new(move |request, _| {
+        app.pull_runner = Box::new(move |request, _, _| {
             sent.lock().unwrap().push(request);
             tokio::sync::oneshot::channel().1
         });
@@ -5152,7 +5166,7 @@ mod tests {
     fn hold_pull_requests(app: &mut App) -> SentPulls {
         let log = SentPulls::default();
         let sent = log.clone();
-        app.pull_runner = Box::new(move |request, image| {
+        app.pull_runner = Box::new(move |request, image, _| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             sent.lock().unwrap().push((request, image, tx));
             rx
@@ -5195,6 +5209,73 @@ mod tests {
         let _ = tx.send(answer.into());
         assert_eq!(app.pull_rx.as_ref().map(|(r, _)| *r), Some(request));
         app.poll_pull()
+    }
+
+    /// A cancel names the pull shown. A poll finding another pull ends the prompt, so a `y`
+    /// then cancels nothing; and if the pull is replaced after the cancel went out, the
+    /// Daemon's refusal leaves the line and says nothing was cancelled.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_cancel_names_the_pull_shown_and_not_one_that_replaced_it() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        const IMAGE: &str = "ghcr.io/example/watched:latest";
+        let (mut app, mut terminal) = key_app();
+        type Sent = Vec<(
+            PullRequest,
+            Option<u64>,
+            tokio::sync::oneshot::Sender<PullAnswer>,
+        )>;
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Sent::new()));
+        let log = sent.clone();
+        app.pull_runner = Box::new(move |request, _, flight| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            log.lock().unwrap().push((request, flight, tx));
+            rx
+        });
+        let answer = |app: &mut App, report: PullReport, flight: Option<u64>| {
+            let (_, _, tx) = sent.lock().unwrap().remove(0);
+            let _ = tx.send(PullAnswer {
+                flight,
+                ..report.into()
+            });
+            app.poll_pull()
+        };
+        let requests = || {
+            sent.lock()
+                .unwrap()
+                .iter()
+                .map(|(request, flight, _)| (*request, *flight))
+                .collect::<Vec<_>>()
+        };
+        let ctrl_e = bindings::key_event(bindings::ActionId::CancelImagePull, false).unwrap();
+        let confirm = KeyEvent::new(CONFIRM_CANCEL_PULL, KeyModifiers::NONE);
+        let running = || PullReport::State(PullState::Running(Default::default()));
+
+        app.start_pull(IMAGE.into());
+        answer(&mut app, running(), Some(1));
+        app.handle_key(ctrl_e, &mut terminal).await.unwrap();
+        app.schedule_pull_poll(app.next_pull_poll);
+        assert!(
+            answer(&mut app, running(), Some(2)),
+            "the ended prompt asked for no repaint"
+        );
+        app.handle_key(confirm, &mut terminal).await.unwrap();
+        assert!(
+            requests().is_empty(),
+            "y cancelled the pull that replaced it"
+        );
+        assert!(app.pull.running());
+
+        app.handle_key(ctrl_e, &mut terminal).await.unwrap();
+        app.handle_key(confirm, &mut terminal).await.unwrap();
+        assert_eq!(requests(), [(PullRequest::Cancel, Some(2))]);
+        assert!(answer(&mut app, PullReport::Replaced, None));
+        assert!(app.pull.running(), "a refused cancel cleared the line");
+        assert_eq!(
+            app.update_status.as_ref().map(|s| s.text.as_str()),
+            Some(image_pull::CANCEL_REPLACED)
+        );
     }
 
     /// A cancel while the Start is in flight waits for it, then goes out, of the image the pull
@@ -5339,6 +5420,7 @@ mod tests {
             report: PullReport::State(pull),
             offer: Some(ImageOffer::Update(update.clone())),
             image: Some(update.image.clone()),
+            flight: None,
         };
         let running = || PullState::Running(Default::default());
 
@@ -5439,6 +5521,7 @@ mod tests {
                             report: running(),
                             offer: None,
                             image: Some(a.image.clone()),
+                            flight: None,
                         },
                     );
                     assert!(app.pull.running(), "{case}: the pull isn't shown");
@@ -5463,6 +5546,7 @@ mod tests {
                     report: PullReport::State(PullState::Idle),
                     offer: Some(ImageOffer::Update(a_at_b.clone())),
                     image: Some(a.image.clone()),
+                    flight: None,
                 },
             );
             assert_eq!(
@@ -5492,6 +5576,7 @@ mod tests {
                 report: PullReport::State(PullState::Idle),
                 offer: Some(ImageOffer::Update(b_at_a.clone())),
                 image: Some(b.image.clone()),
+                flight: None,
             },
         );
         assert_eq!(
@@ -5607,7 +5692,11 @@ mod tests {
         let _home = crate::session::test_support::isolate_app_dir();
         crate::session::get_profile_dir("test").unwrap();
         let ctrl_e = bindings::key_event(bindings::ActionId::CancelImagePull, false).unwrap();
-        for case in ["cancel unconfirmed", "image no longer configured", "another status"] {
+        for case in [
+            "cancel unconfirmed",
+            "image no longer configured",
+            "another status",
+        ] {
             let (mut app, mut terminal) = key_app();
             let sent = hold_pull_requests(&mut app);
             app.update_status = Some(UpdateStatus::persistent(NOTICE.into()));

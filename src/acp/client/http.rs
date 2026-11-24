@@ -156,6 +156,9 @@ pub struct SandboxImageStatus {
     pub checks_enabled: bool,
     pub sandbox_in_use: bool,
     pub pull: crate::containers::image_pull::PullState,
+    /// The running pull's id, which a cancel names; absent from a Daemon that has none.
+    #[serde(default)]
+    pub flight: Option<u64>,
     /// Why this Daemon won't pull; `pull_command` is then what to run instead.
     pub pull_blocked: Option<String>,
     pub pull_command: String,
@@ -170,9 +173,13 @@ pub enum SandboxImageAvailability {
     CheckFailed { error: String },
 }
 
-#[derive(serde::Deserialize)]
-struct SandboxPullReply {
-    pull: crate::containers::image_pull::PullState,
+/// What `image-pull` and `image-pull/cancel` answer.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct SandboxPullReply {
+    pub pull: crate::containers::image_pull::PullState,
+    /// The pull this request started or joined.
+    #[serde(default)]
+    pub flight: Option<u64>,
 }
 
 impl From<reqwest::Error> for HttpError {
@@ -528,20 +535,19 @@ impl HttpClient {
 
     /// `POST /api/sandbox/image-pull`: starts `image`'s pull, or joins it; empty is the
     /// Daemon's configured default.
-    pub async fn sandbox_image_pull(
-        &self,
-        image: &str,
-    ) -> Result<crate::containers::image_pull::PullState, HttpError> {
-        self.sandbox_pull_request("/api/sandbox/image-pull", image)
+    pub async fn sandbox_image_pull(&self, image: &str) -> Result<SandboxPullReply, HttpError> {
+        self.sandbox_pull_request("/api/sandbox/image-pull", image, None)
             .await
     }
 
-    /// `POST /api/sandbox/image-pull/cancel`: the state `image`'s cancelled pull ended in.
+    /// `POST /api/sandbox/image-pull/cancel`: the state `image`'s cancelled pull ended in. With
+    /// `flight`, the Daemon refuses (`409 pull_replaced`) if another pull has replaced it.
     pub async fn sandbox_image_cancel(
         &self,
         image: &str,
-    ) -> Result<crate::containers::image_pull::PullState, HttpError> {
-        self.sandbox_pull_request("/api/sandbox/image-pull/cancel", image)
+        flight: Option<u64>,
+    ) -> Result<SandboxPullReply, HttpError> {
+        self.sandbox_pull_request("/api/sandbox/image-pull/cancel", image, flight)
             .await
     }
 
@@ -561,17 +567,23 @@ impl HttpClient {
         &self,
         path: &str,
         image: &str,
-    ) -> Result<crate::containers::image_pull::PullState, HttpError> {
+        flight: Option<u64>,
+    ) -> Result<SandboxPullReply, HttpError> {
         let url = format!("{}{path}", self.endpoint.base_url);
         let mut request = self.http.post(&url);
+        let mut body = serde_json::Map::new();
         if !image.is_empty() {
-            request = request.json(&serde_json::json!({ "image": image }));
+            body.insert("image".into(), image.into());
+        }
+        if let Some(flight) = flight {
+            body.insert("flight".into(), flight.into());
+        }
+        if !body.is_empty() {
+            request = request.json(&body);
         }
         let res = self.execute(request).await?;
         let res = check_global_status(res)?;
-        Ok(crate::daemon::decode_json::<SandboxPullReply>(res)
-            .await?
-            .pull)
+        Ok(crate::daemon::decode_json::<SandboxPullReply>(res).await?)
     }
 
     /// `GET /api/plugins/commands`. The daemon's active plugin commands with
@@ -2973,9 +2985,13 @@ mod tests {
                 "pull".into(),
             ))
         });
+        let id = flight.flight_id();
+        let started = client.sandbox_image_pull("").await.unwrap();
+        assert_eq!(started.pull, PullState::Running(Default::default()));
         assert_eq!(
-            client.sandbox_image_pull("").await.unwrap(),
-            PullState::Running(Default::default())
+            started.flight,
+            Some(id),
+            "the reply names the pull it joined"
         );
         // The default moves on; a profile still uses the watched image, so it stays configured.
         crate::session::create_profile("work").unwrap();
@@ -2993,16 +3009,21 @@ mod tests {
             PullState::Idle,
             "the default image isn't pulling"
         );
+        let status = client.sandbox_image_status(false, IMAGE).await.unwrap();
+        assert!(matches!(status.pull, PullState::Running(_)));
+        assert_eq!(status.flight, Some(id));
+        // A cancel naming another flight is refused, and this pull runs on.
         assert!(matches!(
+            client.sandbox_image_cancel(IMAGE, Some(id + 1)).await,
+            Err(HttpError::Server { status, ref body })
+                if status == reqwest::StatusCode::CONFLICT && body == "pull_replaced"
+        ));
+        assert_eq!(
             client
-                .sandbox_image_status(false, IMAGE)
+                .sandbox_image_cancel(IMAGE, Some(id))
                 .await
                 .unwrap()
                 .pull,
-            PullState::Running(_)
-        ));
-        assert_eq!(
-            client.sandbox_image_cancel(IMAGE).await.unwrap(),
             PullState::Cancelled
         );
         assert!(matches!(

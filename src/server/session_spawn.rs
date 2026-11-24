@@ -1566,7 +1566,8 @@ mod tests {
             if shared {
                 tokio::task::spawn_blocking(|| {
                     crate::containers::get_container_runtime()
-                        .cancel_pull(IMAGE, Duration::from_secs(5))
+                        .cancel_pull(IMAGE, None, Duration::from_secs(5))
+                        .unwrap()
                 })
                 .await
                 .unwrap();

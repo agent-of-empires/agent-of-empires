@@ -110,7 +110,15 @@ struct FlightState {
     cancel_requested: bool,
 }
 
-static NEXT_FLIGHT: AtomicU64 = AtomicU64::new(0);
+/// Flight ids start from this process's start time in microseconds, so a restarted Daemon
+/// doesn't hand out an id a client still holds. They stay below 2^53, so the dashboard's numbers
+/// keep them exact.
+static NEXT_FLIGHT: LazyLock<AtomicU64> = LazyLock::new(|| {
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    AtomicU64::new(u64::try_from(started.as_micros()).unwrap_or(0))
+});
 
 impl Flight {
     /// Gives up one waiter's place; the last one out kills the pull. Returns whether it was last.
@@ -319,12 +327,25 @@ fn reissue(error: &DockerError) -> DockerError {
 
 /// The running pull's state, or the last one's outcome.
 pub(crate) fn state(key: &PullKey) -> PullState {
+    state_and_flight(key).0
+}
+
+/// [`state`], with the running pull's id from the same lookup, so a client can name the pull
+/// it saw in a [`cancel`].
+pub(crate) fn state_and_flight(key: &PullKey) -> (PullState, Option<u64>) {
     match lock(&FLIGHTS).get(key) {
-        Some(Entry::Running(flight)) => PullState::Running(lock(&flight.progress).snapshot()),
-        Some(Entry::Finished(state)) => state.clone(),
-        None => PullState::Idle,
+        Some(Entry::Running(flight)) => (
+            PullState::Running(lock(&flight.progress).snapshot()),
+            Some(flight.id),
+        ),
+        Some(Entry::Finished(state)) => (state.clone(), None),
+        None => (PullState::Idle, None),
     }
 }
+
+/// [`cancel`] found another pull running than the one it was asked to cancel.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Replaced;
 
 /// The id of `key`'s running pull, to match against [`Waiter::flight_id`]. A killed pull has
 /// none: [`join_with`] won't join it, so a match would stand for a pull nobody can join.
@@ -336,18 +357,26 @@ pub(crate) fn running_flight_id(key: &PullKey) -> Option<u64> {
 }
 
 /// Cancels `key`'s running pull for every waiter and waits up to `backstop` for it to end.
-/// Returns that pull's state, not a retry's that started meanwhile; still `Running` if the
-/// backstop passed first. With no running pull it is the state that lookup found, so a pull
-/// started just after reads as neither cancelled nor running.
-pub(crate) fn cancel(key: &PullKey, backstop: Duration) -> PullState {
+/// With `expected`, only that flight: another one running is left alone, checked under the same
+/// lock as the kill. Returns that pull's state, not a retry's that started meanwhile; still
+/// `Running` if the backstop passed first. With no running pull it is the state that lookup
+/// found, so a pull started just after reads as neither cancelled nor running.
+pub(crate) fn cancel(
+    key: &PullKey,
+    expected: Option<u64>,
+    backstop: Duration,
+) -> std::result::Result<PullState, Replaced> {
     let flight = match lock(&FLIGHTS).get(key) {
+        Some(Entry::Running(flight)) if expected.is_some_and(|id| id != flight.id) => {
+            return Err(Replaced);
+        }
         Some(Entry::Running(flight)) => {
             lock(&flight.state).cancel_requested = true;
             flight.kill.cancel();
             flight.clone()
         }
-        Some(Entry::Finished(state)) => return state.clone(),
-        None => return PullState::Idle,
+        Some(Entry::Finished(state)) => return Ok(state.clone()),
+        None => return Ok(PullState::Idle),
     };
     let deadline = Instant::now() + backstop;
     let mut guard = lock(&flight.state);
@@ -367,7 +396,7 @@ pub(crate) fn cancel(key: &PullKey, backstop: Duration) -> PullState {
         .as_ref()
         .map(|outcome| finished_state(outcome, true).unwrap_or(PullState::Idle));
     drop(guard);
-    ended.unwrap_or_else(|| PullState::Running(lock(&flight.progress).snapshot()))
+    Ok(ended.unwrap_or_else(|| PullState::Running(lock(&flight.progress).snapshot())))
 }
 
 /// How many callers are waiting on `key`'s running pull; 0 when none is running.
@@ -572,7 +601,7 @@ mod tests {
 
         let after = within("a cancel", {
             let cancelled = cancelled.clone();
-            move || cancel(&cancelled, DEADLINE)
+            move || cancel(&cancelled, None, DEADLINE).unwrap()
         });
         assert_eq!(after, PullState::Cancelled);
         for result in waiting {
@@ -594,14 +623,46 @@ mod tests {
             "a waiter that cancelled as well gets its own cancel"
         );
         assert_eq!(
-            cancel(&cancelled, DEADLINE),
+            cancel(&cancelled, None, DEADLINE).unwrap(),
             PullState::Cancelled,
             "a repeat answers the same"
         );
         assert_eq!(
-            cancel(&key("Docker", "never-pulled"), DEADLINE),
+            cancel(&key("Docker", "never-pulled"), None, DEADLINE).unwrap(),
             PullState::Idle
         );
+    }
+
+    /// A cancel naming a flight kills only that one: a pull that replaced it keeps running.
+    /// Ids are seeded from the clock, so a restarted Daemon doesn't reuse a held one.
+    #[test]
+    fn a_cancel_naming_an_ended_flight_leaves_its_replacement_running() {
+        let replaced = key("Docker", "replaced");
+        let first = join_with(replaced.clone(), |_: &PullContext| Ok(()));
+        let stale = first.flight_id();
+        within("the first pull", move || {
+            first.wait(&CancellationToken::new())
+        })
+        .unwrap();
+        let second = join_with(replaced.clone(), |pull: &PullContext| {
+            while !pull.kill.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(DockerError::Cancelled("pull".into()))
+        });
+        let current = second.flight_id();
+        assert_ne!(current, stale);
+        assert_eq!(state_and_flight(&replaced).1, Some(current));
+        // 2020-01-01 in microseconds: an unseeded counter starts at 0.
+        assert!(stale > 1_577_836_800_000_000, "ids aren't seeded: {stale}");
+
+        assert_eq!(cancel(&replaced, Some(stale), DEADLINE), Err(Replaced));
+        assert!(matches!(state(&replaced), PullState::Running(_)));
+        assert_eq!(
+            cancel(&replaced, Some(current), DEADLINE),
+            Ok(PullState::Cancelled)
+        );
+        drop(second);
     }
 
     #[test]
@@ -622,7 +683,7 @@ mod tests {
         let (answer_tx, answer) = mpsc::channel();
         std::thread::spawn({
             let retried = retried.clone();
-            move || answer_tx.send(cancel(&retried, DEADLINE))
+            move || answer_tx.send(cancel(&retried, None, DEADLINE).unwrap())
         });
         killed
             .recv_timeout(DEADLINE)

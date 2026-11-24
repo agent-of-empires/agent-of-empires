@@ -14,6 +14,8 @@ const START_UNANSWERED: &str =
     "Couldn't start the sandbox image download: the Daemon didn't answer.";
 const CANCEL_GATED: &str =
     "Couldn't cancel the sandbox image download: image pulls are off on the Daemon.";
+pub(crate) const CANCEL_REPLACED: &str =
+    "That download already ended and another one is running, so nothing was cancelled.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PullRequest {
@@ -31,6 +33,8 @@ pub(crate) enum PullReport {
     },
     /// The Daemon no longer has this image configured.
     UnknownImage,
+    /// The cancel named a pull that has ended; the one running now replaced it.
+    Replaced,
     /// No answer: the Daemon is unreachable or failed the request.
     Unavailable,
 }
@@ -41,6 +45,8 @@ pub(crate) struct PullAnswer {
     /// Only a poll carries the Daemon's offer, and the image it reported on.
     pub(crate) offer: Option<ImageOffer>,
     pub(crate) image: Option<String>,
+    /// The running pull's id, for a cancel to name.
+    pub(crate) flight: Option<u64>,
 }
 
 impl From<PullReport> for PullAnswer {
@@ -49,6 +55,7 @@ impl From<PullReport> for PullAnswer {
             report,
             offer: None,
             image: None,
+            flight: None,
         }
     }
 }
@@ -95,9 +102,15 @@ impl PullSource {
     }
 
     /// `image` is the pull's image; empty means the Daemon's configured default.
-    pub(crate) async fn run(&self, image: &str, request: PullRequest) -> PullAnswer {
+    /// `flight` is a cancel's: the pull it was asked for.
+    pub(crate) async fn run(
+        &self,
+        image: &str,
+        request: PullRequest,
+        flight: Option<u64>,
+    ) -> PullAnswer {
         match self {
-            Self::Daemon(client) => daemon(client, image, request).await,
+            Self::Daemon(client) => daemon(client, image, request, flight).await,
             Self::Unavailable => PullReport::Unavailable.into(),
         }
     }
@@ -117,34 +130,43 @@ impl PullSource {
     }
 }
 
-async fn daemon(client: &HttpClient, image: &str, request: PullRequest) -> PullAnswer {
+async fn daemon(
+    client: &HttpClient,
+    image: &str,
+    request: PullRequest,
+    flight: Option<u64>,
+) -> PullAnswer {
     let answer = match request {
         PullRequest::Poll => client
             .sandbox_image_status(false, image)
             .await
             .map(|status| {
                 let offer = ImageOffer::from_status(&status);
-                (Some((offer, status.image)), status.pull)
+                (Some((offer, status.image)), status.pull, status.flight)
             }),
         PullRequest::Start => client
             .sandbox_image_pull(image)
             .await
-            .map(|pull| (None, pull)),
+            .map(|reply| (None, reply.pull, reply.flight)),
         PullRequest::Cancel => client
-            .sandbox_image_cancel(image)
+            .sandbox_image_cancel(image, flight)
             .await
-            .map(|pull| (None, pull)),
+            .map(|reply| (None, reply.pull, None)),
     };
     match answer {
-        Ok((polled, pull)) => {
+        Ok((polled, pull, flight)) => {
             let (offer, image) = polled.unzip();
             PullAnswer {
                 report: PullReport::State(pull),
                 offer,
                 image,
+                flight,
             }
         }
         Err(error) if is_unknown_image(&error) => PullReport::UnknownImage.into(),
+        Err(error) if is_code(&error, crate::daemon::ApiErrorCode::PullReplaced) => {
+            PullReport::Replaced.into()
+        }
         Err(error) if is_refusal(&error) => match client.sandbox_image_status(false, image).await {
             Ok(status) => PullReport::Gated {
                 command: status.pull_command,
@@ -163,11 +185,14 @@ fn is_refusal(error: &HttpError) -> bool {
         || matches!(error, HttpError::Server { status, .. } if *status == reqwest::StatusCode::FORBIDDEN)
 }
 
-/// The client classifies by the `AoE-Error-Code` header and keeps only that code as `body`.
 fn is_unknown_image(error: &HttpError) -> bool {
+    is_code(error, crate::daemon::ApiErrorCode::UnknownImage)
+}
+
+/// The client classifies by the `AoE-Error-Code` header and keeps only that code as `body`.
+fn is_code(error: &HttpError, code: crate::daemon::ApiErrorCode) -> bool {
     matches!(error, HttpError::Server { status, body }
-        if *status == reqwest::StatusCode::BAD_REQUEST
-            && body == crate::daemon::ApiErrorCode::UnknownImage.as_str())
+        if *status == code.status() && body == code.as_str())
 }
 
 /// How long Ctrl+E's prompt waits for its confirming key.
@@ -196,6 +221,9 @@ pub(crate) struct PullWatch {
     /// Another client's pull found while an outcome waits to be acknowledged: it takes the line
     /// once the outcome is acknowledged, so the outcome isn't lost unread.
     behind: Option<PullLine>,
+    /// The Daemon's id for the running pull shown, and for the one behind; a cancel names it.
+    flight: Option<u64>,
+    behind_flight: Option<u64>,
 }
 
 /// What [`PullWatch::apply`] changed, beyond the line.
@@ -240,6 +268,8 @@ impl PullWatch {
     /// A pull this TUI asked for runs from now, before the first answer arrives.
     pub(crate) fn start(&mut self) {
         self.behind = None;
+        self.behind_flight = None;
+        self.flight = None;
         self.set_line(Some(PullLine::Running(ProgressSnapshot::default())));
         self.watched = true;
         self.seen_running = false;
@@ -290,6 +320,8 @@ impl PullWatch {
             PullReport::Gated { .. } if request == PullRequest::Cancel => {
                 return Applied::Unanswered(CANCEL_GATED);
             }
+            // The pull shown has ended, and what runs now is another one: the next poll shows it.
+            PullReport::Replaced => return Applied::Unanswered(CANCEL_REPLACED),
             PullReport::Gated { command } => self.end(Some(PullLine::Gated { command })),
             PullReport::UnknownImage => {
                 if !self.running() {
@@ -386,6 +418,29 @@ impl PullWatch {
         false
     }
 
+    /// The pull id the answer to the last request carried. A running pull with a new id is
+    /// another pull than the one shown, so a cancel prompt for it ends. Returns whether it did.
+    pub(crate) fn note_flight(&mut self, flight: Option<u64>) -> bool {
+        let Some(flight) = flight else {
+            return false;
+        };
+        if self.showing_outcome() && self.behind.is_some() {
+            self.behind_flight = Some(flight);
+            return false;
+        }
+        if !self.running() {
+            return false;
+        }
+        let replaced = self.flight.is_some_and(|shown| shown != flight);
+        self.flight = Some(flight);
+        replaced && self.cancel_armed.take().is_some()
+    }
+
+    /// The id of the running pull shown, for the cancel to name.
+    pub(crate) fn cancel_flight(&self) -> Option<u64> {
+        self.flight
+    }
+
     fn showing_outcome(&self) -> bool {
         matches!(
             self.line,
@@ -416,11 +471,15 @@ impl PullWatch {
     /// The shown outcome is acknowledged: a pull waiting behind it takes the line.
     fn acknowledge(&mut self) {
         let next = self.behind.take();
+        let flight = self.behind_flight.take();
         let running = matches!(next, Some(PullLine::Running(_)));
         self.watched = running;
         self.seen_running = running;
         self.start_unanswered = false;
         self.set_line(next);
+        if running {
+            self.flight = flight;
+        }
     }
 
     fn end(&mut self, outcome: Option<PullLine>) {
@@ -434,6 +493,7 @@ impl PullWatch {
         if !matches!(line, Some(PullLine::Running(_))) {
             self.hidden = false;
             self.cancel_armed = None;
+            self.flight = None;
         }
         self.line = line;
     }
@@ -661,8 +721,20 @@ mod tests {
         };
         // (case, the first outcome, reports after it, the line those leave, the line after the
         // outcome is acknowledged)
-        let cases: Vec<(&str, PullReport, Vec<PullReport>, PullLine, Option<PullLine>)> = vec![
-            ("a failure, then another pull", failed(), vec![running(1)], failure.clone(), Some(other(1))),
+        let cases: Vec<(
+            &str,
+            PullReport,
+            Vec<PullReport>,
+            PullLine,
+            Option<PullLine>,
+        )> = vec![
+            (
+                "a failure, then another pull",
+                failed(),
+                vec![running(1)],
+                failure.clone(),
+                Some(other(1)),
+            ),
             (
                 "a failure, then another pull that finishes",
                 failed(),
@@ -677,16 +749,30 @@ mod tests {
                 PullLine::Done,
                 Some(other(2)),
             ),
-            ("a failure, and nothing after", failed(), vec![], failure.clone(), None),
+            (
+                "a failure, and nothing after",
+                failed(),
+                vec![],
+                failure.clone(),
+                None,
+            ),
         ];
         for (case, outcome, after, shown, acknowledged) in cases {
             let mut watch = PullWatch::default();
             watch.start();
             watch.apply(PullRequest::Poll, outcome);
             for report in after {
-                assert_eq!(watch.apply(PullRequest::Poll, report), Applied::Unchanged, "{case}");
+                assert_eq!(
+                    watch.apply(PullRequest::Poll, report),
+                    Applied::Unchanged,
+                    "{case}"
+                );
             }
-            assert_eq!(watch.line(), Some(&shown), "{case}: the outcome was replaced");
+            assert_eq!(
+                watch.line(),
+                Some(&shown),
+                "{case}: the outcome was replaced"
+            );
             if shown == PullLine::Done {
                 assert!(watch.other_key(true), "{case}");
             } else {
@@ -701,7 +787,10 @@ mod tests {
         watch.apply(PullRequest::Poll, failed());
         watch.apply(PullRequest::Poll, running(1));
         watch.start();
-        assert_eq!(watch.line(), Some(&PullLine::Running(ProgressSnapshot::default())));
+        assert_eq!(
+            watch.line(),
+            Some(&PullLine::Running(ProgressSnapshot::default()))
+        );
         watch.apply(PullRequest::Poll, PullReport::State(PullState::Done));
         assert_eq!(watch.line(), Some(&PullLine::Done), "the retry's outcome");
     }
@@ -850,6 +939,7 @@ mod tests {
                 checks_enabled: true,
                 sandbox_in_use: in_use,
                 pull: PullState::Idle,
+                flight: None,
                 pull_blocked: None,
                 pull_command: String::new(),
             };
@@ -922,16 +1012,18 @@ mod tests {
         let source = PullSource::Daemon(HttpClient::new(endpoint).unwrap());
 
         assert_eq!(
-            source.run(IMAGE, PullRequest::Poll).await,
+            source.run(IMAGE, PullRequest::Poll, None).await,
             PullAnswer {
                 report: PullReport::State(PullState::Idle),
                 offer: Some(ImageOffer::NoUpdate),
                 image: Some(IMAGE.into()),
+                flight: None,
             },
             "checks are off, so the Daemon offers nothing"
         );
         for request in [PullRequest::Start, PullRequest::Cancel] {
-            let PullReport::Gated { command } = source.run(IMAGE, request).await.report else {
+            let PullReport::Gated { command } = source.run(IMAGE, request, None).await.report
+            else {
                 panic!("{request:?} should be gated");
             };
             assert!(command.contains(IMAGE), "{command}");
