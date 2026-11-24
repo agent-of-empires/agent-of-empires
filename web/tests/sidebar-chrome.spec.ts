@@ -1,9 +1,9 @@
-// Sidebar chrome: compact mode, empty state, project headers, new-session tooltips, and row chips and actions.
+// Sidebar chrome: resize handle and compact rail, empty state, project headers, new-session tooltips, and row chips and actions.
 
 import type { Page } from "@playwright/test";
 import { test, expect } from "./helpers/mockedTest";
 import { installSidebarMocks, threeSessionsInOneRepo, type MockSessionInput } from "./helpers/sidebarMocks";
-import { openMobileSidebar } from "./helpers/sidebar";
+import { dragSidebarHandle, openMobileSidebar } from "./helpers/sidebar";
 import { iPhone13 } from "./helpers/viewports";
 
 async function openSidebar(page: Page, sessions: MockSessionInput[]) {
@@ -49,28 +49,37 @@ test("archived and snoozed labels retain full opacity and italic styling", async
   }
 });
 
-test.describe("compact mode (#2288)", () => {
+test.describe("resize handle and compact rail (#2288)", () => {
   const SESSIONS = [
     { id: "s-a", title: "alpha-session", project_path: "/tmp/repo-alpha", branch: "feat/a" },
     { id: "s-b", title: "beta-session", project_path: "/tmp/repo-alpha", branch: "feat/b" },
   ];
+  const panelWidth = (page: Page) => async () =>
+    (await page.locator('[data-tour="sidebar"]').boundingBox())?.width ?? 0;
 
-  test("compact toggle slims the sidebar, hides extras and an open filter, stays tappable, and persists", async ({
+  test("dragging below the minimum snaps to the rail, which hides extras and an open filter, stays tappable, and persists", async ({
     page,
   }) => {
     await openSidebar(page, SESSIONS);
     const panel = page.locator('[data-tour="sidebar"]');
-    const width = async () => (await panel.boundingBox())!.width;
+    const width = panelWidth(page);
     await expect(panel).toBeVisible();
-    expect(await width()).toBeGreaterThan(200);
+    await expect(page.getByTestId("sidebar-compact-toggle")).toHaveCount(0);
     await expect(page.locator(COUNT).first()).toBeVisible();
     await expect(page.getByRole("button", { name: "New session in repo-alpha" })).toBeVisible();
 
-    await page.getByRole("button", { name: "Compact sidebar" }).click();
+    // The drag follows the pointer down to the 200px minimum and holds there until the snap point.
+    await dragSidebarHandle(page, 230);
+    await expect.poll(width).toBe(230);
+    await dragSidebarHandle(page, 160);
+    await expect.poll(width).toBe(200);
+    await expect(panel).not.toHaveAttribute("data-compact", "true");
+
+    await dragSidebarHandle(page, 100);
+    await expect(panel).toHaveAttribute("data-compact", "true");
     await expect.poll(width).toBeLessThan(120);
     await expect(page.locator(COUNT)).toHaveCount(0);
     await expect(page.getByRole("button", { name: "New session in repo-alpha" })).toHaveCount(0);
-    await expect(page.getByRole("button", { name: "Expand sidebar" })).toBeVisible();
     await page.getByText("alpha-session").click();
     // Wide uppercase footer labels used to spill past the rail.
     await expect.poll(() => panel.evaluate((el) => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(1);
@@ -81,10 +90,11 @@ test.describe("compact mode (#2288)", () => {
     await expect(page.getByText("aoe", { exact: true })).toBeHidden();
 
     await page.reload();
-    await expect(page.getByRole("button", { name: "Expand sidebar" })).toBeVisible();
+    await expect(panel).toHaveAttribute("data-compact", "true");
     await expect.poll(width).toBeLessThan(120);
-    await page.getByRole("button", { name: "Expand sidebar" }).click();
-    await expect.poll(width).toBeGreaterThan(200);
+    await dragSidebarHandle(page, 260);
+    await expect(panel).not.toHaveAttribute("data-compact", "true");
+    await expect.poll(width).toBe(260);
     await expect(page.locator(COUNT).first()).toBeVisible();
 
     // Entering compact hides an open filter and stops its query narrowing the list.
@@ -94,13 +104,115 @@ test.describe("compact mode (#2288)", () => {
     await filterInput.fill("beta");
     await expect(page.getByText("alpha-session")).toHaveCount(0);
     await expect(page.getByText("beta-session")).toBeVisible();
-    await page.getByRole("button", { name: "Compact sidebar" }).click();
+    await dragSidebarHandle(page, 100);
     await expect(filterInput).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Filter sessions" })).toHaveCount(0);
     await expect(page.getByText("alpha-session")).toBeVisible();
-    await page.getByRole("button", { name: "Expand sidebar" }).click();
+    await dragSidebarHandle(page, 260);
     await expect(filterInput).toHaveValue("beta");
     await expect(page.getByText("alpha-session")).toHaveCount(0);
+  });
+
+  test("dragging past the rail closes the sidebar, and reopening restores the sidebar the drag started from", async ({
+    page,
+  }) => {
+    await openSidebar(page, SESSIONS);
+    const panel = page.locator('[data-tour="sidebar"]');
+    const width = panelWidth(page);
+    const toggle = page.getByRole("button", { name: "Toggle sidebar" });
+    await dragSidebarHandle(page, 300);
+    await expect.poll(width).toBe(300);
+
+    // Through the rail and out again in one gesture: the sidebar comes back with the pointer.
+    await dragSidebarHandle(page, 100, 10, 250);
+    await expect(panel).toBeVisible();
+    await expect.poll(width).toBe(250);
+
+    await dragSidebarHandle(page, 100, 10);
+    await expect(panel).toBeHidden();
+    await expect(page.getByTestId("sidebar-resize-handle")).toBeHidden();
+    await toggle.click();
+    await expect(panel).toBeVisible();
+    await expect(panel).not.toHaveAttribute("data-compact", "true");
+    await expect.poll(width).toBe(250);
+    expect(await page.evaluate(() => localStorage.getItem("aoe-sidebar-width"))).toBe("250");
+
+    // From the rail, closing keeps the rail for the reopen; the top bar toggle and its shortcut stay in step.
+    await dragSidebarHandle(page, 100);
+    await expect(panel).toHaveAttribute("data-compact", "true");
+    await dragSidebarHandle(page, 10);
+    await expect(panel).toBeHidden();
+    await page.keyboard.press("ControlOrMeta+b");
+    await expect(panel).toBeVisible();
+    await expect(panel).toHaveAttribute("data-compact", "true");
+    await toggle.click();
+    await expect(panel).toBeHidden();
+    await toggle.click();
+    await expect(panel).toHaveAttribute("data-compact", "true");
+  });
+
+  test("the handle is a keyboard separator: arrows resize and snap to the rail, Enter restores, double-click resets", async ({
+    page,
+  }) => {
+    await openSidebar(page, SESSIONS);
+    const panel = page.locator('[data-tour="sidebar"]');
+    const width = panelWidth(page);
+    const handle = page.getByRole("separator", { name: "Resize sidebar" });
+    await handle.focus();
+    await expect(handle).toHaveAttribute("aria-valuenow", "280");
+
+    await page.keyboard.press("ArrowRight");
+    await expect(handle).toHaveAttribute("aria-valuenow", "296");
+    await expect.poll(width).toBe(296);
+    await page.keyboard.press("End");
+    await expect(handle).toHaveAttribute("aria-valuenow", "480");
+    await page.keyboard.press("Home");
+    await expect(panel).toHaveAttribute("data-compact", "true");
+    await expect(handle).toHaveAttribute("aria-valuenow", "88");
+    // The rail is as narrow as the keyboard goes; the handle stays focusable.
+    await page.keyboard.press("ArrowLeft");
+    await expect(panel).toBeVisible();
+    await expect(handle).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(handle).toHaveAttribute("aria-valuenow", "480");
+
+    await handle.dblclick();
+    await expect(panel).not.toHaveAttribute("data-compact", "true");
+    await expect.poll(width).toBe(280);
+    expect(await page.evaluate(() => localStorage.getItem("aoe-sidebar-width"))).toBe("280");
+  });
+
+  test("a phone drawer ignores a compact rail saved on a wider screen", async ({ page }) => {
+    await installSidebarMocks(page, { sessions: SESSIONS });
+    await page.addInitScript(() => localStorage.setItem("aoe-web-settings", JSON.stringify({ sidebarCompact: true })));
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto("/");
+    await openMobileSidebar(page);
+    const panel = page.locator('[data-tour="sidebar"]');
+    await expect(panel).not.toHaveAttribute("data-compact", "true");
+    await expect(page.locator(COUNT).first()).toBeVisible();
+
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await expect(panel).toHaveAttribute("data-compact", "true");
+  });
+});
+
+test.describe("resize handle on a touch tablet (#2288)", () => {
+  test.use({ hasTouch: true, viewport: { width: 1024, height: 768 } });
+
+  test("a touch drag snaps the in-flow sidebar to the rail", async ({ page }) => {
+    await installSidebarMocks(page, { sessions: threeSessionsInOneRepo() });
+    await page.goto("/");
+    const box = (await page.getByTestId("sidebar-resize-handle").boundingBox())!;
+    const y = box.y + box.height / 2;
+    // Playwright's touchscreen only taps, so the drag goes through CDP.
+    const cdp = await page.context().newCDPSession(page);
+    const touch = (type: string, x: number) =>
+      cdp.send("Input.dispatchTouchEvent", { type, touchPoints: type === "touchEnd" ? [] : [{ x, y }] });
+    await touch("touchStart", box.x + box.width / 2);
+    for (const x of [250, 200, 150, 100]) await touch("touchMove", x);
+    await touch("touchEnd", 100);
+    await expect(page.locator('[data-tour="sidebar"]')).toHaveAttribute("data-compact", "true");
   });
 });
 

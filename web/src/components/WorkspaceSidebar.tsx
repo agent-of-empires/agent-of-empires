@@ -15,7 +15,7 @@ import {
 } from "../lib/sidebarGroups";
 import type { RepoAppearanceUpdate } from "../lib/repoAppearance";
 import { useWebSettings } from "../hooks/useWebSettings";
-import { SidebarCompactContext } from "../lib/sidebarCompact";
+import { SidebarCompactContext, useSidebarInFlow } from "../lib/sidebarCompact";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { useServerDown } from "../lib/connectionState";
 import type { SidebarSortMode } from "../lib/sidebarSort";
@@ -72,7 +72,8 @@ interface Props {
   /** The session the URL currently points at; lets an expanded sibling row tell it apart from the rest of its group. */
   activeSessionId: string | null;
   open: boolean;
-  onToggle: () => void;
+  /** Closes from the phone backdrop or close button; a resize drag also closes and reopens it. */
+  onOpenChange: (open: boolean) => void;
   onSelect: (workspaceId: string, sessionId: string | null) => void;
   onToggleGroup: (groupId: string) => void;
   onUpdateRepoAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
@@ -122,9 +123,15 @@ export function WorkspaceSidebar(props: Props) {
   } = props;
   const { settings: webSettings, update: updateWebSettings } = useWebSettings();
   const rightSide = webSettings.sidebarSide === "right";
-  const compact = webSettings.sidebarCompact;
+  const inFlow = useSidebarInFlow();
+  const compact = webSettings.sidebarCompact && inFlow;
   const offline = useServerDown();
-  const { effectiveWidth, startResize } = useSidebarWidth(compact);
+  const { effectiveWidth, panelRef, handleProps } = useSidebarWidth({
+    compact,
+    onCompactChange: (sidebarCompact) => updateWebSettings({ sidebarCompact }),
+    open,
+    onOpenChange: props.onOpenChange,
+  });
 
   const pluginUiEntries = usePluginUiEntries();
   const pluginSorts = useMemo(() => pluginSortSpecs(pluginUiEntries), [pluginUiEntries]);
@@ -303,13 +310,14 @@ export function WorkspaceSidebar(props: Props) {
         className={`fixed top-[calc(3rem+env(safe-area-inset-top))] inset-x-0 bottom-0 z-30 md:hidden transition-opacity duration-300 ${
           open ? "bg-black/50" : "opacity-0 pointer-events-none"
         }`}
-        onClick={props.onToggle}
+        onClick={() => props.onOpenChange(false)}
       />
       <div
         {...tourAnchor(TOUR_ANCHORS.sidebar)}
         role="navigation"
         aria-label="Sessions sidebar"
         tabIndex={-1}
+        ref={panelRef}
         style={{ width: effectiveWidth }}
         data-compact={compact ? "true" : undefined}
         className={`fixed top-[calc(3rem+env(safe-area-inset-top))] bottom-0 z-40 md:static md:z-auto bg-surface-800 border-surface-700/60 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 ${
@@ -333,8 +341,7 @@ export function WorkspaceSidebar(props: Props) {
           onToggleFilter={toggleFilter}
           offline={offline}
           onNew={() => props.onNew()}
-          onToggleCompact={() => updateWebSettings({ sidebarCompact: !compact })}
-          onClose={props.onToggle}
+          onClose={() => props.onOpenChange(false)}
         />
 
         {filterOpen && !compact && (
@@ -487,11 +494,12 @@ export function WorkspaceSidebar(props: Props) {
           </button>
         </div>
       </div>
-      {/* Hidden with the panel so no dead drag bar lingers when the sidebar is closed. */}
+      {/* Hidden with the panel so no dead drag bar lingers when the sidebar is closed. On a touch screen the
+         pseudo-element widens the hit area outward, clear of the rows, and touch-action lets it drag instead of scroll. */}
       <div
         data-testid="sidebar-resize-handle"
-        onMouseDown={startResize}
-        className={`${open && !compact ? "hidden md:block" : "hidden"} w-1 cursor-col-resize shrink-0 bg-surface-800 hover:bg-brand-600/50 transition-colors duration-75`}
+        {...handleProps}
+        className={`${open ? "hidden md:block" : "hidden"} relative z-10 w-1 cursor-col-resize shrink-0 touch-none bg-surface-800 hover:bg-brand-600/50 focus-visible:bg-brand-600/50 focus-visible:outline-none pointer-coarse:before:absolute pointer-coarse:before:inset-y-0 pointer-coarse:before:left-0 pointer-coarse:before:-right-5 pointer-coarse:before:content-[''] transition-colors duration-75`}
       />
     </SidebarCompactContext.Provider>
   );
