@@ -87,6 +87,7 @@ pub(crate) use instance::test_helpers::publish_host_pi_transcript;
 #[cfg(test)]
 pub(crate) use instance::ActiveExecution;
 pub use instance::LastError;
+pub(crate) use instance::OwnCmdConfig;
 pub(crate) use instance::CAPTURE_FAILED_RULE;
 pub(crate) use instance::{
     duplicate_session_error, is_duplicate_session, persist_session_with_storage,

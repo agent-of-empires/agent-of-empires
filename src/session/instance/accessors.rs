@@ -15,6 +15,13 @@ pub(crate) fn generate_id() -> String {
     Uuid::new_v4().to_string().replace("-", "")[..16].to_string()
 }
 
+/// The resolved config the launcher-store preview reads.
+pub(crate) struct OwnCmdConfig<C> {
+    pub session: C,
+    pub profile_environment: Vec<String>,
+    pub before_session_hook: bool,
+}
+
 impl Instance {
     pub fn new(title: &str, project_path: &str) -> Self {
         Self {
@@ -261,21 +268,28 @@ impl Instance {
     /// Resolves config only for such a tool.
     pub(crate) fn resumes_claude_under_own_acp_cmd(&self, acp_agent: &str) -> bool {
         self.resumes_claude_under_own_acp_cmd_with(acp_agent, || {
-            crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+            let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                 &self.effective_profile(),
                 self.repo_config_path(),
-            )
-            .session
+            );
+            OwnCmdConfig {
+                before_session_hook: !config.host_hooks.before_session.is_empty(),
+                profile_environment: config.environment,
+                session: config.session,
+            }
         })
     }
 
-    /// As [`Self::resumes_claude_under_own_acp_cmd`], with the caller's `session` config.
+    /// As [`Self::resumes_claude_under_own_acp_cmd`], with the caller's resolved config.
+    /// The launcher's store is previewed from the profile `environment` HOME, which is exact
+    /// only without a `before_session` hook (it can change HOME at launch), so a configured
+    /// hook starts fresh.
     pub(crate) fn resumes_claude_under_own_acp_cmd_with<
         C: std::borrow::Borrow<crate::session::config::SessionConfig>,
     >(
         &self,
         acp_agent: &str,
-        session: impl FnOnce() -> C,
+        config: impl FnOnce() -> OwnCmdConfig<C>,
     ) -> bool {
         if self.tool == "claude"
             || acp_agent != self.tool
@@ -288,17 +302,23 @@ impl Instance {
         let Some(pin) = self.selected_claude_store_pin() else {
             return false;
         };
-        let session = session();
-        let session = session.borrow();
+        let config = config();
+        let session = config.session.borrow();
         let own_cmd = session
             .agent_acp_cmd
             .get(&self.tool)
             .is_some_and(|cmd| crate::acp::agent_registry::runs_claude_adapter(cmd));
-        let launcher_store = super::hooks::host_home(&self.resolved_host_environment())
-            .and_then(|home| session.agent_config_dir_for(&self.tool, &home));
-        own_cmd
-            && launcher_store
-                .is_some_and(|dir| crate::session::capture::same_claude_store(&dir, &pin.store))
+        if !own_cmd || config.before_session_hook {
+            return false;
+        }
+        // As launch does, an unresolvable HOME yields no store.
+        let launcher_store = super::hooks::host_home(
+            &self.resolved_host_environment_from(config.profile_environment),
+        )
+        .filter(|home| home.is_absolute())
+        .and_then(|home| session.agent_config_dir_for(&self.tool, &home));
+        launcher_store
+            .is_some_and(|dir| crate::session::capture::same_claude_store(&dir, &pin.store))
             && self.acp_transcript_cli_resumable_with("claude", session)
     }
 
@@ -1439,6 +1459,65 @@ replies = true
                 "{cmd}"
             );
         }
+    }
+
+    /// The launcher's `~` store resolves against the profile `environment` HOME, as launch
+    /// does, and a `before_session` hook (which can move HOME at launch) starts fresh.
+    #[test]
+    #[serial_test::serial]
+    fn own_acp_cmd_store_resolves_against_the_launch_home() {
+        let home = tempfile::tempdir().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
+        let launch_home = home.path().join("launch-home");
+        let configure = |hook: bool| {
+            crate::session::config::update_config(|c| {
+                let tool = || "claude-work".to_string();
+                c.session.agent_execution_as.insert(tool(), "claude".into());
+                c.session
+                    .agent_acp_cmd
+                    .insert(tool(), "claude-agent-acp".into());
+                c.session
+                    .agent_config_dir
+                    .insert(tool(), "~/stores/work".into());
+                c.environment = vec![format!("HOME={}", launch_home.display())];
+                c.host_hooks.before_session = if hook {
+                    vec!["echo HOME=/elsewhere".into()]
+                } else {
+                    Vec::new()
+                };
+            })
+            .unwrap();
+        };
+        let bound_to = |store: std::path::PathBuf| {
+            let mut inst = Instance::new("own", home.path().join("project").to_str().unwrap());
+            inst.source_profile = "default".to_string();
+            inst.tool = "claude-work".to_string();
+            inst.agent_session_id = Some("sid".into());
+            inst.agent_session_binding = Some(ConversationBinding {
+                session_id: "sid".into(),
+                execution: Some(ExecutionBinding {
+                    agent: "claude".into(),
+                    stores: vec![store],
+                    configuration: Vec::new(),
+                    cwd: home.path().to_path_buf(),
+                    cwd_filesystem: "host".into(),
+                    filesystem: "host".into(),
+                    exported_default_store: Some(true),
+                }),
+                provenance: ConversationProvenance::Observed,
+                transcript_path: None,
+            });
+            inst
+        };
+        let launch_store = launch_home.join("stores/work");
+        let ambient_store = home.path().join("stores/work");
+
+        configure(false);
+        assert!(bound_to(launch_store.clone()).resumes_claude_under_own_acp_cmd("claude-work"));
+        assert!(!bound_to(ambient_store).resumes_claude_under_own_acp_cmd("claude-work"));
+
+        configure(true);
+        assert!(!bound_to(launch_store).resumes_claude_under_own_acp_cmd("claude-work"));
     }
 
     /// A session stored with the fallback's own command keeps its capture after

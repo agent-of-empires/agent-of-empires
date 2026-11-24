@@ -170,7 +170,16 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
             let agent = inst.effective_acp_agent_with(|| cfg);
             resp.keeps_context = inst.acp_transcript_cli_resumable_with(&agent, cfg)
                 || (!inst.is_structured()
-                    && inst.resumes_claude_under_own_acp_cmd_with(&agent, || cfg));
+                    && inst.resumes_claude_under_own_acp_cmd_with(&agent, || {
+                        let config = crate::session::config::profile_config::resolve_config_or_warn(
+                            &inst.effective_profile(),
+                        );
+                        crate::session::OwnCmdConfig {
+                            session: cfg,
+                            profile_environment: config.environment,
+                            before_session_hook: !config.host_hooks.before_session.is_empty(),
+                        }
+                    }));
         }
         // The solo commands of the agent that classifies this session's prompts, resolved as the
         // queue and publication resolve it, so a custom agent's declared reset is advertised.
