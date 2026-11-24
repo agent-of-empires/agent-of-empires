@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, screen } from "@testing-library/react";
 
 import { reportError, reportInfo } from "../../lib/toastBus";
 import type { SessionResponse } from "../../lib/types";
@@ -61,6 +61,22 @@ describe("sidebar Rename workdir", () => {
       method: "PATCH",
       body: { name: "fresh-name", rename_branch: true },
     });
+  });
+
+  it.each([
+    ["keyCode 229", { key: "Enter", keyCode: 229 }],
+    ["isComposing", { key: "Enter", isComposing: true }],
+  ])("does not submit on Enter while an IME composes (%s)", async (_n, init) => {
+    openRowMenu(managed());
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-edit-workdir"));
+    const input = screen.getByTestId("workdir-modal-name");
+    fireEvent.change(input, { target: { value: "fresh-name" } });
+    fireEvent.keyDown(input, init);
+    await act(async () => {});
+    expect(fetchSpy).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: "Enter" });
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    expect(firstRequest(fetchSpy).url).toBe("/api/sessions/s1/worktree-name");
   });
 
   it("surfaces the server validation message on failure", async () => {

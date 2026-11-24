@@ -20,6 +20,10 @@ Push requires HTTPS, and an installed PWA is bound to the exact origin it was in
 
 **Desktop** (Chrome, Firefox, Edge, Safari): Settings, Notifications, *Enable notifications*, then *Send test notification*. Desktop Safari needs macOS 13 or later and no PWA install.
 
+**Android** (Chrome and other browsers that can push from a tab): Settings, Notifications, *Enable notifications*, then *Send test notification*. Chrome on Android is expected to need no install for this; that's not yet verified on a device.
+
+On a phone or tablet, the dashboard shows these steps in a **Get notifications on this device** banner until you hide it or turn notifications on; they stay in Settings › Notifications.
+
 ## How it works
 
 Standard Web Push over VAPID: the server holds a long-lived keypair, each browser registers a subscription with its push service, and payloads are encrypted end to end, so the relay cannot read session titles or URLs. Subscriptions are bound to your bearer token and dropped when it rotates past its grace period.

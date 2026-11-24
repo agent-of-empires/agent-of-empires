@@ -102,7 +102,7 @@ A grouping picker (layers icon) next to the sort picker opens a menu of axes, so
 
 The choice is per-browser (localStorage). Collapse state is tracked separately per axis. You can move a session between groups from the web context menu, but drag-reorder lives on the repo axis only.
 
-**Move to another group.** Right-click (long-press on touch) a session row and choose **More > Move to another group**: type an existing group to move it, a new path to create that group, or clear the field to drop it back to **Ungrouped**. Group paths use `/` for hierarchy (e.g. `work/projects`). Hidden in read-only mode.
+**Move to another group.** Right-click (long-press on touch) a session row and choose **More > Move to another group**. The dialog lists the profile's existing groups with the current one highlighted: pick one, or type a new path to create that group. **Remove from group** (or clearing the field) drops the session back to **Ungrouped**. With the list open, Enter picks the highlighted group and a second Enter saves; Escape closes the list, then the dialog. Group paths use `/` for hierarchy (e.g. `work/projects`). Hidden in read-only mode.
 
 **Add project.** Attachment results stay open through Multi-repo regrouping.
 Warnings and a failed worker restart remain visible until dismissed.
@@ -125,7 +125,7 @@ Under **More** in the same menu, **Show only this Session** reloads the window t
 
 Trashed sessions live behind the **Trash** control in the sidebar footer. Right-click a trashed row for **Open**, **Restore**, or **Delete permanently**. Like an archived session, a trashed one cannot start until it is restored.
 
-A session is never pinned and sunk at once, but the transitions are one-step in either direction: pinning a sunk row surfaces it, and a pinned row's menu still offers Archive, Snooze, and Ignore, any of which removes the pin (matching the TUI, no unpin-first needed). Bulk Archive and Snooze include pinned rows in the selection for the same reason. The "Snoozed & archived" section sits at the bottom and aggregates every sunk workspace; collapsed by default, its state persists in localStorage. The triage menu entries are hidden in read-only mode.
+A session is never pinned and sunk at once, but the transitions are one-step in either direction: pinning a sunk row surfaces it, and a pinned row's menu still offers Archive, Snooze, and Ignore, any of which removes the pin (matching the TUI, no unpin-first needed). Bulk Archive and Snooze include pinned rows in the selection for the same reason. The "Snoozed & archived" section sits at the bottom and aggregates every sunk workspace, newest archived (or snoozed) first whatever the sidebar sort; collapsed by default, its state persists in localStorage. The triage menu entries are hidden in read-only mode.
 
 ### Multi-select and bulk triage
 

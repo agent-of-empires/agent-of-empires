@@ -170,7 +170,7 @@ export function TodoGroupCard({ items }: { items: ToolCardProps[] }) {
   // Preview the latest snapshot that became live state; the header reflects the latest attempt.
   const latestAttempt = snapshots[snapshots.length - 1]!;
   const failedOrStopped = (r?: ActivityRow) => r?.kind === "tool_error" || r?.kind === "tool_stopped";
-  const preview = [...snapshots].reverse().find((s) => !failedOrStopped(s.result)) ?? latestAttempt;
+  const preview = snapshots.findLast((s) => !failedOrStopped(s.result)) ?? latestAttempt;
   const latestFailed = latestAttempt.result?.kind === "tool_error";
   const latestStopped = latestAttempt.result?.kind === "tool_stopped";
   const running = snapshots.some((s) => !s.result);

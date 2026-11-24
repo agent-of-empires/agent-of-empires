@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createProfile, deleteProfile, fetchProfiles, renameProfile } from "../../lib/api";
 import type { ProfileInfo } from "../../lib/types";
 import { validateProfileName } from "../profiles/profileName";
+import { isImeComposing } from "../../lib/ime";
 
 interface Props {
   selectedProfile: string;
@@ -131,7 +132,7 @@ export function ProfileSelector({ selectedProfile, onSelect, onRenamed }: Props)
                 setError(null);
               }}
               onKeyDown={(e) => {
-                if (e.key === "Enter") submitInput();
+                if (e.key === "Enter" && !isImeComposing(e)) submitInput();
                 if (e.key === "Escape") closeInput();
               }}
               placeholder={mode === "create" ? "Profile name" : "New name"}

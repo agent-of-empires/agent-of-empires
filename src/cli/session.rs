@@ -1638,6 +1638,13 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
 
     crate::session::config::profile_config::resolve_config_or_warn(profile);
 
+    if inst.is_structured() {
+        eprintln!(
+            "Structured session: there is no terminal pane to capture. Read the transcript with `aoe acp history {}`.",
+            inst.id
+        );
+    }
+
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
 
     let (content, status) = if !tmux_session.exists() {

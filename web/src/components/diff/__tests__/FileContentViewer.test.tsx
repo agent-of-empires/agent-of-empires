@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { FileContentViewer } from "../FileContentViewer";
 import * as api from "../../../lib/api";
@@ -32,6 +32,9 @@ afterEach(() => {
 });
 
 describe("FileContentViewer", () => {
+  // Preload the lazy markdown view so the first case does not race a cold import against findBy's timeout.
+  beforeAll(() => import("../MarkdownFileView"));
+
   it("renders a .md file as formatted markdown by default and toggles to raw", async () => {
     vi.spyOn(api, "getSessionFile").mockResolvedValue({
       content: "# Plan\n\nstep one",

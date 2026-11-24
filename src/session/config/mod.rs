@@ -2039,9 +2039,10 @@ pub struct AcpAgentDefaults {
     /// agent runs on `model`: [`resolve_spawn_model_effort`] replaces any
     /// other value at creation and respawn, plugin `sessions.create` refuses
     /// one (`model_pinned`), and the plugin settings model picker offers only
-    /// the pin. A running session's live model switch is separate. Meaningless
-    /// without a non-empty `model`; global/profile only, like the rest of
-    /// `acp`.
+    /// the pin. A running session's live model switch is separate. Pins
+    /// nothing at spawn without a non-empty `model`, though the Agent default
+    /// model API still reports it as pinned and refuses to set a model;
+    /// global/profile only, like the rest of `acp`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pin_model: bool,
 
