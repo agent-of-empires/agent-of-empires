@@ -2891,6 +2891,7 @@
       "risk": "high",
       "specs": [
         "tests/live/session-actions.spec.ts",
+        "tests/session-group-edit-short-viewport.spec.ts",
         "src/lib/api.test.ts",
         "src/components/__tests__/SessionGroupModal.test.tsx",
         "src/components/session-wizard/__tests__/GroupCombobox.test.tsx"
