@@ -196,6 +196,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/account-targets",
             get(api::session_account_targets),
         )
+        .route(
+            "/api/sessions/{id}/acp-default-model",
+            get(api::get_session_agent_default_model),
+        )
         .route("/api/sessions/{id}/start", post(api::start_session))
         .route(
             "/api/sessions/{id}/restart",
@@ -236,6 +240,12 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/profiles/{name}/settings",
             get(api::get_profile_settings).patch(api::update_profile_settings),
+        )
+        .route(
+            "/api/profiles/{name}/acp-defaults/{agent}/model",
+            get(api::get_agent_default_model)
+                .put(api::set_agent_default_model)
+                .layer(read_only.clone()),
         )
         .route("/api/profiles/{name}/rename", patch(api::rename_profile))
         .route("/api/default-profile", patch(api::default_profile))
