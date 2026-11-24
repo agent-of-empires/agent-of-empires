@@ -59,6 +59,20 @@ fn feed(grid: &mut Grid, mut bytes: &[u8]) {
     }
 }
 
+/// Give `grid` the link mark it holds for output that has not come; true
+/// when that changed the grid.
+fn flush(grid: &mut Grid) -> bool {
+    let held = grid.callbacks_mut().flush();
+    grid.process(&held);
+    !held.is_empty()
+}
+
+/// Apply a whole stream, with no read to follow it.
+fn feed_whole(grid: &mut Grid, bytes: &[u8]) {
+    feed(grid, bytes);
+    flush(grid);
+}
+
 /// The link ids the drawn grid's cells name, scrollback included.
 fn linked_ids(grid: &mut Grid) -> std::collections::HashSet<u16> {
     let (rows, cols) = grid.screen().size();
@@ -1437,7 +1451,7 @@ fn swap_seeded_parser(
     }
     let (cols, rows) = size;
     *p = new_parser(rows, cols, SCROLLBACK_LINES);
-    feed(&mut p, stream);
+    feed_whole(&mut p, stream);
     app_cursor.store(p.screen().application_cursor(), Ordering::Relaxed);
     grid_gen.fetch_add(1, Ordering::Relaxed);
     VtRefreshResult::Refreshed
@@ -2051,7 +2065,7 @@ pub(crate) fn capture_rows_padded(raw: &[u8], cols: u16, rows: u16) -> Vec<Strin
     // `capture-pane` joins rows with a bare LF, which staircases each row off
     // the previous one's end column unless it is promoted to CRLF first (the
     // same seeding fix the live channel applies).
-    feed(&mut parser, &lf_to_crlf(strip_trailing_row_terminator(raw)));
+    feed_whole(&mut parser, &lf_to_crlf(strip_trailing_row_terminator(raw)));
 
     (0..rows)
         .map(|row| {
@@ -2197,6 +2211,21 @@ impl ReaderCtx {
         self.snapshot.lock()
     }
 
+    /// Give the grid a link mark held for a read that has not come.
+    fn flush_idle(&self) {
+        let Ok(_snapshot) = self.lock_snapshot() else {
+            return;
+        };
+        let Ok(mut p) = self.parser.lock() else {
+            return;
+        };
+        if flush(&mut p) {
+            self.grid_gen.fetch_add(1, Ordering::Relaxed);
+            drop(p);
+            self.notify_viewers();
+        }
+    }
+
     /// Wake the in-process poller and every watch subscriber.
     fn notify_viewers(&self) {
         notify_change_wakeup(&self.wakeup);
@@ -2251,6 +2280,7 @@ fn run_reader_with_wait(
             break;
         }
         if ready == 0 {
+            ctx.flush_idle();
             continue;
         }
         if fd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
@@ -4164,23 +4194,26 @@ mod tests {
                 true,
             ),
         ];
+        let shown = |grid: &Grid| crate::tmux::utils::strip_ansi(&row_to_ansi(grid, 0, 20));
         for (linked_input, plain_input, linked_cell) in cases {
             let mut plain = new_parser(2, 20, 0);
             feed(&mut plain, plain_input.as_bytes());
-            let mut linked = new_parser(2, 20, 0);
-            feed(&mut linked, linked_input.as_bytes());
-            let shown = |grid: &Grid| crate::tmux::utils::strip_ansi(&row_to_ansi(grid, 0, 20));
-            assert_eq!(shown(&linked), shown(&plain), "{plain_input:?}");
-            let first =
-                crate::tmux::osc8::split_cell(linked.screen().cell(0, 0).unwrap().contents());
-            assert_eq!(first.1.is_some(), linked_cell, "{plain_input:?}");
             let x = plain.screen().cursor_position().1 - 1;
-            let last =
-                crate::tmux::osc8::split_cell(linked.screen().cell(0, x).unwrap().contents());
-            assert!(
-                last.1.is_some(),
-                "{plain_input:?}: the next cell keeps its link"
-            );
+            // Split at every byte, so a read can end between the glyph and its
+            // accents; the last `x` is linked only once its mark is flushed.
+            for split in 0..=linked_input.len() {
+                let mut linked = new_parser(2, 20, 0);
+                feed(&mut linked, &linked_input.as_bytes()[..split]);
+                feed_whole(&mut linked, &linked_input.as_bytes()[split..]);
+                let at = format!("{plain_input:?} split at {split}");
+                assert_eq!(shown(&linked), shown(&plain), "{at}");
+                let first =
+                    crate::tmux::osc8::split_cell(linked.screen().cell(0, 0).unwrap().contents());
+                assert_eq!(first.1.is_some(), linked_cell, "{at}");
+                let last =
+                    crate::tmux::osc8::split_cell(linked.screen().cell(0, x).unwrap().contents());
+                assert!(last.1.is_some(), "{at}: the next cell keeps its link");
+            }
         }
     }
 
@@ -4197,7 +4230,7 @@ mod tests {
                 for split in 0..input.len() {
                     let mut grid = new_parser(2, 20, 0);
                     feed(&mut grid, &input.as_bytes()[..split]);
-                    feed(&mut grid, &input.as_bytes()[split..]);
+                    feed_whole(&mut grid, &input.as_bytes()[split..]);
                     assert_eq!(
                         row_to_ansi(&grid, 0, 20),
                         want,
@@ -4273,7 +4306,7 @@ mod tests {
             feed(&mut grid, format!("{}\r\n", osc8(&uri(n), "x")).as_bytes());
         }
         feed(&mut grid, b"\x1bc");
-        feed(&mut grid, osc8(&uri(runs), "fresh").as_bytes());
+        feed_whole(&mut grid, osc8(&uri(runs), "fresh").as_bytes());
         assert_eq!(
             row_to_ansi(&grid, 0, 30),
             format!("\x1b[0m{}", osc8(&uri(runs), "fresh"))
@@ -5259,6 +5292,60 @@ mod tests {
         assert!(
             available,
             "snapshot must stay available during the readiness wait"
+        );
+    }
+
+    #[test]
+    fn an_idle_reader_links_the_last_glyph_of_a_closed_run() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("s.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let stop = Arc::new(AtomicBool::new(false));
+        let parser = Arc::new(Mutex::new(new_parser(2, 20, 0)));
+        let grid_gen = Arc::new(AtomicU64::new(0));
+        let ctx = ReaderCtx {
+            snapshot_contended: None,
+            parser: parser.clone(),
+            stop: stop.clone(),
+            seeded: Arc::new(AtomicBool::new(true)),
+            snapshot: Arc::new(Mutex::new(())),
+            stream: Arc::new(Mutex::new(None)),
+            app_cursor: Arc::new(AtomicBool::new(false)),
+            lifecycle: Arc::new(AtomicU8::new(VtLifecycle::Starting as u8)),
+            wakeup: Arc::new(Mutex::new(None)),
+            clipboard: Arc::new(Mutex::new(None)),
+            chunk_seq: Arc::new(AtomicU64::new(0)),
+            settled_chunk_seq: Arc::new(AtomicU64::new(0)),
+            last_chunk_ms: Arc::new(AtomicU64::new(0)),
+            prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            grid_gen: grid_gen.clone(),
+            signals: Arc::new(ViewerSignals::new()),
+        };
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms));
+        let mut conn = UnixStream::connect(&sock).expect("connect");
+        let url = "https://example.com/idle";
+        conn.write_all(osc8(url, "go").as_bytes()).expect("write");
+
+        // The read ends on the run's close, so the `o` mark waits for a read
+        // that never comes until the idle poll flushes it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let linked = loop {
+            let row = row_to_ansi(&parser.lock().unwrap(), 0, 20);
+            if row == format!("\x1b[0m{}", osc8(url, "go")) || Instant::now() > deadline {
+                break row;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        stop.store(true, Ordering::Relaxed);
+        drop(conn);
+        let _ = reader.join();
+        assert_eq!(linked, format!("\x1b[0m{}", osc8(url, "go")));
+        assert!(
+            grid_gen.load(Ordering::Relaxed) >= 2,
+            "the flush bumps grid_gen"
         );
     }
 
