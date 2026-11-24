@@ -70,8 +70,11 @@ regression, then flake, then infra.
    and take the newest `headSha` that differs from `$SHA` and passes
    `git merge-base --is-ancestor <green> $SHA`. A green run after the failure
    is not a baseline.
-2. List the range with `git log --oneline <green>..$SHA` and pick the commit
-   whose diff touches the failing test's files or the code under test.
+2. List the range with `git log --oneline <green>..$SHA`. Touching the
+   failing test's files or the code under test makes a commit a suspect, not
+   the culprit. Name it only when evidence ties it to the failure, such as a
+   diff that changes the failing assertion's code path or the failure first
+   appearing at that commit; otherwise list the suspects and say unknown.
 3. For a flake, name the commit that introduced the racy code or test only if
    `git log -S` or `git blame` shows it clearly; otherwise say unknown. For
    infra, skip this step.
@@ -112,8 +115,8 @@ run `tessl finding create --project $PROJECT --file finding.json`.
 
 Recommendation by class:
 
-- **regression**: fix or revert the culprit commit, naming the test that must
-  pass again.
+- **regression**: fix or revert the culprit commit, or bisect the suspects
+  when it is unknown, naming the test that must pass again.
 - **flake**: label the tracking issue (or a new one) for a fix that follows the
   plugin rule `deflake.md`, and state the suspected race.
 - **infra**: no code change; name the runner and the failure signature.
