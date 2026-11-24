@@ -26,6 +26,7 @@ import { useAgentDisplayNames } from "../../../lib/agentDisplayName";
 import { startPendingCreates } from "../../../lib/pendingCreates";
 import type { AgentInfo, DockerStatusResponse } from "../../../lib/types";
 import { SANDBOX_IMAGE_PULLED_EVENT, SANDBOX_IMAGE_PULL_STARTED_EVENT } from "../../../lib/sandboxImageEvents";
+import { RUNNING_RECHECK_MS } from "../useSandboxImageRowStatus";
 
 const createSession = vi.fn();
 const reviewCreationTrust = vi.fn();
@@ -1699,6 +1700,36 @@ describe("SessionWizard Pull latest image first", () => {
       expect(payload(0).pull_latest_image).toBe(true);
       expect(started).toHaveBeenCalledOnce();
       await screen.findByText("Waiting for the sandbox image update…", undefined, { timeout: 3000 });
+    });
+
+    it("says a resend pulls on its own once the download it would have joined has ended", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      onTestFinished(() => {
+        vi.useRealTimers();
+        vi.mocked(fetchCreateProgress).mockResolvedValue(null);
+      });
+      let current: object = RUNNING;
+      open(RUNNING);
+      vi.mocked(fetchSandboxImageStatus).mockImplementation(async (image) =>
+        image === IMAGE ? (current as never) : null,
+      );
+      await choice("Wait for the update");
+      // Every response to the first send is lost, so its outcome is unknown.
+      createSession.mockResolvedValue({ ok: false, error: "Network error: offline", network: true });
+      await launch();
+      await vi.advanceTimersByTimeAsync(60_000);
+      await waitFor(() => expect(screen.getByText(/may still be created/)).toBeTruthy());
+      // The download ends before the user resends.
+      current = { ...UPDATE, state: "current", pull: { state: "done" } };
+      await vi.advanceTimersByTimeAsync(RUNNING_RECHECK_MS * 2);
+      createSession.mockReturnValue(new Promise(() => {}));
+      vi.mocked(fetchCreateProgress).mockResolvedValue({ stage: "pulling_image", hook: null, output: [] });
+      const sent = createSession.mock.calls.length;
+      await launch();
+      await waitFor(() => expect(createSession).toHaveBeenCalledTimes(sent + 1));
+      expect(payload(sent).pull_latest_image).toBe(true);
+      await screen.findByText("Pulling latest image...", undefined, { timeout: 3000 });
+      expect(screen.queryByText("Waiting for the sandbox image update…")).toBeNull();
     });
 
     it("Start now launches on the current image without joining", async () => {

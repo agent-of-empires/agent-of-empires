@@ -710,6 +710,8 @@ export function SessionWizard({
       // Recorded before the request goes out, so a reload mid-flight still has the key.
       if (pending) registerPendingCreate(pending, { claimed: true });
       const send = (retry: boolean) => createSession(pending && retry ? retryBody(pending) : body);
+      // Decided at each send, resends included: the download this create would join may have ended.
+      setWaitingForUpdate(!!body.pull_latest_image && !!pullOfferRef.current?.running);
       if (body.pull_latest_image) notifySandboxImagePullStarted();
       let result = await send(!!resume);
       for (let attempt = 0; result.network && pending && attempt < NETWORK_RETRIES; attempt++) {
@@ -821,7 +823,6 @@ export function SessionWizard({
       ),
       idempotency_key: newIdempotencyKey(),
     };
-    setWaitingForUpdate(!!body.pull_latest_image && !!pullOfferRef.current?.running);
     // A failed preview counts as nothing to confirm, so it never blocks creation.
     if (d.sandboxEnabled && !d.scratch && d.path) {
       const preview = await fetchVolumeIgnoresPreview(d.path, d.profile || undefined);
