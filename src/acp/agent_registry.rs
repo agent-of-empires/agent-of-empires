@@ -35,41 +35,44 @@ impl AgentSpec {
 }
 
 /// Whether a custom `agent_acp_cmd` runs the Claude ACP adapter, the only adapter known to
-/// load Claude session ids. Matches the adapter binary or an `npx`/`bunx` launch of its package.
+/// load Claude session ids. Matches the adapter binary, or an `npx`/`bunx` launch that
+/// passes only `-y`/`--yes` before one of the adapter's known packages.
 pub fn runs_claude_adapter(cmd: &str) -> bool {
-    const ADAPTERS: [&str; 2] = ["claude-agent-acp", "claude-code-acp"];
+    const BINARIES: [&str; 2] = ["claude-agent-acp", "claude-code-acp"];
+    const PACKAGES: [&str; 4] = [
+        "@agentclientprotocol/claude-agent-acp",
+        "@zed-industries/claude-code-acp",
+        "claude-agent-acp",
+        "claude-code-acp",
+    ];
     let Ok(spec) = AgentSpec::from_acp_cmd("", cmd) else {
         return false;
     };
-    let basename = |path: &str| {
-        std::path::Path::new(path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_owned)
-    };
-    let Some(program) = basename(&spec.command) else {
+    let Some(program) = std::path::Path::new(&spec.command)
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
         return false;
     };
-    if ADAPTERS.contains(&program.as_str()) {
+    if BINARIES.contains(&program) {
         return true;
     }
-    if !matches!(program.as_str(), "npx" | "bunx") {
+    if !matches!(program, "npx" | "bunx") {
         return false;
     }
-    spec.args
+    let mut args = spec
+        .args
         .iter()
-        .find(|arg| !arg.starts_with('-'))
-        .is_some_and(|package| {
-            let unscoped = package
-                .strip_prefix('@')
-                .map_or(package.as_str(), |scoped| {
-                    scoped.split_once('/').map_or(scoped, |(_, name)| name)
-                });
-            unscoped
-                .split('@')
-                .next()
-                .is_some_and(|name| ADAPTERS.contains(&name))
-        })
+        .skip_while(|arg| matches!(arg.as_str(), "-y" | "--yes"));
+    args.next().is_some_and(|package| {
+        // A version suffix starts at the first `@` after the optional scope marker.
+        let name_end = package
+            .get(1..)
+            .and_then(|rest| rest.find('@'))
+            .map_or(package.len(), |at| at + 1);
+        let (name, version) = package.split_at(name_end);
+        PACKAGES.contains(&name) && (version.is_empty() || version.len() > 1)
+    })
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -449,6 +452,13 @@ mod tests {
             ("claude", false),
             ("", false),
             ("claude-agent-acp \"unterminated", false),
+            ("npx -p other-pkg claude-agent-acp", false),
+            ("npx --package=other claude-agent-acp", false),
+            ("npx @evil/claude-agent-acp", false),
+            ("npx -y @agentclientprotocol/claude-agent-acp@1.2.3", true),
+            ("npx claude-agent-acp", true),
+            ("bunx -y claude-code-acp --foo", true),
+            ("/path/to/npx --yes claude-agent-acp", true),
         ] {
             assert_eq!(runs_claude_adapter(cmd), expected, "{cmd:?}");
         }
