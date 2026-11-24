@@ -46,7 +46,7 @@ export interface SubagentRecord {
   /** Name of the newest call, which `tools` may not reach. */
   lastTool: string | null;
   report: string;
-  /** A resumed child's first report, kept apart because it is not the final one. */
+  /** Set once a resumed child ran again: its first report ("" if it had none), kept apart because it is not the final one. */
   earlierReport?: string;
   /** Latest assistant note while running; not the final report. */
   latestNote: string | null;
@@ -150,6 +150,9 @@ function backgroundTool(t: BackgroundAgentTool, i: number, ended: boolean): Acti
   };
 }
 
+/** The later of two ISO times, ignoring a missing one. */
+const latest = (a?: string, b?: string) => (a && b ? (a > b ? a : b) : (a ?? b));
+
 /** A background child's launch result is stale once the child runs again: it is active now,
  *  or idle after it resumed (a child call, or a running update, past the result). */
 function resultSuperseded(result: ActivityRow, children: ToolCardProps[], roster: RosterEntry): boolean {
@@ -193,13 +196,13 @@ export function fromInline(
     status,
     startedAt: tool.started_at,
     // The roster has no end time, so a child settled without a reply shows no duration.
-    endedAt: settled ? (settled.at ?? lastEnd) : stale && !running ? (roster?.updated_at ?? lastEnd) : undefined,
+    endedAt: settled ? (settled.at ?? lastEnd) : stale && !running ? latest(roster?.idle_since, lastEnd) : undefined,
     prompt: tool.prompt ?? taskPrompt(tool.args_preview),
     tools,
     toolCount: tools.length,
     lastTool: tools.at(-1)?.name ?? null,
     report: status === "done" && settled ? extractTaskResult(settled.text ?? "") : "",
-    earlierReport: stale && result?.kind === "tool_complete" ? extractTaskResult(result.text ?? "") : undefined,
+    earlierReport: stale ? (result?.kind === "tool_complete" ? extractTaskResult(result.text ?? "") : "") : undefined,
     latestNote: null,
     warning: null,
     error: status === "failed" ? settled?.text || roster?.error || "" : null,

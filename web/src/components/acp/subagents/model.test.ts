@@ -183,18 +183,33 @@ describe("fromInline resumed background child", () => {
     expect(record.earlierReport).toBe("");
   });
 
-  it("settles a text-only resume from its running stamp, ending at the last update", () => {
+  it("settles a text-only resume from its running stamp, ending at the idle stamp", () => {
     const idle = roster({
       state: "idle",
       stop_reason: "end_turn",
       running_since: "2026-01-01T00:02:00Z",
-      updated_at: "2026-01-01T00:04:00Z",
+      idle_since: "2026-01-01T00:04:00Z",
     });
     const record = fromInline(launch, first, [], idle);
     expect(record.status).toBe("done");
     expect(record.report).toBe("");
     expect(record.earlierReport).toBe("first report");
     expect(record.endedAt).toBe("2026-01-01T00:04:00Z");
+  });
+
+  it("ends a resumed child at its later completed call, not an older idle stamp", () => {
+    const calls = [call("2026-01-01T00:04:00Z", "2026-01-01T00:05:00Z")];
+    const idle = roster({ state: "idle", stop_reason: "end_turn", idle_since: "2026-01-01T00:02:00Z" });
+    expect(fromInline(launch, first, calls, idle).endedAt).toBe("2026-01-01T00:05:00Z");
+  });
+
+  it("shows the final report as not captured when the first run errored and the resumed run succeeded", () => {
+    const failed: ActivityRow = { ...first, kind: "tool_error", text: "boom" };
+    const calls = [call("2026-01-01T00:02:00Z", "2026-01-01T00:03:00Z")];
+    const record = fromInline(launch, failed, calls, roster({ state: "idle", stop_reason: "end_turn" }));
+    expect(record.status).toBe("done");
+    expect(record.report).toBe("");
+    expect(record.earlierReport).toBe("");
   });
 
   it("keeps the report when the child last ran before its result, or carries no stamps", () => {

@@ -446,7 +446,7 @@ describe("applyEvent control state", () => {
         SubagentUpdated: { subagent: stopped, at: "2026-01-01T00:00:00Z" },
       },
     });
-    expect(replayed.subagents).toEqual([{ ...stopped, updated_at: "2026-01-01T00:00:00Z" }]);
+    expect(replayed.subagents).toEqual([{ ...stopped, idle_since: "2026-01-01T00:00:00Z" }]);
     // A snapshot older than the replayed frame must not roll the record back.
     expect(applyReducedState(replayed, base, [], 8).subagents).toEqual(replayed.subagents);
   });
@@ -497,7 +497,7 @@ describe("applyEvent control state", () => {
     ]);
 
     // Event stamps survive a snapshot that agrees on the state, and drop when it does not.
-    const stamps = { updated_at: "t2", running_since: "t1" };
+    const stamps = { idle_since: "t2", running_since: "t1" };
     const stamped = { ...held, lastSeq: 7, subagents: [{ ...record("a", "running", true), ...stamps }] };
     expect(applyReducedState(stamped, snapshot([record("a", "running", true)]), [], 7).subagents[0]).toMatchObject(
       stamps,

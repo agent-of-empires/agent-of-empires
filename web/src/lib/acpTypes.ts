@@ -752,8 +752,8 @@ export interface SubagentRecord {
   model?: string | null;
   /** Launched in the background: its card stays open until it goes idle. */
   background?: boolean;
-  /** Client-only, stamped by the reducer from the event's `at`; absent on a cold load. */
-  updated_at?: string;
+  /** Client-only: when the child last went idle, from the event's `at`; kept across metadata-only updates, absent on a cold load. */
+  idle_since?: string;
   /** Client-only: when the child last started running again; kept while idle so a later finish can be compared. */
   running_since?: string;
 }
@@ -1549,7 +1549,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     const active = (r?: SubagentRecord) => r?.state === "running" || r?.state === "requires_action";
     const stamped: SubagentRecord = {
       ...subagent,
-      updated_at: at,
+      idle_since: subagent.state === "idle" ? (prev?.state === "idle" ? prev.idle_since : at) : undefined,
       running_since: active(subagent) && !active(prev) ? at : prev?.running_since,
     };
     next.subagents = i >= 0 ? next.subagents.map((s, idx) => (idx === i ? stamped : s)) : [...next.subagents, stamped];
@@ -1645,7 +1645,7 @@ function mergeSubagents(
       if (!fresh) return r;
       // Stamps come from event times, which the snapshot lacks; keep them only while the state agrees.
       // A snapshot that skipped a running round trip looks unchanged, so resultSuperseded's call-based rule still applies.
-      return fresh.state === r.state ? { ...fresh, updated_at: r.updated_at, running_since: r.running_since } : fresh;
+      return fresh.state === r.state ? { ...fresh, idle_since: r.idle_since, running_since: r.running_since } : fresh;
     }),
     ...snapshot.filter((r) => !heldIds.has(r.session_id)),
   ];
