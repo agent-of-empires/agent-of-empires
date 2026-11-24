@@ -2720,6 +2720,62 @@ async fn sandbox_login_send_resolves_the_before_start_hook_once_and_queues_on_re
     assert_eq!(runs(), 1, "the launch reused the hook's values");
 }
 
+/// A stop that lands while the `before_start` hook runs is newer than the one the prompt
+/// observed: the failed start refuses the prompt (409) instead of queueing it.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn hook_failure_after_a_newer_stop_refuses_the_promoted_prompt() {
+    let app_dir = crate::session::test_support::isolate_app_dir();
+    let (_runtime, _calls) =
+        crate::session::test_support::failing_container_runtime(app_dir.path());
+    let _unset = crate::session::test_support::EnvGuard::unset(&[
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+    ]);
+    let project = app_dir.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let id = "sess-hook-newer-stop".to_string();
+    settle_stop_fence(&id);
+    let stop_file = crate::process::worker_registry::workers_dir()
+        .unwrap()
+        .join(format!("{id}.stop"));
+    crate::session::config::update_config(|c| {
+        c.host_hooks.before_start = vec![format!(
+            "printf '{{\"pid\":1,\"generation\":9,\"token\":\"newer\"}}' > '{}'; exit 3",
+            stop_file.display()
+        )]
+    })
+    .unwrap();
+    let mut inst = structured_instance(&id, true);
+    inst.project_path = project.to_string_lossy().into_owned();
+    crate::session::test_support::sandbox_needing_login(app_dir.path(), &mut inst);
+    crate::server::test_support::seed_instances_on_disk_for_test(
+        &inst.source_profile,
+        vec![inst.clone()],
+    );
+    let state = crate::server::test_support::build_native_test_app_state(vec![inst]).await;
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        dashboard_headers(),
+        prompt_req("hello"),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(state
+        .session_service
+        .queued_prompts_snapshot(&id)
+        .await
+        .is_empty());
+    assert!(crate::process::worker_registry::stop_requested(&id));
+}
+
 /// A `before_start` hook that fails during the send's admission is its own error: the text
 /// is queued and the pending initial turn stays, as for a login refusal.
 #[cfg(unix)]

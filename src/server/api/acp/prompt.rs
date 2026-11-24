@@ -497,7 +497,7 @@ pub(crate) async fn submit_prompt(
                 origin,
                 no_revive: req.no_revive,
             },
-            observed_stop,
+            observed_stop.clone(),
         )
         .await;
     // A fresh prompt supersedes a queued rate-limit continuation (#3028),
@@ -525,6 +525,10 @@ pub(crate) async fn submit_prompt(
             return Err(PromptSubmitError::LoginRequired { blocked, queued_id });
         }
         Err(SendTurnError::HookFailed(message)) => {
+            // The hook failure returns before admission: apply its newer-stop rule here.
+            if stop_moved_past(id, observed_stop.as_ref()) {
+                return Err(PromptSubmitError::StopFenced);
+            }
             let queued_id = keep_held_prompt(
                 state,
                 id,
@@ -565,6 +569,21 @@ pub(crate) async fn submit_prompt(
         queued_id: None,
         seq,
     })
+}
+
+/// Whether a stop other than the one a promoted prompt observed is now in force, the
+/// condition under which admission refuses its start. An unreadable intent counts.
+fn stop_moved_past(
+    id: &str,
+    observed: Option<&Option<crate::process::worker_registry::StopIntent>>,
+) -> bool {
+    let Some(observed) = observed else {
+        return false;
+    };
+    match crate::process::worker_registry::stop_intent(id) {
+        Ok(current) => current.is_some() && &current != observed,
+        Err(_) => true,
+    }
 }
 
 /// Keep a prompt the send held back (login missing, hook failed) in the queue and return
