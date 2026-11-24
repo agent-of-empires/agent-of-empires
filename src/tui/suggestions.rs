@@ -1078,17 +1078,17 @@ impl SuggestionsView {
             .border_style(Style::default().fg(theme.border));
         let bordered = block.inner(area);
         frame.render_widget(block, area);
-        // A one-cell margin inside the border, above and at the sides.
+        // A one-cell margin inside the border.
         let inner = Rect {
             x: bordered.x + 1,
             y: bordered.y + 1,
             width: bordered.width.saturating_sub(2),
-            height: bordered.height.saturating_sub(1),
+            height: bordered.height.saturating_sub(2),
         };
         let width = inner.width.max(1);
         let dim = Style::default().fg(theme.dimmed);
 
-        let detail = self.detail_lines(store, theme);
+        let detail = self.detail_lines(store, theme, width as usize);
         let mut units = if self.help {
             vec!["any key closes".to_string()]
         } else {
@@ -1117,7 +1117,7 @@ impl SuggestionsView {
                 Layout::vertical([Constraint::Min(1), Constraint::Length(footer_height)])
                     .areas(inner);
             let [list_area, detail_area] =
-                Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+                Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)])
                     .areas(body);
             (body, footer_area, list_area, detail_area)
         };
@@ -1128,6 +1128,10 @@ impl SuggestionsView {
         }
         if !self.help && detail_rows > visible + self.detail_scroll as usize {
             units.insert(units.len() - 2, "PgDn more".to_string());
+        }
+        // `?` lists Esc too, so it goes first when the key line would wrap.
+        if key_rows(&units, width as usize).len() > 1 {
+            units.retain(|unit| unit != "Esc back");
         }
         let (body, footer_area, list_area, detail_area) = split(&units);
 
@@ -1394,7 +1398,22 @@ impl SuggestionsView {
 
     /// The detail under the divider: what stops the item, what Enter starts,
     /// the prompt, then the source text. The title is on the selected row.
-    fn detail_lines(&self, store: &SuggestionsFeed, theme: &Theme) -> Vec<Line<'static>> {
+    fn detail_lines(
+        &self,
+        store: &SuggestionsFeed,
+        theme: &Theme,
+        width: usize,
+    ) -> Vec<Line<'static>> {
+        // Prompt and source text keep a two-cell hanging indent when they wrap.
+        let indented = |text: &str| -> Vec<Line<'static>> {
+            text.lines()
+                .flat_map(|line| {
+                    let words: Vec<String> = line.split(' ').map(str::to_string).collect();
+                    word_rows(&words, " ", width.saturating_sub(2).max(1))
+                })
+                .map(|row| Line::from(format!("  {row}")))
+                .collect()
+        };
         let Some(item) = self.item_at(store, self.selected) else {
             return Vec::new();
         };
@@ -1425,20 +1444,13 @@ impl SuggestionsView {
         if detail.len() > 1 {
             detail.push(Line::from(""));
         }
-        detail.push(Line::from(Span::styled(
-            "Prompt (untrusted source text)",
-            bold,
-        )));
-        detail.extend(
-            plain(&store.effective_prompt(item))
-                .lines()
-                .map(|l| Line::from(format!("  {l}"))),
-        );
+        detail.push(Line::from(Span::styled("Prompt", bold)));
+        detail.extend(indented(&plain(&store.effective_prompt(item))));
         let preview = plain(&item.preview);
         if !preview.trim().is_empty() {
             detail.push(Line::from(""));
             detail.push(Line::from(Span::styled("Source text", bold)));
-            detail.extend(preview.lines().map(|l| Line::from(format!("  {l}"))));
+            detail.extend(indented(&preview));
         }
         detail
     }
@@ -3353,7 +3365,7 @@ mod tests {
             "reason · repo",
             "Source text",
             "preview text",
-            "Prompt (untrusted source text)",
+            "Prompt",
             "run \u{fffd}[31mrm -rf\u{fffd}[0m now",
         ] {
             assert!(text.contains(expected), "missing {expected:?}: {text}");
@@ -3597,8 +3609,16 @@ mod tests {
             "z dismiss",
             "PgDn more",
             "? all keys",
-            "Esc back",
         ];
+        assert!(lines[13].starts_with("├─ GitHub"), "11 list rows: {text}");
+        assert!(
+            lines[21].contains("↵ start") && !text.contains("Esc back"),
+            "{text}"
+        );
+        assert!(
+            lines[22].trim_matches(['│', ' ']).is_empty(),
+            "a bottom margin: {text}"
+        );
         for key in keys {
             assert!(
                 lines.iter().any(|l| l.contains(key)),
