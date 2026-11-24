@@ -38,19 +38,16 @@ export function ArrowJoystick({ onArrow }: { onArrow: (sequence: string) => void
     onArrowRef.current(JOYSTICK_ARROWS[direction]);
   }, []);
 
-  // Each tick reads the current distance, so dragging further speeds up a repeat already running. A tick
-  // belongs to the gesture that started it and stops once that gesture is gone.
+  // Each tick reads the current distance, so dragging further speeds up a repeat already running.
   const startRepeat = useCallback(() => {
-    stopRepeat();
-    const gesture = originRef.current;
     const tick = () => {
       const direction = directionRef.current;
-      if (!direction || originRef.current !== gesture) return;
+      if (!direction) return;
       emit(direction);
       timerRef.current = setTimeout(tick, joystickRepeatMs(distanceRef.current));
     };
     timerRef.current = setTimeout(tick, JOYSTICK_FIRST_REPEAT_MS);
-  }, [emit, stopRepeat]);
+  }, [emit]);
 
   const endGesture = useCallback(() => {
     stopRepeat();
