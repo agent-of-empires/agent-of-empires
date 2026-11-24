@@ -2136,7 +2136,7 @@
         "web/src/lib/sidebarCompact.ts",
         "web/src/App.tsx"
       ],
-      "notes": "The sidebar has no compact button; its resize handle reaches the rail. A drag follows the pointer down to the 200px minimum, snaps to the 88px rail below 144px (the midpoint) and closes below 44px (half the rail), and dragging back out in the same gesture restores each state. A drag ending closed keeps the width and mode it started from, so the top bar toggle and its shortcut reopen that sidebar. The handle is a focusable separator: arrows step 16px and narrow onto the rail but never close, Home goes to the rail, End to the maximum, Enter collapses to or restores from the rail, and double-click resets to 280px. The phone drawer has no handle and ignores a saved rail."
+      "notes": "The sidebar has no compact button; its resize handle reaches the rail. A drag follows the pointer down to the 200px minimum, snaps to the 88px rail below 144px (the midpoint) and closes below 44px (half the rail), and dragging back out in the same gesture restores each state. A drag ending closed keeps the width and mode it started from, so the top bar toggle and its shortcut reopen that sidebar. The handle is a focusable separator: arrows step 16px and narrow onto the rail but never close, Home goes to the rail, End to the maximum, Enter collapses to or restores from the rail, and double-click resets to 280px. The phone drawer has no handle, ignores a saved rail, and never grows past the viewport. A second contact on the handle cannot take over a drag."
     },
     {
       "id": "sidebar.drawer-swipe",
@@ -2359,7 +2359,7 @@
       "risk": "medium",
       "specs": ["src/components/__tests__/WorkspaceSidebarTrash.test.tsx", "tests/session-trash.spec.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/TrashMenu.tsx"],
-      "notes": "The footer Trash control is an icon button beside Settings, shown only while something is trashed. Its count is a badge on the icon (99+ above 99) and its accessible name and tooltip read \"Trash, N sessions\". On the compact rail the badge stays clear of Settings."
+      "notes": "The footer Trash control is an icon button beside Settings, shown only while something is trashed. Its count is a badge on the icon (99+ above 99) and its accessible name and tooltip read \"Trash, N sessions\". On the compact rail Trash stacks above Settings, so both stay inside the rail and the badge clear of Settings with a 24px root font."
     },
     {
       "id": "sidebar.trash-on-demand",

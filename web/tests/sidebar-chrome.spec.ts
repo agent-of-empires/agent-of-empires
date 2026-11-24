@@ -182,15 +182,23 @@ test.describe("resize handle and compact rail (#2288)", () => {
     expect(await page.evaluate(() => localStorage.getItem("aoe-sidebar-width"))).toBe("280");
   });
 
-  test("a phone drawer ignores a compact rail saved on a wider screen", async ({ page }) => {
+  test("a phone drawer ignores a compact rail saved on a wider screen and fits a saved maximum width", async ({
+    page,
+  }) => {
     await installSidebarMocks(page, { sessions: SESSIONS });
-    await page.addInitScript(() => localStorage.setItem("aoe-web-settings", JSON.stringify({ sidebarCompact: true })));
+    await page.addInitScript(() => {
+      localStorage.setItem("aoe-web-settings", JSON.stringify({ sidebarCompact: true }));
+      localStorage.setItem("aoe-sidebar-width", "480");
+    });
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto("/");
     await openMobileSidebar(page);
     const panel = page.locator('[data-tour="sidebar"]');
     await expect(panel).not.toHaveAttribute("data-compact", "true");
     await expect(page.locator(COUNT).first()).toBeVisible();
+    expect((await panel.boundingBox())!.width).toBe(390);
+    const close = (await page.getByRole("button", { name: "Close sidebar" }).boundingBox())!;
+    expect(close.x + close.width).toBeLessThanOrEqual(390);
 
     await page.setViewportSize({ width: 1280, height: 720 });
     await expect(panel).toHaveAttribute("data-compact", "true");
@@ -225,7 +233,7 @@ test.describe("resize handle and compact rail (#2288)", () => {
 test.describe("resize handle on a touch tablet (#2288)", () => {
   test.use({ hasTouch: true, viewport: { width: 1024, height: 768 } });
 
-  test("a touch drag snaps the in-flow sidebar to the rail, and a second finger does not steer it", async ({
+  test("a touch drag snaps the in-flow sidebar to the rail, and a second finger on the handle does not take it over", async ({
     page,
   }) => {
     await installSidebarMocks(page, { sessions: threeSessionsInOneRepo() });
@@ -242,7 +250,7 @@ test.describe("resize handle on a touch tablet (#2288)", () => {
           type === "touchEnd" ? [] : [{ x, y, id: 1 }, ...(other === undefined ? [] : [{ x: other, y: 400, id: 2 }])],
       });
     await touch("touchStart", box.x + box.width / 2);
-    await touch("touchStart", box.x + box.width / 2, 700);
+    await touch("touchStart", box.x + box.width / 2, box.x + box.width / 2);
     await touch("touchMove", box.x + box.width / 2, 20);
     await expect(panel).toBeVisible();
     await expect(panel).not.toHaveAttribute("data-compact", "true");
