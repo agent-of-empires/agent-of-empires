@@ -806,6 +806,28 @@ describe("sendPrompt outcomes", () => {
     expect(result.current.state.lastError).toMatch(/capacity/i);
   });
 
+  // A newer stop refused the prompt's start: a non-retryable 409, so the prompt is rejected with
+  // its banner and is never re-queued, where it could be delivered after a later start.
+  it("rejects a 409 resume_failed prompt without queueing it", async () => {
+    calls = installAcpFakes(({ url, method }) => {
+      if (url.includes("/acp/replay")) return json({ frames: [], lost: false, highest_seq: 0 });
+      if (url.includes("/acp/prompt")) {
+        return new Response("stop_fenced: the session was stopped again; start it to send this message", {
+          status: 409,
+          headers: { "AoE-Error-Code": "resume_failed" },
+        });
+      }
+      if (url.includes("/queue") && method === "GET") return json([]);
+      return undefined;
+    });
+    const { result } = render("sess-stop-fenced", "absent", null, null);
+    await flushAsync();
+    await act(() => result.current.sendPrompt("too late"));
+    await flushAsync();
+    expect(posts("/queue")).toHaveLength(0);
+    expect(result.current.state.lastError).toMatch(/409.*stop_fenced/);
+  });
+
   // Both park kinds are sendable at `dispatch::decide`, and a still-limited spawn answers 503
   // `worker_not_ready`, which re-queues the prompt. The armed park is the one a weekly limit
   // produces (#3688 covers only the redelivery cap).
