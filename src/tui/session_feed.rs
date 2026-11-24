@@ -5,7 +5,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::TryRecvError,
-        Arc,
+        Arc, Mutex,
     },
 };
 
@@ -232,6 +232,7 @@ pub(crate) struct NativeLease {
     grant: Arc<AtomicU64>,
     generation: u64,
     cancelled: Arc<AtomicBool>,
+    effect_fence: Arc<Mutex<()>>,
 }
 
 impl NativeLease {
@@ -240,7 +241,19 @@ impl NativeLease {
             && self.grant.load(Ordering::SeqCst) == self.generation
     }
 
+    pub(crate) fn with_valid_effect<T>(&self, effect: impl FnOnce() -> T) -> Option<T> {
+        let _fence = self
+            .effect_fence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.is_valid().then(effect)
+    }
+
     pub(crate) fn cancel_continuation(&self) {
+        let _fence = self
+            .effect_fence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.cancelled.store(true, Ordering::SeqCst);
     }
 
@@ -250,6 +263,7 @@ impl NativeLease {
             grant: Arc::new(AtomicU64::new(1)),
             generation: 1,
             cancelled: Arc::new(AtomicBool::new(false)),
+            effect_fence: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -421,6 +435,13 @@ fn set_grant(grant: &AtomicU64, allowed: bool) {
     let _ = grant.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
         ((value & 1 == 1) != allowed).then(|| value + 1)
     });
+}
+
+fn set_native_grant(grant: &AtomicU64, effect_fence: &Mutex<()>, allowed: bool) {
+    let _fence = effect_fence
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_grant(grant, allowed);
 }
 async fn run_namespace(
     client: &crate::daemon::DaemonClient,
@@ -765,6 +786,8 @@ pub struct SessionFeed {
     task: Option<tokio::task::JoinHandle<()>>,
     grant: Arc<AtomicU64>,
     native_grant: Arc<AtomicU64>,
+    /// Serializes native tmux effects with authority revocation.
+    native_effect_fence: Arc<Mutex<()>>,
     /// CityHall client mode is a handshake property rather than a per-revision
     /// grant, so it is recorded once per connection and read by the local-write
     /// gate on the home view.
@@ -804,6 +827,7 @@ impl SessionFeed {
             sandbox_progress_receiver,
             grant: Arc::new(AtomicU64::new(0)),
             native_grant: Arc::new(AtomicU64::new(0)),
+            native_effect_fence: Arc::new(Mutex::new(())),
             cityhall: Arc::new(AtomicBool::new(false)),
             commands: None,
             pending: HashMap::new(),
@@ -820,7 +844,7 @@ impl SessionFeed {
 
     pub(crate) fn suspend_for_dashboard(&mut self) {
         set_grant(&self.grant, false);
-        set_grant(&self.native_grant, false);
+        set_native_grant(&self.native_grant, &self.native_effect_fence, false);
         self.quit_control.send_replace(None);
         if let Some(task) = self.task.take() {
             task.abort();
@@ -830,7 +854,7 @@ impl SessionFeed {
 
     pub(crate) fn connect_prepared(&mut self, profile: String, prepared: Option<Prepared>) {
         set_grant(&self.grant, false);
-        set_grant(&self.native_grant, false);
+        set_native_grant(&self.native_grant, &self.native_effect_fence, false);
         self.quit_control.send_replace(None);
         if let Some(task) = self.task.take() {
             task.abort();
@@ -843,6 +867,8 @@ impl SessionFeed {
         self.grant = grant.clone();
         let native_grant = Arc::new(AtomicU64::new(0));
         self.native_grant = native_grant.clone();
+        let native_effect_fence = Arc::new(Mutex::new(()));
+        self.native_effect_fence = native_effect_fence.clone();
         let cityhall = Arc::new(AtomicBool::new(false));
         self.cityhall = cityhall.clone();
         let (commands, requests) = tokio::sync::mpsc::channel::<SessionCommand>(COMMAND_CAPACITY);
@@ -870,7 +896,11 @@ impl SessionFeed {
                 diagnostics.send_replace(connection.info().owner_diagnostics.clone());
                 cityhall.store(connection.info().cityhall_mode, Ordering::SeqCst);
                 set_grant(&grant, connection.mutations_allowed());
-                set_grant(&native_grant, connection.native_interaction_allowed());
+                set_native_grant(
+                    &native_grant,
+                    &native_effect_fence,
+                    connection.native_interaction_allowed(),
+                );
                 quit_control.send_replace(Some(QuitCancellationHandle {
                     client: client.clone(),
                     epoch: epoch.clone(),
@@ -885,7 +915,11 @@ impl SessionFeed {
                         match connection.next_event().await {
                             Ok(RuntimeEvent::Snapshot(snapshot)) => {
                                 set_grant(&grant, connection.mutations_allowed());
-                                set_grant(&native_grant, connection.native_interaction_allowed());
+                                set_native_grant(
+                                    &native_grant,
+                                    &native_effect_fence,
+                                    connection.native_interaction_allowed(),
+                                );
                                 sender.send_replace(Some(SessionFeedResult::Snapshot(snapshot)));
                             }
                             Ok(RuntimeEvent::OwnerDiagnostics(current)) => {
@@ -899,7 +933,7 @@ impl SessionFeed {
                             }
                             Err(error) => {
                                 set_grant(&grant, false);
-                                set_grant(&native_grant, false);
+                                set_native_grant(&native_grant, &native_effect_fence, false);
                                 progress.send_replace(Some(Vec::new()));
                                 sandbox_progress.send_replace(Vec::new());
                                 sender.send_replace(Some(SessionFeedResult::Unavailable(
@@ -923,7 +957,7 @@ impl SessionFeed {
             }
             .await;
             set_grant(&grant, false);
-            set_grant(&native_grant, false);
+            set_native_grant(&native_grant, &native_effect_fence, false);
             quit_control.send_replace(None);
             sandbox_progress.send_replace(Vec::new());
             if let Err(error) = result {
@@ -978,6 +1012,7 @@ impl SessionFeed {
             grant: self.native_grant.clone(),
             generation: self.native_grant.load(Ordering::SeqCst),
             cancelled: Arc::new(AtomicBool::new(false)),
+            effect_fence: self.native_effect_fence.clone(),
         }
     }
 
@@ -1012,6 +1047,7 @@ impl SessionFeed {
             grant: self.native_grant.clone(),
             generation,
             cancelled: Arc::new(AtomicBool::new(false)),
+            effect_fence: self.native_effect_fence.clone(),
         })
     }
 
@@ -1508,6 +1544,7 @@ impl SessionFeed {
             grant: self.native_grant.clone(),
             generation,
             cancelled: Arc::new(AtomicBool::new(false)),
+            effect_fence: self.native_effect_fence.clone(),
         };
         let size = size.and_then(|(cols, rows)| {
             Some(TerminalSize {
@@ -1551,6 +1588,7 @@ impl SessionFeed {
             grant: self.native_grant.clone(),
             generation,
             cancelled: Arc::new(AtomicBool::new(false)),
+            effect_fence: self.native_effect_fence.clone(),
         };
         let (ready, result) = tokio::sync::oneshot::channel();
         self.enqueue(
@@ -1602,6 +1640,7 @@ impl SessionFeed {
             grant: self.native_grant.clone(),
             generation,
             cancelled: Arc::new(AtomicBool::new(false)),
+            effect_fence: self.native_effect_fence.clone(),
         };
         let size = size.and_then(|(cols, rows)| {
             Some(TerminalSize {
@@ -2411,7 +2450,7 @@ impl Default for SessionFeed {
 impl Drop for SessionFeed {
     fn drop(&mut self) {
         set_grant(&self.grant, false);
-        set_grant(&self.native_grant, false);
+        set_native_grant(&self.native_grant, &self.native_effect_fence, false);
         if let Some(task) = self.task.take() {
             task.abort();
         }
@@ -3357,6 +3396,7 @@ mod tests {
             grant: Arc::new(AtomicU64::new(1)),
             generation: 1,
             cancelled: Arc::new(AtomicBool::new(false)),
+            effect_fence: Arc::new(Mutex::new(())),
         };
         let (slow_result, mut slow_reply) = tokio::sync::oneshot::channel();
         requests

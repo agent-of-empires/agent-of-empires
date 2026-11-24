@@ -2723,6 +2723,9 @@ impl HomeView {
             worker.set_clipboard_capture_enabled(self.agent_clipboard_forward);
             self.preview_capture_worker = Some(worker);
         }
+        if let Some(worker) = self.preview_capture_worker.as_ref() {
+            worker.set_native_input_lease(self.session_feed.native_input_lease());
+        }
         if self.preview_capture_target != desired {
             if let Some(worker) = self.preview_capture_worker.as_ref() {
                 worker.set_target(desired.clone().unwrap_or_default());

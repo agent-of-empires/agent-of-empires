@@ -206,9 +206,9 @@ impl HomeView {
         // render), but it is already running whenever a session was previewed before entry;
         // spawning now closes the rare cold gap.
         if self.preview_capture_worker.is_none() {
-            self.preview_capture_worker = Some(live_send::LiveCaptureWorker::spawn(
-                self.preview_wake.clone(),
-            ));
+            let worker = live_send::LiveCaptureWorker::spawn(self.preview_wake.clone());
+            worker.set_native_input_lease(self.session_feed.native_input_lease());
+            self.preview_capture_worker = Some(worker);
         }
         // Nudge the capture worker after each dispatched batch so typed echo is captured
         // immediately rather than a full fast-cadence cycle later.

@@ -42,6 +42,49 @@ static LIVE_SEND_WORKER_COUNTER: std::sync::atomic::AtomicU64 =
 #[cfg(test)]
 static LIVE_CAPTURE_WORKER_TEST_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+#[cfg(all(unix, feature = "e2e-tests"))]
+static E2E_VT_ARM_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(all(unix, feature = "e2e-tests"))]
+fn e2e_hold_vt_arm(name: &str) -> Option<(std::path::PathBuf, u64)> {
+    let runtime_state = std::path::PathBuf::from(std::env::var_os("AOE_E2E_RUNTIME_STATE")?);
+    let gate = runtime_state.parent()?.join("vt-arm-gate");
+    if !gate.is_dir() {
+        return None;
+    }
+    let attempt = E2E_VT_ARM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    std::fs::write(gate.join(format!("attempt-{attempt}-target")), name).ok()?;
+    if attempt == 1 {
+        std::fs::write(gate.join("attempt-1-held"), b"held").ok()?;
+        let release = gate.join("attempt-1-release");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !release.exists() {
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    Some((gate, attempt))
+}
+
+#[cfg(all(unix, feature = "e2e-tests"))]
+fn e2e_report_vt_arm(
+    observation: Option<(std::path::PathBuf, u64)>,
+    channel: &Option<std::sync::Arc<crate::tmux::vt::VtChannel>>,
+) {
+    let Some((gate, attempt)) = observation else {
+        return;
+    };
+    let result = channel.as_ref().map_or_else(
+        || "none".to_string(),
+        |channel| {
+            let (input, owner) = channel.e2e_arm_result();
+            format!("{} {owner}", if input { "input" } else { "output" })
+        },
+    );
+    let _ = std::fs::write(gate.join(format!("attempt-{attempt}-result")), result);
+}
 
 /// Default exit chord set: `C-q` alone, which works on mobile and restrictive SSH
 /// clients, is reachable on every shipped keyboard layout, and reads as "quit". Users who
@@ -786,6 +829,7 @@ fn channel_arm_due(
 #[cfg(unix)]
 struct PendingArm<T> {
     generation: u64,
+    authority: Option<crate::tui::session_feed::NativeLease>,
     result: std::sync::mpsc::Receiver<Option<std::sync::Arc<T>>>,
 }
 
@@ -795,18 +839,20 @@ impl<T: Send + Sync + 'static> PendingArm<T> {
         name: String,
         generation: u64,
         nudge: CaptureWake,
-        arm: impl FnOnce(&str, &crate::tmux::TmuxCommandDeadline) -> Option<std::sync::Arc<T>>
-            + Send
-            + 'static,
+        authority: Option<crate::tui::session_feed::NativeLease>,
+        arm: impl FnOnce(&str) -> Option<std::sync::Arc<T>> + Send + 'static,
     ) -> Self {
         let (sender, result) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let deadline = crate::tmux::TmuxCommandDeadline::new();
             // A send to a stopped worker fails and drops the channel here.
-            let _ = sender.send(arm(&name, &deadline));
+            let _ = sender.send(arm(&name));
             signal_capture_wake(&nudge);
         });
-        Self { generation, result }
+        Self {
+            generation,
+            authority,
+            result,
+        }
     }
 
     /// The channel a finished arm produced for `generation`. `None` while the arm is
@@ -815,14 +861,22 @@ impl<T: Send + Sync + 'static> PendingArm<T> {
         pending: &mut Option<Self>,
         generation: u64,
         stale: &mut Vec<std::sync::Arc<T>>,
-    ) -> Option<std::sync::Arc<T>> {
+    ) -> Option<(
+        std::sync::Arc<T>,
+        Option<crate::tui::session_feed::NativeLease>,
+    )> {
         let done = match pending.as_ref()?.result.try_recv() {
             Ok(done) => done,
             Err(std::sync::mpsc::TryRecvError::Empty) => return None,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
         };
-        if pending.take().is_some_and(|p| p.generation == generation) {
-            done
+        let pending = pending.take().expect("completed arm must still be pending");
+        let authorized = pending
+            .authority
+            .as_ref()
+            .is_none_or(crate::tui::session_feed::NativeLease::is_valid);
+        if pending.generation == generation && authorized {
+            done.map(|channel| (channel, pending.authority))
         } else {
             stale.extend(done);
             None
@@ -969,6 +1023,9 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// the render reconcile at spawn and on config refresh, and read each cycle, so
     /// toggling off tears down an armed channel and falls back in place.
     vt_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Native runtime grant captured for the next VT arm. Existing and queued channels
+    /// revalidate the same generation before they can install pane input.
+    vt_lease: std::sync::Arc<std::sync::Mutex<Option<crate::tui::session_feed::NativeLease>>>,
     /// Whether the raw OSC 52 observer may run when terminal rendering uses capture-pane.
     /// Mirrors the Clipboard Pass-through setting, so disabling it closes the second
     /// pipe-pane connection.
@@ -1227,6 +1284,7 @@ impl LiveCaptureWorker {
         // Spawned enabled; the render reconcile pushes the real `[tmux] vt_live` value
         // right after spawn and on every config refresh, so the worker never reads config.
         let vt_enabled = Arc::new(AtomicBool::new(true));
+        let vt_lease = Arc::new(Mutex::new(None));
         // Start disabled until the render reconcile publishes the Clipboard Pass-through
         // setting, so a new worker never runs an observer before it is configured.
         let clipboard_capture_enabled = Arc::new(AtomicBool::new(false));
@@ -1244,6 +1302,8 @@ impl LiveCaptureWorker {
         let generation_cell = generation.clone();
         #[cfg(unix)]
         let vt_enabled_cell = vt_enabled.clone();
+        #[cfg(unix)]
+        let vt_lease_cell = vt_lease.clone();
         #[cfg(unix)]
         let clipboard_capture_enabled_cell = clipboard_capture_enabled.clone();
         let thread = std::thread::spawn(move || {
@@ -1273,6 +1333,8 @@ impl LiveCaptureWorker {
             // pane that cannot arm a channel falls back to capture.
             #[cfg(unix)]
             let mut vt_source: Option<std::sync::Arc<crate::tmux::vt::VtChannel>> = None;
+            #[cfg(unix)]
+            let mut vt_source_lease: Option<crate::tui::session_feed::NativeLease> = None;
             // Terminal snapshots carry no raw OSC 52 escapes, so when VT is off for a
             // terminal pane this observer restores clipboard forwarding without building a
             // grid or seed.
@@ -1335,6 +1397,12 @@ impl LiveCaptureWorker {
                 // slips past still carries the old generation for the consumer to drop.
                 let generation_now = generation_cell.load(Ordering::Relaxed);
                 let command_deadline = crate::tmux::TmuxCommandDeadline::new();
+                #[cfg(unix)]
+                let vt_lease_now = vt_lease_cell.lock().ok().and_then(|lease| lease.clone());
+                #[cfg(unix)]
+                let vt_authorized = vt_lease_now
+                    .as_ref()
+                    .is_some_and(crate::tui::session_feed::NativeLease::is_valid);
                 // Channels detached this cycle, shut down after its frame.
                 #[cfg(unix)]
                 let mut stale_vt = Vec::new();
@@ -1362,6 +1430,7 @@ impl LiveCaptureWorker {
                     #[cfg(unix)]
                     {
                         stale_vt.extend(vt_source.take());
+                        vt_source_lease = None;
                         last_vt_arm = None;
                         arm_after = Some(std::time::Instant::now() + CHANNEL_ARM_SETTLE);
                         next_authoritative_capture = None;
@@ -1376,7 +1445,7 @@ impl LiveCaptureWorker {
                 // Adopt finished arms before the enable checks below so a
                 // setting toggled off meanwhile tears the channel down at once.
                 #[cfg(unix)]
-                if let Some(v) =
+                if let Some((v, authority)) =
                     PendingArm::take(&mut pending_vt_arm, generation_now, &mut stale_vt)
                 {
                     // Event-driven echo: the channel pokes the nudge condvar on every grid
@@ -1385,10 +1454,11 @@ impl LiveCaptureWorker {
                     v.set_change_wakeup(nudge_thread.clone());
                     next_authoritative_capture =
                         Some(std::time::Instant::now() + AUTHORITATIVE_CAPTURE_INTERVAL);
+                    vt_source_lease = authority;
                     vt_source = Some(v);
                 }
                 #[cfg(unix)]
-                if let Some(source) =
+                if let Some((source, _)) =
                     PendingArm::take(&mut pending_osc52_arm, generation_now, &mut stale_osc52)
                 {
                     osc52_seen = source.clipboard_sequence();
@@ -1405,8 +1475,15 @@ impl LiveCaptureWorker {
                 // The throttle resets even when no channel is armed (a failed
                 // arm attempt), so re-enabling always arms on the next cycle.
                 #[cfg(unix)]
-                if !vt_enabled {
+                if !vt_enabled
+                    || !vt_authorized
+                    || (vt_source.is_some()
+                        && !vt_source_lease
+                            .as_ref()
+                            .is_some_and(crate::tui::session_feed::NativeLease::is_valid))
+                {
                     shutdown_vt_source(&mut vt_source, &command_deadline);
+                    vt_source_lease = None;
                     last_vt_arm = None;
                     next_authoritative_capture = None;
                 }
@@ -1442,8 +1519,9 @@ impl LiveCaptureWorker {
                     // An OSC 52 clipboard write the displayed pane emitted since the last
                     // cycle, published below under the same retarget guard as the cursor.
                     #[cfg(unix)]
-                    let observe_osc52 =
-                        !vt_enabled && forward_empty_policy && clipboard_capture_enabled;
+                    let observe_osc52 = (!vt_enabled || !vt_authorized)
+                        && forward_empty_policy
+                        && clipboard_capture_enabled;
                     #[cfg(unix)]
                     if !observe_osc52 {
                         shutdown_osc52_source(&mut osc52_source, &command_deadline);
@@ -1463,7 +1541,13 @@ impl LiveCaptureWorker {
                             name.clone(),
                             generation_now,
                             nudge_thread.clone(),
-                            crate::tmux::vt::Osc52Channel::acquire_with_deadline,
+                            None,
+                            |name| {
+                                let deadline = crate::tmux::TmuxCommandDeadline::new();
+                                crate::tmux::vt::Osc52Channel::acquire_with_deadline(
+                                    name, &deadline,
+                                )
+                            },
                         ));
                     }
                     #[cfg(unix)]
@@ -1502,22 +1586,37 @@ impl LiveCaptureWorker {
                     let (capture, cursor_now) = if let Some(capture) = capture_override {
                         capture
                     } else if vt_enabled {
-                        if channel_arm_due(
-                            arm_after,
-                            vt_source.is_some() || pending_vt_arm.is_some(),
-                            last_vt_arm,
-                            std::time::Instant::now(),
-                        ) {
+                        if vt_authorized
+                            && channel_arm_due(
+                                arm_after,
+                                vt_source.is_some() || pending_vt_arm.is_some(),
+                                last_vt_arm,
+                                std::time::Instant::now(),
+                            )
+                        {
+                            let lease = vt_lease_now
+                                .clone()
+                                .expect("authorized VT arm must retain its native lease");
                             last_vt_arm = Some(std::time::Instant::now());
                             pending_vt_arm = Some(PendingArm::spawn(
                                 name.clone(),
                                 generation_now,
                                 nudge_thread.clone(),
-                                |name, deadline| {
-                                    crate::tmux::vt::VtChannel::acquire_with_deadline(
-                                        name, deadline,
-                                    )
-                                    .ok()
+                                Some(lease.clone()),
+                                move |name| {
+                                    #[cfg(feature = "e2e-tests")]
+                                    let observation = e2e_hold_vt_arm(name);
+                                    let channel = lease
+                                        .with_valid_effect(|| {
+                                            let deadline = crate::tmux::TmuxCommandDeadline::new();
+                                            crate::tmux::vt::VtChannel::acquire_with_deadline(
+                                                name, &deadline,
+                                            )
+                                        })
+                                        .and_then(Result::ok);
+                                    #[cfg(feature = "e2e-tests")]
+                                    e2e_report_vt_arm(observation, &channel);
+                                    channel
                                 },
                             ));
                         }
@@ -1527,6 +1626,7 @@ impl LiveCaptureWorker {
                         // name) without thrashing on a permanently broken pane.
                         if vt_source.as_ref().is_some_and(|v| !v.is_alive()) {
                             shutdown_vt_source(&mut vt_source, &command_deadline);
+                            vt_source_lease = None;
                             next_authoritative_capture = None;
                         }
                         let authoritative_due = vt_source.is_some()
@@ -1803,6 +1903,7 @@ impl LiveCaptureWorker {
             stop,
             clipboard,
             vt_enabled,
+            vt_lease,
             clipboard_capture_enabled,
             cycles,
             #[cfg(test)]
@@ -1810,6 +1911,21 @@ impl LiveCaptureWorker {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             #[cfg(test)]
             thread: Some(thread),
+        }
+    }
+
+    pub(in crate::tui) fn set_native_input_lease(
+        &self,
+        lease: Option<crate::tui::session_feed::NativeLease>,
+    ) {
+        let changed = self.vt_lease.lock().is_ok_and(|mut current| {
+            let changed = current.as_ref().is_some_and(|lease| lease.is_valid())
+                != lease.as_ref().is_some_and(|lease| lease.is_valid());
+            *current = lease;
+            changed
+        });
+        if changed {
+            self.nudge();
         }
     }
 
@@ -3257,7 +3373,8 @@ mod tests {
             "pane".into(),
             7,
             wake.clone(),
-            move |name, _| {
+            None,
+            move |name| {
                 gate.recv().ok()?;
                 Some(std::sync::Arc::new(name.to_string()))
             },
@@ -3272,6 +3389,7 @@ mod tests {
         wait_for_capture_wake(&wake, &mut observed, std::time::Duration::from_secs(5));
         assert_eq!(
             PendingArm::take(&mut pending, 7, &mut stale)
+                .map(|(channel, _)| channel)
                 .as_deref()
                 .map(String::as_str),
             Some("pane"),
@@ -3285,7 +3403,8 @@ mod tests {
             "pane".into(),
             7,
             wake.clone(),
-            move |name, _| {
+            None,
+            move |name| {
                 gate.recv().ok()?;
                 Some(std::sync::Arc::new(name.to_string()))
             },
@@ -3304,6 +3423,32 @@ mod tests {
         assert!(
             pending.is_none(),
             "a stale arm no longer blocks the next one"
+        );
+
+        stale.clear();
+        let authority = crate::tui::session_feed::NativeLease::valid_for_test();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let mut pending = Some(PendingArm::spawn(
+            "pane".into(),
+            7,
+            wake.clone(),
+            Some(authority.clone()),
+            move |name| {
+                gate.recv().ok()?;
+                Some(std::sync::Arc::new(name.to_string()))
+            },
+        ));
+        authority.cancel_continuation();
+        release.send(()).unwrap();
+        wait_for_capture_wake(&wake, &mut observed, std::time::Duration::from_secs(5));
+        assert!(
+            PendingArm::take(&mut pending, 7, &mut stale).is_none(),
+            "an arm from a revoked lease is never adopted"
+        );
+        assert_eq!(
+            stale.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            ["pane"],
+            "a revoked arm goes to the teardown sink"
         );
     }
 

@@ -67,6 +67,10 @@ The channel needs tmux 3.4 or newer. A pane that cannot arm one, a grid that cou
 
 To rule the transport in or out while troubleshooting, toggle **Live terminal stream** under Settings (Tmux tab, Advanced) or set `[tmux] vt_live = false`. The TUI applies a change on its next capture cycle; web connections pick it up when they reconnect.
 
+If the TUI loses its Daemon connection, it drops its VT channel and does not
+re-arm pane input while disconnected. Press `r` to reconnect and grant a fresh
+channel; no pending arm from the old connection is resumed.
+
 ## Configuration
 
 Both chords are editable under Settings (Interaction) and in `config.toml`:
