@@ -47,7 +47,7 @@ const TOOL_ARGS_MAX_CHARS: usize = 100;
 ///
 /// Entries are ordered by the seq of the event that began them. A reused tool
 /// id has one start row, patched in place, so its line takes the seq of its
-/// latest start and only terminal rows after that start (completed, failed or
+/// latest start and only terminal rows from that start on (completed, failed or
 /// stopped) describe it.
 pub(crate) fn entries(transcript: &RetainedTranscript) -> Vec<Entry> {
     /// One tool line: where it sits in `out` and how its latest invocation ended.
@@ -104,7 +104,8 @@ pub(crate) fn entries(transcript: &RetainedTranscript) -> Vec<Entry> {
                     .tool_call_id
                     .as_deref()
                     .and_then(|id| invocations.get_mut(id));
-                if let Some(invocation) = latest.filter(|i| seq > i.start) {
+                // `>=`: a start synthesized from this terminal event shares its seq.
+                if let Some(invocation) = latest.filter(|i| seq >= i.start) {
                     invocation.failed = row.kind == TranscriptRowKind::ToolError;
                 }
             }
@@ -508,6 +509,16 @@ mod tests {
                 "late failure of another tool keeps its own slot",
                 &["s t", "s u", "o t", "e u"],
                 &["t {}", "u {} (failed)"],
+            ),
+            (
+                "completion-only failure, start outside the window",
+                &["e t"],
+                &["tool call (failed)"],
+            ),
+            (
+                "completion-only success, start outside the window",
+                &["o t"],
+                &["tool call"],
             ),
         ];
         for (label, ops, want) in cases {
