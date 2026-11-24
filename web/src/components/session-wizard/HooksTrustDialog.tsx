@@ -47,10 +47,7 @@ export function HooksTrustDialog({
     >
       <p className="text-[13px] text-text-secondary">
         {starting ? (
-          <>
-            These commands run on your machine when a Session starts. Approve them once to start &ldquo;{starting}
-            &rdquo;.
-          </>
+          "These run on your machine when a Session starts in this repo:"
         ) : (
           <>
             This repository defines lifecycle hooks{needsMcpTrust ? " and MCP servers" : ""}. They run on your machine;
@@ -83,7 +80,7 @@ export function HooksTrustDialog({
 
       <p className="text-[12px] text-text-dim">
         {starting
-          ? `Approving trusts every hook type${needsMcpTrust ? " and MCP server" : ""} listed above, not only the ones that run now, so future Sessions (including worktrees) run them without prompting.`
+          ? `Approving trusts them${needsMcpTrust ? " and the MCP servers" : ""} for future Sessions too.`
           : `Approving trusts this repository's hooks${needsMcpTrust ? " and project MCP servers" : ""} so future sessions (including worktrees) run them without prompting.`}
       </p>
     </ConfirmCreateDialog>

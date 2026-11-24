@@ -231,6 +231,8 @@ describe("SuggestionsView", () => {
     expect(await screen.findByText("Review this repo's hooks")).toBeTruthy();
     expect(screen.getByText("npm ci")).toBeTruthy();
     expect(screen.getByText("./scripts/dev-setup.sh")).toBeTruthy();
+    expect(screen.getByText("These run on your machine when a Session starts in this repo:")).toBeTruthy();
+    expect(screen.getByText("Approving trusts them for future Sessions too.")).toBeTruthy();
     expect(startSuggestion).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByRole("button", { name: "Approve and start" }));
     await waitFor(() => expect(startSuggestion).toHaveBeenCalledTimes(2));
