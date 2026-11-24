@@ -311,12 +311,11 @@ impl Instance {
         if !own_cmd || config.before_session_hook {
             return false;
         }
-        // As launch does, an unresolvable HOME yields no store.
-        let launcher_store = super::hooks::host_home(
-            &self.resolved_host_environment_from(config.profile_environment),
-        )
-        .filter(|home| home.is_absolute())
-        .and_then(|home| session.agent_config_dir_for(&self.tool, &home));
+        // ACP builds its environment from the profile alone, never from the terminal's saved
+        // hook output. As launch does, an unresolvable HOME yields no store.
+        let launcher_store = super::hooks::host_home(&config.profile_environment)
+            .filter(|home| home.is_absolute())
+            .and_then(|home| session.agent_config_dir_for(&self.tool, &home));
         launcher_store
             .is_some_and(|dir| crate::session::capture::same_claude_store(&dir, &pin.store))
             && self.acp_transcript_cli_resumable_with("claude", session)
@@ -1462,7 +1461,8 @@ replies = true
     }
 
     /// The launcher's `~` store resolves against the profile `environment` HOME, as launch
-    /// does, and a `before_session` hook (which can move HOME at launch) starts fresh.
+    /// does, and a `before_session` hook (which can move HOME at launch) starts fresh. The
+    /// terminal's saved hook HOME plays no part.
     #[test]
     #[serial_test::serial]
     fn own_acp_cmd_store_resolves_against_the_launch_home() {
@@ -1517,7 +1517,19 @@ replies = true
         assert!(!bound_to(ambient_store).resumes_claude_under_own_acp_cmd("claude-work"));
 
         configure(true);
-        assert!(!bound_to(launch_store).resumes_claude_under_own_acp_cmd("claude-work"));
+        assert!(!bound_to(launch_store.clone()).resumes_claude_under_own_acp_cmd("claude-work"));
+
+        configure(false);
+        let saved_home = home.path().join("saved-home");
+        let with_saved_home = |mut inst: Instance| {
+            inst.pending_host_env = vec![("HOME".into(), saved_home.display().to_string())];
+            inst
+        };
+        assert!(!with_saved_home(bound_to(saved_home.join("stores/work")))
+            .resumes_claude_under_own_acp_cmd("claude-work"));
+        assert!(
+            with_saved_home(bound_to(launch_store)).resumes_claude_under_own_acp_cmd("claude-work")
+        );
     }
 
     /// A session stored with the fallback's own command keeps its capture after
