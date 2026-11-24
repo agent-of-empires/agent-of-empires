@@ -661,7 +661,7 @@ impl Instance {
         sandbox_prior: Option<&LaunchSandboxSnapshot>,
         cause: LaunchIndeterminateCause,
     ) -> Result<StartOutcome> {
-        self.last_error = Some(cause.message().to_owned());
+        self.last_error.set(cause.message().to_owned());
         self.last_error_check = Some(std::time::Instant::now());
         self.release_indeterminate_launch(storage, generation, probe, sandbox_prior)
             .map_err(|error| error.context(LaunchFinalizationPending { generation, cause }))?;
