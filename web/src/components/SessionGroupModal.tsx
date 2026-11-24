@@ -57,7 +57,7 @@ export function SessionGroupModal({ sessionTitle, currentGroup, profile, onSave,
       id={DIALOG_ID}
       title="Edit group"
       describedBy={PROMPT_ID}
-      bodyClassName="px-5 py-4 space-y-3"
+      bodyClassName="px-5 py-4 space-y-3 max-h-[calc(100vh-13rem)] overflow-y-auto"
       onDismiss={() => !saving && onClose()}
       footer={
         // Keeps input focus on press, so blur can't collapse the inline list and shift the buttons before the click.
