@@ -752,6 +752,10 @@ export interface SubagentRecord {
   model?: string | null;
   /** Launched in the background: its card stays open until it goes idle. */
   background?: boolean;
+  /** Client-only, stamped by the reducer from the event's `at`; absent on a cold load. */
+  updated_at?: string;
+  /** Client-only: when the child last started running again; kept while idle so a later finish can be compared. */
+  running_since?: string;
 }
 
 export interface BackgroundAgentTool {
@@ -1541,8 +1545,14 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       );
     }
     const i = next.subagents.findIndex((s) => s.session_id === subagent.session_id);
-    next.subagents =
-      i >= 0 ? next.subagents.map((s, idx) => (idx === i ? subagent : s)) : [...next.subagents, subagent];
+    const prev = next.subagents[i];
+    const active = (r?: SubagentRecord) => r?.state === "running" || r?.state === "requires_action";
+    const stamped: SubagentRecord = {
+      ...subagent,
+      updated_at: at,
+      running_since: active(subagent) && !active(prev) ? at : prev?.running_since,
+    };
+    next.subagents = i >= 0 ? next.subagents.map((s, idx) => (idx === i ? stamped : s)) : [...next.subagents, stamped];
     return next;
   }
   if ("BackgroundTaskStarted" in event) {
@@ -1630,7 +1640,12 @@ function mergeSubagents(
   const fromSnapshot = new Map(snapshot.map((r) => [r.session_id, r]));
   const heldIds = new Set(held.map((r) => r.session_id));
   return [
-    ...held.map((r) => (snapshotIsNewer ? (fromSnapshot.get(r.session_id) ?? r) : r)),
+    ...held.map((r) => {
+      const fresh = snapshotIsNewer ? fromSnapshot.get(r.session_id) : undefined;
+      if (!fresh) return r;
+      // Stamps come from event times, which the snapshot lacks; keep them only while the state agrees.
+      return fresh.state === r.state ? { ...fresh, updated_at: r.updated_at, running_since: r.running_since } : fresh;
+    }),
     ...snapshot.filter((r) => !heldIds.has(r.session_id)),
   ];
 }

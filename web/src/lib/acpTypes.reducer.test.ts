@@ -372,6 +372,30 @@ describe("applyEvent / subagent roster", () => {
     ]);
   });
 
+  it("stamps when a child last started running and when it was last updated", () => {
+    const states = (...events: AcpEvent[]) => {
+      let s = emptyAcpState();
+      return events.map((e, i) => {
+        s = ev(s, i + 1, e);
+        return s.subagents[0]!;
+      });
+    };
+    const [r1, r2, r3, r4, r5] = states(
+      update("running", "t1"),
+      update("requires_action", "t2"),
+      update("idle", "t3"),
+      update("running", "t4"),
+      update("idle", "t5"),
+    );
+    expect([r1, r2, r3, r4, r5].map((r) => [r.running_since, r.updated_at])).toEqual([
+      ["t1", "t1"],
+      ["t1", "t2"],
+      ["t1", "t3"],
+      ["t4", "t4"],
+      ["t4", "t5"],
+    ]);
+  });
+
   it("maps the state onto the matching background agent, including idle then running again", () => {
     const agentAfter = (...events: AcpEvent[]) => run(launched, ...events).backgroundAgents[0];
     expect(agentAfter(update("requires_action", "t1"))).toMatchObject({ status: "requires_action", endedAt: null });

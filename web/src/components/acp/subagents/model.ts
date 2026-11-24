@@ -151,12 +151,12 @@ function backgroundTool(t: BackgroundAgentTool, i: number, ended: boolean): Acti
 }
 
 /** A background child's launch result is stale once the child runs again: it is active now,
- *  or idle after a call that started past the result. */
+ *  or idle after it resumed (a child call, or a running update, past the result). */
 function resultSuperseded(result: ActivityRow, children: ToolCardProps[], roster: RosterEntry): boolean {
   if (roster.state === "running" || roster.state === "requires_action") return true;
   if (roster.state !== "idle") return false;
   const end = result.at ? Date.parse(result.at) : NaN;
-  return children.some((c) => Date.parse(c.tool.started_at) > end);
+  return Date.parse(roster.running_since ?? "") > end || children.some((c) => Date.parse(c.tool.started_at) > end);
 }
 
 /** A sync Task or delegation: its own call and result plus the calls it made. A background
@@ -193,7 +193,7 @@ export function fromInline(
     status,
     startedAt: tool.started_at,
     // The roster has no end time, so a child settled without a reply shows no duration.
-    endedAt: settled ? (settled.at ?? lastEnd) : stale && !running ? lastEnd : undefined,
+    endedAt: settled ? (settled.at ?? lastEnd) : stale && !running ? (roster?.updated_at ?? lastEnd) : undefined,
     prompt: tool.prompt ?? taskPrompt(tool.args_preview),
     tools,
     toolCount: tools.length,

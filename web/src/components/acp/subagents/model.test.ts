@@ -183,6 +183,30 @@ describe("fromInline resumed background child", () => {
     expect(record.earlierReport).toBe("");
   });
 
+  it("settles a text-only resume from its running stamp, ending at the last update", () => {
+    const idle = roster({
+      state: "idle",
+      stop_reason: "end_turn",
+      running_since: "2026-01-01T00:02:00Z",
+      updated_at: "2026-01-01T00:04:00Z",
+    });
+    const record = fromInline(launch, first, [], idle);
+    expect(record.status).toBe("done");
+    expect(record.report).toBe("");
+    expect(record.earlierReport).toBe("first report");
+    expect(record.endedAt).toBe("2026-01-01T00:04:00Z");
+  });
+
+  it("keeps the report when the child last ran before its result, or carries no stamps", () => {
+    const before = roster({ state: "idle", stop_reason: "end_turn", running_since: "2026-01-01T00:00:30Z" });
+    for (const idle of [before, roster({ state: "idle", stop_reason: "end_turn" })]) {
+      const record = fromInline(launch, first, [], idle);
+      expect(record.report).toBe("first report");
+      expect(record.earlierReport).toBeUndefined();
+      expect(record.endedAt).toBe(first.at);
+    }
+  });
+
   it("keeps the report of an idle child with no call after its result", () => {
     const calls = [call("2026-01-01T00:00:30Z", "2026-01-01T00:00:40Z")];
     const record = fromInline(launch, first, calls, roster({ state: "idle", stop_reason: "end_turn" }));
