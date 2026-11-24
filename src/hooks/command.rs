@@ -81,14 +81,10 @@ pub(crate) fn status_command_for_event(
 /// sidecar is trustworthy because `aoe __extract-session-id` refuses daemon workers. A missing or
 /// malformed sidecar keeps the write, and so does a payload that is not compact JSON, which Claude
 /// emits.
-fn session_binding_guard(target: HookInstallTarget) -> String {
-    // Host launches publish `session_id.<AOE_SESSION_SOURCE>`; the sandbox writer has no source.
-    let leaf = match target {
-        HookInstallTarget::Host => {
-            "L=session_id; [ -z \"${AOE_SESSION_SOURCE:-}\" ] || L=\"session_id.$AOE_SESSION_SOURCE\"; "
-        }
-        HookInstallTarget::Sandbox => "L=session_id; ",
-    };
+fn session_binding_guard() -> String {
+    // Both writers publish `session_id.<AOE_SESSION_SOURCE>` when the launch has a source.
+    let leaf =
+        "L=session_id; [ -z \"${AOE_SESSION_SOURCE:-}\" ] || L=\"session_id.$AOE_SESSION_SOURCE\"; ";
     // The sidecar must pass the writer's own checks, else it is ignored like a missing one.
     format!(
         "SID=; {leaf}\
@@ -113,7 +109,7 @@ fn status_command_with_base(
         ""
     };
     let guard = if bound {
-        session_binding_guard(target)
+        session_binding_guard()
     } else {
         String::new()
     };
@@ -268,7 +264,12 @@ fn hook_command_session_id_sandbox(
          SID=$(jq -r '\\''{selector}'\\'' 2>/dev/null); \
          case \"$SID\" in \"\"|-*|*[!0-9a-zA-Z._-]*) exit 0 ;; esac; \
          [ \"${{#SID}}\" -le 256 ] || exit 0; \
-         printf \"%s\" \"$SID\" > \"$D/.session_id.$$.tmp\" 2>/dev/null && mv \"$D/.session_id.$$.tmp\" \"$D/session_id\" 2>/dev/null; \
+         L=session_id; \
+         if [ -n \"${{AOE_SESSION_SOURCE+x}}\" ]; then \
+         case \"$AOE_SESSION_SOURCE\" in ????????-????-????-????-????????????) ;; *) exit 0 ;; esac; \
+         case \"$AOE_SESSION_SOURCE\" in *[!0-9a-f-]*) exit 0 ;; esac; \
+         L=\"session_id.$AOE_SESSION_SOURCE\"; fi; \
+         printf \"%s\" \"$SID\" > \"$D/.session_id.$$.tmp\" 2>/dev/null && mv \"$D/.session_id.$$.tmp\" \"$D/$L\" 2>/dev/null; \
          exit 0 # {AOE_HOOK_MARKER}'"
     )
 }
@@ -774,9 +775,9 @@ mod tests {
         }
     }
 
-    /// A host launch publishes `session_id.<AOE_SESSION_SOURCE>`, so the guard must read that leaf.
+    /// A launch with a source publishes `session_id.<AOE_SESSION_SOURCE>`, so the guard must read that leaf.
     #[test]
-    fn bound_host_status_command_reads_the_source_qualified_sidecar() {
+    fn bound_status_command_reads_the_source_qualified_sidecar() {
         let source = "6f1c2d3e-4a5b-4c6d-8e7f-0a1b2c3d4e5f";
         let own = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let foreign = "11111111-2222-3333-4444-555555555555";
@@ -794,19 +795,18 @@ mod tests {
             (None, "session_id".to_string(), foreign, "idle"),
             (Some("../x"), "session_id".to_string(), foreign, "running"),
         ];
-        for (env, leaf, id, want) in cases {
+        let targets = [HookInstallTarget::Host, HookInstallTarget::Sandbox];
+        for ((env, leaf, id, want), target) in cases
+            .into_iter()
+            .flat_map(|case| targets.map(|target| (case.clone(), target)))
+        {
             let tmp = TempDir::new().unwrap();
             let base = tight_dir(&tmp.path().join("aoe-hooks"));
             let inst = tight_dir(&base.join("bound"));
             std::fs::write(inst.join("status"), "idle").unwrap();
             std::fs::write(inst.join(&leaf), own).unwrap();
-            let cmd = status_command_with_base(
-                "running",
-                &[],
-                true,
-                base.to_str().unwrap(),
-                HookInstallTarget::Host,
-            );
+            let cmd =
+                status_command_with_base("running", &[], true, base.to_str().unwrap(), target);
             let payload = format!(r#"{{"session_id":"{id}"}}"#);
             run_hook("sh", &cmd, "bound", &payload, |c| {
                 if let Some(env) = env {
@@ -816,7 +816,7 @@ mod tests {
             assert_eq!(
                 std::fs::read_to_string(inst.join("status")).unwrap(),
                 want,
-                "{env:?} {leaf} {id}"
+                "{target:?} {env:?} {leaf} {id}"
             );
         }
     }
@@ -876,6 +876,44 @@ mod tests {
             run_hook("sh", &cmd, "sid", &payload, |_| {});
             let got = std::fs::read_to_string(tmp.path().join("sid/session_id")).ok();
             assert_eq!(got.as_deref(), want, "{payload}");
+        }
+
+        // The leaf follows the launch's source as the host writer's does; a malformed one writes nothing.
+        let source = "6f1c2d3e-4a5b-4c6d-8e7f-0a1b2c3d4e5f";
+        let qualified = format!("session_id.{source}");
+        for (env, want_leaf) in [
+            (Some(source), Some(qualified.as_str())),
+            (None, Some("session_id")),
+            (Some("6F1C2D3E-4A5B-4C6D-8E7F-0A1B2C3D4E5F"), None),
+            (Some("../x"), None),
+            (Some(""), None),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let cmd = hook_command_session_id_sandbox(
+                tmp.path().to_str().unwrap(),
+                HookIdentityField::SessionId,
+                None,
+            );
+            let payload = format!(r#"{{"session_id":"{uuid}"}}"#);
+            run_hook("sh", &cmd, "sid", &payload, |c| {
+                if let Some(env) = env {
+                    c.env(crate::hooks::SESSION_SOURCE_ENV, env);
+                }
+            });
+            let mut leaves: Vec<String> = std::fs::read_dir(tmp.path().join("sid"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            leaves.sort();
+            assert_eq!(
+                leaves,
+                Vec::from_iter(want_leaf.map(str::to_owned)),
+                "{env:?}"
+            );
+            if let Some(leaf) = want_leaf {
+                let got = std::fs::read_to_string(tmp.path().join("sid").join(leaf)).unwrap();
+                assert_eq!(got, uuid, "{env:?}");
+            }
         }
     }
 
