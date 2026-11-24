@@ -81,5 +81,6 @@ sleep "$SECS"
 sed -i.bak -E 's/^(-u |-S [^ ]+ )+//' "$B/tmux.log"
 ticks=$(grep -c '^list-panes -a' "$B/tmux.log" || true)
 echo "sessions=${#IDS[@]} window=${SECS}s ticks=$ticks"
-awk '{print $1, $2}' "$B/tmux.log" | sort | uniq -c |
+# One exec can chain commands with `;`: count it by its capture, not its first command.
+awk '/ ; capture-pane / {print "capture-pane", "(chained)"; next} {print $1, $2}' "$B/tmux.log" | sort | uniq -c |
   awk -v t="$ticks" '{printf "%-28s total=%-6d per_tick=%.2f\n", $2" "$3, $1, (t ? $1/t : 0)}'
