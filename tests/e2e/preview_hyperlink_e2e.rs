@@ -1,10 +1,8 @@
 //! e2e coverage for opening an OSC 8 hyperlink from the preview pane.
 //!
-//! A hyperlink's target cannot survive the render path: vt100 routes OSC 8 to
-//! its unhandled-sequence hook and keeps nothing, and a ratatui cell has no
-//! attribute to hold a URI, so a link whose visible text is not itself a URL
-//! was inert (#3735). The targets are kept beside the grid and matched back
-//! onto the row that shows them.
+//! A ratatui cell has no attribute to hold a URI, so a link whose visible text
+//! is not itself a URL was inert (#3735). The frame text carries each target,
+//! and the preview matches it back onto the row that shows it.
 //!
 //! Unit tests cover the scanner and the column mapping against real tmux and
 //! real Claude Code bytes. Only an e2e can prove the rest of the chain: a live
@@ -238,9 +236,8 @@ fn test_preview_click_opens_a_bare_url_with_no_osc8() {
 
 /// The same contract in Agent view, which is where the issue was reported and
 /// which renders through the in-process vt100 grid rather than `capture-pane`.
-/// That transport drops OSC 8 during parsing, so the target can only come from
-/// the channel's own tap on the pane's byte stream; the debug trace asserts it
-/// did, rather than the test passing on a silent fall back to capture.
+/// The debug trace asserts the target was collected from a grid frame, rather
+/// than the test passing on a silent fall back to capture.
 ///
 /// The pane runs a custom agent so it emits a known sequence without any real
 /// agent installed.
@@ -318,29 +315,30 @@ custom_agents = {{ "{LINK_AGENT}" = "{LINK_AGENT}" }}
     h.wait_for_timeout("LIVE", Duration::from_secs(15));
     h.wait_for_timeout(LINK_TEXT, Duration::from_secs(20));
 
-    assert_link_underlined_and_opens(&h, &opened);
-
-    // vt100 keeps no hyperlink, so a target reaching the row through the VT
-    // channel can only have come from the raw-stream tap. The channel arms on a
-    // throttle after the pane settles, so the preview can legitimately serve a
-    // frame or two from the capture fallback first; poll for the handover
-    // rather than sampling once and racing it.
+    // The channel arms on a throttle after the pane settles, so the preview can
+    // serve a frame or two from the capture fallback first. Wait for a collection
+    // after the arm: the grid serializes rows differently from `capture-pane`,
+    // so its first frame re-collects the targets it carries.
     let log_path = config_dir.join("debug.log");
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        let collected: Vec<&str> = log
+        let after_arm = log
+            .find("vt channel armed")
+            .map(|at| &log[at..])
+            .unwrap_or_default();
+        if after_arm
             .lines()
-            .filter(|l| l.contains("collected pane hyperlinks"))
-            .collect();
-        if collected.iter().any(|l| l.contains("from_channel=1")) {
+            .any(|l| l.contains("collected pane hyperlinks") && l.contains(LINK_TEXT))
+        {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "Agent view never sourced the target from the VT channel; traces were:\n{}",
-            collected.join("\n")
+            "Agent view never collected the target from a VT grid frame; log was:\n{log}"
         );
         std::thread::sleep(Duration::from_millis(250));
     }
+
+    assert_link_underlined_and_opens(&h, &opened);
 }
