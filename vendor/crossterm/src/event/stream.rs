@@ -121,10 +121,10 @@ fn poll_next_ready(
         if state.terminal {
             return Poll::Ready(None);
         }
-        if !matches!(state.waker.as_ref(), Some(waker) if waker.will_wake(cx.waker())) {
-            state.waker = Some(cx.waker().clone());
-        }
         if state.running {
+            if !matches!(state.waker.as_ref(), Some(waker) if waker.will_wake(cx.waker())) {
+                state.waker = Some(cx.waker().clone());
+            }
             return Poll::Pending;
         }
     }
@@ -145,6 +145,7 @@ fn poll_next_ready(
                     "Terminal input worker stopped",
                 ))));
             }
+            state.waker = Some(cx.waker().clone());
             Poll::Pending
         }
     }
@@ -215,6 +216,17 @@ mod tests {
             let latest_waker = std::task::Waker::from(Arc::clone(&latest));
             let mut first_context = Context::from_waker(&first_waker);
             let mut latest_context = Context::from_waker(&latest_waker);
+            assert!(matches!(
+                poll_next_ready(&shared, &sender, &mut first_context, || {
+                    Ok(Some(Event::FocusGained))
+                }),
+                Poll::Ready(Some(Ok(Event::FocusGained)))
+            ));
+            assert_eq!(
+                Arc::strong_count(&first),
+                2,
+                "Ready must not retain the task"
+            );
             assert!(
                 poll_next_ready(&shared, &sender, &mut first_context, || Ok(None)).is_pending()
             );
