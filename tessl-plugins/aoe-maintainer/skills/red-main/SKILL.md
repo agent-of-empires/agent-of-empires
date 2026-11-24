@@ -91,8 +91,9 @@ regression, then flake, then infra.
 - Check active findings: list
   `tessl finding list --project $PROJECT --tag red-main --json`, following
   `--after` cursors, and keep those open or in progress. Drop each failure
-  one of them already covers: the same test, or for a failure with no test,
-  the same commit. If none remain, do not create a finding; end with their
+  one of them already covers: the same test with the same class, or for a
+  failure with no test, the same commit. A flake finding does not cover a
+  regression in the same test. If none remain, do not create a finding; end with their
   ids. Otherwise the finding covers only the remaining failures and cites
   those ids in `analysis`.
 
