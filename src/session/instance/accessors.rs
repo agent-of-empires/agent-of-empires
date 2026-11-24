@@ -242,7 +242,14 @@ impl Instance {
         {
             self.tool.clone()
         } else {
-            Self::execution_agent_for(&self.tool, &self.get_tool_command(), config)
+            // No declaration applies under `config`, so the empty-command fallback must not
+            // look one up again from disk.
+            let command = if self.command.is_empty() {
+                self.tool_command_with(None)
+            } else {
+                std::borrow::Cow::Borrowed(self.command.as_str())
+            };
+            Self::execution_agent_for(&self.tool, &command, config)
                 .map_or_else(|_| self.tool.clone(), |agent| agent.name.to_string())
         };
         crate::agents::acp_transcript_cli_resumable(&identity, acp_agent)
@@ -1200,6 +1207,12 @@ tool = "wrapped-tool"
 command = "wrapped-tool"
 provider_versions = ["^18"]
 replies = true
+
+[[agent_integrations]]
+tool = "bare-tool"
+command = "claude"
+provider_versions = ["^18"]
+replies = true
 "#;
         let dir = crate::plugin::plugins_dir()
             .unwrap()
@@ -1247,6 +1260,17 @@ replies = true
         );
         assert!(!inst.acp_transcript_cli_resumable_with("claude", &default));
         assert!(inst.acp_transcript_cli_resumable_with("claude", &overridden));
+
+        // An empty command takes its fallback from the passed config: a disk declaration
+        // of `claude` must not leak in once the passed config shadows it.
+        let mut bare = Instance::new("bare", home.path().join("project").to_str().unwrap());
+        bare.tool = "bare-tool".to_string();
+        assert!(bare.declared_agent().is_some());
+        let mut shadowed = crate::session::config::SessionConfig::default();
+        shadowed
+            .agent_command_override
+            .insert("bare-tool".into(), "other --serve".into());
+        assert!(!bare.acp_transcript_cli_resumable_with("claude", &shadowed));
     }
 
     /// The switch previews resolve the same ACP target as the daemon launch.

@@ -933,10 +933,18 @@ impl Instance {
         if !self.command.is_empty() {
             return std::borrow::Cow::Borrowed(&self.command);
         }
-        if let Some(declared) = self.declared_agent() {
-            if let Some(command) = &declared.contribution().command {
-                return std::borrow::Cow::Owned(command.clone());
-            }
+        self.tool_command_with(self.declared_agent().as_ref())
+    }
+
+    /// The command for an empty `self.command`, given the caller's declaration lookup.
+    pub(super) fn tool_command_with(
+        &self,
+        declared: Option<&crate::plugin::agent_integration::DeclaredAgent>,
+    ) -> std::borrow::Cow<'_, str> {
+        if let Some(command) =
+            declared.and_then(|declared| declared.contribution().command.as_ref())
+        {
+            return std::borrow::Cow::Owned(command.clone());
         }
         std::borrow::Cow::Borrowed(
             crate::agents::get_agent(&self.tool)
