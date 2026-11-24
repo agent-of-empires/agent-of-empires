@@ -57,9 +57,13 @@ export function MenuPopover({
       setPos(desktop && trigger ? placeMenu(trigger, menu.current?.offsetHeight ?? 0, align) : null);
     };
     place();
+    // Start in… grows once its Projects load.
+    const resized = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(place);
+    if (menu.current) resized?.observe(menu.current);
     window.addEventListener("resize", place);
     window.addEventListener("scroll", place, true);
     return () => {
+      resized?.disconnect();
       window.removeEventListener("resize", place);
       window.removeEventListener("scroll", place, true);
     };

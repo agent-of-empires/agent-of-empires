@@ -140,3 +140,43 @@ test("the sidebar's Start options menu stays in view and takes a pointer click o
   await page.mouse.click(ib.x + ib.width / 2, ib.y + ib.height / 2);
   await expect.poll(() => dismissed).toEqual({ provider_id: "github", id: "i1" });
 });
+
+test("Start in… moves to stay in view once its Projects load", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await mockHome(page);
+  const unlinked = { ...items[0], mapping_key: "acme/web" };
+  await page.route("**/api/suggestions", (route) =>
+    route.fulfill({ json: { providers: [provider], items: [unlinked], prefs: { ...prefs, sidebar: true } } }),
+  );
+  const projects = Array.from({ length: 8 }, (_, i) => ({ name: `project-${i + 1}`, path: `/work/p${i + 1}` }));
+  let answer = () => {};
+  const answered = new Promise<void>((resolve) => (answer = resolve));
+  await page.route("**/api/suggestions/projects", async (route) => {
+    await answered;
+    await route.fulfill({ json: { projects } });
+  });
+  let started: unknown = null;
+  await page.route("**/api/suggestions/start", (route) => {
+    started = route.request().postDataJSON();
+    return route.fulfill({ json: { session_id: "s1", title: "x" } });
+  });
+  await page.goto("/");
+  await page.getByTestId("sidebar-suggested-toggle").click();
+  const row = page.getByRole("button", { name: /^Start in a Project:/ });
+  // Room below the row for the loading line, not for the loaded list.
+  const rb = (await row.boundingBox())!;
+  const height = Math.ceil(rb.y + rb.height + 90);
+  await page.setViewportSize({ width: 1280, height });
+  await row.click();
+  const menu = page.getByRole("menu", { name: "Start in a Project" });
+  await expect(menu.getByText("Loading Projects…")).toBeVisible();
+  answer();
+  const last = menu.getByRole("menuitem", { name: "project-8" });
+  await expect(last).toBeVisible();
+  await expect
+    .poll(async () => (await menu.boundingBox())!.y + (await menu.boundingBox())!.height)
+    .toBeLessThanOrEqual(height);
+  const lb = (await last.boundingBox())!;
+  await page.mouse.click(lb.x + lb.width / 2, lb.y + lb.height / 2);
+  await expect.poll(() => started).toMatchObject({ provider_id: "github", id: "i1", project: { path: "/work/p8" } });
+});
