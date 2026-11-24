@@ -2148,12 +2148,20 @@
       "id": "sidebar.compact-mode",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/sidebar-chrome.spec.ts", "tests/sidebar-legend.spec.ts"],
+      "specs": [
+        "tests/sidebar-chrome.spec.ts",
+        "tests/sidebar-legend.spec.ts",
+        "src/components/sidebar/useSidebarWidth.test.ts"
+      ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/useSidebarWidth.ts",
         "web/src/components/sidebar/SidebarToolbar.tsx",
-        "web/src/components/sidebar/SidebarLegend.tsx"
-      ]
+        "web/src/components/sidebar/SidebarLegend.tsx",
+        "web/src/lib/sidebarCompact.ts",
+        "web/src/App.tsx"
+      ],
+      "notes": "The sidebar has no compact button; its resize handle reaches the rail. A drag follows the pointer down to the 200px minimum, snaps to the 88px rail below 144px (the midpoint) and closes below 44px (half the rail), and dragging back out in the same gesture restores each state. A drag ending closed keeps the width and mode it started from, so the top bar toggle and its shortcut reopen that sidebar. The handle is a focusable separator: arrows step 16px and narrow onto the rail but never close, Home goes to the rail, End to the maximum, Enter collapses to or restores from the rail, and double-click resets to 280px. The phone drawer has no handle, ignores a saved rail, and never grows past the viewport. A second contact on the handle cannot take over a drag."
     },
     {
       "id": "sidebar.drawer-swipe",

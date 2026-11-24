@@ -46,7 +46,7 @@ function renderSidebar(workspaces: Workspace[], over: Partial<Props> = {}) {
     onReorderGroups: noop,
     activeId: null,
     open: true,
-    onToggle: noop,
+    onOpenChange: noop,
     onSelect: vi.fn(),
     onToggleGroup: noop,
     onUpdateRepoAppearance: noop,
