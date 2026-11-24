@@ -3210,12 +3210,14 @@ fn wait_for_terminal_agent(instance: &Instance, budget: std::time::Duration) -> 
         "the agent was not ready within {}s",
         budget.as_secs()
     );
-    // A person's draft is "not yet" too; the final check fails the turn if it outlasts the budget.
+    // A person's draft is "not yet" too, until the budget runs out.
     if let Some(pane) =
         crate::server::api::sessions::ready_agent_pane_for_automatic_input(instance)?
     {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        instance.wait_for_input_line(&tmux, &pane, remaining);
+        if !instance.wait_for_input_line(&tmux, &pane, remaining) {
+            return Err(TerminalPromptBlocker::InputLineBusy.into());
+        }
     }
     Ok(())
 }
@@ -5622,7 +5624,8 @@ mod tests {
     }
 
     /// An initial prompt that meets a draft waits within its budget, then fails as
-    /// `input_line_busy` and is not typed.
+    /// `input_line_busy` and is not typed. The wait fails by itself, so a draft cleared after
+    /// the budget cannot let the prompt through.
     #[tokio::test(flavor = "multi_thread")]
     #[serial_test::serial]
     async fn an_initial_prompt_that_meets_a_draft_fails_busy() {
@@ -5642,6 +5645,17 @@ mod tests {
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
 
         type_draft(&pane, "half typed");
+        let waited = state.instances.read().await[0].clone();
+        let wait = tokio::task::spawn_blocking(move || {
+            wait_for_terminal_agent(&waited, std::time::Duration::from_secs(1))
+        })
+        .await
+        .unwrap()
+        .expect_err("a draft that outlasts the budget fails the wait");
+        assert_eq!(
+            wait.downcast_ref::<TerminalPromptBlocker>(),
+            Some(&TerminalPromptBlocker::InputLineBusy)
+        );
         service
             .drain_terminal_initial_turn_within(
                 "sess-draft-turn",
