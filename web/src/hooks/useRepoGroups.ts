@@ -60,7 +60,7 @@ export function useRepoGroups(
     const rankOf = (id: string) => rank.get(id) ?? Infinity;
     const groupRank = new Map(groupOrder.map((id, i) => [id, i] as const));
     const sortByRank = (list: Workspace[]) =>
-      list.toSorted((a, b) => {
+      [...list].sort((a, b) => {
         const aTier = workspaceTriageTier(a);
         const bTier = workspaceTriageTier(b);
         if (aTier !== bTier) return aTier - bTier;
@@ -74,13 +74,13 @@ export function useRepoGroups(
     const pluginCompare = pluginSort ? compareWorkspacesByPluginSort(pluginSort) : null;
     const sortWorkspaces = (list: Workspace[]) => {
       if (pluginCompare) {
-        return list.toSorted(pluginCompare);
+        return [...list].sort(pluginCompare);
       }
       if (sortMode === "attention") {
-        return list.toSorted((a, b) => compareWorkspacesByAttention(a, b, pluginAttention));
+        return [...list].sort((a, b) => compareWorkspacesByAttention(a, b, pluginAttention));
       }
       if (sortMode === "lastActivity") {
-        return list.toSorted(compareWorkspacesByLastActivityDesc);
+        return [...list].sort(compareWorkspacesByLastActivityDesc);
       }
       return sortByRank(list);
     };

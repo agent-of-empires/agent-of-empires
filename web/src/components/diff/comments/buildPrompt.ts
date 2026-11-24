@@ -60,8 +60,8 @@ export function parseDiffCommentsSentinel(text: string): DiffCommentsCardPayload
 
 /** Sorted comment sections, each with a fence longer than any backtick run in its snippet. */
 export function buildCommentsMarkdown(comments: DiffComment[], opts: BuildOpts): string {
-  return comments
-    .toSorted(compareComments)
+  return [...comments]
+    .sort(compareComments)
     .map((c) => renderComment(c, opts.isMultiRepo))
     .join("\n\n---\n\n");
 }

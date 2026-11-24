@@ -91,7 +91,7 @@ export function BackgroundAgentsPanel({ sessionId, readOnly, focus, onShowThread
   // Running first, then most-recently-started within each group.
   const sorted = useMemo(
     () =>
-      agents.toSorted((a, b) => {
+      [...agents].sort((a, b) => {
         const ra = isActiveAgent(a) ? 0 : 1;
         const rb = isActiveAgent(b) ? 0 : 1;
         if (ra !== rb) return ra - rb;

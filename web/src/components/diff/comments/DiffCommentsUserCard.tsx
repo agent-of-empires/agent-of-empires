@@ -13,7 +13,7 @@ interface Props {
 /** Diff-comments prompt card for the transcript, from the typed event or a legacy sentinel. */
 export function DiffCommentsUserCard({ payload }: Props) {
   const { intro, outro, isMultiRepo, comments } = payload;
-  const sorted = comments.toSorted(compareComments);
+  const sorted = [...comments].sort(compareComments);
   // Rebuilt from the payload; it is the text the agent received.
   const sentPrompt = useMemo(
     () => buildDiffCommentsPrompt(comments, intro, outro, { isMultiRepo }).assembledMarkdown,
