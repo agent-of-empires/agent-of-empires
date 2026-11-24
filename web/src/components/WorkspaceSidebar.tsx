@@ -501,7 +501,7 @@ export function WorkspaceSidebar(props: Props) {
       <div
         data-testid="sidebar-resize-handle"
         {...handleProps}
-        className={`${open ? "hidden md:block" : "hidden"} relative z-10 w-1 cursor-col-resize shrink-0 touch-none bg-surface-800 hover:bg-brand-600/50 focus-visible:bg-brand-600/50 focus-visible:outline-none pointer-coarse:before:absolute pointer-coarse:before:inset-y-0 pointer-coarse:before:left-0 pointer-coarse:before:-right-5 pointer-coarse:before:content-[''] transition-colors duration-75`}
+        className={`${open ? "hidden md:block" : "hidden"} relative z-10 w-1 cursor-col-resize shrink-0 touch-none bg-surface-800 hover:bg-brand-600/50 focus-visible:bg-brand-600/50 focus-visible:outline-none pointer-coarse:before:absolute pointer-coarse:before:inset-y-0 pointer-coarse:before:left-0 pointer-coarse:before:-right-2 pointer-coarse:before:content-[''] transition-colors duration-75`}
       />
     </SidebarCompactContext.Provider>
   );
