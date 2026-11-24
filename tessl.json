@@ -65,6 +65,39 @@
               "src/**/*.rs",
               "tests/**/*.rs"
             ]
+          },
+          "web-change-updates-coverage-matrix": {
+            "include": [
+              "web/src/**/*.ts",
+              "web/src/**/*.tsx",
+              "web/tests/**/*.ts",
+              "web/tests/coverage-matrix.json"
+            ]
+          },
+          "tests-isolated-from-host-state": {
+            "include": [
+              "src/**/*.rs",
+              "tests/**/*.rs"
+            ]
+          },
+          "api-contract-change-updates-docs": {
+            "include": [
+              "src/server/**/*.rs",
+              "src/daemon/error.rs",
+              "docs/api.md",
+              "docs/plugin-api.md",
+              "docs/development/internals/structured-view.md"
+            ],
+            "exclude": [
+              "src/server/**/tests.rs",
+              "src/server/**/tests/**"
+            ]
+          },
+          "doc-comment-stays-attached": {
+            "include": [
+              "src/**/*.rs",
+              "tests/**/*.rs"
+            ]
           }
         }
       }
