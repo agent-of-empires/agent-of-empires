@@ -2450,7 +2450,7 @@ mod tests {
         let profile = apply_acp_session_change(
             &mut inst,
             "sess-1",
-            Some(&AcpSessionChange::Reset("fork_failed: boom".into())),
+            Some(&AcpSessionChange::Reset("context reset".into())),
             true,
         );
 
