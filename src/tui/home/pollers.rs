@@ -106,7 +106,10 @@ impl HomeView {
             review_closed = true;
         }
         let applied = match &mut self.suggestions_view {
-            Some(view) => view.apply(&mut self.suggestions_feed, &mut polled),
+            Some(view) => {
+                view.retry_pending = self.start_after_trash.is_some();
+                view.apply(&mut self.suggestions_feed, &mut polled)
+            }
             None => false,
         };
         let mut changed = applied || review_closed || blocked_changed;

@@ -245,12 +245,11 @@ fn enter_starts_a_suggestion_and_its_row_leaves_the_group() {
     });
     assert_eq!(next_request(&requests), "load");
     assert!(env.view.new_dialog.is_none(), "no wizard for a plain start");
-    let entry = env
+    let linked = env
         .view
         .suggestions_feed
-        .entry(&("gh".into(), "i0".into()))
-        .unwrap();
-    assert_eq!(entry.started_session.as_deref(), Some("s-new"));
+        .started_session_for_test(&("gh".into(), "i0".into()));
+    assert_eq!(linked.as_deref(), Some("s-new"));
     assert!(
         !suggested_rows(&env)
             .iter()
@@ -295,12 +294,11 @@ fn a_start_the_daemon_says_is_already_started_becomes_open() {
             .status_flash_text()
             .is_some_and(|text| text.contains("Already started"))
     });
-    let entry = env
+    let linked = env
         .view
         .suggestions_feed
-        .entry(&("gh".into(), "i0".into()))
-        .unwrap();
-    assert_eq!(entry.started_session.as_deref(), Some("s-other"));
+        .started_session_for_test(&("gh".into(), "i0".into()));
+    assert_eq!(linked.as_deref(), Some("s-other"));
 }
 
 #[test]

@@ -567,6 +567,8 @@ pub(super) struct SuggestionsView {
     pub(super) strict: bool,
     /// `pre_trust_agent_folders` is on, so a Session blocked on folder trust can start again.
     pub(super) pretrusted: bool,
+    /// Another Try again waits for its Trash, so none can start now.
+    pub(super) retry_pending: bool,
 }
 
 impl SuggestionsView {
@@ -593,6 +595,7 @@ impl SuggestionsView {
             prepare_another: false,
             strict: false,
             pretrusted: false,
+            retry_pending: false,
         }
     }
 
@@ -888,10 +891,11 @@ impl SuggestionsView {
 
     /// Whether Enter on `item` trashes its blocked Session and starts it again:
     /// a one-click start still open at the source, blocked on folder trust,
-    /// with pre-trust on and a daemon that accepts the Trash.
+    /// with pre-trust on, no other retry waiting, and a daemon that accepts the Trash.
     fn retries(&self, store: &SuggestionsFeed, item: &Item, block: Option<MutationBlock>) -> bool {
         block.is_none()
             && self.pretrusted
+            && !self.retry_pending
             && !item.stale
             && item
                 .started_session
@@ -1490,8 +1494,6 @@ pub(super) struct Entry {
     /// The item's `source_url` when it is an http(s) address; core validates
     /// it, this is a second check before anything is opened.
     pub source_url: Option<String>,
-    /// The id of the live Session the item was started as.
-    pub started_session: Option<String>,
     pub dismissed: bool,
     /// Why the last start failed, until the next try.
     pub failed: Option<String>,
@@ -1526,6 +1528,8 @@ pub(super) struct SuggestionsFeed {
     start_key: Option<ItemKey>,
     /// The hooks review on screen: its item, the fingerprint it shows and the origin it was issued for.
     held_trust: Option<(ItemKey, serde_json::Value, Option<Origin>)>,
+    /// The Home group setting a `h` asked for, until the list reloads.
+    home_pending: Option<bool>,
     /// The origin the pre-trust confirmation on screen was opened for.
     held_pre_trust: Option<Origin>,
     /// The last start or prepare that failed, shown on its row on Home and in
@@ -1579,6 +1583,7 @@ impl SuggestionsFeed {
             start_key: None,
             held_trust: None,
             held_pre_trust: None,
+            home_pending: None,
             failed: None,
             blocked_prompts: std::collections::HashMap::new(),
             hooks_changed: false,
@@ -1758,12 +1763,14 @@ impl SuggestionsFeed {
 
     /// Whether Home shows the Suggested group: the daemon's "Show in the sidebar" pref.
     pub(super) fn shown_on_home(&self) -> bool {
-        self.snapshot.as_ref().is_some_and(|s| s.prefs.sidebar)
+        self.home_pending
+            .unwrap_or_else(|| self.snapshot.as_ref().is_some_and(|s| s.prefs.sidebar))
     }
 
     /// Sets that pref through the daemon, then reloads the list.
     pub(super) fn show_on_home(&mut self, shown: bool) {
         let origin = self.origin();
+        self.home_pending = Some(shown);
         self.submit(Req::ShowOnHome { shown, origin });
     }
 
@@ -1874,7 +1881,6 @@ impl SuggestionsFeed {
             preset: self.preset_line(item),
             provider_error: provider.error.as_deref().map(plain),
             source_url: crate::util::is_http_url(&item.source_url).then(|| item.source_url.clone()),
-            started_session: item.started_session.as_ref().map(|s| s.id.clone()),
             dismissed: item.dismissed,
             failed: self
                 .failed
@@ -1908,6 +1914,13 @@ impl SuggestionsFeed {
     #[cfg(test)]
     pub(super) fn is_busy_for_test(&self) -> bool {
         self.busy
+    }
+
+    /// The Session `key` is linked to.
+    #[cfg(test)]
+    pub(super) fn started_session_for_test(&self, key: &ItemKey) -> Option<String> {
+        let item = self.item(key)?;
+        item.started_session.as_ref().map(|s| s.id.clone())
     }
 
     #[cfg(test)]
@@ -2043,7 +2056,6 @@ impl SuggestionsFeed {
         self.snapshot.as_ref()?.pre_trust
     }
 
-    /// Asks the daemon to turn on pre-trust, bound to the list on screen.
     /// Binds the pre-trust confirmation about to open to the list on screen;
     /// false when no list is loaded.
     pub(super) fn hold_pre_trust(&mut self) -> bool {
@@ -2181,7 +2193,10 @@ impl SuggestionsFeed {
         let user = std::mem::take(&mut self.in_flight_user);
         let in_flight_dismiss = self.in_flight_dismiss.take();
         let req_kind = match &res {
-            Res::Snapshot(_) => ResKind::Snapshot,
+            Res::Snapshot(_) => {
+                self.home_pending = None;
+                ResKind::Snapshot
+            }
             Res::Prepared(_) => ResKind::Prepare,
             Res::Started(_) => ResKind::Start,
             _ => ResKind::Other,
@@ -3422,10 +3437,10 @@ mod tests {
             }],
         }));
         let key = ("p".to_string(), "a".to_string());
-        assert_eq!(store.entry(&key).unwrap().started_session, None);
+        assert_eq!(store.started_session_for_test(&key), None);
         store.link_started(&key, "sess-1");
         assert_eq!(
-            store.entry(&key).unwrap().started_session.as_deref(),
+            store.started_session_for_test(&key).as_deref(),
             Some("sess-1")
         );
         assert_eq!(
