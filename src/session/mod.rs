@@ -106,8 +106,8 @@ pub use instance::{
     ManagedResumeCause, PaneObservation, PanePresence, PendingInitialTurn, PluginCreateIdempotency,
     PollerStart, SandboxInfo, SandboxLoginRequired, SandboxLoginUnsupported, SessionBucket,
     SessionGone, StartBlocked, StartOutcome, Status, TerminalInfo, TmuxServerIdentity, View,
-    WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SERVER_UNREACHABLE_ERROR,
-    TMUX_SESSION_GONE_ERROR,
+    WorkspaceInfo, WorkspaceRepo, WorktreeInfo, MAX_INITIAL_PROMPT_BYTES, SESSION_COLORS,
+    TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR,
 };
 pub(crate) use instance::{resolved_agent_for, UNBOUND_STORE_HINT};
 pub(crate) use instance::{
@@ -116,8 +116,8 @@ pub(crate) use instance::{
 };
 pub(crate) use instance::{Handoff, Held, SandboxPin, Unserved};
 pub(crate) use instance::{
-    TerminalHandoffContext, TerminalHandoffIntent, TerminalHandoffKey, TerminalHandoffStage,
-    TerminalHandoffUnbornFence,
+    TerminalHandoffContext, TerminalHandoffIntent, TerminalHandoffKey, TerminalHandoffOutcome,
+    TerminalHandoffStage, TerminalHandoffUnbornFence,
 };
 #[cfg(test)]
 pub(crate) use move_journal::{

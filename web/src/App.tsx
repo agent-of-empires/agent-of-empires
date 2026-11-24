@@ -78,7 +78,6 @@ import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from
 import { PluginPaneBody } from "./components/plugin/PluginPane";
 import { PluginPageView } from "./components/plugin/PluginPageView";
 import { PluginSessionMenu } from "./components/plugin/PluginSessionMenu";
-import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
 import {
   deleteWorkspaceSessions,
   restoreSessions,
@@ -117,6 +116,7 @@ import {
   fetchPlugins,
 } from "./lib/api";
 import type { DeleteSessionOptions, RuntimeCursor, ServerAbout, SettingsResponse } from "./lib/api";
+import { reportFeatureUse, type FeatureUse } from "./lib/featureUse";
 import { autoResumeSettingsHref } from "./lib/autoResumeSettingsHref";
 import { getClientCapabilities } from "./lib/clientCapabilities";
 import { onServerDownChange } from "./lib/connectionState";
@@ -127,6 +127,7 @@ import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay"
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
 import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
 import { parseSessionColorsEnabled, SessionColorsContext } from "./lib/sessionColors";
+import { PanelDefaultsContext, parsePanelDefaults, usePanelDefaults, type PanelDefaults } from "./lib/panelDefaults";
 import { settleSettingsIntrosReadOnly } from "./lib/settingsIntros";
 import { onSettingsChanged } from "./lib/settingsEvents";
 import { parseSystemHealthEnabled, SystemHealthEnabledContext } from "./lib/systemHealth";
@@ -227,6 +228,7 @@ export default function App() {
   const [sessionRowTagMode, setSessionRowTagMode] = useState<SessionRowTagMode>("branch");
   const [sessionColorsEnabled, setSessionColorsEnabled] = useState(true);
   const [systemHealthEnabled, setSystemHealthEnabled] = useState(false);
+  const [panelDefaults, setPanelDefaults] = useState<PanelDefaults>(() => parsePanelDefaults(null));
 
   const applyAppSettings = useCallback((settings: SettingsResponse | null | undefined) => {
     setIdleDecayWindowMs(parseIdleDecayWindowMs(settings));
@@ -234,6 +236,7 @@ export default function App() {
     setSessionRowTagMode(parseSessionRowTagMode(settings));
     setSessionColorsEnabled(parseSessionColorsEnabled(settings));
     setSystemHealthEnabled(parseSystemHealthEnabled(settings));
+    setPanelDefaults(parsePanelDefaults(settings));
   }, []);
 
   // A save can land while an earlier read is in flight; only the latest applies.
@@ -326,13 +329,15 @@ export default function App() {
         <SessionRowTagContext.Provider value={sessionRowTagMode}>
           <SessionColorsContext.Provider value={sessionColorsEnabled}>
             <SystemHealthEnabledContext.Provider value={systemHealthEnabled}>
-              {/* PluginUiProvider must sit above AppContent: AppContent itself reads
-                the plugin UI snapshot (usePluginPanes), so the provider can't live
-                inside its own return. */}
-              <PluginUiProvider>
-                <AppContent loginRequired={loginRequired} onLogout={handleLogout} resolvedTheme={resolvedTheme} />
-              </PluginUiProvider>
-              <ElevationPrompt />
+              <PanelDefaultsContext.Provider value={panelDefaults}>
+                {/* PluginUiProvider must sit above AppContent: AppContent itself reads
+                  the plugin UI snapshot (usePluginPanes), so the provider can't live
+                  inside its own return. */}
+                <PluginUiProvider>
+                  <AppContent loginRequired={loginRequired} onLogout={handleLogout} resolvedTheme={resolvedTheme} />
+                </PluginUiProvider>
+                <ElevationPrompt />
+              </PanelDefaultsContext.Provider>
             </SystemHealthEnabledContext.Provider>
           </SessionColorsContext.Provider>
         </SessionRowTagContext.Provider>
@@ -358,6 +363,15 @@ function isInsideEditable(target: EventTarget | null): boolean {
 }
 
 const noop = (): void => {};
+
+// "snooze" opens the picker, counted when a duration is picked; trash and restore are core.
+const SESSION_STATE_FEATURE: Partial<Record<SessionStateAction, FeatureUse>> = {
+  pin: "pin_toggle",
+  unpin: "pin_toggle",
+  archive: "archive_toggle",
+  unarchive: "archive_toggle",
+  unsnooze: "snooze_toggle",
+};
 
 /** Composes the authenticated dashboard and synchronizes its user-scoped UI state. */
 function AppContent({
@@ -393,6 +407,7 @@ function AppContent({
   useEffect(rememberFileEditLocation, [location]);
   const [searchParams, setSearchParams] = useSearchParams();
   const { settings: webSettings } = useWebSettings();
+  const panelDefaults = usePanelDefaults();
   const sessionMatch = useMatch("/session/:sessionId");
   const settingsRootMatch = useMatch("/settings");
   const settingsTabMatch = useMatch("/settings/:tab");
@@ -554,6 +569,10 @@ function AppContent({
         : undefined,
     [activePluginSort, pluginUiEntries],
   );
+  const selectPluginSort = useCallback((ref: { pluginId: string; entryId: string }) => {
+    reportFeatureUse("sort_plugin");
+    setPluginSortRef(ref);
+  }, []);
   const selectSidebarSortMode = useCallback(
     (mode: SidebarSortMode) => {
       setPluginSortRef(null);
@@ -637,6 +656,7 @@ function AppContent({
   // poll firing mid-PUT can't revert the drag.
   const handleReorderWorkspaces = useCallback(
     (newOrder: string[]) => {
+      reportFeatureUse("row_reorder");
       setWorkspaceOrdering(newOrder);
       markLocalOrderingUpdate();
       void updateWorkspaceOrdering(newOrder);
@@ -672,9 +692,9 @@ function AppContent({
   const selectedFileLine = selectedFile?.line;
   // Dock panes render as tabbed groups (#2437): each dock holds an ordered set
   // of tabs (diff, one-or-more terminals, plugin panes) with one active body.
-  // The tab membership + active tab + terminal count are persisted per session;
-  // dock sizes stay global (Dock/BottomDock own those localStorage keys).
-  // Null until the active Session's row loads, so nothing is seeded from a guess.
+  // A Session shows the Daemon's panel defaults until the user changes its tabs,
+  // which this browser then keeps; dock sizes are per browser (Dock/BottomDock).
+  // Null until the active Session's row loads, so Diff is never seeded from a guess.
   const activeRow = sessions.find((s) => s.id === activeSessionId);
   const activeOutsideRepository = activeRow ? Boolean(activeRow.outside_repository) : null;
   const pluginPanes = usePluginPanes(activeSessionId);
@@ -683,6 +703,11 @@ function AppContent({
     for (const p of pluginPanes) m.set(p.id, p);
     return m;
   }, [pluginPanes]);
+  // With plugin auto-open on, loaded plugin panes show as tabs unless the user closed them.
+  const autoPlugins = useMemo(
+    () => (panelDefaults.plugins ? pluginPanes.map((p) => ({ id: p.id, defaultDock: p.defaultDock })) : []),
+    [panelDefaults.plugins, pluginPanes],
+  );
   // A persisted tab is visible only if its backing pane currently exists: diff
   // and terminals always do; a plugin tab does only while its plugin is loaded.
   const tabAvailable = useCallback(
@@ -699,20 +724,8 @@ function AppContent({
     placeTab,
     toggleKind,
     togglePlugin,
-    syncPlugins,
     setDockCollapsed,
-  } = usePaneLayout(activeSessionId, activeOutsideRepository, tabAvailable);
-
-  // Auto-add newly available plugin panes as tabs in their default dock; the
-  // layout suppresses any the user explicitly closed. With plugin auto-open
-  // off (#3035) an empty list still pins the seeded diff/terminal defaults,
-  // which waits for the Session row so a non-git seed never keeps Diff (#4574).
-  useEffect(() => {
-    if (activeOutsideRepository === null) return;
-    syncPlugins(
-      webSettings.autoOpenPluginPanes ? pluginPanes.map((p) => ({ id: p.id, defaultDock: p.defaultDock })) : [],
-    );
-  }, [pluginPanes, syncPlugins, webSettings.autoOpenPluginPanes, activeOutsideRepository]);
+  } = usePaneLayout(activeSessionId, activeOutsideRepository, panelDefaults, autoPlugins, tabAvailable);
 
   // One-shot lookup from plugin id to its manifest identity (icon name +
   // icon_asset URL), so a pane gets a real identity glyph, up to the plugin's
@@ -789,6 +802,8 @@ function AppContent({
   };
   const togglePaneAny = useCallback(
     (kind: string) => {
+      if (kind === "files") reportFeatureUse("files_pane");
+      if (kind === "agents") reportFeatureUse("agents_pane");
       const defaultDock: DockLocation =
         pluginPaneById.get(kind)?.defaultDock ?? BUILTIN_PANES.find((p) => p.id === kind)?.defaultDock ?? "right";
       if (isPluginPaneId(kind)) togglePlugin(kind, defaultDock);
@@ -941,6 +956,8 @@ function AppContent({
     revision,
     refresh: refreshDiffFiles,
   } = useDiffFiles(activeSessionId, diffPanelActive);
+  // Fetched once per Session even while Diff is closed, so the count is as of opening it.
+  const diffBadge = useCallback((id: string) => (id === "diff" ? diffFiles.length : 0), [diffFiles]);
 
   // Diff-viewer comments (#928). Session-scoped. The
   // banner lives in the diff pane while the inline UI lives inside
@@ -1709,6 +1726,8 @@ function AppContent({
   const handlePickView = useCallback(
     (view: RightPanelView) => {
       if (view !== rightPanelView && !confirmFileEditPanes([null])) return;
+      if (view === "files") reportFeatureUse("files_pane");
+      if (view === "agents") reportFeatureUse("agents_pane");
       transitionKeyboardProxy(activeSessionId, view);
       setRightPanelView(view);
       setPickerOpen(false);
@@ -1923,6 +1942,7 @@ function AppContent({
   const attentionJump = useAttentionJump(sidebarGroups);
 
   const handleJumpToAttention = useCallback(() => {
+    reportFeatureUse("attention_jump");
     const next = nextAttentionSessionId(attentionJump.orderedIds, attentionJump.attention, activeSessionId);
     if (next) handleSelectSession(next);
   }, [attentionJump, activeSessionId, handleSelectSession]);
@@ -2023,6 +2043,8 @@ function AppContent({
         unsnooze: () => setSessionSnooze(id, null),
         trash: () => trashSession(id),
       };
+      const feature = SESSION_STATE_FEATURE[action];
+      if (feature) reportFeatureUse(feature);
       const result = await run[action]();
       if (result) applySession(result);
       else reportError(`Failed to ${action} session`);
@@ -2248,7 +2270,7 @@ function AppContent({
               </div>
             }
             right={
-              <div {...tourAnchor(TOUR_ANCHORS.rightPanel)} className="flex min-h-0 min-w-0 flex-1">
+              <div className="flex min-h-0 min-w-0 flex-1">
                 <DockGroups
                   location="right"
                   groups={rightGroups}
@@ -2717,6 +2739,7 @@ function AppContent({
               paneDescriptor={paneDescriptor}
               isPaneOpen={isPaneOpen}
               onTogglePane={togglePaneAny}
+              closedPaneBadge={diffBadge}
               onOpenHelp={handleOpenHelp}
               onOpenAbout={handleOpenAbout}
               onStartTutorial={tour.startTour}
@@ -2809,7 +2832,7 @@ function AppContent({
                 sortMode={sidebarSortMode}
                 onSortModeChange={selectSidebarSortMode}
                 pluginSortRef={pluginSortRef}
-                onPluginSortChange={setPluginSortRef}
+                onPluginSortChange={selectPluginSort}
                 axis={sidebarAxis}
                 onAxisChange={setSidebarAxis}
               />
@@ -2943,6 +2966,7 @@ function AppContent({
               title="Snooze session"
               onCancel={() => setSnoozeTargetId(null)}
               onPick={(minutes) => {
+                reportFeatureUse("snooze_toggle");
                 const id = snoozeTargetId;
                 setSnoozeTargetId(null);
                 void setSessionSnooze(id, minutes).then((result) => {

@@ -458,12 +458,12 @@ fn unread_dot_yields_to_a_running_status() {
     );
 }
 
-/// Sunk rows never paint the unread dot. Archiving or snoozing an unread
-/// row dismisses it; surfacing it as unread contradicts that. The snooze
+/// Sunk rows never paint the unread dot. Archiving, snoozing, or ignoring an
+/// unread row dismisses it; surfacing it as unread contradicts that. The snooze
 /// case must hold in every sort mode, not just Attention (#2571).
 #[test]
 #[serial]
-fn unread_dot_suppressed_on_archived_and_snoozed() {
+fn unread_dot_suppressed_on_archived_snoozed_and_ignored() {
     use crate::session::config::SortOrder;
     use crate::tui::styles::load_theme;
     use ratatui::backend::TestBackend;
@@ -523,6 +523,23 @@ fn unread_dot_suppressed_on_archived_and_snoozed() {
     assert!(
         !render(&mut env).contains('●'),
         "an archived unread row must not paint the unread dot"
+    );
+
+    env.view.mutate_instance(&id, |inst| {
+        inst.unarchive();
+        inst.ignore();
+    });
+    env.view.flat_items = env.view.build_flat_items();
+    assert!(
+        !render(&mut env).contains('●'),
+        "an ignored unread row must not paint the unread dot"
+    );
+
+    env.view.mutate_instance(&id, |inst| inst.unignore());
+    env.view.flat_items = env.view.build_flat_items();
+    assert!(
+        render(&mut env).contains('●'),
+        "unignoring restores the unread dot"
     );
 }
 
@@ -1038,6 +1055,18 @@ fn test_quit_confirm_without_opt_out_keeps_flag() {
     assert!(env.view.confirm_before_quit);
 }
 
+/// The quit confirm names its keys, and the `q` that opened it accepts it.
+#[test]
+#[serial]
+fn test_quit_confirm_accepts_repeated_quit_key() {
+    let mut env = create_test_env_empty();
+    env.view.show_quit_confirm();
+    let screen = render_home_to_string(&mut env.view, 120, 40);
+    assert!(screen.contains("Press q again to confirm"), "{screen}");
+    let action = env.view.handle_key(key(KeyCode::Char('q')), None);
+    assert_eq!(action, Some(Action::Quit));
+}
+
 /// `?` opens help (a dialog for routing purposes); `Esc`, `?`, `q` and strict mode's `Q`
 /// all close it.
 #[test]
@@ -1499,4 +1528,18 @@ fn untargeted_paste_survives_trash_and_enters_the_next_runnable_composer_once() 
         composer.handle_key(key(KeyCode::Enter)),
         crate::tui::dialogs::DialogResult::Submit(text) if text == "new message"
     ));
+}
+
+/// Restoring a row that is not in the Trash says so instead of doing nothing.
+#[test]
+#[serial]
+fn restore_on_a_live_row_explains_itself() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.select_session_by_id(&id);
+    env.view.restore_selected_from_trash();
+    assert_eq!(
+        env.view.status_flash_text(),
+        Some("Select a session under Trash to restore it")
+    );
 }

@@ -26,6 +26,7 @@ interface Props {
   paneDescriptor: (id: string) => PaneDisplay;
   isPaneOpen: (id: string) => boolean;
   onTogglePane: (id: string) => void;
+  closedPaneBadge?: (id: string) => number;
   onOpenHelp: () => void;
   onOpenAbout: () => void;
   onStartTutorial: () => void;
@@ -69,6 +70,7 @@ export function TopBar({
   paneDescriptor,
   isPaneOpen,
   onTogglePane,
+  closedPaneBadge,
   onOpenHelp,
   onOpenAbout,
   onStartTutorial,
@@ -240,7 +242,13 @@ export function TopBar({
         {activeWorkspace && activeSession && (
           <>
             {/* Desktop: per-pane toggles. */}
-            <ActivityBar paneIds={paneIds} descriptorFor={paneDescriptor} isOpen={isPaneOpen} onToggle={onTogglePane} />
+            <ActivityBar
+              paneIds={paneIds}
+              descriptorFor={paneDescriptor}
+              isOpen={isPaneOpen}
+              onToggle={onTogglePane}
+              closedBadge={closedPaneBadge}
+            />
             <button
               onClick={onToggleDiff}
               className="md:hidden w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors text-text-secondary hover:text-text-primary hover:bg-surface-700/50"

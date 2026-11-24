@@ -1,6 +1,6 @@
 //! Scheduled wakeups and armed monitors.
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use rusqlite::{params, OptionalExtension};
 use tracing::{debug, trace};
 
@@ -10,10 +10,7 @@ use crate::events;
 
 impl EventStore {
     /// The latest `WakeupScheduled`, while its `at` is still in the future.
-    pub fn latest_pending_wakeup(
-        &self,
-        session_id: &str,
-    ) -> Option<(DateTime<Utc>, Option<String>)> {
+    pub fn latest_pending_wakeup(&self, session_id: &str) -> Option<(Timestamp, Option<String>)> {
         let (_, json) = events::latest_by_discriminant(
             &self.conn(),
             &self.schema,
@@ -25,7 +22,7 @@ impl EventStore {
         else {
             return None;
         };
-        let now = Utc::now();
+        let now = Timestamp::now();
         if at <= now {
             return None;
         }
@@ -33,7 +30,7 @@ impl EventStore {
             target: "acp.event_store",
             session = %session_id,
             wake_at = %at,
-            in_secs = (at - now).num_seconds(),
+            in_secs = (at - now).whole_seconds(),
             "latest_pending_wakeup: still pending"
         );
         Some((at, reason))
@@ -96,7 +93,7 @@ impl EventStore {
         &self,
         session_id: &str,
         prompt_seq: u64,
-    ) -> Option<(DateTime<Utc>, Option<String>)> {
+    ) -> Option<(Timestamp, Option<String>)> {
         let conn = self.conn();
         let prompt_seq_i64 = prompt_seq as i64;
         let Some(prompt_created_ms) = conn
@@ -145,7 +142,7 @@ impl EventStore {
         else {
             return None;
         };
-        let at_ms = at.timestamp_millis();
+        let at_ms = at.as_millis();
         if at_ms > prompt_created_ms {
             debug!(
                 target: "acp.event_store",
@@ -199,7 +196,7 @@ mod tests {
 
     fn wakeup(secs_from_now: i64, reason: Option<&str>) -> Event {
         Event::WakeupScheduled {
-            at: Utc::now() + chrono::Duration::seconds(secs_from_now),
+            at: Timestamp::now() + crate::time::Duration::seconds(secs_from_now),
             reason: reason.map(Into::into),
         }
     }
@@ -219,7 +216,7 @@ mod tests {
             ],
         );
         let (at, reason) = store.latest_pending_wakeup("s-1").expect("still pending");
-        assert!((at - Utc::now()).num_seconds() > 60);
+        assert!((at - Timestamp::now()).whole_seconds() > 60);
         assert_eq!(reason.as_deref(), Some("rescheduled"));
 
         store.record("s-2", 1, &wakeup(-30, None)).unwrap();

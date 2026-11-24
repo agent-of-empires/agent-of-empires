@@ -44,8 +44,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::time::Timestamp;
 use anyhow::{bail, Context, Result};
-use chrono::Utc;
 
 use super::builder;
 use super::instance::{WorkspaceInfo, WorkspaceRepo};
@@ -694,7 +694,7 @@ pub fn execute(instance: &super::Instance, plan: AttachPlan) -> Result<PreparedA
             .workspace_info
             .as_ref()
             .map(|ws| ws.created_at)
-            .unwrap_or_else(Utc::now),
+            .unwrap_or_else(Timestamp::now),
         cleanup_on_delete: true,
     };
 
@@ -1218,7 +1218,7 @@ mod tests {
                 base_branch: None,
                 base_branch_override: None,
             }],
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             cleanup_on_delete: true,
         });
         inst
@@ -1249,8 +1249,8 @@ mod tests {
                 |i| i.status = Status::Deleting,
                 "being created or is being deleted",
             ),
-            (|i| i.trashed_at = Some(Utc::now()), "in the trash"),
-            (|i| i.archived_at = Some(Utc::now()), "archived"),
+            (|i| i.trashed_at = Some(Timestamp::now()), "in the trash"),
+            (|i| i.archived_at = Some(Timestamp::now()), "archived"),
             (|i| i.status = Status::Running, "not a git repository"),
         ];
         for (setup, want) in cases {
@@ -1363,7 +1363,7 @@ mod tests {
                 base_branch: None,
                 base_branch_override: None,
             }],
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             cleanup_on_delete: true,
         });
         // A single-repo workspace with a bound conversation still appends: its
@@ -1446,7 +1446,7 @@ mod tests {
             super::plan(&current, "attach-append", &third, ExistingBranch::Refuse).unwrap();
         storage
             .update(|rows, _| {
-                rows[0].trashed_at = Some(Utc::now());
+                rows[0].trashed_at = Some(Timestamp::now());
                 Ok(())
             })
             .unwrap();
@@ -1587,7 +1587,7 @@ mod tests {
             branch: "featx".to_string(),
             main_repo_path: backend.to_string_lossy().to_string(),
             managed_by_aoe: true,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             base_branch: None,
         });
 
@@ -1653,7 +1653,7 @@ mod tests {
             branch: "featx".to_string(),
             main_repo_path: backend.to_string_lossy().to_string(),
             managed_by_aoe: true,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             base_branch: Some("develop".to_string()),
         });
         inst.base_branch_override = Some("upstream/main".to_string());
@@ -1700,7 +1700,7 @@ mod tests {
             branch: "feature/abc".to_string(),
             main_repo_path: "/tmp/src/backend".to_string(),
             managed_by_aoe: true,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             base_branch: None,
         });
         // (session, repo, leaf, expected error fragment; None = accepted)
@@ -1763,7 +1763,7 @@ mod tests {
             branch: "fix/xyz".to_string(),
             main_repo_path: "/tmp/src/backend".to_string(),
             managed_by_aoe: true,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             base_branch: None,
         });
         assert_eq!(session_branch(&wt), Some("fix/xyz"));

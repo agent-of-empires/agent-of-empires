@@ -10,6 +10,7 @@ import {
 } from "react";
 import { X } from "lucide-react";
 import { createPortal } from "react-dom";
+import { useFocusTrap } from "../hooks/useFocusTrap";
 
 // Below Tailwind's `md`, where `sheetOnMobile` docks the menu as a sheet.
 const MOBILE_QUERY = "(max-width: 767.98px)";
@@ -71,6 +72,8 @@ export function ContextMenu({
     };
   }, [modal, menuRef, returnFocusTo]);
 
+  // Modal sheet: Tab and Shift+Tab wrap instead of leaving for the page behind.
+  useFocusTrap(() => menuRef.current, { active: modal });
   const swipe = useSwipeToClose(menuRef, modal ? onClose : undefined);
 
   // `!` overrides the pointer position and height cap set inline.
@@ -91,21 +94,6 @@ export function ContextMenu({
           if (e.key === "Escape" && onClose) {
             e.preventDefault();
             onClose();
-          }
-          // Modal sheet: Tab and Shift+Tab wrap instead of leaving for the page behind.
-          if (e.key === "Tab" && modal) {
-            const items = [...(menuRef.current?.querySelectorAll<HTMLElement>("button:not([disabled])") ?? [])].filter(
-              (el) => !el.closest("[hidden]"),
-            );
-            const first = items[0];
-            const last = items[items.length - 1];
-            const wrapTo = e.shiftKey
-              ? document.activeElement === first && last
-              : document.activeElement === last && first;
-            if (wrapTo) {
-              e.preventDefault();
-              wrapTo.focus();
-            }
           }
         }}
         className={`fixed z-50 bg-surface-800 border border-surface-700 rounded-lg shadow-lg py-1 ${minWidth} overflow-y-auto${sheet}`}

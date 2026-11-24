@@ -25,6 +25,19 @@ impl CreateHookFailed {
             from_repo,
         }
     }
+
+    /// The error for a failed on_create run. A cancelled create stays a cancel, so it is
+    /// answered and kept out of the replay map as one.
+    pub(crate) fn wrap(
+        error: anyhow::Error,
+        origin_hint: Option<&str>,
+        from_repo: bool,
+    ) -> anyhow::Error {
+        if error.is::<crate::server::session_service::CreationCancelled>() {
+            return error;
+        }
+        Self::new(error, origin_hint, from_repo).into()
+    }
 }
 
 /// Hard cap on one `idempotency_key`'s length, so a request cannot persist an
@@ -204,7 +217,7 @@ pub(super) async fn resolve_canonical_fork_seed(
                 super::lifecycle::lifecycle_rejection(state, &error)
                     .unwrap_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())
             })?;
-        if source.has_fresh_lifecycle_reservation(chrono::Utc::now()) {
+        if source.has_fresh_lifecycle_reservation(crate::time::Timestamp::now()) {
             return Err((
                 StatusCode::CONFLICT,
                 crate::daemon::ApiErrorCode::LifecycleLocked.header(),
@@ -231,7 +244,7 @@ pub(super) async fn resolve_canonical_fork_seed(
         .iter()
         .find(|row| row.id == source_id)
         .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
-    if source.has_fresh_lifecycle_reservation(chrono::Utc::now()) {
+    if source.has_fresh_lifecycle_reservation(crate::time::Timestamp::now()) {
         return Err((
             StatusCode::CONFLICT,
             crate::daemon::ApiErrorCode::LifecycleLocked.header(),
@@ -473,7 +486,12 @@ pub async fn review_creation_trust(
             anyhow::ensure!(!profile.is_empty(), "Missing profile");
             let profile = crate::session::resolve_existing_profile(&profile)?;
             let path = std::path::Path::new(&body.path);
-            anyhow::ensure!(body.scratch || path.is_dir(), "Project path does not exist");
+            if !body.scratch && !path.is_dir() {
+                return Err(crate::session::builder::BuildRefusal::WorkingDirMissing(
+                    body.path.clone(),
+                )
+                .into());
+            }
             let base = crate::session::resolve_config(&profile)?.hooks;
             let trust = read_creation_trust(path, body.scratch)?;
             let fingerprint = creation_trust_fingerprint(&base, &trust);
@@ -533,6 +551,15 @@ pub async fn review_creation_trust(
         Ok(Ok(review)) => Json(review).into_response(),
         Ok(Err(error)) => {
             tracing::warn!(target: "http.api.sessions", error = %error, "Creation trust review refused");
+            if matches!(
+                error.downcast_ref(),
+                Some(crate::session::builder::BuildRefusal::WorkingDirMissing(_))
+            ) {
+                return crate::server::api::text_error_with_code_header(
+                    crate::daemon::ApiErrorCode::WorkingDirMissing,
+                    error.to_string(),
+                );
+            }
             (StatusCode::BAD_REQUEST, error.to_string()).into_response()
         }
         Err(error) => {
@@ -660,6 +687,7 @@ pub(crate) fn run_create_hooks(
     instance: &mut Instance,
     plan: &CreateHookPlan,
     store: &dyn crate::session::SessionStore,
+    cancel: &tokio_util::sync::CancellationToken,
     progress: Option<&dyn Fn(crate::session::config::repo_config::HookProgress)>,
 ) -> anyhow::Result<()> {
     use crate::session::config::repo_config;
@@ -670,7 +698,12 @@ pub(crate) fn run_create_hooks(
 
     let hook_env = repo_config::lifecycle_env_vars(instance);
     if instance.sandbox_info.is_some() {
-        instance.ensure_container_in(store, None)?;
+        // The create's cancel reaches a missing image's pull, which may be shared.
+        instance
+            .ensure_container_with_hook_in(store, cancel, None, Instance::mint_before_start_env)
+            .map_err(|error| {
+                crate::server::session_service::CreationCancelled::or_error(cancel, error)
+            })?;
         let workdir = instance.hook_container_workdir(plan.on_create_from_repo);
         if let Some(sandbox) = instance.sandbox_info.as_ref() {
             repo_config::execute_hooks_in_container_streamed(
@@ -813,6 +846,7 @@ pub async fn create_session(
     axum::extract::Query(query): axum::extract::Query<CreateSessionQuery>,
     local: Option<axum::Extension<crate::server::principal::Principal>>,
     request_id: Option<axum::Extension<crate::server::router::RequestId>>,
+    headers: axum::http::HeaderMap,
     body: Result<Json<CreateSessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     let local_owner = crate::server::principal::authorize(
@@ -829,20 +863,33 @@ pub async fn create_session(
         Err(rej) => return rej.into_response(),
     };
     let wait_ready = query.wait.as_deref() == Some("ready");
-    create_session_with(state, local_owner, &reference, wait_ready, body, None).await
+    let origin = crate::server::api::prompt_origin(&headers);
+    create_session_with(
+        state,
+        local_owner,
+        &reference,
+        wait_ready,
+        body,
+        None,
+        origin,
+    )
+    .await
 }
 
 /// `POST /api/sessions` once the caller is authorized and the body parsed, for a surface
 /// that builds the body itself. `local_owner` sees hook failure detail, `reference` names
 /// the request in failure logs and responses, `wait_ready` is `?wait=ready`, and
-/// `initial_turn` is a structured session's first prompt, delivered once its worker runs.
+/// `initial_turn` is a structured session's first prompt and its origin, delivered once its
+/// worker runs. `body_prompt_origin` attributes the body's own `initial_prompt` when no
+/// `initial_turn` is given.
 pub(crate) async fn create_session_with(
     state: Arc<AppState>,
     local_owner: bool,
     reference: &str,
     wait_ready: bool,
     body: CreateSessionBody,
-    initial_turn: Option<String>,
+    initial_turn: Option<(String, crate::daemon::PromptOrigin)>,
+    body_prompt_origin: crate::daemon::PromptOrigin,
 ) -> axum::response::Response {
     if let Some(key) = body.idempotency_key.as_deref() {
         if key.is_empty() || key.len() > IDEMPOTENCY_KEY_MAX_LEN {
@@ -852,6 +899,29 @@ pub(crate) async fn create_session_with(
                 format!("idempotency_key must be 1-{IDEMPOTENCY_KEY_MAX_LEN} characters"),
             );
         }
+    }
+
+    if body
+        .initial_prompt
+        .as_deref()
+        .is_some_and(|prompt| prompt.trim().is_empty())
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "initial_prompt must not be blank",
+        );
+    }
+    if body
+        .initial_prompt
+        .as_deref()
+        .is_some_and(|prompt| prompt.len() > crate::session::MAX_INITIAL_PROMPT_BYTES)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "initial_prompt exceeds 64 KiB",
+        );
     }
 
     // Idempotency first: a known key is answered from its result, replayed failure or
@@ -923,6 +993,17 @@ pub(crate) async fn create_session_with(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
                 "Internal server error",
+            );
+        }
+        Err(error)
+            if matches!(
+                error.downcast_ref(),
+                Some(crate::session::builder::BuildRefusal::WorkingDirMissing(_))
+            ) =>
+        {
+            return crate::server::api::api_error_with_code_header(
+                crate::daemon::ApiErrorCode::WorkingDirMissing,
+                error.to_string(),
             );
         }
         Err(error) => {
@@ -1054,8 +1135,12 @@ pub(crate) async fn create_session_with(
                 "pull_latest_image requires sandbox",
             );
         }
-        if let Some(refusal) =
-            crate::server::api::create_pull_refusal(&state, body.sandbox_image.as_deref()).await
+        if let Some(refusal) = crate::server::api::create_pull_refusal(
+            &state,
+            body.sandbox_image.as_deref(),
+            body.profile.as_deref(),
+        )
+        .await
         {
             return refusal;
         }
@@ -1406,6 +1491,10 @@ pub(crate) async fn create_session_with(
         );
     }
 
+    let initial_turn = initial_turn.or(body
+        .initial_prompt
+        .take()
+        .map(|text| (text, body_prompt_origin)));
     let profile = body.profile.unwrap_or(default_profile);
     // `body.profile` is the caller's authority when it names one; otherwise
     // the served profile resolved above, which is also what the validation
@@ -1496,7 +1585,14 @@ pub(crate) async fn create_session_with(
                 panic_hook::fire(key.as_deref()).await;
                 task_state
                     .session_service
-                    .create_structured_session(spec, None, None, initial_turn.as_deref())
+                    .create_structured_session(
+                        spec,
+                        None,
+                        None,
+                        initial_turn
+                            .as_ref()
+                            .map(|(text, origin)| (text.as_str(), *origin)),
+                    )
                     .await
             },
             &task_state.create_progress,
@@ -1587,12 +1683,14 @@ pub(crate) async fn create_session_with(
     }
 }
 
-fn create_failure_response(
+pub(super) fn create_failure_response(
     failure: crate::server::create_progress::CreateFailure,
 ) -> axum::response::Response {
     let code = [
         crate::daemon::ApiErrorCode::AgentHooksNotApproved,
         crate::daemon::ApiErrorCode::CreateOutcomeUnknown,
+        crate::daemon::ApiErrorCode::WorkingDirMissing,
+        crate::daemon::ApiErrorCode::BranchNotFound,
     ]
     .into_iter()
     .find(|code| failure.code == code.as_str());
@@ -1629,12 +1727,29 @@ pub(super) async fn run_create_task<T>(
         let stage = progress.stage();
         if let Some(failure) = create_failure(e, stage, reference) {
             log_create_failure(e, stage, reference);
-            if let Some(key) = key {
+            if let Some(key) = key.filter(|_| !lost_shared_pull(e)) {
                 failures.record_failure(key, failure);
             }
         }
     }
     result
+}
+
+/// A create whose image pull was cancelled for everyone provisioned nothing, so a same-key
+/// retry may run again once the image can be pulled.
+fn lost_shared_pull(e: &anyhow::Error) -> bool {
+    use crate::containers::error::DockerError;
+    create_cause(e).0.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::server::session_spawn::ImageUpdateFailed>()
+            .is_some_and(|failed| {
+                failed.failure == crate::server::session_spawn::UpdateFailure::Cancelled
+            })
+            || matches!(
+                cause.downcast_ref::<DockerError>(),
+                Some(DockerError::PullCancelled(_))
+            )
+    })
 }
 
 pub(super) fn log_create_failure(
@@ -1803,6 +1918,16 @@ async fn created_session_response(
     crate::server::runtime::mutation_response(&snapshot.value.cursor, (status, Json(response)))
 }
 
+/// What a create failed on, seen through a failed on_create hook, which keeps its cause as a
+/// field, not a source, so `chain()` alone doesn't reach it. Container setup, and with it a
+/// missing image's pull, runs inside the hooks.
+fn create_cause(e: &anyhow::Error) -> (&anyhow::Error, Option<&CreateHookFailed>) {
+    let hook = e
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<CreateHookFailed>());
+    (hook.map_or(e, |hook| &hook.cause), hook)
+}
+
 /// Expose typed creation failures without leaking raw output or internal paths.
 pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, String) {
     if let Some(duplicate) = e.downcast_ref::<crate::server::session_spawn::CliDuplicateSession>() {
@@ -1812,12 +1937,8 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, S
     use crate::session::builder::BuildRefusal;
     use crate::session::config::repo_config::HookFailed;
 
-    // A failed on_create hook keeps its cause, so its typed parts can still be found.
-    let create_hook = e
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<CreateHookFailed>());
+    let (e, create_hook) = create_cause(e);
     let from_repo = create_hook.is_some_and(|hook| hook.from_repo);
-    let e = create_hook.map_or(e, |hook| &hook.cause);
     let runtime = || crate::containers::get_container_runtime().display_name();
     let unavailable = |why: String| ("sandbox_unavailable", why);
     for cause in e.chain() {
@@ -1847,9 +1968,26 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, S
         if let Some(failed) =
             cause.downcast_ref::<crate::server::session_spawn::ImageUpdateFailed>()
         {
+            // The banner's wording for the same pull failure; the runtime's output is added for local owners.
+            let message = match failed.failure {
+                crate::server::session_spawn::UpdateFailure::Cancelled => format!(
+                    "Couldn't pull the latest Sandbox image {}: {}.",
+                    failed.image,
+                    crate::server::session_spawn::CANCELLED_UPDATE
+                ),
+                crate::server::session_spawn::UpdateFailure::Pull(reason) => reason.user_text(),
+            };
+            return ("sandbox_image_update_failed", message);
+        }
+        if let Some(both) =
+            cause.downcast_ref::<crate::containers::sandbox_image::AutomaticImagesUnavailable>()
+        {
             return (
-                "sandbox_image_update_failed",
-                format!("Couldn't pull the latest Sandbox image {}.", failed.image),
+                "sandbox_image_pull_failed",
+                format!(
+                    "Couldn't pull the Sandbox image {} or its minor tag {}.",
+                    both.exact, both.minor
+                ),
             );
         }
         match cause.downcast_ref::<DockerError>() {
@@ -1867,14 +2005,21 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, S
                     format!("Couldn't pull the Sandbox image {image}."),
                 )
             }
+            // A missing image's pull, cancelled for everyone while this create waited on it.
+            Some(DockerError::PullCancelled(image)) => {
+                return (
+                    "sandbox_image_pull_failed",
+                    format!("Couldn't pull the Sandbox image {image}: the pull was cancelled."),
+                )
+            }
             _ => {}
         }
     }
     if let Some(git_err) = e.chain().find_map(|c| c.downcast_ref::<GitError>()) {
         match git_err {
+            GitError::BranchNotFound(_) => return ("branch_not_found", git_err.to_string()),
             GitError::WorktreeAlreadyExists(_)
             | GitError::BranchAlreadyCheckedOut(_)
-            | GitError::BranchNotFound(_)
             | GitError::InvalidTemplate(_)
             | GitError::NotAGitRepo => return ("create_failed", git_err.to_string()),
             // Raw command output / libgit2 / IO: not safe to expose.

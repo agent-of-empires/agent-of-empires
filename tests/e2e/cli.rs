@@ -2554,16 +2554,14 @@ fn cli_review_boundary_repo_base_from_a_linked_worktree() {
 #[test]
 #[parallel]
 fn cli_sandbox_images_preserve_normalization_and_default_fallback() {
+    // Blank resolves to the automatic image; its tag policy is tested where it is derived.
+    let automatic = agent_of_empires::containers::sandbox_image::automatic_sandbox_image();
     for (flag, configured, expected) in [
         (Some(" ubuntu:latest "), "ignored:latest", "ubuntu:latest"),
         (None, " ubuntu:latest ", "ubuntu:latest"),
-        (None, "   ", "ghcr.io/agent-of-empires/aoe-sandbox:latest"),
+        (None, "   ", automatic),
         (Some("   "), " custom:latest ", "custom:latest"),
-        (
-            Some(""),
-            "   ",
-            "ghcr.io/agent-of-empires/aoe-sandbox:latest",
-        ),
+        (Some(""), "   ", automatic),
     ] {
         let mut h = TuiTestHarness::new("cli_sandbox_image");
         let bin = h.install_path_command("docker");

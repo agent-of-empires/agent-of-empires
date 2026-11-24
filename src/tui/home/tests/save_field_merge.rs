@@ -54,7 +54,7 @@ async fn canonical_archive_merges_peer_fields_rows_groups_and_timestamp() {
     );
     assert_eq!(view.get_instance(&victim.id).unwrap().extra_args, "--peer");
     assert!(view.get_instance(&peer.id).is_some());
-    view.reload().unwrap();
+    view.reload();
     assert_eq!(payload_bytes("test"), committed_bytes);
 }
 
@@ -227,7 +227,7 @@ async fn canonical_profile_collision_rejects_before_any_effect_or_partial_commit
                     .to_string_lossy()
                     .into_owned(),
                 managed_by_aoe: true,
-                created_at: chrono::Utc::now(),
+                created_at: crate::time::Timestamp::now(),
                 base_branch: None,
             });
         }
@@ -294,7 +294,7 @@ async fn canonical_peer_deleted_rows_and_cleared_sid_are_not_resurrected() {
         .agent_session_id
         .is_none());
     assert_eq!(view.get_instance(&victim.id).unwrap().group_path, "changed");
-    view.reload().unwrap();
+    view.reload();
     assert_eq!(payload_bytes("test"), bytes);
 }
 
@@ -312,7 +312,7 @@ async fn canonical_refused_restart_preserves_launch_fields_and_snooze() {
     victim.lifecycle_reservation = Some(LifecycleReservation {
         op: LifecycleOperation::Launch,
         generation: 1,
-        at: chrono::Utc::now(),
+        at: crate::time::Timestamp::now(),
     });
     seed_profile("test", std::slice::from_ref(&victim));
     let state = native_state(&["test"]).await;
@@ -402,7 +402,7 @@ async fn native_delete_admission_does_not_take_lifecycle_flock_and_only_snapshot
             apply_published(&mut view, &state).await;
         }
         assert!(view.get_instance(&victim.id).is_none());
-        view.reload().unwrap();
+        view.reload();
         assert_eq!(payload_bytes("test"), committed);
     }
 }
