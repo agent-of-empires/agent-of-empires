@@ -974,7 +974,17 @@ impl DaemonClient {
                 None
             }
         };
-        let mut response = self.execute(request, expected_peer).await?;
+        let response = self.execute(request, expected_peer).await?;
+        self.check_response(response, creating, expected_epoch.as_ref())
+            .await
+    }
+
+    async fn check_response(
+        &self,
+        mut response: reqwest::Response,
+        creating: bool,
+        expected_epoch: Option<&HeaderValue>,
+    ) -> Result<reqwest::Response, DaemonClientError> {
         let status = response.status();
         if !status.is_success() {
             let code = ApiErrorCode::from_headers(status, response.headers(), false);
@@ -989,10 +999,7 @@ impl DaemonClient {
                         | ApiErrorCode::PurgeFailed
                 )
             ) {
-                if let Some(epoch) = expected_epoch
-                    .as_ref()
-                    .and_then(|value| value.to_str().ok())
-                {
+                if let Some(epoch) = expected_epoch.and_then(|value| value.to_str().ok()) {
                     if code == Some(ApiErrorCode::PurgeFailed)
                         || code.is_some_and(|code| code.sandbox_migration_message().is_some())
                         || response.headers().contains_key(RUNTIME_EPOCH_HEADER)
@@ -1183,6 +1190,7 @@ pub async fn decode_json<T: serde::de::DeserializeOwned>(
     decode_json_bounded(response, MAX_SUCCESS_BODY_BYTES).await
 }
 
+/// Decode JSON with a byte limit, capped at the largest representable byte buffer.
 pub async fn decode_json_bounded<T: serde::de::DeserializeOwned>(
     mut response: reqwest::Response,
     limit: usize,
@@ -1206,6 +1214,7 @@ async fn read_bounded_body(
     response: &mut reqwest::Response,
     limit: usize,
 ) -> Result<Vec<u8>, DaemonClientError> {
+    let limit = limit.min(isize::MAX as usize);
     tokio::time::timeout_at(transport::response_deadline(response), async {
         if response
             .content_length()
@@ -1218,7 +1227,10 @@ async fn read_bounded_body(
             .and_then(|length| usize::try_from(length).ok())
             .unwrap_or_default()
             .min(limit);
-        let mut bytes = Vec::with_capacity(capacity);
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(capacity)
+            .map_err(|_| DaemonClientError::ResponseTooLarge { limit })?;
         while let Some(chunk) = response.chunk().await.map_err(transport::request_error)? {
             if chunk.len() > limit.saturating_sub(bytes.len()) {
                 return Err(DaemonClientError::ResponseTooLarge { limit });

@@ -172,7 +172,7 @@ async fn execute_unix(
 }
 
 #[derive(Clone, Copy)]
-struct OperationDeadline(tokio::time::Instant);
+pub(super) struct OperationDeadline(pub(super) tokio::time::Instant);
 
 pub fn response_deadline(response: &reqwest::Response) -> tokio::time::Instant {
     response

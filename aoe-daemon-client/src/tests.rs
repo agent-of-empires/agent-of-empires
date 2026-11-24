@@ -654,6 +654,13 @@ async fn committed_mutation_errors_require_finite_code_and_matching_cursor() {
     ] {
         let purge = code == "purge_failed";
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut headers = vec![(ERROR_CODE_HEADER, code)];
+        if epoch != "absent" {
+            headers.push((RUNTIME_EPOCH_HEADER, epoch));
+        }
+        if revision != "absent" {
+            headers.push((RUNTIME_REVISION_HEADER, revision));
+        }
         let base = serve_mutation_once(
             if purge {
                 "/api/sessions/{id}"
@@ -661,15 +668,7 @@ async fn committed_mutation_errors_require_finite_code_and_matching_cursor() {
                 "/api/sessions/{id}/start"
             },
             status,
-            if epoch == "absent" {
-                vec![(ERROR_CODE_HEADER, code)]
-            } else {
-                vec![
-                    (ERROR_CODE_HEADER, code),
-                    (RUNTIME_EPOCH_HEADER, epoch),
-                    (RUNTIME_REVISION_HEADER, revision),
-                ]
-            },
+            headers,
             "secret-body",
             tx,
         )

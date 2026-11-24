@@ -225,38 +225,6 @@ async fn unix_requests_honor_their_operation_deadline() {
     }
 }
 
-async fn serve_deadline_body<S>(
-    mut stream: S,
-    headers_after: Duration,
-    chunks: usize,
-    chunk_after: Duration,
-) where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut request = Vec::new();
-    let mut buf = [0; 1024];
-    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-        let count = stream.read(&mut buf).await.unwrap();
-        assert!(count > 0);
-        request.extend_from_slice(&buf[..count]);
-    }
-    tokio::time::sleep(headers_after).await;
-    stream
-        .write_all(
-            format!("HTTP/1.1 200 OK\r\nContent-Length: {chunks}\r\nConnection: close\r\n\r\n")
-                .as_bytes(),
-        )
-        .await
-        .unwrap();
-    for _ in 0..chunks {
-        tokio::time::sleep(chunk_after).await;
-        if stream.write_all(b" ").await.is_err() {
-            break;
-        }
-    }
-}
-
 #[tokio::test(start_paused = true)]
 async fn extended_unix_body_keeps_its_operation_deadline() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -321,132 +289,158 @@ async fn extended_unix_body_keeps_its_operation_deadline() {
     server.await.unwrap();
 }
 
-#[tokio::test]
-async fn body_helpers_share_deadlines_without_shortening_long_operations() {
-    for unix in [true, false] {
-        for (headers_ms, chunks, chunk_ms, timeout_ms, expires) in [
-            (0, 2, 0, 5000, false),
-            (350, 1, 300, 500, true),
-            (0, 10, 100, 500, true),
-        ] {
-            for consumer in 0..3 {
-                let temp = tempfile::tempdir().unwrap();
-                let path = temp.path().join("api.sock");
-                let (url, server) = if unix {
-                    let listener = tokio::net::UnixListener::bind(&path).unwrap();
-                    let server = tokio::spawn(async move {
-                        let (stream, _) = listener.accept().await.unwrap();
-                        serve_deadline_body(
-                            stream,
-                            Duration::from_millis(headers_ms),
-                            chunks,
-                            Duration::from_millis(chunk_ms),
-                        )
-                        .await;
-                    });
-                    ("http://localhost/operation".to_owned(), server)
-                } else {
-                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                    let url = format!("http://{}/operation", listener.local_addr().unwrap());
-                    let server = tokio::spawn(async move {
-                        let (stream, _) = listener.accept().await.unwrap();
-                        serve_deadline_body(
-                            stream,
-                            Duration::from_millis(headers_ms),
-                            chunks,
-                            Duration::from_millis(chunk_ms),
-                        )
-                        .await;
-                    });
-                    (url, server)
-                };
-                let http = reqwest::Client::new();
-                let request = http
-                    .get(&url)
-                    .timeout(Duration::from_millis(timeout_ms))
-                    .build()
-                    .unwrap();
-                let mut response = if unix {
-                    execute_unix_test(&path, request).await
-                } else {
-                    execute(&http, request).await
-                }
-                .unwrap();
-                let client = DaemonClient::new(&url, None).unwrap();
-                let result = match consumer {
-                    0 => read_bounded_body(&mut response, 1024).await.map(|_| ()),
-                    1 => discard_bounded_body(&mut response).await,
-                    _ => client.read_error_body(&mut response).await.map(|_| ()),
-                };
-                assert_eq!(
-                    matches!(result, Err(DaemonClientError::Timeout)),
-                    expires,
-                    "unix={unix}, consumer={consumer}, chunks={chunks}, result={result:?}"
-                );
-                if !expires {
-                    result.unwrap();
-                }
-                drop(response);
-                server.abort();
-                let _ = server.await;
-            }
-        }
-    }
+fn stalled_response(
+    status: StatusCode,
+    deadline: tokio::time::Instant,
+) -> (
+    reqwest::Response,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let polled = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&polled);
+    let body = reqwest::Body::wrap_stream(futures_util::stream::poll_fn(move |_| {
+        observed.store(true, Ordering::Relaxed);
+        std::task::Poll::<Option<Result<hyper::body::Bytes, std::io::Error>>>::Pending
+    }));
+    let mut response = hyper::Response::new(body);
+    *response.status_mut() = status;
+    response
+        .extensions_mut()
+        .insert(OperationDeadline(deadline));
+    (response.into(), polled)
 }
 
 #[tokio::test]
-async fn create_hook_error_body_uses_the_request_deadline_and_bad_json_is_decode() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    for malformed in [false, true] {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("api.sock");
-        let listener = tokio::net::UnixListener::bind(&path).unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = [0; 4096];
-            let mut used = 0;
-            while !request[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-                let count = stream.read(&mut request[used..]).await.unwrap();
-                assert!(count > 0, "request must contain complete HTTP headers");
-                used += count;
-            }
-            if malformed {
-                stream
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{",
-                    )
-                    .await
-                    .unwrap();
-            } else {
-                stream.write_all(b"HTTP/1.1 400 Bad Request\r\nAoE-Error-Code: create_hook_failed\r\nContent-Length: 100\r\n\r\n").await.unwrap();
-                let mut eof = [0];
-                let _ = stream.read(&mut eof).await;
-            }
-        });
-        let client = unix_client(&path).unwrap();
-        let request = client
-            .http
-            .get("http://localhost/operation")
-            .timeout(Duration::from_millis(100));
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            client.request_json::<serde_json::Value>(request),
-        )
-        .await
-        .unwrap();
-        if malformed {
-            assert!(matches!(
-                result,
-                Err(DaemonClientError::AuthenticatedDecode)
-            ));
-        } else {
-            assert!(
-                matches!(result, Err(DaemonClientError::Timeout)),
-                "result={result:?}"
-            );
+async fn bounded_decoder_rejects_an_unrepresentable_body_before_reading() {
+    use hyper::body::{Body, Bytes, Frame, SizeHint};
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    struct Oversize;
+
+    impl Body for Oversize {
+        type Data = Bytes;
+        type Error = io::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+            panic!("oversized body should not be polled");
         }
-        server.await.unwrap();
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact(isize::MAX as u64 + 1)
+        }
     }
+
+    let response = hyper::Response::new(reqwest::Body::wrap(Oversize)).into();
+    let result = decode_json_bounded::<serde_json::Value>(response, usize::MAX).await;
+    assert!(matches!(
+        result,
+        Err(DaemonClientError::ResponseTooLarge { limit }) if limit == isize::MAX as usize
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn body_helpers_enforce_the_attached_deadline_without_a_transport_timer() {
+    use std::sync::atomic::Ordering;
+
+    let client = DaemonClient::new("http://localhost", None).unwrap();
+    for consumer in 0..3 {
+        let budget = DEFAULT_TIMEOUT + Duration::from_secs(10);
+        let (mut response, polled) =
+            stalled_response(StatusCode::OK, tokio::time::Instant::now() + budget);
+        let read = async {
+            match consumer {
+                0 => read_bounded_body(&mut response, 1024).await.map(|_| ()),
+                1 => discard_bounded_body(&mut response).await,
+                _ => client.read_error_body(&mut response).await.map(|_| ()),
+            }
+        };
+        tokio::pin!(read);
+        assert!(futures_util::poll!(&mut read).is_pending());
+        assert!(polled.load(Ordering::Relaxed));
+        tokio::time::advance(budget - Duration::from_secs(1)).await;
+        assert!(
+            futures_util::poll!(&mut read).is_pending(),
+            "consumer={consumer}"
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(
+            matches!(
+                futures_util::poll!(&mut read),
+                std::task::Poll::Ready(Err(DaemonClientError::Timeout))
+            ),
+            "consumer={consumer}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn local_create_hook_refusal_times_out_while_reading_the_body() {
+    use std::sync::atomic::Ordering;
+
+    let client = unix_client("/unused.sock").unwrap();
+    let budget = Duration::from_secs(2);
+    let (mut response, polled) = stalled_response(
+        StatusCode::BAD_REQUEST,
+        tokio::time::Instant::now() + budget,
+    );
+    response.headers_mut().insert(
+        ERROR_CODE_HEADER,
+        HeaderValue::from_static(ApiErrorCode::CreateHookFailed.as_str()),
+    );
+    let read = client.check_response(response, true, None);
+    tokio::pin!(read);
+    assert!(futures_util::poll!(&mut read).is_pending());
+    assert!(
+        polled.load(Ordering::Relaxed),
+        "hook error body was not read"
+    );
+    tokio::time::advance(budget + Duration::from_secs(1)).await;
+    assert!(matches!(
+        futures_util::poll!(&mut read),
+        std::task::Poll::Ready(Err(DaemonClientError::Timeout))
+    ));
+}
+
+#[tokio::test]
+async fn malformed_unix_json_uses_the_redacted_decode_error() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("api.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let mut used = 0;
+        while !request[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let count = stream.read(&mut request[used..]).await.unwrap();
+            assert!(count > 0, "request must contain complete HTTP headers");
+            used += count;
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{")
+            .await
+            .unwrap();
+    });
+    let client = unix_client(&path).unwrap();
+    let result = client
+        .request_json::<serde_json::Value>(client.http.get("http://localhost/operation"))
+        .await;
+    assert!(matches!(
+        result,
+        Err(DaemonClientError::AuthenticatedDecode)
+    ));
+    server.await.unwrap();
 }
 
 async fn execute_unix_test(
