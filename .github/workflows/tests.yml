@@ -74,6 +74,18 @@ jobs:
           tool: cargo-nextest
       - name: Install runtime test prerequisites
         run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Install tmux 3.8 for VT e2e
+        if: matrix.leg == 'web-e2e'
+        run: |
+          sudo apt-get install -y build-essential bison libevent-dev libncurses-dev pkg-config
+          curl -fsSLO https://github.com/tmux/tmux/releases/download/3.8/tmux-3.8.tar.gz
+          echo 'e79c699c7e949dccd0a4a125e17b8d1261e311b16979dbc8eb34542f3966d82e  tmux-3.8.tar.gz' | sha256sum -c -
+          tar -xzf tmux-3.8.tar.gz
+          cd tmux-3.8
+          ./configure --prefix=/usr/local
+          make -j2
+          sudo make install
+          test "$(tmux -V)" = 'tmux 3.8'
       - name: Install isolated namespace test prerequisites
         if: matrix.leg == 'core-rest' || matrix.leg == 'web-e2e'
         run: sudo apt-get install -y bubblewrap iproute2 apparmor

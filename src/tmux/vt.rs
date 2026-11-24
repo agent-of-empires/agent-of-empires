@@ -1701,7 +1701,7 @@ fn parse_tmux_pipe_support(version: &str) -> Option<bool> {
     parse_tmux_version(version).map(|v| v >= (3, 4))
 }
 
-fn parse_tmux_pipe_input_support(version: &str) -> Option<bool> {
+pub(super) fn parse_tmux_pipe_input_support(version: &str) -> Option<bool> {
     parse_tmux_version(version).map(|v| v >= (3, 8))
 }
 

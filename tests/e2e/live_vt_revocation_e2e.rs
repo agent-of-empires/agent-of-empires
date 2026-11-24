@@ -11,15 +11,10 @@ fn tmux_supports_pipe_input() -> bool {
         .arg("-V")
         .output()
         .unwrap();
-    let version = String::from_utf8_lossy(&output.stdout);
-    let Some(raw) = version.trim().strip_prefix("tmux ") else {
-        return false;
-    };
-    let digits = raw.trim_end_matches(|c: char| c.is_ascii_alphabetic());
-    let Some((major, minor)) = digits.split_once('.') else {
-        return false;
-    };
-    major.parse::<u32>().ok().zip(minor.parse::<u32>().ok()) >= Some((3, 8))
+    output.status.success()
+        && agent_of_empires::tmux::tmux_pipe_input_version_supported(&String::from_utf8_lossy(
+            &output.stdout,
+        ))
 }
 
 fn tmux_field(h: &TuiTestHarness, target: &str, field: &str) -> Result<String, String> {
@@ -130,9 +125,19 @@ fn stale_pending_vt_arm_is_fenced_after_disconnect() {
         "revoked pending arm installed an input-capable VT channel"
     );
     assert_eq!(tmux_field(&h, &target, "#{pane_pipe}").unwrap(), "0");
+    wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
+        (gate.join("attempt-1-consumed").exists() || gate.join("attempt-1-orphaned").exists())
+            .then_some(())
+            .ok_or("revoked pending arm did not settle".into())
+    });
+    assert!(
+        !gate.join("attempt-2-target").exists(),
+        "VT rearmed before explicit reconnect"
+    );
 
     h.send_keys("r");
     h.wait_for_runtime_ready();
+    h.wait_for_absent("Not responding", Duration::from_secs(10));
     let second = wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
         arm_result(&gate, 2)
     });
@@ -151,4 +156,12 @@ fn stale_pending_vt_arm_is_fenced_after_disconnect() {
         tmux_field(&h, &target, "#{pane_pid}").unwrap(),
         original_pid
     );
+
+    h.run_cli_ok(&["serve", "--stop"]);
+    h.wait_for_timeout("Not responding", Duration::from_secs(10));
+    wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
+        (tmux_field(&h, &target, "#{pane_pipe}")? == "0")
+            .then_some(())
+            .ok_or("active VT input pipe survived revocation".into())
+    });
 }
