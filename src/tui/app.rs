@@ -40,6 +40,8 @@ const PASTE_BURST_MIN_LEN: usize = 3;
 struct UpdateStatus {
     text: String,
     expires_at: Option<std::time::Instant>,
+    /// A persistent status this one covers, shown again when this one expires.
+    beneath: Option<Box<UpdateStatus>>,
 }
 
 impl UpdateStatus {
@@ -47,6 +49,7 @@ impl UpdateStatus {
         Self {
             text,
             expires_at: None,
+            beneath: None,
         }
     }
 
@@ -54,6 +57,7 @@ impl UpdateStatus {
         Self {
             text,
             expires_at: Some(std::time::Instant::now() + std::time::Duration::from_secs(10)),
+            beneath: None,
         }
     }
 
@@ -275,6 +279,29 @@ fn skip_predraw_cursor_hide(live_send_active: bool, has_overlay: bool) -> bool {
 impl App {
     fn set_status(&mut self, text: impl Into<String>) {
         self.update_status = Some(UpdateStatus::transient(text.into()));
+    }
+
+    /// A pull or dismissal message, which keeps a persistent status it covers, such as "Restart
+    /// aoe to use the new version", for when it expires.
+    fn set_pull_status(&mut self, text: impl Into<String>) {
+        let mut status = UpdateStatus::transient(text.into());
+        status.beneath = self.update_status.take().and_then(|covered| {
+            if covered.expires_at.is_none() {
+                Some(Box::new(covered))
+            } else {
+                covered.beneath
+            }
+        });
+        self.update_status = Some(status);
+    }
+
+    fn expire_status(&mut self) {
+        if self.update_status.as_ref().is_some_and(|s| s.is_expired()) {
+            self.update_status = self
+                .update_status
+                .take()
+                .and_then(|s| s.beneath.map(|b| *b));
+        }
     }
     /// Printable ASCII or Enter with no modifier other than Shift. Enter is
     /// included so newlines inside a Mosh-stripped paste stay in the burst.
@@ -1586,9 +1613,7 @@ impl App {
 
     fn render(&mut self, frame: &mut Frame) {
         let start = std::time::Instant::now();
-        if self.update_status.as_ref().is_some_and(|s| s.is_expired()) {
-            self.update_status = None;
-        }
+        self.expire_status();
         let live = self.home.store_move_status_line();
         // The cancel prompt draws over every line, and leaves the status it covers in place.
         let bar = if self.pull.cancel_prompt(std::time::Instant::now()) {
@@ -1844,7 +1869,7 @@ impl App {
         if saved {
             return false;
         }
-        self.set_status(DISMISS_UNSAVED);
+        self.set_pull_status(DISMISS_UNSAVED);
         true
     }
 
@@ -1889,7 +1914,7 @@ impl App {
                 true
             }
             Applied::Unanswered(text) => {
-                self.set_status(text);
+                self.set_pull_status(text);
                 true
             }
             // Repainted: the line loses its cancel prompt, and an unsent cancel says so.
@@ -1917,7 +1942,7 @@ impl App {
             && self.pull.running()
         {
             if start_unanswered {
-                self.set_status(CANCEL_UNSENT);
+                self.set_pull_status(CANCEL_UNSENT);
             } else {
                 self.request_pull(PullRequest::Cancel, self.pull_image.clone());
             }
@@ -2359,7 +2384,7 @@ impl App {
         // Ctrl+E only asks; `y` within the prompt's time cancels.
         if cancels_pull {
             if !self.pull.arm_cancel(std::time::Instant::now()) {
-                self.set_status(CANCEL_UNCONFIRMED);
+                self.set_pull_status(CANCEL_UNCONFIRMED);
             }
             return Ok(());
         }
@@ -3407,7 +3432,7 @@ impl App {
             }
             Action::SpawnImagePull(image) => {
                 if self.pull.running() {
-                    self.set_status("image pull already in progress");
+                    self.set_pull_status("image pull already in progress");
                     return Ok(());
                 }
                 self.start_pull(image);
@@ -5570,6 +5595,44 @@ mod tests {
             Some(DrawnBar::CancelPrompt),
             "a newer status"
         );
+    }
+
+    /// A pull or dismissal message covers the restart notice only while it shows; any other
+    /// status still replaces it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pull_messages_keep_the_restart_notice_beneath_them() {
+        const NOTICE: &str = "update complete. Restart aoe to use the new version.";
+        const IMAGE: &str = "ghcr.io/example/watched:latest";
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let ctrl_e = bindings::key_event(bindings::ActionId::CancelImagePull, false).unwrap();
+        for case in ["cancel unconfirmed", "image no longer configured", "another status"] {
+            let (mut app, mut terminal) = key_app();
+            let sent = hold_pull_requests(&mut app);
+            app.update_status = Some(UpdateStatus::persistent(NOTICE.into()));
+            match case {
+                "cancel unconfirmed" => {
+                    app.start_pull(IMAGE.into());
+                    answer_sent(&mut app, &sent, 0, PullReport::Unavailable);
+                    app.update_status = Some(UpdateStatus::persistent(NOTICE.into()));
+                    app.handle_key(ctrl_e, &mut terminal).await.unwrap();
+                }
+                "image no longer configured" => {
+                    app.pull.start();
+                    answer_pull(&mut app, PullRequest::Poll, PullReport::UnknownImage);
+                }
+                _ => app.set_status("auto-naming \"x\"…"),
+            }
+            let shown = app.update_status.as_ref().map(|s| s.text.clone());
+            assert_ne!(shown.as_deref(), Some(NOTICE), "{case}: no message shown");
+            app.update_status.as_mut().unwrap().expires_at =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+            app.expire_status();
+            let after = app.update_status.as_ref().map(|s| s.text.as_str());
+            let kept = case != "another status";
+            assert_eq!(after, kept.then_some(NOTICE), "{case}");
+        }
     }
 
     /// One trashed row, selected, for its retained reader.
