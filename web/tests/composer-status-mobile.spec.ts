@@ -40,6 +40,14 @@ test("long composer-status stays inside the footer at 360px", async ({ page }) =
   const footerOverflows = await footer.evaluate((el) => el.scrollWidth > el.clientWidth);
   expect(footerOverflows).toBe(false);
 
+  const text = status.locator("[data-plugin-slot] > span.truncate");
+  const clipped = await text.evaluate((el) => ({
+    ellipsis: getComputedStyle(el).textOverflow === "ellipsis",
+    truncated: el.scrollWidth > el.clientWidth,
+  }));
+  expect(clipped).toEqual({ ellipsis: true, truncated: true });
+  expect(await status.evaluate((el) => el.scrollWidth > el.clientWidth)).toBe(false);
+
   const viewport = page.viewportSize()!;
   const send = await page.getByRole("button", { name: "Send message" }).boundingBox();
   expect(send!.x + send!.width).toBeLessThanOrEqual(viewport.width);
