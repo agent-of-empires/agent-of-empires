@@ -8,6 +8,7 @@ import {
   isHttpUrl,
   lineText,
   linkifyLine,
+  linkifyWrappedRuns,
   splitCellRuns,
   splitUrls,
   textWidth,
@@ -234,6 +235,39 @@ describe("linkifyLine", () => {
   it("returns the line unchanged when it has no URL", () => {
     const line = [seg("plain", "red"), seg(" text")];
     expect(linkifyLine(line)).toBe(line);
+  });
+});
+
+describe("linkifyWrappedRuns", () => {
+  const rows = (...t: string[]) => t.map((x) => [seg(x)]);
+  const links = (out: Map<number, ReturnType<typeof linkifyLine>>) =>
+    [...out].map(([i, r]) => [i, r.filter((s) => s.url).map((s) => [s.text, s.url])]);
+
+  it("links every row of a soft-wrapped URL to the whole href", () => {
+    const out = linkifyWrappedRuns(rows("$ echo", "see https://ex.com/a", "b-c/d", "e tail", "$"), [1, 2]);
+    expect(links(out)).toEqual([
+      [1, [["https://ex.com/a", "https://ex.com/ab-c/de"]]],
+      [2, [["b-c/d", "https://ex.com/ab-c/de"]]],
+      [3, [["e", "https://ex.com/ab-c/de"]]],
+    ]);
+    expect(lineText(out.get(3)!)).toBe("e tail");
+  });
+
+  it("keeps a row break the server did not flag", () => {
+    // Hyphens are URL characters, so only the flag says the row continues.
+    expect(linkifyWrappedRuns(rows("https://ex.com/control", "-plane next"), []).size).toBe(0);
+    expect(linkifyWrappedRuns(rows("https://ex.com/control", "-plane next"), undefined).size).toBe(0);
+  });
+
+  it("keeps styles and empty rows in place across a run", () => {
+    const out = linkifyWrappedRuns([[seg("https://ex.com/", "red")], [], [seg("x", "blue")]], [0, 1]);
+    expect(out.get(0)).toEqual([{ text: "https://ex.com/", style: { fg: "red" }, url: "https://ex.com/x" }]);
+    expect(out.get(1)).toEqual([]);
+    expect(out.get(2)).toEqual([{ text: "x", style: { fg: "blue" }, url: "https://ex.com/x" }]);
+  });
+
+  it("ignores a flag on the last row", () => {
+    expect(linkifyWrappedRuns(rows("a", "https://ex.com/a"), [1]).size).toBe(0);
   });
 });
 
