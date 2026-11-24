@@ -46,8 +46,10 @@ when all of these hold:
 3. **Acceptance criteria**: a reviewer could check the result.
 4. **Touched code**: the files or modules to change are named or clear. Confirm
    they exist in this checkout with `git ls-files` or `grep`.
-5. **Unblocked**: every `Blocked by #<n>` or `Depends on #<n>` issue is
-   closed, and no open PR already fixes it
+5. **Unblocked**: it has no open native blocker
+   (`gh api repos/$REPO/issues/<n> --jq .issue_dependencies_summary.blocked_by`
+   is 0; see `docs/agents/issue-tracker.md`), every `Blocked by #<n>` or
+   `Depends on #<n>` issue is closed, and no open PR already fixes it
    (`gh pr list -R $REPO --state open --search "<n> in:body"`).
 6. **Decided**: no open design question or maintainer disagreement in the
    comments.

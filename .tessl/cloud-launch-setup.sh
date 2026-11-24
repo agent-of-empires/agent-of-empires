@@ -37,15 +37,22 @@ if [ ! -x "$HOME/.local/bin/cargo-nextest" ]; then
   rm -f "$archive"
 fi
 
-echo "Checking Node.js (CI uses 22)"
-if ! node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)'; then
-  echo "Node.js >=22 is required, found $(node -v)"
+echo "Checking Node.js against the web lockfile's engines"
+if ! node -e '
+const [major, minor, patch] = process.versions.node.split(".").map(Number);
+const ok = (major === 22 && (minor > 22 || (minor === 22 && patch >= 2))) ||
+  (major === 24 && minor >= 15) || major >= 26;
+process.exit(ok ? 0 : 1);'; then
+  echo "Node.js ^22.22.2 || ^24.15.0 || >=26 is required, found $(node -v)"
   exit 1
 fi
 
 for dir in web acp-worker/test-shim; do
   echo "Installing npm dependencies in $dir"
-  if [ ! -d "$dir/node_modules" ]; then
+  stamp="$dir/node_modules/.lockfile-sha256"
+  sum=$(sha256sum "$dir/package-lock.json" | cut -d' ' -f1)
+  if [ "$(cat "$stamp" 2>/dev/null)" != "$sum" ]; then
     (cd "$dir" && npm ci --no-audit --no-fund)
+    echo "$sum" >"$stamp"
   fi
 done

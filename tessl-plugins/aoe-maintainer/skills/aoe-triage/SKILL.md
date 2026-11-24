@@ -48,8 +48,9 @@ An issue is **done** when it is open and has:
 - at least one of `bug`, `enhancement`, `question`;
 - at least one `area:*` label;
 - no `needs-triage` label;
-- when the board is reachable: an item on board 1 with `Status`, `Size` and,
-  unless the priority is `P3`, `Priority` set.
+- when the board is reachable: an item on board 1 with `Status` and `Size`
+  set, `Priority` set unless the priority is `P3`, and `Roadmap state` set on
+  an `enhancement`.
 
 For each issue you look at, take the first situation that applies:
 

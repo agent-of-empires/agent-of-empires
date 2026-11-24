@@ -63,11 +63,14 @@ regression, then flake, then infra.
 
 ## 4. Find the culprit commit
 
-1. Find the last green push run of the same workflow on main:
-   `gh run list -R $REPO --workflow <path> --branch main --event push --status success --limit 1 --json headSha`.
-2. List the range with `git log --oneline <green>..$SHA` (run
-   `git fetch origin main` first if needed) and pick the commit whose diff
-   touches the failing test's files or the code under test.
+1. Find the last green push run of the same workflow before the failure. Run
+   `git fetch origin main` first if needed, list
+   `gh run list -R $REPO --workflow <path> --branch main --event push --status success --limit 50 --json headSha`,
+   and take the newest `headSha` that differs from `$SHA` and passes
+   `git merge-base --is-ancestor <green> $SHA`. A green run after the failure
+   is not a baseline.
+2. List the range with `git log --oneline <green>..$SHA` and pick the commit
+   whose diff touches the failing test's files or the code under test.
 3. For a flake, name the commit that introduced the racy code or test only if
    `git log -S` or `git blame` shows it clearly; otherwise say unknown. For
    infra, skip this step.
