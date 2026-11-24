@@ -197,6 +197,7 @@ impl CommandFailure {
                     && *code != Some(crate::daemon::ApiErrorCode::CreateOutcomeUnknown)
             }
             DaemonClientError::FavoriteSelection(_) => true,
+            DaemonClientError::RuntimeCursorUnsupported => !submitted,
             DaemonClientError::InvalidBaseUrl { .. }
             | DaemonClientError::InvalidPathSegment
             | DaemonClientError::InvalidBearerToken

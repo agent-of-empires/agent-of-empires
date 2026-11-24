@@ -36,6 +36,7 @@ pub enum ApiErrorCode {
     CreateHookFailed,
     CreateOutcomeUnknown,
     FavoriteSelectionRefused,
+    FavoriteNamespaceBusy,
     OutcomeUnconfirmed,
     /// The project path is not a directory on the Daemon host.
     WorkingDirMissing,
@@ -85,6 +86,7 @@ impl ApiErrorCode {
             Self::CreateHookFailed => "create_hook_failed",
             Self::CreateOutcomeUnknown => "create_outcome_unknown",
             Self::FavoriteSelectionRefused => "favorite_selection_refused",
+            Self::FavoriteNamespaceBusy => "favorite_namespace_busy",
             Self::OutcomeUnconfirmed => "outcome_unconfirmed",
             Self::WorkingDirMissing => "working_dir_missing",
             Self::BranchNotFound => "branch_not_found",
@@ -114,6 +116,7 @@ impl ApiErrorCode {
             | Self::TrashIncomplete
             | Self::LifecycleSuperseded
             | Self::RuntimeEpochMismatch
+            | Self::FavoriteNamespaceBusy
             | Self::ResumeFailed
             | Self::ManagedResumeRefused(_)
             | Self::SandboxMigrationDeferred
@@ -195,6 +198,7 @@ impl ApiErrorCode {
             b"runtime_epoch_mismatch" => Self::RuntimeEpochMismatch,
             b"create_outcome_unknown" => Self::CreateOutcomeUnknown,
             b"favorite_selection_refused" => Self::FavoriteSelectionRefused,
+            b"favorite_namespace_busy" => Self::FavoriteNamespaceBusy,
             b"outcome_unconfirmed" => Self::OutcomeUnconfirmed,
             b"agent_hooks_not_approved" => Self::AgentHooksNotApproved,
             b"resume_failed" => Self::ResumeFailed,

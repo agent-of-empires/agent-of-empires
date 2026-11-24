@@ -150,8 +150,14 @@ async fn update_favorite_by_selector(
     selector: String,
     favorited: bool,
 ) -> axum::response::Response {
-    use crate::daemon::FavoriteOutcome;
-    let namespace = state.profile_namespace.write().await;
+    use crate::daemon::{ApiErrorCode, FavoriteOutcome, SessionLookupError};
+    // A purge can hold a namespace lease past the client's request deadline.
+    let Ok(namespace) = state.profile_namespace.try_write() else {
+        return crate::server::api::api_error_with_code_header(
+            ApiErrorCode::FavoriteNamespaceBusy,
+            "Profile namespace is busy; no favorite change was made.",
+        );
+    };
     {
         let metadata = state.canonical_metadata.read().await;
         if profile.is_empty() {
@@ -169,6 +175,13 @@ async fn update_favorite_by_selector(
         profile,
         "favorite update",
         move |rows| {
+            if cityhall_mode
+                && rows
+                    .iter()
+                    .any(|row| row.id == selector && !row.is_structured())
+            {
+                return Err(favorite_selection_refused(SessionLookupError::NotFound));
+            }
             let (index, _) = crate::cli::lookup_session(
                 &selector,
                 rows.iter()

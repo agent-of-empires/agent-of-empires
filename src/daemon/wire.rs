@@ -774,8 +774,8 @@ pub struct UpdatePinBody {
     pub pinned: bool,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(untagged, deny_unknown_fields)]
+#[derive(Serialize)]
+#[serde(untagged)]
 pub enum UpdateFavoriteBody {
     Scoped {
         profile: String,
@@ -786,6 +786,70 @@ pub enum UpdateFavoriteBody {
     Unscoped {
         favorited: bool,
     },
+}
+
+impl<'de> Deserialize<'de> for UpdateFavoriteBody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Keep the scoped form map-only, but allow legacy clients' extra fields.
+        #[derive(Deserialize)]
+        #[serde(untagged, deny_unknown_fields)]
+        enum Scoped {
+            Request {
+                profile: String,
+                selector: String,
+                select_favorited: bool,
+            },
+        }
+
+        #[derive(Deserialize)]
+        struct Legacy {
+            favorited: bool,
+            #[serde(
+                default,
+                rename = "profile",
+                deserialize_with = "reject_selector_field"
+            )]
+            _profile: (),
+            #[serde(
+                default,
+                rename = "selector",
+                deserialize_with = "reject_selector_field"
+            )]
+            _selector: (),
+            #[serde(
+                default,
+                rename = "select_favorited",
+                deserialize_with = "reject_selector_field"
+            )]
+            _select_favorited: (),
+        }
+
+        fn reject_selector_field<'de, D: serde::Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+            Err(serde::de::Error::custom(
+                "selector field in legacy favorite request",
+            ))
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Request {
+            Scoped(Scoped),
+            Legacy(Legacy),
+        }
+
+        Ok(match Request::deserialize(deserializer)? {
+            Request::Scoped(Scoped::Request {
+                profile,
+                selector,
+                select_favorited,
+            }) => Self::Scoped {
+                profile,
+                selector,
+                select_favorited,
+            },
+            Request::Legacy(Legacy { favorited, .. }) => Self::Unscoped { favorited },
+        })
+    }
 }
 
 pub(crate) const FAVORITE_BY_SELECTOR: &str = "by-selector";

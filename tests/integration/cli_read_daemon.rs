@@ -194,6 +194,122 @@ fn favorite_writes_require_a_writable_daemon_and_stay_in_profile() {
 
 #[tokio::test]
 #[parallel]
+async fn favorite_requires_cursor_support_and_never_replays_a_patch() {
+    use agent_of_empires::daemon::{
+        RUNTIME_EPOCH_HEADER, RUNTIME_PROTOCOL_VERSION, RUNTIME_REVISION_HEADER,
+    };
+    use axum::response::IntoResponse;
+
+    let fixture = Fixture::new();
+    for (epoch, revision, patch_revision, title, diagnostic) in [
+        (
+            false,
+            false,
+            Some("7"),
+            Some("Unconfirmed"),
+            "Upgrade the Daemon",
+        ),
+        (
+            true,
+            false,
+            Some("7"),
+            Some("Unconfirmed"),
+            "mutation acknowledgment does not match",
+        ),
+        (
+            false,
+            true,
+            Some("7"),
+            Some("Unconfirmed"),
+            "mutation acknowledgment does not match",
+        ),
+        (
+            true,
+            true,
+            Some("7"),
+            Some("Unconfirmed"),
+            "Favorite outcome may be unknown",
+        ),
+        (
+            true,
+            true,
+            Some("8"),
+            None,
+            "Favorite outcome may be unknown",
+        ),
+        (true, true, None, None, "Favorite outcome may be unknown"),
+    ] {
+        let (requests, seen) = std::sync::mpsc::channel();
+        let router = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let requests = requests.clone();
+            async move {
+                let method = request.method().as_str().to_owned();
+                let path = request.uri().path().to_owned();
+                requests.send((method.clone(), path)).unwrap();
+                if method == "GET" {
+                    let mut response = axum::Json(serde_json::json!({
+                        "protocol_version": RUNTIME_PROTOCOL_VERSION,
+                        "epoch": "test-epoch",
+                        "namespace": "test",
+                        "local_owner": false,
+                        "profiles": ["main"],
+                        "read_only": false,
+                        "cityhall_mode": false,
+                        "health": {"state": "healthy"},
+                        "interaction_capabilities": {"mutations": true, "native_interaction": false}
+                    }))
+                    .into_response();
+                    if epoch {
+                        response
+                            .headers_mut()
+                            .insert(RUNTIME_EPOCH_HEADER, "test-epoch".parse().unwrap());
+                    }
+                    if revision {
+                        response
+                            .headers_mut()
+                            .insert(RUNTIME_REVISION_HEADER, "7".parse().unwrap());
+                    }
+                    response
+                } else if let Some(patch_revision) = patch_revision {
+                    (
+                        [
+                            (RUNTIME_EPOCH_HEADER, "test-epoch"),
+                            (RUNTIME_REVISION_HEADER, patch_revision),
+                        ],
+                        axum::Json(serde_json::json!({"title": title})),
+                    )
+                        .into_response()
+                } else {
+                    axum::http::StatusCode::GATEWAY_TIMEOUT.into_response()
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut command = fixture.command(&[
+            "--daemon-url",
+            &url,
+            "session",
+            "favorite",
+            "daemon-only-row",
+        ]);
+        let output = tokio::task::spawn_blocking(move || command.output().unwrap())
+            .await
+            .unwrap();
+        assert_refused(&output, diagnostic);
+        let mut expected: Vec<(String, String)> = vec![("GET".into(), "/api/runtime".into())];
+        if epoch && revision {
+            expected.push(("PATCH".into(), "/api/sessions/by-selector/favorite".into()));
+        }
+        assert_eq!(seen.try_iter().collect::<Vec<_>>(), expected);
+        fixture.assert_not_started();
+        server.abort();
+    }
+}
+
+#[tokio::test]
+#[parallel]
 async fn unreachable_selected_targets_never_answer_from_disk() {
     let fixture = Fixture::new();
     // Retain the bound, non-listening socket so no other process can take the port.

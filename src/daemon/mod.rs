@@ -141,6 +141,8 @@ pub enum DaemonClientError {
     AuthenticatedDecode,
     #[error("daemon mutation acknowledgment does not match this runtime")]
     InvalidMutationReceipt,
+    #[error("The selected Daemon does not provide the runtime cursor required by this command. Upgrade the Daemon and run `aoe serve --restart` on its host.")]
+    RuntimeCursorUnsupported,
     #[error("Daemon could not resolve the favorite selector")]
     FavoriteSelection(SessionLookupError),
 }
@@ -256,6 +258,7 @@ fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &
     }
     match code {
         Some(ApiErrorCode::ReadOnly) => "Daemon is read-only; request refused".into(),
+        Some(ApiErrorCode::FavoriteNamespaceBusy) => "Profile namespace is busy; no favorite change was made.".into(),
         Some(ApiErrorCode::OutcomeUnconfirmed) =>
             "The change committed, but runtime publication is unconfirmed. Check canonical state before retrying.".into(),
         Some(ApiErrorCode::ManagedResumeRefused(cause)) => cause.message().into(),
@@ -416,6 +419,11 @@ impl DaemonClient {
             .join("runtime")
             .map_err(|_| DaemonClientError::Transport)?;
         let response = self.request_response(self.http.get(url)).await?;
+        if !response.headers().contains_key(RUNTIME_EPOCH_HEADER)
+            && !response.headers().contains_key(RUNTIME_REVISION_HEADER)
+        {
+            return Err(DaemonClientError::RuntimeCursorUnsupported);
+        }
         let epoch = response
             .headers()
             .get(RUNTIME_EPOCH_HEADER)
@@ -1864,13 +1872,20 @@ mod tests {
     fn favorite_wire_rejects_partial_and_mixed_selectors() {
         for malformed in [
             serde_json::json!({"profile": "main", "favorited": true}),
+            serde_json::json!({"selector": null, "favorited": true}),
+            serde_json::json!({"select_favorited": null, "favorited": true}),
             serde_json::json!({"profile": "main", "select_favorited": true}),
             serde_json::json!({"profile": "main", "selector": "title", "select_favorited": true, "favorited": false}),
+            serde_json::json!({"profile": "main", "selector": "title", "select_favorited": true, "client_tag": "batch"}),
+            serde_json::json!(["main", "title", true]),
         ] {
             assert!(serde_json::from_value::<UpdateFavoriteBody>(malformed).is_err());
         }
         assert!(matches!(
-            serde_json::from_str::<UpdateFavoriteBody>(r#"{"favorited":false}"#).unwrap(),
+            serde_json::from_str::<UpdateFavoriteBody>(
+                r#"{"favorited":false,"client_tag":{"origin":"batch"}}"#
+            )
+            .unwrap(),
             UpdateFavoriteBody::Unscoped { favorited: false }
         ));
     }

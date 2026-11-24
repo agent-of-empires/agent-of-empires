@@ -481,6 +481,22 @@ async fn set_favorite(profile: &str, args: SessionIdArgs, favorited: bool) -> Re
             };
             return Err(error.for_cli(&selector));
         }
+        Err(
+            error @ (DaemonClientError::Transport
+            | DaemonClientError::Timeout
+            | DaemonClientError::UnixTransport
+            | DaemonClientError::InvalidMutationReceipt
+            | DaemonClientError::AuthenticatedDecode
+            | DaemonClientError::Status {
+                status: reqwest::StatusCode::GATEWAY_TIMEOUT,
+                ..
+            }
+            | DaemonClientError::ResponseTooLarge { .. }),
+        ) => {
+            return Err(anyhow::Error::new(error).context(
+                "Favorite outcome may be unknown; check the session before running the command again",
+            ));
+        }
         Err(error) => bail!("{}", super::terminal_text(&error.to_string())),
     };
     let verb = if favorited {
