@@ -87,8 +87,11 @@ regression, then flake, then infra.
   issue.
 - Check active findings: list
   `tessl finding list --project $PROJECT --tag red-main --json`, following
-  `--after` cursors, and keep those open or in progress. If one already covers the same test or culprit commit, do not create another;
-  end with its id in your summary.
+  `--after` cursors, and keep those open or in progress. Drop each failure
+  one of them already covers: the same test, or for a failure with no test,
+  the same commit. If none remain, do not create a finding; end with their
+  ids. Otherwise the finding covers only the remaining failures and cites
+  those ids in `analysis`.
 
 ## 6. Record one finding
 
