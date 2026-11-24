@@ -26,6 +26,8 @@ pub(crate) enum SendKeysError {
     StructuredView,
     Ignored,
     Blocked(crate::session::StartBlocked),
+    /// The agent's input box held a person's unsent text for the whole wait.
+    InputLineBusy,
     Gone,
     Tmux(anyhow::Error),
     Preparation {
@@ -216,16 +218,18 @@ async fn send_terminal_message_inner(
                 !instance.is_structured(),
                 "Session no longer has a terminal agent"
             );
-            anyhow::ensure!(
-                super::ensure::ready_agent_session(&instance)?.is_some(),
-                TerminalNotRunning
-            );
+            let pane = super::ensure::ready_agent_pane(&instance)?.ok_or(TerminalNotRunning)?;
             let session = instance.tmux_session()?;
             session.wait_until_ready(
                 std::time::Duration::from_secs(5),
                 crate::agents::ready_markers(&instance.tool),
             );
-            session.send_keys_with_delay(&message, instance.send_keys_enter_delay())?;
+            // Typed after a person's unsent text, the message would merge with it on Enter.
+            anyhow::ensure!(
+                instance.wait_for_input_line(&session, &pane, INPUT_LINE_WAIT),
+                InputLineBusy
+            );
+            session.send_keys_to_pane(&pane, &message, instance.send_keys_enter_delay())?;
             anyhow::Ok((instance, ownership))
         })
         .await
@@ -272,6 +276,8 @@ async fn send_terminal_message_inner(
             SendKeysError::Gone
         } else if error.is::<TerminalNotRunning>() {
             SendKeysError::NotRunning
+        } else if error.is::<InputLineBusy>() {
+            SendKeysError::InputLineBusy
         } else if let Some(response) = super::lifecycle::lifecycle_rejection(&state, &error) {
             SendKeysError::Preparation {
                 response: Box::new(response),
@@ -291,6 +297,13 @@ struct TerminalNotRunning;
 #[error("Session is ignored")]
 struct IgnoredSession;
 
+#[derive(Debug, thiserror::Error)]
+#[error("The agent's input box holds unsent text")]
+struct InputLineBusy;
+
+/// How long a send waits for a person's draft to clear before refusing.
+const INPUT_LINE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 impl IntoResponse for TerminalSendError {
     fn into_response(self) -> axum::response::Response {
         let mut response = match self.error {
@@ -298,6 +311,10 @@ impl IntoResponse for TerminalSendError {
             SendKeysError::NotRunning => crate::server::api::api_error_with_code_header(
                 crate::daemon::ApiErrorCode::SessionNotRunning,
                 "Terminal session is not running",
+            ),
+            SendKeysError::InputLineBusy => crate::server::api::api_error_with_code_header(
+                crate::daemon::ApiErrorCode::InputLineBusy,
+                crate::tmux::InputLine::BUSY_MESSAGE,
             ),
             SendKeysError::Preparation { response, .. } => *response,
             SendKeysError::Transient(status) => (
@@ -800,6 +817,17 @@ mod send_output_tests {
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["error"],
             "session_not_running"
+        );
+
+        let response = TerminalSendError {
+            error: SendKeysError::InputLineBusy,
+            committed_cursor: None,
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response.headers()[crate::daemon::ERROR_CODE_HEADER],
+            "input_line_busy"
         );
 
         let response = TerminalSendError {

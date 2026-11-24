@@ -113,6 +113,20 @@ impl HomeView {
             },
             _ => None,
         };
+        // Checked once: a wait here would freeze the TUI, and the person can see the pane.
+        if matches!(target, live_send::LiveSendTarget::Agent)
+            && tmux_session
+                .live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())
+                .is_ok_and(|pane| {
+                    inst.input_line_in(&tmux_session, &pane) == crate::tmux::InputLine::Draft
+                })
+        {
+            self.info_dialog = Some(InfoDialog::new(
+                "Send Failed",
+                crate::tmux::InputLine::BUSY_MESSAGE,
+            ));
+            return;
+        }
         if let Err(e) = tmux_session.send_keys_with_delay(message, delay) {
             self.info_dialog = Some(InfoDialog::new(
                 "Send Failed",

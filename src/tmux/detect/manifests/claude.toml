@@ -1,5 +1,9 @@
 id = "claude"
 
+# The input box: the `❯` line and the lines below it, down to the box's bottom rule.
+[input_line]
+prompt = '^\s*\x{276F}'
+
 # The terminal title Claude publishes over OSC: a braille or half-circle spinner
 # frame while a turn runs, a static glyph when it is over.
 [[rules]]

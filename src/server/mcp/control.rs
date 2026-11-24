@@ -286,6 +286,11 @@ impl McpServer {
                         PROMPT_READY_TIMEOUT.as_secs()
                     )),
                 ),
+                PaneReadiness::Drafted => (
+                    false,
+                    PromptDelivery::NotReady,
+                    Some(crate::tmux::InputLine::BUSY_MESSAGE.to_string()),
+                ),
                 PaneReadiness::NoPromptRule => (
                     false,
                     PromptDelivery::NotReady,
@@ -505,13 +510,8 @@ impl McpServer {
         // Keys sent into a dialog answer it (Enter accepts Claude's folder trust), so MCP refuses a
         // pane whose status rules detect one; an agent without status rules gets no check. HTTP
         // `POST /send` is left as is: a person at the dashboard sees the pane.
-        if self.terminal_pane_waiting(&id).await {
-            return Err(Box::new(tool_error(
-                "waiting",
-                "The agent is waiting on a dialog or question in its terminal, or its pane could \
-                 not be read, so nothing was typed. A person answers a dialog there; retry once \
-                 the pane can be read.",
-            )));
+        if let Some(refusal) = self.terminal_pane_refusal(&id).await {
+            return Err(Box::new(refusal));
         }
         // No revival: a restarted agent can open on a dialog the check above never saw.
         if let Err(e) = send_terminal_message(
@@ -598,11 +598,12 @@ impl McpServer {
             .map(|i| i.view)
     }
 
-    /// Whether a terminal session's status rules detect a dialog or question waiting on a
-    /// person, read once, without waiting. A check that fails to run counts as waiting, as does,
-    /// for an agent with a status manifest, a pane that can't be captured. `send` is explicit, so
-    /// an agent without one (`NoPromptRule`) is not refused.
-    async fn terminal_pane_waiting(&self, id: &str) -> bool {
+    /// Why `send` refuses a terminal session's pane, read once, without waiting: its status rules
+    /// detect a dialog or question waiting on a person, or its input box holds a person's draft.
+    /// A check that fails to run counts as waiting, as does, for an agent with a status manifest,
+    /// a pane that can't be captured. `send` is explicit, so an agent without one
+    /// (`NoPromptRule`) is not refused.
+    async fn terminal_pane_refusal(&self, id: &str) -> Option<CallToolResult> {
         let instance = self
             .state
             .instances
@@ -611,12 +612,23 @@ impl McpServer {
             .iter()
             .find(|i| i.id == id)
             .cloned();
-        let Some(instance) = instance else {
-            return false;
-        };
-        tokio::task::spawn_blocking(move || refuses_send(pane_readiness(&instance)))
+        let instance = instance?;
+        let readiness = tokio::task::spawn_blocking(move || pane_readiness(&instance))
             .await
-            .unwrap_or(true)
+            .unwrap_or(PaneReadiness::Unreadable);
+        match readiness {
+            PaneReadiness::Drafted => Some(tool_error(
+                "input_line_busy",
+                crate::tmux::InputLine::BUSY_MESSAGE,
+            )),
+            readiness if refuses_send(readiness) => Some(tool_error(
+                "waiting",
+                "The agent is waiting on a dialog or question in its terminal, or its pane could \
+                 not be read, so nothing was typed. A person answers a dialog there; retry once \
+                 the pane can be read.",
+            )),
+            _ => None,
+        }
     }
 
     /// Mutations reach the dashboard through a published snapshot, as the HTTP routes do.
@@ -675,6 +687,8 @@ enum PaneReadiness {
     AtPrompt,
     /// A rule matched a dialog or question waiting for a person.
     Waiting,
+    /// The input box holds text a person typed and has not sent.
+    Drafted,
     /// Neither yet: still starting, working, idle by a rule that does not see the prompt box, or
     /// the pane could not be captured.
     NotYet,
@@ -731,25 +745,38 @@ fn pane_readiness(instance: &Instance) -> PaneReadiness {
     if !session.exists() || session.is_pane_dead() {
         return PaneReadiness::Gone;
     }
-    readiness_of(instance.detect_pane_now(&instance.source_profile, &session, None))
+    let input_line = session
+        .live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())
+        .map_or(crate::tmux::InputLine::Unknown, |pane| {
+            instance.input_line_in(&session, &pane)
+        });
+    readiness_of(
+        instance.detect_pane_now(&instance.source_profile, &session, None),
+        input_line,
+    )
 }
 
-/// MCP `send` refuses a pane whose status rules detect a dialog, or one it could not read. An
-/// agent without status rules (`NoPromptRule`) gets no dialog check.
+/// MCP `send` refuses a pane whose status rules detect a dialog, one holding a draft, or one it
+/// could not read. An agent without status rules (`NoPromptRule`) gets no dialog check.
 fn refuses_send(readiness: PaneReadiness) -> bool {
     matches!(
         readiness,
-        PaneReadiness::Waiting | PaneReadiness::Unreadable
+        PaneReadiness::Waiting | PaneReadiness::Drafted | PaneReadiness::Unreadable
     )
 }
 
 /// Only a rule that sees the prompt box counts as at the prompt: other idle rules (a finished
 /// turn, an interrupt banner, the pane title) also hold while a dialog is on screen.
-fn readiness_of(detected: Option<(Option<Status>, &str)>) -> PaneReadiness {
+/// A dialog outranks a draft, which outranks the prompt box.
+fn readiness_of(
+    detected: Option<(Option<Status>, &str)>,
+    input_line: crate::tmux::InputLine,
+) -> PaneReadiness {
     match detected {
         None => PaneReadiness::NoPromptRule,
         Some((_, CAPTURE_FAILED_RULE)) => PaneReadiness::Unreadable,
         Some((Some(Status::Waiting), _)) => PaneReadiness::Waiting,
+        _ if input_line == crate::tmux::InputLine::Draft => PaneReadiness::Drafted,
         Some((Some(Status::Idle), "ready_prompt" | "live_prompt_box")) => PaneReadiness::AtPrompt,
         Some(_) => PaneReadiness::NotYet,
     }
@@ -989,6 +1016,9 @@ async fn terminal_refusal(id: &str, error: SendKeysError) -> CallToolResult {
              reclaim ownership or unignore it before MCP sends a prompt.",
         ),
         SendKeysError::Blocked(blocked) => tool_error("invalid_request", blocked.to_string()),
+        SendKeysError::InputLineBusy => {
+            tool_error("input_line_busy", crate::tmux::InputLine::BUSY_MESSAGE)
+        }
         SendKeysError::Tmux(error) => {
             tracing::warn!(target: "http.api.sessions", session = %id, %error, "terminal send failed");
             tool_error("send_failed", "Terminal send failed")
@@ -1007,30 +1037,85 @@ mod tests {
 
     #[test]
     fn only_a_prompt_box_rule_reads_as_at_the_prompt() {
+        use crate::tmux::InputLine::{Draft, Empty, Unknown};
         use PaneReadiness::*;
-        // (detected, readiness, whether MCP `send` refuses it)
+        // (detected, input line, readiness, whether MCP `send` refuses it)
         let cases = [
-            (None, NoPromptRule, false),
-            (Some((Some(Status::Waiting), "trust_dialog")), Waiting, true),
-            (Some((Some(Status::Idle), "ready_prompt")), AtPrompt, false),
+            (None, Unknown, NoPromptRule, false),
             (
-                Some((Some(Status::Idle), "live_prompt_box")),
+                Some((Some(Status::Waiting), "trust_dialog")),
+                Unknown,
+                Waiting,
+                true,
+            ),
+            (
+                Some((Some(Status::Waiting), "trust_dialog")),
+                Draft,
+                Waiting,
+                true,
+            ),
+            (
+                Some((Some(Status::Idle), "ready_prompt")),
+                Empty,
                 AtPrompt,
                 false,
             ),
-            (Some((Some(Status::Idle), "osc_title_idle")), NotYet, false),
-            (Some((Some(Status::Idle), "completed_turn")), NotYet, false),
             (
-                Some((Some(Status::Idle), "interrupt_banner")),
+                Some((Some(Status::Idle), "ready_prompt")),
+                Draft,
+                Drafted,
+                true,
+            ),
+            (
+                Some((Some(Status::Idle), "live_prompt_box")),
+                Unknown,
+                AtPrompt,
+                false,
+            ),
+            (
+                Some((Some(Status::Idle), "osc_title_idle")),
+                Unknown,
                 NotYet,
                 false,
             ),
-            (Some((Some(Status::Idle), "no_rule")), NotYet, false),
-            (Some((Some(Status::Running), "spinner")), NotYet, false),
-            (Some((None, CAPTURE_FAILED_RULE)), Unreadable, true),
+            (
+                Some((Some(Status::Idle), "completed_turn")),
+                Unknown,
+                NotYet,
+                false,
+            ),
+            (
+                Some((Some(Status::Idle), "interrupt_banner")),
+                Unknown,
+                NotYet,
+                false,
+            ),
+            (
+                Some((Some(Status::Idle), "no_rule")),
+                Unknown,
+                NotYet,
+                false,
+            ),
+            (
+                Some((Some(Status::Running), "spinner")),
+                Unknown,
+                NotYet,
+                false,
+            ),
+            (
+                Some((Some(Status::Running), "spinner")),
+                Draft,
+                Drafted,
+                true,
+            ),
+            (Some((None, CAPTURE_FAILED_RULE)), Draft, Unreadable, true),
         ];
-        for (detected, want, refused) in cases {
-            assert_eq!(readiness_of(detected), want, "{detected:?}");
+        for (detected, input_line, want, refused) in cases {
+            assert_eq!(
+                readiness_of(detected, input_line),
+                want,
+                "{detected:?} {input_line:?}"
+            );
             assert_eq!(refuses_send(want), refused, "{want:?}");
         }
     }
@@ -1170,6 +1255,7 @@ mod tests {
             ),
             (SendKeysError::NotRunning, "not_running"),
             (SendKeysError::Ignored, "ignored"),
+            (SendKeysError::InputLineBusy, "input_line_busy"),
             (SendKeysError::Gone, "not_found"),
         ];
         for (error, code) in cases {

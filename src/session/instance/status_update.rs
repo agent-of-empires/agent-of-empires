@@ -615,6 +615,47 @@ impl Instance {
             .unwrap_or_else(|| session.is_pane_running_shell())
     }
 
+    /// What the agent's input box in `pane` holds, read through its detection manifest. A pane
+    /// that cannot be captured, or an agent with no `[input_line]` table, is `Unknown`.
+    pub(crate) fn input_line_in(&self, session: &tmux::Session, pane: &str) -> tmux::InputLine {
+        let alias = tmux::status_rules::effective_detect_as(
+            &self.source_profile,
+            &self.tool,
+            &self.detect_as,
+        );
+        let tool: &str = if alias.is_empty() { &self.tool } else { &alias };
+        if !tmux::detect::has_input_line(tool) {
+            return tmux::InputLine::Unknown;
+        }
+        session
+            .try_capture_pane_in(pane, 0)
+            .map_or(tmux::InputLine::Unknown, |capture| {
+                tmux::detect::input_line(tool, &capture)
+            })
+    }
+
+    /// Polls [`Self::input_line_in`] until the box holds no draft. `false` when a draft is
+    /// still there once `budget` runs out.
+    pub(crate) fn wait_for_input_line(
+        &self,
+        session: &tmux::Session,
+        pane: &str,
+        budget: std::time::Duration,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            if self.input_line_in(session, pane) != tmux::InputLine::Draft {
+                return true;
+            }
+            #[cfg(test)]
+            tmux::test_helpers::observe_draft(pane);
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+
     /// A status read of this session's pane taken now, through its detection manifest, for
     /// callers outside the poller (`aoe session show`, MCP). `None` when the agent has no
     /// manifest. `reuse` is a capture the caller already took and how many lines it holds; it is

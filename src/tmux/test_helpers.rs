@@ -104,3 +104,21 @@ macro_rules! require_tmux {
     };
 }
 pub(crate) use require_tmux;
+
+static DRAFT_WATCHERS: std::sync::Mutex<Vec<(String, std::sync::mpsc::Sender<()>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Signals each time an input-line wait reads a draft in `pane`.
+pub(crate) fn watch_drafts(pane: &str) -> std::sync::mpsc::Receiver<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    DRAFT_WATCHERS.lock().unwrap().push((pane.to_string(), tx));
+    rx
+}
+
+pub(crate) fn observe_draft(pane: &str) {
+    for (watched, tx) in DRAFT_WATCHERS.lock().unwrap().iter() {
+        if watched == pane {
+            let _ = tx.send(());
+        }
+    }
+}

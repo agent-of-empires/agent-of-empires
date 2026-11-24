@@ -254,7 +254,7 @@ pub struct PendingInitialTurn {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Stable machine-readable form of `error`, for the causes a client can act
-    /// on (`agent_folder_not_trusted`, `agent_bypass_not_accepted`).
+    /// on (`agent_folder_not_trusted`, `agent_bypass_not_accepted`, `input_line_busy`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
     /// Identifies this turn across reloads, so state kept for one turn never

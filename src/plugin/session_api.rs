@@ -1219,6 +1219,11 @@ fn map_terminal_error(e: SendKeysError) -> DispatchError {
             "ignored",
             "the session is ignored because another session manages it",
         ),
+        SendKeysError::InputLineBusy => DispatchError::with_kind(
+            codes::FAILED_PRECONDITION,
+            "input_line_busy",
+            "the agent's input box holds text someone has not sent; retry once it is sent or cleared",
+        ),
         SendKeysError::Tmux(error) => {
             tracing::warn!(target: "plugin.host", %error, "plugin terminal send failed");
             DispatchError::internal("terminal send failed")
@@ -2086,6 +2091,7 @@ mod tests {
                 "session_trashed",
             ),
             (SendKeysError::NotRunning, "session_not_running"),
+            (SendKeysError::InputLineBusy, "input_line_busy"),
             (
                 SendKeysError::Transient(Status::Starting),
                 "session_transient",
