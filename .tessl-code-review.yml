@@ -1,0 +1,34 @@
+# Tessl Code Review profile: the six tessl/code-review defaults, with the
+# security lens on every file, plus the AoE invariants lens. Keep every
+# default listed: this list replaces the built-in set.
+# https://docs.tessl.io/reference/configuration.md#tessl-code-reviewyml
+schemaVersion: 1
+effort: adaptive
+lenses:
+  - ref: tessl/code-review@0.5.2#review-plugin-content
+    globs:
+      - tessl-plugins/aoe-maintainer/**
+  - ref: tessl/code-review@0.5.2#review-markdown
+    globs:
+      - '**/*.md'
+      - '!tessl-plugins/aoe-maintainer/**'
+  - ref: tessl/code-review@0.5.2#review-correctness-and-data-integrity
+    globs:
+      - '**'
+      - '!**/*.md'
+      - '!tessl-plugins/aoe-maintainer/**'
+  - ref: tessl/code-review@0.5.2#review-maintainability-and-code-quality
+    globs:
+      - '**'
+      - '!**/*.md'
+      - '!tessl-plugins/aoe-maintainer/**'
+  - ref: tessl/code-review@0.5.2#review-scale-and-resilience
+    globs:
+      - '**'
+      - '!**/*.md'
+      - '!tessl-plugins/aoe-maintainer/**'
+  # Skills, rules and agent instructions steer runs that hold write tokens.
+  - ref: tessl/code-review@0.5.2#review-security-and-privacy
+    globs:
+      - '**'
+  - ref: ./tessl-plugins/aoe-maintainer/lenses/aoe-invariants/SKILL.md

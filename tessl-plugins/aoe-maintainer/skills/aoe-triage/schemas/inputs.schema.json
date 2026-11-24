@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "properties": {
+    "MODE": {
+      "description": "issue: triage GITHUB_ISSUE_NUMBER only. sweep: triage every open issue missing a required field, at most 30 per run.",
+      "type": "string",
+      "enum": ["issue", "sweep"]
+    },
+    "GITHUB_ISSUE_NUMBER": {
+      "description": "Issue number in agent-of-empires/agent-of-empires. Required when MODE is issue.",
+      "type": "string",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "DRY_RUN": {
+      "description": "true: report the plan and write nothing. Absent means false.",
+      "type": "string",
+      "enum": ["true", "false"]
+    }
+  },
+  "required": ["MODE"],
+  "if": { "properties": { "MODE": { "const": "issue" } } },
+  "then": { "required": ["GITHUB_ISSUE_NUMBER"] },
+  "additionalProperties": false
+}
