@@ -1528,8 +1528,8 @@ pub(super) struct SuggestionsFeed {
     start_key: Option<ItemKey>,
     /// The hooks review on screen: its item, the fingerprint it shows and the origin it was issued for.
     held_trust: Option<(ItemKey, serde_json::Value, Option<Origin>)>,
-    /// The Home group setting a `h` asked for, until the list reloads.
-    home_pending: Option<bool>,
+    /// The Home group setting the `ShowOnHome` in flight asks for.
+    home_in_flight: Option<bool>,
     /// The origin the pre-trust confirmation on screen was opened for.
     held_pre_trust: Option<Origin>,
     /// The last start or prepare that failed, shown on its row on Home and in
@@ -1583,7 +1583,7 @@ impl SuggestionsFeed {
             start_key: None,
             held_trust: None,
             held_pre_trust: None,
-            home_pending: None,
+            home_in_flight: None,
             failed: None,
             blocked_prompts: std::collections::HashMap::new(),
             hooks_changed: false,
@@ -1607,6 +1607,7 @@ impl SuggestionsFeed {
         self.in_flight_user = user;
         match &req {
             Req::Load => self.load_attempt_at = Some(std::time::Instant::now()),
+            Req::ShowOnHome { shown, .. } => self.home_in_flight = Some(*shown),
             Req::Prepare {
                 provider_id,
                 id,
@@ -1761,16 +1762,23 @@ impl SuggestionsFeed {
             || self.is_recent(&(item.provider_id.clone(), item.id.clone()))
     }
 
-    /// Whether Home shows the Suggested group: the daemon's "Show in the sidebar" pref.
+    /// Whether Home shows the Suggested group: the last `h` still on its way
+    /// to the daemon, else its "Show in the sidebar" pref.
     pub(super) fn shown_on_home(&self) -> bool {
-        self.home_pending
+        self.queued
+            .iter()
+            .rev()
+            .find_map(|req| match req {
+                Req::ShowOnHome { shown, .. } => Some(*shown),
+                _ => None,
+            })
+            .or(self.home_in_flight)
             .unwrap_or_else(|| self.snapshot.as_ref().is_some_and(|s| s.prefs.sidebar))
     }
 
     /// Sets that pref through the daemon, then reloads the list.
     pub(super) fn show_on_home(&mut self, shown: bool) {
         let origin = self.origin();
-        self.home_pending = Some(shown);
         self.submit(Req::ShowOnHome { shown, origin });
     }
 
@@ -2184,19 +2192,18 @@ impl SuggestionsFeed {
             Err(TryRecvError::Disconnected) if self.busy => {
                 self.busy = false;
                 self.queued.clear();
+                self.home_in_flight = None;
                 out.error = Some("The suggestions worker stopped".into());
                 return out;
             }
             Err(_) => return out,
         };
         self.busy = false;
+        self.home_in_flight = None;
         let user = std::mem::take(&mut self.in_flight_user);
         let in_flight_dismiss = self.in_flight_dismiss.take();
         let req_kind = match &res {
-            Res::Snapshot(_) => {
-                self.home_pending = None;
-                ResKind::Snapshot
-            }
+            Res::Snapshot(_) => ResKind::Snapshot,
             Res::Prepared(_) => ResKind::Prepare,
             Res::Started(_) => ResKind::Start,
             _ => ResKind::Other,
@@ -3277,6 +3284,49 @@ mod tests {
         assert!(rig.view.error.is_some());
         let mut polled = rig.store.poll();
         assert!(!rig.view.apply(&mut rig.store, &mut polled));
+    }
+
+    #[test]
+    fn a_reload_between_two_h_presses_keeps_the_second_press_a_toggle() {
+        let (gate_tx, gate) = std::sync::mpsc::channel::<()>();
+        let (sent_tx, sent) = std::sync::mpsc::channel::<bool>();
+        let snapshot = view_with(vec![], idle_worker()).store.snapshot.unwrap();
+        let worker = Worker::spawn("t", move |req| {
+            if let Req::ShowOnHome { shown, .. } = req {
+                sent_tx.send(shown).unwrap();
+            }
+            let _ = gate.recv();
+            Res::Snapshot(Ok(snapshot.clone()))
+        });
+        let mut rig = view_with(vec![item("a", None, false)], worker);
+        rig.store.reload();
+        press(&mut rig, KeyCode::Char('h'), true);
+        assert!(!rig.store.shown_on_home());
+
+        // Answers the request in flight, then polls until the next `h` reaches the worker.
+        let next_press = |rig: &mut Rig| {
+            gate_tx.send(()).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let mut polled = rig.store.poll();
+                rig.view.apply(&mut rig.store, &mut polled);
+                if let Ok(shown) = sent.try_recv() {
+                    return shown;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no h reached the worker"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        // The reload answers with the old pref while the first `h` waits behind it.
+        assert!(!next_press(&mut rig));
+        assert!(!rig.store.shown_on_home(), "the first h is still pending");
+
+        press(&mut rig, KeyCode::Char('h'), true);
+        assert!(rig.store.shown_on_home());
+        assert!(next_press(&mut rig), "the second h toggles back");
     }
 
     #[test]
