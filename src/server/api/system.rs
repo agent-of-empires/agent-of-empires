@@ -3097,6 +3097,7 @@ pub struct AgentDefaultModel {
     /// The `acp_defaults` key the Agent reads from (`claude` for a legacy `claude-code`).
     agent_key: String,
     model: Option<String>,
+    /// `pin_model` is on, with or without a model: a write would set the pin.
     pinned: bool,
 }
 
@@ -3107,7 +3108,7 @@ impl AgentDefaultModel {
             profile: profile.to_string(),
             agent_key: acp.acp_defaults_key_for(agent).to_string(),
             model: defaults.and_then(|d| d.model()),
-            pinned: defaults.and_then(|d| d.pinned_model()).is_some(),
+            pinned: defaults.is_some_and(|d| d.pin_model),
         }
     }
 }
@@ -3202,7 +3203,8 @@ pub async fn get_agent_default_model(
 }
 
 /// `PUT /api/profiles/{name}/acp-defaults/{agent}/model`: set only this Agent's default
-/// model in the profile, refusing while the profile's resolved settings pin it.
+/// model in the profile, refusing while the profile's resolved settings turn its pin on,
+/// even with no model yet, since the write would then make the model a pin.
 ///
 /// The check and the write share the profile's lock and the settings write gate, so a
 /// pin saved through this Daemon after the caller read the default is honoured. The
@@ -3273,7 +3275,7 @@ pub async fn set_agent_default_model(
                 )
                 .into());
             }
-            if resolved.acp.pinned_model_for(&agent).is_some() {
+            if resolved.acp.acp_defaults_for(&agent).is_some_and(|d| d.pin_model) {
                 return Err(DefaultModelRefused(
                     crate::daemon::ApiErrorCode::ModelPinned,
                     format!(
@@ -4929,7 +4931,8 @@ command = "zzzeta"
     }
 
     /// A pin the profile resolves, from either layer, refuses the write and leaves the profile
-    /// file untouched, including a pin saved after the caller last read the default.
+    /// file untouched, including a pin saved after the caller last read the default and a
+    /// pin with no model yet, which the write would make a pin.
     #[tokio::test]
     #[serial_test::serial]
     async fn agent_default_model_put_refuses_a_pin_in_either_layer() {
@@ -4942,6 +4945,18 @@ command = "zzzeta"
             ("pinned in the profile", pin("p"), json!({}), "m"),
             ("pinned on the machine", json!({}), pin("p"), "m"),
             ("pinned to the requested model", pin("m"), json!({}), "m"),
+            (
+                "a pin with no model in the profile",
+                json!({"claude": {"pin_model": true}}),
+                json!({}),
+                "m",
+            ),
+            (
+                "a pin with no model on the machine",
+                json!({}),
+                json!({"claude": {"pin_model": true}}),
+                "m",
+            ),
         ] {
             set_machine_acp_defaults(json!({}));
             set_profile_acp_defaults("work", json!({}));
