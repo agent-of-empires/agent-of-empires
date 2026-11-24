@@ -1595,6 +1595,26 @@
       ]
     },
     {
+      "id": "wizard.worktree-info",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": [
+        "tests/wizard-worktree-info.spec.ts",
+        "tests/live/session-create.spec.ts",
+        "src/components/session-wizard/__tests__/InfoPopover.test.tsx",
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/hooks/useKeyboardShortcuts.test.ts"
+      ],
+      "components": [
+        "web/src/components/session-wizard/InfoPopover.tsx",
+        "web/src/components/session-wizard/WorktreeInfo.tsx",
+        "web/src/components/session-wizard/WizardRows.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/hooks/useKeyboardShortcuts.ts"
+      ],
+      "notes": "#5910: the Worktree row's info icon, in every row state including blocked ones, opens a dialog explaining worktrees. Enter or Space opens it, Escape closes it without closing the wizard and refocuses the icon. It renders inside the wizard's dialog, so the wizard's focus trap lets Tab go on to its link. A scroll under it or a change of window width closes it too, refocusing the icon only when focus was inside it; a height-only change keeps it open, moved back inside the window. The icon is a 44px target on phones. Its link closes the wizard and opens Settings > Worktree in the app, without a page load, so a passphrase login's redirect to /login doesn't apply."
+    },
+    {
       "id": "wizard.worktree-title-derived-branch",
       "kind": "vitest",
       "risk": "medium",
