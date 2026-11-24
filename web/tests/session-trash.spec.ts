@@ -10,6 +10,7 @@ import {
   trashRows,
   trashToggle,
 } from "./helpers/trashMocks";
+import { dragSidebarHandle } from "./helpers/sidebar";
 
 test.use({ viewport: { width: 1280, height: 720 } });
 
@@ -64,6 +65,21 @@ test.describe("Session trash flow", () => {
 
     await confirmDelete(dialog);
     await expect.poll(() => handle.deletedIds.length, { timeout: 10_000 }).toBe(1);
+  });
+
+  test("the footer Trash icon keeps its count badge clear of Settings on the compact rail", async ({ page }) => {
+    await installTrashMocks(page, [{ ...SESSION, trashed: true }]);
+    await page.goto("/");
+    await expect(trashToggle(page)).toHaveAccessibleName("Trash, 1 session");
+    await dragSidebarHandle(page, 100);
+    const panel = page.locator('[data-tour="sidebar"]');
+    await expect(panel).toHaveAttribute("data-compact", "true");
+
+    const panelBox = (await panel.boundingBox())!;
+    const badge = (await page.getByTestId("sidebar-trash-count").boundingBox())!;
+    const settings = (await page.getByRole("button", { name: "Settings" }).boundingBox())!;
+    expect(badge.x + badge.width).toBeLessThanOrEqual(settings.x);
+    expect(settings.x + settings.width).toBeLessThanOrEqual(panelBox.x + panelBox.width);
   });
 });
 
