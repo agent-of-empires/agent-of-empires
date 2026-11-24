@@ -514,18 +514,23 @@ async fn start_outcome(
     }
     let hint = match code {
         "acp_adapter_missing" | "agent_not_allowed" => {
-            "Choose another agent in the preset, then try again."
+            "Choose another agent in the preset, then try again.".to_string()
         }
         "agent_hooks_not_approved" => {
             "Approve agent hooks with `aoe hooks approve` in a terminal, then try again."
+                .to_string()
         }
-        _ => "Try again, or use Start with changes to see the full error.",
+        "sandbox_unavailable" => format!(
+            "Start {} and try again, or use Start with changes to run without the sandbox.",
+            crate::containers::get_container_runtime().display_name()
+        ),
+        _ => "Try again, or use Start with changes to see the full error.".to_string(),
     };
     let reason = body["message"]
         .as_str()
         .map(String::from)
         .unwrap_or_else(|| format!("The Session could not be created ({status})"));
-    start_failed(reason, hint)
+    start_failed(reason, &hint)
 }
 
 /// The create a Start asks for. A worktree preset makes its own branch, as the
@@ -1104,20 +1109,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unapproved_agent_hooks_say_how_to_approve_them() {
-        let refused = api_error(
-            StatusCode::from_u16(422).unwrap(),
-            "agent_hooks_not_approved",
-            "Agent hooks are not approved",
-        );
-        let response = start_outcome(refused, "default".into(), "/repo".into()).await;
-        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(
-            body["hint"].as_str().unwrap().contains("aoe hooks approve"),
-            "{body}"
-        );
+    async fn a_refused_start_says_how_to_get_past_it() {
+        for (code, needle) in [
+            ("agent_hooks_not_approved", "aoe hooks approve"),
+            (
+                "sandbox_unavailable",
+                "use Start with changes to run without the sandbox",
+            ),
+        ] {
+            let refused = api_error(StatusCode::from_u16(422).unwrap(), code, "refused");
+            let response = start_outcome(refused, "default".into(), "/repo".into()).await;
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(body["hint"].as_str().unwrap().contains(needle), "{body}");
+        }
     }
 }
