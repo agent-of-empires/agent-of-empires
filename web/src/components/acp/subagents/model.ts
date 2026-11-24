@@ -199,7 +199,7 @@ export function fromInline(
     toolCount: tools.length,
     lastTool: tools.at(-1)?.name ?? null,
     report: status === "done" && settled ? extractTaskResult(settled.text ?? "") : "",
-    earlierReport: (stale && result?.kind === "tool_complete" && extractTaskResult(result.text ?? "")) || undefined,
+    earlierReport: stale && result?.kind === "tool_complete" ? extractTaskResult(result.text ?? "") : undefined,
     latestNote: null,
     warning: null,
     error: status === "failed" ? settled?.text || roster?.error || "" : null,

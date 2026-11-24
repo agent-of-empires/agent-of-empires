@@ -278,7 +278,7 @@ function OutputSection({ record }: { record: SubagentRecord }) {
     body = <SteppedMarkdown text={report} />;
   } else if (status === "stalled" || status === "detached") {
     body = <p className="text-text-dim">No activity; nothing to stop.</p>;
-  } else if (status === "done" && record.earlierReport) {
+  } else if (status === "done" && record.earlierReport !== undefined) {
     body = <p className="text-text-dim">Final report not captured.</p>;
   } else {
     body = (

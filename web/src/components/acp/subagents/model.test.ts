@@ -175,6 +175,14 @@ describe("fromInline resumed background child", () => {
     expect(record.earlierReport).toBe("first report");
   });
 
+  it("keeps an empty first report as earlier output so the missing final report is not blamed on the child", () => {
+    const empty: ActivityRow = { ...first, text: "" };
+    const calls = [call("2026-01-01T00:02:00Z", "2026-01-01T00:03:00Z")];
+    const record = fromInline(launch, empty, calls, roster({ state: "idle", stop_reason: "end_turn" }));
+    expect(record.status).toBe("done");
+    expect(record.earlierReport).toBe("");
+  });
+
   it("keeps the report of an idle child with no call after its result", () => {
     const calls = [call("2026-01-01T00:00:30Z", "2026-01-01T00:00:40Z")];
     const record = fromInline(launch, first, calls, roster({ state: "idle", stop_reason: "end_turn" }));
