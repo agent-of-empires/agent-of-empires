@@ -1135,6 +1135,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_fence_refuses_an_observing_explicit_resume_as_superseded() {
+        use crate::process::worker_registry::ResumeAuthority::{Automatic, Explicit};
+        let fence = |stop_owners| SpawnFence {
+            request_id: 1,
+            owners: 1,
+            stop_owners,
+        };
+        let sup = Supervisor::new(VecSink::new());
+        let id = "s-fence-observing";
+        let resume = |authority, observed| {
+            sup.begin_resume_observing(id, ResumeKind::Spawn, authority, observed)
+        };
+
+        lock_recover(&sup.spawn_requests)
+            .stop_fences
+            .insert(id.into(), fence(1));
+        assert!(matches!(
+            resume(Explicit, Some(None)).await,
+            Err(SupervisorError::StopSuperseded(_))
+        ));
+        // A caller that observed nothing, or an automatic one, keeps the old refusal.
+        assert!(matches!(
+            resume(Explicit, None).await,
+            Err(SupervisorError::SpawnCancelled(_))
+        ));
+        assert!(matches!(
+            resume(Automatic, Some(None)).await,
+            Err(SupervisorError::SpawnCancelled(_))
+        ));
+
+        // A purge fence is not a stop: it stays retryable.
+        lock_recover(&sup.spawn_requests)
+            .stop_fences
+            .insert(id.into(), fence(0));
+        assert!(matches!(
+            resume(Explicit, Some(None)).await,
+            Err(SupervisorError::PurgeInProgress(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn stop_fence_cancellation_helper_cancels_pending_spawn_before_worker_wait() {
         let sup = Arc::new(Supervisor::new(VecSink::new()));
         let pending = sup.begin_spawn_request("s-fence-helper").unwrap();
