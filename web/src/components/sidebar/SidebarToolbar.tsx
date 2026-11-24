@@ -38,7 +38,6 @@ export function SidebarToolbar({
   onToggleFilter,
   offline,
   onNew,
-  onToggleCompact,
   onClose,
 }: {
   compact: boolean;
@@ -57,7 +56,6 @@ export function SidebarToolbar({
   onToggleFilter: () => void;
   offline: boolean;
   onNew: () => void;
-  onToggleCompact: () => void;
   onClose: () => void;
 }) {
   const axisHeading = AXIS_HEADING[axis];
@@ -123,20 +121,6 @@ export function SidebarToolbar({
         </>
       )}
       <SidebarLegend />
-      <Tooltip text={compact ? "Expand sidebar" : "Compact sidebar"}>
-        <button
-          onClick={onToggleCompact}
-          aria-pressed={compact}
-          aria-label={compact ? "Expand sidebar" : "Compact sidebar"}
-          data-testid="sidebar-compact-toggle"
-          className={`${TOOLBAR_BUTTON} ${TOOLBAR_TINT(compact)}`}
-        >
-          <StrokeIcon size={14} strokeWidth="2">
-            <rect x="3" y="3" width="18" height="18" rx="2" />
-            <line x1="9" y1="3" x2="9" y2="21" />
-          </StrokeIcon>
-        </button>
-      </Tooltip>
       <button
         onClick={onClose}
         className="md:hidden w-8 h-8 flex items-center justify-center text-text-dim hover:text-text-secondary cursor-pointer rounded-md hover:bg-surface-800 ml-1"
