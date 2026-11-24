@@ -31,21 +31,21 @@ gh api "repos/$REPO/issues?state=open&per_page=100" --paginate --slurp |
     | select(.labels | any(. == "ready-for-agent" or . == "tessl" or . == "needs-triage" or . == "epic" or . == "blocked:upstream" or . == "question" or . == "stale") | not)]'
 ```
 
-Skip issues already judged: list
+Match findings to issues: list
 `tessl finding list --project $PROJECT --tag groom-ready --json` in every
 state, following `--after` cursors. A finding is for issue `<n>` when its
-title starts with `groom-ready: #<n> ` (trailing space included). Drop each
-issue with an open or in-progress finding, and each whose newest finding has
-the tag `updated:<the issue's updatedAt>`; an issue edited since the
-assessment behind its last finding is assessed again. Order the rest by priority label (`P0`, `P1`,
+title starts with `groom-ready: #<n> ` (trailing space included). Drop an
+issue whose newest finding, in any state, has the tag
+`updated:<the issue's updatedAt>`. Assess every other issue, keeping the id
+of a stale finding for step 3. Order them by priority label (`P0`, `P1`,
 `P2`, `P3`, none), then by most recently updated.
 
 ## 2. Assess each issue
 
 Read the body and comments with
-`gh issue view <n> -R $REPO --json body,comments,labels,updatedAt`. Skip the
-issue if its labels now include one that step 1 excludes. An issue is ready
-when all of these hold:
+`gh issue view <n> -R $REPO --json body,comments,labels,state,updatedAt`.
+Skip the issue if its `state` is not `OPEN` or its labels now include one
+that step 1 excludes. An issue is ready when all of these hold:
 
 1. **Problem**: current and expected behavior are stated.
 2. **Repro**: a bug has steps, a log, or a failing test. Features skip this.
@@ -68,7 +68,12 @@ those.
 ## 3. Record one finding per candidate
 
 Build the JSON with `jq -n --arg ...` and run
-`tessl finding create --project $PROJECT --file finding.json`.
+`tessl finding create --project $PROJECT --file finding.json`. For an issue
+with a stale finding, never create a second one: run
+`tessl finding update <id> --file finding.json` with the same fields minus
+`schemaVersion`, plus `"state": "open"`. If that issue is no longer a
+candidate, update the finding with the reason in `analysis`, the new
+`updated:` tag, and `"state": "ignored"`.
 
 ```json
 {
