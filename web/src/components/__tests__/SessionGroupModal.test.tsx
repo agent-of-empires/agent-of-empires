@@ -34,7 +34,10 @@ const pending = () => {
   return { onSave, resolve: (ok: boolean) => resolve(ok) };
 };
 
-beforeEach(() => vi.mocked(fetchGroups).mockResolvedValue([]));
+// Braced: a function returned from beforeEach runs as its teardown.
+beforeEach(() => {
+  vi.mocked(fetchGroups).mockResolvedValue([]);
+});
 afterEach(cleanup);
 
 describe("SessionGroupModal", () => {
@@ -179,6 +182,17 @@ describe("SessionGroupModal", () => {
     resolve(false);
     await waitFor(() => expect(errorText()).toBe("Failed to clear group."));
     expect(screen.queryByTestId("group-combobox-popup")).toBeNull();
+  });
+
+  it("withholds the previous profile's groups while the new profile's load", async () => {
+    vi.mocked(fetchGroups).mockImplementation((p) =>
+      p === "a" ? Promise.resolve([group("from-a")]) : new Promise<GroupInfo[]>(() => {}),
+    );
+    const props = { sessionTitle: "alpha", currentGroup: "", onSave: vi.fn(), onClose: vi.fn() };
+    const { rerender } = render(<SessionGroupModal {...props} profile="a" />);
+    await screen.findByRole("option", { name: /from-a/ });
+    rerender(<SessionGroupModal {...props} profile="b" />);
+    expect(screen.queryByRole("option", { name: /from-a/ })).toBeNull();
   });
 
   it("names the group field for assistive tech", () => {

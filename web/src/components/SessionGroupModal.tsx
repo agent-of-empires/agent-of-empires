@@ -24,13 +24,15 @@ export function SessionGroupModal({ sessionTitle, currentGroup, profile, onSave,
   const [value, setValue] = useState(currentGroup);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [groups, setGroups] = useState<GroupInfo[]>([]);
+  // Tagged with their profile, so a profile change withholds the old list until the new one loads.
+  const [loaded, setLoaded] = useState<{ profile?: string; groups: GroupInfo[] }>({ groups: [] });
+  const groups = loaded.profile === profile ? loaded.groups : [];
   const fieldRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     let live = true;
     fetchGroups(profile)
-      .then((g) => live && setGroups(g))
+      .then((g) => live && setLoaded({ profile, groups: g }))
       .catch((err) => reportError(err, { level: "warn", target: "web.client" }));
     return () => {
       live = false;
