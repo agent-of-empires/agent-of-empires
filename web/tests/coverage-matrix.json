@@ -2332,8 +2332,9 @@
       "id": "sidebar.trash-control",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/__tests__/WorkspaceSidebarTrash.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/TrashMenu.tsx"]
+      "specs": ["src/components/__tests__/WorkspaceSidebarTrash.test.tsx", "tests/session-trash.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/TrashMenu.tsx"],
+      "notes": "The footer Trash control is an icon button beside Settings, shown only while something is trashed. Its count is a badge on the icon (99+ above 99) and its accessible name and tooltip read \"Trash, N sessions\". On the compact rail the badge stays clear of Settings."
     },
     {
       "id": "sidebar.trash-on-demand",
