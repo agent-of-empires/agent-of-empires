@@ -122,11 +122,21 @@ pub(crate) fn claude_host_transcript_confirmed_absent(
         return false;
     };
     let canonical = canonicalize_or_raw(project_path);
-    let transcript = claude_home
+    claude_transcript_confirmed_absent_in(&claude_home, &canonical.to_string_lossy(), session_id)
+}
+
+/// [`claude_host_transcript_confirmed_absent`] for a known store and the cwd as the agent sees it,
+/// which for a container is not a host path and so is not canonicalized here.
+pub(crate) fn claude_transcript_confirmed_absent_in(
+    store: &Path,
+    agent_cwd: &str,
+    session_id: &str,
+) -> bool {
+    !store
         .join("projects")
-        .join(encode_claude_project_path(&canonical.to_string_lossy()))
-        .join(format!("{session_id}.jsonl"));
-    !transcript.is_file()
+        .join(encode_claude_project_path(agent_cwd))
+        .join(format!("{session_id}.jsonl"))
+        .is_file()
 }
 
 #[cfg(test)]

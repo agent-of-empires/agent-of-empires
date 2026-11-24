@@ -195,11 +195,15 @@ impl Instance {
                 }
                 None => stored,
             };
-            // An unwritten Claude pin can be created under the same ID. Uncertain reads preserve resume.
+            // An unwritten Claude pin can be created under the same ID. Uncertain reads preserve resume;
+            // a container's store counts only when it is a host directory.
             let absent = backend == Some(crate::agents::SessionCaptureBackend::Claude)
                 && execution.map_or_else(
                     || !self.is_sandboxed(),
-                    |execution| execution.inputs.container.is_none(),
+                    |execution| {
+                        execution.inputs.container.is_none()
+                            || execution.binding.filesystem == "host"
+                    },
                 )
                 && !self.agent_session_binding.as_ref().is_some_and(|binding| {
                     binding.session_id == stored
@@ -213,12 +217,20 @@ impl Instance {
                 })
                 && match execution {
                     Some(execution) => execution.binding.stores.first().is_some_and(|root| {
-                        crate::session::capture::claude_host_transcript_confirmed_absent(
-                            execution.inputs.cwd.to_str().unwrap_or(&self.project_path),
-                            &stored,
-                            &[],
-                            Some(root),
-                        )
+                        if execution.inputs.container.is_some() {
+                            execution.inputs.cwd.to_str().is_some_and(|cwd| {
+                                crate::session::capture::claude_transcript_confirmed_absent_in(
+                                    root, cwd, &stored,
+                                )
+                            })
+                        } else {
+                            crate::session::capture::claude_host_transcript_confirmed_absent(
+                                execution.inputs.cwd.to_str().unwrap_or(&self.project_path),
+                                &stored,
+                                &[],
+                                Some(root),
+                            )
+                        }
                     }),
                     None => crate::session::capture::claude_host_transcript_confirmed_absent(
                         &self.project_path,

@@ -24,7 +24,8 @@ pub(crate) use claude::encode_claude_project_path;
 pub(crate) use claude::exports_claude_store;
 pub(crate) use claude::{
     claude_home_for_host_environment, claude_host_transcript_confirmed_absent,
-    is_default_claude_store, is_explicit_claude_store_route, ClaudeStorePin,
+    claude_transcript_confirmed_absent_in, is_default_claude_store, is_explicit_claude_store_route,
+    ClaudeStorePin,
 };
 #[cfg(test)]
 pub(crate) use codex::with_codex_admission_scan_limit;

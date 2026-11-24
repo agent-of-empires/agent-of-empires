@@ -3675,24 +3675,35 @@ sandbox = "unsupported"
                 .as_deref(),
             Some("/root/.claude")
         );
-        inst.resume_intent = ResumeIntent::Default;
-        inst.resume_binding = None;
-        inst.set_agent_conversation(
-            Some(sid.into()),
-            Some(crate::session::ConversationBinding::unknown(sid)),
-            None,
-        );
-        let carried = inst
-            .prepare_launch_command(inst.conversation_state())
-            .unwrap();
-        assert!(carried
-            .command
-            .unwrap()
-            .contains(&format!("--resume {sid}")));
-        assert_eq!(
-            inst.agent_session_binding,
-            Some(crate::session::ConversationBinding::unknown(sid))
-        );
+        // A carried id resumes only when the container's store holds its transcript (#5960).
+        let transcript = resumed.binding.stores[0]
+            .join("projects")
+            .join(crate::session::capture::encode_claude_project_path(
+                "/workspace/project",
+            ))
+            .join(format!("{sid}.jsonl"));
+        for (written, want) in [(false, "--session-id"), (true, "--resume")] {
+            if written {
+                std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+                std::fs::write(&transcript, "").unwrap();
+            }
+            inst.resume_intent = ResumeIntent::Default;
+            inst.resume_binding = None;
+            inst.set_agent_conversation(
+                Some(sid.into()),
+                Some(crate::session::ConversationBinding::unknown(sid)),
+                None,
+            );
+            let carried = inst
+                .prepare_launch_command(inst.conversation_state())
+                .unwrap();
+            let command = carried.command.unwrap();
+            assert!(
+                command.contains(&format!("{want} {sid}")),
+                "{written}: {command}"
+            );
+            assert_eq!(inst.agent_session_id.as_deref(), Some(sid), "{written}");
+        }
     }
 
     #[test]
