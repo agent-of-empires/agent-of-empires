@@ -796,6 +796,21 @@ describe("settings saves", () => {
     }
   });
 
+  it("sends a default model PUT only after the one before it has answered", async () => {
+    let answerFirst: (r: Response) => void = () => {};
+    fetchSpy
+      .mockImplementationOnce(() => new Promise<Response>((r) => (answerFirst = r)))
+      .mockResolvedValueOnce(json({}));
+    const first = api.putAgentModelDefault("work", "claude", "opus");
+    const second = api.putAgentModelDefault("work", "claude", "sonnet");
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(1));
+    await Promise.resolve();
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    answerFirst(json({}));
+    expect([await first, await second]).toEqual(["committed", "committed"]);
+    expect(fetchSpy.mock.calls.map(([, init]) => JSON.parse(String(init?.body)).model)).toEqual(["opus", "sonnet"]);
+  });
+
   it("setDefaultProfile announces a landed save and stays quiet on a rejected one", async () => {
     const listener = vi.fn();
     const off = onSettingsChanged(listener);

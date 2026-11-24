@@ -1269,13 +1269,20 @@ export function fetchSessionModelDefault(sessionId: string): Promise<AgentModelD
   return fetchJson<AgentModelDefault>(`/api/sessions/${encodeURIComponent(sessionId)}/acp-default-model`);
 }
 
+/** Chains the PUTs so an earlier save still in flight can't land after, and overwrite, a later one. */
+let agentModelSaves: Promise<unknown> = Promise.resolve();
+
 /** Sets only `agent`'s default model in `profile`. `pinned`: the profile's resolved settings pin it, so nothing changed. */
 export async function putAgentModelDefault(
   profile: string,
   agent: string,
   model: string,
 ): Promise<SaveOutcome | "pinned"> {
-  const reply = await send(agentModelUrl(profile, agent), jsonInit("PUT", { model })).catch(() => null);
+  const request = agentModelSaves.then(() =>
+    send(agentModelUrl(profile, agent), jsonInit("PUT", { model })).catch(() => null),
+  );
+  agentModelSaves = request;
+  const reply = await request;
   if (reply?.status === 409 && stringField(reply.payload, "error") === "model_pinned") return "pinned";
   const outcome = reply ? saveOutcome(reply) : "uncertain";
   if (outcome !== "rejected") notifySettingsChanged();
