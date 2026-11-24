@@ -60,7 +60,8 @@ export function SessionGroupModal({ sessionTitle, currentGroup, profile, onSave,
       bodyClassName="px-5 py-4 space-y-3"
       onDismiss={() => !saving && onClose()}
       footer={
-        <>
+        // Keeps input focus on press, so blur can't collapse the inline list and shift the buttons before the click.
+        <div className="contents" onMouseDown={(e) => e.preventDefault()}>
           {currentGroup && (
             <button
               type="button"
@@ -81,7 +82,7 @@ export function SessionGroupModal({ sessionTitle, currentGroup, profile, onSave,
           >
             {saving ? "Saving..." : "Save"}
           </ConfirmButton>
-        </>
+        </div>
       }
     >
       <p id={PROMPT_ID} className="text-[13px] text-text-secondary">

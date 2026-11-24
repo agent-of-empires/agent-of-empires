@@ -176,6 +176,16 @@ describe("SessionGroupModal", () => {
     expect(screen.queryByRole("button", { name: "Remove from group" })).toBeNull();
   });
 
+  it("keeps input focus on mousedown over the footer buttons and still saves on click", async () => {
+    const { input, saveBtn, onSave } = setup("work");
+    const remove = screen.getByRole("button", { name: "Remove from group" });
+    expect(fireEvent.mouseDown(saveBtn)).toBe(false);
+    expect(fireEvent.mouseDown(remove)).toBe(false);
+    fireEvent.change(input, { target: { value: "play" } });
+    fireEvent.click(saveBtn);
+    expect(onSave).toHaveBeenCalledWith("play");
+  });
+
   it("restores focus on unmount", () => {
     expectRestoresFocus(() => setup().unmount);
   });
