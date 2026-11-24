@@ -5166,6 +5166,7 @@ async fn create_holds_a_structured_fork_to_the_parents_agent_and_profile() {
             axum::extract::Query(create::CreateSessionQuery { wait: None }),
             None,
             None,
+            axum::http::HeaderMap::new(),
             Ok(Json(create_body_from_json(serde_json::json!({
                 "path": project.path(), "tool": "claude", "agent_name": agent_name,
                 "view": "structured", "fork_from": acp_id,
