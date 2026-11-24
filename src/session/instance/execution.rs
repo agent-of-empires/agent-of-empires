@@ -243,8 +243,11 @@ fn ensure_claude_store_root(
 /// resume nor a `/tmp` wipe, so without this a session can stay `Preallocated`
 /// for good and be refused as a fork parent despite holding a complete
 /// transcript. Existence uses the same probe as the `--resume` arm.
+///
+/// `container_cwd` is the cwd a sandboxed agent sees, under which it names its project.
 pub(super) fn transcript_confirms_reserved_claude_conversation(
     binding: &ConversationBinding,
+    container_cwd: Option<&str>,
 ) -> bool {
     if binding.provenance != ConversationProvenance::Preallocated {
         return false;
@@ -258,12 +261,19 @@ pub(super) fn transcript_confirms_reserved_claude_conversation(
     let Some(store) = single_store(&execution.stores) else {
         return false;
     };
-    !crate::session::capture::claude_host_transcript_confirmed_absent(
-        &execution.cwd.to_string_lossy(),
-        &binding.session_id,
-        &[],
-        Some(store),
-    )
+    match container_cwd {
+        Some(cwd) => !crate::session::capture::claude_transcript_confirmed_absent_in(
+            store,
+            cwd,
+            &binding.session_id,
+        ),
+        None => !crate::session::capture::claude_host_transcript_confirmed_absent(
+            &execution.cwd.to_string_lossy(),
+            &binding.session_id,
+            &[],
+            Some(store),
+        ),
+    }
 }
 
 /// Confirms, from inside a live pane's sidecar poller, the reserved Claude id
@@ -278,6 +288,7 @@ pub(super) fn transcript_confirms_reserved_claude_conversation(
 pub(super) struct ReservedClaudeConfirmation {
     binding: ConversationBinding,
     active: ActiveExecution,
+    container_cwd: Option<String>,
     superseded: std::cell::Cell<bool>,
     confirmed: std::cell::OnceCell<crate::session::poller::SessionIdObservation>,
 }
@@ -295,6 +306,10 @@ impl ReservedClaudeConfirmation {
         })?;
         Some(Self {
             binding: binding.clone(),
+            container_cwd: active
+                .container
+                .is_some()
+                .then(|| instance.container_workdir()),
             active: active.clone(),
             superseded: std::cell::Cell::new(false),
             confirmed: std::cell::OnceCell::new(),
@@ -329,7 +344,10 @@ impl ReservedClaudeConfirmation {
         if let Some(confirmed) = self.confirmed.get() {
             return Some(confirmed.clone());
         }
-        if !transcript_confirms_reserved_claude_conversation(&self.binding) {
+        if !transcript_confirms_reserved_claude_conversation(
+            &self.binding,
+            self.container_cwd.as_deref(),
+        ) {
             return None;
         }
         let execution = self.binding.execution.clone()?;
@@ -4757,13 +4775,32 @@ sandbox = "unsupported"
         );
         std::fs::create_dir_all(&project_dir).unwrap();
         std::fs::write(project_dir.join(format!("{present}.jsonl")), "data\n").unwrap();
+        // A sandboxed Claude names its project by the container's cwd (#5960).
+        let boxed = "22222222-3333-4444-5555-666666666666";
+        let container_dir = store.path().join("projects").join(
+            crate::session::capture::encode_claude_project_path("/workspace/project"),
+        );
+        std::fs::create_dir_all(&container_dir).unwrap();
+        std::fs::write(container_dir.join(format!("{boxed}.jsonl")), "data\n").unwrap();
 
         use ConversationProvenance::{Preallocated, Unknown};
         let second = store.path().join("second");
-        // (sid, agent, filesystem, provenance, extra store, confirmed)
-        for (sid, agent, filesystem, provenance, extra, confirmed) in [
-            (present, "claude", "host", Preallocated, None, true),
-            (absent, "claude", "host", Preallocated, None, false),
+        let sandboxed = Some("/workspace/project");
+        // (sid, agent, filesystem, provenance, extra store, container cwd, confirmed)
+        for (sid, agent, filesystem, provenance, extra, container_cwd, confirmed) in [
+            (present, "claude", "host", Preallocated, None, None, true),
+            (absent, "claude", "host", Preallocated, None, None, false),
+            (boxed, "claude", "host", Preallocated, None, sandboxed, true),
+            (boxed, "claude", "host", Preallocated, None, None, false),
+            (
+                present,
+                "claude",
+                "host",
+                Preallocated,
+                None,
+                sandboxed,
+                false,
+            ),
             // A container store is not on this filesystem.
             (
                 present,
@@ -4771,16 +4808,18 @@ sandbox = "unsupported"
                 "container:session",
                 Preallocated,
                 None,
+                None,
                 false,
             ),
-            (present, "codex", "host", Preallocated, None, false),
-            (present, "claude", "host", Unknown, None, false),
+            (present, "codex", "host", Preallocated, None, None, false),
+            (present, "claude", "host", Unknown, None, None, false),
             (
                 present,
                 "claude",
                 "host",
                 Preallocated,
                 Some(&second),
+                None,
                 false,
             ),
         ] {
@@ -4801,9 +4840,9 @@ sandbox = "unsupported"
                 transcript_path: None,
             };
             assert_eq!(
-                transcript_confirms_reserved_claude_conversation(&binding),
+                transcript_confirms_reserved_claude_conversation(&binding, container_cwd),
                 confirmed,
-                "sid={sid} agent={agent} filesystem={filesystem} provenance={provenance:?} extra={extra:?}"
+                "sid={sid} agent={agent} filesystem={filesystem} provenance={provenance:?} extra={extra:?} container_cwd={container_cwd:?}"
             );
         }
     }

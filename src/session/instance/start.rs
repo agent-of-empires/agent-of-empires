@@ -942,6 +942,11 @@ impl Instance {
             .and_then(|program| std::fs::canonicalize(program).ok());
         if let Some(execution) = prepared.execution.take() {
             let attested = self.attested_claude_store_route(&execution);
+            let container_cwd = execution
+                .inputs
+                .container
+                .is_some()
+                .then(|| execution.inputs.cwd.to_string_lossy().into_owned());
             self.active_execution = Some(ActiveExecution {
                 launch_id: execution.inputs.launch_id,
                 binding: execution.binding.clone(),
@@ -977,7 +982,10 @@ impl Instance {
                         transcript_path: None,
                     });
                 if matches!(prepared.expected_conversation.intent, ResumeIntent::Default)
-                    && super::execution::transcript_confirms_reserved_claude_conversation(&binding)
+                    && super::execution::transcript_confirms_reserved_claude_conversation(
+                        &binding,
+                        container_cwd.as_deref(),
+                    )
                 {
                     binding.provenance = ConversationProvenance::Observed;
                 }
