@@ -152,8 +152,8 @@ Thanks for the report. To work on it we need the steps to reproduce it, what you
   removes it. The bug, feature and question templates add `bug`,
   `enhancement` and `question`.
 - Adding the `tessl` label starts the Implement loop only when a maintainer
-  adds it; the trigger checks the sender. No other label this skill may add
-  starts a run.
+  or the Tessl App adds it; the trigger checks the sender, and this run's
+  token is neither. No other label this skill may add starts a run.
 - Nothing wakes this skill when a reporter replies. A later sweep sees the
   reply and finishes the issue.
 - The run's `GH_TOKEN` is a fine-grained token from the `aoe-issues`
