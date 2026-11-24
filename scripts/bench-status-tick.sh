@@ -6,6 +6,7 @@
 # `ps -E` hides process environments (macOS). Hook files live under
 # /tmp/aoe-hooks-$(id -u)/<instance id>/ and are removed on exit.
 set -euo pipefail
+[ $# -ge 1 ] || { sed -n 3p "$0" | sed 's/^# //' >&2; exit 2; }
 
 AOE=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 N=${2:-20}
@@ -25,6 +26,8 @@ export HOME="$B/home" AOE_TMUX_SOCKET="$B/tmux.sock"
 # An inherited absolute XDG path would beat the throwaway HOME.
 export XDG_CONFIG_HOME="$B/home/.config" XDG_DATA_HOME="$B/home/.local/share" \
   XDG_STATE_HOME="$B/home/.local/state" XDG_CACHE_HOME="$B/home/.cache"
+# Agent config-dir overrides would also beat it, so hook installs stay in $B.
+unset CLAUDE_CONFIG_DIR CODEX_HOME
 IDS=()
 SERVE_PID=  # never inherit the caller's value
 cleanup() {
@@ -67,9 +70,18 @@ LIST=$(curl -fsS "$API" -H "$AUTH" |
   echo "expected $N sessions, got: $LIST" >&2
   exit 1
 }
+# Write hook files only under a hook dir this user owns and keeps private, so no other
+# user can swap a child for a symlink.
+H="/tmp/aoe-hooks-$(id -u)"
+mkdir -p -m 700 "$H"
+[ -d "$H" ] && [ ! -L "$H" ] && [ -O "$H" ] || {
+  echo "$H is not a directory owned by $(id -un)" >&2
+  exit 1
+}
+chmod 700 "$H"
 while read -r id; do
   IDS+=("$id")
-  d="/tmp/aoe-hooks-$(id -u)/$id"
+  d="$H/$id"
   mkdir -p "$d" && chmod 700 "$d"
   echo idle > "$d/status"
 done <<< "$LIST"
