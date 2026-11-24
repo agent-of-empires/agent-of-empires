@@ -24,6 +24,7 @@ export function SessionGroupModal({ sessionTitle, currentGroup, profile, onSave,
   const [value, setValue] = useState(currentGroup);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [refocusing, setRefocusing] = useState(false);
   // Tagged with their profile, so a profile change withholds the old list until the new one loads.
   const [loaded, setLoaded] = useState<{ profile?: string; groups: GroupInfo[] }>({ groups: [] });
   const groups = loaded.profile === profile ? loaded.groups : [];
@@ -45,12 +46,14 @@ export function SessionGroupModal({ sessionTitle, currentGroup, profile, onSave,
     setSaving(true);
     setError(null);
     if (await onSave(next)) return onClose();
-    // Commit first so the refocus doesn't open the list over the error (`openOnFocus`).
+    // Commit first so this refocus alone doesn't open the list over the error (`openOnFocus`).
     flushSync(() => {
       setSaving(false);
       setError(next ? "Failed to update group." : "Failed to clear group.");
+      setRefocusing(true);
     });
     fieldRef.current?.querySelector("input")?.focus();
+    setRefocusing(false);
   };
   const handleSave = () => save(value.trim());
 
@@ -111,7 +114,7 @@ export function SessionGroupModal({ sessionTitle, currentGroup, profile, onSave,
           inline
           showAllUntilEdited
           disabled={saving}
-          openOnFocus={!error}
+          openOnFocus={!refocusing}
           value={value}
           onChange={(v) => {
             setValue(v);

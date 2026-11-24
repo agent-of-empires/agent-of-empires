@@ -103,6 +103,10 @@ describe("SessionGroupModal", () => {
     expect(saveBtn.disabled).toBe(false);
     expect(document.activeElement).toBe(input);
     expect(screen.queryByTestId("group-combobox-popup")).toBeNull();
+    // Only the programmatic refocus is suppressed; a later focus opens the list.
+    fireEvent.blur(input);
+    fireEvent.focus(input);
+    screen.getByTestId("group-combobox-popup");
     fireEvent.change(input, { target: { value: "again" } });
     expect(errorText()).toBeUndefined();
   });
