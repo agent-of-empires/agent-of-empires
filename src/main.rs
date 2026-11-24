@@ -396,6 +396,15 @@ async fn run(
             let profile = cli.profile.as_deref().unwrap_or_default();
             return exit_zero(cli::add::run(profile, *args).await);
         }
+        Some(Commands::Session {
+            command:
+                command @ (cli::session::SessionCommands::Favorite(_)
+                | cli::session::SessionCommands::Unfavorite(_)),
+        }) => {
+            return exit_zero(
+                cli::session::run(cli.profile.as_deref().unwrap_or_default(), command).await,
+            )
+        }
         Some(Commands::Stop { .. }) => return exit_zero(cli::killall::stop_trap()),
         // Before the startup lock and migrations: see `cli::serve::run_control`.
         Some(Commands::Serve(ref args)) => {

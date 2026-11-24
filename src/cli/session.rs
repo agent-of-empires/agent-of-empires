@@ -441,48 +441,54 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
 }
 
 async fn set_favorite(profile: &str, args: SessionIdArgs, favorited: bool) -> Result<()> {
-    use crate::daemon::{DaemonClientError, SessionMutation, UpdateFavoriteBody};
-
-    let (client, epoch) = super::group::daemon_client().await?;
-    let mut snapshot = client.runtime_snapshot(&epoch).await?;
-    let profile = if profile.is_empty() {
-        &snapshot.contents.default_profile
-    } else {
-        anyhow::ensure!(
-            snapshot
-                .contents
-                .profiles
-                .iter()
-                .any(|row| row.name == profile),
-            "Profile '{profile}' does not exist"
-        );
-        profile
+    use crate::acp::client::{
+        daemon_manager::require_local_read_daemon, discovery::discover_env, HttpClient,
     };
-    snapshot
-        .contents
-        .sessions
-        .retain(|row| row.profile == profile);
-    let row = super::resolve_session(&args.identifier, &snapshot.contents.sessions)?;
-    let cursor = client
-        .mutate_session(
-            &row.id,
-            &SessionMutation::Favorite(UpdateFavoriteBody::Scoped {
-                profile: row.profile.clone(),
-                scoped_favorited: favorited,
-            }),
-            &epoch,
-        )
-        .await?;
+    use crate::daemon::{
+        DaemonClientError, RuntimeHealth, UpdateFavoriteBody, RUNTIME_PROTOCOL_VERSION,
+    };
+
     anyhow::ensure!(
-        cursor.revision >= snapshot.cursor.revision,
-        DaemonClientError::InvalidMutationReceipt
+        !matches!(
+            std::env::var("AOE_DAEMON_URL"),
+            Err(std::env::VarError::NotUnicode(_))
+        ),
+        "AOE_DAEMON_URL must be valid UTF-8"
     );
+    let endpoint = match discover_env() {
+        Some(endpoint) => endpoint,
+        None => require_local_read_daemon().await?,
+    };
+    let (client, info, baseline) = HttpClient::new(endpoint)?
+        .runtime_mutation_client()
+        .await
+        .map_err(|error| anyhow::anyhow!("{}", super::terminal_text(&error.to_string())))?;
+    anyhow::ensure!(
+        info.protocol_version == RUNTIME_PROTOCOL_VERSION && info.health == RuntimeHealth::Healthy,
+        "Daemon runtime is not ready"
+    );
+    let selector = args.identifier;
+    let body = UpdateFavoriteBody::Scoped {
+        profile: profile.into(),
+        selector,
+        select_favorited: favorited,
+    };
+    let outcome = match client.set_favorite_by_selector(&body, &baseline).await {
+        Ok(outcome) => outcome,
+        Err(DaemonClientError::FavoriteSelection(error)) => {
+            let UpdateFavoriteBody::Scoped { selector, .. } = body else {
+                unreachable!()
+            };
+            return Err(error.for_cli(&selector));
+        }
+        Err(error) => bail!("{}", super::terminal_text(&error.to_string())),
+    };
     let verb = if favorited {
         "Favorited"
     } else {
         "Unfavorited"
     };
-    println!("{verb}: {}", row.title);
+    println!("{verb}: {}", super::terminal_text(&outcome.title));
     Ok(())
 }
 

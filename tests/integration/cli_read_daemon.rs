@@ -108,7 +108,7 @@ fn favorite_writes_require_a_writable_daemon_and_stay_in_profile() {
     std::fs::write(&other, serde_json::to_vec(&rows).unwrap()).unwrap();
     rows[0].unarchive();
     rows[0].trash();
-    let mut marked = Instance::new("Already favorited", "/isolated/marked");
+    let mut marked = Instance::new("Already\nfavorited\u{1b}", "/isolated/marked");
     marked.id = "marked-row".into();
     marked.view = View::Structured;
     marked.favorite();
@@ -129,8 +129,8 @@ fn favorite_writes_require_a_writable_daemon_and_stay_in_profile() {
 
     let start = fixture.run(&["serve", "--core-only", "--daemon", "--read-only"]);
     assert!(start.status.success(), "{start:?}");
-    assert_refused(&run("favorite", "daemon-only-row"), "403 Forbidden");
-    assert_refused(&run("unfavorite", "marked-row"), "403 Forbidden");
+    assert_refused(&run("favorite", "daemon-only-row"), "read-only");
+    assert_refused(&run("unfavorite", "marked-row"), "read-only");
     let stored: Vec<Instance> = serde_json::from_slice(&std::fs::read(&main).unwrap()).unwrap();
     assert!(stored
         .iter()
@@ -143,6 +143,25 @@ fn favorite_writes_require_a_writable_daemon_and_stay_in_profile() {
 
     let start = fixture.run(&["serve", "--core-only", "--daemon"]);
     assert!(start.status.success(), "{start:?}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let output = fixture
+            .command(&["session", "favorite", "daemon-only-row"])
+            .env("AOE_DAEMON_URL", std::ffi::OsString::from_vec(vec![0xff]))
+            .output()
+            .unwrap();
+        assert_refused(&output, "AOE_DAEMON_URL must be valid UTF-8");
+        assert!(!favorite(&main));
+    }
+    assert_refused(&run("favorite", "missing"), "Session not found: missing");
+    let ambiguous = run("favorite", "");
+    assert_refused(&ambiguous, "matches 2 sessions");
+    assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("Alreadyfavorited)"));
+    assert!(!ambiguous.stderr.contains(&0x1b));
+    let output = run("favorite", "marked-row");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"Favorited: Alreadyfavorited\n");
     let output = run("favorite", "Disk must not answer");
     assert!(output.status.success(), "{output:?}");
     assert_eq!(output.stdout, b"Favorited: Disk must not answer\n");

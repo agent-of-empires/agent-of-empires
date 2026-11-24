@@ -775,16 +775,35 @@ pub struct UpdatePinBody {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum UpdateFavoriteBody {
     Scoped {
-        // A distinct value key makes older Daemons reject the scoped request.
         profile: String,
-        scoped_favorited: bool,
+        selector: String,
+        // A distinct value key makes older Daemons reject the scoped request.
+        select_favorited: bool,
     },
     Unscoped {
         favorited: bool,
     },
+}
+
+pub(crate) const FAVORITE_BY_SELECTOR: &str = "by-selector";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLookupError {
+    NotFound,
+    ProfileNotFound(String),
+    Ambiguous {
+        count: usize,
+        candidates: Vec<(String, String)>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct FavoriteOutcome {
+    pub title: String,
 }
 
 #[derive(Serialize, Deserialize)]

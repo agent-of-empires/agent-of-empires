@@ -62,6 +62,7 @@ pub async fn update_session_pin(
 pub async fn update_session_favorite(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
     body: Result<Json<UpdateFavoriteBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
@@ -71,26 +72,35 @@ pub async fn update_session_favorite(
         Ok(body) => body,
         Err(rejection) => return rejection.into_response(),
     };
-    let (selected_profile, favorited) = match body {
+    let favorited = match body {
         UpdateFavoriteBody::Scoped {
             profile,
-            scoped_favorited,
-        } => (Some(profile), scoped_favorited),
-        UpdateFavoriteBody::Unscoped { favorited } => (None, favorited),
+            selector,
+            select_favorited,
+        } => {
+            use crate::daemon::{ApiErrorCode, FAVORITE_BY_SELECTOR, RUNTIME_EPOCH_HEADER};
+            if id != FAVORITE_BY_SELECTOR {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            if !headers.contains_key(RUNTIME_EPOCH_HEADER) {
+                return crate::server::api::api_error_with_code_header(
+                    ApiErrorCode::RuntimeEpochMismatch,
+                    "An epoch is required for selector-based favorite updates.",
+                );
+            }
+            return update_favorite_by_selector(&state, profile, selector, select_favorited).await;
+        }
+        UpdateFavoriteBody::Unscoped { favorited } => favorited,
     };
 
     let namespace = state.profile_namespace.read().await;
     let lock = state.instance_lock(&id).await;
     let guard = lock.lock().await;
+    let cityhall_mode = state.cityhall_mode;
     let profile = {
         let instances = state.instances.read().await;
-        let target = instances.iter().find(|instance| {
-            instance.id == id
-                && selected_profile
-                    .as_ref()
-                    .is_none_or(|profile| instance.source_profile == *profile)
-        });
-        if state.cityhall_mode && !target.is_some_and(Instance::is_structured) {
+        let target = instances.iter().find(|instance| instance.id == id);
+        if cityhall_mode && !target.is_some_and(Instance::is_structured) {
             return crate::server::api::cityhall_response();
         }
         let Some(instance) = target else {
@@ -108,11 +118,10 @@ pub async fn update_session_favorite(
                 .iter_mut()
                 .find(|instance| instance.id == persist_id)
                 .ok_or_else(crate::server::api::session_not_found)?;
-            if favorited {
-                instance.favorite();
-            } else {
-                instance.unfavorite();
+            if cityhall_mode && !instance.is_structured() {
+                return Err(crate::server::api::cityhall_response());
             }
+            apply_favorite(instance, favorited);
             Ok(())
         },
         None,
@@ -124,13 +133,103 @@ pub async fn update_session_favorite(
     tracing::info!(target: "session.sync", session = %id, field = "favorite", value = favorited, "session updated");
     drop(guard);
     drop(namespace);
-    crate::server::runtime::scoped_session_mutation_response(
-        &state,
-        &id,
-        selected_profile.as_deref(),
-        None::<()>,
+    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
+}
+
+fn apply_favorite(row: &mut Instance, favorited: bool) {
+    if favorited {
+        row.favorite();
+    } else {
+        row.unfavorite();
+    }
+}
+
+async fn update_favorite_by_selector(
+    state: &Arc<AppState>,
+    mut profile: String,
+    selector: String,
+    favorited: bool,
+) -> axum::response::Response {
+    use crate::daemon::FavoriteOutcome;
+    let namespace = state.profile_namespace.write().await;
+    {
+        let metadata = state.canonical_metadata.read().await;
+        if profile.is_empty() {
+            profile.clone_from(&metadata.default_profile);
+        }
+        if !metadata.profiles.iter().any(|entry| entry.name == profile) {
+            return favorite_selection_refused(crate::daemon::SessionLookupError::ProfileNotFound(
+                profile,
+            ));
+        }
+    }
+    let cityhall_mode = state.cityhall_mode;
+    let committed = commit_profile_update_with_refusal(
+        state,
+        profile,
+        "favorite update",
+        move |rows| {
+            let (index, _) = crate::cli::lookup_session(
+                &selector,
+                rows.iter()
+                    .enumerate()
+                    .filter(|(_, row)| !cityhall_mode || row.is_structured()),
+            )
+            .map_err(favorite_selection_refused)?;
+            let row = &mut rows[index];
+            apply_favorite(row, favorited);
+            Ok(FavoriteOutcome {
+                title: row.title.clone(),
+            })
+        },
+        None,
     )
-    .await
+    .await;
+    let outcome = match committed {
+        Ok(outcome) => outcome,
+        Err(response) => return response,
+    };
+    drop(namespace);
+    match state.runtime.publish(state).await {
+        Ok(snapshot) => {
+            crate::server::runtime::mutation_response(&snapshot.value.cursor, Json(outcome))
+        }
+        Err(error) => {
+            tracing::debug!(target: "server.runtime", %error, "favorite publication failed");
+            outcome_unconfirmed_response()
+        }
+    }
+}
+
+fn favorite_selection_refused(
+    mut error: crate::daemon::SessionLookupError,
+) -> axum::response::Response {
+    if let crate::daemon::SessionLookupError::Ambiguous { candidates, .. } = &mut error {
+        candidates.sort_unstable();
+        // Budget for worst-case JSON escaping within the client's error response limit.
+        let mut remaining = 1000usize;
+        let keep = candidates
+            .iter()
+            .take(12)
+            .take_while(|(id, title)| {
+                let bytes = id.len() + title.len();
+                if bytes > remaining {
+                    return false;
+                }
+                remaining -= bytes;
+                true
+            })
+            .count();
+        candidates.truncate(keep);
+    }
+    if let crate::daemon::SessionLookupError::ProfileNotFound(name) = &mut error {
+        if name.len() > 1000 {
+            name.truncate(name.floor_char_boundary(1000));
+            name.push('…');
+        }
+    }
+    let code = crate::daemon::ApiErrorCode::FavoriteSelectionRefused;
+    (code.status(), code.header(), Json(error)).into_response()
 }
 
 /// 409 for ignore refusing a sunk row. The codes stay the ones clients already

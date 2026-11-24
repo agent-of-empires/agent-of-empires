@@ -61,7 +61,7 @@ pub(crate) fn lifecycle_notice_line(indent: &str, notice: &str) -> String {
 }
 
 use crate::session::Instance;
-use anyhow::{bail, Result};
+use anyhow::Result;
 
 /// A client for the Daemon, auto-started when none runs (ADR 0004).
 pub(crate) async fn daemon_client() -> Result<crate::acp::client::HttpClient> {
@@ -140,41 +140,86 @@ impl SessionRef for crate::daemon::SessionResponse {
 }
 
 pub fn resolve_session<'a, S: SessionRef>(identifier: &str, instances: &'a [S]) -> Result<&'a S> {
-    if let Some(inst) = instances.iter().find(|i| i.id() == identifier) {
-        return Ok(inst);
-    }
+    lookup_session(identifier, instances.iter().enumerate())
+        .map(|(_, row)| row)
+        .map_err(|error| error.for_cli(identifier))
+}
 
-    let prefix_matches: Vec<&S> = instances
-        .iter()
-        .filter(|i| i.id().starts_with(identifier))
-        .collect();
-    match prefix_matches.len() {
-        0 => {}
-        1 => return Ok(prefix_matches[0]),
-        _ => {
-            let mut candidates: Vec<String> = prefix_matches
-                .iter()
-                .map(|i| format!("  {} ({})", i.id(), i.title()))
-                .collect();
-            candidates.sort();
-            bail!(
-                "Ambiguous session identifier {:?} matches {} sessions:\n{}\nUse a longer prefix or the full ID.",
-                identifier,
-                prefix_matches.len(),
-                candidates.join("\n")
-            );
+pub(crate) fn terminal_text(value: &str) -> std::borrow::Cow<'_, str> {
+    let Some((start, _)) = value.char_indices().find(|(_, ch)| ch.is_control()) else {
+        return std::borrow::Cow::Borrowed(value);
+    };
+    let mut clean = String::with_capacity(value.len());
+    clean.push_str(&value[..start]);
+    clean.extend(value[start..].chars().filter(|ch| !ch.is_control()));
+    std::borrow::Cow::Owned(clean)
+}
+
+impl crate::daemon::SessionLookupError {
+    pub(crate) fn for_cli(self, identifier: &str) -> anyhow::Error {
+        match self {
+            Self::NotFound => anyhow::anyhow!("Session not found: {}", terminal_text(identifier)),
+            Self::ProfileNotFound(profile) => {
+                anyhow::anyhow!("Profile '{}' does not exist", terminal_text(&profile))
+            }
+            Self::Ambiguous { count, candidates } => {
+                let mut lines: Vec<_> = candidates
+                    .iter()
+                    .map(|(id, title)| {
+                        format!("  {} ({})", terminal_text(id), terminal_text(title))
+                    })
+                    .collect();
+                lines.sort_unstable();
+                if count > lines.len() {
+                    lines.push(format!("  ({} more)", count - lines.len()));
+                }
+                anyhow::anyhow!(
+                    "Ambiguous session identifier {:?} matches {} sessions:\n{}\nUse a longer prefix or the full ID.",
+                    identifier,
+                    count,
+                    lines.join("\n")
+                )
+            }
         }
     }
+}
 
-    if let Some(inst) = instances.iter().find(|i| i.title() == identifier) {
+pub(crate) fn lookup_session<'a, S: SessionRef + 'a>(
+    identifier: &str,
+    mut rows: impl Iterator<Item = (usize, &'a S)> + Clone,
+) -> std::result::Result<(usize, &'a S), crate::daemon::SessionLookupError> {
+    use crate::daemon::SessionLookupError;
+    if let Some(inst) = rows.clone().find(|(_, row)| row.id() == identifier) {
         return Ok(inst);
     }
 
-    if let Some(inst) = instances.iter().find(|i| i.project_path() == identifier) {
+    let mut prefixes = rows
+        .clone()
+        .filter(|(_, row)| row.id().starts_with(identifier));
+    if let Some(first) = prefixes.next() {
+        let Some(second) = prefixes.next() else {
+            return Ok(first);
+        };
+        let candidates: Vec<_> = [first, second]
+            .into_iter()
+            .chain(prefixes)
+            .map(|(_, row)| (row.id().into(), row.title().into()))
+            .collect();
+        return Err(SessionLookupError::Ambiguous {
+            count: candidates.len(),
+            candidates,
+        });
+    }
+
+    if let Some(inst) = rows.clone().find(|(_, row)| row.title() == identifier) {
         return Ok(inst);
     }
 
-    bail!("Session not found: {}", identifier)
+    if let Some(inst) = rows.find(|(_, row)| row.project_path() == identifier) {
+        return Ok(inst);
+    }
+
+    Err(SessionLookupError::NotFound)
 }
 
 pub fn truncate(s: &str, max: usize) -> String {
