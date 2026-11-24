@@ -53,7 +53,6 @@ pub struct LivePaneMeta {
     /// the next row (a soft wrap), ascending. Absent when none do, or when the
     /// transport cannot tell (a composited split window).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[cfg_attr(feature = "typescript", ts(optional))]
     pub wrapped: Vec<u32>,
 }
 
