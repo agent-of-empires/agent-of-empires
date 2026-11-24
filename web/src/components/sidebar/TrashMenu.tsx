@@ -126,16 +126,18 @@ export function TrashMenu({
         title={label}
         aria-label={label}
       >
-        <Trash2 className="h-4 w-4" />
-        {count > 0 && (
-          <span
-            data-testid="sidebar-trash-count"
-            aria-hidden
-            className="pointer-events-none absolute -right-0.5 -top-0.5 h-4 min-w-4 rounded-full bg-surface-700 px-1 text-center text-[10px] font-mono tabular-nums leading-4 text-text-primary"
-          >
-            {count > 99 ? "99+" : count}
-          </span>
-        )}
+        <span className="relative">
+          <Trash2 className="h-4 w-4" />
+          {count > 0 && (
+            <span
+              data-testid="sidebar-trash-count"
+              aria-hidden="true"
+              className="pointer-events-none absolute -top-1.5 -right-2.5 min-w-[1rem] rounded-full border border-surface-600 bg-surface-800 px-1 text-[10px] font-semibold leading-[0.875rem] tabular-nums text-text-secondary text-center"
+            >
+              {count > 99 ? "99+" : count}
+            </span>
+          )}
+        </span>
       </button>
       {open &&
         panelPosition &&
