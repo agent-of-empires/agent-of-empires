@@ -410,7 +410,7 @@ read `sessions`; the array is never returned unwrapped.
 `aoe-runtime-epoch` and `aoe-runtime-revision` identify the exact returned
 snapshot. Revisions are decimal unsigned 64-bit integers; clients must preserve
 their precision. A stale list must not replace newer canonical rows or ordering.
-Color and notification mutation receipts identify one session: another session
+Notification mutation receipts identify one session: another session
 at a higher revision cannot satisfy that receipt.
 
 **Query parameters**

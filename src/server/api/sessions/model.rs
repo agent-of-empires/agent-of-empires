@@ -113,7 +113,6 @@ pub(super) fn session_response_from_instance_with_plan(
         created_without_setup: inst.created_without_setup,
         favorited: inst.is_favorited(),
         favorited_at: inst.favorited_at.map(|t| t.to_rfc3339()),
-        color: inst.color.clone(),
         urgent: inst.is_urgent(),
         pinned_at: timestamp(row.pinned_at),
         archived_at: timestamp(row.archived_at),

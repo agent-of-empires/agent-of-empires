@@ -91,13 +91,6 @@ pub enum SessionCommands {
     /// Clear the favorite flag on a session.
     Unfavorite(SessionIdArgs),
 
-    /// Set (or clear) a per-session color label, rendered as a colored dot in
-    /// the web sidebar for at-a-glance status signaling. Intended for a
-    /// running agent to flag its own state, e.g.
-    /// `aoe session color $(aoe session current -q) red`. Colors: `red`
-    /// (needs attention), `amber` (working), `green` (done); `none` clears it.
-    Color(SetColorArgs),
-
     /// Archive a session: sink it in the Attention sort and tear down its
     /// tmux sessions. Worktree, branch, container preserved. `--no-kill`
     /// skips tmux teardown. See #1868.
@@ -396,15 +389,6 @@ pub struct SetBaseArgs {
     pub repo: Option<String>,
 }
 
-#[derive(Args)]
-pub struct SetColorArgs {
-    /// Session ID or title
-    pub identifier: String,
-    /// Color label: `red` (needs attention), `amber` (working), `green`
-    /// (done), or `none`/`clear` to remove the label.
-    pub color: String,
-}
-
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
     match command {
@@ -430,7 +414,6 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Unfavorite(args) => {
             mark_session(profile, args, "Unfavorited", Instance::unfavorite).await
         }
-        SessionCommands::Color(args) => set_color_session(profile, args).await,
         SessionCommands::Archive(args) => archive_session(profile, args).await,
         SessionCommands::Unarchive(args) => {
             mark_session(profile, args, "Unarchived", Instance::unarchive).await
@@ -459,29 +442,6 @@ async fn mark_session(
         })
     })?;
     println!("{verb}: {title}");
-    Ok(())
-}
-
-async fn set_color_session(profile: &str, args: SetColorArgs) -> Result<()> {
-    let normalized = args.color.trim().to_lowercase();
-    let new_color = match normalized.as_str() {
-        "none" | "clear" | "" => None,
-        other => Some(other.to_string()),
-    };
-
-    let storage = Storage::open_unwatched(profile)?;
-    let (title, color) = storage.update(|instances, _groups| {
-        super::patch_instance(instances, &args.identifier, |inst| {
-            inst.set_color(new_color.clone())
-                .map_err(|e| anyhow::anyhow!(e))?;
-            Ok((inst.title.clone(), inst.color.clone()))
-        })
-    })?;
-
-    match color {
-        Some(c) => println!("✓ Set color for '{}': {}", title, c),
-        None => println!("✓ Cleared color for '{}'", title),
-    }
     Ok(())
 }
 
@@ -3443,7 +3403,7 @@ mod start_blocked_tests {
 
 #[cfg(test)]
 mod session_mutation_tests {
-    use super::{set_color_session, set_session_id, SetColorArgs, SetSessionIdArgs};
+    use super::{set_session_id, SetSessionIdArgs};
     use crate::session::{Instance, ResumeIntent, Storage};
     use serial_test::serial;
     use tempfile::tempdir;
@@ -3626,64 +3586,6 @@ mod session_mutation_tests {
         assert_eq!(
             row.agent_session_id, None,
             "rejected call must not mutate sid"
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn set_color_normalizes_clears_and_rejects_unknown_values() {
-        let temp = tempdir().unwrap();
-        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
-
-        let (storage, id) = seed("set-color", Instance::new("color_session", "/tmp/x"));
-        let set = |color: &str| {
-            set_color_session(
-                "set-color",
-                SetColorArgs {
-                    identifier: id.clone(),
-                    color: color.to_string(),
-                },
-            )
-        };
-
-        set("Red")
-            .await
-            .expect("palette names are case-insensitive");
-        assert_eq!(stored(&storage, &id).color.as_deref(), Some("red"));
-
-        set("chartreuse")
-            .await
-            .expect_err("unknown color must error");
-        assert_eq!(stored(&storage, &id).color.as_deref(), Some("red"));
-
-        set("none").await.unwrap();
-        assert_eq!(stored(&storage, &id).color, None);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn set_color_refuses_unknown_profile_without_vivifying_it() {
-        let _guard = crate::session::test_support::isolate_app_dir();
-        let profiles = crate::session::get_app_dir().unwrap().join("profiles");
-        std::fs::create_dir_all(profiles.join("real")).unwrap();
-
-        let msg = set_color_session(
-            "ghost-profile",
-            SetColorArgs {
-                identifier: "whatever".to_string(),
-                color: "red".to_string(),
-            },
-        )
-        .await
-        .expect_err("unknown profile must error")
-        .to_string();
-        assert!(
-            msg.contains("does not exist"),
-            "expected the unknown-profile error, got: {msg}"
-        );
-        assert!(
-            !profiles.join("ghost-profile").exists(),
-            "set-color must not mint profiles/ghost-profile"
         );
     }
 }

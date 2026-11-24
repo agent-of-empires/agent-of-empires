@@ -35,7 +35,6 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe session unsnooze`↴](#aoe-session-unsnooze)
 * [`aoe session favorite`↴](#aoe-session-favorite)
 * [`aoe session unfavorite`↴](#aoe-session-unfavorite)
-* [`aoe session color`↴](#aoe-session-color)
 * [`aoe session archive`↴](#aoe-session-archive)
 * [`aoe session unarchive`↴](#aoe-session-unarchive)
 * [`aoe session restore`↴](#aoe-session-restore)
@@ -454,7 +453,6 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `unsnooze` — Wake a snoozed session immediately
 * `favorite` — Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope in every sort order; with it off, they pin within their status tier in the Attention sort only. Either way the row shows a `✦` in the session list gutter wherever the pin applies. Snoozing a favorite suspends the pin until it wakes
 * `unfavorite` — Clear the favorite flag on a session
-* `color` — Set (or clear) a per-session color label, rendered as a colored dot in the web sidebar for at-a-glance status signaling. Intended for a running agent to flag its own state, e.g. `aoe session color $(aoe session current -q) red`. Colors: `red` (needs attention), `amber` (working), `green` (done); `none` clears it
 * `archive` — Archive a session: sink it in the Attention sort and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
 * `unarchive` — Unarchive a session (restores it to its tier in the Attention sort)
 * `restore` — Restore a trashed session, returning it to its prior bucket with its transcript and metadata intact. See #2489
@@ -745,19 +743,6 @@ Clear the favorite flag on a session
 ###### **Arguments:**
 
 * `<IDENTIFIER>` — Session ID or title
-
-
-
-## `aoe session color`
-
-Set (or clear) a per-session color label, rendered as a colored dot in the web sidebar for at-a-glance status signaling. Intended for a running agent to flag its own state, e.g. `aoe session color $(aoe session current -q) red`. Colors: `red` (needs attention), `amber` (working), `green` (done); `none` clears it
-
-**Usage:** `aoe session color <IDENTIFIER> <COLOR>`
-
-###### **Arguments:**
-
-* `<IDENTIFIER>` — Session ID or title
-* `<COLOR>` — Color label: `red` (needs attention), `amber` (working), `green` (done), or `none`/`clear` to remove the label
 
 
 

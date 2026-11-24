@@ -100,13 +100,13 @@ A grouping picker (layers icon) next to the sort picker opens a menu of axes, so
 - **By repo and group**: repository headers with user groups nested inside each. A session split across groups appears once per subgroup.
 - **By status**: groups by each session's actual execution status, in the same attention order the Attention sort and the Board's cards use: Waiting, Error, Idle, Unknown, Running, Stopped, then the transient Creating, Deleting and Starting. A workspace whose sessions differ in status appears once per status. This mirrors the TUI's Status grouping (`g` then Status).
 
-The choice is per-browser (localStorage). Collapse state is tracked separately per axis. You can move a session between groups from the web context menu, but group rename, color, and drag-reorder live on the repo axis only.
+The choice is per-browser (localStorage). Collapse state is tracked separately per axis. You can move a session between groups from the web context menu, but drag-reorder lives on the repo axis only.
 
 **Move to another group.** Right-click (long-press on touch) a session row and choose **More > Move to another group**: type an existing group to move it, a new path to create that group, or clear the field to drop it back to **Ungrouped**. Group paths use `/` for hierarchy (e.g. `work/projects`). Hidden in read-only mode.
 
 **Add project.** Attachment results stay open through Multi-repo regrouping.
 Warnings and a failed worker restart remain visible until dismissed.
-Accepted color and notification picks also survive collapse, filtering and
+Accepted notification picks also survive collapse, filtering and
 navigation to Settings. They retain exact sessions and runtime epoch, never
 replay against replacement sessions or a replacement daemon.
 

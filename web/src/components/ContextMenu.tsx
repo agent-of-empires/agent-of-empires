@@ -1,13 +1,4 @@
-import {
-  useEffect,
-  useLayoutEffect,
-  useRef,
-  useState,
-  type CSSProperties,
-  type ReactNode,
-  type RefObject,
-  useId,
-} from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject, useId } from "react";
 import { X } from "lucide-react";
 import { createPortal } from "react-dom";
 import { useFocusTrap } from "../hooks/useFocusTrap";
@@ -232,55 +223,5 @@ export function MenuChoiceRow({ label, hint, children }: { label: string; hint?:
       </div>
       {hint && <p className="mt-1 pl-14 text-[11px] text-text-dim">{hint}</p>}
     </div>
-  );
-}
-
-export interface SwatchOption<K extends string> {
-  key: K;
-  label: string;
-  className?: string;
-  style?: CSSProperties;
-}
-
-/** Color picker: a dashed "none" swatch, then each color; the current pick is ringed. Testids are
- *  `${testIdPrefix}-${key}` and `${testIdPrefix}-clear`. */
-export function MenuSwatches<K extends string>({
-  options,
-  value,
-  onPick,
-  testIdPrefix,
-}: {
-  options: SwatchOption<K>[];
-  value: K | null;
-  onPick: (key: K | null) => void;
-  testIdPrefix: string;
-}) {
-  const swatch = (key: K | null, label: string, fill: ReactNode) => (
-    <button
-      key={key ?? "none"}
-      type="button"
-      onClick={() => onPick(key)}
-      data-testid={`${testIdPrefix}-${key ?? "clear"}`}
-      title={label}
-      aria-label={label}
-      aria-pressed={value === key}
-      className="flex h-8 w-8 max-md:h-10 max-md:w-10 items-center justify-center rounded-md cursor-pointer hover:bg-surface-700/50 transition-colors"
-    >
-      <span
-        className={`flex h-5 w-5 rounded-full ${
-          value === key ? "ring-2 ring-text-primary ring-offset-2 ring-offset-surface-800" : ""
-        }`}
-      >
-        {fill}
-      </span>
-    </button>
-  );
-  return (
-    <>
-      {swatch(null, "No color", <span className="h-full w-full rounded-full border border-dashed border-text-dim" />)}
-      {options.map((o) =>
-        swatch(o.key, o.label, <span className={`h-full w-full rounded-full ${o.className ?? ""}`} style={o.style} />),
-      )}
-    </>
   );
 }

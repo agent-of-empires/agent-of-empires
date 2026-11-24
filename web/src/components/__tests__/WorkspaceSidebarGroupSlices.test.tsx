@@ -52,7 +52,6 @@ const sidebar = (ws: Workspace, onNew: Props["onNew"] = noop) => (
         onToggle: noop,
         onSelect: vi.fn(),
         onToggleGroup: noop,
-        onUpdateRepoAppearance: noop,
         onNew,
         onCreateSession: noop,
         savedProjects: [],

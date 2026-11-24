@@ -921,7 +921,6 @@ mod workspace_ordering_tests {
             monitor_description: None,
             favorited: false,
             favorited_at: None,
-            color: None,
             urgent: false,
             pinned_at: None,
             archived_at: None,

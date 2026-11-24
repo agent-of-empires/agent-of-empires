@@ -31,9 +31,6 @@ function repoGroup(repoPath: string, over: Partial<RepoGroup> = {}): RepoGroup {
     id: repoPath,
     repoPath,
     displayName: repoPath.split("/").pop() ?? repoPath,
-    defaultDisplayName: repoPath.split("/").pop() ?? repoPath,
-    alias: null,
-    color: null,
     remoteOwner: null,
     workspaces: [workspace(repoPath)],
     status: "idle",
@@ -104,13 +101,9 @@ describe("mergeRegisteredProjects", () => {
     expect(merged.find((g) => g.id === MULTI_REPO_GROUP_ID)!.registeredProjects).toEqual([]);
   });
 
-  it("applies resolved alias/color/collapse to appended groups", () => {
-    const [g] = mergeRegisteredProjects([], [project("/work/beta")], {
-      alias: () => "Beta",
-      color: () => "teal",
-      collapsed: () => true,
-    });
-    expect(g).toMatchObject({ displayName: "Beta", alias: "Beta", color: "teal", collapsed: true });
+  it("applies resolved collapse to appended groups", () => {
+    const [g] = mergeRegisteredProjects([], [project("/work/beta")], () => true);
+    expect(g).toMatchObject({ displayName: "beta", collapsed: true });
   });
 });
 
@@ -173,14 +166,9 @@ describe("unpinnedSavedProjects (#2212)", () => {
       project("/work/pinned", { scope: "profile" }),
       unpinned("/work/saved"),
     ];
-    const listed = unpinnedSavedProjects([repoGroup("/work/alpha")], projects, undefined, {
+    const listed = unpinnedSavedProjects([repoGroup("/work/alpha")], projects, {
       drawsRepoHeaders: axisDrawsRepoHeaders(axis),
     });
     expect(listed.map((g) => g.repoPath)).toEqual(expected);
-  });
-
-  it("applies resolved alias/color", () => {
-    const [g] = unpinnedSavedProjects([], [unpinned("/work/beta")], { alias: () => "Beta", color: () => "teal" });
-    expect(g).toMatchObject({ displayName: "Beta", color: "teal" });
   });
 });

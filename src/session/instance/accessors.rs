@@ -87,7 +87,6 @@ impl Instance {
             callback_url: None,
             idempotency_key: None,
             base_branch_override: None,
-            color: None,
             view: View::Terminal,
             agent_name: None,
             agent_model: None,

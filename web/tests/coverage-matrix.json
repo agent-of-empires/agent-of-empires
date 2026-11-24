@@ -2128,7 +2128,7 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
-      "id": "sidebar.session-color",
+      "id": "sidebar.notify-receipts",
       "kind": "vitest",
       "risk": "high",
       "specs": [
@@ -2137,7 +2137,7 @@
         "src/hooks/__tests__/useSessionsPolling.test.tsx",
         "src/lib/api.test.ts"
       ],
-      "description": "Accepted color and notification resets survive visual unmount and temporary polling failure. Dispatched receipts survive read-only changes; revoked unsent work and true identity invalidation never replay.",
+      "description": "Accepted notification resets survive visual unmount and temporary polling failure. Dispatched receipts survive read-only changes; revoked unsent work and true identity invalidation never replay.",
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/sidebar/SessionActionProvider.tsx",
@@ -2191,25 +2191,6 @@
         "web/src/lib/settingsEvents.ts",
         "web/src/hooks/useSystemHealth.ts",
         "web/src/components/SystemHealthStrip.tsx"
-      ]
-    },
-    {
-      "id": "sidebar.session-color-toggle",
-      "kind": "vitest",
-      "risk": "low",
-      "specs": [
-        "src/lib/__tests__/sessionColors.test.ts",
-        "src/components/__tests__/SessionRowTriage.test.tsx",
-        "src/components/__tests__/SessionRowReceipts.test.tsx"
-      ],
-      "notes": "Accepted color queues survive visual unmount. Independent canonical values permanently surrender only the optimistic overlay; away-and-back observations cannot resurrect a stale choice or suppress a new pick.",
-      "components": [
-        "web/src/lib/sessionColors.ts",
-        "web/src/components/WorkspaceSidebar.tsx",
-        "web/src/components/sidebar/usePendingSetting.ts",
-        "web/src/components/sidebar/SessionActionProvider.tsx",
-        "web/src/components/sidebar/rowModel.ts",
-        "web/src/components/sidebar/useSessionRowModel.ts"
       ]
     },
     {
@@ -2277,13 +2258,6 @@
         "web/src/components/sidebar/SessionRowMenu.tsx"
       ],
       "notes": "The item is reachable under More on desktop and in the 375 px bottom sheet, and the dialog and both buttons fit that viewport."
-    },
-    {
-      "id": "sidebar.repo-appearance",
-      "kind": "mocked-playwright",
-      "risk": "low",
-      "specs": ["tests/sidebar-multi-session.spec.ts"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sidebar.workspace-ordering",
@@ -4471,7 +4445,7 @@
         "web/src/components/MobileMainPane.tsx",
         "web/src/App.tsx"
       ],
-      "notes": "An AgentStartupError with cause container_missing shows this banner instead of the generic one: no Retry or Use Terminal view, Recreate container (primary, full width at 375px) and New Session in the Project, named as its sidebar header (alias, else folder name). The composer is disabled with \"Recreate the container to send messages.\" as its placeholder, since a send would start the Session and rebuild the container without the warning; a queued row's Start and send is disabled with the same reason, and the compaction reminder's Compact now isn't offered; an untyped startup error leaves all three as on main. Recreate confirms through the Session menu's dialog and, once the Daemon accepts it, hands over to the startup line as a Retry does. New Session opens the wizard with the Project, Agent, Group and Structured view (kept over a Terminal view profile default, not over off), title empty, sandbox and yolo from the defaults. The cause is set and cleared wherever the startup error is, a later untyped error replaces it, and it persists with the cached state."
+      "notes": "An AgentStartupError with cause container_missing shows this banner instead of the generic one: no Retry or Use Terminal view, Recreate container (primary, full width at 375px) and New Session in the Project, named as its sidebar header (the folder name). The composer is disabled with \"Recreate the container to send messages.\" as its placeholder, since a send would start the Session and rebuild the container without the warning; a queued row's Start and send is disabled with the same reason, and the compaction reminder's Compact now isn't offered; an untyped startup error leaves all three as on main. Recreate confirms through the Session menu's dialog and, once the Daemon accepts it, hands over to the startup line as a Retry does. New Session opens the wizard with the Project, Agent, Group and Structured view (kept over a Terminal view profile default, not over off), title empty, sandbox and yolo from the defaults. The cause is set and cleared wherever the startup error is, a later untyped error replaces it, and it persists with the cached state."
     },
     {
       "id": "acp.container-gone-read-only",
@@ -6228,7 +6202,7 @@
         "web/src/hooks/useSessions.ts",
         "web/src/lib/api.ts"
       ],
-      "notes": "Color and notification receipt ordering remains exact above Number.MAX_SAFE_INTEGER. Accepted color reset survives Settings navigation before its first ACK; true invalidation never replays queued work."
+      "notes": "Notification receipt ordering remains exact above Number.MAX_SAFE_INTEGER. An accepted notification reset survives Settings navigation before its first ACK; true invalidation never replays queued work."
     },
     {
       "id": "sidebar.canonical-settings-receipts.live",
@@ -6245,7 +6219,7 @@
         "web/src/hooks/useSessions.ts",
         "web/src/lib/api.ts"
       ],
-      "notes": "Browser: isolated serve publishes advancing native epoch revision receipts for color and notifications. Uses the isolated spawnServe fixture; native HTTP receipts and canonical persistence are asserted, then a page reload verifies the sidebar without pending overlays."
+      "notes": "Browser: isolated serve publishes advancing native epoch revision receipts for notifications. Uses the isolated spawnServe fixture; native HTTP receipts and canonical persistence are asserted, then a page reload verifies the sidebar without pending overlays."
     },
     {
       "id": "selected-item-contrast",
