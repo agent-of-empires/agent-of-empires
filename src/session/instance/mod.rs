@@ -226,6 +226,9 @@ pub struct DetectionState {
     /// flipped parked sessions between Idle and Running every few seconds.
     pub pending: Option<Status>,
     pub observation_key: Option<tmux::ObservationKey>,
+    /// Whether the last verdict was an Error for a pane that ended, so a poll that reuses it can
+    /// still reconcile the remedy a refused restart needs.
+    pub ended: bool,
 }
 
 /// A turn queued for delivery once the (resumed) worker is live. See

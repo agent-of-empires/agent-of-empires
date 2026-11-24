@@ -397,6 +397,7 @@ impl Instance {
                     self.detection.activity = None;
                     self.detection.captured_at = None;
                     self.detection.observation_key = None;
+                    self.detection.ended = false;
                 }
             }
         }
@@ -426,6 +427,7 @@ impl Instance {
             self.detection.activity = None;
             self.detection.captured_at = None;
             self.detection.observation_key = None;
+            self.detection.ended = false;
             self.detection.rule = Some(if reported {
                 crate::plugin::agent_integration::OWNED_RULE
             } else {
@@ -685,10 +687,14 @@ impl Instance {
         hook: Option<tmux::detect::HookObservation>,
         is_dead: bool,
     ) {
-        // An edited command can make a named remedy stale without moving the screen, so this runs
-        // before the returns below that reuse or keep the last verdict.
+        // An edited command can make a named remedy stale, or due again, without moving the
+        // screen, so this runs before the returns below that reuse or keep the last verdict.
         if self.status == Status::Error {
-            self.drop_remedy_if_launchable();
+            if is_dead || self.detection.ended {
+                self.name_refused_restart(None, None);
+            } else {
+                self.drop_remedy_if_launchable();
+            }
         }
         let activity = metadata.and_then(|m| m.window_activity);
         let plan = tmux::DetectionPlan::for_manifest(&self.source_profile, rules_tool, agent)
@@ -766,11 +772,12 @@ impl Instance {
         let confirmed = self.confirm_detection(candidate, detection.visible);
         if let Some(status) = confirmed {
             self.status = status;
+            self.detection.ended = status == Status::Error && (is_dead || shell_stale);
             if status == Status::Error {
                 let diagnostic = detection
                     .diagnostic
                     .map(pane_status::summarize_error_diagnostic);
-                if is_dead || shell_stale {
+                if self.detection.ended {
                     self.name_refused_restart(None, diagnostic.clone());
                 }
                 if self.last_error.is_none() {
@@ -1981,7 +1988,10 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
 
         // 4664722975: every return before the remedy reconcile. Either remedy applied drops the
         // remedy on a poll that reuses the last verdict, and on one that reads an agent-owned
-        // viewer. Each case first shows its return taken with the remedy still named.
+        // viewer, and undoing it names the remedy again on the next such poll. Each case first
+        // shows its return taken with the remedy still named. A pane back at a shell prompt ended
+        // too, though tmux reports it alive; only a row whose selector is in its arguments gets
+        // there, since a command naming one is an override, which never reads as a stale shell.
         let viewer = home.path().join("viewer.txt");
         std::fs::write(
             &viewer,
@@ -1991,25 +2001,45 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             ),
         )
         .expect("write viewer");
+        let prompt = home.path().join("prompt.txt");
+        std::fs::write(
+            &prompt,
+            format!("{}turn over\nuser@host:~$\n", "\n".repeat(150)),
+        )
+        .expect("write prompt");
         let mut mismatches = Vec::new();
         let before = crate::time::Timestamp::now().as_unix_secs() - 100;
         let remedies: [(&str, fn(&mut Instance)); 2] = [
-            ("flag removed", |inst| inst.command = "claude".into()),
+            ("flag removed", |inst| {
+                inst.command = "claude".into();
+                inst.extra_args.clear();
+            }),
             ("AoE's id cleared", |inst| {
                 inst.resume_intent = ResumeIntent::Cleared
             }),
         ];
-        for ((label, rule), (fix, apply)) in [
-            ("unchanged screen", "screen_unchanged"),
-            ("agent-owned viewer", "transcript_viewer"),
+        for ((label, rule, ended_by), (fix, apply)) in [
+            ("unchanged screen", "screen_unchanged", "dead"),
+            ("agent-owned viewer", "transcript_viewer", "dead"),
+            ("shell prompt", "screen_unchanged", "shell"),
         ]
         .into_iter()
         .flat_map(|case| remedies.map(|remedy| (case, remedy)))
         {
             let mut inst = conflicting();
+            if ended_by == "shell" {
+                inst.command = "claude".into();
+                inst.extra_args = "--resume external".into();
+            }
+            let refused_by = (
+                inst.command.clone(),
+                inst.extra_args.clone(),
+                inst.resume_intent.clone(),
+            );
             let name = tmux::Session::generate_name(&inst.id, &inst.title);
             let shown = format!("{name}_shown");
-            let _pane = spawn_pane(&name, &format!("cat {}; sleep 300", shell_quote(&frame)));
+            let painted = if ended_by == "shell" { &prompt } else { &frame };
+            let _pane = spawn_pane(&name, &format!("cat {}; sleep 300", shell_quote(painted)));
             let _shown = spawn_pane(&shown, &format!("cat {}; sleep 300", shell_quote(&viewer)));
             assert!(wait_for_pane(&name, "turn over"), "{label}: never painted");
             assert!(
@@ -2018,18 +2048,21 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             );
             let guard = crate::tmux::SessionCacheGuard::capture();
             guard.force_present(&[name.as_str(), shown.as_str()]);
-            let dead_at = |activity| tmux::PaneMetadata {
-                pane_dead: true,
-                ..agent_pane_metadata("claude", Some(activity))
+            let ended_at = |activity| match ended_by {
+                "shell" => agent_pane_metadata("bash", Some(activity)),
+                _ => tmux::PaneMetadata {
+                    pane_dead: true,
+                    ..agent_pane_metadata("claude", Some(activity))
+                },
             };
-            // The viewer's polls each see a new activity second, so neither reuses the cache.
-            let (pane, activity, edited_at) = if rule == "screen_unchanged" {
-                (name.as_str(), before, before)
+            // The viewer's polls each see a new activity second, so none reuses the cache.
+            let (pane, at): (&str, fn(i64, i64) -> i64) = if rule == "screen_unchanged" {
+                (name.as_str(), |before, _| before)
             } else {
-                (shown.as_str(), before + 1, before + 2)
+                (shown.as_str(), |before, step| before + step)
             };
             let poll = |inst: &mut Instance, pane: &str, activity| {
-                inst.update_status_with_metadata_inner(Some(&dead_at(activity)), Some(pane));
+                inst.update_status_with_metadata_inner(Some(&ended_at(activity)), Some(pane));
                 (
                     inst.status,
                     inst.last_error.as_deref().map(str::to_owned),
@@ -2038,12 +2071,12 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             };
             poll(&mut inst, &name, before);
             let named = refused(&inst, "The terminal ended.");
-            let taken = poll(&mut inst, pane, activity);
+            let taken = poll(&mut inst, pane, at(before, 1));
             if taken != (Status::Error, Some(named.clone()), Some(rule)) {
                 mismatches.push(format!("{label}, {fix}, still refused: {taken:?}"));
             }
             apply(&mut inst);
-            let seen = poll(&mut inst, pane, edited_at);
+            let seen = poll(&mut inst, pane, at(before, 2));
             let want = (
                 Status::Error,
                 Some("The terminal ended.".to_owned()),
@@ -2051,6 +2084,14 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             );
             if seen != want {
                 mismatches.push(format!("{label}, {fix}: {seen:?}, want {want:?}"));
+            }
+            (inst.command, inst.extra_args, inst.resume_intent) = refused_by;
+            let restored = poll(&mut inst, pane, at(before, 3));
+            let want = (Status::Error, Some(named), Some(rule));
+            if restored != want {
+                mismatches.push(format!(
+                    "{label}, {fix} undone: {restored:?}, want {want:?}"
+                ));
             }
         }
         assert!(mismatches.is_empty(), "{mismatches:#?}");
