@@ -460,7 +460,6 @@ function ComposerDock({
   const compactAliases = useCompactAliases();
   // The Daemon's solo commands: they run as their own turn, never steered into one.
   const soloAliases = useMemo(() => [...clearAliases, ...compactAliases], [clearAliases, compactAliases]);
-  // A send would start the Session, which rebuilds the container without Recreate's warning.
   const { agentDefaultsHref, onOpenSettings } = view;
   const currentAgent = state.agent ?? acpAgent;
   // The Daemon resolves which profile and Agent the default saves under, as the spawn does.
@@ -471,6 +470,7 @@ function ComposerDock({
         : null,
     [sessionId, agentDefaultsHref, onOpenSettings, currentAgent],
   );
+  // A send would start the Session, which rebuilds the container without Recreate's warning.
   const blockedReason =
     state.startupError && state.startupCause?.kind === "container_missing"
       ? composerBlockedReason(containerGoneRemedy(!!view.canRestartAgent, view.recreateContainerBlock))
