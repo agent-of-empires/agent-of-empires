@@ -184,6 +184,37 @@ describe("fromInline resumed background child", () => {
     expect(record.earlierReport).toBeUndefined();
   });
 
+  it("fails an idle resumed child from its roster error, not the first result", () => {
+    const calls = [call("2026-01-01T00:02:00Z", "2026-01-01T00:03:00Z")];
+    const idle = roster({ state: "idle", stop_reason: "error", error: "boom" });
+    const record = fromInline(launch, first, calls, idle);
+    expect(record.status).toBe("failed");
+    expect(record.error).toBe("boom");
+  });
+
+  it("leaves a child with an unknown roster state done by its result", () => {
+    const record = fromInline(launch, first, [], roster({ state: "unknown" }));
+    expect(record.status).toBe("done");
+    expect(record.report).toBe("first report");
+    expect(record.earlierReport).toBeUndefined();
+  });
+
+  it("still follows a running roster when the launch call was stopped", () => {
+    const stopped: ActivityRow = { id: "s", kind: "tool_stopped", text: "", at: "2026-01-01T00:01:00Z" };
+    const record = fromInline(launch, stopped, [], roster());
+    expect(record.status).toBe("running");
+    expect(record.earlierReport).toBeUndefined();
+  });
+
+  it("does not treat a result without a time as superseded", () => {
+    const untimed: ActivityRow = { id: "r", kind: "tool_complete", text: "first report" };
+    const calls = [call("2026-01-01T00:02:00Z", "2026-01-01T00:03:00Z")];
+    const record = fromInline(launch, untimed, calls, roster({ state: "idle", stop_reason: "end_turn" }));
+    expect(record.status).toBe("done");
+    expect(record.report).toBe("first report");
+    expect(record.earlierReport).toBeUndefined();
+  });
+
   it("leaves a foreground card done by its result", () => {
     const record = fromInline(launch, first, [], roster({ background: false }));
     expect(record.status).toBe("done");
