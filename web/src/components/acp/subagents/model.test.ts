@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { ActivityRow, BackgroundAgent, SubagentRecord, ToolCall } from "../../../lib/acpTypes";
+import type { ToolCardProps } from "../ToolCardChrome";
 import { fromBackground, fromInline, taskPrompt } from "./model";
 
 const agent = (over: Partial<BackgroundAgent>): BackgroundAgent => ({
@@ -125,6 +126,69 @@ describe("fromInline activity rows", () => {
     expect(record.endedAt).toBe("2026-01-01T00:02:00Z");
     expect(record.report).toBe("");
     expect(record.tools[0]!.status).toBe("stopped");
+  });
+});
+
+describe("fromInline resumed background child", () => {
+  const launch: ToolCall = {
+    id: "launch",
+    name: "Explore",
+    kind: "think",
+    args_preview: "{}",
+    started_at: "2026-01-01T00:00:00Z",
+  };
+  const first: ActivityRow = {
+    id: "r",
+    kind: "tool_complete",
+    text: "first report",
+    at: "2026-01-01T00:01:00Z",
+  };
+  const call = (startedAt: string, endedAt?: string): ToolCardProps => ({
+    tool: { id: startedAt, name: "Read", kind: "read", args_preview: "{}", started_at: startedAt },
+    result: endedAt ? { id: `d-${startedAt}`, kind: "tool_complete", text: "", at: endedAt } : undefined,
+  });
+  const roster = (over: Partial<SubagentRecord> = {}): SubagentRecord => ({
+    session_id: "child",
+    parent_session_id: "root",
+    parent_tool_call_id: "launch",
+    state: "running",
+    cancel_capable: true,
+    background: true,
+    ...over,
+  });
+
+  it("follows a running or waiting roster past the first result and keeps that report apart", () => {
+    const running = fromInline(launch, first, [], roster());
+    expect(running.status).toBe("running");
+    expect(running.endedAt).toBeUndefined();
+    expect(running.report).toBe("");
+    expect(running.earlierReport).toBe("first report");
+    expect(fromInline(launch, first, [], roster({ state: "requires_action" })).status).toBe("waiting");
+  });
+
+  it("settles an idle child that ran again at its last call, not the first result", () => {
+    const calls = [call("2026-01-01T00:02:00Z", "2026-01-01T00:03:00Z")];
+    const record = fromInline(launch, first, calls, roster({ state: "idle", stop_reason: "end_turn" }));
+    expect(record.status).toBe("done");
+    expect(record.endedAt).toBe("2026-01-01T00:03:00Z");
+    expect(record.report).toBe("");
+    expect(record.earlierReport).toBe("first report");
+  });
+
+  it("keeps the report of an idle child with no call after its result", () => {
+    const calls = [call("2026-01-01T00:00:30Z", "2026-01-01T00:00:40Z")];
+    const record = fromInline(launch, first, calls, roster({ state: "idle", stop_reason: "end_turn" }));
+    expect(record.status).toBe("done");
+    expect(record.endedAt).toBe(first.at);
+    expect(record.report).toBe("first report");
+    expect(record.earlierReport).toBeUndefined();
+  });
+
+  it("leaves a foreground card done by its result", () => {
+    const record = fromInline(launch, first, [], roster({ background: false }));
+    expect(record.status).toBe("done");
+    expect(record.report).toBe("first report");
+    expect(record.earlierReport).toBeUndefined();
   });
 });
 
