@@ -5,8 +5,9 @@ description: "Classify a failed GitHub Actions check suite on main in agent-of-e
 
 # Red main
 
-Explain one red check suite on `main` of `agent-of-empires/agent-of-empires`
-and record exactly one Tessl finding. This runs unattended with a read-only
+Explain the red check suites of one commit on `main` of
+`agent-of-empires/agent-of-empires` and record exactly one Tessl finding. The
+trigger gathers every suite of a commit into one run. This runs unattended with a read-only
 GitHub token. Do not comment, label, rerun jobs, or push.
 
 ```sh
@@ -47,7 +48,7 @@ Collect each failing test id with its job and OS:
 
 ## 3. Classify
 
-Pick one class for the suite. When jobs disagree, use the most severe:
+Pick one class for the commit. When jobs disagree, use the most severe:
 regression, then flake, then infra.
 
 - **infra**: no test failed and the job died for reasons outside the code.
@@ -81,9 +82,9 @@ regression, then flake, then infra.
   `gh issue list -R $REPO --state open --search "flaky in:title <test name>" --json number,title,url`.
   If one matches, cite it and recommend adding this hit to it instead of a new
   issue.
-- Check open findings:
-  `tessl finding list --project $PROJECT --tag red-main --state open --json`.
-  If one already covers the same test or culprit commit, do not create another;
+- Check active findings: list
+  `tessl finding list --project $PROJECT --tag red-main --json`, following
+  `--after` cursors, and keep those open or in progress. If one already covers the same test or culprit commit, do not create another;
   end with its id in your summary.
 
 ## 6. Record one finding

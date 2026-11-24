@@ -56,9 +56,9 @@ For each issue you look at, take the first situation that applies:
 
 1. **Not an open issue** (closed, a pull request, or not found): skip it as
    `not_open_issue`.
-2. **Waiting on its reporter**: it still has `needs-triage`, and its newest
-   comment is this skill's own comment (see Invariant 9). Skip it as
-   `waiting_on_reporter`; the reporter has not answered yet.
+2. **Waiting on its reporter**: it still has `needs-triage`, this skill has
+   commented on it (see Invariant 9), and the issue's author has not commented
+   since. Skip it as `waiting_on_reporter`.
 3. **Done**: count it in `alreadyTriaged`. In `issue` mode the run ends
    `no_action`.
 4. **A clear duplicate**, by Judgment below, and this skill has never

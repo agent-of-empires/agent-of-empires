@@ -35,14 +35,18 @@ alerts for the `aoe-readonly` environment. Then stop.
 ## 2. Skip alerts already judged
 
 List findings with `tessl finding list --project $PROJECT --tag codeql-review --json`
-in every state, following `--after` cursors. Skip each alert whose number
-already appears in a finding title as `CodeQL #<number>`. Work through the
+in every state, following `--after` cursors. A finding is for alert `<n>` when
+its title starts with `CodeQL #<n> `. Skip an alert whose finding is open, in
+progress or ignored. An open alert whose finding is resolved came back after a
+fix: judge it again and say in `analysis` that it recurred. Work through the
 rest from critical to low severity.
 
 ## 3. Judge each alert
 
-1. Read the code at the alert location in this checkout, and the data flow
-   CodeQL reports: `gh api "repos/$REPO/code-scanning/alerts/<number>/instances"`.
+1. Read the code at the alert location in this checkout, and the alert's
+   instances: `gh api "repos/$REPO/code-scanning/alerts/<number>/instances"`.
+   They give locations and the message, not the data-flow path, so trace the
+   path from the code.
 2. Trace the value from source to sink. Name the source, any check or
    sanitizer on the way, and the sink, each as `path:line`.
 3. Decide whether an attacker controls the source. Treat as attacker
