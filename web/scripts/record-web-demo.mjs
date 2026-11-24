@@ -19,7 +19,7 @@
 //   3. Open the project once so it lands in the wizard's "Recent" list
 //      (e.g. create + delete a session), then start the server:
 //        HOME=$SB/home XDG_CONFIG_HOME=$SB/home/.config \
-//          target/release/aoe serve --host 127.0.0.1 --port 8182 --no-auth -p webdemo
+//          target/release/aoe serve --host 127.0.0.1 --port 8182 --no-auth --behind-proxy --allowed-host 127.0.0.1 -p webdemo
 //   4. Run this script per viewport, pointing --project at the repo from step 2.
 // The Claude structured view needs the `claude-agent-acp` adapter (>=0.49):
 //   npm install -g @agentclientprotocol/claude-agent-acp@latest

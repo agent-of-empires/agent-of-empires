@@ -1,14 +1,16 @@
 // @vitest-environment jsdom
 
 import { renderHook, act } from "@testing-library/react";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useSidebarAxis, useSidebarSortMode } from "./useSidebarPrefs";
+import { reportFeatureUse } from "../lib/featureUse";
 import { SIDEBAR_AXIS_KEY } from "../lib/sidebarAxis";
 import { SIDEBAR_SORT_MODE_KEY } from "../lib/sidebarSort";
 
 beforeEach(() => {
   window.localStorage.clear();
+  vi.mocked(reportFeatureUse).mockClear();
 });
 
 function persistedChoiceCases<T extends string>(
@@ -46,3 +48,12 @@ describe("useSidebarAxis", () =>
 
 describe("useSidebarSortMode", () =>
   persistedChoiceCases(SIDEBAR_SORT_MODE_KEY, useSidebarSortMode, "manual", ["lastActivity"]));
+
+it.each([
+  [useSidebarSortMode, "attention", "sort_attention"],
+  [useSidebarAxis, "repo+group", "axis_repo_group"],
+] as const)("a chosen sidebar mode reports its feature use", (useChoice, value, feature) => {
+  const { result } = renderHook(() => (useChoice as () => readonly [string, (v: string) => void])());
+  act(() => result.current[1](value));
+  expect(reportFeatureUse).toHaveBeenCalledWith(feature);
+});

@@ -32,6 +32,7 @@ async fn shim_agent_round_trips_approval_allow() {
 
             let cwd = std::env::temp_dir();
             let config = SpawnConfig {
+                workspace_info: None,
                 launch_lease: None,
                 provider_routing: Vec::new(),
                 wrapper_substitution: None,
@@ -158,6 +159,7 @@ async fn shim_agent_round_trips_a_question_option_list() {
             let shim = shim_path();
 
             let config = SpawnConfig {
+                workspace_info: None,
                 launch_lease: None,
                 provider_routing: Vec::new(),
                 generation: 0,
@@ -281,6 +283,7 @@ async fn shim_agent_sees_a_dismissed_question_as_cancelled() {
             let shim = shim_path();
 
             let config = SpawnConfig {
+                workspace_info: None,
                 launch_lease: None,
                 provider_routing: Vec::new(),
                 generation: 0,
@@ -382,6 +385,7 @@ async fn shim_agent_round_trips_fs() {
             let temp = scope.tempdir();
             let cwd = temp.path().to_path_buf();
             let config = SpawnConfig {
+                workspace_info: None,
                 launch_lease: None,
                 provider_routing: Vec::new(),
                 wrapper_substitution: None,
@@ -481,6 +485,7 @@ async fn shim_agent_round_trips_terminal() {
             let temp = scope.tempdir();
             let cwd = temp.path().to_path_buf();
             let config = SpawnConfig {
+                workspace_info: None,
                 launch_lease: None,
                 provider_routing: Vec::new(),
                 wrapper_substitution: None,
@@ -591,6 +596,7 @@ async fn shim_agent_set_mode_emits_current_mode_changed() {
 
             let cwd = std::env::temp_dir();
             let config = SpawnConfig {
+                workspace_info: None,
                 launch_lease: None,
                 provider_routing: Vec::new(),
                 wrapper_substitution: None,
@@ -687,6 +693,7 @@ async fn shim_agent_emits_rate_limit_event() {
 
             let cwd = std::env::temp_dir();
             let config = SpawnConfig {
+                workspace_info: None,
                 launch_lease: None,
                 provider_routing: Vec::new(),
                 wrapper_substitution: None,
@@ -794,6 +801,7 @@ async fn shim_usage_updates_preserve_cost_before_real_prompt_completion() {
             let test_name = std::thread::current().name().expect("managed libtest name").to_owned();
             let inspection = scope.inspect_next_runner(&test_name);
             let config = SpawnConfig {
+                workspace_info: None,
                 launch_lease: None,
                 provider_routing: Vec::new(),
                 wrapper_substitution: None,

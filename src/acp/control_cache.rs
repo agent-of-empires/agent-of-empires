@@ -317,6 +317,13 @@ impl ControlStateCache {
                 .apply_scoped_event(seq, event, metadata)
                 .is_err()
         {
+            tracing::debug!(
+                target: "acp.control_fold",
+                session = %session_id,
+                expected = cached.last_seq + 1,
+                seq,
+                "dropped a control fold that no longer follows the log"
+            );
             guard.cached = None;
             return None;
         }
@@ -357,6 +364,11 @@ impl ControlStateCache {
                 .is_some_and(|current| Arc::ptr_eq(current, &slot))
             {
                 map.remove(session_id);
+                tracing::debug!(
+                    target: "acp.control_fold",
+                    session = %session_id,
+                    "forgot a session's control fold"
+                );
             }
         }
     }
@@ -433,7 +445,7 @@ impl ControlStateCache {
         session_id: &str,
         mut historical: Option<(u64, NativeEventSubject)>,
         mut control_seq: u64,
-        identity: Option<(String, chrono::DateTime<chrono::Utc>, u64)>,
+        identity: Option<(String, crate::time::Timestamp, u64)>,
         current: Option<crate::acp::state::CurrentNativeAvailability>,
     ) -> Result<
         (
@@ -660,7 +672,7 @@ mod tests {
                     name: "Edit".into(),
                     kind: "edit".into(),
                     args_preview: String::new(),
-                    started_at: chrono::Utc::now(),
+                    started_at: crate::time::Timestamp::now(),
                     diffs: Vec::new(),
                     memory_recall: None,
                     parent_tool_call_id: None,
@@ -669,7 +681,7 @@ mod tests {
                 options: Vec::new(),
                 choice: false,
                 plan: None,
-                requested_at: chrono::Utc::now(),
+                requested_at: crate::time::Timestamp::now(),
                 resolved: None,
             },
         };

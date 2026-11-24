@@ -33,8 +33,6 @@ impl SteerRequest {
 }
 
 /// Text of the first text block, for the retry pill on a refused prompt.
-/// Attachments are not carried back into the pill; text is the retry hook
-/// and this is a rare edge.
 pub(super) fn first_text_block(blocks: &[ContentBlock]) -> String {
     blocks
         .iter()
@@ -396,7 +394,7 @@ done
                             .expect("timed out waiting for PromptRejected + Stopped")
                             .expect("event channel closed");
                         match ev {
-                            Event::PromptRejected { reason, text } => {
+                            Event::PromptRejected { reason, text, .. } => {
                                 assert_eq!(reason, "agent_busy");
                                 assert_eq!(
                                     text, follow_up,
@@ -464,11 +462,12 @@ done
                     }
                     assert!(!projected.compacting, "real completion releases compaction");
                     let expected_sid = format!("sid-{}", generation + 1);
+                    let reset = client.reset_session("/clear").await.unwrap();
                     assert!(matches!(
-                        client.reset_session("/clear").await.unwrap(),
+                        &reset,
                         crate::acp::acp_client::ResetSessionOutcome::Reset { new_acp_session_id }
-                            if new_acp_session_id == expected_sid
-                    ));
+                            if new_acp_session_id == &expected_sid
+                    ), "reset after compaction {generation}: {reset:?}");
                     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
                     loop {
                         let event = tokio::time::timeout_at(deadline, client.next_event())

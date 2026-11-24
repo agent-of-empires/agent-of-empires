@@ -11,7 +11,9 @@ on:
 # Queue generations have distinct refs; cancel-obsolete-queue-runs handles them.
 concurrency:
   group: tests-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # A push to main runs to completion so macOS results and kache seeds land;
+  # a newer push waits as the single pending run.
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -70,16 +72,19 @@ jobs:
         if: matrix.leg == 'core-rest'
         with:
           tool: cargo-nextest
-      - name: Install tmux
+      - name: Install runtime test prerequisites
         run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Install isolated namespace test prerequisites
+        if: matrix.leg == 'core-rest' || matrix.leg == 'web-e2e'
+        run: sudo apt-get install -y bubblewrap iproute2 apparmor
       # RunsOn appends `. /etc/environment` to /etc/profile, so every login shell
       # resets PATH and aoe's login-shell launches lose the e2e stub dirs.
       - name: Keep inherited PATH in login shells
         run: sudo sed -i '/runs-on\/env/d' /etc/profile
-      - name: Install confined Local test prerequisites
-        if: matrix.leg == 'web-e2e'
+      - name: Enable isolated namespace tests
+        if: matrix.leg == 'core-rest' || matrix.leg == 'web-e2e'
         run: |
-          sudo apt-get install -y bubblewrap iproute2 apparmor
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           # The packaged profile denies capabilities to bwrap children, including ip.
           # Replace it only in memory on this disposable runner; keep network isolation.
           sudo apparmor_parser -r -K <<'PROFILE'
@@ -159,7 +164,13 @@ jobs:
         # rather than passing as a green run with the guard gone.
         run: |
           echo "TMPDIR=${TMPDIR:-unset}"
+          cargo build --bin aoe
+          target_dir=$(cargo metadata --no-deps --format-version 1 | jq -er .target_directory)
+          export AOE_TEST_ACP_RUNNER_EXE="$target_dir/debug/aoe"
           cargo nextest run --no-fail-fast
+      - name: Exercise bounded plugin staging
+        if: matrix.leg == 'core-rest'
+        run: cargo nextest run --run-ignored only --no-tests=fail -E 'test(staging_volume_) | test(startup_reclaims)'
       - name: Require scoped cancellation coverage
         if: matrix.leg == 'core-rest'
         env:
@@ -380,6 +391,8 @@ jobs:
         run: |
           # Owned-runner unit fixtures launch the matching normal binary, not a test harness.
           cargo build --features e2e-tests --bin aoe
+          target_dir=$(cargo metadata --no-deps --format-version 1 | jq -er .target_directory)
+          export AOE_TEST_ACP_RUNNER_EXE="$target_dir/debug/aoe"
           cargo nextest run --features e2e-tests --lib --bins --no-fail-fast
       - name: Cargo test (macOS, daemon-only CLI reads)
         run: cargo nextest run --features e2e-tests --test integration -E 'test(cli_read_daemon::)' --no-fail-fast
@@ -618,9 +631,6 @@ jobs:
           node-version: '22'
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - name: Install web deps
-        working-directory: web
-        run: npm ci
       - uses: ./.github/actions/rust-toolchain
       - uses: ./.github/actions/kache
         with:

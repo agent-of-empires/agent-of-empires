@@ -2041,7 +2041,7 @@ mod metadata_tests {
         for event in [
             Event::BackgroundTaskFinished {
                 task_id: "task".into(),
-                ended_at: Some(chrono::Utc::now()),
+                ended_at: Some(crate::time::Timestamp::now()),
             },
             Event::BackgroundAgentCompleted {
                 agent_id: "agent".into(),
@@ -2049,7 +2049,7 @@ mod metadata_tests {
                 tools: Vec::new(),
                 result: None,
                 warning: None,
-                ended_at: chrono::Utc::now(),
+                ended_at: crate::time::Timestamp::now(),
             },
         ] {
             let mut metadata = EventMetadata::host(&event);
@@ -2079,6 +2079,7 @@ mod metadata_tests {
             prompt_id: None,
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let mut metadata = EventMetadata::host(&prompt);
         metadata.resource_ref = Some(allocation);
@@ -2093,7 +2094,7 @@ mod metadata_tests {
                 tools: Vec::new(),
                 result: None,
                 warning: None,
-                ended_at: chrono::Utc::now(),
+                ended_at: crate::time::Timestamp::now(),
             };
             assert!(metadata.validate_for_event(&event).is_err());
         }
@@ -2103,7 +2104,7 @@ mod metadata_tests {
             tools: Vec::new(),
             result: Some("claimed Native output".into()),
             warning: None,
-            ended_at: chrono::Utc::now(),
+            ended_at: crate::time::Timestamp::now(),
         };
         assert!(metadata.validate_for_event(&fabricated_result).is_err());
     }

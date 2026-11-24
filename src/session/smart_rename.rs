@@ -2261,6 +2261,7 @@ mod serve {
                 attachments: vec![],
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             };
             assert!(!should_trigger_smart_rename(&non_stop, id, &empty, &empty));
 
@@ -2466,7 +2467,7 @@ mod tests {
 
     #[test]
     fn oneshot_argv_places_model_args_by_agent_convention() {
-        let cases: [(&str, Option<&str>, &[&str]); 8] = [
+        let cases: [(&str, Option<&str>, &[&str]); 9] = [
             (
                 "claude",
                 Some("picked-small"),
@@ -2526,6 +2527,19 @@ mod tests {
                 &["kimi", "-p", "name this", "-m", "moonshot-v1-8k"],
             ),
             (
+                "vibe",
+                Some("mistral-medium-3.5"),
+                &[
+                    "vibe",
+                    "-p",
+                    "name this",
+                    "--model",
+                    "mistral-medium-3.5",
+                    "--disabled-tools",
+                    "*",
+                ],
+            ),
+            (
                 "opencode",
                 Some("anthropic/claude-haiku-4-5"),
                 &[
@@ -2541,11 +2555,25 @@ mod tests {
             let argv = argv_for(name, model);
             assert_eq!(argv.as_slice(), expected, "{name} {model:?}");
         }
-        for name in ["opencode", "kimi", "codex", "gemini", "copilot"] {
+        for name in ["opencode", "kimi", "codex", "gemini", "copilot", "vibe"] {
             let argv = argv_for(name, None);
             assert!(
                 !argv.iter().any(|arg| arg == "--model" || arg == "-m"),
                 "{name} has no built-in cheap alias: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vibe_oneshots_disable_every_tool() {
+        let vibe = OneshotAgent::Builtin(agents::get_agent("vibe").unwrap());
+        let pinned = HashMap::from([("vibe".to_string(), "mistral-medium-3.5".to_string())]);
+        for models in [None, Some(&HashMap::new()), Some(&pinned)] {
+            let argv = vibe.argv("name this", models).expect("one-shot");
+            assert_eq!(
+                &argv[argv.len() - 2..],
+                ["--disabled-tools", "*"],
+                "{models:?}"
             );
         }
     }

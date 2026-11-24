@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 
 use super::{is_resumable, query_control, query_store, resolve_per_profile, AppState};
 use crate::acp::event_store::ControlKnowledge::{Indeterminate, Known};
@@ -35,14 +35,12 @@ const RATE_LIMIT_UNKNOWN_RESET_MAX_SHIFT: u32 = 4;
 const RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES: i64 = 5;
 
 /// The later of the reported reset plus grace and the minimum park floor.
-fn rate_limit_resume_at(
-    resets_at: DateTime<Utc>,
-    recorded_at_ms: i64,
-    grace_secs: u32,
-) -> DateTime<Utc> {
-    let resets_plus_grace = resets_at + chrono::Duration::seconds(i64::from(grace_secs));
-    match DateTime::from_timestamp_millis(recorded_at_ms)
-        .map(|t| t + chrono::Duration::seconds(RATE_LIMIT_MIN_PARK_SECS))
+fn rate_limit_resume_at(resets_at: Timestamp, recorded_at_ms: i64, grace_secs: u32) -> Timestamp {
+    let resets_plus_grace = resets_at
+        .checked_add(crate::time::Duration::seconds(i64::from(grace_secs)))
+        .unwrap_or(Timestamp::MAX);
+    match Timestamp::from_millis(recorded_at_ms)
+        .map(|t| t + crate::time::Duration::seconds(RATE_LIMIT_MIN_PARK_SECS))
     {
         Some(floor) if floor > resets_plus_grace => floor,
         _ => resets_plus_grace,
@@ -55,7 +53,7 @@ fn scheduled_resume_at(
     info: &crate::acp::state::RateLimitInfo,
     recorded_at_ms: i64,
     streak: i64,
-) -> DateTime<Utc> {
+) -> Timestamp {
     match info.resets_at {
         Some(resets_at) => {
             rate_limit_resume_at(resets_at, recorded_at_ms, RATE_LIMIT_AUTO_RESUME_GRACE_SECS)
@@ -64,17 +62,18 @@ fn scheduled_resume_at(
     }
 }
 
-fn rate_limit_unknown_reset_retry_at(recorded_at_ms: i64, redeliveries: i64) -> DateTime<Utc> {
+fn rate_limit_unknown_reset_retry_at(recorded_at_ms: i64, redeliveries: i64) -> Timestamp {
     let shift = redeliveries.clamp(0, i64::from(RATE_LIMIT_UNKNOWN_RESET_MAX_SHIFT)) as u32;
-    let retry_after =
-        chrono::Duration::seconds(RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS.saturating_mul(1 << shift));
-    DateTime::from_timestamp_millis(recorded_at_ms).unwrap_or_else(Utc::now) + retry_after
+    let retry_after = crate::time::Duration::seconds(
+        RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS.saturating_mul(1 << shift),
+    );
+    Timestamp::from_millis(recorded_at_ms).unwrap_or_else(Timestamp::now) + retry_after
 }
 
 fn row_minted_at_ms(entry: &crate::daemon::QueuedPromptEntry) -> Option<i64> {
-    DateTime::parse_from_rfc3339(&entry.created_at)
+    Timestamp::parse_rfc3339(&entry.created_at)
         .ok()
-        .map(|queued_at| queued_at.timestamp_millis())
+        .map(|queued_at| queued_at.as_millis())
 }
 
 /// Whether any queued prompt was minted after the limit that interrupted the
@@ -116,7 +115,7 @@ pub(crate) enum ContinuationOutcome {
 
 pub(crate) struct PreparedContinuation {
     session_id: String,
-    created_at: chrono::DateTime<Utc>,
+    created_at: crate::time::Timestamp,
     pub(crate) prompt: Option<(String, Vec<crate::daemon::PromptAttachmentRef>)>,
     limit_at_ms: Option<i64>,
 }
@@ -246,7 +245,7 @@ pub(crate) async fn install_prepared_continuation(
                 .ok_or(SupervisorError::ControlStateUnavailable)?;
             state
                 .session_service
-                .set_pending_initial_turn(id, text, attachments)
+                .set_pending_initial_turn(id, text, attachments, crate::daemon::PromptOrigin::Aoe)
                 .await;
         }
         ContinuationOutcome::Stands => {}
@@ -273,6 +272,7 @@ pub(crate) enum QuotaResume {
     Manual,
     Automatic { park_seq: u64 },
     QueuedAtCap { park_seq: u64 },
+    LoginQueue { park_seq: u64 },
 }
 
 pub(crate) async fn resume_rate_limited(
@@ -298,6 +298,7 @@ pub(crate) async fn resume_rate_limited(
         QuotaResume::QueuedAtCap { park_seq } if park.seq != park_seq || !park.cap_reached => {
             return Ok(())
         }
+        QuotaResume::LoginQueue { park_seq } if park.seq != park_seq => return Ok(()),
         _ => {}
     }
     let (profile, generation) = {
@@ -329,7 +330,7 @@ pub(crate) async fn resume_rate_limited(
         .info
         .as_ref()
         .and_then(|info| info.resets_at)
-        .unwrap_or_else(Utc::now);
+        .unwrap_or_else(crate::time::Timestamp::now);
     if matches!(kind, QuotaResume::Automatic { .. }) {
         let settings = resolve_per_profile([profile.clone()].into_iter(), |config| {
             (
@@ -361,12 +362,12 @@ pub(crate) async fn resume_rate_limited(
             reported.unwrap_or_else(|| scheduled_resume_at(&info, park.recorded_at_ms, streak));
         if let Some(attempt) = park
             .last_resume_attempt_ms
-            .and_then(DateTime::from_timestamp_millis)
+            .and_then(crate::time::Timestamp::from_millis)
         {
             resume_at =
-                resume_at.max(attempt + chrono::Duration::seconds(RATE_LIMIT_MIN_PARK_SECS));
+                resume_at.max(attempt + crate::time::Duration::seconds(RATE_LIMIT_MIN_PARK_SECS));
         }
-        if Utc::now() < resume_at {
+        if crate::time::Timestamp::now() < resume_at {
             return Ok(());
         }
         if streak >= RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES {
@@ -421,7 +422,19 @@ pub(crate) async fn resume_rate_limited(
         Indeterminate => return Err(SupervisorError::ControlStateUnavailable),
     }
     let delivery = QuotaDelivery { park_seq: park.seq };
-    let outcome = if matches!(kind, QuotaResume::QueuedAtCap { .. }) {
+    let outcome = if matches!(kind, QuotaResume::LoginQueue { .. }) {
+        if state
+            .instances
+            .read()
+            .await
+            .iter()
+            .any(|row| row.id == id && row.pending_initial_turn.is_some())
+        {
+            ContinuationOutcome::Stands
+        } else {
+            ContinuationOutcome::SupersededByQueue
+        }
+    } else if matches!(kind, QuotaResume::QueuedAtCap { .. }) {
         if state
             .session_service
             .queued_prompts_snapshot(id)
@@ -463,7 +476,7 @@ pub(crate) async fn resume_rate_limited(
         )
     {
         if manual && park.cap_reached {
-            resume_at = Utc::now();
+            resume_at = crate::time::Timestamp::now();
         }
         state
             .acp_supervisor
@@ -531,7 +544,7 @@ pub(super) async fn schedule_capped_queue(state: &Arc<AppState>, id: &str, park_
     true
 }
 
-fn schedule_quota_release(
+pub(super) fn schedule_quota_release(
     state: Arc<AppState>,
     id: String,
     submission: tokio::sync::OwnedMutexGuard<()>,
@@ -541,9 +554,12 @@ fn schedule_quota_release(
         "acp.quota_release",
         crate::task_util::PanicPolicy::Log,
         async move {
+            let login_release = matches!(kind, QuotaResume::LoginQueue { .. });
             if let Err(error) = resume_rate_limited(&state, &id, submission, kind).await {
                 tracing::warn!(target: "acp.supervisor", session = %id, %error,
                     "quota continuation remains held");
+            } else if login_release {
+                state.session_service.sandbox_login.release(&id);
             }
         },
     );
@@ -580,10 +596,15 @@ pub(crate) async fn reap_rate_limit_resumes(
         })
         .await;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     for row in eligible {
         let id = row.id.clone();
         let has_queued_prompts = !row.queued_prompts.is_empty();
+        if state.session_service.sandbox_login.is_held(&id)
+            || crate::process::worker_registry::stop_requested(&id)
+        {
+            continue;
+        }
         let skip = |reason: &str| {
             tracing::trace!(target: "acp.supervisor", session = %id, "rate-limit auto-resume: skipped, {reason}");
         };
@@ -683,12 +704,9 @@ pub(crate) async fn reap_rate_limit_resumes(
         }
         let mut resume_at = scheduled_at;
         // A resume that fired but got no worker retries on the minimum park window.
-        if let Some(last_attempt) = park
-            .last_resume_attempt_ms
-            .and_then(DateTime::from_timestamp_millis)
-        {
-            resume_at =
-                resume_at.max(last_attempt + chrono::Duration::seconds(RATE_LIMIT_MIN_PARK_SECS));
+        if let Some(last_attempt) = park.last_resume_attempt_ms.and_then(Timestamp::from_millis) {
+            resume_at = resume_at
+                .max(last_attempt + crate::time::Duration::seconds(RATE_LIMIT_MIN_PARK_SECS));
         }
         if now < resume_at {
             skip("park window has not elapsed");
@@ -720,7 +738,6 @@ mod tests {
     use crate::acp::supervisor::test_support::managed::with_managed;
     use crate::acp::Event;
     use crate::server::test_support::managed_control_session;
-    use chrono::TimeZone;
 
     fn known_park(state: &AppState, id: &str) -> crate::acp::event_store::RateLimitPark {
         match state
@@ -792,27 +809,26 @@ mod tests {
 
     #[test]
     fn unknown_reset_backs_off_per_redelivery_spent() {
-        let recorded_at = Utc.timestamp_opt(1_500_000, 0).unwrap();
-        let at =
-            |n| rate_limit_unknown_reset_retry_at(recorded_at.timestamp_millis(), n) - recorded_at;
-        let hour = chrono::Duration::seconds(RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS);
+        let recorded_at = crate::time::Timestamp::from_unix_secs(1_500_000).unwrap();
+        let at = |n| rate_limit_unknown_reset_retry_at(recorded_at.as_millis(), n) - recorded_at;
+        let hour = crate::time::Duration::seconds(RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS);
         for (n, factor) in [(0, 1), (1, 2), (2, 4), (3, 8), (4, 16)] {
             assert_eq!(at(n), hour * factor);
         }
         let total = (0..RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES)
-            .fold(chrono::Duration::zero(), |acc, n| acc + at(n));
+            .fold(crate::time::Duration::ZERO, |acc, n| acc + at(n));
         assert_eq!(total, hour * 31);
         assert_eq!(at(RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES + 50), hour * 16);
 
-        let recorded = Utc.timestamp_opt(1_000_000, 0).unwrap();
-        let ms = recorded.timestamp_millis();
-        let secs = chrono::Duration::seconds;
+        let recorded = crate::time::Timestamp::from_unix_secs(1_000_000).unwrap();
+        let ms = recorded.as_millis();
+        let secs = crate::time::Duration::seconds;
         let cases = [
             (
                 "far future reset",
-                recorded + chrono::Duration::hours(1),
+                recorded + crate::time::Duration::hours(1),
                 15,
-                recorded + chrono::Duration::hours(1) + secs(15),
+                recorded + crate::time::Duration::hours(1) + secs(15),
             ),
             (
                 "past reset floors",
@@ -833,8 +849,8 @@ mod tests {
 
     #[test]
     fn only_a_row_minted_after_the_limit_supersedes() {
-        let limit = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
-        let limit_ms = limit.timestamp_millis();
+        let limit = crate::time::Timestamp::from_unix_secs(1_700_000_000).unwrap();
+        let limit_ms = limit.as_millis();
         let row = |seq: u64, created_at: &str| crate::daemon::QueuedPromptEntry {
             id: format!("q-{seq}"),
             seq,
@@ -843,9 +859,14 @@ mod tests {
             created_at: created_at.into(),
             origin_device: None,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
-        let after = Utc.timestamp_opt(1_700_000_001, 0).unwrap().to_rfc3339();
-        let before = Utc.timestamp_opt(1_699_999_999, 0).unwrap().to_rfc3339();
+        let after = crate::time::Timestamp::from_unix_secs(1_700_000_001)
+            .unwrap()
+            .to_rfc3339();
+        let before = crate::time::Timestamp::from_unix_secs(1_699_999_999)
+            .unwrap()
+            .to_rfc3339();
         let cases = [
             (
                 "row after the limit",
@@ -1036,7 +1057,7 @@ mod tests {
                         "new user work".into(),
                         Vec::new(),
                         None,
-                        None,
+                        crate::server::session_service::QueueSender::default(),
                     )
                     .await
                     .unwrap();
@@ -1099,6 +1120,7 @@ mod tests {
                                 &id,
                                 "run the nightly task".into(),
                                 Vec::new(),
+                                crate::daemon::PromptOrigin::Unknown,
                             )
                             .await;
                     }
@@ -1107,7 +1129,7 @@ mod tests {
                     queued.text = "manual prompt B".into();
                     queued.created_at = offset
                         .map(|offset| {
-                            DateTime::from_timestamp_millis(park.recorded_at_ms + offset)
+                            crate::time::Timestamp::from_millis(park.recorded_at_ms + offset)
                                 .unwrap()
                                 .to_rfc3339()
                         })
@@ -1159,7 +1181,7 @@ mod tests {
                 enable_auto_resume(true);
                 live.park("original interrupted work").await;
                 live.make_quota_due();
-                live.state.session_service.set_pending_initial_turn(&id, "original interrupted work".into(), Vec::new()).await;
+                live.state.session_service.set_pending_initial_turn(&id, "original interrupted work".into(), Vec::new(), crate::daemon::PromptOrigin::Unknown).await;
                 let park = known_park(&live.state, &id);
                 let before = live.state.instances.read().await.iter().find(|row| row.id == id).unwrap().clone();
                 let requests = live.native.requests();
@@ -1235,6 +1257,7 @@ mod tests {
                                 &id,
                                 "existing pending work".into(),
                                 Vec::new(),
+                                crate::daemon::PromptOrigin::Unknown,
                             )
                             .await;
                     }
@@ -1592,7 +1615,12 @@ mod tests {
                 live.park("original work").await;
                 live.state
                     .session_service
-                    .set_pending_initial_turn(&id, "original work".into(), Vec::new())
+                    .set_pending_initial_turn(
+                        &id,
+                        "original work".into(),
+                        Vec::new(),
+                        crate::daemon::PromptOrigin::Unknown,
+                    )
                     .await;
                 let before = live.state.acp_event_store.highest_seq(&id).unwrap();
                 let budget = live
@@ -1648,7 +1676,12 @@ mod tests {
                     live.make_quota_due();
                     live.state
                         .session_service
-                        .set_pending_initial_turn(&id, "existing pending work".into(), Vec::new())
+                        .set_pending_initial_turn(
+                            &id,
+                            "existing pending work".into(),
+                            Vec::new(),
+                            crate::daemon::PromptOrigin::Unknown,
+                        )
                         .await;
                     if !automatic {
                         let submission = live.state.session_service.prompt_submission(&id).await;
@@ -1660,7 +1693,7 @@ mod tests {
                                 "queued work must remain".into(),
                                 Vec::new(),
                                 None,
-                                None,
+                                crate::server::session_service::QueueSender::default(),
                             )
                             .await
                             .unwrap();
@@ -1768,7 +1801,7 @@ mod tests {
                 )
                 .unwrap();
                 live.client.lease.test_backdate_idle_baseline(
-                    (Utc::now() - chrono::Duration::days(1)).timestamp_millis(),
+                    (crate::time::Timestamp::now() - crate::time::Duration::days(1)).as_millis(),
                 );
                 live.make_quota_due();
                 let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
@@ -1922,7 +1955,7 @@ mod tests {
                         model: "test".into(),
                         output_file: String::new(),
                         workflow: None,
-                        started_at: Utc::now(),
+                        started_at: crate::time::Timestamp::now(),
                     };
                     live.state
                         .acp_event_store
@@ -1972,7 +2005,7 @@ mod tests {
                             "newer queued intent"
                         }
                         .into();
-                        queued.created_at = DateTime::from_timestamp_millis(
+                        queued.created_at = crate::time::Timestamp::from_millis(
                             park.recorded_at_ms + if index == 0 { -1000 } else { 1000 },
                         )
                         .unwrap()

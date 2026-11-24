@@ -315,6 +315,7 @@ pub(crate) fn build_test_app_state_with_event_capacity(
         idempotency_locks,
         create_progress: Default::default(),
         list_sessions_resolver_misses: std::sync::atomic::AtomicUsize::new(0),
+        session_cfg_store: Default::default(),
         smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_semaphore: tokio::sync::Semaphore::new(
@@ -430,6 +431,38 @@ pub fn seed_instances_on_disk_for_test(profile: &str, insts: Vec<Instance>) {
             Ok(())
         })
         .expect("seed sessions.json");
+}
+
+/// Seeds the rows `state` holds into their profiles' stores and refreshes the canonical
+/// metadata: a launch opens the stored row, so a row that exists only in memory is a session
+/// whose source is unavailable. Rows with no profile run under `default`.
+pub async fn seed_native_rows_for_test(state: &Arc<AppState>) {
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().expect("app dir"))
+        .expect("purge owners");
+    let mut by_profile: std::collections::BTreeMap<String, Vec<Instance>> = Default::default();
+    for row in state.instances.read().await.iter() {
+        by_profile
+            .entry(row.source_profile.clone())
+            .or_default()
+            .push(row.clone());
+    }
+    for (profile, rows) in by_profile {
+        seed_instances_on_disk_for_test(&profile, rows);
+    }
+    refresh_canonical_metadata_for_test(state).await;
+}
+
+/// [`build_test_app_state`] for rows a launch opens from the store (see
+/// [`seed_native_rows_for_test`]); a row with no profile gets `default`.
+pub async fn build_native_test_app_state(mut rows: Vec<Instance>) -> Arc<AppState> {
+    for row in &mut rows {
+        if row.source_profile.is_empty() {
+            row.source_profile = "default".to_string();
+        }
+    }
+    let state = build_test_app_state(rows);
+    seed_native_rows_for_test(&state).await;
+    state
 }
 
 /// Make storage for `profile` fail on every write: a plain file where its directory belongs.
@@ -725,6 +758,7 @@ impl ManagedControlSession {
                     woke_idle_dormant: false,
                     prompt_ids: Vec::new(),
                     synthesized: false,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                     no_revive: false,
                 },
             )
@@ -770,7 +804,7 @@ impl ManagedControlSession {
         let reason = if error_kind == Some("rate_limit") {
             "rate_limited"
         } else if error_kind.is_some() {
-            "prompt_failed"
+            "prompt_rejected"
         } else {
             "prompt_complete"
         };
@@ -816,7 +850,7 @@ impl ManagedControlSession {
                 "UPDATE acp_events SET created_at=?2 WHERE session_id=?1",
                 rusqlite::params![
                     self.id(),
-                    (chrono::Utc::now() - chrono::Duration::days(3)).timestamp_millis()
+                    (crate::time::Timestamp::now() - crate::time::Duration::days(3)).as_millis()
                 ],
             )
             .unwrap();
@@ -1033,7 +1067,7 @@ impl ManagedControlSession {
         &mut self,
         text: &str,
         kind: &str,
-        resets_at: chrono::DateTime<chrono::Utc>,
+        resets_at: crate::time::Timestamp,
     ) {
         let request = self.start_prompt(text).await;
         self.native
@@ -1045,7 +1079,7 @@ impl ManagedControlSession {
                         "cost":{"amount":0.1,"currency":"USD"},
                         "_meta":{"_claude/rateLimit":{
                             "status":"rejected", "rateLimitType":kind,
-                            "resetsAt":resets_at.timestamp()
+                            "resetsAt":resets_at.as_unix_secs()
                         }}
                     }
                 }
@@ -1066,7 +1100,10 @@ impl ManagedControlSession {
             .info
             .expect("the original rejected quota window is retained");
         assert_eq!(info.kind, kind);
-        assert_eq!(info.resets_at.unwrap().timestamp(), resets_at.timestamp());
+        assert_eq!(
+            info.resets_at.unwrap().as_unix_secs(),
+            resets_at.as_unix_secs()
+        );
     }
 
     /// Reuse the first-I/O path from supervisor::launch's managed resource fixtures.
@@ -1162,6 +1199,73 @@ pub(crate) fn sql_projection_metadata() -> crate::acp::event_sender::EventMetada
         }),
         ..EventMetadata::history()
     }
+}
+
+/// Serve the production router through the kernel-verified owner Unix acceptor.
+#[cfg(all(test, unix))]
+pub(crate) async fn serve_local_plugin_fixture(
+    state: Arc<AppState>,
+    path: &std::path::Path,
+    submissions: Arc<std::sync::atomic::AtomicUsize>,
+) -> tokio::task::JoinHandle<()> {
+    let app = build_router_for_test(state).layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let submissions = submissions.clone();
+            async move {
+                if request.method() == axum::http::Method::POST
+                    && request.uri().path().ends_with("/update/apply")
+                {
+                    submissions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                next.run(request).await
+            }
+        },
+    ));
+    serve_owner_router_for_test(path, app).await
+}
+
+/// An instance whose `workspace_info` is a one-repo workspace rooted at `dir`.
+#[cfg(test)]
+pub(crate) fn workspace_instance(title: &str, dir: &std::path::Path) -> Instance {
+    use crate::acp::mcp_rewrite::test_support::{workspace_info, OUTSIDE_MAIN};
+    let mut instance = Instance::new(title, &dir.to_string_lossy());
+    instance.workspace_info = Some(workspace_info(
+        dir,
+        &[("alpha", std::path::Path::new(OUTSIDE_MAIN))],
+    ));
+    instance
+}
+
+/// Asserts a spawn carries `expected`'s workspace layout, not just some workspace.
+#[cfg(test)]
+pub(crate) fn assert_carries_workspace(
+    actual: Option<&crate::session::WorkspaceInfo>,
+    expected: &Instance,
+    site: &str,
+) {
+    let expected = expected.workspace_info.as_ref().expect("fixture workspace");
+    let actual = actual.unwrap_or_else(|| panic!("{site} dropped the workspace_info"));
+    assert_eq!(actual.workspace_dir, expected.workspace_dir, "{site}");
+    assert_eq!(actual.repos, expected.repos, "{site}");
+}
+
+/// A launcher that records each launch's `workspace_info` and fails the launch.
+#[cfg(test)]
+pub(crate) fn workspace_capturing_launcher() -> (
+    crate::acp::supervisor::Launcher,
+    Arc<std::sync::Mutex<Vec<Option<crate::session::WorkspaceInfo>>>>,
+) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&seen);
+    let launcher: crate::acp::supervisor::Launcher = Arc::new(move |config, _id| {
+        recorded.lock().unwrap().push(config.workspace_info.clone());
+        Box::pin(async {
+            Err::<crate::acp::acp_client::AcpClient, _>(crate::acp::acp_client::AcpError::Spawn(
+                "test launcher".into(),
+            ))
+        })
+    });
+    (launcher, seen)
 }
 
 /// A launcher whose agent rejects `initialize` for want of a login, as the connection task

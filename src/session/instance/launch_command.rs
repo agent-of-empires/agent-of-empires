@@ -967,7 +967,7 @@ impl Instance {
     /// `kiro-cli chat`). A user command override takes precedence verbatim and
     /// the subcommand is not applied to it. Used when assembling the launch
     /// command so subcommand-scoped flags (yolo, resume) parse correctly.
-    fn get_launch_command(&self) -> String {
+    pub(super) fn get_launch_command(&self) -> String {
         if self.command.is_empty() {
             if let Some(declared) = self.declared_agent() {
                 if let Some(command) = &declared.contribution().command {
@@ -2007,7 +2007,7 @@ sandbox = "unsupported"
                             manifest.as_bytes(),
                         ),
                         capabilities: Vec::new(),
-                        granted_at: chrono::Utc::now(),
+                        granted_at: crate::time::Timestamp::now(),
                     }),
                     ..Default::default()
                 },

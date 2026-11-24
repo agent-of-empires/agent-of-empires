@@ -74,6 +74,7 @@ export function AccessStep({ status, about, schema, values, onSaveField }: Props
               values={values}
               onSaveField={onSaveField}
               onlyFields={["notify_on_waiting", "notify_on_idle", "notify_on_error"]}
+              hideKeys
             />
           </div>
         </div>
@@ -86,7 +87,7 @@ export function AccessStep({ status, about, schema, values, onSaveField }: Props
         </div>
         <p className="text-xs text-text-dim">
           <a
-            href="https://www.agent-of-empires.com/docs/guides/web-dashboard"
+            href="https://www.agent-of-empires.com/guides/web-dashboard/"
             target="_blank"
             rel="noreferrer"
             className="text-brand-500 underline"

@@ -28,6 +28,9 @@ export function agentIntegrationDetails(agent: PluginAgentIntegration): string[]
       );
     }
     if (flags.length > 0) details.push(`launch flags: ${flags.join("; ")}`);
+    if (launch.send_keys_enter_delay_ms !== undefined) {
+      details.push(`enter delay: ${launch.send_keys_enter_delay_ms} ms`);
+    }
     const env = Object.entries(launch.container_env ?? {});
     if (env.length > 0) details.push(`sandbox environment: ${env.map(([key, value]) => `${key}=${value}`).join(", ")}`);
     if (launch.aliases?.length) details.push(`aliases: ${launch.aliases.join(", ")}`);

@@ -456,7 +456,7 @@ impl AdoptedPromptDiagnostic {
 
     pub(crate) fn inherit_rate_limit_hint(
         &mut self,
-        hint: impl FnOnce() -> Option<(String, chrono::DateTime<chrono::Utc>)>,
+        hint: impl FnOnce() -> Option<(String, crate::time::Timestamp)>,
     ) {
         if let crate::acp::state::Event::RateLimit { info } = &mut self.0 {
             if info.resets_at.is_none() || info.kind.is_empty() || info.kind == "rate_limit" {

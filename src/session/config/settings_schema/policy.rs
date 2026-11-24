@@ -308,6 +308,24 @@ mod tests {
     }
 
     #[test]
+    fn plugin_staging_requires_global_scope_and_elevation() {
+        for enabled in [false, true] {
+            let body = json!({"session": {"plugin_staging_sandbox": enabled}});
+            assert!(matches!(
+                validate_patch(&body, Scope::Global, false),
+                Err(PatchRejection::NeedsElevation { .. })
+            ));
+            assert!(validate_patch(&body, Scope::Global, true).is_ok());
+            assert_eq!(
+                validate_patch(&body, Scope::Profile, true),
+                Err(PatchRejection::GlobalOnly(
+                    "session.plugin_staging_sandbox".into()
+                ))
+            );
+        }
+    }
+
+    #[test]
     fn profile_scope_rejects_global_only_fields_including_resets() {
         for field in schema().iter().filter(|field| !field.profile_overridable) {
             let body = json!({&field.section: {&field.field: null}});

@@ -12,7 +12,7 @@ fn render_at(env: &mut TestEnv, w: u16, h: u16) {
     terminal
         .draw(|f| {
             let area = f.area();
-            env.view.render(f, area, &theme, None, None, None);
+            env.view.render(f, area, &theme, None);
         })
         .unwrap();
 }
@@ -110,8 +110,9 @@ fn trash_footer_scroll_preserves_sidebar_selection() {
     for strict in [false, true] {
         let mut env = create_test_env_with_sessions(2);
         let id = env.view.instance_at(0).id.clone();
-        env.view
-            .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+        env.view.mutate_instance(&id, |inst| {
+            inst.trashed_at = Some(crate::time::Timestamp::now())
+        });
         env.view.trashed_section_collapsed = false;
         env.view.rebuild_flat_items();
         env.view.select_session_by_id(&id);

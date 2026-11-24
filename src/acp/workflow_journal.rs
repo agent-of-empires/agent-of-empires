@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::acp::event_sender::WeakEventSender;
-use chrono::Utc;
+use crate::time::Timestamp;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -332,7 +332,7 @@ impl Follower {
                             name: self.journal.launch.name.clone(),
                             phase: str_field("phase").unwrap_or_default().to_string(),
                         }),
-                        started_at: Utc::now(),
+                        started_at: Timestamp::now(),
                     })
                 } else {
                     None
@@ -461,7 +461,7 @@ fn completed(
         tools: Vec::new(),
         result,
         warning,
-        ended_at: Utc::now(),
+        ended_at: Timestamp::now(),
     }
 }
 

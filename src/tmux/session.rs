@@ -1017,6 +1017,22 @@ impl Session {
         let target = format!("={}:", self.name);
         append_session_setup_args(&mut args, &target, &config, None);
         crate::tmux::append_session_kind_args(&mut args, &target, crate::tmux::SessionKind::Agent);
+        if let Some(source) = extra_env.iter().find_map(|mutation| match mutation {
+            PaneEnvMutation::Set { key, value } if key == crate::hooks::SESSION_SOURCE_ENV => {
+                uuid::Uuid::parse_str(value).ok().map(|_| value)
+            }
+            _ => None,
+        }) {
+            args.extend([
+                ";".into(),
+                "set-option".into(),
+                "-pF".into(),
+                "-t".into(),
+                target,
+                "@aoe-hook-launch".into(),
+                format!("#{{pane_pid}}:{source}"),
+            ]);
+        }
 
         let output = crate::tmux::tmux_command().args(&args).output()?;
 
@@ -1294,6 +1310,12 @@ impl Session {
             .ok_or_else(|| anyhow::anyhow!("could not capture tmux session '{}'", self.name))
     }
 
+    /// [`Self::try_capture_pane`] of exactly `pane`, a `#{pane_id}`, never a re-resolved one.
+    pub fn try_capture_pane_in(&self, pane: &str, lines: usize) -> Result<String> {
+        self.capture_target(pane, lines)?
+            .ok_or_else(|| anyhow::anyhow!("could not capture tmux pane '{pane}'"))
+    }
+
     /// `None` when the session is gone or `capture-pane` failed; `Err` when tmux could not run.
     fn capture(&self, lines: usize) -> Result<Option<String>> {
         if self.physical.is_none() && !self.exists() {
@@ -1301,12 +1323,16 @@ impl Session {
         }
         let target =
             self.live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
+        self.capture_target(&target, lines)
+    }
+
+    fn capture_target(&self, target: &str, lines: usize) -> Result<Option<String>> {
         let output = self
             .input_command()?
             .args([
                 "capture-pane",
                 "-t",
-                &target,
+                target,
                 "-p",
                 "-e",
                 "-S",
@@ -1316,33 +1342,52 @@ impl Session {
         Ok(capture_output(output.status.success(), &output.stdout))
     }
 
-    /// Wait for a known marker, or for two stable captures when no marker exists.
+    /// Wait for any known marker, or for two stable captures when no marker exists.
     /// The polling budget bounds readiness checks, not each native subprocess.
-    pub fn wait_until_ready(&self, max_wait: std::time::Duration, ready_marker: Option<&str>) {
+    /// Returns false when the budget ran out first.
+    pub fn wait_until_ready(&self, max_wait: std::time::Duration, ready_markers: &[&str]) -> bool {
+        self.wait_until_ready_unless(max_wait, ready_markers, |_| None::<()>)
+            .unwrap_or(false)
+    }
+
+    /// [`Self::wait_until_ready`] that also stops at once with `Err` when
+    /// `blocked` recognizes the plain-text screen as a dialog.
+    pub fn wait_until_ready_unless<B>(
+        &self,
+        max_wait: std::time::Duration,
+        ready_markers: &[&str],
+        blocked: impl Fn(&str) -> Option<B>,
+    ) -> Result<bool, B> {
         let poll_interval = std::time::Duration::from_millis(200);
         let deadline = std::time::Instant::now() + max_wait;
-        let ready_marker = ready_marker.map(str::to_lowercase);
+        let ready_markers: Vec<String> = ready_markers.iter().map(|m| m.to_lowercase()).collect();
         let mut last: Option<String> = None;
         while std::time::Instant::now() < deadline {
             std::thread::sleep(poll_interval);
-            let Ok(now) = self.capture_pane(5) else {
+            let Ok(now) = self.capture_pane(0) else {
                 continue;
             };
             #[cfg(test)]
             tests::observe_ready_capture(&now);
-            if let Some(marker) = ready_marker.as_deref() {
-                if now.to_lowercase().contains(marker) {
-                    return;
+            let screen = crate::tmux::utils::strip_ansi(&now);
+            if let Some(blocker) = blocked(&screen) {
+                return Err(blocker);
+            }
+            if !ready_markers.is_empty() {
+                let screen = screen.to_lowercase();
+                if ready_markers.iter().any(|m| screen.contains(m)) {
+                    return Ok(true);
                 }
                 continue;
             }
             if now.trim().len() > 20 {
                 if last.as_deref() == Some(now.as_str()) {
-                    return;
+                    return Ok(true);
                 }
                 last = Some(now);
             }
         }
+        Ok(false)
     }
 
     /// Capture the whole first window, panes composited, for the passive
@@ -1745,7 +1790,7 @@ impl Session {
             return Ok(physical.identity.pane_id.clone());
         }
         #[cfg(unix)]
-        if let Some(id) = crate::tmux::vt::channel_pane_id(&self.name) {
+        if let Some(id) = crate::tmux::vt::channel_pane_id(&self.name, deadline) {
             return Ok(id);
         }
         super::utils::first_pane_id_with_deadline(&self.name, deadline)
@@ -1830,10 +1875,14 @@ impl Session {
     pub fn send_raw_bytes(&self, bytes: &[u8]) -> Result<()> {
         let target =
             self.live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
+        self.send_raw_bytes_to(&target, bytes)
+    }
+
+    fn send_raw_bytes_to(&self, target: &str, bytes: &[u8]) -> Result<()> {
         for batch in raw_byte_batches(bytes) {
             self.tmux_input(
                 "send-keys",
-                &target,
+                target,
                 std::iter::once("-H").chain(batch.iter().map(String::as_str)),
             )?;
         }
@@ -1888,12 +1937,40 @@ impl Session {
     /// treating them as newlines instead of submit. The delay lets the
     /// suppression window expire before Enter is sent.
     pub fn send_keys_with_delay(&self, text: &str, enter_delay_ms: u64) -> Result<()> {
+        self.send_keys_with_delivery(text, enter_delay_ms, || {})
+    }
+
+    pub(crate) fn send_keys_with_delivery(
+        &self,
+        text: &str,
+        enter_delay_ms: u64,
+        body_delivered: impl FnOnce(),
+    ) -> Result<()> {
         if self.physical.is_none() && !self.exists() {
             bail!("Session does not exist: {}", self.name);
         }
 
         let target =
             self.live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
+        self.send_keys_to(&target, text, enter_delay_ms, body_delivered)
+    }
+
+    /// [`Self::send_keys_with_delay`] to exactly `pane`, a `#{pane_id}`: text and Enter
+    /// reach the pane that was checked, or fail if it is gone.
+    pub fn send_keys_to_pane(&self, pane: &str, text: &str, enter_delay_ms: u64) -> Result<()> {
+        if self.physical.is_none() && !self.exists() {
+            bail!("Session does not exist: {}", self.name);
+        }
+        self.send_keys_to(pane, text, enter_delay_ms, || {})
+    }
+
+    fn send_keys_to(
+        &self,
+        target: &str,
+        text: &str,
+        enter_delay_ms: u64,
+        body_delivered: impl FnOnce(),
+    ) -> Result<()> {
         let delivery = submit_text(text);
         tracing::debug!(target: "tmux.command",
             "send_keys_with_delay: bytes={} lines={} paste={} target={}",
@@ -1904,25 +1981,26 @@ impl Session {
         );
 
         match delivery {
-            SubmitText::Paste(text) => self.send_via_paste_buffer(&target, text)?,
+            SubmitText::Paste(text) => self.send_via_paste_buffer(target, text)?,
             SubmitText::Literal(payload) => {
                 let (head, semis) = peel_trailing_semicolons(&payload);
                 if !head.is_empty() {
                     // `--` so lines starting with `-` are not read as tmux flags.
-                    self.tmux_input("send-keys", &target, ["-l", "--", head])?;
+                    self.tmux_input("send-keys", target, ["-l", "--", head])?;
                 }
                 if semis > 0 {
-                    self.send_raw_bytes(&vec![b';'; semis])?;
+                    self.send_raw_bytes_to(target, &vec![b';'; semis])?;
                 }
             }
         }
+        body_delivered();
 
         if enter_delay_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(enter_delay_ms));
         }
 
         // Enter to submit
-        self.tmux_input("send-keys", &target, ["Enter"])?;
+        self.tmux_input("send-keys", target, ["Enter"])?;
 
         Ok(())
     }
@@ -3710,7 +3788,7 @@ mod tests {
                         resume: resume_rx,
                     });
                     Session::from_name(name)
-                        .wait_until_ready(std::time::Duration::from_secs(60), Some("ask anything"));
+                        .wait_until_ready(std::time::Duration::from_secs(60), &["ask anything"]);
                 });
                 let _release_on_unwind = ReleaseOnDrop(&release);
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -5732,6 +5810,97 @@ mod tests {
         );
     }
 
+    /// #5850: a tmux client without a UTF-8 locale prints every byte outside printable ASCII
+    /// as `_`. The locale reaches only a child test process, never this one's environment.
+    #[test]
+    #[serial_test::serial]
+    fn pane_queries_read_intact_without_a_utf8_locale() {
+        const CHILD: &str = "AOE_TEST_PANE_QUERY_LOCALE_CHILD";
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        if std::env::var_os(CHILD).is_none() {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tmux::session::tests::pane_queries_read_intact_without_a_utf8_locale",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("LANG", "C")
+                .env("LC_ALL", "C")
+                .env("LC_CTYPE", "C")
+                // tmux treats a set TMUX as UTF-8 before it reads the locale.
+                .env_remove("TMUX")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&child.stdout);
+            assert!(
+                child.status.success() && stdout.contains("1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_pane_query_locale");
+        let session_name = guard.name().to_string();
+        let mut args: Vec<String> = ["new-session", "-d", "-s", &session_name, "sleep 30"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        append_pane_base_index_args(&mut args, &session_name);
+        assert!(crate::tmux::tmux_command()
+            .args(&args)
+            .status()
+            .expect("tmux new-session")
+            .success());
+        let pane = only_pane_id(&session_name);
+        wait_for_pane_command(&pane, "sleep");
+        let title = "π ⠋ working";
+        assert!(crate::tmux::tmux_query_command()
+            .args(["select-pane", "-t", &pane, "-T", title])
+            .status()
+            .expect("set pane title")
+            .success());
+        let pid = pane_field(&pane, "#{pane_pid}");
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        let server_pid = pane_field(&pane, "#{pid}");
+        let cases = [
+            (
+                "pane PID",
+                crate::process::get_pane_pid(&session_name).map(|pid| pid.to_string()),
+                pid.as_str(),
+            ),
+            (
+                "pane title",
+                crate::tmux::utils::pane_title(&session_name),
+                title,
+            ),
+            (
+                "server PID",
+                crate::tmux::vt::server_pid(&pane, &deadline),
+                server_pid.as_str(),
+            ),
+            (
+                "session pane membership",
+                Some(
+                    crate::tmux::vt::session_holds_pane(
+                        &session_name,
+                        &server_pid,
+                        &pane,
+                        &deadline,
+                    )
+                    .to_string(),
+                ),
+                "true",
+            ),
+        ];
+        for (query, read, expected) in cases {
+            assert_eq!(read.as_deref(), Some(expected), "{query}");
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     /// Regression test for #488: when a user creates a split pane and makes it
@@ -5755,7 +5924,7 @@ mod tests {
             "80",
             "-y",
             "24",
-            "sleep 30",
+            "exec sleep 30",
         ]
         .iter()
         .map(|arg| arg.to_string())

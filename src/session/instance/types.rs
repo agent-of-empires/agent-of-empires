@@ -124,7 +124,7 @@ pub struct WorktreeInfo {
     pub branch: String,
     pub main_repo_path: String,
     pub managed_by_aoe: bool,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Branch the worktree was created from when `managed_by_aoe` is
     /// true. None means "the repo's default branch was used" (the
     /// historical behavior before #948) or the worktree was attached
@@ -183,7 +183,7 @@ pub struct WorkspaceInfo {
     pub branch: String,
     pub workspace_dir: String,
     pub repos: Vec<WorkspaceRepo>,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     #[serde(default = "default_true")]
     pub cleanup_on_delete: bool,
 }
@@ -201,7 +201,7 @@ pub(crate) struct SandboxPin {
     pub(crate) container_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SandboxInfo {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -244,6 +244,31 @@ pub struct SandboxInfo {
     /// built before the pick existed, so it matches no explicit pick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+}
+
+/// Never prints the `before_start` environment: it holds tokens a host hook minted, and a
+/// `{:?}` of a row must not be able to leak them.
+impl std::fmt::Debug for SandboxInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxInfo")
+            .field("enabled", &self.enabled)
+            .field("container_id", &self.container_id)
+            .field("image", &self.image)
+            .field("container_name", &self.container_name)
+            .field("extra_env", &self.extra_env)
+            .field("custom_instruction", &self.custom_instruction)
+            .field("container_workdir", &self.container_workdir)
+            .field(
+                "before_start_env",
+                &format_args!("<{} redacted>", self.before_start_env.len()),
+            )
+            .field(
+                "before_start_hook_env",
+                &format_args!("<{} redacted>", self.before_start_hook_env.len()),
+            )
+            .field("provider", &self.provider)
+            .finish()
+    }
 }
 
 /// Deserialize agent_session_id, treating empty/whitespace strings as None.
@@ -374,6 +399,9 @@ pub struct PluginCreateIdempotency {
     pub key: String,
     pub payload_hash: String,
 }
+
+/// Largest accepted `initial_prompt`, in bytes.
+pub const MAX_INITIAL_PROMPT_BYTES: usize = 64 * 1024;
 
 #[cfg(test)]
 mod tests {

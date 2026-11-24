@@ -4,6 +4,8 @@
 use agent_client_protocol::v1::schema::ContentBlock;
 use tokio::sync::oneshot;
 
+use crate::daemon::PromptAttachmentRef;
+
 use super::delete::DeleteSessionOutcome;
 use super::reset::ResetSessionOutcome;
 
@@ -16,7 +18,7 @@ pub(super) struct QueuedClientCmd {
 
 /// Steering fallback retains the same operation, not a freshly admitted turn.
 pub(super) struct QueuedPrompt {
-    pub(super) blocks: Vec<ContentBlock>,
+    pub(super) input: PromptInput,
     pub(super) scope: Option<crate::acp::establishment::NativeRequestContext>,
     pub(super) correlation: Option<crate::acp::establishment::NativeOperationCorrelation>,
 }
@@ -36,7 +38,7 @@ pub(super) struct InitialPromptIntent {
     pub(super) expected: std::sync::Arc<crate::acp::establishment::EstablishmentAttempt>,
     pub(super) owner: crate::acp::runner_lifecycle::RunnerIdentity,
     pub(super) cancellation: tokio_util::sync::CancellationToken,
-    pub(super) blocks: Vec<ContentBlock>,
+    pub(super) input: PromptInput,
 }
 
 pub(crate) enum InitialPromptCancellation {
@@ -96,14 +98,14 @@ impl Drop for PreparedInitialPrompt {
 }
 
 impl InitialPromptIntent {
-    pub(super) async fn into_native(
-        self,
-    ) -> Result<QueuedClientCmd, (super::errors::AcpError, Self)> {
+    pub(super) async fn prepare_native(
+        &mut self,
+    ) -> Result<QueuedClientCmd, super::errors::AcpError> {
         use crate::acp::establishment::{
             EstablishmentAttempt, EstablishmentRefusal, NativeOperationCorrelation,
         };
         let Some(client) = self.client.upgrade() else {
-            return Err((super::errors::AcpError::NotRunning, self));
+            return Err(super::errors::AcpError::NotRunning);
         };
         let result = async {
             tokio::select! {
@@ -155,7 +157,7 @@ impl InitialPromptIntent {
         .await;
         match result {
             Ok((scope, correlation)) => Ok(QueuedClientCmd {
-                command: ClientCmd::Prompt(self.blocks),
+                command: ClientCmd::Prompt(std::mem::take(&mut self.input)),
                 scope: Some(scope),
                 correlation: Some(correlation),
             }),
@@ -163,18 +165,41 @@ impl InitialPromptIntent {
                 if !self.cancellation.is_cancelled() {
                     client.clear_initial_prompt(self.id);
                 }
-                Err((error, self))
+                Err(error)
             }
+        }
+    }
+}
+
+/// A user prompt as `send_prompt` built it (#1000): the blocks the agent
+/// receives, and refs to the stored attachments among them, which a refusal
+/// hands back so Retry resends the same payload.
+#[derive(Debug, Clone, Default)]
+pub(super) struct PromptInput {
+    pub(super) blocks: Vec<ContentBlock>,
+    pub(super) attachments: Vec<PromptAttachmentRef>,
+}
+
+impl PromptInput {
+    /// The text the retry pill shows and resends.
+    pub(super) fn text(&self) -> String {
+        super::steer::first_text_block(&self.blocks)
+    }
+}
+
+#[cfg(test)]
+impl From<Vec<ContentBlock>> for PromptInput {
+    fn from(blocks: Vec<ContentBlock>) -> Self {
+        Self {
+            blocks,
+            attachments: Vec::new(),
         }
     }
 }
 
 /// Commands sent from `AcpClient` methods to the background connection task.
 pub(super) enum ClientCmd {
-    /// The fully-built prompt content blocks (text first, then any
-    /// attachments). Built in `send_prompt` so the connection task just
-    /// forwards them to `session/prompt`. See #1000.
-    Prompt(Vec<ContentBlock>),
+    Prompt(PromptInput),
     InitialPromptIntent(InitialPromptIntent),
     Cancel,
     CancelInitialPrompt {

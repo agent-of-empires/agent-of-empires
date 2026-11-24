@@ -1,5 +1,6 @@
 //! Fixed error discriminators shared by native clients and daemon handlers.
 
+use crate::acp::protocol::TerminalSwitchReason;
 use crate::session::ManagedResumeCause;
 use reqwest::{header::HeaderMap, StatusCode};
 
@@ -12,6 +13,10 @@ pub enum ApiErrorCode {
     ElevationRequired,
     AccessPolicyDenied,
     CityhallMode,
+    LocalPluginSourceRequired,
+    PluginPreviewFailed,
+    PluginJobActive,
+    PluginAlreadyInstalled,
     LifecycleLocked,
     TrashIncomplete,
     LifecycleSuperseded,
@@ -31,6 +36,10 @@ pub enum ApiErrorCode {
     CreationNotPending,
     CreateHookFailed,
     CreateOutcomeUnknown,
+    /// The project path is not a directory on the Daemon host.
+    WorkingDirMissing,
+    /// A worktree checkout named a branch that exists neither locally nor on a remote.
+    BranchNotFound,
     AgentHooksNotApproved,
     SmartRenameSkipped,
     SmartRenameFailed,
@@ -40,6 +49,9 @@ pub enum ApiErrorCode {
     SessionArchived,
     SessionTrashed,
     AccountSwapUnavailable,
+    ModelPinned,
+    UnknownAgent,
+    TerminalSwitchRefused(TerminalSwitchReason),
 }
 
 impl ApiErrorCode {
@@ -49,6 +61,10 @@ impl ApiErrorCode {
             Self::ElevationRequired => "elevation_required",
             Self::AccessPolicyDenied => "access_policy_denied",
             Self::CityhallMode => "cityhall_mode",
+            Self::LocalPluginSourceRequired => "local_plugin_source_required",
+            Self::PluginPreviewFailed => "preview_failed",
+            Self::PluginJobActive => "plugin_job_active",
+            Self::PluginAlreadyInstalled => "plugin_already_installed",
             Self::LifecycleLocked => "lifecycle_locked",
             Self::TrashIncomplete => "trash_incomplete",
             Self::LifecycleSuperseded => "lifecycle_superseded",
@@ -68,6 +84,8 @@ impl ApiErrorCode {
             Self::CreationNotPending => "creation_not_pending",
             Self::CreateHookFailed => "create_hook_failed",
             Self::CreateOutcomeUnknown => "create_outcome_unknown",
+            Self::WorkingDirMissing => "working_dir_missing",
+            Self::BranchNotFound => "branch_not_found",
             Self::AgentHooksNotApproved => "agent_hooks_not_approved",
             Self::SmartRenameSkipped => "smart_rename_skipped",
             Self::SmartRenameFailed => "smart_rename_failed",
@@ -77,6 +95,9 @@ impl ApiErrorCode {
             Self::SessionArchived => "session_archived",
             Self::SessionTrashed => "session_trashed",
             Self::AccountSwapUnavailable => "account_swap_unavailable",
+            Self::ModelPinned => "model_pinned",
+            Self::UnknownAgent => "unknown_agent",
+            Self::TerminalSwitchRefused(reason) => reason.as_str(),
         }
     }
 
@@ -85,6 +106,7 @@ impl ApiErrorCode {
             Self::ReadOnly
             | Self::ElevationRequired
             | Self::AccessPolicyDenied
+            | Self::LocalPluginSourceRequired
             | Self::CityhallMode => StatusCode::FORBIDDEN,
             Self::LifecycleLocked
             | Self::TrashIncomplete
@@ -101,18 +123,28 @@ impl ApiErrorCode {
             | Self::CreationNotPending
             | Self::CreateOutcomeUnknown
             | Self::AgentHooksNotApproved
+            | Self::PluginJobActive
+            | Self::PluginAlreadyInstalled
             | Self::GroupNotEmpty
             | Self::SessionNotRunning
             | Self::SessionArchived
             | Self::SessionTrashed
-            | Self::AccountSwapUnavailable => StatusCode::CONFLICT,
+            | Self::AccountSwapUnavailable
+            | Self::ModelPinned => StatusCode::CONFLICT,
             Self::PendingTargetGone => StatusCode::NOT_FOUND,
             Self::TlsRequired => StatusCode::UPGRADE_REQUIRED,
-            Self::CreateHookFailed => StatusCode::BAD_REQUEST,
+            Self::CreateHookFailed
+            | Self::WorkingDirMissing
+            | Self::BranchNotFound
+            | Self::UnknownAgent => StatusCode::BAD_REQUEST,
             Self::SmartRenameSkipped => StatusCode::CONFLICT,
-            Self::SmartRenameFailed => StatusCode::BAD_GATEWAY,
+            Self::SmartRenameFailed | Self::PluginPreviewFailed => StatusCode::BAD_GATEWAY,
             Self::SmartRenameTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::StartFailed | Self::SandboxMigrationFailed => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::TerminalSwitchRefused(
+                TerminalSwitchReason::HandoffPending | TerminalSwitchReason::ContextUnconfirmed,
+            ) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::TerminalSwitchRefused(_) => StatusCode::CONFLICT,
         }
     }
 
@@ -148,6 +180,10 @@ impl ApiErrorCode {
             b"elevation_required" => Self::ElevationRequired,
             b"access_policy_denied" => Self::AccessPolicyDenied,
             b"cityhall_mode" => Self::CityhallMode,
+            b"local_plugin_source_required" => Self::LocalPluginSourceRequired,
+            b"preview_failed" => Self::PluginPreviewFailed,
+            b"plugin_job_active" => Self::PluginJobActive,
+            b"plugin_already_installed" => Self::PluginAlreadyInstalled,
             b"lifecycle_locked" => Self::LifecycleLocked,
             b"trash_incomplete" => Self::TrashIncomplete,
             b"lifecycle_superseded" => Self::LifecycleSuperseded,
@@ -168,6 +204,8 @@ impl ApiErrorCode {
             b"purge_failed" => Self::PurgeFailed,
             b"creation_not_pending" => Self::CreationNotPending,
             b"create_hook_failed" => Self::CreateHookFailed,
+            b"working_dir_missing" => Self::WorkingDirMissing,
+            b"branch_not_found" => Self::BranchNotFound,
             b"smart_rename_skipped" => Self::SmartRenameSkipped,
             b"smart_rename_failed" => Self::SmartRenameFailed,
             b"smart_rename_timeout" => Self::SmartRenameTimeout,
@@ -176,7 +214,13 @@ impl ApiErrorCode {
             b"session_archived" => Self::SessionArchived,
             b"session_trashed" => Self::SessionTrashed,
             b"account_swap_unavailable" => Self::AccountSwapUnavailable,
-            _ => return None,
+            b"model_pinned" => Self::ModelPinned,
+            b"unknown_agent" => Self::UnknownAgent,
+            other => Self::TerminalSwitchRefused(
+                TerminalSwitchReason::ALL
+                    .into_iter()
+                    .find(|reason| reason.as_str().as_bytes() == other)?,
+            ),
         };
         (status == code.status()).then_some(code)
     }
@@ -299,6 +343,19 @@ mod tests {
                 Some(ApiErrorCode::CreateHookFailed),
             ),
             (
+                StatusCode::BAD_REQUEST,
+                "working_dir_missing",
+                false,
+                Some(ApiErrorCode::WorkingDirMissing),
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                "branch_not_found",
+                false,
+                Some(ApiErrorCode::BranchNotFound),
+            ),
+            (StatusCode::CONFLICT, "branch_not_found", false, None),
+            (
                 StatusCode::CONFLICT,
                 "group_not_empty",
                 false,
@@ -306,11 +363,39 @@ mod tests {
             ),
             (StatusCode::FORBIDDEN, "group_not_empty", false, None),
             (
+                StatusCode::BAD_GATEWAY,
+                "preview_failed",
+                false,
+                Some(ApiErrorCode::PluginPreviewFailed),
+            ),
+            (StatusCode::CONFLICT, "preview_failed", false, None),
+            (
+                StatusCode::CONFLICT,
+                "plugin_job_active",
+                false,
+                Some(ApiErrorCode::PluginJobActive),
+            ),
+            (StatusCode::BAD_GATEWAY, "plugin_job_active", false, None),
+            (
                 StatusCode::CONFLICT,
                 "account_swap_unavailable",
                 false,
                 Some(ApiErrorCode::AccountSwapUnavailable),
             ),
+            (
+                StatusCode::CONFLICT,
+                "model_pinned",
+                false,
+                Some(ApiErrorCode::ModelPinned),
+            ),
+            (StatusCode::BAD_REQUEST, "model_pinned", false, None),
+            (
+                StatusCode::BAD_REQUEST,
+                "unknown_agent",
+                false,
+                Some(ApiErrorCode::UnknownAgent),
+            ),
+            (StatusCode::CONFLICT, "unknown_agent", false, None),
         ] {
             let mut headers = HeaderMap::new();
             headers.insert(ERROR_CODE_HEADER, HeaderValue::from_static(value));
@@ -322,6 +407,59 @@ mod tests {
             assert_eq!(
                 ApiErrorCode::from_headers(status, &headers, resolving),
                 None
+            );
+        }
+    }
+
+    #[test]
+    fn every_terminal_switch_reason_decodes_only_with_its_status() {
+        use serde::Deserialize;
+        use TerminalSwitchReason::*;
+        // Every variant in declaration order, from the derived Deserialize, so `ALL` can't drop one.
+        let variants: Vec<_> = (0..)
+            .map_while(|index| {
+                TerminalSwitchReason::deserialize(serde::de::value::U32Deserializer::<
+                    serde::de::value::Error,
+                >::new(index))
+                .ok()
+            })
+            .collect();
+        assert_eq!(variants, TerminalSwitchReason::ALL);
+        for reason in variants {
+            let (wire, status) = match reason {
+                AgentNotResumable => ("agent_not_resumable", StatusCode::CONFLICT),
+                NoConversationYet => ("no_conversation_yet", StatusCode::CONFLICT),
+                EarlierConversation => ("earlier_conversation", StatusCode::CONFLICT),
+                ConversationNotBound => ("conversation_not_bound", StatusCode::CONFLICT),
+                Sandboxed => ("sandboxed", StatusCode::CONFLICT),
+                HandoffPending => ("handoff_pending", StatusCode::SERVICE_UNAVAILABLE),
+                NoTerminalTool => ("no_terminal_tool", StatusCode::CONFLICT),
+                ContextUnconfirmed => ("context_unconfirmed", StatusCode::SERVICE_UNAVAILABLE),
+                SessionChanged => ("session_changed", StatusCode::CONFLICT),
+                NotStructured => ("not_structured", StatusCode::CONFLICT),
+                CommandSelectsConversation => {
+                    ("command_selects_conversation", StatusCode::CONFLICT)
+                }
+                CommandSelectorConflict => ("command_selector_conflict", StatusCode::CONFLICT),
+            };
+            assert_eq!(reason.as_str(), wire);
+            let code = ApiErrorCode::TerminalSwitchRefused(reason);
+            let mut headers = HeaderMap::new();
+            headers.insert(ERROR_CODE_HEADER, HeaderValue::from_static(wire));
+            assert_eq!(
+                ApiErrorCode::from_headers(status, &headers, false),
+                Some(code),
+                "{wire}"
+            );
+            let other = if status == StatusCode::CONFLICT {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::CONFLICT
+            };
+            assert_eq!(
+                ApiErrorCode::from_headers(other, &headers, false),
+                None,
+                "{wire}"
             );
         }
     }

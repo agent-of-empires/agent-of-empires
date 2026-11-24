@@ -14,7 +14,7 @@ aoe remove <session>
 aoe remove <session> --keep-container
 ```
 
-In the TUI or web wizard, enable the sandbox toggle when creating a session. The TUI shows it when a container runtime is available and cannot set a per-session image.
+In the TUI or web wizard, enable the sandbox toggle when creating a session. The TUI shows it when a container runtime is available; `Ctrl+P` on it sets a per-session image.
 
 ## Deleting a stopped sandbox
 
@@ -33,7 +33,7 @@ or unrelated agent stores to bypass the refusal.
 ```toml
 [sandbox]
 enabled_by_default = false
-default_image = "ghcr.io/agent-of-empires/aoe-sandbox:latest"
+# default_image unset: the aoe-sandbox image tagged with your AoE version
 auto_cleanup = true
 cpu_limit = "4"
 memory_limit = "8g"
@@ -43,7 +43,7 @@ environment = ["ANTHROPIC_API_KEY"]
 | Option | Default | Description |
 |--------|---------|-------------|
 | `enabled_by_default` | `false` | Auto-enable the sandbox for new sessions. Overridable per project. |
-| `default_image` | `aoe-sandbox:latest` | Image to run |
+| `default_image` | (unset) | Image to run. Unset runs the [`aoe-sandbox` image](#available-images) tagged with your AoE version |
 | `allow_image_pull` | `true` | Let the web dashboard pull a newer sandbox image on the host, as the daemon user. Off, the dashboard shows the pull command to run instead. Global only, and the dashboard can't turn it on; pulling is always blocked in read-only and CityHall mode |
 | `container_runtime` | `docker` | `docker`, `podman`, or `apple_container`. Global only; a profile or repo override is ignored |
 | `auto_cleanup` | `true` | Remove the container when the session is deleted |
@@ -60,8 +60,9 @@ environment = ["ANTHROPIC_API_KEY"]
 | `cap_add` / `cap_drop` | `[]` | Capabilities added or dropped |
 | `security_opt` | `[]` | Security options, e.g. `seccomp=unconfined` |
 | `extra_run_args` | `[]` | Extra arguments passed to container run, before the image |
+| `shared_credential` | `"host_seed"` | `"host_seed"` or `"separate_login"`: where the credential an agent shares across its sandboxes comes from (see [Shared credentials](#shared-credentials)); applies to every agent with a sandbox login, today Claude. `"separate_login"` is not supported with Apple Container. Global only |
 
-Docker and Podman honor every run-policy option. Apple Container honors `cap_add` / `cap_drop` and ignores `privileged` and `security_opt` with a warning; `extra_run_args` is passed through everywhere.
+Docker and Podman honor every run-policy option. Apple Container honors `cap_add` / `cap_drop` and ignores `privileged` and `security_opt` with a warning; `extra_run_args` is passed through everywhere. Apple Container also ignores read-only mounts, including the `.git` overlays described in [Git config and hooks](#git-config-and-hooks).
 
 ## Volume mounts
 
@@ -70,11 +71,20 @@ Docker and Podman honor every run-policy option. Apple Container honors `cap_add
 | Host path | Container path | Mode |
 |-----------|----------------|------|
 | Project directory | `/workspace` | RW |
+| `<repo>/.git/config`, `config.worktree`, `hooks` (bare repo: the same names in the bare dir); for a linked worktree also its `.git` file and the admin dir's `commondir`, `gitdir` and `config.worktree` | the same path under the repo's mount | RO (none on Apple Container) |
 | `~/.gitconfig` | `/root/.gitconfig` | RO |
 | `~/.ssh/` (with `mount_ssh`) | `/root/.ssh/` | RO |
 | The session's artifact dir | `/aoe/artifacts` | RW |
 | `<agent config>/sandbox-v2/<instance-id>/` | the agent's config path, e.g. `/root/.claude/` | RW |
 | `~/.claude/sandbox-v2/.credentials.json` | `/root/.claude/.credentials.json` | RW |
+
+### Git config and hooks
+
+Git runs a repo's hooks and config-defined commands (`core.sshCommand`, `credential.helper`, `core.fsmonitor`) on whichever machine invokes it. AoE and your own terminal run git on the host against the same repo the sandbox mounts, so a writable `.git/config` or `.git/hooks` would let code in the container execute on the host. AoE therefore mounts both read-only, over the writable repo mount, for the session's repo, including the main repo of a worktree. Apple Container cannot mount read-only, so it gets no overlays: the repo's `.git` stays writable from the container, and AoE never runs repo hooks on the host on any runtime, `git worktree add` included. Your own terminal still runs hooks the sandbox wrote, so on Apple Container treat the repo's `.git` as untrusted after a session.
+
+Inside the container, commands that write `.git/config` fail, for example `git remote add`, `git push -u` (the push succeeds, recording the upstream fails) and `git branch --set-upstream-to`, `git sparse-checkout` and `git worktree repair`. Run them on the host. Each overlay is a single-file bind mount and git writes files by rename, so after such a host-side change the container can keep showing the old config until the session restarts. Commits and refs are unaffected, and so are checkouts of existing local branches. Creating a branch with upstream tracking, for example `git checkout -b feature origin/main` or `git switch -c feature origin/feature`, can fail because git records the tracking setup in `.git/config`. Installing hooks from inside the container is not possible; install them on the host. Protection covers the session's repository, a worktree's main repo and each workspace repo. A repository nested inside the project directory (a submodule, a vendored clone, or one the sandbox creates) is not protected: running git inside it on the host can execute what the sandbox wrote. Hooks in a writable checkout path (`core.hooksPath=.githooks`) are not protected, so do not point `core.hooksPath` into the checkout of a sandboxed repo.
+
+Containers created by an older AoE keep a writable `.git` until you recreate the session. AoE's own host git calls also ignore repo-local `core.fsmonitor`, `core.sshCommand`, `credential.helper`, the `ext::` transport and, except for `git worktree add`, hooks. Set `core.sshCommand` and `credential.helper` in your global git config; repo-local values are not used by AoE.
 
 ### Volume ignores
 
@@ -132,8 +142,14 @@ Two official images are available:
 
 | Image | Contents |
 |---|---|
-| `ghcr.io/agent-of-empires/aoe-sandbox:latest` | Supported agent CLIs, git, ripgrep and fzf |
-| `ghcr.io/agent-of-empires/aoe-dev-sandbox:latest` | Base image plus Rust, uv, Node.js LTS and GitHub CLI |
+| `ghcr.io/agent-of-empires/aoe-sandbox` | Supported agent CLIs, git, ripgrep and fzf |
+| `ghcr.io/agent-of-empires/aoe-dev-sandbox` | Base image plus Rust, uv, Node.js LTS and GitHub CLI |
+
+Each release publishes both as `:<version>` (e.g. `:1.19.0`), `:<major>.<minor>` and `:latest`. With `default_image` unset, AoE runs `aoe-sandbox:<version>` for the version you are running (`aoe --version`), so upgrading AoE also moves new sandboxes to the matching image. AoE pulls an image only when it is missing locally, so a pinned `:latest` keeps whatever copy was pulled first. Upgrading unpins a stored `default_image` that is exactly the old `ghcr.io/agent-of-empires/aoe-sandbox:latest` default; a profile keeps it as `""`, which also means automatic. Existing sessions keep the image they were created with.
+
+A profile inherits the global `default_image`. To use the automatic image in a profile while the global one is custom, set `default_image = ""` under `[sandbox]` in that profile's `config.toml`; clearing the field in the TUI's profile scope removes the override and inherits instead.
+
+If the matching tag cannot be pulled (right after a release, before the image is published, or offline), AoE uses the `:<major>.<minor>` tag instead, local or pulled. The session keeps that image, and AoE never pulls it again, so it does not pick up later updates to that tag. This also applies to a session created with `--sandbox-image` or the API's `sandbox_image` naming the exact tag of your version while no `default_image` is set. A nightly build uses `aoe-sandbox:nightly` and has no fallback. A pull that times out counts as failed, so the worst case waits for two pulls. If neither tag is available, session start fails naming both: retry later, or set `default_image` to an image you have locally.
 
 Use the dev image per session with `aoe add --sandbox-image ghcr.io/agent-of-empires/aoe-dev-sandbox:latest .`, or set `[sandbox] default_image`.
 
@@ -146,7 +162,7 @@ A session keeps the container it was created with, so pulling a newer image only
 Extend either image for project dependencies:
 
 ```dockerfile
-FROM ghcr.io/agent-of-empires/aoe-sandbox:latest
+FROM ghcr.io/agent-of-empires/aoe-sandbox:<version>
 RUN apt-get update && apt-get install -y python3 python3-pip \
     && rm -rf /var/lib/apt/lists/*
 ```
@@ -223,11 +239,30 @@ or stop it and run `aoe migrate` before launching the session.
 
 Claude Code rotates refresh tokens and invalidates the old token, so per-session credential copies would log each other out. All Claude sandboxes mount `sandbox-v2/.credentials.json`; login or refresh in one reaches all. Conversation stores remain private.
 
-When the shared file holds no credential, the next start or refresh seeds it from the freshest macOS Keychain entry, host `.credentials.json`, or earlier session-store copy. Once populated, the host never replaces it automatically; the sandboxes have their own refresh chain. Fresher sandbox credentials from an earlier layout are folded in at that session's next start.
+When the shared file holds no credential, the next start or refresh seeds it from the freshest macOS Keychain entry, host `.credentials.json`, or earlier session-store copy (in `host_seed` mode). Once populated, the host never replaces it automatically; the sandboxes have their own refresh chain. Fresher sandbox credentials from an earlier layout are folded in at that session's next start.
 
-Claude Code empties both tokens after failed authentication, making the shared file eligible for seeding again. Simultaneous refreshes can still conflict: the losing container may empty the shared file and lose the winner's new token.
+Claude Code empties both tokens after failed authentication, making the shared file eligible for seeding again (in `host_seed` mode). Simultaneous refreshes can still conflict: the losing container may empty the shared file and lose the winner's new token.
 
 To seed from a new host login, stop every Claude sandbox, delete only `sandbox-v2/.credentials.json`, and start one. Older containers are recreated when stopped; a running one must be stopped before relaunch. `/logout` in any sandbox revokes all sandboxes' tokens but cannot remove the mounted file; log in again to replace the revoked credential.
+
+
+#### Separate sandbox login
+
+By default the shared file starts from the host's own token, so the first side to refresh logs the other out once. With `shared_credential = "separate_login"` under `[sandbox]` the sandboxes hold a login of their own. A host refresh or logout never touches it, and a sandbox refresh or logout never touches the host. AoE never reads the host file or the Keychain for it, and only creates the shared file empty when it is absent. The setting applies to every agent that declares a sandbox login; today that is Claude.
+
+Log in once with [`aoe sandbox login`](../cli/reference.md#aoe-sandbox-login). It prints a sign-in link and reads the code shown after you sign in. The login lands in the shared file every sandbox of that agent mounts.
+
+- The file belongs to a profile and tool. A session of profile `work` running tool `T` waits for `aoe sandbox login -p work --tool T`; a session with its own command for the tool waits for `aoe sandbox login --tool T --command <command>`. The "sandbox login required" message prints the exact command.
+- Without `--tool`, the login is for the profile's default tool when it has a sandbox login, else the only agent that has one. `--check` reports whether a login is needed, and `--force` logs in again.
+- A launch that needs the login stops with "sandbox login required". A Structured view session then starts by itself after the login, and prompts and messages sent to it meanwhile are kept. A terminal session does not: nothing is queued, so start it again or resend the message after the login.
+- A launch that does not use the shared credential is not held: an API key in the sandbox environment or in the request that spawns the session, a Bedrock or Vertex provider, or a key a `host_hooks.before_start` hook produces. Such a hook runs only when the launch would otherwise be refused, is cut off after 120 seconds, and must not call back into the daemon about its own session (the call would wait for the hook it came from). If it fails, the launch reports that error instead.
+- A credential that fails to authenticate is emptied for all sandboxes and is not seeded again; log in again. `/logout` in a sandbox ends the sandbox login for all of them.
+- The shared file is writable from every sandbox of that agent, so any sandbox can replace the login for all of them. Share one file only between sandboxes that trust each other.
+- Apple Container cannot run the login helper, so `separate_login` is refused there at once, and `aoe sandbox login` says so.
+
+AoE leaves an existing file as it is, so an install that was seeded from the host keeps the host's token after the switch. To switch, stop the sandboxes, delete `sandbox-v2/.credentials.json`, set the option and run `aoe sandbox login`. The option is global only: a profile cannot override it, because every profile that uses the same agent config directory shares the one file. Profiles with their own directory via `session.agent_config_dir` have separate shared files, but still follow the one global value.
+
+MCP servers hold credentials of their own. A plugin can rewrite what a sandboxed session receives with the [`mcp.rewrite` hook](../plugin-api.md#hooks). AoE does not copy host MCP definitions into a Claude sandbox's agent store (`.mcp.json` files inside the copied Claude `plugins/` directory are copied as they are), but other agents' MCP-bearing config files are still copied verbatim, so for those agents the hook alone does not keep host MCP secrets out of the sandbox.
 
 ### Reclaiming stores
 
@@ -256,6 +291,10 @@ unreadable or unsupported purge-ownership journal. Failed irreversible purges
 retain their stores even when the session row no longer exists.
 
 A session still on the legacy shared store has no private store to reclaim; deleting it leaves the shared store for migration. The shared Claude credential file `sandbox-v2/.credentials.json` belongs to no session and is not reclaimed; remove it manually only after the last Claude sandbox is gone.
+
+## Host loopback services
+
+On Docker Desktop, OrbStack and Podman machine, a sandbox container reaches services bound to the host's `127.0.0.1` through `host.docker.internal` or `host.containers.internal`, and the host sees a loopback peer. Treat every host loopback listener as reachable by sandboxed code. For this reason `aoe serve --auth none` requires `--behind-proxy`; the default token auth and `--auth passphrase` stay safe against containers.
 
 ## Worktrees
 

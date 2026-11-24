@@ -19,7 +19,7 @@ use crate::acp::event_sender::WeakEventSender;
 use std::io::{Read, Seek, SeekFrom};
 use tokio_util::sync::CancellationToken;
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 
 use crate::acp::background_agent::{ActiveAgents, TailerStart};
 use crate::acp::establishment::NativeResourceAuthority;
@@ -57,7 +57,7 @@ pub(crate) type IdleHook = Arc<dyn Fn() + Send + Sync>;
 /// notifications carry the task id without a status.
 /// Returns when it ended: the entry's own time, so a resumed read does not
 /// count daemon downtime.
-fn terminal_notification(line: &str, task_id: &str, tool_call_id: &str) -> Option<DateTime<Utc>> {
+fn terminal_notification(line: &str, task_id: &str, tool_call_id: &str) -> Option<Timestamp> {
     if !line.contains(task_id) {
         return None;
     }
@@ -111,8 +111,8 @@ fn terminal_notification(line: &str, task_id: &str, tool_call_id: &str) -> Optio
         entry
             .get("timestamp")
             .and_then(serde_json::Value::as_str)
-            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
-            .map_or_else(Utc::now, |at| at.with_timezone(&Utc))
+            .and_then(|at| Timestamp::parse_rfc3339(at).ok())
+            .unwrap_or_else(Timestamp::now)
     })
 }
 
@@ -489,7 +489,7 @@ impl TaskTailer {
             });
             let ended_at = tokio::select! {
                 () = owner.cancellation.cancelled() => return,
-                () = owner.stop.cancelled() => Some(Utc::now()),
+                () = owner.stop.cancelled() => Some(Timestamp::now()),
                 ended_at = async {
                     match path {
                         Some(path) => self.follow(path, &access).await,
@@ -572,7 +572,7 @@ struct Cursor {
 }
 
 enum Scan {
-    Ended(DateTime<Utc>),
+    Ended(Timestamp),
     /// Nothing ended the task yet.
     Pending,
     /// The transcript cannot be read any more.
@@ -581,7 +581,7 @@ enum Scan {
 
 impl TaskTailer {
     /// Returns when the task ended, or `None` once tracking was given up.
-    async fn follow(&self, path: PathBuf, owner: &TaskReadOwner) -> Option<DateTime<Utc>> {
+    async fn follow(&self, path: PathBuf, owner: &TaskReadOwner) -> Option<Timestamp> {
         self.tool_call_id.as_ref()?;
         let path = owner
             .blocking(move || Ok(std::fs::canonicalize(&path).unwrap_or(path)))
@@ -710,7 +710,7 @@ fn scan_chunk(
     chunk: &[u8],
     task_id: &str,
     tool_call_id: &str,
-) -> Option<DateTime<Utc>> {
+) -> Option<Timestamp> {
     let mut rest = chunk;
     while !rest.is_empty() {
         let Some(end) = rest.iter().position(|byte| *byte == b'\n') else {
@@ -1407,18 +1407,20 @@ mod tests {
                 use crate::session::Status;
 
                 let mut f = fixture(scope, "{\"type\":\"user\"}\n").await;
-                let mut state = scope
-                    .state
-                    .session_service
-                    .fold_control_state(&f._managed.id)
-                    .await
-                    .unwrap();
-                let seq = scope
-                    .state
-                    .acp_event_store
-                    .highest_seq(&f._managed.id)
-                    .unwrap()
-                    + 1;
+                let store = &scope.state.acp_event_store;
+                let id = &f._managed.id;
+                let mut state = crate::acp::state::AcpState::new(
+                    crate::acp::state::AcpSessionId(id.clone()),
+                    crate::acp::state::AgentName("claude".into()),
+                    None,
+                );
+                let page = store.replay_page(id, 0, None).unwrap();
+                for stored in page.events {
+                    state
+                        .apply_scoped_event(stored.seq, &stored.event, &stored.metadata)
+                        .unwrap();
+                }
+                let seq = page.highest_seq + 1;
                 assert_eq!(
                     state.sidebar_status(),
                     Status::Running,

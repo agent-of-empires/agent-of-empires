@@ -3,9 +3,12 @@ import { fetchAgents, fetchThemes } from "../../lib/api";
 import { dispatchThemePickerChanged } from "../../hooks/useResolvedTheme";
 import type { AgentInfo, SettingsFieldDescriptor } from "../../lib/types";
 import { SelectField, SliderField, TextField } from "./FormFields";
+import type { RowLabel } from "./rowLabel";
 
 export interface CustomWidgetProps {
   descriptor: SettingsFieldDescriptor;
+  /** The row draws the label and plain line; the widget draws only its control. */
+  row: RowLabel;
   value: unknown;
   /** Returns the save result so a widget can gate side effects on success. */
   save: (value: unknown) => Promise<boolean> | unknown;
@@ -30,7 +33,7 @@ function useOneshotAgents(): AgentInfo[] {
 }
 
 /** Theme picker; repaints only after the save succeeds. */
-export function ThemeNameWidget({ descriptor, value, save }: CustomWidgetProps) {
+export function ThemeNameWidget({ descriptor, value, save, row }: CustomWidgetProps) {
   const [themes, setThemes] = useState<string[]>([]);
   useEffect(() => {
     fetchThemes()
@@ -40,7 +43,7 @@ export function ThemeNameWidget({ descriptor, value, save }: CustomWidgetProps) 
   return (
     <SelectField
       label={descriptor.label}
-      description={descriptor.description}
+      row={row}
       value={typeof value === "string" ? value : ""}
       onChange={async (v) => {
         if (await didSave(save(v))) {
@@ -53,11 +56,11 @@ export function ThemeNameWidget({ descriptor, value, save }: CustomWidgetProps) 
 }
 
 /** Free-text default agent; empty means auto-detect. */
-export function DefaultToolWidget({ descriptor, value, save }: CustomWidgetProps) {
+export function DefaultToolWidget({ descriptor, value, save, row }: CustomWidgetProps) {
   return (
     <TextField
       label={descriptor.label}
-      description={descriptor.description}
+      row={row}
       value={typeof value === "string" ? value : ""}
       onChange={(v) => save(v || null)}
       placeholder="Auto-detect"
@@ -67,7 +70,7 @@ export function DefaultToolWidget({ descriptor, value, save }: CustomWidgetProps
 }
 
 /** Agent for one-shot utility calls; empty means the session's agent. */
-export function SmartRenameAgentWidget({ descriptor, value, save }: CustomWidgetProps) {
+export function SmartRenameAgentWidget({ descriptor, value, save, row }: CustomWidgetProps) {
   const options = [
     { value: "", label: "Same as session" },
     ...useOneshotAgents().map((a) => ({ value: a.name, label: a.name })),
@@ -75,7 +78,7 @@ export function SmartRenameAgentWidget({ descriptor, value, save }: CustomWidget
   return (
     <SelectField
       label={descriptor.label}
-      description={descriptor.description}
+      row={row}
       value={typeof value === "string" ? value : ""}
       onChange={(v) => save(v)}
       options={options}
@@ -84,11 +87,10 @@ export function SmartRenameAgentWidget({ descriptor, value, save }: CustomWidget
 }
 
 /** Float volume slider; the generic slider is integer-only. */
-export function SoundVolumeWidget({ descriptor, value, save }: CustomWidgetProps) {
+export function SoundVolumeWidget({ value, save, row }: CustomWidgetProps) {
   return (
     <SliderField
-      label={descriptor.label}
-      description={descriptor.description}
+      row={row}
       value={typeof value === "number" ? value : 1.0}
       onChange={save}
       min={0.1}
@@ -163,6 +165,8 @@ const KNOWN_TARGETS: { value: string; group: string }[] = [
   { value: "migrations.v048", group: "Migrations" },
   { value: "migrations.v052", group: "Migrations" },
   { value: "migrations.v053", group: "Migrations" },
+  { value: "migrations.v058", group: "Migrations" },
+  { value: "migrations.v061", group: "Migrations" },
   { value: "update.fetch", group: "Update" },
   { value: "update.cache", group: "Update" },
   { value: "update.parse", group: "Update" },
@@ -185,7 +189,7 @@ const LEVELS = [
 ];
 
 /** `{ target: level }` map; "(default)" removes the override. */
-export function LoggingTargetsWidget({ descriptor, value, save }: CustomWidgetProps) {
+export function LoggingTargetsWidget({ value, save, row }: CustomWidgetProps) {
   const targets = (value ?? {}) as Record<string, string>;
   const saveTarget = (target: string, level: string) => {
     const next = { ...targets };
@@ -201,9 +205,7 @@ export function LoggingTargetsWidget({ descriptor, value, save }: CustomWidgetPr
     return acc;
   }, {});
   return (
-    <div className="space-y-4">
-      <h4 className="text-sm font-semibold text-text-primary">{descriptor.label}</h4>
-      {descriptor.description && <p className="text-xs text-text-dim">{descriptor.description}</p>}
+    <div role="group" aria-labelledby={row.labelId} className="space-y-4">
       {Object.entries(grouped).map(([group, items]) => (
         <div key={group} className="space-y-2">
           <h5 className="text-xs font-mono uppercase tracking-widest text-text-primary">{group}</h5>
@@ -225,7 +227,7 @@ export function LoggingTargetsWidget({ descriptor, value, save }: CustomWidgetPr
 }
 
 /** `{ agent: model }` map for one-shot calls; clearing a row restores the built-in default. */
-export function SmartRenameModelWidget({ descriptor, value, save }: CustomWidgetProps) {
+export function SmartRenameModelWidget({ value, save, row }: CustomWidgetProps) {
   const tunable = useOneshotAgents();
   const models = (value ?? {}) as Record<string, string>;
   const saveModel = (agent: string, model: string) => {
@@ -239,9 +241,7 @@ export function SmartRenameModelWidget({ descriptor, value, save }: CustomWidget
     save(next);
   };
   return (
-    <div className="space-y-4">
-      <h4 className="text-sm font-semibold text-text-primary">{descriptor.label}</h4>
-      {descriptor.description && <p className="text-xs text-text-dim">{descriptor.description}</p>}
+    <div role="group" aria-labelledby={row.labelId} className="space-y-4">
       {tunable.length === 0 ? (
         <p className="text-xs text-text-dim">No one-shot-capable agents installed.</p>
       ) : (

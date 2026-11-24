@@ -189,7 +189,13 @@ for (const terminal of ["succeeded", "failed", "gone"] as const) {
                 started_at: 1,
                 finished_at: state === "running" ? null : 2,
               },
-              log: { exists: true, tail: "Example job log", lines_returned: 1, truncated: false },
+              log: {
+                path: "/daemon/plugin-jobs/example.log",
+                exists: true,
+                tail: "Example job log",
+                lines_returned: 1,
+                truncated: false,
+              },
             },
           }),
     );
@@ -198,6 +204,9 @@ for (const terminal of ["succeeded", "failed", "gone"] as const) {
     const job = page.getByTestId("plugin-job-modal");
     await expect(job).toBeVisible();
     await expect(page.getByTestId("plugin-job-log")).toHaveText("Example job log");
+    await expect(page.getByTestId("plugin-job-host-path")).toHaveText(
+      "Full log on Daemon host: /daemon/plugin-jobs/example.log",
+    );
     await expect(page.getByTestId("plugin-job-close")).toBeDisabled();
     await page.keyboard.press("Escape");
     await expect(job).toBeVisible();

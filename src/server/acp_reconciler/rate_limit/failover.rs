@@ -7,10 +7,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use tokio::sync::Semaphore;
 
 use crate::acp::event_store::AccountState;
@@ -51,6 +52,15 @@ static RETRIES: LazyLock<Mutex<Retries>> = LazyLock::new(Mutex::default);
 
 /// Pool entries already warned about, so a misconfigured name logs once.
 static WARNED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+
+/// Whether the account table is currently unreadable and already reported, so a persistent fault
+/// logs once instead of on every pass for every parked session.
+static STATE_UNREADABLE: AtomicBool = AtomicBool::new(false);
+
+/// Marks the start of an outage; `true` only for the first failure since the last good read.
+fn begin_outage(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::Relaxed)
+}
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -178,14 +188,19 @@ pub(super) fn select_target<'a>(
     pool.iter().find(|account| {
         account.key != current_key
             && match state_of(&account.key) {
-                Ok(state) => state.is_none_or(|state| state.has_headroom(now_ms)),
+                Ok(state) => {
+                    STATE_UNREADABLE.store(false, Ordering::Relaxed);
+                    state.is_none_or(|state| state.has_headroom(now_ms))
+                }
                 Err(error) => {
-                    tracing::warn!(
-                        target: "acp.supervisor",
-                        account = %account.tool,
-                        %error,
-                        "rate-limit failover: account state unreadable; not a target"
-                    );
+                    if begin_outage(&STATE_UNREADABLE) {
+                        tracing::error!(
+                            target: "acp.supervisor",
+                            account = %account.tool,
+                            %error,
+                            "rate-limit failover: account state unreadable; no account is a target until it reads again"
+                        );
+                    }
                     false
                 }
             }
@@ -212,7 +227,7 @@ pub(super) async fn record_limit(
     state: &Arc<AppState>,
     row: &Instance,
     info: &RateLimitInfo,
-    limited_until: DateTime<Utc>,
+    limited_until: Timestamp,
     observed_at_ms: i64,
 ) {
     let Some(key) = observed_account_key(state, row).await else {
@@ -224,7 +239,7 @@ pub(super) async fn record_limit(
     let _ = tokio::task::spawn_blocking(move || {
         store.record_account_limit(
             &key,
-            limited_until.timestamp_millis(),
+            limited_until.as_millis(),
             &kind,
             observed_at_ms,
             estimated,
@@ -240,7 +255,7 @@ pub(super) async fn reported_deadline(
     state: &Arc<AppState>,
     row: &Instance,
     info: &RateLimitInfo,
-) -> Option<DateTime<Utc>> {
+) -> Option<Timestamp> {
     if info.resets_at.is_some() {
         return None;
     }
@@ -250,13 +265,13 @@ pub(super) async fn reported_deadline(
         .await
         .ok()
         .flatten()?;
-    in_force_deadline(&account, &info.kind, Utc::now().timestamp_millis())
+    in_force_deadline(&account, &info.kind, Timestamp::now().as_millis())
 }
 
-fn in_force_deadline(account: &AccountState, kind: &str, now_ms: i64) -> Option<DateTime<Utc>> {
+fn in_force_deadline(account: &AccountState, kind: &str, now_ms: i64) -> Option<Timestamp> {
     let window = account.window(kind)?;
     (!window.estimated && window.until_ms > now_ms)
-        .then(|| DateTime::from_timestamp_millis(window.until_ms))
+        .then(|| Timestamp::from_millis_saturating(window.until_ms))
         .flatten()
 }
 
@@ -284,7 +299,7 @@ fn note_failed_attempt(
         let until = super::scheduled_resume_at(info, attempt_ms, 0);
         store.record_account_limit(
             key,
-            until.timestamp_millis(),
+            until.as_millis(),
             &info.kind,
             attempt_ms,
             info.resets_at.is_none(),
@@ -451,7 +466,7 @@ pub(crate) fn pending_target(
     }
     let current_key = account_key(row)?;
     let pool = resolve_pool(row, &settings.accounts);
-    let now_ms = Utc::now().timestamp_millis();
+    let now_ms = Timestamp::now().as_millis();
     select_target(&pool, &current_key, now_ms, |key| {
         store.account_state_checked(key)
     })
@@ -482,7 +497,7 @@ pub(super) async fn maybe_fail_over(
         return false;
     }
     let store = Arc::clone(&state.acp_event_store);
-    let now_ms = Utc::now().timestamp_millis();
+    let now_ms = Timestamp::now().as_millis();
     let target = {
         let store = Arc::clone(&store);
         tokio::task::spawn_blocking(move || {
@@ -627,6 +642,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_unreadable_table_is_reported_once_per_outage() {
+        let flag = AtomicBool::new(false);
+        assert!(begin_outage(&flag));
+        assert!(
+            !begin_outage(&flag),
+            "the same outage is not reported again"
+        );
+        flag.store(false, Ordering::Relaxed);
+        assert!(begin_outage(&flag), "a later outage is");
+    }
+
     /// Only an error after the attempt starts marks its target unusable.
     #[test]
     fn a_login_failure_after_the_attempt_marks_the_target_unusable() {
@@ -646,7 +673,7 @@ mod tests {
                 &crate::acp::event_sender::EventMetadata::host(&event),
             )
             .unwrap();
-        let now = Utc::now().timestamp_millis();
+        let now = Timestamp::now().as_millis();
 
         record_auth_failure(&store, "/target", "s", now + 3_600_000);
         assert_eq!(
@@ -674,7 +701,7 @@ mod tests {
         )
         .unwrap();
         let pool = [account("b", "/b"), account("c", "/c")];
-        let now = Utc::now().timestamp_millis();
+        let now = Timestamp::now().as_millis();
         let pick = || {
             select_target(&pool, "/a", now + 1_000, |key| {
                 store.account_state_checked(key)
@@ -707,13 +734,13 @@ mod tests {
         )
         .unwrap();
         let pool = [account("b", "/b"), account("c", "/c")];
-        let now = Utc::now().timestamp_millis();
+        let now = Timestamp::now().as_millis();
         let limited = |kind: &str, resets_in_ms: Option<i64>| FailoverError {
             permanent: false,
             target_auth_failed: false,
             target_rate_limit: Some(RateLimitInfo {
                 status: "limited".into(),
-                resets_at: resets_in_ms.and_then(|ms| DateTime::from_timestamp_millis(now + ms)),
+                resets_at: resets_in_ms.and_then(|ms| Timestamp::from_millis(now + ms)),
                 kind: kind.into(),
             }),
             message: String::new(),
@@ -815,7 +842,7 @@ mod tests {
         };
         let at = |account: AccountState, kind| in_force_deadline(&account, kind, 1_000);
         assert_eq!(
-            at(reported(5_000, "usage", false), "usage").map(|d| d.timestamp_millis()),
+            at(reported(5_000, "usage", false), "usage").map(|d| d.as_millis()),
             Some(5_000)
         );
         assert_eq!(
@@ -832,6 +859,11 @@ mod tests {
             at(reported(1_000, "usage", false), "usage"),
             None,
             "already elapsed"
+        );
+        assert_eq!(
+            at(reported(253_402_300_800_000, "usage", false), "usage"),
+            Some(Timestamp::MAX),
+            "past year 9999"
         );
     }
 

@@ -1,0 +1,6 @@
+# runtime: docker 29.5.2
+# command: docker pull docker.io/aoecapture/aoe-capture-1794863764:latest
+# captured: 2026-11-16T21:16:04Z
+# exit and stderr follow
+Error response from daemon: pull access denied for aoecapture/aoe-capture-1794863764, repository does not exist or may require 'docker login'
+# exit: 1

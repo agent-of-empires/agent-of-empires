@@ -71,9 +71,13 @@ pub async fn set_telemetry_consent(
         Err(rej) => return rej.into_response(),
     };
 
-    if let Err(e) = crate::session::update_config(|config| {
-        config.telemetry.enabled = req.enabled;
-    }) {
+    let enabled = req.enabled;
+    let saved =
+        tokio::task::spawn_blocking(move || crate::telemetry::consent::set_consent(enabled))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result);
+    if let Err(e) = saved {
         tracing::error!(target: "http.api.telemetry", "failed to save telemetry consent: {e}");
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -91,9 +95,6 @@ pub async fn set_telemetry_consent(
             "Failed to save telemetry setting",
         );
     }
-    // Reconcile the install id (no-op under DO_NOT_TRACK). The daemon, not the
-    // browser, owns the id.
-    crate::telemetry::apply_opt_in_change(req.enabled);
     tracing::info!(target: "http.api.telemetry", enabled = req.enabled, "telemetry consent changed");
     (StatusCode::OK, Json(current_mutation())).into_response()
 }
@@ -104,23 +105,24 @@ pub async fn reset_telemetry_id(State(state): State<Arc<AppState>>) -> impl Into
     if state.read_only {
         return super::read_only_response();
     }
-    let status = current_status();
-    if status.enabled && !status.do_not_track {
-        if let Err(error) = crate::telemetry::reset_install_id() {
-            tracing::warn!(target: "http.api.telemetry", "install id reset failed: {error}");
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "reset_failed",
-                "Could not rotate the install id",
-            );
-        }
+    let reset = tokio::task::spawn_blocking(crate::telemetry::consent::reset_install_id)
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result);
+    if let Err(error) = reset {
+        tracing::warn!(target: "http.api.telemetry", "install id reset failed: {error}");
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "reset_failed",
+            "Could not rotate the install id",
+        );
     }
     (StatusCode::OK, Json(current_mutation())).into_response()
 }
 
 #[derive(Deserialize)]
 pub struct SeenRequest {
-    /// `"web"` or `"structured_view"`.
+    /// A `USAGE_SIGNALS` name, such as `"tui"` or `"web"`.
     surface: String,
     /// Optional coarse client form-factor (`"desktop"` / `"desktop_pwa"` /
     /// `"mobile"` / `"mobile_pwa"`). Absent on older clients; any value outside
@@ -209,10 +211,7 @@ pub async fn post_telemetry_structured_interaction(
     };
     match req.kind.as_str() {
         "prompt_queued" => {
-            state
-                .telemetry_structured
-                .prompts_queued
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::telemetry::consent::bump(&state.telemetry_structured.prompts_queued);
         }
         other => {
             return api_error(
@@ -221,6 +220,33 @@ pub async fn post_telemetry_structured_interaction(
                 format!("unknown interaction kind '{other}'"),
             );
         }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Deserialize)]
+pub struct FeatureUseRequest {
+    feature: String,
+}
+
+/// Count one use of an accessory dashboard feature from the `feature_use` registry.
+pub async fn post_telemetry_feature_use(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<FeatureUseRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+    if !crate::telemetry::feature_use::record_name(&req.feature) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "bad_feature",
+            format!("unknown feature '{}'", req.feature),
+        );
     }
     StatusCode::NO_CONTENT.into_response()
 }

@@ -52,6 +52,19 @@ pub(crate) fn inherit_file_at_fd(
     }
 }
 
+/// Mount points visible to this process. Errors where the table is
+/// unavailable on Linux; other platforms have none to list and return empty.
+pub(crate) fn mount_points() -> std::io::Result<std::collections::HashSet<std::path::PathBuf>> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::mount_points()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(Default::default())
+    }
+}
+
 #[cfg(target_os = "linux")]
 use linux as platform;
 #[cfg(target_os = "macos")]
@@ -105,6 +118,158 @@ pub(crate) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<s
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("staging filesystem acquisition cleanup is unproven: {0}")]
+pub(crate) struct StagingAcquisitionUncertain(pub String);
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StagingProcess {
+    pub(crate) pid: u32,
+    pub(crate) birth: ProcessBirthIdentity,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) use linux::StagingRecoveryScope;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", deny_unknown_fields)]
+pub(crate) enum StagingCustody {
+    Prepared,
+    LinuxPidNamespace {
+        holder: StagingProcess,
+        init: StagingProcess,
+    },
+    Uncertain,
+}
+
+pub(crate) fn prove_staging_custody_gone(
+    custody: &StagingCustody,
+    writers: &[StagingProcess],
+    previous_boot: bool,
+) -> anyhow::Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = previous_boot;
+    match custody {
+        StagingCustody::Prepared if writers.is_empty() => Ok(()),
+        #[cfg(target_os = "linux")]
+        StagingCustody::LinuxPidNamespace { holder, init } => {
+            let valid = |process: &StagingProcess| {
+                process.pid > 1
+                    && process.pid <= i32::MAX as u32
+                    && !process.birth.boot_id.is_empty()
+                    && process
+                        .birth
+                        .start_id
+                        .strip_prefix("proc:")
+                        .is_some_and(|start| start.parse::<u64>().is_ok_and(|start| start > 0))
+            };
+            anyhow::ensure!(
+                valid(holder)
+                    && valid(init)
+                    && holder.pid != init.pid
+                    && holder.birth.boot_id == init.birth.boot_id
+                    && writers
+                        .iter()
+                        .all(|writer| valid(writer) && writer.birth.boot_id == init.birth.boot_id),
+                "invalid staging namespace custody"
+            );
+            if previous_boot {
+                return Ok(());
+            }
+            linux::prove_staging_pid_namespace_gone(holder, init, writers)
+        }
+        _ => anyhow::bail!("plugin staging native resource absence is unproven"),
+    }
+}
+
+pub(crate) fn prove_staging_host_mount_absent(mount: &Path) -> anyhow::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        platform::prove_staging_host_mount_absent(mount)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = mount;
+        anyhow::bail!("staging mount absence unsupported on this platform")
+    }
+}
+
+pub(crate) fn prove_same_mount(
+    parent: std::os::fd::BorrowedFd<'_>,
+    child: std::os::fd::BorrowedFd<'_>,
+) -> anyhow::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        platform::prove_same_mount(parent, child)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (parent, child);
+        anyhow::bail!("mount identity unavailable on this platform")
+    }
+}
+
+/// A private filesystem with an enforced allocation ceiling. Unsupported hosts fail closed.
+pub(crate) struct StagingVolume {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    inner: platform::StagingVolume,
+}
+
+impl StagingVolume {
+    pub(crate) fn create(mount: &Path, limit: u64) -> anyhow::Result<Self> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            Ok(Self {
+                inner: platform::StagingVolume::create_recorded(mount, limit, |custody| {
+                    crate::plugin::install::record_staging_custody(mount, custody)
+                })?,
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (mount, limit);
+            anyhow::bail!("strict plugin staging filesystems are unavailable on this platform")
+        }
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.inner.root()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        unreachable!("unsupported platforms cannot acquire a staging volume")
+    }
+
+    pub(crate) fn limit(&self) -> u64 {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.inner.limit()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        unreachable!("unsupported platforms cannot acquire a staging volume")
+    }
+
+    pub(crate) fn git_command(&self) -> Command {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.inner.git_command()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        unreachable!("unsupported platforms cannot acquire a staging volume")
+    }
+
+    pub(crate) fn close(&mut self) -> anyhow::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.inner.close()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        unreachable!("unsupported platforms cannot acquire a staging volume")
+    }
+}
+
 pub(crate) const LIVE_PANE_ENV_KEYS: [&str; 3] = ["TERM", "TMUX", "TMUX_PANE"];
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -152,6 +317,33 @@ pub(crate) mod test_support {
     }
     pub(crate) fn executable() -> Option<std::path::PathBuf> {
         EXECUTABLE.with(|slot| slot.borrow().clone())
+    }
+
+    /// Opens a FIFO's write end once its reader is there, failing at `deadline` instead of
+    /// blocking forever when the reader has gone.
+    #[cfg(unix)]
+    pub(crate) fn open_fifo_writer(
+        path: &std::path::Path,
+        deadline: std::time::Instant,
+    ) -> std::fs::File {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+            {
+                Ok(file) => return file,
+                Err(err) if err.raw_os_error() == Some(libc::ENXIO) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the FIFO's reader went away before it was released"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(err) => panic!("opening {}: {err}", path.display()),
+            }
+        }
     }
 }
 
@@ -314,13 +506,234 @@ pub(crate) fn spawn_process_group(command: &mut Command) -> std::io::Result<Chil
     command.spawn()
 }
 
+/// Exclusive unreaped direct-child custody reserves the original process group.
+pub(crate) struct OwnedProcessGroup {
+    child: Child,
+    settled: bool,
+}
+
+impl OwnedProcessGroup {
+    pub(crate) fn spawn(command: &mut Command) -> std::io::Result<Self> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            spawn_process_group(command).map(|child| Self {
+                child,
+                settled: false,
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = command;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "owned process group custody unsupported",
+            ))
+        }
+    }
+
+    pub(crate) fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub(crate) fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    pub(crate) fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.stderr.take()
+    }
+
+    pub(crate) fn exited(&self) -> std::io::Result<bool> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        return unix::child_exited_unreaped(self.id());
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "owned child observation unsupported",
+        ))
+    }
+
+    fn signal(&self, signal: i32) -> anyhow::Result<()> {
+        self.exited()?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let signal = Signal::try_from(signal)?;
+            match nix::sys::signal::killpg(Pid::from_raw(i32::try_from(self.id())?), signal) {
+                Ok(()) | Err(Errno::ESRCH) => Ok(()),
+                Err(error) => Err(error.into()),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        anyhow::bail!("owned group signalling unsupported: {signal}")
+    }
+
+    pub(crate) fn settle(&mut self, grace: Duration) -> anyhow::Result<()> {
+        self.settle_with_signal(grace, Self::signal)
+    }
+
+    fn settle_with_signal(
+        &mut self,
+        grace: Duration,
+        mut signal: impl FnMut(&Self, i32) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let settled = || -> anyhow::Result<bool> {
+            Ok(self
+                .exited()
+                .context("could not observe original child exit")?
+                && !runner_group_executing(self.id())
+                    .context("could not observe original process group")?)
+        };
+        if settled()? {
+            self.settled = true;
+            return Ok(());
+        }
+        let term_deadline = Instant::now() + grace;
+        let kill_deadline = term_deadline + Duration::from_secs(5);
+        let mut signal_error = signal(self, libc::SIGTERM).err().map(|error| {
+            error.context(format!(
+                "could not send SIGTERM to original process group {}",
+                self.id()
+            ))
+        });
+        let mut killed = false;
+        loop {
+            if settled()? {
+                self.settled = true;
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= term_deadline && !killed {
+                if let Err(error) = signal(self, libc::SIGKILL) {
+                    if signal_error.is_none() {
+                        signal_error = Some(error.context(format!(
+                            "could not send SIGKILL to original process group {}",
+                            self.id()
+                        )));
+                    }
+                }
+                killed = true;
+            }
+            if now >= kill_deadline {
+                return Err(match signal_error {
+                    Some(error) => error.context("owned process group termination unproven"),
+                    None => anyhow::anyhow!("owned process group termination unproven"),
+                });
+            }
+            std::thread::sleep(WAIT_POLL_INTERVAL);
+        }
+    }
+
+    pub(crate) fn reap(mut self) -> std::io::Result<ExitStatus> {
+        if !self.settled {
+            return Err(std::io::Error::other(
+                "cannot reap before original group settlement",
+            ));
+        }
+        self.child.wait()
+    }
+}
+
+/// Descendant custody borrows the unreaped child that reserves its root PID.
+pub(crate) struct OwnedProcessTree<'a> {
+    root: &'a OwnedProcessGroup,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    members: HashMap<u32, platform::ProcessHandle>,
+}
+
+impl<'a> OwnedProcessTree<'a> {
+    pub(crate) fn capture(root: &'a OwnedProcessGroup) -> anyhow::Result<Self> {
+        let mut tree = Self {
+            root,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            members: HashMap::new(),
+        };
+        if let Err(error) = tree.refresh() {
+            std::mem::forget(tree);
+            return Err(error);
+        }
+        Ok(tree)
+    }
+
+    pub(crate) fn refresh(&mut self) -> anyhow::Result<()> {
+        self.root.exited()?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let root = PrimeProcessIdentity {
+                pid: self.root.id(),
+                start_id: String::new(),
+            };
+            let samples = platform::owned_process_tree_samples(self.root)?;
+            let selected = prime_selection_mask(&samples, std::slice::from_ref(&root));
+            // Prune after sampling so an observed replacement cannot hide behind an exited handle.
+            let mut failure = None;
+            self.members.retain(|_, handle| {
+                if failure.is_some() {
+                    return true;
+                }
+                match handle.physically_exited() {
+                    Ok(exited) => !exited,
+                    Err(error) => {
+                        failure = Some(error);
+                        true
+                    }
+                }
+            });
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            for (sample, selected) in samples.into_iter().zip(selected) {
+                let identity = sample.identity;
+                if !selected || identity.pid == root.pid || self.members.contains_key(&identity.pid)
+                {
+                    continue;
+                }
+                if let Some(handle) = platform::ProcessHandle::capture_owned(&identity, self.root)?
+                {
+                    self.members.insert(identity.pid, handle);
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        anyhow::bail!("owned descendant custody unsupported on this platform")
+    }
+
+    pub(crate) fn settle(&self, grace: Duration) -> anyhow::Result<()> {
+        self.root.exited()?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            settle_process_handles(
+                self.members.values(),
+                grace,
+                platform::ProcessHandle::physically_exited,
+                platform::ProcessHandle::signal_owned,
+            )
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = grace;
+            anyhow::bail!("owned descendant custody unsupported on this platform")
+        }
+    }
+}
+
 /// Keep the owned leader unreaped until the last group signal, reserving its PID.
+/// SIGKILL follows once the group settles or `grace` expires, whichever is first.
 pub(crate) fn terminate_and_reap_process_group(
     child: &mut Child,
     grace: Duration,
 ) -> std::io::Result<()> {
     platform::terminate_process_group(child);
-    std::thread::sleep(grace);
+    let grace_deadline = Instant::now() + grace;
+    while !unreaped_group_settled(child.id()) {
+        let now = Instant::now();
+        if now >= grace_deadline {
+            break;
+        }
+        std::thread::sleep(WAIT_POLL_INTERVAL.min(grace_deadline - now));
+    }
     platform::kill_process_group(child);
     let _ = child.kill();
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -338,6 +751,20 @@ pub(crate) fn terminate_and_reap_process_group(
         }
         std::thread::sleep(poll.min(deadline.saturating_duration_since(now)));
         poll = (poll * 2).min(WAIT_POLL_INTERVAL);
+    }
+}
+
+/// An unobservable group counts as unsettled, so it waits out the full grace.
+fn unreaped_group_settled(leader: u32) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        matches!(unix::child_exited_unreaped(leader), Ok(true))
+            && matches!(runner_group_executing(leader), Ok(false))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = leader;
+        false
     }
 }
 
@@ -500,7 +927,7 @@ fn wait_with_timeout_inner_with_clock(
 /// The caller keeps control of stdin; pipe it to null when the child might
 /// prompt (SSH passphrases, credential helpers).
 pub fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<Option<Output>> {
-    run_with_timeout_inner(cmd, timeout, false, None)
+    run_with_timeout_inner(cmd, timeout, false, None, None)
 }
 
 /// [`run_with_timeout`] that also kills the child once `cancel` fires, returning `Ok(None)`.
@@ -509,7 +936,7 @@ pub fn run_until_cancelled(
     timeout: Duration,
     cancel: &CancellationToken,
 ) -> std::io::Result<Option<Output>> {
-    run_with_timeout_inner(cmd, timeout, false, Some(cancel))
+    run_with_timeout_inner(cmd, timeout, false, Some(cancel), None)
 }
 
 /// [`run_with_timeout`] variant that makes the child a process-group leader
@@ -526,6 +953,7 @@ pub fn run_with_timeout_process_group(
         cmd,
         timeout,
         cfg!(any(target_os = "linux", target_os = "macos")),
+        None,
         None,
     )
 }
@@ -562,7 +990,66 @@ pub(crate) fn run_until_cancelled_process_group(
         timeout,
         cfg!(any(target_os = "linux", target_os = "macos")),
         Some(cancel),
+        None,
     )
+}
+
+/// [`run_until_cancelled_process_group`] that also passes `on_output` each stream's bytes while
+/// the child runs, best effort: usually by the next poll, later behind a backlog of more than
+/// one pass.
+pub(crate) fn run_until_cancelled_process_group_observed(
+    cmd: &mut Command,
+    timeout: Duration,
+    cancel: &CancellationToken,
+    on_output: &mut dyn FnMut(OutputStream, &[u8]),
+) -> std::io::Result<Option<Output>> {
+    platform::configure_process_group(cmd);
+    run_with_timeout_inner(
+        cmd,
+        timeout,
+        cfg!(any(target_os = "linux", target_os = "macos")),
+        Some(cancel),
+        Some(on_output),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+/// Reads what a child appended to its capture files since the last call.
+struct OutputTail<'a> {
+    stdout: std::fs::File,
+    stderr: std::fs::File,
+    forward: &'a mut dyn FnMut(OutputStream, &[u8]),
+}
+
+/// Bytes read per stream on one pass while the child runs, so a fast writer can't hold off the
+/// wait loop's deadline and cancel checks.
+const TAIL_PASS_LIMIT: usize = 64 * 1024;
+
+impl OutputTail<'_> {
+    /// Best effort: a failed read loses progress, not the captured output. `limit` bounds each
+    /// stream's bytes; `None` drains to the current end.
+    fn forward_new(&mut self, limit: Option<usize>) {
+        let mut buf = [0u8; 8192];
+        for (stream, file) in [
+            (OutputStream::Stdout, &mut self.stdout),
+            (OutputStream::Stderr, &mut self.stderr),
+        ] {
+            let mut left = limit.unwrap_or(usize::MAX);
+            while left > 0 {
+                let want = left.min(buf.len());
+                let Ok(n @ 1..) = file.read(&mut buf[..want]) else {
+                    break;
+                };
+                (self.forward)(stream, &buf[..n]);
+                left -= n;
+            }
+        }
+    }
 }
 
 fn run_with_timeout_inner(
@@ -570,18 +1057,52 @@ fn run_with_timeout_inner(
     timeout: Duration,
     kill_process_group: bool,
     cancel: Option<&CancellationToken>,
+    on_output: Option<&mut dyn FnMut(OutputStream, &[u8])>,
 ) -> std::io::Result<Option<Output>> {
+    // Before any setup, so a cancelled run can't fail on it instead.
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Ok(None);
+    }
     let mut stdout_file = tempfile::NamedTempFile::new()?;
     let mut stderr_file = tempfile::NamedTempFile::new()?;
     cmd.stdout(Stdio::from(stdout_file.reopen()?));
     cmd.stderr(Stdio::from(stderr_file.reopen()?));
+    // Separate handles, so tailing doesn't move the offsets the final read starts from.
+    let mut tail = match on_output {
+        Some(forward) => Some(OutputTail {
+            stdout: stdout_file.reopen()?,
+            stderr: stderr_file.reopen()?,
+            forward,
+        }),
+        None => None,
+    };
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Ok(None);
+    }
     let mut child = cmd.spawn()?;
 
-    let Some(status) =
-        wait_with_timeout_inner(&mut child, timeout, kill_process_group, false, cancel)?
-    else {
+    let waited = match tail.as_mut() {
+        None => wait_with_timeout_inner(&mut child, timeout, kill_process_group, false, cancel)?,
+        Some(tail) => wait_with_timeout_inner_with_clock(
+            &mut child,
+            timeout,
+            kill_process_group,
+            false,
+            cancel,
+            Instant::now,
+            |pause| {
+                tail.forward_new(Some(TAIL_PASS_LIMIT));
+                std::thread::sleep(pause);
+            },
+        )?,
+    };
+    let Some(status) = waited else {
         return Ok(None);
     };
+    // Only a child that exited drains: a killed one's backlog would hold back its outcome.
+    if let Some(tail) = tail.as_mut() {
+        tail.forward_new(None);
+    }
     // Regular files, rather than pipes drained by background threads, keep
     // output capture bounded when a descendant outlives the direct child. A
     // read reaches the current EOF without waiting for every inherited writer
@@ -662,8 +1183,9 @@ fn collect_descendants_from_map(
 pub fn get_pane_pid(session_name: &str) -> Option<u32> {
     let pane = crate::tmux::first_pane_id(session_name)?;
     // The pane id must travel alone: `session:%id` reads as a window
-    // spec and falls back to the window's active pane (tmux 3.7c).
-    let output = crate::tmux::tmux_command()
+    // spec and falls back to the window's active pane (tmux 3.7c). A client
+    // without UTF-8 prints the tab as `_`, so the query passes `-u`.
+    let output = crate::tmux::tmux_query_command()
         .args([
             "display-message",
             "-t",
@@ -1025,12 +1547,30 @@ mod captured_process_tests {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Default)]
+struct RunnerMembers {
+    processes: Vec<(PrimeProcessIdentity, platform::ProcessHandle)>,
+    active: HashMap<u32, usize>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl RunnerMembers {
+    fn remove(&mut self, index: usize) {
+        let (identity, _) = self.processes.swap_remove(index);
+        self.active.remove(&identity.pid);
+        if let Some((moved, _)) = self.processes.get(index) {
+            self.active.insert(moved.pid, index);
+        }
+    }
+}
+
 pub(crate) struct RunnerProcessGuard {
     pid: u32,
     fingerprint: Option<ProcessBirthFingerprint>,
     obsolete: bool,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    members: parking_lot::Mutex<Vec<(PrimeProcessIdentity, platform::ProcessHandle)>>,
+    members: parking_lot::Mutex<RunnerMembers>,
     #[cfg(target_os = "linux")]
     group_anchor: Option<platform::ProcessHandle>,
 }
@@ -1082,7 +1622,7 @@ impl RunnerProcessGuard {
                 pid,
                 fingerprint,
                 obsolete,
-                members: parking_lot::Mutex::new(Vec::new()),
+                members: parking_lot::Mutex::new(RunnerMembers::default()),
                 #[cfg(target_os = "linux")]
                 group_anchor,
             };
@@ -1104,10 +1644,7 @@ impl RunnerProcessGuard {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn refresh(
-        &self,
-        members: &mut Vec<(PrimeProcessIdentity, platform::ProcessHandle)>,
-    ) -> anyhow::Result<()> {
+    fn refresh(&self, members: &mut RunnerMembers) -> anyhow::Result<()> {
         let before = runner_birth_identity(self.pid)?;
         let root_attested = before
             .as_ref()
@@ -1117,13 +1654,20 @@ impl RunnerProcessGuard {
             "runner birth identity is unattested; confirm external settlement before recovery"
         );
         if before.is_none() {
-            members.retain(|(identity, _)| identity.pid != self.pid);
+            if let Some(index) = members.active.get(&self.pid).copied() {
+                members.remove(index);
+            }
+        }
+        for index in (0..members.processes.len()).rev() {
+            if members.processes[index].1.exited()? {
+                members.remove(index);
+            }
         }
         let anchor = if root_attested {
             None
         } else {
             let mut anchor = None;
-            for (index, (identity, handle)) in members.iter().enumerate() {
+            for (index, (identity, handle)) in members.processes.iter().enumerate() {
                 if !handle.exited()? && platform::process_group_id(identity.pid)? == Some(self.pid)
                 {
                     anchor = Some(index);
@@ -1151,7 +1695,11 @@ impl RunnerProcessGuard {
         }
         let mut added = Vec::new();
         for identity in identities {
-            if !members.iter().any(|(known, _)| known == &identity) {
+            if !members
+                .active
+                .get(&identity.pid)
+                .is_some_and(|index| members.processes[*index].0 == identity)
+            {
                 if let Some(handle) = platform::ProcessHandle::capture(&identity)? {
                     added.push((identity, handle));
                 }
@@ -1165,7 +1713,7 @@ impl RunnerProcessGuard {
             );
             after == before
         } else if let Some(index) = anchor {
-            let (identity, handle) = &members[index];
+            let (identity, handle) = &members.processes[index];
             !handle.exited()? && platform::process_group_id(identity.pid)? == Some(self.pid)
         } else {
             false
@@ -1173,7 +1721,10 @@ impl RunnerProcessGuard {
         if !stable {
             return Ok(());
         }
-        members.extend(added);
+        for (identity, handle) in added {
+            members.active.insert(identity.pid, members.processes.len());
+            members.processes.push((identity, handle));
+        }
         Ok(())
     }
 
@@ -1196,7 +1747,7 @@ impl RunnerProcessGuard {
         {
             let mut members = self.members.lock();
             self.refresh(&mut members)?;
-            for (_, handle) in members.iter() {
+            for (_, handle) in &members.processes {
                 if !handle.exited()? {
                     return Ok(true);
                 }
@@ -1217,7 +1768,7 @@ impl RunnerProcessGuard {
         {
             let mut members = self.members.lock();
             self.refresh(&mut members)?;
-            for (_, handle) in members.iter() {
+            for (_, handle) in &members.processes {
                 handle.signal(signal)?;
             }
         }
@@ -1364,7 +1915,7 @@ thread_local! {
 pub(crate) struct CapturedProcessTree {
     receipt: CapturedProcessTreeReceipt,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    handles: Vec<platform::ProcessHandle>,
+    handles: Vec<Option<platform::ProcessHandle>>,
 }
 
 impl CapturedProcessTree {
@@ -1378,12 +1929,12 @@ impl CapturedProcessTree {
                 .ok_or_else(|| anyhow::anyhow!("tool process exited before capture"))?;
             let samples = platform::process_tree_samples(&root)?;
             let selected = prime_selection_mask(&samples, std::slice::from_ref(&root));
-            let mut handles = vec![handle];
+            let mut handles = vec![Some(handle)];
             let mut identities = vec![root.clone()];
             for (sample, selected) in samples.into_iter().zip(selected) {
                 if selected && sample.identity != root {
                     if let Some(handle) = platform::ProcessHandle::capture(&sample.identity)? {
-                        handles.push(handle);
+                        handles.push(Some(handle));
                         identities.push(sample.identity);
                     }
                 }
@@ -1408,6 +1959,21 @@ impl CapturedProcessTree {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn prune_exited(&mut self) -> anyhow::Result<()> {
+        for index in (1..self.handles.len()).rev() {
+            let exited = match &self.handles[index] {
+                Some(handle) => handle.exited()?,
+                None => true,
+            };
+            if exited {
+                self.handles.swap_remove(index);
+                self.receipt.processes.swap_remove(index);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn receipt(&self) -> &CapturedProcessTreeReceipt {
         &self.receipt
     }
@@ -1423,16 +1989,17 @@ impl CapturedProcessTree {
             .ok_or_else(|| anyhow::anyhow!("process boot identity unavailable"))?;
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            let mut handles = Vec::new();
-            if receipt.boot_id == current_boot {
-                handles.reserve(receipt.processes.len());
-                for identity in &receipt.processes {
-                    if let Some(handle) = platform::ProcessHandle::capture(identity)? {
-                        handles.push(handle);
-                    }
-                }
+            let mut handles = Vec::with_capacity(receipt.processes.len());
+            for identity in &receipt.processes {
+                handles.push(if receipt.boot_id == current_boot {
+                    platform::ProcessHandle::capture(identity)?
+                } else {
+                    None
+                });
             }
-            Ok(Self { receipt, handles })
+            let mut tree = Self { receipt, handles };
+            tree.prune_exited()?;
+            Ok(tree)
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         anyhow::bail!("incarnation-bound signalling unsupported on this platform")
@@ -1440,7 +2007,7 @@ impl CapturedProcessTree {
 
     #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn all_exited(&self) -> anyhow::Result<bool> {
-        for handle in &self.handles {
+        for handle in self.handles.iter().flatten() {
             if !handle.exited()? {
                 return Ok(false);
             }
@@ -1448,12 +2015,16 @@ impl CapturedProcessTree {
         Ok(true)
     }
 
-    pub(crate) fn settle(self, grace: Duration) -> anyhow::Result<()> {
+    pub(crate) fn settle(&self, grace: Duration) -> anyhow::Result<()> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             #[cfg(test)]
             if FAIL_CAPTURED_TREE_AFTER_ROOT.replace(false) {
-                let root = self.handles.first().expect("captured root handle");
+                let root = self
+                    .handles
+                    .first()
+                    .and_then(Option::as_ref)
+                    .expect("captured root handle");
                 root.signal(libc::SIGKILL)?;
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while !root.exited()? {
@@ -1462,7 +2033,12 @@ impl CapturedProcessTree {
                 }
                 anyhow::bail!("injected retirement proof failure after root exit");
             }
-            settle_process_handles(&self.handles, grace)
+            settle_process_handles(
+                self.handles.iter().flatten(),
+                grace,
+                platform::ProcessHandle::exited,
+                |handle, signal, _| handle.signal(signal),
+            )
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
@@ -1473,28 +2049,30 @@ impl CapturedProcessTree {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn settle_process_handles(
-    handles: &[platform::ProcessHandle],
+fn settle_process_handles<'a>(
+    handles: impl Iterator<Item = &'a platform::ProcessHandle> + Clone,
     grace: Duration,
+    exited: impl Fn(&platform::ProcessHandle) -> anyhow::Result<bool>,
+    signal: impl Fn(&platform::ProcessHandle, i32, Instant) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    for handle in handles {
-        handle.signal(libc::SIGTERM)?;
-    }
     let term_deadline = Instant::now() + grace;
     let kill_deadline = term_deadline + Duration::from_secs(5);
+    for handle in handles.clone() {
+        signal(handle, libc::SIGTERM, kill_deadline)?;
+    }
     let mut killed = false;
     loop {
         let mut live = false;
-        for handle in handles {
-            live |= !handle.exited()?;
+        for handle in handles.clone() {
+            live |= !exited(handle)?;
         }
         if !live {
             return Ok(());
         }
         let now = Instant::now();
         if now >= term_deadline && !killed {
-            for handle in handles {
-                handle.signal(libc::SIGKILL)?;
+            for handle in handles.clone() {
+                signal(handle, libc::SIGKILL, kill_deadline)?;
             }
             killed = true;
         }
@@ -1515,7 +2093,12 @@ pub(crate) fn fence_processes(
                 handles.push(handle);
             }
         }
-        settle_process_handles(&handles, grace)
+        settle_process_handles(
+            handles.iter(),
+            grace,
+            platform::ProcessHandle::exited,
+            |handle, signal, _| handle.signal(signal),
+        )
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -1894,6 +2477,110 @@ fn signal_process_tree(pid: u32, signal: Signal) {
 mod tests {
     use super::*;
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn group_cleanup_kills_a_sigterm_ignoring_descendant_after_the_grace() {
+        use std::io::BufRead;
+
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "trap '' TERM; sleep 30 & echo ready; wait"])
+            .stdout(Stdio::piped());
+        let mut child = spawn_process_group(&mut command).unwrap();
+        let group = child.id();
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+
+        let grace = Duration::from_millis(300);
+        let started = Instant::now();
+        terminate_and_reap_process_group(&mut child, grace).unwrap();
+        assert!(
+            started.elapsed() >= grace,
+            "a descendant that ignores SIGTERM keeps the group alive for the whole grace"
+        );
+        // SIGKILL is only queued; the descendant exits asynchronously.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runner_group_executing(group).unwrap() {
+            assert!(Instant::now() < deadline, "SIGKILL must end the group");
+            std::thread::sleep(WAIT_POLL_INTERVAL);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn owned_group_signal_errors_require_physical_settlement() {
+        use std::io::BufRead;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        struct Original {
+            group: Option<OwnedProcessGroup>,
+            input: Option<std::process::ChildStdin>,
+        }
+        impl Drop for Original {
+            fn drop(&mut self) {
+                drop(self.input.take());
+                if let Some(mut group) = self.group.take() {
+                    if group.settle(Duration::ZERO).is_ok() {
+                        let _ = group.reap();
+                    } else {
+                        std::mem::forget(group);
+                    }
+                }
+            }
+        }
+
+        for completes in [true, false] {
+            let (reader, writer) = UnixStream::pair().unwrap();
+            reader
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", "printf 'ready\\n'; IFS= read -r release; exit 0"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::from(OwnedFd::from(writer)))
+                .stderr(Stdio::null());
+            let mut original = Original {
+                group: Some(OwnedProcessGroup::spawn(&mut command).unwrap()),
+                input: None,
+            };
+            original.input = original.group.as_mut().unwrap().child.stdin.take();
+            let mut ready = String::new();
+            std::io::BufReader::new(reader)
+                .read_line(&mut ready)
+                .unwrap();
+            assert_eq!(ready, "ready\n");
+            let Original { group, input } = &mut original;
+            let group = group.as_mut().unwrap();
+            let result = group.settle_with_signal(Duration::ZERO, |_, signal| {
+                if completes && signal == libc::SIGKILL {
+                    drop(input.take());
+                }
+                Err(Errno::EPERM.into())
+            });
+            if completes {
+                result.unwrap();
+                assert!(group.exited().unwrap());
+                assert!(!runner_group_executing(group.id()).unwrap());
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::EPERM));
+                assert!(!group.exited().unwrap());
+                assert!(runner_group_executing(group.id()).unwrap());
+            }
+            drop(input.take());
+            group.settle(Duration::ZERO).unwrap();
+            let status = original.group.take().unwrap().reap().unwrap();
+            if completes {
+                assert!(status.success());
+            }
+        }
+    }
+
     #[test]
     fn prime_process_selection_preserves_scope_across_pid_reuse() {
         let sample = |pid, parent, start: &str, marked| PrimeProcessSample {
@@ -1954,6 +2641,156 @@ mod tests {
         obsolete.settle(Duration::ZERO).unwrap();
         receipt.processes.push(receipt.processes[0].clone());
         assert!(CapturedProcessTree::resume(receipt, std::process::id()).is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn captured_tree_prunes_exited_cohorts_but_retains_live_escaped_custody() {
+        use std::io::{BufRead, BufReader, Write as _};
+        let effects = tempfile::tempdir().unwrap();
+        let script = effects.path().join("cohorts.py");
+        std::fs::write(
+            &script,
+            r#"import os, signal, subprocess, sys
+escaped = None
+cohorts = []
+released = False
+def terminate(*_):
+    raise SystemExit
+def finish(child):
+    if child.poll() is None:
+        child.kill()
+    child.wait()
+signal.signal(signal.SIGTERM, terminate)
+try:
+    for command in sys.stdin:
+        command = command.strip()
+        if command == "escape":
+            escaped = subprocess.Popen([sys.executable, "-u", "-c",
+                "import os,signal,sys; sys.stdin.readline(); os.setsid(); print(os.getpid(),flush=True); signal.pause()"],
+                stdin=subprocess.PIPE)
+            escaped.stdin.write(b"detach\n")
+            escaped.stdin.close()
+        elif command == "cohort":
+            cohorts.append(subprocess.Popen([sys.executable, "-u", "-c",
+                "import os,sys; print(os.getpid(),flush=True); sys.stdin.read()"],
+                stdin=subprocess.PIPE))
+        elif command == "exit":
+            cohorts[-1].stdin.close()
+            print("released", flush=True)
+        elif command == "reap":
+            cohorts.pop().wait()
+            print("reaped", flush=True)
+        elif command == "leave":
+            released = True
+            break
+finally:
+    if escaped is not None and not released:
+        finish(escaped)
+    for child in cohorts:
+        finish(child)
+"#,
+        )
+        .unwrap();
+        let mut command = Command::new("python3");
+        command
+            .arg("-u")
+            .arg(&script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        struct Cleanup {
+            group: Option<OwnedProcessGroup>,
+            escaped: Option<CapturedProcess>,
+            reader: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(escaped) = &self.escaped {
+                    let _ = escaped.signal(libc::SIGKILL);
+                }
+                if let Some(mut group) = self.group.take() {
+                    let _ = group.settle(Duration::ZERO);
+                    let _ = group.reap();
+                }
+                if let Some(reader) = self.reader.take() {
+                    let _ = reader.join();
+                }
+            }
+        }
+        let mut cleanup = Cleanup {
+            group: Some(OwnedProcessGroup::spawn(&mut command).unwrap()),
+            escaped: None,
+            reader: None,
+        };
+        let group = cleanup.group.as_mut().unwrap();
+        let mut input = group.child.stdin.take().unwrap();
+        let output = group.take_stdout().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        cleanup.reader = Some(std::thread::spawn(move || {
+            for line in BufReader::new(output).lines() {
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        }));
+        let next = || {
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("fixture response")
+                .unwrap()
+        };
+        let group = cleanup.group.as_ref().unwrap();
+        let mut tree = OwnedProcessTree::capture(group).unwrap();
+        writeln!(input, "escape").unwrap();
+        let escaped_pid: u32 = next().parse().unwrap();
+        let birth = process_birth_identity(escaped_pid).unwrap().unwrap();
+        cleanup.escaped = Some(
+            CapturedProcess::capture(escaped_pid, &birth)
+                .unwrap()
+                .unwrap(),
+        );
+        tree.refresh().unwrap();
+        assert!(tree.members.contains_key(&escaped_pid));
+        for _ in 0..8 {
+            writeln!(input, "cohort").unwrap();
+            let pid = next().parse().unwrap();
+            let birth = process_birth_identity(pid).unwrap().unwrap();
+            let cohort = CapturedProcess::capture(pid, &birth).unwrap().unwrap();
+            tree.refresh().unwrap();
+            assert!(tree.members.contains_key(&pid));
+            writeln!(input, "exit").unwrap();
+            assert_eq!(next(), "released");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !cohort.exited().unwrap() {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            tree.refresh().unwrap();
+            assert!(!tree.members.contains_key(&pid));
+            assert!(tree.members.contains_key(&escaped_pid));
+            assert_eq!(tree.members.len(), 1);
+            writeln!(input, "reap").unwrap();
+            assert_eq!(next(), "reaped");
+        }
+        writeln!(input, "leave").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !group.exited().unwrap() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        tree.refresh().unwrap();
+        assert!(tree.members.contains_key(&escaped_pid));
+        tree.settle(Duration::ZERO).unwrap();
+        tree.refresh().unwrap();
+        assert!(!tree.members.contains_key(&escaped_pid));
+        drop(tree);
+        cleanup
+            .group
+            .as_mut()
+            .unwrap()
+            .settle(Duration::ZERO)
+            .unwrap();
+        assert!(cleanup.group.take().unwrap().reap().unwrap().success());
     }
 
     #[cfg(target_os = "macos")]
@@ -2384,19 +3221,204 @@ mod tests {
     }
 
     #[test]
+    fn a_cancel_before_spawn_starts_nothing() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        // A missing program would fail to spawn, so `Ok(None)` shows no spawn was tried.
+        let mut cmd = Command::new("/nonexistent/aoe-cancelled-before-spawn");
+        assert!(matches!(
+            run_until_cancelled_process_group(&mut cmd, Duration::from_secs(5), &cancel),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn a_tail_pass_reads_a_bounded_amount_and_the_final_one_drains() {
+        use std::io::Write as _;
+        let total = 3 * TAIL_PASS_LIMIT + 7;
+        let file = |byte| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            file.write_all(&vec![byte; total]).unwrap();
+            file
+        };
+        let (stdout, stderr) = (file(b'o'), file(b'e'));
+        let received = std::cell::RefCell::new(Vec::<(OutputStream, u8)>::new());
+        let mut forward = |stream, bytes: &[u8]| {
+            received
+                .borrow_mut()
+                .extend(bytes.iter().map(|&byte| (stream, byte)));
+        };
+        let mut tail = OutputTail {
+            stdout: stdout.reopen().unwrap(),
+            stderr: stderr.reopen().unwrap(),
+            forward: &mut forward,
+        };
+        // Bytes forwarded per stream since the last read; each stream carries only its own.
+        let take = || {
+            let bytes = std::mem::take(&mut *received.borrow_mut());
+            [(OutputStream::Stdout, b'o'), (OutputStream::Stderr, b'e')].map(|(stream, own)| {
+                let mine: Vec<u8> = bytes
+                    .iter()
+                    .filter(|(s, _)| *s == stream)
+                    .map(|&(_, b)| b)
+                    .collect();
+                assert!(
+                    mine.iter().all(|&b| b == own),
+                    "{stream:?} got another stream's bytes"
+                );
+                mine.len()
+            })
+        };
+        tail.forward_new(Some(TAIL_PASS_LIMIT));
+        assert_eq!(take(), [TAIL_PASS_LIMIT; 2], "a bounded pass per stream");
+        tail.forward_new(None);
+        assert_eq!(
+            take(),
+            [total - TAIL_PASS_LIMIT; 2],
+            "the final pass drains the rest, from where the bounded one stopped"
+        );
+    }
+
+    /// A cancelled run returns without draining the backlog its child left unread. After the
+    /// cancel, passes run only for the kill's 250 ms grace, which reaches a small part of the
+    /// backlog; the old final drain forwarded all of it.
+    #[test]
+    #[cfg(unix)]
+    fn a_cancel_is_not_held_behind_the_unread_backlog() {
+        const BACKLOG: usize = 16 << 20;
+        let dir = tempfile::tempdir().unwrap();
+        let written = dir.path().join("written");
+        let mut cmd = Command::new("sh");
+        // `written` appears once the backlog and `ready` are both out.
+        cmd.args([
+            "-c",
+            &format!("head -c {BACKLOG} /dev/zero; echo ready >&2; : > \"$1\"; exec sleep 600"),
+            "sh",
+        ])
+        .arg(&written);
+        let cancel = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (mut forwarded, mut at_cancel, mut gate_expired) = (0usize, None, false);
+        let mut forward = |stream: OutputStream, bytes: &[u8]| {
+            // Hold the first callback until the child is done writing, so `ready` is read in that
+            // pass however the child was scheduled. On expiry, cancel rather than panic here, so
+            // the runner still kills and reaps the child.
+            while !gate_expired && !written.exists() {
+                if Instant::now() >= deadline {
+                    gate_expired = true;
+                    cancel.cancel();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            match stream {
+                OutputStream::Stdout => forwarded += bytes.len(),
+                OutputStream::Stderr => {
+                    at_cancel.get_or_insert(forwarded);
+                    cancel.cancel();
+                }
+            }
+        };
+        let result = run_until_cancelled_process_group_observed(
+            &mut cmd,
+            Duration::from_secs(30),
+            &cancel,
+            &mut forward,
+        )
+        .unwrap();
+        assert!(!gate_expired, "the child never wrote its backlog");
+        assert!(result.is_none(), "cancelled");
+        // At most one bounded pass came first; none if stdout was still empty at its read.
+        assert!(
+            at_cancel.is_some_and(|bytes| bytes <= TAIL_PASS_LIMIT),
+            "forwarded {at_cancel:?} before the cancel"
+        );
+        assert!(
+            forwarded < BACKLOG / 2,
+            "forwarded {forwarded} of {BACKLOG} bytes: the backlog was drained"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn observed_output_arrives_while_the_child_still_runs() {
+        use std::io::Write as _;
+        use std::sync::mpsc;
+        const DEADLINE: Duration = Duration::from_secs(10);
+        let dir = tempfile::tempdir().unwrap();
+        let gate = dir.path().join("gate");
+        nix::unistd::mkfifo(&gate, nix::sys::stat::Mode::S_IRWXU).unwrap();
+
+        let (chunk_tx, chunks) = mpsc::channel();
+        let (done_tx, done) = mpsc::channel();
+        let child_gate = gate.clone();
+        std::thread::spawn(move || {
+            let mut cmd = Command::new("sh");
+            // Blocks opening the FIFO until the test opens its write end.
+            cmd.args([
+                "-c",
+                "printf 'first\\n'; read x < \"$1\"; printf 'last\\n' >&2",
+                "sh",
+            ])
+            .arg(&child_gate);
+            let mut forward = |stream: OutputStream, bytes: &[u8]| {
+                let _ = chunk_tx.send((stream, bytes.to_vec()));
+            };
+            let _ = done_tx.send(run_until_cancelled_process_group_observed(
+                &mut cmd,
+                Duration::from_secs(30),
+                &CancellationToken::new(),
+                &mut forward,
+            ));
+        });
+
+        let mut received: Vec<(OutputStream, Vec<u8>)> = Vec::new();
+        let read = |received: &[(OutputStream, Vec<u8>)], stream| {
+            received
+                .iter()
+                .filter(|(s, _)| *s == stream)
+                .flat_map(|(_, b)| b.iter().copied())
+                .collect::<Vec<u8>>()
+        };
+        while read(&received, OutputStream::Stdout) != b"first\n" {
+            received.push(chunks.recv_timeout(DEADLINE).expect("first line forwarded"));
+        }
+        assert!(
+            done.try_recv().is_err(),
+            "the child is still blocked on the gate"
+        );
+
+        test_support::open_fifo_writer(&gate, Instant::now() + DEADLINE)
+            .write_all(b"go\n")
+            .unwrap();
+        let output = done
+            .recv_timeout(DEADLINE)
+            .expect("the child exits once released")
+            .unwrap()
+            .expect("no timeout");
+        received.extend(chunks.try_iter());
+        assert_eq!(read(&received, OutputStream::Stderr), b"last\n");
+        assert_eq!(output.stdout, b"first\n", "the final capture is unaffected");
+        assert_eq!(output.stderr, b"last\n");
+    }
+
+    #[test]
     #[cfg(unix)]
     fn run_with_timeout_kills_child_on_deadline_or_cancel() {
         use std::io::Read;
         use std::os::fd::AsRawFd;
         use std::os::unix::{net::UnixStream, process::CommandExt};
+        // The cancel case's timeout: kills the child if the cancel never comes.
+        const WATCHDOG: Duration = Duration::from_secs(60);
 
         for cancelled in [false, true] {
             let (mut pid_reader, pid_writer) = UnixStream::pair().unwrap();
             pid_reader
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
+            // Outlives the watchdog, so only a kill ends it.
             let mut cmd = Command::new("sleep");
-            cmd.arg("5");
+            cmd.arg("600");
             unsafe {
                 cmd.pre_exec(move || {
                     let pid = libc::getpid().to_ne_bytes();
@@ -2409,27 +3431,45 @@ mod tests {
                 });
             }
 
-            let start = Instant::now();
-            let result = if cancelled {
-                let cancel = CancellationToken::new();
-                cancel.cancel();
-                run_until_cancelled(&mut cmd, Duration::from_secs(60), &cancel).unwrap()
-            } else {
-                run_with_timeout(&mut cmd, Duration::from_millis(300)).unwrap()
+            let mut read_pid = move || {
+                let mut pid = [0; std::mem::size_of::<libc::pid_t>()];
+                pid_reader
+                    .read_exact(&mut pid)
+                    .expect("child must publish its PID before exec");
+                libc::pid_t::from_ne_bytes(pid) as u32
             };
-            let mut pid = [0; std::mem::size_of::<libc::pid_t>()];
-            pid_reader
-                .read_exact(&mut pid)
-                .expect("child must publish its PID before exec");
-            assert_child_reaped(libc::pid_t::from_ne_bytes(pid) as u32);
+            let start = Instant::now();
+            let (result, pid) = if cancelled {
+                // Cancelled once the child runs: a token cancelled before the spawn starts nothing.
+                let cancel = CancellationToken::new();
+                let canceller = std::thread::spawn({
+                    let cancel = cancel.clone();
+                    move || {
+                        let pid = read_pid();
+                        cancel.cancel();
+                        pid
+                    }
+                });
+                let result = run_until_cancelled(&mut cmd, WATCHDOG, &cancel);
+                (result.unwrap(), canceller.join().unwrap())
+            } else {
+                let result = run_with_timeout(&mut cmd, Duration::from_millis(300)).unwrap();
+                (result, read_pid())
+            };
+            assert_child_reaped(pid);
             assert!(
                 result.is_none(),
                 "cancelled={cancelled}: child must be killed"
             );
-            assert!(
-                start.elapsed() < Duration::from_secs(4),
-                "cancelled={cancelled}: wait should return promptly, not block on the child"
-            );
+            let elapsed = start.elapsed();
+            if cancelled {
+                assert!(elapsed < WATCHDOG, "the cancel killed it, not the watchdog");
+            } else {
+                assert!(
+                    elapsed < Duration::from_secs(4),
+                    "the deadline returns promptly, not when the child would exit"
+                );
+            }
         }
     }
 

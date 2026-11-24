@@ -81,7 +81,11 @@ impl LoadedPlugin {
     }
 }
 
-fn grant_covers(grant: &CapabilityGrant, manifest: &PluginManifest, manifest_hash: &str) -> bool {
+pub(super) fn grant_covers(
+    grant: &CapabilityGrant,
+    manifest: &PluginManifest,
+    manifest_hash: &str,
+) -> bool {
     grant.manifest_hash == manifest_hash
         && manifest
             .capabilities
@@ -356,7 +360,7 @@ capabilities = ["net", "fs.read"]
         let full = CapabilityGrant {
             manifest_hash: hash.to_string(),
             capabilities: vec!["net".into(), "fs.read".into()],
-            granted_at: chrono::Utc::now(),
+            granted_at: crate::time::Timestamp::now(),
         };
         assert!(grant_covers(&full, &manifest, hash));
 
@@ -369,7 +373,7 @@ capabilities = ["net", "fs.read"]
         let partial = CapabilityGrant {
             manifest_hash: hash.to_string(),
             capabilities: vec!["net".into()],
-            granted_at: chrono::Utc::now(),
+            granted_at: crate::time::Timestamp::now(),
         };
         assert!(!grant_covers(&partial, &manifest, hash));
     }

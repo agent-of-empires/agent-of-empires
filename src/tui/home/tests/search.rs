@@ -74,7 +74,7 @@ fn test_reload_after_enter_preserves_search_state() {
         "test needs matches for meaningful assertions"
     );
 
-    env.view.reload().unwrap();
+    env.view.reload();
 
     assert_eq!(
         env.view.search_matches.len(),
@@ -608,7 +608,7 @@ fn test_reload_does_not_snap_cursor_after_enter() {
     env.view.update_selected();
 
     // Simulate periodic reload
-    env.view.reload().unwrap();
+    env.view.reload();
 
     // Cursor should stay where the user put it, not snap back to best match
     assert_eq!(env.view.cursor, 4);

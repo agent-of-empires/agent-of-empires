@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useFocusTrap } from "../../hooks/useFocusTrap";
 
 interface Props {
   /** Prefix for the `-dialog` and `-proceed` test ids. */
@@ -15,6 +16,9 @@ export function ConfirmCreateDialog({ id, title, confirmLabel, onConfirm, onCanc
   const [confirming, setConfirming] = useState(false);
   const confirmButtonRef = useRef<HTMLButtonElement | null>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  // Without its own trap, Tab leaves for the wizard behind it, whose trap then pulls focus in.
+  useFocusTrap(() => dialogRef.current);
 
   const handleConfirm = useCallback(async () => {
     setConfirming(true);
@@ -53,6 +57,7 @@ export function ConfirmCreateDialog({ id, title, confirmLabel, onConfirm, onCanc
 
   return (
     <div
+      ref={dialogRef}
       role="dialog"
       aria-modal="true"
       aria-labelledby={`${id}-dialog-title`}

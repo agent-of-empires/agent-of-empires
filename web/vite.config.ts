@@ -23,6 +23,7 @@ export default defineConfig(({ mode, command }) => {
   const proxy = httpTarget
     ? {
         "/api": { target: httpTarget, changeOrigin: true },
+        "/plugin-icons": { target: httpTarget, changeOrigin: true },
         [SESSION_WS_PROXY]: {
           target: httpTarget.replace(/^http/, "ws"),
           ws: true,
@@ -33,6 +34,8 @@ export default defineConfig(({ mode, command }) => {
 
   return {
     server: { proxy },
+    // ES workers can code-split, so Shiki grammars load as lazy chunks instead of one inlined IIFE.
+    worker: { format: "es" },
     plugins: [
       react(),
       tailwindcss(),

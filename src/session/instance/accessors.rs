@@ -3,6 +3,9 @@
 
 use super::*;
 
+/// How to bind a Structured view conversation so a switch to Terminal view can carry it.
+pub(crate) const UNBOUND_STORE_HINT: &str = "ACP does not prove a native conversation store; bind its current ID with aoe session set-session-id SESSION ID --store /absolute/claude-store before switching to terminal";
+
 /// A sub-session was named as a new session's parent.
 #[derive(Debug, thiserror::Error)]
 #[error("Cannot create sub-session of a sub-session (single level only)")]
@@ -31,10 +34,11 @@ impl Instance {
             detect_as: String::new(),
             yolo_mode: false,
             status: Status::Idle,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             last_accessed_at: None,
             idle_entered_at: None,
             archived_at: None,
+            ignored_at: None,
             favorited_at: None,
             snoozed_until: None,
             unread: false,
@@ -103,6 +107,8 @@ impl Instance {
             unknown_since: None,
             detection: DetectionState::default(),
             pending_host_env: Vec::new(),
+            launch_admission: None,
+            before_start_minted_for_launch: false,
             capture_started_at: None,
             started_at: None,
             launch_executable: None,
@@ -110,8 +116,8 @@ impl Instance {
             pi_extension_launched: false,
             identity_publisher_launched: false,
             pi_session_path: None,
-            last_error: None,
             last_error_evidence: None,
+            last_error: LastError::default(),
             capture_poller: Default::default(),
             retroactive_capture_excludes: HashSet::new(),
             pane_dead_observed: false,
@@ -258,6 +264,23 @@ impl Instance {
             self.command.is_empty()
                 || agent.contribution().command.as_deref() == Some(self.command.as_str())
         })
+    }
+
+    /// The pause to leave between typing into this session's pane and Enter.
+    ///
+    /// Only the program a declaration actually owns is paced by it. The
+    /// effective identity rules out a custom wrapper, command override, stored
+    /// command or ambiguous claim first, so those keep the built-in table's
+    /// pace for their tool instead of inheriting another program's delay.
+    pub(crate) fn send_keys_enter_delay(&self) -> u64 {
+        let declared = self.declared_agent().and_then(|agent| {
+            agent
+                .contribution()
+                .launch
+                .as_ref()
+                .and_then(|launch| launch.send_keys_enter_delay_ms)
+        });
+        declared.unwrap_or_else(|| crate::agents::send_keys_enter_delay(&self.tool))
     }
 
     fn declared_session_support(
@@ -854,7 +877,7 @@ impl Instance {
                         .is_some_and(|execution| execution.agent == "claude")
             })
             .cloned();
-        let unresolved = "ACP does not prove a native conversation store; bind its current ID with aoe session set-session-id SESSION ID --store /absolute/claude-store before switching to terminal";
+        let unresolved = UNBOUND_STORE_HINT;
         let persisted = self.persisted_observed_store(&sid);
         let resolved = match asserted {
             Some(asserted) => Ok(Some(asserted)),
@@ -1061,7 +1084,7 @@ mod tests {
             branch: "feature/abc".to_string(),
             main_repo_path: main_repo_path.to_string(),
             managed_by_aoe: true,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             base_branch: None,
         }
     }
@@ -1287,7 +1310,7 @@ mod tests {
             .insert(ConversationBinding::unknown("stale-sid"));
         inst.last_error_check = Some(std::time::Instant::now());
         inst.last_start_time = Some(std::time::Instant::now());
-        inst.last_error = Some("test error".to_string());
+        inst.last_error.set("test error".to_string());
         inst.acp_load_session_capable = Some(true);
 
         let json = serde_json::to_string(&inst).unwrap();
@@ -1370,7 +1393,7 @@ mod tests {
                 base_branch: None,
                 base_branch_override: None,
             }],
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             cleanup_on_delete: true,
         });
         assert!(ws.has_managed_worktree_or_workspace());

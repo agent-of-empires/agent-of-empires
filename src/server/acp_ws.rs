@@ -1214,7 +1214,7 @@ mod tests {
             model: "test-model".into(),
             output_file: String::new(),
             workflow: None,
-            started_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            started_at: crate::time::Timestamp::from_unix_secs(0).unwrap(),
         }
     }
 
@@ -1245,7 +1245,7 @@ mod tests {
                 model: None,
                 background: false,
             },
-            at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            at: crate::time::Timestamp::from_unix_secs(0).unwrap(),
         };
         reduced
             .apply_scoped_event(
@@ -1317,7 +1317,7 @@ mod tests {
                 name: "Edit".into(),
                 kind: "edit".into(),
                 args_preview: "{}".into(),
-                started_at: chrono::Utc::now(),
+                started_at: crate::time::Timestamp::now(),
                 parent_tool_call_id: None,
                 memory_recall: None,
                 diffs: Vec::new(),
@@ -1326,7 +1326,7 @@ mod tests {
             options: Vec::new(),
             choice: false,
             plan: None,
-            requested_at: chrono::Utc::now(),
+            requested_at: crate::time::Timestamp::now(),
             resolved: None,
         };
         let row = |seq, event| crate::acp::event_store::StoredEvent {
@@ -1521,7 +1521,7 @@ mod tests {
         use crate::acp::protocol::{AcpOperationMetadata, AcpOriginalRequestResult};
         use crate::acp::state::ToolCall;
         use crate::acp::transcript::TranscriptRowKind;
-        let at = chrono::Utc::now();
+        let at = crate::time::Timestamp::now();
         let history = [
             (
                 Event::ToolCallStarted {
@@ -1625,7 +1625,7 @@ mod tests {
         use crate::acp::state::test_support::{prompt, stopped};
         use crate::acp::state::ToolCall;
         use crate::acp::transcript::{TranscriptDelta, TranscriptRowKind};
-        let at = chrono::Utc::now();
+        let at = crate::time::Timestamp::now();
         let started = |id: &str| Event::ToolCallStarted {
             tool_call: ToolCall {
                 prompt: None,
@@ -1886,7 +1886,7 @@ mod tests {
                         tools: tools.clone(),
                         last_tool: Some("Read".into()),
                         last_text: Some("latest preview".into()),
-                        at: chrono::DateTime::from_timestamp(1, 0).unwrap(),
+                        at: crate::time::Timestamp::from_unix_secs(1).unwrap(),
                     },
                 ),
                 (
@@ -1898,7 +1898,7 @@ mod tests {
                         tools,
                         result: Some("complete result".into()),
                         warning: None,
-                        ended_at: chrono::DateTime::from_timestamp(2, 0).unwrap(),
+                        ended_at: crate::time::Timestamp::from_unix_secs(2).unwrap(),
                     },
                 ),
             ] {
@@ -2003,6 +2003,7 @@ mod tests {
                     text: "new explicit input".into(),
                     prompt_id: None,
                     origin_plugin: None,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                     attachments: Vec::new(),
                     synthesized: false,
                 },
@@ -2214,7 +2215,7 @@ mod tests {
                             state.acp_supervisor.test_respawn_worker(&id).await;
                         }
                         Change::Incarnation => {
-                            let created = row.created_at + chrono::Duration::seconds(1);
+                            let created = row.created_at + crate::time::Duration::seconds(1);
                             let disk = storage.clone();
                             let disk_id = id.clone();
                             tokio::task::spawn_blocking(move || {
@@ -2853,6 +2854,7 @@ mod tests {
                 let response = crate::server::api::acp_prompt(
                     axum::extract::State(live.state.clone()),
                     axum::extract::Path(id.clone()),
+                    axum::http::HeaderMap::new(),
                     Ok(axum::Json(
                         serde_json::from_value(serde_json::json!({
                             "text":"must not be delivered","prompt_id":"blocked",
@@ -3044,7 +3046,7 @@ mod tests {
 
         let _home = crate::session::test_support::isolate_app_dir();
         let state = crate::server::test_support::build_test_app_state(Vec::new());
-        let at = chrono::Utc::now();
+        let at = crate::time::Timestamp::now();
         for (seq, id) in [(1, "missed"), (2, "queued")] {
             let event = Event::ToolCallStarted {
                 tool_call: ToolCall {

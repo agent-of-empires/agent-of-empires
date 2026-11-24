@@ -534,32 +534,26 @@ impl SettingsView {
             .cloned()
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
+        let editor = if self.editing_input.is_some() || self.list_edit_state.is_some() {
+            self.fields.get(self.selected_field).map(|field| {
+                let owner = field
+                    .schema_section()
+                    .and_then(crate::session::config::settings_schema::section_plugin_id);
+                let valid = owner.is_none_or(|id| {
+                    crate::plugin::registry::is_builtin_id(id)
+                        || old_baseline
+                            .get(id)
+                            .zip(disk.plugins.get(id))
+                            .is_some_and(|(base, current)| same_plugin_lifecycle(base, current))
+                });
+                (field.ident(), valid)
+            })
+        } else {
+            None
+        };
         let staged = std::mem::take(&mut self.global_config.plugins);
         let baseline_val = serde_json::to_value(&disk.plugins);
-        self.global_config.plugins = disk.plugins;
-        for (id, staged_config) in staged {
-            let was_in_baseline = old_baseline.contains_key(&id);
-            match self.global_config.plugins.get_mut(&id) {
-                Some(disk_entry) => {
-                    let base = old_baseline.get(&id).cloned().unwrap_or_default();
-                    if staged_config.enabled != base.enabled {
-                        disk_entry.enabled = staged_config.enabled;
-                    }
-                    if staged_config.settings != base.settings {
-                        disk_entry.settings = staged_config.settings;
-                    }
-                }
-                None => {
-                    // Not on disk: keep a purely user-staged entry (a first
-                    // toggle for a plugin with no config row yet); drop edits
-                    // for an id the operation removed (it was in the
-                    // baseline, so the removal is the newer intent).
-                    if !was_in_baseline {
-                        self.global_config.plugins.insert(id, staged_config);
-                    }
-                }
-            }
-        }
+        self.global_config.plugins = merge_staged_plugins(&old_baseline, &staged, disk.plugins);
         if let (Some(obj), Ok(plugins_val)) = (self.baseline_global.as_object_mut(), baseline_val) {
             obj.insert("plugins".to_string(), plugins_val);
         }
@@ -568,6 +562,21 @@ impl SettingsView {
         // with it the virtual `plugin:<id>` settings sections; rebuild so the
         // fields pane under the manager tracks it.
         self.rebuild_fields();
+        if let Some((identity, valid)) = editor {
+            if let Some(index) = valid
+                .then(|| {
+                    self.fields
+                        .iter()
+                        .position(|field| field.ident() == identity)
+                })
+                .flatten()
+            {
+                self.selected_field = index;
+            } else {
+                self.editing_input = None;
+                self.list_edit_state = None;
+            }
+        }
     }
 
     /// Advance `selected_field` to the first interactive field
@@ -782,6 +791,43 @@ impl SettingsView {
             || config_to_json(&self.repo_config) != self.baseline_repo;
     }
 
+    /// Confirms a save once the Daemon has acknowledged its consent change. A view opened
+    /// while the change was in flight read the old value, so an unedited toggle adopts the
+    /// saved one.
+    pub(in crate::tui) fn consent_saved(&mut self) {
+        let baseline = self
+            .baseline_global
+            .pointer("/telemetry/enabled")
+            .and_then(serde_json::Value::as_bool);
+        let saved = crate::session::get_telemetry_settings().enabled;
+        if baseline == Some(self.global_config.telemetry.enabled)
+            && self.global_config.telemetry.enabled != saved
+        {
+            self.global_config.telemetry.enabled = saved;
+            if let Some(slot) = self.baseline_global.pointer_mut("/telemetry/enabled") {
+                *slot = saved.into();
+            }
+            self.rebuild_fields();
+            self.recompute_dirty();
+        }
+        self.success_message = Some("Settings saved".to_string());
+        self.success_message_expires_at = Some(std::time::Instant::now() + SUCCESS_MESSAGE_TTL);
+    }
+
+    /// A telemetry change the Daemon did not save: show why and put the toggle back.
+    pub(in crate::tui) fn consent_not_saved(&mut self, message: String) {
+        let saved = crate::session::get_telemetry_settings().enabled;
+        self.global_config.telemetry.enabled = saved;
+        if let Some(slot) = self.baseline_global.pointer_mut("/telemetry/enabled") {
+            *slot = saved.into();
+        }
+        self.rebuild_fields();
+        self.recompute_dirty();
+        self.success_message = None;
+        self.success_message_expires_at = None;
+        self.error_message = Some(message);
+    }
+
     /// Adopt the live configs as the new baseline and mark the view clean.
     /// Called after a save or a reload, when on-disk state matches memory.
     pub(super) fn snapshot_baseline(&mut self) {
@@ -804,6 +850,8 @@ impl SettingsView {
             }
         }
 
+        let mut accepted_toggles = Vec::new();
+        let mut consent_pending = false;
         match self.scope {
             SettingsScope::Global => {
                 // Saving the Telemetry page counts as answering the opt-in
@@ -823,16 +871,65 @@ impl SettingsView {
                 // `aoe serve` PATCH, a second `aoe`, a hand edit) wrote to an
                 // unrelated field while the pane sat open, which is the same
                 // clobber the removed `save_config` caused.
-                let edited = config_to_json(&self.global_config);
+                let mut edited = config_to_json(&self.global_config);
                 let baseline = self.baseline_global.clone();
-                update_config(|c| -> anyhow::Result<()> {
+                // The Daemon owns consent, so the toggle is sent to it, never written here.
+                let consent = self.global_config.telemetry.enabled;
+                let consent_changed =
+                    edited.pointer("/telemetry/enabled") != baseline.pointer("/telemetry/enabled");
+                if let (Some(slot), Some(saved)) = (
+                    edited.pointer_mut("/telemetry/enabled"),
+                    baseline.pointer("/telemetry/enabled"),
+                ) {
+                    *slot = saved.clone();
+                }
+                let baseline_plugins: std::collections::BTreeMap<
+                    String,
+                    crate::session::PluginConfig,
+                > = serde_json::from_value(
+                    baseline
+                        .get("plugins")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({})),
+                )?;
+                let staged_plugins = self.global_config.plugins.clone();
+                let plugin_edits = staged_plugins.iter().any(|(id, edited)| {
+                    let default = crate::session::PluginConfig::default();
+                    let base = baseline_plugins.get(id).unwrap_or(&default);
+                    edited.enabled != base.enabled || edited.settings != base.settings
+                });
+                // Cooperating writers always take plugin exclusion before config.
+                // Busy refusal leaves the staged view and baseline untouched.
+                let _operation = if plugin_edits {
+                    Some(crate::plugin::install::begin_operation()?)
+                } else {
+                    None
+                };
+                self.global_config = update_config(|c| -> anyhow::Result<Config> {
+                    let before = serde_json::to_value(&c.plugins)?;
+                    let plugins =
+                        merge_staged_plugins(&baseline_plugins, &staged_plugins, c.plugins.clone());
                     let mut fresh = serde_json::to_value(&*c)?;
+                    let mut baseline = baseline.clone();
+                    let mut edited = edited.clone();
+                    for value in [&mut fresh, &mut baseline, &mut edited] {
+                        if let Some(object) = value.as_object_mut() {
+                            object.remove("plugins");
+                        }
+                    }
                     crate::session::config::settings_schema::apply_changed_leaves(
                         &mut fresh, &baseline, &edited,
                     );
-                    *c = serde_json::from_value(fresh)?;
-                    Ok(())
+                    let mut merged: Config = serde_json::from_value(fresh)?;
+                    merged.plugins = plugins;
+                    accepted_toggles = plugin_enabled_changes(
+                        Some(&before),
+                        &Some(serde_json::to_value(&merged.plugins)?),
+                    );
+                    *c = merged;
+                    Ok(c.clone())
                 })??;
+                drop(_operation);
                 // `app_state` lives in state.toml now (not persisted by
                 // `update_config`); only write it when this save actually
                 // flipped it, so an already-true flag on disk is never
@@ -841,6 +938,11 @@ impl SettingsView {
                     update_app_state(|state| {
                         state.has_responded_to_telemetry = true;
                     })?;
+                }
+                if consent_changed {
+                    self.global_config.telemetry.enabled = consent;
+                    crate::tui::telemetry::set_consent(consent);
+                    consent_pending = true;
                 }
                 self.resolved_base =
                     merge_configs(self.global_config.clone(), &self.profile_config);
@@ -855,10 +957,6 @@ impl SettingsView {
                         &app_dir,
                     );
                 }
-                // Reconcile the on-disk install id with the saved opt-in
-                // state: generate one when enabled, delete it on opt-out.
-                // Idempotent, so running it on every global save is safe.
-                crate::telemetry::apply_opt_in_change(self.global_config.telemetry.enabled);
             }
             SettingsScope::Profile => {
                 // Same changed-leaves write-back as the global scope: a whole-struct
@@ -901,18 +999,21 @@ impl SettingsView {
                 // The active set changed, so the virtual `plugin:<id>`
                 // settings sections may have too.
                 self.rebuild_fields();
-                let changes =
-                    plugin_enabled_changes(self.baseline_global.get("plugins"), &now_plugins);
-                if !changes.is_empty() {
-                    crate::plugin::install::nudge_daemon_enabled(changes);
+                if !accepted_toggles.is_empty() {
+                    crate::plugin::install::nudge_daemon_enabled(accepted_toggles);
                 }
             }
         }
 
         // The just-written state is the new clean baseline.
         self.snapshot_baseline();
-        self.success_message = Some("Settings saved".to_string());
-        self.success_message_expires_at = Some(std::time::Instant::now() + SUCCESS_MESSAGE_TTL);
+        if consent_pending || crate::tui::telemetry::consent_in_flight() {
+            // Held until the Daemon answers; see `consent_saved` and `consent_not_saved`.
+            self.success_message = Some("Saving telemetry setting…".to_string());
+            self.success_message_expires_at = None;
+        } else {
+            self.consent_saved();
+        }
         self.error_message = None;
         Ok(())
     }
@@ -1066,11 +1167,52 @@ impl SettingsView {
     }
 }
 
-/// Ids whose `enabled` flag differs between two serialized `config.plugins`
-/// subtrees, with the flag's new value. An absent entry (or an id missing
-/// entirely) counts as enabled, the config default. Drives the best-effort
-/// daemon worker nudge after a settings save, which writes `config.plugins`
-/// wholesale rather than toggling one id at a time.
+fn same_plugin_lifecycle(
+    base: &crate::session::PluginConfig,
+    current: &crate::session::PluginConfig,
+) -> bool {
+    current.source == base.source && current.dev == base.dev && current.grant == base.grant
+}
+
+/// Merge only settings-owned plugin leaves. Source, dev and the complete
+/// grant are conservative identity evidence, not an unconditional ABA token.
+fn merge_staged_plugins(
+    baseline: &std::collections::BTreeMap<String, crate::session::PluginConfig>,
+    staged: &std::collections::BTreeMap<String, crate::session::PluginConfig>,
+    mut fresh: std::collections::BTreeMap<String, crate::session::PluginConfig>,
+) -> std::collections::BTreeMap<String, crate::session::PluginConfig> {
+    for (id, edited) in staged {
+        let default = crate::session::PluginConfig::default();
+        let base = baseline.get(id).unwrap_or(&default);
+        if edited.enabled == base.enabled && edited.settings == base.settings {
+            continue;
+        }
+        let builtin = crate::plugin::registry::is_builtin_id(id);
+        if !builtin {
+            let Some(current) = fresh.get(id) else {
+                continue;
+            };
+            if !baseline.contains_key(id) || !same_plugin_lifecycle(base, current) {
+                continue;
+            }
+        }
+        let current = fresh.entry(id.clone()).or_default();
+        if edited.enabled != base.enabled {
+            current.enabled = edited.enabled;
+        }
+        let mut settings =
+            serde_json::to_value(&current.settings).expect("TOML settings serialize");
+        crate::session::config::settings_schema::apply_changed_leaves(
+            &mut settings,
+            &serde_json::to_value(&base.settings).expect("TOML settings serialize"),
+            &serde_json::to_value(&edited.settings).expect("TOML settings serialize"),
+        );
+        current.settings = serde_json::from_value(settings).expect("merged TOML settings");
+    }
+    fresh
+}
+
+/// Report accepted enabled changes; removal is not an implicit enable.
 fn plugin_enabled_changes(
     before: Option<&serde_json::Value>,
     after: &Option<serde_json::Value>,
@@ -1094,12 +1236,6 @@ fn plugin_enabled_changes(
     for (id, enabled) in &new {
         if old.get(id).copied().unwrap_or(true) != *enabled {
             changes.push((id.clone(), *enabled));
-        }
-    }
-    // An id dropped from the map reverts to the default (enabled).
-    for (id, was_enabled) in &old {
-        if !new.contains_key(id) && !*was_enabled {
-            changes.push((id.clone(), true));
         }
     }
     changes
@@ -1141,7 +1277,7 @@ mod plugin_enabled_changes_tests {
             (
                 Some(json!({ "gone": { "enabled": false } })),
                 json!({}),
-                vec![("gone", true)],
+                vec![],
             ),
         ];
         for (before, after, want) in cases {
@@ -1209,6 +1345,59 @@ pub(super) mod test_util {
 }
 
 #[cfg(test)]
+mod loaded_value_tests {
+    use super::*;
+    use crate::session::Storage;
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    /// A breakpoint hand-written below the renderer's floor still loads and
+    /// saves: the renderer raises it to 50, so the schema accepts it instead of
+    /// blocking the save of every field on the tab.
+    #[test]
+    #[serial]
+    fn a_narrow_breakpoint_below_the_floor_does_not_block_an_unrelated_save() {
+        let temp = TempDir::new().unwrap();
+        let home = crate::session::test_support::isolate_home(temp.path());
+        let _ = Storage::new_unwatched("test").unwrap();
+        update_config(|config| config.session.narrow_breakpoint = 40).unwrap();
+
+        let mut view = SettingsView::new("test", None).unwrap();
+        view.scope = SettingsScope::Global;
+        view.rebuild_categories_for_scope();
+        view.selected_category = view
+            .categories
+            .iter()
+            .position(|row| row.as_tab() == Some(SettingsCategory::Session))
+            .expect("the Session tab is visible for the global scope");
+        view.rebuild_fields();
+        assert!(
+            view.fields
+                .iter()
+                .any(|field| field.label == "Narrow layout below this width"),
+            "the Session tab carries the breakpoint field"
+        );
+
+        // An unrelated edit on the same tab, as the reported flow had it.
+        view.global_config.session.snooze_duration_minutes = 17;
+        view.recompute_dirty();
+        view.save().unwrap();
+
+        assert_eq!(
+            view.error_message, None,
+            "a loaded 40 must not block the save"
+        );
+        let on_disk = Config::load().unwrap();
+        assert_eq!(on_disk.session.snooze_duration_minutes, 17);
+        assert_eq!(
+            on_disk.session.narrow_breakpoint, 40,
+            "the value the user wrote is kept as written"
+        );
+        drop(home);
+    }
+}
+
+#[cfg(test)]
 mod dirty_tracking_tests {
     use super::*;
     use crate::session::Storage;
@@ -1227,6 +1416,47 @@ mod dirty_tracking_tests {
         let _ = Storage::new_unwatched("test").unwrap();
         let view = SettingsView::new("test", None).unwrap();
         (home, temp, view)
+    }
+
+    /// A telemetry toggle the Daemon refused goes back to the saved value, with the error
+    /// shown, and leaves other unsaved edits flagged.
+    #[test]
+    #[serial]
+    fn an_unsaved_consent_change_restores_the_toggle() {
+        let (_home, _temp, mut view) = fresh_view();
+        view.global_config.telemetry.enabled = true;
+        view.save().unwrap();
+        assert_eq!(
+            view.success_message.as_deref(),
+            Some("Saving telemetry setting…"),
+            "a consent change is not reported saved before the Daemon answers"
+        );
+        assert!(view.success_message_expires_at.is_none());
+        // A view reopened before the Daemon answers read the old value.
+        let mut reopened = SettingsView::new("test", None).unwrap();
+        assert!(!reopened.global_config.telemetry.enabled);
+        crate::session::update_config(|c| c.telemetry.enabled = true).unwrap();
+        view.consent_saved();
+        assert_eq!(view.success_message.as_deref(), Some("Settings saved"));
+        assert!(view.global_config.telemetry.enabled);
+        reopened.consent_saved();
+        assert!(reopened.global_config.telemetry.enabled);
+        assert!(!reopened.has_changes);
+
+        crate::session::update_config(|c| c.telemetry.enabled = false).unwrap();
+
+        view.consent_not_saved("Telemetry setting not saved: read-only".into());
+        assert!(!view.global_config.telemetry.enabled);
+        assert!(!view.has_changes);
+        assert_eq!(view.success_message, None);
+        assert_eq!(
+            view.error_message.as_deref(),
+            Some("Telemetry setting not saved: read-only")
+        );
+
+        view.global_config.default_profile = "other".into();
+        view.consent_not_saved("again".into());
+        assert!(view.has_changes, "an unrelated edit stays unsaved");
     }
 
     /// The unsaved-changes flag is diff-based, not a one-way latch, and a
@@ -1326,6 +1556,18 @@ mod dirty_tracking_tests {
     fn resync_after_plugin_mutation_preserves_staged_edits() {
         let (_home, _temp, mut view) = fresh_view();
         view.scope = SettingsScope::Global;
+        update_config(|c| {
+            let a = c.plugins.entry("a".into()).or_default();
+            a.source = Some("/fixture/a".into());
+            a.grant = Some(crate::session::CapabilityGrant {
+                manifest_hash: "sha256:abc".into(),
+                capabilities: vec!["net".into()],
+                granted_at: crate::time::Timestamp::now(),
+            });
+        })
+        .unwrap();
+        view.global_config = Config::load().unwrap();
+        view.snapshot_baseline();
 
         view.global_config
             .plugins
@@ -1335,14 +1577,10 @@ mod dirty_tracking_tests {
         view.recompute_dirty();
         assert!(view.has_changes);
 
-        // A lifecycle operation grants "a" and installs "b" on disk.
+        // A lifecycle operation dismisses an update for "a" and installs "b".
         crate::session::config::update_config(|c| {
             let a = c.plugins.entry("a".to_string()).or_default();
-            a.grant = Some(crate::session::CapabilityGrant {
-                manifest_hash: "sha256:abc".to_string(),
-                capabilities: vec!["net".to_string()],
-                granted_at: chrono::Utc::now(),
-            });
+            a.dismissed_update = Some("fresh-fingerprint".into());
             c.plugins.entry("b".to_string()).or_default().enabled = true;
         })
         .unwrap();
@@ -1351,6 +1589,7 @@ mod dirty_tracking_tests {
 
         let a = view.global_config.plugins.get("a").expect("a survives");
         assert!(!a.enabled, "the staged toggle must survive the resync");
+        assert_eq!(a.dismissed_update.as_deref(), Some("fresh-fingerprint"));
         assert!(
             a.grant.is_some(),
             "the lifecycle-written grant must win over the staged copy"
@@ -1360,6 +1599,248 @@ mod dirty_tracking_tests {
             "the disk-side install must appear in the staged view"
         );
         assert!(view.has_changes, "the staged toggle keeps the view dirty");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn plugin_resync_invalidates_affected_editors_and_rebinds_unrelated_fields() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        for editor in ["text", "list", "unrelated"] {
+            for mutation in ["replacement", "removal", "field-disappearance", "unchanged"] {
+                let (_home, _temp, mut view) = fresh_view();
+                let source = tempfile::tempdir().unwrap();
+                let manifest = "id = \"acme.editor\"\nname = \"Editor\"\nversion = \"1.0.0\"\napi_version = 14\n[[settings]]\nkey = \"text\"\nlabel = \"Text\"\ntype = \"string\"\ndefault = \"old\"\n[[settings]]\nkey = \"items\"\nlabel = \"Items\"\ntype = \"string_list\"\ndefault = []\n";
+                std::fs::write(source.path().join("aoe-plugin.toml"), manifest).unwrap();
+                crate::plugin::install::install(source.path().to_str().unwrap(), true, false)
+                    .await
+                    .unwrap();
+                view.scope = SettingsScope::Global;
+                view.global_config = Config::load().unwrap();
+                view.snapshot_baseline();
+                view.plugin_manager = crate::tui::dialogs::PluginManagerDialog::embedded();
+                let category = if editor == "unrelated" {
+                    SettingsCategory::Worktree
+                } else {
+                    SettingsCategory::Plugins
+                };
+                view.selected_category = view
+                    .categories
+                    .iter()
+                    .position(|row| row.as_tab() == Some(category))
+                    .unwrap();
+                view.focus = SettingsFocus::Fields;
+                view.plugins_fields_focus = true;
+                let identity = match editor {
+                    "text" => "plugin:acme.editor.text",
+                    "list" => "plugin:acme.editor.items",
+                    _ => "worktree.path_template",
+                };
+                if editor != "unrelated" {
+                    // The field list shows only the plugin under the manager's
+                    // cursor, and registry row order is not ours to assume: the
+                    // `aoe.web` builtin is compiled in only under `web`, and
+                    // there it holds row 0. Select the fixture's row the way a
+                    // settings search jump does.
+                    assert!(view.plugin_manager.select_plugin_owning_ident(identity));
+                }
+                view.rebuild_fields();
+                // Preserve an editor across a change in field order, not just a reload.
+                if mutation == "unchanged" || editor == "unrelated" {
+                    view.fields.rotate_left(1);
+                }
+                view.selected_field = view
+                    .fields
+                    .iter()
+                    .position(|field| field.ident() == identity)
+                    .unwrap();
+                let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+                view.handle_key(key(KeyCode::Enter));
+                if editor == "list" {
+                    view.handle_key(key(KeyCode::Char('a')));
+                }
+                view.handle_key(key(KeyCode::Char('z')));
+                match mutation {
+                    "replacement" => {
+                        crate::plugin::install::uninstall("acme.editor").unwrap();
+                        crate::plugin::install::install(
+                            source.path().to_str().unwrap(),
+                            true,
+                            false,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    "removal" => crate::plugin::install::uninstall("acme.editor").unwrap(),
+                    "field-disappearance" => {
+                        std::fs::write(crate::plugin::plugins_dir().unwrap().join("acme.editor/aoe-plugin.toml"),
+                            "id = \"acme.editor\"\nname = \"Editor\"\nversion = \"1.0.0\"\napi_version = 14\n").unwrap();
+                        crate::plugin::reload_registry();
+                    }
+                    _ => {
+                        update_config(|config| {
+                            config
+                                .plugins
+                                .get_mut("acme.editor")
+                                .unwrap()
+                                .dismissed_update = Some("new notice".into())
+                        })
+                        .unwrap();
+                    }
+                }
+                view.resync_after_plugin_mutation();
+                let retained = editor == "unrelated" || mutation == "unchanged";
+                assert_eq!(
+                    view.editing_input.is_some() || view.list_edit_state.is_some(),
+                    retained,
+                    "{editor}/{mutation}"
+                );
+                if retained {
+                    assert_eq!(view.fields[view.selected_field].ident(), identity);
+                    view.handle_key(key(KeyCode::Enter));
+                    if editor == "unrelated" {
+                        assert!(view.global_config.worktree.path_template.ends_with('z'));
+                    } else if editor == "text" {
+                        assert_eq!(
+                            view.global_config.plugins["acme.editor"].settings["text"].as_str(),
+                            Some("oldz")
+                        );
+                    } else {
+                        assert_eq!(
+                            view.global_config.plugins["acme.editor"].settings["items"]
+                                .as_array()
+                                .unwrap()[0]
+                                .as_str(),
+                            Some("z")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn settings_save_and_resync_discard_removed_or_replaced_plugins() {
+        for resync in [false, true] {
+            for reinstall in [false, true] {
+                let (_home, _temp, mut view) = fresh_view();
+                let _reload = crate::plugin::ReloadRegistryOnDrop;
+                let source = tempfile::tempdir().unwrap();
+                std::fs::write(source.path().join("aoe-plugin.toml"),
+                    "id = \"acme.settings-race\"\nname = \"Settings race\"\nversion = \"1.0.0\"\napi_version = 2\n").unwrap();
+                let input = source.path().to_str().unwrap();
+                crate::plugin::install::install(input, true, false)
+                    .await
+                    .unwrap();
+                view.scope = SettingsScope::Global;
+                view.global_config = Config::load().unwrap();
+                view.snapshot_baseline();
+                let original = view.global_config.plugins["acme.settings-race"].clone();
+                let staged = view
+                    .global_config
+                    .plugins
+                    .get_mut("acme.settings-race")
+                    .unwrap();
+                staged.enabled = false;
+                staged
+                    .settings
+                    .insert("stale".into(), toml::Value::Boolean(true));
+                view.global_config.default_profile = "unrelated-staged-edit".into();
+                view.recompute_dirty();
+                crate::plugin::install::uninstall("acme.settings-race").unwrap();
+                assert!(!Config::load()
+                    .unwrap()
+                    .plugins
+                    .contains_key("acme.settings-race"));
+                if reinstall {
+                    crate::plugin::install::install(input, true, false)
+                        .await
+                        .unwrap();
+                    assert_ne!(
+                        serde_json::to_value(original.grant).unwrap(),
+                        serde_json::to_value(
+                            &Config::load().unwrap().plugins["acme.settings-race"].grant
+                        )
+                        .unwrap()
+                    );
+                }
+                let fresh = Config::load().unwrap().plugins;
+                if resync {
+                    view.resync_after_plugin_mutation();
+                    assert_eq!(
+                        serde_json::to_value(&view.global_config.plugins).unwrap(),
+                        serde_json::to_value(&fresh).unwrap()
+                    );
+                    assert!(view.has_changes, "unrelated edit stays staged");
+                }
+                view.save().unwrap();
+                let persisted = Config::load().unwrap();
+                assert_eq!(persisted.default_profile, "unrelated-staged-edit");
+                assert_eq!(
+                    serde_json::to_value(&persisted.plugins).unwrap(),
+                    serde_json::to_value(&fresh).unwrap()
+                );
+                assert_eq!(
+                    serde_json::to_value(&view.global_config.plugins).unwrap(),
+                    serde_json::to_value(&fresh).unwrap()
+                );
+                assert!(!view.has_changes);
+                assert_eq!(
+                    crate::plugin::plugins_dir()
+                        .unwrap()
+                        .join("acme.settings-race")
+                        .exists(),
+                    reinstall
+                );
+                assert_eq!(
+                    crate::plugin::lockfile::Lockfile::load()
+                        .unwrap()
+                        .get("acme.settings-race")
+                        .is_some(),
+                    reinstall
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn settings_busy_refusal_preserves_staging_and_builtin_first_toggle() {
+        let (_home, _temp, mut view) = fresh_view();
+        view.scope = SettingsScope::Global;
+        // A pending plugin edit must not be silently lost on busy refusal,
+        // even when fresh lifecycle identity will later discard that edit.
+        view.global_config
+            .plugins
+            .entry("acme.staged".into())
+            .or_default()
+            .enabled = false;
+        view.global_config.default_profile = "pending".into();
+        view.recompute_dirty();
+        let lease = crate::plugin::install::begin_operation().unwrap();
+        assert!(view
+            .save()
+            .unwrap_err()
+            .to_string()
+            .contains("another plugin operation"));
+        assert!(!view.global_config.plugins["acme.staged"].enabled);
+        assert!(view.has_changes);
+        drop(lease);
+        for builtin in crate::plugin::registry::BUILTINS {
+            let manifest =
+                aoe_plugin_api::PluginManifest::from_toml_str(builtin.manifest_toml).unwrap();
+            let id = manifest.id.as_str().to_owned();
+            view.global_config.plugins.clear();
+            view.snapshot_baseline();
+            view.global_config
+                .plugins
+                .entry(id.clone())
+                .or_default()
+                .enabled = false;
+            view.save().unwrap();
+            assert!(!Config::load().unwrap().plugins[&id].enabled);
+        }
     }
 
     /// The Plugins tab is Global-only, so `]` from either sub-pane switches
@@ -1395,37 +1876,6 @@ mod dirty_tracking_tests {
                 "the Global-only Plugins tab falls back to another tab in Profile scope"
             );
         }
-    }
-
-    /// A staged entry that was never in the baseline survives a resync: no
-    /// lifecycle operation can have removed it.
-    #[test]
-    #[serial]
-    fn resync_keeps_staged_entry_for_plugin_absent_from_disk() {
-        let (_home, _temp, mut view) = fresh_view();
-        view.scope = SettingsScope::Global;
-        view.global_config
-            .plugins
-            .entry("aoe.web".to_string())
-            .or_default()
-            .enabled = false;
-
-        crate::session::config::update_config(|c| {
-            c.plugins.entry("other".to_string()).or_default().enabled = false;
-        })
-        .unwrap();
-
-        view.resync_after_plugin_mutation();
-
-        assert!(
-            !view
-                .global_config
-                .plugins
-                .get("aoe.web")
-                .expect("staged entry kept")
-                .enabled,
-            "a purely user-staged entry must survive the resync"
-        );
     }
 }
 

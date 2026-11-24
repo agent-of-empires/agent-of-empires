@@ -82,7 +82,16 @@ fn test_serve_refuses_when_web_plugin_disabled() {
     let disable = h.run_cli(&["plugin", "disable", "aoe.web"]);
     assert!(disable.status.success(), "disable aoe.web failed");
 
-    let refused = h.run_cli(&["serve", "--daemon", "--port", &free_port, "--no-auth"]);
+    let refused = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &free_port,
+        "--no-auth",
+        "--behind-proxy",
+        "--allowed-host",
+        "127.0.0.1",
+    ]);
     assert!(
         !refused.status.success(),
         "serve must refuse while aoe.web is disabled"
@@ -98,7 +107,16 @@ fn test_serve_refuses_when_web_plugin_disabled() {
     // The disable auto-started a Daemon; stop it so the explicit start below binds its own port.
     assert!(h.run_cli(&["serve", "--stop"]).status.success());
 
-    let started = h.run_cli(&["serve", "--daemon", "--port", &free_port, "--no-auth"]);
+    let started = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &free_port,
+        "--no-auth",
+        "--behind-proxy",
+        "--allowed-host",
+        "127.0.0.1",
+    ]);
     assert!(
         started.status.success(),
         "serve must start once aoe.web is enabled:\n{}",
@@ -347,4 +365,57 @@ capabilities = ["net"]
     h.send_keys("y");
     h.wait_for("Uninstalled acme.tui");
     h.wait_for_absent("Tui Test", std::time::Duration::from_secs(5));
+}
+
+/// An explicit update of an unchanged local source repairs a damaged
+/// installation instead of reporting "no update", and no staging directory
+/// survives a successful install.
+///
+/// The CLI routes both calls through the daemon; the repair is driven by the
+/// fingerprint the `NoUpdate` preview carries.
+#[test]
+#[parallel]
+fn test_plugin_cli_update_repairs_damaged_install_and_cleans_staging() {
+    let mut h = TuiTestHarness::new_in_tmp("plugin_cli_update_repair");
+    h.stop_daemon_on_drop();
+
+    let src = h.home_path().join("src-repair");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("aoe-plugin.toml"),
+        r#"
+id = "acme.repair"
+name = "Repair Test"
+version = "0.1.0"
+api_version = 2
+"#,
+    )
+    .unwrap();
+    std::fs::write(src.join("worker.js"), b"original worker bytes").unwrap();
+
+    h.run_cli_ok(&["plugin", "install", src.to_str().unwrap(), "--yes"]);
+    let plugins = crate::harness::app_dir_in(h.home_path()).join("plugins");
+    let installed = plugins.join("acme.repair");
+    assert!(installed.join("worker.js").is_file());
+    let staging: Vec<_> = std::fs::read_dir(&plugins)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".staging-"))
+        .collect();
+    assert!(
+        staging.is_empty(),
+        "successful install left staging dirs: {staging:?}"
+    );
+
+    std::fs::remove_file(installed.join("worker.js")).unwrap();
+    let output = h.run_cli_ok(&["plugin", "update", "acme.repair", "--yes"]);
+    assert!(
+        output.contains("succeeded."),
+        "repair job did not report success:\n{output}"
+    );
+    assert_eq!(
+        std::fs::read(installed.join("worker.js")).unwrap(),
+        b"original worker bytes"
+    );
 }

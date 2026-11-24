@@ -38,6 +38,11 @@ use crate::acp::runner_lifecycle::{Lease, ProcessControl, RunnerIdentity, Settle
 use crate::acp::state::{AcpSessionId, Event};
 use crate::process::worker_registry::{self, WorkerRecord};
 
+pub(crate) struct AgentKeyGate {
+    pub(crate) before_read: Arc<tokio::sync::Barrier>,
+    pub(crate) after_read: Arc<tokio::sync::Barrier>,
+}
+
 impl<S: BroadcastSink> Supervisor<S> {
     /// Pause only the exact installed worker's next dequeue, never publication alone.
     pub(crate) async fn test_pause_drain(
@@ -94,6 +99,14 @@ impl<S: BroadcastSink> Supervisor<S> {
         lock_recover(&self.lifecycle)
             .admit(session_id, ResumeKind::Spawn)
             .expect("admit")
+    }
+
+    pub(crate) fn test_gate_prompt_publish(&self, gate: Arc<tokio::sync::Barrier>) {
+        *self.prompt_publish_gate.lock().unwrap() = Some(gate);
+    }
+
+    pub(crate) fn test_gate_agent_key(&self, gate: AgentKeyGate) {
+        *self.agent_key_gate.lock().unwrap() = Some(gate);
     }
 
     /// End a teardown `test_hold_stopping` left open.
@@ -594,6 +607,7 @@ pub(crate) fn spawn_request(session_id: &str) -> SpawnRequest {
         seed_history_replay: false,
         prior_conversation: false,
         sandbox_info: None,
+        workspace_info: None,
         source_profile: None,
         yolo_mode: false,
         acp_mode_id: None,
@@ -632,6 +646,7 @@ pub(super) fn runner_config(socket_path: PathBuf) -> SpawnConfig {
         prior_conversation: false,
         artifact_dir: None,
         sandbox_info: None,
+        workspace_info: None,
         source_profile: None,
         mcp_servers: Vec::new(),
         generation: 0,
@@ -654,6 +669,26 @@ pub(super) fn worker_record(session_id: &str, pid: u32, socket: PathBuf) -> Work
         None,
         None,
     )
+}
+
+/// Record `agent` as the session's runner. A live record keeps its control socket bound for as
+/// long as the returned listener lives; a dead one has no socket, as after an unclean death.
+pub(crate) fn save_agent_record(
+    session_id: &str,
+    agent: &str,
+    live: bool,
+) -> Option<std::os::unix::net::UnixListener> {
+    let socket = worker_registry::socket_path_for(session_id).unwrap();
+    let mut record = worker_record(session_id, std::process::id(), socket.clone());
+    record.agent_name = agent.into();
+    record.agent_key = agent.into();
+    worker_registry::save(&record).unwrap();
+    live.then(|| {
+        std::os::unix::net::UnixListener::bind(crate::process::worker::control_socket_sibling(
+            &socket,
+        ))
+        .unwrap()
+    })
 }
 
 pub(crate) fn save_record(session_id: &str, pid: u32, generation: u64) {

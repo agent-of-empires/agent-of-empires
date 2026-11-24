@@ -3,6 +3,7 @@
 // alignment, the settings header, and the desktop-only toolbar gate.
 
 import { test, expect } from "./helpers/mockedTest";
+import { openPanelsByDefault } from "./helpers/apiMocks";
 import type { Page } from "@playwright/test";
 import { mockTerminalApis, type MockHandle } from "./helpers/terminal-mocks";
 import { iPhone13 } from "./helpers/viewports";
@@ -209,7 +210,9 @@ test.describe("Desktop right panel split is unchanged (#1452)", () => {
   // The mobile touch toolbar is gated on (pointer: coarse) in useMobileKeyboard,
   // which never matches a desktop project even with a session open.
   test("renders the side-by-side split and no mobile picker or touch toolbar", async ({ page }) => {
-    await openLiveTerminal(page, { settings: null });
+    const handle = await mockTerminalApis(page);
+    await openPanelsByDefault(page);
+    await openLiveSession(page, handle, { settings: null });
     await expect(page).toHaveURL(/\/session\/pinch-test/, { timeout: 10_000 });
 
     await expect(page.getByTestId("content-split-resize-handle")).toBeVisible();

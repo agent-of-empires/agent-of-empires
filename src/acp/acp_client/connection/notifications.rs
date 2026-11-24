@@ -46,7 +46,7 @@ use crate::acp::acp_client::watchdog::classify_watchdog_notification_signals;
 use crate::acp::acp_client::SessionState;
 
 pub(super) fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
+    crate::time::Timestamp::now().as_millis()
 }
 
 pub(super) struct Shared {
@@ -535,7 +535,10 @@ impl Shared {
                             &state.terminal_claim,
                             |evidence| {
                                 ingress
-                                    .take_original_rate_limit_reset(evidence, chrono::Utc::now())
+                                    .take_original_rate_limit_reset(
+                                        evidence,
+                                        crate::time::Timestamp::now(),
+                                    )
                                     .map(|captured| (captured.window, captured.resets_at))
                             },
                             publication,

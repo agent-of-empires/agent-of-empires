@@ -24,7 +24,7 @@ import type {
   ImportableSession,
   SettingsFieldDescriptor,
 } from "./types";
-import type { ConfigOptionDescriptor } from "./acpTypes";
+import type { AcpAttachment, ConfigOptionDescriptor, PromptAttachmentInput } from "./acpTypes";
 import { clearDeviceBindingSecret, getOrCreateDeviceBindingSecret } from "./deviceBinding";
 import { INLINE_ELEVATION_HEADER } from "./fetchInterceptor";
 
@@ -375,7 +375,7 @@ export async function ensureTerminal(
   }
 }
 
-function fileToBase64(file: File): Promise<string> {
+function fileToBase64(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onerror = () => reject(reader.error ?? new Error("read failed"));
@@ -385,8 +385,20 @@ function fileToBase64(file: File): Promise<string> {
       const comma = result.indexOf(",");
       resolve(comma >= 0 ? result.slice(comma + 1) : result);
     };
-    reader.readAsDataURL(file);
+    reader.readAsDataURL(blob);
   });
+}
+
+/** Reads a sent prompt's stored attachment back as an upload, or null when it is gone. */
+export async function loadStoredAttachment(a: AcpAttachment): Promise<PromptAttachmentInput | null> {
+  try {
+    const res = await fetch(a.url);
+    if (!res.ok) return null;
+    const dataB64 = await fileToBase64(await res.blob());
+    return { kind: a.kind, mimeType: a.mimeType, ...(a.name ? { name: a.name } : {}), dataB64 };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -845,6 +857,7 @@ export interface PluginAgentLaunch {
   container_env?: Record<string, string>;
   install_hint?: string;
   host_only?: boolean;
+  send_keys_enter_delay_ms?: number;
   resume?:
     | { kind: "flag"; flag: string }
     | { kind: "flag_pair"; existing: string; new_session: string }
@@ -1024,6 +1037,7 @@ export interface PluginJob {
     finished_at: number | null;
   };
   log: {
+    path: string;
     exists: boolean;
     tail: string;
     lines_returned: number;
@@ -1146,8 +1160,8 @@ export function fetchPluginSessions(pluginId: string): Promise<{ sessions: Recor
 
 /** The host's aggregated UI-state snapshot. Returns an empty state (not null)
  *  shape on the server when no plugin host is running. */
-export function fetchPluginUiState(): Promise<PluginUiState | null> {
-  return fetchJson<PluginUiState>("/api/plugins/ui-state");
+export function fetchPluginUiState(init?: RequestInit): Promise<PluginUiState | null> {
+  return fetchJson<PluginUiState>("/api/plugins/ui-state", init);
 }
 
 /** Lets the next frame load of a page's `url` authenticate when device binding is on; the ticket rides an HttpOnly cookie. */
@@ -1641,8 +1655,8 @@ export interface UpdateStatus {
   update_command?: string;
 }
 
-export function fetchUpdateStatus(): Promise<UpdateStatus | null> {
-  return fetchJson<UpdateStatus>("/api/system/update-status");
+export function fetchUpdateStatus(init?: RequestInit): Promise<UpdateStatus | null> {
+  return fetchJson<UpdateStatus>("/api/system/update-status", init);
 }
 
 /** Persist that the update banner was dismissed for `version`, server-side, so
@@ -1685,10 +1699,11 @@ export type SandboxImageStatus = SandboxImageState & {
  *  offline. `fresh` skips the Daemon's cache. */
 export async function fetchSandboxImageStatus(
   image?: string,
-  opts: { fresh?: boolean } = {},
+  opts: { fresh?: boolean; profile?: string } = {},
 ): Promise<SandboxImageStatus | { error: string } | null> {
   const query = new URLSearchParams();
   if (image) query.set("image", image);
+  if (opts.profile) query.set("profile", opts.profile);
   if (opts.fresh) query.set("fresh", "true");
   const qs = query.toString();
   const reply = await send(`/api/sandbox/image-status${qs ? `?${qs}` : ""}`).catch(() => null);
@@ -1947,7 +1962,8 @@ const stringList = (value: unknown) => (Array.isArray(value) ? value : []);
 /** Enqueue a prompt server-side (POST /queue). `id` is the client-minted stable
  *  id so an optimistic row reconciles against the returned entry; re-posting the
  *  same id updates it in place rather than duplicating. Returns the stored entry
- *  (with its assigned `seq`) or null on non-2xx. */
+ *  (with its assigned `seq`), `{ id, delivered: true }` when the daemon already
+ *  delivered that id (nothing is queued), or null on non-2xx. */
 export async function enqueueServerPrompt(
   sessionId: string,
   prompt: {
@@ -1956,29 +1972,32 @@ export async function enqueueServerPrompt(
     originDevice?: string;
     attachments?: QueueAttachmentUpload[];
   },
-): Promise<ServerQueuedPrompt | null> {
-  return fetchJson<ServerQueuedPrompt>(
+): Promise<ServerQueuedPrompt | { id: string; delivered: true } | null> {
+  return fetchJson<ServerQueuedPrompt | { id: string; delivered: true }>(
     queuePath(sessionId),
-    jsonInit("POST", {
-      id: prompt.id,
-      text: prompt.text,
-      origin_device: prompt.originDevice,
-      attachments: (prompt.attachments ?? []).map((a) => ({
-        kind: a.kind,
-        mime_type: a.mimeType,
-        data: a.dataB64,
-        name: a.name,
-      })),
-    }),
+    jsonInit(
+      "POST",
+      {
+        id: prompt.id,
+        text: prompt.text,
+        origin_device: prompt.originDevice,
+        attachments: (prompt.attachments ?? []).map((a) => ({
+          kind: a.kind,
+          mime_type: a.mimeType,
+          data: a.dataB64,
+          name: a.name,
+        })),
+      },
+      { "X-Aoe-Prompt-Origin": "dashboard" },
+    ),
   );
 }
 
-/** The session's server queue, ordered by `seq` (GET /queue). Always returns an
- *  array: a non-array body (error page, unexpected shape) yields `[]` so callers
- *  can `.map` without guarding. */
-export async function listServerQueue(sessionId: string): Promise<ServerQueuedPrompt[]> {
+/** The session's server queue, ordered by `seq` (GET /queue), or `null` when the request fails or
+ *  the body isn't an array, so a failure is never mistaken for an empty queue. */
+export async function listServerQueue(sessionId: string): Promise<ServerQueuedPrompt[] | null> {
   const rows = await fetchJson<ServerQueuedPrompt[]>(queuePath(sessionId));
-  return Array.isArray(rows) ? rows : [];
+  return Array.isArray(rows) ? rows : null;
 }
 
 /** Replace a queued prompt's text (PATCH /queue/{id}). */
@@ -3164,6 +3183,24 @@ export async function startSession(id: string): Promise<StartSessionResult> {
 export async function setSessionSnooze(id: string, minutes: number | null): Promise<SessionResponse | null> {
   try {
     return await sessionUpdate(id, "snooze", jsonInit("PATCH", { minutes }));
+  } catch {
+    return null;
+  }
+}
+
+/** Ignore or unignore a session managed by another session. The row stays present and live. */
+export async function setSessionIgnored(id: string, ignored: boolean): Promise<SessionResponse | null> {
+  try {
+    return await sessionUpdate(id, "ignored", jsonInit("PATCH", { ignored }));
+  } catch {
+    return null;
+  }
+}
+
+/** Take ownership back from a managing session: clears its manager link and ignore marker. */
+export async function reclaimSessionOwnership(id: string): Promise<SessionResponse | null> {
+  try {
+    return await sessionUpdate(id, "reclaim-ownership", jsonInit("POST", { reclaim: true }));
   } catch {
     return null;
   }

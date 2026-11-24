@@ -575,7 +575,7 @@ impl EventStore {
         );
         let json = Self::encode_event(event)
             .with_context(|| format!("serialise event for {session_id}@{seq}"))?;
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = crate::time::Timestamp::now().as_millis();
         let recorded = self.append_controlled(session_id, seq, event, metadata, now_ms, |tx| {
             if let Some(recorded) =
                 Self::record_autonomous_result(tx, session_id, seq, &json, now_ms, metadata)?
@@ -1073,7 +1073,7 @@ pub(super) mod test_support {
             name: "Bash".into(),
             kind: "execute".into(),
             args_preview: "ls".into(),
-            started_at: chrono::Utc::now(),
+            started_at: crate::time::Timestamp::now(),
             parent_tool_call_id: None,
             memory_recall: None,
             diffs: Vec::new(),

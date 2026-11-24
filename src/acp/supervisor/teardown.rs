@@ -38,7 +38,7 @@ struct StopFence<'a> {
         &'a worker_registry::StopIntent,
         &'a worker_registry::WorkerRecord,
     )>,
-    dormancy_stamp: Option<chrono::DateTime<chrono::Utc>>,
+    dormancy_stamp: Option<crate::time::Timestamp>,
     admissions: Option<u64>,
 }
 
@@ -1257,7 +1257,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         observed: (&Lease, u64),
         activity_seq: u64,
-        stamp: chrono::DateTime<chrono::Utc>,
+        stamp: crate::time::Timestamp,
     ) -> Result<IdleRetirement, SupervisorError> {
         self.accept_stop(
             session_id,
@@ -2739,7 +2739,7 @@ mod tests {
             sup.publish_next(
                 id,
                 Event::CancelRequested {
-                    escalates_at: chrono::Utc::now(),
+                    escalates_at: crate::time::Timestamp::now(),
                 },
             );
             sup.publish_next(
@@ -2761,7 +2761,7 @@ mod tests {
                     prompt: "work".into(),
                     model: "test-model".into(),
                     output_file: String::new(),
-                    started_at: chrono::Utc::now(),
+                    started_at: crate::time::Timestamp::now(),
                     workflow: None,
                 },
             );
@@ -2902,7 +2902,7 @@ mod tests {
         p.sup.publish_next(
             id,
             Event::CancelRequested {
-                escalates_at: chrono::Utc::now(),
+                escalates_at: crate::time::Timestamp::now(),
             },
         );
         p.sup.publish_next(
@@ -2914,7 +2914,7 @@ mod tests {
                 prompt: "work".into(),
                 model: "test-model".into(),
                 output_file: String::new(),
-                started_at: chrono::Utc::now(),
+                started_at: crate::time::Timestamp::now(),
                 workflow: None,
             },
         );
@@ -3503,7 +3503,7 @@ mod tests {
                     prompt: "do it".into(),
                     model: "claude-opus-4-8".into(),
                     output_file: "/tmp/bg-real.output".into(),
-                    started_at: chrono::Utc::now(),
+                    started_at: crate::time::Timestamp::now(),
                     workflow: None,
                 },
                 &crate::acp::event_sender::EventMetadata::history(),
@@ -3578,7 +3578,7 @@ mod tests {
                     prompt: "do it".into(),
                     model: "claude-opus-4-8".into(),
                     output_file: String::new(),
-                    started_at: chrono::Utc::now(),
+                    started_at: crate::time::Timestamp::now(),
                     workflow: None,
                 },
                 &crate::acp::event_sender::EventMetadata::history(),
@@ -3603,7 +3603,7 @@ mod tests {
                         model: None,
                         background: true,
                     },
-                    at: chrono::Utc::now(),
+                    at: crate::time::Timestamp::now(),
                 },
                 &crate::acp::event_sender::EventMetadata::history(),
             )
@@ -3732,7 +3732,7 @@ mod tests {
         row.source_profile = "default".into();
         row.view = crate::session::View::Structured;
         row.status = crate::session::Status::Idle;
-        let stamp = chrono::Utc::now();
+        let stamp = crate::time::Timestamp::now();
         row.idle_dormant_since = Some(stamp);
         crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
         sup.test_bind_native_scope(&lease, &row);
@@ -4250,7 +4250,7 @@ mod tests {
         row.source_profile = "default".into();
         row.view = crate::session::View::Structured;
         row.status = crate::session::Status::Idle;
-        let stamp = chrono::Utc::now();
+        let stamp = crate::time::Timestamp::now();
         row.idle_dormant_since = Some(stamp);
         crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
         p.sup.test_bind_native_scope(&lease, &row);

@@ -32,6 +32,7 @@ pub enum DockerError {
         runtime: &'static str,
         image: String,
         detail: String,
+        reason: super::image_pull::PullFailureReason,
     },
 
     #[error("Failed to create container: {0}")]
@@ -51,6 +52,10 @@ pub enum DockerError {
 
     #[error("Cancelled: {0}")]
     Cancelled(String),
+
+    /// The shared pull this caller was waiting on was cancelled for everyone.
+    #[error("The pull of {0} was cancelled")]
+    PullCancelled(String),
 
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
@@ -105,6 +110,7 @@ mod tests {
                 runtime,
                 image: "img:1".to_string(),
                 detail: sanitize_stderr("denied\nretry later"),
+                reason: crate::containers::image_pull::PullFailureReason::Other,
             }
             .to_string();
             assert_eq!(

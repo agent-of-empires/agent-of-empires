@@ -182,8 +182,8 @@ fn trash_inspection_never_requests_interaction() {
                 .unwrap();
                 let id = env.view.instance_at(0).id.clone();
                 env.view.mutate_instance(&id, |inst| {
-                    inst.trashed_at = Some(chrono::Utc::now());
-                    inst.archived_at = archived.then(chrono::Utc::now);
+                    inst.trashed_at = Some(crate::time::Timestamp::now());
+                    inst.archived_at = archived.then(crate::time::Timestamp::now);
                 });
                 env.view.trashed_section_collapsed = false;
                 env.view.rebuild_flat_items();
@@ -269,8 +269,9 @@ fn trash_inspection_never_requests_interaction() {
 fn trash_enter_before_reader_mount_keeps_navigation_in_reader() {
     let mut env = create_test_env_with_sessions(2);
     let id = env.view.instance_at(0).id.clone();
-    env.view
-        .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+    env.view.mutate_instance(&id, |inst| {
+        inst.trashed_at = Some(crate::time::Timestamp::now())
+    });
     env.view.trashed_section_collapsed = false;
     env.view.rebuild_flat_items();
     env.view.select_session_by_id(&id);
@@ -296,7 +297,7 @@ fn trash_transition_discards_edit_dialog_and_stale_menu_actions() {
                 branch: "fixture".into(),
                 main_repo_path: "/tmp".into(),
                 managed_by_aoe: true,
-                created_at: chrono::Utc::now(),
+                created_at: crate::time::Timestamp::now(),
                 base_branch: None,
             });
         });
@@ -304,8 +305,9 @@ fn trash_transition_discards_edit_dialog_and_stale_menu_actions() {
         env.view
             .handle_key(bindings::key_event(action, false).unwrap(), None);
         assert!(env.view.rename_dialog.is_some() || env.view.worktree_name_dialog.is_some());
-        env.view
-            .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+        env.view.mutate_instance(&id, |inst| {
+            inst.trashed_at = Some(crate::time::Timestamp::now())
+        });
         env.view.enforce_trash_read_only();
         assert!(env.view.rename_dialog.is_none());
         assert!(env.view.worktree_name_dialog.is_none());
@@ -351,7 +353,7 @@ fn trash_dwell_and_engagement_do_not_mark_retained_data_read() {
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
     env.view.mutate_instance(&id, |inst| {
-        inst.trashed_at = Some(chrono::Utc::now());
+        inst.trashed_at = Some(crate::time::Timestamp::now());
         inst.mark_unread();
     });
     let snapshot = super::session_feed_tests::daemon_snapshot(&env.view, &id, "Stopped");
@@ -480,6 +482,86 @@ fn double_click_tears_down_live_send_before_tmux_attach() {
     assert!(
         env.view.live_send.is_none(),
         "the tmux attach path must exit live mode first, not strand the worker"
+    );
+}
+
+#[test]
+#[serial]
+fn structured_click_leaves_a_relay_on_another_session() {
+    // Structured view has no pane to relay into, so a click only selects. A relay
+    // still aimed at the row the user left would keep eating their keystrokes.
+    use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
+    let mut env = create_test_env_with_sessions(3);
+    setup_inner(&mut env);
+    env.view.cursor = 0;
+    env.view.update_selected();
+    let left_behind = env.view.selected_session.clone().unwrap();
+    let target = match &env.view.flat_items[2] {
+        Item::Session { id, .. } => id.clone(),
+        _ => panic!("flat_items[2] should be a session"),
+    };
+    env.view
+        .mutate_instance(&target, |inst| inst.view = crate::session::View::Structured);
+    env.view.view_mode = ViewMode::Structured;
+    env.view.live_send = Some(LiveSendState {
+        session_id: left_behind,
+        title: "previous".into(),
+        tmux_name: "aoe_test_structured".into(),
+        target: LiveSendTarget::Agent,
+        exit_chords: Vec::new(),
+        leader: None,
+    });
+
+    let now = std::time::Instant::now();
+    assert_eq!(env.view.handle_click_at(now, 5, 3), None);
+    assert_eq!(
+        env.view.selected_session.as_deref(),
+        Some(target.as_str()),
+        "the click still selects the row"
+    );
+    assert!(
+        env.view.live_send.is_none(),
+        "keystrokes must follow the selection"
+    );
+
+    // The next key has to reach the UI: a relay left on the row the user left is
+    // handled before anything else and swallows it, so the help toggle only
+    // lands when the click really ended the relay.
+    env.view.handle_key(key(KeyCode::Char('?')), None);
+    assert!(
+        env.view.show_help,
+        "the next key must reach the UI, not the previous session's relay"
+    );
+}
+
+#[test]
+#[serial]
+fn structured_click_keeps_a_relay_on_the_same_session() {
+    // Clicking the row that is already the live target only re-selects it, so its
+    // relay stays: the user did not move off the pane it is aimed at.
+    use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
+    let mut env = create_test_env_with_sessions(3);
+    setup_inner(&mut env);
+    env.view.cursor = 0;
+    env.view.update_selected();
+    let id = env.view.selected_session.clone().unwrap();
+    env.view
+        .mutate_instance(&id, |inst| inst.view = crate::session::View::Structured);
+    env.view.view_mode = ViewMode::Structured;
+    env.view.live_send = Some(LiveSendState {
+        session_id: id.clone(),
+        title: "same".into(),
+        tmux_name: "aoe_test_structured".into(),
+        target: LiveSendTarget::Terminal,
+        exit_chords: Vec::new(),
+        leader: None,
+    });
+
+    let now = std::time::Instant::now();
+    assert_eq!(env.view.handle_click_at(now, 5, 1), None);
+    assert!(
+        env.view.live_send.is_some(),
+        "a relay on the clicked session is left alone"
     );
 }
 

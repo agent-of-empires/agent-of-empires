@@ -549,6 +549,10 @@ impl AnchoredDir {
         Ok((stat.st_dev, stat.st_ino))
     }
 
+    pub(crate) fn descriptor(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.fd)
+    }
+
     pub(crate) fn sync(&self) -> Result<()> {
         #[cfg(test)]
         if FAIL_SYNC_ONCE.with(|path| {
@@ -869,6 +873,24 @@ impl AnchoredDir {
             Err(Errno::ENOENT) => Ok(None),
             Err(error) => Err(error).context("inspecting anchored entry"),
         }
+    }
+
+    pub(crate) fn rename_child_exclusive(
+        &self,
+        from: &Path,
+        destination: &Self,
+        to: &Path,
+    ) -> Result<()> {
+        let (source, from) = self.open_parent(from)?;
+        let (destination, to) = destination.open_parent(to)?;
+        crate::process::rename_exclusive(&source, &from, &destination, &to)
+            .context("renaming anchored entry without replacement")
+    }
+
+    pub(crate) fn remove_empty_dir(&self, relative: &Path) -> Result<()> {
+        let (parent, leaf) = self.open_parent(relative)?;
+        unlinkat(&parent, leaf.as_os_str(), UnlinkatFlags::RemoveDir)
+            .context("removing empty anchored directory")
     }
 
     pub(crate) fn remove_file(&self, relative: &Path) -> Result<()> {
@@ -1207,14 +1229,22 @@ impl AnchoredDir {
         let mut current = openat(
             &self.fd,
             ".",
-            OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+            OFlag::O_DIRECTORY
+                | OFlag::O_NOFOLLOW
+                | OFlag::O_CLOEXEC
+                | OFlag::O_RDONLY
+                | OFlag::O_NONBLOCK,
             Mode::empty(),
         )?;
         for component in normal_components(relative)? {
             current = openat(
                 &current,
                 component.as_os_str(),
-                OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+                OFlag::O_DIRECTORY
+                    | OFlag::O_NOFOLLOW
+                    | OFlag::O_CLOEXEC
+                    | OFlag::O_RDONLY
+                    | OFlag::O_NONBLOCK,
                 Mode::empty(),
             )
             .context("opening anchored directory component")?;

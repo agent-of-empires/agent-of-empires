@@ -1,6 +1,6 @@
 //! Worker spawn, shutdown, and agent switching.
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::acp::event_store::ControlKnowledge::{self, Indeterminate, Known};
@@ -52,8 +52,8 @@ fn not_structured_response() -> Response {
 /// rate-limit park. A cap park has no schedule, so it uses the fallback.
 fn rate_limit_resume_marker_resets_at(
     park: Option<&crate::acp::event_store::RateLimitPark>,
-    fallback_resets_at: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
+    fallback_resets_at: Timestamp,
+) -> Option<Timestamp> {
     let park = park?;
     if park.cap_reached {
         return Some(fallback_resets_at);
@@ -69,7 +69,7 @@ fn rate_limit_resume_marker_resets_at(
 pub(in crate::server::api) async fn rate_limit_resume_probe(
     state: &AppState,
     id: &str,
-) -> Result<ControlKnowledge<Option<(u64, DateTime<Utc>)>>, SupervisorError> {
+) -> Result<ControlKnowledge<Option<(u64, crate::time::Timestamp)>>, SupervisorError> {
     let store = Arc::clone(&state.acp_event_store);
     let id_for_probe = id.to_string();
     let park = tokio::task::spawn_blocking(move || store.rate_limit_park(&id_for_probe))
@@ -78,7 +78,7 @@ pub(in crate::server::api) async fn rate_limit_resume_probe(
         .map_err(|_| SupervisorError::NativeStoreUnavailable)?;
     Ok(match park {
         Known(park) => Known(park.and_then(|park| {
-            rate_limit_resume_marker_resets_at(Some(&park), Utc::now())
+            rate_limit_resume_marker_resets_at(Some(&park), crate::time::Timestamp::now())
                 .map(|resets_at| (park.seq, resets_at))
         })),
         Indeterminate => Indeterminate,
@@ -250,13 +250,34 @@ pub async fn spawn_acp(
         }
     }
 
+    let request_env: Vec<(String, String)> = req
+        .provider_env
+        .iter()
+        .map(|p| (p.key.clone(), p.value.clone()))
+        .collect();
+    let explicit = req.agent.as_deref().or(instance.agent_name.as_deref());
+    let agent = pick_agent(&state, &instance, explicit).await;
+    let (native, exclusion) = match launch_store_for(&state, &instance, exclusion).await {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    let exclusion = match crate::acp::sandbox::admit_sandbox_launch(
+        native,
+        instance.clone(),
+        exclusion,
+        Some(agent.clone()),
+        request_env.clone(),
+    )
+    .await
+    {
+        Ok(exclusion) => exclusion,
+        Err(error) => return launch_error_response("sandbox login admission", &error),
+    };
     let (instance, resume_reservation) =
         match crate::server::api::sessions::resume_structured_stop(&state, instance, None).await {
             Ok(instance) => instance,
             Err(response) => return response,
         };
-    let explicit = req.agent.clone().or_else(|| instance.agent_name.clone());
-    let agent = pick_agent(&state, &instance, explicit.as_deref()).await;
     let (native, exclusion) = match launch_store_for(&state, &instance, exclusion).await {
         Ok(store) => store,
         Err(response) => return response,
@@ -295,16 +316,22 @@ pub async fn spawn_acp(
         Ok(row) => row,
         Err(error) => return supervisor_error_response("spawn admission failed", &error),
     };
-    let (sandbox_info, exclusion) = match crate::acp::sandbox::ensure_container_for_session(
-        native.clone(),
-        instance.clone(),
-        exclusion,
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(e) => return launch_error_response("sandbox container ensure", &e),
-    };
+    // The request's auth payload and the agent it selected count for the sandbox login
+    // admission of this launch only: they are passed by value into the check and are never
+    // stored. The admission reads the allowlist of the agent the launch below runs.
+    let (sandbox_info, exclusion) =
+        match crate::acp::sandbox::ensure_container_for_session_with_request_env(
+            native.clone(),
+            instance.clone(),
+            exclusion,
+            Some(agent.clone()),
+            request_env,
+        )
+        .await
+        {
+            Ok(info) => info,
+            Err(e) => return launch_error_response("sandbox container ensure", &e),
+        };
     if spawn_request.cancellation().is_cancelled() {
         return supervisor_error_response(
             "spawn cancelled",
@@ -378,6 +405,14 @@ pub async fn restart_acp(
     }
 }
 
+pub(in crate::server::api) fn restart_purge_conflict() -> Response {
+    (
+        StatusCode::CONFLICT,
+        "purge_in_progress: permanent deletion is in progress for this session",
+    )
+        .into_response()
+}
+
 async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpRequest) -> Response {
     let restart = match state
         .acp_supervisor
@@ -398,6 +433,9 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
                 "restart_in_progress: a restart is already in progress for this session",
             )
                 .into_response();
+        }
+        Err(crate::acp::supervisor::RestartClaimConflict::Purge) => {
+            return restart_purge_conflict();
         }
     };
     let Some(preflight_instance) = find_instance(&state, &id).await else {
@@ -663,6 +701,7 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
             .await
         {
             Ok(reservation) => reservation,
+            Err(SupervisorError::PurgeInProgress(_)) => return restart_purge_conflict(),
             Err(error) => return supervisor_error_response("restart admission failed", &error),
         },
     };
@@ -725,6 +764,7 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
             status: "running",
         })
         .into_response(),
+        Err(SupervisorError::PurgeInProgress(_)) => restart_purge_conflict(),
         Err(e) => supervisor_error_response("restart spawn failed", &e),
     }
 }
@@ -1358,6 +1398,22 @@ pub async fn switch_acp_agent(
         Ok(agent) => agent,
         Err(resp) => return resp,
     };
+    let (native, exclusion) = match launch_store_for(&state, &instance, exclusion).await {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    let exclusion = match crate::acp::sandbox::admit_sandbox_launch(
+        native.clone(),
+        instance.clone(),
+        exclusion,
+        Some(target.clone()),
+        Vec::new(),
+    )
+    .await
+    {
+        Ok(exclusion) => exclusion,
+        Err(e) => return launch_error_response("sandbox login admission", &e),
+    };
     let (instance, resume_reservation) =
         match crate::server::api::sessions::resume_structured_stop_deferred(
             &state,
@@ -1455,16 +1511,19 @@ pub async fn switch_acp_agent(
         Ok(row) => row,
         Err(error) => return supervisor_error_response("agent switch admission failed", &error),
     };
-    let (sandbox_info, exclusion) = match crate::acp::sandbox::ensure_container_for_session(
-        native.clone(),
-        instance.clone(),
-        exclusion,
-    )
-    .await
-    {
-        Ok(info) => info,
-        Err(error) => return launch_error_response("sandbox container ensure", &error),
-    };
+    let (sandbox_info, exclusion) =
+        match crate::acp::sandbox::ensure_container_for_session_with_request_env(
+            native.clone(),
+            instance.clone(),
+            exclusion,
+            Some(target.clone()),
+            Vec::new(),
+        )
+        .await
+        {
+            Ok(info) => info,
+            Err(error) => return launch_error_response("sandbox container ensure", &error),
+        };
     let request = SpawnRequest {
         launch_admission: Some(admission),
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Fresh,
@@ -1505,10 +1564,7 @@ pub async fn switch_acp_agent(
             }
             Err(error) => return launch_error_response("agent switch completion", &error),
         };
-    state
-        .telemetry_structured
-        .agent_switches
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::telemetry::consent::bump(&state.telemetry_structured.agent_switches);
 
     let reason = req
         .reason
@@ -1881,7 +1937,7 @@ mod tests {
                 base_branch: None,
                 base_branch_override: None,
             }],
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             cleanup_on_delete: true,
         });
         let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
@@ -2045,6 +2101,7 @@ mod tests {
             &mut std::collections::HashMap::new(),
             &mut std::collections::HashSet::new(),
             &mut std::collections::HashMap::new(),
+            &mut std::collections::HashSet::new(),
         )
         .await;
         assert_eq!(starts.load(Ordering::SeqCst), 0);
@@ -2276,7 +2333,7 @@ mod tests {
                 .try_acquire_lifecycle_reservation(
                     LifecycleOperation::Launch,
                     Instance::LIFECYCLE_RESERVATION_TTL,
-                    Utc::now(),
+                    Timestamp::now(),
                 )
                 .unwrap();
             let state = durable_stop_state(row.clone()).await;
@@ -2687,6 +2744,7 @@ mod tests {
             crate::server::api::acp_prompt(
                 State(state.clone()),
                 Path(row.id.clone()),
+                axum::http::HeaderMap::new(),
                 Ok(Json(
                     serde_json::from_value(serde_json::json!({
                         "text":"explicit wake at capacity", "prompt_id":"capacity-prompt",
@@ -2878,6 +2936,7 @@ mod tests {
                 &mut std::collections::HashMap::new(),
                 &mut std::collections::HashSet::new(),
                 &mut std::collections::HashMap::new(),
+                &mut std::collections::HashSet::new(),
             )
             .await;
             assert_eq!(
@@ -2946,7 +3005,7 @@ mod tests {
                 .try_acquire_lifecycle_reservation(
                     LifecycleOperation::Stop,
                     Instance::LIFECYCLE_RESERVATION_TTL,
-                    Utc::now(),
+                    Timestamp::now(),
                 )
                 .unwrap();
             crate::server::test_support::seed_instances_on_disk_for_test(
@@ -3070,6 +3129,83 @@ mod tests {
             .try_begin_restart_with_reason(&id)
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restart_returns_purge_conflict_at_claim_and_replacement_admission() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut row =
+            crate::session::Instance::new("restart during purge", project.path().to_str().unwrap());
+        row.source_profile = "default".into();
+        row.view = crate::session::View::Structured;
+        crate::server::test_support::select_retained_for_test(&mut row);
+        row.agent_name = Some("claude".into());
+        let id = row.id.clone();
+        let state = durable_stop_state(row).await;
+        let request = || SpawnAcpRequest {
+            recovery: None,
+            agent: None,
+            model: None,
+            additional_dirs: Vec::new(),
+            provider_env: Vec::new(),
+        };
+
+        let fence = state.acp_supervisor.fence_spawn_admission(&id);
+        let immediate = restart_acp(State(state.clone()), Path(id.clone()), Ok(Json(request())))
+            .await
+            .into_response();
+        drop(fence);
+
+        let submission = state
+            .session_service
+            .prompt_submission_for_session(&id)
+            .await
+            .expect("session has a submission barrier");
+        let pending = tokio::spawn({
+            let state = state.clone();
+            let id = id.clone();
+            let request = request();
+            async move {
+                restart_acp(State(state), Path(id), Ok(Json(request)))
+                    .await
+                    .into_response()
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match state.acp_supervisor.begin_spawn_request(&id) {
+                    Err(
+                        SupervisorError::RestartInProgress(_) | SupervisorError::SpawnCancelled(_),
+                    ) => break,
+                    Ok(probe) => drop(probe),
+                    Err(error) => panic!("unexpected spawn conflict: {error:?}"),
+                }
+                assert!(!pending.is_finished(), "restart did not reach the barrier");
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("restart claims the session before the submission barrier");
+        let fence = state.acp_supervisor.fence_spawn_admission(&id);
+        drop(submission);
+        let late = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+            .await
+            .expect("restart settles with a purge conflict")
+            .unwrap();
+
+        for response in [immediate, late] {
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                body.as_ref(),
+                b"purge_in_progress: permanent deletion is in progress for this session"
+            );
+        }
+        drop(fence);
     }
 
     #[tokio::test]
@@ -4553,11 +4689,7 @@ mod tests {
     #[test]
     fn rate_limit_resume_marker_follows_the_durable_park() {
         use crate::acp::event_store::RateLimitPark;
-        let ts = |raw| {
-            DateTime::parse_from_rfc3339(raw)
-                .unwrap()
-                .with_timezone(&Utc)
-        };
+        let ts = |raw| Timestamp::parse_rfc3339(raw).unwrap();
         let fallback = ts("2099-01-01T00:00:00Z");
         let resets_at = ts("2099-02-03T04:05:06Z");
         let info = |resets_at| RateLimitInfo {
@@ -4598,6 +4730,750 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// The state of a daemon that holds `inst` on disk and in memory: a launch opens the
+    /// stored row, so a row only in memory is a session whose source is unavailable.
+    #[cfg(unix)]
+    async fn seeded_state(mut inst: crate::session::Instance) -> Arc<AppState> {
+        inst.source_profile = "default".to_string();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        state
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_gate_acp_ensure_is_409() {
+        use crate::session::SandboxLoginRequired;
+        let app_dir = crate::session::test_support::isolate_app_dir();
+        let _auth = crate::session::test_support::unset_claude_auth_routes();
+        let (_runtime, calls) =
+            crate::session::test_support::failing_container_runtime(app_dir.path());
+        crate::session::config::update_config(|c| {
+            c.sandbox.shared_credential =
+                crate::session::config::SharedCredentialMode::SeparateLogin;
+        })
+        .unwrap();
+        let root = app_dir.path().join(".claude").join("sandbox-v2");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".credentials.json"), "{}").unwrap();
+        let mut inst = crate::session::Instance::new("login gate", "/tmp/aoe-login-gate-acp");
+        inst.view = crate::session::View::Structured;
+        crate::server::test_support::select_retained_for_test(&mut inst);
+        inst.agent_name = Some("claude".to_string());
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "aoe-login-gate".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        });
+        inst.source_profile = "default".to_string();
+        let id = inst.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        let exclusion = crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &id, true)
+            .await
+            .unwrap();
+        let Ok((native, exclusion)) = launch_store_for(&state, &inst, exclusion).await else {
+            panic!("the launch store opens for a seeded row");
+        };
+        let err = match crate::acp::sandbox::ensure_container_for_session(
+            native,
+            inst.clone(),
+            exclusion,
+        )
+        .await
+        {
+            Ok(_) => panic!("a launch that needs the login came up"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.downcast_ref::<SandboxLoginRequired>(),
+            Some(&crate::session::test_support::login_required_under(
+                "claude",
+                app_dir.path()
+            )),
+            "{err:#}"
+        );
+
+        let response = spawn_acp(
+            State(Arc::clone(&state)),
+            Path(id.clone()),
+            Ok(Json(SpawnAcpRequest {
+                recovery: None,
+                agent: None,
+                model: None,
+                additional_dirs: Vec::new(),
+                provider_env: Vec::new(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "sandbox_login_required",
+                "message": "sandbox login required for claude: run `aoe sandbox login --tool claude`",
+                "tool": "claude",
+            })
+        );
+        assert!(!state.acp_supervisor.is_running(&id).await);
+        assert_eq!(
+            std::fs::read_to_string(&calls).unwrap_or_default(),
+            "",
+            "the gate runs before any runtime call"
+        );
+    }
+
+    /// An API key supplied only in the spawn request is the launch's auth route, as the
+    /// launch forwards it, so it is admitted without the OAuth login; the same request
+    /// without a usable key stays refused. The key is read for the decision only: it
+    /// reaches no stored row, event, hold record, response or log.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_gate_acp_spawn_admits_a_request_only_api_key() {
+        const SECRET: &str = "sk-ant-request-only-secret-0123456789";
+        let app_dir = crate::session::test_support::isolate_app_dir();
+        let (_runtime, calls) =
+            crate::session::test_support::failing_container_runtime(app_dir.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+        ]);
+        let logs = crate::session::test_support::LogCapture::start();
+        crate::session::config::update_config(|c| {
+            c.sandbox.shared_credential =
+                crate::session::config::SharedCredentialMode::SeparateLogin;
+        })
+        .unwrap();
+        let root = app_dir.path().join(".claude").join("sandbox-v2");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".credentials.json"), "{}").unwrap();
+        let mut inst = crate::session::Instance::new("login gate key", "/tmp/aoe-login-gate-key");
+        inst.view = crate::session::View::Structured;
+        crate::server::test_support::select_retained_for_test(&mut inst);
+        inst.agent_name = Some("claude".to_string());
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "aoe-login-gate-key".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        });
+        let id = inst.id.clone();
+        let state = seeded_state(inst).await;
+        let spawn = |key: Option<&str>| {
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            let provider_env = key
+                .map(|value| EnvPair {
+                    key: "ANTHROPIC_API_KEY".to_string(),
+                    value: value.to_string(),
+                })
+                .into_iter()
+                .collect();
+            async move {
+                let response = spawn_acp(
+                    State(state),
+                    Path(id),
+                    Ok(Json(SpawnAcpRequest {
+                        recovery: None,
+                        agent: None,
+                        model: None,
+                        additional_dirs: Vec::new(),
+                        provider_env,
+                    })),
+                )
+                .await
+                .into_response();
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+        let runtime_calls = || std::fs::read_to_string(&calls).unwrap_or_default();
+
+        for (label, key) in [("no key", None), ("empty key", Some(""))] {
+            let (status, body) = spawn(key).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{label}: {body}");
+            assert!(body.contains("sandbox_login_required"), "{label}: {body}");
+            assert_eq!(runtime_calls(), "", "{label}: the gate runs first");
+        }
+
+        let (status, body) = spawn(Some(SECRET)).await;
+        assert_ne!(status, StatusCode::CONFLICT, "{body}");
+        assert!(!body.contains("sandbox_login_required"), "{body}");
+        assert!(
+            !runtime_calls().is_empty(),
+            "admitted: the launch reached the container runtime"
+        );
+        assert!(
+            state
+                .session_service
+                .sandbox_login
+                .held_origin(&id)
+                .is_none(),
+            "no hold record"
+        );
+
+        // Nothing of the key outlives the request.
+        assert!(!body.contains(SECRET), "response body");
+        assert!(!logs.contents().contains(SECRET), "log output");
+        assert!(
+            !format!("{:?}", state.acp_event_store.replay_from(&id, 0)).contains(SECRET),
+            "event log"
+        );
+        for inst in state.instances.read().await.iter() {
+            let row = serde_json::to_string(inst).unwrap();
+            assert!(!row.contains(SECRET), "session row");
+        }
+        let mut dirs = vec![app_dir.path().to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if let Ok(bytes) = std::fs::read(&path) {
+                    let found = bytes
+                        .windows(SECRET.len())
+                        .any(|window| window == SECRET.as_bytes());
+                    assert!(!found, "{} holds the request key", path.display());
+                }
+            }
+        }
+
+        // A launch resumed without the request is gated on what is stored.
+        let (status, _) = spawn(None).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a later launch without the key"
+        );
+    }
+
+    /// The agent a spawn request selects is the one the launch runs, so admission reads its
+    /// adapter's allowlist, not the stored agent's: a daemon `ANTHROPIC_API_KEY` counts when
+    /// the selected adapter forwards it and not when it does not. Without a request agent
+    /// the stored one decides, and the selection is never stored.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_gate_acp_spawn_admits_on_the_selected_agents_allowlist() {
+        let app_dir = crate::session::test_support::isolate_app_dir();
+        let (_runtime, calls) =
+            crate::session::test_support::failing_container_runtime(app_dir.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+        ]);
+        let _host =
+            crate::session::test_support::EnvGuard::set(&[("ANTHROPIC_API_KEY", "sk-daemon")]);
+        crate::session::config::update_config(|c| {
+            c.sandbox.shared_credential =
+                crate::session::config::SharedCredentialMode::SeparateLogin;
+        })
+        .unwrap();
+        let root = app_dir.path().join(".claude").join("sandbox-v2");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".credentials.json"), "{}").unwrap();
+        let session = |stored: &str| {
+            let mut inst =
+                crate::session::Instance::new("login gate agent", "/tmp/aoe-login-gate-agent");
+            inst.tool = "claude".to_string();
+            inst.view = crate::session::View::Structured;
+            crate::server::test_support::select_retained_for_test(&mut inst);
+            inst.agent_name = Some(stored.to_string());
+            inst.sandbox_info = Some(crate::session::SandboxInfo {
+                provider: None,
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "aoe-login-gate-agent".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
+                container_workdir: None,
+            });
+            inst
+        };
+        let runtime_calls = || std::fs::read_to_string(&calls).unwrap_or_default();
+
+        // (stored agent, requested agent, admitted)
+        let cases = [
+            ("codex", Some("claude"), true),
+            ("claude", Some("codex"), false),
+            ("claude", None, true),
+            ("codex", None, false),
+            ("claude", Some("claude"), true),
+        ];
+        for (stored, requested, admitted) in cases {
+            let inst = session(stored);
+            let id = inst.id.clone();
+            let state = seeded_state(inst).await;
+            let before = runtime_calls();
+            let response = spawn_acp(
+                State(Arc::clone(&state)),
+                Path(id.clone()),
+                Ok(Json(SpawnAcpRequest {
+                    recovery: None,
+                    agent: requested.map(str::to_string),
+                    model: None,
+                    additional_dirs: Vec::new(),
+                    provider_env: Vec::new(),
+                })),
+            )
+            .await
+            .into_response();
+            let label = format!("stored {stored}, requested {requested:?}");
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&body).into_owned();
+            if admitted {
+                assert_ne!(status, StatusCode::CONFLICT, "{label}: {body}");
+                assert_ne!(runtime_calls(), before, "{label}: reached the runtime");
+            } else {
+                assert_eq!(status, StatusCode::CONFLICT, "{label}: {body}");
+                assert!(body.contains("sandbox_login_required"), "{label}: {body}");
+                assert_eq!(runtime_calls(), before, "{label}: held before the runtime");
+            }
+            let stored_now = state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|i| i.id == id)
+                .and_then(|i| i.agent_name.clone());
+            assert_eq!(
+                stored_now.as_deref(),
+                Some(stored),
+                "{label}: not persisted"
+            );
+        }
+    }
+
+    /// A switch launches the target agent, so admission reads the target's adapter
+    /// allowlist, not the stored agent's, and a refusal comes before the old worker is
+    /// stopped (marked here by the load-session capability, which the stop clears). The
+    /// target is never persisted by admission.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_gate_acp_switch_admits_on_the_target_agents_allowlist() {
+        let app_dir = crate::session::test_support::isolate_app_dir();
+        let (_runtime, calls) =
+            crate::session::test_support::failing_container_runtime(app_dir.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+        ]);
+        let _host =
+            crate::session::test_support::EnvGuard::set(&[("ANTHROPIC_API_KEY", "sk-daemon")]);
+        crate::session::config::update_config(|c| {
+            c.sandbox.shared_credential =
+                crate::session::config::SharedCredentialMode::SeparateLogin;
+        })
+        .unwrap();
+        let root = app_dir.path().join(".claude").join("sandbox-v2");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".credentials.json"), "{}").unwrap();
+        let runtime_calls = || std::fs::read_to_string(&calls).unwrap_or_default();
+
+        // (stored agent, switch target, admitted)
+        for (stored, target, admitted) in [("codex", "claude", true), ("claude", "codex", false)] {
+            let mut inst =
+                crate::session::Instance::new("login gate switch", "/tmp/aoe-login-gate-switch");
+            inst.tool = "claude".to_string();
+            inst.view = crate::session::View::Structured;
+            crate::server::test_support::select_retained_for_test(&mut inst);
+            inst.agent_name = Some(stored.to_string());
+            inst.acp_load_session_capable = Some(true);
+            inst.sandbox_info = Some(crate::session::SandboxInfo {
+                provider: None,
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "aoe-login-gate-switch".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
+                container_workdir: None,
+            });
+            let id = inst.id.clone();
+            let state = seeded_state(inst).await;
+            let before = runtime_calls();
+            let response = switch_acp_agent(
+                State(Arc::clone(&state)),
+                Path(id.clone()),
+                Ok(Json(SwitchAgentRequest {
+                    target: target.to_string(),
+                    model: None,
+                    reason: None,
+                })),
+            )
+            .await
+            .into_response();
+            let label = format!("stored {stored}, target {target}");
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&body).into_owned();
+            let row = state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|i| i.id == id)
+                .cloned()
+                .unwrap();
+            if admitted {
+                assert_ne!(status, StatusCode::CONFLICT, "{label}: {body}");
+                assert_ne!(runtime_calls(), before, "{label}: reached the runtime");
+            } else {
+                assert_eq!(status, StatusCode::CONFLICT, "{label}: {body}");
+                assert!(body.contains("sandbox_login_required"), "{label}: {body}");
+                assert_eq!(runtime_calls(), before, "{label}: held before the runtime");
+                assert_eq!(
+                    row.acp_load_session_capable,
+                    Some(true),
+                    "{label}: refused before the old worker was stopped"
+                );
+                assert_eq!(
+                    row.agent_name.as_deref(),
+                    Some(stored),
+                    "{label}: not persisted"
+                );
+            }
+        }
+    }
+
+    /// An agent switch whose target launch a `before_start` hook cannot admit is refused
+    /// before the old worker is stopped, and the hook runs once however often it is retried;
+    /// a hook that supplies the key admits it.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_gate_switch_resolves_the_before_start_hook_before_stopping_the_worker() {
+        let app_dir = crate::session::test_support::isolate_app_dir();
+        let (_runtime, _calls) =
+            crate::session::test_support::failing_container_runtime(app_dir.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+        ]);
+        crate::session::config::update_config(|c| {
+            c.sandbox.shared_credential =
+                crate::session::config::SharedCredentialMode::SeparateLogin;
+        })
+        .unwrap();
+        let root = app_dir.path().join(".claude").join("sandbox-v2");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".credentials.json"), "{}").unwrap();
+        let project = app_dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let counter = app_dir.path().join("hook-runs");
+        let runs = || {
+            std::fs::read_to_string(&counter)
+                .map(|r| r.lines().count())
+                .unwrap_or(0)
+        };
+
+        for (tail, admitted) in [
+            ("echo FOO=bar", false),
+            ("echo ANTHROPIC_API_KEY=sk-hook", true),
+        ] {
+            let hook = format!(
+                "echo run >> {}; {tail}",
+                crate::session::environment::shell_escape(&counter.to_string_lossy())
+            );
+            crate::session::config::update_config(|c| c.host_hooks.before_start = vec![hook])
+                .unwrap();
+            let _ = std::fs::remove_file(&counter);
+            let mut inst = crate::session::Instance::new("hook switch", project.to_str().unwrap());
+            inst.tool = "claude".to_string();
+            inst.view = crate::session::View::Structured;
+            crate::server::test_support::select_retained_for_test(&mut inst);
+            inst.agent_name = Some("claude".to_string());
+            inst.acp_load_session_capable = Some(true);
+            inst.sandbox_info = Some(crate::session::SandboxInfo {
+                provider: None,
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "aoe-hook-switch".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
+                container_workdir: None,
+            });
+            let id = inst.id.clone();
+            let state = seeded_state(inst).await;
+            state
+                .acp_supervisor
+                .test_insert_worker_cmd_recording(&id)
+                .await;
+            let switch = || async {
+                switch_acp_agent(
+                    State(Arc::clone(&state)),
+                    Path(id.clone()),
+                    Ok(Json(SwitchAgentRequest {
+                        target: "codex".to_string(),
+                        model: None,
+                        reason: None,
+                    })),
+                )
+                .await
+                .into_response()
+            };
+            let response = switch().await;
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&body).into_owned();
+            if admitted {
+                assert!(!body.contains("sandbox_login_required"), "{status}: {body}");
+            } else {
+                assert_eq!(status, StatusCode::CONFLICT, "{body}");
+                assert!(body.contains("sandbox_login_required"), "{body}");
+                assert!(
+                    state.acp_supervisor.is_running(&id).await,
+                    "refused before the old worker was stopped"
+                );
+                assert_eq!(runs(), 1);
+                let again = switch().await;
+                assert_eq!(again.status(), StatusCode::CONFLICT);
+                assert_eq!(runs(), 1, "a retry does not run the hook again");
+            }
+        }
+    }
+
+    /// A `before_start` hook that fails while a switch's target launch is admitted answers
+    /// 502 in fixed words, before the old worker is stopped; a switch queues nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_gate_switch_hook_failure_is_a_502_with_fixed_text() {
+        let app_dir = crate::session::test_support::isolate_app_dir();
+        let (_runtime, _calls) =
+            crate::session::test_support::failing_container_runtime(app_dir.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+        ]);
+        crate::session::config::update_config(|c| {
+            c.sandbox.shared_credential =
+                crate::session::config::SharedCredentialMode::SeparateLogin;
+            c.host_hooks.before_start = vec!["echo sekret-token >&2; exit 3".to_string()];
+        })
+        .unwrap();
+        let root = app_dir.path().join(".claude").join("sandbox-v2");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".credentials.json"), "{}").unwrap();
+        let project = app_dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut inst = crate::session::Instance::new("hook switch", project.to_str().unwrap());
+        inst.tool = "claude".to_string();
+        inst.view = crate::session::View::Structured;
+        crate::server::test_support::select_retained_for_test(&mut inst);
+        inst.agent_name = Some("claude".to_string());
+        inst.acp_load_session_capable = Some(true);
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "aoe-hook-switch-fail".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        });
+        let id = inst.id.clone();
+        let state = seeded_state(inst).await;
+        state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(&id)
+            .await;
+        let response = switch_acp_agent(
+            State(Arc::clone(&state)),
+            Path(id.clone()),
+            Ok(Json(SwitchAgentRequest {
+                target: "codex".to_string(),
+                model: None,
+                reason: None,
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "before_start_hook_failed");
+        assert_eq!(body["message"], "the before_start hook failed");
+        assert!(!body.to_string().contains("sekret-token"), "{body}");
+        assert!(
+            state.acp_supervisor.is_running(&id).await,
+            "refused before the old worker was stopped"
+        );
+    }
+
+    /// With Apple Container the mode is refused where a launch would wait for the login:
+    /// a typed 409 that names the setting, no hold and no queued login episode.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_gate_acp_spawn_refuses_the_mode_on_apple_container() {
+        let app_dir = crate::session::test_support::isolate_app_dir();
+        let (_runtime, calls) =
+            crate::session::test_support::failing_container_runtime(app_dir.path());
+        let _unset = crate::session::test_support::EnvGuard::unset(&[
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+        ]);
+        crate::session::config::update_config(|c| {
+            c.sandbox.shared_credential =
+                crate::session::config::SharedCredentialMode::SeparateLogin;
+            c.sandbox.container_runtime =
+                crate::session::config::ContainerRuntimeName::AppleContainer;
+        })
+        .unwrap();
+        let root = app_dir.path().join(".claude").join("sandbox-v2");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".credentials.json"), "{}").unwrap();
+        let mut inst =
+            crate::session::Instance::new("login gate apple", "/tmp/aoe-login-gate-apple");
+        inst.tool = "claude".to_string();
+        inst.view = crate::session::View::Structured;
+        crate::server::test_support::select_retained_for_test(&mut inst);
+        inst.agent_name = Some("claude".to_string());
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "aoe-login-gate-apple".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        });
+        let id = inst.id.clone();
+        let state = seeded_state(inst).await;
+        let spawn = |key: Option<&str>| {
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            let provider_env = key
+                .map(|value| EnvPair {
+                    key: "ANTHROPIC_API_KEY".to_string(),
+                    value: value.to_string(),
+                })
+                .into_iter()
+                .collect();
+            async move {
+                let response = spawn_acp(
+                    State(state),
+                    Path(id),
+                    Ok(Json(SpawnAcpRequest {
+                        recovery: None,
+                        agent: None,
+                        model: None,
+                        additional_dirs: Vec::new(),
+                        provider_env,
+                    })),
+                )
+                .await
+                .into_response();
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&body).ok(),
+                )
+            }
+        };
+
+        let (status, body) = spawn(None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body,
+            Some(serde_json::json!({
+                "error": "sandbox_login_unsupported",
+                "message": "sandbox.shared_credential is separate_login, which is not supported with Apple Container; use host_seed or Docker/Podman",
+            }))
+        );
+        assert!(!state.acp_supervisor.is_running(&id).await);
+        assert!(
+            state
+                .session_service
+                .sandbox_login
+                .held_origin(&id)
+                .is_none(),
+            "no hold, so no push and no kept-message episode"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&calls).unwrap_or_default(),
+            "",
+            "refused before any runtime call"
+        );
+
+        // A launch with its own API key does not use the shared login: admitted.
+        let (status, _) = spawn(Some("sk-request")).await;
+        assert_ne!(status, StatusCode::CONFLICT);
+        assert!(!std::fs::read_to_string(&calls)
+            .unwrap_or_default()
+            .is_empty());
     }
 
     /// #4092: the manual resume installs a continuation under the session's

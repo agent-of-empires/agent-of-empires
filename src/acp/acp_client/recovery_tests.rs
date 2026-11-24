@@ -1181,7 +1181,7 @@ async fn recovered_completion_orders_updates_and_applies_rate_limit_parking() {
         ] {
             let mut runner = Runner::new(scope).await;
             let original = runner.start("original Native operation before quota recovery").await;
-            let resets_at = chrono::Utc::now().timestamp() + reset_after;
+            let resets_at = crate::time::Timestamp::now().as_unix_secs() + reset_after;
             let usage_start = runner.events.len();
             runner.update(json!({"sessionUpdate":"usage_update","used":1,"size":2,
                 "_meta":{"_claude/rateLimit":{"status":"rejected","rateLimitType":"five_hour","resetsAt":resets_at}}})).await;
@@ -1214,7 +1214,7 @@ async fn recovered_completion_orders_updates_and_applies_rate_limit_parking() {
             }).collect();
             assert_eq!(limits.len(), usize::from(parked));
             if parked {
-                assert_eq!(limits[0].1.resets_at.unwrap().timestamp(), resets_at);
+                assert_eq!(limits[0].1.resets_at.unwrap().as_unix_secs(), resets_at);
                 assert!(limits[0].0 < events.len() - 1);
             }
             assert_eq!(events.iter().filter(|event| matches!(event, Event::Stopped { .. })).count(), 1);

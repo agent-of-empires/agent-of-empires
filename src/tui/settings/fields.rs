@@ -61,7 +61,7 @@ impl SettingsCategory {
             Self::StatusHooks => "Status Hooks",
             Self::Hooks => "Lifecycle Hooks",
             Self::Web => "Web",
-            Self::Acp => "Acp",
+            Self::Acp => "ACP",
             Self::Diff => "Diff",
             Self::Logging => "Logging",
             Self::Plugins => "Plugins",
@@ -123,6 +123,10 @@ pub enum FieldKind {
         widget: WidgetKind,
         validation: ValidationKind,
         profile_overridable: bool,
+        /// Shown as a "Needs restart" tag after the label.
+        restart: bool,
+        /// Shown as a "Web dashboard only" tag after the label.
+        web_only: bool,
     },
     /// Profile-only description (no global counterpart to inherit).
     ProfileDescription,
@@ -192,9 +196,40 @@ impl SettingField {
         matches!(self.value, FieldValue::SectionHeader)
     }
 
+    /// Schema tags shown after the label.
+    pub fn tags(&self) -> Vec<&'static str> {
+        let FieldKind::Schema {
+            restart, web_only, ..
+        } = &self.kind
+        else {
+            return Vec::new();
+        };
+        [
+            (*restart, "Needs restart"),
+            (*web_only, "Web dashboard only"),
+        ]
+        .into_iter()
+        .filter_map(|(on, tag)| on.then_some(tag))
+        .collect()
+    }
+
     /// Human-readable rendering of the current value (for read-only displays).
     pub fn display_value(&self) -> String {
-        value_display_string(&self.value)
+        match &self.kind {
+            FieldKind::Schema { section, field, .. } => {
+                schema_value_display(section, field, &self.value)
+            }
+            _ => value_display_string(&self.value),
+        }
+    }
+
+    /// What this row shows while its optional value is unset, when unset
+    /// means something other than empty.
+    pub fn unset_display(&self) -> Option<String> {
+        match &self.kind {
+            FieldKind::Schema { section, field, .. } => unset_display(section, field),
+            _ => None,
+        }
     }
 
     /// The schema `section` this row edits, if it is a schema-backed row.
@@ -357,6 +392,26 @@ fn value_display_string(value: &FieldValue) -> String {
     }
 }
 
+/// An unset `sandbox.default_image` resolves to the image for this AoE version.
+fn unset_display(section: &str, field: &str) -> Option<String> {
+    (section == "sandbox" && field == "default_image").then(|| {
+        format!(
+            "automatic ({})",
+            crate::containers::sandbox_image::automatic_sandbox_image_short()
+        )
+    })
+}
+
+/// [`value_display_string`] that names what an unset optional field resolves to.
+fn schema_value_display(section: &str, field: &str, value: &FieldValue) -> String {
+    match value {
+        FieldValue::OptionalText(v) if v.as_deref().is_none_or(|s| s.trim().is_empty()) => {
+            unset_display(section, field).unwrap_or_else(|| value_display_string(value))
+        }
+        _ => value_display_string(value),
+    }
+}
+
 /// Parse `key=value` strings into a JSON object (for map-backed list fields).
 fn parse_key_value_object(items: &[String]) -> Value {
     let mut map = serde_json::Map::new();
@@ -379,6 +434,7 @@ fn is_map_list(section: &str, field: &str) -> bool {
                 | "custom_agents"
                 | "agent_detect_as"
                 | "agent_acp_cmd"
+                | "agent_clear_alias"
                 | "agent_config_dir"
                 | "agent_execution_as"
         )
@@ -844,7 +900,11 @@ fn build_schema_row(
             &desc.widget,
             json_at(ctx.base_json, &desc.section, &desc.field),
         );
-        Some(value_display_string(&base_value))
+        Some(schema_value_display(
+            &desc.section,
+            &desc.field,
+            &base_value,
+        ))
     } else {
         None
     };
@@ -855,6 +915,8 @@ fn build_schema_row(
             widget: desc.widget.clone(),
             validation: desc.validation.clone(),
             profile_overridable: desc.profile_overridable,
+            restart: desc.restart,
+            web_only: desc.web_only,
         },
         label: desc.label.clone(),
         description: desc.description.clone(),
@@ -1112,8 +1174,12 @@ fn set_config_path(config: &mut Config, section: &str, field: &str, leaf: Value)
 }
 
 /// Write `section.field = leaf` into a profile/repo override via its JSON form.
-/// Always stores the value as an override; the `r` key clears it.
+/// Always stores the value as an override; the `r` key clears it. A null leaf
+/// (a cleared optional value) has no TOML form, so it clears the override.
 fn set_override_path(profile: &mut ProfileConfig, section: &str, field: &str, leaf: Value) {
+    if leaf.is_null() {
+        return clear_override_path(profile, section, field);
+    }
     let mut j = serde_json::to_value(&*profile).unwrap_or_else(|_| json!({}));
     merge_json(&mut j, &nested_leaf(section, field, leaf));
     if let Ok(updated) = serde_json::from_value(j) {
@@ -1164,6 +1230,21 @@ fn clear_override_path(profile: &mut ProfileConfig, section: &str, field: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_clear_alias_entries_round_trip_as_a_map_not_an_array() {
+        assert!(is_map_list("session", "agent_clear_alias"));
+        let items = vec!["bridge=/clear".to_string(), "other=/new".to_string()];
+        let value = parse_key_value_object(&items);
+        assert_eq!(value, json!({ "bridge": "/clear", "other": "/new" }));
+        // The settings struct accepts the map the TUI writes, so the entry is not discarded.
+        let config: crate::session::SessionConfig =
+            serde_json::from_value(json!({ "agent_clear_alias": value })).unwrap();
+        assert_eq!(
+            config.agent_clear_alias.get("bridge").map(String::as_str),
+            Some("/clear")
+        );
+    }
 
     #[test]
     #[serial_test::serial]
@@ -1222,6 +1303,8 @@ mod tests {
                 widget: WidgetKind::OptionalText { mono: false },
                 validation: ValidationKind::MemoryLimit,
                 profile_overridable: true,
+                restart: false,
+                web_only: false,
             },
             label: "Memory Limit".to_string(),
             description: String::new(),
@@ -1285,6 +1368,7 @@ mod tests {
             "session.agent_command_override",
             "session.agent_extra_args",
             "session.agent_acp_cmd",
+            "session.agent_clear_alias",
             "session.default_tool",
             "session.agent_config_dir",
             "session.agent_execution_as",
@@ -1503,6 +1587,39 @@ mod tests {
         );
         apply_field_to_config(&f, SettingsScope::Profile, &mut global, &mut profile);
         assert!(has_override_path(&profile, "status_hooks", "on_waiting"));
+    }
+
+    /// Clearing an optional profile value is "no override": TOML has no null,
+    /// so a stored null leaf made `save_profile_config` fail.
+    #[test]
+    #[serial_test::serial]
+    fn clearing_an_optional_profile_value_inherits_and_saves() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        for (category, section, name) in [
+            (SettingsCategory::Sandbox, "sandbox", "default_image"),
+            (SettingsCategory::Sandbox, "sandbox", "cpu_limit"),
+            (SettingsCategory::StatusHooks, "status_hooks", "on_waiting"),
+        ] {
+            let mut global = Config::default();
+            let mut profile = profile_from(json!({ section: { name: "set" } }));
+            let mut f = field(
+                &build(category, SettingsScope::Profile, &profile),
+                &format!("{section}.{name}"),
+            )
+            .clone();
+            f.value = FieldValue::OptionalText(None);
+            apply_field_to_config(&f, SettingsScope::Profile, &mut global, &mut profile);
+
+            crate::session::config::profile_config::save_profile_config("work", &profile)
+                .unwrap_or_else(|e| panic!("{section}.{name}: {e}"));
+            assert!(
+                !has_override_path(&profile, section, name),
+                "{section}.{name}"
+            );
+            let saved =
+                crate::session::config::profile_config::load_profile_config("work").unwrap();
+            assert_eq!(saved.overrides.get(section), profile.overrides.get(section));
+        }
     }
 
     #[test]

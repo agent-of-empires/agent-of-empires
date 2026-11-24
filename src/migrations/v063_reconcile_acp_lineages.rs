@@ -11,8 +11,10 @@ pub fn run() -> Result<()> {
     super::v055_global_max_concurrent_workers::run()?;
     super::v056_launch_resolved_executable::run()?;
     super::v057_worker_launch_executable::run()?;
+    super::v058_account_limits_window_shape::run()?;
     reconcile_autonomous_metadata()?;
-    tracing::info!(target: "migrations.v059", "Reconciled ACP establishment, scope, publication, budget, retained identity and global worker cap");
+    super::v059_owner_only_event_logs::run()?;
+    tracing::info!(target: "migrations.v063", "Reconciled ACP establishment, scope, publication, budget, retained identity and global worker cap");
     Ok(())
 }
 
@@ -338,13 +340,13 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn fresh_storage_reaches_59_without_manufacturing_native_history() {
+    fn fresh_storage_reaches_current_version_without_manufacturing_native_history() {
         let home = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(home.path());
         let app = crate::session::get_app_dir().unwrap();
         fs::create_dir_all(&app).unwrap();
         run_migrations().unwrap();
-        assert_eq!(get_current_version(), 59);
+        assert_eq!(get_current_version(), 63);
         assert!(!app.join("acp_events.db").exists());
     }
 
@@ -372,7 +374,7 @@ mod tests {
             prepare_history(history, &conn);
             let old_identity = identity(&conn);
             run_migrations().unwrap();
-            assert_eq!(get_current_version(), 59, "{history:?}");
+            assert_eq!(get_current_version(), 63, "{history:?}");
             assert_preserved(&app, &conn);
             let reconciled_identity = identity(&conn).unwrap();
             if let Some(old) = old_identity {
@@ -441,12 +443,16 @@ mod tests {
         let conn = seed_legacy_database(&app);
         prepare_history(History::Main57, &conn);
         let old_identity = identity(&conn).unwrap();
-        let marker = fs::read(app.join(VERSION_FILE)).unwrap();
+        set_version(62).unwrap();
+        let marker_before_reconciliation = fs::read(app.join(VERSION_FILE)).unwrap();
         let other = app.join("profiles/other/config.toml");
         let valid_config = fs::read(&other).unwrap();
         fs::write(&other, "[acp\n").unwrap();
         assert!(run_migrations().is_err());
-        assert_eq!(fs::read(app.join(VERSION_FILE)).unwrap(), marker);
+        assert_eq!(
+            fs::read(app.join(VERSION_FILE)).unwrap(),
+            marker_before_reconciliation
+        );
         assert_eq!(identity(&conn).unwrap(), old_identity);
         assert_eq!(
             conn.query_row(
@@ -468,7 +474,7 @@ mod tests {
         let backups = crate::session::migration_backups(&path).unwrap().len();
         fs::write(&other, valid_config).unwrap();
         run_migrations().unwrap();
-        assert_eq!(get_current_version(), 59);
+        assert_eq!(get_current_version(), 63);
         assert_preserved(&app, &conn);
         assert_eq!(identity(&conn).unwrap(), old_identity);
         assert_eq!(
@@ -479,7 +485,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn incompatible_legacy_scope_or_budget_preserves_data_without_stamping_59() {
+    fn incompatible_legacy_scope_or_budget_preserves_data_without_stamping_reconciliation() {
         for malformed_scope in [true, false] {
             let home = tempfile::tempdir().unwrap();
             let _home = crate::session::test_support::isolate_app_dir_at(home.path());
@@ -498,6 +504,7 @@ mod tests {
                 )
                 .unwrap();
             }
+            set_version(62).unwrap();
             let marker = fs::read(app.join(VERSION_FILE)).unwrap();
             assert!(run_migrations().is_err());
             assert_eq!(fs::read(app.join(VERSION_FILE)).unwrap(), marker);
@@ -520,7 +527,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn malformed_readable_native_establishment_preserves_evidence_and_refuses_59() {
+    fn malformed_readable_native_establishment_preserves_evidence_and_refuses_reconciliation() {
         let home = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(home.path());
         let app = crate::session::get_app_dir().unwrap();
@@ -530,6 +537,7 @@ mod tests {
         prepare_history(History::Main57, &conn);
         let malformed = br#"[{"id":"5959595959595959","acp_establishment":{"version":999}}]"#;
         fs::write(app.join("sessions.json"), malformed).unwrap();
+        set_version(62).unwrap();
         let marker = fs::read(app.join(VERSION_FILE)).unwrap();
         assert!(run_migrations().is_err());
         assert_eq!(fs::read(app.join(VERSION_FILE)).unwrap(), marker);

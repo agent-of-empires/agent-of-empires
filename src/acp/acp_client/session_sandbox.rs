@@ -2,13 +2,14 @@
 //! agent command is wrapped in.
 
 use crate::acp::fs_handler::SandboxPathMap;
-use crate::session::SandboxInfo;
+use crate::containers::container_interface::VolumeMount;
+use crate::session::{SandboxInfo, WorkspaceInfo};
 use std::path::{Path, PathBuf};
 
 use super::errors::AcpError;
 use super::spawn::{
-    adapter_default_env_pairs, allowlisted_env_pairs, is_host_only_path_env,
-    request_env_denyreason, SpawnConfig,
+    adapter_default_env_pairs, allowlisted_env_pairs, allowlisted_env_pairs_for,
+    is_host_only_path_env, request_env_denyreason, SpawnConfig,
 };
 
 /// Sandbox handles a connection task needs to route ACP fs/* and
@@ -40,33 +41,16 @@ impl SessionSandbox {
         config_path: &Path,
         source_profile: Option<String>,
     ) -> Result<(Self, SandboxPathMap), AcpError> {
-        let project_path_str = project_path.to_string_lossy().to_string();
-        let (volumes, computed_workdir) =
-            crate::session::config::container_config::compute_volume_paths(
-                project_path,
-                &project_path_str,
-            )
-            .map_err(|e| AcpError::Spawn(format!("compute container workdir: {e}")))?;
-        // Must be what the container was created with. `compute_volume_paths`
-        // collapses to `/workspace/<basename>` once the worktree's git linkage
-        // breaks, naming a path the container never mounted (#2414), so prefer
-        // the create-time pin, then the live container, then the recompute.
-        let workdir = sandbox
-            .container_workdir
-            .clone()
-            .or_else(|| {
-                crate::containers::get_container_runtime()
-                    .container_working_dir(&sandbox.container_name)
-            })
-            .unwrap_or(computed_workdir);
-        let mounts: Vec<(PathBuf, PathBuf)> = volumes
+        let layout = SandboxLayout::resolve(sandbox, project_path, None)?;
+        let mounts: Vec<(PathBuf, PathBuf)> = layout
+            .volumes
             .into_iter()
             .map(|v| (PathBuf::from(v.container_path), PathBuf::from(v.host_path)))
             .collect();
         Ok((
             Self {
                 container_name: sandbox.container_name.clone(),
-                container_workdir: PathBuf::from(workdir),
+                container_workdir: PathBuf::from(layout.container_workdir),
                 sandbox_info: sandbox.clone(),
                 source_profile,
                 config_path: config_path.to_path_buf(),
@@ -96,6 +80,56 @@ impl SessionSandbox {
             crate::session::environment::resolved_sandbox_config(profile, &self.config_path);
         crate::session::environment::collect_environment(&sandbox_config, &self.sandbox_info)
     }
+}
+
+/// The workspace volumes a session's container was built with and the workdir it runs in.
+pub(crate) struct SandboxLayout {
+    pub(crate) volumes: Vec<VolumeMount>,
+    pub(crate) container_workdir: String,
+}
+
+impl SandboxLayout {
+    /// Blocking: without a pinned workdir it asks the container runtime. Pass the
+    /// session's `workspace_info` so the volumes match the ones its container was created with.
+    pub(crate) fn resolve(
+        sandbox: &SandboxInfo,
+        project_path: &Path,
+        workspace: Option<&WorkspaceInfo>,
+    ) -> Result<Self, AcpError> {
+        Self::resolve_with(sandbox, project_path, workspace, known_container_workdir)
+    }
+
+    /// [`Self::resolve`] with the workdir source chosen by the caller.
+    pub(crate) fn resolve_with(
+        sandbox: &SandboxInfo,
+        project_path: &Path,
+        workspace: Option<&WorkspaceInfo>,
+        known_workdir: impl FnOnce(&SandboxInfo) -> Option<String>,
+    ) -> Result<Self, AcpError> {
+        use crate::session::config::container_config::{
+            compute_volume_paths, compute_workspace_volume_paths,
+        };
+        let (volumes, computed_workdir) = match workspace {
+            Some(workspace) => compute_workspace_volume_paths(project_path, workspace),
+            None => compute_volume_paths(project_path, &project_path.to_string_lossy()),
+        }
+        .map_err(|e| AcpError::Spawn(format!("compute container workdir: {e}")))?;
+        let container_workdir = known_workdir(sandbox).unwrap_or(computed_workdir);
+        Ok(Self {
+            volumes,
+            container_workdir,
+        })
+    }
+}
+
+/// The workdir the container was created with. `compute_volume_paths` collapses to
+/// `/workspace/<basename>` once a worktree's git linkage breaks, naming a path the
+/// container never mounted (#2414), so the create-time pin, then the live container,
+/// outrank a recompute.
+pub(crate) fn known_container_workdir(sandbox: &SandboxInfo) -> Option<String> {
+    sandbox.container_workdir.clone().or_else(|| {
+        crate::containers::get_container_runtime().container_working_dir(&sandbox.container_name)
+    })
 }
 
 /// `docker_binary` is `argv[0]` (docker/podman). Export `inherit_env` so the
@@ -156,24 +190,21 @@ pub(super) fn build_sandbox_docker_argv(
     // host-only paths (which name nothing inside the container) never cross.
     // docker forwards only a name handed to it via `-e`, so the value is set on
     // the runner via `inherit_env` and the key alone goes in the argv.
-    let request_auth = config
-        .provider_env
-        .iter()
-        .filter(|&(key, _)| request_env_denyreason(key).is_none())
-        .cloned();
-    let adapter_allowlist = allowlisted_env_pairs(config);
-    let adapter_defaults = adapter_default_env_pairs(config);
-    for (key, value) in request_auth
-        .chain(adapter_allowlist)
-        .chain(adapter_defaults)
-    {
-        if forwards_into_container(&key) {
-            if seen_keys.insert(key.clone()) {
-                docker_args.push("-e".into());
-                docker_args.push(key.clone());
-                inherit_env.push((key, value));
-            }
-        } else if seen_keys.insert(key.clone()) {
+    for ClaimedEnv {
+        key,
+        value,
+        forwards,
+    } in claim_launch_env(
+        &mut seen_keys,
+        &config.provider_env,
+        allowlisted_env_pairs(config),
+        adapter_default_env_pairs(config),
+    ) {
+        if forwards {
+            docker_args.push("-e".into());
+            docker_args.push(key.clone());
+            inherit_env.push((key, value));
+        } else {
             // Only a key the sandbox env did not already claim is really
             // dropped: `docker_env_args` already forwarded a claimed one.
             tracing::warn!(
@@ -205,6 +236,68 @@ pub(super) fn build_sandbox_docker_argv(
         inherit_env,
         target_env,
     })
+}
+
+/// One variable a sandboxed launch claims from the request or the adapter allowlist.
+pub(super) struct ClaimedEnv {
+    pub(super) key: String,
+    pub(super) value: String,
+    /// `false` for a host-only path, which the launch drops instead of forwarding.
+    pub(super) forwards: bool,
+}
+
+/// The variables a sandboxed launch takes beyond the sandbox environment, in claim order:
+/// the request's `provider_env` (minus denied keys), then the adapter allowlist. `claimed`
+/// holds the keys already taken, the sandbox environment's among them; the first claim of a
+/// key wins even when its value is empty, so a later source never fills it in. `defaults` are
+/// AoE's own adapter defaults, claimed last so any explicit value wins. The one resolution
+/// shared by the launch's argv and the launch-authentication admission.
+pub(super) fn claim_launch_env(
+    claimed: &mut std::collections::HashSet<String>,
+    request: &[(String, String)],
+    allowlist: Vec<(String, String)>,
+    defaults: Vec<(String, String)>,
+) -> Vec<ClaimedEnv> {
+    let request = request
+        .iter()
+        .filter(|&(key, _)| request_env_denyreason(key).is_none())
+        .cloned();
+    request
+        .chain(allowlist)
+        .chain(defaults)
+        .filter(|(key, _)| claimed.insert(key.clone()))
+        .map(|(key, value)| ClaimedEnv {
+            forwards: forwards_into_container(&key),
+            key,
+            value,
+        })
+        .collect()
+}
+
+/// The environment a sandboxed launch of an adapter with `allowlist` runs with, as far as its
+/// authentication is concerned: `sandbox_env` first, then what `claim_launch_env` forwards
+/// of the request's `provider_env` and the allowlisted host variables the daemon has set.
+/// Resolved in memory for the admission check; the request's values are never stored.
+pub fn effective_launch_env(
+    sandbox_env: &[crate::containers::EnvEntry],
+    request: &[(String, String)],
+    allowlist: Option<&[String]>,
+) -> Vec<crate::containers::EnvEntry> {
+    let mut claimed = sandbox_env.iter().map(|e| e.key().to_string()).collect();
+    // AoE's adapter defaults carry no authentication, so they take no part in the admission.
+    let forwarded = claim_launch_env(
+        &mut claimed,
+        request,
+        allowlisted_env_pairs_for(allowlist),
+        Vec::new(),
+    )
+    .into_iter()
+    .filter(|c| c.forwards)
+    .map(|c| crate::containers::EnvEntry::Inherit {
+        key: c.key,
+        value: c.value,
+    });
+    sandbox_env.iter().cloned().chain(forwarded).collect()
 }
 
 /// A path-valued key names nothing inside the container, so a sandboxed launch
