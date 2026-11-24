@@ -43,7 +43,8 @@ assessment behind its last finding is assessed again. Order the rest by priority
 ## 2. Assess each issue
 
 Read the body and comments with
-`gh issue view <n> -R $REPO --json body,comments,labels,updatedAt`. An issue is ready
+`gh issue view <n> -R $REPO --json body,comments,labels,updatedAt`. Skip the
+issue if its labels now include one that step 1 excludes. An issue is ready
 when all of these hold:
 
 1. **Problem**: current and expected behavior are stated.
