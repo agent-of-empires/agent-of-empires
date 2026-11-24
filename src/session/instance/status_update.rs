@@ -229,6 +229,19 @@ impl Instance {
         self.last_error.latch_tmux(TmuxAbsence::Gone, gone);
     }
 
+    /// The remedy reconcile a tmux latch's own poll makes ([`Self::latch_missing_pane`]).
+    fn reconcile_latched_remedy(&mut self) {
+        let lead = match self.last_error.absence() {
+            Some(absence @ TmuxAbsence::Gone) => (absence, TMUX_SESSION_GONE_LEAD),
+            Some(absence @ TmuxAbsence::Unreachable) => (absence, TMUX_SERVER_UNREACHABLE_LEAD),
+            None => {
+                self.drop_remedy_if_launchable();
+                return;
+            }
+        };
+        self.name_refused_restart(Some(lead), None);
+    }
+
     /// Whether the row can launch again, having dropped a remedy already named if so. The latch
     /// stays.
     fn drop_remedy_if_launchable(&mut self) -> bool {
@@ -308,6 +321,8 @@ impl Instance {
         if self.status == Status::Error && self.last_error.is_some() {
             if let Some(last_check) = self.last_error_check {
                 if last_check.elapsed().as_secs() < 30 {
+                    // Throttles tmux probes only; the remedy follows the row's own command.
+                    self.reconcile_latched_remedy();
                     return;
                 }
             }
@@ -1534,6 +1549,56 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             ));
             latched.clear_stale_tmux_error();
             assert_eq!(latched.last_error.as_deref(), None);
+        }
+
+        // Inside the 30 s Error throttle, which spares tmux, the remedy still follows the command:
+        // either fix drops it on the next poll, and undoing the fix names it again.
+        {
+            let mut mismatches = Vec::new();
+            let remedies: [(&str, fn(&mut Instance)); 2] = [
+                ("flag removed", |inst| inst.command = "claude".into()),
+                ("AoE's id cleared", |inst| {
+                    inst.resume_intent = ResumeIntent::Cleared
+                }),
+            ];
+            for (absence, bare) in [
+                (TmuxAbsence::Gone, TMUX_SESSION_GONE_ERROR),
+                (TmuxAbsence::Unreachable, TMUX_SERVER_UNREACHABLE_ERROR),
+            ] {
+                for (fix, apply) in remedies {
+                    let guard = crate::tmux::SessionCacheGuard::capture();
+                    match absence {
+                        TmuxAbsence::Gone => guard.force_present(&["aoe_some_other_session"]),
+                        TmuxAbsence::Unreachable => guard.force_unreachable(),
+                    }
+                    let mut inst = conflicting();
+                    let refused_by = (inst.command.clone(), inst.resume_intent.clone());
+                    inst.unknown_since = Some(std::time::Instant::now() - Duration::from_secs(60));
+                    inst.update_status_with_metadata_inner(None, None);
+                    let named = inst.last_error.as_deref().map(str::to_owned);
+                    let poll = |inst: &mut Instance| {
+                        inst.last_error_check = Some(std::time::Instant::now());
+                        inst.update_status_with_metadata_inner(None, None);
+                        (
+                            inst.last_error.as_deref().map(str::to_owned),
+                            inst.last_error.absence(),
+                        )
+                    };
+                    apply(&mut inst);
+                    let fixed = poll(&mut inst);
+                    (inst.command, inst.resume_intent) = refused_by;
+                    let undone = poll(&mut inst);
+                    let seen = (fixed, undone);
+                    let want = (
+                        (Some(bare.to_owned()), Some(absence)),
+                        (named, Some(absence)),
+                    );
+                    if seen != want {
+                        mismatches.push(format!("{absence:?}, {fix}: {seen:?}, want {want:?}"));
+                    }
+                }
+            }
+            assert!(mismatches.is_empty(), "{mismatches:#?}");
         }
 
         // No tmux server, as after the last pane ended, past the window that waits for one.
