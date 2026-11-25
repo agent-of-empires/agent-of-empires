@@ -371,6 +371,7 @@ impl HomeView {
             suggestions_focused: false,
             prompt_failures_announced: std::collections::HashSet::new(),
             prompt_failures_seeded: false,
+            prompt_failure_queue: Vec::new(),
             undelivered_prompt: None,
             start_after_trash: None,
             suggestions_feed: crate::tui::suggestions::SuggestionsFeed::new(),

@@ -87,7 +87,7 @@ impl HomeView {
             if let Err(error) = update_app_state(|state| state.used_system_health = true) {
                 tracing::warn!(target: "tui.home", "failed to persist System Health discovery: {error}");
             } else if let Ok(config) = load_config().map(|config| config.unwrap_or_default()) {
-                self.tips_unseen = tips_unseen_count(&config);
+                self.tips_unseen = self.tips_unseen_count(&config);
             }
         }
         self.system_health_open = true;
@@ -121,7 +121,7 @@ impl HomeView {
         let Ok(config) = load_config().map(|config| config.unwrap_or_default()) else {
             return;
         };
-        self.tips_unseen = tips_unseen_count(&config);
+        self.tips_unseen = self.tips_unseen_count(&config);
         if config.session.show_tips
             && !config.app_state.used_system_health
             && !config
@@ -938,7 +938,8 @@ impl HomeView {
                 self.clear_unread_on_view(&id);
             }
         }
-        let outcomes_changed = self.apply_runtime_outcomes(promote_dialogs);
+        let outcomes_changed = self.apply_runtime_outcomes(promote_dialogs)
+            | (promote_dialogs && self.promote_prompt_failure());
         let pending_after =
             self.session_feed.any_pending() || self.pending_namespace_intent.is_some();
         updated

@@ -461,33 +461,39 @@ impl HomeView {
         self.creating_hook_progress.remove(stub_id);
     }
 
-    /// Tells the user once when a session was created but its first prompt
-    /// was not delivered, and offers to copy the retained prompt.
+    /// Queues a notice, once per failure, when a session was created but its
+    /// first prompt was not delivered. The tick path opens it.
     pub(super) fn announce_prompt_failure(&mut self, row: &crate::daemon::SessionResponse) {
         let Some(error) = &row.initial_prompt_error else {
             self.prompt_failures_announced.remove(&row.id);
+            self.prompt_failure_queue.retain(|(id, _)| *id != row.id);
             return;
         };
-        if !self.prompt_failures_seeded {
-            self.prompt_failures_announced.insert(row.id.clone());
+        if !self.prompt_failures_announced.insert(row.id.clone()) || !self.prompt_failures_seeded {
             return;
         }
-        // Another dialog is open: the next snapshot tries again.
-        if self.prompt_failures_announced.contains(&row.id)
-            || self.info_dialog.is_some()
-            || self.confirm_dialog.is_some()
-        {
-            return;
-        }
-        self.prompt_failures_announced.insert(row.id.clone());
-        let prompt = self
-            .get_instance(&row.id)
-            .and_then(|i| i.pending_initial_turn.as_ref())
-            .map(|turn| turn.text.clone());
-        let mut message = format!(
+        let message = format!(
             "{} was created, but its first prompt was not delivered: {error}",
             row.title
         );
+        self.prompt_failure_queue.push((row.id.clone(), message));
+    }
+
+    /// Opens the oldest queued prompt failure when no other dialog is open,
+    /// offering to copy the retained prompt. True when one opened.
+    pub(super) fn promote_prompt_failure(&mut self) -> bool {
+        if self.prompt_failure_queue.is_empty()
+            || self.info_dialog.is_some()
+            || self.confirm_dialog.is_some()
+            || self.has_non_live_send_overlay()
+        {
+            return false;
+        }
+        let (id, mut message) = self.prompt_failure_queue.remove(0);
+        let prompt = self
+            .get_instance(&id)
+            .and_then(|i| i.pending_initial_turn.as_ref())
+            .map(|turn| turn.text.clone());
         match prompt {
             Some(text) => {
                 message.push_str("\n\nCopy the prompt, then attach the session and paste it.");
@@ -503,6 +509,7 @@ impl HomeView {
                 self.info_dialog = Some(InfoDialog::sized_to_fit("Prompt not delivered", &message));
             }
         }
+        true
     }
 
     fn commit_created_session(&mut self) -> Option<String> {

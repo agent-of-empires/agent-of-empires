@@ -627,6 +627,8 @@ pub struct HomeView {
     pub(super) prompt_failures_announced: std::collections::HashSet<String>,
     /// False until the first snapshot: failures it already carries are not announced.
     pub(super) prompt_failures_seeded: bool,
+    /// Announced failures waiting for the tick path: session id and message.
+    pub(super) prompt_failure_queue: Vec<(String, String)>,
     /// The prompt the "Prompt not delivered" dialog's Copy button puts on the clipboard.
     pub(super) undelivered_prompt: Option<String>,
     /// A suggestion to start again once its blocked Session, by id, is in Trash.

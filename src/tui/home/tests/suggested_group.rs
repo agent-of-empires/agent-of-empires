@@ -433,14 +433,26 @@ fn focusing_the_pane_releases_a_focused_trash_reader() {
 #[serial]
 fn the_row_vanishing_under_the_focused_pane_leaves_a_valid_cursor() {
     for case in ["pref off", "other profile"] {
-        let (mut env, _requests) = expanded_env(2);
+        let mut env = create_test_env_with_sessions(1);
         let mut snap = snapshot(2, &[]);
         if case == "pref off" {
             snap["prefs"]["sidebar"] = false.into();
         } else {
+            snap["profile"] = "theirs".into();
+        }
+        // A reload racing the test answers with the case's snapshot too.
+        let (sink, _requests) = mpsc::channel();
+        env.view.suggestions_feed = SuggestionsFeed::recording_for_test(snap.clone(), sink);
+        env.view
+            .suggestions_feed
+            .set_snapshot_for_test(snapshot(2, &[]));
+        env.view.rebuild_flat_items();
+        select_suggested_row(&mut env);
+        env.view.handle_key(key(KeyCode::Enter), None);
+        assert!(env.view.suggestions_focused, "{case}");
+        if case == "other profile" {
             let mine = env.view.instance_at(0).source_profile.clone();
             env.view.active_profile = Some(mine);
-            snap["profile"] = "theirs".into();
         }
         env.view.suggestions_feed.set_snapshot_for_test(snap);
         env.view.apply_suggestions_results();
@@ -1211,25 +1223,38 @@ fn an_undelivered_first_prompt_is_announced_once_per_failure() {
     let instance = env.view.instances().next().unwrap().clone();
     let mut row = crate::server::api::sessions::session_response_from_instance(&instance, false);
     row.initial_prompt_error = Some("the agent was not ready".into());
+    let announce = |env: &mut TestEnv, row: &crate::daemon::SessionResponse| {
+        env.view.announce_prompt_failure(row);
+        env.view.promote_prompt_failure();
+    };
 
     // As on launch, before the first snapshot is applied.
     env.view.prompt_failures_seeded = false;
-    env.view.announce_prompt_failure(&row);
+    announce(&mut env, &row);
     assert!(
         env.view.info_dialog.is_none(),
         "a failure the first snapshot already carries is not announced"
     );
     env.view.prompt_failures_seeded = true;
-    env.view.announce_prompt_failure(&row);
+    announce(&mut env, &row);
     assert!(env.view.info_dialog.is_none(), "nor on later snapshots");
 
     row.initial_prompt_error = None;
-    env.view.announce_prompt_failure(&row);
+    announce(&mut env, &row);
     row.initial_prompt_error = Some("the agent was not ready".into());
+    // The pre-input path only queues it, so a key cannot close it unseen.
     env.view.announce_prompt_failure(&row);
+    assert!(env.view.info_dialog.is_none());
+    // Another dialog holds it back until it closes.
+    env.view.confirm_dialog = Some(crate::tui::dialogs::ConfirmDialog::new(
+        "Other", "", "other",
+    ));
+    assert!(!env.view.promote_prompt_failure());
+    env.view.confirm_dialog = None;
+    assert!(env.view.promote_prompt_failure());
     assert!(env.view.info_dialog.is_some(), "a new failure is announced");
     env.view.info_dialog = None;
-    env.view.announce_prompt_failure(&row);
+    announce(&mut env, &row);
     assert!(
         env.view.info_dialog.is_none(),
         "the same failure is not repeated"
@@ -1243,9 +1268,9 @@ fn an_undelivered_first_prompt_is_announced_once_per_failure() {
         .pending_initial_turn =
         Some(serde_json::from_value(serde_json::json!({ "text": "fix the bug" })).unwrap());
     row.initial_prompt_error = None;
-    env.view.announce_prompt_failure(&row);
+    announce(&mut env, &row);
     row.initial_prompt_error = Some("the agent was not ready".into());
-    env.view.announce_prompt_failure(&row);
+    announce(&mut env, &row);
     let dialog = env.view.confirm_dialog.as_ref().expect("Copy is offered");
     assert_eq!(dialog.action(), "copy_undelivered_prompt");
     assert_eq!(env.view.undelivered_prompt.as_deref(), Some("fix the bug"));
