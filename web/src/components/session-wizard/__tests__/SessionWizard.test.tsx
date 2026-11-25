@@ -1796,6 +1796,34 @@ describe("SessionWizard Pull latest image first", () => {
       expect(screen.queryByText("Waiting for the sandbox image update…")).toBeNull();
     });
 
+    it("says a network retry pulls on its own once the download it would have joined has ended", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      onTestFinished(() => {
+        vi.useRealTimers();
+        vi.mocked(fetchCreateProgress).mockResolvedValue(null);
+      });
+      let current: object = RUNNING;
+      open(RUNNING);
+      vi.mocked(fetchSandboxImageStatus).mockImplementation(async (image) =>
+        image === IMAGE ? (current as never) : null,
+      );
+      await choice("Wait for the update");
+      let loseFirst: (result: object) => void = () => {};
+      createSession.mockImplementationOnce(() => new Promise((resolve) => (loseFirst = resolve)));
+      createSession.mockReturnValue(new Promise(() => {}));
+      vi.mocked(fetchCreateProgress).mockResolvedValue({ stage: "pulling_image", hook: null, output: [] });
+      await launch();
+      await screen.findByText("Waiting for the sandbox image update…", undefined, { timeout: 3000 });
+      // The download ends while the first send is out, and then its answer is lost.
+      current = { ...UPDATE, state: "current", pull: { state: "done" } };
+      await vi.advanceTimersByTimeAsync(RUNNING_RECHECK_MS * 2);
+      loseFirst({ ok: false, error: "Network error: offline", network: true });
+      await vi.advanceTimersByTimeAsync(2_000);
+      await waitFor(() => expect(createSession).toHaveBeenCalledTimes(2));
+      await screen.findByText("Pulling latest image...", undefined, { timeout: 3000 });
+      expect(screen.queryByText("Waiting for the sandbox image update…")).toBeNull();
+    });
+
     it("Start now launches on the current image without joining", async () => {
       const started = vi.fn();
       window.addEventListener(SANDBOX_IMAGE_PULL_STARTED_EVENT, started);

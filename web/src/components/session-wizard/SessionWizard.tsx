@@ -713,9 +713,12 @@ export function SessionWizard({
         : null;
       // Recorded before the request goes out, so a reload mid-flight still has the key.
       if (pending) registerPendingCreate(pending, { claimed: true });
-      const send = (retry: boolean) => createSession(pending && retry ? retryBody(pending) : body);
-      // Decided at each send, resends included: the download this create would join may have ended.
-      setWaitingForUpdate(!!body.pull_latest_image && !!pullOfferRef.current?.running);
+      const send = (retry: boolean) => {
+        // Decided at each send, network retries and resends included: the download this create
+        // would join may have ended.
+        setWaitingForUpdate(!!body.pull_latest_image && !!pullOfferRef.current?.running);
+        return createSession(pending && retry ? retryBody(pending) : body);
+      };
       if (body.pull_latest_image) notifySandboxImagePullStarted();
       let result = await send(!!resume);
       for (let attempt = 0; result.network && pending && attempt < NETWORK_RETRIES; attempt++) {
