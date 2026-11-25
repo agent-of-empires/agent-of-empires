@@ -334,7 +334,7 @@ export function SuggestionActions({
   );
 }
 
-/** Every installed provider is off. Read-only says where to turn one on instead of offering it. */
+/** Every installed provider is off. Read-only says it can't turn them on; its Settings are read-only too. */
 export function SuggestionsOffNote({
   providers,
   readOnly,
@@ -356,7 +356,7 @@ export function SuggestionsOffNote({
     <li className={SUGGESTION_NOTE_CLASS} data-testid="suggestions-off">
       Suggestions are off: {providers.map((p) => p.name).join(", ")} {one ? "is" : "are"} installed but turned off.{" "}
       {readOnly ? (
-        "Turn one on in Settings › Suggestions."
+        `Read-only: this dashboard can't turn ${one ? "it" : "them"} on.`
       ) : (
         <button
           type="button"

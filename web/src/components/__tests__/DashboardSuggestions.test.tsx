@@ -101,7 +101,7 @@ describe("DashboardSuggestions", () => {
     });
     renderIt({ readOnly: true });
     expect((await screen.findByTestId("suggestions-off")).textContent).toBe(
-      "Suggestions are off: GitHub, Linear are installed but turned off. Turn one on in Settings › Suggestions.",
+      "Suggestions are off: GitHub, Linear are installed but turned off. Read-only: this dashboard can't turn them on.",
     );
     expect(screen.queryByRole("button", { name: /Turn/ })).toBeNull();
   });
