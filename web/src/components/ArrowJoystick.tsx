@@ -22,7 +22,7 @@ export function ArrowJoystick({ onArrow }: { onArrow: (sequence: string) => void
   useEffect(() => {
     onArrowRef.current = onArrow;
   }, [onArrow]);
-  const originRef = useRef<{ x: number; y: number; pointerId: number } | null>(null);
+  const originRef = useRef<{ x: number; y: number; pointerId: number; pointerType: string } | null>(null);
   const directionRef = useRef<Direction | null>(null);
   const distanceRef = useRef(0);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -32,7 +32,6 @@ export function ArrowJoystick({ onArrow }: { onArrow: (sequence: string) => void
     if (timerRef.current) clearTimeout(timerRef.current);
     timerRef.current = null;
   }, []);
-  useEffect(() => stopRepeat, [stopRepeat]);
 
   const emit = useCallback((direction: Direction) => {
     navigator.vibrate?.(5);
@@ -50,6 +49,46 @@ export function ArrowJoystick({ onArrow }: { onArrow: (sequence: string) => void
     timerRef.current = setTimeout(tick, JOYSTICK_FIRST_REPEAT_MS);
   }, [emit]);
 
+  const endGesture = useCallback(() => {
+    stopRepeat();
+    if (!originRef.current) return;
+    originRef.current = null;
+    directionRef.current = null;
+    setThumb(null);
+  }, [stopRepeat]);
+  useEffect(() => endGesture, [endGesture]);
+
+  // iOS can drop a touch's pointerup and pointercancel, for example when a system gesture takes the finger
+  // or the PWA is backgrounded mid-hold, so the window and page lifecycle also end the gesture.
+  useEffect(() => {
+    const onPointerEnd = (e: PointerEvent) => {
+      if (originRef.current?.pointerId === e.pointerId) endGesture();
+    };
+    // A new primary pointer of the same type means no other such pointer is down, so a held gesture
+    // lost its end event, even when the new press reuses its ID. Capture runs before the pad's own
+    // pointerdown, which then starts fresh.
+    const onPointerStart = (e: PointerEvent) => {
+      if (e.isPrimary && e.pointerType === originRef.current?.pointerType) endGesture();
+    };
+    const onHidden = () => {
+      if (document.visibilityState === "hidden") endGesture();
+    };
+    window.addEventListener("pointerdown", onPointerStart, true);
+    window.addEventListener("pointerup", onPointerEnd, true);
+    window.addEventListener("pointercancel", onPointerEnd, true);
+    window.addEventListener("blur", endGesture);
+    window.addEventListener("pagehide", endGesture);
+    document.addEventListener("visibilitychange", onHidden);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerStart, true);
+      window.removeEventListener("pointerup", onPointerEnd, true);
+      window.removeEventListener("pointercancel", onPointerEnd, true);
+      window.removeEventListener("blur", endGesture);
+      window.removeEventListener("pagehide", endGesture);
+      document.removeEventListener("visibilitychange", onHidden);
+    };
+  }, [endGesture]);
+
   // The drawer swipe listens on window, so the pad's touches stop here.
   useEffect(() => {
     const pad = padRef.current;
@@ -65,7 +104,7 @@ export function ArrowJoystick({ onArrow }: { onArrow: (sequence: string) => void
   const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
     if (originRef.current) return;
     e.currentTarget.setPointerCapture?.(e.pointerId);
-    originRef.current = { x: e.clientX, y: e.clientY, pointerId: e.pointerId };
+    originRef.current = { x: e.clientX, y: e.clientY, pointerId: e.pointerId, pointerType: e.pointerType };
     directionRef.current = null;
     setThumb({ x: 0, y: 0 });
   };
@@ -87,11 +126,7 @@ export function ArrowJoystick({ onArrow }: { onArrow: (sequence: string) => void
   };
 
   const end = (e: ReactPointerEvent<HTMLDivElement>) => {
-    if (originRef.current?.pointerId !== e.pointerId) return;
-    stopRepeat();
-    originRef.current = null;
-    directionRef.current = null;
-    setThumb(null);
+    if (originRef.current?.pointerId === e.pointerId) endGesture();
   };
 
   return (
