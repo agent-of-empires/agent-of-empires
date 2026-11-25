@@ -333,9 +333,20 @@ impl Instance {
         }
         // ACP builds its environment from the profile alone, never from the terminal's saved
         // hook output. As launch does, an unresolvable HOME yields no store.
-        let launcher_store = super::hooks::host_home(&config.profile_environment)
-            .filter(|home| home.is_absolute())
-            .and_then(|home| session.agent_config_dir_for(&self.tool, &home))?;
+        let home = super::hooks::host_home(&config.profile_environment)
+            .filter(|home| home.is_absolute())?;
+        let launcher_store = session.agent_config_dir_for(&self.tool, &home)?;
+        // Launch leaves an implicit default store unexported, so a profile `CLAUDE_CONFIG_DIR`
+        // decides the store instead.
+        if crate::session::capture::is_default_claude_store(&launcher_store, &home)
+            && crate::session::environment::resolve_host_environment_value(
+                &config.profile_environment,
+                "CLAUDE_CONFIG_DIR",
+            )
+            .is_some_and(|value| !value.is_empty())
+        {
+            return None;
+        }
         self.acp_transcript_cli_resumable_with("claude", session)
             .then_some((launcher_store, bound_store))
     }
@@ -1489,6 +1500,43 @@ replies = true
                     .resumes_claude_under_own_acp_cmd("claude-work"),
                 expected,
                 "{cmd}"
+            );
+        }
+
+        // A default-store declaration is not exported at launch, so a profile
+        // `CLAUDE_CONFIG_DIR` decides the store and the preview starts fresh.
+        let default_store = home.path().join(".claude");
+        for (environment, expected) in [(None, true), (Some("CLAUDE_CONFIG_DIR=/elsewhere"), false)]
+        {
+            let mut session = toml::Table::new();
+            let entry = |value: &str| {
+                toml::Value::Table(toml::Table::from_iter([(
+                    "claude-work".into(),
+                    toml::Value::String(value.into()),
+                )]))
+            };
+            session.insert("agent_execution_as".into(), entry("claude"));
+            session.insert("agent_acp_cmd".into(), entry("claude-agent-acp"));
+            session.insert(
+                "agent_config_dir".into(),
+                entry(default_store.to_str().unwrap()),
+            );
+            let mut config =
+                toml::Table::from_iter([("session".into(), toml::Value::Table(session))]);
+            if let Some(environment) = environment {
+                config.insert(
+                    "environment".into(),
+                    toml::Value::String(environment.into()),
+                );
+            }
+            let path =
+                crate::session::config::profile_config::get_profile_config_path(PROFILE).unwrap();
+            std::fs::write(path, toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(
+                instance("claude-work", Some(&default_store))
+                    .resumes_claude_under_own_acp_cmd("claude-work"),
+                expected,
+                "{environment:?}"
             );
         }
     }
