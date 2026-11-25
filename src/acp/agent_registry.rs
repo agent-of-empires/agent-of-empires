@@ -71,7 +71,17 @@ pub fn runs_claude_adapter(cmd: &str) -> bool {
             .and_then(|rest| rest.find('@'))
             .map_or(package.len(), |at| at + 1);
         let (name, version) = package.split_at(name_end);
-        PACKAGES.contains(&name) && (version.is_empty() || version.len() > 1)
+        // Only a plain registry selector proves identity; aliases and archive refs do not.
+        let is_registry_selector = |selector: &str| {
+            !selector.is_empty()
+                && selector
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || " ._+-^~<>=|*".contains(c))
+                && ![".tgz", ".tar", ".tar.gz"]
+                    .iter()
+                    .any(|ext| selector.ends_with(ext))
+        };
+        PACKAGES.contains(&name) && (version.is_empty() || is_registry_selector(&version[1..]))
     })
 }
 
@@ -459,6 +469,22 @@ mod tests {
             ("npx claude-agent-acp", true),
             ("bunx -y claude-code-acp --foo", true),
             ("/path/to/npx --yes claude-agent-acp", true),
+            ("npx @agentclientprotocol/claude-agent-acp@^1.2", true),
+            ("npx \"@agentclientprotocol/claude-agent-acp@>=1 <2\"", true),
+            ("npx @agentclientprotocol/claude-agent-acp@npm:other", false),
+            ("npx @agentclientprotocol/claude-agent-acp@file:../x", false),
+            (
+                "npx @agentclientprotocol/claude-agent-acp@https://x/y.tgz",
+                false,
+            ),
+            (
+                "npx @agentclientprotocol/claude-agent-acp@github:u/r",
+                false,
+            ),
+            ("npx @agentclientprotocol/claude-agent-acp@u/r", false),
+            ("npx @agentclientprotocol/claude-agent-acp@x.tgz", false),
+            ("npx claude-agent-acp@npm:other", false),
+            ("npx claude-agent-acp@", false),
         ] {
             assert_eq!(runs_claude_adapter(cmd), expected, "{cmd:?}");
         }
