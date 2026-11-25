@@ -727,8 +727,8 @@ fn queued_send_keeps_admitted_runtime_before_terminal_writer_dispatch() {
             let id = env.view.instance_at(0).id.clone();
             env.view.select_session_by_id(&id);
             let mut respond = env.view.session_feed.terminal_driver_for_test();
-            let SessionFeedResult::Snapshot(mut snapshot) =
-                daemon_snapshot(&env.view, &id, "Stopped")
+            let status = if agent { "Idle" } else { "Stopped" };
+            let SessionFeedResult::Snapshot(mut snapshot) = daemon_snapshot(&env.view, &id, status)
             else {
                 unreachable!()
             };

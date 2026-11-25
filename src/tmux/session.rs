@@ -102,16 +102,75 @@ impl Drop for InputCommandProcess {
     }
 }
 
+/// A selected effect has acknowledged, but its command client may still be
+/// waiting for user hooks. Keep draining and reaping separate from delivery.
+struct AcknowledgedInput {
+    _child: InputCommandProcess,
+    stdout: std::process::ChildStdout,
+    deadline: Instant,
+}
+
+impl AcknowledgedInput {
+    fn finish(mut self) {
+        let mut buffer = [0u8; 4096];
+        while matches!(
+            read_input_output(&mut self.stdout, self.deadline, &mut buffer),
+            Ok(1..)
+        ) {}
+    }
+}
+
+fn read_input_output(
+    stdout: &mut std::process::ChildStdout,
+    deadline: Instant,
+    buffer: &mut [u8],
+) -> std::io::Result<usize> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(0);
+        }
+        let mut poll = libc::pollfd {
+            fd: stdout.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe {
+            libc::poll(
+                &mut poll,
+                1,
+                remaining.as_millis().clamp(1, i32::MAX as u128) as i32,
+            )
+        };
+        if ready == 0 {
+            continue;
+        }
+        let result = if ready < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            stdout.read(buffer)
+        };
+        match result {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) => {}
+            result => return result,
+        }
+    }
+}
+
 /// -C on a one-shot argv command emits flags=0 guards without attaching a client.
 /// The outer if-shell guard is NOT delivery: its selected synchronous send/paste
 /// must finish too. tmux emits that guard before running after-send hooks.
-fn run_input_effect(
+fn acknowledge_input_effect(
     command: &mut std::process::Command,
-    native: Option<crate::session::StorageFlock>,
-) -> Result<()> {
-    use std::io::Read;
+    native_lock: Option<crate::session::StorageFlock>,
+) -> Result<AcknowledgedInput> {
     use std::os::fd::AsRawFd;
-    let mut native = native;
     let mut child = InputCommandProcess(
         command
             .stdin(Stdio::null())
@@ -119,109 +178,54 @@ fn run_input_effect(
             .stderr(Stdio::null())
             .spawn()?,
     );
-    let result = (|| -> Result<()> {
-        let mut stdout = child
-            .0
-            .stdout
-            .take()
-            .context("tmux control stdout missing")?;
-        let fd = stdout.as_raw_fd();
-        // This is our command's pipe; no other reader shares its descriptor flags.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        anyhow::ensure!(
-            flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0,
-            std::io::Error::last_os_error()
-        );
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut ack = InputAcknowledgement::default();
-        let mut line = [0u8; 4096];
-        let mut line_len = 0;
-        let mut buffer = [0u8; 4096];
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+    let native = native_lock;
+    let mut stdout = child
+        .0
+        .stdout
+        .take()
+        .context("tmux control stdout missing")?;
+    let fd = stdout.as_raw_fd();
+    // This is our command's pipe; no other reader shares its descriptor flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    anyhow::ensure!(
+        flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0,
+        std::io::Error::last_os_error()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut ack = InputAcknowledgement::default();
+    let mut line = [0u8; 4096];
+    let mut line_len = 0;
+    let mut buffer = [0u8; 4096];
+    loop {
+        let count = read_input_output(&mut stdout, deadline, &mut buffer)?;
+        anyhow::ensure!(count != 0, crate::session::NativeInputError::Ownership);
+        for &byte in &buffer[..count] {
+            if byte == b'\n' {
+                ack.line(&line[..line_len])
+                    .context(crate::session::NativeInputError::Ownership)?;
+                line_len = 0;
+                if ack.completed == 2 {
+                    // User hooks may re-enter AoE. Release before draining/reaping
+                    // their command client, and independently fence a later Enter.
+                    drop(native);
+                    #[cfg(test)]
+                    tests::observe_selected_input_ack();
+                    return Ok(AcknowledgedInput {
+                        _child: child,
+                        stdout,
+                        deadline,
+                    });
+                }
+            } else {
                 anyhow::ensure!(
-                    ack.completed == 2,
+                    line_len < line.len(),
                     crate::session::NativeInputError::Ownership
                 );
-                break;
-            }
-            let mut poll = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let ready = unsafe {
-                libc::poll(
-                    &mut poll,
-                    1,
-                    remaining.as_millis().clamp(1, i32::MAX as u128) as i32,
-                )
-            };
-            if ready < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                if ack.completed == 2 {
-                    break;
-                }
-                return Err(error.into());
-            }
-            if ready == 0 {
-                continue;
-            }
-            let count = match stdout.read(&mut buffer) {
-                Ok(0) => {
-                    anyhow::ensure!(
-                        ack.completed == 2,
-                        crate::session::NativeInputError::Ownership
-                    );
-                    break;
-                }
-                Ok(count) => count,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    continue
-                }
-                Err(_) if ack.completed == 2 => break,
-                Err(error) => return Err(error.into()),
-            };
-            if ack.completed == 2 {
-                continue;
-            }
-            for &byte in &buffer[..count] {
-                if byte == b'\n' {
-                    ack.line(&line[..line_len])
-                        .context(crate::session::NativeInputError::Ownership)?;
-                    line_len = 0;
-                    if ack.completed == 2 {
-                        // User hooks may re-enter AoE. Release before draining/reaping
-                        // their command client, and independently fence a later Enter.
-                        drop(native.take());
-                        #[cfg(test)]
-                        tests::observe_selected_input_ack();
-                        break;
-                    }
-                } else {
-                    anyhow::ensure!(
-                        line_len < line.len(),
-                        crate::session::NativeInputError::Ownership
-                    );
-                    line[line_len] = byte;
-                    line_len += 1;
-                }
+                line[line_len] = byte;
+                line_len += 1;
             }
         }
-        Ok(())
-    })();
-    drop(native.take());
-    // A selected native ACK, not process exit after user hooks, establishes delivery.
-    result
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -815,6 +819,16 @@ impl Session {
         target: &str,
         args: impl IntoIterator<Item = &'a str>,
     ) -> Result<()> {
+        self.tmux_input_with_completion(verb, target, args, None)
+    }
+
+    fn tmux_input_with_completion<'a>(
+        &self,
+        verb: &str,
+        target: &str,
+        args: impl IntoIterator<Item = &'a str>,
+        pending: Option<&mut Vec<AcknowledgedInput>>,
+    ) -> Result<()> {
         let mut command = self.input_command()?;
         if let Some(physical) = &self.physical {
             anyhow::ensure!(
@@ -841,8 +855,13 @@ impl Session {
                 &effect,
                 "display-message -p AOE_INPUT_REFUSED",
             ]);
-            run_input_effect(&mut command, native)
+            let client = acknowledge_input_effect(&mut command, native)
                 .context(crate::session::NativeInputError::Ownership)?;
+            if let Some(pending) = pending {
+                pending.push(client);
+            } else {
+                client.finish();
+            }
         } else {
             let output = command.arg(verb).args(["-t", target]).args(args).output()?;
             anyhow::ensure!(
@@ -2077,11 +2096,21 @@ impl Session {
     }
 
     fn send_raw_bytes_to(&self, target: &str, bytes: &[u8]) -> Result<()> {
+        self.send_raw_bytes_to_with_completion(target, bytes, None)
+    }
+
+    fn send_raw_bytes_to_with_completion(
+        &self,
+        target: &str,
+        bytes: &[u8],
+        mut pending: Option<&mut Vec<AcknowledgedInput>>,
+    ) -> Result<()> {
         for batch in raw_byte_batches(bytes) {
-            self.tmux_input(
+            self.tmux_input_with_completion(
                 "send-keys",
                 target,
                 std::iter::once("-H").chain(batch.iter().map(String::as_str)),
+                pending.as_deref_mut(),
             )?;
         }
         Ok(())
@@ -2135,13 +2164,40 @@ impl Session {
     /// treating them as newlines instead of submit. The delay lets the
     /// suppression window expire before Enter is sent.
     pub fn send_keys_with_delay(&self, text: &str, enter_delay_ms: u64) -> Result<()> {
+        self.send_keys_with_delay_inner(text, enter_delay_ms, None)
+    }
+
+    /// Settle daemon custody after the final input ACK (or input failure) and
+    /// before waiting for any send/paste command clients. Their user hooks may
+    /// re-enter the daemon, including during the text phase before Enter.
+    pub(crate) fn send_keys_with_ack<T>(
+        &self,
+        text: &str,
+        enter_delay_ms: u64,
+        settle: impl FnOnce(Result<()>) -> Result<T>,
+    ) -> Result<T> {
+        let mut pending = Vec::new();
+        let result = self.send_keys_with_delay_inner(text, enter_delay_ms, Some(&mut pending));
+        let result = settle(result);
+        for client in pending {
+            client.finish();
+        }
+        result
+    }
+
+    fn send_keys_with_delay_inner(
+        &self,
+        text: &str,
+        enter_delay_ms: u64,
+        pending: Option<&mut Vec<AcknowledgedInput>>,
+    ) -> Result<()> {
         if self.physical.is_none() && !self.exists() {
             bail!("Session does not exist: {}", self.name);
         }
 
         let target =
             self.live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
-        self.send_keys_to(&target, text, enter_delay_ms)
+        self.send_keys_to(&target, text, enter_delay_ms, pending)
     }
 
     /// [`Self::send_keys_with_delay`] to exactly `pane`, a `#{pane_id}`: text and Enter
@@ -2150,10 +2206,16 @@ impl Session {
         if !self.exists() {
             bail!("Session does not exist: {}", self.name);
         }
-        self.send_keys_to(pane, text, enter_delay_ms)
+        self.send_keys_to(pane, text, enter_delay_ms, None)
     }
 
-    fn send_keys_to(&self, target: &str, text: &str, enter_delay_ms: u64) -> Result<()> {
+    fn send_keys_to(
+        &self,
+        target: &str,
+        text: &str,
+        enter_delay_ms: u64,
+        mut pending: Option<&mut Vec<AcknowledgedInput>>,
+    ) -> Result<()> {
         let delivery = submit_text(text);
         tracing::debug!(target: "tmux.command",
             "send_keys_with_delay: bytes={} lines={} paste={} target={}",
@@ -2164,15 +2226,26 @@ impl Session {
         );
 
         match delivery {
-            SubmitText::Paste(text) => self.send_via_paste_buffer(target, text)?,
+            SubmitText::Paste(text) => {
+                self.send_via_paste_buffer_with_completion(target, text, pending.as_deref_mut())?;
+            }
             SubmitText::Literal(payload) => {
                 let (head, semis) = peel_trailing_semicolons(&payload);
                 if !head.is_empty() {
                     // `--` so lines starting with `-` are not read as tmux flags.
-                    self.tmux_input("send-keys", target, ["-l", "--", head])?;
+                    self.tmux_input_with_completion(
+                        "send-keys",
+                        target,
+                        ["-l", "--", head],
+                        pending.as_deref_mut(),
+                    )?;
                 }
                 if semis > 0 {
-                    self.send_raw_bytes_to(target, &vec![b';'; semis])?;
+                    self.send_raw_bytes_to_with_completion(
+                        target,
+                        &vec![b';'; semis],
+                        pending.as_deref_mut(),
+                    )?;
                 }
             }
         }
@@ -2182,9 +2255,7 @@ impl Session {
         }
 
         // Enter to submit
-        self.tmux_input("send-keys", target, ["Enter"])?;
-
-        Ok(())
+        self.tmux_input_with_completion("send-keys", target, ["Enter"], pending)
     }
 
     /// Send exactly these tokens, with no implicit Enter, to answer an agent's own
@@ -3083,6 +3154,15 @@ impl Session {
     /// [`SubmitText::Paste`] for that agent and keep the per-line
     /// Shift+Enter path.
     fn send_via_paste_buffer(&self, target: &str, text: &str) -> Result<()> {
+        self.send_via_paste_buffer_with_completion(target, text, None)
+    }
+
+    fn send_via_paste_buffer_with_completion(
+        &self,
+        target: &str,
+        text: &str,
+        pending: Option<&mut Vec<AcknowledgedInput>>,
+    ) -> Result<()> {
         static SEND_COUNTER: AtomicU64 = AtomicU64::new(0);
         let seq = SEND_COUNTER.fetch_add(1, Ordering::Relaxed);
         let buf_name = format!("aoe-send-{}-{}", std::process::id(), seq);
@@ -3101,10 +3181,11 @@ impl Session {
             bail!("tmux load-buffer failed (status={:?})", status.code());
         }
 
-        if let Err(error) = self.tmux_input(
+        if let Err(error) = self.tmux_input_with_completion(
             "paste-buffer",
             target,
             ["-d", "-p", "-b", buf_name.as_str()],
+            pending,
         ) {
             // `-d` only deletes on success. Cleanup stays on the captured server.
             if let Ok(mut command) = self.input_command() {
@@ -3516,10 +3597,11 @@ mod tests {
                 acknowledged: ack_tx,
                 resume,
             });
-            let result = run_input_effect(
+            let result = acknowledge_input_effect(
                 std::process::Command::new("sh").args(["-c", &script]),
                 Some(native),
             );
+            let result = result.map(AcknowledgedInput::finish);
             done_tx.send(result).unwrap();
         });
         let acknowledged = ack.recv_timeout(Duration::from_secs(5));
