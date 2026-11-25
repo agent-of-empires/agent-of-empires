@@ -81,12 +81,8 @@ function SortableTab({ id, location, groupIndex, isActive, desc, onActivate, onC
     <div
       ref={setNodeRef}
       style={style}
-      className={`group flex items-center border-r border-surface-700/20 transition-colors ${
-        isDragging ? "opacity-40" : ""
-      } ${
-        isActive
-          ? "bg-surface-800 text-text-secondary"
-          : "text-text-dim hover:text-text-secondary hover:bg-surface-800/40"
+      className={`group flex items-center transition-colors ${isDragging ? "opacity-40" : ""} ${
+        isActive ? "text-text-primary" : "text-text-dim hover:text-text-secondary"
       }`}
     >
       {/* A real button so the tab is keyboard-reachable and Enter / Space
@@ -201,7 +197,7 @@ export function Dock({
       <div
         ref={setGroupRef}
         role="tablist"
-        className="flex items-stretch h-7 shrink-0 bg-surface-900 border-b border-surface-700/20"
+        className="flex items-stretch h-8 shrink-0 px-1 border-b border-surface-700/30"
       >
         <div className="flex items-stretch min-w-0 overflow-x-auto">
           <SortableContext items={tabs} strategy={horizontalListSortingStrategy}>

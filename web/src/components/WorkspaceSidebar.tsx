@@ -319,8 +319,8 @@ export function WorkspaceSidebar(props: Props) {
         ref={panelRef}
         style={{ width: effectiveWidth }}
         data-compact={compact ? "true" : undefined}
-        className={`fixed top-[calc(3rem+env(safe-area-inset-top))] bottom-0 z-40 max-md:max-w-full md:static md:z-auto bg-surface-800 border-surface-700/60 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 ${
-          rightSide ? "right-0 border-l md:border-l-0 md:border-r" : "left-0 border-r"
+        className={`fixed top-[calc(3rem+env(safe-area-inset-top))] bottom-0 z-40 max-md:max-w-full md:static md:z-auto bg-surface-800 md:bg-transparent border-surface-700/60 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 ${
+          rightSide ? "right-0 border-l md:border-l-0" : "left-0 border-r md:border-r-0"
         } ${open ? "translate-x-0" : `${rightSide ? "translate-x-full" : "-translate-x-full"} md:hidden`}`}
       >
         <SidebarToolbar
@@ -368,7 +368,7 @@ export function WorkspaceSidebar(props: Props) {
           />
         )}
 
-        <div className="flex-1 overflow-y-auto overflow-x-hidden border-t border-surface-700/60">
+        <div className="flex-1 overflow-y-auto overflow-x-hidden border-t border-surface-700/40">
           {isNested ? (
             <NestedGroupList
               ctx={ctx}
@@ -465,7 +465,7 @@ export function WorkspaceSidebar(props: Props) {
 
         {/* The rail is a fixed 88px, so its controls stack to fit a scaled root font. */}
         <div
-          className={`border-t border-surface-700/20 p-2 max-md:pb-[max(0.5rem,env(safe-area-inset-bottom))] flex items-center ${
+          className={`max-md:border-t border-surface-700/20 p-2 max-md:pb-[max(0.5rem,env(safe-area-inset-bottom))] flex items-center ${
             compact ? "flex-col gap-2" : "gap-1"
           }`}
         >
@@ -503,7 +503,7 @@ export function WorkspaceSidebar(props: Props) {
       <div
         data-testid="sidebar-resize-handle"
         {...handleProps}
-        className={`${open ? "hidden md:block" : "hidden"} relative z-10 w-1 cursor-col-resize shrink-0 touch-none bg-surface-800 hover:bg-brand-600/50 focus-visible:bg-brand-600/50 focus-visible:outline-none pointer-coarse:before:absolute pointer-coarse:before:inset-y-0 pointer-coarse:before:left-0 pointer-coarse:before:-right-2 pointer-coarse:before:content-[''] transition-colors duration-75`}
+        className={`${open ? "hidden md:block" : "hidden"} relative z-10 w-1 cursor-col-resize shrink-0 touch-none hover:bg-brand-600/50 focus-visible:bg-brand-600/50 focus-visible:outline-none pointer-coarse:before:absolute pointer-coarse:before:inset-y-0 pointer-coarse:before:left-0 pointer-coarse:before:-right-2 pointer-coarse:before:content-[''] transition-colors duration-75`}
       />
     </SidebarCompactContext.Provider>
   );

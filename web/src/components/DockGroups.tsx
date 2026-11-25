@@ -34,14 +34,12 @@ export function DockGroups({
 }: Props) {
   if (groups.length === 0) return null;
   const axis = location === "right" ? "flex-col" : "flex-row";
-  const divider = location === "right" ? "border-t" : "border-l";
   return (
-    <div className={`flex ${axis} min-h-0 min-w-0 flex-1 overflow-hidden`}>
-      {groups.map((g, i) => (
+    <div className={`flex ${axis} gap-2 min-h-0 min-w-0 flex-1 overflow-hidden`}>
+      {groups.map((g) => (
         <Fragment key={g.group}>
-          <div
-            className={`flex min-h-0 min-w-0 flex-1 overflow-hidden ${i > 0 ? `${divider} border-surface-700/40` : ""}`}
-          >
+          {/* Each group is a card on the canvas (see DESIGN.md). */}
+          <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden rounded-xl border border-surface-700/45 bg-surface-900">
             <Dock
               location={location}
               groupIndex={g.group}

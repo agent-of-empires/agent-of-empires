@@ -98,12 +98,15 @@ export function TopBar({
   const toggleLabel = onExitFocusMode ? "All Sessions" : "Toggle sidebar";
 
   return (
-    <header {...tourAnchor(TOUR_ANCHORS.topbar)} className="h-12 bg-surface-850 flex items-stretch shrink-0">
-      {/* Left zone: widens to the sidebar column when it's visible so the divider runs vertically through the
-         header instead of cutting across it; otherwise it keeps the shared bottom border like the rest. */}
+    <header
+      {...tourAnchor(TOUR_ANCHORS.topbar)}
+      className="h-12 bg-surface-850 md:bg-transparent flex items-stretch shrink-0"
+    >
+      {/* Left zone: widens to the sidebar column when it's visible, so the header lines up with the sidebar on the
+         canvas. */}
       <div
-        className={`flex items-center gap-2 px-3 min-w-0 shrink-0 border-b border-surface-700/60 ${
-          sidebarColumnVisible ? "md:w-[var(--aoe-sidebar-width)] md:bg-surface-800 md:border-b-0 md:border-r" : ""
+        className={`flex items-center gap-2 px-3 min-w-0 shrink-0 border-b border-surface-700/60 md:border-transparent ${
+          sidebarColumnVisible ? "md:w-[var(--aoe-sidebar-width)]" : ""
         }`}
       >
         <button
@@ -197,7 +200,7 @@ export function TopBar({
 
       {/* Center zone: palette trigger and plugin page buttons; carries the bottom border across the
           middle, between the two column-aligned zones. */}
-      <div className="flex-1 flex items-center px-3 min-w-0 border-b border-surface-700/60">
+      <div className="flex-1 flex items-center px-3 min-w-0 border-b border-surface-700/60 md:border-transparent">
         <div className="flex-1 flex justify-center items-center gap-1 px-2">
           <PaletteTriggerPill onClick={onOpenPalette} />
           <PluginPageButtons />
@@ -205,11 +208,10 @@ export function TopBar({
         </div>
       </div>
 
-      {/* Right zone: widens to the right-panel column when it's visible so the divider runs vertically through
-         the header instead of cutting across it; otherwise it keeps the shared bottom border like the rest. */}
+      {/* Right zone: widens to the right-panel column when it's visible, so its controls sit over the panel. */}
       <div
-        className={`flex items-center justify-end gap-1.5 px-3 shrink-0 border-b border-surface-700/60 ${
-          rightColumnVisible ? "md:w-[var(--aoe-right-panel-width)] md:border-b-0 md:border-l" : ""
+        className={`flex items-center justify-end gap-1.5 px-3 shrink-0 border-b border-surface-700/60 md:border-transparent ${
+          rightColumnVisible ? "md:w-[var(--aoe-right-panel-width)]" : ""
         }`}
       >
         <PluginStatusBarSegments />

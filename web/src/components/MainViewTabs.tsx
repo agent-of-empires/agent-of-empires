@@ -13,8 +13,8 @@ interface Props {
 }
 
 const tab = (active: boolean) =>
-  `group flex items-center gap-1 pl-2 pr-1 border-r border-surface-700/20 transition-colors ${
-    active ? "bg-surface-800 text-text-secondary" : "text-text-dim hover:text-text-secondary hover:bg-surface-800/40"
+  `group flex items-center gap-1 pl-2 pr-1 transition-colors ${
+    active ? "text-text-primary" : "text-text-dim hover:text-text-secondary"
   }`;
 
 /** The main area's tabs while a file is open: the agent and that one file, which the next pick replaces. */
@@ -25,7 +25,7 @@ export function MainViewTabs({ filePath, fileShown, onShowAgent, onShowFile, onC
       role="tablist"
       aria-label="Main view"
       data-testid="main-view-tabs"
-      className="flex items-stretch h-7 shrink-0 bg-surface-900 border-b border-surface-700/20"
+      className="flex items-stretch h-8 shrink-0 px-1 border-b border-surface-700/30"
     >
       <div className={tab(!fileShown)}>
         <button

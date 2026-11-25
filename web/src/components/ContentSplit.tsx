@@ -98,11 +98,15 @@ export function ContentSplit({ left, right, collapsed, onToggleCollapse, sheet =
   useFocusTrap(() => sheetRef.current, { active: sheetOpen });
 
   const inlineMaximized = maximized && !sheet;
+  // Desktop panes are cards on the canvas, as in Claude Code desktop (see DESIGN.md).
+  const dockBeside = !collapsed && !sheet && !inlineMaximized;
   return (
     <div ref={containerRef} className="flex-1 flex min-h-0 overflow-hidden relative">
       {/* Terminal pane */}
       <div
-        className={`${inlineMaximized && !collapsed ? "hidden" : "flex"} flex-1 flex-col min-w-0 min-h-0`}
+        className={`${inlineMaximized && !collapsed ? "hidden" : "flex"} flex-1 flex-col min-w-0 min-h-0 md:mb-2 md:ml-1 ${
+          dockBeside ? "md:mr-1" : "md:mr-2"
+        } md:rounded-xl md:border md:border-surface-700/45 md:bg-surface-900 md:overflow-hidden`}
         inert={sheetOpen}
       >
         {left}
@@ -149,10 +153,10 @@ export function ContentSplit({ left, right, collapsed, onToggleCollapse, sheet =
             }
             className={`flex flex-col min-h-0 overflow-hidden ${
               sheet
-                ? "absolute inset-y-0 right-0 z-40 bg-surface-900 border-l border-surface-700/60 shadow-xl focus:outline-none"
+                ? "absolute inset-y-0 right-0 z-40 bg-surface-950 p-2 border-l border-surface-700/60 shadow-xl focus:outline-none"
                 : inlineMaximized
-                  ? "flex-1 min-w-0"
-                  : "shrink-0"
+                  ? "flex-1 min-w-0 md:mb-2 md:mx-2"
+                  : "shrink-0 md:mb-2 md:mr-2 md:ml-1"
             }`}
           >
             {right}

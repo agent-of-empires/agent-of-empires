@@ -105,6 +105,11 @@ content. It is denser and quieter than the marketing site.
   them in the same dock, as in Conductor.
   Below 1100px the right dock overlays the main area as a sheet rather than
   squeezing a third column.
+- On desktop the app is a near-black canvas (`surface-950`) holding cards: the
+  agent pane and each dock group are `surface-900` cards with a 12px radius, a
+  faint border and 8px gaps, as in Claude Code desktop. The header and sidebar
+  sit on the canvas without borders. Tabs are plain text, the active one
+  brighter; a count follows its label (`Diff 3`).
 - Follow the conventions of Claude Code desktop, VS Code and Conductor rather
   than inventing controls. The header toggles regions, not individual panes:
   a terminal icon, then the review panel's split button (panel icon toggles it,
