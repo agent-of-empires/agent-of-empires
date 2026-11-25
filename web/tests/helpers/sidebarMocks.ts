@@ -55,7 +55,12 @@ export interface SidebarView {
 export interface SidebarMockHandle {
   puts: Array<{ order?: string[]; repositories?: string[] }>;
   /** `POST /api/reorder` bodies, in arrival order. */
-  reorders: Array<{ target: string; group: { profile: string; path: string }; direction: "up" | "down" }>;
+  reorders: Array<{
+    target: string;
+    group: { profile: string; path: string };
+    direction: "up" | "down";
+    siblings?: string[];
+  }>;
   /** `PATCH /api/sidebar-view` bodies, in arrival order. */
   viewPatches: Array<Partial<SidebarView>>;
   /** One-shot override for the next PUT's response. */
@@ -127,13 +132,16 @@ export async function installSidebarMocks(page: Page, opts: SidebarMockOptions):
     }
     return r.fulfill({ headers: runtime(true), json: { order: ordering, repositories: repositoryOrder } });
   });
-  // Swaps the Group with its neighbouring sibling, like the Daemon.
+  // Arranges the listed siblings slot for slot, then swaps the Group with its neighbouring sibling, like the Daemon.
   await page.route("**/api/reorder", (r: Route) => {
     const body = r.request().postDataJSON() as SidebarMockHandle["reorders"][number];
     handle.reorders.push(body);
-    const order = groupOrder[body.group.profile] ?? [];
+    const order = (groupOrder[body.group.profile] ??= []);
+    order.push(...(body.siblings ?? []).filter((p) => !order.includes(p)));
     const parent = (p: string) => p.slice(0, Math.max(0, p.lastIndexOf("/")));
     const siblings = order.flatMap((p, i) => (parent(p) === parent(body.group.path) ? [i] : []));
+    const wanted = (body.siblings ?? []).filter((p) => siblings.some((i) => order[i] === p));
+    siblings.filter((i) => wanted.includes(order[i]!)).forEach((slot, n) => (order[slot] = wanted[n]!));
     const at = siblings.findIndex((i) => order[i] === body.group.path);
     const to = siblings[at + (body.direction === "up" ? -1 : 1)];
     if (at < 0 || to === undefined) return r.fulfill({ json: { status: "at_edge" } });

@@ -55,9 +55,14 @@ export function filterNested(groups: NestedSidebarGroup[], keep: RowFilter): Nes
     .filter((ng) => ng.subgroups.length > 0);
 }
 
-/** The subgroups the Repository grouping renders: a collapsed repo hides every subgroup under it. */
+/** The subgroups the Repository grouping renders: a collapsed repo hides every subgroup under it, and its
+ *  ungrouped rows have no header to collapse them. */
 export function visibleSubgroups(groups: NestedSidebarGroup[], expandAll: boolean): SidebarGroup[] {
-  return groups.flatMap((ng) => (expandAll || !ng.repo.collapsed ? ng.subgroups : []));
+  return groups.flatMap((ng) =>
+    expandAll || !ng.repo.collapsed
+      ? ng.subgroups.map((sg) => (sg.id === UNGROUPED_GROUP_ID && sg.collapsed ? { ...sg, collapsed: false } : sg))
+      : [],
+  );
 }
 
 /** Footer order: archived rows newest archived first, then snoozed rows soonest wake first, then the rest newest

@@ -87,13 +87,25 @@ describe("the sidebar view button", () => {
     expect(onResetCustomOrder).toHaveBeenCalledTimes(1);
   });
 
-  it("leaves the shared choices to a viewer who may change them", () => {
-    renderSidebar([ws("a")], { readOnly: true });
+  it.each<[string, Partial<Props>]>([
+    ["read-only", { readOnly: true }],
+    ["CityHall", { canArrangeView: false }],
+  ])("leaves the shared choices to a viewer who may change them: %s", (_, over) => {
+    renderSidebar([ws("a")], over);
     const menu = openMenu();
     for (const item of within(menu).getAllByRole("menuitemradio"))
       expect((item as HTMLButtonElement).disabled).toBe(true);
     const reset = within(menu).getByRole("menuitem", { name: "Reset to newest first" }) as HTMLButtonElement;
     expect(reset.disabled).toBe(true);
+  });
+});
+
+describe("arranging in CityHall", () => {
+  it("leaves rows in place but lets Group headers move", () => {
+    renderSidebar([ws("a", { group_path: "team" }), ws("b", { group_path: "team" })], { canArrangeView: false });
+    expect(document.querySelectorAll("[aria-roledescription='Press and hold to reorder']")).toHaveLength(0);
+    const headers = screen.getAllByTestId("sidebar-group-header");
+    expect(headers.map((h) => h.getAttribute("data-draggable"))).toEqual(["true"]);
   });
 });
 

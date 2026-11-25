@@ -31,9 +31,19 @@ const keepIfSame = (next: string[]) => (prev: string[]) => (sameList(prev, next)
 const keepIfSameOrder = (next: GroupOrder) => (prev: GroupOrder) => {
   const names = Object.keys(next);
   const same =
-    names.length === Object.keys(prev).length && names.every((name) => prev[name] && sameList(prev[name], next[name]!));
+    names.length === Object.keys(prev).length &&
+    names.every((name) => Object.hasOwn(prev, name) && sameList(prev[name]!, next[name]!));
   return same ? prev : next;
 };
+
+/** The shared values a read installed; a value a local write still holds is absent. */
+export interface SharedRead {
+  cursor: RuntimeCursor;
+  order?: string[];
+  repositories?: string[];
+  groups?: GroupOrder;
+  sort?: SidebarView["sort"];
+}
 
 interface SessionState {
   sessions: SessionResponse[];
@@ -109,6 +119,21 @@ export function useSessions() {
   // never with the global floor, and one from an epoch not yet installed waits for a read of that epoch.
   const pushedRef = useRef(new Map<string, PushedStatus>());
 
+  // A receipt from a restarted Daemon abandons the installed epoch, so a read of it still in flight cannot
+  // replace what this Client just wrote.
+  const noteWriteEpoch = useCallback((receipt: RuntimeCursor | null) => {
+    const floor = floorGet.current;
+    if (!receipt || !floor || floor.epoch === receipt.epoch || abandonedEpochs.current.has(receipt.epoch)) return;
+    abandonedEpochs.current.add(floor.epoch);
+  }, []);
+  const sharedReadListeners = useRef(new Set<(read: SharedRead) => void>());
+  /** Calls `listener` with each read's shared values, as installed; returns the unsubscribe. */
+  const onSharedRead = useCallback((listener: (read: SharedRead) => void) => {
+    const listeners = sharedReadListeners.current;
+    listeners.add(listener);
+    return () => void listeners.delete(listener);
+  }, []);
+
   const injectSession = useCallback((session: SessionResponse) => {
     setState((prev) =>
       prev.sessions.some((s) => s.id === session.id) ? prev : { ...prev, sessions: [session, ...prev.sessions] },
@@ -116,40 +141,41 @@ export function useSessions() {
   }, []);
 
   /** Applies an ordering write at once and sends it; resolves with its receipt, or null when it failed. */
-  const changeOrdering = useCallback(async (patch: WorkspaceOrderingPatch) => {
-    const holds = [];
-    if (patch.order) {
-      setWorkspaceOrdering(patch.order);
-      holds.push(orderHold.current);
-    }
-    if (patch.repositories) {
-      setRepositoryOrder(patch.repositories);
-      holds.push(repositoryHold.current);
-    }
-    holds.forEach(holdStarted);
-    const receipt = await orderingWrites.current(() => updateWorkspaceOrdering(patch));
-    for (const hold of holds) holdSettled(hold, receipt);
-    return receipt;
-  }, []);
-
-  /**
-   * Applies a Group move at once and sends its single-slot moves one after another, stopping at the first that
-   * does not move; the next poll then restores what the Daemon holds.
-   */
-  const moveGroup = useCallback(async (profile: string, path: string, move: GroupMove) => {
-    setGroupOrder((prev) => ({ ...prev, [profile]: move.order }));
-    holdStarted(groupHold.current);
-    const receipt = await groupWrites.current(async () => {
-      let last: RuntimeCursor | null = null;
-      for (let step = 0; step < move.steps; step++) {
-        last = await reorderGroup({ profile, path }, move.direction);
-        if (!last) break;
+  const changeOrdering = useCallback(
+    async (patch: WorkspaceOrderingPatch) => {
+      const holds = [];
+      if (patch.order) {
+        setWorkspaceOrdering(patch.order);
+        holds.push(orderHold.current);
       }
-      return last;
-    });
-    holdSettled(groupHold.current, receipt);
-    return receipt;
-  }, []);
+      if (patch.repositories) {
+        setRepositoryOrder(patch.repositories);
+        holds.push(repositoryHold.current);
+      }
+      holds.forEach(holdStarted);
+      const receipt = await orderingWrites.current(() => updateWorkspaceOrdering(patch));
+      noteWriteEpoch(receipt);
+      for (const hold of holds) holdSettled(hold, receipt);
+      return receipt;
+    },
+    [noteWriteEpoch],
+  );
+
+  /** Applies a Group move at once and sends it after `after`, dropping it when that fails; the next poll then
+   *  restores what the Daemon holds. */
+  const moveGroup = useCallback(
+    async (profile: string, path: string, move: GroupMove, after?: Promise<RuntimeCursor | null>) => {
+      setGroupOrder((prev) => ({ ...prev, [profile]: move.order }));
+      holdStarted(groupHold.current);
+      const receipt = await groupWrites.current(async () =>
+        !after || (await after) !== null ? reorderGroup({ profile, path }, move.direction, move.siblings) : null,
+      );
+      noteWriteEpoch(receipt);
+      holdSettled(groupHold.current, receipt);
+      return receipt;
+    },
+    [noteWriteEpoch],
+  );
 
   /** Whether an ordering write is queued or in flight. */
   const orderingSaving = useCallback(
@@ -162,21 +188,25 @@ export function useSessions() {
    * and is dropped when that fails; a field picked again meanwhile is left to the newer pick. Either way the next
    * poll restores what the Daemon holds.
    */
-  const changeSidebarView = useCallback(async (patch: Partial<SidebarView>, after?: Promise<RuntimeCursor | null>) => {
-    setSidebarView((prev) => ({ ...prev, ...patch }));
-    const picks = viewPicks.current;
-    const pick = ++picks.seq;
-    const fields = Object.keys(patch) as (keyof SidebarView)[];
-    for (const field of fields) picks.latest[field] = pick;
-    holdStarted(viewHold.current);
-    const receipt = await viewWrites.current(async () => {
-      const ready = !after || (await after) !== null;
-      const current = fields.filter((field) => picks.latest[field] === pick);
-      const send = Object.fromEntries(current.map((field) => [field, patch[field]]));
-      return ready && current.length > 0 ? updateSidebarView(send) : null;
-    });
-    holdSettled(viewHold.current, receipt);
-  }, []);
+  const changeSidebarView = useCallback(
+    async (patch: Partial<SidebarView>, after?: Promise<RuntimeCursor | null>) => {
+      setSidebarView((prev) => ({ ...prev, ...patch }));
+      const picks = viewPicks.current;
+      const pick = ++picks.seq;
+      const fields = Object.keys(patch) as (keyof SidebarView)[];
+      for (const field of fields) picks.latest[field] = pick;
+      holdStarted(viewHold.current);
+      const receipt = await viewWrites.current(async () => {
+        const ready = !after || (await after) !== null;
+        const current = fields.filter((field) => picks.latest[field] === pick);
+        const send = Object.fromEntries(current.map((field) => [field, patch[field]]));
+        return ready && current.length > 0 ? updateSidebarView(send) : null;
+      });
+      noteWriteEpoch(receipt);
+      holdSettled(viewHold.current, receipt);
+    },
+    [noteWriteEpoch],
+  );
 
   const applyResult = useCallback(
     (data: SessionsEnvelope | null) => {
@@ -247,15 +277,25 @@ export function useSessions() {
           }
           return { sessions: [...rows, ...carried], observedById, epoch: cursor.epoch };
         });
-        if (pollMayReplace(orderHold.current, cursor)) setWorkspaceOrdering(keepIfSame(data.workspace_ordering));
-        if (pollMayReplace(repositoryHold.current, cursor)) {
-          setRepositoryOrder(keepIfSame(data.repository_order ?? []));
+        const read: SharedRead = { cursor };
+        if (pollMayReplace(orderHold.current, cursor)) {
+          read.order = data.workspace_ordering;
+          setWorkspaceOrdering(keepIfSame(read.order));
         }
-        if (pollMayReplace(groupHold.current, cursor)) setGroupOrder(keepIfSameOrder(data.group_order ?? {}));
+        if (pollMayReplace(repositoryHold.current, cursor)) {
+          read.repositories = data.repository_order ?? [];
+          setRepositoryOrder(keepIfSame(read.repositories));
+        }
+        if (pollMayReplace(groupHold.current, cursor)) {
+          read.groups = data.group_order ?? {};
+          setGroupOrder(keepIfSameOrder(read.groups));
+        }
         if (pollMayReplace(viewHold.current, cursor)) {
           const view = data.sidebar_view ?? DEFAULT_SIDEBAR_VIEW;
+          read.sort = view.sort;
           setSidebarView((prev) => (prev.group_by === view.group_by && prev.sort === view.sort ? prev : view));
         }
+        for (const listener of sharedReadListeners.current) listener(read);
       } else {
         setError(true);
         setServerDown(true);
@@ -486,6 +526,7 @@ export function useSessions() {
     changeOrdering,
     orderingSaving,
     changeSidebarView,
+    onSharedRead,
     error,
     loaded,
     trashedCount,

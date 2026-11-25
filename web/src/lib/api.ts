@@ -331,14 +331,16 @@ export function updateWorkspaceOrdering(patch: WorkspaceOrderingPatch): Promise<
   return writeReceipt("/api/workspace-ordering", jsonInit("PUT", patch));
 }
 
-/** Moves a Group one slot among its siblings; resolves with the receipt when it moved, else null. */
+/** Arranges a Group's siblings as `siblings` lists them, then moves it one slot; resolves with the receipt when it
+ *  moved, else null. */
 export async function reorderGroup(
   group: { profile: string; path: string },
   direction: "up" | "down",
+  siblings: string[],
 ): Promise<RuntimeCursor | null> {
   try {
     const res = await fetch("/api/reorder", {
-      ...jsonInit("POST", { target: "group", group, direction }),
+      ...jsonInit("POST", { target: "group", group, direction, siblings }),
       signal: AbortSignal.timeout(WRITE_RECEIPT_DEADLINE_MS),
     });
     if (!res.ok) return null;

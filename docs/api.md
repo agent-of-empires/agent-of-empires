@@ -457,7 +457,8 @@ The response is an object, not a bare array:
   `PATCH /api/sidebar-view`).
 - `group_order`: each profile's Group paths, nested ones included, in the
   Custom order of its Group headers (its `groups.json` order). Siblings keep
-  their relative order in the list; `POST /api/reorder` moves one a slot.
+  their relative order in the list; `POST /api/reorder` moves one a slot, after
+  arranging its siblings as an optional `siblings` list gives them.
 
 `PUT /api/workspace-ordering` takes `{"order": [...], "repositories": [...]}`;
 an omitted list keeps its value and an empty one clears it. An optional

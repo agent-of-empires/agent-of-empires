@@ -11,6 +11,7 @@ import {
   type SidebarWorkspaceView,
 } from "../../lib/sidebarGroups";
 import { workspaceIsPinned, workspaceIsSunk } from "../../lib/sidebarSort";
+import { isSyntheticGroup } from "../../hooks/useRepoGroups";
 import { dragEnded, dragStarted, typedClosestCenter, useReleaseDragOnUnmount, type DragClickGuard } from "./dnd";
 import { SessionRow } from "./SessionRow";
 import { SidebarGroupHeader } from "./SidebarGroupHeader";
@@ -100,7 +101,8 @@ function GroupHeader({
 /** What a drag may do; rows reorder within their own header, headers among themselves. */
 export interface DragOptions {
   rowsDisabled: boolean;
-  headersDisabled: boolean;
+  repoHeadersDisabled: boolean;
+  groupHeadersDisabled: boolean;
   onMoveWorkspace: (activeId: string, overId: string, after: boolean) => void;
   onMoveRepository: (activeId: string, overId: string, after: boolean) => void;
   /** Moves a Group header among its siblings, by path. */
@@ -129,9 +131,9 @@ function SidebarDnd({ drag, children }: { drag: DragOptions; children: ReactNode
     // A row dropped under another header, or a header on a row, is not a move.
     if (!from?.sortable || !to?.sortable || from.sortable.containerId !== to.sortable.containerId) return;
     const after = to.sortable.index > from.sortable.index;
-    if (from.type === "group" && !drag.headersDisabled)
+    if (from.type === "group" && !drag.repoHeadersDisabled)
       drag.onMoveRepository(String(active.id), String(over.id), after);
-    if (from.type === "sessionGroup" && !drag.headersDisabled && from.groupPath && to.groupPath) {
+    if (from.type === "sessionGroup" && !drag.groupHeadersDisabled && from.groupPath && to.groupPath) {
       drag.onMoveGroup(from.groupPath, to.groupPath, after);
     }
     if (from.type === "workspace" && !drag.rowsDisabled && from.workspaceId && to.workspaceId) {
@@ -205,25 +207,22 @@ export function FlatGroupList({
     </>
   );
   const named = live.filter((g) => g.id !== UNGROUPED_GROUP_ID);
+  const off = drag.groupHeadersDisabled;
+  // Ungrouped leads, as in the order selection ranges and the attention jump walk.
   return (
     <SidebarDnd drag={drag}>
-      <SortableContext items={named.map((g) => g.id)} strategy={verticalListSortingStrategy}>
-        {named.map((group) => (
-          <SortableGroupBlock
-            key={group.id}
-            groupId={group.id}
-            groupPath={group.groupPath}
-            disabled={drag.headersDisabled}
-          >
-            {(handle) => block(group, drag.headersDisabled ? undefined : handle)}
-          </SortableGroupBlock>
-        ))}
-      </SortableContext>
       {live
         .filter((g) => g.id === UNGROUPED_GROUP_ID)
         .map((group) => (
           <div key={group.id}>{block(group)}</div>
         ))}
+      <SortableContext items={named.map((g) => g.id)} strategy={verticalListSortingStrategy}>
+        {named.map((group) => (
+          <SortableGroupBlock key={group.id} groupId={group.id} groupPath={group.groupPath} disabled={off}>
+            {(handle) => block(group, off ? undefined : handle)}
+          </SortableGroupBlock>
+        ))}
+      </SortableContext>
     </SidebarDnd>
   );
 }
@@ -291,7 +290,7 @@ export function NestedGroupList({
                       key={subgroupId(sg)}
                       groupId={subgroupId(sg)}
                       groupPath={groupPath}
-                      disabled={drag.headersDisabled}
+                      disabled={drag.groupHeadersDisabled}
                     >
                       {(handle) => (
                         <IndentedLevel testId="sidebar-nested-subgroup" repoId={repo.id}>
@@ -300,7 +299,7 @@ export function NestedGroupList({
                             full={{ ...full, collapsed: sg.collapsed }}
                             visible={sg.workspaces}
                             onToggle={() => onToggleSubgroup(repo.id, groupPath)}
-                            dragHandle={drag.headersDisabled ? undefined : handle}
+                            dragHandle={drag.groupHeadersDisabled ? undefined : handle}
                             rows={rows}
                           />
                           <GroupRows id={rows}>
@@ -318,19 +317,28 @@ export function NestedGroupList({
       </>
     );
   };
+  const off = drag.repoHeadersDisabled;
+  // Multi-repo and Scratch sort last and do not move, so they are not sortable.
+  const sortable = live.filter((n) => !isSyntheticGroup(n.repo.id));
+  const repoBlock = (group: NestedSidebarGroup, dragHandle?: DragHandleProps) => (
+    <div data-testid="sidebar-nested-repo" data-repo-id={group.repo.id}>
+      {body(group, dragHandle)}
+    </div>
+  );
   return (
     <SidebarDnd drag={drag}>
-      <SortableContext items={live.map((n) => n.repo.id)} strategy={verticalListSortingStrategy}>
-        {live.map((group) => (
-          <SortableGroupBlock key={group.repo.id} groupId={group.repo.id} disabled={drag.headersDisabled}>
-            {(handle) => (
-              <div data-testid="sidebar-nested-repo" data-repo-id={group.repo.id}>
-                {body(group, drag.headersDisabled ? undefined : handle)}
-              </div>
-            )}
+      <SortableContext items={sortable.map((n) => n.repo.id)} strategy={verticalListSortingStrategy}>
+        {sortable.map((group) => (
+          <SortableGroupBlock key={group.repo.id} groupId={group.repo.id} disabled={off}>
+            {(handle) => repoBlock(group, off ? undefined : handle)}
           </SortableGroupBlock>
         ))}
       </SortableContext>
+      {live
+        .filter((n) => isSyntheticGroup(n.repo.id))
+        .map((group) => (
+          <div key={group.repo.id}>{repoBlock(group)}</div>
+        ))}
     </SidebarDnd>
   );
 }

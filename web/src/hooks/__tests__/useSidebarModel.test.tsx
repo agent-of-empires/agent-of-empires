@@ -9,6 +9,7 @@ import { reportFeatureUse } from "../../lib/featureUse";
 import { toastBus, type ToastApi } from "../../lib/toastBus";
 import type { SessionResponse } from "../../lib/types";
 import { useSidebarModel } from "../app/useSidebarModel";
+import { MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID } from "../useRepoGroups";
 import { useSessions } from "../useSessions";
 import { useWorkspaces } from "../useWorkspaces";
 import { session } from "./fixtures";
@@ -59,20 +60,36 @@ const server = setupServer(
     return HttpResponse.json({ order: daemon.workspace_ordering }, { headers: runtime(daemon.revision) });
   }),
   http.post("*/api/reorder", async ({ request }) => {
-    const body = (await request.json()) as { group: { profile: string; path: string }; direction: "up" | "down" };
+    const body = (await request.json()) as ReorderBody;
     writes.push({ method: "POST", body });
-    // Swaps the Group with its neighbouring sibling, as the Daemon's `move_group` does.
-    const order = daemon.group_order[body.group.profile] ?? [];
-    const parent = (p: string) => p.slice(0, Math.max(0, p.lastIndexOf("/")));
-    const siblings = order.flatMap((p, i) => (parent(p) === parent(body.group.path) ? [i] : []));
-    const at = siblings.findIndex((i) => order[i] === body.group.path);
-    const to = siblings[at + (body.direction === "up" ? -1 : 1)];
-    if (at < 0 || to === undefined) return HttpResponse.json({ status: "at_edge" });
-    [order[siblings[at]!], order[to]] = [order[to]!, order[siblings[at]!]!];
+    if (!reorder(body)) return HttpResponse.json({ status: "at_edge" });
     daemon.revision += 1;
     return HttpResponse.json({ status: "moved", destination: null }, { headers: runtime(daemon.revision) });
   }),
 );
+
+interface ReorderBody {
+  group: { profile: string; path: string };
+  direction: "up" | "down";
+  siblings?: string[];
+}
+
+/** Arranges the listed siblings slot for slot, then swaps the Group with its neighbour, as the Daemon does. */
+function reorder(body: ReorderBody): boolean {
+  const order = (daemon.group_order[body.group.profile] ??= []);
+  // A Group that only sessions name joins the tree at the end.
+  order.push(...(body.siblings ?? []).filter((p) => !order.includes(p)));
+  const parent = (p: string) => p.slice(0, Math.max(0, p.lastIndexOf("/")));
+  const siblings = order.flatMap((p, i) => (parent(p) === parent(body.group.path) ? [i] : []));
+  const wanted = (body.siblings ?? []).filter((p) => siblings.some((i) => order[i] === p));
+  const slots = siblings.filter((i) => wanted.includes(order[i]!));
+  slots.forEach((slot, n) => (order[slot] = wanted[n]!));
+  const at = siblings.findIndex((i) => order[i] === body.group.path);
+  const to = siblings[at + (body.direction === "up" ? -1 : 1)];
+  if (at < 0 || to === undefined) return false;
+  [order[siblings[at]!], order[to]] = [order[to]!, order[siblings[at]!]!];
+  return true;
+}
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => {
   server.resetHandlers();
@@ -151,6 +168,7 @@ function mount() {
       changeOrdering: sessions.changeOrdering,
       orderingSaving: sessions.orderingSaving,
       changeSidebarView: sessions.changeSidebarView,
+      onSharedRead: sessions.onSharedRead,
     });
     return { sessions, model };
   });
@@ -233,6 +251,36 @@ describe("the shared sidebar view", () => {
     await waitFor(() => expect(settled).toBe(true));
     await pollAt(result, 3);
     expect(result.current.model.sort).toBe("custom");
+  });
+
+  it("ignores a read from before a restart that a write's receipt already reported", async () => {
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const stale = { ...daemon, sidebar_view: { ...daemon.sidebar_view } };
+    server.use(
+      http.get("*/api/sessions", async () => {
+        await held;
+        return HttpResponse.json({ ...stale, sessions: stale.sessions }, { headers: runtime(9) });
+      }),
+      http.patch("*/api/sidebar-view", () =>
+        HttpResponse.json({}, { headers: { "aoe-runtime-epoch": "reboot", "aoe-runtime-revision": "1" } }),
+      ),
+    );
+    const seen = vi.fn();
+    server.events.on("request:start", seen);
+    act(() => void result.current.sessions.refresh());
+    await waitFor(() => expect(seen).toHaveBeenCalled());
+    await act(async () => result.current.sessions.changeSidebarView({ sort: "name" }));
+    const answered = vi.fn();
+    server.events.on("response:mocked", answered);
+    await act(async () => release());
+    await waitFor(() => expect(answered).toHaveBeenCalled());
+    server.events.removeListener("request:start", seen);
+    server.events.removeListener("response:mocked", answered);
+    await act(async () => {});
+    expect(result.current.model.sort).toBe("name");
   });
 
   it("puts a failed pick back on the next poll", async () => {
@@ -355,6 +403,19 @@ describe("the shared Custom order", () => {
     await waitFor(() => expect(headers(result)).toEqual(["/r/beta", "/r/Alpha"]));
     await act(async () => result.current.model.moveRepository("/r/Alpha", "/r/beta", false));
     expect(writes[0]!.body).toEqual({ repositories: ["/r/Alpha", "/r/beta", "/r/gone"] });
+  });
+
+  it("a drag of the Scratch or Multi-repo header writes nothing", async () => {
+    daemon.sidebar_view = { group_by: "project", sort: "name" };
+    const { result } = mount();
+    await waitFor(() => expect(headers(result)).toEqual(["/r/Alpha", "/r/beta"]));
+    for (const id of [SCRATCH_GROUP_ID, MULTI_REPO_GROUP_ID]) {
+      act(() => result.current.model.moveRepository(id, "/r/beta", false));
+      act(() => result.current.model.moveRepository("/r/beta", id, true));
+    }
+    expect(result.current.sessions.orderingSaving()).toBe(false);
+    expect(writes).toEqual([]);
+    expect(result.current.model.sort).toBe("name");
   });
 
   it("a header drag under Custom writes only the repository order", async () => {
@@ -500,6 +561,35 @@ describe("Undo", () => {
   });
 });
 
+describe("Undo after another Client", () => {
+  it("survives the read of its own write, and is dropped once a read shows another Client's change", async () => {
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    await act(async () => result.current.model.resetCustomOrder());
+    await waitFor(() => expect(toasts.undo).toHaveLength(1));
+    // The Daemon lists the rows the cleared order lacks, newest first.
+    daemon.workspace_ordering = ["/r/beta::b2", "/r/beta::b1", "/r/Alpha::a1"];
+    await pollAt(result, daemon.revision);
+    expect(toasts.undo[0]!.dismissed).toBe(false);
+    daemon.repository_order = ["/r/Alpha"];
+    await pollAt(result, daemon.revision + 1);
+    expect(toasts.undo[0]!.dismissed).toBe(true);
+  });
+
+  it("puts back only the lists its change wrote", async () => {
+    daemon.sidebar_view = { group_by: "group", sort: "name" };
+    const before = [...daemon.workspace_ordering];
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    await act(async () => result.current.model.moveWorkspace("/r/beta::b2", "/r/beta::b1", false));
+    await waitFor(() => expect(toasts.undo).toHaveLength(1));
+    await waitFor(() => expect(writes).toHaveLength(2));
+    await act(async () => void toasts.undo[0]!.run());
+    await waitFor(() => expect(writes).toHaveLength(4));
+    expect(writes[2]).toEqual({ method: "PUT", body: { order: before } });
+  });
+});
+
 describe("Group headers", () => {
   const grouped = (id: string, group_path: string) =>
     session({ id, title: id, project_path: "/r/one", branch: id, group_path, created_at: "2025-01-01T00:00:00Z" });
@@ -522,7 +612,7 @@ describe("Group headers", () => {
     await waitFor(() => expect(groupHeaders(result)).toEqual(["alpha", "alpha/inner", "loose", "mid", "zeta"]));
   });
 
-  it("a drag sends one single-slot move per sibling passed, in turn, and refuses another meanwhile", async () => {
+  it("a drag sends one move carrying the siblings, and refuses another meanwhile", async () => {
     const { result } = mount();
     await waitFor(() => expect(groupHeaders(result)).toHaveLength(5));
     const releases = heldReorders();
@@ -533,16 +623,51 @@ describe("Group headers", () => {
     act(() => result.current.model.moveGroupHeader("zeta", "alpha", true));
     expect(toasts.info).toHaveBeenCalledWith("The last move is still saving");
     await act(async () => releases.shift()!());
-    await waitFor(() => expect(writes).toHaveLength(2));
-    await act(async () => releases.shift()!());
     await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
-    const step = { target: "group", group: { profile: "default", path: "mid" }, direction: "up" };
     expect(writes).toEqual([
-      { method: "POST", body: step },
-      { method: "POST", body: step },
+      {
+        method: "POST",
+        body: {
+          target: "group",
+          group: { profile: "default", path: "mid" },
+          direction: "up",
+          siblings: ["zeta", "mid", "alpha", "loose"],
+        },
+      },
     ]);
     await pollAt(result, daemon.revision);
     expect(groupHeaders(result)).toEqual(["mid", "zeta", "alpha", "alpha/inner", "loose"]);
+  });
+
+  it("keep their place when a row drag switches Name to Custom, and Undo puts their order back", async () => {
+    daemon.sidebar_view = { group_by: "group", sort: "name" };
+    const { result } = mount();
+    const named = ["alpha", "alpha/inner", "loose", "mid", "zeta"];
+    await waitFor(() => expect(groupHeaders(result)).toEqual(named));
+    await act(async () => result.current.model.moveWorkspace("/r/one::zeta", "/r/one::mid", false));
+    await waitFor(() => expect(writes).toHaveLength(3));
+    expect(writes.slice(1)).toEqual([
+      {
+        method: "POST",
+        body: {
+          target: "group",
+          group: { profile: "default", path: "alpha" },
+          direction: "up",
+          siblings: ["loose", "alpha", "mid", "zeta"],
+        },
+      },
+      { method: "PATCH", body: { sort: "custom" } },
+    ]);
+    expect(result.current.model.sort).toBe("custom");
+    expect(groupHeaders(result)).toEqual(named);
+    await pollAt(result, daemon.revision);
+    expect(groupHeaders(result)).toEqual(named);
+
+    await act(async () => void toasts.undo[0]!.run());
+    await waitFor(() => expect(writes).toHaveLength(6));
+    expect(writes[4]).toMatchObject({ method: "POST", body: { group: { path: "zeta" } } });
+    expect(daemon.group_order.default).toEqual(["zeta", "alpha", "alpha/inner", "mid", "loose"]);
+    expect(writes[5]).toEqual({ method: "PATCH", body: { sort: "name" } });
   });
 
   it("are not moved under Name, which points to Custom, nor across parents", async () => {
@@ -594,8 +719,10 @@ describe("Group headers", () => {
     await waitFor(() => expect(groupHeaders(result)).toContain("aaa"));
     act(() => result.current.model.moveGroupHeader("zeta", "loose", true));
     await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
-    // Past alpha, mid and the unlisted loose; the other profile's aaa is not a sibling to pass.
-    expect(writes.filter((w) => w.method === "POST")).toHaveLength(3);
+    // The other profile's aaa is not a sibling.
+    expect(writes.filter((w) => w.method === "POST").map((w) => (w.body as ReorderBody).siblings)).toEqual([
+      ["alpha", "mid", "zeta", "loose"],
+    ]);
   });
 });
 
@@ -604,14 +731,10 @@ function heldReorders() {
   const releases: (() => void)[] = [];
   server.use(
     http.post("*/api/reorder", async ({ request }) => {
-      const body = (await request.json()) as { group: { profile: string; path: string }; direction: "up" | "down" };
+      const body = (await request.json()) as ReorderBody;
       writes.push({ method: "POST", body });
       await new Promise<void>((r) => releases.push(r));
-      const order = daemon.group_order[body.group.profile]!;
-      const at = order.indexOf(body.group.path);
-      const siblings = order.flatMap((p, i) => (p.includes("/") ? [] : [i]));
-      const to = siblings[siblings.indexOf(at) - 1]!;
-      [order[at], order[to]] = [order[to]!, order[at]!];
+      reorder(body);
       daemon.revision += 1;
       return HttpResponse.json({ status: "moved", destination: null }, { headers: runtime(daemon.revision) });
     }),

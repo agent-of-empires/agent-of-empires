@@ -72,11 +72,16 @@ export function useSuppressClickAfterDrag(ref: MutableRefObject<DragClickGuard>)
   }, [ref]);
 }
 
-/** Headers and rows share one DndContext, so only droppables of the dragged item's type may collide. */
+/** Headers and rows share one DndContext, so only droppables of the dragged item's type and sortable list may
+ *  collide; any other drop is refused. */
 export const typedClosestCenter: CollisionDetection = (args) => {
-  const activeType = args.active.data.current?.type;
+  const active = args.active.data.current;
   return closestCenter({
     ...args,
-    droppableContainers: args.droppableContainers.filter((container) => container.data.current?.type === activeType),
+    droppableContainers: args.droppableContainers.filter(
+      (container) =>
+        container.data.current?.type === active?.type &&
+        container.data.current?.sortable?.containerId === active?.sortable?.containerId,
+    ),
   });
 };

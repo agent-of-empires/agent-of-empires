@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import type { NestedSidebarGroup, SidebarGroup, SidebarWorkspaceView } from "../../lib/sidebarGroups";
+import {
+  UNGROUPED_GROUP_ID,
+  type NestedSidebarGroup,
+  type SidebarGroup,
+  type SidebarWorkspaceView,
+} from "../../lib/sidebarGroups";
 import type { Workspace } from "../../lib/types";
 import { renderedOrder, sunkViews, visibleSubgroups } from "./filterGroups";
 
@@ -127,5 +132,13 @@ describe("visible parents", () => {
     ] as NestedSidebarGroup[];
     expect(visibleSubgroups(nested, false).map((g) => g.id)).toEqual(["feature"]);
     expect(visibleSubgroups(nested, true).map((g) => g.id)).toEqual(["feature", "fix"]);
+  });
+
+  it("ranges over a repo's ungrouped rows even when a browser saved them collapsed", () => {
+    const shut = (id: string) => ({ ...group(id, [live(id)]), collapsed: true });
+    const nested = [
+      { repo: group("/a", []), subgroups: [shut(UNGROUPED_GROUP_ID), shut("fix")] },
+    ] as NestedSidebarGroup[];
+    expect(renderedOrder(visibleSubgroups(nested, false), false, false)).toEqual([`${UNGROUPED_GROUP_ID}-row`]);
   });
 });
