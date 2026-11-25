@@ -530,7 +530,7 @@ Each call replaces the provider's whole list. It fails with invalid-params, and 
 
 ### Suggestions API
 
-Suggestions are stored per profile. The routes below list and act on them; only `POST /api/suggestions/start` creates a session. Mutations return 403 `read_only` in read-only mode and are refused in CityHall mode; the `GET` routes below stay readable in both. Item bodies name an item by `{ "provider_id", "id" }`, since an `id` is only unique within a provider.
+Suggestions are stored per profile. The routes below list and act on them; only `POST /api/suggestions/start` creates a session. Mutations return 403 `read_only` in read-only mode and are refused in CityHall mode; the `GET` routes below stay readable in both, and so does `POST /api/suggestions/prepare`, which mutates nothing (CityHall's "Start with changes" needs it, and `POST /api/sessions` is allowed there). `start` is refused. Item bodies name an item by `{ "provider_id", "id" }`, since an `id` is only unique within a provider.
 
 | Route | Body | Result |
 |---|---|---|
