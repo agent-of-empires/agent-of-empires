@@ -758,7 +758,7 @@ pub async fn update_sidebar_view(
         Err(rej) => return rej.into_response(),
     };
 
-    let publication = state.publication.write().await;
+    let lane = state.sidebar_view_lane.lock().await;
     let result = tokio::task::spawn_blocking(move || {
         crate::session::update_app_state(|app| {
             if let Some(group_by) = patch.group_by {
@@ -784,12 +784,15 @@ pub async fn update_sidebar_view(
                 .into_response();
         }
     };
+    // The epoch bump makes a reload that read state.toml before this write discard itself.
+    let publication = state.publication.write().await;
     state.canonical_metadata.write().await.sidebar_view = view;
     state
         .mutation_epoch
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     state.runtime.request_publish();
     drop(publication);
+    drop(lane);
     let snapshot = match state.runtime.publish(&state).await {
         Ok(snapshot) => snapshot,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -848,6 +851,53 @@ mod sidebar_view_tests {
                 expected
             );
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_stalled_storage_lock_leaves_publication_free() {
+        use std::time::Duration;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            crate::session::update_app_state(|_| {
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            })
+            .unwrap();
+        });
+        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let patch = SidebarViewPatch {
+            group_by: None,
+            sort: Some(SortOrder::Name),
+        };
+        let write = tokio::spawn(update_sidebar_view(State(state.clone()), Ok(Json(patch))));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while state.sidebar_view_lane.try_lock().is_ok() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the write never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        drop(
+            tokio::time::timeout(Duration::from_secs(5), state.publication.write())
+                .await
+                .expect("a stalled sidebar write must not hold publication"),
+        );
+        assert!(!write.is_finished());
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let response = write.await.unwrap().into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state.canonical_metadata.read().await.sidebar_view.sort,
+            SortOrder::Name
+        );
     }
 }
 

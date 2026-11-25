@@ -4096,13 +4096,11 @@ fn a_settled_sidebar_write_converges_on_the_daemon_value() {
             env.view.apply_session_feed();
             cursor
         };
-        publish(
-            &mut env,
-            SidebarView {
-                group_by: GroupByMode::Project,
-                sort: SortOrder::Custom,
-            },
-        );
+        let original = SidebarView {
+            group_by: GroupByMode::Project,
+            sort: SortOrder::Custom,
+        };
+        publish(&mut env, original);
         env.view.apply_group_by(GroupByMode::Group);
         let merged = SidebarView {
             group_by: GroupByMode::Group,
@@ -4129,5 +4127,32 @@ fn a_settled_sidebar_write_converges_on_the_daemon_value() {
             (merged.group_by, merged.sort),
             "case {same_epoch}"
         );
+        // A peer restoring the value seen before the write is still a change.
+        publish(&mut env, original);
+        assert_eq!(
+            (env.view.group_by, env.view.sort_order),
+            (original.group_by, original.sort),
+            "case {same_epoch}"
+        );
     }
+}
+
+#[test]
+#[serial]
+fn a_sidebar_pick_is_not_sent_once_mutations_are_revoked() {
+    use crate::daemon::RuntimeCursor;
+    use crate::session::config::GroupByMode;
+    let mut env = create_test_env_empty();
+    let mut reply = env.view.session_feed.sidebar_view_driver_for_test();
+    env.view
+        .session_feed
+        .set_mutation_permission_for_test(false);
+    env.view.apply_group_by(GroupByMode::Group);
+    assert!(reply(RuntimeCursor {
+        epoch: "e".into(),
+        revision: 1,
+    })
+    .is_none());
+    assert!(!env.view.session_feed.sidebar_view_pending());
+    assert_eq!(env.view.group_by, GroupByMode::Group);
 }

@@ -1163,10 +1163,11 @@ impl HomeView {
                 self.flash_status(format!("Grouping and sort not saved: {error}"));
                 changed = true;
             }
-            // Snapshots applied while the write was pending were not shown, so converge on
-            // the Daemon's value, which may carry another Client's change.
+            // Snapshots applied while the write was pending were not shown or recorded, so
+            // converge on the Daemon's value, which may carry another Client's change.
             if let Some(snapshot) = self.session_feed.applied_snapshot() {
                 let view = snapshot.contents.sidebar_view;
+                self.observed_sidebar_view = Some(view);
                 if (view.group_by, view.sort) != (self.group_by, self.sort_order) {
                     self.show_sidebar_view(view.group_by, view.sort);
                     changed = true;

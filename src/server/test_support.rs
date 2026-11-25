@@ -256,6 +256,7 @@ pub(crate) fn build_test_app_state_impl_with_event_store(
         profile_namespace: Arc::new(RwLock::new(())),
         publication: Arc::new(RwLock::new(())),
         reload_lane: tokio::sync::Mutex::new(()),
+        sidebar_view_lane: tokio::sync::Mutex::new(()),
         canonical_metadata: RwLock::new(super::reload::CanonicalMetadata {
             default_profile: "test".into(),
             ..Default::default()

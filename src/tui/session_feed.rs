@@ -1166,11 +1166,13 @@ impl SessionFeed {
             .commands
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("the Daemon is not connected"))?;
+        let lease = self.grant.load(Ordering::SeqCst);
+        anyhow::ensure!(lease & 1 == 1, "the Daemon is read-only or unhealthy");
         let (result, receiver) = tokio::sync::oneshot::channel();
         commands
             .try_send(SessionCommand {
                 request: CommandRequest::SidebarView(patch),
-                lease: self.grant.load(Ordering::SeqCst),
+                lease,
                 native: None,
                 result,
             })
