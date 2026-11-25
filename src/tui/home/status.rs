@@ -91,6 +91,7 @@ impl HomeView {
             }
         }
         self.system_health_open = true;
+        self.suggestions_focused = false;
         self.system_health_scroll = 0;
         self.diff_view = None;
         self.live_send = None;

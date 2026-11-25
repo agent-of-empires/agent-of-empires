@@ -215,6 +215,47 @@ fn s_selects_the_row_and_focuses_the_pane() {
     }
 }
 
+/// A click on the shown pane focuses it; a click in the list gives the list
+/// the keys back.
+#[test]
+#[serial]
+fn clicking_the_pane_focuses_it_and_clicking_the_list_returns() {
+    let mut env = create_test_env_with_sessions(1);
+    env.view
+        .suggestions_feed
+        .set_snapshot_for_test(snapshot(2, &[]));
+    env.view.rebuild_flat_items();
+    env.view.cursor = 0;
+    env.view.update_selected();
+    render_home_to_string(&mut env.view, 140, 40);
+    let preview = env.view.preview_area;
+    assert!(
+        !env.view
+            .handle_suggestions_pane_click(preview.x + 2, preview.y + 2),
+        "the pane is not shown on a Session"
+    );
+
+    select_suggested_row(&mut env);
+    render_home_to_string(&mut env.view, 140, 40);
+    let preview = env.view.preview_area;
+    assert!(env
+        .view
+        .handle_suggestions_pane_click(preview.x + 2, preview.y + 2));
+    assert!(env.view.suggestions_focused);
+
+    let list = env.view.list_inner_area;
+    let session_row = (list.y..list.y + list.height)
+        .find(|&r| {
+            env.view
+                .resolve_row_to_index(list.x + 2, r)
+                .is_some_and(|i| matches!(env.view.flat_items[i], Item::Session { .. }))
+        })
+        .expect("a session row on screen");
+    env.view.handle_click(list.x + 2, session_row);
+    assert!(!env.view.suggestions_focused);
+    assert!(!env.view.suggestions_pane_shown());
+}
+
 fn expanded_env(count: usize) -> (TestEnv, mpsc::Receiver<String>) {
     let started = StartAnswer::Started {
         session_id: "s-new".into(),

@@ -843,6 +843,7 @@ impl App {
                                                             || self.home.handle_dialog_click(mouse.column, mouse.row)
                                                             || self.home.handle_sidebar_collapse_click(mouse.column, mouse.row)
                                                             || self.home.handle_diagnostics_click(mouse.column, mouse.row)
+                                                            || self.home.handle_suggestions_pane_click(mouse.column, mouse.row)
                                                         {
                                                         } else if self.home.handle_tips_badge_click(mouse.column, mouse.row) {
                                                             let _ = self.home.clear_preview_selection();
@@ -1064,6 +1065,7 @@ impl App {
                                     None
                                 } else if self.home.handle_sidebar_collapse_click(mouse.column, mouse.row)
                                     || self.home.handle_diagnostics_click(mouse.column, mouse.row)
+                                    || self.home.handle_suggestions_pane_click(mouse.column, mouse.row)
                                     || self.home.handle_tips_badge_click(mouse.column, mouse.row)
                                 {
                                     let _ = self.home.clear_preview_selection();

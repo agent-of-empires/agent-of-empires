@@ -6461,6 +6461,8 @@ impl HomeView {
         row: u16,
     ) -> Option<Action> {
         let abs_idx = self.resolve_row_to_index(col, row)?;
+        // A click in the list gives it the keys back from the suggestions pane.
+        self.suggestions_focused = false;
 
         let is_double_click = matches!(
             self.last_click,

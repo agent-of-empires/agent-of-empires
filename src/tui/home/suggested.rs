@@ -76,6 +76,19 @@ impl HomeView {
         self.suggestions_focused = true;
     }
 
+    /// A click on the suggestions pane moves the keys into it; true when it
+    /// was on the pane.
+    pub fn handle_suggestions_pane_click(&mut self, col: u16, row: u16) -> bool {
+        if self.has_non_live_send_overlay()
+            || !self.suggestions_pane_shown()
+            || !self.hit_preview(col, row)
+        {
+            return false;
+        }
+        self.focus_suggestions();
+        true
+    }
+
     /// The preview pane shows the suggestions list.
     pub(super) fn suggestions_pane_shown(&self) -> bool {
         self.suggestions_view.is_some() && (self.suggestions_focused || self.on_suggested_row())
