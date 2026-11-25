@@ -118,11 +118,21 @@ pub(crate) fn claude_host_transcript_confirmed_absent(
     host_env: &[String],
     declared_config_dir: Option<&Path>,
 ) -> bool {
-    let Ok(claude_home) = claude_home_for_host_environment(declared_config_dir, host_env) else {
-        return false;
-    };
+    claude_host_transcript_lookup(project_path, session_id, host_env, declared_config_dir)
+        == Some(false)
+}
+
+/// [`claude_transcript_lookup_in`] in the store the host launch resolves; `None` when Claude's
+/// home doesn't resolve.
+pub(crate) fn claude_host_transcript_lookup(
+    project_path: &str,
+    session_id: &str,
+    host_env: &[String],
+    declared_config_dir: Option<&Path>,
+) -> Option<bool> {
+    let claude_home = claude_home_for_host_environment(declared_config_dir, host_env).ok()?;
     let canonical = canonicalize_or_raw(project_path);
-    claude_transcript_confirmed_absent_in(&claude_home, &canonical.to_string_lossy(), session_id)
+    claude_transcript_lookup_in(&claude_home, &canonical.to_string_lossy(), session_id)
 }
 
 /// [`claude_host_transcript_confirmed_absent`] for a known store and the cwd as the agent sees it,
@@ -132,11 +142,26 @@ pub(crate) fn claude_transcript_confirmed_absent_in(
     agent_cwd: &str,
     session_id: &str,
 ) -> bool {
-    !store
+    claude_transcript_lookup_in(store, agent_cwd, session_id) == Some(false)
+}
+
+/// Whether `<store>/projects/<cwd>/<id>.jsonl` is a file. Only a lookup that reports it missing
+/// is `Some(false)`; one that can't tell (permissions, I/O, a link loop) is `None`, so neither a
+/// fresh launch nor a confirmation rests on it.
+pub(crate) fn claude_transcript_lookup_in(
+    store: &Path,
+    agent_cwd: &str,
+    session_id: &str,
+) -> Option<bool> {
+    let path = store
         .join("projects")
         .join(encode_claude_project_path(agent_cwd))
-        .join(format!("{session_id}.jsonl"))
-        .is_file()
+        .join(format!("{session_id}.jsonl"));
+    match std::fs::metadata(path) {
+        Ok(metadata) => Some(metadata.is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
 }
 
 #[cfg(test)]
@@ -155,6 +180,40 @@ mod tests {
             ),
         ] {
             assert_eq!(encode_claude_project_path(input), expected);
+        }
+    }
+
+    /// Only a lookup that reports the transcript missing is absence; one that can't tell, here a
+    /// project dir linked to itself, is neither absent nor present.
+    #[test]
+    fn transcript_lookup_reads_only_not_found_as_absent() {
+        let store = tempfile::tempdir().unwrap();
+        let sid = "11111111-2222-4333-8444-555555555555";
+        let dir = |cwd: &str| {
+            store
+                .path()
+                .join("projects")
+                .join(encode_claude_project_path(cwd))
+        };
+        std::fs::create_dir_all(dir("/present")).unwrap();
+        std::fs::write(dir("/present").join(format!("{sid}.jsonl")), "x\n").unwrap();
+        std::os::unix::fs::symlink(dir("/loop"), dir("/loop")).unwrap();
+        // (case, agent cwd, lookup)
+        for (case, cwd, want) in [
+            ("present", "/present", Some(true)),
+            ("missing", "/missing", Some(false)),
+            ("loop", "/loop", None),
+        ] {
+            assert_eq!(
+                claude_transcript_lookup_in(store.path(), cwd, sid),
+                want,
+                "{case}"
+            );
+            assert_eq!(
+                claude_transcript_confirmed_absent_in(store.path(), cwd, sid),
+                want == Some(false),
+                "{case}"
+            );
         }
     }
 

@@ -261,19 +261,19 @@ pub(super) fn transcript_confirms_reserved_claude_conversation(
     let Some(store) = single_store(&execution.stores) else {
         return false;
     };
-    match container_cwd {
-        Some(cwd) => !crate::session::capture::claude_transcript_confirmed_absent_in(
-            store,
-            cwd,
-            &binding.session_id,
-        ),
-        None => !crate::session::capture::claude_host_transcript_confirmed_absent(
+    // Confirmation needs the transcript seen: a lookup that can't tell confirms nothing.
+    let seen = match container_cwd {
+        Some(cwd) => {
+            crate::session::capture::claude_transcript_lookup_in(store, cwd, &binding.session_id)
+        }
+        None => crate::session::capture::claude_host_transcript_lookup(
             &execution.cwd.to_string_lossy(),
             &binding.session_id,
             &[],
             Some(store),
         ),
-    }
+    };
+    seen == Some(true)
 }
 
 /// Confirms, from inside a live pane's sidecar poller, the reserved Claude id
@@ -4785,6 +4785,12 @@ sandbox = "unsupported"
         std::fs::create_dir_all(&container_dir).unwrap();
         std::fs::write(container_dir.join(format!("{boxed}.jsonl")), "data\n").unwrap();
 
+        // A project dir that is a link to itself: the lookup can't tell, so nothing confirms.
+        let looped = store.path().join("projects").join(
+            crate::session::capture::encode_claude_project_path("/workspace/looped"),
+        );
+        std::os::unix::fs::symlink(&looped, &looped).unwrap();
+
         use ConversationProvenance::{Preallocated, Unknown};
         let second = store.path().join("second");
         let sandboxed = Some("/workspace/project");
@@ -4794,6 +4800,15 @@ sandbox = "unsupported"
             (absent, "claude", "host", Preallocated, None, None, false),
             (boxed, "claude", "host", Preallocated, None, sandboxed, true),
             (boxed, "claude", "host", Preallocated, None, None, false),
+            (
+                boxed,
+                "claude",
+                "host",
+                Preallocated,
+                None,
+                Some("/workspace/looped"),
+                false,
+            ),
             (
                 present,
                 "claude",
