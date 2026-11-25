@@ -6133,6 +6133,7 @@
       ],
       "components": [
         "web/src/components/Dashboard.tsx",
+        "web/src/components/DashboardSuggestions.tsx",
         "web/src/components/tour/TourRunner.tsx",
         "web/src/components/tour/tourRunnerStyles.ts",
         "web/src/lib/brandMark.ts",
