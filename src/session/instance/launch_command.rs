@@ -938,13 +938,20 @@ impl Instance {
                 return std::borrow::Cow::Owned(command.clone());
             }
         }
+        let sandboxed = self.is_sandboxed();
         std::borrow::Cow::Borrowed(
             crate::agents::get_agent(&self.tool)
                 .or_else(|| {
                     crate::plugin::bundled_agents::definitions()
                         .find(|agent| agent.name == self.tool)
                 })
-                .map(|a| a.resolved_binary())
+                .map(|a| {
+                    if sandboxed {
+                        a.binary
+                    } else {
+                        a.resolved_binary()
+                    }
+                })
                 .unwrap_or("bash"),
         )
     }
@@ -974,12 +981,19 @@ impl Instance {
                     return command.clone();
                 }
             }
+            let sandboxed = self.is_sandboxed();
             crate::agents::get_agent(&self.tool)
                 .or_else(|| {
                     crate::plugin::bundled_agents::definitions()
                         .find(|agent| agent.name == self.tool)
                 })
-                .map(|a| a.launch_base_command())
+                .map(|a| {
+                    if sandboxed {
+                        a.primary_launch_base_command()
+                    } else {
+                        a.launch_base_command()
+                    }
+                })
                 .unwrap_or_else(|| "bash".to_string())
         } else {
             self.command.clone()

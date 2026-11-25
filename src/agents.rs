@@ -1178,17 +1178,34 @@ impl<'a> AgentDef<'a> {
         self.candidate_binaries().any(|bin| bin == program)
     }
 
-    /// Executable name to launch: prefers `binary`, falls back to the first
-    /// entry in `fallback_binaries` found on `PATH`, or `binary` if none resolve.
+    /// Executable name to launch on the host: prefers `binary`, falls back to
+    /// the first entry in `fallback_binaries` found on `PATH` or discovered by
+    /// the login-shell probe, or `binary` if none resolve.
     pub fn resolved_binary(&self) -> &'a str {
         if self.fallback_binaries.is_empty() || which::which(self.binary).is_ok() {
             return self.binary;
         }
-        self.fallback_binaries
+        if let Some(found) = self
+            .fallback_binaries
             .iter()
             .copied()
             .find(|bin| which::which(bin).is_ok())
-            .unwrap_or(self.binary)
+        {
+            return found;
+        }
+        if let Some(discovered) = crate::tmux::discovered_agent_binary(self.name) {
+            if let Some(candidate) = self.candidate_binaries().find(|bin| *bin == discovered) {
+                return candidate;
+            }
+        }
+        self.binary
+    }
+
+    pub fn primary_launch_base_command(&self) -> String {
+        match self.launch_subcommand {
+            Some(sub) => format!("{} {}", self.binary, sub),
+            None => self.binary.to_string(),
+        }
     }
 
     pub fn launch_base_command(&self) -> String {
@@ -2766,6 +2783,23 @@ if [ "$PROBE_MODE" = legacy ]; then printf '%s\n' 'FLAGS --fork fork session'; e
         assert_eq!(instance.get_tool_command(), "cursor-agent");
         instance.command = "cursor-agent".to_string();
         assert!(!instance.has_command_override());
+
+        // Sandboxed launches must not adopt the host's fallback binary.
+        let mut sandboxed = crate::session::Instance::new("cursor-sandbox", "/tmp");
+        sandboxed.tool = "cursor".to_string();
+        sandboxed.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "example:latest".to_string(),
+            container_name: "aoe-test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            provider: None,
+        });
+        assert_eq!(sandboxed.get_tool_command(), "agent");
 
         // Both installed: primary `agent` takes precedence.
         let agent_bin = bin.join("agent");

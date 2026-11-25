@@ -1384,6 +1384,29 @@ impl NativeLaunchInputs {
         self.canonical_path(&path)
     }
 
+    fn resolve_agent_program(
+        &self,
+        agent: &AgentDef<'_>,
+        program: &str,
+        allow_fallback: bool,
+    ) -> Result<PathBuf> {
+        if !allow_fallback || agent.fallback_binaries.is_empty() {
+            return self.resolve_program(program);
+        }
+        let mut first_err = None;
+        for candidate in agent.candidate_binaries() {
+            match self.resolve_program(candidate) {
+                Ok(path) => return Ok(path),
+                Err(err) => {
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
+            }
+        }
+        Err(first_err.unwrap_or_else(|| anyhow::anyhow!("native program is unavailable")))
+    }
+
     fn resolve_program(&self, program: &str) -> Result<PathBuf> {
         let path = self.environment.get("PATH").map(String::as_str);
         let Some(container) = &self.container else {
@@ -2050,8 +2073,11 @@ impl Instance {
             }),
             "managed conversation requires an immutable container execution identity"
         );
-        let program =
-            inputs.resolve_program(parsed.words.first().context("native program is missing")?)?;
+        let program = inputs.resolve_agent_program(
+            agent,
+            parsed.words.first().context("native program is missing")?,
+            self.command.is_empty(),
+        )?;
         anyhow::ensure!(
             program.is_absolute() && program.to_str().is_some(),
             "native program must have an absolute UTF-8 path"
