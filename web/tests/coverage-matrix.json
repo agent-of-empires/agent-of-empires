@@ -367,7 +367,8 @@
       "specs": [
         "src/lib/liveTermLines.test.ts",
         "src/components/__tests__/MobileLiveTerminal.linkify.test.tsx",
-        "src/components/__tests__/MobileLiveTerminal.forward.test.tsx"
+        "src/components/__tests__/MobileLiveTerminal.forward.test.tsx",
+        "src/components/__tests__/MobileLiveTerminal.wrappedLinks.test.tsx"
       ],
       "components": ["web/src/components/MobileLiveTerminal.tsx"]
     },
@@ -376,7 +377,11 @@
       "kind": "mocked-playwright",
       "risk": "high",
       "specs": ["tests/live-terminal-input.spec.ts"],
-      "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/lib/liveTermLines.ts"]
+      "components": [
+        "web/src/components/MobileLiveTerminal.tsx",
+        "web/src/lib/liveTermLines.ts",
+        "web/src/hooks/useLiveTerminal.ts"
+      ]
     },
     {
       "id": "terminal.live-cursor-wide-chars",

@@ -299,6 +299,7 @@ export function useLiveTerminal(
           mouse: msg.mouse,
           mouseSgr: msg.mouseSgr,
           pane0: msg.pane0,
+          wrapped: msg.wrapped,
         };
         // Keep the capture window covering the full history while reading, or old lines fall out.
         if (readingRef.current) {
