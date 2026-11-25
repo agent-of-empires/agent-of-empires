@@ -791,6 +791,43 @@ impl SettingsView {
             || config_to_json(&self.repo_config) != self.baseline_repo;
     }
 
+    /// Confirms a save once the Daemon has acknowledged its consent change. A view opened
+    /// while the change was in flight read the old value, so an unedited toggle adopts the
+    /// saved one.
+    pub(in crate::tui) fn consent_saved(&mut self) {
+        let baseline = self
+            .baseline_global
+            .pointer("/telemetry/enabled")
+            .and_then(serde_json::Value::as_bool);
+        let saved = crate::session::get_telemetry_settings().enabled;
+        if baseline == Some(self.global_config.telemetry.enabled)
+            && self.global_config.telemetry.enabled != saved
+        {
+            self.global_config.telemetry.enabled = saved;
+            if let Some(slot) = self.baseline_global.pointer_mut("/telemetry/enabled") {
+                *slot = saved.into();
+            }
+            self.rebuild_fields();
+            self.recompute_dirty();
+        }
+        self.success_message = Some("Settings saved".to_string());
+        self.success_message_expires_at = Some(std::time::Instant::now() + SUCCESS_MESSAGE_TTL);
+    }
+
+    /// A telemetry change the Daemon did not save: show why and put the toggle back.
+    pub(in crate::tui) fn consent_not_saved(&mut self, message: String) {
+        let saved = crate::session::get_telemetry_settings().enabled;
+        self.global_config.telemetry.enabled = saved;
+        if let Some(slot) = self.baseline_global.pointer_mut("/telemetry/enabled") {
+            *slot = saved.into();
+        }
+        self.rebuild_fields();
+        self.recompute_dirty();
+        self.success_message = None;
+        self.success_message_expires_at = None;
+        self.error_message = Some(message);
+    }
+
     /// Adopt the live configs as the new baseline and mark the view clean.
     /// Called after a save or a reload, when on-disk state matches memory.
     pub(super) fn snapshot_baseline(&mut self) {
@@ -814,6 +851,7 @@ impl SettingsView {
         }
 
         let mut accepted_toggles = Vec::new();
+        let mut consent_pending = false;
         match self.scope {
             SettingsScope::Global => {
                 // Saving the Telemetry page counts as answering the opt-in
@@ -833,8 +871,18 @@ impl SettingsView {
                 // `aoe serve` PATCH, a second `aoe`, a hand edit) wrote to an
                 // unrelated field while the pane sat open, which is the same
                 // clobber the removed `save_config` caused.
-                let edited = config_to_json(&self.global_config);
+                let mut edited = config_to_json(&self.global_config);
                 let baseline = self.baseline_global.clone();
+                // The Daemon owns consent, so the toggle is sent to it, never written here.
+                let consent = self.global_config.telemetry.enabled;
+                let consent_changed =
+                    edited.pointer("/telemetry/enabled") != baseline.pointer("/telemetry/enabled");
+                if let (Some(slot), Some(saved)) = (
+                    edited.pointer_mut("/telemetry/enabled"),
+                    baseline.pointer("/telemetry/enabled"),
+                ) {
+                    *slot = saved.clone();
+                }
                 let baseline_plugins: std::collections::BTreeMap<
                     String,
                     crate::session::PluginConfig,
@@ -891,6 +939,11 @@ impl SettingsView {
                         state.has_responded_to_telemetry = true;
                     })?;
                 }
+                if consent_changed {
+                    self.global_config.telemetry.enabled = consent;
+                    crate::tui::telemetry::set_consent(consent);
+                    consent_pending = true;
+                }
                 self.resolved_base =
                     merge_configs(self.global_config.clone(), &self.profile_config);
                 // Persist + live-apply the logging filter so a running
@@ -904,10 +957,6 @@ impl SettingsView {
                         &app_dir,
                     );
                 }
-                // Reconcile the on-disk install id with the saved opt-in
-                // state: generate one when enabled, delete it on opt-out.
-                // Idempotent, so running it on every global save is safe.
-                crate::telemetry::apply_opt_in_change(self.global_config.telemetry.enabled);
             }
             SettingsScope::Profile => {
                 // Same changed-leaves write-back as the global scope: a whole-struct
@@ -958,8 +1007,13 @@ impl SettingsView {
 
         // The just-written state is the new clean baseline.
         self.snapshot_baseline();
-        self.success_message = Some("Settings saved".to_string());
-        self.success_message_expires_at = Some(std::time::Instant::now() + SUCCESS_MESSAGE_TTL);
+        if consent_pending || crate::tui::telemetry::consent_in_flight() {
+            // Held until the Daemon answers; see `consent_saved` and `consent_not_saved`.
+            self.success_message = Some("Saving telemetry setting…".to_string());
+            self.success_message_expires_at = None;
+        } else {
+            self.consent_saved();
+        }
         self.error_message = None;
         Ok(())
     }
@@ -1291,6 +1345,59 @@ pub(super) mod test_util {
 }
 
 #[cfg(test)]
+mod loaded_value_tests {
+    use super::*;
+    use crate::session::Storage;
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    /// A breakpoint hand-written below the renderer's floor still loads and
+    /// saves: the renderer raises it to 50, so the schema accepts it instead of
+    /// blocking the save of every field on the tab.
+    #[test]
+    #[serial]
+    fn a_narrow_breakpoint_below_the_floor_does_not_block_an_unrelated_save() {
+        let temp = TempDir::new().unwrap();
+        let home = crate::session::test_support::isolate_home(temp.path());
+        let _ = Storage::new_unwatched("test").unwrap();
+        update_config(|config| config.session.narrow_breakpoint = 40).unwrap();
+
+        let mut view = SettingsView::new("test", None).unwrap();
+        view.scope = SettingsScope::Global;
+        view.rebuild_categories_for_scope();
+        view.selected_category = view
+            .categories
+            .iter()
+            .position(|row| row.as_tab() == Some(SettingsCategory::Session))
+            .expect("the Session tab is visible for the global scope");
+        view.rebuild_fields();
+        assert!(
+            view.fields
+                .iter()
+                .any(|field| field.label == "Narrow layout below this width"),
+            "the Session tab carries the breakpoint field"
+        );
+
+        // An unrelated edit on the same tab, as the reported flow had it.
+        view.global_config.session.snooze_duration_minutes = 17;
+        view.recompute_dirty();
+        view.save().unwrap();
+
+        assert_eq!(
+            view.error_message, None,
+            "a loaded 40 must not block the save"
+        );
+        let on_disk = Config::load().unwrap();
+        assert_eq!(on_disk.session.snooze_duration_minutes, 17);
+        assert_eq!(
+            on_disk.session.narrow_breakpoint, 40,
+            "the value the user wrote is kept as written"
+        );
+        drop(home);
+    }
+}
+
+#[cfg(test)]
 mod dirty_tracking_tests {
     use super::*;
     use crate::session::Storage;
@@ -1309,6 +1416,47 @@ mod dirty_tracking_tests {
         let _ = Storage::new_unwatched("test").unwrap();
         let view = SettingsView::new("test", None).unwrap();
         (home, temp, view)
+    }
+
+    /// A telemetry toggle the Daemon refused goes back to the saved value, with the error
+    /// shown, and leaves other unsaved edits flagged.
+    #[test]
+    #[serial]
+    fn an_unsaved_consent_change_restores_the_toggle() {
+        let (_home, _temp, mut view) = fresh_view();
+        view.global_config.telemetry.enabled = true;
+        view.save().unwrap();
+        assert_eq!(
+            view.success_message.as_deref(),
+            Some("Saving telemetry setting…"),
+            "a consent change is not reported saved before the Daemon answers"
+        );
+        assert!(view.success_message_expires_at.is_none());
+        // A view reopened before the Daemon answers read the old value.
+        let mut reopened = SettingsView::new("test", None).unwrap();
+        assert!(!reopened.global_config.telemetry.enabled);
+        crate::session::update_config(|c| c.telemetry.enabled = true).unwrap();
+        view.consent_saved();
+        assert_eq!(view.success_message.as_deref(), Some("Settings saved"));
+        assert!(view.global_config.telemetry.enabled);
+        reopened.consent_saved();
+        assert!(reopened.global_config.telemetry.enabled);
+        assert!(!reopened.has_changes);
+
+        crate::session::update_config(|c| c.telemetry.enabled = false).unwrap();
+
+        view.consent_not_saved("Telemetry setting not saved: read-only".into());
+        assert!(!view.global_config.telemetry.enabled);
+        assert!(!view.has_changes);
+        assert_eq!(view.success_message, None);
+        assert_eq!(
+            view.error_message.as_deref(),
+            Some("Telemetry setting not saved: read-only")
+        );
+
+        view.global_config.default_profile = "other".into();
+        view.consent_not_saved("again".into());
+        assert!(view.has_changes, "an unrelated edit stays unsaved");
     }
 
     /// The unsaved-changes flag is diff-based, not a one-way latch, and a
@@ -1414,7 +1562,7 @@ mod dirty_tracking_tests {
             a.grant = Some(crate::session::CapabilityGrant {
                 manifest_hash: "sha256:abc".into(),
                 capabilities: vec!["net".into()],
-                granted_at: chrono::Utc::now(),
+                granted_at: crate::time::Timestamp::now(),
             });
         })
         .unwrap();

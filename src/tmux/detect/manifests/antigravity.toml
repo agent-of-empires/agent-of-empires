@@ -22,7 +22,7 @@ state = "waiting"
 priority = 975
 region = "whole_recent"
 visible = true
-contains_any = ["approval required", "awaiting user approval", "deny access"]
+contains_any = ["approval required", "awaiting user approval", "deny access", "ctrl+k approve"]
 
 [[rules]]
 extends = "approval_prompt"
@@ -37,6 +37,11 @@ contains_any = [
   "enter confirm",
   "esc to cancel",
 ]
+
+[[rules]]
+extends = "approval_choice"
+id = "approval_choice"
+priority = 970
 
 [[rules]]
 extends = "interrupt_hint"

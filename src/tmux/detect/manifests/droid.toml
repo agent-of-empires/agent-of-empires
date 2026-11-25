@@ -26,6 +26,24 @@ priority = 950
 contains_any = ["continue?", "proceed?", "execute?", "enter to select", "esc to cancel"]
 
 [[rules]]
+extends = "approval_choice"
+id = "approval_choice"
+priority = 950
+
+# The permission dialog's options, which name no prompt of their own. Each
+# label must fill its own row, so prose starting with a label does not match.
+[[rules]]
+id = "permission_choice"
+state = "waiting"
+priority = 945
+region = "whole_recent"
+visible = true
+line_regex = [
+  '(?i)^\s*(?:\x{276F}\s*)?yes, allow\s*$',
+  '(?i)^\s*(?:\x{276F}\s*)?no, cancel\s*$',
+]
+
+[[rules]]
 extends = "input_prompt"
 id = "input_prompt"
 priority = 930

@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionResponse, Workspace } from "../lib/types";
 import { useSidebarTriage } from "./useSidebarTriage";
 import { setSessionArchive, setSessionUnread } from "../lib/api";
+import { reportFeatureUse } from "../lib/featureUse";
 
 vi.mock("../lib/api", () => ({
   setSessionArchive: vi.fn(),
@@ -34,6 +35,7 @@ const slices = [archivedSlice, unreadSlice];
 const accepted = { id: "a" } as SessionResponse;
 
 beforeEach(() => {
+  vi.mocked(reportFeatureUse).mockClear();
   vi.mocked(setSessionArchive).mockReset().mockResolvedValue(accepted);
   vi.mocked(setSessionUnread).mockReset().mockResolvedValue(accepted);
 });
@@ -75,6 +77,7 @@ describe("useSidebarTriage pending actions", () => {
       result.current.unreadToggle(unreadSlice, true);
     });
     rerender({ workspaces: [combined] });
+    expect(vi.mocked(reportFeatureUse).mock.calls).toEqual([["archive_toggle"], ["unread_toggle"]]);
 
     const row = result.current.optimisticFor(combined);
     expect(row).toMatchObject({ archived: true, unread: true });

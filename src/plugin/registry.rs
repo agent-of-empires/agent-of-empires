@@ -360,7 +360,7 @@ capabilities = ["net", "fs.read"]
         let full = CapabilityGrant {
             manifest_hash: hash.to_string(),
             capabilities: vec!["net".into(), "fs.read".into()],
-            granted_at: chrono::Utc::now(),
+            granted_at: crate::time::Timestamp::now(),
         };
         assert!(grant_covers(&full, &manifest, hash));
 
@@ -373,7 +373,7 @@ capabilities = ["net", "fs.read"]
         let partial = CapabilityGrant {
             manifest_hash: hash.to_string(),
             capabilities: vec!["net".into()],
-            granted_at: chrono::Utc::now(),
+            granted_at: crate::time::Timestamp::now(),
         };
         assert!(!grant_covers(&partial, &manifest, hash));
     }

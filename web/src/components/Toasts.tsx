@@ -142,6 +142,15 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     setToasts((t) => [...t, { id, kind: "error", message, action: { label, run } }]);
   }, []);
 
+  const pushInfoAction = useCallback(
+    (message: string, label: string, run: () => void) => {
+      const id = nextId.current++;
+      setToasts((t) => [...t, { id, kind: "info", message, action: { label, run } }]);
+      scheduleDismiss(id);
+    },
+    [scheduleDismiss],
+  );
+
   const api = useMemo<ToastApi>(
     () => ({
       push,
@@ -149,8 +158,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       info: (m: string) => push(m, "info"),
       openLink: pushWithHref,
       action: pushWithAction,
+      infoAction: pushInfoAction,
     }),
-    [push, pushWithHref, pushWithAction],
+    [push, pushWithHref, pushWithAction, pushInfoAction],
   );
 
   // Service worker forwards incoming push payloads here when the PWA is already visible and focused, so we show

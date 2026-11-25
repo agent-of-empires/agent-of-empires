@@ -34,6 +34,11 @@ const PROMPT_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// Pane lines `read_output` captures when the caller names none, as `GET /output` does.
 const DEFAULT_LINES: u32 = 200;
 
+/// Why a `create_session` prompt did not reach a session another one manages.
+const IGNORED_PROMPT: &str =
+    "The session is ignored because another session manages it, so nothing was typed. Take \
+     ownership back, then `send` the prompt.";
+
 /// The create fields a model may set. Hook trust, callbacks, command and environment
 /// overrides, fork and import sources and UI-only fields stay with the dashboard and CLI.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -96,6 +101,9 @@ enum PromptDelivery {
     BlockedWaiting,
     /// The terminal agent did not reach its input prompt in time, so nothing was typed.
     NotReady,
+    /// The terminal session was ignored, because another session manages it, before the
+    /// prompt could be typed: nothing was typed.
+    Ignored,
     /// The create was a retry of an earlier one with the same `idempotency_key`, so the prompt
     /// was not attempted by this call; the first create's outcome is unknown here.
     Replayed,
@@ -216,7 +224,10 @@ impl McpServer {
             return Err(tool_error("invalid_request", "The prompt is empty"));
         }
         let body = create_body(&params).map_err(|e| tool_error("invalid_request", e))?;
-        let initial_turn = if structured { prompt.clone() } else { None };
+        let initial_turn = prompt
+            .clone()
+            .filter(|_| structured)
+            .map(|text| (text, crate::daemon::PromptOrigin::Mcp));
         let wait_ready = !structured && prompt.is_some();
         // Names this create in failure logs and responses, as an HTTP request's id does.
         let reference = format!("mcp-{}", uuid::Uuid::new_v4());
@@ -227,14 +238,35 @@ impl McpServer {
             wait_ready,
             body,
             initial_turn,
+            crate::daemon::PromptOrigin::Mcp,
         )
         .await;
         let (session, fresh) = success_body(response).await.map_err(|e| *e)?;
+        // Ignore outranks the readiness wait: a person who ignores the new row while its pane
+        // comes up did not ask for this prompt to land there.
+        let ignored =
+            prompt.is_some() && fresh && !structured && self.session_is_ignored(&session.id).await;
         let (prompt_sent, prompt_delivery, prompt_error) = match prompt {
             None => (false, PromptDelivery::None, None),
             Some(_) if !fresh => (false, PromptDelivery::Replayed, None),
             Some(_) if structured => (true, PromptDelivery::PendingInitialTurn, None),
-            Some(text) => match wait_for_input_prompt(&self.state, &session.id).await {
+            Some(_) if ignored => (
+                false,
+                PromptDelivery::Ignored,
+                Some(IGNORED_PROMPT.to_string()),
+            ),
+            Some(text) => {
+                let readiness = wait_for_input_prompt(&self.state, &session.id).await;
+                // The wait can outlast a person's ignore, so it is checked again before
+                // the readiness result decides what the caller is told.
+                if self.session_is_ignored(&session.id).await {
+                    (
+                        false,
+                        PromptDelivery::Ignored,
+                        Some(IGNORED_PROMPT.to_string()),
+                    )
+                } else {
+                    match readiness {
                 PaneReadiness::Waiting => (
                     false,
                     PromptDelivery::BlockedWaiting,
@@ -270,6 +302,7 @@ impl McpServer {
                     &session.id,
                     text.clone(),
                     false,
+                    true,
                 )
                 .await
                 {
@@ -279,6 +312,11 @@ impl McpServer {
                         (true, PromptDelivery::Sent, None)
                     }
                     Err(e) => match e.error {
+                        SendKeysError::Ignored => (
+                            false,
+                            PromptDelivery::Ignored,
+                            Some(IGNORED_PROMPT.to_string()),
+                        ),
                         SendKeysError::NotRunning => (false, PromptDelivery::NotRunning, None),
                         other => {
                             let refusal = terminal_refusal(&session.id, other).await;
@@ -291,7 +329,9 @@ impl McpServer {
                         }
                     },
                 },
-            },
+                    }
+                }
+            }
         };
         Ok(Json(CreatedSession {
             session,
@@ -441,6 +481,8 @@ impl McpServer {
                 prompt_id: None,
                 queued_prompt_id: None,
                 no_revive: false,
+                refuse_if_ignored: true,
+                origin: crate::daemon::PromptOrigin::Mcp,
             };
             let submitted = submit_prompt(&self.state, &SessionCaller::User, &id, submission)
                 .await
@@ -453,6 +495,13 @@ impl McpServer {
                 "The message is empty",
             )));
         };
+        // Ignore outranks the pane probe: an ignored row whose pane shows a dialog would
+        // report `waiting` forever, and answering that dialog would never unblock it.
+        if self.session_is_ignored(&id).await {
+            return Err(Box::new(
+                terminal_refusal(&id, SendKeysError::Ignored).await,
+            ));
+        }
         // Keys sent into a dialog answer it (Enter accepts Claude's folder trust), so MCP refuses a
         // pane whose status rules detect one; an agent without status rules gets no check. HTTP
         // `POST /send` is left as is: a person at the dashboard sees the pane.
@@ -465,8 +514,14 @@ impl McpServer {
             )));
         }
         // No revival: a restarted agent can open on a dialog the check above never saw.
-        if let Err(e) =
-            send_terminal_message(&self.state.session_service, &id, message.clone(), false).await
+        if let Err(e) = send_terminal_message(
+            &self.state.session_service,
+            &id,
+            message.clone(),
+            false,
+            true,
+        )
+        .await
         {
             return Err(Box::new(terminal_refusal(&id, e.error).await));
         }
@@ -519,6 +574,18 @@ impl McpServer {
                     && i.ensure_can_parent().is_ok()
             })
             .map(|i| i.id.clone())
+    }
+
+    /// The canonical ignore marker, which outranks the snapshot and any pane probe.
+    async fn session_is_ignored(&self, id: &str) -> bool {
+        match self.state.session_service.is_ignored_on_disk(id).await {
+            Ok(ignored) => ignored,
+            Err(error) => {
+                tracing::warn!(target: "http.mcp", session = %id, %error,
+                    "reading the canonical ignore marker failed");
+                false
+            }
+        }
     }
 
     pub(super) async fn view_of(&self, id: &str) -> Option<View> {
@@ -850,6 +917,11 @@ fn prompt_refusal(id: &str, error: PromptSubmitError) -> CallToolResult {
             tool_error("busy", message)
         }
         PromptSubmitError::Blocked(blocked) => tool_error("invalid_request", blocked.to_string()),
+        PromptSubmitError::Ignored => tool_error(
+            "ignored",
+            "The session is ignored because another session manages it. A person must \
+             reclaim ownership or unignore it before MCP sends a prompt.",
+        ),
         // The prompt stays queued and goes out after the login; resending would queue it twice.
         PromptSubmitError::LoginRequired { blocked, queued_id } => tool_error(
             "send_failed",
@@ -866,8 +938,10 @@ fn prompt_refusal(id: &str, error: PromptSubmitError) -> CallToolResult {
         | PromptSubmitError::Turn(SendTurnError::ModeApplication(e)) => {
             tool_error("send_failed", e.to_string())
         }
-        // Unreachable for a user caller that names no queue row and allows revival.
-        PromptSubmitError::RevivalRefused
+        // Unreachable for a user caller that names no queue row and allows revival, and
+        // `StopFenced` only follows a foreground-origin prompt.
+        PromptSubmitError::StopFenced
+        | PromptSubmitError::RevivalRefused
         | PromptSubmitError::Turn(SendTurnError::RevivalRefused)
         | PromptSubmitError::Turn(SendTurnError::NotOwner)
         | PromptSubmitError::Turn(SendTurnError::LoginRequired(_))
@@ -910,6 +984,11 @@ async fn terminal_refusal(id: &str, error: SendKeysError) -> CallToolResult {
         SendKeysError::StructuredView => tool_error(
             "invalid_request",
             "The session no longer has a terminal agent",
+        ),
+        SendKeysError::Ignored => tool_error(
+            "ignored",
+            "The session is ignored because another session manages it. A person must \
+             reclaim ownership or unignore it before MCP sends a prompt.",
         ),
         SendKeysError::Blocked(blocked) => tool_error("invalid_request", blocked.to_string()),
         SendKeysError::Tmux(error) => {
@@ -1092,6 +1171,7 @@ mod tests {
                 "busy",
             ),
             (SendKeysError::NotRunning, "not_running"),
+            (SendKeysError::Ignored, "ignored"),
             (SendKeysError::Gone, "not_found"),
         ];
         for (error, code) in cases {

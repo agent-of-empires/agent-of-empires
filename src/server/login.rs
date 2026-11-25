@@ -463,8 +463,8 @@ impl LoginManager {
                     session_id: id.clone(),
                     user_agent: s.user_agent.clone(),
                     created_ip: s.created_ip.clone(),
-                    created_at: chrono::DateTime::<chrono::Utc>::from(s.created_at),
-                    last_seen: chrono::DateTime::<chrono::Utc>::from(last_seen),
+                    created_at: crate::time::Timestamp::from(s.created_at),
+                    last_seen: crate::time::Timestamp::from(last_seen),
                     current: current_session_id == Some(id.as_str()),
                 }
             })
@@ -539,8 +539,8 @@ pub struct DeviceSession {
     pub session_id: String,
     pub user_agent: String,
     pub created_ip: String,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub last_seen: chrono::DateTime<chrono::Utc>,
+    pub created_at: crate::time::Timestamp,
+    pub last_seen: crate::time::Timestamp,
     /// True for the session making the request, so the UI can label
     /// "this device" and guard self-revocation.
     pub current: bool,

@@ -62,7 +62,7 @@ impl SilentOrphanWatchdog {
         &mut self,
         sig: LifecycleSignal,
         now: Instant,
-        wall_now: chrono::DateTime<chrono::Utc>,
+        wall_now: crate::time::Timestamp,
         cfg: SilentOrphanWatchdogConfig,
     ) {
         match sig {
@@ -120,10 +120,8 @@ impl SilentOrphanWatchdog {
                 self.off_protocol_work_seen = Some(OffProtocolWorkKind::ScheduledWakeup);
                 // Monotonic deadline with the floor as a tail so the agent has
                 // room to resume after `at`. Later wakes only extend it.
-                let until_wakeup = at
-                    .signed_duration_since(wall_now)
-                    .to_std()
-                    .unwrap_or(Duration::ZERO);
+                let until_wakeup =
+                    std::time::Duration::try_from(at - wall_now).unwrap_or(Duration::ZERO);
                 let deadline = now + until_wakeup + cfg.off_protocol_grace_floor;
                 self.wakeup_suppress_until = Some(
                     self.wakeup_suppress_until
@@ -601,7 +599,7 @@ mod tests {
             ),
         ];
         let t0 = Instant::now();
-        let wall = chrono::Utc::now();
+        let wall = crate::time::Timestamp::now();
         for (name, steps) in cases {
             let mut w = SilentOrphanWatchdog::default();
             let mut child = false;
@@ -610,7 +608,7 @@ mod tests {
                     At(ms, sig) => w.apply_signal(sig, t0 + Duration::from_millis(ms), wall, CFG),
                     Wake(ms, secs) => w.apply_signal(
                         L::WakeupPending {
-                            at: wall + chrono::Duration::seconds(secs),
+                            at: wall + crate::time::Duration::seconds(secs),
                         },
                         t0 + Duration::from_millis(ms),
                         wall,
@@ -632,7 +630,7 @@ mod tests {
             let t0 = Instant::now();
             let mut w = SilentOrphanWatchdog::default();
             let sig = classify_lifecycle_signal(&text_chunk("Compacting...", Some("m1"))).unwrap();
-            w.apply_signal(sig, t0, chrono::Utc::now(), CFG);
+            w.apply_signal(sig, t0, crate::time::Timestamp::now(), CFG);
             assert!(!w.should_fire(t0 + Duration::from_millis(120_400), CFG, false));
         }
     }

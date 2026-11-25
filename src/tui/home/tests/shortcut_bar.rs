@@ -223,7 +223,7 @@ fn shortcut_bar_tip_waits_for_idle_and_persists_seen_state() {
     env.view.refresh_shortcut_bar_tip();
     assert!(!env.view.try_present_shortcut_bar_tip());
     crate::tips::record_session_creations(1);
-    env.view.reload().unwrap();
+    env.view.reload();
     assert_eq!(
         env.view.pending_tip_pop.map(|tip| tip.id),
         Some(SHORTCUT_BAR_TIP_ID)
@@ -265,7 +265,7 @@ fn shortcut_bar_tip_waits_for_idle_and_persists_seen_state() {
         .tips_seen
         .iter()
         .any(|id| id == SHORTCUT_BAR_TIP_ID));
-    env.view.reload().unwrap();
+    env.view.reload();
     assert!(!env.view.try_present_shortcut_bar_tip());
     let mut restarted = test_view(Some("test"));
     assert!(!restarted.try_present_shortcut_bar_tip());

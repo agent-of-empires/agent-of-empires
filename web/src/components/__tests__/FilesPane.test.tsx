@@ -24,6 +24,7 @@ vi.mock("../../hooks/useShikiTheme", () => ({
   useShikiTheme: () => ({ theme: "github-dark", appearance: "dark" }),
 }));
 vi.mock("../../lib/snippetHighlighter", () => ({
+  peekHighlight: () => undefined,
   highlightSnippet: vi.fn().mockResolvedValue(null),
 }));
 

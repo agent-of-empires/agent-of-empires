@@ -1,7 +1,7 @@
-//! Opt-in clean-only plugin auto-update sweep at startup.
+//! Opt-in clean-only plugin auto-update sweep at Daemon startup.
 //!
-//! Gated on `updates.auto_update_plugins` (off by default). When on, the TUI and
-//! `aoe serve` run [`run_if_enabled`] at startup; it checks installed
+//! Gated on `updates.auto_update_plugins` (off by default). When on, `aoe serve`
+//! runs [`run_if_enabled`] at startup; it checks installed
 //! external plugins for updates and applies only the ones that need no new
 //! consent. Anything that changes capabilities, build steps, or UI slots is
 //! skipped and left for a manual `aoe plugin update`, so a background sweep never

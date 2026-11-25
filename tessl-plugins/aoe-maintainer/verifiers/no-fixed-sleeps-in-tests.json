@@ -1,0 +1,14 @@
+{
+  "name": "Tests wait on a condition, not a fixed sleep",
+  "instruction": "Added test code does not use a fixed sleep to assume that another task, process or tmux pane has progressed.",
+  "relevant_when": "A patch adds std::thread::sleep, tokio::time::sleep, sleep(Duration...), page.waitForTimeout, or a setTimeout used as a delay, inside a Rust #[test] or #[tokio::test] function, a #[cfg(test)] module, a file under tests/, or a web test file (*.test.ts, *.test.tsx, *.spec.ts).",
+  "context": "AGENTS.md: do not use fixed sleeps to assume another task has progressed; use a channel, barrier, or an observable predicate with a deadline. CI runs tests in parallel under nextest, so a fixed sleep is a flake source. Allowed: a short sleep as the poll interval inside a loop that re-checks a condition against a deadline, and a sleep whose elapsed time is itself the behavior under test (a timeout, debounce or file mtime granularity) when the code says so.",
+  "scope": "diff",
+  "scope_reason": "Existing tests contain sleeps from before the rule; the judge needs the added lines and their surrounding hunk to see whether a sleep sits in a polling loop.",
+  "checklist": [
+    {
+      "name": "sleep-is-poll-interval-or-under-test",
+      "rule": "Each added sleep in test code either sits inside a loop that re-checks an observable condition and stops at a deadline, or is commented as the elapsed time under test. Fail when the added sleep is followed by an assertion or read that assumes progress with no such loop in the hunk."
+    }
+  ]
+}

@@ -12,8 +12,8 @@ const siteUrl = Astro.site?.toString().replace(/\/$/, '') ?? '';
 const {
   title,
   description,
-  ogTitle = 'Agent of Empires',
-  ogDescription = 'Terminal session manager for AI coding agents. Git worktrees, Docker sandboxing, beautiful TUI.',
+  ogTitle = title,
+  ogDescription = description,
   ogImage = `${siteUrl}/assets/social-preview.png`
 } = Astro.props;
 
@@ -38,7 +38,7 @@ const structuredData = {
   "author": {
     "@type": "Organization",
     "name": "Agent of Empires",
-    "url": "https://agent-of-empires.com"
+    "url": siteUrl
   },
   "license": "https://github.com/agent-of-empires/agent-of-empires/blob/main/LICENSE",
   "codeRepository": "https://github.com/agent-of-empires/agent-of-empires",

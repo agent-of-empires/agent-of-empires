@@ -33,13 +33,17 @@
 //!   same origin when forwarding pointer cells. Single-pane frames serialize
 //!   `pane0` as `null`. The origin fields are optional for older clients and
 //!   default to zero for frames from older servers. Every frame carries a
-//!   monotonic `seq`.
+//!   monotonic `seq`. `wrapped`, when present, lists the rows whose line
+//!   continues on the next row (a soft wrap), so the client can join them
+//!   before finding URLs. Rows carry OSC 8 hyperlinks on both transports, each
+//!   row opening and closing its own.
 //!   `{"type":"patch","seq":..,"base":..,"shift":k,"lines":[[i,"<ANSI>"],..],
 //!     ...same geometry/cursor/flag fields as a frame}`: sent instead of a
 //!   frame when the client advertised `caps.patch` and few rows changed. The
 //!   client drops the first `shift` rows of its previous window (history
 //!   grew by that many lines), appends `shift` blank rows, then replaces the
-//!   listed rows. `base` names the `seq` the patch applies to; a client that
+//!   listed rows; `wrapped` describes the whole patched window. `base` names
+//!   the `seq` the patch applies to; a client that
 //!   is not at `base` sends `{"type":"resync"}` and receives a full frame.
 //!   `{"type":"size_owner","is_owner":bool,"owner"?:"web"|"tui"}`: whether
 //!     this client holds the session's size-owner lock. Only the owner
@@ -268,13 +272,14 @@ fn paste_payload(mut text: String, submit: bool) -> String {
 
 /// Paste, then Enter after the agent's paste-burst delay when submitting. A live input
 /// channel (tmux 3.8) is the pane's single writer, so the paste and the Enter ride it to
-/// stay ordered with keystrokes; otherwise tmux's paste path takes them.
-fn deliver_paste(tmux_name: &str, text: &str, submit: bool, enter_delay_ms: u64) {
+/// stay ordered with keystrokes; otherwise tmux's paste path takes them. `false` when the
+/// pane took nothing.
+fn deliver_paste(tmux_name: &str, text: &str, submit: bool, enter_delay_ms: u64) -> bool {
     #[cfg(unix)]
     if crate::tmux::vt::input_mode(tmux_name).is_some()
         && deliver_paste_via_channel(tmux_name, text, submit, enter_delay_ms)
     {
-        return;
+        return true;
     }
     let session = crate::tmux::Session::from_name(tmux_name);
     let result = if submit {
@@ -282,9 +287,10 @@ fn deliver_paste(tmux_name: &str, text: &str, submit: bool, enter_delay_ms: u64)
     } else {
         session.paste_text(text)
     };
-    if let Err(e) = result {
+    if let Err(e) = &result {
         warn!(target: "terminal.ws", tmux = %tmux_name, kind = "live", "paste failed: {}", e);
     }
+    result.is_ok()
 }
 
 /// `send_keys_with_delay` over the input channel; `false` when the channel is gone before
@@ -309,6 +315,47 @@ fn deliver_paste_via_channel(
         try_send_input(tmux_name, b"\r");
     }
     sent
+}
+
+/// Input the pane accepted is the operator typing in this session, so an ignored row wakes
+/// the way `send` wakes it rather than staying hidden under its own keystrokes.
+///
+/// The check reads the canonical store, which decodes every session and group behind a lock,
+/// so the receive loop hands wakes to a worker instead of awaiting a decode per accepted
+/// frame. Requests coalesce into one read per burst; input that lands while a read is in
+/// flight queues one more.
+struct InputWake {
+    requests: tokio::sync::mpsc::Sender<()>,
+    worker: tokio::task::JoinHandle<()>,
+}
+
+impl InputWake {
+    fn spawn(wake: (Arc<AppState>, String)) -> Self {
+        let (requests, mut queued) = tokio::sync::mpsc::channel::<()>(1);
+        let worker = tokio::spawn(async move {
+            let (state, id) = wake;
+            while queued.recv().await.is_some() {
+                if let Err(error) = state.session_service.touch_after_direct_input(&id).await {
+                    warn!(target: "terminal.ws", session = %id, %error,
+                        "failed to wake an ignored session after input");
+                }
+            }
+        });
+        Self { requests, worker }
+    }
+
+    /// A full queue already holds a wake that runs after this input, so a dropped request
+    /// is not a missed one.
+    fn request(&self) {
+        let _ = self.requests.try_send(());
+    }
+
+    /// Closing the sender lets a queued wake, or one already reading the store, finish, so
+    /// input the pane accepted is not lost when the tab closes.
+    async fn stop(self) {
+        drop(self.requests);
+        let _ = self.worker.await;
+    }
 }
 
 /// Which transport renders a live surface. The agent pane takes the shared VT
@@ -745,9 +792,9 @@ impl FrameDeflater {
 /// One iteration's fetch result, normalizing the vt100-grid sample and the
 /// legacy capture-pane fork onto the same downstream publish/death logic.
 enum CaptureOutcome {
-    /// A renderable frame: ANSI content plus the (already reliability-filtered)
-    /// cursor.
-    Frame(String, Option<crate::tmux::PaneCursor>),
+    /// A renderable frame: ANSI content, the cursor (reliability-filtered
+    /// before publishing), and the rows that soft-wrap.
+    Frame(String, Option<crate::tmux::PaneCursor>, Vec<u32>),
     /// The pane looks gone (dead channel, or an empty capture). Counts toward
     /// the dead-probe threshold before the connection closes.
     Dead,
@@ -781,6 +828,8 @@ pub async fn live_terminal_ws(
     let shutdown = state.shutdown.clone();
     let work = state.runtime.work.clone();
 
+    // Input into the pane is the operator typing in this session, which wakes it.
+    let wake = Some((state.clone(), id.clone()));
     match target {
         Some((tmux_name, enter_delay_ms)) => ws
             .protocols(["aoe-auth"])
@@ -791,7 +840,7 @@ pub async fn live_terminal_ws(
                         handle_live_ws(
                             socket,
                             tmux_name,
-                            read_only,
+                            LiveInput { read_only, wake },
                             shutdown,
                             LiveTransport::Grid,
                             enter_delay_ms,
@@ -935,6 +984,7 @@ async fn live_shell_ws(
     let read_only = state.read_only;
     let shutdown = state.shutdown.clone();
     let work = state.runtime.work.clone();
+    let wake = Some((state.clone(), id.clone()));
     ws.protocols(["aoe-auth"])
         .on_upgrade(move |socket| async move {
             let _ = work
@@ -943,7 +993,7 @@ async fn live_shell_ws(
                     handle_live_ws(
                         socket,
                         tmux_name,
-                        read_only,
+                        LiveInput { read_only, wake },
                         shutdown,
                         LiveTransport::Snapshot,
                         0,
@@ -954,11 +1004,18 @@ async fn live_shell_ws(
         .into_response()
 }
 
+/// Where a pane's input goes: whether this viewer may type, and the session it belongs to,
+/// so accepted input clears that row's Ignore marker.
+struct LiveInput {
+    read_only: bool,
+    wake: Option<(Arc<AppState>, String)>,
+}
+
 /// `enter_delay_ms` is the agent's paste-burst guard before a submitting Enter; 0 for shells.
 async fn handle_live_ws(
     socket: WebSocket,
     tmux_name: String,
-    read_only: bool,
+    input: LiveInput,
     shutdown: tokio_util::sync::CancellationToken,
     transport: LiveTransport,
     enter_delay_ms: u64,
@@ -966,7 +1023,7 @@ async fn handle_live_ws(
     handle_live_ws_inner(
         socket,
         tmux_name,
-        read_only,
+        input,
         shutdown,
         transport,
         enter_delay_ms,
@@ -995,12 +1052,14 @@ impl Drop for CaptureCycleWitness {
 async fn handle_live_ws_inner(
     mut socket: WebSocket,
     tmux_name: String,
-    read_only: bool,
+    input: LiveInput,
     shutdown: tokio_util::sync::CancellationToken,
     transport: LiveTransport,
     enter_delay_ms: u64,
     #[cfg(test)] witness_cycles: bool,
 ) {
+    let LiveInput { read_only, wake } = input;
+    let wake = wake.map(InputWake::spawn);
     match wait_for_tmux_ready(&tmux_name).await {
         PaneReadiness::Ready => {}
         PaneReadiness::Dead => {
@@ -1106,7 +1165,7 @@ async fn handle_live_ws_inner(
             (None, Instant::now() - PANE_COUNT_PROBE_INTERVAL);
         #[cfg(unix)]
         let mut first_publish_wait_started: Option<Instant> = None;
-        let mut last_published: Option<(String, Option<crate::tmux::PaneCursor>)> = None;
+        let mut last_published: Option<(String, Option<crate::tmux::PaneCursor>, Vec<u32>)> = None;
         // Announced on the first frame and whenever it flips, so a client can
         // report the transport rather than infer it.
         let mut announced_transport: Option<(bool, Option<LiveTransportReason>)> = None;
@@ -1213,7 +1272,7 @@ async fn handle_live_ws_inner(
                         {
                             Ok(sample) => {
                                 grid_incomplete = sample.incomplete;
-                                CaptureOutcome::Frame(sample.content, sample.cursor)
+                                CaptureOutcome::Frame(sample.content, sample.cursor, sample.wrapped)
                             }
                             Err(_) => break,
                         }
@@ -1221,16 +1280,22 @@ async fn handle_live_ws_inner(
                     _ => {
                         let name = capture_tmux.clone();
                         match tokio::task::spawn_blocking(move || {
-                            crate::tmux::Session::from_name(&name)
-                                .capture_window_composited_with_cursor(lines)
+                            crate::tmux::Session::from_name(&name).capture_window_with_wraps(lines)
                         })
                         .await
                         {
-                            Ok(Ok((content, cursor)))
-                                if !content.is_empty()
-                                    || cursor.as_ref().is_some_and(|c| c.position_reliable) =>
+                            Ok(Ok(capture))
+                                if !capture.content.is_empty()
+                                    || capture
+                                        .cursor
+                                        .as_ref()
+                                        .is_some_and(|c| c.position_reliable) =>
                             {
-                                CaptureOutcome::Frame(content, cursor)
+                                CaptureOutcome::Frame(
+                                    capture.content,
+                                    capture.cursor,
+                                    capture.wrapped,
+                                )
                             }
                             Ok(Ok(_)) => CaptureOutcome::Dead,
                             _ => break,
@@ -1242,16 +1307,15 @@ async fn handle_live_ws_inner(
             {
                 let name = capture_tmux.clone();
                 outcome = match tokio::task::spawn_blocking(move || {
-                    crate::tmux::Session::from_name(&name)
-                        .capture_window_composited_with_cursor(lines)
+                    crate::tmux::Session::from_name(&name).capture_window_with_wraps(lines)
                 })
                 .await
                 {
-                    Ok(Ok((content, cursor)))
-                        if !content.is_empty()
-                            || cursor.as_ref().is_some_and(|c| c.position_reliable) =>
+                    Ok(Ok(capture))
+                        if !capture.content.is_empty()
+                            || capture.cursor.as_ref().is_some_and(|c| c.position_reliable) =>
                     {
-                        CaptureOutcome::Frame(content, cursor)
+                        CaptureOutcome::Frame(capture.content, capture.cursor, capture.wrapped)
                     }
                     Ok(Ok(_)) => CaptureOutcome::Dead,
                     _ => break,
@@ -1292,7 +1356,7 @@ async fn handle_live_ws_inner(
             stats.sample_micros += sample_started.elapsed().as_micros() as u64;
 
             match outcome {
-                CaptureOutcome::Frame(content, cursor) => {
+                CaptureOutcome::Frame(content, cursor, wrapped) => {
                     dead_probes = 0;
                     let cursor = cursor.filter(|c| c.position_reliable);
                     // Keep the size-owner lock alive while we hold it, and
@@ -1589,7 +1653,7 @@ async fn handle_live_ws_inner(
                             break;
                         }
                     }
-                    let frame = (content, cursor);
+                    let frame = (content, cursor, wrapped);
                     // A resync republishes even when the frame is unchanged.
                     let force_full = capture_settings.force_full.swap(false, Ordering::Relaxed);
                     if force_full || last_published.as_ref() != Some(&frame) {
@@ -1613,9 +1677,9 @@ async fn handle_live_ws_inner(
                         let json = match patch {
                             Some((changed, shift)) => {
                                 stats.patches += 1;
-                                patch_json(&changed, shift, seq, frame.1.as_ref())
+                                patch_json(&changed, shift, seq, frame.1.as_ref(), &frame.2)
                             }
-                            None => frame_json(&frame.0, frame.1.as_ref(), seq),
+                            None => frame_json(&frame.0, frame.1.as_ref(), seq, &frame.2),
                         };
                         last_sent = Some((lines.iter().map(|l| l.to_string()).collect(), history));
                         stats.publishes += 1;
@@ -1754,21 +1818,31 @@ async fn handle_live_ws_inner(
                         // otherwise input goes through tmux send-keys. Cursor
                         // keys are re-encoded for the pane's DECCKM state
                         // before either.
-                        let _ = tokio::task::spawn_blocking(move || {
+                        let sent = tokio::task::spawn_blocking(move || {
                             #[cfg(unix)]
                             let bytes = pane_input_bytes(&name, bytes);
                             #[cfg(unix)]
                             if crate::tmux::vt::input_mode(&name).is_some()
                                 && crate::tmux::vt::try_send_input(&name, &bytes)
                             {
-                                return;
+                                return true;
                             }
                             let session = crate::tmux::Session::from_name(&name);
-                            if let Err(e) = session.send_raw_bytes(&bytes) {
-                                warn!(target: "terminal.ws", tmux = %name, kind = "live", "send_raw_bytes failed: {}", e);
+                            match session.send_raw_bytes(&bytes) {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    warn!(target: "terminal.ws", tmux = %name, kind = "live", "send_raw_bytes failed: {}", e);
+                                    false
+                                }
                             }
                         })
-                        .await;
+                        .await
+                        .unwrap_or(false);
+                        if sent {
+                            if let Some(wake) = wake.as_ref() {
+                                wake.request();
+                            }
+                        }
                         // Capture the echo promptly rather than waiting out
                         // the current sleep.
                         send_nudge.notify_one();
@@ -1922,10 +1996,16 @@ async fn handle_live_ws_inner(
                                 }
                                 let name = tmux_name.clone();
                                 // Awaited like binary input, so it lands after earlier keystrokes.
-                                let _ = tokio::task::spawn_blocking(move || {
+                                let sent = tokio::task::spawn_blocking(move || {
                                     deliver_paste(&name, &text, submit, enter_delay_ms)
                                 })
-                                .await;
+                                .await
+                                .unwrap_or(false);
+                                if sent {
+                                    if let Some(wake) = wake.as_ref() {
+                                        wake.request();
+                                    }
+                                }
                                 nudge.notify_one();
                             }
                             LiveClientMessage::Resync => {
@@ -1949,6 +2029,9 @@ async fn handle_live_ws_inner(
     let _ = capture_task.await;
     drop(out_tx);
     let _ = send_task.await;
+    if let Some(wake) = wake {
+        wake.stop().await;
+    }
 
     // Release only this viewer's size lease. The last owner restores
     // window-size latest; another viewer's lease remains untouched.
@@ -2067,7 +2150,7 @@ fn live_json(message: &LiveServerMessage) -> String {
 }
 
 /// The geometry, cursor and mode fields every frame and patch carries.
-fn frame_meta(cursor: Option<&crate::tmux::PaneCursor>) -> LivePaneMeta {
+fn frame_meta(cursor: Option<&crate::tmux::PaneCursor>, wrapped: &[u32]) -> LivePaneMeta {
     // The cursor is pane relative while composited content uses the window grid.
     let pane0 = cursor.and_then(|c| c.composite_pane0);
     let (origin_x, origin_y) = pane0.map_or((0, 0), |p| (p.left, p.top));
@@ -2089,6 +2172,7 @@ fn frame_meta(cursor: Option<&crate::tmux::PaneCursor>) -> LivePaneMeta {
             left: p.left,
             top: p.top,
         }),
+        wrapped: wrapped.to_vec(),
     }
 }
 
@@ -2098,21 +2182,27 @@ fn patch_json(
     shift: usize,
     seq: u64,
     cursor: Option<&crate::tmux::PaneCursor>,
+    wrapped: &[u32],
 ) -> String {
     live_json(&LiveServerMessage::Patch {
         seq,
         base: seq - 1,
         shift,
         lines: changed.iter().map(|(i, row)| (*i, (*row).into())).collect(),
-        meta: frame_meta(cursor),
+        meta: frame_meta(cursor, wrapped),
     })
 }
 
-fn frame_json(content: &str, cursor: Option<&crate::tmux::PaneCursor>, seq: u64) -> String {
+fn frame_json(
+    content: &str,
+    cursor: Option<&crate::tmux::PaneCursor>,
+    seq: u64,
+    wrapped: &[u32],
+) -> String {
     live_json(&LiveServerMessage::Frame {
         seq,
         content: content.into(),
-        meta: frame_meta(cursor),
+        meta: frame_meta(cursor, wrapped),
     })
 }
 
@@ -2294,7 +2384,7 @@ mod tests {
                 position_reliable: true,
                 composite_pane0: pane0,
             };
-            let json = frame_json("hello\nworld", Some(&cursor), 1);
+            let json = frame_json("hello\nworld", Some(&cursor), 1, &[]);
             let v: serde_json::Value = serde_json::from_str(&json).unwrap();
             assert_eq!(v["type"], "frame");
             assert_eq!(v["content"], "hello\nworld");
@@ -2326,7 +2416,7 @@ mod tests {
             composite_pane0: None,
         };
         let v: serde_json::Value =
-            serde_json::from_str(&frame_json("x", Some(&cursor), 1)).unwrap();
+            serde_json::from_str(&frame_json("x", Some(&cursor), 1, &[])).unwrap();
         assert_eq!(v["altScreen"], true);
         assert_eq!(v["mouse"], true);
         assert_eq!(v["mouseSgr"], false);
@@ -2349,14 +2439,14 @@ mod tests {
             composite_pane0: None,
         };
         let v: serde_json::Value =
-            serde_json::from_str(&frame_json("x", Some(&cursor), 1)).unwrap();
+            serde_json::from_str(&frame_json("x", Some(&cursor), 1, &[])).unwrap();
         assert!(v["cursor"].is_null());
         assert_eq!(v["rows"], 46);
     }
 
     #[test]
     fn frame_json_null_cursor() {
-        let v: serde_json::Value = serde_json::from_str(&frame_json("x", None, 1)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&frame_json("x", None, 1, &[])).unwrap();
         assert!(v["cursor"].is_null());
         assert_eq!(v["rows"], 0);
     }
@@ -2378,7 +2468,8 @@ mod tests {
             composite_pane0: None,
         };
         let v: serde_json::Value =
-            serde_json::from_str(&patch_json(&[(1, "B"), (3, "e")], 1, 7, Some(&cursor))).unwrap();
+            serde_json::from_str(&patch_json(&[(1, "B"), (3, "e")], 1, 7, Some(&cursor), &[]))
+                .unwrap();
         assert_eq!(v["type"], "patch");
         assert_eq!(v["seq"], 7);
         assert_eq!(v["base"], 6);
@@ -2431,13 +2522,13 @@ mod tests {
         let screen: String = (0..50)
             .map(|i| format!("\x1b[38;5;208mline {i} with some agent output text\x1b[0m\n"))
             .collect();
-        let frame1 = frame_json(&screen, None, 1);
+        let frame1 = frame_json(&screen, None, 1, &[]);
         // Frame 2.
         let scrolled = format!(
             "{}\x1b[38;5;208mline 50 with some agent output text\x1b[0m\n",
             screen.split_once('\n').unwrap().1
         );
-        let frame2 = frame_json(&scrolled, None, 2);
+        let frame2 = frame_json(&scrolled, None, 2, &[]);
 
         let mut d = FrameDeflater::new();
         let c1 = d.frame(&frame1).unwrap();
@@ -2622,7 +2713,10 @@ mod tests {
                             handle_live_ws_inner(
                                 socket,
                                 name,
-                                true,
+                                LiveInput {
+                                    read_only: true,
+                                    wake: None,
+                                },
                                 shutdown,
                                 LiveTransport::Grid,
                                 0,
@@ -2848,7 +2942,10 @@ mod tests {
                             handle_live_ws_inner(
                                 socket,
                                 name,
-                                false,
+                                LiveInput {
+                                    read_only: false,
+                                    wake: None,
+                                },
                                 shutdown,
                                 LiveTransport::Grid,
                                 0,
@@ -3032,6 +3129,39 @@ mod tests {
                 "grid={grid} owned={owned} panes={panes:?} lines={lines}"
             );
         }
+    }
+
+    /// Closing the tab right after the pane accepts input must not drop the wake that
+    /// clears a peer's Ignore. The worker is only polled when the test awaits, so a queued
+    /// request that survives `stop` is one this test can see land.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_accepted_input_wake_survives_disconnect() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut managed = crate::session::Instance::new("typed", "/tmp/aoe-typed");
+        managed.id = "typed".into();
+        managed.source_profile = "default".into();
+        managed.parent_session_id = Some("manager".into());
+        managed.ignore();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![managed.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![managed]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        let wake = InputWake::spawn((Arc::clone(&state), "typed".into()));
+        wake.request();
+        wake.stop().await;
+
+        assert!(
+            !state
+                .session_service
+                .is_ignored_on_disk("typed")
+                .await
+                .unwrap(),
+            "accepted input must clear the canonical marker even if the tab closed"
+        );
     }
 
     #[test]

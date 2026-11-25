@@ -10,6 +10,12 @@ const OMP_TERMINAL_RETRY_MARKERS: &[&str] =
 
 /// Build a short human-readable hint for why a session transitioned to Error.
 pub(super) fn summarize_error_from_pane(pane_content: &str) -> String {
+    pane_error_line(pane_content)
+        .unwrap_or_else(|| "Agent stopped responding and the pane is empty.".to_string())
+}
+
+/// [`summarize_error_from_pane`], or `None` for a pane that printed nothing.
+pub(super) fn pane_error_line(pane_content: &str) -> Option<String> {
     const MAX_BANNER_LINES: usize = 3;
 
     let cleaned = crate::tmux::utils::strip_ansi(pane_content);
@@ -66,7 +72,7 @@ pub(super) fn summarize_error_from_pane(pane_content: &str) -> String {
                 }
                 reason.push_str(text);
             }
-            return truncate_error_line(&reason);
+            return Some(truncate_error_line(&reason));
         }
         // No collectable banner lines (exotic theme): fall through to the
         // word list below.
@@ -83,18 +89,16 @@ pub(super) fn summarize_error_from_pane(pane_content: &str) -> String {
             || lower.contains("traceback")
             || lower.contains("panic")
         {
-            return truncate_error_line(line);
+            return Some(truncate_error_line(line));
         }
     }
 
-    if let Some(last) = tail.first() {
-        return format!(
+    tail.first().map(|last| {
+        format!(
             "Agent stopped responding. Last line: {}",
             truncate_error_line(last)
-        );
-    }
-
-    "Agent stopped responding and the pane is empty.".to_string()
+        )
+    })
 }
 
 /// Present an adapter-selected diagnostic without interpreting the agent's UI.

@@ -9,8 +9,8 @@ import {
   updateSessionGroup,
   type SessionMutation,
 } from "../../lib/api";
+import { reportFeatureUse } from "../../lib/featureUse";
 import { useUnreadIndicatorEnabled } from "../../lib/unreadIndicator";
-import { useSessionColorsEnabled } from "../../lib/sessionColors";
 import { enterFocusWindow, openFocusWindow, requestOpenSession } from "../../lib/sessionRoute";
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
 import { requestSwitchAccount } from "../../lib/switchAccountTrigger";
@@ -45,6 +45,8 @@ export interface SessionActionHandlers {
   onArchiveToggle: (ws: Workspace, archived: boolean) => void;
   onSnooze: (ws: Workspace, minutes: number | null) => void;
   onUnreadToggle: (ws: Workspace, markUnread: boolean) => void;
+  onIgnoreToggle: (sessionId: string, ignored: boolean) => void;
+  onReclaimOwnership: (sessionId: string) => void;
 }
 
 export type SessionMenuState = { x: number; y: number; scope: RowContextScope };
@@ -58,7 +60,6 @@ export function SessionActionsMenu({
   workspace,
   model,
   setNotify,
-  setColor,
   readOnly,
   handlers,
   onRename,
@@ -72,7 +73,6 @@ export function SessionActionsMenu({
   workspace: Workspace;
   model: RowModel;
   setNotify: SingleRowActions["notify"];
-  setColor: SingleRowActions["color"];
   readOnly?: boolean;
   handlers: SessionActionHandlers;
   onRename: () => void;
@@ -83,7 +83,6 @@ export function SessionActionsMenu({
   const [modal, setModal] = useState<Modal>(null);
   const [recreating, setRecreating] = useState<SessionResponse | null>(null);
   const owner = useSessionActions();
-  const colorsEnabled = useSessionColorsEnabled();
   const unreadEnabled = useUnreadIndicatorEnabled();
   // An installed dashboard on a phone cannot open a second window.
   const canOpenWindows = !useIsCoarsePointer();
@@ -96,7 +95,6 @@ export function SessionActionsMenu({
     openOwnWindow: canOpenWindows ? rowActions.openOwnWindow : undefined,
     rename: onRename,
     notify: setNotify,
-    color: setColor,
   };
 
   return (
@@ -122,9 +120,6 @@ export function SessionActionsMenu({
                     dormant={model.dormant}
                   />
                 </span>
-                {model.sessionColorDot && colorsEnabled && (
-                  <span className={`h-2 w-2 shrink-0 rounded-full ${model.sessionColorDot}`} aria-hidden="true" />
-                )}
                 <span className="min-w-0">
                   <span className="block truncate">{label}</span>
                   {model.sessionCount > 0 && (
@@ -150,7 +145,6 @@ export function SessionActionsMenu({
             <SingleRowMenuItems
               model={model}
               readOnly={readOnly}
-              colorsEnabled={colorsEnabled}
               unreadEnabled={unreadEnabled}
               actions={actions}
               extraItems={extraItems}
@@ -183,7 +177,7 @@ export function SessionActionsMenu({
 }
 
 /** Menu actions; each closes the menu first so its dismiss listener cannot race a modal mount.
- *  Pin, unread, notify and color are in-place toggles that keep it open; the row supplies the last two. */
+ *  Pin, unread and notify are in-place toggles that keep it open; the row supplies notify. */
 function buildRowActions(
   workspace: Workspace,
   props: SessionActionHandlers,
@@ -192,7 +186,7 @@ function buildRowActions(
   setModal: (m: Modal) => void,
   setRecreating: (session: SessionResponse) => void,
   openAttach: () => void,
-): Omit<SingleRowActions, "rename" | "notify" | "color"> {
+): Omit<SingleRowActions, "rename" | "notify"> {
   const after = (fn: () => unknown) => () => {
     closeMenu();
     void fn();
@@ -226,6 +220,7 @@ function buildRowActions(
       requestSwitchAccount(s.id);
     }),
     fork: afterTarget("fork", async (s) => {
+      reportFeatureUse("fork");
       const result = await createSession({
         path: s.project_path,
         tool: s.tool,
@@ -237,22 +232,37 @@ function buildRowActions(
       else reportError(result.error ?? "Could not fork this session. Please try again.");
     }),
     autoName: afterTarget("autoName", async (s) => {
+      reportFeatureUse("auto_name");
       const result = await smartRenameSession(s.id);
       if (!result.ok) reportError(result.message ?? "Could not start auto-name. Please try again.");
     }),
     summarize: afterTarget("summarize", async (s) => {
+      reportFeatureUse("summarize");
       const result = await summarizeSession(s.id);
       if (result.ok) reportInfo("Summarizing the conversation so far…");
       else reportError(result.message ?? "Could not start the summary. Please try again.");
     }),
-    showOnly: afterTarget("showOnly", (s) => enterFocusWindow(s.id)),
-    openOwnWindow: afterTarget("openOwnWindow", (s) => openFocusWindow(s.id)),
+    showOnly: afterTarget("showOnly", (s) => {
+      reportFeatureUse("focus_mode");
+      enterFocusWindow(s.id);
+    }),
+    openOwnWindow: afterTarget("openOwnWindow", (s) => {
+      reportFeatureUse("focus_mode");
+      openFocusWindow(s.id);
+    }),
     stop: afterTarget("stop", (s) => props.onStop?.(s.id)),
     start: afterTarget("start", (s) => props.onStart?.(s.id)),
     restartUpdate: afterTarget("restartUpdate", (s) => props.onRestartForUpdate?.(s.id)),
     recreateContainer: afterTarget("recreateContainer", setRecreating),
     pin: () => props.onPinToggle(workspace, !model.effectivePinned),
     archive: after(() => props.onArchiveToggle(workspace, !model.effectiveArchived)),
+    ignore: (sessionId: string) => {
+      closeMenu();
+      const session = workspace.sessions.find((s) => s.id === sessionId);
+      if (!session) return;
+      props.onIgnoreToggle(sessionId, session.ignored_at == null);
+    },
+    reclaimOwnership: afterTarget("reclaimOwnership", (s) => props.onReclaimOwnership(s.id)),
     openSnooze: after(() => setModal("snooze")),
     unsnooze: after(() => {
       setModal(null);
@@ -286,6 +296,7 @@ function RowModals({
       <SessionGroupModal
         sessionTitle={model.sessionTitle || label}
         currentGroup={model.firstSession?.group_path ?? ""}
+        profile={model.firstSession?.profile}
         onSave={async (group) => {
           if (!sessionId) return false;
           const mutation = await updateSessionGroup(sessionId, group);

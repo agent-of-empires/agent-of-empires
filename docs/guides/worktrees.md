@@ -76,7 +76,7 @@ Variables are read from the process that creates the worktree. For sessions crea
 
 ### Bare repos
 
-Bare repos are auto-detected and use `bare_repo_path_template` instead, so worktrees land as siblings inside the project directory. A sandboxed session needs this layout to reach the repo's git directory from the container.
+Bare repos are auto-detected and use `bare_repo_path_template` instead, so worktrees land as siblings inside the project directory.
 
 ### Submodules
 
@@ -111,11 +111,11 @@ An external `git worktree lock` is not a deletion guard: AoE unlocks worktrees b
 
 ## Warnings during create
 
-Two kinds of non-fatal failure surface through the same channel instead of aborting the session: a `⚠` line on stderr for `aoe add`, a **Worktree warnings** dialog in the TUI, and a toast plus `warnings: string[]` on the `POST /api/sessions` response for the web.
+Non-fatal failures surface through one channel instead of aborting the session: a `⚠` line on stderr for `aoe add`, a **Worktree warnings** dialog in the TUI, and a toast plus `warnings: string[]` on the `POST /api/sessions` response for the web.
 
-### Post-checkout hooks
+### Repo hooks do not run
 
-Some repos install pre-commit hooks at the `post-checkout` stage (`uv-sync`, `npm install`, LFS smudge) that fire when `git worktree add` checks out the branch. If one fails, the worktree and its `.git` pointer already exist and are usable. Usually the hook needs network access or credentials the new worktree does not have yet: re-run it by hand once the environment is set up, or set `core.hooksPath` per checkout.
+AoE never runs the repo's git hooks when it creates a worktree, because a sandboxed session could have written them. That includes `post-checkout` hooks such as `uv-sync`, `npm install` or LFS smudge installed by pre-commit. Run that setup by hand in the new worktree, or from an [`on_create` hook](repo-config.md#hooks). See [Git config and hooks](sandbox.md#git-config-and-hooks).
 
 ### Fetch failures
 

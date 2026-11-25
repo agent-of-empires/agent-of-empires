@@ -1,10 +1,5 @@
-//! Drain sticky poller observations through profile-bound commits.
-//!
-//! Shared by the TUI tick (`apply_session_id_updates`) and the daemon's
-//! `status_poll_loop`. Without the daemon-side caller, sessions running
-//! under `aoe serve` without an attached TUI never persist post-`/clear`
-//! sids through the channel and `sessions.json` stays stale until the
-//! next launch's resume-time verify (#2291).
+//! Drain sticky poller observations through profile-bound commits, from the
+//! daemon's `status_poll_loop` (#2291).
 //!
 //! The helper takes `&mut [Instance]` and mutates the slice's per-instance
 //! agent conversation directly. It does NOT take any tokio lock and is
@@ -421,7 +416,7 @@ fn drain_and_persist_session_ids_inner(
                             .try_acquire_lifecycle_reservation(
                                 crate::session::LifecycleOperation::Capture,
                                 Instance::LIFECYCLE_RESERVATION_TTL,
-                                chrono::Utc::now(),
+                                crate::time::Timestamp::now(),
                             )
                             .map_err(anyhow::Error::from)
                     })?;
@@ -1614,7 +1609,7 @@ mod tests {
         instance.lifecycle_reservation = Some(crate::session::LifecycleReservation {
             op: crate::session::LifecycleOperation::Trash,
             generation: 1,
-            at: chrono::Utc::now(),
+            at: crate::time::Timestamp::now(),
         });
         seed_instance_on_disk(profile, &instance);
         attach_poller_with_update(&mut instance, sid);

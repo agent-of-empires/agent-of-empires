@@ -62,21 +62,23 @@ pub(crate) use sandbox_image::status_generation_for_test as sandbox_image_status
 pub(crate) use sandbox_image::{
     create_pull_refusal, invalidate_status as invalidate_sandbox_image_status,
 };
-pub use sandbox_image::{sandbox_image_dismiss, sandbox_image_pull, sandbox_image_status};
+pub use sandbox_image::{
+    sandbox_image_cancel, sandbox_image_dismiss, sandbox_image_pull, sandbox_image_status,
+};
 pub use sessions::{
     abandon_purge, attach_session_project, cancel_creation, create_session,
     create_session_progress, delete_session, delete_workspace, empty_trash,
     ensure_container_terminal, ensure_session, ensure_terminal, ensure_tool, force_smart_rename,
     get_recent_projects, kill_terminal, list_sessions, paste_image, preview_volume_ignores_globs,
-    read_output, recreate_container, rename_session, restart_for_update, restart_session,
-    restore_session, review_creation_trust, save_session_file, search_sessions, send_message,
-    serve_session_artifact, session_account_targets, session_diff_file, session_diff_file_raw,
-    session_diff_files, session_file, session_file_raw, set_worktree_name, start_session,
-    stop_auxiliary, stop_session, summarize_session, touch_session_access, trash_session,
-    update_session_archive, update_session_color, update_session_diff_base,
-    update_session_favorite, update_session_group, update_session_notifications,
-    update_session_pin, update_session_snooze, update_session_unread, update_workspace_ordering,
-    OutputQuery, SendMessageRequest,
+    read_output, reclaim_session_ownership, recreate_container, rename_session, restart_for_update,
+    restart_session, restore_session, review_creation_trust, save_session_file, search_sessions,
+    send_message, serve_session_artifact, session_account_targets, session_diff_file,
+    session_diff_file_raw, session_diff_files, session_file, session_file_raw, set_worktree_name,
+    start_session, stop_auxiliary, stop_session, summarize_session, touch_session_access,
+    trash_session, update_session_archive, update_session_diff_base, update_session_favorite,
+    update_session_group, update_session_ignored, update_session_notifications, update_session_pin,
+    update_session_snooze, update_session_unread, update_workspace_ordering, OutputQuery,
+    SendMessageRequest,
 };
 pub(crate) use sessions::{
     lifecycle_rejection, persist_session_update, purge_expired_trash, reconcile_trashed_worktrees,
@@ -89,17 +91,19 @@ pub use skills::{
 
 pub use system::{
     apply_cityhall_bundle, browse_filesystem, create_profile, default_profile, delete_profile,
-    dismiss_update, docker_status, filesystem_home, get_about, get_cityhall_bundle,
-    get_current_theme, get_profile_settings, get_resolved_theme, get_settings,
-    get_settings_resolved, get_settings_schema, get_tips, get_update_status, get_web_ui_state,
-    list_agents, list_groups, list_profiles, list_sounds, list_themes, mark_tip_seen,
-    mark_volume_ignores_globs_acknowledged, mark_web_tour_seen, patch_web_ui_state,
-    post_dashboard_presence, rename_profile, serve_sound_file, set_show_tips, system_health,
+    dismiss_update, docker_status, filesystem_home, get_about, get_agent_default_model,
+    get_cityhall_bundle, get_current_theme, get_profile_settings, get_resolved_theme,
+    get_session_agent_default_model, get_settings, get_settings_resolved, get_settings_schema,
+    get_tips, get_update_status, get_web_ui_state, list_agents, list_groups, list_profiles,
+    list_sounds, list_themes, mark_tip_seen, mark_volume_ignores_globs_acknowledged,
+    mark_web_tour_seen, patch_web_ui_state, post_dashboard_presence, rename_profile,
+    serve_sound_file, set_agent_default_model, set_show_tips, system_health,
     update_profile_settings, update_settings, update_theme,
 };
 pub use telemetry::{
-    get_telemetry_status, post_telemetry_seen, post_telemetry_structured_interaction,
-    reset_telemetry_id, set_telemetry_consent, TelemetryMutation,
+    get_telemetry_status, post_telemetry_feature_use, post_telemetry_seen,
+    post_telemetry_structured_interaction, reset_telemetry_id, set_telemetry_consent,
+    TelemetryMutation,
 };
 
 /// A clone of the live instance with this id.
@@ -233,6 +237,16 @@ pub(crate) fn before_start_hook_failed_response(
         StatusCode::BAD_GATEWAY,
         "before_start_hook_failed",
         err.to_string(),
+    )
+}
+
+/// The origin a client claims with the prompt-origin header. Only the dashboard, TUI and
+/// CLI values are accepted; anything else, and any body field, is `Unknown`.
+pub(crate) fn prompt_origin(headers: &axum::http::HeaderMap) -> crate::daemon::PromptOrigin {
+    crate::daemon::PromptOrigin::from_header_value(
+        headers
+            .get(crate::daemon::PromptOrigin::HEADER)
+            .and_then(|v| v.to_str().ok()),
     )
 }
 
@@ -570,10 +584,11 @@ mod tests {
                 "touch_session_access",
                 "trash_session",
                 "update_session_archive",
-                "update_session_color",
                 "update_session_favorite",
+                "update_session_ignored",
                 "update_session_pin",
                 "update_session_snooze",
+                "reclaim_session_ownership",
                 "update_session_unread",
             ],
         ),
@@ -613,7 +628,11 @@ mod tests {
         (
             "sandbox_image.rs",
             include_str!("sandbox_image.rs"),
-            &["sandbox_image_pull", "sandbox_image_dismiss"],
+            &[
+                "sandbox_image_pull",
+                "sandbox_image_cancel",
+                "sandbox_image_dismiss",
+            ],
         ),
         ("setup.rs", include_str!("setup.rs"), &["patch_setup"]),
         (
@@ -630,6 +649,7 @@ mod tests {
                 "mark_web_tour_seen",
                 "patch_web_ui_state",
                 "rename_profile",
+                "set_agent_default_model",
                 "set_show_tips",
                 "update_profile_settings",
                 "update_settings",
@@ -679,6 +699,7 @@ mod tests {
             "telemetry.rs",
             include_str!("telemetry.rs"),
             &[
+                "post_telemetry_feature_use",
                 "post_telemetry_seen",
                 "post_telemetry_structured_interaction",
                 "reset_telemetry_id",
@@ -1862,6 +1883,7 @@ mod tests {
             (Method::POST, "/api/plugins/missing/update/dismiss"),
             (Method::PATCH, "/api/theme"),
             (Method::POST, "/api/sandbox/image-pull"),
+            (Method::POST, "/api/sandbox/image-pull/cancel"),
             (Method::POST, "/api/sandbox/image-dismiss"),
             (Method::PUT, "/api/sessions/missing/file"),
         ] {

@@ -266,12 +266,12 @@ describe("SessionRow context menu", () => {
   });
 
   it("hides write actions in read-only mode", () => {
-    const text = openRowMenu(ws({ view: "structured", color: "amber" }), {
+    const text = openRowMenu(ws({ view: "structured" }), {
       readOnly: true,
       onCreateSession: vi.fn(),
     }).textContent;
     for (const t of ["Pin", "Archive", "Snooze", "Delete"]) expect(text).not.toContain(t);
-    for (const id of ["switch-agent", "new-session", "color-red", "color-clear"]) {
+    for (const id of ["switch-agent", "new-session"]) {
       expect(testId(`sidebar-context-menu-${id}`)).toBeNull();
     }
     // Showing a session alone changes nothing on the server.
@@ -344,8 +344,6 @@ describe("SessionRow triage actions", () => {
       { archived: false, kill_pane: true },
     ],
     ["Unsnooze", { snoozed_until: inMinutes(60) }, "sidebar-context-menu-unsnooze", "snooze", { minutes: null }],
-    ["Color", {}, "sidebar-context-menu-color-red", "color", { color: "red" }],
-    ["Clear color", { color: "green" }, "sidebar-context-menu-color-clear", "color", { color: null }],
   ] as [string, Partial<SessionResponse>, string, string, unknown][])(
     "%s PATCHes its endpoint",
     async (_n, over, item, path, body) => {
@@ -374,10 +372,8 @@ describe("SessionRow triage actions", () => {
     await vi.waitFor(() => expect(label(chip)).toBeNull());
   });
 
-  it.each([
-    ["Notify all", "sidebar-context-menu-notify-all"],
-    ["Color", "sidebar-context-menu-color-red"],
-  ])("%s keeps the menu open, shows the pick, and reverts on failure", async (_n, item) => {
+  it("Notify all keeps the menu open, shows the pick, and reverts on failure", async () => {
+    const item = "sidebar-context-menu-notify-all";
     let fail = () => {};
     fetchSpy.mockImplementation(
       () => new Promise((resolve) => (fail = () => resolve(new Response("nope", { status: 500 })))),
@@ -451,31 +447,6 @@ describe("SessionRow triage actions", () => {
   });
 });
 
-describe("SessionRow color label (#2383)", () => {
-  it.each([
-    ["red", {}, "red"],
-    ["unset", {}, null],
-    ["unknown", {}, null],
-    // Disabling colors hides the stored value without clearing it (#3104).
-    ["red", { colorsEnabled: false }, null],
-  ] as const)("color %s with %o shows dot %s", (color, options, shown) => {
-    renderRow(ws({ color: color === "unset" ? undefined : color === "unknown" ? "chartreuse" : color }), options);
-    const dot = testId("sidebar-session-color-dot");
-    expect(dot?.getAttribute("data-color") ?? null).toBe(shown);
-    if (shown) expect(dot!.className).toContain("bg-red-500");
-  });
-
-  it("marks No color as picked on an uncolored row and hides the section when disabled", () => {
-    openRowMenu(ws());
-    expect(testId("sidebar-context-menu-color-clear")!.getAttribute("aria-pressed")).toBe("true");
-    expect(testId("sidebar-context-menu-color-red")!.getAttribute("aria-pressed")).toBe("false");
-    cleanup();
-    openRowMenu(ws({ color: "green" }), { colorsEnabled: false });
-    for (const key of ["red", "amber", "green", "clear"]) {
-      expect(testId(`sidebar-context-menu-color-${key}`)).toBeNull();
-    }
-  });
-});
 describe("SessionRow keyboard navigation", () => {
   it("prevents page scrolling at the last row", () => {
     const { container } = renderRow(ws());

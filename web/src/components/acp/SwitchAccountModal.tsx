@@ -1,4 +1,5 @@
-import { useEffect, useEffectEvent, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useEffect, useEffectEvent, useRef, useState } from "react";
+import { useFocusTrap } from "../../hooks/useFocusTrap";
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
 import { fetchAccountTargets } from "../../lib/api";
 import type { AuthStatus } from "../../lib/acpTypes";
@@ -82,20 +83,7 @@ function SwitchAccountDialog({
   }, [ready]);
 
   // Tab and Shift+Tab wrap instead of reaching the page behind the dialog.
-  const trapTab = (e: ReactKeyboardEvent) => {
-    if (e.key !== "Tab") return;
-    // The radio group is one tab stop, its checked radio, so that is the first stop, not the first radio.
-    const items = Array.from(
-      dialogRef.current?.querySelectorAll<HTMLElement>("button:not([disabled]), input:not([disabled])") ?? [],
-    ).filter((el) => !(el instanceof HTMLInputElement && el.type === "radio" && !el.checked));
-    const first = items[0];
-    const last = items[items.length - 1];
-    const wrapTo = e.shiftKey ? document.activeElement === first && last : document.activeElement === last && first;
-    if (wrapTo) {
-      e.preventDefault();
-      wrapTo.focus();
-    }
-  };
+  useFocusTrap(() => dialogRef.current);
 
   const confirm = () => {
     if (!selected || failoverTo) return;
@@ -109,7 +97,6 @@ function SwitchAccountDialog({
   return (
     <div
       ref={dialogRef}
-      onKeyDown={trapTab}
       tabIndex={-1}
       role="dialog"
       aria-modal="true"

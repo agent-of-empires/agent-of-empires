@@ -220,7 +220,8 @@ impl LineVisitor {
 
     fn format(&self, event: &Event<'_>) -> String {
         let meta = event.metadata();
-        let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let ts =
+            crate::time::Timestamp::now().to_rfc3339_opts(crate::time::SecondsFormat::Micros, true);
         let msg = self.message.as_deref().unwrap_or("");
         format!(
             "{ts}  {} {}: {}{}\n",

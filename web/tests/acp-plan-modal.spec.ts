@@ -80,7 +80,7 @@ test("the terminal-focus shortcut cannot strand focus behind the plan modal", as
   const sentToTerminal = () => terminal.liveInput.length;
   const pairedInput = page.locator('[data-term="paired"]:visible textarea').first();
   const { dialog } = await openPlanModal(page, async () => {
-    await page.locator('[data-testid^="pane-tab-terminal:"]').first().click();
+    await page.getByTestId("pane-toggle-terminal").click();
     await expect(pairedInput).toBeAttached();
   });
 

@@ -34,16 +34,19 @@ function mount(ready = true) {
 type ActionName = keyof ShortcutActions;
 
 describe("useKeyboardShortcuts", () => {
-  it.each([
-    ["an open field that owns Escape keeps it for its list", true, "true", 0],
-    ["the same field closed lets Escape close the surface", true, "false", 1],
-    ["any other open combobox, such as the palette's, doesn't", false, "true", 1],
+  it.each<[string, string | null, string | null, number]>([
+    ["an open field that owns Escape keeps it for its list", "", "true", 0],
+    ["the same field closed lets Escape close the surface", "", "false", 1],
+    ["any other open combobox, such as the palette's, doesn't", null, "true", 1],
+    ["a popover that exists only while open keeps it", "open", null, 0],
   ])("%s", (_label, owns, expanded, calls) => {
     const { actions, unmount } = mount();
     const field = document.createElement("input");
-    field.setAttribute("role", "combobox");
-    if (owns) field.setAttribute("data-owns-escape", "");
-    field.setAttribute("aria-expanded", expanded);
+    if (owns !== null) field.setAttribute("data-owns-escape", owns);
+    if (expanded !== null) {
+      field.setAttribute("role", "combobox");
+      field.setAttribute("aria-expanded", expanded);
+    }
     document.body.append(field);
     dispatch(field, { key: "Escape" });
     expect(actions.onEscape).toHaveBeenCalledTimes(calls);

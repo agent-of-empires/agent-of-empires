@@ -267,18 +267,19 @@ test("changing the other dock keeps a visible draft without asking", async ({ pa
   const serve = await spawnServe({
     seedFn: seedSessionViaAoeAdd({ title: "file-docks", git: false, files: { "notes.txt": "original" } }),
   });
-  await page.addInitScript(() => {
+  const [session] = await listSessions(serve.baseUrl);
+  await page.addInitScript((id) => {
     localStorage.setItem("aoe-web-settings", JSON.stringify({ fileEditing: true }));
     const group = (tab: string) => [{ tabs: [tab], active: tab }];
-    const template = {
+    const layout = {
       right: group("files"),
       bottom: group("terminal:0"),
       nextTerminalIndex: 1,
       closedPlugins: [],
       collapsed: { right: false, bottom: false },
     };
-    localStorage.setItem("aoe-pane-layout-v2", JSON.stringify({ version: 2, template, sessions: {}, provisional: {} }));
-  });
+    localStorage.setItem("aoe-pane-layout-v3", JSON.stringify({ version: 3, sessions: { [id]: layout } }));
+  }, session!.id);
   await openFile(page, serve);
   await page.getByRole("button", { name: "Edit", exact: true }).click();
   const editor = page.getByRole("textbox", { name: "Edit notes.txt" });
@@ -312,7 +313,10 @@ test("an unsaved draft survives crossing the mobile breakpoint in both direction
   await editor.fill("desktop draft");
   await page.setViewportSize({ width: 390, height: 844 });
   // The desktop sidebar stays open as an overlay after the resize.
-  await page.getByRole("navigation", { name: "Sessions sidebar" }).getByRole("button", { name: "×" }).click();
+  await page
+    .getByRole("navigation", { name: "Sessions sidebar" })
+    .getByRole("button", { name: "Close sidebar" })
+    .click();
   // The Files pane keeps its selection locally; reopening the file restores the draft.
   await showNotes(page);
   await expect(editor).toHaveValue("desktop draft");

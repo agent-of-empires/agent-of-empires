@@ -350,6 +350,23 @@
       "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/live-terminal/TermRow.tsx"]
     },
     {
+      "id": "terminal.cell-rendering",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": [
+        "src/components/live-terminal/rowHeight.test.ts",
+        "src/components/live-terminal/segStyle.test.ts",
+        "src/components/__tests__/MobileLiveTerminal.font.test.tsx"
+      ],
+      "components": [
+        "web/src/components/MobileLiveTerminal.tsx",
+        "web/src/components/live-terminal/TermRow.tsx",
+        "web/src/components/live-terminal/rowHeight.ts",
+        "web/src/components/live-terminal/segStyle.ts"
+      ],
+      "notes": "Rows are whole pixels tall at any font size, using a bundled font's own line ratio; the cell width is re-measured once a newly chosen font face loads; dim text blends its colour toward the cell background instead of fading the cell."
+    },
+    {
       "id": "terminal.live-pipe-contention-notice",
       "kind": "vitest",
       "risk": "medium",
@@ -384,7 +401,8 @@
       "specs": [
         "src/lib/liveTermLines.test.ts",
         "src/components/__tests__/MobileLiveTerminal.linkify.test.tsx",
-        "src/components/__tests__/MobileLiveTerminal.forward.test.tsx"
+        "src/components/__tests__/MobileLiveTerminal.forward.test.tsx",
+        "src/components/__tests__/MobileLiveTerminal.wrappedLinks.test.tsx"
       ],
       "components": ["web/src/components/MobileLiveTerminal.tsx"]
     },
@@ -393,7 +411,11 @@
       "kind": "mocked-playwright",
       "risk": "high",
       "specs": ["tests/live-terminal-input.spec.ts"],
-      "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/lib/liveTermLines.ts"]
+      "components": [
+        "web/src/components/MobileLiveTerminal.tsx",
+        "web/src/lib/liveTermLines.ts",
+        "web/src/hooks/useLiveTerminal.ts"
+      ]
     },
     {
       "id": "terminal.live-cursor-wide-chars",
@@ -467,6 +489,14 @@
         "web/src/lib/terminalToolbarKeys.ts",
         "web/src/lib/arrowJoystick.ts"
       ]
+    },
+    {
+      "id": "terminal.arrow-joystick-gesture",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/__tests__/ArrowJoystick.test.tsx"],
+      "components": ["web/src/components/ArrowJoystick.tsx"],
+      "notes": "A held repeat stops on pad release, an off-pad pointerup or pointercancel, window blur, pagehide, a hidden page, and unmount. A fresh primary press of the same pointer type ends a gesture whose release was lost, including one reusing the lost pointer's ID, and the new drag moves from its own origin. A second finger, its release, or a primary pointer of another type leaves the held gesture repeating."
     },
     {
       "id": "terminal.mobile-ctrl-consumption",
@@ -752,6 +782,26 @@
       "notes": "The real schema-driven switch persists machine-wide, rejects profile overrides, survives reload, and changes MCP route availability only after daemon restart."
     },
     {
+      "id": "settings.strict-plugin-staging",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/settings-persistence.spec.ts"],
+      "components": [
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
+        "src/session/config/mod.rs"
+      ],
+      "notes": "The real Advanced Session switch defaults off, saves strict plugin staging machine-wide, rejects profile overrides and non-boolean PATCH values, and preserves opt-in across reload and daemon restart. Switching off persists too; TCP saves require schema elevation."
+    },
+    {
+      "id": "settings.mcp-enabled-copy",
+      "kind": "deferred",
+      "issue": "https://github.com/agent-of-empires/agent-of-empires/issues/5769",
+      "risk": "low",
+      "reason": "Copy only: the Let other apps control AoE description and summary say what the MCP tools allow instead of read-only. The switch and its persistence are covered by settings.mcp-server-toggle.",
+      "components": ["web/src/components/settings/SchemaSection.tsx"]
+    },
+    {
       "id": "settings.startup-recovery-wake",
       "kind": "live-playwright",
       "risk": "high",
@@ -891,6 +941,14 @@
       "components": ["web/src/lib/api.ts"]
     },
     {
+      "id": "acp.state-persist-flush",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/acp-state-persist-flush.spec.ts"],
+      "components": ["web/src/hooks/acpSession/stateCache.ts", "web/src/hooks/useAcpSession.ts"],
+      "notes": "Structured view state is written to localStorage on a 2 s trailing throttle; hiding or unloading the page before it expires still persists the latest state."
+    },
+    {
       "id": "acp.server-owned-prompt-dispatch",
       "kind": "live-playwright",
       "risk": "high",
@@ -911,6 +969,19 @@
         "web/src/components/diff/comments/SendCommentsDialog.tsx",
         "web/src/lib/api.ts"
       ]
+    },
+    {
+      "id": "telemetry.feature-use",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/telemetry-feature-use.spec.ts", "src/lib/featureUse.test.ts"],
+      "components": [
+        "web/src/lib/featureUse.ts",
+        "web/src/App.tsx",
+        "web/src/hooks/useSidebarPrefs.ts",
+        "web/src/components/command-palette/CommandPalette.tsx"
+      ],
+      "notes": "Sort picker, attention shortcut and palette cheat codes post their registry names to /api/telemetry/feature-use."
     },
     {
       "id": "settings.theme-persistence-passphrase",
@@ -1040,7 +1111,7 @@
         "web/src/components/settings/FormFields.tsx",
         "web/src/components/settings/SchemaSection.tsx"
       ],
-      "notes": "The Updates tab shows the Daemon port (`serve.port`) under a Daemon heading; editing it saves `{ serve: { port } }` through the normal settings path. Global only; a new value applies after a stop and start. The same block renders the Funnel port select (`serve.funnel_port`) from the schema with no web code of its own. Folder-ignore entries (`sandbox.volume_ignores`) are checked client-side from the schema's `volume_ignore_list` rule: an absolute path, a `:` or a `..` segment is rejected inline and not saved, while a relative entry such as node_modules saves as `{ sandbox: { volume_ignores } }`."
+      "notes": "The Updates tab shows the Daemon port (`serve.port`) under a Daemon heading; editing it saves `{ serve: { port } }` through the normal settings path. Global only; a new value applies after a stop and start. The same block renders the Funnel port select (`serve.funnel_port`) from the schema with no web code of its own. Folder-ignore entries (`sandbox.volume_ignores`) are checked client-side from the schema's `volume_ignore_list` rule: an absolute path, a `:` or a `..` segment is rejected inline and not saved, while a relative entry such as node_modules saves as `{ sandbox: { volume_ignores } }`. Port mappings (`sandbox.port_mappings`) reject a port above 65535 on either side inline and keep the draft, while `65535:65535` saves as `{ sandbox: { port_mappings } }`."
     },
     {
       "id": "settings.global-migration-and-persistence",
@@ -1072,6 +1143,18 @@
       "risk": "medium",
       "specs": ["src/components/__tests__/SettingsView.session.test.tsx"],
       "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/FormFields.tsx"]
+    },
+    {
+      "id": "settings.narrow-breakpoint",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/settings/__tests__/SchemaFieldPatches.test.tsx"],
+      "components": [
+        "web/src/components/settings/SchemaSection.tsx",
+        "web/src/components/settings/FormFields.tsx",
+        "src/session/config/mod.rs"
+      ],
+      "notes": "The breakpoint is a number control in the Terminal UI group with the 0 to 1000 range the TUI accepts, patching { session: { narrow_breakpoint } } sparsely like its neighbours, so a config holding a value below the 50-column floor still saves."
     },
     {
       "id": "settings.advanced-fold-persistence",
@@ -1146,6 +1229,27 @@
       "notes": "Deferred-operation tests cover an enable that settles after every consumer unmounted and remounted, and refresh registration POSTs (one or two overlapping) that must not land after disable."
     },
     {
+      "id": "notifications.install-banner",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/live/install-banner.spec.ts",
+        "tests/tour-install-hint.spec.ts",
+        "src/components/__tests__/InstallBanner.test.tsx",
+        "src/components/__tests__/BannerStack.test.tsx",
+        "src/components/__tests__/NotificationSettings.test.tsx",
+        "src/lib/__tests__/platform.test.ts"
+      ],
+      "components": [
+        "web/src/components/InstallBanner.tsx",
+        "web/src/components/BannerStack.tsx",
+        "web/src/components/NotificationSettings.tsx",
+        "web/src/lib/platform.ts",
+        "web/src/lib/tourSteps.ts"
+      ],
+      "notes": "#4595: a phone or tablet browser tab gets iOS Home Screen steps (any iPad, including desktop mode), a Settings › Notifications link where the tab can push (feature-detected), or the generic install line. It hides once installed, when push is on, denied or off on the server, while Disconnected or the tour runs, and for good after ×; Settings › Notifications shows each platform's own step. Live: an iPhone with the tour seen and never opened, and × across a reload."
+    },
+    {
       "id": "notifications.push-health-banner",
       "kind": "vitest",
       "risk": "medium",
@@ -1200,13 +1304,21 @@
       "id": "settings.terminal-localstorage",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/__tests__/TerminalSettings.test.tsx", "src/lib/__tests__/fontDetect.test.ts"],
+      "specs": [
+        "src/components/__tests__/TerminalSettings.test.tsx",
+        "src/lib/__tests__/fontDetect.test.ts",
+        "src/lib/__tests__/terminalFonts.test.ts"
+      ],
       "components": [
         "web/src/components/TerminalSettings.tsx",
         "web/src/components/TerminalSessionStack.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
-        "web/src/lib/fontDetect.ts"
-      ]
+        "web/src/components/settings/TerminalFontPicker.tsx",
+        "web/src/hooks/useWebSettings.ts",
+        "web/src/lib/fontDetect.ts",
+        "web/src/lib/terminalFonts.ts"
+      ],
+      "notes": "The font picker offers bundled fonts plus detected system fonts; a synced font this device lacks stays selected with a hint, and legacy free-text values map to a listed font or the default on read."
     },
     {
       "id": "sidebar.attention-badges",
@@ -1374,8 +1486,9 @@
       "id": "profiles.lifecycle",
       "kind": "mocked-playwright",
       "risk": "high",
-      "specs": ["tests/profile-lifecycle.spec.ts"],
-      "components": ["web/src/components/settings/ProfileSelector.tsx"]
+      "specs": ["tests/profile-lifecycle.spec.ts", "src/components/settings/__tests__/ProfileSelector.test.tsx"],
+      "components": ["web/src/components/settings/ProfileSelector.tsx"],
+      "notes": "Enter is ignored while an IME composes."
     },
     {
       "id": "profiles.page",
@@ -1432,6 +1545,27 @@
       "components": []
     },
     {
+      "id": "modal.focus-trap",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/hooks/__tests__/useFocusTrap.test.tsx",
+        "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx",
+        "tests/wizard.spec.ts"
+      ],
+      "components": [
+        "web/src/components/AboutModal.tsx",
+        "web/src/components/ContextMenu.tsx",
+        "web/src/components/TerminalComposeSheet.tsx",
+        "web/src/components/acp/BackgroundShells.tsx",
+        "web/src/components/acp/PlanModal.tsx",
+        "web/src/components/acp/SwitchAccountModal.tsx",
+        "web/src/components/session-wizard/ConfirmCreateDialog.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx"
+      ],
+      "notes": "Every modal keeps Tab and Shift+Tab inside it through useFocusTrap: Tab wraps at either end, Tab from focus behind every modal enters the last one opened, a modal opened inside it keeps the key (a hooks trust confirm over the wizard holds Tab), and an inert or inactive trap does nothing. PlanModal, the shell dialog and the session wizard return focus to the opener on close."
+    },
+    {
       "id": "wizard",
       "kind": "mocked-playwright",
       "risk": "high",
@@ -1468,7 +1602,7 @@
         "web/src/components/Toasts.tsx",
         "web/src/hooks/app/useWizardReopen.ts"
       ],
-      "notes": "The View row is a Structured view | Terminal view radio group: arrow keys move the selection, Structured view is disabled with the reason for an agent that can't run it, and with \"ACP adapter not installed\" when the /api/agents row for the selected Profile and project (path, or scratch) has acp_create_ready false, Sandbox is off and there is no command override, so a project whose repository hook installs the adapter stays Structured; a list fetched for another project leaves Structured available until the new project's answer arrives, except for an agent that only the repository's agent_detect_as makes ACP-capable, and the create's acp_adapter_missing refusal shows its message in the error box; acp_create_ready true counts as ACP-capable unless acp_allowed is false; at 375px the summary wraps under the label and segments, and Launch without Sandbox with no host adapter focuses Terminal view in view without sending. The Yolo mode row says what each value does and is locked on for an Agent whose /api/agents?profile= row for the selected Profile has always_yolo (Terminal view) or acp_always_yolo (Structured view), so a custom agent with its own adapter and an always-Yolo base locks only in Terminal view; the create sends the user's value and the server forces it; until /api/agents answers for that Profile (retried on failure) the row promises neither value and Launch waits, and a list loaded for another Profile is not used; a 404 profile_not_found is not retried and the footer asks for another Profile, with the Profile row shown even when only one is left; the unavailable Sandbox names the configured Container runtime from /api/docker/status. A refused create shows a box with its title, failed step, one recovery action per code and its reference, outlines the row it blames, and takes focus; Retry re-reads /api/docker/status, and every relaunch, Launch without Sandbox included, uses a new idempotency key. A failed on_create hook also offers Create without setup, which resends that once with skip_on_create under a new key, and closes the wizard on a 201. A background refusal toasts with Reopen, which stays until used or dismissed, stays in view when the toasts overflow the column, and restores the form as sent and the box, with the hook output the create printed after the wizard closed; while another wizard is open, Reopen asks to close it first and the toast stays. A backgrounded create polls its progress only until it settles. An adopted create toasts plainly. A reopened wizard sends its own form, never another wizard's unresolved create, shows an agent-list error beside the box, and applies only the newest runtime check."
+      "notes": "The View row is a Structured view | Terminal view radio group: arrow keys move the selection, Structured view is disabled with the reason for an agent that can't run it, and with \"ACP adapter not installed\" when the /api/agents row for the selected Profile and project (path, or scratch) has acp_create_ready false, Sandbox is off and there is no command override, so a project whose repository hook installs the adapter stays Structured; a list fetched for another project leaves Structured available until the new project's answer arrives, except for an agent that only the repository's agent_detect_as makes ACP-capable, and the create's acp_adapter_missing refusal shows its message in the error box; acp_create_ready true counts as ACP-capable unless acp_allowed is false; at 375px the summary wraps under the label and segments, and Launch without Sandbox with no host adapter focuses Terminal view in view without sending. The Yolo mode row says what each value does and is locked on for an Agent whose /api/agents?profile= row for the selected Profile has always_yolo (Terminal view) or acp_always_yolo (Structured view), so a custom agent with its own adapter and an always-Yolo base locks only in Terminal view; the create sends the user's value and the server forces it; until /api/agents answers for that Profile (retried on failure) the row promises neither value and Launch waits, and a list loaded for another Profile is not used; a 404 profile_not_found is not retried and the footer asks for another Profile, with the Profile row shown even when only one is left; the unavailable Sandbox names the configured Container runtime from /api/docker/status. A refused create shows a box with its title, failed step, one recovery action per code and its reference, outlines the row it blames, and takes focus; Retry re-reads /api/docker/status, and every relaunch, Launch without Sandbox included, uses a new idempotency key. A failed on_create hook also offers Create without setup, which resends that once with skip_on_create under a new key, and closes the wizard on a 201. A background refusal toasts with Reopen, which stays until used or dismissed, stays in view when the toasts overflow the column, and restores the form as sent and the box, with the hook output the create printed after the wizard closed; while another wizard is open, Reopen asks to close it first and the toast stays. A backgrounded create polls its progress only until it settles. An adopted create toasts plainly. A reopened wizard sends its own form, never another wizard's unresolved create, shows an agent-list error beside the box, and applies only the newest runtime check. The wizard is a modal dialog named by its heading; Tab and Shift+Tab wrap inside it, Tab from focus left behind it enters it, closing returns focus to the opener, and a touch device starts focus on Close."
     },
     {
       "id": "wizard.structured-view-exposure",
@@ -1552,6 +1686,26 @@
         "web/src/components/session-wizard/steps/WorktreePanel.tsx",
         "web/src/components/session-wizard/steps/AgentPanel.tsx"
       ]
+    },
+    {
+      "id": "wizard.worktree-info",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": [
+        "tests/wizard-worktree-info.spec.ts",
+        "tests/live/session-create.spec.ts",
+        "src/components/session-wizard/__tests__/InfoPopover.test.tsx",
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/hooks/useKeyboardShortcuts.test.ts"
+      ],
+      "components": [
+        "web/src/components/session-wizard/InfoPopover.tsx",
+        "web/src/components/session-wizard/WorktreeInfo.tsx",
+        "web/src/components/session-wizard/WizardRows.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/hooks/useKeyboardShortcuts.ts"
+      ],
+      "notes": "#5910: the Worktree row's info icon, in every row state including blocked ones, opens a dialog explaining worktrees. Enter or Space opens it, Escape closes it without closing the wizard and refocuses the icon. It renders inside the wizard's dialog, so the wizard's focus trap lets Tab go on to its link. A scroll under it or a change of window width closes it too, refocusing the icon only when focus was inside it; a height-only change keeps it open, moved back inside the window. The icon is a 44px target on phones. Its link closes the wizard and opens Settings > Worktree in the app, without a page load, so a passphrase login's redirect to /login doesn't apply."
     },
     {
       "id": "wizard.worktree-title-derived-branch",
@@ -2066,12 +2220,20 @@
       "id": "sidebar.compact-mode",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/sidebar-chrome.spec.ts", "tests/sidebar-legend.spec.ts"],
+      "specs": [
+        "tests/sidebar-chrome.spec.ts",
+        "tests/sidebar-legend.spec.ts",
+        "src/components/sidebar/useSidebarWidth.test.ts"
+      ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/useSidebarWidth.ts",
         "web/src/components/sidebar/SidebarToolbar.tsx",
-        "web/src/components/sidebar/SidebarLegend.tsx"
-      ]
+        "web/src/components/sidebar/SidebarLegend.tsx",
+        "web/src/lib/sidebarCompact.ts",
+        "web/src/App.tsx"
+      ],
+      "notes": "The sidebar has no compact button; its resize handle reaches the rail. A drag follows the pointer down to the 200px minimum, snaps to the 88px rail below 144px (the midpoint) and closes below 44px (half the rail), and dragging back out in the same gesture restores each state. A drag ending closed keeps the width and mode it started from, so the top bar toggle and its shortcut reopen that sidebar. The handle is a focusable separator: arrows step 16px and narrow onto the rail but never close, Home goes to the rail, End to the maximum, Enter collapses to or restores from the rail, and double-click resets to 280px. The phone drawer has no handle, ignores a saved rail, and never grows past the viewport. A second contact on the handle cannot take over a drag."
     },
     {
       "id": "sidebar.drawer-swipe",
@@ -2096,7 +2258,7 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
-      "id": "sidebar.session-color",
+      "id": "sidebar.notify-receipts",
       "kind": "vitest",
       "risk": "high",
       "specs": [
@@ -2105,7 +2267,7 @@
         "src/hooks/__tests__/useSessionsPolling.test.tsx",
         "src/lib/api.test.ts"
       ],
-      "description": "Accepted color and notification resets survive visual unmount and temporary polling failure. Dispatched receipts survive read-only changes; revoked unsent work and true identity invalidation never replay.",
+      "description": "Accepted notification resets survive visual unmount and temporary polling failure. Dispatched receipts survive read-only changes; revoked unsent work and true identity invalidation never replay.",
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/sidebar/SessionActionProvider.tsx",
@@ -2159,25 +2321,6 @@
         "web/src/lib/settingsEvents.ts",
         "web/src/hooks/useSystemHealth.ts",
         "web/src/components/SystemHealthStrip.tsx"
-      ]
-    },
-    {
-      "id": "sidebar.session-color-toggle",
-      "kind": "vitest",
-      "risk": "low",
-      "specs": [
-        "src/lib/__tests__/sessionColors.test.ts",
-        "src/components/__tests__/SessionRowTriage.test.tsx",
-        "src/components/__tests__/SessionRowReceipts.test.tsx"
-      ],
-      "notes": "Accepted color queues survive visual unmount. Independent canonical values permanently surrender only the optimistic overlay; away-and-back observations cannot resurrect a stale choice or suppress a new pick.",
-      "components": [
-        "web/src/lib/sessionColors.ts",
-        "web/src/components/WorkspaceSidebar.tsx",
-        "web/src/components/sidebar/usePendingSetting.ts",
-        "web/src/components/sidebar/SessionActionProvider.tsx",
-        "web/src/components/sidebar/rowModel.ts",
-        "web/src/components/sidebar/useSessionRowModel.ts"
       ]
     },
     {
@@ -2247,18 +2390,19 @@
       "notes": "The item is reachable under More on desktop and in the 375 px bottom sheet, and the dialog and both buttons fit that viewport."
     },
     {
-      "id": "sidebar.repo-appearance",
-      "kind": "mocked-playwright",
-      "risk": "low",
-      "specs": ["tests/sidebar-multi-session.spec.ts"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
-    },
-    {
       "id": "sidebar.workspace-ordering",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/workspaces.spec.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sidebar.sunk-footer-order",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/sidebar/filterGroups.test.ts"],
+      "components": ["web/src/components/sidebar/filterGroups.ts"],
+      "notes": "The Snoozed & archived footer lists Workspaces newest archived_at (or snoozed_until) first across every group, whatever the sidebar sort; ties keep group order."
     },
     {
       "id": "sidebar.group-reorder",
@@ -2292,8 +2436,9 @@
       "id": "sidebar.trash-control",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/__tests__/WorkspaceSidebarTrash.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/TrashMenu.tsx"]
+      "specs": ["src/components/__tests__/WorkspaceSidebarTrash.test.tsx", "tests/session-trash.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/TrashMenu.tsx"],
+      "notes": "The footer Trash control is an icon button beside Settings, shown only while something is trashed. Its count is a badge on the icon (99+ above 99) and its accessible name and tooltip read \"Trash, N sessions\". On the compact rail Trash stacks above Settings, so both stay inside the rail and the badge clear of Settings with a 24px root font."
     },
     {
       "id": "sidebar.trash-on-demand",
@@ -2564,7 +2709,12 @@
         "src/components/__tests__/SettingsView.session.test.tsx",
         "src/lib/sessionRowTag.test.ts"
       ],
-      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/SettingsView.tsx"]
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/sidebar/RowBadges.tsx"
+      ],
+      "notes": "A single-repo branch tag that only repeats the row label is dropped."
     },
     {
       "id": "sidebar.sort-pure",
@@ -2669,6 +2819,22 @@
         "web/src/components/plugin/SlotChrome.tsx"
       ],
       "notes": "Grouped badge items collapse into one chip that cycles on click. The Playwright story clicks it inside the real session-row link, which jsdom cannot cover: the click must cycle without the row selecting or the browser following the row href. Group, wrap-around and clamping logic is in PluginSlots.test.tsx, which also verifies that changing the addressed session resets a detail badge cycle."
+    },
+    {
+      "id": "composer.plugin-status-slot",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/composer-status-mobile.spec.ts",
+        "src/components/plugin/__tests__/PluginSlots.test.tsx",
+        "src/components/acp/Composer.test.tsx"
+      ],
+      "components": [
+        "web/src/components/plugin/PluginSlots.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/ComposerControls.tsx"
+      ],
+      "notes": "The composer-status slot renders beside the usage hint for its own session only, ordered by payload order. The Playwright story proves a long status truncates inside the footer at 360px without overflow or pushing Send off screen."
     },
     {
       "id": "sidebar.plugin-row-badge-link",
@@ -2843,12 +3009,20 @@
       "id": "session.group-edit",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": ["tests/live/session-actions.spec.ts", "src/lib/api.test.ts"],
+      "specs": [
+        "tests/live/session-actions.spec.ts",
+        "tests/session-group-edit-short-viewport.spec.ts",
+        "src/lib/api.test.ts",
+        "src/components/__tests__/SessionGroupModal.test.tsx",
+        "src/components/session-wizard/__tests__/GroupCombobox.test.tsx"
+      ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/SessionGroupModal.tsx",
+        "web/src/components/session-wizard/steps/GroupCombobox.tsx",
         "web/src/lib/api.ts"
-      ]
+      ],
+      "notes": "Enter is ignored while an IME composes."
     },
     {
       "id": "session.delete-dialog-keyboard",
@@ -3104,6 +3278,7 @@
       "specs": ["tests/diff-comments.spec.ts"],
       "components": [
         "web/src/components/diff/comments/SendCommentsDialog.tsx",
+        "web/src/components/diff/comments/CloseOnEscape.tsx",
         "web/src/components/diff/comments/CommentsBanner.tsx",
         "web/src/components/diff/comments/CommentForm.tsx",
         "web/src/components/diff/comments/CommentCard.tsx"
@@ -3285,7 +3460,8 @@
         "web/src/components/diff/find/FindBar.tsx",
         "web/src/lib/snippetHighlighter.ts",
         "web/src/components/diff/pierre/DiffWorkerPoolProvider.tsx"
-      ]
+      ],
+      "notes": "The find bar ignores Enter while an IME composes."
     },
     {
       "id": "settings.diff-section",
@@ -3302,10 +3478,13 @@
         "src/components/settings/__tests__/StructuredViewDisplaySettings.test.tsx",
         "src/components/acp/__tests__/StructuredViewRoot.test.tsx",
         "src/components/acp/Markdown.test.tsx",
+        "src/hooks/__tests__/useHistoryWindow.test.tsx",
         "tests/acp-structured-view.spec.ts"
       ],
       "components": [
         "web/src/components/settings/StructuredViewDisplaySettings.tsx",
+        "web/src/hooks/useHistoryWindow.ts",
+        "web/src/lib/structuredHistoryWindow.ts",
         "web/src/components/settings/FontSizeControl.tsx",
         "web/src/components/TerminalSettings.tsx",
         "web/src/lib/fontSizeRange.ts",
@@ -3351,6 +3530,14 @@
       ]
     },
     {
+      "id": "app-shell.panel-defaults",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/right-panel-persistence.spec.ts", "src/lib/__tests__/paneLayout.test.ts"],
+      "components": ["web/src/App.tsx", "web/src/components/ActivityBar.tsx", "web/src/components/TopBar.tsx"],
+      "notes": "Diff and terminal follow the Daemon's web.auto_open_* defaults (off) until the user changes a Session's tabs; nothing is saved on view, so a changed default reaches Sessions already viewed. A closed Diff shows its changed-file count."
+    },
+    {
       "id": "devices",
       "kind": "live-playwright",
       "risk": "medium",
@@ -3385,7 +3572,8 @@
         "web/src/hooks/useConnectionBanner.ts",
         "web/src/hooks/useUpdateBanner.ts",
         "web/src/components/SandboxImageBanner.tsx"
-      ]
+      ],
+      "notes": "#5932: a hung update-status poll is aborted after 15s, the offer stays visible and the next hourly poll runs; pinned in UpdateBanner.test.tsx."
     },
     {
       "id": "connectivity.sandbox-image-banner",
@@ -3498,14 +3686,20 @@
       "id": "acp.memory-recall",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": ["tests/live/acp-transcript.spec.ts", "tests/acp-structured-view.spec.ts"],
+      "specs": [
+        "tests/live/acp-transcript.spec.ts",
+        "tests/acp-structured-view.spec.ts",
+        "src/components/acp/ToolCards.render.test.tsx"
+      ],
       "components": [
         "web/src/components/acp/ToolCards.tsx",
+        "web/src/components/acp/NamedToolCards.tsx",
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/AcpRuntime.tsx",
         "web/src/lib/memoryClassify.ts",
         "web/src/lib/memoryRecall.ts"
-      ]
+      ],
+      "notes": "Synthesized memory renders as markdown; raw HTML is dropped and javascript: links are blocked."
     },
     {
       "id": "acp.attachments",
@@ -3745,6 +3939,31 @@
         "web/src/lib/acpTypes.ts"
       ],
       "notes": "Provider requests remain single-flight across keyed session-view remounts and keep controls locked until settlement. Canonical changes observed during a pending request invalidate its late echo, including a return to the previous provider. Open model menus close when turn or provider locks arrive. Model search filters case-insensitively by display name and provider/model id with whitespace-separated terms. Unit tests cover empty results, pending choices, confirmed values, and reset on reopen; mocked browser tests cover search focus, Arrow/Enter selection without prompt submission, Escape/outside dismissal, and pinned search with scrollable results. Desktop and short viewports center the current model on open, reopen, and search clearing without moving the page or taking search focus. Before searching, Enter preserves the current model and arrows navigate from it; reopening after a switch reveals the newly confirmed model. Keyboard selection from the search field or from a result returns focus to the chip while pointer clicks are left alone, Escape during IME composition cancels the candidate without closing the menu, and an advertised list with no options reads as unavailable rather than as a failed search. Fast mode and Ultracode arrive as model_config selects with exactly on and off choices and render as switches beside the model and effort pickers: a click sends the opposite value, the switch shows the confirmed value and disables while its request is pending, other model_config options and categories render nothing, and a switch disappears when the adapter stops advertising its option (SessionConfigControls.test.tsx). Persistence, respawn and reset re-apply are covered by the Rust integration tests in tests/integration/acp_model_respawn.rs, and the TUI picker and status line by unit tests in src/tui/structured_view."
+    },
+    {
+      "id": "acp.model-default",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/acp-model-default.spec.ts",
+        "tests/live/acp-worker-api.spec.ts",
+        "src/components/acp/SessionConfigControls.test.tsx",
+        "src/lib/agentModelDefault.test.ts",
+        "src/lib/api.test.ts",
+        "src/components/__tests__/Toasts.test.tsx"
+      ],
+      "components": [
+        "web/src/components/acp/SessionConfigControls.tsx",
+        "web/src/lib/agentModelDefault.ts",
+        "web/src/lib/api.ts",
+        "web/src/components/Toasts.tsx",
+        "web/src/lib/toastBus.ts",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/App.tsx"
+      ],
+      "notes": "#5909: the model picker's checkbox makes the picked model the default of the Agent the Session's Structured view spawn runs as, for new Structured view Sessions in the Session's profile, such as Cursor's for an Agent detected as Cursor. Unchecked when another model or none is configured; checked and aria-disabled when it is the default; a pin shows a link to Agent defaults instead. The default, its profile and its Agent key are read from GET /api/sessions/{id}/acp-default-model and saved with PUT /api/profiles/{name}/acp-defaults/{agent}/model, which sets only that Agent's model and refuses with 409 model_pinned if either layer pins it; the toast then says nothing was changed. A 6 s toast links to Settings > Structured view in the app. Hidden on read-only and CityHall dashboards."
     },
     {
       "id": "acp.mode-switch",
@@ -4383,7 +4602,7 @@
         "web/src/components/acp/RecoveryActionRow.tsx",
         "web/src/components/sidebar/RecreateContainerDialog.tsx"
       ],
-      "notes": "Steps follow install-info: installs allowed, read-only or CityHall, sandboxed, a stopped container (whose manual steps start with Check again, which starts it), npm-installable. Re-reads it on focus so a setting turned on in the TUI unlocks Update; the in-container command comes from the Daemon. Descriptive text uses text-text-subtle, with no text-text-secondary or text-text-dim classes, asserted across install-off, allowed, sandboxed, non-npm and protocol states. A sandboxed Session the Session menu could recreate (shared canRecreateContainer) gets Recreate container in every state once install-info confirms the Sandbox, never on read-only or CityHall; it opens the menu's confirmation, which fits at 375px, and Details describes it in the dialog's terms only where it's offered."
+      "notes": "Headlines name the Agent from install-info (\"The Agent\" before it answers), say \"in this sandbox\" only for a sandboxed update, and drop \"ACP\"; the update's version line uses the unscoped package name. One button label, Update & restart. While the update runs only it shows: step 2 reads Updating inside the container or Updating <Agent> with the restart hint, the fallback command is hidden and Check again is disabled. A done step 1 is one line. A failed update gets its own Update failed card: npm's exit code on the version line, or the error text with no code, npm's output under Details, Try again, and the fallback command, which wraps and has a bordered Copy button; asserted at desktop and 375px with no sideways scroll. If installs are turned off after the failure, the card shows the permission step and the disabled Try again points at it; a stopped container reported after the failure gets the stopped-container steps instead of the card. The divider above Details is neutral. Steps follow install-info: installs allowed, read-only or CityHall, sandboxed, a stopped container (whose manual steps start with Check again, which starts it), npm-installable. Re-reads it on focus so a setting turned on in the TUI unlocks Update; the in-container command comes from the Daemon. Descriptive text uses text-text-subtle, with no text-text-secondary or text-text-dim classes, asserted across install-off, allowed, sandboxed, non-npm and protocol states. A sandboxed Session the Session menu could recreate (shared canRecreateContainer) gets Recreate container in every state once install-info confirms the Sandbox, never on read-only or CityHall; it opens the menu's confirmation, which fits at 375px, and Details describes it in the dialog's terms only where it's offered."
     },
     {
       "id": "acp.startup-error-banner",
@@ -4396,7 +4615,7 @@
         "web/src/components/acp/RecoveryActionRow.tsx",
         "web/src/components/acp/signInSteps.ts"
       ],
-      "notes": "Auth-required startup errors name the agent's own sign-in step from signInSteps.ts: Claude gets claude auth login and ANTHROPIC_API_KEY, Codex gets codex login (codex login --device-auth in a Container) and OPENAI_API_KEY, other agents get generic sign-in copy with no Claude or Codex commands. A sandboxed Session with install off runs the command inside the container and points new Sessions at the dashboard's \"Sandbox image update available\" banner, which offers Update now to pull it or shows the command to run, never at the TUI."
+      "notes": "Auth-required startup errors name the agent's own sign-in step from signInSteps.ts: Claude gets claude auth login and ANTHROPIC_API_KEY, Codex gets codex login (codex login --device-auth in a Container) and OPENAI_API_KEY, other agents get generic sign-in copy with no Claude or Codex commands. A sandboxed Session with install off runs the command inside the container and points new Sessions at the dashboard's \"Sandbox image update available\" banner, which offers Update now to pull it or shows the command to run, never at the TUI. A Session stopped with aoe acp stop shows a was stopped headline and says its queued message waits for Retry, with no adapter install hint or Install button."
     },
     {
       "id": "acp.container-gone-banner",
@@ -4422,7 +4641,7 @@
         "web/src/components/MobileMainPane.tsx",
         "web/src/App.tsx"
       ],
-      "notes": "An AgentStartupError with cause container_missing shows this banner instead of the generic one: no Retry or Use Terminal view, Recreate container (primary, full width at 375px) and New Session in the Project, named as its sidebar header (alias, else folder name). The composer is disabled with \"Recreate the container to send messages.\" as its placeholder, since a send would start the Session and rebuild the container without the warning; a queued row's Start and send is disabled with the same reason, and the compaction reminder's Compact now isn't offered; an untyped startup error leaves all three as on main. Recreate confirms through the Session menu's dialog and, once the Daemon accepts it, hands over to the startup line as a Retry does. New Session opens the wizard with the Project, Agent, Group and Structured view (kept over a Terminal view profile default, not over off), title empty, sandbox and yolo from the defaults. The cause is set and cleared wherever the startup error is, a later untyped error replaces it, and it persists with the cached state."
+      "notes": "An AgentStartupError with cause container_missing shows this banner instead of the generic one: no Retry or Use Terminal view, Recreate container (primary, full width at 375px) and New Session in the Project, named as its sidebar header (the folder name). The composer is disabled with \"Recreate the container to send messages.\" as its placeholder, since a send would start the Session and rebuild the container without the warning; a queued row's Start and send is disabled with the same reason, and the compaction reminder's Compact now isn't offered; an untyped startup error leaves all three as on main. Recreate confirms through the Session menu's dialog and, once the Daemon accepts it, hands over to the startup line as a Retry does. New Session opens the wizard with the Project, Agent, Group and Structured view (kept over a Terminal view profile default, not over off), title empty, sandbox and yolo from the defaults. The cause is set and cleared wherever the startup error is, a later untyped error replaces it, and it persists with the cached state."
     },
     {
       "id": "acp.container-gone-read-only",
@@ -5572,6 +5791,31 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "triage.ignore-managed-session",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/triage.spec.ts"],
+      "components": [
+        "web/src/components/sidebar/SessionRowMenu.tsx",
+        "web/src/components/sidebar/SessionActions.tsx",
+        "web/src/hooks/useSidebarTriage.ts"
+      ],
+      "notes": "Against a real daemon: the row menu ignores a managed session (PATCH /ignored, which keeps the row live and out of the footer), then offers Unignore with the inverse body, and Take ownership back (POST /reclaim-ownership) clears the manager link so both managed actions leave the menu."
+    },
+    {
+      "id": "triage.ignore-managed-session-ranking",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/lib/api.test.ts",
+        "src/lib/__tests__/sidebarSort.test.ts",
+        "src/components/__tests__/SessionRowMenuOrder.test.tsx",
+        "src/components/__tests__/SessionRowMenuActions.test.tsx"
+      ],
+      "components": ["web/src/lib/api.ts", "web/src/lib/sidebarSort.ts"],
+      "notes": "An ignored session ranks last in the attention order, never needs attention, and stays out of the archived footer. The daemon side is covered by ignore_session_keeps_the_row_live_and_reports_its_manager and reclaim_ownership_clears_manager_and_ignore_in_one_commit."
+    },
+    {
       "id": "triage.api-wire-format",
       "kind": "vitest",
       "risk": "medium",
@@ -5776,9 +6020,16 @@
       "id": "onboarding.first-run-tutorial",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": ["tests/live/onboarding.spec.ts"],
+      "specs": [
+        "tests/live/onboarding.spec.ts",
+        "tests/tour-install-hint.spec.ts",
+        "src/lib/__tests__/platform.test.ts",
+        "src/components/tour/TourRunner.installHint.test.tsx"
+      ],
       "components": [
         "web/src/components/tour/TourRunner.tsx",
+        "web/src/lib/platform.ts",
+        "web/src/lib/tourSteps.ts",
         "web/src/components/TopBar.tsx",
         "web/src/components/OverflowMenu.tsx",
         "web/src/components/Dashboard.tsx",
@@ -5787,7 +6038,8 @@
         "web/src/components/acp/Composer.tsx",
         "web/src/components/SettingsView.tsx",
         "web/src/components/settings/SettingsIntro.tsx"
-      ]
+      ],
+      "notes": "#4595: the last step adds the iOS Home Screen steps, a turn-them-on-in-Settings line where the tab can push, or the generic install line, only in a phone or tablet browser tab over a secure origin. Any iPad gets the iOS steps, with a trackpad or in desktop mode; installed apps, desktops and plain HTTP get none."
     },
     {
       "id": "onboarding.settings-tab-intros",
@@ -6155,7 +6407,7 @@
         "web/src/hooks/useSessions.ts",
         "web/src/lib/api.ts"
       ],
-      "notes": "Color and notification receipt ordering remains exact above Number.MAX_SAFE_INTEGER. Accepted color reset survives Settings navigation before its first ACK; true invalidation never replays queued work."
+      "notes": "Notification receipt ordering remains exact above Number.MAX_SAFE_INTEGER. An accepted notification reset survives Settings navigation before its first ACK; true invalidation never replays queued work."
     },
     {
       "id": "sidebar.canonical-settings-receipts.live",
@@ -6172,7 +6424,7 @@
         "web/src/hooks/useSessions.ts",
         "web/src/lib/api.ts"
       ],
-      "notes": "Browser: isolated serve publishes advancing native epoch revision receipts for color and notifications. Uses the isolated spawnServe fixture; native HTTP receipts and canonical persistence are asserted, then a page reload verifies the sidebar without pending overlays."
+      "notes": "Browser: isolated serve publishes advancing native epoch revision receipts for notifications. Uses the isolated spawnServe fixture; native HTTP receipts and canonical persistence are asserted, then a page reload verifies the sidebar without pending overlays."
     },
     {
       "id": "selected-item-contrast",

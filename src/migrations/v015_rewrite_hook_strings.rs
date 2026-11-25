@@ -490,7 +490,7 @@ mod tests {
         // hit the (event, command) collision branch and preserve approved_at.
         // Without this trick (e.g. running run_in twice back-to-back without
         // the sentinel injection), the test would pass even if preservation
-        // were reverted to per-call `Utc::now()`, because to_rfc3339_opts
+        // were reverted to per-call `Timestamp::now()`, because to_rfc3339_opts
         // collapses sub-second timestamps to the same string within one
         // wall-clock second.
         const SENTINEL: &str = "2020-01-01T00:00:00Z";

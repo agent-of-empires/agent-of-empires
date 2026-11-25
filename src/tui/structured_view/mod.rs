@@ -273,6 +273,11 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
+                // Checked before the poll so a view nobody holds stops here even
+                // while every poll keeps failing.
+                if plugin_tx.is_closed() {
+                    break;
+                }
                 let snapshot = match http.plugin_ui_state().await {
                     Ok(snapshot) => snapshot,
                     // A fixed env credential cannot recover inside this view.
@@ -989,6 +994,21 @@ async fn handle_terminal_event(
             open_toggle_picker(state);
             Ok(false)
         }
+        Intent::ToggleThinking => {
+            // Expanding a thought above the reader would push their row down, so
+            // hold onto the one at the top and let the next frame find it again.
+            if state.scroll_offset.get() != u16::MAX {
+                state.anchor_scroll_to_top_line();
+            }
+            state.show_full_thinking = !state.show_full_thinking;
+            let message = if state.show_full_thinking {
+                "showing full thinking"
+            } else {
+                "thinking collapsed to a preview"
+            };
+            set_toast(state, toast_deadline, message.into(), ToastKind::Info);
+            Ok(false)
+        }
         Intent::AnswerElicitation => {
             start_elicitation_answer(state, toast_deadline);
             Ok(false)
@@ -1137,6 +1157,8 @@ fn open_mode_picker(state: &mut StructuredViewState) {
         .collect();
     state.choice = Some(ChoicePicker {
         title: " Mode (Enter=set · Esc=close) ".to_string(),
+        context: None,
+        details: Vec::new(),
         options,
         selected,
         purpose: ChoicePurpose::Mode,
@@ -1166,6 +1188,8 @@ fn open_toggle_picker(state: &mut StructuredViewState) {
     }
     state.choice = Some(ChoicePicker {
         title: " Toggles (Enter=flip · Esc=close) ".to_string(),
+        context: None,
+        details: Vec::new(),
         options,
         selected: 0,
         purpose: ChoicePurpose::Toggle,
@@ -1244,20 +1268,33 @@ fn question_picker(
     remaining: Vec<crate::acp::elicitations::ElicitationQuestion>,
     answers: std::collections::BTreeMap<String, crate::acp::elicitations::AnswerValue>,
 ) -> ChoicePicker {
-    let prompt = question
-        .title
-        .clone()
-        .filter(|t| !t.trim().is_empty())
-        .unwrap_or_else(|| {
-            // Later questions advance with an empty lead-in; never a blank title.
-            if message.trim().is_empty() {
-                "Answer".to_string()
-            } else {
-                message.to_string()
-            }
-        });
+    let titled = question.title.as_deref().filter(|t| !t.trim().is_empty());
+    let prompt = match (titled, message.trim()) {
+        (Some(title), _) => title.to_string(),
+        // Later questions advance with an empty lead-in; never a blank title.
+        (None, "") => "Answer".to_string(),
+        (None, lead_in) => lead_in.to_string(),
+    };
+    // The title holds the question; the lead-in and the question's own detail
+    // are what tell the user how to read the options. Some agents send the lead-in
+    // as the title too, so skip a repeat rather than print it twice.
+    let context: Vec<String> = [
+        titled.map(|_| message.trim()),
+        question.description.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|text| !text.is_empty() && Some(*text) != titled)
+    .map(str::to_string)
+    .collect();
     ChoicePicker {
         title: format!(" {prompt} (Enter=pick · Esc=dismiss) "),
+        context: (!context.is_empty()).then(|| context.join("\n")),
+        details: question
+            .options
+            .iter()
+            .map(|o| o.description.clone().filter(|d| !d.trim().is_empty()))
+            .collect(),
         options: question
             .options
             .iter()
@@ -1308,6 +1345,8 @@ fn approval_key_outcome(
 fn approval_option_picker(pending: &reducer::PendingApproval) -> ChoicePicker {
     ChoicePicker {
         title: format!(" {} (Enter=pick · Esc=dismiss) ", pending.title),
+        context: None,
+        details: Vec::new(),
         options: pending
             .options
             .iter()
@@ -1547,6 +1586,8 @@ fn open_link_picker(state: &mut StructuredViewState, links: Vec<(String, String)
         .collect();
     state.choice = Some(ChoicePicker {
         title: " Open link (1-9=open · Esc=close) ".to_string(),
+        context: None,
+        details: Vec::new(),
         options,
         selected: 0,
         purpose: ChoicePurpose::OpenLink,
@@ -1694,11 +1735,11 @@ fn accept_mention(state: &mut StructuredViewState) {
 
 fn apply_scroll(state: &mut StructuredViewState, delta: i32) {
     if delta == i32::MIN {
-        state.scroll_offset = 0;
+        state.scroll_offset.set(0);
         return;
     }
     if delta == i32::MAX {
-        state.scroll_offset = u16::MAX;
+        state.scroll_offset.set(u16::MAX);
         return;
     }
     // Resolve the current position first: `scroll_offset == u16::MAX`
@@ -1707,14 +1748,18 @@ fn apply_scroll(state: &mut StructuredViewState, delta: i32) {
     // still clamps to the bottom, so scrollback never moves (the
     // reported "wheel scroll does nothing").
     let max = state.last_scroll_max.get();
-    let current = state.scroll_offset.min(max);
+    let current = state.scroll_offset.get().min(max);
     if delta < 0 {
-        state.scroll_offset = current.saturating_sub((-delta) as u16);
+        state
+            .scroll_offset
+            .set(current.saturating_sub((-delta) as u16));
     } else {
         let next = current.saturating_add(delta as u16);
         // Scrolling back down to the bottom re-arms auto-follow so new
         // streaming content keeps the view pinned to the latest row.
-        state.scroll_offset = if next >= max { u16::MAX } else { next };
+        state
+            .scroll_offset
+            .set(if next >= max { u16::MAX } else { next });
     }
 }
 
@@ -1801,32 +1846,62 @@ async fn send_prompt_now(
     text: &str,
 ) {
     use crate::acp::client::http::PromptDispositionWire;
+    // A test submit stands in for a `Sent` response: accepted, with the submit
+    // lock still held until the turn-start echo arrives.
+    #[cfg(test)]
+    if state.accept_submits_for_test > 0 {
+        state.accept_submits_for_test -= 1;
+        state.submitted_prompts.push(text.to_owned());
+        state.accepted_submits += 1;
+        state.submit_rejected = false;
+        state.restored_prompt = None;
+        state.in_flight = true;
+        return;
+    }
+    #[cfg(test)]
+    state.submitted_prompts.push(text.to_owned());
     state.in_flight = true;
-    match state.http.prompt(&state.session_id, text, false).await {
-        Ok(dispatch) => match dispatch.disposition {
-            PromptDispositionWire::Queued => {
-                // A queued prompt starts no turn, so nothing will clear the
-                // submit lock for us.
-                state.in_flight = false;
-                refresh_queue(state).await;
-                set_toast(
-                    state,
-                    toast_deadline,
-                    format!("queued ({} waiting)", state.queue.len()),
-                    ToastKind::Info,
-                );
+    match state
+        .http
+        .prompt(
+            &state.session_id,
+            text,
+            false,
+            crate::daemon::PromptOrigin::Tui,
+        )
+        .await
+    {
+        Ok(dispatch) => {
+            state.accepted_submits += 1;
+            state.submit_rejected = false;
+            state.restored_prompt = None;
+            match dispatch.disposition {
+                PromptDispositionWire::Queued => {
+                    // A queued prompt starts no turn, so nothing will clear the
+                    // submit lock for us.
+                    state.in_flight = false;
+                    refresh_queue(state).await;
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        format!("queued ({} waiting)", state.queue.len()),
+                        ToastKind::Info,
+                    );
+                }
+                PromptDispositionWire::Sent | PromptDispositionWire::Steered => {
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        format!("prompt sent ({} bytes)", text.len()),
+                        ToastKind::Info,
+                    );
+                }
             }
-            PromptDispositionWire::Sent | PromptDispositionWire::Steered => {
-                set_toast(
-                    state,
-                    toast_deadline,
-                    format!("prompt sent ({} bytes)", text.len()),
-                    ToastKind::Info,
-                );
-            }
-        },
+        }
         Err(e) => {
             state.in_flight = false;
+            state.submit_rejected = true;
+            state.restored_prompt = Some(text.to_owned());
             state.set_composer_text(text);
             set_toast(
                 state,
@@ -2488,6 +2563,49 @@ mod tests {
             picker.title.contains("Answer"),
             "blank picker title: {:?}",
             picker.title
+        );
+    }
+
+    /// A titled question keeps the form's lead-in and its own detail as context,
+    /// and each option carries the description the highlighted row shows. An
+    /// agent that repeats the lead-in as the title must not print it twice.
+    #[test]
+    fn question_picker_carries_the_context_and_option_details_once() {
+        let mut q = select_question("question_1", "Which store?", true, &["pg", "sqlite"]);
+        q.description = Some("Both are supported today.".into());
+        q.options[1].description = Some("No server to run.".into());
+        let picker = question_picker(
+            test_nonce(),
+            "Choose where the new service keeps its data.",
+            q,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+        );
+        let context = picker.context.as_deref().unwrap_or_default();
+        assert!(
+            context.contains("Choose where the new service"),
+            "{context}"
+        );
+        assert!(context.contains("Both are supported today."), "{context}");
+        assert_eq!(
+            picker.details,
+            [None, Some("No server to run.".to_string())],
+            "a detail belongs to its own option"
+        );
+
+        let mut repeated = select_question("question_1", "Which store?", true, &["pg"]);
+        repeated.description = None;
+        let picker = question_picker(
+            test_nonce(),
+            "Which store?",
+            repeated,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+        );
+        assert_eq!(
+            picker.context, None,
+            "the title already says it: {:?}",
+            picker.context
         );
     }
 

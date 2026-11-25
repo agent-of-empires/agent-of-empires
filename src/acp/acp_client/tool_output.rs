@@ -247,7 +247,7 @@ pub(super) fn extract_diffs_from_content(
     blocks: &[agent_client_protocol::v1::schema::ToolCallContent],
 ) -> Vec<DiffPreview> {
     use agent_client_protocol::v1::schema::ToolCallContent;
-    let created_at = chrono::Utc::now();
+    let created_at = crate::time::Timestamp::now();
     blocks
         .iter()
         .filter_map(|block| match block {
@@ -285,7 +285,7 @@ pub(super) fn write_diff_from_meta(
         path,
         old_text: old_text.map(cap_diff_text),
         new_text: Some(cap_diff_text(new_text)),
-        created_at: chrono::Utc::now(),
+        created_at: crate::time::Timestamp::now(),
     }])
 }
 

@@ -414,6 +414,9 @@ impl Instance {
     }
 
     pub(super) fn probe_failure_cause(&self, error: anyhow::Error) -> LaunchIndeterminateCause {
+        if let Some(&cause) = error.downcast_ref::<LaunchIndeterminateCause>() {
+            return cause;
+        }
         let cause = if error.chain().any(|source| {
             source
                 .downcast_ref::<std::io::Error>()
@@ -550,8 +553,8 @@ impl Instance {
                         Ok(false) => StartOutcome::Indeterminate {
                             cause: LaunchIndeterminateCause::StabilizationExpired,
                         },
-                        Err(_) => StartOutcome::Indeterminate {
-                            cause: LaunchIndeterminateCause::ObservationFailed,
+                        Err(error) => StartOutcome::Indeterminate {
+                            cause: self.probe_failure_cause(error),
                         },
                     });
                 }
@@ -564,7 +567,7 @@ impl Instance {
         }
         if self.status == Status::Error {
             self.status = Status::Idle;
-            self.last_error = None;
+            self.last_error.clear();
             self.last_error_evidence = None;
             self.last_error_check = None;
         }
@@ -662,7 +665,7 @@ impl Instance {
         sandbox_prior: Option<&LaunchSandboxSnapshot>,
         cause: LaunchIndeterminateCause,
     ) -> Result<StartOutcome> {
-        self.last_error = Some(cause.message().to_owned());
+        self.last_error.set(cause.message().to_owned());
         if self.lifecycle_generation == generation {
             self.record_terminal_error(
                 ErrorEvidenceSource::TmuxObservation,
@@ -857,7 +860,21 @@ impl Instance {
                 cause,
             );
         }
-        if let Err(error) = self.commit_lifecycle_launch(storage, generation, restart) {
+        let expected = matches!(
+            outcome,
+            StartOutcome::Fresh | StartOutcome::FreshAfterFailedResume { .. }
+        )
+        .then_some(&probe.expected);
+        if let Err(error) = self.commit_lifecycle_launch(storage, generation, restart, expected) {
+            if let Some(&cause) = error.downcast_ref::<LaunchIndeterminateCause>() {
+                return self.preserve_indeterminate_launch(
+                    storage,
+                    generation,
+                    &probe,
+                    sandbox_prior.as_ref(),
+                    cause,
+                );
+            }
             self.fail_reserved_launch(storage, generation, &error, None, None);
             return Err(error);
         }
@@ -1241,7 +1258,7 @@ impl Instance {
             ErrorEvidenceSource::TmuxObservation,
             RuntimeEvidence::PaneExited { exit_code: None },
         );
-        self.last_error = Some(format!(
+        self.last_error.set(format!(
             "resume failed for sid {}; preserved for explicit retry",
             stale_sid
         ));
@@ -1308,6 +1325,13 @@ mod tests {
             StartOutcome::Indeterminate {
                 cause: LaunchIndeterminateCause::OwnershipUnproven,
             }
+        );
+        let error = instance
+            .commit_lifecycle_launch(&storage, generation, false, Some(&probe.expected))
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<LaunchIndeterminateCause>(),
+            Some(&LaunchIndeterminateCause::OwnershipUnproven)
         );
         assert_eq!(
             crate::tmux::test_helpers::pane_field(
@@ -2943,7 +2967,7 @@ mod tests {
         let finalized_in_observer = finalized.clone();
         let retained_capture =
             std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        let retained_start = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let retained_start = crate::time::Timestamp::from_unix_secs(1_700_000_000).unwrap();
         let _observer = FinalizeObserver::install(inst.id.clone(), move |instance, phase| {
             match phase {
                 FinalizePhase::Before => {
@@ -3137,10 +3161,11 @@ mod tests {
             assert_eq!(inst.resume_probe_failed_sid.as_deref(), Some(stale_sid));
             assert_eq!(inst.status, Status::Error);
             assert_eq!(
-                inst.last_error,
-                Some(format!(
-                    "resume failed for sid {stale_sid}; preserved for explicit retry"
-                ))
+                inst.last_error.as_deref(),
+                Some(
+                    format!("resume failed for sid {stale_sid}; preserved for explicit retry")
+                        .as_str()
+                )
             );
             assert!(inst.last_error_check.is_some());
             let loaded = storage.load().unwrap();
@@ -3568,7 +3593,10 @@ exec sleep 60
             assert!(hook.wait().unwrap().success());
             assert_eq!(
                 instance.ensure_pane_ready().unwrap(),
-                crate::session::EnsureReadyOutcome::AlreadyAlive
+                crate::session::EnsureReadyOutcome::Indeterminate {
+                    cause: LaunchIndeterminateCause::StabilizationExpired,
+                },
+                "even B's qualified hook cannot authorize a replacement process"
             );
             assert_eq!(only_pane_id(&name), pane);
             assert_eq!(
@@ -3829,7 +3857,7 @@ exec sleep 60
             Some(&LaunchIndeterminateCause::OwnershipUnproven),
             "{error:#}"
         );
-        let stored = storage.load().unwrap().remove(0);
+        let mut stored = storage.load().unwrap().remove(0);
         assert_eq!(stored.conversation_state(), prior);
         assert_eq!(
             serde_json::to_value(&stored.active_execution).unwrap(),
@@ -3837,6 +3865,14 @@ exec sleep 60
         );
         assert_eq!(stored.last_start_time, prior_start);
         assert_eq!(instance.conversation_state(), prior);
+        assert!(matches!(
+            stored.ensure_pane_ready().unwrap(),
+            super::super::EnsureReadyOutcome::Indeterminate {
+                cause: LaunchIndeterminateCause::OwnershipUnproven,
+            }
+        ));
+        assert!(stored.lock_for_input().is_err());
+        assert_eq!(std::fs::read(&births).unwrap(), b"x");
     }
 
     #[test]

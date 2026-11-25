@@ -365,7 +365,7 @@ impl Session {
         // prompt path so the reaper can resume after the reset (#4373).
         let captured = take_rate_limit_from_captured_rejection(
             &shared.rate_limit_rejections,
-            chrono::Utc::now(),
+            crate::time::Timestamp::now(),
         );
         if let Some(info) = captured {
             info!(
