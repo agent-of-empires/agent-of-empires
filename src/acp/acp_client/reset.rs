@@ -1462,7 +1462,7 @@ done
         scope.configure_sdk(crate::acp::acp_client::SdkTestOptions {
             tracking: Some(observe), ..Default::default()
         });
-        let agent_key = if kind == "agent" { "codex" } else { "claude" };
+        let agent_key = if kind == "agent" { "gemini" } else { "claude" };
         let (config, peer) = scope.native_peer(dir.path().into(), agent_key, agent_key, move |request| {
             let id = request.get("id")?;
             Some(match request["method"].as_str().unwrap() {

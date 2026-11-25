@@ -5,18 +5,18 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
 use crate::acp::event_store::{EventStore, EventTableShape};
 
+use super::v055_acp_event_scope::{resolve_database_path, snapshot};
+
 pub fn run() -> Result<()> {
     migrate(&crate::session::get_app_dir()?.join("acp_events.db"))
 }
 
 fn migrate(path: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).context("inspect ACP budget database"),
-        Ok(metadata) => anyhow::ensure!(metadata.is_file(), "ACP database is not a regular file"),
-    }
+    let Some(path) = resolve_database_path(path)? else {
+        return Ok(());
+    };
     let mut conn = Connection::open_with_flags(
-        path,
+        &path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .context("open ACP database for migration57")?;
@@ -43,7 +43,7 @@ fn migrate(path: &Path) -> Result<()> {
     if present {
         return EventStore::validate_budget_knowledge(&conn);
     }
-    super::v055_acp_event_scope::snapshot(&conn, path)?;
+    snapshot(&conn, &path)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute_batch(
         "ALTER TABLE acp_rate_limit_budgets

@@ -2885,7 +2885,7 @@ mod tests {
                     let mut live = test_support::managed_control_session(
                         scope,
                         "lag-live-work",
-                        if background { "codex" } else { "claude" },
+                        if background { "gemini" } else { "claude" },
                         None,
                     )
                     .await;
@@ -3322,7 +3322,7 @@ mod tests {
                     let mut live = test_support::managed_control_session(
                         scope,
                         "listener-cold",
-                        "codex",
+                        "gemini",
                         None,
                     )
                     .await;

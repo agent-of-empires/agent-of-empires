@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use rusqlite::{
@@ -13,16 +13,11 @@ pub fn run() -> Result<()> {
 }
 
 fn migrate(path: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).context("inspect ACP event database"),
-        Ok(metadata) => anyhow::ensure!(
-            metadata.is_file(),
-            "ACP event database is not a regular file"
-        ),
-    }
+    let Some(path) = resolve_database_path(path)? else {
+        return Ok(());
+    };
     let mut conn = Connection::open_with_flags(
-        path,
+        &path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .context("open ACP database for migration55")?;
@@ -32,7 +27,7 @@ fn migrate(path: &Path) -> Result<()> {
         EventStore::validate_auxiliary_tables(&conn)?;
         return Ok(());
     }
-    snapshot(&conn, path)?;
+    snapshot(&conn, &path)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     match shape {
         EventTableShape::Absent => EventStore::create_scoped_event_table(&tx)?,
@@ -67,6 +62,30 @@ fn migrate(path: &Path) -> Result<()> {
     tx.commit()?;
     tracing::info!(target: "migrations.v055", "ACP event scope migrated to55; historical rows remain unqualified");
     Ok(())
+}
+
+pub(super) fn resolve_database_path(path: &Path) -> Result<Option<PathBuf>> {
+    let leaf = path.file_name().context("ACP database has no file name")?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    // SQLite NOFOLLOW also rejects symlinked ancestors. Resolve only the
+    // parent so the regular-file check and NOFOLLOW still protect the leaf.
+    let parent = match parent.canonicalize() {
+        Ok(parent) => parent,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("resolve ACP database parent"),
+    };
+    let path = parent.join(leaf);
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("inspect ACP database"),
+        Ok(metadata) => {
+            anyhow::ensure!(metadata.is_file(), "ACP database is not a regular file");
+            Ok(Some(path))
+        }
+    }
 }
 
 pub(super) fn snapshot(source: &Connection, path: &Path) -> Result<()> {
