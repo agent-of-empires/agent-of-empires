@@ -1,5 +1,4 @@
 import type { ProjectInfo, RepoGroup } from "./types";
-import type { RepoColor } from "./repoAppearance";
 import { workspaceIsSunk } from "./sidebarSort";
 import { MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID } from "../hooks/useRepoGroups";
 
@@ -22,12 +21,8 @@ function isSyntheticRepoGroup(id: string): boolean {
 export function mergeRegisteredProjects(
   repoGroups: RepoGroup[],
   projects: ProjectInfo[],
-  // Per-browser appearance and collapse for the appended groups.
-  resolve?: {
-    alias: (repoPath: string) => string | null;
-    color: (repoPath: string) => RepoColor | null;
-    collapsed: (repoPath: string) => boolean;
-  },
+  // Per-browser collapse for the appended groups.
+  collapsed?: (repoPath: string) => boolean,
 ): RepoGroup[] {
   const byKey = new Map<string, ProjectInfo[]>();
   for (const project of projects) {
@@ -54,20 +49,15 @@ export function mergeRegisteredProjects(
     if (!registrations.some((p) => p.pinned)) continue;
     const primary = registrations[0];
     if (!primary) continue;
-    const defaultDisplayName = primary.path.split("/").pop() || primary.path;
-    const alias = resolve?.alias(primary.path) ?? null;
     merged.push({
       id: primary.path,
       repoPath: primary.path,
-      displayName: alias ?? defaultDisplayName,
-      defaultDisplayName,
-      alias,
-      color: resolve?.color(primary.path) ?? null,
+      displayName: primary.path.split("/").pop() || primary.path,
       remoteOwner: null,
       remoteOwnerKey: null,
       workspaces: [],
       status: "idle",
-      collapsed: resolve?.collapsed(primary.path) ?? false,
+      collapsed: collapsed?.(primary.path) ?? false,
       registeredProjects: registrations,
     });
   }
@@ -83,10 +73,6 @@ export function mergeRegisteredProjects(
 export function unpinnedSavedProjects(
   repoGroups: RepoGroup[],
   projects: ProjectInfo[],
-  resolve?: {
-    alias: (repoPath: string) => string | null;
-    color: (repoPath: string) => RepoColor | null;
-  },
   { drawsRepoHeaders = true }: { drawsRepoHeaders?: boolean } = {},
 ): RepoGroup[] {
   // An all-sunk repo does not render above, so its saved project still surfaces here.
@@ -113,15 +99,10 @@ export function unpinnedSavedProjects(
     if (drawsRepoHeaders && registrations.some((p) => p.pinned)) continue; // shown above as a pinned header
     const primary = registrations[0];
     if (!primary) continue;
-    const defaultDisplayName = primary.path.split("/").pop() || primary.path;
-    const alias = resolve?.alias(primary.path) ?? null;
     out.push({
       id: primary.path,
       repoPath: primary.path,
-      displayName: alias ?? defaultDisplayName,
-      defaultDisplayName,
-      alias,
-      color: resolve?.color(primary.path) ?? null,
+      displayName: primary.path.split("/").pop() || primary.path,
       remoteOwner: null,
       remoteOwnerKey: null,
       workspaces: [],

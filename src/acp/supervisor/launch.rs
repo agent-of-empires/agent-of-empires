@@ -345,6 +345,14 @@ pub(super) fn registry_error(error: anyhow::Error) -> SupervisorError {
     }
 }
 
+fn resume_registry_error(error: anyhow::Error, id: &str) -> SupervisorError {
+    if error.is::<worker_registry::StopSuperseded>() {
+        SupervisorError::StopSuperseded(id.to_owned())
+    } else {
+        registry_error(error)
+    }
+}
+
 pub(super) fn claimed_stop_for_lease(
     registry: &worker_registry::RegistryGuard<'_>,
     lease: &Lease,
@@ -558,10 +566,10 @@ impl<S: BroadcastSink> Supervisor<S> {
                     {
                         return Err(SupervisorError::SpawnCancelled(id.into()));
                     }
-                    if let Some(observed) = reservation.resume_stop.as_ref() {
+                    if let Some(observed) = reservation.observed_stop() {
                         registry
                             .admit_resume(reservation.resume_authority, observed)
-                            .map_err(registry_error)?;
+                            .map_err(|error| resume_registry_error(error, id))?;
                     }
                     reservation.stop_committed();
                     return Ok(());
@@ -587,7 +595,15 @@ impl<S: BroadcastSink> Supervisor<S> {
             ResumeKind::SpawnFirst
         };
         match self
-            .begin_resume_with_restart_claim(&req.session_id, kind, authority, None, None, None)
+            .begin_resume_with_restart_claim(
+                &req.session_id,
+                kind,
+                authority,
+                None,
+                None,
+                None,
+                None,
+            )
             .await?
         {
             Some(r) => self.spawn_inner(req, r).await,
@@ -602,7 +618,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         kind: ResumeKind,
         authority: crate::process::worker_registry::ResumeAuthority,
     ) -> Result<ResumeReservation, SupervisorError> {
-        self.reserve_spawn_with_restart(session_id, kind, authority, None)
+        self.reserve_spawn_with_restart(session_id, kind, authority, None, None)
             .await
     }
 
@@ -612,9 +628,18 @@ impl<S: BroadcastSink> Supervisor<S> {
         kind: ResumeKind,
         authority: worker_registry::ResumeAuthority,
         restart: Option<&RestartRequestGuard>,
+        observed_stop: Option<Option<worker_registry::StopIntent>>,
     ) -> Result<ResumeReservation, SupervisorError> {
         match self
-            .begin_resume_with_restart_claim(session_id, kind, authority, None, restart, None)
+            .begin_resume_with_restart_claim(
+                session_id,
+                kind,
+                authority,
+                None,
+                restart,
+                None,
+                observed_stop,
+            )
             .await?
         {
             Some(reservation) => Ok(reservation),
@@ -628,7 +653,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         kind: ResumeKind,
         authority: worker_registry::ResumeAuthority,
     ) -> Result<Option<ResumeReservation>, SupervisorError> {
-        self.begin_resume_inner(session_id, kind, authority, None)
+        self.begin_resume_observing(session_id, kind, authority, None)
             .await
     }
 
@@ -640,28 +665,40 @@ impl<S: BroadcastSink> Supervisor<S> {
         kind: ResumeKind,
         predecessor: RunnerIdentity,
     ) -> Result<Option<ResumeReservation>, SupervisorError> {
-        self.begin_resume_inner(
+        self.begin_resume_with_restart_claim(
             session_id,
             kind,
             worker_registry::ResumeAuthority::Automatic,
             Some(predecessor),
+            None,
+            None,
+            None,
         )
         .await
     }
 
-    /// Admit a resume and reserve its capacity slot; only spawns count, since
-    /// an attach takes over a runner the registry already counts.
-    async fn begin_resume_inner(
+    /// [`Self::begin_resume`] admitting against `observed_stop` (`Some`: the stop intent the
+    /// caller already observed) so a newer stop is refused instead of cleared.
+    pub(crate) async fn begin_resume_observing(
         &self,
         session_id: &str,
         kind: ResumeKind,
         authority: crate::process::worker_registry::ResumeAuthority,
-        predecessor: Option<RunnerIdentity>,
+        observed_stop: Option<Option<worker_registry::StopIntent>>,
     ) -> Result<Option<ResumeReservation>, SupervisorError> {
-        self.begin_resume_with_restart_claim(session_id, kind, authority, predecessor, None, None)
-            .await
+        self.begin_resume_with_restart_claim(
+            session_id,
+            kind,
+            authority,
+            None,
+            None,
+            None,
+            observed_stop,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn begin_resume_with_restart_claim(
         &self,
         session_id: &str,
@@ -670,7 +707,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         predecessor: Option<RunnerIdentity>,
         restart: Option<&RestartRequestGuard>,
         cancellation: Option<CancellationToken>,
+        observed_stop: Option<Option<worker_registry::StopIntent>>,
     ) -> Result<Option<ResumeReservation>, SupervisorError> {
+        let caller_observed = observed_stop.is_some();
         // Declared before body resources so every early admitted return drops them first.
         let mut _original_constructor = None;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -690,7 +729,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                     return Err(SupervisorError::SpawnCancelled(session_id.to_string()));
                 }
                 if let Some(error) = request_state.admission_error(session_id, restart.is_some()) {
-                    return Err(error);
+                    return Err(stop_refusal(error, caller_observed, authority));
                 }
             }
             {
@@ -717,10 +756,15 @@ impl<S: BroadcastSink> Supervisor<S> {
                 if let Some(registry) =
                     worker_registry::try_registry_lock(session_id).map_err(registry_error)?
                 {
-                    let observed_stop = registry.stop().map_err(registry_error)?;
+                    let observed_stop = match &observed_stop {
+                        Some(observed) => observed.clone(),
+                        None => registry
+                            .stop()
+                            .map_err(|error| resume_registry_error(error, session_id))?,
+                    };
                     registry
                         .verify_resume(authority, &observed_stop)
-                        .map_err(registry_error)?;
+                        .map_err(|error| resume_registry_error(error, session_id))?;
                     let retained = if workers.contains_key(session_id) {
                         None
                     } else {
@@ -773,22 +817,21 @@ impl<S: BroadcastSink> Supervisor<S> {
                             return Err(SupervisorError::SpawnCancelled(session_id.into()))
                         }
                     };
-                    {
-                        _original_constructor =
-                            Some(lease.begin_original_constructor(self.worker_notify.clone()));
-                    }
-                    let request_state = lock_recover(&self.spawn_requests);
-                    let admission_error = if cancellation
+                    _original_constructor =
+                        Some(lease.begin_original_constructor(self.worker_notify.clone()));
+                    if cancellation
                         .as_ref()
                         .is_some_and(CancellationToken::is_cancelled)
                     {
-                        Some(SupervisorError::SpawnCancelled(session_id.to_string()))
-                    } else {
-                        request_state.admission_error(session_id, restart.is_some())
-                    };
-                    if let Some(error) = admission_error {
                         table.abandon(&lease);
-                        return Err(error);
+                        return Err(SupervisorError::SpawnCancelled(session_id.to_string()));
+                    }
+                    let request_state = lock_recover(&self.spawn_requests);
+                    if let Some(error) =
+                        request_state.admission_error(session_id, restart.is_some())
+                    {
+                        table.abandon(&lease);
+                        return Err(stop_refusal(error, caller_observed, authority));
                     }
                     drop(request_state);
                     if kind != ResumeKind::Attach {
@@ -2277,6 +2320,25 @@ async fn capture_durable_launch(
     .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?
 }
 
+/// A stop cancelled an explicit resume whose caller observed its intent earlier. The
+/// in-memory stop fence precedes the durable token, so no token comparison is possible:
+/// the caller's observation is older than that stop.
+fn stop_refusal(
+    error: SupervisorError,
+    caller_observed: bool,
+    authority: crate::process::worker_registry::ResumeAuthority,
+) -> SupervisorError {
+    match error {
+        SupervisorError::SpawnCancelled(id)
+            if caller_observed
+                && authority == crate::process::worker_registry::ResumeAuthority::Explicit =>
+        {
+            SupervisorError::StopSuperseded(id)
+        }
+        other => other,
+    }
+}
+
 fn admission_error(error: anyhow::Error, session_id: &str) -> SupervisorError {
     if let Some(blocked) = error.downcast_ref::<crate::session::StartBlocked>() {
         SupervisorError::Blocked(*blocked)
@@ -3597,6 +3659,7 @@ time.sleep(60)
                 ResumeKind::SpawnFirst,
                 crate::process::worker_registry::ResumeAuthority::Explicit,
                 Some(&restart),
+                None,
             )
             .await;
 
@@ -3626,6 +3689,7 @@ time.sleep(60)
                     crate::process::worker_registry::ResumeAuthority::Explicit,
                     None,
                     Some(&restart),
+                    None,
                     None,
                 )
                 .await;

@@ -17,20 +17,16 @@ Migrations must be idempotent, use `tracing::info!`, gate platform-specific ones
 
 Do not reuse a published migration number for a different transformation. When integrating divergent schema histories, preserve the published meaning and add idempotent reconciliation steps newer than both histories. Test upgrades from each history and a second run over the migrated state.
 
-ACP reconciliation (v063) preserves the historical ACP54 establishment, ACP55 event
-scope, ACP56 prompt publication and ACP57 budget-knowledge transformations. They
-are not ordinary pending56/57 entries: an installation carrying main55 has not
-necessarily acquired ACP55's scoped schema. The normal registry retains main54
-retained-history identity and main55 global worker-cap promotion, then runs v063.
-That reconciliation invokes all four historical ACP operations in order, followed
-by both main operations, using their real validators and idempotent writes. Only
-the migration runner stamps version 63, after every operation succeeds. A partial failure
-retains the last completed marker and resumes safely on the next explicit upgrade;
-neither the old marker nor a current schema proves native execution authority.
+ACP reconciliation (v064) preserves ACP54–57 establishment, event scope,
+prompt publication and budget knowledge. A main55 marker does not prove ACP55
+event scope. The migration registry keeps main63 for retired color labels.
+v064 reconciles both histories, including repeating color-label cleanup for
+installations that reached 63 through the ACP lineage. It advances the marker
+only after all steps succeed; a retry can safely repeat completed steps.
 
 Qualification reconciliation also validates recorded private child source and
 ancestry metadata. It does not synthesize that proof from reported parent/child
-IDs, rewrite historical content into current authority, or treat schema version 63 as
+IDs, rewrite historical content into current authority, or treat schema version 64 as
 proof that a legacy child may join a current resource.
 
 Adding an optional field whose missing and null forms mean the same thing does not require rewriting existing rows.

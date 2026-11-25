@@ -3065,6 +3065,7 @@ mod tests {
                     pane_current_command: Some("claude".to_string()),
                     pane_start_command_is_protected: false,
                     pane_pid: None,
+                    first_window: true,
                     pane_title: None,
                     window_activity,
                     window_size: None,
@@ -3138,6 +3139,7 @@ mod tests {
                 pane_current_command: Some("claude".into()),
                 pane_start_command_is_protected: false,
                 pane_pid: None,
+                first_window: true,
                 pane_title: None,
                 window_activity: None,
                 window_size: None,
@@ -3227,18 +3229,20 @@ mod tests {
         crate::tmux::test_helpers::wait_for_pane_command(&session_name, "sleep");
         let cache_guard = crate::tmux::SessionCacheGuard::capture();
         cache_guard.force_present(&[&session_name]);
+        let pane_id = crate::tmux::first_pane_id(&session_name).expect("first pane id");
         let metadata = std::collections::HashMap::from([(
             session_name,
             crate::tmux::PaneMetadata {
                 server: None,
                 session_id: "$42".into(),
-                pane_id: "%42".into(),
+                pane_id: pane_id.clone(),
                 session_kind: None,
                 tool_owner: crate::tmux::ToolPaneOwner::Unmarked,
                 pane_dead: false,
                 pane_current_command: Some("claude".into()),
                 pane_start_command_is_protected: false,
                 pane_pid: None,
+                first_window: true,
                 pane_title: None,
                 window_activity: None,
                 window_size: None,
@@ -3861,6 +3865,7 @@ mod tests {
                 pane_current_command: Some("claude".into()),
                 pane_start_command_is_protected: false,
                 pane_pid: None,
+                first_window: true,
                 pane_title: None,
                 window_activity: Some(100),
                 window_size: None,

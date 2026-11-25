@@ -325,17 +325,11 @@ impl RegistryGuard<'_> {
         authority: ResumeAuthority,
         observed: &Option<StopIntent>,
     ) -> Result<()> {
-        let current = self.stop()?;
+        let current = self.stop().map_err(|error| error.context(StopSuperseded))?;
         let record = self.record()?;
-        anyhow::ensure!(
-            &current == observed,
-            "worker stop intent changed before resume"
-        );
+        anyhow::ensure!(&current == observed, StopSuperseded);
         if current.is_some() {
-            anyhow::ensure!(
-                authority == ResumeAuthority::Explicit,
-                "worker stop intent fences automatic resume"
-            );
+            anyhow::ensure!(authority == ResumeAuthority::Explicit, StopSuperseded);
             anyhow::ensure!(record.is_none(), "worker shutdown remains unsettled");
         }
         Ok(())
@@ -502,6 +496,11 @@ pub(crate) fn request_stop(selected: &WorkerRecord) -> Result<StopIntent> {
         Ok(intent)
     })
 }
+
+/// An explicit resume was refused because the stop fence is not the one it observed.
+#[derive(Debug, thiserror::Error)]
+#[error("worker stop intent fences automatic or superseded resume")]
+pub(crate) struct StopSuperseded;
 
 pub(crate) fn admit_resume(
     session_id: &str,
@@ -1338,7 +1337,10 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&control).unwrap();
         let first = request_stop(&record).unwrap();
         assert!(admit_resume(id, ResumeAuthority::Automatic, &Some(first.clone())).is_err());
-        assert!(admit_resume(id, ResumeAuthority::Explicit, &Some(first.clone())).is_err());
+        // Matching intent but an unsettled record: a refusal, not a superseded stop.
+        let unsettled =
+            admit_resume(id, ResumeAuthority::Explicit, &Some(first.clone())).unwrap_err();
+        assert!(!unsettled.is::<StopSuperseded>());
         let replacement = record.clone().with_generation(2);
         assert!(register_runner(&replacement, &try_registry_lock(id).unwrap().unwrap()).is_err());
         assert_eq!(
@@ -1348,7 +1350,8 @@ mod tests {
         let latest = request_stop(&record).unwrap();
         drop(listener);
         retire_selected(&record).unwrap();
-        assert!(admit_resume(id, ResumeAuthority::Explicit, &Some(first)).is_err());
+        let superseded = admit_resume(id, ResumeAuthority::Explicit, &Some(first)).unwrap_err();
+        assert!(superseded.is::<StopSuperseded>());
         assert!(stop_requested(id));
         admit_resume(id, ResumeAuthority::Explicit, &Some(latest)).unwrap();
         let listener =

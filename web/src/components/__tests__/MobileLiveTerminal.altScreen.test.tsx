@@ -33,7 +33,7 @@ describe("MobileLiveTerminal on the alternate screen", () => {
 
     it("moves a slow drag a line at a time, with no wait between lines", () => {
       const { scroller, wheel, touches } = drag();
-      // 14px over a 16.8px line earns one notch with the touch gain.
+      // 14px over a 17px line earns one notch with the touch gain.
       fireEvent.touchStart(scroller, touches(300));
       fireEvent.touchMove(scroller, touches(286));
       expect(wheel).toHaveBeenCalledTimes(1);

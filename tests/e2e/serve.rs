@@ -2517,8 +2517,8 @@ fn migration_contention_does_not_block_runtime_publication() {
     mutation
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    let body = r#"{"color":"red"}"#;
-    write!(mutation, "PATCH /api/sessions/{id}/color HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    let body = r#"{"pinned":true}"#;
+    write!(mutation, "PATCH /api/sessions/{id}/pin HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let waiting = std::fs::read_dir(format!("/proc/{pid}/fd"))
@@ -2557,10 +2557,7 @@ fn migration_contention_does_not_block_runtime_publication() {
         .contains("aoe-runtime-revision:"));
     let rows: Vec<serde_json::Value> =
         serde_json::from_slice(&std::fs::read(rows_path).unwrap()).unwrap();
-    assert_eq!(
-        rows.iter().find(|row| row["id"] == id).unwrap()["color"],
-        "red"
-    );
+    assert!(rows.iter().find(|row| row["id"] == id).unwrap()["pinned_at"].is_string());
 }
 
 #[cfg(unix)]

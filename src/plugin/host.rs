@@ -1174,44 +1174,44 @@ async fn serve_connection(
             &mut lane_queue
         };
         queue.push_back(Box::pin(async move {
-            let outcome = work
-                .run("plugin.rpc", async move {
-                    #[cfg(test)]
-                    if method == TEST_HOLD_METHOD {
-                        TEST_HOLD.acquire().await.unwrap().forget();
-                        return Ok(serde_json::json!({ "held": true }));
-                    }
-                    if crate::plugin::session_api::handles(&method) {
-                        match invocation_deps {
-                            Some(deps) => {
-                                Box::pin(crate::plugin::session_api::dispatch(
-                                    &deps,
-                                    &invocation_ctx,
-                                    &method,
-                                    &params,
-                                ))
-                                .await
-                            }
-                            None => {
-                                let unavailable = crate::plugin::host_api::DispatchError::with_kind(
-                                    codes::SERVICE_UNAVAILABLE,
-                                    "service_unavailable",
-                                    "session service is not available in this host",
-                                );
-                                match crate::plugin::session_api::required_capability(&method) {
-                                    Some(cap) => invocation_ctx.require(cap).and(Err(unavailable)),
-                                    None => Err(unavailable),
-                                }
+            // Bound the dispatch future before it crosses the supervised work wrappers.
+            let invocation = Box::pin(async move {
+                #[cfg(test)]
+                if method == TEST_HOLD_METHOD {
+                    TEST_HOLD.acquire().await.unwrap().forget();
+                    return Ok(serde_json::json!({ "held": true }));
+                }
+                if crate::plugin::session_api::handles(&method) {
+                    match invocation_deps {
+                        Some(deps) => {
+                            crate::plugin::session_api::dispatch(
+                                &deps,
+                                &invocation_ctx,
+                                &method,
+                                &params,
+                            )
+                            .await
+                        }
+                        None => {
+                            let unavailable = crate::plugin::host_api::DispatchError::with_kind(
+                                codes::SERVICE_UNAVAILABLE,
+                                "service_unavailable",
+                                "session service is not available in this host",
+                            );
+                            match crate::plugin::session_api::required_capability(&method) {
+                                Some(cap) => invocation_ctx.require(cap).and(Err(unavailable)),
+                                None => Err(unavailable),
                             }
                         }
-                    } else {
-                        #[cfg(test)]
-                        let _lane = {
-                            let probe = LaneProbe::enter();
-                            tokio::task::yield_now().await;
-                            probe
-                        };
-                        tokio::task::spawn_blocking(move || {
+                    }
+                } else {
+                    #[cfg(test)]
+                    let _lane = {
+                        let probe = LaneProbe::enter();
+                        tokio::task::yield_now().await;
+                        probe
+                    };
+                    tokio::task::spawn_blocking(move || {
                         dispatch(&invocation_api, &invocation_ctx, &method, &params)
                     })
                     .await
@@ -1221,9 +1221,9 @@ async fn serve_connection(
                             "host dispatch task failed",
                         ))
                     })
-                    }
-                })
-                .await;
+                }
+            });
+            let outcome = work.run("plugin.rpc", invocation).await;
             let outcome = match outcome {
                 Ok(outcome) => outcome,
                 Err(crate::server::runtime::RuntimeWorkError::ShuttingDown) => {

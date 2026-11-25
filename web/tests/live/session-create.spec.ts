@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { Locator, Page } from "@playwright/test";
-import { test, expect, type ServeHandle } from "../helpers/liveTest";
+import { bootDashboard, test, expect, type ServeHandle } from "../helpers/liveTest";
 import {
   listSessions,
   resolveAoeBinary,
@@ -200,6 +200,26 @@ test.describe("scratch sessions", () => {
       page.getByRole("option", { name: /New session/i }).filter({ hasNotText: "Opens settings" }),
     ).toHaveCount(0);
   });
+});
+
+// #5910: a page load of /settings/* under a passphrase redirects to /login, so the link must route in the app.
+test("the wizard's Worktree settings link lands on Settings › Worktree with a passphrase set", async ({
+  servePreauthed,
+  page,
+}) => {
+  await bootDashboard(page, servePreauthed);
+  await page.getByRole("button", { name: "New session", exact: true }).first().click();
+  const wizard = page.getByTestId("session-wizard");
+  await pickScratch(wizard);
+  await wizard.getByRole("button", { name: "What's a worktree?" }).click();
+  await page
+    .getByRole("dialog", { name: "What's a worktree?" })
+    .getByRole("link", { name: "Worktree settings ›" })
+    .click();
+  await expect(wizard).toHaveCount(0);
+  await expect(page).toHaveURL(/\/settings\/worktree$/);
+  await expect(page.getByRole("heading", { name: "Worktree" }).first()).toBeVisible();
+  await expect(page.locator("input#passphrase")).toHaveCount(0);
 });
 
 test("search surfaces a session by its conversation content", async ({ spawnServe }) => {

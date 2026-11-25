@@ -1,0 +1,14 @@
+{
+  "name": "OS-specific behavior lives in src/process/{macos,linux}.rs",
+  "instruction": "New macOS-only or Linux-only behavior is implemented in src/process/macos.rs or src/process/linux.rs and called through a platform-neutral function, not inlined elsewhere.",
+  "relevant_when": "A Rust patch adds #[cfg(target_os = \"macos\")], #[cfg(target_os = \"linux\")], cfg!(target_os = ...), or a call to an API that exists on only one of those systems (for example /proc reads, SO_PEERCRED or LOCAL_PEERCRED, launchctl, systemctl or systemd-run, pbcopy, libproc), in a file other than src/process/macos.rs and src/process/linux.rs.",
+  "context": "AGENTS.md: keep OS-specific behavior in src/process/{macos,linux}.rs, so platform differences stay in one place and callers stay portable. Not violations: the module declarations and dispatch in src/process/mod.rs that select macos.rs or linux.rs; migrations in src/migrations/, which docs/development/adding-a-migration.md requires to gate with #[cfg(target_os = ...)]; cfg attributes that only gate a test or test helper to the platform whose behavior it exercises; and a type-width shim, a pair of target_os gates whose branches only cast or convert a libc or FFI value whose type differs by platform (for example #[cfg(target_os = \"macos\")] let device = stat.st_dev as u64; with #[cfg(not(target_os = \"macos\"))] let device = stat.st_dev;) while every branch does the same thing. A gate that calls a different API, takes a different code path or changes behavior on one platform is still in scope anywhere in src/.",
+  "scope": "diff",
+  "scope_reason": "Many files already contain target_os gates from before the rule, so only gates and platform calls a change adds are judged.",
+  "checklist": [
+    {
+      "name": "no-new-inline-os-branch",
+      "rule": "No added non-test code outside src/process/macos.rs, src/process/linux.rs and the src/process/mod.rs dispatch introduces a target_os gate or a single-OS API call to implement behavior. Not applicable for src/migrations/ files, for gates on #[test] functions or test-only helpers, and for type-width shims whose branches only cast or convert a platform-typed libc or FFI value and otherwise do the same thing."
+    }
+  ]
+}

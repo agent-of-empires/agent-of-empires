@@ -871,6 +871,20 @@ pub(crate) async fn trigger_resume_background(
     origin: LaunchOrigin,
     reservation: Option<crate::acp::supervisor::ResumeReservation>,
 ) -> Result<ResumeTrigger, SupervisorError> {
+    trigger_resume_observing(service, id, authority, origin, reservation, None, None).await
+}
+
+/// [`trigger_resume_background`] admitting against a stop intent the caller already
+/// observed (`Some`), so a newer stop is refused instead of cleared.
+pub(crate) async fn trigger_resume_observing(
+    service: &Arc<SessionService>,
+    id: &str,
+    authority: crate::process::worker_registry::ResumeAuthority,
+    origin: LaunchOrigin,
+    reservation: Option<crate::acp::supervisor::ResumeReservation>,
+    observed_stop: Option<Option<crate::process::worker_registry::StopIntent>>,
+    stop_refused: Option<tokio::sync::oneshot::Sender<SupervisorError>>,
+) -> Result<ResumeTrigger, SupervisorError> {
     if service
         .instances
         .read()
@@ -929,7 +943,7 @@ pub(crate) async fn trigger_resume_background(
             };
             match service
                 .acp_supervisor
-                .begin_resume(id, kind, authority)
+                .begin_resume_observing(id, kind, authority, observed_stop)
                 .await?
             {
                 Some(reservation) => reservation,
@@ -957,9 +971,17 @@ pub(crate) async fn trigger_resume_background(
                 .await
                 .map_err(|_| SupervisorError::Acp(crate::acp::acp_client::AcpError::AttachTimedOut))
                 .and_then(|result| result);
-                if let Err(error) = attached {
-                    tracing::warn!(target: "acp.supervisor", session = %target.id, %error,
-                        "explicit input could not attach the retained actor; preserving its owner");
+                match attached {
+                    Err(error @ SupervisorError::StopSuperseded(_)) => {
+                        if let Some(reply) = stop_refused {
+                            let _ = reply.send(error);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(target: "acp.supervisor", session = %target.id, %error,
+                            "explicit input could not attach the retained actor; preserving its owner");
+                    }
+                    Ok(()) => {}
                 }
                 return;
             }
@@ -979,6 +1001,11 @@ pub(crate) async fn trigger_resume_background(
                 // parked session. Same exemption `resume_one` makes.
                 Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::RateLimited(_)))
                 | Ok(()) => {}
+                Err(error @ SupervisorError::StopSuperseded(_)) => {
+                    if let Some(reply) = stop_refused {
+                        let _ = reply.send(error);
+                    }
+                }
                 Err(e) => report_spawn_failure(&service, &target, &agent, &e).await,
             }
         },

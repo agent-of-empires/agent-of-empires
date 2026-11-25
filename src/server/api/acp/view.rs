@@ -702,15 +702,11 @@ fn switch_unavailable(error: &anyhow::Error, message: &'static str) -> Response 
 const CHECK_UNAVAILABLE: &str = "Couldn't check the switch to Terminal view; retry shortly";
 const SWITCH_UNAVAILABLE: &str = "Couldn't start the switch to Terminal view; retry shortly";
 const COMMAND_SELECTOR_CONFLICT: &str = "This Session's command picks a conversation with its own session flag, and AoE holds one for it too; remove the session flag from its command or arguments to switch";
-/// Ends a handoff owed from before the refusal above: its launch can never start. Clearing AoE's
-/// id is a way out only here, in Terminal view; Structured view refuses that clear.
-fn command_selector_ended(session_id: &str) -> String {
-    Instance::handoff_refused(session_id)
-}
-
-/// A handoff whose launch the command's own session selector refused; it ended in Terminal view.
+/// A handoff owed from before the refusal above, whose launch the command's own session selector
+/// refused; it ended in Terminal view. Clearing AoE's id is a way out only there; Structured view
+/// refuses that clear.
 #[derive(Debug, thiserror::Error)]
-#[error("{}", command_selector_ended(.0))]
+#[error("{}", Instance::handoff_refused(.0))]
 struct CommandSelectorEnded(String);
 
 /// A coded refusal, so a client can show the matching dialog state. The body
@@ -2201,7 +2197,7 @@ fn drive_terminal_handoff(
                             // replaced, never on disk.
                             current.terminal_handoff = None;
                             current.status = Status::Error;
-                            current.last_error.set(command_selector_ended(&cleanup_id));
+                            current.last_error.set(Instance::handoff_refused(&cleanup_id));
                             if let Err(error) = native.adopt_runtime_fields(&current) {
                                 tracing::warn!(target: "acp.switch", session = %cleanup_id, %error, "ended handoff's remedy not published");
                             }
@@ -6468,7 +6464,7 @@ mod tests {
                 );
                 assert_eq!(
                     std::str::from_utf8(&body)?,
-                    command_selector_ended(&held.id)
+                    Instance::handoff_refused(&held.id)
                 );
             } else {
                 // So does the daemon's own recovery, which has no request to answer.
@@ -6504,7 +6500,7 @@ mod tests {
                 // The ended switch is in Terminal view, so a retry just reports that.
                 assert_eq!(switch().await.into_response().status(), StatusCode::OK);
             } else {
-                let ended = command_selector_ended(&held.id);
+                let ended = Instance::handoff_refused(&held.id);
                 assert_eq!(cached.last_error.as_deref(), Some(ended.as_str()));
                 // Either way out drops the ended text's remedy on the next poll; until then the
                 // poll keeps it as written, without naming the remedy twice.

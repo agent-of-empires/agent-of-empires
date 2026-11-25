@@ -210,63 +210,6 @@ test.describe("Sidebar multi-session (#956)", () => {
     await expect(row.getByTestId("sidebar-session-row-tag")).toHaveCount(0);
   });
 
-  test("project group context menu opens from the keyboard and stores alias and background color", async ({ page }) => {
-    await mockApis(page, [
-      {
-        id: "sess-a",
-        title: "Ethiopians",
-        project_path: "/tmp/agent-of-empires",
-        branch: null,
-      },
-      {
-        id: "sess-b",
-        title: "Celts",
-        project_path: "/tmp/other-repo",
-        branch: null,
-      },
-    ]);
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
-
-    const projectHeader = page.locator('[data-testid="sidebar-group-header"][data-group-id="/tmp/agent-of-empires"]');
-    await expect(projectHeader).toBeVisible();
-
-    // The appearance menu opens from the keyboard too.
-    await projectHeader.locator("button[aria-expanded]").focus();
-    await page.keyboard.press("Shift+F10");
-    const menu = page.locator("[data-testid='sidebar-group-context-menu']");
-    await expect(menu).toBeVisible();
-    await menu.locator("[data-testid='sidebar-group-context-menu-rename']").click();
-
-    const input = page.locator("[data-testid='sidebar-group-rename-input']");
-    // Rename sends focus to its input rather than back to the header button.
-    await expect(input).toBeFocused();
-    await input.fill("Client Alpha");
-    await input.press("Enter");
-    await expect(projectHeader.getByText("Client Alpha")).toBeVisible();
-
-    await page.getByLabel("Filter sessions").click();
-    const filter = page.locator("[data-testid='sidebar-filter-input']");
-    await filter.fill("client alpha");
-    await expect(page.locator("[data-testid='sidebar-group-header']")).toHaveCount(1);
-    await filter.fill("");
-
-    await projectHeader.click({ button: "right" });
-    await page.locator("[data-testid='sidebar-group-color-amber']").click();
-    await expect(projectHeader).toHaveAttribute("style", /color-mix/);
-
-    const stored = await page.evaluate(() => window.localStorage.getItem("aoe-repo-appearance-v1"));
-    expect(JSON.parse(stored ?? "{}")).toMatchObject({
-      "/tmp/agent-of-empires": { alias: "Client Alpha", color: "amber" },
-    });
-
-    await page.reload();
-    const restoredHeader = page.locator('[data-testid="sidebar-group-header"][data-group-id="/tmp/agent-of-empires"]');
-    await expect(restoredHeader.getByText("Client Alpha")).toBeVisible();
-    await expect(restoredHeader).toHaveAttribute("style", /color-mix/);
-  });
-
   test("project group context menu archives every active session", async ({ page }) => {
     await mockApis(page, [
       {

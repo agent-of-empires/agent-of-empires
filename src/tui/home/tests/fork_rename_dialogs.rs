@@ -257,6 +257,63 @@ fn fork_from_selection_structured_parent_seeds_structured_fork() {
     );
 }
 
+/// A custom agent that declares a forking execution contract forks its structured
+/// parent structured even when new sessions open in the terminal view: a terminal
+/// child would carry the parent's ACP id without the `session/fork` handshake.
+#[test]
+#[serial]
+fn fork_from_selection_keeps_a_custom_structured_parent_structured_under_a_terminal_default() {
+    let mut env = create_test_env_empty();
+    crate::session::config::update_config(|config| {
+        config.acp.structured_view = crate::session::config::StructuredView::Terminal;
+        let session = &mut config.session;
+        session
+            .agent_acp_cmd
+            .insert("claude-acct".into(), "/state/wrappers/acct-acp.sh".into());
+        session
+            .agent_execution_as
+            .insert("claude-acct".into(), "claude".into());
+        session
+            .agent_config_dir
+            .insert("claude-acct".into(), "~/.claude-acct".into());
+    })
+    .unwrap();
+    // The parent lives in another profile than the view's.
+    crate::session::create_profile("personal").unwrap();
+    let mut inst = Instance::new("parent", "/tmp/repo");
+    inst.source_profile = "personal".to_string();
+    inst.tool = "claude-acct".into();
+    inst.view = crate::session::View::Structured;
+    inst.acp_session_id = Some("acp-parent-custom".into());
+    let parent_profile = inst.effective_profile();
+    let id = inst.id.clone();
+    env.view.add_instance(inst);
+    env.view.selected_session = Some(id);
+
+    env.view.open_fork_from_selection();
+
+    let dialog = env
+        .view
+        .new_dialog
+        .as_ref()
+        .expect("fork opens the new-session dialog for a custom structured parent");
+    assert_eq!(
+        dialog.fork_seed().cloned(),
+        Some(crate::session::ForkSeed::Structured {
+            parent_acp_session_id: "acp-parent-custom".into(),
+        })
+    );
+    assert!(
+        dialog.structured_value(),
+        "the fork opens structured whatever the default view"
+    );
+    assert_eq!(
+        dialog.profile_value(),
+        parent_profile,
+        "the fork opens in its parent's profile"
+    );
+}
+
 /// Context-menu Snooze mirrors the Attention-gated `h` key: on an active session it opens
 /// the duration picker, on a snoozed one it submits the wake to the daemon.
 #[test]

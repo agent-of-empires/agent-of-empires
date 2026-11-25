@@ -1266,7 +1266,7 @@ fn successful_native_send_preserves_shelving_committed_after_final_enter_ack() {
                 row.status = Status::Idle;
                 row.lifecycle_generation = 7;
                 row.last_accessed_at =
-                    Some(crate::time::Timestamp::now() - crate::time::Duration::hours(1));
+                    Some(crate::time::Timestamp::now() - crate::time::Duration::seconds(3600));
                 Ok(())
             })
             .unwrap();
@@ -2221,6 +2221,24 @@ fn native_preparation_waits_for_its_receipt_and_lifecycle_generation() {
         ),
         (
             "Running",
+            PanePresence::Alive,
+            5,
+            Some("restarted-agent"),
+            "test",
+            true,
+            false,
+        ),
+        (
+            "Running",
+            PanePresence::Alive,
+            4,
+            Some("prepared-agent"),
+            "test",
+            false,
+            true,
+        ),
+        (
+            "Unknown",
             PanePresence::Alive,
             4,
             Some("prepared-agent"),

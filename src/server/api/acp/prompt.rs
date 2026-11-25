@@ -48,6 +48,17 @@ fn resume_failed_response(err: &SupervisorError) -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
 }
 
+/// A newer stop refused the start this prompt asked for. Unlike `worker_not_ready` it is
+/// not retryable: queueing the prompt would deliver it after a later start.
+fn stop_fenced_refused() -> Response {
+    (
+        StatusCode::CONFLICT,
+        crate::daemon::ApiErrorCode::ResumeFailed.header(),
+        "stop_fenced: the session was stopped again; start it to send this message",
+    )
+        .into_response()
+}
+
 fn worker_not_ready() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
 }
@@ -177,6 +188,7 @@ pub async fn acp_prompt(
         Err(PromptSubmitError::Ignored) => ignored_refused(),
         Err(PromptSubmitError::Attachments(code, msg))
         | Err(PromptSubmitError::Enqueue(code, msg)) => (code, msg).into_response(),
+        Err(PromptSubmitError::StopFenced) => stop_fenced_refused(),
         Err(PromptSubmitError::QueuedPromptGone) => queued_prompt_gone(),
         Err(PromptSubmitError::QueuedPromptChanged) => queued_prompt_changed(),
         Err(PromptSubmitError::QueuedAttachmentsMissing) => queued_attachments_missing(),
@@ -258,6 +270,9 @@ pub(crate) enum PromptSubmitError {
     QueuedPromptGone,
     QueuedPromptChanged,
     QueuedAttachmentsMissing,
+    /// A foreground prompt's start was refused because a newer stop won (409); the prompt
+    /// was neither sent nor queued.
+    StopFenced,
     /// The dispatch chose the queue, or the prompt was held for the login or a failed hook,
     /// and the enqueue was refused, e.g. a full queue (429).
     Enqueue(StatusCode, String),
@@ -293,45 +308,6 @@ pub(crate) async fn submit_prompt(
     else {
         return Err(PromptSubmitError::SessionNotFound);
     };
-    let touch = if req.refuse_if_ignored {
-        state
-            .session_service
-            .touch_and_wake_on_prompt_refusing_ignored(id, req.no_revive)
-            .await
-    } else {
-        state
-            .session_service
-            .touch_and_wake_on_prompt(id, req.no_revive)
-            .await
-    };
-    let (woke_idle_dormant, resume_reservation) = match touch {
-        PromptTouch::Touched {
-            idle_dormant,
-            resume_reservation,
-        } => (idle_dormant, resume_reservation),
-        PromptTouch::Establishment(refusal) => {
-            return Err(PromptSubmitError::Turn(SendTurnError::ResumeFailed(
-                refusal.into(),
-            )));
-        }
-        PromptTouch::AdmissionRefused(response) => {
-            return Err(PromptSubmitError::AdmissionRefused(response))
-        }
-        PromptTouch::Unavailable(unavailability) => {
-            return Err(PromptSubmitError::Turn(SendTurnError::Unavailable(
-                unavailability,
-            )));
-        }
-        PromptTouch::RevivalRefused => return Err(PromptSubmitError::RevivalRefused),
-        PromptTouch::WorkerNotReady => return Err(PromptSubmitError::WorkerNotReady),
-        PromptTouch::ControlStateUnavailable => {
-            return Err(PromptSubmitError::Turn(
-                SendTurnError::ControlStateUnavailable,
-            ))
-        }
-        PromptTouch::Blocked(blocked) => return Err(PromptSubmitError::Blocked(blocked)),
-        PromptTouch::Ignored => return Err(PromptSubmitError::Ignored),
-    };
     // Validated before publishing or resuming, so a rejected prompt leaves no
     // trace in the transcript and spawns no worker.
     // A named queue row is delivered with its stored bytes, so request uploads are not read.
@@ -366,6 +342,51 @@ pub(crate) async fn submit_prompt(
     }
     let origin_plugin = queued_row.as_ref().and_then(|r| r.origin_plugin.clone());
     let origin = queued_row.as_ref().map_or(req.origin, |r| r.origin);
+    let allow_explicit_stop = matches!(caller, SessionCaller::User)
+        && queued_row.is_none()
+        && matches!(
+            req.origin,
+            crate::daemon::PromptOrigin::Dashboard
+                | crate::daemon::PromptOrigin::Tui
+                | crate::daemon::PromptOrigin::Cli
+        );
+    let touch = state
+        .session_service
+        .touch_and_wake_on_prompt_with(
+            id,
+            req.no_revive,
+            req.refuse_if_ignored,
+            allow_explicit_stop,
+        )
+        .await;
+    let (woke_idle_dormant, resume_reservation) = match touch {
+        PromptTouch::Touched {
+            idle_dormant,
+            resume_reservation,
+        } => (idle_dormant, resume_reservation),
+        PromptTouch::AdmissionRefused(response) => {
+            return Err(PromptSubmitError::AdmissionRefused(response))
+        }
+        PromptTouch::Unavailable(unavailability) => {
+            return Err(PromptSubmitError::Turn(SendTurnError::Unavailable(
+                unavailability,
+            )));
+        }
+        PromptTouch::Establishment(refusal) => {
+            return Err(PromptSubmitError::Turn(SendTurnError::ResumeFailed(
+                refusal.into(),
+            )));
+        }
+        PromptTouch::ControlStateUnavailable => {
+            return Err(PromptSubmitError::Turn(
+                SendTurnError::ControlStateUnavailable,
+            ));
+        }
+        PromptTouch::RevivalRefused => return Err(PromptSubmitError::RevivalRefused),
+        PromptTouch::WorkerNotReady => return Err(PromptSubmitError::WorkerNotReady),
+        PromptTouch::Blocked(blocked) => return Err(PromptSubmitError::Blocked(blocked)),
+        PromptTouch::Ignored => return Err(PromptSubmitError::Ignored),
+    };
     // Decided under the guard so the decision and its dispatch are atomic
     // (#3621). The wake already cleared the dormant marker, hence the flag.
     let dispatch = state
@@ -378,6 +399,31 @@ pub(crate) async fn submit_prompt(
             unavailability,
         )));
     }
+    // A prompt typed on a foreground surface to a stop-fenced session starts it like an
+    // idle wake. The resume admits against this observed intent, so a newer stop wins and
+    // refuses the prompt. MCP, plugin and automated prompts keep waiting behind the fence.
+    // A foreground decision that did not observe a stop cannot clear a later one.
+    let mut observed_stop = allow_explicit_stop.then_some(None);
+    let dispatch = if !req.no_revive
+        && allow_explicit_stop
+        && matches!(
+            dispatch,
+            PromptDispatch::Queued {
+                reason: QueueReason::WorkerDown
+            }
+        ) {
+        match crate::process::worker_registry::stop_intent(id) {
+            Ok(Some(intent)) => {
+                observed_stop = Some(Some(intent));
+                PromptDispatch::Sent
+            }
+            Ok(None) => dispatch,
+            // Keep the observed absence so an unreadable fence still refuses admission.
+            Err(_) => PromptDispatch::Sent,
+        }
+    } else {
+        dispatch
+    };
     // Refused before touching the pending-turn/queue state below, so a
     // rejected prompt leaves both untouched (#4081 review).
     if req.no_revive
@@ -483,12 +529,16 @@ pub(crate) async fn submit_prompt(
     };
     let outcome = state
         .session_service
-        .send_turn(
+        .send_turn_observing(
             caller,
             id,
             SendTurnRequest {
                 resume_reservation,
-                resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit,
+                resume_authority: if allow_explicit_stop {
+                    crate::process::worker_registry::ResumeAuthority::Explicit
+                } else {
+                    crate::process::worker_registry::ResumeAuthority::Automatic
+                },
                 text: req.text,
                 attachments: &attachments,
                 woke_idle_dormant,
@@ -505,6 +555,7 @@ pub(crate) async fn submit_prompt(
                 origin,
                 no_revive: req.no_revive,
             },
+            observed_stop.clone(),
         )
         .await;
     // A fresh prompt supersedes a queued rate-limit continuation (#3028),
@@ -532,6 +583,10 @@ pub(crate) async fn submit_prompt(
             return Err(PromptSubmitError::LoginRequired { blocked, queued_id });
         }
         Err(SendTurnError::HookFailed(message)) => {
+            // The hook failure returns before admission: apply its newer-stop rule here.
+            if stop_moved_past(id, observed_stop.as_ref()) {
+                return Err(PromptSubmitError::StopFenced);
+            }
             let queued_id = keep_held_prompt(
                 state,
                 id,
@@ -543,6 +598,10 @@ pub(crate) async fn submit_prompt(
             )
             .await?;
             return Err(PromptSubmitError::HookFailed { message, queued_id });
+        }
+        // Admission refused the start because a newer stop won the race.
+        Err(SendTurnError::ResumeFailed(SupervisorError::StopSuperseded(_))) => {
+            return Err(PromptSubmitError::StopFenced);
         }
         Err(e) => return Err(PromptSubmitError::Turn(e)),
     };
@@ -568,6 +627,21 @@ pub(crate) async fn submit_prompt(
         queued_id: None,
         seq,
     })
+}
+
+/// Whether a stop other than the one a promoted prompt observed is now in force, the
+/// condition under which admission refuses its start. An unreadable intent counts.
+fn stop_moved_past(
+    id: &str,
+    observed: Option<&Option<crate::process::worker_registry::StopIntent>>,
+) -> bool {
+    let Some(observed) = observed else {
+        return false;
+    };
+    match crate::process::worker_registry::stop_intent(id) {
+        Ok(current) => current.is_some() && &current != observed,
+        Err(_) => true,
+    }
 }
 
 /// Keep a prompt the send held back (login missing, hook failed) in the queue and return

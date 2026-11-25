@@ -203,26 +203,26 @@ pub async fn ensure_session(
 pub(crate) fn ready_agent_session_for_automatic_input(
     instance: &Instance,
 ) -> anyhow::Result<Option<String>> {
-    agent_session_in_pane(instance, false)
+    Ok(ready_agent_target_for_automatic_input(instance)?.map(|(name, _)| name))
 }
 
-/// [`ready_agent_session_for_automatic_input`], as the `#{pane_id}` the check
-/// saw, so a later capture and send address that pane and no other.
-pub(crate) fn ready_agent_pane_for_automatic_input(
+pub(crate) fn ready_agent_target_for_automatic_input(
     instance: &Instance,
-) -> anyhow::Result<Option<String>> {
-    Ok(agent_pane_in(instance, false)?.map(|(_, pane_id)| pane_id))
-}
-
-fn agent_session_in_pane(
-    instance: &Instance,
-    trust_hook_status: bool,
-) -> anyhow::Result<Option<String>> {
-    Ok(agent_pane_in(instance, trust_hook_status)?.map(|(name, _)| name))
+) -> anyhow::Result<Option<(String, Arc<crate::session::LegacyToolObservation>)>> {
+    Ok(observe_agent_target(instance, false)?
+        .filter(|(_, _, ready)| *ready)
+        .map(|(name, physical, _)| (name, physical)))
 }
 
 pub(super) fn physical_agent_target(
     instance: &Instance,
+) -> anyhow::Result<Option<(String, Arc<crate::session::LegacyToolObservation>, bool)>> {
+    observe_agent_target(instance, true)
+}
+
+fn observe_agent_target(
+    instance: &Instance,
+    trust_hook_status: bool,
 ) -> anyhow::Result<Option<(String, Arc<crate::session::LegacyToolObservation>, bool)>> {
     let panes = crate::tmux::batch_pane_metadata()?;
     let Some((name, pane)) =
@@ -233,27 +233,11 @@ pub(super) fn physical_agent_target(
     if pane.pane_dead {
         return Ok(None);
     }
-    let ready = instance.pane_is_ready(pane, true)?;
+    let ready = instance.pane_is_ready(pane, trust_hook_status)?;
     let physical = pane
         .physical_observation()
         .ok_or(crate::session::LaunchIndeterminateCause::OwnershipUnproven)?;
     Ok(Some((name.to_owned(), physical, ready)))
-}
-
-fn agent_pane_in(
-    instance: &Instance,
-    trust_hook_status: bool,
-) -> anyhow::Result<Option<(String, String)>> {
-    let panes = crate::tmux::batch_pane_metadata()?;
-    let Some((name, pane)) =
-        crate::tmux::agent_pane_metadata_in(&panes, &instance.id, &instance.title)?
-    else {
-        return Ok(None);
-    };
-    if !instance.pane_is_ready(pane, trust_hook_status)? {
-        return Ok(None);
-    }
-    Ok(Some((name.to_owned(), pane.pane_id.clone())))
 }
 
 #[derive(Debug, thiserror::Error)]

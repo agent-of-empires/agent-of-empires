@@ -551,9 +551,10 @@ impl AcpTranscript {
 mod tests {
     use super::*;
     use crate::acp::approvals::{Approval, Nonce};
-    use crate::acp::event_sender::EventMetadata;
+    use crate::acp::elicitations::Elicitation;
+    use crate::acp::event_sender::{EventMetadata, EventScope};
     use crate::acp::state::{
-        AcpSessionId, AgentName, AuthStatusKind, Event, ThinkingSignal, ToolCall,
+        AcpSessionId, AgentName, AuthStatusKind, Event, Plan, PlanStep, ThinkingSignal, ToolCall,
     };
     use crate::acp::transcript::{TranscriptModel, TranscriptRowKind};
     use crate::time::Timestamp;
@@ -587,7 +588,10 @@ mod tests {
             AgentName("claude".into()),
             Some("claude-opus-5".into()),
         );
-        let metadata = EventMetadata::history();
+        let metadata = EventMetadata {
+            scope: EventScope::SessionCurrent,
+            ..EventMetadata::history()
+        };
         for event in events {
             state
                 .apply_scoped_event(state.last_seq.saturating_add(1), event, &metadata)
@@ -626,6 +630,104 @@ mod tests {
             requested_at: Timestamp::now(),
             resolved: None,
         }
+    }
+
+    /// Every control field the view renders comes off the frame verbatim: the
+    /// TUI holds no derivation of its own any more, so a mapping slip here is
+    /// the whole class of bug this tier can still introduce.
+    #[test]
+    fn reduced_state_maps_every_rendered_control_field() {
+        let mut t = AcpTranscript::new("s-1");
+        let mut s = reduced(&[
+            Event::UserPromptSent {
+                merged_prompt_ids: Vec::new(),
+                prompt_id: None,
+                text: "go".into(),
+                attachments: vec![],
+                synthesized: false,
+                origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
+            },
+            Event::PromptCapabilities {
+                steering: true,
+                image: false,
+                audio: false,
+                embedded_context: false,
+                load_session: None,
+            },
+            Event::CancelRequested {
+                escalates_at: Timestamp::now(),
+            },
+            Event::ModesAvailable {
+                current_mode_id: "plan".into(),
+                modes: vec![ModeInfo {
+                    id: "plan".into(),
+                    name: "Plan".into(),
+                    description: None,
+                }],
+            },
+            Event::AvailableCommandsUpdated {
+                commands: vec![AvailableCommand {
+                    name: "review".into(),
+                    description: "Review".into(),
+                    accepts_input: true,
+                    input_hint: None,
+                }],
+            },
+            Event::PlanUpdated {
+                plan: Plan {
+                    plan_id: "p-1".into(),
+                    version: 1,
+                    steps: vec![PlanStep {
+                        id: "s-1".into(),
+                        title: "Step one".into(),
+                        detail: None,
+                        status: PlanStepStatus::InProgress,
+                    }],
+                },
+            },
+            Event::UsageUpdated {
+                usage: SessionUsage {
+                    used: 5_000,
+                    size: 200_000,
+                    cost: None,
+                },
+            },
+        ]);
+        s.pending_approvals = vec![approval("n-1")];
+        s.pending_elicitations = vec![Elicitation {
+            nonce: Nonce("n-2".into()),
+            message: "Which one?".into(),
+            title: None,
+            description: None,
+            tool_call_id: None,
+            questions: Vec::new(),
+            requested_at: Timestamp::now(),
+            resolved: None,
+        }];
+
+        t.apply_reduced_state(9, s, &[]);
+
+        assert_eq!(t.last_seq, 9);
+        assert_eq!(t.agent_name.as_deref(), Some("claude"));
+        assert!(t.turn_active && t.steering && t.cancelling);
+        assert!(!t.compacting);
+        assert_eq!(t.usage.as_ref().map(|u| u.used), Some(5_000));
+        assert_eq!(t.current_mode.as_deref(), Some("plan"));
+        assert_eq!(t.available_modes.len(), 1);
+        assert_eq!(t.available_commands.len(), 1);
+        assert_eq!(t.current_plan.len(), 1);
+        assert_eq!(t.current_plan[0].title, "Step one");
+        // Approvals carry the whole request: the shelf renders from these
+        // fields, since the transcript holds no approval row.
+        assert_eq!(t.pending_approvals.len(), 1);
+        assert_eq!(t.pending_approvals[0].nonce, "n-1");
+        assert_eq!(t.pending_approvals[0].title, "Edit a file");
+        assert_eq!(t.pending_approvals[0].kind, "execute");
+        assert_eq!(t.pending_approvals[0].args, "ls");
+        assert!(t.pending_approvals[0].destructive);
+        assert_eq!(t.pending_elicitations.len(), 1);
+        assert_eq!(t.pending_elicitations[0].message, "Which one?");
     }
 
     /// The banner only shows inside a running turn, so the phases that end

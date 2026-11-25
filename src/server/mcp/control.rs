@@ -978,8 +978,10 @@ async fn prompt_refusal(id: &str, error: PromptSubmitError) -> CallToolResult {
         | PromptSubmitError::Turn(SendTurnError::ModeApplication(e)) => {
             tool_error("send_failed", e.to_string())
         }
-        // Unreachable for a user caller that names no queue row and allows revival.
-        PromptSubmitError::RevivalRefused
+        // Unreachable for a user caller that names no queue row and allows revival, and
+        // `StopFenced` only follows a foreground-origin prompt.
+        PromptSubmitError::StopFenced
+        | PromptSubmitError::RevivalRefused
         | PromptSubmitError::Turn(SendTurnError::RevivalRefused)
         | PromptSubmitError::Turn(SendTurnError::NotOwner)
         | PromptSubmitError::Turn(SendTurnError::LoginRequired(_))

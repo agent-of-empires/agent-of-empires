@@ -330,7 +330,7 @@ pub(crate) async fn resume_rate_limited(
         .info
         .as_ref()
         .and_then(|info| info.resets_at)
-        .unwrap_or_else(crate::time::Timestamp::now);
+        .unwrap_or_else(Timestamp::now);
     if matches!(kind, QuotaResume::Automatic { .. }) {
         let settings = resolve_per_profile([profile.clone()].into_iter(), |config| {
             (
@@ -360,14 +360,11 @@ pub(crate) async fn resume_rate_limited(
         };
         resume_at =
             reported.unwrap_or_else(|| scheduled_resume_at(&info, park.recorded_at_ms, streak));
-        if let Some(attempt) = park
-            .last_resume_attempt_ms
-            .and_then(crate::time::Timestamp::from_millis)
-        {
+        if let Some(attempt) = park.last_resume_attempt_ms.and_then(Timestamp::from_millis) {
             resume_at =
                 resume_at.max(attempt + crate::time::Duration::seconds(RATE_LIMIT_MIN_PARK_SECS));
         }
-        if crate::time::Timestamp::now() < resume_at {
+        if Timestamp::now() < resume_at {
             return Ok(());
         }
         if streak >= RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES {
@@ -476,7 +473,7 @@ pub(crate) async fn resume_rate_limited(
         )
     {
         if manual && park.cap_reached {
-            resume_at = crate::time::Timestamp::now();
+            resume_at = Timestamp::now();
         }
         state
             .acp_supervisor

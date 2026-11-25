@@ -1,0 +1,14 @@
+{
+  "name": "Daemon API contract changes update the API reference",
+  "instruction": "A patch that changes the Daemon's public HTTP or MCP contract updates the doc page that owns that contract in the same patch.",
+  "relevant_when": "A patch under src/server/ or src/daemon/error.rs adds or removes a route, returns a new response status or AoE-Error-Code value to clients, adds, renames or removes a field or enum value of a JSON request or response body, adds an MCP tool or a new value of an MCP result field, or changes a client-visible limit or timeout such as a size cap or wait duration.",
+  "context": "AGENTS.md: update the documentation a change makes materially wrong or incomplete in the same PR, and Clients tell refusals apart by status and AoE-Error-Code. docs/api.md is the canonical HTTP and MCP reference, docs/plugin-api.md owns the plugin contract, and docs/development/internals/structured-view.md lists the ACP restart and view-switch refusals. Not in scope: internal refactors that keep the wire shape, logging or telemetry changes, test-only changes, and a refusal that reuses a status and error code pair the patch shows is already documented.",
+  "scope": "diff",
+  "scope_reason": "The rule pairs a server change with a companion docs change, which only the change's patch set shows together.",
+  "checklist": [
+    {
+      "name": "contract-change-documented",
+      "rule": "For each contract change described in relevant_when, the patch also changes docs/api.md, docs/plugin-api.md or docs/development/internals/structured-view.md so that the new or changed route, status, error code, field, value or limit is described. Not applicable when the patch makes no such contract change."
+    }
+  ]
+}

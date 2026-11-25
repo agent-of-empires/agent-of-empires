@@ -183,8 +183,8 @@ pub(crate) async fn project_sessions(
         )
         .await;
 
-    // Overlay custom-agent ACP capability; built-ins were resolved in the
-    // constructor. Distinct `(profile, project_path)` pairs resolve once via
+    // Overlay custom-agent ACP and fork capability; built-ins were resolved in
+    // the constructor. Distinct `(profile, project_path)` pairs resolve once via
     // the shared cache.
     for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
         if !resp.acp_capable {
@@ -199,6 +199,8 @@ pub(crate) async fn project_sessions(
                 .filter(|name| !name.is_empty())
                 .unwrap_or(&inst.tool);
             resp.acp_capable = custom_agent_acp_capable(cfg, agent_key);
+            resp.acp_can_fork =
+                crate::session::fork::custom_structured_fork_capable(agent_key, None, cfg);
         }
         // The solo commands of the agent that classifies this session's prompts, resolved as the
         // queue and publication resolve it, so a custom agent's declared reset is advertised.
@@ -946,7 +948,6 @@ mod workspace_ordering_tests {
             monitor_description: None,
             favorited: false,
             favorited_at: None,
-            color: None,
             urgent: false,
             pinned_at: None,
             archived_at: None,
