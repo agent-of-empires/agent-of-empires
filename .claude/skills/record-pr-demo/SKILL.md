@@ -48,7 +48,7 @@ Make small git repos under `$DEMO/projects/` so sessions fall into real groups, 
 
 ```sh
 aoe add -t shell-urls -g web-shop --tool shell -l .
-aoe add -t claude-agent -g web-shop --tool claude -l --prompt '<one tiny prompt>' .
+aoe add -t claude-agent -g web-shop --tool claude -l --structured-view --prompt '<one tiny prompt>' .
 ```
 
 Use `--tool shell` for anything scripted; use one real agent session where the PR touches agent views, and keep its prompt tiny (it may ignore `--model`). Done when every session the clips need shows in `aoe list` and its tmux pane holds the state you will film.
@@ -73,7 +73,7 @@ nohup ttyd --port 7683 --interface 127.0.0.1 --cwd "$DEMO/projects/<scene>" -c d
 echo $! > "$DEMO/ttyd.pid"
 ```
 
-In the clip script: `launch()`, `await context.setHTTPCredentials({ username: "demo", password: process.env.TTYD_PW })`, `page.goto("http://127.0.0.1:7683")`, click `.xterm`, then `page.keyboard.press`. Set `AOE_DEMO_TOKEN=-` (no dashboard token). Assert on `document.body.innerText` before each key. Traps are in [`TECHNIQUES.md`](TECHNIQUES.md#tui-clips-ttyd). For scripted e2e tests, `RECORD_E2E=1` records asciinema casts that `agg` converts; both must be on `PATH` (`tests/e2e/harness.rs`).
+In the clip script: `const h = await launch("<clip>")` (the name also goes to `finish(h, "<clip>")` at the end), `await h.context.setHTTPCredentials({ username: "demo", password: process.env.TTYD_PW })`, `h.page.goto("http://127.0.0.1:7683")`, click `.xterm`, then `h.page.keyboard.press`. Set `AOE_DEMO_TOKEN=-` (no dashboard token). Assert on `document.body.innerText` before each key. Traps are in [`TECHNIQUES.md`](TECHNIQUES.md#tui-clips-ttyd). For scripted e2e tests, `RECORD_E2E=1` records asciinema casts that `agg` converts; both must be on `PATH` (`tests/e2e/harness.rs`).
 
 Done when the contact sheet shows each key's effect at the moment its caption claims.
 
