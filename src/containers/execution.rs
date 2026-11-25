@@ -677,24 +677,21 @@ fn colima_shared_root(
     colima_default_mounts(&config).then(|| home.to_path_buf())
 }
 
-/// Whether a `colima.yaml` keeps the default mounts (no `mounts:` key, or an empty one). Any
-/// list replaces the home share. A line scan, as there is no YAML parser here.
+/// Whether a `colima.yaml` keeps the default mounts: a mapping whose `mounts` is absent, null or
+/// empty. Any list replaces the home share, and a file that doesn't parse as such a mapping
+/// proves nothing, so it counts as custom.
 fn colima_default_mounts(config: &str) -> bool {
-    let mut lines = config.lines();
-    while let Some(line) = lines.next() {
-        let Some(value) = line.strip_prefix("mounts:") else {
-            continue;
-        };
-        let value = value.split('#').next().unwrap_or_default().trim();
-        if !value.is_empty() {
-            return value == "[]";
-        }
-        return !lines
-            .map(str::trim)
-            .find(|line| !line.is_empty() && !line.starts_with('#'))
-            .is_some_and(|line| line.starts_with('-'));
+    use serde_json::Value;
+    let Ok(Value::Object(config)) =
+        serde_saphyr::from_str_with_options::<Value>(config, crate::yaml::options())
+    else {
+        return false;
+    };
+    match config.get("mounts") {
+        None | Some(Value::Null) => true,
+        Some(Value::Array(mounts)) => mounts.is_empty(),
+        Some(_) => false,
     }
-    true
 }
 
 #[cfg(test)]
@@ -799,6 +796,54 @@ mod tests {
                     "inline",
                     Some("mounts: [{location: /Volumes/x}]\n"),
                 ),
+                None,
+                None,
+            ),
+            (
+                "quoted-key",
+                profile(
+                    &colima,
+                    "quoted",
+                    Some("\"mounts\": [{location: /Volumes/work}]\n"),
+                ),
+                None,
+                None,
+            ),
+            (
+                "spaced-key",
+                profile(
+                    &colima,
+                    "spaced",
+                    Some("mounts : [{location: /Volumes/work}]\n"),
+                ),
+                None,
+                None,
+            ),
+            (
+                "flow-mapping",
+                profile(
+                    &colima,
+                    "flow",
+                    Some("{cpu: 2, mounts: [{location: /Volumes/work}]}\n"),
+                ),
+                None,
+                None,
+            ),
+            (
+                "null-mounts",
+                profile(&colima, "null", Some("cpu: 2\nmounts:\n")),
+                None,
+                shared.clone(),
+            ),
+            (
+                "malformed",
+                profile(&colima, "malformed", Some("mounts: [\n")),
+                None,
+                None,
+            ),
+            (
+                "not-a-mapping",
+                profile(&colima, "sequence", Some("- mounts\n")),
                 None,
                 None,
             ),
