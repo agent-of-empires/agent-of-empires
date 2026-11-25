@@ -114,12 +114,23 @@ pub enum AgentCaptureBackend {
     Claude,
     OpenCode,
     Codex,
+    /// The plugin's agent-side extension writes the conversation id into the
+    /// session's hook sidecar, so the host parses no provider format.
+    ExtensionSidecar,
     Gemini,
     Hermes,
     Kimi,
     Pi,
     PrimeAgent,
     Omp,
+}
+
+impl AgentCaptureBackend {
+    /// Whether this backend captures one pane's conversation, which a resume
+    /// needs published in a pane-scoped context.
+    pub fn captures_pane(self) -> bool {
+        matches!(self, Self::Omp | Self::ExtensionSidecar)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

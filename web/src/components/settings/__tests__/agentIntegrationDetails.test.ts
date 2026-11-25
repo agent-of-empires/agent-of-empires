@@ -38,6 +38,7 @@ describe("agentIntegrationDetails", () => {
       "host only",
       "install: install \\u{202e}now",
       "detection: native_only",
+      "sandbox reports: /tmp/aoe-hooks/<session id>",
       "provider versions: ^1.0",
       "native replies: no",
       'reply fallback: allow ["y"], deny [Escape], allow always [Enter]',
@@ -51,13 +52,23 @@ describe("agentIntegrationDetails", () => {
         tool: "agent",
         launch: { yolo: { kind: "flag", flag: "--yes" }, resume: { kind: "flag", flag: "--resume" } },
       }),
-    ).toEqual(["launch flags: yolo --yes", "resume: flag --resume", "native replies: no"]);
+    ).toEqual([
+      "launch flags: yolo --yes",
+      "resume: flag --resume",
+      "sandbox reports: /tmp/aoe-hooks/<session id>",
+      "native replies: no",
+    ]);
     expect(
       agentIntegrationDetails({
         tool: "agent",
         replies: true,
         launch: { yolo: { kind: "always" }, resume: { kind: "subcommand", command: "resume" } },
       }),
-    ).toEqual(["launch flags: yolo always", "resume: subcommand resume", "native replies: yes"]);
+    ).toEqual([
+      "launch flags: yolo always",
+      "resume: subcommand resume",
+      "sandbox reports: /tmp/aoe-hooks/<session id>",
+      "native replies: yes",
+    ]);
   });
 });

@@ -389,6 +389,7 @@ impl Instance {
                 }
                 crate::agents::SessionCaptureBackend::Pi => self.pi_sidecar_source().is_some(),
                 crate::agents::SessionCaptureBackend::Claude
+                | crate::agents::SessionCaptureBackend::ExtensionSidecar
                 | crate::agents::SessionCaptureBackend::HookSidecar => true,
                 crate::agents::SessionCaptureBackend::OpenCode => false,
             };
@@ -671,6 +672,7 @@ impl Instance {
                 ))
             }
             crate::agents::SessionCaptureBackend::Claude
+            | crate::agents::SessionCaptureBackend::ExtensionSidecar
             | crate::agents::SessionCaptureBackend::HookSidecar
             | crate::agents::SessionCaptureBackend::OpenCode
             | crate::agents::SessionCaptureBackend::Pi

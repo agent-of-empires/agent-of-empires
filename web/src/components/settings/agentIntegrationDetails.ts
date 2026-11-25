@@ -52,6 +52,7 @@ export function agentIntegrationDetails(agent: PluginAgentIntegration): string[]
     if (launch.install_hint) details.push(`install: ${launch.install_hint}`);
   }
   if (agent.detection) details.push(`detection: ${agent.detection.mode}`);
+  details.push("sandbox reports: /tmp/aoe-hooks/<session id>");
   if (agent.provider_versions?.length) details.push(`provider versions: ${agent.provider_versions.join(", ")}`);
   details.push(`native replies: ${agent.replies ? "yes" : "no"}`);
   if (agent.reply_fallback) {

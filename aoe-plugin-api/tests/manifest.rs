@@ -134,14 +134,14 @@ deny = [{ kind = "literal", value = "n" }]
                 "[agent_integrations.launch.capture]\nbackend = \"omp\"\nhost = \"pane_scoped\"\nsandbox = \"pane_scoped\"\n",
                 "",
             ),
-            "resume requires OMP capture",
+            "resume requires pane-scoped capture",
         ),
         (
             valid.replace(
                 "host = \"pane_scoped\"\nsandbox = \"pane_scoped\"",
                 "host = \"unsupported\"\nsandbox = \"unsupported\"",
             ),
-            "resume requires OMP capture",
+            "resume requires pane-scoped capture",
         ),
         (
             valid.replace("backend = \"omp\"", "backend = \"codex\""),

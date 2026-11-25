@@ -123,6 +123,7 @@ impl Instance {
             }
             // Sidecar publishers returned above.
             crate::agents::SessionCaptureBackend::Claude
+            | crate::agents::SessionCaptureBackend::ExtensionSidecar
             | crate::agents::SessionCaptureBackend::HookSidecar
             | crate::agents::SessionCaptureBackend::Codex
             | crate::agents::SessionCaptureBackend::Gemini

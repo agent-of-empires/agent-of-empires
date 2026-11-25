@@ -459,6 +459,9 @@ impl NativeAgent {
                     aoe_plugin_api::agent_integration::AgentCaptureBackend::Omp => {
                         Some(crate::agents::SessionCaptureBackend::Omp)
                     }
+                    aoe_plugin_api::agent_integration::AgentCaptureBackend::ExtensionSidecar => {
+                        Some(crate::agents::SessionCaptureBackend::ExtensionSidecar)
+                    }
                     _ => None,
                 }),
         }
@@ -1420,11 +1423,9 @@ impl NativeLaunchInputs {
 
     fn hook_capture_context(&self, instance_id: &str) -> Result<Option<CaptureContext>> {
         let leaf = crate::hooks::session_id_leaf(Some(&self.launch_id))?;
-        let directory = if self.container.is_some() {
-            PathBuf::from(crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER).join(instance_id)
-        } else {
-            crate::hooks::hook_base_path().join(instance_id)
-        };
+        // A container reaches this directory through the launch's bind mount,
+        // so the host base holds everything either side writes.
+        let directory = crate::hooks::hook_base_path().join(instance_id);
         let path = self.canonical_path(&directory.join(leaf.as_ref()))?;
         let location = self.physical_location(&path);
         Ok((location.filesystem == "host").then_some(CaptureContext::Hooks(location.path)))
@@ -2938,22 +2939,27 @@ enum ManagedArgumentPolicy {
 
 fn managed_argument_policy(agent: &AgentDef<'_>) -> ManagedArgumentPolicy {
     use crate::agents::SessionCaptureBackend::{
-        Claude, Codex, Gemini, Hermes, HookSidecar, Kimi, Omp, OpenCode, Pi, PrimeAgent,
+        Claude, Codex, ExtensionSidecar, Gemini, Hermes, HookSidecar, Kimi, Omp, OpenCode, Pi,
+        PrimeAgent,
     };
     let backend = agent
         .session_support
         .and_then(|support| support.capture)
         .map(|capture| capture.backend);
-    if let Some(backend) = backend {
-        return match backend {
-            Omp => ManagedArgumentPolicy::Omp,
-            Pi => ManagedArgumentPolicy::Pi,
-            PrimeAgent => ManagedArgumentPolicy::Prime,
-            Codex => ManagedArgumentPolicy::Codex,
-            OpenCode => ManagedArgumentPolicy::OpenCode,
-            Claude => ManagedArgumentPolicy::Claude,
-            Gemini | HookSidecar | Hermes | Kimi => ManagedArgumentPolicy::Generic,
-        };
+    let backend_policy = match backend {
+        Some(Omp) => Some(ManagedArgumentPolicy::Omp),
+        Some(Pi) => Some(ManagedArgumentPolicy::Pi),
+        Some(PrimeAgent) => Some(ManagedArgumentPolicy::Prime),
+        Some(Codex) => Some(ManagedArgumentPolicy::Codex),
+        Some(OpenCode) => Some(ManagedArgumentPolicy::OpenCode),
+        Some(Claude) => Some(ManagedArgumentPolicy::Claude),
+        Some(Gemini | HookSidecar | Hermes | Kimi) => Some(ManagedArgumentPolicy::Generic),
+        // A plugin-declared agent has no core argv table; the tool-name fallback
+        // below still recognizes a tool core knows.
+        Some(ExtensionSidecar) | None => None,
+    };
+    if let Some(policy) = backend_policy {
+        return policy;
     }
     match agent.name {
         "omp" => ManagedArgumentPolicy::Omp,

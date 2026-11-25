@@ -26,6 +26,8 @@ const SANDBOX_PRIVATE_SUBDIR: &str = "sandbox-v2";
 /// The home directory every sandbox runs under.
 pub(crate) const CONTAINER_HOME: &str = "/root";
 pub(crate) const CURRENT_SANDBOX_STORE_GENERATION: u8 = 2;
+/// Names the bind-mounted hook directory a plugin provider writes into.
+pub(crate) const INTEGRATION_DIR_ENV: &str = "AOE_INTEGRATION_DIR";
 
 /// Content seeded into the Claude sandbox `.sandbox-gitconfig`. Scoped to github.com;
 /// the helper emits credentials only on `get` and only when GH_TOKEN is non-empty, so
@@ -3076,6 +3078,7 @@ pub(crate) fn build_container_config(
     let mut identity_publisher_installed = false;
     let mut identity_publisher_path: Option<(PathBuf, String)> = None;
     let mut identity_output_path: Option<(PathBuf, String)> = None;
+    let mut plugin_sidecar_publisher = false;
     let content_roots = sandbox_content_roots(
         agent_selection.tool,
         agent_selection.command,
@@ -3162,6 +3165,59 @@ pub(crate) fn build_container_config(
                     container_path: format!("{}/{}", CONTAINER_HOME, filename),
                     read_only: false,
                 });
+            }
+        }
+    }
+
+    // A plugin-owned tool reports status and session identity into the hook
+    // directory, and its provider runs inside the container. Mount only this
+    // session's directory so the host reads what the container writes, and name
+    // it so a provider need not infer the path from its own uid.
+    if plugin_agent.is_some() {
+        crate::session::validate_instance_id(instance_id).map_err(|e| {
+            anyhow::anyhow!(
+                "refusing to mount hook directory: AOE_INSTANCE_ID failed validation: {e}"
+            )
+        })?;
+        match crate::hooks::ensure_instance_dir_path(instance_id) {
+            Ok(hook_dir) => {
+                let container_hook_path = format!(
+                    "{}/{instance_id}",
+                    crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
+                );
+                volumes.push(VolumeMount {
+                    host_path: hook_dir.to_string_lossy().to_string(),
+                    container_path: container_hook_path.clone(),
+                    read_only: false,
+                });
+                environment.push(EnvEntry::Literal {
+                    key: INTEGRATION_DIR_ENV.to_string(),
+                    value: container_hook_path.clone(),
+                });
+                // The plugin's extension ships with the plugin, so core installs
+                // no hook file to prove it publishes identity; the mounted
+                // directory it writes into is the evidence.
+                if plugin_agent.as_ref().is_some_and(|agent| {
+                    agent
+                        .contribution()
+                        .launch
+                        .as_ref()
+                        .and_then(|launch| launch.capture.as_ref())
+                        .is_some_and(|capture| {
+                            capture.backend
+                                == aoe_plugin_api::agent_integration::AgentCaptureBackend::ExtensionSidecar
+                                && capture.sandbox
+                                    == aoe_plugin_api::agent_integration::AgentCaptureContext::PaneScoped
+                        })
+                }) {
+                    plugin_sidecar_publisher = true;
+                    identity_output_path = Some((hook_dir.clone(), container_hook_path));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "session.profile",
+                    "Hook directory unavailable, skipping bind-mount; \
+                     provider status stays with pane detection: {e:#}");
             }
         }
     }
@@ -3511,7 +3567,19 @@ pub(crate) fn build_container_config(
     }
     deduped.reverse();
 
-    if identity_publisher_installed {
+    if plugin_sidecar_publisher {
+        let candidate = ContainerConfig {
+            volumes: deduped.clone(),
+            environment: environment.clone(),
+            ..ContainerConfig::default()
+        };
+        identity_publisher_installed = candidate.uses_default_container_home()
+            && identity_output_path
+                .as_ref()
+                .is_some_and(|(host, container)| {
+                    candidate.path_is_mounted(host, Path::new(container), true)
+                });
+    } else if identity_publisher_installed {
         let candidate = ContainerConfig {
             volumes: deduped.clone(),
             environment: environment.clone(),
@@ -7908,6 +7976,156 @@ codex-work = "{}"
         assert!(
             msg.contains("AOE_INSTANCE_ID"),
             "error must surface validator failure, got: {msg}"
+        );
+    }
+
+    /// A tool a plugin declares gets this session's hook directory mounted, so
+    /// the provider inside the container publishes reports and identity where
+    /// the host reads them. The mount is named so a provider never infers it
+    /// from its own uid.
+    #[test]
+    #[serial_test::serial]
+    fn a_plugin_owned_tool_mounts_its_hook_directory_and_names_it() {
+        let (_hg, _base_path, hook_tmp) = BaseGuard::ready();
+        let temporary = TempDir::new().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        crate::session::test_support::install_omp_takeover("omp-next");
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let sandbox_info = SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        };
+        let instance_id = "plugin-hook-mount";
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("omp", Some("omp-next")),
+            SandboxYolo::default(),
+            instance_id,
+            None,
+            "",
+        )
+        .unwrap();
+
+        let container_path = format!(
+            "{}/{instance_id}",
+            crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
+        );
+        let host =
+            std::fs::canonicalize(hook_tmp.path().join("aoe-hooks").join(instance_id)).unwrap();
+        assert!(
+            config.volumes.iter().any(|volume| {
+                std::fs::canonicalize(&volume.host_path).ok().as_deref() == Some(host.as_path())
+                    && volume.container_path == container_path
+                    && !volume.read_only
+            }),
+            "the session hook directory must be mounted: {:?}",
+            config.volumes
+        );
+        assert!(
+            config.environment.iter().any(|entry| matches!(
+                entry,
+                EnvEntry::Literal { key, value }
+                    if key == INTEGRATION_DIR_ENV && *value == container_path
+            )),
+            "the mount must be named for the provider: {:?}",
+            config.environment
+        );
+    }
+
+    /// A sidecar-publishing declaration is what proves the container holds the
+    /// directory its extension writes the conversation id into.
+    #[test]
+    #[serial_test::serial]
+    fn a_sidecar_declaration_reports_a_container_identity_publisher() {
+        let (_hg, _base_path, _hook_tmp) = BaseGuard::ready();
+        let temporary = TempDir::new().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+
+        let manifest = r#"
+id = "acme.sidecar"
+name = "Sidecar"
+version = "1.0.0"
+api_version = 25
+
+[[agent_integrations]]
+tool = "sidecario"
+command = "sidecario"
+
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--continue"
+
+[agent_integrations.launch.capture]
+backend = "extension_sidecar"
+host = "pane_scoped"
+sandbox = "pane_scoped"
+"#;
+        let dir = crate::plugin::plugins_dir().unwrap().join("acme.sidecar");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.sidecar".into(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: Vec::new(),
+                        granted_at: crate::time::Timestamp::now(),
+                    }),
+                    ..crate::session::PluginConfig::default()
+                },
+            );
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let sandbox_info = SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        };
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("sidecario", Some("sidecario")),
+            SandboxYolo::default(),
+            "sidecar-publisher-test",
+            None,
+            "",
+        )
+        .unwrap();
+        assert!(
+            config.identity_publisher_installed,
+            "the mounted hook directory is the proof: {:?}",
+            config.volumes
         );
     }
 

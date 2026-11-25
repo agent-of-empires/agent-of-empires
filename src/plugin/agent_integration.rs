@@ -487,6 +487,10 @@ pub fn consent_lines(integration: &AgentIntegrationContribution) -> Vec<String> 
     if let Some(detection) = &integration.detection {
         lines.push(format!("  detection: {:?}", detection.mode));
     }
+    lines.push(format!(
+        "  sandbox reports: {}/<session id>",
+        crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
+    ));
     if !integration.provider_versions.is_empty() {
         lines.push(format!(
             "  provider versions: {}",
@@ -548,7 +552,6 @@ pub fn agent_command<'a>(
 fn eligible(instance: &Instance) -> bool {
     !instance.is_structured()
         && !instance.is_archived()
-        && !instance.is_sandboxed()
         && !matches!(
             instance.status,
             crate::session::Status::Stopped
@@ -746,9 +749,14 @@ pub fn snapshot(instance: &Instance) -> Option<AgentIntegrationSnapshot> {
     }
     let registry = super::registry();
     let plugin = provider(&registry, &instance.tool).ok()??;
-    read_snapshot(&instance.id, &instance.tool, plugin)
-        .ok()
-        .flatten()
+    read_snapshot(
+        &instance.id,
+        &instance.tool,
+        plugin,
+        instance.is_sandboxed(),
+    )
+    .ok()
+    .flatten()
 }
 
 pub(crate) fn session_status(status: AgentIntegrationStatus) -> crate::session::Status {
@@ -853,7 +861,7 @@ pub(crate) fn owned_status(
         None
     } else {
         let read = plugin
-            .map(|plugin| read_report(&instance.id, tool, plugin))
+            .map(|plugin| read_report(&instance.id, tool, plugin, instance.is_sandboxed()))
             .transpose()
             .ok()
             .flatten();
@@ -868,13 +876,30 @@ pub(crate) fn owned_status(
             Some(ReportRead::Absent) | None => None,
         }
     };
+    // A sandboxed provider publishes through the session's bind-mounted hook
+    // directory. A container built before that mount existed, or a provider
+    // that has not written yet, leaves the pane rules authoritative instead of
+    // owning the status as unavailable.
+    if report.is_none() && instance.is_sandboxed() {
+        return None;
+    }
     session_status_override(true, pane_dead, report.as_ref().map(|report| report.status))
         .map(|status| (status, report.is_some()))
 }
 
-fn check_file(meta: &std::fs::Metadata) -> Result<()> {
+/// Owner and liveness rules for a report.
+///
+/// A sandboxed provider runs inside the container, where the writing uid is the
+/// container's (root in the AoE images), and on rootful Linux the host sees
+/// that uid unchanged. Only root can create a root-owned file, and root can
+/// already write any session's status, so this admits no writer that could not
+/// spoof one already. The report's pid is a container-namespace (or VM) pid, so
+/// the freshness bound is what proves it is live there.
+fn check_file(meta: &std::fs::Metadata, sandboxed: bool) -> Result<()> {
+    let owner = meta.uid();
+    let euid = nix::unistd::geteuid().as_raw();
     ensure!(
-        meta.uid() == nix::unistd::geteuid().as_raw(),
+        owner == euid || (sandboxed && owner == 0),
         "integration report has another owner"
     );
     ensure!(
@@ -913,14 +938,20 @@ fn read_snapshot(
     instance_id: &str,
     tool: &str,
     plugin: &super::LoadedPlugin,
+    sandboxed: bool,
 ) -> Result<Option<AgentIntegrationSnapshot>> {
-    Ok(match read_report(instance_id, tool, plugin)? {
+    Ok(match read_report(instance_id, tool, plugin, sandboxed)? {
         ReportRead::Snapshot(report) => Some(report),
         ReportRead::Absent | ReportRead::UnsupportedVersion { .. } => None,
     })
 }
 
-fn read_report(instance_id: &str, tool: &str, plugin: &super::LoadedPlugin) -> Result<ReportRead> {
+fn read_report(
+    instance_id: &str,
+    tool: &str,
+    plugin: &super::LoadedPlugin,
+    sandboxed: bool,
+) -> Result<ReportRead> {
     let Some(dir) = dir_guard::open_instance_dir_read_only(instance_id)? else {
         return Ok(ReportRead::Absent);
     };
@@ -930,7 +961,7 @@ fn read_report(instance_id: &str, tool: &str, plugin: &super::LoadedPlugin) -> R
     else {
         return Ok(ReportRead::Absent);
     };
-    check_file(&meta)?;
+    check_file(&meta, sandboxed)?;
     ensure!(
         bytes.len() <= MAX_REPORT_BYTES,
         "integration report exceeds size limit"
@@ -952,7 +983,7 @@ fn read_report(instance_id: &str, tool: &str, plugin: &super::LoadedPlugin) -> R
     // an incompatible version from it keeps the owned `Unknown` rather than
     // handing the session back to pane rules.
     ensure!(
-        crate::process::worker::is_pid_alive(report.writer_pid),
+        sandboxed || crate::process::worker::is_pid_alive(report.writer_pid),
         "integration writer exited"
     );
     if integration
@@ -1135,7 +1166,12 @@ pub fn respond(
             _ => "the configuration is unreadable, so a custom program may now run this agent",
         }
     );
-    let current = match read_report(&instance.id, &instance.tool, plugin)? {
+    let current = match read_report(
+        &instance.id,
+        &instance.tool,
+        plugin,
+        instance.is_sandboxed(),
+    )? {
         ReportRead::Snapshot(report) => report,
         ReportRead::UnsupportedVersion { version, declared } => bail!(
             "provider version {} is outside the integration's provider_versions ({}); \
@@ -1192,6 +1228,64 @@ pub fn respond(
 mod tests {
     use super::*;
     use std::time::SystemTime;
+
+    #[test]
+    fn an_extension_sidecar_declaration_reads_the_hook_sidecar() {
+        let manifest: aoe_plugin_api::PluginManifest = toml::from_str(
+            r#"
+id = "acme.sidecar"
+name = "Sidecar"
+version = "1.0.0"
+api_version = 25
+[[agent_integrations]]
+tool = "example-helper"
+command = "example-helper"
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--continue"
+[agent_integrations.launch.capture]
+backend = "extension_sidecar"
+host = "pane_scoped"
+sandbox = "pane_scoped"
+"#,
+        )
+        .unwrap();
+        let registry = std::sync::Arc::new(super::super::PluginRegistry::from_test_plugins(vec![
+            super::super::LoadedPlugin {
+                manifest,
+                enabled: true,
+                trust: aoe_plugin_api::TrustLevel::Community,
+                validation: super::super::registry::ValidationState::Local,
+                source: None,
+                dir: None,
+                manifest_hash: String::new(),
+                granted: true,
+            },
+        ]));
+        let agent = declared_agent(registry, "example-helper", std::iter::empty()).unwrap();
+        agent
+            .with_definition(|definition| {
+                let capture = definition.session_support.unwrap().capture.unwrap();
+                assert_eq!(
+                    capture.backend,
+                    crate::agents::SessionCaptureBackend::ExtensionSidecar
+                );
+                for context in [
+                    crate::agents::SessionCaptureContext::PaneScoped,
+                    crate::agents::SessionCaptureContext::Unsupported,
+                ] {
+                    assert!(
+                        capture.reads_hook_sidecar(context),
+                        "the extension's sidecar is the only source in {context:?}"
+                    );
+                }
+                assert_eq!(
+                    capture.backend.identity_publisher(),
+                    Some(crate::agents::SessionIdentityPublisher::Extension)
+                );
+            })
+            .unwrap();
+    }
 
     #[test]
     fn borrowed_definition_preserves_generic_omp_contract() {
@@ -1417,6 +1511,28 @@ oneshot_flag = "-p"
     }
 
     #[test]
+    fn a_sandboxed_session_is_eligible_for_provider_status() {
+        let mut instance = Instance::new("sandbox-eligible", "/tmp");
+        instance.status = crate::session::Status::Running;
+        instance.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        });
+        assert!(
+            eligible(&instance),
+            "a sandboxed session publishes through its bind-mounted hook directory"
+        );
+    }
+
+    #[test]
     fn check_file_rejects_insecure_mode_and_oversized_reports() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1425,14 +1541,14 @@ oneshot_flag = "-p"
 
         std::fs::write(&path, b"{}").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(check_file(&std::fs::metadata(&path).unwrap())
+        assert!(check_file(&std::fs::metadata(&path).unwrap(), false)
             .unwrap_err()
             .to_string()
             .contains("mode 0600"));
 
         std::fs::write(&path, vec![b'x'; MAX_REPORT_BYTES + 1]).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(check_file(&std::fs::metadata(&path).unwrap())
+        assert!(check_file(&std::fs::metadata(&path).unwrap(), false)
             .unwrap_err()
             .to_string()
             .contains("size limit"));
@@ -3066,7 +3182,7 @@ command = "acme-omp-shim"
             granted: true,
         };
         assert!(matches!(
-            read_report("host-test", "test-agent", &plugin).unwrap(),
+            read_report("host-test", "test-agent", &plugin, false).unwrap(),
             ReportRead::Absent
         ));
         let dir = dir_guard::open_instance_dir("host-test").unwrap();
@@ -3076,7 +3192,7 @@ command = "acme-omp-shim"
             report.provider_version = version.into();
             dir_guard::write_atomic(dir.as_fd(), &leaf, &serde_json::to_vec(&report).unwrap())
                 .unwrap();
-            let loaded = read_report("host-test", "test-agent", &plugin).unwrap();
+            let loaded = read_report("host-test", "test-agent", &plugin, false).unwrap();
             if matches!(version, "1.2.0" | "1.9.0") {
                 assert!(matches!(loaded, ReportRead::Snapshot(_)), "{version}");
             } else {
@@ -3104,7 +3220,7 @@ command = "acme-omp-shim"
             dir_guard::write_atomic(dir.as_fd(), &leaf, &serde_json::to_vec(&wire).unwrap())
                 .unwrap();
             let ReportRead::Snapshot(loaded) =
-                read_report("host-test", "test-agent", &plugin).unwrap()
+                read_report("host-test", "test-agent", &plugin, false).unwrap()
             else {
                 panic!("a supported version must produce a snapshot");
             };
@@ -3118,7 +3234,7 @@ command = "acme-omp-shim"
             .unwrap();
         file.set_modified(SystemTime::now() - REPORT_MAX_AGE - Duration::from_secs(60))
             .unwrap();
-        assert!(read_report("host-test", "test-agent", &plugin)
+        assert!(read_report("host-test", "test-agent", &plugin, false)
             .unwrap_err()
             .to_string()
             .contains("expired"));

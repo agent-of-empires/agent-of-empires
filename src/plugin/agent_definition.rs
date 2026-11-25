@@ -98,11 +98,15 @@ impl<'a> DefinitionData<'a> {
                     AgentCaptureContext::Unsupported => Some(SessionCaptureContext::Unsupported),
                     _ => None,
                 };
-                if capture.backend != AgentCaptureBackend::Omp {
-                    return None;
-                }
+                let backend = match capture.backend {
+                    AgentCaptureBackend::Omp => SessionCaptureBackend::Omp,
+                    AgentCaptureBackend::ExtensionSidecar => {
+                        SessionCaptureBackend::ExtensionSidecar
+                    }
+                    _ => return None,
+                };
                 Some(SessionCaptureSpec {
-                    backend: SessionCaptureBackend::Omp,
+                    backend,
                     host: context(capture.host)?,
                     sandbox: context(capture.sandbox)?,
                 })
