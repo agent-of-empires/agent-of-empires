@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { SidebarModal } from "./SidebarModal";
 import { MODAL_CANCEL, MODAL_INPUT, MODAL_PRIMARY } from "./styles";
+import { isImeComposing } from "../../lib/ime";
 
 /** Renames the worktree directory and, when opted in, the git branch. */
 export function WorkdirNameModal({
@@ -56,7 +57,7 @@ export function WorkdirNameModal({
             setError(null);
           }}
           onKeyDown={(e) => {
-            if (e.key === "Enter") {
+            if (e.key === "Enter" && !isImeComposing(e)) {
               e.preventDefault();
               void submit();
             }

@@ -81,7 +81,9 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> Response {
         SupervisorError::RestartInProgress(_) => {
             (StatusCode::CONFLICT, format!("restart_in_progress: {err}"))
         }
-        SupervisorError::Superseded(_) => (StatusCode::CONFLICT, err.to_string()),
+        SupervisorError::Superseded(_) | SupervisorError::StopSuperseded(_) => {
+            (StatusCode::CONFLICT, err.to_string())
+        }
         SupervisorError::CapacityFull { .. }
         | SupervisorError::TeardownPending(_)
         | SupervisorError::PurgeInProgress(_)

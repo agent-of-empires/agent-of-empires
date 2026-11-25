@@ -1,0 +1,18 @@
+{
+  "name": "No em dash or double-hyphen prose separator in added prose",
+  "instruction": "Added hand-written prose in docs and code comments does not use an em dash (U+2014) or a spaced double hyphen as a sentence separator.",
+  "relevant_when": "A patch adds lines to a Markdown file, or adds Rust, TypeScript or TOML comment lines (//, ///, //!, /* */, #), that contain the character U+2014 or the sequence ' -- ' between words.",
+  "context": "AGENTS.md bans em dashes and '--' as prose separators in hand-written docs and comments. Only prose is in scope: string literals shown in a UI, CLI flags and arguments (git log -- path, cargo test -- --nocapture), shell end-of-options markers, numeric ranges, code blocks inside Markdown, and comment banner lines such as '// -- section name ----' are not prose separators. Generated files such as docs/cli/reference.md are regenerated, not hand-written.",
+  "scope": "diff",
+  "scope_reason": "Many existing files already contain the pattern, so only lines a change adds can be judged fairly.",
+  "checklist": [
+    {
+      "name": "no-em-dash-in-added-prose",
+      "rule": "No added Markdown prose line or added code comment contains the em dash character U+2014. Not applicable when every U+2014 in added lines is inside a string literal or a fenced code block."
+    },
+    {
+      "name": "no-double-hyphen-separator-in-added-prose",
+      "rule": "No added Markdown prose line or added code comment uses ' -- ' to join two clauses of a sentence. Not applicable when every '--' in added lines is a CLI flag, an end-of-options marker, part of code or a fenced code block, or a decorative banner line."
+    }
+  ]
+}

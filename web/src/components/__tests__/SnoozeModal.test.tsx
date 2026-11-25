@@ -61,6 +61,22 @@ describe("SnoozeModal", () => {
     fireEvent.keyDown(screen.getByTestId("snooze-modal-custom-value"), { key: "Enter" });
     expect(onPick).toHaveBeenCalledWith(120);
   });
+
+  it.each([
+    ["custom", "keyCode 229", { key: "Enter", keyCode: 229 }],
+    ["custom", "isComposing", { key: "Enter", isComposing: true }],
+    ["until", "keyCode 229", { key: "Enter", keyCode: 229 }],
+    ["until", "isComposing", { key: "Enter", isComposing: true }],
+  ])("ignores Enter in the %s field while an IME composes (%s)", (field, _n, init) => {
+    const { onPick } = setup();
+    const input = screen.getByTestId(`snooze-modal-${field}-value`);
+    // An empty field makes a submitted Enter observable as a validation error.
+    fireEvent.keyDown(input, init);
+    expect(screen.queryByTestId(`snooze-modal-${field}-error`)).toBeNull();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.queryByTestId(`snooze-modal-${field}-error`)).not.toBeNull();
+    expect(onPick).not.toHaveBeenCalled();
+  });
 });
 
 describe("with a fixed clock", () => {

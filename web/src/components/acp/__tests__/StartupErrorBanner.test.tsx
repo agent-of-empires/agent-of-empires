@@ -135,6 +135,17 @@ describe("StartupErrorBanner layout", () => {
       actions: ["Retry", "Use Terminal view"],
     },
     {
+      label: "a stopped Session says so instead of offering an install",
+      info: claude(),
+      message:
+        "Structured view worker was stopped (aoe acp stop); queued prompts wait until the session is started again.",
+      headline: "Claude was stopped",
+      command: null,
+      texts: ["was stopped", "Retry"],
+      absent: ["usually missing or out of date", CLAUDE_NPM],
+      actions: ["Retry", "Use Terminal view"],
+    },
+    {
       label: "install on: Install and retry replaces the command",
       info: claude({ install_allowed: true }),
       headline: "Claude couldn't start in Structured view",

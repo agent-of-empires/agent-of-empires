@@ -1,0 +1,4 @@
+[mcp_servers.tessl]
+type = "stdio"
+command = "tessl"
+args = [ "mcp", "start" ]

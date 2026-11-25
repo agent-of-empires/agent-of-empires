@@ -816,22 +816,11 @@ pub(super) fn prove_staging_pid_namespace_gone(
     Ok(())
 }
 
-pub(super) fn prove_staging_host_mount_absent(mount: &Path) -> anyhow::Result<()> {
-    use std::os::fd::AsRawFd as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let open = |path: &Path| -> std::io::Result<fs::File> {
-        fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)
-    };
-    let mount = open(mount)?;
-    let parent = open(Path::new(&format!(
-        "/proc/self/fd/{}/..",
-        mount.as_raw_fd()
-    )))?;
-    use std::os::fd::AsFd as _;
-    prove_same_mount(parent.as_fd(), mount.as_fd()).context("staging path remains a host mount")
+pub(super) fn prove_staging_host_mount_absent(
+    parent: std::os::fd::BorrowedFd<'_>,
+    child: std::os::fd::BorrowedFd<'_>,
+) -> anyhow::Result<()> {
+    prove_same_mount(parent, child).context("staging path remains a host mount")
 }
 
 pub(super) fn prove_same_mount(

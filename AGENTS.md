@@ -175,3 +175,7 @@ Only `needs-triage` and `ready-for-agent` exist. See `docs/agents/triage-labels.
 ### Domain docs
 
 Single-context: root `CONTEXT.md` plus `docs/adr/`. See `docs/agents/domain.md`.
+
+# Agent Rules <!-- tessl-managed -->
+
+@.tessl/RULES.md follow the [instructions](.tessl/RULES.md)

@@ -156,6 +156,54 @@ export function linkifyLine(line: AnsiSegment[]): AnsiSegment[] {
   return changed ? out : line;
 }
 
+/**
+ * Linkify soft-wrapped rows the way xterm.js uses `isWrapped`: `wrapped` lists each row the server says continues
+ * onto the next, a run of such rows joins into one logical line for URL detection, and each row gets back its own
+ * pieces carrying the whole href. Only rows inside a run are returned; the rest need linkifyLine alone. With `cache`,
+ * a run whose rows are the same arrays as last time returns its earlier rows, so memoized rows skip it.
+ */
+export function linkifyWrappedRuns(
+  lines: AnsiSegment[][],
+  wrapped: readonly number[] | undefined,
+  cache?: WrappedRunCache,
+): Map<number, AnsiSegment[]> {
+  const out = new Map<number, AnsiSegment[]>();
+  if (!wrapped || wrapped.length === 0) return out;
+  const continues = new Set(wrapped);
+  for (let first = 0; first < lines.length; first++) {
+    if (!continues.has(first)) continue;
+    let last = first;
+    while (last + 1 < lines.length && continues.has(last)) last++;
+    if (last === first) continue;
+    const group = lines.slice(first, last + 1);
+    const hit = cache?.get(group[0]!);
+    if (hit && hit.group.length === group.length && hit.group.every((line, i) => line === group[i])) {
+      hit.rows.forEach((r, i) => out.set(first + i, r));
+      first = last;
+      continue;
+    }
+    const ends: number[] = [];
+    let at = 0;
+    for (const row of group) ends.push((at += lineText(row).length));
+    // linkifyLine only splits segments, so every piece falls inside one row.
+    let row = 0;
+    let pos = 0;
+    const rows: AnsiSegment[][] = group.map(() => []);
+    for (const seg of linkifyLine(group.flat())) {
+      while (row < ends.length - 1 && pos >= ends[row]!) row++;
+      rows[row]!.push(seg);
+      pos += seg.text.length;
+    }
+    rows.forEach((r, i) => out.set(first + i, r));
+    cache?.set(group[0]!, { group, rows });
+    first = last;
+  }
+  return out;
+}
+
+/** Each run's processed rows, keyed by its first row's parsed array. */
+export type WrappedRunCache = WeakMap<AnsiSegment[], { group: AnsiSegment[][]; rows: AnsiSegment[][] }>;
+
 // Cell widths per grapheme cluster, aligned with tmux 3.6a: marks, ZWJ and variation selectors take no column; VS16 emoji, flags and ZWJ chains take two.
 const ZERO_WIDTH = /[\u200B-\u200D\uFEFF]|\p{M}/u;
 const EMOJI_TAIL = /^[\uFE0E\uFE0F]$/u;

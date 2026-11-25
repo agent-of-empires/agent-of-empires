@@ -173,6 +173,7 @@ dependencies = [
  "unicode-width",
  "uuid",
  "vt100",
+ "vte",
  "webauthn-authenticator-rs",
  "webauthn-rs",
  "webbrowser",

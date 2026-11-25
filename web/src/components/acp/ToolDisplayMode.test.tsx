@@ -16,6 +16,7 @@ import { act, cleanup, fireEvent, render, renderHook, screen } from "@testing-li
 import type { ReactNode } from "react";
 
 vi.mock("../../lib/snippetHighlighter", () => ({
+  peekHighlight: () => undefined,
   highlightSnippet: vi.fn().mockResolvedValue(null),
 }));
 

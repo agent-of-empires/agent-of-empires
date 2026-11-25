@@ -110,7 +110,7 @@ function HostMenu({
   observedById: RowObservation["observedById"];
   runtimeEpoch: RowObservation["runtimeEpoch"];
 }) {
-  const { model, setNotify, setColor } = useSessionRowModel(workspace, optimistic, false, {
+  const { model, setNotify } = useSessionRowModel(workspace, optimistic, false, {
     observedById,
     runtimeEpoch,
     onSessionMutation: handlers.onSessionMutation,
@@ -167,7 +167,6 @@ function HostMenu({
         workspace={workspace}
         model={model}
         setNotify={setNotify}
-        setColor={setColor}
         readOnly={readOnly}
         handlers={handlers}
         onRename={() => {

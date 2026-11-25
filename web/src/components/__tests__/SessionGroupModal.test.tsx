@@ -1,10 +1,16 @@
 // @vitest-environment jsdom
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
+import { fetchGroups } from "../../lib/api";
+import type { GroupInfo } from "../../lib/types";
 import { SessionGroupModal } from "../SessionGroupModal";
 import { expectRestoresFocus } from "./dialogTestUtils";
+
+vi.mock("../../lib/api", () => ({ fetchGroups: vi.fn() }));
+
+const group = (path: string): GroupInfo => ({ path, session_count: 2 });
 
 function setup(currentGroup = "work", onSave: (group: string) => Promise<boolean> = vi.fn().mockResolvedValue(true)) {
   const onClose = vi.fn();
@@ -28,6 +34,10 @@ const pending = () => {
   return { onSave, resolve: (ok: boolean) => resolve(ok) };
 };
 
+// Braced: a function returned from beforeEach runs as its teardown.
+beforeEach(() => {
+  vi.mocked(fetchGroups).mockResolvedValue([]);
+});
 afterEach(cleanup);
 
 describe("SessionGroupModal", () => {
@@ -49,10 +59,34 @@ describe("SessionGroupModal", () => {
   ] as const)("%s: saves the trimmed value then closes", async (_name, current, typed, saved, via) => {
     const { input, saveBtn, onSave, onClose } = setup(current);
     fireEvent.change(input, { target: { value: typed } });
-    if (via === "enter") fireEvent.keyDown(input, { key: "Enter" });
-    else fireEvent.click(saveBtn);
+    if (via === "enter") {
+      // The open list takes the first Enter; the second saves.
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(onSave).not.toHaveBeenCalled();
+      fireEvent.keyDown(input, { key: "Enter" });
+    } else fireEvent.click(saveBtn);
     if (saved == null) expect(onSave).not.toHaveBeenCalled();
-    else expect(onSave).toHaveBeenCalledWith(saved);
+    else {
+      expect(onSave).toHaveBeenCalledTimes(1);
+      expect(onSave).toHaveBeenCalledWith(saved);
+    }
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+  });
+
+  it.each([
+    ["keyCode 229", { key: "Enter", keyCode: 229 }],
+    ["isComposing", { key: "Enter", isComposing: true }],
+  ] as const)("ignores Enter while an IME composes (%s)", async (_n, init) => {
+    const { input, onSave, onClose } = setup("old");
+    fireEvent.change(input, { target: { value: "new" } });
+    fireEvent.keyDown(input, init);
+    expect(onSave).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole("listbox")).toBeTruthy();
+    // The open list takes the first plain Enter; the second saves.
+    fireEvent.keyDown(input, { key: "Enter" });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onSave).toHaveBeenCalledWith("new");
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
   });
 
@@ -62,11 +96,17 @@ describe("SessionGroupModal", () => {
   ])("from %j to %j a failed save shows %j and stays open", async (current, typed, message) => {
     const { input, saveBtn, onClose } = setup(current, vi.fn().mockResolvedValue(false));
     fireEvent.change(input, { target: { value: typed } });
+    input.blur();
     fireEvent.click(saveBtn);
     await waitFor(() => expect(errorText()).toBe(message));
     expect(onClose).not.toHaveBeenCalled();
     expect(saveBtn.disabled).toBe(false);
     expect(document.activeElement).toBe(input);
+    expect(screen.queryByTestId("group-combobox-popup")).toBeNull();
+    // Only the programmatic refocus is suppressed; a later focus opens the list.
+    fireEvent.blur(input);
+    fireEvent.focus(input);
+    screen.getByTestId("group-combobox-popup");
     fireEvent.change(input, { target: { value: "again" } });
     expect(errorText()).toBeUndefined();
   });
@@ -75,6 +115,7 @@ describe("SessionGroupModal", () => {
     const { onSave, resolve } = pending();
     const { input, saveBtn, cancelBtn, onClose } = setup("", onSave);
     fireEvent.change(input, { target: { value: "work" } });
+    fireEvent.keyDown(input, { key: "Enter" });
     fireEvent.keyDown(input, { key: "Enter" });
     await Promise.resolve();
     fireEvent.keyDown(input, { key: "Enter" });
@@ -89,6 +130,8 @@ describe("SessionGroupModal", () => {
   it("closes without saving via Cancel, Escape, and the backdrop but not the panel", () => {
     const { cancelBtn, input, onClose, onSave } = setup();
     fireEvent.click(cancelBtn);
+    // The first Escape closes the open list, the second the dialog.
+    fireEvent.keyDown(input, { key: "Escape" });
     fireEvent.keyDown(input, { key: "Escape" });
     const backdrop = screen.getByTestId("session-group-modal");
     fireEvent.click(backdrop.firstElementChild!);
@@ -96,6 +139,90 @@ describe("SessionGroupModal", () => {
     fireEvent.click(backdrop);
     expect(onClose).toHaveBeenCalledTimes(3);
     expect(onSave).not.toHaveBeenCalled();
+  });
+
+  it("lists existing groups and saves the picked path", async () => {
+    vi.mocked(fetchGroups).mockResolvedValue([group("work/api"), group("play")]);
+    const { input, saveBtn, onSave } = setup("");
+    fireEvent.change(input, { target: { value: "wor" } });
+    fireEvent.mouseDown(await screen.findByRole("option", { name: /work\/api/ }));
+    fireEvent.click(saveBtn);
+    expect(onSave).toHaveBeenCalledWith("work/api");
+  });
+
+  it("lists every group with the current one active until the text is edited", async () => {
+    vi.mocked(fetchGroups).mockResolvedValue([group("work"), group("play")]);
+    const { saveBtn, onSave } = setup("work");
+    const current = await screen.findByRole("option", { name: /^work/ });
+    const other = await screen.findByRole("option", { name: /^play/ });
+    expect(current.getAttribute("aria-selected")).toBe("true");
+    fireEvent.mouseDown(other);
+    fireEvent.click(saveBtn);
+    expect(onSave).toHaveBeenCalledWith("play");
+  });
+
+  it("Save with the list open saves the current value without picking a row; Escape closes the list first", async () => {
+    vi.mocked(fetchGroups).mockResolvedValue([group("work"), group("play")]);
+    const { input, saveBtn, onSave, onClose } = setup("work");
+    await screen.findByRole("option", { name: /^play/ });
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    fireEvent.focus(input);
+    screen.getByRole("listbox");
+    fireEvent.change(input, { target: { value: "wor" } });
+    fireEvent.click(saveBtn);
+    expect(onSave).toHaveBeenCalledWith("wor");
+  });
+
+  it("closes the open list while a save is in flight and keeps it closed after a failure", async () => {
+    vi.mocked(fetchGroups).mockResolvedValue([group("work"), group("play")]);
+    const { onSave, resolve } = pending();
+    setup("work", onSave);
+    await screen.findByRole("option", { name: /^play/ });
+    fireEvent.click(screen.getByRole("button", { name: "Remove from group" }));
+    expect(onSave).toHaveBeenCalledWith("");
+    expect(screen.queryByTestId("group-combobox-popup")).toBeNull();
+    resolve(false);
+    await waitFor(() => expect(errorText()).toBe("Failed to clear group."));
+    expect(screen.queryByTestId("group-combobox-popup")).toBeNull();
+  });
+
+  it("withholds the previous profile's groups while the new profile's load", async () => {
+    vi.mocked(fetchGroups).mockImplementation((p) =>
+      p === "a" ? Promise.resolve([group("from-a")]) : new Promise<GroupInfo[]>(() => {}),
+    );
+    const props = { sessionTitle: "alpha", currentGroup: "", onSave: vi.fn(), onClose: vi.fn() };
+    const { rerender } = render(<SessionGroupModal {...props} profile="a" />);
+    await screen.findByRole("option", { name: /from-a/ });
+    rerender(<SessionGroupModal {...props} profile="b" />);
+    expect(screen.queryByRole("option", { name: /from-a/ })).toBeNull();
+  });
+
+  it("names the group field for assistive tech", () => {
+    const { input } = setup();
+    expect(screen.getByRole("combobox", { name: "Group" })).toBe(input);
+  });
+
+  it("Remove from group saves a blank group and is absent without one", async () => {
+    const { onSave, onClose, unmount } = setup("work");
+    fireEvent.click(screen.getByRole("button", { name: "Remove from group" }));
+    expect(onSave).toHaveBeenCalledTimes(1);
+    expect(onSave).toHaveBeenCalledWith("");
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+    unmount();
+    setup("");
+    expect(screen.queryByRole("button", { name: "Remove from group" })).toBeNull();
+  });
+
+  it("keeps input focus on mousedown over the footer buttons and still saves on click", async () => {
+    const { input, saveBtn, onSave } = setup("work");
+    const remove = screen.getByRole("button", { name: "Remove from group" });
+    expect(fireEvent.mouseDown(saveBtn)).toBe(false);
+    expect(fireEvent.mouseDown(remove)).toBe(false);
+    fireEvent.change(input, { target: { value: "play" } });
+    fireEvent.click(saveBtn);
+    expect(onSave).toHaveBeenCalledWith("play");
   });
 
   it("restores focus on unmount", () => {

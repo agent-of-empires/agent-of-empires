@@ -72,17 +72,11 @@ const STAGING_SANDBOX: &str = r#"
     (ipc-posix-name "apple.shm.notification_center"))
 "#;
 
-pub(super) fn prove_staging_host_mount_absent(mount: &std::path::Path) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        staging_mount_strings(&staging_statfs(mount)?)?.0 != mount,
-        "plugin staging path remains mounted"
-    );
-    anyhow::ensure!(
-        std::fs::symlink_metadata(mount.with_extension("dmg"))
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
-        "plugin staging image remains present or its absence is unknown"
-    );
-    Ok(())
+pub(super) fn prove_staging_host_mount_absent(
+    parent: std::os::fd::BorrowedFd<'_>,
+    child: std::os::fd::BorrowedFd<'_>,
+) -> anyhow::Result<()> {
+    prove_same_mount(parent, child).context("plugin staging path remains mounted")
 }
 
 pub(super) fn prove_same_mount(

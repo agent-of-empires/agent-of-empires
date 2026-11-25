@@ -85,6 +85,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 authority,
                 restart,
                 cancellation,
+                None,
             )
             .await?
         {
@@ -103,7 +104,20 @@ impl<S: BroadcastSink> Supervisor<S> {
         kind: ResumeKind,
         authority: crate::process::worker_registry::ResumeAuthority,
     ) -> Result<ResumeReservationOutcome, SupervisorError> {
-        self.begin_resume_with_restart_claim(session_id, kind, authority, None, None)
+        self.begin_resume_observing(session_id, kind, authority, None)
+            .await
+    }
+
+    /// [`Self::begin_resume`] admitting against `observed_stop` (`Some`: the stop intent the
+    /// caller already observed) so a newer stop is refused instead of cleared.
+    pub(crate) async fn begin_resume_observing(
+        &self,
+        session_id: &str,
+        kind: ResumeKind,
+        authority: crate::process::worker_registry::ResumeAuthority,
+        observed_stop: Option<Option<worker_registry::StopIntent>>,
+    ) -> Result<ResumeReservationOutcome, SupervisorError> {
+        self.begin_resume_with_restart_claim(session_id, kind, authority, None, None, observed_stop)
             .await
     }
 
@@ -114,9 +128,14 @@ impl<S: BroadcastSink> Supervisor<S> {
         authority: crate::process::worker_registry::ResumeAuthority,
         restart: Option<&RestartRequestGuard>,
         cancellation: Option<CancellationToken>,
+        observed_stop: Option<Option<worker_registry::StopIntent>>,
     ) -> Result<ResumeReservationOutcome, SupervisorError> {
-        let observed_stop = worker_registry::stop_intent(session_id)
-            .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?;
+        let caller_observed = observed_stop.is_some();
+        let observed_stop = match observed_stop {
+            Some(observed) => observed,
+            None => worker_registry::stop_intent(session_id)
+                .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?,
+        };
         // Hold the worker gate while claiming the matching durable stop token.
         let _workers = self.workers.lock().await;
         let request_state = lock_recover(&self.spawn_requests);
@@ -128,7 +147,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
         let admission_error = request_state.admission_error(session_id, restart.is_some());
         if let Some(error) = admission_error {
-            return Err(error);
+            return Err(stop_refusal(error, caller_observed, authority));
         }
         drop(request_state);
         let restart_requests = lock_recover(&self.restart_requests);
@@ -148,8 +167,13 @@ impl<S: BroadcastSink> Supervisor<S> {
             return Err(SupervisorError::RestartInProgress(session_id.to_string()));
         }
         drop(restart_requests);
-        worker_registry::admit_resume(session_id, authority, &observed_stop)
-            .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?;
+        worker_registry::admit_resume(session_id, authority, &observed_stop).map_err(|error| {
+            if error.is::<worker_registry::StopSuperseded>() {
+                SupervisorError::StopSuperseded(session_id.to_string())
+            } else {
+                SupervisorError::Acp(AcpError::Spawn(error.to_string()))
+            }
+        })?;
         // Freeze the observed runner under the same gate as stop and installation.
         // Later registry contents may describe a replacement, not this attach.
         let attach_record = if kind == ResumeKind::Attach {
@@ -188,7 +212,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         };
         if let Some(error) = admission_error {
             table.abandon(&lease);
-            return Err(error);
+            return Err(stop_refusal(error, caller_observed, authority));
         }
         drop(request_state);
         if kind != ResumeKind::Attach {
@@ -1161,6 +1185,25 @@ async fn capture_durable_launch(
     .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?
 }
 
+/// A stop cancelled an explicit resume whose caller observed its intent earlier. The
+/// in-memory stop fence precedes the durable token, so no token comparison is possible:
+/// the caller's observation is older than that stop.
+fn stop_refusal(
+    error: SupervisorError,
+    caller_observed: bool,
+    authority: crate::process::worker_registry::ResumeAuthority,
+) -> SupervisorError {
+    match error {
+        SupervisorError::SpawnCancelled(id)
+            if caller_observed
+                && authority == crate::process::worker_registry::ResumeAuthority::Explicit =>
+        {
+            SupervisorError::StopSuperseded(id)
+        }
+        other => other,
+    }
+}
+
 fn admission_error(error: anyhow::Error, session_id: &str) -> SupervisorError {
     if let Some(blocked) = error.downcast_ref::<crate::session::StartBlocked>() {
         SupervisorError::Blocked(*blocked)
@@ -1797,6 +1840,7 @@ time.sleep(60)
                     ResumeKind::SpawnFirst,
                     crate::process::worker_registry::ResumeAuthority::Explicit,
                     Some(&restart),
+                    None,
                     None,
                 )
                 .await;

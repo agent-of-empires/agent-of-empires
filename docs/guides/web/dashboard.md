@@ -6,7 +6,7 @@ The dashboard is the home screen of the web app: a workspace sidebar on the left
 
 ## Layout
 
-- **Workspace sidebar** (left) lists every session grouped by repo, with a live status glyph per row. On phones it collapses behind a top-bar toggle. With no sessions, it shows a hint and a **New session** button.
+- **Workspace sidebar** (left) lists every session grouped by repo, with a live status glyph per row. On phones it collapses behind a top-bar toggle. On wider screens, drag its right edge to resize it: below the minimum width it snaps to a compact rail of glyphs and short titles, and further still it closes, until the top-bar toggle reopens it as it was. Focus the edge to resize it with the arrow keys, **Home** for the rail and **Enter** to collapse to or restore from the rail; double-click it to reset the width. With no sessions, it shows a hint and a **New session** button.
 - **Main pane** shows the selected session: the agent terminal (or structured view), with the diff and paired terminal reachable from the top bar.
 - **Top bar** carries the command-palette trigger, the right-panel picker, and the overflow (three-dot) **More options** menu.
 - **Home screen** (no session selected) shows the AoE logo and a count of running, waiting, and error sessions.
@@ -100,13 +100,13 @@ A grouping picker (layers icon) next to the sort picker opens a menu of axes, so
 - **By repo and group**: repository headers with user groups nested inside each. A session split across groups appears once per subgroup.
 - **By status**: groups by each session's actual execution status, in the same attention order the Attention sort and the Board's cards use: Waiting, Error, Idle, Unknown, Running, Stopped, then the transient Creating, Deleting and Starting. A workspace whose sessions differ in status appears once per status. This mirrors the TUI's Status grouping (`g` then Status).
 
-The choice is per-browser (localStorage). Collapse state is tracked separately per axis. You can move a session between groups from the web context menu, but group rename, color, and drag-reorder live on the repo axis only.
+The choice is per-browser (localStorage). Collapse state is tracked separately per axis. You can move a session between groups from the web context menu, but drag-reorder lives on the repo axis only.
 
-**Move to another group.** Right-click (long-press on touch) a session row and choose **More > Move to another group**: type an existing group to move it, a new path to create that group, or clear the field to drop it back to **Ungrouped**. Group paths use `/` for hierarchy (e.g. `work/projects`). Hidden in read-only mode.
+**Move to another group.** Right-click (long-press on touch) a session row and choose **More > Move to another group**. The dialog lists the profile's existing groups with the current one highlighted: pick one, or type a new path to create that group. **Remove from group** (or clearing the field) drops the session back to **Ungrouped**. With the list open, Enter picks the highlighted group and a second Enter saves; Escape closes the list, then the dialog. Group paths use `/` for hierarchy (e.g. `work/projects`). Hidden in read-only mode.
 
 **Add project.** Attachment results stay open through Multi-repo regrouping.
 Warnings and a failed worker restart remain visible until dismissed.
-Accepted color and notification picks also survive collapse, filtering and
+Accepted notification picks also survive collapse, filtering and
 navigation to Settings. They retain exact sessions and runtime epoch, never
 replay against replacement sessions or a replacement daemon.
 
@@ -125,7 +125,7 @@ Under **More** in the same menu, **Show only this Session** reloads the window t
 
 Trashed sessions live behind the **Trash** control in the sidebar footer. Right-click a trashed row for **Open**, **Restore**, or **Delete permanently**. Like an archived session, a trashed one cannot start until it is restored.
 
-A session is never pinned and sunk at once, but the transitions are one-step in either direction: pinning a sunk row surfaces it, and a pinned row's menu still offers Archive, Snooze, and Ignore, any of which removes the pin (matching the TUI, no unpin-first needed). Bulk Archive and Snooze include pinned rows in the selection for the same reason. The "Snoozed & archived" section sits at the bottom and aggregates every sunk workspace; collapsed by default, its state persists in localStorage. The triage menu entries are hidden in read-only mode.
+A session is never pinned and sunk at once, but the transitions are one-step in either direction: pinning a sunk row surfaces it, and a pinned row's menu still offers Archive, Snooze, and Ignore, any of which removes the pin (matching the TUI, no unpin-first needed). Bulk Archive and Snooze include pinned rows in the selection for the same reason. The "Snoozed & archived" section sits at the bottom and aggregates every sunk workspace, newest archived (or snoozed) first whatever the sidebar sort; collapsed by default, its state persists in localStorage. The triage menu entries are hidden in read-only mode.
 
 ### Multi-select and bulk triage
 
