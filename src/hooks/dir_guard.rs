@@ -35,9 +35,9 @@ use std::os::fd::AsRawFd;
 
 use anyhow::{anyhow, bail, Context, Result};
 use nix::errno::Errno;
-use nix::fcntl::{open, openat, renameat, OFlag};
+use nix::fcntl::{open, openat, renameat, AtFlags, OFlag};
 use nix::libc;
-use nix::sys::stat::{fchmod, fstat, mkdirat, Mode};
+use nix::sys::stat::{fchmod, fstat, fstatat, mkdirat, Mode};
 use nix::unistd::{geteuid, mkdir, unlinkat, UnlinkatFlags};
 
 // Path resolution.
@@ -248,7 +248,11 @@ fn open_and_verify_base(kind: HookBase) -> Result<OwnedFd> {
     //    /tmp -> /private/tmp is still followed.
     let fd: OwnedFd = open(
         &path,
-        OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+        OFlag::O_DIRECTORY
+            | OFlag::O_NOFOLLOW
+            | OFlag::O_CLOEXEC
+            | OFlag::O_RDONLY
+            | OFlag::O_NONBLOCK,
         Mode::empty(),
     )
     .with_context(|| {
@@ -351,7 +355,11 @@ fn create_child(kind: HookBase, instance_id: &str) -> Result<OwnedFd> {
         let fd: OwnedFd = openat(
             base,
             instance_id,
-            OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+            OFlag::O_DIRECTORY
+                | OFlag::O_NOFOLLOW
+                | OFlag::O_CLOEXEC
+                | OFlag::O_RDONLY
+                | OFlag::O_NONBLOCK,
             Mode::empty(),
         )
         .with_context(|| format!("openat instance subdir {instance_id} (symlink or non-dir)"))?;
@@ -360,14 +368,18 @@ fn create_child(kind: HookBase, instance_id: &str) -> Result<OwnedFd> {
     })
 }
 
-/// Exclusive `flock` on `<sandbox base>/.<id>.lock`, outside any bound dir. `None` when the
-/// sandbox base is unusable, in which case no switch can run either.
+/// Exclusive `flock` on `<sandbox base>/.<id>.lock`, outside any bound dir. `None` when it
+/// can't be taken: the sandbox base is unusable, or the lock file can't be opened or locked.
 fn lock_instance(instance_id: &str) -> Option<std::fs::File> {
     let file = with_base(HookBase::Sandbox, |base| {
         let fd = openat(
             base,
             format!(".{instance_id}.lock").as_str(),
-            OFlag::O_CREAT | OFlag::O_RDWR | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            OFlag::O_CREAT
+                | OFlag::O_RDWR
+                | OFlag::O_NOFOLLOW
+                | OFlag::O_CLOEXEC
+                | OFlag::O_NONBLOCK,
             Mode::S_IRUSR | Mode::S_IWUSR,
         )
         .with_context(|| format!("open switch lock for {instance_id}"))?;
@@ -375,24 +387,32 @@ fn lock_instance(instance_id: &str) -> Option<std::fs::File> {
     })
     .map_err(|e| tracing::warn!(target: "hooks.guard", "switch lock unavailable: {e:#}"))
     .ok()?;
-    if let Err(std::fs::TryLockError::WouldBlock) = file.try_lock() {
-        #[cfg(test)]
-        if let Some(sender) = LOCK_CONTENTION_FOR_TEST.lock().unwrap().as_ref() {
-            let _ = sender.send(HookBase::Sandbox.label(instance_id));
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            #[cfg(test)]
+            if let Some(sender) = LOCK_CONTENTION_FOR_TEST.lock().unwrap().as_ref() {
+                let _ = sender.send(HookBase::Sandbox.label(instance_id));
+            }
+            file.lock()
+                .map_err(|e| tracing::warn!(target: "hooks.guard", "switch lock: {e}"))
+                .ok()?;
         }
-        file.lock()
-            .map_err(|e| tracing::warn!(target: "hooks.guard", "switch lock: {e}"))
-            .ok()?;
+        Err(std::fs::TryLockError::Error(e)) => {
+            tracing::warn!(target: "hooks.guard", "switch lock: {e}");
+            return None;
+        }
     }
     Some(file)
 }
 
 /// Moves a row's hook dir to `to`: creates it there, then removes the other, under the row's
 /// switch lock so a creating open waits rather than recreating the dir being removed. Returns
-/// the canonical path, for a bind-mount source.
+/// the canonical path, for a bind-mount source. Without the lock it changes nothing.
 pub(crate) fn switch_instance_dir(instance_id: &str, to: HookBase) -> Result<PathBuf> {
     crate::session::validate_instance_id(instance_id)?;
-    let _lock = lock_instance(instance_id);
+    let _lock = lock_instance(instance_id)
+        .with_context(|| format!("switch lock for {instance_id} unavailable"))?;
     create_child(to, instance_id)?;
     #[cfg(test)]
     if let Some(pause) = SWITCH_PAUSE_FOR_TEST.with(|slot| slot.borrow_mut().take()) {
@@ -426,7 +446,11 @@ pub(crate) fn open_recorded_instance_dir(
         .context("recorded hook directory has no parent")?;
     let base = open(
         parent,
-        OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+        OFlag::O_DIRECTORY
+            | OFlag::O_NOFOLLOW
+            | OFlag::O_CLOEXEC
+            | OFlag::O_RDONLY
+            | OFlag::O_NONBLOCK,
         Mode::empty(),
     )?;
     verify_dir_metadata(&base, parent)?;
@@ -441,7 +465,11 @@ fn open_instance_child(
     match openat(
         base,
         instance_id,
-        OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+        OFlag::O_DIRECTORY
+            | OFlag::O_NOFOLLOW
+            | OFlag::O_CLOEXEC
+            | OFlag::O_RDONLY
+            | OFlag::O_NONBLOCK,
         Mode::empty(),
     ) {
         Ok(fd) => {
@@ -697,7 +725,11 @@ fn remove_child(kind: HookBase, instance_id: &str) -> Result<()> {
         let dir_fd = match openat(
             base,
             instance_id,
-            OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+            OFlag::O_DIRECTORY
+                | OFlag::O_NOFOLLOW
+                | OFlag::O_CLOEXEC
+                | OFlag::O_RDONLY
+                | OFlag::O_NONBLOCK,
             Mode::empty(),
         ) {
             Ok(fd) => fd,
@@ -759,44 +791,46 @@ fn walk_and_unlink_entries(dir_fd: &OwnedFd) -> Result<()> {
                 continue;
             }
         };
-        // Re-validate before removing: O_NOFOLLOW rejects a symlink leaf with
-        // ELOOP, and anything but a regular file is hostile or stale.
+        // Classify without opening: a FIFO with no writer would block an open, and the dir is a
+        // sandbox's writable bind. Only symlinks and regular files are removed.
+        let kind = match fstatat(dir_fd, name_str, AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(st) => st.st_mode & libc::S_IFMT,
+            Err(Errno::ENOENT) => continue,
+            Err(e) => {
+                tracing::warn!(target: "hooks.guard", "fstatat entry {name_str}: {e}; skipping");
+                continue;
+            }
+        };
+        if kind == libc::S_IFLNK {
+            if let Err(e) = unlinkat(dir_fd, name_str, UnlinkatFlags::NoRemoveDir) {
+                tracing::warn!(target: "hooks.guard", "unlinkat symlink {name_str}: {e}");
+            }
+            continue;
+        }
+        if kind != libc::S_IFREG {
+            tracing::warn!(target: "hooks.guard",
+                "non-regular entry {name_str} (mode {kind:o}) inside {}; skipping. The \
+                 instance dir will be left non-empty; remove manually if it matters.",
+                hook_base_path().display());
+            continue;
+        }
+        // Re-validate before removing, without blocking: an entry swapped in since must still
+        // be a regular file.
         match openat(
             dir_fd,
             name_str,
-            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
             Mode::empty(),
         ) {
             Ok(child_fd) => {
-                let st = match fstat(&child_fd) {
-                    Ok(st) => st,
-                    Err(e) => {
-                        tracing::warn!(target: "hooks.guard",
-                            "fstat entry {name_str}: {e}; skipping");
-                        continue;
-                    }
-                };
-                if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+                if !fstat(&child_fd).is_ok_and(|st| (st.st_mode & libc::S_IFMT) == libc::S_IFREG) {
                     tracing::warn!(target: "hooks.guard",
-                        "non-regular entry {name_str} (mode {:o}) inside {}; \
-                         skipping. The instance dir will be left non-empty; \
-                         remove manually if it matters.",
-                        st.st_mode,
-                        hook_base_path().display());
+                        "entry {name_str} changed type during cleanup; skipping");
                     continue;
                 }
-                // Regular file under a uid-checked parent: safe to unlink.
                 drop(child_fd);
                 if let Err(e) = unlinkat(dir_fd, name_str, UnlinkatFlags::NoRemoveDir) {
-                    tracing::warn!(target: "hooks.guard",
-                        "unlinkat {name_str}: {e}");
-                }
-            }
-            Err(Errno::ELOOP) => {
-                // Symlink at leaf: unlink it without following.
-                if let Err(e) = unlinkat(dir_fd, name_str, UnlinkatFlags::NoRemoveDir) {
-                    tracing::warn!(target: "hooks.guard",
-                        "unlinkat symlink {name_str}: {e}");
+                    tracing::warn!(target: "hooks.guard", "unlinkat {name_str}: {e}");
                 }
             }
             Err(Errno::ENOENT) => {
@@ -1132,6 +1166,76 @@ mod tests {
         assert_eq!(read_status(id).as_deref(), Some("running"));
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o700);
+        remove_instance_dir(id).unwrap();
+    }
+
+    /// A switch that can't take its lock changes nothing: it would otherwise remove a dir a
+    /// creating open may be choosing.
+    #[test]
+    #[serial(hook_base)]
+    fn a_switch_without_its_lock_changes_nothing() {
+        let (_g, _base, _tmp) = BaseGuard::ready();
+        let id = "unlockable";
+        write_status(HookBase::Host, id, "idle");
+        // A directory where the lock file goes: opening it read-write fails.
+        with_base(HookBase::Sandbox, |_| Ok(())).unwrap();
+        let lock = sandbox_hook_base_path()
+            .unwrap()
+            .join(format!(".{id}.lock"));
+        std::fs::create_dir(&lock).unwrap();
+        assert!(switch_instance_dir(id, HookBase::Sandbox).is_err());
+        assert_eq!(read_status(id).as_deref(), Some("idle"));
+        assert!(
+            !kind_exists(HookBase::Sandbox, id),
+            "no sandbox dir was made"
+        );
+        std::fs::remove_dir(&lock).unwrap();
+        remove_instance_dir(id).unwrap();
+    }
+
+    /// A sandbox can leave a FIFO in its writable hook dir. Cleanup never opens it, so a switch
+    /// away completes; the dir it leaves behind reads the FIFO as absent and takes a new write
+    /// when the row is sandboxed again.
+    #[test]
+    #[serial(hook_base)]
+    fn a_switch_skips_a_fifo_in_the_old_dir() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        let id = "fifo";
+        create_child(HookBase::Sandbox, id).unwrap();
+        let fifo = HookBase::Sandbox.label(id).join("status");
+        nix::unistd::mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let inode = std::os::unix::fs::MetadataExt::ino(
+            &std::fs::metadata(HookBase::Sandbox.label(id)).unwrap(),
+        );
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            BaseGuard::set_thread_base(base);
+            switch_instance_dir(id, HookBase::Host).unwrap();
+            let after_host = read_status(id);
+            switch_instance_dir(id, HookBase::Sandbox).unwrap();
+            let reused = std::os::unix::fs::MetadataExt::ino(
+                &std::fs::metadata(HookBase::Sandbox.label(id)).unwrap(),
+            );
+            let polluted = read_status(id);
+            write_status(HookBase::Sandbox, id, "idle");
+            let _ = done.send((after_host, reused, polluted, read_status(id)));
+        });
+        let Ok((after_host, reused, polluted, written)) =
+            finished.recv_timeout(std::time::Duration::from_secs(10))
+        else {
+            // A writer releases an open blocked on the FIFO, so the thread can end.
+            let _ = open(&fifo, OFlag::O_WRONLY | OFlag::O_NONBLOCK, Mode::empty());
+            panic!("the switch or a read blocked on a FIFO");
+        };
+        worker.join().unwrap();
+        assert_eq!(after_host, None, "the host dir is read");
+        assert_eq!(reused, inode, "the sandbox dir left by the skip is reused");
+        assert_eq!(polluted, None, "a FIFO reads as absent");
+        assert_eq!(
+            written.as_deref(),
+            Some("idle"),
+            "a write replaces the FIFO"
+        );
         remove_instance_dir(id).unwrap();
     }
 
