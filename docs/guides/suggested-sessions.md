@@ -12,6 +12,8 @@ With no provider installed, the web homepage and the empty `/suggestions` view o
 
 Providers are off until you turn one on, in the setup sheet, in Settings › Suggestions › Sources, or through the API (`PATCH /api/suggestions/prefs` with `provider_enabled`). The sheet turns on each source it installs, and no other. To skip the sheet, install a provider with `aoe plugin install` ([Plugins](../plugins.md)), then turn it on. While every installed provider is off, the homepage section and `/suggestions` say so and offer **Turn it on** (**Turn them on** for several); a read-only dashboard says it can't turn them on.
 
+Suggestions stay off until you set them up. While a featured plugin offers them and none is installed, a **New: suggested sessions** tip shows once in the TUI and the dashboard, saying how to turn them on. The dashboard walkthrough also has a step on the homepage's Suggested section, skipped when the section is not on the page. The TUI intro's last page lists `S`.
+
 ## Web dashboard
 
 ### Homepage and `/suggestions`
