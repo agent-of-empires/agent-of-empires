@@ -51,7 +51,7 @@ pub enum ActionId {
     Diff,
     Serve,
     Settings,
-    /// Open the suggested-sessions browser. `S` is provisional pending #4597.
+    /// Select the Suggested row and focus its pane. `S` is provisional pending #4597.
     Suggestions,
     Profiles,
     Projects,

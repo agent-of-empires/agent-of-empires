@@ -171,6 +171,50 @@ fn enter_or_right_focuses_the_pane_and_esc_returns_to_the_row() {
     }
 }
 
+/// S (Ctrl+S in strict mode) moves the cursor to the Suggested row and
+/// focuses its pane; with the row hidden it focuses the pane where the cursor
+/// is, and Esc gives the preview back to that Session.
+#[test]
+#[serial]
+fn s_selects_the_row_and_focuses_the_pane() {
+    for (strict, shortcut, shown) in [
+        (false, key(KeyCode::Char('S')), true),
+        (
+            true,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            true,
+        ),
+        (false, key(KeyCode::Char('S')), false),
+    ] {
+        let mut env = create_test_env_with_sessions(2);
+        env.view.strict_hotkeys = strict;
+        let mut snap = snapshot(2, &[]);
+        snap["prefs"]["sidebar"] = shown.into();
+        env.view.suggestions_feed.set_snapshot_for_test(snap);
+        env.view.rebuild_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        let session = env.view.selected_session.clone();
+
+        env.view.handle_key(shortcut, None);
+        assert!(
+            env.view.suggestions_focused,
+            "strict {strict}, shown {shown}"
+        );
+        assert_eq!(env.view.on_suggested_row(), shown);
+        assert!(env.view.suggestions_pane_shown());
+        assert_eq!(env.view.suggestions_view.as_ref().unwrap().strict, strict);
+
+        env.view.handle_key(key(KeyCode::Esc), None);
+        assert!(!env.view.suggestions_focused);
+        assert_eq!(env.view.suggestions_pane_shown(), shown);
+        if !shown {
+            assert_eq!(env.view.cursor, 0);
+            assert_eq!(env.view.selected_session, session);
+        }
+    }
+}
+
 fn expanded_env(count: usize) -> (TestEnv, mpsc::Receiver<String>) {
     let started = StartAnswer::Started {
         session_id: "s-new".into(),

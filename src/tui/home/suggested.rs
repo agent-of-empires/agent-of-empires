@@ -61,10 +61,15 @@ impl HomeView {
         true
     }
 
-    /// Shows the suggestions list in the preview pane with the keys in it.
+    /// Shows the suggestions list in the preview pane with the keys in it,
+    /// with the cursor on the Suggested row when the sidebar lists it.
     pub(super) fn focus_suggestions(&mut self) {
         if let Some(state) = self.live_send.clone() {
             self.exit_live_send_and_restore_sizing(&state);
+        }
+        if let Some(row) = self.suggested_row() {
+            self.cursor = row;
+            self.update_selected();
         }
         self.ensure_suggestions_view();
         self.system_health_open = false;
