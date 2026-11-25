@@ -153,6 +153,19 @@ export async function waitForReplayContains(
     .toBe(true);
 }
 
+export async function enableStructuredViewAndWait(
+  baseUrl: string,
+  sessionId: string,
+  timeoutMs = 30_000,
+  home?: string,
+): Promise<void> {
+  const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/acp/enable`, { method: "POST" });
+  if (!res.ok) {
+    throw new Error(`structured view enable failed: status=${res.status} body=${await res.text()}`);
+  }
+  await waitForAcpReady(baseUrl, sessionId, timeoutMs, home);
+}
+
 export async function spawnAcpAgentAndWait(
   baseUrl: string,
   sessionId: string,
