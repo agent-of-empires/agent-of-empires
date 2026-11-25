@@ -46,6 +46,17 @@ impl<S: BroadcastSink> Supervisor<S> {
         reason: &str,
         expected_seq: u64,
     ) -> bool {
+        self.publish_if_seq(
+            session_id,
+            &Event::Stopped {
+                reason: reason.to_string(),
+            },
+            expected_seq,
+        )
+    }
+
+    /// [`Self::publish_stopped_if_seq`] for any event.
+    pub fn publish_if_seq(&self, session_id: &str, event: &Event, expected_seq: u64) -> bool {
         let counter = super::session_seq(&self.next_seqs, session_id);
         let persisted = super::sink::blocking_io(|| {
             let mut last = super::lock_recover(&counter);
@@ -53,13 +64,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 return None;
             }
             *last = last.saturating_add(1);
-            Some(self.sink.queue_persisted(
-                session_id,
-                *last,
-                &Event::Stopped {
-                    reason: reason.to_string(),
-                },
-            ))
+            Some(self.sink.queue_persisted(session_id, *last, event))
         });
         let Some(persisted) = persisted else {
             return false;

@@ -149,6 +149,29 @@ impl RateLimitInfo {
             kind: "rate_limit".into(),
         }
     }
+
+    /// The limit an agent-initiated turn reports only as message text, such as
+    /// `You've hit your 5-hour limit · resets 10pm (America/New_York)` (#5990).
+    /// The text is kept verbatim as the status; no reset time is read from it.
+    pub fn from_agent_text(text: &str) -> Option<Self> {
+        let text = text.trim();
+        if text.is_empty() || text.contains('\n') || text.chars().count() > 200 {
+            return None;
+        }
+        let lower = text.to_lowercase().replace('\u{2019}', "'");
+        let clause = lower
+            .split(['·', '∙', '|'])
+            .next()
+            .unwrap_or_default()
+            .trim();
+        let matched = (clause.starts_with("you've hit your ") && clause.ends_with(" limit"))
+            || clause.ends_with(" limit reached");
+        matched.then(|| Self {
+            status: text.to_string(),
+            resets_at: None,
+            kind: "rate_limit".into(),
+        })
+    }
 }
 
 /// A live advisory the agent pushed outside the turn flow (approaching a rate
@@ -1704,6 +1727,32 @@ mod tests {
             s.apply_event(s.last_seq.saturating_add(1), event).unwrap();
         }
         s
+    }
+
+    #[test]
+    fn usage_limit_is_read_only_from_a_lone_limit_sentence() {
+        let cases = [
+            (
+                "You've hit your 5-hour limit · resets 10pm (America/New_York) · out of usage credits",
+                true,
+            ),
+            ("You\u{2019}ve hit your weekly limit ∙ resets Nov 18, 12am", true),
+            ("  You've hit your limit · resets 3pm\n", true),
+            ("5-hour limit reached ∙ resets 1am", true),
+            ("Claude AI usage limit reached|1700000000", true),
+            ("You've hit your limit on retries; trying another approach.", false),
+            ("I fixed the rate limit handling.", false),
+            ("You've hit your limit · resets 3pm\n\nThen the build passed.", false),
+            ("", false),
+        ];
+        for (text, limited) in cases {
+            let info = RateLimitInfo::from_agent_text(text);
+            assert_eq!(info.is_some(), limited, "{text:?}");
+            if let Some(info) = info {
+                assert_eq!(info.status, text.trim());
+                assert_eq!(info.resets_at, None);
+            }
+        }
     }
 
     /// The sidebar projection over event sequences, including the ones the old

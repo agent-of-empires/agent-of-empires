@@ -65,10 +65,11 @@ pub(super) async fn repair_missing_terminal(state: &Arc<AppState>) {
                 s.has_open_tool_call_in_epoch(id),
                 !s.unresolved_approval_nonces(id).is_empty()
                     || !s.unresolved_elicitation_nonces(id).is_empty(),
+                s.agent_turn_sole_text(id),
             )
         })
         .await;
-        let Some((Some(latest), in_flight, open_tool, awaiting_user)) = probe else {
+        let Some((Some(latest), in_flight, open_tool, awaiting_user, sole_text)) = probe else {
             continue;
         };
         // Same condition as `acp_client`'s `LifecycleSignal::TerminalUsage`.
@@ -82,6 +83,13 @@ pub(super) async fn repair_missing_terminal(state: &Arc<AppState>) {
             || awaiting_user
             || now_ms.saturating_sub(latest.substantive_at_ms) < grace_ms
         {
+            continue;
+        }
+        if let Some(info) = sole_text
+            .as_deref()
+            .and_then(crate::acp::state::RateLimitInfo::from_agent_text)
+        {
+            park_limited_agent_turn(state, &id, info, latest.latest_seq).await;
             continue;
         }
         // Conditional on `latest_seq` (not the substantive seq, which ambient
@@ -100,6 +108,54 @@ pub(super) async fn repair_missing_terminal(state: &Arc<AppState>) {
             );
         }
     }
+}
+
+/// Ends a turn whose only output was the agent's usage-limit text the way the
+/// connection does (#4373): `RateLimit`, a `rate_limited` stop, and no worker,
+/// so the rate-limit reaper owns the session (#5990).
+async fn park_limited_agent_turn(
+    state: &Arc<AppState>,
+    id: &str,
+    info: crate::acp::state::RateLimitInfo,
+    latest_seq: u64,
+) {
+    let supervisor = &state.acp_supervisor;
+    let observed = supervisor
+        .running_lease(id)
+        .map(|lease| (lease.admissions(), lease));
+    let status = info.status.clone();
+    if !supervisor.publish_if_seq(id, &crate::acp::Event::RateLimit { info }, latest_seq) {
+        return;
+    }
+    use crate::acp::supervisor::SupervisorError;
+    // The stop publishes the `rate_limited` terminal itself.
+    let stop = match &observed {
+        Some((admissions, lease)) => {
+            supervisor
+                .shutdown_rate_limited(id, (lease, *admissions))
+                .await
+        }
+        None => Err(SupervisorError::UnknownSession(id.to_string())),
+    };
+    match stop {
+        Ok(()) => {}
+        Err(SupervisorError::UnknownSession(_)) => {
+            supervisor.publish_stopped_if_seq(id, "rate_limited", latest_seq + 1);
+        }
+        // A prompt admitted since owns the turn's terminal.
+        Err(SupervisorError::Superseded(_)) => return,
+        Err(e) => {
+            tracing::warn!(target: "acp.supervisor", session = %id, "terminal-repair: usage-limit stop failed: {e}");
+            return;
+        }
+    }
+    tracing::info!(
+        target: "acp.supervisor",
+        session = %id,
+        after_seq = latest_seq,
+        %status,
+        "terminal-repair: agent-initiated turn ended on the usage limit; published RateLimit + rate_limited"
+    );
 }
 
 /// A worker is auto-stopped only when enabled, not mid-turn, and its last
@@ -555,10 +611,11 @@ mod tests {
     }
 
     /// Case 0 replays the real occurrence: an agent-initiated turn after the
-    /// prompt's own `Stopped`, ending on the cost-bearing marker. The rest are vetoes.
+    /// prompt's own `Stopped`, ending on the cost-bearing marker. A turn whose
+    /// only output is the usage-limit text parks instead (#5990). The rest are vetoes.
     #[tokio::test]
     #[serial_test::serial]
-    async fn terminal_repair_publishes_only_for_a_finished_agent_turn() {
+    async fn terminal_repair_closes_only_a_finished_agent_turn() {
         fn usage(cost: bool) -> Event {
             Event::UsageUpdated {
                 usage: SessionUsage {
@@ -635,14 +692,51 @@ mod tests {
                 resolved: None,
             },
         };
-        // (name, events, status, age_secs, expect_repair)
+        const LIMIT: &str =
+            "You've hit your 5-hour limit · resets 10pm (America/New_York) · out of usage credits";
+        let limit_text = || Event::AgentMessageChunk {
+            text: LIMIT.to_string(),
+            message_id: None,
+        };
+        let limited_turn = vec![
+            prompt("go"),
+            Event::Stopped {
+                reason: "prompt_complete".to_string(),
+            },
+            limit_text(),
+            usage(true),
+        ];
+        const INFERRED: Option<&str> = Some("inferred_prompt_complete");
+        const PARKED: Option<&str> = Some("rate_limited");
+        // (name, events, status, age_secs, expected terminal)
         let cases = vec![
+            (
+                "usage-limit text is the turn's only output",
+                limited_turn.clone(),
+                Running,
+                120,
+                PARKED,
+            ),
+            (
+                "usage-limit text after a tool call",
+                finished_turn(vec![limit_text()], vec![]),
+                Running,
+                120,
+                INFERRED,
+            ),
+            (
+                "usage-limit text inside the grace window",
+                limited_turn,
+                Running,
+                5,
+                None,
+            ),
             (
                 "finished agent-initiated turn",
                 finished_turn(vec![], vec![]),
                 Running,
                 120,
-                true,
+                INFERRED,
             ),
             (
                 // The seq counter advances for ambient events too.
@@ -655,28 +749,28 @@ mod tests {
                 ),
                 Running,
                 120,
-                true,
+                INFERRED,
             ),
             (
                 "inside the grace window",
                 finished_turn(vec![], vec![]),
                 Running,
                 5,
-                false,
+                None,
             ),
             (
                 "latest is cost-free usage",
                 finished_turn(vec![], vec![usage(false)]),
                 Running,
                 120,
-                false,
+                None,
             ),
             (
                 "prompt lacks its terminator",
                 vec![prompt("go"), usage(true)],
                 Running,
                 120,
-                false,
+                None,
             ),
             (
                 "tool still open",
@@ -688,7 +782,7 @@ mod tests {
                 ),
                 Running,
                 120,
-                false,
+                None,
             ),
             // An approval can outlive the Waiting status; seeded before the marker.
             (
@@ -696,18 +790,18 @@ mod tests {
                 finished_turn(vec![approval], vec![]),
                 Running,
                 120,
-                false,
+                None,
             ),
             (
                 "waiting on the user",
                 finished_turn(vec![], vec![]),
                 Waiting,
                 120,
-                false,
+                None,
             ),
         ];
 
-        for (name, events, status, age_secs, expect_repair) in cases {
+        for (name, events, status, age_secs, expected) in cases {
             let id = "acp-terminal-repair";
             let project = tempfile::TempDir::new().unwrap();
             let mut inst = structured_instance(id, &project.path().to_string_lossy());
@@ -727,19 +821,38 @@ mod tests {
 
             repair_missing_terminal(&state).await;
 
-            let repaired: Vec<u64> = state
+            let published: Vec<Event> = state
                 .acp_event_store
-                .replay_from(id, 0)
+                .replay_from(id, last_seq)
                 .into_iter()
-                .filter(|(_, e)| matches!(e, Event::Stopped { reason } if reason == "inferred_prompt_complete"))
-                .map(|(seq, _)| seq)
+                .map(|(_, e)| e)
                 .collect();
-            let expected = if expect_repair {
-                vec![last_seq + 1]
-            } else {
-                vec![]
+            let stop = |reason: &str| Event::Stopped {
+                reason: reason.to_string(),
             };
-            assert_eq!(repaired, expected, "{name}");
+            let want = match expected {
+                None => vec![],
+                Some("rate_limited") => vec![
+                    Event::RateLimit {
+                        info: crate::acp::state::RateLimitInfo::from_agent_text(LIMIT).unwrap(),
+                    },
+                    stop("rate_limited"),
+                ],
+                Some(reason) => vec![stop(reason)],
+            };
+            assert_eq!(
+                serde_json::to_value(&published).unwrap(),
+                serde_json::to_value(&want).unwrap(),
+                "{name}"
+            );
+            if expected == PARKED {
+                let store = &state.acp_event_store;
+                assert!(store.rate_limit_park(id).is_some(), "{name}: parked");
+                assert!(
+                    store.rate_limit_interrupted_agent_turn(id),
+                    "{name}: resumes with a bare continuation"
+                );
+            }
         }
     }
 }
