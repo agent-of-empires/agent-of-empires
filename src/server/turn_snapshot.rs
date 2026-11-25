@@ -67,6 +67,14 @@ impl Baselines {
         }
     }
 
+    /// Drop every baseline and in-flight capture: skipped events may have started and settled a turn since.
+    fn forget_all(&mut self) {
+        self.ready.clear();
+        for generation in self.generation.values_mut() {
+            *generation += 1;
+        }
+    }
+
     /// Start a turn: take the finished baseline, if any.
     fn start_turn(&mut self, session_id: &str) -> Option<HashMap<String, git2::Oid>> {
         let ready = self.ready.remove(session_id);
@@ -87,6 +95,7 @@ pub fn spawn_recorder(state: Arc<AppState>) {
                     Ok(change) => change,
                     Err(RecvError::Lagged(n)) => {
                         tracing::warn!(target: "server.turn_snapshot", lagged = n, "turn snapshot recorder lagged, skipped status changes");
+                        lock(&baselines).forget_all();
                         continue;
                     }
                     Err(RecvError::Closed) => return,
@@ -221,6 +230,14 @@ mod tests {
         b.finish("s", early, tree(3));
         b.finish("s", late, tree(4));
         assert_eq!(b.start_turn("s"), Some(tree(4)));
+
+        // A lag drops both finished and in-flight baselines.
+        let g = b.bump("s");
+        b.finish("s", g, tree(5));
+        let in_flight = b.bump("t");
+        b.forget_all();
+        b.finish("t", in_flight, tree(6));
+        assert_eq!((b.start_turn("s"), b.start_turn("t")), (None, None));
 
         // A capture that got no trees leaves nothing to publish.
         let g = b.bump("s");
