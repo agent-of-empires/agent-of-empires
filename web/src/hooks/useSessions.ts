@@ -3,6 +3,7 @@ import type { SessionResponse } from "../lib/types";
 import {
   fetchSessions,
   fetchTrashedSessions,
+  reorderGroup,
   updateSidebarView,
   updateWorkspaceOrdering,
   type RuntimeCursor,
@@ -11,6 +12,7 @@ import {
   type SidebarView,
   type WorkspaceOrderingPatch,
 } from "../lib/api";
+import type { GroupMove, GroupOrder } from "../lib/groupOrder";
 import { noteDaemonChanged, setServerDown } from "../lib/connectionState";
 import {
   DEFAULT_SIDEBAR_VIEW,
@@ -26,6 +28,12 @@ const POLL_DEADLINE_MS = 15000;
 
 const sameList = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
 const keepIfSame = (next: string[]) => (prev: string[]) => (sameList(prev, next) ? prev : next);
+const keepIfSameOrder = (next: GroupOrder) => (prev: GroupOrder) => {
+  const names = Object.keys(next);
+  const same =
+    names.length === Object.keys(prev).length && names.every((name) => prev[name] && sameList(prev[name], next[name]!));
+  return same ? prev : next;
+};
 
 interface SessionState {
   sessions: SessionResponse[];
@@ -63,12 +71,15 @@ export function useSessions() {
   const [workspaceOrdering, setWorkspaceOrdering] = useState<string[]>([]);
   const [repositoryOrder, setRepositoryOrder] = useState<string[]>([]);
   const [sidebarView, setSidebarView] = useState<SidebarView>(DEFAULT_SIDEBAR_VIEW);
+  const [groupOrder, setGroupOrder] = useState<GroupOrder>({});
   // This Client's own writes of each shared value, so a poll that predates one cannot undo it.
   const orderHold = useRef(newWriteHold());
   const repositoryHold = useRef(newWriteHold());
   const viewHold = useRef(newWriteHold());
+  const groupHold = useRef(newWriteHold());
   const orderingWrites = useRef(newWriteQueue());
   const viewWrites = useRef(newWriteQueue());
+  const groupWrites = useRef(newWriteQueue());
   // The newest pick of each view field, so a write that waited cannot overwrite a later pick.
   const viewPicks = useRef<{ seq: number; latest: Partial<Record<keyof SidebarView, number>> }>({ seq: 0, latest: {} });
   const [error, setError] = useState(false);
@@ -121,8 +132,30 @@ export function useSessions() {
     return receipt;
   }, []);
 
+  /**
+   * Applies a Group move at once and sends its single-slot moves one after another, stopping at the first that
+   * does not move; the next poll then restores what the Daemon holds.
+   */
+  const moveGroup = useCallback(async (profile: string, path: string, move: GroupMove) => {
+    setGroupOrder((prev) => ({ ...prev, [profile]: move.order }));
+    holdStarted(groupHold.current);
+    const receipt = await groupWrites.current(async () => {
+      let last: RuntimeCursor | null = null;
+      for (let step = 0; step < move.steps; step++) {
+        last = await reorderGroup({ profile, path }, move.direction);
+        if (!last) break;
+      }
+      return last;
+    });
+    holdSettled(groupHold.current, receipt);
+    return receipt;
+  }, []);
+
   /** Whether an ordering write is queued or in flight. */
-  const orderingSaving = useCallback(() => orderHold.current.pending + repositoryHold.current.pending > 0, []);
+  const orderingSaving = useCallback(
+    () => orderHold.current.pending + repositoryHold.current.pending + groupHold.current.pending > 0,
+    [],
+  );
 
   /**
    * Applies a grouping or sort pick at once. The write is sent after the earlier picks' writes, waits for `after`,
@@ -218,6 +251,7 @@ export function useSessions() {
         if (pollMayReplace(repositoryHold.current, cursor)) {
           setRepositoryOrder(keepIfSame(data.repository_order ?? []));
         }
+        if (pollMayReplace(groupHold.current, cursor)) setGroupOrder(keepIfSameOrder(data.group_order ?? {}));
         if (pollMayReplace(viewHold.current, cursor)) {
           const view = data.sidebar_view ?? DEFAULT_SIDEBAR_VIEW;
           setSidebarView((prev) => (prev.group_by === view.group_by && prev.sort === view.sort ? prev : view));
@@ -447,6 +481,8 @@ export function useSessions() {
     workspaceOrdering,
     repositoryOrder,
     sidebarView,
+    groupOrder,
+    moveGroup,
     changeOrdering,
     orderingSaving,
     changeSidebarView,

@@ -88,6 +88,8 @@ export function buildSessionGroups(
     isCollapsed: (groupId: string, groupPath: string) => boolean;
     /** Every session in Ungrouped, whatever its Group. */
     ungrouped?: boolean;
+    /** Orders Group paths; name order when absent. */
+    comparePaths?: (a: string, b: string) => number;
   },
 ): SidebarGroup[] {
   const { compareWorkspace } = opts;
@@ -148,7 +150,9 @@ export function buildSessionGroups(
   groups.sort((a, b) => {
     if (a.id === UNGROUPED_GROUP_ID) return 1;
     if (b.id === UNGROUPED_GROUP_ID) return -1;
-    return compareNames(a.displayName, b.displayName);
+    return opts.comparePaths
+      ? opts.comparePaths(a.groupPath!, b.groupPath!)
+      : compareNames(a.displayName, b.displayName);
   });
 
   return groups;
@@ -186,6 +190,7 @@ export function buildNestedSidebarGroups(
     idleDecayWindowMs: number;
     compareWorkspace: (a: Workspace, b: Workspace) => number;
     isSubgroupCollapsed: (repoId: string, groupPath: string) => boolean;
+    comparePaths?: (a: string, b: string) => number;
   },
 ): NestedSidebarGroup[] {
   return repoGroups.map((repoGroup) => {
@@ -194,6 +199,7 @@ export function buildNestedSidebarGroups(
       ungrouped: repoGroup.id === SCRATCH_GROUP_ID,
       idleDecayWindowMs: opts.idleDecayWindowMs,
       compareWorkspace: opts.compareWorkspace,
+      comparePaths: opts.comparePaths,
       isCollapsed: (_groupId, groupPath) => opts.isSubgroupCollapsed(repo.id, groupPath),
     });
     const ungrouped = subgroups.filter((g) => g.id === UNGROUPED_GROUP_ID);

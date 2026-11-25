@@ -2726,6 +2726,17 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.reorder-group-headers",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/sidebar-reorder.spec.ts",
+        "src/hooks/__tests__/useSidebarModel.test.tsx",
+        "src/lib/groupOrder.test.ts"
+      ],
+      "components": ["web/src/components/sidebar/GroupLists.tsx", "web/src/hooks/app/useSidebarModel.ts"]
+    },
+    {
       "id": "story.sidebar-reorder-reload-persists",
       "kind": "mocked-playwright",
       "risk": "medium",

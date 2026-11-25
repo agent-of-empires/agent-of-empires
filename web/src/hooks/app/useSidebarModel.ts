@@ -4,6 +4,7 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import type { RuntimeCursor, SidebarView, WorkspaceOrderingPatch } from "../../lib/api";
 import { reportFeatureUse } from "../../lib/featureUse";
+import { groupMove, groupPathComparator, mergeGroupOrder, type GroupMove, type GroupOrder } from "../../lib/groupOrder";
 import { buildSortValueMap, pluginSortSpecs } from "../../lib/pluginUi";
 import { usePluginUiEntries } from "../../lib/pluginUiContext";
 import { reportInfo, toastBus } from "../../lib/toastBus";
@@ -24,6 +25,8 @@ interface Options {
   view: SidebarView;
   workspaceOrdering: string[];
   repositoryOrder: string[];
+  groupOrder: GroupOrder;
+  moveGroup: (profile: string, path: string, move: GroupMove) => Promise<RuntimeCursor | null>;
   changeOrdering: (patch: WorkspaceOrderingPatch) => Promise<RuntimeCursor | null>;
   orderingSaving: () => boolean;
   changeSidebarView: (patch: Partial<SidebarView>, after?: Promise<RuntimeCursor | null>) => Promise<void>;
@@ -35,6 +38,8 @@ export function useSidebarModel({
   view,
   workspaceOrdering,
   repositoryOrder,
+  groupOrder,
+  moveGroup,
   changeOrdering,
   orderingSaving,
   changeSidebarView,
@@ -77,8 +82,13 @@ export function useSidebarModel({
     pluginSort,
     drawsRepoHeaders: groupBy === "project",
   });
-  const session = useSessionGroups(workspaces, compareWorkspace);
-  const nested = useNestedSidebarGroups(repo.groups, compareWorkspace);
+  // Under Custom, Group headers follow the Daemon's Group order; under Name they stay A to Z.
+  const comparePaths = useMemo(
+    () => (sort === "custom" ? groupPathComparator(mergeGroupOrder(groupOrder)) : undefined),
+    [sort, groupOrder],
+  );
+  const session = useSessionGroups(workspaces, compareWorkspace, comparePaths);
+  const nested = useNestedSidebarGroups(repo.groups, compareWorkspace, comparePaths);
 
   // The rendered groups in display order, so jump-to-next and drags follow what the user sees.
   const displayGroups = useMemo(
@@ -203,6 +213,31 @@ export function useSidebarModel({
     [refuseWhileSaving, repo.groups, repositoryOrder, frozen, onScreenOrder, commit],
   );
 
+  /** Moves a Group header next to its sibling `overPath`, after it when the drag went down. */
+  const moveGroupHeader = useCallback(
+    (activePath: string, overPath: string, after: boolean) => {
+      if (sort !== "custom") {
+        reportInfo("Pick Custom to arrange groups");
+        return;
+      }
+      if (refuseWhileSaving()) return;
+      const profiles = new Set(
+        displayGroups
+          .filter((g) => g.groupPath === activePath)
+          .flatMap((g) => g.workspaces.flatMap((v) => v.workspace.sessions.map((s) => s.profile))),
+      );
+      // The Daemon orders each profile's Groups apart, so a header merging two has no one place to go.
+      const [profile] = profiles;
+      if (profiles.size !== 1 || profile === undefined) return;
+      const shown = displayGroups.map((g) => g.groupPath ?? "").filter((p) => p !== "");
+      const move = groupMove(groupOrder[profile] ?? [], shown, activePath, overPath, after);
+      if (!move) return;
+      dropUndo();
+      void moveGroup(profile, activePath, move);
+    },
+    [sort, refuseWhileSaving, displayGroups, groupOrder, dropUndo, moveGroup],
+  );
+
   return {
     groupBy,
     sort,
@@ -220,6 +255,7 @@ export function useSidebarModel({
     toggleSubgroupCollapsed: nested.toggleSubgroupCollapsed,
     moveWorkspace,
     moveRepository,
+    moveGroupHeader,
     attentionJump,
   };
 }

@@ -11,6 +11,7 @@ const subgroupKey = (repoId: string, groupPath: string) =>
 export function useNestedSidebarGroups(
   repoGroups: RepoGroup[],
   compareWorkspace: (a: Workspace, b: Workspace) => number,
+  comparePaths?: (a: string, b: string) => number,
 ): {
   groups: NestedSidebarGroup[];
   toggleSubgroupCollapsed: (repoId: string, groupPath: string) => void;
@@ -23,9 +24,10 @@ export function useNestedSidebarGroups(
       buildNestedSidebarGroups(repoGroups, {
         idleDecayWindowMs,
         compareWorkspace,
+        comparePaths,
         isSubgroupCollapsed: (repoId, groupPath) => isCollapsed(subgroupKey(repoId, groupPath)),
       }),
-    [repoGroups, idleDecayWindowMs, compareWorkspace, isCollapsed],
+    [repoGroups, idleDecayWindowMs, compareWorkspace, comparePaths, isCollapsed],
   );
 
   const toggleSubgroupCollapsed = useCallback(

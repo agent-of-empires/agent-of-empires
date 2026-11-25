@@ -529,6 +529,24 @@ impl serde::Serialize for ScopedSessions<'_> {
     }
 }
 
+/// Each profile's Group paths in `groups.json` order, the Custom order of its Group headers.
+struct GroupOrder<'a>(&'a [crate::daemon::ProfileSnapshot]);
+
+impl serde::Serialize for GroupOrder<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.0.iter().map(|profile| {
+            (
+                &profile.name,
+                profile
+                    .groups
+                    .iter()
+                    .map(|group| &group.path)
+                    .collect::<Vec<_>>(),
+            )
+        }))
+    }
+}
+
 pub(crate) struct SessionsView {
     snapshot: Arc<crate::server::runtime::PublishedSnapshot>,
     filter: SessionFilter,
@@ -542,6 +560,7 @@ impl serde::Serialize for SessionsView {
             workspace_ordering: &'a [String],
             repository_order: &'a [String],
             sidebar_view: crate::session::config::SidebarView,
+            group_order: GroupOrder<'a>,
             trashed_count: usize,
         }
         let rows = &self.snapshot.value.contents.sessions;
@@ -553,6 +572,7 @@ impl serde::Serialize for SessionsView {
             workspace_ordering: &self.snapshot.value.contents.workspace_ordering,
             repository_order: &self.snapshot.value.contents.repository_order,
             sidebar_view: self.snapshot.value.contents.sidebar_view,
+            group_order: GroupOrder(&self.snapshot.value.contents.profiles),
             trashed_count: rows.iter().filter(|row| row.trashed_at.is_some()).count(),
         }
         .serialize(serializer)
@@ -1442,6 +1462,47 @@ mod workspace_ordering_tests {
         assert_eq!(
             snapshot["workspace_ordering"],
             serde_json::to_value(expected_order)?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn listing_publishes_each_profiles_group_order() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        state.canonical_metadata.write().await.profiles = ["work", "home"]
+            .into_iter()
+            .map(|name| crate::daemon::ProfileSnapshot {
+                name: name.into(),
+                description: None,
+                groups: ["zeta", "alpha/b", "alpha"]
+                    .into_iter()
+                    .map(|path| crate::session::Group::new(path, path))
+                    .take(if name == "work" { 3 } else { 1 })
+                    .collect(),
+                projects: Vec::new(),
+            })
+            .collect();
+        state.runtime.publish(&state).await?;
+        let response = list_sessions(
+            State(state),
+            axum::extract::Query(ListSessionsQuery { state: None }),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
+        let envelope: crate::daemon::SessionsEnvelope = serde_json::from_slice(&bytes)?;
+        assert_eq!(
+            envelope.group_order,
+            std::collections::BTreeMap::from([
+                ("home".into(), vec!["zeta".into()]),
+                (
+                    "work".into(),
+                    vec!["zeta".into(), "alpha/b".into(), "alpha".into()]
+                ),
+            ])
         );
         Ok(())
     }

@@ -206,6 +206,8 @@ export interface SessionsEnvelope {
   /** Repository paths in the shared Custom order of the Repository headers. */
   repository_order?: string[];
   sidebar_view?: SidebarView;
+  /** Each profile's Group paths in the Custom order of its Group headers. */
+  group_order?: Record<string, string[]>;
   /** Trashed rows in the whole snapshot; the list itself omits them. */
   trashed_count?: number;
   cursor: RuntimeCursor;
@@ -327,6 +329,24 @@ async function writeReceipt(url: string, init: RequestInit): Promise<RuntimeCurs
 
 export function updateWorkspaceOrdering(patch: WorkspaceOrderingPatch): Promise<RuntimeCursor | null> {
   return writeReceipt("/api/workspace-ordering", jsonInit("PUT", patch));
+}
+
+/** Moves a Group one slot among its siblings; resolves with the receipt when it moved, else null. */
+export async function reorderGroup(
+  group: { profile: string; path: string },
+  direction: "up" | "down",
+): Promise<RuntimeCursor | null> {
+  try {
+    const res = await fetch("/api/reorder", {
+      ...jsonInit("POST", { target: "group", group, direction }),
+      signal: AbortSignal.timeout(WRITE_RECEIPT_DEADLINE_MS),
+    });
+    if (!res.ok) return null;
+    const outcome = (await res.json().catch(() => null)) as { status?: string } | null;
+    return outcome?.status === "moved" ? runtimeCursor(res) : null;
+  } catch {
+    return null;
+  }
 }
 
 export function updateSidebarView(patch: Partial<SidebarView>): Promise<RuntimeCursor | null> {

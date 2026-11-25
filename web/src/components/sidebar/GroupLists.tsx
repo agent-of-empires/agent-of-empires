@@ -15,7 +15,7 @@ import { dragEnded, dragStarted, typedClosestCenter, useReleaseDragOnUnmount, ty
 import { SessionRow } from "./SessionRow";
 import { SidebarGroupHeader } from "./SidebarGroupHeader";
 import { ROWS, rowsId } from "./keyboardNav";
-import { SortableRepoGroup, SortableSessionRow } from "./Sortable";
+import { SortableGroupBlock, SortableSessionRow } from "./Sortable";
 import type { DragHandleProps } from "./types";
 
 type RowProps = Omit<ComponentProps<typeof SessionRow>, "indented">;
@@ -103,12 +103,15 @@ export interface DragOptions {
   headersDisabled: boolean;
   onMoveWorkspace: (activeId: string, overId: string, after: boolean) => void;
   onMoveRepository: (activeId: string, overId: string, after: boolean) => void;
+  /** Moves a Group header among its siblings, by path. */
+  onMoveGroup: (activePath: string, overPath: string, after: boolean) => void;
   dragClickGuard: MutableRefObject<DragClickGuard>;
 }
 
 interface SortableData {
-  type?: "group" | "workspace";
+  type?: "group" | "sessionGroup" | "workspace";
   workspaceId?: string;
+  groupPath?: string;
   sortable?: { containerId: string | number; index: number };
 }
 
@@ -128,6 +131,9 @@ function SidebarDnd({ drag, children }: { drag: DragOptions; children: ReactNode
     const after = to.sortable.index > from.sortable.index;
     if (from.type === "group" && !drag.headersDisabled)
       drag.onMoveRepository(String(active.id), String(over.id), after);
+    if (from.type === "sessionGroup" && !drag.headersDisabled && from.groupPath && to.groupPath) {
+      drag.onMoveGroup(from.groupPath, to.groupPath, after);
+    }
     if (from.type === "workspace" && !drag.rowsDisabled && from.workspaceId && to.workspaceId) {
       drag.onMoveWorkspace(from.workspaceId, to.workspaceId, after);
     }
@@ -166,7 +172,8 @@ function SortableRows({ ctx, group, drag }: { ctx: ListContext; group: SidebarGr
   );
 }
 
-/** My groups: one header per Group, in name order; rows reorder within their Group. */
+/** My groups: one header per Group, in the shared sort; headers reorder among their siblings, rows within their
+ *  Group. */
 export function FlatGroupList({
   ctx,
   groups,
@@ -181,22 +188,42 @@ export function FlatGroupList({
   onToggleGroup: (groupId: string) => void;
 }) {
   const byId = new Map(fullGroups.map((g) => [g.id, g]));
+  const live = groups.filter(sidebarGroupShouldRender);
+  const block = (group: SidebarGroup, dragHandle?: DragHandleProps) => (
+    <>
+      <GroupHeader
+        ctx={ctx}
+        full={{ ...(byId.get(group.id) ?? group), collapsed: group.collapsed }}
+        visible={group.workspaces}
+        onToggle={() => onToggleGroup(group.id)}
+        dragHandle={dragHandle}
+        rows={rowsId(group.id)}
+      />
+      <GroupRows id={rowsId(group.id)}>
+        {(ctx.hasFilter || !group.collapsed) && <SortableRows ctx={ctx} group={group} drag={drag} />}
+      </GroupRows>
+    </>
+  );
+  const named = live.filter((g) => g.id !== UNGROUPED_GROUP_ID);
   return (
     <SidebarDnd drag={drag}>
-      {groups.filter(sidebarGroupShouldRender).map((group) => (
-        <div key={group.id}>
-          <GroupHeader
-            ctx={ctx}
-            full={{ ...(byId.get(group.id) ?? group), collapsed: group.collapsed }}
-            visible={group.workspaces}
-            onToggle={() => onToggleGroup(group.id)}
-            rows={rowsId(group.id)}
-          />
-          <GroupRows id={rowsId(group.id)}>
-            {(ctx.hasFilter || !group.collapsed) && <SortableRows ctx={ctx} group={group} drag={drag} />}
-          </GroupRows>
-        </div>
-      ))}
+      <SortableContext items={named.map((g) => g.id)} strategy={verticalListSortingStrategy}>
+        {named.map((group) => (
+          <SortableGroupBlock
+            key={group.id}
+            groupId={group.id}
+            groupPath={group.groupPath}
+            disabled={drag.headersDisabled}
+          >
+            {(handle) => block(group, drag.headersDisabled ? undefined : handle)}
+          </SortableGroupBlock>
+        ))}
+      </SortableContext>
+      {live
+        .filter((g) => g.id === UNGROUPED_GROUP_ID)
+        .map((group) => (
+          <div key={group.id}>{block(group)}</div>
+        ))}
     </SidebarDnd>
   );
 }
@@ -229,6 +256,11 @@ export function NestedGroupList({
   const body = ({ repo, subgroups }: NestedSidebarGroup, dragHandle?: DragHandleProps) => {
     const repoRows = rowsId(`repo:${encodeURIComponent(repo.id)}`);
     const fullSubgroups = fullGroups.find((n) => n.repo.id === repo.id)?.subgroups ?? [];
+    const shown = subgroups.filter(sidebarGroupHasLiveWorkspace);
+    const named = shown.filter((sg) => sg.id !== UNGROUPED_GROUP_ID);
+    // Every id part is encoded, top level included, so `::` is only ever the separator.
+    const subgroupId = (sg: SidebarGroup) =>
+      `repo:${encodeURIComponent(repo.id)}::${encodeURIComponent(sg.groupPath ?? "")}`;
     return (
       <>
         <GroupHeader
@@ -242,30 +274,46 @@ export function NestedGroupList({
           rows={repoRows}
         />
         <GroupRows id={repoRows}>
-          {(ctx.hasFilter || !repo.collapsed) &&
-            subgroups.filter(sidebarGroupHasLiveWorkspace).map((sg) => {
-              const groupPath = sg.groupPath ?? "";
-              if (sg.id === UNGROUPED_GROUP_ID) {
-                return <SortableRows key={`${repo.id}::`} ctx={ctx} group={sg} drag={drag} />;
-              }
-              const full = fullSubgroups.find((s) => (s.groupPath ?? "") === groupPath) ?? sg;
-              // Every id part is encoded, top level included, so `::` is only ever the separator.
-              const rows = rowsId(`repo:${encodeURIComponent(repo.id)}::${encodeURIComponent(groupPath)}`);
-              return (
-                <IndentedLevel key={`${repo.id}::${groupPath}`} testId="sidebar-nested-subgroup" repoId={repo.id}>
-                  <GroupHeader
-                    ctx={ctx}
-                    full={{ ...full, collapsed: sg.collapsed }}
-                    visible={sg.workspaces}
-                    onToggle={() => onToggleSubgroup(repo.id, groupPath)}
-                    rows={rows}
-                  />
-                  <GroupRows id={rows}>
-                    {(ctx.hasFilter || !sg.collapsed) && <SortableRows ctx={ctx} group={sg} drag={drag} />}
-                  </GroupRows>
-                </IndentedLevel>
-              );
-            })}
+          {(ctx.hasFilter || !repo.collapsed) && (
+            <>
+              {shown
+                .filter((sg) => sg.id === UNGROUPED_GROUP_ID)
+                .map((sg) => (
+                  <SortableRows key={`${repo.id}::`} ctx={ctx} group={sg} drag={drag} />
+                ))}
+              <SortableContext items={named.map(subgroupId)} strategy={verticalListSortingStrategy}>
+                {named.map((sg) => {
+                  const groupPath = sg.groupPath ?? "";
+                  const full = fullSubgroups.find((s) => (s.groupPath ?? "") === groupPath) ?? sg;
+                  const rows = rowsId(subgroupId(sg));
+                  return (
+                    <SortableGroupBlock
+                      key={subgroupId(sg)}
+                      groupId={subgroupId(sg)}
+                      groupPath={groupPath}
+                      disabled={drag.headersDisabled}
+                    >
+                      {(handle) => (
+                        <IndentedLevel testId="sidebar-nested-subgroup" repoId={repo.id}>
+                          <GroupHeader
+                            ctx={ctx}
+                            full={{ ...full, collapsed: sg.collapsed }}
+                            visible={sg.workspaces}
+                            onToggle={() => onToggleSubgroup(repo.id, groupPath)}
+                            dragHandle={drag.headersDisabled ? undefined : handle}
+                            rows={rows}
+                          />
+                          <GroupRows id={rows}>
+                            {(ctx.hasFilter || !sg.collapsed) && <SortableRows ctx={ctx} group={sg} drag={drag} />}
+                          </GroupRows>
+                        </IndentedLevel>
+                      )}
+                    </SortableGroupBlock>
+                  );
+                })}
+              </SortableContext>
+            </>
+          )}
         </GroupRows>
       </>
     );
@@ -274,13 +322,13 @@ export function NestedGroupList({
     <SidebarDnd drag={drag}>
       <SortableContext items={live.map((n) => n.repo.id)} strategy={verticalListSortingStrategy}>
         {live.map((group) => (
-          <SortableRepoGroup key={group.repo.id} groupId={group.repo.id} disabled={drag.headersDisabled}>
+          <SortableGroupBlock key={group.repo.id} groupId={group.repo.id} disabled={drag.headersDisabled}>
             {(handle) => (
               <div data-testid="sidebar-nested-repo" data-repo-id={group.repo.id}>
                 {body(group, drag.headersDisabled ? undefined : handle)}
               </div>
             )}
-          </SortableRepoGroup>
+          </SortableGroupBlock>
         ))}
       </SortableContext>
     </SidebarDnd>

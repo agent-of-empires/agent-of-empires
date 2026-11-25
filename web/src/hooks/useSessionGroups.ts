@@ -7,6 +7,7 @@ import { useCollapsedKeys } from "./useCollapsedKeys";
 export function useSessionGroups(
   workspaces: Workspace[],
   compareWorkspace: (a: Workspace, b: Workspace) => number,
+  comparePaths?: (a: string, b: string) => number,
 ): {
   groups: SidebarGroup[];
   toggleGroupCollapsed: (groupId: string) => void;
@@ -15,8 +16,8 @@ export function useSessionGroups(
   const { isCollapsed, toggle } = useCollapsedKeys("aoe-group-collapsed-");
 
   const groups = useMemo(
-    () => buildSessionGroups(workspaces, { idleDecayWindowMs, compareWorkspace, isCollapsed }),
-    [workspaces, idleDecayWindowMs, compareWorkspace, isCollapsed],
+    () => buildSessionGroups(workspaces, { idleDecayWindowMs, compareWorkspace, comparePaths, isCollapsed }),
+    [workspaces, idleDecayWindowMs, compareWorkspace, comparePaths, isCollapsed],
   );
 
   return { groups, toggleGroupCollapsed: toggle };

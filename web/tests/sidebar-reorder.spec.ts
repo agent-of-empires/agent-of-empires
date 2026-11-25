@@ -343,3 +343,75 @@ test.describe("group headers", () => {
     await expect.poll(() => groupNames(page), { timeout: 4_000 }).toEqual(expected);
   });
 });
+
+// Group headers follow each profile's `groups.json` order under Custom, moved one sibling slot per request.
+test.describe("My groups headers", () => {
+  const grouped: MockSessionInput[] = ["alpha", "beta", "gamma"].map((group) => ({
+    id: `s-${group}`,
+    title: `${group}-session`,
+    project_path: "/tmp/repo",
+    branch: `feat/${group}`,
+    group,
+  }));
+  const groupOrder = { default: ["alpha", "beta", "gamma"] };
+  const headers = (page: Page) => page.locator("[data-testid='sidebar-group-header']");
+  const names = (page: Page) =>
+    page.evaluate(() =>
+      Array.from(document.querySelectorAll<HTMLElement>("[data-testid='sidebar-group-header']"))
+        .map((h) => h.querySelector("span[title]")?.textContent?.trim() ?? "")
+        .filter(Boolean),
+    );
+  const dragHeader = async (page: Page, from: number, to: number) => {
+    const source = (await headers(page).nth(from).boundingBox())!;
+    const target = (await headers(page).nth(to).boundingBox())!;
+    await page.mouse.move(source.x + 40, source.y + source.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(target.x + 40, target.y + target.height / 3, { steps: 12 });
+    await page.mouse.up();
+  };
+
+  test("under Custom a header drag moves the Group one slot per sibling passed, and persists", async ({ page }) => {
+    const handle = await openDesktop(page, grouped, { groupOrder, view: { group_by: "group", sort: "custom" } });
+    await expect.poll(() => names(page), { timeout: 8_000 }).toEqual(["alpha", "beta", "gamma"]);
+    await expect(headers(page).and(page.locator("[data-draggable='true']"))).toHaveCount(3);
+
+    await dragHeader(page, 2, 0);
+    await expect.poll(() => names(page), { timeout: 4_000 }).toEqual(["gamma", "alpha", "beta"]);
+    const step = { target: "group", group: { profile: "default", path: "gamma" }, direction: "up" };
+    await expect.poll(() => handle.reorders, { timeout: 4_000 }).toEqual([step, step]);
+    expect(handle.puts).toEqual([]);
+    await page.reload();
+    await expect.poll(() => names(page), { timeout: 8_000 }).toEqual(["gamma", "alpha", "beta"]);
+  });
+
+  test("under Repository a nested Group header moves among the Groups of its repository", async ({ page }) => {
+    const handle = await openDesktop(page, grouped, { groupOrder });
+    const nested = page.getByTestId("sidebar-nested-subgroup").locator("[data-testid='sidebar-group-header']");
+    await expect(nested).toHaveCount(3);
+    await expect.poll(() => names(page), { timeout: 8_000 }).toEqual(["repo", "alpha", "beta", "gamma"]);
+    await dragHeader(page, 1, 3);
+    await expect.poll(() => names(page), { timeout: 4_000 }).toEqual(["repo", "beta", "gamma", "alpha"]);
+    const step = { target: "group", group: { profile: "default", path: "alpha" }, direction: "down" };
+    await expect.poll(() => handle.reorders, { timeout: 4_000 }).toEqual([step, step]);
+  });
+
+  test("under Name a header drag points to Custom and moves nothing", async ({ page }) => {
+    const handle = await openDesktop(page, grouped, {
+      groupOrder: { default: ["gamma", "beta", "alpha"] },
+      view: { group_by: "group", sort: "name" },
+    });
+    await expect.poll(() => names(page), { timeout: 8_000 }).toEqual(["alpha", "beta", "gamma"]);
+    await dragHeader(page, 2, 0);
+    await expect(page.getByText("Pick Custom to arrange groups")).toBeVisible();
+    await expect.poll(() => names(page)).toEqual(["alpha", "beta", "gamma"]);
+    expect(handle.reorders).toEqual([]);
+    expect(handle.viewPatches).toEqual([]);
+  });
+
+  test("a read-only viewer gets no draggable Group header", async ({ page }) => {
+    await openDesktop(page, grouped, { groupOrder, readOnly: true, view: { group_by: "group", sort: "custom" } });
+    await waitForResponseBody(page, "/api/about");
+    await expect.poll(() => names(page), { timeout: 8_000 }).toEqual(["alpha", "beta", "gamma"]);
+    await expect(page.locator("[data-testid='sidebar-group-header'][data-draggable='true']")).toHaveCount(0);
+  });
+});

@@ -20,6 +20,7 @@ interface Daemon {
   workspace_ordering: string[];
   repository_order: string[];
   sidebar_view: SidebarView;
+  group_order: Record<string, string[]>;
 }
 
 const row = (id: string, repo: string, title: string, created_at = "2025-01-01T00:00:00Z") =>
@@ -37,6 +38,7 @@ const server = setupServer(
         workspace_ordering: daemon.workspace_ordering,
         repository_order: daemon.repository_order,
         sidebar_view: daemon.sidebar_view,
+        group_order: daemon.group_order,
       },
       { headers: runtime(daemon.revision) },
     ),
@@ -55,6 +57,20 @@ const server = setupServer(
     if (body.repositories) daemon.repository_order = body.repositories;
     daemon.revision += 1;
     return HttpResponse.json({ order: daemon.workspace_ordering }, { headers: runtime(daemon.revision) });
+  }),
+  http.post("*/api/reorder", async ({ request }) => {
+    const body = (await request.json()) as { group: { profile: string; path: string }; direction: "up" | "down" };
+    writes.push({ method: "POST", body });
+    // Swaps the Group with its neighbouring sibling, as the Daemon's `move_group` does.
+    const order = daemon.group_order[body.group.profile] ?? [];
+    const parent = (p: string) => p.slice(0, Math.max(0, p.lastIndexOf("/")));
+    const siblings = order.flatMap((p, i) => (parent(p) === parent(body.group.path) ? [i] : []));
+    const at = siblings.findIndex((i) => order[i] === body.group.path);
+    const to = siblings[at + (body.direction === "up" ? -1 : 1)];
+    if (at < 0 || to === undefined) return HttpResponse.json({ status: "at_edge" });
+    [order[siblings[at]!], order[to]] = [order[to]!, order[siblings[at]!]!];
+    daemon.revision += 1;
+    return HttpResponse.json({ status: "moved", destination: null }, { headers: runtime(daemon.revision) });
   }),
 );
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
@@ -116,6 +132,7 @@ beforeEach(() => {
     workspace_ordering: sessions.map(wsId),
     repository_order: ["/r/beta", "/r/Alpha"],
     sidebar_view: { group_by: "project", sort: "custom" },
+    group_order: {},
   };
 });
 
@@ -129,6 +146,8 @@ function mount() {
       view: sessions.sidebarView,
       workspaceOrdering: sessions.workspaceOrdering,
       repositoryOrder: sessions.repositoryOrder,
+      groupOrder: sessions.groupOrder,
+      moveGroup: sessions.moveGroup,
       changeOrdering: sessions.changeOrdering,
       orderingSaving: sessions.orderingSaving,
       changeSidebarView: sessions.changeSidebarView,
@@ -480,3 +499,81 @@ describe("Undo", () => {
     expect(toasts.undo).toHaveLength(1);
   });
 });
+
+describe("Group headers", () => {
+  const grouped = (id: string, group_path: string) =>
+    session({ id, title: id, project_path: "/r/one", branch: id, group_path, created_at: "2025-01-01T00:00:00Z" });
+  const groupHeaders = (r: Mounted) => r.current.model.groups.map((g) => g.id);
+
+  beforeEach(() => {
+    daemon.sessions = ["zeta", "alpha", "mid", "alpha/inner", "loose"].map((path) =>
+      grouped(path.replace("/", "-"), path),
+    );
+    daemon.workspace_ordering = daemon.sessions.map(wsId);
+    daemon.group_order = { default: ["zeta", "alpha", "alpha/inner", "mid"] };
+    daemon.sidebar_view = { group_by: "group", sort: "custom" };
+  });
+
+  it("follow the Daemon's Group order under Custom, unlisted ones after by name, and A to Z under Name", async () => {
+    const { result } = mount();
+    await waitFor(() => expect(groupHeaders(result)).toEqual(["zeta", "alpha", "alpha/inner", "mid", "loose"]));
+    daemon.sidebar_view = { group_by: "group", sort: "name" };
+    await pollAt(result, 2);
+    await waitFor(() => expect(groupHeaders(result)).toEqual(["alpha", "alpha/inner", "loose", "mid", "zeta"]));
+  });
+
+  it("a drag sends one single-slot move per sibling passed, in turn, and refuses another meanwhile", async () => {
+    const { result } = mount();
+    await waitFor(() => expect(groupHeaders(result)).toHaveLength(5));
+    const releases = heldReorders();
+    act(() => result.current.model.moveGroupHeader("mid", "zeta", false));
+    // Shown in its new place at once.
+    expect(groupHeaders(result)).toEqual(["mid", "zeta", "alpha", "alpha/inner", "loose"]);
+    await waitFor(() => expect(writes).toHaveLength(1));
+    act(() => result.current.model.moveGroupHeader("zeta", "alpha", true));
+    expect(toasts.info).toHaveBeenCalledWith("The last move is still saving");
+    await act(async () => releases.shift()!());
+    await waitFor(() => expect(writes).toHaveLength(2));
+    await act(async () => releases.shift()!());
+    await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
+    const step = { target: "group", group: { profile: "default", path: "mid" }, direction: "up" };
+    expect(writes).toEqual([
+      { method: "POST", body: step },
+      { method: "POST", body: step },
+    ]);
+    await pollAt(result, daemon.revision);
+    expect(groupHeaders(result)).toEqual(["mid", "zeta", "alpha", "alpha/inner", "loose"]);
+  });
+
+  it("are not moved under Name, which points to Custom, nor across parents", async () => {
+    daemon.sidebar_view = { group_by: "group", sort: "name" };
+    const { result } = mount();
+    await waitFor(() => expect(groupHeaders(result)).toHaveLength(5));
+    act(() => result.current.model.moveGroupHeader("zeta", "alpha", false));
+    expect(toasts.info).toHaveBeenCalledWith("Pick Custom to arrange groups");
+    act(() => result.current.model.selectSort("custom"));
+    await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
+    act(() => result.current.model.moveGroupHeader("alpha/inner", "zeta", false));
+    expect(writes.filter((w) => w.method === "POST")).toEqual([]);
+  });
+});
+
+/** Holds each `POST /api/reorder` until released, then moves the Group as the default handler does. */
+function heldReorders() {
+  const releases: (() => void)[] = [];
+  server.use(
+    http.post("*/api/reorder", async ({ request }) => {
+      const body = (await request.json()) as { group: { profile: string; path: string }; direction: "up" | "down" };
+      writes.push({ method: "POST", body });
+      await new Promise<void>((r) => releases.push(r));
+      const order = daemon.group_order[body.group.profile]!;
+      const at = order.indexOf(body.group.path);
+      const siblings = order.flatMap((p, i) => (p.includes("/") ? [] : [i]));
+      const to = siblings[siblings.indexOf(at) - 1]!;
+      [order[at], order[to]] = [order[to]!, order[at]!];
+      daemon.revision += 1;
+      return HttpResponse.json({ status: "moved", destination: null }, { headers: runtime(daemon.revision) });
+    }),
+  );
+  return releases;
+}

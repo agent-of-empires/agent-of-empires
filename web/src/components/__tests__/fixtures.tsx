@@ -230,6 +230,7 @@ export function sidebarProps(workspaces: Workspace[], over: Partial<SidebarProps
     onToggleSubgroup: noop,
     onMoveWorkspace: noop,
     onMoveRepository: noop,
+    onMoveGroup: noop,
     activeId: null,
     activeSessionId: null,
     open: true,

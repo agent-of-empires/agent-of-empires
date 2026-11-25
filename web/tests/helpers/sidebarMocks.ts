@@ -54,6 +54,8 @@ export interface SidebarView {
 
 export interface SidebarMockHandle {
   puts: Array<{ order?: string[]; repositories?: string[] }>;
+  /** `POST /api/reorder` bodies, in arrival order. */
+  reorders: Array<{ target: string; group: { profile: string; path: string }; direction: "up" | "down" }>;
   /** `PATCH /api/sidebar-view` bodies, in arrival order. */
   viewPatches: Array<Partial<SidebarView>>;
   /** One-shot override for the next PUT's response. */
@@ -69,6 +71,8 @@ export interface SidebarMockOptions {
   ordering?: string[];
   /** The shared Repository header order; defaults to none moved. */
   repositoryOrder?: string[];
+  /** Each profile's Group order; defaults to none. */
+  groupOrder?: Record<string, string[]>;
   /** Defaults to Repository and Custom. */
   view?: SidebarView;
   readOnly?: boolean;
@@ -80,6 +84,7 @@ export async function installSidebarMocks(page: Page, opts: SidebarMockOptions):
   const filled = opts.sessions.map((s, i) => fillCreatedAt(s, i));
   const handle: SidebarMockHandle = {
     puts: [],
+    reorders: [],
     viewPatches: [],
     nextPutResponse: null,
     readOnly: !!opts.readOnly,
@@ -88,6 +93,7 @@ export async function installSidebarMocks(page: Page, opts: SidebarMockOptions):
 
   let ordering = opts.ordering ?? filled.map((s) => workspaceId(s));
   let repositoryOrder = opts.repositoryOrder ?? [];
+  const groupOrder = structuredClone(opts.groupOrder ?? {});
   // Each write publishes a newer snapshot, so its receipt and later reads line up like the Daemon's.
   let revision = 1;
   const runtime = (write = false) => {
@@ -105,6 +111,7 @@ export async function installSidebarMocks(page: Page, opts: SidebarMockOptions):
         workspace_ordering: ordering,
         repository_order: repositoryOrder,
         sidebar_view: handle.view,
+        group_order: groupOrder,
       },
     });
   });
@@ -119,6 +126,20 @@ export async function installSidebarMocks(page: Page, opts: SidebarMockOptions):
       if (opts.persistPutOrdering && body?.repositories) repositoryOrder = body.repositories;
     }
     return r.fulfill({ headers: runtime(true), json: { order: ordering, repositories: repositoryOrder } });
+  });
+  // Swaps the Group with its neighbouring sibling, like the Daemon.
+  await page.route("**/api/reorder", (r: Route) => {
+    const body = r.request().postDataJSON() as SidebarMockHandle["reorders"][number];
+    handle.reorders.push(body);
+    const order = groupOrder[body.group.profile] ?? [];
+    const parent = (p: string) => p.slice(0, Math.max(0, p.lastIndexOf("/")));
+    const siblings = order.flatMap((p, i) => (parent(p) === parent(body.group.path) ? [i] : []));
+    const at = siblings.findIndex((i) => order[i] === body.group.path);
+    const to = siblings[at + (body.direction === "up" ? -1 : 1)];
+    if (at < 0 || to === undefined) return r.fulfill({ json: { status: "at_edge" } });
+    const from = siblings[at]!;
+    [order[from], order[to]] = [order[to]!, order[from]!];
+    return r.fulfill({ headers: runtime(true), json: { status: "moved", destination: null } });
   });
   await page.route("**/api/sidebar-view", (r: Route) => {
     const body = (r.request().postDataJSON() ?? {}) as Partial<SidebarView>;

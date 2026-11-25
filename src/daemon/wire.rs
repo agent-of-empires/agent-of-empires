@@ -1672,6 +1672,9 @@ pub struct SessionsEnvelope {
     /// The grouping and sort every Client shows.
     #[serde(default)]
     pub sidebar_view: crate::session::config::SidebarView,
+    /// Each profile's Group paths in the Custom order of its Group headers.
+    #[serde(default)]
+    pub group_order: std::collections::BTreeMap<String, Vec<String>>,
     /// Trashed rows in the whole snapshot, whatever the scope filtered out.
     #[serde(default)]
     pub trashed_count: usize,

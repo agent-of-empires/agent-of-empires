@@ -438,6 +438,7 @@ The response is an object, not a bare array:
   "workspace_ordering": ["/path/to/repo::main"],
   "repository_order": ["/path/to/repo"],
   "sidebar_view": { "group_by": "project", "sort": "custom" },
+  "group_order": { "default": ["work", "work/api"] },
   "trashed_count": 0
 }
 ```
@@ -452,8 +453,11 @@ The response is an object, not a bare array:
   workspace's position in this list.
 - `repository_order`: repository paths in the shared Custom order of the
   Repository headers; headers not listed come first, newest first.
-- `sidebar_view`: the grouping and sort the Daemon publishes, which the TUI
-  follows (see `PATCH /api/sidebar-view`).
+- `sidebar_view`: the grouping and sort every Client shows (see
+  `PATCH /api/sidebar-view`).
+- `group_order`: each profile's Group paths, nested ones included, in the
+  Custom order of its Group headers (its `groups.json` order). Siblings keep
+  their relative order in the list; `POST /api/reorder` moves one a slot.
 
 `PUT /api/workspace-ordering` takes `{"order": [...], "repositories": [...]}`;
 an omitted list keeps its value and an empty one clears it. An optional
