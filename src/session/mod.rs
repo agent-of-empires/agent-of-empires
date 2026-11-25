@@ -108,9 +108,9 @@ pub use instance::{
     LifecycleOperation, LifecycleReservation, LifecycleReservationError, ManagedResumeCause,
     PaneObservation, PanePresence, PendingInitialTurn, PluginCreateIdempotency, PollerStart,
     SandboxInfo, SandboxLoginRequired, SandboxLoginUnsupported, SessionBucket, SessionGone,
-    StartBlocked, StartOutcome, Status, SuggestionOrigin, TerminalInfo, TmuxServerIdentity, View, WorkspaceInfo,
-    WorkspaceRepo, WorktreeInfo, MAX_INITIAL_PROMPT_BYTES, TMUX_SERVER_UNREACHABLE_ERROR,
-    TMUX_SESSION_GONE_ERROR,
+    StartBlocked, StartOutcome, Status, SuggestionOrigin, TerminalInfo, TmuxServerIdentity, View,
+    WorkspaceInfo, WorkspaceRepo, WorktreeInfo, MAX_INITIAL_PROMPT_BYTES,
+    TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR,
 };
 pub(crate) use instance::{
     ConversationState, LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy,
