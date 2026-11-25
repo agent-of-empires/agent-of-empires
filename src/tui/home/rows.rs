@@ -184,7 +184,8 @@ impl HomeView {
         self.flash_status(if !self.hide_stopped_in_groups {
             "Showing stopped sessions"
         } else if self.hide_snoozed_with_stopped {
-            "Stopped and snoozed sessions in groups hidden (y to show)"
+            // Keep the recovery key on screen at the supported 48-column minimum.
+            "Stopped and snoozed hidden (y to show)"
         } else {
             "Stopped sessions in groups hidden (y to show)"
         });

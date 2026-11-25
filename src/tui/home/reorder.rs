@@ -26,7 +26,7 @@ impl HomeView {
             if self.hide_stopped_in_groups {
                 // A session move renumbers every sibling in the store, the hidden ones too.
                 self.flash_status(if self.hide_snoozed_with_stopped {
-                    "Show stopped and snoozed sessions (y) to move sessions by hand"
+                    "Show stopped and snoozed (y) to move by hand"
                 } else {
                     "Show stopped sessions (y) to move sessions by hand"
                 });
