@@ -14,6 +14,7 @@ import type { HooksOverride, ProfileInfo, ProfileSettingsResponse } from "../../
 import { buildEffectiveHooks } from "../../lib/profileHooks";
 import { HooksReadOnlyPanel } from "./HooksReadOnlyPanel";
 import { validateProfileName } from "./profileName";
+import { isImeComposing } from "../../lib/ime";
 
 interface Props {
   readOnly?: boolean;
@@ -172,7 +173,7 @@ export function ProfilesSection({ readOnly, onRenamed }: Props) {
               setError(null);
             }}
             onKeyDown={(e) => {
-              if (e.key === "Enter") submitName();
+              if (e.key === "Enter" && !isImeComposing(e)) submitName();
               if (e.key === "Escape") closeInput();
             }}
             placeholder={creating ? "Profile name" : "New name"}

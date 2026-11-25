@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 vi.mock("../../lib/snippetHighlighter", () => ({
+  peekHighlight: () => undefined,
   highlightSnippet: vi.fn().mockResolvedValue(null),
   getSnippetHighlighter: vi.fn().mockResolvedValue(null),
   langHintForPath: () => "",

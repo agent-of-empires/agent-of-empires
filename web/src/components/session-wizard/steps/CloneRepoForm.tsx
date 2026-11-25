@@ -1,5 +1,6 @@
 import { useState, type Ref } from "react";
 import { cloneRepo } from "../../../lib/api";
+import { isImeComposing } from "../../../lib/ime";
 
 export function CloneRepoForm({
   onCloned,
@@ -52,7 +53,7 @@ export function CloneRepoForm({
             setCloneError(null);
           }}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && cloneUrl.trim() && !cloning) handleClone();
+            if (e.key === "Enter" && !isImeComposing(e) && cloneUrl.trim() && !cloning) handleClone();
           }}
           placeholder="https://github.com/user/repo.git"
           className="w-full px-3 py-2.5 text-sm bg-surface-900 border border-surface-700/40 rounded-md text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600 font-mono"

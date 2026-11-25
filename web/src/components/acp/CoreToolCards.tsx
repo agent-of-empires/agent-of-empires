@@ -181,7 +181,9 @@ export function EditToolCard({ tool, result }: ToolCardProps) {
       },
       { adds: 0, dels: 0 },
     );
-  }, [tool.diffs, legacyOld, legacyNew]);
+    // `tool.diffs` is rebuilt every render from `args_preview` (its `_aoe_diffs` key), so the string is the stable key.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tool.args_preview, legacyOld, legacyNew]);
 
   return (
     <CardChrome

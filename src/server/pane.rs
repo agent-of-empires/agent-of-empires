@@ -1657,6 +1657,7 @@ mod tests {
             pane_current_command: Some("sleep".into()),
             pane_start_command_is_protected: false,
             pane_pid: Some(4242),
+            first_window: true,
             pane_title: None,
             window_activity: None,
             window_size: Some((80, 24)),

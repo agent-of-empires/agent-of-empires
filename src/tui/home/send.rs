@@ -356,8 +356,11 @@ mod deliver_to_live_pane_tests {
             let first = only_pane_id(session.name());
             let checked = split_pane(session.name(), "exec cat");
             let dir = tempfile::tempdir().unwrap();
-            let pin =
-                crate::tmux::vt::register_pinned_for_test(session.name(), dir.path(), &checked);
+            let pin = crate::tmux::vt::register_live_target_for_test(
+                session.name(),
+                dir.path(),
+                &checked,
+            );
             let target = checked.clone();
             on_input_checked(&checked, move || {
                 drop(pin);

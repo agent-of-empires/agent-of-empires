@@ -330,6 +330,52 @@ fn capture_output(success: bool, stdout: &[u8]) -> Option<String> {
     success.then(|| String::from_utf8_lossy(stdout).into_owned())
 }
 
+/// Capture `pane_id` only while `session_name` still lists it. Membership comes from the
+/// session's own pane list, not the bare id, which resolves through whichever session sharing a
+/// linked window was active last. One tmux call frames its markers with a per-call nonce that
+/// pane output cannot contain, so screen text never reads as a membership result.
+fn capture_pane_in_session(
+    pane_id: &str,
+    session_name: &str,
+    lines: usize,
+) -> std::io::Result<Option<String>> {
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let output = crate::tmux::tmux_command()
+        .args([
+            "list-panes",
+            "-s",
+            "-t",
+            &format!("={session_name}:"),
+            "-F",
+            &format!("{nonce}:#{{pane_id}}"),
+            ";",
+            "display-message",
+            "-p",
+            &format!("{nonce}:capture"),
+            ";",
+            "capture-pane",
+            "-t",
+            pane_id,
+            "-p",
+            "-e",
+            "-S",
+            &format!("-{lines}"),
+        ])
+        .output()?;
+    let Some(text) = capture_output(output.status.success(), &output.stdout) else {
+        return Ok(None);
+    };
+    // One line per pane per window link. Matched here, not with `list-panes -f`, which needs
+    // tmux 3.2.
+    let (listing, capture) = text
+        .split_once(&format!("{nonce}:capture\n"))
+        .unwrap_or_default();
+    let owned = listing
+        .lines()
+        .any(|line| line.strip_prefix(&nonce).and_then(|l| l.strip_prefix(':')) == Some(pane_id));
+    Ok(owned.then(|| capture.to_owned()))
+}
+
 impl Session {
     pub fn new(id: &str, title: &str) -> Result<Self> {
         Ok(Self {
@@ -860,6 +906,25 @@ impl Session {
         Ok(capture_output(output.status.success(), &output.stdout))
     }
 
+    /// Capture a pane the caller already resolved, skipping the existence and pane-id probes.
+    /// `None` when the capture failed or the pane no longer belongs to this session, so a stale
+    /// or moved id never reads as a blank pane.
+    pub(crate) fn capture_pane_at(&self, pane_id: &str, lines: usize) -> Option<String> {
+        capture_pane_in_session(pane_id, &self.name, lines)
+            .ok()
+            .flatten()
+    }
+
+    /// Capture this session's first agent pane, ignoring any VT channel. For callers whose channel
+    /// pane was just rejected, so the same pane is never re-selected.
+    pub(crate) fn capture_first_pane(&self, lines: usize) -> Option<String> {
+        let pane_id = super::utils::first_pane_id_with_deadline(
+            &self.name,
+            &crate::tmux::TmuxCommandDeadline::new(),
+        )?;
+        self.capture_pane_at(&pane_id, lines)
+    }
+
     /// Wait for any known marker, or for two stable captures when no marker exists.
     /// The polling budget bounds readiness checks, not each native subprocess.
     /// Returns false when the budget ran out first.
@@ -1335,12 +1400,25 @@ impl Session {
         self.capture_pane_with_cursor_with_deadline(lines, &deadline)
     }
 
+    /// The pane a held VT channel owns, which input and capture must keep targeting.
+    pub(crate) fn live_channel_pane(
+        &self,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> Option<String> {
+        #[cfg(unix)]
+        return crate::tmux::vt::channel_pane_id(&self.name, deadline);
+        #[cfg(not(unix))]
+        {
+            let _ = deadline;
+            None
+        }
+    }
+
     pub(crate) fn live_pane_target_with_deadline(
         &self,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> Result<String> {
-        #[cfg(unix)]
-        if let Some(id) = crate::tmux::vt::channel_pane_id(&self.name, deadline) {
+        if let Some(id) = self.live_channel_pane(deadline) {
             return Ok(id);
         }
         super::utils::first_pane_id_with_deadline(&self.name, deadline)

@@ -5,6 +5,7 @@ import { useSandboxImageBanner } from "../hooks/useSandboxImageBanner";
 import { useUpdateBanner } from "../hooks/useUpdateBanner";
 import { DashboardUpdateBanner } from "./DashboardUpdateBanner";
 import { DisconnectBanner } from "./DisconnectBanner";
+import { InstallBanner } from "./InstallBanner";
 import { PushHealthBanner } from "./PushHealthBanner";
 import { SandboxImageBanner } from "./SandboxImageBanner";
 import { ServerSettingsBanner } from "./ServerSettingsBanner";
@@ -13,10 +14,14 @@ import { UpdateBanner } from "./UpdateBanner";
 /**
  * The connection and update banners, one at a time, most urgent first: Disconnected, server settings
  * unavailable, Dashboard updated, the Reconnected flash, Update available, then the sandbox image. The push
- * banner may sit below that one, except while Disconnected. `onRetryServerSettings` is set while /api/about
- * has no answer.
+ * banner may sit below that one, then the phone install banner, both except while Disconnected; the install
+ * banner also waits out the tour, whose last step says the same. `onRetryServerSettings` is set while
+ * /api/about has no answer.
  */
-export function BannerStack({ onRetryServerSettings }: { onRetryServerSettings?: () => void } = {}) {
+export function BannerStack({
+  onRetryServerSettings,
+  tourActive = false,
+}: { onRetryServerSettings?: () => void; tourActive?: boolean } = {}) {
   const connection = useConnectionBanner();
   const dashboardVersion = useDashboardUpdate();
   const update = useUpdateBanner();
@@ -34,6 +39,7 @@ export function BannerStack({ onRetryServerSettings }: { onRetryServerSettings?:
     <>
       {top}
       <PushHealthBanner hidden={connection === "down"} />
+      <InstallBanner hidden={connection === "down" || tourActive} />
     </>
   );
 }

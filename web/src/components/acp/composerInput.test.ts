@@ -6,7 +6,7 @@ import {
   decideArrowRecall,
   decideBeforeInputAction,
   decideEnterAction,
-  fitTextarea,
+  fitTextareaFallback,
   insertAtCaret,
   insertNewlineAtCaret,
   insertSlashCommand,
@@ -156,35 +156,25 @@ describe("caret insertion", () => {
   });
 });
 
-describe("fitTextarea", () => {
-  function measured(parent: HTMLElement) {
+describe("fitTextareaFallback", () => {
+  function textarea(scrollHeight: number) {
     const ta = document.createElement("textarea");
-    const seen: { minHeight: string | null; height: string | null } = { minHeight: null, height: null };
-    Object.defineProperty(ta, "scrollHeight", {
-      get() {
-        seen.minHeight = parent.style.minHeight;
-        seen.height = ta.style.height;
-        return 120;
-      },
-    });
-    parent.appendChild(ta);
-    return { ta, seen };
+    Object.defineProperty(ta, "scrollHeight", { value: scrollHeight });
+    return ta;
   }
 
-  it("holds the parent height while collapsed to measure, then releases it", () => {
-    const parent = document.createElement("div");
-    Object.defineProperty(parent, "offsetHeight", { value: 300 });
-    const { ta, seen } = measured(parent);
-    fitTextarea(ta);
-    expect(seen).toEqual({ minHeight: "300px", height: "auto" });
-    expect(parent.style.minHeight).toBe("");
-    expect(ta.style.height).toBe("120px");
+  it("grows to the content height, capped at 200px, when field-sizing is unsupported", () => {
+    const short = textarea(120);
+    fitTextareaFallback(short, false);
+    expect(short.style.height).toBe("120px");
+    const tall = textarea(500);
+    fitTextareaFallback(tall, false);
+    expect(tall.style.height).toBe("200px");
   });
 
-  it("caps the height at 200px and tolerates a detached textarea", () => {
-    const ta = document.createElement("textarea");
-    Object.defineProperty(ta, "scrollHeight", { value: 500 });
-    fitTextarea(ta);
-    expect(ta.style.height).toBe("200px");
+  it("leaves sizing to CSS when field-sizing is supported", () => {
+    const ta = textarea(120);
+    fitTextareaFallback(ta, true);
+    expect(ta.style.height).toBe("");
   });
 });
