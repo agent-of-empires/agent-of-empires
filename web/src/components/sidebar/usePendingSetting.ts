@@ -2,7 +2,6 @@ import { createContext, useContext } from "react";
 import type { SessionResponse } from "../../lib/types";
 
 export interface SettingValues {
-  color: string | null;
   notifications: "off" | "default" | "all";
 }
 

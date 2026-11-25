@@ -1262,11 +1262,11 @@ async fn metadata_commit_rejects_partial_rows_without_rewriting_them() -> anyhow
     partial.push(serde_json::json!({"id": 5}));
     let damaged = serde_json::to_vec(&partial)?;
     std::fs::write(storage.sessions_path(), &damaged)?;
-    let response = update_session_color(
+    let response = update_session_pin(
         State(state.clone()),
         Path(id.clone()),
         Ok(Json(serde_json::from_value(
-            serde_json::json!({"color": "red"}),
+            serde_json::json!({"pinned": true}),
         )?)),
     )
     .await
@@ -1288,12 +1288,7 @@ async fn metadata_commit_rejects_partial_rows_without_rewriting_them() -> anyhow
         }
     );
     let rows = state.instances.read().await;
-    assert!(rows
-        .iter()
-        .find(|row| row.id == id)
-        .unwrap()
-        .color
-        .is_none());
+    assert!(!rows.iter().find(|row| row.id == id).unwrap().is_pinned());
     Ok(())
 }
 
