@@ -15,8 +15,11 @@ const HOST = "aoe-plugin-mcp.invalid";
 const TIMEOUT_MS = 610_000;
 const EXIT_GRACE_MS = 2_000;
 // Calls forwarded at once. A slot is held until the reply is flushed to stdout, so a slow
-// reader holds back new requests instead of buffering replies without limit.
+// reader holds back new calls instead of buffering replies without limit. Calls beyond it wait
+// in a bounded queue and are refused with an error past that; stdin is always read, so a
+// cancel is handled at once. Control messages (initialize, ping, notifications) skip the limit.
 const MAX_IN_FLIGHT = 16;
+const MAX_QUEUED = 64;
 const META_VERSION = "io.modelcontextprotocol/protocolVersion";
 const VERSION_SHAPE = /^\d{4}-\d{2}-\d{2}$/;
 const METHOD_SHAPE = /^[A-Za-z0-9_./-]+$/;
@@ -38,6 +41,7 @@ let stdinClosed = false;
 const inFlight = new Map();
 const queue = [];
 let pending = 0;
+let active = 0;
 
 process.stdout.on("error", () => process.exit(0));
 
@@ -139,18 +143,17 @@ function settle() {
 }
 
 function pump() {
-  while (queue.length > 0 && pending < MAX_IN_FLIGHT) {
+  while (queue.length > 0 && active < MAX_IN_FLIGHT) {
     const { message, line } = queue.shift();
-    forward(message, line);
-  }
-  if (queue.length < MAX_IN_FLIGHT) {
-    input.resume();
-  } else {
-    input.pause();
+    forward(message, line, true);
   }
 }
 
-function forward(message, body) {
+function isControl(message) {
+  return !isRequest(message) || message.method === "initialize" || message.method === "ping";
+}
+
+function forward(message, body, counted) {
   let headers;
   try {
     headers = headersFor(message, body);
@@ -159,11 +162,17 @@ function forward(message, body) {
     return;
   }
   pending += 1;
+  if (counted) {
+    active += 1;
+  }
   let settled = false;
   let answered = false;
   const finish = () => {
     if (!settled) {
       settled = true;
+      if (counted) {
+        active -= 1;
+      }
       if (isRequest(message)) {
         inFlight.delete(message.id);
       }
@@ -261,8 +270,15 @@ input.on("line", (line) => {
     return;
   }
   cancel(message);
-  queue.push({ message, line });
-  pump();
+  if (isControl(message)) {
+    forward(message, line, false);
+  } else if (active < MAX_IN_FLIGHT && queue.length === 0) {
+    forward(message, line, true);
+  } else if (queue.length < MAX_QUEUED) {
+    queue.push({ message, line });
+  } else {
+    fail(message, -32000, "Too many requests in flight; retry later.");
+  }
 });
 input.on("close", () => {
   stdinClosed = true;

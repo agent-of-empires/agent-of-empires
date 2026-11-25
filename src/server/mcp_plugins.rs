@@ -1362,6 +1362,7 @@ mod tests {
     mod forwarder {
         use super::*;
         use crate::server::plugin_mcp_socket::{FORWARDER, SESSION_ENV, SOCKET_HOST, TOKEN_ENV};
+        use axum::response::IntoResponse;
         use std::path::{Path, PathBuf};
         use tokio::io::AsyncWriteExt;
 
@@ -1390,12 +1391,10 @@ mod tests {
             (path, task)
         }
 
-        /// Runs the forwarder for `acme.plug`/`srv`, feeds it `lines`, closes stdin, and
-        /// returns the stdout lines once it exits.
-        async fn run(dir: &Path, socket: &Path, lines: &[String]) -> Vec<String> {
+        fn spawn(dir: &Path, socket: &Path) -> tokio::process::Child {
             let script = dir.join("forward.mjs");
             std::fs::write(&script, FORWARDER).unwrap();
-            let mut child = tokio::process::Command::new("node")
+            tokio::process::Command::new("node")
                 .arg(&script)
                 .arg(socket)
                 .args(["acme.plug", "srv"])
@@ -1406,7 +1405,13 @@ mod tests {
                 .stderr(std::process::Stdio::piped())
                 .kill_on_drop(true)
                 .spawn()
-                .unwrap();
+                .unwrap()
+        }
+
+        /// Runs the forwarder for `acme.plug`/`srv`, feeds it `lines`, closes stdin, and
+        /// returns the stdout lines once it exits.
+        async fn run(dir: &Path, socket: &Path, lines: &[String]) -> Vec<String> {
+            let mut child = spawn(dir, socket);
             let mut stdin = child.stdin.take().unwrap();
             for line in lines {
                 stdin
@@ -1448,62 +1453,204 @@ mod tests {
             (app, seen)
         }
 
-        /// A burst of requests never has more than the forwarder's in-flight limit in the
+        const LIMIT: usize = 16;
+
+        /// An endpoint whose `tools/call` handlers wait on `gate`; every other method is
+        /// answered at once. Records which calls entered and which were dropped unfinished.
+        struct Gated {
+            app: axum::Router,
+            gate: Arc<tokio::sync::Semaphore>,
+            full: Arc<tokio::sync::Notify>,
+            dropped: Arc<tokio::sync::Notify>,
+            entered: Arc<std::sync::Mutex<Vec<u64>>>,
+            abandoned: Arc<std::sync::Mutex<Vec<u64>>>,
+            peak: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        struct Entry {
+            id: u64,
+            done: bool,
+            active: Arc<std::sync::atomic::AtomicUsize>,
+            abandoned: Arc<std::sync::Mutex<Vec<u64>>>,
+            dropped: Arc<tokio::sync::Notify>,
+        }
+
+        impl Drop for Entry {
+            fn drop(&mut self) {
+                self.active
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                if !self.done {
+                    self.abandoned.lock().unwrap().push(self.id);
+                    self.dropped.notify_one();
+                }
+            }
+        }
+
+        fn gated() -> Gated {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let g = Gated {
+                app: axum::Router::new(),
+                gate: Arc::new(tokio::sync::Semaphore::new(0)),
+                full: Default::default(),
+                dropped: Default::default(),
+                entered: Default::default(),
+                abandoned: Default::default(),
+                peak: Default::default(),
+            };
+            let active = Arc::new(AtomicUsize::new(0));
+            let (gate, full, dropped) = (g.gate.clone(), g.full.clone(), g.dropped.clone());
+            let (entered, abandoned, peak) =
+                (g.entered.clone(), g.abandoned.clone(), g.peak.clone());
+            let app = axum::Router::new().route(
+                "/mcp/plugins/{plugin}/{server}",
+                any(move |req: axum::extract::Request| {
+                    let (gate, full, dropped) = (gate.clone(), full.clone(), dropped.clone());
+                    let (entered, abandoned, peak, active) = (
+                        entered.clone(),
+                        abandoned.clone(),
+                        peak.clone(),
+                        active.clone(),
+                    );
+                    async move {
+                        let body = axum::body::to_bytes(req.into_body(), 1 << 20)
+                            .await
+                            .unwrap();
+                        let msg: Value = serde_json::from_slice(&body).unwrap();
+                        let reply = json!({"jsonrpc": "2.0", "id": msg["id"], "result": {}});
+                        if msg.get("id").is_none() {
+                            return StatusCode::ACCEPTED.into_response();
+                        }
+                        if msg["method"] != "tools/call" {
+                            return axum::Json(reply).into_response();
+                        }
+                        let id = msg["id"].as_u64().unwrap();
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        let mut entry = Entry {
+                            id,
+                            done: false,
+                            active,
+                            abandoned,
+                            dropped,
+                        };
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        entered.lock().unwrap().push(id);
+                        if now == LIMIT {
+                            full.notify_one();
+                        }
+                        gate.acquire().await.unwrap().forget();
+                        entry.done = true;
+                        axum::Json(reply).into_response()
+                    }
+                }),
+            );
+            Gated { app, ..g }
+        }
+
+        fn call(id: u64) -> String {
+            json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": "echo", "arguments": {}}})
+            .to_string()
+        }
+
+        /// A burst of calls never has more than the forwarder's in-flight limit in the
         /// endpoint at once, and every one is still answered once the endpoint lets go.
         #[tokio::test]
         async fn forwarder_bounds_the_calls_it_has_in_flight() {
-            use std::sync::atomic::{AtomicUsize, Ordering};
             if !node() {
                 return;
             }
-            const LIMIT: usize = 16;
-            const BURST: usize = 40;
+            const BURST: u64 = 40;
             let temp = tempfile::tempdir().unwrap();
-            let gate = Arc::new(tokio::sync::Semaphore::new(0));
-            let full = Arc::new(tokio::sync::Notify::new());
-            let (active, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-            let app = {
-                let (gate, full, active, peak) =
-                    (gate.clone(), full.clone(), active.clone(), peak.clone());
-                axum::Router::new().route(
-                    "/mcp/plugins/{plugin}/{server}",
-                    any(move |req: axum::extract::Request| {
-                        let (gate, full, active, peak) =
-                            (gate.clone(), full.clone(), active.clone(), peak.clone());
-                        async move {
-                            let body = axum::body::to_bytes(req.into_body(), 1 << 20)
-                                .await
-                                .unwrap();
-                            let id = serde_json::from_slice::<Value>(&body).unwrap()["id"].clone();
-                            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
-                            peak.fetch_max(now, Ordering::SeqCst);
-                            if now == LIMIT {
-                                full.notify_one();
-                            }
-                            gate.acquire().await.unwrap().forget();
-                            active.fetch_sub(1, Ordering::SeqCst);
-                            axum::Json(json!({"jsonrpc": "2.0", "id": id, "result": {}}))
-                        }
-                    }),
-                )
-            };
-            let (socket, _server) = serve_unix(temp.path(), app);
-            let lines: Vec<String> = (0..BURST)
-                .map(|i| json!({"jsonrpc": "2.0", "id": i, "method": "ping"}).to_string())
-                .collect();
+            let g = gated();
+            let (socket, _server) = serve_unix(temp.path(), g.app);
+            let lines: Vec<String> = (0..BURST).map(call).collect();
             let release = async {
-                tokio::time::timeout(DEADLINE, full.notified())
+                tokio::time::timeout(DEADLINE, g.full.notified())
                     .await
                     .expect("the endpoint reaches the in-flight limit");
-                gate.add_permits(BURST);
+                g.gate.add_permits(BURST as usize);
             };
             let (replies, ()) = tokio::join!(run(temp.path(), &socket, &lines), release);
-            assert_eq!(replies.len(), BURST, "every request is answered");
+            assert_eq!(replies.len(), BURST as usize, "every request is answered");
+            let peak = g.peak.load(std::sync::atomic::Ordering::SeqCst);
+            assert!(peak <= LIMIT, "peak {peak} in flight");
+        }
+
+        /// With every slot taken and calls queued, the forwarder still reads: a cancel
+        /// reaches an active call and a queued one (which is never forwarded), and `ping`
+        /// is answered while the calls are still held.
+        #[tokio::test]
+        async fn forwarder_handles_cancel_and_control_messages_while_saturated() {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            if !node() {
+                return;
+            }
+            const BURST: u64 = 40;
+            let temp = tempfile::tempdir().unwrap();
+            let g = gated();
+            let (socket, _server) = serve_unix(temp.path(), g.app);
+            let mut child = spawn(temp.path(), &socket);
+            let mut stdin = child.stdin.take().unwrap();
+            let mut stdout = BufReader::new(child.stdout.take().unwrap()).lines();
+            let burst: String = (0..BURST).map(|i| call(i) + "\n").collect();
+            stdin.write_all(burst.as_bytes()).await.unwrap();
+            tokio::time::timeout(DEADLINE, g.full.notified())
+                .await
+                .expect("the endpoint reaches the in-flight limit");
+
+            let cancel = |id: u64| {
+                format!(
+                    "{}\n",
+                    json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                        "params": {"requestId": id}})
+                )
+            };
+            stdin
+                .write_all(format!("{}{}", cancel(0), cancel(30)).as_bytes())
+                .await
+                .unwrap();
+            tokio::time::timeout(DEADLINE, g.dropped.notified())
+                .await
+                .expect("the endpoint sees the active call dropped while saturated");
+
+            stdin
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":999,\"method\":\"ping\"}\n")
+                .await
+                .unwrap();
+            let first = tokio::time::timeout(DEADLINE, stdout.next_line())
+                .await
+                .expect("ping is answered while the calls are held")
+                .unwrap()
+                .expect("a reply line");
+            assert_eq!(serde_json::from_str::<Value>(&first).unwrap()["id"], 999);
+
+            g.gate.add_permits(BURST as usize);
+            drop(stdin);
+            let mut ids = Vec::new();
+            while let Some(line) = tokio::time::timeout(DEADLINE, stdout.next_line())
+                .await
+                .expect("the forwarder finishes")
+                .unwrap()
+            {
+                ids.push(
+                    serde_json::from_str::<Value>(&line).unwrap()["id"]
+                        .as_u64()
+                        .unwrap(),
+                );
+            }
+            ids.sort_unstable();
+            let want: Vec<u64> = (1..BURST).filter(|i| *i != 30).collect();
+            assert_eq!(ids, want, "every call but the two cancelled is answered");
+            assert_eq!(*g.abandoned.lock().unwrap(), vec![0]);
             assert!(
-                peak.load(Ordering::SeqCst) <= LIMIT,
-                "peak {} in flight",
-                peak.load(Ordering::SeqCst)
+                !g.entered.lock().unwrap().contains(&30),
+                "the cancelled queued call was never forwarded"
             );
+            assert!(tokio::time::timeout(DEADLINE, child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success());
         }
 
         /// A reply far larger than the stdout pipe buffer is still written whole when stdin
