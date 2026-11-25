@@ -189,7 +189,14 @@ fn fixed_conflict(id: ActionId, c: &Chord, reserved: &Reserved) -> Option<String
     if let Some(owner) = navigation_owner(c) {
         return Some(format!("{key} is reserved for {owner}"));
     }
-    if let Some((tool, _)) = reserved.tools.iter().find(|(_, t)| overlaps(t, c)) {
+    let tool_clash = |t: &Chord| {
+        if id == ActionId::Quit {
+            t.code == c.code
+        } else {
+            overlaps(t, c)
+        }
+    };
+    if let Some((tool, _)) = reserved.tools.iter().find(|(_, t)| tool_clash(t)) {
         return Some(format!("{key} is the hotkey for tool {tool}"));
     }
     // `App` probes Quit with modifiers stripped, so any other chord would reach the home
@@ -416,6 +423,7 @@ mod tests {
             ("next-finished", &["Tab"], "live mode relays typing"),
             ("delete", &["C-c"], "Ctrl+C is reserved for quit"),
             ("delete", &["M-g"], "Alt+G is the hotkey for tool lazygit"),
+            ("quit", &["g"], "g is the hotkey for tool lazygit"),
             (
                 "delete",
                 &["C-x"],
