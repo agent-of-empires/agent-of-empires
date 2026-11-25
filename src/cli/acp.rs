@@ -221,9 +221,9 @@ pub enum AcpCommands {
     /// keeping the conversation. Accounts are tool names with their own
     /// `[session.agent_config_dir]`; the transcript is copied into the new
     /// account's store and the worker resumes it. A session parked on a
-    /// rate limit continues with the interrupted prompt. Refuses, changing nothing, where the
-    /// swap would start a fresh conversation (not Claude, no recorded
-    /// conversation, other agent).
+    /// rate limit continues with the interrupted prompt. Refuses, changing
+    /// nothing, where the swap would start a fresh conversation (not Claude,
+    /// no recorded conversation, other agent).
     SwitchAccount {
         /// Acp session id.
         session: String,
