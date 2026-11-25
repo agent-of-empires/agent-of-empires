@@ -18,8 +18,25 @@ use axum::http::StatusCode;
 /// Optional body of the routes that take none: the profile the caller selected
 /// its target under.
 #[derive(Deserialize)]
-pub struct ProfileGuard {
+struct ProfileGuard {
     expected_profile: Option<String>,
+}
+
+/// The `expected_profile` of an optional JSON body. An empty body, which a
+/// client sends with a JSON content type, names none.
+fn body_expected_profile(body: &[u8]) -> Result<Option<String>, axum::response::Response> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    serde_json::from_slice::<Option<ProfileGuard>>(body)
+        .map(|guard| guard.and_then(|guard| guard.expected_profile))
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                error.to_string(),
+            )
+        })
 }
 
 /// 409 `profile_mismatch` when the caller chose its target under a profile this
@@ -180,7 +197,7 @@ pub async fn get_suggestions(State(state): State<Arc<AppState>>) -> impl IntoRes
 
 pub async fn refresh_suggestions(
     State(state): State<Arc<AppState>>,
-    body: Option<Json<ProfileGuard>>,
+    body: axum::body::Bytes,
 ) -> impl IntoResponse {
     if state.read_only {
         return super::read_only_response();
@@ -188,7 +205,11 @@ pub async fn refresh_suggestions(
     let Some(host) = &state.plugin_host else {
         return Json(json!({ "ok": true, "notified": 0 })).into_response();
     };
-    if let Some(refused) = wrong_profile(host, body.and_then(|b| b.0.expected_profile).as_deref()) {
+    let expected = match body_expected_profile(&body) {
+        Ok(expected) => expected,
+        Err(refused) => return refused,
+    };
+    if let Some(refused) = wrong_profile(host, expected.as_deref()) {
         return refused;
     }
     let notified = host.refresh_suggestions(None).await;
@@ -197,7 +218,7 @@ pub async fn refresh_suggestions(
 
 pub async fn run_suggestion_checks(
     State(state): State<Arc<AppState>>,
-    body: Option<Json<ProfileGuard>>,
+    body: axum::body::Bytes,
 ) -> impl IntoResponse {
     if state.read_only {
         return super::read_only_response();
@@ -205,7 +226,11 @@ pub async fn run_suggestion_checks(
     let Some(host) = &state.plugin_host else {
         return Json(json!({ "ok": true, "notified": 0 })).into_response();
     };
-    if let Some(refused) = wrong_profile(host, body.and_then(|b| b.0.expected_profile).as_deref()) {
+    let expected = match body_expected_profile(&body) {
+        Ok(expected) => expected,
+        Err(refused) => return refused,
+    };
+    if let Some(refused) = wrong_profile(host, expected.as_deref()) {
         return refused;
     }
     let notified = host.run_suggestion_checks().await;

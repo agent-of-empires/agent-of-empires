@@ -669,6 +669,36 @@ async fn a_suggestion_request_for_another_profile_is_refused_untouched() {
     assert_eq!(status, StatusCode::OK);
 }
 
+/// Refresh and Check are sent with a JSON content type and no body: that is no
+/// guard. A body that is not a guard is a 400.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_empty_json_body_is_accepted_as_no_guard() {
+    let f = fixture();
+    let send = |uri: &'static str, body: &'static str| {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            crate::server::peer::ConnectionPeer::UnixOwner {
+                uid: nix::unistd::geteuid().as_raw(),
+            },
+        ));
+        let app = f.app.clone();
+        async move { app.oneshot(request).await.unwrap().status() }
+    };
+    for uri in ["/api/suggestions/refresh", "/api/suggestions/checks/run"] {
+        for body in ["", "  ", "null", "{}"] {
+            assert_eq!(send(uri, body).await, StatusCode::OK, "{uri} {body:?}");
+        }
+        assert_eq!(send(uri, "[1]").await, StatusCode::BAD_REQUEST, "{uri}");
+    }
+}
+
 /// An installed provider with no stored switch is listed as off and shows
 /// nothing; the API turns it on.
 #[tokio::test]
