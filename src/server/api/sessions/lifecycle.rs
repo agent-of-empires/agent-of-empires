@@ -3831,7 +3831,7 @@ pub(super) async fn prepare_agent_session(
     preparation: AgentPreparation,
     restart: Option<Arc<crate::daemon::RestartSessionBody>>,
 ) -> axum::response::Response {
-    prepare_agent_session_inner(
+    Box::pin(prepare_agent_session_inner(
         state,
         id,
         AgentPreparationInput {
@@ -3845,7 +3845,7 @@ pub(super) async fn prepare_agent_session(
         None,
         RestartOrigin::Explicit,
         None,
-    )
+    ))
     .await
 }
 
@@ -3857,7 +3857,7 @@ pub(super) async fn prepare_captured_terminal_session(
     physical: Option<Arc<crate::session::LegacyToolObservation>>,
     refuse_if_ignored: bool,
 ) -> axum::response::Response {
-    prepare_agent_session_inner(
+    Box::pin(prepare_agent_session_inner(
         state,
         id,
         AgentPreparationInput {
@@ -3874,7 +3874,7 @@ pub(super) async fn prepare_captured_terminal_session(
         None,
         RestartOrigin::Explicit,
         None,
-    )
+    ))
     .await
 }
 
@@ -4159,7 +4159,7 @@ pub(crate) async fn recovery_restart(
     id: String,
     expected_generation: u64,
 ) -> axum::response::Response {
-    prepare_agent_session_inner(
+    Box::pin(prepare_agent_session_inner(
         state,
         id,
         AgentPreparationInput {
@@ -4176,7 +4176,7 @@ pub(crate) async fn recovery_restart(
         Some(expected_generation),
         RestartOrigin::StartupRecovery,
         None,
-    )
+    ))
     .await
 }
 
