@@ -123,7 +123,7 @@ test.describe("at 1280px", () => {
       line: "This Session's sandbox container is gone. Ask the owner to recreate the container.",
     });
     await expect(banner.getByRole("button")).toHaveText(["Details"]);
-    await expect(composer(page)).toHaveAttribute("placeholder", "Ask the owner to recreate the container.");
+    await expect(composer(page)).toHaveCount(0);
     await banner.getByRole("button", { name: "Details" }).click();
     await expect(banner.locator("pre")).toHaveText(MESSAGE);
   });

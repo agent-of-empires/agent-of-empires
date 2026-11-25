@@ -4789,7 +4789,7 @@
       "risk": "medium",
       "specs": ["tests/container-gone.spec.ts", "src/components/acp/__tests__/ContainerGoneBanner.test.tsx"],
       "components": ["web/src/components/acp/ContainerGoneBanner.tsx"],
-      "notes": "Where the server refuses a restart (read-only and CityHall), the banner keeps the heading and says \"This Session's sandbox container is gone. Ask the owner to recreate the container.\" whatever the Session's state, offers no actions, and the composer's placeholder says the same; Details still shows the server's message."
+      "notes": "When restart is forbidden, the banner asks the viewer to contact the owner and offers no recovery actions. Read-only views hide the composer. Details still shows the server message."
     },
     {
       "id": "acp.container-gone-recreate-unavailable",
