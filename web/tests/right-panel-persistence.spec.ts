@@ -5,7 +5,7 @@ import { mockSessionShellApis, mockStaticApis } from "./helpers/apiMocks";
 import { mockSessionsList } from "./helpers/sessions";
 import { clickSidebarSession } from "./helpers/sidebar";
 
-const LAYOUT_KEY = "aoe-pane-layout-v3";
+const LAYOUT_KEY = "aoe-pane-layout-v4";
 const SESSIONS = ["alpha", "beta", "gamma"];
 
 /** Serves the Daemon's panel defaults; the returned object changes what later reads see. */

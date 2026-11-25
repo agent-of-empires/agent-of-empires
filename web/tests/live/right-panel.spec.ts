@@ -66,7 +66,7 @@ test("diff pane in a non-git session stays closed until opened, then shows one n
   expect(session!.outside_repository).toBe(true);
   const storedTabs = () =>
     page.evaluate((id) => {
-      const store = JSON.parse(localStorage.getItem("aoe-pane-layout-v3") ?? "{}");
+      const store = JSON.parse(localStorage.getItem("aoe-pane-layout-v4") ?? "{}");
       const layout = store.sessions?.[id];
       return layout ? [...layout.right, ...layout.bottom].flatMap((g: { tabs: string[] }) => g.tabs) : null;
     }, session!.id);

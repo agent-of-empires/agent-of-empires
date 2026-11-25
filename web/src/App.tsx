@@ -739,11 +739,11 @@ function AppContent({
     () => (panelDefaults.plugins ? pluginPanes.map((p) => ({ id: p.id, defaultDock: p.defaultDock })) : []),
     [panelDefaults.plugins, pluginPanes],
   );
-  // A persisted tab is visible only if its backing pane currently exists: diff
-  // always does; a terminal while its Session is listed; a plugin tab while its plugin is loaded.
   // Host or Container per shell, so choosing one never switches another shell.
   const { modeFor: shellModeFor, setMode: setShellMode } = usePairedShellModes();
   const sessionById = useMemo(() => new Map(sessions.map((s) => [s.id, s])), [sessions]);
+  // A persisted tab is visible only if its backing pane currently exists: diff
+  // always does; a terminal while its Session is listed; a plugin tab while its plugin is loaded.
   const tabAvailable = useCallback(
     (id: string) => {
       if (id.startsWith("plugin:")) return pluginPaneById.has(id);
@@ -1784,6 +1784,8 @@ function AppContent({
       if (view === "files") reportFeatureUse("files_pane");
       if (view === "agents") reportFeatureUse("agents_pane");
       transitionKeyboardProxy(activeSessionId, view);
+      // The picker's Paired terminal entry is the active Session's primary shell.
+      if (view === "paired") setMobileShell(null);
       setRightPanelView(view);
       setPickerOpen(false);
     },

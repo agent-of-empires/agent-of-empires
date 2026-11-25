@@ -273,12 +273,13 @@ test("changing the other dock keeps a visible draft without asking", async ({ pa
     const group = (tab: string) => [{ tabs: [tab], active: tab }];
     const layout = {
       right: group("files"),
-      bottom: group("terminal:0"),
+      bottom: group(`terminal:${id}:0`),
       nextTerminalIndex: 1,
       closedPlugins: [],
       collapsed: { right: false, bottom: false },
     };
-    localStorage.setItem("aoe-pane-layout-v3", JSON.stringify({ version: 3, sessions: { [id]: layout } }));
+    const terminals = [{ id: `terminal:${id}:0`, dock: "bottom" }];
+    localStorage.setItem("aoe-pane-layout-v4", JSON.stringify({ version: 4, sessions: { [id]: layout }, terminals }));
   }, session!.id);
   await openFile(page, serve);
   await page.getByRole("button", { name: "Edit", exact: true }).click();
