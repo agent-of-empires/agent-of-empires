@@ -20,7 +20,7 @@ jobs:
     runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-record-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 45
     permissions:
-      contents: write
+      contents: read
       pull-requests: write
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
@@ -77,7 +77,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Attach GIFs to PR comments
+      # GITHUB_TOKEN cannot upload with `gh --attach`, so link the artifact.
+      - name: Link recordings on the PR
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
@@ -85,33 +86,20 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           shopt -s nullglob
-          cd target/e2e-media
-          gifs=(*.gif)
+          gifs=(target/e2e-media/*.gif)
           if [ ${#gifs[@]} -eq 0 ]; then
             echo "No GIF recordings found, skipping PR comment."
             exit 0
           fi
 
-          # Replace this workflow's comments from earlier runs.
-          gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
-            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("## E2E Test Recordings"))) | .id' \
-            | while read -r id; do gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/comments/$id"; done
+          body="## E2E Test Recordings"$'\n\n'
+          body+="${#gifs[@]} GIFs and their .cast files are in the [e2e-media artifact]($RUN_URL) for 30 days."
 
-          # gh uploads at most 50 attachments per command.
-          for ((i = 0; i < ${#gifs[@]}; i += 50)); do
-            batch=("${gifs[@]:i:50}")
-            {
-              echo "## E2E Test Recordings ($((i / 50 + 1)))"
-              echo
-              for gif in "${batch[@]}"; do
-                echo "### ${gif%.gif}"
-                echo
-                echo "![${gif%.gif}](./$gif)"
-                echo
-              done
-              echo "*Raw recordings (.cast) are in the [e2e-media artifact]($RUN_URL).*"
-            } > body.md
-            args=()
-            for gif in "${batch[@]}"; do args+=(--attach "./$gif"); done
-            gh pr comment "$PR" -R "$GITHUB_REPOSITORY" --body-file body.md "${args[@]}"
-          done
+          existing=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("## E2E Test Recordings"))) | .id' \
+            | head -1)
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" -f body="$body"
+          else
+            gh pr comment "$PR" -R "$GITHUB_REPOSITORY" --body "$body"
+          fi
