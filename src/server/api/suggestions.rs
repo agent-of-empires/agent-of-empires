@@ -688,9 +688,11 @@ pub async fn start_suggestion(
         &reference,
         false,
         create,
-        None,
-        crate::daemon::PromptOrigin::Unknown,
-        crate::plugin::suggestions::StartedVia::Start(sent),
+        super::sessions::CreateOrigin {
+            initial_turn: None,
+            prompt_origin: crate::daemon::PromptOrigin::Unknown,
+            via: crate::plugin::suggestions::StartedVia::Start(sent),
+        },
     )
     .await;
     start_outcome(response, profile, path).await

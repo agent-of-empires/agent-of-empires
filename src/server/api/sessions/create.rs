@@ -1116,38 +1116,55 @@ pub async fn create_session(
         Err(rej) => return rej.into_response(),
     };
     let wait_ready = query.wait.as_deref() == Some("ready");
-    let origin = crate::server::api::prompt_origin(&headers);
+    let prompt_origin = crate::server::api::prompt_origin(&headers);
     create_session_with(
         state,
         local_owner,
         &reference,
         wait_ready,
         body,
-        None,
-        origin,
-        crate::plugin::suggestions::StartedVia::Wizard,
+        CreateOrigin::wizard(prompt_origin),
     )
     .await
 }
 
+/// Where a create comes from: what attributes its first prompt and how a suggestion
+/// link it claims is recorded.
+pub(crate) struct CreateOrigin {
+    /// A structured session's first prompt and its origin, delivered once its worker runs.
+    pub(crate) initial_turn: Option<(String, crate::daemon::PromptOrigin)>,
+    /// Attributes the body's own `initial_prompt` when no `initial_turn` is given.
+    pub(crate) prompt_origin: crate::daemon::PromptOrigin,
+    pub(crate) via: crate::plugin::suggestions::StartedVia,
+}
+
+impl CreateOrigin {
+    /// A create whose prompt, if any, is the body's, and whose link is a wizard start.
+    pub(crate) fn wizard(prompt_origin: crate::daemon::PromptOrigin) -> Self {
+        Self {
+            initial_turn: None,
+            prompt_origin,
+            via: crate::plugin::suggestions::StartedVia::Wizard,
+        }
+    }
+}
+
 /// `POST /api/sessions` once the caller is authorized and the body parsed, for a surface
 /// that builds the body itself. `local_owner` sees hook failure detail, `reference` names
-/// the request in failure logs and responses, `wait_ready` is `?wait=ready`, and
-/// `initial_turn` is a structured session's first prompt and its origin, delivered once its
-/// worker runs. `body_prompt_origin` attributes the body's own `initial_prompt` when no
-/// `initial_turn` is given.
-/// `via` is how a suggestion link it claims is recorded.
-#[allow(clippy::too_many_arguments)]
+/// the request in failure logs and responses, and `wait_ready` is `?wait=ready`.
 pub(crate) async fn create_session_with(
     state: Arc<AppState>,
     local_owner: bool,
     reference: &str,
     wait_ready: bool,
     body: CreateSessionBody,
-    initial_turn: Option<(String, crate::daemon::PromptOrigin)>,
-    body_prompt_origin: crate::daemon::PromptOrigin,
-    via: crate::plugin::suggestions::StartedVia,
+    origin: CreateOrigin,
 ) -> axum::response::Response {
+    let CreateOrigin {
+        initial_turn,
+        prompt_origin: body_prompt_origin,
+        via,
+    } = origin;
     if let Some(key) = body.idempotency_key.as_deref() {
         if key.is_empty() || key.len() > IDEMPOTENCY_KEY_MAX_LEN {
             return api_error(

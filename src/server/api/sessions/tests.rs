@@ -11458,9 +11458,11 @@ async fn a_link_records_whether_start_or_the_wizard_made_it() {
         "test",
         false,
         serde_json::from_value(start).unwrap(),
-        None,
-        crate::daemon::PromptOrigin::Unknown,
-        StartedVia::Start(Some("the preset prompt".to_string())),
+        create::CreateOrigin {
+            initial_turn: None,
+            prompt_origin: crate::daemon::PromptOrigin::Unknown,
+            via: StartedVia::Start(Some("the preset prompt".to_string())),
+        },
     )
     .await;
     assert_eq!(response.status(), axum::http::StatusCode::CREATED);
