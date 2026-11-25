@@ -1,6 +1,6 @@
 ---
 name: record-pr-demo
-description: Record a demo video of a PR's change by driving real Chromium against a real `aoe serve` with real tmux sessions, then publish MP4 + inline GIF to the PR. Use when asked for a demo, video, GIF or recording of a PR or branch, or to show a dashboard change working.
+description: Record a demo video of a PR's change by driving real Chromium against a real `aoe serve` with real tmux sessions, then attach the MP4 to a PR comment, where it plays inline. Use when asked for a demo, video, GIF or recording of a PR or branch, or to show a dashboard change working.
 ---
 
 # Record a PR demo
@@ -10,8 +10,7 @@ Each clip is evidence a reviewer can watch: a real daemon, real sessions, real b
 Files beside this one:
 
 - `demo-lib.mjs`: Playwright helpers (`launch`, `finish`, `caption`, `ring`, `glide`, `prep`) with a visible pointer overlay.
-- `convert.sh`: webm to MP4 + GIF + a contact sheet of frames.
-- `publish.sh`: push clips to the `e2e-recordings` branch and print their URLs.
+- `convert.sh`: webm to MP4 plus a contact sheet of frames.
 - [`TECHNIQUES.md`](TECHNIQUES.md): read when a clip needs touch input, a native `<select>`, link hover/click proof, a WebSocket counter, or a simulated lost event.
 
 ## 1. Build
@@ -70,27 +69,27 @@ Run with `AOE_DEMO_TOKEN_FILE` (or `AOE_DEMO_TOKEN`) and `AOE_DEMO_RAW=<scratch>
 .claude/skills/record-pr-demo/convert.sh <raw>/<clip>.webm <out-dir>
 ```
 
-Read every contact sheet it prints. Done when each clip visibly shows its behavior at the moments the captions claim, the GIF is at most 8 MB, and no overlay hides the thing being shown. Re-record any clip that fails.
+Read every contact sheet it prints. Done when each clip visibly shows its behavior at the moments the captions claim, the MP4 is at most 10 MB (the attachment limit), and no overlay hides the thing being shown. Re-record any clip that fails.
 
 ## 6. Publish
 
 Posting is outward-facing: confirm with the user before this step.
 
-```sh
-.claude/skills/record-pr-demo/publish.sh <out-dir> <subdir-name>
-```
-
-It commits the files onto the `e2e-recordings` branch (the same branch `e2e-recording.yml` uses) without touching any worktree, and prints raw GIF and MP4 page URLs. GitHub has no API for PR video attachments; a raw GIF URL renders inline in a comment. Post one comment per PR:
+Write the comment to `<out-dir>/body.md`, referencing each clip by relative path, and post it with one `--attach` per clip (gh 2.103 or later):
 
 ```md
 **Demo** (real Chromium, debug `aoe serve` at <sha>, real tmux sessions)
 
 <one or two sentences on what the clip shows, plus any simulated input or overlay a reviewer should know about>
 
-![<clip>](<raw gif url>)
-
-[MP4](<mp4 blob url>)
+![<clip>](./<clip>.mp4)
 ```
+
+```sh
+gh pr comment <N> --body-file <out-dir>/body.md --attach <out-dir>/<clip>.mp4
+```
+
+`gh` uploads each file to GitHub's attachment storage and rewrites its reference to the uploaded URL, which renders as a video player. A video reference must be alone in its paragraph. `gh pr create` and `gh pr edit` take `--attach` the same way. Never commit clips to a branch of the repo.
 
 ## 7. Clean up
 
