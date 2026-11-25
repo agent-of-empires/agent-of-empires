@@ -4537,15 +4537,8 @@ impl HomeView {
     /// The jump and preview-scroll actions live-send takes from the agent; every other
     /// registry chord relays to the pane.
     fn live_send_action(&self, key: &KeyEvent) -> Option<ActionId> {
-        bindings::resolve(key, self.strict_hotkeys, &self.bindings_ctx(true)).filter(|id| {
-            matches!(
-                id,
-                ActionId::JumpPrevFinished
-                    | ActionId::JumpNextFinished
-                    | ActionId::PreviewScrollUp
-                    | ActionId::PreviewScrollDown
-            )
-        })
+        bindings::resolve(key, self.strict_hotkeys, &self.bindings_ctx(true))
+            .filter(|id| super::keybinds::is_live_action(*id))
     }
 
     fn open_command_palette(&mut self) {

@@ -1403,11 +1403,13 @@ mod tests {
 
     #[test]
     fn keybinds_tab_lists_ignored_entries_then_effective_keys_read_only() {
-        let mut config = Config::default();
-        config.keybinds = [("delete", vec!["C-e"]), ("bogus", vec!["F2"])]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.into_iter().map(String::from).collect()))
-            .collect();
+        let config = Config {
+            keybinds: [("delete", vec!["C-e"]), ("bogus", vec!["F2"])]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.into_iter().map(String::from).collect()))
+                .collect(),
+            ..Config::default()
+        };
         let rows = build_fields_for_category(
             SettingsCategory::Keybinds,
             SettingsScope::Global,

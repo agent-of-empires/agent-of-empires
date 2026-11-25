@@ -585,16 +585,17 @@ pub(super) fn format_chord(c: &Chord) -> String {
     };
     // A bare letter keeps its lone-character form; every modified chord is spelled out, or
     // the help overlay and the palette show the new arrow bindings with no key at all.
-    if c.shift {
-        return format!("Shift+{key}");
+    match c.code {
+        KeyCode::Char(ch) if ch != ' ' && !c.ctrl && !c.alt => return ch.to_string(),
+        _ => {}
     }
-    match (c.ctrl, c.alt, c.code) {
-        (false, false, KeyCode::Char(ch)) if ch != ' ' => ch.to_string(),
-        (true, true, _) => format!("Ctrl+Alt+{key}"),
-        (true, false, _) => format!("Ctrl+{key}"),
-        (false, true, _) => format!("Alt+{key}"),
-        (false, false, _) => key,
+    let mut out = String::new();
+    for (on, prefix) in [(c.ctrl, "Ctrl+"), (c.alt, "Alt+"), (c.shift, "Shift+")] {
+        if on {
+            out.push_str(prefix);
+        }
     }
+    out + &key
 }
 
 // Order matters: context-guarded bindings that share a chord with an unguarded
@@ -1436,7 +1437,8 @@ pub static BINDINGS: &[Binding] = &[
 ];
 
 /// Stable palette/test id for an action (matches the legacy `builtin_commands`
-/// ids). Only actions that surface in the palette need one.
+/// ids). It is also the action's name in a user's `[keybinds]` table, so a
+/// rename turns their override into an "unknown action" warning.
 pub fn palette_id(id: ActionId) -> &'static str {
     match id {
         ActionId::NewSession => "new-session",

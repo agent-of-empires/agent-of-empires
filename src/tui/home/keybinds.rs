@@ -131,10 +131,14 @@ pub fn from_config(config: &crate::session::Config) -> (Keymap, Vec<EntryWarning
 }
 
 /// Bare keys the home view's navigation arms handle after the registry, which an
-/// override would take from them. Ctrl+C quits from `App` before the home view runs.
+/// override would take from them, and the Ctrl chords handled before the registry runs.
 fn navigation_owner(c: &Chord) -> Option<&'static str> {
-    if c.ctrl && !c.alt && c.code == KeyCode::Char('c') {
-        return Some("quit");
+    if c.ctrl && !c.alt {
+        match c.code {
+            KeyCode::Char('c') => return Some("quit"),
+            KeyCode::Char('l') => return Some("the last-prompt footer"),
+            _ => {}
+        }
     }
     if c.ctrl || c.alt {
         return None;
@@ -158,7 +162,7 @@ fn navigation_owner(c: &Chord) -> Option<&'static str> {
 }
 
 /// Live mode checks these before relaying a key to the Agent.
-fn is_live_action(id: ActionId) -> bool {
+pub(super) fn is_live_action(id: ActionId) -> bool {
     matches!(
         id,
         ActionId::JumpPrevFinished
@@ -183,13 +187,21 @@ fn fixed_conflict(id: ActionId, c: &Chord, reserved: &Reserved) -> Option<String
     if let Some((tool, _)) = reserved.tools.iter().find(|(_, t)| overlaps(t, c)) {
         return Some(format!("{key} is the hotkey for tool {tool}"));
     }
-    if id == ActionId::Quit && (c.ctrl || c.alt) {
-        return Some(format!("{key}: quit takes a key without Ctrl or Alt"));
+    // `App` probes Quit with modifiers stripped, so any other chord would reach the home
+    // view's Quit, which skips the confirm.
+    if id == ActionId::Quit && (c.ctrl || c.alt || c.shift) {
+        return Some(format!(
+            "{key}: quit takes a key without Ctrl, Alt or Shift"
+        ));
     }
     if is_live_action(id) {
-        if matches!(c.code, KeyCode::Char(_)) && !c.ctrl && !c.alt {
+        let typing = matches!(
+            c.code,
+            KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete | KeyCode::BackTab
+        );
+        if typing && !c.ctrl && !c.alt {
             return Some(format!(
-                "{key}: live mode relays typing, so a character key needs Ctrl or Alt"
+                "{key}: live mode relays typing, so this key needs Ctrl or Alt"
             ));
         }
         if reserved.leader.as_ref().is_some_and(|l| overlaps(l, c)) {
@@ -342,6 +354,7 @@ mod tests {
                 ("next-finished", &["M-j"]),
                 ("stop", &[]),
                 ("projects", &["p", "F3"]),
+                ("toggle-view", &["C-S-PageUp"]),
             ]),
             false,
             &reserved(),
@@ -356,6 +369,7 @@ mod tests {
         assert!(km.is_overridden(ActionId::Delete));
         assert!(!km.is_overridden(ActionId::Diff));
         assert_eq!(chords(&km, ActionId::Diff, false), ["D"]);
+        assert_eq!(chords(&km, ActionId::ToggleView, true), ["Ctrl+Shift+PgUp"]);
     }
 
     #[test]
@@ -374,8 +388,27 @@ mod tests {
                 &["C-x"],
                 "Ctrl+X is bound to dismiss-update-banner",
             ),
-            ("quit", &["C-w"], "quit takes a key without Ctrl or Alt"),
+            (
+                "delete",
+                &["C-l"],
+                "Ctrl+L is reserved for the last-prompt footer",
+            ),
+            (
+                "quit",
+                &["C-w"],
+                "quit takes a key without Ctrl, Alt or Shift",
+            ),
+            (
+                "quit",
+                &["S-F10"],
+                "quit takes a key without Ctrl, Alt or Shift",
+            ),
             ("next-finished", &["S-x"], "live mode relays typing"),
+            (
+                "preview-scroll-up",
+                &["Backspace"],
+                "live mode relays typing",
+            ),
             ("next-finished", &["C-b"], "Ctrl+B is the live-send leader"),
             ("preview-scroll-up", &["C-q"], "Ctrl+Q exits live mode"),
         ];
