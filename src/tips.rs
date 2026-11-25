@@ -193,18 +193,17 @@ static CATALOG: &[Tip] = &[
     Tip {
         id: "group-sessions",
         title: "Organize sessions into groups",
-        body: "The grouping picker offers Repository, Organization, User group, Repository \
-               then group, and Session status. Right-click a session and choose Edit group to \
-               file it under any name you like.",
+        body: "The view menu above the list groups by Repository, with your Groups nested \
+               inside, or by My groups. Right-click a session and choose More, then Move to \
+               another group, to file it under any name you like.",
         trigger: TipTrigger::Rotation,
         surfaces: &[TipSurface::Web],
     },
     Tip {
         id: "sort-sidebar",
         title: "Sort the sidebar your way",
-        body: "The sort picker offers Manual, where you drag the rows into any order \
-               yourself, Recent activity, and Attention, which floats the sessions that need \
-               you to the top.",
+        body: "The view menu sorts by Custom, where you drag rows and repositories into any \
+               order yourself, or by Name. The TUI and every browser share the choice.",
         trigger: TipTrigger::Rotation,
         surfaces: &[TipSurface::Web],
     },

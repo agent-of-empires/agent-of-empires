@@ -60,6 +60,8 @@ export function useSessions() {
   const orderHold = useRef(newWriteHold());
   const repositoryHold = useRef(newWriteHold());
   const viewHold = useRef(newWriteHold());
+  // The newest pick of each view field, so a write that waited cannot overwrite a later pick.
+  const viewPicks = useRef<{ seq: number; latest: Partial<Record<keyof SidebarView, number>> }>({ seq: 0, latest: {} });
   const [error, setError] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [trashedCount, setTrashedCount] = useState(0);
@@ -110,12 +112,21 @@ export function useSessions() {
     return receipt;
   }, []);
 
-  /** Applies a grouping or sort pick at once; the write waits for `after`, which the hold already covers. */
-  const changeSidebarView = useCallback(async (patch: Partial<SidebarView>, after?: Promise<unknown>) => {
+  /**
+   * Applies a grouping or sort pick at once. The write waits for `after` and is dropped when that fails; a field
+   * picked again meanwhile is left to the newer pick. Either way the next poll restores what the Daemon holds.
+   */
+  const changeSidebarView = useCallback(async (patch: Partial<SidebarView>, after?: Promise<RuntimeCursor | null>) => {
     setSidebarView((prev) => ({ ...prev, ...patch }));
+    const picks = viewPicks.current;
+    const pick = ++picks.seq;
+    const fields = Object.keys(patch) as (keyof SidebarView)[];
+    for (const field of fields) picks.latest[field] = pick;
     holdStarted(viewHold.current);
-    await after;
-    holdSettled(viewHold.current, await updateSidebarView(patch));
+    const ready = !after || (await after) !== null;
+    const current = fields.filter((field) => picks.latest[field] === pick);
+    const send = Object.fromEntries(current.map((field) => [field, patch[field]]));
+    holdSettled(viewHold.current, ready && current.length > 0 ? await updateSidebarView(send) : null);
   }, []);
 
   const applyResult = useCallback(

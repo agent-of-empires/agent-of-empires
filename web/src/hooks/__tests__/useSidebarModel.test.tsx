@@ -155,6 +155,25 @@ describe("the shared sidebar view", () => {
     expect(result.current.model.groupBy).toBe("group");
   });
 
+  it("gives up on a write that never answers, so polls reconcile again", async () => {
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    server.use(http.patch("*/api/sidebar-view", () => new Promise<never>(() => {})));
+    const deadline = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+    let settled = false;
+    act(() => void result.current.sessions.changeSidebarView({ sort: "name" }).then(() => (settled = true)));
+    await waitFor(() => expect(timeout).toHaveBeenCalledWith(15_000));
+    timeout.mockRestore();
+    await pollAt(result, 2);
+    expect(result.current.model.sort).toBe("name");
+
+    await act(async () => deadline.abort());
+    await waitFor(() => expect(settled).toBe(true));
+    await pollAt(result, 3);
+    expect(result.current.model.sort).toBe("custom");
+  });
+
   it("puts a failed pick back on the next poll", async () => {
     server.use(http.patch("*/api/sidebar-view", () => new HttpResponse(null, { status: 500 })));
     const { result } = mount();
@@ -211,6 +230,47 @@ describe("the shared Custom order", () => {
     expect(rows(result)).toEqual(["/r/Alpha::a1", "/r/beta::b2", "/r/beta::b1"]);
   });
 
+  it("under Name, a failed ordering write leaves the sort on Name", async () => {
+    daemon.sidebar_view = { group_by: "project", sort: "name" };
+    server.use(http.put("*/api/workspace-ordering", () => new HttpResponse(null, { status: 500 })));
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toEqual(["/r/Alpha::a1", "/r/beta::b1", "/r/beta::b2"]));
+    await act(async () => result.current.model.moveWorkspace("/r/beta::b2", "/r/beta::b1", false));
+    await pollAt(result, 2);
+    await waitFor(() => expect(result.current.model.sort).toBe("name"));
+    expect(writes).toEqual([]);
+    expect(rows(result)).toEqual(["/r/Alpha::a1", "/r/beta::b1", "/r/beta::b2"]);
+  });
+
+  it("under Name, a drag's switch to Custom waits for its order, refuses another move, and yields to a newer pick", async () => {
+    daemon.sidebar_view = { group_by: "project", sort: "name" };
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toEqual(["/r/Alpha::a1", "/r/beta::b1", "/r/beta::b2"]));
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    server.use(
+      http.put("*/api/workspace-ordering", async ({ request }) => {
+        writes.push({ method: "PUT", body: await request.json() });
+        await held;
+        return HttpResponse.json({}, { headers: runtime(5) });
+      }),
+    );
+    act(() => result.current.model.moveWorkspace("/r/beta::b2", "/r/beta::b1", false));
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(result.current.model.sort).toBe("custom");
+
+    act(() => result.current.model.moveRepository("/r/beta", "/r/Alpha", false));
+    expect(headers(result)).toEqual(["/r/Alpha", "/r/beta"]);
+
+    act(() => result.current.model.selectSort("name"));
+    await waitFor(() => expect(writes).toHaveLength(2));
+    await act(async () => release());
+    await pollAt(result, 6);
+    expect(writes.map((w) => w.method)).toEqual(["PUT", "PATCH"]);
+    expect(writes[1]!.body).toEqual({ sort: "name" });
+    expect(result.current.model.sort).toBe("name");
+  });
+
   it("under Name, a header drag freezes the rows too and moves only that header", async () => {
     daemon.sidebar_view = { group_by: "project", sort: "name" };
     const { result } = mount();
@@ -223,6 +283,14 @@ describe("the shared Custom order", () => {
     });
     expect(headers(result)).toEqual(["/r/beta", "/r/Alpha"]);
     expect(rows(result)).toEqual(["/r/beta::b1", "/r/beta::b2", "/r/Alpha::a1"]);
+  });
+
+  it("a header drag keeps the place of a saved repository with no header", async () => {
+    daemon.repository_order = ["/r/beta", "/r/gone", "/r/Alpha"];
+    const { result } = mount();
+    await waitFor(() => expect(headers(result)).toEqual(["/r/beta", "/r/Alpha"]));
+    await act(async () => result.current.model.moveRepository("/r/Alpha", "/r/beta", false));
+    expect(writes[0]!.body).toEqual({ repositories: ["/r/Alpha", "/r/beta", "/r/gone"] });
   });
 
   it("a header drag under Custom writes only the repository order", async () => {
@@ -241,5 +309,10 @@ describe("the shared Custom order", () => {
     // Nothing is listed, so headers and rows sit newest first until the Daemon's merged order arrives.
     expect(headers(result)).toEqual(["/r/beta", "/r/Alpha"]);
     expect(rows(result)).toEqual(["/r/beta::b2", "/r/beta::b1", "/r/Alpha::a1"]);
+
+    // A drag before the next poll starts from the rows on screen, not the cleared local order.
+    await act(async () => result.current.model.moveWorkspace("/r/beta::b1", "/r/beta::b2", false));
+    expect(writes[1]).toEqual({ method: "PUT", body: { order: ["/r/beta::b1", "/r/beta::b2", "/r/Alpha::a1"] } });
+    expect(rows(result)).toEqual(["/r/beta::b1", "/r/beta::b2", "/r/Alpha::a1"]);
   });
 });

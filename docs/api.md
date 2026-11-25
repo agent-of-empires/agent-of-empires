@@ -420,9 +420,9 @@ a disconnect does not cancel admitted work or authorize replay.
 
 Change the one sidebar grouping and sort the Daemon owns. The body is
 `{"group_by": "project" | "group", "sort": "custom" | "newest" | "name"}`; an
-omitted field keeps its value. The response is the whole value, with the mutation receipt
-headers, and every Client receives it as `sidebar_view` in the runtime snapshot;
-the TUI shows it. Refused under `--read-only` and in CityHall mode.
+omitted field keeps its value. The response is the whole value, with the mutation
+receipt headers, and every Client receives it as `sidebar_view` in the runtime
+snapshot and shows it. Refused under `--read-only` and in CityHall mode.
 
 ## GET /api/sessions
 

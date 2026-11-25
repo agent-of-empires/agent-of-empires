@@ -1,12 +1,12 @@
 // Sidebar grouping, sort, and ordering for the dashboard's workspaces. The grouping, the sort and the Custom
 // order are the Daemon's, shared with every Client; a plugin sort is this browser's alone.
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import type { RuntimeCursor, SidebarView, WorkspaceOrderingPatch } from "../../lib/api";
 import { reportFeatureUse } from "../../lib/featureUse";
 import { buildSortValueMap, pluginSortSpecs } from "../../lib/pluginUi";
 import { usePluginUiEntries } from "../../lib/pluginUiContext";
-import { moveId, orderStartingWith } from "../../lib/sidebarReorder";
+import { keepUnshown, moveId, orderStartingWith } from "../../lib/sidebarReorder";
 import { workspaceComparator, type PluginSortContext } from "../../lib/sidebarSort";
 import { GROUP_BY_FEATURE, SORT_FEATURE, type SidebarGroupBy, type SidebarSort } from "../../lib/sidebarView";
 import type { ProjectInfo, Workspace } from "../../lib/types";
@@ -24,7 +24,7 @@ interface Options {
   workspaceOrdering: string[];
   repositoryOrder: string[];
   changeOrdering: (patch: WorkspaceOrderingPatch) => Promise<RuntimeCursor | null>;
-  changeSidebarView: (patch: Partial<SidebarView>, after?: Promise<unknown>) => Promise<void>;
+  changeSidebarView: (patch: Partial<SidebarView>, after?: Promise<RuntimeCursor | null>) => Promise<void>;
 }
 
 export function useSidebarModel({
@@ -114,15 +114,22 @@ export function useSidebarModel({
         workspaceOrdering,
       ),
       ...(groupBy === "project" && {
-        repositories: repo.groups.map((g) => g.id).filter((id) => !isSyntheticGroup(id)),
+        repositories: keepUnshown(
+          repo.groups.map((g) => g.id).filter((id) => !isSyntheticGroup(id)),
+          repositoryOrder,
+        ),
       }),
     }),
-    [displayGroups, workspaceOrdering, groupBy, repo.groups],
+    [displayGroups, workspaceOrdering, groupBy, repo.groups, repositoryOrder],
   );
+  // Like the TUI, a move waits while a switch to Custom is saving, so it never builds on a switch that may fail.
+  const switching = useRef(false);
   const commit = useCallback(
     (patch: WorkspaceOrderingPatch) => {
       const write = changeOrdering(patch);
-      if (frozen) void changeSidebarView({ sort: "custom" }, write);
+      if (!frozen) return;
+      switching.current = true;
+      void changeSidebarView({ sort: "custom" }, write).finally(() => (switching.current = false));
     },
     [frozen, changeOrdering, changeSidebarView],
   );
@@ -130,8 +137,11 @@ export function useSidebarModel({
   /** Moves a row next to `overId`, after it when the drag went down. */
   const moveWorkspace = useCallback(
     (activeId: string, overId: string, after: boolean) => {
+      if (switching.current) return;
       reportFeatureUse("row_reorder");
-      const base = frozen ? onScreenOrder() : { order: workspaceOrdering };
+      // A reset lists nothing until the next poll, and moving next to an unlisted row needs it listed.
+      const listed = workspaceOrdering.includes(activeId) && workspaceOrdering.includes(overId);
+      const base = frozen ? onScreenOrder() : { order: listed ? workspaceOrdering : onScreenOrder().order };
       commit({ ...base, order: moveId(base.order ?? [], activeId, overId, after) });
     },
     [frozen, workspaceOrdering, onScreenOrder, commit],
@@ -140,11 +150,13 @@ export function useSidebarModel({
   /** Moves a Repository header next to `overId`, after it when the drag went down. */
   const moveRepository = useCallback(
     (activeId: string, overId: string, after: boolean) => {
+      if (switching.current) return;
       const headers = repo.groups.map((g) => g.id);
-      const repositories = moveId(headers, activeId, overId, after).filter((id) => !isSyntheticGroup(id));
+      const moved = moveId(headers, activeId, overId, after).filter((id) => !isSyntheticGroup(id));
+      const repositories = keepUnshown(moved, repositoryOrder);
       commit(frozen ? { ...onScreenOrder(), repositories } : { repositories });
     },
-    [repo.groups, frozen, onScreenOrder, commit],
+    [repo.groups, repositoryOrder, frozen, onScreenOrder, commit],
   );
 
   return {

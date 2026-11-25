@@ -313,9 +313,12 @@ export interface WorkspaceOrderingPatch {
 }
 
 /** The receipt cursor of a committed write, or null when it failed or carried none. */
+// A write that never answers would hold polls off its value forever; past this it counts as failed.
+const WRITE_RECEIPT_DEADLINE_MS = 15_000;
+
 async function writeReceipt(url: string, init: RequestInit): Promise<RuntimeCursor | null> {
   try {
-    const res = await fetch(url, init);
+    const res = await fetch(url, { ...init, signal: AbortSignal.timeout(WRITE_RECEIPT_DEADLINE_MS) });
     return res.ok ? runtimeCursor(res) : null;
   } catch {
     return null;

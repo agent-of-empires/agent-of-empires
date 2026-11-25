@@ -18,8 +18,8 @@ export const SORT_FEATURE: Record<SidebarSort, FeatureUse> = { custom: "sort_cus
 
 /**
  * Local writes of one Daemon value that a poll must not undo. A poll is held off while any write is in
- * flight, and after that until it reads a snapshot at least as new as the newest receipt. A failed write
- * leaves no receipt, so the next poll restores what the Daemon holds.
+ * flight, and after that until it reads a snapshot at least as new as the newest receipt. A failed write,
+ * including one past its deadline, leaves no receipt, so the next poll restores what the Daemon holds.
  */
 export interface WriteHold {
   pending: number;
