@@ -6,8 +6,9 @@
 //! Running from a settled state, and publishes the baseline captured since the last settle. Waiting
 //! to Running resumes the same turn after an approval, so it does not start one. A turn that starts
 //! with no finished baseline (the capture failed or was still running) clears Last turn rather than
-//! comparing against an older turn. Edits made between turns count toward the next one. Snapshots
-//! live in Daemon memory and are lost on restart.
+//! comparing against an older turn, and so does a lag that skips status events. Edits made between
+//! turns count toward the next one. Only the tree ids live in Daemon memory and are lost on restart;
+//! the trees and blobs are written to each repo's object store and stay until `git gc` prunes them.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
