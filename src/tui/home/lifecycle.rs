@@ -105,6 +105,7 @@ impl HomeView {
             row_tag_mode: resolved.session.row_tag,
             show_activity_age: resolved.session.show_activity_age,
             show_structured_badge: resolved.session.show_structured_badge,
+            hide_snoozed_with_stopped: resolved.session.hide_snoozed_with_stopped,
             sidebar_position: resolved.session.sidebar_position,
             narrow_layout: resolved.session.narrow_layout,
             narrow_breakpoint: resolved.session.narrow_breakpoint,
