@@ -2,34 +2,6 @@
 
 use super::*;
 
-pub(super) fn container_exec_command(
-    container_name: &str,
-    runtime_name: Option<crate::session::config::ContainerRuntimeName>,
-    snapshot: Option<&crate::containers::RuntimeExecutionSnapshot>,
-    argv: &[&str],
-) -> std::process::Command {
-    use crate::session::config::ContainerRuntimeName;
-    let command_argv = argv
-        .iter()
-        .map(|value| (*value).to_owned())
-        .collect::<Vec<_>>();
-    if let Some(snapshot) = snapshot {
-        return snapshot.exec(container_name, "", &command_argv);
-    }
-    let runtime = match runtime_name {
-        Some(ContainerRuntimeName::AppleContainer) => {
-            crate::containers::ContainerRuntime::apple_container()
-        }
-        Some(ContainerRuntimeName::Docker) => crate::containers::ContainerRuntime::docker(),
-        Some(ContainerRuntimeName::Podman) => crate::containers::ContainerRuntime::podman(),
-        None => crate::containers::get_container_runtime(),
-    };
-    let exec_argv = runtime.build_exec_argv(container_name, "", &command_argv);
-    let mut command = std::process::Command::new(&exec_argv[0]);
-    command.args(&exec_argv[1..]);
-    command
-}
-
 pub(super) const CONTAINER_BREADCRUMB_SCRIPT: &str = r#"TERM_DIR=$1
 LAUNCH_MARKER=$2
 EXPECTED_LAUNCH=$3
