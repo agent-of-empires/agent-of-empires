@@ -14,7 +14,7 @@ use std::path::Path;
 use tracing::info;
 
 const WEB_AXIS_KEY: &str = "aoe-sidebar-axis";
-const WEB_SORT_KEY: &str = "aoe-sidebar-sort-mode";
+pub(super) const WEB_SORT_KEY: &str = "aoe-sidebar-sort-mode";
 pub(super) const LEGACY_SORT_KEY: &str = "legacy_sort_order";
 
 pub fn run() -> Result<()> {
@@ -118,7 +118,7 @@ fn tui_effective_sort(sort: &str) -> &'static str {
 }
 
 /// The sort a web pick showed, for v065. Manual's drag order is already in the shared store.
-fn web_effective_sort(sort: &str) -> &'static str {
+pub(super) fn web_effective_sort(sort: &str) -> &'static str {
     match sort {
         "lastActivity" | "attention" => "last_activity",
         _ => "manual",

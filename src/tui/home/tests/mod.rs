@@ -216,6 +216,7 @@ mod live_send_mode;
 mod local_write_guard;
 mod permission_response_dialog;
 mod pickers_groups_sort;
+pub(in crate::tui::home) use pickers_groups_sort::receipt_cursor;
 mod post_create_attach_mode;
 mod preview_drag_select;
 mod preview_links;

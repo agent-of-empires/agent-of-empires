@@ -1,7 +1,9 @@
 //! Pickers, settings entry, group management, layout, and sort.
 
 use super::*;
-pub(super) fn receipt_cursor(headers: &axum::http::HeaderMap) -> crate::daemon::RuntimeCursor {
+pub(in crate::tui::home) fn receipt_cursor(
+    headers: &axum::http::HeaderMap,
+) -> crate::daemon::RuntimeCursor {
     crate::daemon::RuntimeCursor {
         epoch: headers[crate::daemon::RUNTIME_EPOCH_HEADER]
             .to_str()
@@ -371,7 +373,7 @@ pub(super) async fn cross_then_peer_collapse(
     let mut respond = view.session_feed.namespace_driver_for_test();
     view.move_row_at_cursor(1).unwrap();
     let (status, headers, outcome) =
-        request_with_headers(state, "POST", "/api/reorder", body).await;
+        request_with_headers(state, "POST", "/api/reorder", body.clone()).await;
     assert!(status.is_success());
     let receipt = crate::daemon::MutationReceipt {
         cursor: receipt_cursor(&headers),
@@ -389,10 +391,16 @@ pub(super) async fn cross_then_peer_collapse(
     )
     .await;
     assert!(status.is_success());
-    assert!(matches!(
-        respond(Ok(receipt)),
-        Some(crate::daemon::NamespaceMutation::Reorder(_))
-    ));
+    match respond(Ok(receipt)) {
+        Some(crate::daemon::NamespaceMutation::Reorder(sent)) => {
+            assert_eq!(
+                serde_json::to_value(sent).unwrap(),
+                body,
+                "the TUI sent this carry"
+            );
+        }
+        _ => panic!("expected the carry"),
+    }
     view.apply_session_feed();
     apply_published(view, state).await;
 }
@@ -412,9 +420,29 @@ pub(in crate::tui::home) async fn settle_reorder(
     };
     let request = if let Some(path) = view.selected_group.clone() {
         let profile = view.canonical_group_location(&path)?.profile;
+        // Under Name the move starts from the headers on screen.
+        let parent = |p: &str| p.rsplit_once('/').map(|(head, _)| head.to_owned());
+        let siblings = (view.sort_order != crate::session::config::SortOrder::Custom).then(|| {
+            view.flat_items
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Group {
+                        path: p,
+                        profile: row_profile,
+                        ..
+                    } if parent(p) == parent(&path)
+                        && row_profile.as_deref().is_none_or(|r| r == profile) =>
+                    {
+                        Some(p.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        });
         ReorderBody::Group {
             group: GroupLocation { profile, path },
             direction,
+            siblings,
         }
     } else {
         let id = view.selected_session.clone().expect("selected session");
@@ -2774,6 +2802,16 @@ async fn test_ctrl_arrows_under_name_start_custom_from_the_screen_order() {
         Some("Sort is now Custom (Undo in Ctrl+K)")
     );
 
+    // A refused Undo leaves the sort alone and stays on offer.
+    let mut capture = env.view.session_feed.view_write_driver_for_test();
+    env.view.undo_order_change().unwrap();
+    let refused = capture().expect("the restoring order write");
+    assert!(matches!(refused.write, ViewWrite::Ordering(_)));
+    refused.finish(Err("refused".into()));
+    env.view.apply_session_feed();
+    assert!(capture().is_none(), "no sort write follows a refused Undo");
+    assert_eq!(env.view.sort_order, SortOrder::Custom);
+
     // Undo restores the order and the Name sort from before the move.
     let writes = settle_view_writes(&state, &mut env.view, |view| {
         view.undo_order_change().unwrap();
@@ -2889,6 +2927,30 @@ async fn test_undo_restores_the_order_from_before_a_reset() {
     );
     assert_eq!(env.view.sort_order, sort);
 
+    env.view.undo_order_change().unwrap();
+    assert_eq!(flash_text(&env.view), Some("No order change to undo"));
+
+    // A peer's reorder after a reset leaves nothing to undo.
+    settle_view_writes(&state, &mut env.view, |view| {
+        view.reset_custom_order().unwrap();
+    })
+    .await;
+    let (status, _, _) = request_with_headers(
+        &state,
+        "PUT",
+        "/api/workspace-ordering",
+        serde_json::json!({ "order": arranged }),
+    )
+    .await;
+    assert!(status.is_success());
+    apply_published(&mut env.view, &state).await;
+    let mut capture = env.view.session_feed.view_write_driver_for_test();
+    env.view.undo_order_change().unwrap();
+    assert_eq!(
+        flash_text(&env.view),
+        Some("The order changed elsewhere, nothing to undo")
+    );
+    assert!(capture().is_none(), "Undo sent nothing");
     env.view.undo_order_change().unwrap();
     assert_eq!(flash_text(&env.view), Some("No order change to undo"));
 }
@@ -3122,6 +3184,10 @@ async fn test_ctrl_down_stops_at_the_last_group() {
         env.view.move_row_at_cursor(1).unwrap();
     }
     assert!(capture().is_none(), "nothing was sent");
+    assert!(
+        env.view.pending_namespace_intent.is_none(),
+        "no carry was sent"
+    );
 
     assert_eq!(
         env.view.get_instance(&last.1).map(|i| i.group_path.clone()),

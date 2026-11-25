@@ -9,6 +9,7 @@ mod client_log;
 mod file_provenance;
 mod git;
 mod groups;
+pub(crate) use groups::place_at_entering_edge;
 mod log_level;
 mod logs;
 mod mcp;

@@ -677,11 +677,12 @@ pub(crate) fn merge_workspace_ordering(
 
 /// Each session's place in the shared Custom order: its workspace's index in `ordering`.
 pub(crate) fn rank_by_workspace(sessions: &mut [SessionResponse], ordering: &[String]) {
-    let rank: std::collections::HashMap<&str, u32> = ordering
-        .iter()
-        .enumerate()
-        .map(|(at, id)| (id.as_str(), u32::try_from(at).unwrap_or(u32::MAX)))
-        .collect();
+    let mut rank: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+    // A repeated id keeps its first place, the one a Client's move starts from.
+    for (at, id) in ordering.iter().enumerate() {
+        rank.entry(id.as_str())
+            .or_insert_with(|| u32::try_from(at).unwrap_or(u32::MAX));
+    }
     for session in sessions {
         session.sort_index = rank
             .get(workspace_id_for_session(session).as_str())
@@ -691,6 +692,25 @@ pub(crate) fn rank_by_workspace(sessions: &mut [SessionResponse], ordering: &[St
 
 const MAX_ORDER_ENTRIES: usize = 4096;
 const MAX_ORDER_ENTRY_LEN: usize = 1024;
+
+/// `order` without repeats or workspaces no session in `sessions` belongs to, and within
+/// what `PUT /api/workspace-ordering` accepts, so rewriting the full order never grows it.
+pub(crate) fn writable_workspace_order(
+    sessions: &[SessionResponse],
+    mut order: Vec<String>,
+) -> Vec<String> {
+    let mut live: std::collections::HashSet<String> =
+        sessions.iter().map(workspace_id_for_session).collect();
+    order.retain(|id| live.remove(id));
+    writable_repository_order(order)
+}
+
+/// `order` with entries the endpoint refuses dropped and cut to the length it accepts.
+pub(crate) fn writable_repository_order(mut order: Vec<String>) -> Vec<String> {
+    order.retain(|entry| entry.len() <= MAX_ORDER_ENTRY_LEN);
+    order.truncate(MAX_ORDER_ENTRIES);
+    order
+}
 
 #[derive(serde::Serialize)]
 struct WorkspaceOrderingResponse<'a> {
@@ -1504,6 +1524,33 @@ mod workspace_ordering_tests {
             assert_eq!(rank(at), Some(expected), "{}", rows[at].title);
         }
         Ok(())
+    }
+
+    /// A repeated id ranks at its first place, and a full-order write drops repeats and
+    /// workspaces no session has.
+    #[test]
+    fn a_repeated_or_stale_workspace_neither_ranks_twice_nor_is_written_back() {
+        let mut sessions = vec![
+            mock_response("s1", "/repo/a", Some("main")),
+            mock_response("s2", "/repo/b", Some("main")),
+        ];
+        let order: Vec<String> = [
+            "/repo/a::main",
+            "/repo/gone::x",
+            "/repo/b::main",
+            "/repo/a::main",
+        ]
+        .map(String::from)
+        .into();
+        rank_by_workspace(&mut sessions, &order);
+        assert_eq!(
+            sessions.iter().map(|s| s.sort_index).collect::<Vec<_>>(),
+            [Some(0), Some(2)]
+        );
+        assert_eq!(
+            writable_workspace_order(&sessions, order),
+            ["/repo/a::main", "/repo/b::main"]
+        );
     }
 
     #[test]

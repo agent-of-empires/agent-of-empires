@@ -9,12 +9,14 @@
 //! A `sort_index` left from an earlier Custom stint is not what the user saw, so it is
 //! dropped unused. The dashboard's header order is copied, not removed, because the
 //! dashboard still reads it. `sort_index` and `legacy_sort_order` are dropped only after
-//! the shared order is written, so an interrupted run retries from them.
-//! A `sessions.json` that cannot be read is left for its owner's recovery path, and its
-//! rows count as never moved.
+//! the shared order is written, so an interrupted run retries from them. An install that
+//! ran an earlier v064 without `legacy_sort_order` falls back to the sort v064 left.
+//! A `sessions.json` that cannot be read is left untouched and the run completes without
+//! it; the sort is kept in `PENDING_FILE`, and `aoe migrate` adds the repaired profile's
+//! order to the shared one.
 
 use super::sessions_file;
-use super::v064_shared_sidebar_view::LEGACY_SORT_KEY;
+use super::v064_shared_sidebar_view::{web_effective_sort, LEGACY_SORT_KEY, WEB_SORT_KEY};
 use crate::time::Timestamp;
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -24,9 +26,23 @@ use std::path::Path;
 use tracing::{info, warn};
 
 const WEB_REPO_ORDER_KEY: &str = "aoe-repo-group-order-v1";
+/// The legacy sort, kept while a skipped `sessions.json` still owes its order.
+const PENDING_FILE: &str = ".v065_custom_order_pending";
 
 pub fn run() -> Result<()> {
-    run_in(&crate::session::get_app_dir()?)
+    run_in(&crate::session::get_app_dir()?, Pass::Upgrade)
+}
+
+/// Seed the order of profiles the upgrade skipped, once they read again.
+pub(super) fn recover() -> Result<()> {
+    run_in(&crate::session::get_app_dir()?, Pass::Recovery)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    Upgrade,
+    /// Adds the rows a skipped profile owes to the order the upgrade wrote.
+    Recovery,
 }
 
 /// A live row's place in each order v065 can seed.
@@ -37,13 +53,24 @@ struct LiveRow {
     accessed: Option<Timestamp>,
 }
 
-fn run_in(app_dir: &Path) -> Result<()> {
+fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
+    let pending_path = app_dir.join(PENDING_FILE);
+    let pending = read_if_present(&pending_path)?.map(|sort| sort.trim().to_owned());
+    if pass == Pass::Recovery && pending.is_none() {
+        return Ok(());
+    }
     let mut placed: Vec<(u64, String, String)> = Vec::new();
     let mut live: Vec<LiveRow> = Vec::new();
     let mut to_strip: Vec<(std::path::PathBuf, String)> = Vec::new();
+    let mut skipped = false;
     for path in sessions_file::session_files(app_dir)? {
-        let Some((content, rows)) = read_session_rows(&path) else {
-            continue;
+        let (content, rows) = match read_session_rows(&path) {
+            SessionList::Rows(content, rows) => (content, rows),
+            SessionList::Missing => continue,
+            SessionList::Unreadable => {
+                skipped = true;
+                continue;
+            }
         };
         for row in rows.iter().filter_map(Value::as_object) {
             if sessions_file::is_archived(row)
@@ -83,11 +110,17 @@ fn run_in(app_dir: &Path) -> Result<()> {
 
     let state = read_state(app_dir)?;
     let web_repositories = web_repository_order(state.as_ref());
-    let legacy_sort = state
+    let in_state = state
         .as_ref()
         .and_then(|state| state.get(LEGACY_SORT_KEY))
         .and_then(toml::Value::as_str)
         .map(str::to_owned);
+    let legacy_sort = match pass {
+        Pass::Upgrade => in_state
+            .clone()
+            .or_else(|| sort_left_by_v064(state.as_ref())),
+        Pass::Recovery => pending,
+    };
 
     let ordering_path = app_dir.join("workspace-ordering.json");
     let mut ordering: crate::session::WorkspaceOrdering = read_if_present(&ordering_path)?
@@ -100,24 +133,27 @@ fn run_in(app_dir: &Path) -> Result<()> {
         .and_then(|sort| legacy_rank(live, sort))
         .unwrap_or_default();
     let legacy_repositories = dedup(legacy.iter().map(|row| row.repository.clone()));
-    if ordering.order.is_empty() {
-        let seeded = match legacy_sort.as_deref() {
-            Some("custom") => tui_order,
-            _ => dedup(legacy.iter().map(|row| row.workspace.clone())),
+    let seeded = match legacy_sort.as_deref() {
+        Some("custom") => tui_order,
+        _ => dedup(legacy.iter().map(|row| row.workspace.clone())),
+    };
+    let seeded_repositories = if web_repositories.is_empty() {
+        legacy_repositories
+    } else {
+        web_repositories
+    };
+    for (current, seeded) in [
+        (&mut ordering.order, seeded),
+        (&mut ordering.repositories, seeded_repositories),
+    ] {
+        let next = match pass {
+            Pass::Upgrade if current.is_empty() => seeded,
+            Pass::Upgrade => continue,
+            // Earlier entries keep their place, which the user may have moved since.
+            Pass::Recovery => add_missing(current, &seeded),
         };
-        if !seeded.is_empty() {
-            ordering.order = seeded;
-            changed = true;
-        }
-    }
-    if ordering.repositories.is_empty() {
-        let seeded = if web_repositories.is_empty() {
-            legacy_repositories
-        } else {
-            web_repositories
-        };
-        if !seeded.is_empty() {
-            ordering.repositories = seeded;
+        if !next.is_empty() && next != *current {
+            *current = next;
             changed = true;
         }
     }
@@ -137,12 +173,52 @@ fn run_in(app_dir: &Path) -> Result<()> {
         crate::session::backup_before_migration(&path)?;
         sessions_file::heal_rows(&path, &content, |row| row.remove("sort_index").is_some())?;
     }
-    if legacy_sort.is_some() {
+    // `state.toml` drops keys this binary does not know on its next save, so the pending
+    // sort lives in its own file.
+    match (&legacy_sort, skipped) {
+        (Some(sort), true) => crate::session::atomic_write(&pending_path, sort.as_bytes())?,
+        _ if pass == Pass::Recovery => fs::remove_file(&pending_path)?,
+        _ => {}
+    }
+    if in_state.is_some() {
         super::config_file::rewrite_strict(&app_dir.join("state.toml"), "v065", |state| {
             state.remove(LEGACY_SORT_KEY).is_some()
         })?;
     }
     Ok(())
+}
+
+/// The sort an earlier v064, which kept no `legacy_sort_order`, left: the dashboard's
+/// pick while its key remains, else Custom only when that was the TUI's sort.
+fn sort_left_by_v064(state: Option<&toml::Table>) -> Option<String> {
+    let state = state?;
+    let web = state
+        .get("web_ui_state")
+        .and_then(|web| web.get(WEB_SORT_KEY))
+        .and_then(toml::Value::as_str);
+    match web {
+        Some(web) => Some(web_effective_sort(web).to_owned()),
+        None => (state.get("sort_order").and_then(toml::Value::as_str) == Some("custom"))
+            .then(|| "custom".to_owned()),
+    }
+}
+
+/// `current` with each `seeded` entry it lacks placed after the entry it follows in
+/// `seeded`, or first when none does.
+fn add_missing(current: &[String], seeded: &[String]) -> Vec<String> {
+    let mut merged = current.to_vec();
+    let mut previous: Option<usize> = None;
+    for entry in seeded {
+        previous = Some(match merged.iter().position(|e| e == entry) {
+            Some(at) => at,
+            None => {
+                let at = previous.map_or(0, |at| at + 1);
+                merged.insert(at, entry.clone());
+                at
+            }
+        });
+    }
+    merged
 }
 
 /// Live rows in the order the removed sort `sort` showed them, or `None` for a sort with
@@ -164,25 +240,31 @@ fn legacy_rank(mut live: Vec<LiveRow>, sort: &str) -> Option<Vec<LiveRow>> {
     Some(live)
 }
 
-/// A profile's raw content and rows, or `None` when it is missing or cannot be read as a
-/// session list. Such a file is left untouched for the recovery that owns it.
-fn read_session_rows(path: &Path) -> Option<(String, Vec<Value>)> {
+enum SessionList {
+    Rows(String, Vec<Value>),
+    Missing,
+    /// Left untouched for the recovery that owns it.
+    Unreadable,
+}
+
+fn read_session_rows(path: &Path) -> SessionList {
     let content = match read_if_present(path) {
-        Ok(content) => content?,
+        Ok(Some(content)) => content,
+        Ok(None) => return SessionList::Missing,
         Err(error) => {
-            warn!(target: "migrations.v065", path = %path.display(), %error, "skipping an unreadable session list");
-            return None;
+            warn!(target: "migrations.v065", path = %path.display(), %error, "Preserved unreadable session list; repair it and run aoe migrate");
+            return SessionList::Unreadable;
         }
     };
     match serde_json::from_str::<Value>(&content) {
-        Ok(Value::Array(rows)) => Some((content, rows)),
+        Ok(Value::Array(rows)) => SessionList::Rows(content, rows),
         Ok(_) => {
-            warn!(target: "migrations.v065", path = %path.display(), "skipping a file that is not a session list");
-            None
+            warn!(target: "migrations.v065", path = %path.display(), "Preserved a file that is not a session list; repair it and run aoe migrate");
+            SessionList::Unreadable
         }
         Err(error) => {
-            warn!(target: "migrations.v065", path = %path.display(), %error, "skipping a session list that does not parse");
-            None
+            warn!(target: "migrations.v065", path = %path.display(), %error, "Preserved a session list that does not parse; repair it and run aoe migrate");
+            SessionList::Unreadable
         }
     }
 }
@@ -294,7 +376,7 @@ mod tests {
         )
         .unwrap();
 
-        run_in(dir.path()).unwrap();
+        run_in(dir.path(), Pass::Upgrade).unwrap();
 
         let ordering = ordering(dir.path());
         assert_eq!(ordering.order, ["/r/two::feat", "/r/one::__session__::a"]);
@@ -308,7 +390,7 @@ mod tests {
         );
 
         // A second run over migrated state changes nothing.
-        run_in(dir.path()).unwrap();
+        run_in(dir.path(), Pass::Upgrade).unwrap();
         assert_eq!(ordering.order, self::ordering(dir.path()).order);
     }
 
@@ -325,7 +407,7 @@ mod tests {
                 serde_json::json!([{"id": "a", "project_path": "/r/one", "sort_index": 0}]),
             );
             fs::write(dir.path().join(file), broken).unwrap();
-            assert!(run_in(dir.path()).is_err(), "{file}");
+            assert!(run_in(dir.path(), Pass::Upgrade).is_err(), "{file}");
             let rows = fs::read_to_string(dir.path().join("profiles/main/sessions.json")).unwrap();
             assert!(rows.contains("sort_index"), "{file}");
             assert_eq!(fs::read_to_string(dir.path().join(file)).unwrap(), broken);
@@ -333,8 +415,9 @@ mod tests {
     }
 
     /// A session list that cannot be read is skipped and left for its recovery, while the
-    /// other profiles migrate. An unreadable `workspace-ordering.json` fails the run
-    /// untouched, since writing over it could lose an order.
+    /// other profiles migrate; once repaired, recovery adds its order. An unreadable
+    /// `workspace-ordering.json` fails the run untouched, since writing over it could lose
+    /// an order.
     #[test]
     fn an_unreadable_input_is_left_untouched() {
         for broken in [
@@ -369,18 +452,88 @@ mod tests {
             let rows =
                 || fs::read_to_string(dir.path().join("profiles/main/sessions.json")).unwrap();
             if file == "workspace-ordering.json" {
-                assert!(run_in(dir.path()).is_err(), "{broken}");
+                assert!(run_in(dir.path(), Pass::Upgrade).is_err(), "{broken}");
                 assert!(rows().contains("sort_index"), "{broken}");
-            } else {
-                run_in(dir.path()).unwrap();
-                assert!(!rows().contains("sort_index"), "{broken}");
-                assert_eq!(
-                    ordering(dir.path()).order,
-                    ["/r/one::__session__::a"],
-                    "{broken}"
-                );
+                assert!(read_back(), "{broken}");
+                continue;
             }
+            run_in(dir.path(), Pass::Upgrade).unwrap();
+            assert!(!rows().contains("sort_index"), "{broken}");
+            assert_eq!(
+                ordering(dir.path()).order,
+                ["/r/one::__session__::a"],
+                "{broken}"
+            );
             assert!(read_back(), "{broken}");
+            let pending = dir.path().join(PENDING_FILE);
+            assert_eq!(fs::read_to_string(&pending).unwrap(), "custom", "{broken}");
+            assert!(!fs::read_to_string(dir.path().join("state.toml"))
+                .unwrap()
+                .contains(LEGACY_SORT_KEY));
+
+            // Still unreadable, recovery waits; repaired, its rows join the shared order.
+            run_in(dir.path(), Pass::Recovery).unwrap();
+            assert!(pending.exists(), "{broken}");
+            if path.is_dir() {
+                fs::remove_dir(&path).unwrap();
+            }
+            fs::write(
+                &path,
+                serde_json::json!([
+                    {"id": "b", "project_path": "/r/two", "sort_index": 1},
+                    {"id": "c", "project_path": "/r/three", "sort_index": 0},
+                ])
+                .to_string(),
+            )
+            .unwrap();
+            run_in(dir.path(), Pass::Recovery).unwrap();
+            assert_eq!(
+                ordering(dir.path()).order,
+                [
+                    "/r/three::__session__::c",
+                    "/r/two::__session__::b",
+                    "/r/one::__session__::a"
+                ],
+                "{broken}"
+            );
+            assert!(!fs::read_to_string(&path).unwrap().contains("sort_index"));
+            assert!(!pending.exists(), "{broken}");
+            run_in(dir.path(), Pass::Recovery).unwrap();
+        }
+    }
+
+    /// An install whose v064 kept no `legacy_sort_order` seeds from the sort v064 left:
+    /// the TUI order under Custom, the dashboard's pick while its key remains.
+    #[test]
+    fn an_earlier_v064_without_the_marker_keeps_the_custom_order() {
+        let (a, b) = ("/r/a::__session__::a", "/r/b::__session__::b");
+        for (state, expected) in [
+            ("sort_order = \"custom\"\n", vec![a]),
+            ("sort_order = \"name\"\n", vec![]),
+            (
+                "sort_order = \"custom\"\n[web_ui_state]\n\"aoe-sidebar-sort-mode\" = \"lastActivity\"\n",
+                vec![b, a],
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            seed(
+                dir.path(),
+                serde_json::json!([
+                    {"id": "a", "project_path": "/r/a", "sort_index": 0,
+                     "last_accessed_at": "2026-01-01T00:00:00Z"},
+                    {"id": "b", "project_path": "/r/b", "last_accessed_at": "2026-01-02T00:00:00Z"},
+                ]),
+            );
+            fs::write(dir.path().join("state.toml"), state).unwrap();
+            run_in(dir.path(), Pass::Upgrade).unwrap();
+            let seeded = if expected.is_empty() {
+                assert!(!dir.path().join("workspace-ordering.json").exists(), "{state}");
+                Vec::new()
+            } else {
+                ordering(dir.path()).order
+            };
+            assert_eq!(seeded, expected, "{state}");
+            assert_eq!(fs::read_to_string(dir.path().join("state.toml")).unwrap(), state);
         }
     }
 
@@ -401,7 +554,7 @@ mod tests {
             format!("{LEGACY_SORT_KEY} = \"custom\"\n"),
         )
         .unwrap();
-        run_in(dir.path()).unwrap();
+        run_in(dir.path(), Pass::Upgrade).unwrap();
         assert_eq!(ordering(dir.path()).order, ["/r/web::main"]);
     }
 
@@ -473,7 +626,7 @@ mod tests {
                 fs::write(dir.path().join("workspace-ordering.json"), ordering).unwrap();
             }
 
-            run_in(dir.path()).unwrap();
+            run_in(dir.path(), Pass::Upgrade).unwrap();
 
             let seeded = if expected.is_empty() {
                 assert!(
@@ -491,7 +644,7 @@ mod tests {
             assert!(state.contains("sort_order"), "{legacy:?}");
 
             // A second run over migrated state changes nothing.
-            run_in(dir.path()).unwrap();
+            run_in(dir.path(), Pass::Upgrade).unwrap();
             assert_eq!(
                 fs::read_to_string(dir.path().join("state.toml")).unwrap(),
                 state
@@ -535,7 +688,7 @@ mod tests {
             if let Some(order) = web_order {
                 fs::write(dir.path().join("workspace-ordering.json"), order).unwrap();
             }
-            run_in(dir.path()).unwrap();
+            run_in(dir.path(), Pass::Upgrade).unwrap();
             let seeded = if expected.is_empty() {
                 assert!(
                     !dir.path().join("workspace-ordering.json").exists(),

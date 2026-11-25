@@ -758,7 +758,9 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
         .iter()
         .any(|entry| &entry.name == profile);
     let reordered_group = match &body {
-        ReorderBody::Group { group, direction } => Some((
+        ReorderBody::Group {
+            group, direction, ..
+        } => Some((
             group.profile.clone(),
             group.path.clone(),
             format!("{direction:?}"),
@@ -890,7 +892,7 @@ fn place_carried_workspace(
 
 /// `order` with `moved` at the edge of the `peers` workspaces a carry enters from: before
 /// the first moving down, after the last moving up.
-fn place_at_entering_edge(
+pub(crate) fn place_at_entering_edge(
     mut order: Vec<String>,
     moved: &str,
     peers: &[String],
@@ -918,7 +920,11 @@ fn apply_canonical_reorder(
 ) -> Result<crate::daemon::ReorderOutcome> {
     use crate::daemon::{MoveDirection, ReorderBody, ReorderOutcome};
     match body {
-        ReorderBody::Group { group, direction } => {
+        ReorderBody::Group {
+            group,
+            direction,
+            siblings,
+        } => {
             if cityhall {
                 let parent = group.path.rsplit_once('/').map_or("", |(parent, _)| parent);
                 for row in rows.iter().filter(|row| {
@@ -931,6 +937,9 @@ fn apply_canonical_reorder(
             let mut tree = GroupTree::new_with_groups(rows, groups);
             if !tree.group_exists(&group.path) {
                 return Ok(ReorderOutcome::Stale);
+            }
+            if let Some(siblings) = siblings {
+                tree.arrange_siblings(&group.path, siblings);
             }
             let delta = match direction {
                 MoveDirection::Up => -1,

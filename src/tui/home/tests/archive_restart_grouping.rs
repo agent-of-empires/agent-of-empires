@@ -652,7 +652,8 @@ fn pinned_project_without_sessions_shows_empty_header() {
         .map(|inst| inst.repo_path().to_string())
         .unwrap();
     env.view.sort_order = crate::session::config::SortOrder::Custom;
-    env.view.repository_order = vec!["/repos/gamma".into(), alpha];
+    // A stored entry may keep a trailing slash.
+    env.view.repository_order = vec!["/repos/gamma/".into(), alpha];
     env.view.flat_items = env.view.build_flat_items();
     let headers: Vec<&str> = env
         .view

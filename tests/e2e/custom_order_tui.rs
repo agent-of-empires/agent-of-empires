@@ -115,4 +115,32 @@ fn test_tui_custom_sort_reorders_and_persists() {
         Some(2),
         "both rows placed: {ordering}"
     );
+    // Keyed as `Instance::workspace_id` writes them.
+    let sessions = h.read_sessions();
+    let workspace = |title: &str| {
+        let row = sessions
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["title"] == title))
+            .unwrap_or_else(|| panic!("{title} in sessions.json: {sessions}"));
+        let text = |value: &serde_json::Value| value.as_str().expect("string").to_owned();
+        match row.get("worktree_info").filter(|w| !w.is_null()) {
+            Some(worktree) => format!(
+                "{}::{}",
+                text(&worktree["main_repo_path"]).trim_end_matches('/'),
+                text(&worktree["branch"])
+            ),
+            None => format!(
+                "{}::__session__::{}",
+                text(&row["project_path"]).trim_end_matches('/'),
+                text(&row["id"])
+            ),
+        }
+    };
+    let expected: Vec<serde_json::Value> =
+        moved.iter().map(|title| workspace(title).into()).collect();
+    assert_eq!(
+        ordering["order"].as_array(),
+        Some(&expected),
+        "the moved order was saved"
+    );
 }

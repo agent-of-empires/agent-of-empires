@@ -298,7 +298,11 @@ impl HomeView {
         let rank = |repo: &str| {
             let repo = repo.trim_end_matches('/');
             (self.sort_order == SortOrder::Custom)
-                .then(|| self.repository_order.iter().position(|r| r == repo))
+                .then(|| {
+                    self.repository_order
+                        .iter()
+                        .position(|r| r.trim_end_matches('/') == repo)
+                })
                 .flatten()
         };
         grouped.sort_by_key(|inst| std::cmp::Reverse(inst.created_at));

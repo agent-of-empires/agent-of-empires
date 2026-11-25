@@ -425,6 +425,11 @@ pub enum ReorderBody {
     Group {
         group: GroupLocation,
         direction: MoveDirection,
+        /// The group's sibling paths in the order the Client shows them, which the move
+        /// starts from and the stored order then keeps. Omitted, it starts from the stored
+        /// order.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        siblings: Option<Vec<String>>,
     },
 }
 

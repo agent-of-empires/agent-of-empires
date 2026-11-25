@@ -292,6 +292,33 @@ impl GroupTree {
         true
     }
 
+    /// Put `path` and its siblings named in `shown` in that order, each in one of the
+    /// slots they held. Entries that are not siblings are ignored.
+    pub fn arrange_siblings(&mut self, path: &str, shown: &[String]) {
+        let parent = |p: &str| p.rsplit_once('/').map(|(head, _)| head.to_string());
+        let anchor_parent = parent(path);
+        let mut wanted: Vec<&String> = Vec::new();
+        for entry in shown {
+            if self.groups_by_path.contains_key(entry)
+                && parent(entry) == anchor_parent
+                && !wanted.contains(&entry)
+            {
+                wanted.push(entry);
+            }
+        }
+        let slots: Vec<usize> = self
+            .insertion_order
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| wanted.contains(p))
+            .map(|(idx, _)| idx)
+            .collect();
+        for (slot, entry) in slots.into_iter().zip(wanted) {
+            self.insertion_order[slot] = entry.clone();
+        }
+        self.rebuild_tree();
+    }
+
     pub fn get_all_groups(&self) -> Vec<Group> {
         // Return in insertion order so groups.json preserves creation order
         self.insertion_order

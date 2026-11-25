@@ -1333,11 +1333,24 @@ impl HomeView {
                     }
                     NamespaceOutcome::Reordered(outcome) => match outcome {
                         ReorderOutcome::Moved { destination } => {
-                            if let Some(NamespaceIntent::ReorderSession { id, .. }) = intent {
-                                self.follow_committed_reorder(&id, destination.as_ref());
-                            } else {
-                                self.rebuild_flat_items_keeping_cursor();
-                                self.update_selected();
+                            let freeze = match intent {
+                                Some(NamespaceIntent::ReorderSession { id, freeze }) => {
+                                    self.follow_committed_reorder(&id, destination.as_ref());
+                                    freeze
+                                }
+                                Some(NamespaceIntent::ReorderGroup { freeze }) => {
+                                    self.rebuild_flat_items_keeping_cursor();
+                                    self.update_selected();
+                                    freeze
+                                }
+                                _ => {
+                                    self.rebuild_flat_items_keeping_cursor();
+                                    self.update_selected();
+                                    None
+                                }
+                            };
+                            if let Some(order) = freeze {
+                                self.switch_to_custom_after_move(order);
                             }
                         }
                         ReorderOutcome::AtEdge => {}

@@ -183,10 +183,15 @@ pub(super) enum NamespaceIntent {
     Plain,
     ProfileCreated(String),
     ProfileDeleted(String),
+    /// `freeze` is the order on screen under Name, written once the move commits so the
+    /// list switches to Custom looking as it did.
     ReorderSession {
         id: String,
+        freeze: Option<Vec<String>>,
     },
-    ReorderGroup,
+    ReorderGroup {
+        freeze: Option<Vec<String>>,
+    },
 }
 
 pub(super) enum CreationConfirmation {
@@ -301,7 +306,7 @@ pub struct HomeView {
     /// An order write that offers Undo once it commits.
     pending_order_change: Option<reorder::OrderChange>,
     /// What "Undo last order change" writes back.
-    order_undo: Option<reorder::OrderUndo>,
+    order_undo: Option<reorder::UndoPoint>,
     session_feed_reload_retry_at: Option<std::time::Instant>,
     session_feed_failed_cursor: Option<crate::daemon::RuntimeCursor>,
     canonical_metadata_lag: Option<CanonicalMetadataLagState>,
