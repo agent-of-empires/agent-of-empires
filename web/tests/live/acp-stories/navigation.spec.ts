@@ -78,7 +78,8 @@ test("Cmd/Ctrl+` activates the paired terminal panel", async ({ page, spawnServe
   // The panels start closed; the chord opens the paired terminal tab and focuses it once its PTY is ready.
   await page.locator("body").click({ position: { x: 5, y: 5 } });
   await page.keyboard.press(`${MOD}+Backquote`);
-  await expect(page.locator('[data-testid="content-split-resize-handle"]')).toBeVisible({ timeout: 10_000 });
+  // The terminal opens in the bottom dock.
+  await expect(page.getByTestId("bottom-dock-resize")).toBeVisible({ timeout: 10_000 });
   await expect(page.locator('[data-term="paired"]').first()).toBeVisible({ timeout: 15_000 });
   await expect(page.getByText(/Reconnecting/i)).toBeHidden({ timeout: 15_000 });
   await expect
