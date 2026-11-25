@@ -248,6 +248,7 @@ pub(crate) fn attach_presets(
             "view": effective.view,
             "worktree": effective.worktree,
             "sandbox": effective.sandbox,
+            "yolo": effective.yolo,
         });
         if !project.is_null() {
             start["project"] = project;

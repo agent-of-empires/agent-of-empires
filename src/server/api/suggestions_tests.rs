@@ -444,6 +444,7 @@ async fn the_snapshot_shows_each_kinds_preset_and_what_start_uses() {
         body["items"][0]["start"].get("project").is_none(),
         "unlinked"
     );
+    assert!(!body["items"][0]["start"]["yolo"].is_null());
     assert_eq!(
         body["items"][0]["start"]["prompt"], "Fix #{number}",
         "the published prompt"
@@ -476,6 +477,7 @@ async fn the_snapshot_shows_each_kinds_preset_and_what_start_uses() {
     for field in ["view", "worktree", "sandbox"] {
         assert!(!start[field].is_null(), "{field}");
     }
+    assert_eq!(start["yolo"], true, "the preset auto-approves");
 
     f.call(
         Method::PUT,
