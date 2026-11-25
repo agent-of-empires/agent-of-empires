@@ -39,6 +39,7 @@ import {
 import { FlatGroupList, NestedGroupList, OrgGroupList, type ListContext } from "./sidebar/GroupLists";
 import { SessionRow } from "./sidebar/SessionRow";
 import { FacetPanel, SidebarToolbar } from "./sidebar/SidebarToolbar";
+import { SidebarNav } from "./sidebar/SidebarNav";
 import { TrashMenu } from "./sidebar/TrashMenu";
 import { useFacetFilter } from "./sidebar/useFacetFilter";
 import { useSidebarSelection } from "./sidebar/useSidebarSelection";
@@ -77,6 +78,8 @@ interface Props {
   onSelect: (workspaceId: string, sessionId: string | null) => void;
   onToggleGroup: (groupId: string) => void;
   onNew: (prefill?: { group?: string }) => void;
+  /** Opens the command palette from the sidebar's Search row. */
+  onOpenPalette?: () => void;
   onCreateSession: (repoPath: string) => void;
   onPinProject?: (repoPath: string) => void;
   onUnpinProject?: (group: SidebarGroup) => void;
@@ -323,6 +326,7 @@ export function WorkspaceSidebar(props: Props) {
           rightSide ? "right-0 border-l md:border-l-0" : "left-0 border-r md:border-r-0"
         } ${open ? "translate-x-0" : `${rightSide ? "translate-x-full" : "-translate-x-full"} md:hidden`}`}
       >
+        <SidebarNav compact={compact} offline={offline} onNew={() => props.onNew()} onSearch={props.onOpenPalette} />
         <SidebarToolbar
           compact={compact}
           axis={axis}
@@ -338,8 +342,6 @@ export function WorkspaceSidebar(props: Props) {
           onToggleFacets={() => setFacetOpen((o) => !o)}
           filterOpen={filterOpen}
           onToggleFilter={toggleFilter}
-          offline={offline}
-          onNew={() => props.onNew()}
           onClose={() => props.onOpenChange(false)}
         />
 
@@ -368,7 +370,7 @@ export function WorkspaceSidebar(props: Props) {
           />
         )}
 
-        <div className="flex-1 overflow-y-auto overflow-x-hidden border-t border-surface-700/40">
+        <div className="flex-1 overflow-y-auto overflow-x-hidden border-t border-surface-700/40 px-2 pt-1">
           {isNested ? (
             <NestedGroupList
               ctx={ctx}
@@ -409,7 +411,7 @@ export function WorkspaceSidebar(props: Props) {
                 // A header for the arrow keys like a Group's, so Left on one of its rows comes back here.
                 aria-controls={SUNK_ROWS}
                 {...{ [NAV_ITEM]: "" }}
-                className={`w-full flex items-center gap-2 py-1.5 text-[11px] font-mono uppercase text-text-muted hover:text-text-secondary hover:bg-surface-800/40 cursor-pointer transition-colors border-t border-surface-800/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 ${
+                className={`w-full flex items-center gap-2 py-1.5 rounded-md text-[12px] font-medium text-text-dim hover:text-text-secondary hover:bg-surface-800/60 cursor-pointer transition-colors border-t border-surface-800/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 ${
                   compact ? "px-2" : "px-3 tracking-widest"
                 }`}
               >

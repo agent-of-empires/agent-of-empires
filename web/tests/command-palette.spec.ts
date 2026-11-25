@@ -58,7 +58,7 @@ test.describe("Command palette", () => {
     await page.route("**/api/projects*", (r) => r.fulfill({ json: [] }));
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
-    await page.getByLabel("New project session").first().click();
+    await page.getByTestId("sidebar-new-session").first().click();
     await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
     await page.getByPlaceholder("Type to filter...").click();
     await page.keyboard.press("ControlOrMeta+k");

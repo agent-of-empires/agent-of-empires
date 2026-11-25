@@ -2,11 +2,10 @@ import { ListFilter } from "lucide-react";
 import type { SidebarAxis } from "../../lib/sidebarAxis";
 import type { SidebarSortMode } from "../../lib/sidebarSort";
 import { toneTextClass, type PluginFacetSpec, type PluginSortSpec } from "../../lib/pluginUi";
-import { OFFLINE_TITLE } from "../../lib/connectionState";
 import { SidebarAxisPicker } from "../SidebarAxisPicker";
 import { SidebarSortPicker } from "../SidebarSortPicker";
 import { Tooltip } from "../Tooltip";
-import { DISABLED_ICON_BUTTON, TOOLBAR_BUTTON, TOOLBAR_TINT } from "./styles";
+import { TOOLBAR_BUTTON, TOOLBAR_TINT } from "./styles";
 import { StrokeIcon } from "../icons";
 import { SidebarLegend } from "./SidebarLegend";
 
@@ -36,8 +35,6 @@ export function SidebarToolbar({
   onToggleFacets,
   filterOpen,
   onToggleFilter,
-  offline,
-  onNew,
   onClose,
 }: {
   compact: boolean;
@@ -54,18 +51,16 @@ export function SidebarToolbar({
   onToggleFacets: () => void;
   filterOpen: boolean;
   onToggleFilter: () => void;
-  offline: boolean;
-  onNew: () => void;
   onClose: () => void;
 }) {
   const axisHeading = AXIS_HEADING[axis];
   return (
-    <div className={`${compact ? "px-1" : "px-3"} pt-3 pb-1 flex items-center`}>
+    <div className={`${compact ? "px-1" : "pl-4 pr-2"} pt-4 pb-1 flex items-center`}>
       {compact ? (
         <span className="flex-1" />
       ) : (
         <>
-          <span data-testid="sidebar-axis-heading" className="text-sm text-text-muted flex-1">
+          <span data-testid="sidebar-axis-heading" className="text-[12px] font-medium text-text-dim flex-1">
             {axisHeading}
           </span>
           <SidebarAxisPicker axis={axis} onAxisChange={onAxisChange} />
@@ -101,20 +96,6 @@ export function SidebarToolbar({
             >
               <StrokeIcon size={14} strokeWidth="2">
                 <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
-              </StrokeIcon>
-            </button>
-          </Tooltip>
-          <Tooltip text={offline ? OFFLINE_TITLE : "New project session"}>
-            <button
-              onClick={onNew}
-              disabled={offline}
-              className={`w-8 h-8 flex items-center justify-center text-text-muted hover:text-text-secondary hover:bg-surface-800 cursor-pointer rounded-md transition-colors ${DISABLED_ICON_BUTTON}`}
-              aria-label="New project session"
-            >
-              <StrokeIcon size={16} strokeWidth="1.5">
-                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-                <line x1="12" y1="11" x2="12" y2="17" />
-                <line x1="9" y1="14" x2="15" y2="14" />
               </StrokeIcon>
             </button>
           </Tooltip>

@@ -85,7 +85,8 @@ export function SidebarLegend() {
   const toggle = () => {
     if (menu) return close();
     const rect = buttonRef.current?.getBoundingClientRect();
-    openMenu({ x: rect?.left ?? 0, y: (rect?.bottom ?? 0) + 4 });
+    // Beside the button, past the sidebar: clamped up to fit the window, it still never covers its own trigger.
+    openMenu({ x: (rect?.right ?? 0) + 8, y: rect?.top ?? 0 });
     // The popover isn't modal, so it takes focus itself; Escape then reaches it. The phone sheet is
     // modal and has already focused its close button, where its Tab trap starts; leave that be.
     requestAnimationFrame(() => {

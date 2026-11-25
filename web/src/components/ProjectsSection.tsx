@@ -55,7 +55,7 @@ export function ProjectsSection({
           onClick={toggle}
           data-testid="sidebar-projects-toggle"
           aria-expanded={expanded}
-          className={`flex-1 min-w-0 flex items-center gap-2 py-1.5 text-[11px] font-mono uppercase text-text-muted hover:text-text-secondary hover:bg-surface-800/40 cursor-pointer transition-colors ${
+          className={`flex-1 min-w-0 flex items-center gap-2 py-1.5 rounded-md text-[12px] font-medium text-text-dim hover:text-text-secondary hover:bg-surface-800/60 cursor-pointer transition-colors ${
             compact ? "px-2" : "px-3 tracking-wider"
           }`}
         >

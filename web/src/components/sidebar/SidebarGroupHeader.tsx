@@ -97,7 +97,7 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
               }
             : undefined
         }
-        className={`group flex items-center gap-2 ${compact ? "px-2" : "px-3"} py-2 transition-colors duration-75 text-text-secondary ${rowClass}`}
+        className={`group flex items-center gap-2 ${compact ? "px-2" : "px-2.5"} py-1.5 mt-1 rounded-md transition-colors duration-75 text-text-secondary ${rowClass}`}
         // The whole row activates the drag; `attributes` would add a role and a second tab stop.
         ref={(el) => {
           rowRef.current = el;
@@ -182,10 +182,7 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
               </Tooltip>
             )
           )}
-          <span
-            className="text-[13px] md:text-[14px] font-medium truncate flex-1"
-            title={group.groupPath ?? group.repoPath}
-          >
+          <span className="text-[13px] font-medium truncate flex-1" title={group.groupPath ?? group.repoPath}>
             {group.displayName}
           </span>
           {attentionCount > 0 && (

@@ -98,7 +98,7 @@ describe("TopBar", () => {
     }
   });
 
-  it("does not render the workspace/repo breadcrumb even with an active workspace and session", () => {
+  it("heads an open session with its project and title, as Claude Code desktop does", () => {
     const workspace = {
       id: "ws-1",
       branch: null,
@@ -109,14 +109,13 @@ describe("TopBar", () => {
       status: "idle",
       sessions: [],
     } as unknown as Workspace;
-    const { queryByText } = renderTopBar({
+    const { getByTestId, rerender } = renderTopBar({
       activeWorkspace: workspace,
-      activeSession: {} as SessionResponse,
+      activeSession: { title: "Fix the cart", project_path: "/home/user/breadcrumb-repo/" } as SessionResponse,
     });
-    // The old breadcrumb rendered the repo name (last path segment) and the
-    // workspace display name; both must be gone now that #1456 removed it.
-    expect(queryByText("breadcrumb-repo")).toBeNull();
-    expect(queryByText("breadcrumb-feature")).toBeNull();
+    expect(getByTestId("session-breadcrumb").textContent).toBe("breadcrumb-repo/Fix the cart");
+    rerender(<TopBar {...topBarProps({ activeWorkspace: undefined, activeSession: null })} />);
+    expect(() => getByTestId("session-breadcrumb")).toThrow();
   });
 
   it("replaces the sidebar toggle and dashboard link with an All Sessions button in focus mode", () => {

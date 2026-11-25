@@ -39,7 +39,7 @@ test.describe("Sidebar", () => {
   test("sidebar can be toggled closed and open on desktop", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
-    const addBtn = page.getByLabel("New project session");
+    const addBtn = page.getByTestId("sidebar-new-session");
     await expect(addBtn).toBeVisible();
 
     await page.getByRole("button", { name: "Toggle sidebar" }).click();
@@ -97,7 +97,7 @@ test.describe("Create session from home screen", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
 
-    await page.getByLabel("New project session").first().click();
+    await page.getByTestId("sidebar-new-session").first().click();
     await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
 
     await page.getByRole("button", { name: "Close" }).click();
@@ -141,7 +141,7 @@ test.describe("Mobile responsive", () => {
     await page.setViewportSize({ width: 375, height: 812 });
     await page.goto("/");
     await page.getByText("Show sessions").click();
-    await expect(page.getByLabel("New project session")).toBeInViewport();
+    await expect(page.getByTestId("sidebar-new-session")).toBeInViewport();
   });
 
   test("mobile home offers the five most recent sessions while desktop keeps them hidden", async ({ page }) => {
@@ -208,9 +208,9 @@ test.describe("Mobile responsive", () => {
     await page.setViewportSize({ width: 375, height: 812 });
     await page.goto("/");
     await page.getByRole("button", { name: "Toggle sidebar" }).click();
-    await expect(page.getByLabel("New project session")).toBeInViewport();
+    await expect(page.getByTestId("sidebar-new-session")).toBeInViewport();
     // Toggle the sidebar closed again
     await page.getByRole("button", { name: "Toggle sidebar" }).click();
-    await expect(page.getByLabel("New project session")).not.toBeInViewport();
+    await expect(page.getByTestId("sidebar-new-session")).not.toBeInViewport();
   });
 });

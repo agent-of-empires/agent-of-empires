@@ -127,8 +127,8 @@ test.describe("sidebar repo groups (#1220)", () => {
     await expect(page.getByText("repo-beta")).toBeVisible();
 
     await expect(page.locator(ROW)).toHaveCount(2);
-    await expect(page.getByText("alpha-session")).toBeVisible();
-    await expect(page.getByText("beta-session")).toBeVisible();
+    await expect(page.locator('[data-tour="sidebar"]').getByText("alpha-session")).toBeVisible();
+    await expect(page.locator('[data-tour="sidebar"]').getByText("beta-session")).toBeVisible();
 
     await page.getByLabel("Filter sessions").click();
     const filter = page.locator("[data-testid='sidebar-filter-input']");
@@ -163,7 +163,7 @@ test.describe("sidebar repo groups (#1220)", () => {
 
     // Collapsed, the header uses the projected token; border-brand-600 fails contrast on catppuccin-latte.
     await expandBtn.click();
-    await expect(page.getByText("alpha-session")).toBeHidden();
+    await expect(page.locator('[data-tour="sidebar"]').getByText("alpha-session")).toBeHidden();
     expect(await alphaHeader.getAttribute("class")).toContain("border-session-active");
     expect(await betaHeader.getAttribute("class")).not.toContain("border-session-active");
     // toHaveCSS polls past the color transition.
@@ -673,8 +673,8 @@ test.describe("sidebar org axis (#3283)", () => {
 
     await alphaExpand.click();
     await expect(alphaExpand).toHaveAttribute("aria-expanded", "false");
-    await expect(page.getByText("alpha-session")).toBeHidden();
-    await expect(page.getByText("beta-session")).toBeVisible();
+    await expect(page.locator('[data-tour="sidebar"]').getByText("alpha-session")).toBeHidden();
+    await expect(page.locator('[data-tour="sidebar"]').getByText("beta-session")).toBeVisible();
 
     await page.reload();
     await expect(axisToggle).toHaveAttribute("data-axis", "org");

@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { Folder } from "lucide-react";
 import type { SessionResponse, Workspace } from "../lib/types";
 import { PaletteTriggerPill } from "./PaletteTriggerPill";
 import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
@@ -55,6 +56,9 @@ interface Props {
    *  right zone widens to match it and the divider runs up through the header. */
   rightColumnVisible: boolean;
 }
+
+/** The last segment of a project path, as a sidebar group names it. */
+const projectName = (path: string) => path.replace(/\/+$/, "").split("/").pop() || path;
 
 export function TopBar({
   activeWorkspace,
@@ -198,11 +202,29 @@ export function TopBar({
         </div>
       </div>
 
-      {/* Center zone: palette trigger and plugin page buttons; carries the bottom border across the
-          middle, between the two column-aligned zones. */}
+      {/* Center zone: on desktop the open session's `project / title`, as Claude Code desktop heads its pane, with
+          search in the sidebar; otherwise the palette trigger. Plugin page buttons follow. */}
       <div className="flex-1 flex items-center px-3 min-w-0 border-b border-surface-700/60 md:border-transparent">
-        <div className="flex-1 flex justify-center items-center gap-1 px-2">
-          <PaletteTriggerPill onClick={onOpenPalette} />
+        <div
+          className={`flex-1 flex justify-center items-center gap-1 px-2 min-w-0 ${activeSession ? "md:justify-start" : ""}`}
+        >
+          {activeSession && (
+            <div
+              data-testid="session-breadcrumb"
+              className="hidden md:flex items-center gap-1.5 min-w-0 flex-1 text-[13px]"
+              title={activeSession.project_path}
+            >
+              <Folder className="size-3.5 shrink-0 text-text-dim" strokeWidth={1.5} aria-hidden />
+              <span className="text-text-secondary truncate shrink">{projectName(activeSession.project_path)}</span>
+              <span className="text-text-dim" aria-hidden>
+                /
+              </span>
+              <span className="text-text-primary font-medium truncate">{activeSession.title}</span>
+            </div>
+          )}
+          <div className={activeSession ? "contents md:hidden" : "contents"}>
+            <PaletteTriggerPill onClick={onOpenPalette} />
+          </div>
           <PluginPageButtons />
           <LiveSlowNotice sessionId={activeSession?.id ?? null} />
         </div>

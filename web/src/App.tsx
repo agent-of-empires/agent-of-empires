@@ -3058,6 +3058,7 @@ function AppContent({
                     setShowSessionWizard(true);
                   }}
                   onCreateSession={handleCreateSession}
+                  onOpenPalette={() => setShowPalette(true)}
                   onPinProject={projectsReady ? handlePinProject : undefined}
                   onUnpinProject={projectsReady ? handleUnpinProject : undefined}
                   onEditProjectSettings={handleEditProjectSettings}
