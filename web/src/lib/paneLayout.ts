@@ -9,6 +9,7 @@ import {
   isTerminalTabId,
   parseTerminalTabId,
   terminalTabId,
+  TERMINAL_DOCK,
   type DockLocation,
 } from "./panes";
 
@@ -326,7 +327,7 @@ export function deriveLayout(
   if (!terminals) return seedLayout(prefs, sessionId);
   const seeded = withTerminals(seedLayout({ ...prefs, terminal: false }, sessionId), terminals);
   if (!prefs.terminal || terminals.length > 0) return seeded;
-  return addTab(seeded, "right", terminalTabId(sessionId, 0), false);
+  return addTab(seeded, TERMINAL_DOCK, terminalTabId(sessionId, 0), false);
 }
 
 function normalizeGroups(v: unknown, sessionId: string): PaneGroup[] {

@@ -16,13 +16,16 @@ export interface PaneDescriptor {
 export const BUILTIN_PANES: PaneDescriptor[] = [
   { id: "diff", title: "Diff", icon: FileDiff, defaultDock: "right" },
   { id: "files", title: "Files", icon: FolderTree, defaultDock: "right" },
-  { id: "terminal", title: "Terminal", icon: SquareTerminal, defaultDock: "right" },
+  { id: "terminal", title: "Terminal", icon: SquareTerminal, defaultDock: "bottom" },
   { id: "agents", title: "Background", icon: Bot, defaultDock: "right" },
 ];
 
 // Terminals are the only multi-instance pane. Tab `terminal:<sessionId>:<n>` is bound at creation to that
 // Session's paired shell at tmux index n, whichever Session is selected.
 export const TERMINAL_KIND = "terminal";
+
+/** Where a terminal tab opens when no other terminal tab is open: below the main view, as in an editor. */
+export const TERMINAL_DOCK: DockLocation = "bottom";
 
 // Strict, so a malformed id cannot alias a real tmux index.
 const TERMINAL_TAB_ID_RE = /^terminal:([A-Za-z0-9_-]+):(\d+)$/;

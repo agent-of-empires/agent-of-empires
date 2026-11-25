@@ -10,7 +10,7 @@ import {
   type DockLayout,
   type PaneLayoutApi,
 } from "../lib/paneLayout";
-import { parseTerminalTabId, terminalTabId, type TerminalRef } from "../lib/panes";
+import { parseTerminalTabId, terminalTabId, TERMINAL_DOCK, type TerminalRef } from "../lib/panes";
 import type { ShellMode } from "../components/PairedTerminal";
 import { dispatchFocusTerminal, setPendingTerminalFocus } from "../lib/terminalFocus";
 
@@ -72,7 +72,7 @@ export function usePairedTerminalReveal({
       setPendingTerminalFocus("paired", shell.index, shell.sessionId);
       const termDock = dockOf(layout, tabId);
       if (termDock) activateTab(termDock, tabId);
-      else openTab(tabId, terminalPlacements(layout)[0]?.dock ?? "right");
+      else openTab(tabId, terminalPlacements(layout)[0]?.dock ?? TERMINAL_DOCK);
     },
     [singlePane, shown, layout, openTab, activateTab, showMobileShell],
   );

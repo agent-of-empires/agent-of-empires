@@ -216,7 +216,14 @@ import {
 } from "./lib/pairedShells";
 import { usePairedShellModes } from "./hooks/usePairedShellModes";
 import { useOpenPairedTerminal, usePairedTerminalReveal } from "./hooks/usePairedTerminalReveal";
-import { BUILTIN_PANES, parseTerminalTabId, terminalTabId, type DockLocation, type TerminalRef } from "./lib/panes";
+import {
+  BUILTIN_PANES,
+  parseTerminalTabId,
+  terminalTabId,
+  TERMINAL_DOCK,
+  type DockLocation,
+  type TerminalRef,
+} from "./lib/panes";
 import { MobileRightPanelPicker } from "./components/MobileRightPanelPicker";
 import { MobileMainPane } from "./components/MobileMainPane";
 import { ChromeCollapseHandle, CollapsibleRegion } from "./components/CollapsibleChrome";
@@ -1981,7 +1988,7 @@ function AppContent({
   const newTerminal = useCallback(
     (dock?: DockLocation) =>
       addTerminal(
-        dock ?? terminalPlacements(paneLayout)[0]?.dock ?? "right",
+        dock ?? terminalPlacements(paneLayout)[0]?.dock ?? TERMINAL_DOCK,
         Math.max(0, ...liveShellIndices(activeSession)) + 1,
       ),
     [addTerminal, paneLayout, activeSession],

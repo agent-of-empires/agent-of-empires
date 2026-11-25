@@ -6,7 +6,8 @@ import type { DockControls, PaneDisplay } from "./Dock";
 import type { DockLocation } from "../lib/panes";
 
 const HEIGHT_KEY = "aoe-bottom-dock-height";
-const DEFAULT_HEIGHT = 240;
+// Unsized, the dock takes a third of the window: room for a shell, as in an editor's terminal panel.
+const DEFAULT_SHARE = 1 / 3;
 const MIN_HEIGHT = 120;
 // Leave at least this much for the main view above the dock while dragging.
 const MIN_TOP_PX = 160;
@@ -17,7 +18,7 @@ function loadHeight(): number {
     const h = parseInt(saved, 10);
     if (h >= MIN_HEIGHT) return h;
   }
-  return DEFAULT_HEIGHT;
+  return Math.max(MIN_HEIGHT, Math.round(window.innerHeight * DEFAULT_SHARE));
 }
 
 interface Props extends DockControls {
