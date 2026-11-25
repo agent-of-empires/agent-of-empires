@@ -39,7 +39,7 @@ impl SortPickerDialog {
     pub fn new(current: SortOrder) -> Self {
         Self::with_options(
             " Sort Order ",
-            &[SortOrder::Custom, SortOrder::Name],
+            &[SortOrder::Custom, SortOrder::Newest, SortOrder::Name],
             SortOrder::label,
             SortOrder::mnemonic,
             current,
@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn selects_current_and_submits_navigated_option() {
-        assert_eq!(SortPickerDialog::new(SortOrder::Name).selected, 1);
+        assert_eq!(SortPickerDialog::new(SortOrder::Name).selected, 2);
         assert_eq!(GroupPickerDialog::new(GroupByMode::Group).selected, 1);
 
         let mut dialog = SortPickerDialog::new(SortOrder::Custom);
@@ -209,7 +209,7 @@ mod tests {
         dialog.handle_key(key(KeyCode::Down));
         assert!(matches!(
             dialog.handle_key(key(KeyCode::Enter)),
-            DialogResult::Submit(SortOrder::Name)
+            DialogResult::Submit(SortOrder::Newest)
         ));
 
         let mut dialog = GroupPickerDialog::new(GroupByMode::Group);
@@ -231,6 +231,7 @@ mod tests {
         for (letter, expected) in [
             ('c', SortOrder::Custom),
             ('a', SortOrder::Name),
+            ('n', SortOrder::Newest),
             ('C', SortOrder::Custom),
         ] {
             let mut dialog = SortPickerDialog::new(SortOrder::Name);
@@ -240,7 +241,7 @@ mod tests {
                 "{letter}"
             );
         }
-        for (letter, expected) in [('p', GroupByMode::Project), ('m', GroupByMode::Group)] {
+        for (letter, expected) in [('p', GroupByMode::Project), ('g', GroupByMode::Group)] {
             let mut dialog = GroupPickerDialog::new(GroupByMode::Group);
             assert_eq!(
                 dialog.handle_key(key(KeyCode::Char(letter))),

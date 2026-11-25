@@ -35,7 +35,7 @@ fn session_offset(created_at: &Timestamp) -> usize {
 /// Build the list-pane title. `prefix` is the leading label ("aoe", "Terminals",
 /// "Tool: <name>"); `profile` is `Some(name)` only when a real filter is active, so the
 /// default all-profiles state drops the `[<profile>]` segment. Group and sort state hang
-/// off the prefix as `· my groups` / `· name`, each dropped when it is the default.
+/// off the prefix as `· groups` / `· name`, each dropped when it is the default.
 fn compose_list_title(
     prefix: &str,
     profile: Option<&str>,
@@ -5268,7 +5268,7 @@ mod tests {
     #[test]
     fn compose_list_title_cases() {
         use crate::session::config::GroupByMode::{Group, Project};
-        use crate::session::config::SortOrder::{Custom, Name};
+        use crate::session::config::SortOrder::{Custom, Name, Newest};
         // Repository and Custom are the defaults and add no suffix; the profile tag shows only
         // while a profile filter is active.
         let cases = [
@@ -5280,15 +5280,16 @@ mod tests {
                 Custom,
                 " aoe [my-profile] ",
             ),
-            ("aoe", None, Group, Custom, " aoe · my groups "),
+            ("aoe", None, Group, Custom, " aoe · groups "),
             ("aoe", None, Project, Name, " aoe · name "),
-            ("aoe", None, Group, Name, " aoe · my groups · name "),
+            ("aoe", None, Project, Newest, " aoe · newest first "),
+            ("aoe", None, Group, Name, " aoe · groups · name "),
             (
                 "Terminals",
                 Some("work"),
                 Group,
                 Name,
-                " Terminals [work] · my groups · name ",
+                " Terminals [work] · groups · name ",
             ),
         ];
         for (prefix, profile, group_by, sort, expected) in cases {

@@ -461,6 +461,7 @@ fn sort_sessions_inner(sessions: &mut [&Instance], sort_order: SortOrder, favori
             sessions.sort_by_key(|i| i.custom_order_key());
             return;
         }
+        SortOrder::Newest => sessions.sort_by_key(|i| Reverse(i.created_at)),
         SortOrder::Name => sessions.sort_by_key(|i| i.title.to_lowercase()),
     }
     if favorites_first {
@@ -504,6 +505,7 @@ fn sort_groups_inner<T, N, P>(
 {
     match sort_order {
         SortOrder::Custom => return,
+        SortOrder::Newest => items.sort_by_key(|g| Reverse(newest_member(path(g), instances))),
         SortOrder::Name => items.sort_by_key(|g| name(g).to_lowercase()),
     }
     if favorites_first {
@@ -522,6 +524,11 @@ fn group_members<'a>(
             && !i.is_archived()
             && !i.is_trashed()
     })
+}
+
+/// Creation time of the newest session under `path`; an empty group sorts last.
+fn newest_member(path: &str, instances: &[Instance]) -> Option<Timestamp> {
+    group_members(path, instances).map(|i| i.created_at).max()
 }
 
 /// True for a favorited session that is actively pinnable: not archived, not trashed, not
@@ -582,11 +589,15 @@ pub fn flatten_tree_all_profiles(
 
     // Favorites are scoped to each root's own profile, so same-named groups in two profiles
     // never borrow each other's members.
-    if sort_order == SortOrder::Name {
-        all_roots.sort_by_key(|(_, g, _)| g.name.to_lowercase());
-        if crate::session::favorites_first() {
-            all_roots.sort_by_key(|(_, g, insts)| !has_live_favorite(&g.path, insts));
+    match sort_order {
+        SortOrder::Custom => {}
+        SortOrder::Newest => {
+            all_roots.sort_by_key(|(_, g, insts)| Reverse(newest_member(&g.path, insts)));
         }
+        SortOrder::Name => all_roots.sort_by_key(|(_, g, _)| g.name.to_lowercase()),
+    }
+    if sort_order != SortOrder::Custom && crate::session::favorites_first() {
+        all_roots.sort_by_key(|(_, g, insts)| !has_live_favorite(&g.path, insts));
     }
 
     for (profile_name, root, profile_instances) in &all_roots {
@@ -1065,13 +1076,21 @@ mod tests {
 
     #[test]
     fn name_sorts_apply_to_groups_and_sessions() {
-        let groups = vec![inst("z", "zebra"), inst("a", "apple"), inst("m", "Mango")];
+        // Each row is a day newer than the one before it.
+        let aged = |rows: &[(&str, &str)]| -> Vec<Instance> {
+            let count = rows.len() as i64;
+            rows.iter()
+                .enumerate()
+                .map(|(at, (title, group))| {
+                    let mut row = inst(title, group);
+                    row.created_at = Timestamp::now() - Duration::days(count - at as i64);
+                    row
+                })
+                .collect()
+        };
+        let groups = aged(&[("z", "zebra"), ("a", "apple"), ("m", "Mango")]);
         let tree = GroupTree::new_with_groups(&groups, &[]);
-        let nested = vec![
-            inst("p", "parent"),
-            inst("z", "parent/zeta"),
-            inst("a", "parent/alpha"),
-        ];
+        let nested = aged(&[("p", "parent"), ("z", "parent/zeta"), ("a", "parent/alpha")]);
         let nested_tree = GroupTree::new_with_groups(&nested, &[]);
         for (order, want_groups, want_children) in [
             (
@@ -1082,6 +1101,11 @@ mod tests {
             (
                 SortOrder::Name,
                 ["apple", "Mango", "zebra"],
+                ["alpha", "zeta"],
+            ),
+            (
+                SortOrder::Newest,
+                ["Mango", "apple", "zebra"],
                 ["alpha", "zeta"],
             ),
         ] {
@@ -1167,6 +1191,8 @@ mod tests {
             (SortOrder::Custom, true, ["yak", "apple", "zebra"]),
             (SortOrder::Name, false, ["apple", "yak", "zebra"]),
             (SortOrder::Name, true, ["yak", "zebra", "apple"]),
+            (SortOrder::Newest, false, ["yak", "apple", "zebra"]),
+            (SortOrder::Newest, true, ["yak", "zebra", "apple"]),
         ] {
             let mut refs: Vec<&Instance> = instances.iter().collect();
             sort_sessions_inner(&mut refs, order, favorites_first);

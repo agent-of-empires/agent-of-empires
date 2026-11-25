@@ -791,13 +791,15 @@ fn default_replay_events() -> u32 {
     0
 }
 
-/// Session list sort order. Neither order reacts to session state, so rows hold still.
+/// Session list sort order. No order reacts to session state, so rows hold still.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SortOrder {
     /// The order the user arranged. Rows never moved sit on top, newest first.
     #[default]
     Custom,
+    /// Creation time, newest on top.
+    Newest,
     Name,
 }
 
@@ -805,6 +807,7 @@ impl SortOrder {
     pub fn label(self) -> &'static str {
         match self {
             SortOrder::Custom => "Custom",
+            SortOrder::Newest => "Newest first",
             SortOrder::Name => "Name",
         }
     }
@@ -813,6 +816,7 @@ impl SortOrder {
     pub fn mnemonic(self) -> char {
         match self {
             SortOrder::Custom => 'c',
+            SortOrder::Newest => 'n',
             SortOrder::Name => 'a',
         }
     }
@@ -833,7 +837,7 @@ impl GroupByMode {
     pub fn label(self) -> &'static str {
         match self {
             GroupByMode::Project => "Repository",
-            GroupByMode::Group => "My groups",
+            GroupByMode::Group => "Groups",
         }
     }
 
@@ -841,7 +845,7 @@ impl GroupByMode {
     pub fn mnemonic(self) -> char {
         match self {
             GroupByMode::Project => 'p',
-            GroupByMode::Group => 'm',
+            GroupByMode::Group => 'g',
         }
     }
 }
@@ -1898,7 +1902,7 @@ pub struct SessionConfig {
     pub unread_indicator: bool,
 
     /// Pin favorited sessions to the top of their sibling scope under the Name
-    /// sort of the TUI session list; Custom keeps the order the user arranged. A
+    /// and Newest first sorts of the TUI session list; Custom keeps the order the user arranged. A
     /// group holding a favorited session is pinned the same way. When off, the
     /// favorite key is inert.
     ///
@@ -5843,7 +5847,7 @@ mod tests {
     #[test]
     fn removed_sort_and_grouping_values_load_as_unpicked() {
         for (sort, group) in [
-            ("newest", "manual"),
+            ("oldest", "manual"),
             ("oldest", "org"),
             ("attention", "status"),
             ("last_activity", "manual"),
@@ -5865,6 +5869,8 @@ mod tests {
             toml::from_str("sort_order = \"name\"\ngroup_by = \"group\"\n").unwrap();
         assert_eq!(state.sort_order, Some(SortOrder::Name));
         assert_eq!(state.group_by, Some(GroupByMode::Group));
+        let state: AppStateConfig = toml::from_str("sort_order = \"newest\"\n").unwrap();
+        assert_eq!(state.sort_order, Some(SortOrder::Newest));
     }
 
     /// A blank or absent `default_image` is the automatic image; a request

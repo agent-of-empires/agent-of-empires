@@ -1288,7 +1288,7 @@ fn test_g_key_opens_group_picker() {
     assert!(env.view.group_picker_dialog.is_none());
     assert_eq!(env.view.group_by, GroupByMode::Project);
 
-    // 'g' again, Down + Enter goes back to My groups.
+    // 'g' again, Down + Enter goes back to Groups.
     env.view.handle_key(key(KeyCode::Char('g')), None);
     env.view.handle_key(key(KeyCode::Down), None);
     env.view.handle_key(key(KeyCode::Enter), None);

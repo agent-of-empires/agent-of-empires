@@ -3,8 +3,8 @@
 //! `state.toml` held the TUI's `group_by` and `sort_order`, and its `web_ui_state` table
 //! held the dashboard's own `aoe-sidebar-axis` and `aoe-sidebar-sort-mode`. Both pairs fold
 //! into `group_by` and `sort_order`, a value picked on the web winning, and the removed
-//! choices map to the nearest kept one. A TUI user who never picked a grouping keeps My
-//! groups, the TUI's old default; everyone else gets the new Repository default. The
+//! choices map to the nearest kept one. A TUI user who never picked a grouping keeps
+//! Groups, the TUI's old default; everyone else gets the new Repository default. The
 //! org and status collapse lists go with their groupings. The web keys stay, since the
 //! dashboard still reads them.
 
@@ -93,6 +93,7 @@ fn tui_group_by(mode: &str) -> &'static str {
 fn tui_sort_order(order: &str) -> &'static str {
     match order {
         "a_z" | "az" | "z_a" | "za" | "name" => "name",
+        "newest" => "newest",
         _ => "custom",
     }
 }
@@ -126,11 +127,12 @@ mod tests {
     fn folds_both_clients_into_one_value() {
         let some = |s: &str| Some(s.to_string());
         let cases = [
-            // Nothing picked: a TUI user keeps My groups, a new or web-only user gets defaults.
+            // Nothing picked: a TUI user keeps Groups, a new or web-only user gets defaults.
             ("has_seen_welcome = true\n", some("group"), None),
             ("has_seen_welcome = false\n", None, None),
             // The TUI's removed choices map to the nearest kept one.
-            ("group_by = \"manual\"\nsort_order = \"newest\"\n", some("group"), some("custom")),
+            ("group_by = \"manual\"\nsort_order = \"newest\"\n", some("group"), some("newest")),
+            ("group_by = \"manual\"\nsort_order = \"oldest\"\n", some("group"), some("custom")),
             ("group_by = \"org\"\nsort_order = \"attention\"\n", some("project"), some("custom")),
             ("group_by = \"status\"\nsort_order = \"z_a\"\n", some("project"), some("name")),
             ("group_by = \"project\"\nsort_order = \"a_z\"\n", some("project"), some("name")),

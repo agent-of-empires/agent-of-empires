@@ -2487,6 +2487,7 @@ fn test_o_key_flat_items_follow_sort_order() {
     assert_eq!(env.view.sort_order, SortOrder::Custom);
     env.view.handle_key(key(KeyCode::Char('o')), None);
     env.view.handle_key(key(KeyCode::Down), None);
+    env.view.handle_key(key(KeyCode::Down), None);
     env.view.handle_key(key(KeyCode::Enter), None);
     assert_eq!(env.view.sort_order, SortOrder::Name);
     assert_eq!(work_group_titles(&env.view), ["Apple", "Mango", "Zebra"]);
@@ -2494,6 +2495,7 @@ fn test_o_key_flat_items_follow_sort_order() {
     let mut env = create_test_env_with_mixed_sessions();
     for (letter, expected) in [
         ('a', SortOrder::Name),
+        ('n', SortOrder::Newest),
         ('c', SortOrder::Custom),
         ('a', SortOrder::Name),
     ] {
@@ -2523,10 +2525,9 @@ fn test_o_key_clamps_cursor_when_list_shrinks() {
     let filtered_count = env.view.search_matches.len();
     assert!(filtered_count < initial_items);
 
-    // Open the sort picker and pick Name (one entry down from Custom).
+    // Open the sort picker and pick Name.
     env.view.handle_key(key(KeyCode::Char('o')), None);
-    env.view.handle_key(key(KeyCode::Down), None);
-    env.view.handle_key(key(KeyCode::Enter), None);
+    env.view.handle_key(key(KeyCode::Char('a')), None);
     assert_eq!(env.view.sort_order, SortOrder::Name);
 
     let valid_max = env.view.flat_items.len().saturating_sub(1);

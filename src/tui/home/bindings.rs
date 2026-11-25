@@ -251,7 +251,7 @@ pub enum Context {
     Always,
     TerminalView,
     /// Favorites are actionable: `session.favorites_first` is on, where they pin under
-    /// the Name sort. Otherwise toggling a favorite would have no visible effect, so the
+    /// the Name and Newest first sorts. Otherwise toggling a favorite would have no visible effect, so the
     /// key stays inert.
     FavoritesUsable,
     SearchActive,

@@ -1593,10 +1593,9 @@ fn group_by_toggle_preserves_selected_session() {
             Some(target_id.as_str())
         );
 
-        // Open the sort picker and pick Name (one down from Custom).
+        // Open the sort picker and pick Name.
         env.view.handle_key(key(KeyCode::Char('o')), None);
-        env.view.handle_key(key(KeyCode::Down), None);
-        env.view.handle_key(key(KeyCode::Enter), None);
+        env.view.handle_key(key(KeyCode::Char('a')), None);
         assert_eq!(env.view.sort_order, SortOrder::Name);
         assert_eq!(
             env.view.selected_session.as_deref(),

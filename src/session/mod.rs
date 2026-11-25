@@ -162,7 +162,7 @@ pub fn set_unread_enabled(on: bool) {
 /// threaded through the sort helpers.
 static FAVORITES_FIRST: AtomicBool = AtomicBool::new(true);
 
-/// Whether favorited rows pin to the top of their sibling scope under the Name sort.
+/// Whether favorited rows pin to the top of their sibling scope under the Name and Newest first sorts.
 pub fn favorites_first() -> bool {
     FAVORITES_FIRST.load(Ordering::Relaxed)
 }

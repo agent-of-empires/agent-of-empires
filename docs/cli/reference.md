@@ -451,7 +451,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `set-base` — Set or clear the per-session diff base branch. The diff view compares the worktree against this ref instead of the auto-detected default. Useful when the PR target differs from the project default (stacked PRs, hotfix off `release/*`, renamed default branch). See #970
 * `snooze` — Snooze a session for a duration (temporary archive, auto wakes)
 * `unsnooze` — Wake a snoozed session immediately
-* `favorite` — Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope under the Name sort and show a `✦` in the session list gutter; Custom keeps the order you arranged. Snoozing a favorite suspends the pin until it wakes
+* `favorite` — Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope under the Name and Newest first sorts and show a `✦` in the session list gutter; Custom keeps the order you arranged. Snoozing a favorite suspends the pin until it wakes
 * `unfavorite` — Clear the favorite flag on a session
 * `archive` — Archive a session: move it to the Archived section and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
 * `unarchive` — Unarchive a session, returning it to its place in the list
@@ -724,7 +724,7 @@ Wake a snoozed session immediately
 
 ## `aoe session favorite`
 
-Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope under the Name sort and show a `✦` in the session list gutter; Custom keeps the order you arranged. Snoozing a favorite suspends the pin until it wakes
+Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope under the Name and Newest first sorts and show a `✦` in the session list gutter; Custom keeps the order you arranged. Snoozing a favorite suspends the pin until it wakes
 
 **Usage:** `aoe session favorite <IDENTIFIER>`
 

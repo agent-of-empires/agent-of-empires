@@ -4990,7 +4990,7 @@ impl HomeView {
     }
 
     /// Info-dialog copy for a rename/delete attempted on a header under the Repository grouping.
-    /// `None` under My groups, where the caller proceeds with its normal flow.
+    /// `None` under Groups, where the caller proceeds with its normal flow.
     fn automatic_group_hint(&self, path: &str) -> Option<(String, String)> {
         if self.group_by == GroupByMode::Group {
             return None;
@@ -5001,12 +5001,12 @@ impl HomeView {
         Some(if nested_group {
             (
                 "Manage Groups Under My Groups".to_string(),
-                format!("This is one of your Groups. Press {toggle} and pick My groups to rename or delete it."),
+                format!("This is one of your Groups. Press {toggle} and pick Groups to rename or delete it."),
             )
         } else {
             (
                 "Cannot Modify Repository Headers".to_string(),
-                format!("Repository headers are automatic. Press {toggle} and pick My groups to manage groups."),
+                format!("Repository headers are automatic. Press {toggle} and pick Groups to manage groups."),
             )
         })
     }

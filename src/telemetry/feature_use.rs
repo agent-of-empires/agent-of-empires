@@ -23,7 +23,8 @@ macro_rules! feature_uses {
 }
 
 feature_uses! {
-    // Names predate the Name sort and the My groups label; kept so counts stay comparable.
+    // Names predate the Name sort and the Groups label; kept so counts stay comparable.
+    SortNewest => "sort_newest",
     SortAz => "sort_az",
     SortCustom => "sort_custom",
     GroupByManual => "group_by_manual",
@@ -74,6 +75,7 @@ const WEB_ONLY: &[&str] = &[
 impl From<SortOrder> for FeatureUse {
     fn from(order: SortOrder) -> Self {
         match order {
+            SortOrder::Newest => FeatureUse::SortNewest,
             SortOrder::Name => FeatureUse::SortAz,
             SortOrder::Custom => FeatureUse::SortCustom,
         }

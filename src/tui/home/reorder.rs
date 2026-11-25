@@ -17,7 +17,7 @@ impl HomeView {
             return Ok(());
         }
         if self.group_by != GroupByMode::Group {
-            self.flash_status("Rows are arranged by hand under My groups only (g)");
+            self.flash_status("Rows are arranged by hand under Groups only (g)");
             return Ok(());
         }
         if let Some(path) = self.selected_group.clone() {
