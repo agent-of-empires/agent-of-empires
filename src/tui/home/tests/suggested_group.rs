@@ -285,9 +285,15 @@ fn a_start_answered_after_leaving_the_pane_flashes_on_home() {
             .status_flash_text()
             .is_some_and(|text| text.contains("Started Prepared title"))
     });
+    let flash = env.view.status_flash_text().unwrap();
+    assert!(
+        !flash.contains("Enter opens"),
+        "Enter on Home opens nothing: {flash}"
+    );
 }
 
-/// A prefill answered after leaving the pane does not open the dialog over Home.
+/// A prefill answered after leaving the pane does not open the dialog over
+/// Home, and says so there.
 #[test]
 #[serial]
 fn a_prepare_answered_after_leaving_the_pane_opens_nothing() {
@@ -299,7 +305,9 @@ fn a_prepare_answered_after_leaving_the_pane_opens_nothing() {
     assert_eq!(next_request(&requests), "prepare gh/i0");
     leave_the_pane(&mut env);
     poll_until(&mut env, |env| {
-        pane_notice(env).is_some_and(|text| text.starts_with("Not opened"))
+        env.view
+            .status_flash_text()
+            .is_some_and(|text| text.starts_with("Not opened"))
     });
     assert!(env.view.new_dialog.is_none());
 }
@@ -313,6 +321,34 @@ fn a_dialog_over_the_focused_pane_takes_the_keys() {
     env.view.handle_key(key(KeyCode::Char('j')), None);
     let view = env.view.suggestions_view.as_ref().unwrap();
     assert_eq!(view.selected_key(), Some(("gh".into(), "i0".into())));
+}
+
+/// Focusing the pane releases a focused Trash transcript reader, so the pane
+/// gets the keys at once and one Esc leaves it.
+#[test]
+#[serial]
+fn focusing_the_pane_releases_a_focused_trash_reader() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.mutate_instance(&id, |inst| {
+        inst.trashed_at = Some(crate::time::Timestamp::now())
+    });
+    env.view.trashed_section_collapsed = false;
+    let mut hidden = snapshot(3, &[]);
+    hidden["prefs"]["sidebar"] = false.into();
+    env.view.suggestions_feed.set_snapshot_for_test(hidden);
+    env.view.rebuild_flat_items();
+    env.view.select_session_by_id(&id);
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(env.view.retained_reader_focused());
+
+    env.view.focus_suggestions();
+    assert!(!env.view.retained_reader_focused());
+    env.view.handle_key(key(KeyCode::Char('j')), None);
+    let view = env.view.suggestions_view.as_ref().unwrap();
+    assert_eq!(view.selected_key(), Some(("gh".into(), "i1".into())));
+    env.view.handle_key(key(KeyCode::Esc), None);
+    assert!(!env.view.suggestions_focused, "one Esc leaves the pane");
 }
 
 /// Focusing the pane releases a focused Trash transcript reader, so the pane

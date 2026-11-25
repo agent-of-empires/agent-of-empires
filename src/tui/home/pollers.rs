@@ -119,10 +119,14 @@ impl HomeView {
             .and_then(SuggestionsView::take_prepared)
         {
             // A dialog only opens over the pane that asked for it.
+            let note = "Not opened: you left the list. Press the key again.";
+            let shown = self.suggestions_pane_shown();
             if self.suggestions_focused && !self.has_non_live_send_overlay() {
                 self.start_suggestion(start);
-            } else if let Some(view) = &mut self.suggestions_view {
-                view.set_notice("Not opened: you left the list. Press the key again.");
+            } else if let Some(view) = self.suggestions_view.as_mut().filter(|_| shown) {
+                view.set_notice(note);
+            } else {
+                self.flash_status(note);
             }
             changed = true;
         }
@@ -150,22 +154,28 @@ impl HomeView {
             Some(view) if shown => view.set_notice(message),
             _ => this.flash_status(message),
         };
+        // Enter opens a started item only in the pane.
+        let opens = if shown { " · Enter opens it" } else { "" };
         match answer {
             StartAnswer::Started { session_id, title } => {
                 self.suggestions_feed.link_started(&key, &session_id);
                 self.rebuild_flat_items_keeping_cursor();
                 self.update_selected();
-                say(self, format!("Started {title} · Enter opens it"), false);
+                say(self, format!("Started {title}{opens}"), false);
             }
             StartAnswer::AlreadyStarted(Some(session_id)) => {
                 self.suggestions_feed.link_started(&key, &session_id);
                 self.rebuild_flat_items_keeping_cursor();
                 self.update_selected();
-                say(self, "Already started · Enter opens it".to_string(), false);
+                say(self, format!("Already started{opens}"), false);
             }
             StartAnswer::AlreadyStarted(None) => {
-                let reload = if self.strict_hotkeys { "R" } else { "r" };
-                let message = format!("Already starting. Press {reload} in a moment to reload.");
+                let message = if shown {
+                    let reload = if self.strict_hotkeys { "R" } else { "r" };
+                    format!("Already starting. Press {reload} in a moment to reload.")
+                } else {
+                    "Already starting. It shows under its Project in a moment.".to_string()
+                };
                 say(self, message, false);
             }
             StartAnswer::TrustChanged => self.suggestions_feed.restart_after_trust_change(key),

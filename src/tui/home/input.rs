@@ -2274,7 +2274,7 @@ impl HomeView {
             }
         }
 
-        if self.command_palette.is_none()
+        if !self.has_non_live_send_overlay()
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('k' | 'K'))
         {
