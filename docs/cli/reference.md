@@ -472,7 +472,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `set-base` — Set or clear the per-session diff base branch. The diff view compares the worktree against this ref instead of the auto-detected default. Useful when the PR target differs from the project default (stacked PRs, hotfix off `release/*`, renamed default branch). See #970
 * `snooze` — Snooze a session for a duration (temporary archive, auto wakes)
 * `unsnooze` — Wake a snoozed session immediately
-* `pin` — Pin a session to the top of its header in the session list and the web dashboard, under every sort. Pinning cancels archive, ignore and snooze; archiving, ignoring or snoozing it clears the pin
+* `pin` — Pin a session to the top of its header in the session list and the web dashboard, under every sort, with the sessions sharing its worktree. Pinning cancels archive, ignore and snooze; archiving, ignoring or snoozing it clears the pin
 * `unpin` — Unpin a session
 * `archive` — Archive a session: move it to the Archived section and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
 * `unarchive` — Unarchive a session, returning it to its place in the list
@@ -745,7 +745,7 @@ Wake a snoozed session immediately
 
 ## `aoe session pin`
 
-Pin a session to the top of its header in the session list and the web dashboard, under every sort. Pinning cancels archive, ignore and snooze; archiving, ignoring or snoozing it clears the pin
+Pin a session to the top of its header in the session list and the web dashboard, under every sort, with the sessions sharing its worktree. Pinning cancels archive, ignore and snooze; archiving, ignoring or snoozing it clears the pin
 
 **Usage:** `aoe session pin <IDENTIFIER>`
 

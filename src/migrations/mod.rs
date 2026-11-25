@@ -585,7 +585,8 @@ fn run_explicit_recovery(
         recovery::reconcile_repaired_components()?;
         // Not in the helper: registered v046 calls it, and an upgrade must reach v060 in order.
         v060_terminal_handoff_outcome::run()?;
-        v069_shared_custom_order::recover()
+        v069_shared_custom_order::recover()?;
+        v067_favorite_to_pin::recover()
     })?;
     legacy_scope_recovery::run_under_exclusion(transaction, serve)
 }

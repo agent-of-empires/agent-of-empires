@@ -87,11 +87,17 @@ impl HomeView {
             return Ok(());
         };
         match self.sibling_session(at, delta, &workspace) {
-            (Some(neighbour), _) if self.is_live_pin(&id) != self.is_live_pin(&neighbour) => {
-                self.flash_status("Pinned rows stay at the top of their header");
-                Ok(())
+            (Some(neighbour), _) => {
+                let Some(other) = self.get_instance(&neighbour).map(Instance::workspace_id) else {
+                    return self.refresh_after_stale_move();
+                };
+                let pinned = self.header_pinned_workspaces(at);
+                if pinned.contains(&workspace) != pinned.contains(&other) {
+                    self.flash_status("Pinned rows stay at the top of their header");
+                    return Ok(());
+                }
+                self.move_workspace_past(at, &id, &workspace, &other, delta)
             }
-            (Some(neighbour), _) => self.place_workspace(at, &id, &workspace, &neighbour, delta),
             (None, true) => {
                 self.flash_status("Sessions on the same branch move together");
                 Ok(())
@@ -101,9 +107,10 @@ impl HomeView {
         }
     }
 
-    fn is_live_pin(&self, id: &str) -> bool {
-        self.get_instance(id)
-            .is_some_and(crate::session::is_live_pin)
+    /// The workspaces lifted under the header of the row at `at`, from the run of rows it
+    /// owns directly.
+    fn header_pinned_workspaces(&self, at: usize) -> std::collections::HashSet<String> {
+        crate::session::pinned_workspaces(self.header_run(at))
     }
 
     /// Flash and return true while an order write or a carry or group move is unapplied,
@@ -127,6 +134,14 @@ impl HomeView {
 
     /// The workspaces of the session rows sharing row `at`'s header, in the order shown.
     fn header_workspaces(&self, at: usize) -> Vec<String> {
+        self.header_run(at)
+            .into_iter()
+            .map(Instance::workspace_id)
+            .collect()
+    }
+
+    /// The sessions of the run of rows the header of row `at` owns directly, in order.
+    fn header_run(&self, at: usize) -> Vec<&Instance> {
         let Some(depth) = self.flat_items.get(at).map(Item::depth) else {
             return Vec::new();
         };
@@ -139,7 +154,7 @@ impl HomeView {
             .iter()
             .take_while(|item| sibling(item))
             .filter_map(|item| match item {
-                Item::Session { id, .. } => self.get_instance(id).map(Instance::workspace_id),
+                Item::Session { id, .. } => self.get_instance(id),
                 _ => None,
             })
             .collect()
@@ -172,22 +187,19 @@ impl HomeView {
         (None, passed)
     }
 
-    /// Put session `id`'s workspace `a`, on row `at`, just before `neighbour`'s moving up and just after
-    /// it moving down, in the stored order, or in the order on screen under Name or Newest
-    /// first, which then switches to Custom. A workspace whose rows the sort splits apart
-    /// still lands on the side it moved to.
-    fn place_workspace(
+    /// Move session `id`'s workspace `a`, on row `at`, one place past `b` in `delta`'s
+    /// direction: in the shared order by swapping the two, or in the order on screen when
+    /// the list is sorted by Name, which then switches to Custom. Name can interleave a
+    /// workspace's rows with others, so there `a` is placed next to `b` rather than swapped,
+    /// which could leave the row in place.
+    fn move_workspace_past(
         &mut self,
         at: usize,
         id: &str,
         a: &str,
-        neighbour: &str,
+        b: &str,
         delta: isize,
     ) -> anyhow::Result<()> {
-        let Some(b) = self.get_instance(neighbour).map(Instance::workspace_id) else {
-            return self.refresh_after_stale_move();
-        };
-        let a = a.to_owned();
         let freeze = self.sort_order != SortOrder::Custom;
         let mut order = if freeze {
             self.displayed_workspace_order()
@@ -200,12 +212,18 @@ impl HomeView {
                 .filter(|w| placed.contains(w) || header.contains(w))
                 .collect()
         };
-        order.retain(|w| *w != a);
-        if !order.contains(&b) {
-            order.push(b.clone());
+        for workspace in [a, b] {
+            if !order.iter().any(|w| w == workspace) {
+                order.push(workspace.to_owned());
+            }
         }
-        let at = order.iter().position(|w| *w == b).unwrap();
-        order.insert(if delta < 0 { at } else { at + 1 }, a.clone());
+        if freeze {
+            place_next_to(&mut order, a, b, delta);
+        } else {
+            let i = order.iter().position(|w| w == a).unwrap();
+            let j = order.iter().position(|w| w == b).unwrap();
+            order.swap(i, j);
+        }
         let repositories = (freeze && self.group_by == GroupByMode::Project)
             .then(|| keep_unshown(self.displayed_repository_order(), &self.repository_order));
         // The write drops what the Daemon refuses; without both rows the move cannot show.
@@ -215,8 +233,8 @@ impl HomeView {
             .map(|snapshot| snapshot.contents.sessions.clone())
             .unwrap_or_default();
         let order = crate::server::api::sessions::writable_workspace_order(&sessions, order);
-        if !order.contains(&a) || !order.contains(&b) {
-            if [&a, &b]
+        if ![a, b].iter().all(|id| order.iter().any(|w| w == id)) {
+            if [a, b]
                 .iter()
                 .any(|id| id.len() > crate::server::api::sessions::MAX_ORDER_ENTRY_LEN)
             {
@@ -1168,6 +1186,13 @@ impl HomeView {
     }
 }
 
+/// Move `a` to just before `b` (`delta` -1) or just after it (1). Both are in `order`.
+fn place_next_to(order: &mut Vec<String>, a: &str, b: &str, delta: isize) {
+    let moved = order.remove(order.iter().position(|w| w == a).unwrap());
+    let at = order.iter().position(|w| w == b).unwrap();
+    order.insert(if delta > 0 { at + 1 } else { at }, moved);
+}
+
 fn move_direction(delta: isize) -> crate::daemon::MoveDirection {
     if delta < 0 {
         crate::daemon::MoveDirection::Up
@@ -1725,6 +1750,24 @@ mod tests {
                 request_with_headers(&state, "POST", "/api/reorder", body).await;
             assert!(status.is_success(), "{status}: {value}");
             assert_eq!(value["status"], expected, "{base_sort}");
+        }
+    }
+
+    /// Under Name, workspace A's rows `a1`, `c1` sit around B's `b1`, so the order on
+    /// screen lists A first; moving `c1` up keeps A before B, where a swap would leave `c1`
+    /// below `b1`.
+    #[test]
+    fn a_frozen_move_places_the_workspace_next_to_its_neighbour() {
+        let list = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (order, a, b, delta, expected) in [
+            (&["A", "B"][..], "A", "B", -1, &["A", "B"][..]),
+            (&["A", "B"], "B", "A", 1, &["A", "B"]),
+            (&["A", "B"], "B", "A", -1, &["B", "A"]),
+            (&["A", "X", "B"], "A", "B", 1, &["X", "B", "A"]),
+        ] {
+            let mut order = list(order);
+            place_next_to(&mut order, a, b, delta);
+            assert_eq!(order, list(expected), "{a} {delta} past {b}");
         }
     }
 

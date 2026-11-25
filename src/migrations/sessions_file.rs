@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde_json::{Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Every profile's `sessions.json`, then the legacy top-level one from the
 /// pre-profiles layout.
@@ -21,6 +21,39 @@ pub(super) fn session_files(app_dir: &Path) -> Result<Vec<PathBuf>> {
     }
     paths.push(app_dir.join("sessions.json"));
     Ok(paths)
+}
+
+/// A `sessions.json` as a migration that must not lose its rows sees it.
+pub(super) enum SessionList {
+    Rows(String, Vec<Value>),
+    Missing,
+    /// Left untouched for the migration's recovery under `aoe migrate`.
+    Unreadable,
+}
+
+/// Read `path` for `migration`, warning when it is kept for repair. A blank file is
+/// missing.
+pub(super) fn read_rows(path: &Path, migration: &str) -> SessionList {
+    let content = match fs::read_to_string(path) {
+        Ok(content) if content.trim().is_empty() => return SessionList::Missing,
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return SessionList::Missing,
+        Err(error) => {
+            warn!(target: "migrations", migration, path = %path.display(), %error, "Preserved unreadable session list; repair it and run aoe migrate");
+            return SessionList::Unreadable;
+        }
+    };
+    match serde_json::from_str::<Value>(&content) {
+        Ok(Value::Array(rows)) => SessionList::Rows(content, rows),
+        Ok(_) => {
+            warn!(target: "migrations", migration, path = %path.display(), "Preserved a file that is not a session list; repair it and run aoe migrate");
+            SessionList::Unreadable
+        }
+        Err(error) => {
+            warn!(target: "migrations", migration, path = %path.display(), %error, "Preserved a session list that does not parse; repair it and run aoe migrate");
+            SessionList::Unreadable
+        }
+    }
 }
 
 /// Apply `heal` to every row of a `sessions.json` document, writing the file

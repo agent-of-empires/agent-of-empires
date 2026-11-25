@@ -1610,32 +1610,52 @@ fn a_blocked_suggestion_start_keeps_the_view_open_with_the_reason() {
         .contains("already being created"));
 }
 
-/// A pinned row sits above every unpinned one in its header, so a move across that boundary
-/// would change nothing on screen; it is refused instead of writing the order.
+/// A pinned workspace sits above every unpinned one in its header, so a move across that
+/// boundary would change nothing on screen; it is refused instead of writing the order. A
+/// row sharing a pinned row's worktree is lifted with it.
 #[test]
 #[serial]
 fn a_row_does_not_move_across_the_pinned_boundary() {
-    let mut env = create_test_env_with_sessions(2);
-    let pinned = env.view.instance_at(1).id.clone();
-    env.view.mutate_instance(&pinned, |inst| inst.pin());
-    env.view.flat_items = env.view.build_flat_items();
-    let rows: Vec<String> = env
-        .view
-        .flat_items
-        .iter()
-        .filter_map(|item| match item {
-            Item::Session { id, .. } => Some(id.clone()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(rows[0], pinned, "the pinned row leads");
-    for (id, delta) in [(&rows[1], -1), (&rows[0], 1)] {
-        env.view.select_session_by_id(id);
-        env.view.move_row_at_cursor(delta).unwrap();
-        assert!(!env.view.session_feed.ordering_pending(), "{delta}");
-        assert_eq!(
-            env.view.status_flash_text(),
-            Some("Pinned rows stay at the top of their header")
-        );
+    for shared_worktree in [false, true] {
+        let mut env = create_test_env_with_sessions(3);
+        let ids: Vec<String> = (0..3).map(|i| env.view.instance_at(i).id.clone()).collect();
+        env.view.mutate_instance(&ids[1], |inst| inst.pin());
+        let lifted = if shared_worktree {
+            for id in [&ids[1], &ids[2]] {
+                env.view.mutate_instance(id, |inst| {
+                    inst.worktree_info = Some(crate::session::WorktreeInfo {
+                        branch: "feat".into(),
+                        main_repo_path: "/tmp/repo".into(),
+                        managed_by_aoe: true,
+                        created_at: crate::time::Timestamp::now(),
+                        base_branch: None,
+                    });
+                });
+            }
+            2
+        } else {
+            1
+        };
+        env.view.flat_items = env.view.build_flat_items();
+        let rows: Vec<String> = env
+            .view
+            .flat_items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(rows[..lifted].contains(&ids[1]), "{shared_worktree}");
+        assert!(!rows[..lifted].contains(&ids[0]), "{shared_worktree}");
+        for (id, delta) in [(&rows[lifted], -1), (&rows[lifted - 1], 1)] {
+            env.view.select_session_by_id(id);
+            env.view.move_row_at_cursor(delta).unwrap();
+            assert!(!env.view.session_feed.ordering_pending(), "{delta}");
+            assert_eq!(
+                env.view.status_flash_text(),
+                Some("Pinned rows stay at the top of their header")
+            );
+        }
     }
 }

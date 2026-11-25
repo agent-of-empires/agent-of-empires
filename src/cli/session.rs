@@ -81,8 +81,9 @@ pub enum SessionCommands {
     Unsnooze(SessionIdArgs),
 
     /// Pin a session to the top of its header in the session list and the web
-    /// dashboard, under every sort. Pinning cancels archive, ignore and snooze;
-    /// archiving, ignoring or snoozing it clears the pin.
+    /// dashboard, under every sort, with the sessions sharing its worktree. Pinning
+    /// cancels archive, ignore and snooze; archiving, ignoring or snoozing it clears
+    /// the pin.
     Pin(SessionIdArgs),
 
     /// Unpin a session

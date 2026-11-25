@@ -23,7 +23,7 @@
 //! legacy input, and recovery reruns the whole upgrade once it reads, seeding only a list
 //! the repaired file leaves empty.
 
-use super::sessions_file;
+use super::sessions_file::{self, SessionList};
 use super::v068_shared_sidebar_view::{web_effective_sort, LEGACY_SORT_KEY, WEB_SORT_KEY};
 use crate::time::Timestamp;
 use anyhow::{Context, Result};
@@ -31,7 +31,7 @@ use serde_json::Value;
 use std::cmp::Reverse;
 use std::fs;
 use std::path::Path;
-use tracing::{info, warn};
+use tracing::info;
 
 const WEB_REPO_ORDER_KEY: &str = "aoe-repo-group-order-v1";
 /// The legacy sort on its first line, then the `sessions.json` paths, relative to the app
@@ -117,7 +117,7 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
         {
             continue;
         }
-        let (content, rows) = match read_session_rows(&path) {
+        let (content, rows) = match sessions_file::read_rows(&path, "v066") {
             SessionList::Rows(content, rows) => (content, rows),
             SessionList::Missing => continue,
             SessionList::Unreadable => {
@@ -403,35 +403,6 @@ fn legacy_rank(mut live: Vec<LiveRow>, sort: &str) -> Option<Vec<LiveRow>> {
         _ => return None,
     }
     Some(live)
-}
-
-enum SessionList {
-    Rows(String, Vec<Value>),
-    Missing,
-    /// Left untouched for the recovery that owns it.
-    Unreadable,
-}
-
-fn read_session_rows(path: &Path) -> SessionList {
-    let content = match read_if_present(path) {
-        Ok(Some(content)) => content,
-        Ok(None) => return SessionList::Missing,
-        Err(error) => {
-            warn!(target: "migrations.v069", path = %path.display(), %error, "Preserved unreadable session list; repair it and run aoe migrate");
-            return SessionList::Unreadable;
-        }
-    };
-    match serde_json::from_str::<Value>(&content) {
-        Ok(Value::Array(rows)) => SessionList::Rows(content, rows),
-        Ok(_) => {
-            warn!(target: "migrations.v069", path = %path.display(), "Preserved a file that is not a session list; repair it and run aoe migrate");
-            SessionList::Unreadable
-        }
-        Err(error) => {
-            warn!(target: "migrations.v069", path = %path.display(), %error, "Preserved a session list that does not parse; repair it and run aoe migrate");
-            SessionList::Unreadable
-        }
-    }
 }
 
 /// `ids` with each one kept at its first position.

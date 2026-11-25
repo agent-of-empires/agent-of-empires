@@ -483,9 +483,9 @@ impl Item {
     }
 }
 
-/// Sort a slice of session references by `sort_order`, then lift pinned rows to the top
-/// with a stable pass, so pinned rows keep the sort's order among themselves. The web
-/// dashboard's `workspaceTriageTier` does the same.
+/// Sort a slice of session references by `sort_order`, then lift every row of a workspace
+/// holding a pin with a stable pass, as the dashboard's `workspaceTriageTier` lifts its
+/// workspace rows. Lifted rows keep the sort's order among themselves.
 fn sort_sessions(sessions: &mut [&Instance], sort_order: SortOrder) {
     match sort_order {
         // Rows never moved sit on top, newest first.
@@ -493,7 +493,21 @@ fn sort_sessions(sessions: &mut [&Instance], sort_order: SortOrder) {
         SortOrder::Newest => sessions.sort_by_key(|i| Reverse(i.created_at)),
         SortOrder::Name => sessions.sort_by_key(|i| i.title.to_lowercase()),
     }
-    sessions.sort_by_key(|i| !is_live_pin(i));
+    let pinned = pinned_workspaces(sessions.iter().copied());
+    if !pinned.is_empty() {
+        sessions.sort_by_cached_key(|i| !pinned.contains(&i.workspace_id()));
+    }
+}
+
+/// The workspaces among `sessions` that the list lifts: those holding a live pin.
+pub(crate) fn pinned_workspaces<'a>(
+    sessions: impl IntoIterator<Item = &'a Instance>,
+) -> std::collections::HashSet<String> {
+    sessions
+        .into_iter()
+        .filter(|i| is_live_pin(i))
+        .map(Instance::workspace_id)
+        .collect()
 }
 
 /// Sort group references by `sort_order`. Under Custom they keep the order they arrive in.
@@ -1164,7 +1178,8 @@ mod tests {
     }
 
     /// Pinned rows sit at the top of their header under every sort and keep that sort's order
-    /// among themselves; headers holding a pinned row are not lifted.
+    /// among themselves; a pin lifts its whole workspace, and headers holding a pinned row
+    /// are not lifted.
     #[test]
     fn pinned_rows_lead_their_header_under_every_sort() {
         let now = Timestamp::now();
@@ -1177,6 +1192,17 @@ mod tests {
             }
             i
         };
+        let branch_row = |title: &str, sort_index: Option<u32>, pinned: bool| {
+            let mut i = row(title, "w-group", sort_index, pinned);
+            i.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: "feat".into(),
+                main_repo_path: "/tmp/repo".into(),
+                managed_by_aoe: true,
+                created_at: now,
+                base_branch: None,
+            });
+            i
+        };
         let instances = vec![
             row("delta", "", Some(0), false),
             row("charlie", "", Some(1), true),
@@ -1185,31 +1211,39 @@ mod tests {
             row("zulu", "b-group", Some(0), false),
             row("yankee", "b-group", Some(1), true),
             row("plain", "a-group", None, false),
+            branch_row("whiskey", Some(0), false),
+            row("victor", "w-group", Some(1), false),
+            branch_row("uniform", Some(2), true),
         ];
         let tree = GroupTree::new_with_groups(&instances, &[]);
-        for (order, ungrouped, b_group, groups) in [
+        for (order, ungrouped, b_group, w_group, groups) in [
             (
                 SortOrder::Custom,
                 ["charlie", "alpha", "delta", "bravo"],
                 ["yankee", "zulu"],
-                ["b-group", "a-group"],
+                ["whiskey", "uniform", "victor"],
+                ["b-group", "a-group", "w-group"],
             ),
             (
                 SortOrder::Name,
                 ["alpha", "charlie", "bravo", "delta"],
                 ["yankee", "zulu"],
-                ["a-group", "b-group"],
+                ["uniform", "whiskey", "victor"],
+                ["a-group", "b-group", "w-group"],
             ),
         ] {
             let items = flatten_tree(&tree, &instances, &instances, order);
             let titles = session_titles(&items, &instances);
             assert_eq!(titles[..4], ungrouped, "{order:?}");
-            let b_titles: Vec<&str> = titles
-                .iter()
-                .copied()
-                .filter(|t| ["zulu", "yankee"].contains(t))
-                .collect();
-            assert_eq!(b_titles, b_group, "{order:?}");
+            let only = |group: &[&str]| -> Vec<&str> {
+                titles
+                    .iter()
+                    .copied()
+                    .filter(|t| group.contains(t))
+                    .collect()
+            };
+            assert_eq!(only(&b_group), b_group, "{order:?}");
+            assert_eq!(only(&w_group), w_group, "{order:?}");
             assert_eq!(group_names(&items), groups, "{order:?}");
         }
 

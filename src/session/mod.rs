@@ -64,9 +64,6 @@ pub use config::{
 pub(crate) use environment::user_shell;
 pub use environment::{validate_env_entries, validate_env_entry};
 pub use fork::{ForkDenied, ForkParentRef, ForkSeed};
-/// Shared by the sorter and the row renderer so a row shows the pin mark exactly
-/// when the list lifts it.
-pub(crate) use groups::is_live_pin;
 pub use groups::{
     append_archived_section, append_archived_section_by_project, append_trash_section,
     archived_project_sub_path, flatten_tree, flatten_tree_all_profiles, is_archived_section_path,
@@ -75,6 +72,9 @@ pub use groups::{
     ARCHIVED_SECTION_NAME, ARCHIVED_SECTION_PATH, SCRATCH_GROUP_NAME, SCRATCH_GROUP_PATH,
     TRASH_SECTION_NAME, TRASH_SECTION_PATH,
 };
+/// Shared by the sorter and the row renderer so a row shows the pin mark exactly
+/// when the list lifts it.
+pub(crate) use groups::{is_live_pin, pinned_workspaces};
 #[cfg(test)]
 pub(crate) use instance::before_start_slot_waiters;
 pub(crate) use instance::generate_id;

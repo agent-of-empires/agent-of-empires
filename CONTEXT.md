@@ -69,7 +69,7 @@ A Session whose `parent_session_id` names the Session that created or drives it.
 A Session that is trashed, snoozed, archived or ignored. The "do not bother me" states as one set.
 
 **Pin**:
-A user mark that lifts a Session to the top of its header in every Client, under every sort; pinned Sessions keep the sort's order among themselves, and a header holding one does not move. Pinning cancels Archive, Ignore and Snooze; Archive, Ignore and Snooze clear it.
+A user mark that lifts a Session's workspace to the top of its header in every Client, under every sort: every Session sharing the worktree rises with it, in the order it had among them. Lifted workspaces keep the sort's order among themselves, and a header holding one does not move. Pinning cancels Archive, Ignore and Snooze; Archive, Ignore and Snooze clear it.
 _Avoid_: favorite, star
 
 **Unread**:
