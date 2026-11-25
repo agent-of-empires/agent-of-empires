@@ -95,7 +95,7 @@ Change any proposal with its select, then **Link N repos** stores every checked 
 
 > The TUI keys below are provisional until #4597 settles the key bindings.
 
-**Home.** With **Show in the sidebar** on (off by default; `h` in the pane turns it on or off), one **Suggested (N)** row sits above Trash. It is absent when there are no open suggestions, unless a provider failed: then the row stays, marked `!`. Selecting the row shows every suggestion in the preview pane, the way the System Health strip shows its view there. Enter or → moves the keys into the pane, and Esc gives them back to the row. `S` (`Ctrl+S` in strict mode) selects the row and moves the keys into the pane from anywhere; with the row hidden it still opens the pane, and Esc returns to the Session you were on. Clicking the pane moves the keys into it, and clicking a row in the list gives them back.
+**Home.** With **Show in the sidebar** on (off by default; `h` in the pane turns it on or off), one **Suggested (N)** row sits above Trash. It is absent when there are no open suggestions, unless a provider failed: then the row stays, marked `!`. Selecting the row shows every suggestion in the preview pane, the way the System Health strip shows its view there. Enter or → moves the keys into the pane, and Esc gives them back to the row. `S` (`Ctrl+S` in strict mode) selects the row and moves the keys into the pane from anywhere; with the row hidden it still opens the pane, and Esc returns to the Session you were on. Clicking the pane moves the keys into it, and clicking a row in the list gives them back. If the row goes away while the pane has the keys (`h` hid it, or the suggestions belong to another profile), the pane stays until Esc, which lands on the row that took its place.
 
 **Pane.** Items are grouped under their repo or Project, each with its source reference after the title. The divider shows when each provider last updated, and a provider that failed to refresh is named at the top of the list with its fix and the key that retries. Below the divider are what Enter starts ("Starts with Claude Code · Structured · worktree"), the prompt, and the item's source text. While the pane has the keys, its key line shows only the keys for the selected item. A started suggestion stays listed with its Session's status, and Enter opens the Session.
 
@@ -110,7 +110,7 @@ Strict mode moves the letters by Home's rule: a bare letter takes Shift, and a S
 | `z` | `Z` | Dismiss or restore |
 | `d` | `D` | Show or hide dismissed items |
 | `t` | `T` | Turn on pre-trust, on a Session blocked on folder trust |
-| `h` | `H` | Show or hide the Suggested row on Home (the **Show in the sidebar** setting) |
+| `h` | `H` | Show or hide the Suggested row on Home (the **Show in the sidebar** setting). The pane stays open until Esc |
 | `r` | `R` | Ask providers to refresh, then reload the list. On a read-only dashboard it only reloads |
 | PgUp / PgDn | PgUp / PgDn | Scroll the detail: the prompt, then the item's source text |
 | `Ctrl+K` | `Ctrl+K` | Open in the provider |
