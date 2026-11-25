@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   fetchSuggestions,
   refreshSuggestions,
@@ -35,6 +35,9 @@ export function SuggestionsSetupSheet({ sources, onClose, onFinished, onOpenMark
   // Sources still to install; the head is the one being previewed or installed.
   const [queue, setQueue] = useState<string[]>([]);
   const [job, setJob] = useState<PluginJobRef | null>(null);
+  // Plugin ids this sheet installed; only these are turned on, not one another client installed meanwhile.
+  const [installedIds, setInstalledIds] = useState<string[]>([]);
+  const approvedId = useRef<string | null>(null);
   const market = usePluginMarketplace(setJob);
   const installing = queue.length > 0;
   const toDone = useCallback(() => setStep("done"), []);
@@ -67,6 +70,8 @@ export function SuggestionsSetupSheet({ sources, onClose, onFinished, onOpenMark
       setQueue([]);
       return;
     }
+    const id = approvedId.current;
+    if (id) setInstalledIds((ids) => [...ids, id]);
     // Installed sources leave the selection, so a retry does not install them again.
     const installed = sources.find((s) => sourceFromCommand(s.install_command) === queue[0]);
     if (installed)
@@ -124,7 +129,7 @@ export function SuggestionsSetupSheet({ sources, onClose, onFinished, onOpenMark
             onOpenMarketplace={onOpenMarketplace}
           />
         )}
-        {step === "checks" && <ChecksStep onDone={toDone} onFinishLater={onFinished} />}
+        {step === "checks" && <ChecksStep ids={installedIds} onDone={toDone} onFinishLater={onFinished} />}
         {step === "done" && (
           <>
             <p className="px-4 py-4 text-sm text-text-secondary">
@@ -143,7 +148,10 @@ export function SuggestionsSetupSheet({ sources, onClose, onFinished, onOpenMark
           consent={market.consent}
           busy={market.installBusy}
           error={market.installError}
-          onApprove={() => void market.approveInstall()}
+          onApprove={() => {
+            approvedId.current = market.consent?.id ?? null;
+            void market.approveInstall();
+          }}
           onClose={cancelInstall}
         />
       )}
@@ -252,7 +260,7 @@ function PickStep(p: {
   );
 }
 
-function ChecksStep({ onDone, onFinishLater }: { onDone: () => void; onFinishLater: () => void }) {
+function ChecksStep({ ids, onDone, onFinishLater }: { ids: string[]; onDone: () => void; onFinishLater: () => void }) {
   const [snapshot, setSnapshot] = useState<SuggestionsSnapshot | null>(null);
   const [polling, setPolling] = useState(true);
   const [rechecking, setRechecking] = useState(false);
@@ -266,15 +274,16 @@ function ChecksStep({ onDone, onFinishLater }: { onDone: () => void; onFinishLat
     let alive = true;
     let switchedOn = false;
     const tick = async () => {
-      const next = await fetchSuggestions();
+      const all = await fetchSuggestions();
       if (!alive) return;
-      if (!next) {
+      if (!all) {
         setLoadFailed(true);
         setPolling(false);
         return;
       }
+      const next = { ...all, providers: all.providers.filter((p) => ids.includes(p.id)) };
       setSnapshot(next);
-      // Providers start off and are not checked until on. The sheet is only offered with none installed, so every one is one it installed.
+      // Providers start off and are not checked until on.
       const off = next.providers.filter((p) => !p.enabled);
       if (off.length > 0 && !switchedOn) {
         const res = await updateSuggestionPrefs({ provider_enabled: Object.fromEntries(off.map((p) => [p.id, true])) });
@@ -295,7 +304,7 @@ function ChecksStep({ onDone, onFinishLater }: { onDone: () => void; onFinishLat
       alive = false;
       clearTimeout(timer);
     };
-  }, [polling, onDone]);
+  }, [polling, onDone, ids]);
 
   const checks = snapshot ? checkRows(snapshot) : [];
   const firstFail = checks.findIndex((c) => c.status === "fail");

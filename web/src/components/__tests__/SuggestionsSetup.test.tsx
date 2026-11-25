@@ -205,7 +205,11 @@ describe("setup sheet", () => {
     fireEvent.click(screen.getByTestId("suggestions-setup-install"));
     fireEvent.click(await screen.findByText("approve-consent"));
   };
-  const consent = (source: string) => ({ kind: "ok", consent: { source, id: "g", fingerprint: `f-${source}` } });
+  // The plugin id, which is also its provider id: "gh:agent-of-empires/plugin-github" is "github".
+  const consent = (source: string) => ({
+    kind: "ok",
+    consent: { source, id: source.split("plugin-")[1], fingerprint: `f-${source}` },
+  });
 
   beforeEach(() => {
     api.previewPluginInstall.mockImplementation(async (source: string) => consent(source));
@@ -360,6 +364,22 @@ describe("setup sheet", () => {
       return { ok: true, data: undefined };
     });
     api.fetchSuggestions.mockResolvedValue(snapshot([provider({ status: "pending", enabled: false })]));
+    fireEvent.click(await screen.findByText("close-job"));
+
+    expect(await screen.findByTestId("suggestions-setup-show", {}, { timeout: 4000 })).toBeTruthy();
+    expect(api.updateSuggestionPrefs).toHaveBeenCalledTimes(1);
+    expect(api.updateSuggestionPrefs).toHaveBeenCalledWith({ provider_enabled: { github: true } });
+  });
+
+  it("leaves a provider it did not install off, and does not wait on it", async () => {
+    await openSheet();
+    await approveInstall();
+    const linear = provider({ id: "linear", name: "Linear", status: "pending", enabled: false });
+    api.updateSuggestionPrefs.mockImplementation(async () => {
+      api.fetchSuggestions.mockResolvedValue(snapshot([provider({ checks: [check("cli", "ok")] }), linear]));
+      return { ok: true, data: undefined };
+    });
+    api.fetchSuggestions.mockResolvedValue(snapshot([provider({ status: "pending", enabled: false }), linear]));
     fireEvent.click(await screen.findByText("close-job"));
 
     expect(await screen.findByTestId("suggestions-setup-show", {}, { timeout: 4000 })).toBeTruthy();
