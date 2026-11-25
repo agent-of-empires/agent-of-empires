@@ -221,8 +221,14 @@ impl AgentTurnText {
         match event {
             Event::AgentMessageChunk { text, .. } => {
                 if let Some(turn) = &mut self.0 {
-                    turn.push_str(text);
-                    if turn.trim().chars().count() > RateLimitInfo::AGENT_TEXT_MAX_CHARS {
+                    turn.push_str(if turn.is_empty() {
+                        text.trim_start()
+                    } else {
+                        text
+                    });
+                    // Bytes, so the check is constant time: a limit sentence
+                    // fits in four bytes a char, plus a little trailing space.
+                    if turn.len() > RateLimitInfo::AGENT_TEXT_MAX_CHARS * 4 + 64 {
                         self.disqualify();
                     }
                 }
@@ -323,9 +329,26 @@ mod tests {
             assert_eq!(turn.take_rate_limit().is_some(), parks, "{name}");
             assert!(turn.take_rate_limit().is_none(), "{name}: taking resets");
         }
-        let mut long = AgentTurnText::default();
-        long.observe(&chunk(&"x".repeat(RateLimitInfo::AGENT_TEXT_MAX_CHARS + 1)));
-        assert!(long.0.is_none(), "long text releases its buffer");
+        for filler in ["x", " "] {
+            let mut long = AgentTurnText::default();
+            long.observe(&chunk("Working."));
+            for _ in 0..=RateLimitInfo::AGENT_TEXT_MAX_CHARS * 4 + 64 {
+                long.observe(&chunk(filler));
+            }
+            assert!(
+                long.0.is_none(),
+                "{filler:?}: long text releases its buffer"
+            );
+        }
+        let mut padded = AgentTurnText::default();
+        for _ in 0..1000 {
+            padded.observe(&chunk(" "));
+        }
+        padded.observe(&chunk("You've hit your limit"));
+        assert!(
+            padded.take_rate_limit().is_some(),
+            "leading space is dropped"
+        );
         let mut prompted = AgentTurnText::default();
         prompted.disqualify();
         prompted.observe(&chunk("You've hit your limit"));
