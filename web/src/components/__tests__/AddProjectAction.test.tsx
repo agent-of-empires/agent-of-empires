@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 
 import type { SessionResponse } from "../../lib/types";
 import { jsonResponse, makeSession, makeWorkspace, openRowMenu, renderRow, stubFetch } from "./fixtures";
@@ -100,6 +100,20 @@ describe("AddProjectModal", () => {
     const init = attachCalls()[0]![1] as RequestInit;
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body as string)).toEqual({ project, attach_existing_branch: reuseBranch });
+  });
+
+  it.each([
+    ["keyCode 229", { key: "Enter", keyCode: 229 }],
+    ["isComposing", { key: "Enter", isComposing: true }],
+  ])("does not submit on Enter while an IME composes (%s)", async (_n, init) => {
+    await submit(null);
+    const input = screen.getByTestId("add-project-modal-input");
+    fireEvent.change(input, { target: { value: "frontend" } });
+    fireEvent.keyDown(input, init);
+    await act(async () => {});
+    expect(attachCalls()).toHaveLength(0);
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(attachCalls()).toHaveLength(1));
   });
 
   it("lists saved projects in the picker instead of a native datalist", async () => {

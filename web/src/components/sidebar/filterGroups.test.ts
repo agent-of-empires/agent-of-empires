@@ -3,8 +3,15 @@ import type { NestedSidebarGroup, OrgNestedGroup, SidebarGroup, SidebarWorkspace
 import type { Workspace } from "../../lib/types";
 import { renderedOrder, sunkViews, visibleOrgRepos, visibleSubgroups } from "./filterGroups";
 
-const workspace = (id: string, sessions: { id: string; archived_at?: string; trashed_at?: string }[]): Workspace =>
-  ({ id, sessions }) as unknown as Workspace;
+type SessionStub = {
+  id: string;
+  archived_at?: string;
+  snoozed_until?: string;
+  last_accessed_at?: string;
+  trashed_at?: string;
+};
+
+const workspace = (id: string, sessions: SessionStub[]): Workspace => ({ id, sessions }) as unknown as Workspace;
 
 const group = (id: string, views: SidebarWorkspaceView[]): SidebarGroup => ({ id, workspaces: views }) as SidebarGroup;
 
@@ -36,6 +43,28 @@ describe("sunkViews", () => {
       ]),
     ];
     expect(sunkViews(groups)).toEqual([]);
+  });
+
+  it("orders rows newest sunk first across groups, whatever the group order", () => {
+    const row = (groupId: string, id: string, sessions: SessionStub[]) => ({
+      key: `${groupId}::${id}`,
+      workspace: workspace(id, sessions),
+    });
+    const groups = [
+      group("a", [
+        row("a", "old", [{ id: "s1", archived_at: "2026-01-01T00:00:00Z", last_accessed_at: "2026-06-01T00:00:00Z" }]),
+        row("a", "stale", [{ id: "s2", archived_at: "2026-01-01T00:00:00Z" }]),
+      ]),
+      group("b", [
+        row("b", "snoozed", [{ id: "s3", snoozed_until: "2026-03-01T00:00:00Z" }]),
+        row("b", "mixed", [
+          { id: "s4", archived_at: "2026-01-01T00:00:00Z" },
+          { id: "s5", archived_at: "2026-04-01T00:00:00Z" },
+        ]),
+      ]),
+    ];
+    // archived_at wins over later activity; ties keep group order.
+    expect(sunkViews(groups).map((v) => v.workspace.id)).toEqual(["mixed", "snoozed", "old", "stale"]);
   });
 });
 

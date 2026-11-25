@@ -72,15 +72,31 @@ const STAGING_SANDBOX: &str = r#"
     (ipc-posix-name "apple.shm.notification_center"))
 "#;
 
-pub(super) fn prove_staging_host_mount_absent(mount: &std::path::Path) -> anyhow::Result<()> {
+pub(super) fn prove_staging_host_mount_absent(
+    parent: std::os::fd::BorrowedFd<'_>,
+    child: std::os::fd::BorrowedFd<'_>,
+) -> anyhow::Result<()> {
+    prove_same_mount(parent, child).context("plugin staging path remains mounted")
+}
+
+pub(super) fn prove_same_mount(
+    parent: std::os::fd::BorrowedFd<'_>,
+    child: std::os::fd::BorrowedFd<'_>,
+) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let mount = |fd: std::os::fd::BorrowedFd<'_>| -> anyhow::Result<_> {
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: fd is borrowed and stat points to writable storage.
+        if unsafe { libc::fstatfs(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("inspecting host mount");
+        }
+        // SAFETY: successful fstatfs initialized stat.
+        let stat = unsafe { stat.assume_init() };
+        Ok((stat.f_mntonname, stat.f_mntfromname))
+    };
     anyhow::ensure!(
-        staging_mount_strings(&staging_statfs(mount)?)?.0 != mount,
-        "plugin staging path remains mounted"
-    );
-    anyhow::ensure!(
-        std::fs::symlink_metadata(mount.with_extension("dmg"))
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
-        "plugin staging image remains present or its absence is unknown"
+        mount(parent)? == mount(child)?,
+        "operation crosses a host mount"
     );
     Ok(())
 }

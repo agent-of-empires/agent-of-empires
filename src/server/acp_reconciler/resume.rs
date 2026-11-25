@@ -602,6 +602,18 @@ pub(crate) async fn trigger_resume_background(
     authority: crate::process::worker_registry::ResumeAuthority,
     origin: LaunchOrigin,
 ) -> Result<ResumeTrigger, SupervisorError> {
+    trigger_resume_observing(service, id, authority, origin, None).await
+}
+
+/// [`trigger_resume_background`] admitting against a stop intent the caller already
+/// observed (`Some`), so a newer stop is refused instead of cleared.
+pub(crate) async fn trigger_resume_observing(
+    service: &Arc<SessionService>,
+    id: &str,
+    authority: crate::process::worker_registry::ResumeAuthority,
+    origin: LaunchOrigin,
+    observed_stop: Option<Option<crate::process::worker_registry::StopIntent>>,
+) -> Result<ResumeTrigger, SupervisorError> {
     if service
         .instances
         .read()
@@ -632,7 +644,7 @@ pub(crate) async fn trigger_resume_background(
         .any(|i| i.id == id && i.acp_session_id.is_some());
     let reservation = match service
         .acp_supervisor
-        .begin_resume(id, spawn_kind(has_stored_id), authority)
+        .begin_resume_observing(id, spawn_kind(has_stored_id), authority, observed_stop)
         .await?
     {
         ResumeReservationOutcome::Reserved(r) => r,

@@ -335,6 +335,23 @@ test.describe("Live terminal grid inset (touch)", () => {
   });
 });
 
+test.describe("Live terminal bundled font", () => {
+  test.use(DESKTOP);
+
+  test("JetBrains Mono loads from the bundle and sizes rows from its metrics", async ({ page }) => {
+    await openLiveTerminal(page, { settings: { desktopFontSize: 14, terminalFontFamily: "JetBrains Mono" } });
+    // check() also passes for an unregistered family, so require the bundled face itself.
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          [...document.fonts].some((f) => f.family === "JetBrains Mono" && f.weight === "400" && f.status === "loaded"),
+        ),
+      )
+      .toBe(true);
+    await expect(scroller(page)).toHaveCSS("line-height", "18px");
+  });
+});
+
 // #3342: rows rendered as one `white-space: pre` run take their column
 // positions from whatever font supplied each glyph, so a glyph missing from the
 // configured font falls back to a non-1-cell advance and shifts every later

@@ -51,6 +51,7 @@ import { ProjectStep } from "./steps/ProjectStep";
 import { ExtraReposPicker } from "./steps/ExtraReposPicker";
 import { AgentPanel } from "./steps/AgentPanel";
 import { WorktreePanel } from "./steps/WorktreePanel";
+import { WorktreeInfo } from "./WorktreeInfo";
 import { SandboxPanel } from "./steps/SandboxPanel";
 import { ProfilePresetPicker } from "./steps/ProfilePresetPicker";
 import { GroupCombobox } from "./steps/GroupCombobox";
@@ -228,6 +229,8 @@ export interface WizardRestore {
 
 interface Props {
   onClose: () => void;
+  /** Opens a Settings tab in the app; the wizard closes first. */
+  onOpenSettingsTab: (tab: string) => void;
   onCreated: (session?: SessionResponse) => void;
   /** A create the user sent to the background finished; the wizard is already closed. */
   onCreatedInBackground?: (session?: SessionResponse) => void;
@@ -247,6 +250,7 @@ const NO_GROUPS: GroupInfo[] = [];
 
 export function SessionWizard({
   onClose,
+  onOpenSettingsTab,
   onCreated,
   onCreatedInBackground,
   onReopenFailure,
@@ -1200,6 +1204,14 @@ export function SessionWizard({
           disabled={!!worktreeBlocked && !d.useWorktree}
           summary={worktreeBlocked ?? (d.useWorktree ? worktreeSummary(d) : "run in the repo folder")}
           onConfigure={!worktreeBlocked && d.useWorktree ? openPanel("worktree") : undefined}
+          info={
+            <WorktreeInfo
+              onOpenSettings={() => {
+                onClose();
+                onOpenSettingsTab("worktree");
+              }}
+            />
+          }
         />
         <SwitchRow
           label="Sandbox"

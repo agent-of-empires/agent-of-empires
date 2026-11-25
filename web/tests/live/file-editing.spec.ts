@@ -313,7 +313,10 @@ test("an unsaved draft survives crossing the mobile breakpoint in both direction
   await editor.fill("desktop draft");
   await page.setViewportSize({ width: 390, height: 844 });
   // The desktop sidebar stays open as an overlay after the resize.
-  await page.getByRole("navigation", { name: "Sessions sidebar" }).getByRole("button", { name: "×" }).click();
+  await page
+    .getByRole("navigation", { name: "Sessions sidebar" })
+    .getByRole("button", { name: "Close sidebar" })
+    .click();
   // The Files pane keeps its selection locally; reopening the file restores the draft.
   await showNotes(page);
   await expect(editor).toHaveValue("desktop draft");

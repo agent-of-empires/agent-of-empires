@@ -282,6 +282,17 @@ async fn acquire_local_read(
     ))
 }
 
+/// Long enough for a healthy update check (about 0.3 to 0.6 s) to finish and refresh
+/// its cache; a hung endpoint costs this instead of the client's 5 s timeouts.
+const UPDATE_NOTICE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+async fn bounded_notice(
+    budget: std::time::Duration,
+    notice: impl std::future::Future<Output = Option<String>>,
+) -> Option<String> {
+    tokio::time::timeout(budget, notice).await.ok().flatten()
+}
+
 async fn finish(
     result: Result<render::Projection, ReadFailure>,
     source: &ReadRequestSource,
@@ -289,7 +300,7 @@ async fn finish(
     match result {
         Ok(projection) => {
             let notice = if projection.session_table {
-                crate::update::update_notice().await
+                bounded_notice(UPDATE_NOTICE_BUDGET, crate::update::update_notice()).await
             } else {
                 None
             };
@@ -843,6 +854,16 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::ffi::OsString;
+
+    #[tokio::test]
+    async fn bounded_notice_gives_up_on_a_stalled_check_and_keeps_a_fast_one() {
+        let budget = std::time::Duration::from_millis(20);
+        assert_eq!(bounded_notice(budget, std::future::pending()).await, None);
+        assert_eq!(
+            bounded_notice(budget, async { Some("update".to_string()) }).await,
+            Some("update".to_string())
+        );
+    }
 
     #[tokio::test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]

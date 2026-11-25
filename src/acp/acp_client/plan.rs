@@ -62,6 +62,9 @@ pub(super) fn parse_plan_steps(text: &str) -> Vec<PlanStep> {
                     title.push_str(&format!("`{t}`"));
                 }
             }
+            // A heading that opens the item (`- ### Step`) is its title.
+            Event::Start(Tag::Heading { .. }) if matches!(&current, Some(Some(t)) if t.is_empty()) =>
+                {}
             // Inline markup keeps the line going; a break or any nested
             // block (sub-list, code block, second paragraph) ends it.
             Event::Start(
@@ -200,6 +203,26 @@ mod tests {
             (
                 "- step\n  ```\n  - hidden\n\nprose\n- after",
                 &["step", "after"],
+            ),
+        ] {
+            let titles: Vec<String> = parse_plan_steps(md).into_iter().map(|s| s.title).collect();
+            assert_eq!(titles, want, "{md:?}");
+        }
+
+        // A heading opening the item is its title; one after text is not.
+        for (md, want) in [
+            (
+                "- ### Inspect the logs\n- ### Verify the fix",
+                &["Inspect the logs", "Verify the fix"][..],
+            ),
+            ("- text\n  ### Heading", &["text"]),
+            (
+                "- ### Inspect logs\n\n  Search the service logs",
+                &["Inspect logs"],
+            ),
+            (
+                "- ### Inspect logs\n  Search the service logs",
+                &["Inspect logs"],
             ),
         ] {
             let titles: Vec<String> = parse_plan_steps(md).into_iter().map(|s| s.title).collect();

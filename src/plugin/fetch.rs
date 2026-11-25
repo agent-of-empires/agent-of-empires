@@ -183,6 +183,14 @@ fn cleanup_staging(
 }
 
 impl FetchedPlugin {
+    pub(super) fn journals_publication(&self) -> bool {
+        matches!(&self.source, PluginSource::Github { .. })
+            && self
+                .staging
+                .as_ref()
+                .is_some_and(|stage| stage.marker.is_none())
+    }
+
     pub(super) fn begin_publication(&self) -> Result<()> {
         if let Some(marker) = self
             .staging
@@ -300,6 +308,15 @@ fn stage(
     clone_url: Option<String>,
 ) -> Result<FetchedPlugin> {
     stage_with_limit(source, plugins_root, clone_url, STAGING_LIMIT)
+}
+
+#[cfg(test)]
+pub(super) fn stage_remote_fixture(source: PluginSource, repo: &Path) -> Result<FetchedPlugin> {
+    stage(
+        source,
+        super::plugins_dir()?,
+        Some(format!("file://{}", repo.display())),
+    )
 }
 
 fn stage_with_limit(
@@ -1983,7 +2000,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let fixture = tempfile::tempdir().unwrap();
-        let directory = fixture.path().join("staging");
+        let directory = fixture.path().join("plugins/.staging-read-only");
         let mount = directory.join("volume");
         let nested = mount.join("tree/read-only");
         std::fs::create_dir_all(&nested).unwrap();

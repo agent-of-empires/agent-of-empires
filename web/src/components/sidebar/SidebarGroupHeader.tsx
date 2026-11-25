@@ -27,6 +27,7 @@ import { FoldChevron, PlusIcon } from "../icons";
 import { DISABLED_ICON_BUTTON } from "./styles";
 import { NAV_ITEM, onSidebarArrowKey, refocusNearbyWhenRemoved } from "./keyboardNav";
 import type { DragHandleProps } from "./types";
+import { isImeComposing } from "../../lib/ime";
 
 interface Props {
   group: SidebarGroup;
@@ -112,7 +113,7 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
           onChange={(e) => setRenameValue(e.target.value)}
           onBlur={commitRename}
           onKeyDown={(e) => {
-            if (e.key === "Enter") {
+            if (e.key === "Enter" && !isImeComposing(e)) {
               commitRename();
               refocusHeader();
             }

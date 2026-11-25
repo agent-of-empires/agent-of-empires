@@ -1,5 +1,11 @@
 id = "gemini"
 
+# The trust dialog's first choice row, inside its border, so neither quoted
+# prose nor a composer repeating the label can stand in for it. The quoted-prose
+# veto below uses the same predicate.
+[markers.trust_choice]
+line_regex = ['(?i)^\s*\x{2502}\s*(?:\x{25CF}\s*)?(?:1\.\s+)?trust folder\b']
+
 [[rules]]
 extends = "interrupt_hint"
 id = "interrupt_hint"
@@ -19,18 +25,22 @@ priority = 955
 region = "collapsed_recent"
 visible = true
 contains = ["do you trust the files in this folder?", "trust folder (", "don't trust"]
-not = [{ region = "whole_recent", line_regex = ['^\s*>(?:\s|$)'] }]
+not = [
+  { region = "after(trust_choice)", line_regex = ['^\s*>(?:\s|$)'] },
+  # Quoted in the transcript: a composer is up and no `trust_choice` row is.
+  { region = "whole_recent", line_regex = ['^\s*>(?:\s|$)'], not = [{ region = "whole_recent", line_regex = ['(?i)^\s*\x{2502}\s*(?:\x{25CF}\s*)?(?:1\.\s+)?trust folder\b'] }] },
+]
 
 [[rules]]
 extends = "approval_prompt"
 id = "approval_prompt"
 priority = 950
 contains_any = ["execute?", "enter to select", "esc to cancel"]
-# The trust dialog's "allows", left on screen after the restart, unless a tool
-# confirmation is up too.
-not = [
-  { contains = ["trusting a folder allows gemini cli"], not = [{ contains_any = ["allow once", "execute?", "enter to select", "esc to cancel", "(y/n)", "[y/n]", "approve"] }] },
-]
+
+[[rules]]
+extends = "approval_choice"
+id = "approval_choice"
+priority = 950
 
 # Only a bare `>`: Gemini renders ordinary prose behind the same glyph, so the
 # `> something` form the other agents accept would fire on transcript text.

@@ -790,6 +790,52 @@ describe("settings saves", () => {
     expect(await api.updateSettings({ a: 1 })).toBe("rejected");
   });
 
+  it("reads a Session's default model from the Daemon, and gives null when it can't", async () => {
+    const reply = { profile: "my work", agent_key: "cursor", model: "opus", pinned: false };
+    fetchSpy.mockResolvedValueOnce(json(reply)).mockResolvedValueOnce(json({ error: "not_found" }, 404));
+    expect(await api.fetchSessionModelDefault("s/1")).toEqual(reply);
+    expect(fetchSpy.mock.calls[0][0]).toBe("/api/sessions/s%2F1/acp-default-model");
+    expect(await api.fetchSessionModelDefault("s/1")).toBeNull();
+  });
+
+  it.each([
+    ["a saved model", () => json({ agent_key: "claude", model: "opus", pinned: false }), "committed", true],
+    ["a pin", () => json({ error: "model_pinned", message: "" }, 409), "pinned", false],
+    ["another conflict", () => json({ error: "read_only", message: "" }, 409), "rejected", false],
+    ["an unknown Agent", () => json({ error: "unknown_agent", message: "" }, 400), "rejected", false],
+    ["a server error", () => json({ error: "internal", message: "" }, 500), "uncertain", true],
+    ["no reply", () => Promise.reject(new Error("offline")), "uncertain", true],
+  ])("PUTs only the model, and maps %s", async (_name, reply, outcome, announced) => {
+    const listener = vi.fn();
+    const off = onSettingsChanged(listener);
+    try {
+      fetchSpy.mockImplementationOnce(async () => reply());
+      expect(await api.putAgentModelDefault("work", "claude", "opus")).toBe(outcome);
+      const [url, init] = fetchSpy.mock.calls[0];
+      expect(url).toBe("/api/profiles/work/acp-defaults/claude/model");
+      expect(init?.method).toBe("PUT");
+      expect(JSON.parse(String(init?.body))).toEqual({ model: "opus" });
+      expect(listener).toHaveBeenCalledTimes(announced ? 1 : 0);
+    } finally {
+      off();
+    }
+  });
+
+  it("sends a default model PUT only after the one before it has answered", async () => {
+    let answerFirst: (r: Response) => void = () => {};
+    fetchSpy
+      .mockImplementationOnce(() => new Promise<Response>((r) => (answerFirst = r)))
+      .mockResolvedValueOnce(json({}));
+    const first = api.putAgentModelDefault("work", "claude", "opus");
+    const second = api.putAgentModelDefault("work", "claude", "sonnet");
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(1));
+    await Promise.resolve();
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    answerFirst(json({}));
+    expect([await first, await second]).toEqual(["committed", "committed"]);
+    expect(fetchSpy.mock.calls.map(([, init]) => JSON.parse(String(init?.body)).model)).toEqual(["opus", "sonnet"]);
+  });
+
   it("setDefaultProfile announces a landed save and stays quiet on a rejected one", async () => {
     const listener = vi.fn();
     const off = onSettingsChanged(listener);

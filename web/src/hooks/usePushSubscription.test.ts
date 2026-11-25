@@ -3,6 +3,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { setServerDown } from "../lib/connectionState";
 import { usePushSubscription, type PushState } from "./usePushSubscription";
 
 type Hook = ReturnType<typeof usePushSubscription>;
@@ -144,6 +145,7 @@ afterEach(() => {
   for (const [key, descriptor] of Object.entries(originalDescriptors)) {
     if (descriptor) Object.defineProperty(navigator, key, descriptor);
   }
+  delete (navigator as { maxTouchPoints?: number }).maxTouchPoints;
 });
 
 async function mountAndSettle() {
@@ -174,6 +176,17 @@ describe("usePushSubscription initial refresh", () => {
       () => {
         removePushManager();
         setUserAgent(IOS_UA);
+      },
+      unsupported("ios-not-standalone"),
+    ],
+    [
+      "an iPad Safari tab in desktop mode",
+      () => {
+        removePushManager();
+        setUserAgent(
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.0 Safari/605.1.15",
+        );
+        Object.defineProperty(navigator, "maxTouchPoints", { configurable: true, value: 5 });
       },
       unsupported("ios-not-standalone"),
     ],
@@ -249,6 +262,31 @@ describe("usePushSubscription enable()", () => {
     expect(result.current.state).toEqual({ kind: "off" });
     expect(await act_(result, "enable")).toEqual({ kind: "enabled" });
     expect(called("/api/push/vapid-public-key") && called("/api/push/subscribe")).toBe(true);
+  });
+
+  it("replays a refresh asked for while permission is pending, so a Daemon with push off isn't offered", async () => {
+    noSubscription();
+    const { result } = await mountAndSettle();
+    expect(result.current.state).toEqual({ kind: "off" });
+    let answer!: (p: NotificationPermission) => void;
+    vi.mocked(Notification.requestPermission).mockReturnValueOnce(new Promise((r) => (answer = r)));
+    // The Daemon restarts with push off while the permission prompt is open.
+    installFetch({ status: { ok: true, body: { enabled: false } }, vapid: 404 });
+    let enabling!: Promise<void>;
+    act(() => {
+      enabling = result.current.enable();
+    });
+    await act(async () => {
+      setServerDown(true);
+      setServerDown(false);
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    await act(async () => {
+      answer("granted");
+      await enabling;
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    expect(result.current.state).toEqual({ kind: "disabled-by-server" });
   });
 
   it.each<[string, () => void, PushState]>([
@@ -585,6 +623,18 @@ describe("usePushSubscription health", () => {
       for (let i = 0; i < 10; i++) await Promise.resolve();
     });
     expect(result.current.health).toBe("revoked");
+  });
+
+  it("re-checks when the Daemon reconnects, which may have turned push off", async () => {
+    const { result } = await mountAndSettle();
+    expect(result.current.state).toEqual({ kind: "enabled" });
+    installFetch({ status: { ok: true, body: { enabled: false } } });
+    await act(async () => {
+      setServerDown(true);
+      setServerDown(false);
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    });
+    expect(result.current.state).toEqual({ kind: "disabled-by-server" });
   });
 
   it.each([

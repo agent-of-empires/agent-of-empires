@@ -9,10 +9,17 @@ import {
   type ActivityRow,
   type BackgroundAgent,
   type BackgroundShell,
+  type QueuedPrompt,
   type SubagentRecord,
   type WorkflowRun,
 } from "../../lib/acpTypes";
-import { STORAGE_KEY_PREFIX, STATE_TTL_MS, type PersistedEntry } from "../../lib/acpStateStorage";
+import {
+  PENDING_DONE_KEY_PREFIX,
+  PENDING_KEY_PREFIX,
+  STORAGE_KEY_PREFIX,
+  STATE_TTL_MS,
+  type PersistedEntry,
+} from "../../lib/acpStateStorage";
 import { safeSetItem } from "../../lib/safeStorage";
 
 const STATE_CACHE_CAP = 32;
@@ -34,14 +41,16 @@ function parseEntry(raw: string | null): PersistedEntry | null {
   }
 }
 
-function persistedKeys(): string[] {
+function keysWithPrefix(prefix: string): string[] {
   const keys: string[] = [];
   for (let i = 0; i < window.localStorage.length; i++) {
     const k = window.localStorage.key(i);
-    if (k?.startsWith(STORAGE_KEY_PREFIX)) keys.push(k);
+    if (k?.startsWith(prefix)) keys.push(k);
   }
   return keys;
 }
+
+const persistedKeys = () => keysWithPrefix(STORAGE_KEY_PREFIX);
 
 // Only ever touches `aoe:acp-state:v1:*`: drafts and other keys are authoritative and must survive.
 export function evictOldestPersistedAcpState(currentKey: string): boolean {
@@ -72,7 +81,7 @@ export function evictOldestPersistedAcpState(currentKey: string): boolean {
 
 // Optimistic rows and in-flight ids are ephemeral, and attachment bytes would blow the quota
 // (text alone would drain a degraded prompt on reload), so none of them are persisted.
-function toPersistedState(state: AcpState): AcpState {
+function toPersistedState(state: AcpState, durable: (id: string) => boolean): AcpState {
   const base: AcpState =
     state.optimisticRows.length > 0 ||
     state.inflightPromptIds.length > 0 ||
@@ -90,13 +99,134 @@ function toPersistedState(state: AcpState): AcpState {
           retriedError: null,
         }
       : state;
-  if (!base.queuedPrompts.some((q) => q.attachments?.length)) return base;
-  return { ...base, queuedPrompts: base.queuedPrompts.filter((q) => !q.attachments?.length) };
+  // A pending row leaves the transcript only once its own entry (or its terminal mark) is durable.
+  const dropped = (q: QueuedPrompt) => !!q.attachments?.length || (q.pending === true && durable(q.id));
+  if (!base.queuedPrompts.some(dropped)) return base;
+  return { ...base, queuedPrompts: base.queuedPrompts.filter((q) => !dropped(q)) };
 }
 
-export function persistState(sessionId: string, state: AcpState): void {
+// An unconfirmed queued prompt is the only retry copy. Each lives in its own entry, written at once and never
+// part of the throttled transcript, so a stale snapshot or a concurrent tab can neither erase nor resurrect it.
+interface PendingEntry {
+  savedAt: number;
+  row: QueuedPrompt;
+}
+
+const pendingPrefix = (sessionId: string) => `${PENDING_KEY_PREFIX}${sessionId}:`;
+// Written when a tab confirms or removes a row, so a legacy transcript copy is never adopted again.
+const donePrefix = (sessionId: string) => `${PENDING_DONE_KEY_PREFIX}${sessionId}:`;
+
+function hasStored(key: string): boolean {
+  try {
+    return window.localStorage.getItem(key) !== null;
+  } catch {
+    return false;
+  }
+}
+
+function readPendingRows(sessionId: string): QueuedPrompt[] {
+  const rows: QueuedPrompt[] = [];
+  try {
+    for (const k of keysWithPrefix(pendingPrefix(sessionId))) {
+      const parsed = JSON.parse(window.localStorage.getItem(k) ?? "null") as PendingEntry | null;
+      if (parsed?.row && Date.now() - parsed.savedAt <= STATE_TTL_MS) rows.push(parsed.row);
+    }
+  } catch {
+    // Storage unavailable or corrupt.
+  }
+  return rows.sort((a, b) => a.queuedAt.localeCompare(b.queuedAt));
+}
+
+// Rows with attachments are never persisted: their bytes would blow the quota.
+function pendingRowsOf(state: AcpState): QueuedPrompt[] {
+  return state.queuedPrompts.filter((q) => q.pending && !q.attachments?.length);
+}
+
+// Per session, the ids this tab saw pending at its last sync (so it removes only rows it removed itself) and
+// the text it has durably written for each (so a failed write is retried and an edit is rewritten).
+const knownPendingIds = new Map<string, ReadonlySet<string>>();
+const writtenPendingText = new Map<string, Map<string, string>>();
+
+function writePendingRow(sessionId: string, row: QueuedPrompt): boolean {
+  const key = pendingPrefix(sessionId) + row.id;
+  const body = JSON.stringify({ savedAt: Date.now(), row } satisfies PendingEntry);
+  const ok = safeSetItem(key, body) || (evictOldestPersistedAcpState(storageKey(sessionId)) && safeSetItem(key, body));
+  if (ok) {
+    const written = writtenPendingText.get(sessionId) ?? new Map<string, string>();
+    written.set(row.id, row.text);
+    writtenPendingText.set(sessionId, written);
+  }
+  return ok;
+}
+
+function writeDoneMark(sessionId: string, id: string): boolean {
+  const key = donePrefix(sessionId) + id;
+  const body = JSON.stringify({ savedAt: Date.now() });
+  return safeSetItem(key, body) || (evictOldestPersistedAcpState(storageKey(sessionId)) && safeSetItem(key, body));
+}
+
+function syncPendingRows(sessionId: string, state: AcpState): void {
+  if (typeof window === "undefined") return;
+  const rows = pendingRowsOf(state);
+  const ids = new Set(rows.map((q) => q.id));
+  const written = writtenPendingText.get(sessionId);
+  const known = new Set(ids);
+  try {
+    for (const id of knownPendingIds.get(sessionId) ?? []) {
+      if (ids.has(id)) continue;
+      // The terminal mark goes first; until it is stored the row stays tracked and its entry stays, so this retries.
+      if (!writeDoneMark(sessionId, id)) {
+        known.add(id);
+        continue;
+      }
+      window.localStorage.removeItem(pendingPrefix(sessionId) + id);
+      written?.delete(id);
+    }
+    for (const row of rows) {
+      const stored = written?.get(row.id);
+      if (stored === row.text) continue;
+      // An edit must not recreate a row another tab already confirmed or removed.
+      if (stored !== undefined && window.localStorage.getItem(pendingPrefix(sessionId) + row.id) === null) continue;
+      writePendingRow(sessionId, row);
+    }
+  } catch {
+    // Storage unavailable.
+  }
+  knownPendingIds.set(sessionId, known);
+}
+
+/** The state with its unconfirmed rows taken from their own entries; the stored list never carries pending rows. */
+function withStoredPendingRows(sessionId: string, state: AcpState): AcpState {
+  const stored = new Map(readPendingRows(sessionId).map((q) => [q.id, q]));
+  if (stored.size === 0) return state;
+  const queued = state.queuedPrompts.map((q) => (q.pending && stored.has(q.id) ? stored.get(q.id)! : q));
+  const known = new Set(queued.map((q) => q.id));
+  return { ...state, queuedPrompts: [...queued, ...[...stored.values()].filter((q) => !known.has(q.id))] };
+}
+
+// Rows an older bundle left only in the transcript get their own entry; one another tab already finished is dropped.
+function adoptPendingRows(sessionId: string, state: AcpState): AcpState {
+  const finished = (q: QueuedPrompt) => q.pending === true && hasStored(donePrefix(sessionId) + q.id);
+  const live = state.queuedPrompts.some(finished)
+    ? { ...state, queuedPrompts: state.queuedPrompts.filter((q) => !finished(q)) }
+    : state;
+  if (knownPendingIds.has(sessionId)) return live;
+  const rows = pendingRowsOf(live);
+  knownPendingIds.set(sessionId, new Set(rows.map((q) => q.id)));
+  const stored = new Set(readPendingRows(sessionId).map((q) => q.id));
+  const written = new Map<string, string>();
+  writtenPendingText.set(sessionId, written);
+  for (const row of rows) {
+    if (stored.has(row.id)) written.set(row.id, row.text);
+    else writePendingRow(sessionId, row);
+  }
+  return live;
+}
+
+export function persistState(sessionId: string, state: AcpState, savedAt = Date.now()): void {
   const key = storageKey(sessionId);
-  const body = JSON.stringify({ savedAt: Date.now(), state: toPersistedState(state) } satisfies PersistedEntry);
+  const durable = (id: string) => hasStored(pendingPrefix(sessionId) + id) || hasStored(donePrefix(sessionId) + id);
+  const body = JSON.stringify({ savedAt, state: toPersistedState(state, durable) } satisfies PersistedEntry);
   // On a quota failure evict one entry and retry once; the cache is best effort.
   if (!safeSetItem(key, body) && evictOldestPersistedAcpState(key)) safeSetItem(key, body);
 }
@@ -112,19 +242,25 @@ export function loadPersistedState(sessionId: string): AcpState | undefined {
   if (typeof window === "undefined") return undefined;
   try {
     const parsed = parseEntry(window.localStorage.getItem(storageKey(sessionId)));
-    if (!parsed || typeof parsed.state !== "object" || parsed.state === null) return undefined;
-    const state = parsed.state as Partial<AcpState>;
-    if (
-      Date.now() - parsed.savedAt > STATE_TTL_MS ||
-      typeof state.lastSeq !== "number" ||
-      !Array.isArray(state.activity) ||
-      !Array.isArray(state.queuedPrompts)
-    ) {
-      window.localStorage.removeItem(storageKey(sessionId));
-      return undefined;
+    let base: AcpState | undefined;
+    if (parsed && typeof parsed.state === "object" && parsed.state !== null) {
+      const state = parsed.state as Partial<AcpState>;
+      if (
+        Date.now() - parsed.savedAt > STATE_TTL_MS ||
+        typeof state.lastSeq !== "number" ||
+        !Array.isArray(state.activity) ||
+        !Array.isArray(state.queuedPrompts)
+      ) {
+        window.localStorage.removeItem(storageKey(sessionId));
+      } else {
+        // Merge over defaults so entries from an older bundle gain newly added fields.
+        base = { ...emptyAcpState(), ...(state as AcpState) };
+      }
     }
-    // Merge over defaults so entries from an older bundle gain newly added fields.
-    return reopenState(normaliseTurnState({ ...emptyAcpState(), ...(state as AcpState) }));
+    // Unconfirmed rows outlive a missing or evicted transcript.
+    const loaded = adoptPendingRows(sessionId, withStoredPendingRows(sessionId, base ?? emptyAcpState()));
+    if (!base && loaded.queuedPrompts.length === 0) return undefined;
+    return reopenState(normaliseTurnState(loaded));
   } catch {
     return undefined;
   }
@@ -144,12 +280,18 @@ export function sweepExpiredStorage(): void {
   if (sweptStorage) return;
   sweptStorage = true;
   const now = Date.now();
-  removePersisted(() =>
-    persistedKeys().filter((k) => {
-      const parsed = parseEntry(window.localStorage.getItem(k));
-      return !parsed || now - parsed.savedAt > STATE_TTL_MS;
-    }),
-  );
+  for (const keys of [
+    persistedKeys,
+    () => keysWithPrefix(PENDING_KEY_PREFIX),
+    () => keysWithPrefix(PENDING_DONE_KEY_PREFIX),
+  ]) {
+    removePersisted(() =>
+      keys().filter((k) => {
+        const parsed = parseEntry(window.localStorage.getItem(k));
+        return !parsed || now - parsed.savedAt > STATE_TTL_MS;
+      }),
+    );
+  }
 }
 
 function lruInsert(sessionId: string, value: AcpState): void {
@@ -164,7 +306,9 @@ function lruInsert(sessionId: string, value: AcpState): void {
 
 export function cacheGet(sessionId: string): AcpState | undefined {
   const memory = stateCache.get(sessionId);
-  const value = memory ? reopenState(memory) : loadPersistedState(sessionId);
+  // An evicted session can still have unflushed state, newer than anything in storage.
+  const known = memory ?? pendingPersist.get(sessionId)?.state;
+  const value = known ? reopenState(known) : loadPersistedState(sessionId);
   if (value === undefined) return undefined;
   lruInsert(sessionId, value);
   // Wake subscribers that rendered before the cache was primed or saw a pre-reset entry; deferred so it never fires mid-render.
@@ -172,9 +316,54 @@ export function cacheGet(sessionId: string): AcpState | undefined {
   return value;
 }
 
+const PERSIST_THROTTLE_MS = 2000;
+// `at` is when the snapshot was last captured, to detect another tab writing after it.
+const pendingPersist = new Map<string, { state: AcpState; at: number; timer: ReturnType<typeof setTimeout> }>();
+
+function schedulePersist(sessionId: string, state: AcpState): void {
+  const pending = pendingPersist.get(sessionId);
+  if (pending) {
+    pending.state = state;
+    pending.at = Date.now();
+    return;
+  }
+  const timer = setTimeout(() => flushPersist(sessionId), PERSIST_THROTTLE_MS);
+  pendingPersist.set(sessionId, { state, at: Date.now(), timer });
+}
+
+function storedSavedAt(sessionId: string): number {
+  try {
+    return parseEntry(window.localStorage.getItem(storageKey(sessionId)))?.savedAt ?? -Infinity;
+  } catch {
+    return -Infinity;
+  }
+}
+
+/** Persist pending state now, for one session or all. */
+export function flushPersist(sessionId?: string): void {
+  for (const id of sessionId === undefined ? [...pendingPersist.keys()] : [sessionId]) {
+    const pending = pendingPersist.get(id);
+    if (!pending) continue;
+    clearTimeout(pending.timer);
+    pendingPersist.delete(id);
+    // Entries carry capture time, so the newer capture wins whichever tab flushes first.
+    if (storedSavedAt(id) > pending.at) continue;
+    persistState(id, pending.state, pending.at);
+  }
+}
+
+// localStorage only needs the latest state by the time the page is hidden or unloaded.
+if (typeof window !== "undefined" && typeof document !== "undefined") {
+  window.addEventListener("pagehide", () => flushPersist());
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushPersist();
+  });
+}
+
 export function cacheSet(sessionId: string, value: AcpState): void {
   lruInsert(sessionId, value);
-  persistState(sessionId, value);
+  syncPendingRows(sessionId, value);
+  schedulePersist(sessionId, value);
   notifyStateListeners(sessionId);
 }
 
@@ -250,11 +439,26 @@ export function useWorkflowRuns(sessionId: string | null): Record<string, Workfl
 
 /** Drop one session's cached state, or all of it, so a reused id never shows a prior transcript. */
 export function clearAcpCache(sessionId?: string): void {
+  for (const id of sessionId === undefined ? [...pendingPersist.keys()] : [sessionId]) {
+    const pending = pendingPersist.get(id);
+    if (pending) clearTimeout(pending.timer);
+    pendingPersist.delete(id);
+  }
   if (sessionId === undefined) {
     stateCache.clear();
+    knownPendingIds.clear();
+    writtenPendingText.clear();
     removePersisted(persistedKeys);
+    removePersisted(() => keysWithPrefix(PENDING_KEY_PREFIX));
+    removePersisted(() => keysWithPrefix(PENDING_DONE_KEY_PREFIX));
   } else {
     stateCache.delete(sessionId);
-    removePersisted(() => [storageKey(sessionId)]);
+    knownPendingIds.delete(sessionId);
+    writtenPendingText.delete(sessionId);
+    removePersisted(() => [
+      storageKey(sessionId),
+      ...keysWithPrefix(pendingPrefix(sessionId)),
+      ...keysWithPrefix(donePrefix(sessionId)),
+    ]);
   }
 }

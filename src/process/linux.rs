@@ -816,32 +816,30 @@ pub(super) fn prove_staging_pid_namespace_gone(
     Ok(())
 }
 
-pub(super) fn prove_staging_host_mount_absent(mount: &Path) -> anyhow::Result<()> {
+pub(super) fn prove_staging_host_mount_absent(
+    parent: std::os::fd::BorrowedFd<'_>,
+    child: std::os::fd::BorrowedFd<'_>,
+) -> anyhow::Result<()> {
+    prove_same_mount(parent, child).context("staging path remains a host mount")
+}
+
+pub(super) fn prove_same_mount(
+    parent: std::os::fd::BorrowedFd<'_>,
+    child: std::os::fd::BorrowedFd<'_>,
+) -> anyhow::Result<()> {
     use std::os::fd::AsRawFd as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let open = |path: &Path| -> std::io::Result<fs::File> {
-        fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)
-    };
-    let mount = open(mount)?;
-    let parent = open(Path::new(&format!(
-        "/proc/self/fd/{}/..",
-        mount.as_raw_fd()
-    )))?;
-    let mount_id = |file: &fs::File| -> anyhow::Result<u64> {
-        let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
+    let mount_id = |fd: std::os::fd::BorrowedFd<'_>| -> anyhow::Result<u64> {
+        let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd()))?;
         Ok(info
             .lines()
             .find_map(|line| line.strip_prefix("mnt_id:"))
-            .context("staging host mount identity unavailable")?
+            .context("host mount identity unavailable")?
             .trim()
             .parse()?)
     };
     anyhow::ensure!(
-        mount_id(&mount)? == mount_id(&parent)?,
-        "staging path remains a host mount"
+        mount_id(child)? == mount_id(parent)?,
+        "operation crosses a host mount"
     );
     Ok(())
 }
