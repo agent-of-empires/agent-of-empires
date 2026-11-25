@@ -73,6 +73,8 @@ import { useDrawerSwipe, type DrawerSwipeAction } from "./hooks/useDrawerSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useMobileViewportLock } from "./hooks/useMobileViewportLock";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
+import { useMediaQuery } from "./hooks/useMediaQuery";
+import { SHEET_MEDIA_QUERY } from "./lib/rightDockMode";
 import type { RightPanelView } from "./lib/rightPanelView";
 import {
   usePaneLayout,
@@ -205,6 +207,7 @@ import { hasStartedBefore } from "./components/acp/startupWait";
 import { DiffPane } from "./components/DiffPane";
 import { FilesPane } from "./components/FilesPane";
 import { FileContentViewer } from "./components/diff/FileContentViewer";
+import { MainViewTabs } from "./components/MainViewTabs";
 import { PairedShellPane, ShellModeToggle } from "./components/PairedTerminal";
 import { TerminalSwitcherButton, TerminalSwitcherOverlay } from "./components/TerminalSwitcher";
 import {
@@ -725,6 +728,9 @@ function AppContent({
     external?: boolean;
   } | null>(null);
   const selectedFilePath = selectedFile?.path ?? null;
+  // The open file the user stepped back from to the Agent tab; picking another file shows that one.
+  const [agentTabFor, setAgentTabFor] = useState<typeof selectedFile>(null);
+  const fileShown = selectedFile !== null && agentTabFor !== selectedFile;
   const selectedFileExternal = selectedFile?.external ?? false;
   const selectedRepoName = selectedFile?.repoName;
   const selectedFileLine = selectedFile?.line;
@@ -920,6 +926,11 @@ function AppContent({
   // pane shows one of agent / diff / paired, chosen via the picker (#1452).
   const isMdUp = useIsWideViewport();
   const singlePane = !isMdUp;
+  // Between md and the inline threshold the right dock overlays the main area as a sheet.
+  const rightDockSheet = useMediaQuery(SHEET_MEDIA_QUERY, true);
+  const rightSheetOpen = rightDockSheet && !rightDockCollapsed;
+  // Not persisted: a reload shows the agent again.
+  const [rightMaximized, setRightMaximized] = useState(false);
   const [rightPanelView, setRightPanelView] = useState<RightPanelView>("agent");
   const [pickerOpen, setPickerOpen] = useState(false);
   // Reading mode for the phone conversation view: the top bar folds away so the
@@ -1080,6 +1091,7 @@ function AppContent({
     setPickerOpen(false);
     setPairedMounted(false);
     setMobileShell(null);
+    setRightMaximized(false);
     setSelectedFile(null);
   }
 
@@ -1800,10 +1812,16 @@ function AppContent({
     [activeSessionId, rightPanelView, transitionKeyboardProxy],
   );
 
-  const handleSelectFile = useCallback((path: string, repoName?: string, line?: number) => {
-    if (!confirmFileEditPanes([null])) return;
-    setSelectedFile({ path, repoName, line });
-  }, []);
+  const handleSelectFile = useCallback(
+    (path: string, repoName?: string, line?: number) => {
+      if (!confirmFileEditPanes([null])) return;
+      setSelectedFile({ path, repoName, line });
+      // The file opens in the main area: a sheet over it closes and a maximized dock makes room.
+      setRightMaximized(false);
+      if (rightDockSheet) setDockCollapsed("right", true);
+    },
+    [rightDockSheet, setDockCollapsed],
+  );
 
   // Open a local file reference cited in an acp transcript (Codex
   // `path:line` markdown links). Resolve the absolute path back to a
@@ -2038,17 +2056,15 @@ function AppContent({
       requestAnimationFrame(() => dispatchFocusTerminal("agent"));
       return;
     }
-    if (target === "agent" && selectedFilePath) {
-      // Agent terminal is hidden under the diff viewer; close the diff first
-      // so the wrapper un-hides, then dispatch on the next frame because
-      // focus() on a display:none element is a no-op.
-      if (!confirmFileEditPanes([null])) return;
-      setSelectedFile(null);
+    if (target === "agent" && fileShown) {
+      // The agent is hidden behind the file tab; switch to the Agent tab, keeping the file open,
+      // then dispatch on the next frame because focus() on a display:none element is a no-op.
+      setAgentTabFor(selectedFile);
       requestAnimationFrame(() => dispatchFocusTerminal("agent"));
       return;
     }
     dispatchFocusTerminal(target);
-  }, [activeSessionId, singlePane, selectedFilePath, showPairedTerminal]);
+  }, [activeSessionId, singlePane, fileShown, selectedFile, showPairedTerminal]);
 
   // Flattened, display-ordered session ids plus the subset needing attention,
   // sourced from the same sidebar model the user sees so jump-to-next follows
@@ -2100,6 +2116,10 @@ function AppContent({
             setPaletteQuery("");
             return;
           }
+          if (rightSheetOpen) {
+            setDockCollapsed("right", true);
+            return;
+          }
           setShowSessionWizard(false);
           setShowHelp(false);
           // Settings dialogs handle Escape after this capture-phase shortcut.
@@ -2122,6 +2142,8 @@ function AppContent({
         toggleDiff,
         toggleRightDock,
         showPalette,
+        rightSheetOpen,
+        setDockCollapsed,
         deletingSessions,
         stoppingSessionId,
         showSettings,
@@ -2318,12 +2340,23 @@ function AppContent({
           <ContentSplit
             collapsed={rightDockCollapsed}
             onToggleCollapse={toggleRightDock}
+            sheet={rightDockSheet}
+            maximized={rightMaximized}
             left={
               <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
-                <div className={selectedFilePath ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}>
+                {selectedFilePath && (
+                  <MainViewTabs
+                    filePath={selectedFilePath}
+                    fileShown={fileShown}
+                    onShowAgent={() => setAgentTabFor(selectedFile)}
+                    onShowFile={() => setAgentTabFor(null)}
+                    onCloseFile={handleCloseFile}
+                  />
+                )}
+                <div className={fileShown ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}>
                   {activeSession?.view === "structured" ? (
                     <StructuredSessionStack
-                      active={!selectedFilePath}
+                      active={!fileShown}
                       activeSessionId={activeSessionId!}
                       sessions={sessions.filter((session) => session.view === "structured")}
                       persistent={webSettings.persistentStructuredViews}
@@ -2384,27 +2417,30 @@ function AppContent({
                   )}
                 </div>
 
-                {selectedFilePath &&
-                  activeSessionId &&
-                  (selectedFileExternal ? (
-                    <FileContentViewer
-                      structured={activeSession?.view === "structured"}
-                      sessionId={activeSessionId}
-                      filePath={selectedFilePath}
-                      onBack={handleCloseFile}
-                    />
-                  ) : (
-                    <DiffFileViewer
-                      sessionId={activeSessionId}
-                      filePath={selectedFilePath}
-                      repoName={selectedRepoName}
-                      targetLine={selectedFileLine}
-                      revision={revision}
-                      onClose={handleCloseFile}
-                      commentsEnabled={commentsEnabled}
-                      commentsStore={diffComments}
-                    />
-                  ))}
+                {selectedFilePath && activeSessionId && (
+                  // Kept mounted behind the Agent tab, so the file keeps its scroll, comments and draft.
+                  <div className={fileShown ? "flex-1 flex flex-col min-h-0 overflow-hidden" : "hidden"}>
+                    {selectedFileExternal ? (
+                      <FileContentViewer
+                        structured={activeSession?.view === "structured"}
+                        sessionId={activeSessionId}
+                        filePath={selectedFilePath}
+                        onBack={handleCloseFile}
+                      />
+                    ) : (
+                      <DiffFileViewer
+                        sessionId={activeSessionId}
+                        filePath={selectedFilePath}
+                        repoName={selectedRepoName}
+                        targetLine={selectedFileLine}
+                        revision={revision}
+                        onClose={handleCloseFile}
+                        commentsEnabled={commentsEnabled}
+                        commentsStore={diffComments}
+                      />
+                    )}
+                  </div>
+                )}
               </div>
             }
             right={
@@ -2418,6 +2454,11 @@ function AppContent({
                   onMove={movePaneAny}
                   onClose={closePaneAny}
                   {...dockControls("right")}
+                  maximize={
+                    rightDockSheet
+                      ? undefined
+                      : { maximized: rightMaximized, onToggle: () => setRightMaximized((m) => !m) }
+                  }
                 />
               </div>
             }
@@ -2900,7 +2941,13 @@ function AppContent({
               onExitFocusMode={focusMode ? exitFocusMode : undefined}
               sidebarColumnVisible={!focusMode && !fullPageView && sidebarOpen}
               rightColumnVisible={
-                isMdUp && !fullPageView && !!activeWorkspace && !!activeSession && !rightDockCollapsed
+                isMdUp &&
+                !rightDockSheet &&
+                !rightMaximized &&
+                !fullPageView &&
+                !!activeWorkspace &&
+                !!activeSession &&
+                !rightDockCollapsed
               }
             />
           </CollapsibleRegion>

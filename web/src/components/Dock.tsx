@@ -1,5 +1,5 @@
 import { Fragment, type ReactNode } from "react";
-import { PanelBottom, PanelRight, Plus, X, type LucideIcon } from "lucide-react";
+import { Maximize2, Minimize2, PanelBottom, PanelRight, Plus, X, type LucideIcon } from "lucide-react";
 import { useDroppable } from "@dnd-kit/core";
 import { SortableContext, horizontalListSortingStrategy, useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
@@ -30,6 +30,8 @@ export interface DockControls {
   tabActions?: (id: string) => ReactNode;
   /** The terminal switcher trigger, shown beside the new-terminal control. */
   terminalSwitcher?: ReactNode;
+  /** Lets the dock take the whole main area and give it back. */
+  maximize?: { maximized: boolean; onToggle: () => void };
 }
 
 interface Props extends DockControls {
@@ -162,6 +164,7 @@ export function Dock({
   newTerminalLabel = "New terminal",
   tabActions,
   terminalSwitcher,
+  maximize,
 }: Props) {
   const { activeTab, source, dropTarget } = usePaneDnd();
   const { setNodeRef: setGroupRef } = useDroppable({
@@ -226,6 +229,23 @@ export function Dock({
           >
             <MoveIcon className="size-3.5" aria-hidden />
           </button>
+          {maximize && (
+            <button
+              type="button"
+              onClick={maximize.onToggle}
+              aria-pressed={maximize.maximized}
+              className={btn}
+              title={maximize.maximized ? "Restore panel" : "Maximize panel"}
+              aria-label={maximize.maximized ? "Restore panel" : "Maximize panel"}
+              data-testid="dock-maximize"
+            >
+              {maximize.maximized ? (
+                <Minimize2 className="size-3.5" aria-hidden />
+              ) : (
+                <Maximize2 className="size-3.5" aria-hidden />
+              )}
+            </button>
+          )}
           {terminalSwitcher}
           {onNewTerminal && (
             <button onClick={onNewTerminal} className={btn} title={newTerminalLabel} aria-label={newTerminalLabel}>
