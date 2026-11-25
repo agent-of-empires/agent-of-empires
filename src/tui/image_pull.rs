@@ -890,12 +890,14 @@ mod tests {
         assert!(watch.other_key(true));
         assert_eq!(watch.line(), None);
 
-        // A Start with no reply ends the prompt, so a poll then showing a pull running, which
-        // may be another client's, doesn't bring it back.
+        // A Start with no reply ends the prompt, so a poll then showing a pull running, under
+        // an id this TUI never saw and maybe another client's, doesn't bring it back.
         watch.start();
         assert!(watch.arm_cancel(at));
         watch.apply(PullRequest::Start, PullReport::Unavailable);
         watch.apply(PullRequest::Poll, running(1));
+        assert!(!watch.note_flight(Some(7)));
+        assert_eq!(watch.cancel_flight(), Some(7));
         assert!(watch.cancellable());
         assert!(!watch.cancel_prompt(at), "the prompt came back on a poll");
     }

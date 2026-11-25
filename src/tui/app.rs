@@ -2428,7 +2428,16 @@ impl App {
             self.request_pull(PullRequest::Cancel, self.pull_image.clone());
             return Ok(());
         }
-        self.pull.other_key(done_drawn);
+        // Ctrl+X acknowledges a drawn Done through the bar; acknowledging it here too would
+        // dismiss a Done waiting behind it before it is drawn.
+        let dismisses_bar = bindings::is_bound(
+            bindings::ActionId::DismissUpdateBanner,
+            self.home.strict_hotkeys,
+            &key,
+        ) && !self.home.has_dialog();
+        if !dismisses_bar {
+            self.pull.other_key(done_drawn);
+        }
         match (key.code, key.modifiers) {
             // Ctrl+C belongs to the agent in live-send.
             (KeyCode::Char('c'), KeyModifiers::CONTROL) if !self.home.is_live_send_capturing() => {
@@ -2472,13 +2481,7 @@ impl App {
                 return Ok(());
             }
             // No `needs_redraw`: its full clear flashes the screen.
-            _ if bindings::is_bound(
-                bindings::ActionId::DismissUpdateBanner,
-                self.home.strict_hotkeys,
-                &key,
-            ) && !self.home.has_dialog()
-                && self.dismiss_update_bar() =>
-            {
+            _ if dismisses_bar && self.dismiss_update_bar() => {
                 return Ok(());
             }
             _ if bindings::is_bound(bindings::ActionId::Update, self.home.strict_hotkeys, &key)
@@ -5392,7 +5395,18 @@ mod tests {
                 app.handle_key(ctrl_e, &mut terminal).await.unwrap();
             }
             answer_sent(&mut app, &sent, 0, PullReport::Unavailable);
-            if !armed_before_answer {
+            if armed_before_answer {
+                // A poll then finds a pull running under an id this TUI never saw.
+                answer_pull(
+                    &mut app,
+                    PullRequest::Poll,
+                    PullAnswer {
+                        flight: Some(9),
+                        ..PullReport::State(PullState::Running(Default::default())).into()
+                    },
+                );
+                assert!(app.pull.running());
+            } else {
                 app.handle_key(ctrl_e, &mut terminal).await.unwrap();
                 assert!(!app.pull.cancel_prompt(std::time::Instant::now()));
                 assert_eq!(
@@ -5687,6 +5701,41 @@ mod tests {
         draw(&mut app);
         app.handle_key(down, &mut terminal).await.unwrap();
         assert_eq!(app.pull.line(), None, "a drawn Done outlived the next key");
+
+        // Ctrl+X on a drawn Done with another client's Done waiting behind it acknowledges only
+        // the drawn one; the second is acknowledged once it was drawn.
+        let ctrl_x = bindings::key_event(bindings::ActionId::DismissUpdateBanner, false).unwrap();
+        app.start_pull(image_update().image);
+        answer_pull(
+            &mut app,
+            PullRequest::Poll,
+            PullReport::State(PullState::Running(Default::default())),
+        );
+        answer_pull(
+            &mut app,
+            PullRequest::Poll,
+            PullReport::State(PullState::Done),
+        );
+        answer_pull(
+            &mut app,
+            PullRequest::Poll,
+            PullReport::State(PullState::Running(Default::default())),
+        );
+        answer_pull(
+            &mut app,
+            PullRequest::Poll,
+            PullReport::State(PullState::Done),
+        );
+        for (press, expected) in [(1, Some(&PullLine::Done)), (2, None)] {
+            draw(&mut app);
+            assert_eq!(
+                app.drawn_bar,
+                Some(DrawnBar::Pull(PullLine::Done)),
+                "{press}"
+            );
+            app.handle_key(ctrl_x, &mut terminal).await.unwrap();
+            assert_eq!(app.pull.line(), expected, "Ctrl+X #{press}");
+        }
     }
 
     /// The Daemon's state is read with this TUI's update checks off and no sandbox in use: the
