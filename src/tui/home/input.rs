@@ -6094,7 +6094,7 @@ impl HomeView {
     /// Queue the armed suggested-sessions tip; the drain re-checks that it is
     /// earned, unseen and that tips are on.
     pub(super) fn queue_suggested_sessions_tip(&mut self) {
-        if self.suggestions_feed.provider_installed().is_none() {
+        if self.suggestions_feed.providers_enabled().is_none() {
             return;
         }
         self.suggested_sessions_tip_armed = false;

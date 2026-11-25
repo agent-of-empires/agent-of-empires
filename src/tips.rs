@@ -9,8 +9,8 @@ pub struct TipSignals {
     pub used_system_health: bool,
     pub sessions_created: u64,
     pub shortcut_bar_hidden: bool,
-    /// A featured plugin offers suggestions and the daemon has no provider.
-    /// Each surface sets it from what its daemon reports.
+    /// See [`suggestions_setup_available`]. Each surface sets it from what its
+    /// daemon reports.
     pub suggestions_setup_available: bool,
 }
 
@@ -28,12 +28,15 @@ impl From<&crate::session::Config> for TipSignals {
     }
 }
 
-/// True when a featured plugin offers suggestions and the daemon reports no
-/// installed provider.
-pub fn suggestions_setup_available(provider_installed: bool) -> bool {
-    !provider_installed
-        && crate::plugin::featured::FeaturedIndex::load()
-            .is_ok_and(|index| index.offers_suggestions())
+/// Whether suggestions are worth announcing, from the daemon's providers'
+/// `enabled` flags: every installed provider is off, or none is installed and a
+/// featured plugin offers them.
+pub fn suggestions_setup_available(providers_enabled: &[bool]) -> bool {
+    if providers_enabled.is_empty() {
+        crate::plugin::featured::FeaturedIndex::load().is_ok_and(|index| index.offers_suggestions())
+    } else {
+        !providers_enabled.contains(&true)
+    }
 }
 
 /// Called only after a creation is committed, never for a restart or a placeholder.
@@ -147,8 +150,9 @@ static CATALOG: &[Tip] = &[
         title: "New: suggested sessions",
         body: "Plugins can propose sessions worth starting, like pull requests waiting for \
                your review. Nothing runs until you press Start.\n\n\
-               In the dashboard, use Set up suggestions on the homepage. In the TUI, press S \
-               to open the list, and h there to show its row on Home.",
+               To set them up, use Set up suggestions on the dashboard's homepage. To turn on \
+               a source you already installed, open Settings › Suggestions in the dashboard. \
+               In the TUI, press S to open the list, and h there to show its row on Home.",
         trigger: TipTrigger::Earned(earned_suggested_sessions),
         surfaces: &[TipSurface::Tui, TipSurface::Web],
     },
@@ -485,6 +489,26 @@ mod tests {
         let seen = vec!["install-dashboard-pwa".to_string()];
         assert_eq!(web_unseen_ids(&seen, &signals(0)).len(), all.len() - 1);
         assert!(next_earned_pop(TipSurface::Web, &[], &signals(0)).is_none());
+    }
+
+    #[test]
+    fn suggestions_are_announced_while_every_installed_source_is_off() {
+        for (enabled, expected) in [
+            (&[false][..], true),
+            (&[false, false][..], true),
+            (&[false, true][..], false),
+            (&[true][..], false),
+        ] {
+            assert_eq!(
+                suggestions_setup_available(enabled),
+                expected,
+                "{enabled:?}"
+            );
+        }
+        // With none installed, only a featured plugin offering them counts.
+        let featured = crate::plugin::featured::FeaturedIndex::load()
+            .is_ok_and(|index| index.offers_suggestions());
+        assert_eq!(suggestions_setup_available(&[]), featured);
     }
 
     #[test]

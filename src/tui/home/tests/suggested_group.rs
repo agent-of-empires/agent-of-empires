@@ -1216,6 +1216,27 @@ fn the_row_shows_without_any_session() {
     assert!(!text.contains("No sessions yet"));
 }
 
+/// The tip's signal comes from the daemon's snapshot: it holds while every
+/// installed source is off, and not before a snapshot loads.
+#[test]
+#[serial]
+fn the_suggestions_tip_signal_follows_the_daemon_snapshot() {
+    let mut env = create_test_env_with_sessions(1);
+    let config = crate::session::Config::default();
+    env.view.suggestions_feed = SuggestionsFeed::failed_load_for_test("not yet");
+    assert!(!env.view.tip_signals(&config).suggestions_setup_available);
+    for (enabled, expected) in [(false, true), (true, false)] {
+        let mut snap = snapshot(0, &[]);
+        snap["providers"][0]["enabled"] = enabled.into();
+        env.view.suggestions_feed.set_snapshot_for_test(snap);
+        assert_eq!(
+            env.view.tip_signals(&config).suggestions_setup_available,
+            expected,
+            "enabled={enabled}"
+        );
+    }
+}
+
 #[test]
 #[serial]
 fn an_undelivered_first_prompt_is_announced_once_per_failure() {

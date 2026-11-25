@@ -44,8 +44,8 @@ impl HomeView {
         let mut signals = crate::tips::TipSignals::from(config);
         signals.suggestions_setup_available = self
             .suggestions_feed
-            .provider_installed()
-            .is_some_and(crate::tips::suggestions_setup_available);
+            .providers_enabled()
+            .is_some_and(|enabled| crate::tips::suggestions_setup_available(&enabled));
         signals
     }
 

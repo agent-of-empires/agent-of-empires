@@ -1310,14 +1310,22 @@ impl SuggestionsView {
             };
             lines.push(Line::from(""));
         }
-        if self.order.is_empty() && store.provider_installed() == Some(false) {
-            for line in [
+        let setup: Option<&[&str]> = match store.providers_enabled() {
+            Some(enabled) if enabled.is_empty() => Some(&[
                 "No suggestion source is installed. To set one up, use",
                 "Set up suggestions on the web dashboard's homepage, or run:",
                 "",
                 "  aoe plugin install gh:agent-of-empires/plugin-github",
-            ] {
-                lines.push(Line::from(Span::styled(line, dim)));
+            ]),
+            Some(enabled) if !enabled.contains(&true) => Some(&[
+                "Your suggestion sources are off. Turn one on in the web",
+                "dashboard under Settings › Suggestions.",
+            ]),
+            _ => None,
+        };
+        if let Some(setup) = setup.filter(|_| self.order.is_empty()) {
+            for line in setup {
+                lines.push(Line::from(Span::styled(*line, dim)));
             }
         } else if self.order.is_empty() {
             let message = match (&store.snapshot, store.busy) {
@@ -1867,9 +1875,12 @@ impl SuggestionsFeed {
         }
     }
 
-    /// Whether the daemon reports a suggestions provider; None until a snapshot loads.
-    pub(super) fn provider_installed(&self) -> Option<bool> {
-        self.snapshot.as_ref().map(|s| !s.providers.is_empty())
+    /// Each provider's `enabled` flag as the daemon reports it; None until a
+    /// snapshot loads.
+    pub(super) fn providers_enabled(&self) -> Option<Vec<bool>> {
+        self.snapshot
+            .as_ref()
+            .map(|s| s.providers.iter().map(|p| p.enabled).collect())
     }
 
     /// True while a request is in flight: its answer is not yet processed.
@@ -3694,6 +3705,18 @@ mod tests {
             text.contains("aoe plugin install gh:agent-of-empires/plugin-github"),
             "{text}"
         );
+        assert!(!text.contains("Nothing to suggest"), "{text}");
+    }
+
+    #[test]
+    fn an_empty_list_with_every_source_off_says_where_to_turn_one_on() {
+        let mut rig = view_with(vec![item("a", None, false)], idle_worker());
+        let snapshot = rig.store.snapshot.as_mut().unwrap();
+        snapshot.items.clear();
+        snapshot.providers[0].enabled = false;
+        rig.view.sync(&rig.store);
+        let text = render_sized(&rig, None, 80, 24);
+        assert!(text.contains("Settings › Suggestions"), "{text}");
         assert!(!text.contains("Nothing to suggest"), "{text}");
     }
 
