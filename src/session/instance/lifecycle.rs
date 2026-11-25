@@ -1665,6 +1665,78 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn indeterminate_release_clears_native_birth_marker_only_with_pane_proof() {
+        use crate::session::{LegacyToolIdentity, LegacyToolObservation, TmuxServerIdentity};
+
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let pid = std::process::id();
+        let birth = crate::process::process_birth_identity(pid)
+            .unwrap()
+            .unwrap();
+        for proved in [false, true] {
+            let profile = if proved {
+                "proved-pane"
+            } else {
+                "unproved-pane"
+            };
+            let mut instance = Instance::new(profile, root.path().to_str().unwrap());
+            instance.source_profile = profile.into();
+            let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let generation = instance
+                .acquire_lifecycle_reservation(
+                    &storage,
+                    LifecycleOperation::Launch,
+                    Some(Status::Starting),
+                )
+                .unwrap();
+            instance.unproven_native_birth_generation = Some(generation);
+            storage
+                .update(|rows, _| {
+                    rows[0].unproven_native_birth_generation = Some(generation);
+                    Ok(())
+                })
+                .unwrap();
+            let probe = resume::LaunchProbe {
+                tmux_session: profile.into(),
+                pane: proved.then(|| {
+                    std::sync::Arc::new(LegacyToolObservation {
+                        identity: LegacyToolIdentity {
+                            session_id: "$1".into(),
+                            pane_id: "%1".into(),
+                            pane_pid: Some(pid),
+                        },
+                        server: std::sync::Arc::new(TmuxServerIdentity {
+                            socket: "test-socket".into(),
+                            pid,
+                            birth: birth.clone(),
+                        }),
+                    })
+                }),
+                expected: instance.conversation_state(),
+            };
+
+            instance
+                .release_indeterminate_launch(&storage, generation, &probe, None)
+                .unwrap();
+
+            let expected = (!proved).then_some(generation);
+            assert_eq!(instance.unproven_native_birth_generation, expected);
+            assert_eq!(
+                storage.load().unwrap()[0].unproven_native_birth_generation,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn indeterminate_creation_release_preserves_concurrent_status_and_generation() {
         for status in [
             Status::Creating,

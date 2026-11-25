@@ -189,8 +189,13 @@ mod tests {
     /// id, so only profiles that handle child sessions may advertise it.
     #[test]
     fn initialize_advertises_subagents_only_for_supporting_profiles() {
-        use crate::acp::agent_profiles::{CLAUDE, CODEX};
-        for (profile, expected) in [(&CLAUDE, Some(serde_json::json!({}))), (&CODEX, None)] {
+        use crate::acp::agent_profiles::{CLAUDE, CODEX, OPENCODE};
+        let supported = Some(serde_json::json!({}));
+        for (profile, expected) in [
+            (&CLAUDE, supported.clone()),
+            (&CODEX, supported),
+            (&OPENCODE, None),
+        ] {
             let wire = serde_json::to_value(build_initialize_request(profile)).expect("serialize");
             assert_eq!(
                 wire.pointer("/clientCapabilities/subagents").cloned(),
