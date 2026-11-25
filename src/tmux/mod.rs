@@ -3207,17 +3207,28 @@ fn agent_available_direct(
     use crate::agents::DetectionMethod;
     match &agent.detection {
         DetectionMethod::Which(binary) => {
-            if binary.contains('/') || binary.contains('\\') {
-                return Some(std::path::Path::new(binary).exists());
+            let mut all_paths = true;
+            for candidate in std::iter::once(*binary).chain(agent.fallback_binaries.iter().copied())
+            {
+                if candidate.contains('/') || candidate.contains('\\') {
+                    if std::path::Path::new(candidate).exists() {
+                        return Some(true);
+                    }
+                    continue;
+                }
+                all_paths = false;
+                let found = agent_probe_output(
+                    Command::new("which").arg(candidate),
+                    AGENT_PROBE_TIMEOUT,
+                    cancel,
+                )
+                .is_some_and(|output| output.status.success());
+                if found {
+                    return Some(true);
+                }
             }
-            let found = agent_probe_output(
-                Command::new("which").arg(binary),
-                AGENT_PROBE_TIMEOUT,
-                cancel,
-            )
-            .is_some_and(|output| output.status.success());
-            if found {
-                Some(true)
+            if all_paths {
+                Some(false)
             } else {
                 None
             }
@@ -3234,32 +3245,40 @@ fn agent_available_direct(
     }
 }
 
-/// One probe command per agent, chained with `;` so every probe runs
-/// regardless of earlier results. Each hit prints a `AOE_AGENT_OK <name>`
-/// marker line that [`parse_login_shell_probe`] picks out of whatever else
-/// the user's login shell prints (motd, nvm chatter, ...).
+/// One probe command per agent (or per candidate binary), chained with `;` so
+/// every probe runs regardless of earlier results. Each hit prints an
+/// `AOE_AGENT_OK <name>` marker line that [`parse_login_shell_probe`] picks
+/// out of whatever else the user's login shell prints (motd, nvm chatter, ...).
 fn login_shell_probe_script(agents: &[&crate::agents::AgentDef<'_>]) -> String {
     use crate::agents::DetectionMethod;
-    agents
-        .iter()
-        .map(|agent| {
-            let probe = match &agent.detection {
-                DetectionMethod::Which(binary) => {
-                    format!("which {}", shell_words::quote(binary))
+    let mut probes = Vec::new();
+    for agent in agents {
+        let quoted_name = shell_words::quote(agent.name);
+        match &agent.detection {
+            DetectionMethod::Which(binary) => {
+                for candidate in
+                    std::iter::once(*binary).chain(agent.fallback_binaries.iter().copied())
+                {
+                    probes.push(format!(
+                        "which {} >/dev/null 2>&1 && echo {} {}",
+                        shell_words::quote(candidate),
+                        LOGIN_PROBE_MARKER,
+                        quoted_name
+                    ));
                 }
-                DetectionMethod::RunWithArg(binary, arg) => {
-                    format!("{} {}", shell_words::quote(binary), shell_words::quote(arg))
-                }
-            };
-            format!(
-                "{} >/dev/null 2>&1 && echo {} {}",
-                probe,
-                LOGIN_PROBE_MARKER,
-                shell_words::quote(agent.name)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
+            }
+            DetectionMethod::RunWithArg(binary, arg) => {
+                probes.push(format!(
+                    "{} {} >/dev/null 2>&1 && echo {} {}",
+                    shell_words::quote(binary),
+                    shell_words::quote(arg),
+                    LOGIN_PROBE_MARKER,
+                    quoted_name
+                ));
+            }
+        }
+    }
+    probes.join("; ")
 }
 
 const LOGIN_PROBE_MARKER: &str = "AOE_AGENT_OK";
@@ -3468,16 +3487,18 @@ pub(crate) fn agent_availability_snapshot(
             }
         }
     }
-    found.extend(
-        uncached
-            .into_iter()
-            .filter_map(|agent| match agent.detection {
-                crate::agents::DetectionMethod::Which(binary) if which::which(binary).is_ok() => {
-                    Some(agent.name.to_string())
-                }
-                _ => None,
-            }),
-    );
+    found.extend(uncached.into_iter().filter_map(|agent| {
+        match agent.detection {
+            crate::agents::DetectionMethod::Which(binary)
+                if std::iter::once(binary)
+                    .chain(agent.fallback_binaries.iter().copied())
+                    .any(|candidate| which::which(candidate).is_ok()) =>
+            {
+                Some(agent.name.to_string())
+            }
+            _ => None,
+        }
+    }));
     found
 }
 
@@ -6080,5 +6101,86 @@ AOE_AGENT_OK\n";
             ["kimi", "omp"].iter().map(|s| s.to_string()).collect(),
             "markers parse through profile noise; mid-line and empty markers are ignored"
         );
+    }
+
+    #[test]
+    fn login_shell_probe_script_includes_fallback_binaries() {
+        let claude = crate::agents::get_agent("claude").unwrap();
+        let cursor = crate::agents::get_agent("cursor").unwrap();
+        let script = login_shell_probe_script(&[claude, cursor]);
+        assert_eq!(
+            script,
+            "which claude >/dev/null 2>&1 && echo AOE_AGENT_OK claude; \
+             which agent >/dev/null 2>&1 && echo AOE_AGENT_OK cursor; \
+             which cursor-agent >/dev/null 2>&1 && echo AOE_AGENT_OK cursor"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn cursor_detected_via_cursor_agent_fallback_on_clean_path() {
+        if run_probe_test_in_subprocess() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join("bin");
+        let login_bin = home.path().join("login-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&login_bin).unwrap();
+
+        let make_exec = |path: &std::path::Path, content: &str| {
+            std::fs::write(path, content).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        // Hermetic `which` checking only the current PATH directories.
+        make_exec(
+            &bin.join("which"),
+            "#!/bin/sh\nIFS=:; for d in $PATH; do [ -x \"$d/$1\" ] && exit 0; done; exit 1\n",
+        );
+        make_exec(&bin.join("login-shell"), "#!/bin/sh\nexit 0\n");
+
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", home.path().to_path_buf()),
+            ("PATH", bin.clone()),
+            ("SHELL", bin.join("login-shell")),
+        ]);
+        let memo = AgentAvailabilityGuard::capture();
+        let cursor = crate::agents::get_agent("cursor").unwrap();
+
+        // Neither `agent` nor `cursor-agent` present.
+        memo.clear();
+        assert!(!agent_availability_snapshot(&[cursor]).contains("cursor"));
+        assert!(!probe_agents_available(&[cursor]).contains("cursor"));
+
+        // Only `cursor-agent` present on PATH.
+        let cursor_agent = bin.join("cursor-agent");
+        make_exec(&cursor_agent, "#!/bin/sh\nexit 0\n");
+        memo.clear();
+        assert!(agent_availability_snapshot(&[cursor]).contains("cursor"));
+        assert!(probe_agents_available(&[cursor]).contains("cursor"));
+
+        // Only `agent` present on PATH.
+        std::fs::remove_file(&cursor_agent).unwrap();
+        let agent_bin = bin.join("agent");
+        make_exec(&agent_bin, "#!/bin/sh\nexit 0\n");
+        memo.clear();
+        assert!(agent_availability_snapshot(&[cursor]).contains("cursor"));
+        assert!(probe_agents_available(&[cursor]).contains("cursor"));
+
+        // Only `cursor-agent` present on login shell PATH.
+        std::fs::remove_file(&agent_bin).unwrap();
+        make_exec(&login_bin.join("cursor-agent"), "#!/bin/sh\nexit 0\n");
+        make_exec(
+            &bin.join("login-shell"),
+            &format!(
+                "#!/bin/sh\nexport PATH={}:$PATH\nexec /bin/sh -c \"$2\"\n",
+                shell_words::quote(login_bin.to_str().unwrap())
+            ),
+        );
+        memo.clear();
+        assert!(!agent_availability_snapshot(&[cursor]).contains("cursor"));
+        assert!(probe_agents_available(&[cursor]).contains("cursor"));
     }
 }

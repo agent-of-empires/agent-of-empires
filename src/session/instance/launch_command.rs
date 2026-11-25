@@ -921,7 +921,7 @@ impl Instance {
             return false;
         }
         crate::agents::get_agent(&self.tool)
-            .map(|a| self.command != a.binary)
+            .map(|a| !a.matches_binary(&self.command))
             .unwrap_or(true)
     }
 
@@ -944,7 +944,7 @@ impl Instance {
                     crate::plugin::bundled_agents::definitions()
                         .find(|agent| agent.name == self.tool)
                 })
-                .map(|a| a.binary)
+                .map(|a| a.resolved_binary())
                 .unwrap_or("bash"),
         )
     }

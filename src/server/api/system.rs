@@ -307,7 +307,7 @@ pub async fn list_agents(
                     display_name: crate::acp::display_name_for(a.name)
                         .unwrap_or(a.name)
                         .to_string(),
-                    binary: a.binary.to_string(),
+                    binary: a.resolved_binary().to_string(),
                     host_only: a.host_only,
                     always_yolo: crate::agents::is_always_yolo(a.name),
                     acp_always_yolo: crate::agents::is_always_yolo(a.name),

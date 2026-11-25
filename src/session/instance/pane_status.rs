@@ -196,9 +196,11 @@ fn pane_has_agent_content(raw_content: &str, tool: &str) -> bool {
     // false positives inside words like "api" or "pipeline".
     let mut tool_names = vec![tool.to_lowercase()];
     if let Some(agent) = crate::agents::get_agent(tool) {
-        let binary = agent.binary.to_lowercase();
-        if !tool_names.contains(&binary) {
-            tool_names.push(binary);
+        for candidate in agent.candidate_binaries() {
+            let binary = candidate.to_lowercase();
+            if !tool_names.contains(&binary) {
+                tool_names.push(binary);
+            }
         }
     }
     let lower = clean.to_lowercase();

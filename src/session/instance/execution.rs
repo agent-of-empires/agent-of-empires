@@ -1890,7 +1890,7 @@ impl Instance {
                 .iter()
                 .chain(crate::plugin::bundled_agents::definitions())
         };
-        let direct = retained().find(|agent| agent.binary == program);
+        let direct = retained().find(|agent| agent.matches_binary(program));
         let declared = config
             .agent_execution_as
             .get(tool)
@@ -1940,7 +1940,10 @@ impl Instance {
                 !AGENTS
                     .iter()
                     .chain(crate::plugin::bundled_agents::definitions())
-                    .any(|agent| Some(agent.binary) == basename && agent.name != actual.name),
+                    .any(|agent| {
+                        basename.is_some_and(|b| agent.matches_binary(b))
+                            && agent.name != actual.name
+                    }),
                 "wrapper command names a different native agent"
             );
             if !config.agent_config_dir.contains_key(tool) {
