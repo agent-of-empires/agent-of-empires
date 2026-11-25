@@ -162,10 +162,14 @@ pub(super) fn chord_matches(spec: (KeyCode, KeyModifiers), event: KeyEvent) -> b
 }
 
 /// Parse a comma-separated chord list (`"C-q,F12"`) into the pairs the exit check
-/// compares against. Invalid pieces are dropped with a warning so one typo doesn't
-/// disable the list, and an entirely unparseable string falls back to the default, so the
-/// user is never trapped in live mode.
+/// compares against. Invalid pieces are dropped so one typo doesn't disable the list, and
+/// an entirely unparseable string falls back to the default, so the user is never trapped
+/// in live mode. [`LiveSendChords::from_config`] reports what was dropped.
 pub(super) fn parse_chord_list(spec: &str) -> Vec<(KeyCode, KeyModifiers)> {
+    exit_chords(spec, &mut Vec::new())
+}
+
+fn exit_chords(spec: &str, problems: &mut Vec<String>) -> Vec<(KeyCode, KeyModifiers)> {
     let mut out = Vec::new();
     for piece in spec.split(',') {
         let trimmed = piece.trim();
@@ -174,19 +178,15 @@ pub(super) fn parse_chord_list(spec: &str) -> Vec<(KeyCode, KeyModifiers)> {
         }
         match parse_chord(trimmed) {
             Some(chord) => out.push(chord),
-            None => tracing::warn!(
-                "live-send: ignoring unparseable exit chord '{}' in '{}'",
-                trimmed,
-                spec
-            ),
+            None => problems.push(format!(
+                "ignoring unparseable exit chord '{trimmed}' in '{spec}'"
+            )),
         }
     }
     if out.is_empty() && spec != DEFAULT_EXIT_CHORD {
-        tracing::warn!(
-            "live-send: exit chord '{}' parsed to nothing; falling back to default '{}'",
-            spec,
-            DEFAULT_EXIT_CHORD
-        );
+        problems.push(format!(
+            "exit chord '{spec}' parsed to nothing; falling back to default '{DEFAULT_EXIT_CHORD}'"
+        ));
         return parse_chord_list(DEFAULT_EXIT_CHORD);
     }
     out
@@ -202,27 +202,37 @@ pub(super) struct LiveSendChords {
 }
 
 impl LiveSendChords {
+    /// The chords plus what was dropped or replaced while parsing them, without logging.
+    pub(super) fn parse(config: &crate::session::Config) -> (Self, Vec<String>) {
+        let mut problems = Vec::new();
+        let chords = Self {
+            exit: exit_chords(&config.session.live_send_exit_chord, &mut problems),
+            leader: leader_chord(&config.session.live_send_leader, &mut problems),
+        };
+        (chords, problems)
+    }
+
+    /// [`Self::parse`], logging its problems. For the paths that apply config.
     pub(super) fn from_config(config: &crate::session::Config) -> Self {
-        Self {
-            exit: parse_chord_list(&config.session.live_send_exit_chord),
-            leader: resolve_leader(&config.session.live_send_leader),
+        let (chords, problems) = Self::parse(config);
+        for problem in problems {
+            tracing::warn!(target: "tui.live_send", problem = %problem, "live-send chord config");
         }
+        chords
     }
 }
 
 /// The configured leader chord. An empty value disables it, so every key passes through;
 /// an unparseable value is treated as a typo and falls back to the default rather than
 /// silently dropping the feature, like the exit chord.
-pub(super) fn resolve_leader(spec: &str) -> Option<(KeyCode, KeyModifiers)> {
+fn leader_chord(spec: &str, problems: &mut Vec<String>) -> Option<(KeyCode, KeyModifiers)> {
     if spec.trim().is_empty() {
         return None;
     }
     parse_chord(spec).or_else(|| {
-        tracing::warn!(
-            "live-send: unparseable leader chord '{}'; falling back to default '{}'",
-            spec,
-            DEFAULT_LEADER
-        );
+        problems.push(format!(
+            "unparseable leader chord '{spec}'; falling back to default '{DEFAULT_LEADER}'"
+        ));
         parse_chord(DEFAULT_LEADER)
     })
 }

@@ -201,10 +201,20 @@ impl HomeView {
     }
 }
 
-/// Make the config's `[keybinds]` the active keymap, returning its warnings.
+/// Make the config's `[keybinds]` the active keymap, logging and returning its warnings.
+/// The only logging point: building the keymap is pure, since the settings page rebuilds
+/// it on every search keystroke.
 pub(super) fn install_keybinds(config: &crate::session::Config) -> Vec<String> {
     let (keymap, warnings) = super::keybinds::from_config(config);
     super::keybinds::install(keymap);
+    for w in &warnings {
+        tracing::warn!(
+            target: "tui.input",
+            action = %w.name,
+            reason = %w.reason,
+            "ignoring [keybinds] entry"
+        );
+    }
     warnings.iter().map(ToString::to_string).collect()
 }
 
@@ -290,6 +300,34 @@ mod tests {
         assert_eq!(view.live_send_chords.exit, exit("C-e"), "not yet applied");
         view.try_refresh_from_config_watcher().unwrap();
         assert_eq!(view.live_send_chords.exit, exit("C-r"));
+    }
+
+    /// Building the keymap is silent, so the settings page can rebuild it per search
+    /// keystroke; applying config logs each problem once, under its TUI area target.
+    #[test]
+    fn keybind_and_live_send_problems_log_only_when_applied() {
+        let mut config = crate::session::Config {
+            keybinds: [("bogus".to_string(), vec!["F2".to_string()])].into(),
+            ..Default::default()
+        };
+        config.session.live_send_leader = "Ctrl+".to_string();
+        let logs = crate::session::test_support::LogCapture::start();
+        let (_, warnings) = super::super::keybinds::describe(&config);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(logs.contents(), "", "the settings path never logs");
+
+        install_keybinds(&config);
+        live_send::LiveSendChords::from_config(&config);
+        let out = logs.contents();
+        assert_eq!(out.lines().count(), 2, "{out}");
+        assert!(
+            out.contains("tui.input") && out.contains("action=bogus"),
+            "{out}"
+        );
+        assert!(
+            out.contains("tui.live_send") && out.contains("unparseable leader"),
+            "{out}"
+        );
     }
 
     /// A bad `[keybinds]` entry is reported at startup and on interactive reloads, not

@@ -106,7 +106,7 @@ pub struct Reserved {
 impl Reserved {
     pub fn from_config(config: &crate::session::Config) -> Self {
         let to_chord = |(code, mods)| chord_from_parts(code, mods);
-        let live = super::live_send::LiveSendChords::from_config(config);
+        let (live, _) = super::live_send::LiveSendChords::parse(config);
         Self {
             leader: live.leader.map(to_chord),
             exit: live.exit.into_iter().map(to_chord).collect(),
@@ -302,12 +302,10 @@ pub fn build(
 }
 
 fn warn(warnings: &mut Vec<EntryWarning>, name: &str, reason: String) {
-    let warning = EntryWarning {
+    warnings.push(EntryWarning {
         name: name.to_string(),
         reason,
-    };
-    tracing::warn!(target: "tui.input", "{warning}");
-    warnings.push(warning);
+    });
 }
 
 fn binding(id: ActionId) -> &'static Binding {
