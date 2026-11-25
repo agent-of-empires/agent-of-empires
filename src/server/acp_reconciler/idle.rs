@@ -17,8 +17,8 @@ pub(super) const TERMINAL_REPAIR_INTERVAL: Duration = Duration::from_secs(30);
 const TERMINAL_REPAIR_GRACE_SECS: u32 = 60;
 
 /// Publishes the `Stopped` an agent-initiated turn never got, inferred from the
-/// adapter's end-of-turn marker being latest, never from silence alone. It
-/// only appends the event; it never stops or restarts a worker.
+/// adapter's end-of-turn marker being latest, never from silence alone. A turn
+/// that ended on the usage limit is parked instead, which stops its worker.
 pub(super) async fn repair_missing_terminal(state: &Arc<AppState>) {
     // `Waiting` is excluded: an approval is legitimately silent.
     let candidates: Vec<String> = {
@@ -65,11 +65,10 @@ pub(super) async fn repair_missing_terminal(state: &Arc<AppState>) {
                 s.has_open_tool_call_in_epoch(id),
                 !s.unresolved_approval_nonces(id).is_empty()
                     || !s.unresolved_elicitation_nonces(id).is_empty(),
-                s.agent_turn_sole_text(id),
             )
         })
         .await;
-        let Some((Some(latest), in_flight, open_tool, awaiting_user, sole_text)) = probe else {
+        let Some((Some(latest), in_flight, open_tool, awaiting_user)) = probe else {
             continue;
         };
         // Same condition as `acp_client`'s `LifecycleSignal::TerminalUsage`.
@@ -85,6 +84,14 @@ pub(super) async fn repair_missing_terminal(state: &Arc<AppState>) {
         {
             continue;
         }
+        let sole_text = query_store(
+            &state.acp_event_store,
+            &id,
+            "terminal-repair text",
+            |s, id| s.agent_turn_sole_text(id),
+        )
+        .await
+        .flatten();
         if let Some(info) = sole_text
             .as_deref()
             .and_then(crate::acp::state::RateLimitInfo::from_agent_text)
@@ -854,5 +861,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The production shape: a live worker is stopped, leaving a workerless
+    /// park for the reaper (#5990).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_repair_stops_the_worker_of_a_limited_agent_turn() {
+        let id = "acp-limited-live";
+        let (_home, state, _project) = super::super::test_fixtures::test_state(id);
+        state.instances.write().await[0].status = crate::session::Status::Running;
+        state.acp_supervisor.test_insert_worker(id).await;
+        let at_ms = Timestamp::now().as_millis() - 120_000;
+        let events = [
+            Event::Stopped {
+                reason: "prompt_complete".to_string(),
+            },
+            Event::AgentMessageChunk {
+                text: "You've hit your 5-hour limit · resets 10pm (America/New_York)".to_string(),
+                message_id: None,
+            },
+            Event::UsageUpdated {
+                usage: SessionUsage {
+                    used: 1,
+                    size: 10,
+                    cost: Some(UsageCost {
+                        amount: 0.1,
+                        currency: "USD".to_string(),
+                    }),
+                },
+            },
+        ];
+        for (idx, event) in events.iter().enumerate() {
+            state
+                .acp_event_store
+                .record_at(id, idx as u64 + 1, event, at_ms)
+                .unwrap();
+        }
+        let last_seq = events.len() as u64;
+        state
+            .acp_supervisor
+            .hydrate_seqs([(id.to_string(), last_seq)]);
+
+        repair_missing_terminal(&state).await;
+
+        assert!(!state.acp_supervisor.is_running(id).await);
+        // A test worker's stop publishes no closing events, so only the
+        // `RateLimit` lands here; a real worker's stop adds `rate_limited`.
+        let tail: Vec<&str> = state
+            .acp_event_store
+            .replay_from(id, last_seq)
+            .iter()
+            .map(|(_, e)| match e {
+                Event::RateLimit { .. } => "RateLimit",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(tail, ["RateLimit"]);
+        assert!(state.acp_event_store.rate_limit_park(id).is_some());
     }
 }

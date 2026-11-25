@@ -165,7 +165,7 @@ impl RateLimitInfo {
             .unwrap_or_default()
             .trim();
         let matched = (clause.starts_with("you've hit your ") && clause.ends_with(" limit"))
-            || clause.ends_with(" limit reached");
+            || clause.ends_with(" usage limit reached");
         matched.then(|| Self {
             status: text.to_string(),
             resets_at: None,
@@ -1738,7 +1738,7 @@ mod tests {
             ),
             ("You\u{2019}ve hit your weekly limit ∙ resets Nov 18, 12am", true),
             ("  You've hit your limit · resets 3pm\n", true),
-            ("5-hour limit reached ∙ resets 1am", true),
+            ("Context limit reached", false),
             ("Claude AI usage limit reached|1700000000", true),
             ("You've hit your limit on retries; trying another approach.", false),
             ("I fixed the rate limit handling.", false),
