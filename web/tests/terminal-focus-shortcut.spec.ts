@@ -86,6 +86,9 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await page.goto("/");
     await openSession(page);
 
+    // The terminal opens at the bottom; put it on the right so collapsing that dock hides it.
+    await page.getByLabel("Move pinch-test · 1 to right dock").click();
+    await page.getByTestId("pane-tab-terminal:pinch-test:0").click();
     await page.keyboard.press("ControlOrMeta+Alt+b");
     await expect(page.locator('[data-term="paired"]')).toHaveCount(0);
 

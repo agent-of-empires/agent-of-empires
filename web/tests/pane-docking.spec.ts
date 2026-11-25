@@ -13,6 +13,12 @@ async function openSession(page: Page) {
   await page.setViewportSize({ width: 1280, height: 720 });
 }
 
+/** The terminal opens in the bottom dock; these drags start from it beside Diff on the right. */
+async function terminalToRight(page: Page) {
+  await page.getByLabel("Move pinch-test · 1 to right dock").click();
+  await expect(page.getByTestId("bottom-dock-resize")).toHaveCount(0);
+}
+
 async function dockTabOrder(page: Page, dock: "right" | "bottom"): Promise<string[]> {
   return page.$$eval(`[data-pane-dock="${dock}"] [data-testid^="pane-tab-"]`, (els) =>
     els.map((el) => (el.getAttribute("data-testid") ?? "").replace("pane-tab-", "")),
@@ -144,6 +150,7 @@ test.describe("Dockable pane system", () => {
   test("dragging a tab reorders it within a dock and the order persists across reload", async ({ page }) => {
     await openSession(page);
     await page.goto(`/session/${SESSION}`);
+    await terminalToRight(page);
 
     await expect(page.getByTestId("pane-tab-diff")).toBeVisible();
     await expect(page.getByTestId("pane-tab-terminal:pinch-test:0")).toBeVisible();
@@ -172,6 +179,7 @@ test.describe("Dockable pane system", () => {
   test("dragging a tab onto the empty bottom dock opens it there", async ({ page }) => {
     await openSession(page);
     await page.goto(`/session/${SESSION}`);
+    await terminalToRight(page);
     await expect(page.getByTestId("bottom-dock-resize")).toHaveCount(0);
 
     await dragTab(page, "diff", { x: 640, y: 715 }, async () => {
@@ -189,7 +197,9 @@ test.describe("Dockable pane system", () => {
   test("a cross-dock drag shows an insertion marker and moves the pane", async ({ page }) => {
     await openSession(page);
     await page.goto(`/session/${SESSION}`);
+    await terminalToRight(page);
 
+    await page.getByTestId("pane-tab-diff").click();
     await page.getByLabel("Move diff to bottom dock").click();
     await expect(page.getByTestId("bottom-dock-resize")).toBeVisible();
     expect(await dockTabOrder(page, "right")).toEqual(["terminal:pinch-test:0"]);

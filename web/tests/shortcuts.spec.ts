@@ -86,17 +86,18 @@ test("Cmd/Ctrl+Alt+B toggles the right panel and Shift+D the diff pane on a sess
 
   const handle = page.locator('[data-testid="content-split-resize-handle"]');
   await expect(handle).toBeVisible();
-  // Nothing is saved until the layout changes; the defaults show both panes.
-  await expect(page.locator('[data-pane-dock="right"] [data-testid^="pane-tab-"]')).toHaveCount(2);
+  // Nothing is saved until the layout changes; the defaults show Diff on the right and the terminal below.
+  await expect(page.locator('[data-pane-dock="right"] [data-testid^="pane-tab-"]')).toHaveCount(1);
+  await expect(page.getByTestId(`pane-tab-terminal:${SESSION}:0`)).toBeVisible();
   expect(await rightDockState(page)).toBeNull();
 
   await page.keyboard.press("ControlOrMeta+Alt+b");
   await expect(handle).toBeHidden();
-  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", `terminal:${SESSION}:0`], collapsed: true });
+  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff"], collapsed: true });
 
   await page.keyboard.press("ControlOrMeta+Alt+b");
   await expect(handle).toBeVisible();
-  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", `terminal:${SESSION}:0`], collapsed: false });
+  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff"], collapsed: false });
 
   // Shift+D toggles the diff pane specifically (not the whole dock); the
   // activity-bar toggle's pressed state reflects whether diff is open.
