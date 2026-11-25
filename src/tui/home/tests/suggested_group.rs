@@ -256,6 +256,58 @@ fn clicking_the_pane_focuses_it_and_clicking_the_list_returns() {
     assert!(!env.view.suggestions_pane_shown());
 }
 
+/// Moves the keys back to the list and the cursor onto the Session above the row.
+fn leave_the_pane(env: &mut TestEnv) {
+    env.view.handle_key(key(KeyCode::Esc), None);
+    env.view.handle_key(key(KeyCode::Char('k')), None);
+    assert!(!env.view.suggestions_pane_shown());
+}
+
+/// A start answered after leaving the pane shows on the status line.
+#[test]
+#[serial]
+fn a_start_answered_after_leaving_the_pane_flashes_on_home() {
+    let (mut env, requests) = expanded_env(2);
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Enter), None);
+    });
+    assert_eq!(next_request(&requests), "start gh/i0");
+    leave_the_pane(&mut env);
+    poll_until(&mut env, |env| {
+        env.view
+            .status_flash_text()
+            .is_some_and(|text| text.contains("Started Prepared title"))
+    });
+}
+
+/// A prefill answered after leaving the pane does not open the dialog over Home.
+#[test]
+#[serial]
+fn a_prepare_answered_after_leaving_the_pane_opens_nothing() {
+    let (mut env, requests) = expanded_env(2);
+    terminal_view_config();
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Char('e')), None);
+    });
+    assert_eq!(next_request(&requests), "prepare gh/i0");
+    leave_the_pane(&mut env);
+    poll_until(&mut env, |env| {
+        pane_notice(env).is_some_and(|text| text.starts_with("Not opened"))
+    });
+    assert!(env.view.new_dialog.is_none());
+}
+
+/// A dialog that opens over the focused pane takes the keys first.
+#[test]
+#[serial]
+fn a_dialog_over_the_focused_pane_takes_the_keys() {
+    let (mut env, _requests) = expanded_env(2);
+    env.view.info_dialog = Some(crate::tui::dialogs::InfoDialog::new("Note", "hello"));
+    env.view.handle_key(key(KeyCode::Char('j')), None);
+    let view = env.view.suggestions_view.as_ref().unwrap();
+    assert_eq!(view.selected_key(), Some(("gh".into(), "i0".into())));
+}
+
 fn expanded_env(count: usize) -> (TestEnv, mpsc::Receiver<String>) {
     let started = StartAnswer::Started {
         session_id: "s-new".into(),

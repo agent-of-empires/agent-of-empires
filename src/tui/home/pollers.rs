@@ -118,7 +118,12 @@ impl HomeView {
             .as_mut()
             .and_then(SuggestionsView::take_prepared)
         {
-            self.start_suggestion(start);
+            // A dialog only opens over the pane that asked for it.
+            if self.suggestions_focused && !self.has_non_live_send_overlay() {
+                self.start_suggestion(start);
+            } else if let Some(view) = &mut self.suggestions_view {
+                view.set_notice("Not opened: you left the list. Press the key again.");
+            }
             changed = true;
         }
         if polled.changed {
@@ -139,10 +144,11 @@ impl HomeView {
 
     /// Shows what the daemon answered to a start, on the surface that asked.
     fn apply_start_answer(&mut self, key: (String, String), answer: StartAnswer) {
+        let shown = self.suggestions_pane_shown();
         let say = |this: &mut Self, message: String, error: bool| match &mut this.suggestions_view {
-            Some(view) if error => view.set_error(message),
-            Some(view) => view.set_notice(message),
-            None => this.flash_status(message),
+            Some(view) if shown && error => view.set_error(message),
+            Some(view) if shown => view.set_notice(message),
+            _ => this.flash_status(message),
         };
         match answer {
             StartAnswer::Started { session_id, title } => {
@@ -198,8 +204,11 @@ impl HomeView {
                 }
             }
             StartAnswer::Failed(reason) => match &mut self.suggestions_view {
-                Some(view) => view.set_failed(&mut self.suggestions_feed, key, reason),
-                None => self.flash_status(reason),
+                Some(view) if shown => view.set_failed(&mut self.suggestions_feed, key, reason),
+                _ => {
+                    self.flash_status(format!("Couldn't start: {reason}"));
+                    self.suggestions_feed.failed = Some((key, reason));
+                }
             },
         }
     }

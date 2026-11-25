@@ -89,6 +89,11 @@ impl HomeView {
         true
     }
 
+    /// The suggestions pane has the keys, so app-level keys such as `q` reach it.
+    pub(in crate::tui) fn suggestions_pane_focused(&self) -> bool {
+        self.suggestions_focused
+    }
+
     /// The preview pane shows the suggestions list.
     pub(super) fn suggestions_pane_shown(&self) -> bool {
         self.suggestions_view.is_some() && (self.suggestions_focused || self.on_suggested_row())

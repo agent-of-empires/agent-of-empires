@@ -2166,7 +2166,9 @@ impl App {
             return Ok(());
         }
         let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL;
-        if !ctrl_c && self.home.retained_reader_focused() && !self.home.has_non_live_send_overlay()
+        if !ctrl_c
+            && (self.home.retained_reader_focused() || self.home.suggestions_pane_focused())
+            && !self.home.has_non_live_send_overlay()
         {
             let _ = self.home.handle_key(key, self.update_info.as_ref());
             return Ok(());

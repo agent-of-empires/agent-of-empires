@@ -2300,11 +2300,11 @@ impl HomeView {
                 return None;
             }
         }
-        if let (Some(view), true, None, None) = (
+        let overlay = self.has_non_live_send_overlay();
+        if let (Some(view), true, false) = (
             &mut self.suggestions_view,
             self.suggestions_focused,
-            &self.command_palette,
-            &self.confirm_dialog,
+            overlay,
         ) {
             let block = self.session_feed.mutation_block();
             match view.handle_key(key, block, &mut self.suggestions_feed) {
