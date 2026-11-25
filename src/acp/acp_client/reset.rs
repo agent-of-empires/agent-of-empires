@@ -68,6 +68,8 @@ mod tests {
         /// Emitted right after the first `session/new`.
         initial_update: Option<serde_json::Value>,
         claude_home: Option<PathBuf>,
+        /// Profile key in place of the default fake `codex`.
+        agent_key: Option<&'static str>,
     }
 
     impl FakeAgent {
@@ -138,9 +140,13 @@ done
 
         async fn spawn(self, dir: &Path, name: &str, effort: Option<&str>) -> (AcpClient, PathBuf) {
             let claude_home = self.claude_home.clone();
+            let agent_key = self.agent_key;
             let (script, capture) = self.write(dir);
             let mut config = reset_fake_spawn_config(&script, dir);
             config.default_effort = effort.map(Into::into);
+            if let Some(key) = agent_key {
+                config.agent_key = key.into();
+            }
             if let Some(store) = claude_home {
                 config.agent_key = "claude".into();
                 config.tool = "claude".into();
@@ -1262,9 +1268,15 @@ done
             } else {
                 None
             };
+            // Only a profile without subagents tails a legacy launch.
+            let agent_key = (index == 1).then_some("opencode");
+            if let Some(key) = agent_key {
+                assert!(!crate::acp::agent_profiles::resolve(key).supports_subagents);
+            }
             let agent = FakeAgent {
                 initial_update: Some(initial_update),
                 claude_home,
+                agent_key,
                 ..FakeAgent::default()
             };
             let (mut client, capture) = agent.spawn(&dir, "reset-open-work", None).await;
