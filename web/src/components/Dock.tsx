@@ -5,7 +5,7 @@ import { SortableContext, horizontalListSortingStrategy, useSortable } from "@dn
 import { CSS } from "@dnd-kit/utilities";
 
 import { FileEditorPaneContext } from "../lib/fileEditGuard";
-import type { DockLocation } from "../lib/panes";
+import { isTerminalTabId, type DockLocation } from "../lib/panes";
 import { usePaneDnd, type PaneTabData, type SplitDropData } from "./paneDnd";
 import { PaneIcon } from "./PaneIcon";
 
@@ -186,6 +186,9 @@ export function Dock({
     dropTarget.group === groupIndex &&
     !isSourceGroup;
   const markerIndex = isDropTarget ? (dropTarget!.index ?? tabs.length) : null;
+  // Terminal controls belong to a group of terminals, and the dock-wide maximize to its first group.
+  const holdsTerminals = tabs.some(isTerminalTabId);
+  const showMaximize = maximize && groupIndex === 0;
 
   return (
     <section
@@ -229,7 +232,7 @@ export function Dock({
           >
             <MoveIcon className="size-3.5" aria-hidden />
           </button>
-          {maximize && (
+          {showMaximize && (
             <button
               type="button"
               onClick={maximize.onToggle}
@@ -246,8 +249,8 @@ export function Dock({
               )}
             </button>
           )}
-          {terminalSwitcher}
-          {onNewTerminal && (
+          {holdsTerminals && terminalSwitcher}
+          {holdsTerminals && onNewTerminal && (
             <button onClick={onNewTerminal} className={btn} title={newTerminalLabel} aria-label={newTerminalLabel}>
               <Plus className="size-3.5" aria-hidden />
             </button>
