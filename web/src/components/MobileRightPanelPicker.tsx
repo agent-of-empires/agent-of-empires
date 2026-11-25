@@ -32,7 +32,7 @@ interface Props {
 function Section({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div className="pt-2">
-      <div className="px-3 pb-1 text-[11px] font-mono uppercase tracking-wider text-text-dim">{label}</div>
+      <div className="px-3 pb-1 text-[12px] font-medium text-text-dim">{label}</div>
       <ul>{children}</ul>
     </div>
   );

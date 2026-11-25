@@ -46,7 +46,8 @@ export function SidebarNav({
           {!compact && (
             <>
               <span className="flex-1 text-left">Search</span>
-              <kbd className="font-mono text-[10px] text-text-dim">{searchKeys}</kbd>
+              {/* A shortcut means nothing on a touch screen. */}
+              <kbd className="font-mono text-[10px] text-text-dim pointer-coarse:hidden">{searchKeys}</kbd>
             </>
           )}
         </button>
