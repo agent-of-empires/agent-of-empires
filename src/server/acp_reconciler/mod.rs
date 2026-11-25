@@ -23,7 +23,7 @@ pub(crate) use rate_limit::ContinuationOutcome;
 #[cfg(test)]
 pub(crate) use rate_limit::{failover_in_flight, reap_rate_limit_resumes};
 pub(crate) use rate_limit::{failover_target, FailoverSettings};
-pub(crate) use resume::{trigger_resume_background, ResumeTrigger};
+pub(crate) use resume::{trigger_resume_background, trigger_resume_observing, ResumeTrigger};
 
 use resume::{resume_one, ResumeTarget};
 

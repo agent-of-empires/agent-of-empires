@@ -755,7 +755,7 @@ pub async fn update_session_archive(
             if !row.finish_lifecycle_status(LifecycleOperation::Stop, generation, status) {
                 return Err(LifecycleTargetError::Busy.into());
             }
-            if let Err(error) = &stopped { row.last_error = Some(error.to_string()); }
+            if let Err(error) = &stopped { row.last_error.set(error.to_string()); }
             Ok(())
         });
         if let Err(error) = finalized {
@@ -1034,7 +1034,7 @@ pub async fn trash_session(
                 let row = rows.iter_mut().find(|row| row.id == worker_id)
                     .ok_or(LifecycleTargetError::Missing)?;
                 row.status = Status::Error;
-                row.last_error = Some(error.to_string());
+                row.last_error.set(error.to_string());
             }
             Ok(())
         });
@@ -2106,7 +2106,7 @@ async fn stop_with_commit(
                 pi.apply(row);
             }
             if !stopped {
-                row.last_error = Some("Failed to stop session resources".into());
+                row.last_error.set("Failed to stop session resources");
             }
             Ok(())
         });
@@ -2536,7 +2536,7 @@ fn admit_restart(
     row.touch_last_accessed();
     row.idle_dormant_since = None;
     row.idle_entered_at = None;
-    row.last_error = None;
+    row.last_error.clear();
     row.last_error_check = None;
     row.status = Status::Starting;
     Ok(())
@@ -3900,7 +3900,7 @@ async fn prepare_agent_session_inner(
                 )?;
                 row.idle_dormant_since = None;
                 row.idle_entered_at = None;
-                row.last_error = None;
+                row.last_error.clear();
                 if row.is_structured() {
                     row.status = Status::Idle;
                     row.release_lifecycle_reservation_if_owned(
@@ -4672,7 +4672,7 @@ mod durable_stop_tests {
                     Status::Error
                 }
             );
-            assert!(current.last_error.as_ref().is_none_or(|message| {
+            assert!(current.last_error.as_deref().is_none_or(|message| {
                 !message.contains(source.to_str().unwrap())
                     && !message.contains("private-content")
                     && cause.as_ref().is_none_or(|cause| !message.contains(cause))
@@ -5098,7 +5098,11 @@ mod durable_stop_tests {
             let log = std::fs::read_to_string(&calls).unwrap_or_default();
             assert_eq!(
                 log.trim(),
-                if superseded { "" } else { "stop c1" },
+                if superseded {
+                    ""
+                } else {
+                    "inspect --format {{json .Config.Entrypoint}}|{{json .HostConfig.Init}}|{{json .Config.StopTimeout}}|{{json .State.Pid}} c1\nstop c1"
+                },
                 "superseded={superseded}"
             );
         }

@@ -4,6 +4,20 @@ import { ChevronUp } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 
 import type { ConfigOptionChoice, ConfigOptionDescriptor, AcpState } from "../../lib/acpTypes";
+import { useAgentDisplayNames } from "../../lib/agentDisplayName";
+import { loadSessionModelDefault, saveAgentModelDefault, type AgentModelDefault } from "../../lib/agentModelDefault";
+import { isImeComposing } from "../../lib/ime";
+import { REJECTED_ERROR, UNCERTAIN_ERROR } from "../../lib/settingsStore";
+import { toastBus } from "../../lib/toastBus";
+
+/** The Session whose next spawn's default the picker offers; the Daemon names the profile and Agent it saves under. */
+export interface ModelDefaultTarget {
+  sessionId: string;
+  /** The Agent the Session runs as now, so a switch reloads the default. */
+  agent: string;
+  /** Opens Settings › Structured view at the Agent defaults row. */
+  open: () => void;
+}
 
 interface Props {
   configOptions: AcpState["configOptions"];
@@ -17,6 +31,8 @@ interface Props {
   onSetProvider?: (provider: string) => void | Promise<void>;
   /** Why the provider cannot change right now, if it cannot. */
   providerLockedReason?: string | null;
+  /** Offers the picked model as the Agent's default; absent where Settings can't be written. */
+  modelDefault?: ModelDefaultTarget | null;
 }
 
 const MODEL_LABEL_MAX = 24;
@@ -77,6 +93,7 @@ export function SessionConfigControls({
   providerPending,
   onSetProvider,
   providerLockedReason,
+  modelDefault,
 }: Props) {
   const model = findByCategory(configOptions, "model");
   const effort = findByCategory(configOptions, "thought_level");
@@ -91,6 +108,7 @@ export function SessionConfigControls({
           option={model}
           pending={pendingConfigOption?.configId === model.id ? pendingConfigOption.value : null}
           onSelect={(value) => onSetConfigOption(model.id, value)}
+          modelDefault={modelDefault}
         />
       )}
       {effort && (
@@ -127,6 +145,7 @@ interface SubProps {
   onSelect: (value: string) => void | Promise<void>;
   /** Disables the trigger and explains why. */
   lockedReason?: string | null;
+  modelDefault?: ModelDefaultTarget | null;
 }
 
 interface MenuLayout {
@@ -157,7 +176,7 @@ function computeMenuLayout(rect: DOMRect, viewportHeight: number, viewportTop = 
   return { direction, maxHeight: Math.max(0, Math.min(MENU_MAX_HEIGHT_CAP, available)) };
 }
 
-function ModelDropdown({ option, pending, onSelect, lockedReason }: SubProps) {
+function ModelDropdown({ option, pending, onSelect, lockedReason, modelDefault }: SubProps) {
   const [open, setOpen] = useState(false);
   if (lockedReason && open) setOpen(false);
   const [query, setQuery] = useState("");
@@ -180,10 +199,9 @@ function ModelDropdown({ option, pending, onSelect, lockedReason }: SubProps) {
 
   const onMenuKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
     if (!searchable) return;
-    // Composition keys belong to the IME, not the menu. Safari ends the composition before the Enter that
-    // commits it, leaving isComposing false, so keyCode 229 is the only marker left on that event. Escape
-    // additionally has to be kept from the document listener below, which would close the picker.
-    if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) {
+    // Composition keys belong to the IME, not the menu. Escape additionally has to be kept from the
+    // document listener below, which would close the picker.
+    if (isImeComposing(e)) {
       if (e.key === "Escape") e.stopPropagation();
       return;
     }
@@ -195,7 +213,9 @@ function ModelDropdown({ option, pending, onSelect, lockedReason }: SubProps) {
       return;
     }
     const items = Array.from(
-      menuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)') ?? [],
+      menuRef.current?.querySelectorAll<HTMLButtonElement>(
+        '[role="menuitem"]:not(:disabled), [role="menuitemcheckbox"]',
+      ) ?? [],
     );
     const currentIndex = query.trim() ? -1 : items.findIndex((item) => item === currentOptionRef.current);
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
@@ -208,7 +228,10 @@ function ModelDropdown({ option, pending, onSelect, lockedReason }: SubProps) {
       items[next]?.scrollIntoView({ block: "nearest" });
     } else if (e.key === "Enter" && e.target instanceof HTMLInputElement) {
       e.preventDefault();
-      items[Math.max(0, currentIndex)]?.click();
+      // Only a model: with no match the default row would be the first item, and Enter would save it.
+      const models = items.filter((item) => !item.hasAttribute("data-model-default"));
+      const current = query.trim() ? -1 : models.findIndex((item) => item === currentOptionRef.current);
+      models[Math.max(0, current)]?.click();
     }
   };
 
@@ -361,10 +384,122 @@ function ModelDropdown({ option, pending, onSelect, lockedReason }: SubProps) {
                 </button>
               );
             })}
+            {modelDefault && (
+              <ModelDefaultItem
+                // A new Session or Agent starts from loading, not the last one's default.
+                key={`${modelDefault.sessionId}\0${modelDefault.agent}`}
+                target={modelDefault}
+                option={option}
+                onDone={(keyboard) => {
+                  if (keyboard) triggerRef.current?.focus({ preventScroll: true });
+                  setOpen(false);
+                }}
+              />
+            )}
           </div>
         </div>
       )}
     </div>
+  );
+}
+
+type DefaultState = { status: "loading" } | { status: "ready"; value: AgentModelDefault } | { status: "failed" };
+
+/** Below the models: makes the picked model the Agent's default, or says the default is pinned. */
+function ModelDefaultItem({
+  target,
+  option,
+  onDone,
+}: {
+  target: ModelDefaultTarget;
+  option: ConfigOptionDescriptor;
+  onDone: (keyboard: boolean) => void;
+}) {
+  const { sessionId, agent, open } = target;
+  const agentName = useAgentDisplayNames();
+  const [state, setState] = useState<DefaultState>({ status: "loading" });
+  useEffect(() => {
+    let alive = true;
+    loadSessionModelDefault(sessionId).then(
+      (value) => alive && setState(value ? { status: "ready", value } : { status: "failed" }),
+      () => alive && setState({ status: "failed" }),
+    );
+    return () => {
+      alive = false;
+    };
+  }, [sessionId, agent]);
+  // The Agent whose default changes, such as Cursor for an Agent detected as Cursor.
+  const agentLabel = agentName(state.status === "ready" ? state.value.agent_key : agent);
+
+  if (state.status === "failed") return null;
+  const itemClass =
+    "sticky bottom-0 flex w-full items-center gap-2 border-t border-surface-800 bg-surface-850 px-3 py-2 text-left text-[12px]";
+
+  if (state.status === "ready" && state.value.pinned) {
+    return (
+      <button
+        type="button"
+        role="menuitem"
+        data-model-default
+        onClick={(e) => {
+          onDone(e.detail === 0);
+          open();
+        }}
+        className={`${itemClass} text-text-secondary hover:bg-surface-800 hover:text-text-primary`}
+      >
+        Pinned in Agent defaults ›
+      </button>
+    );
+  }
+
+  const picked = option.current_value;
+  const checked = state.status === "ready" && state.value.model === picked;
+  const inert = checked || state.status === "loading";
+  const save = async () => {
+    if (state.status !== "ready") return;
+    const outcome = await saveAgentModelDefault(state.value.profile, state.value.agent_key, picked);
+    if (outcome === "committed") {
+      const name = option.options.find((o) => o.value === picked)?.name ?? picked;
+      toastBus.handler?.infoAction(
+        `${name} is now the default for new ${agentLabel} Sessions in Structured view`,
+        "Agent defaults ›",
+        open,
+      );
+    } else if (outcome === "pinned") {
+      // Pinned since the menu opened; the next open shows the pinned link.
+      toastBus.handler?.action(
+        `${agentLabel}'s model is pinned in Agent defaults. Nothing was changed.`,
+        "Agent defaults ›",
+        open,
+      );
+    } else {
+      toastBus.handler?.error(outcome === "rejected" ? REJECTED_ERROR : UNCERTAIN_ERROR);
+    }
+  };
+  return (
+    <button
+      type="button"
+      role="menuitemcheckbox"
+      data-model-default
+      aria-checked={checked}
+      aria-disabled={inert || undefined}
+      onClick={(e) => {
+        if (inert) return;
+        onDone(e.detail === 0);
+        void save();
+      }}
+      className={`${itemClass} ${inert ? "cursor-default text-text-dim" : "text-text-secondary hover:bg-surface-800 hover:text-text-primary"}`}
+    >
+      <span
+        aria-hidden
+        className={`inline-flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-[3px] border text-[10px] font-bold ${
+          checked ? "border-surface-600 bg-surface-700 text-text-secondary" : "border-text-dim"
+        }`}
+      >
+        {checked ? "✓" : ""}
+      </span>
+      Default for new {agentLabel} Sessions in Structured view
+    </button>
   );
 }
 

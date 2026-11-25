@@ -44,12 +44,8 @@ const RESUME_IDLE_GRACE_DEFAULT: Duration = Duration::from_secs(30);
 fn initial_reset_reason(
     stored: bool,
     load_session_capable: bool,
-    fork_requested: bool,
     prior_conversation: bool,
 ) -> Option<String> {
-    if fork_requested {
-        return None;
-    }
     if stored && !load_session_capable {
         return Some("session/load unavailable; started a new session with empty context".into());
     }
@@ -468,13 +464,6 @@ impl Session {
             self.shared.seed_user_replay.store(true, Ordering::Relaxed);
         }
         let fork_requested = fork_from.as_deref().is_some_and(|s| !s.is_empty());
-        // Lost resume context is announced only once a replacement succeeds.
-        let mut context_reset_reason = initial_reset_reason(
-            stored.is_some(),
-            load_session_capable,
-            fork_requested,
-            prior_conversation,
-        );
 
         if should_fork(fork_from.as_deref(), fork_capable) {
             // Never falls through to session/new, which would hand the user
@@ -516,13 +505,10 @@ impl Session {
                         parent_acp_id = %parent,
                         "session/fork failed; failing spawn (no session/new fallback): {e}"
                     );
-                    // Clears the one-shot fork marker so reattach does not
-                    // retry the failing fork forever.
-                    self.shared
-                        .emit(Event::SessionContextReset {
-                            reason: format!("fork_failed: {e}"),
-                        })
-                        .await;
+                    // No reset event: it would clear the pending fork, and the next
+                    // start would open an empty conversation in the fork row. A
+                    // startup failure is retried only under the reconciler's
+                    // respawn budget, as a fork the agent cannot run is.
                     Err(e)
                 }
             };
@@ -531,14 +517,17 @@ impl Session {
             warn!(
                 target: "acp.protocol",
                 session = %label,
-                "fork requested but agent does not advertise fork; falling back to session/new"
+                "fork requested but agent does not advertise fork; failing spawn (no session/new fallback)"
             );
-            self.shared
-                .emit(Event::SessionContextReset {
-                    reason: "fork_unsupported_by_agent".to_string(),
-                })
-                .await;
+            // No reset event, so the pending fork survives as a refused terminal
+            // fork's does and a restart cannot start the child empty.
+            return Err(acp_internal_error(
+                "Cannot fork: the agent does not advertise the ACP session/fork capability".into(),
+            ));
         }
+        // Lost resume context is announced only once a replacement succeeds.
+        let mut context_reset_reason =
+            initial_reset_reason(stored.is_some(), load_session_capable, prior_conversation);
 
         if let (true, Some(stored)) = (load_session_capable, stored) {
             info!(target: "acp.protocol", session = %label, stored_id = %stored, "resuming session via session/load");
@@ -609,9 +598,7 @@ impl Session {
                     self.shared
                         .suppress_history_replay
                         .store(false, Ordering::Relaxed);
-                    if !fork_requested {
-                        context_reset_reason = Some(load_failed_reason(prior_conversation, &e));
-                    }
+                    context_reset_reason = Some(load_failed_reason(prior_conversation, &e));
                 }
             }
         }
@@ -840,18 +827,17 @@ mod tests {
 
     #[test]
     fn reset_reasons_follow_prior_conversation() {
-        // (stored, load_capable, fork, prior) -> announced
-        for (stored, load, fork, prior, announced) in [
-            (false, true, false, true, true),
-            (false, true, false, false, false),
-            (false, true, true, true, false),
-            (true, false, false, false, true),
-            (true, true, false, true, false),
+        // (stored, load_capable, prior) -> announced
+        for (stored, load, prior, announced) in [
+            (false, true, true, true),
+            (false, true, false, false),
+            (true, false, false, true),
+            (true, true, true, false),
         ] {
             assert_eq!(
-                initial_reset_reason(stored, load, fork, prior).is_some(),
+                initial_reset_reason(stored, load, prior).is_some(),
                 announced,
-                "stored={stored} load={load} fork={fork} prior={prior}"
+                "stored={stored} load={load} prior={prior}"
             );
         }
         assert!(load_failed_reason(false, &"boom").starts_with(LOAD_FAILED_PREFIX));

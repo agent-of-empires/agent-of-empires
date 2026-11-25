@@ -1169,6 +1169,21 @@ pub struct SessionConfig {
     )]
     pub pre_trust_agent_folders: bool,
 
+    /// Require native OS sandbox enforcement for remote plugin staging. Disabled
+    /// by default; enabling requires native OS sandbox support and tools and fails
+    /// closed when unavailable. Default streamed byte, archive-entry, and source
+    /// snapshot accounting cannot hard-limit Git/helper filesystem writes.
+    #[serde(default)]
+    #[setting(
+        label = "Strict plugin staging",
+        widget = "toggle",
+        advanced,
+        global_only,
+        repo = "deny",
+        web = "elevation:changes the machine-wide plugin staging filesystem security boundary"
+    )]
+    pub plugin_staging_sandbox: bool,
+
     /// Show the compact system-health strip below the session list. It reports
     /// CPU, memory pressure, and running agent and process counts. Off by
     /// default; also toggleable from the command palette.
@@ -2045,9 +2060,10 @@ pub struct AcpAgentDefaults {
     /// agent runs on `model`: [`resolve_spawn_model_effort`] replaces any
     /// other value at creation and respawn, plugin `sessions.create` refuses
     /// one (`model_pinned`), and the plugin settings model picker offers only
-    /// the pin. A running session's live model switch is separate. Meaningless
-    /// without a non-empty `model`; global/profile only, like the rest of
-    /// `acp`.
+    /// the pin. A running session's live model switch is separate. Pins
+    /// nothing at spawn without a non-empty `model`, though the Agent default
+    /// model API still reports it as pinned and refuses to set a model;
+    /// global/profile only, like the rest of `acp`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pin_model: bool,
 
@@ -2133,13 +2149,21 @@ impl AcpConfig {
     }
 
     pub fn acp_defaults_for(&self, agent: &str) -> Option<&AcpAgentDefaults> {
-        let non_empty = |key: &str| self.acp_defaults.get(key).filter(|d| !d.is_empty());
-        non_empty(agent).or_else(|| {
-            // `claude-code` is the legacy alias stored by older session records.
-            (agent == "claude-code")
-                .then(|| non_empty("claude"))
-                .flatten()
-        })
+        self.acp_defaults
+            .get(self.acp_defaults_key_for(agent))
+            .filter(|d| !d.is_empty())
+    }
+
+    /// The `acp_defaults` key `agent` reads from, and so the one a write for it
+    /// changes: its own entry, or `claude` for the legacy `claude-code` alias
+    /// stored by older session records when only `claude` is set.
+    pub fn acp_defaults_key_for<'a>(&self, agent: &'a str) -> &'a str {
+        let set = |key: &str| self.acp_defaults.get(key).is_some_and(|d| !d.is_empty());
+        if agent == "claude-code" && !set(agent) && set("claude") {
+            "claude"
+        } else {
+            agent
+        }
     }
 
     /// The model `agent` is pinned to (`pin_model` with a non-empty `model`).
@@ -2331,6 +2355,7 @@ impl Default for SessionConfig {
             default_tool: None,
             yolo_mode_default: false,
             pre_trust_agent_folders: false,
+            plugin_staging_sandbox: false,
             show_diagnostics_pane: false,
             sidebar_position: SidebarPosition::default(),
             narrow_layout: NarrowLayout::default(),
@@ -2775,6 +2800,41 @@ pub struct WebConfig {
         summary = "Apps like Claude Code can list, create and send to your Sessions, read their output, wait on them and approve requests. Works when aoe serve uses the access link without a passphrase, or --auth none."
     )]
     pub mcp_enabled: bool,
+
+    /// Show the diff pane when a Session opens whose pane layout the user has
+    /// not changed in this browser.
+    #[serde(default)]
+    #[setting(
+        label = "Open the diff panel in Sessions",
+        widget = "toggle",
+        web_only,
+        global_only,
+        summary = "Show the changed files beside every Session you haven't arranged yourself."
+    )]
+    pub auto_open_diff_pane: bool,
+
+    /// Show a terminal pane when a Session opens whose pane layout the user
+    /// has not changed in this browser.
+    #[serde(default)]
+    #[setting(
+        label = "Open a terminal panel in Sessions",
+        widget = "toggle",
+        web_only,
+        global_only,
+        summary = "Show a shell beside every Session you haven't arranged yourself."
+    )]
+    pub auto_open_terminal_pane: bool,
+
+    /// Add panes contributed by installed plugins as tabs when they load.
+    #[serde(default)]
+    #[setting(
+        label = "Open plugin panels automatically",
+        widget = "toggle",
+        web_only,
+        global_only,
+        summary = "Add panes from installed plugins, such as the GitHub pull-request pane, as they load."
+    )]
+    pub auto_open_plugin_panes: bool,
 }
 
 impl Default for WebConfig {
@@ -2786,6 +2846,9 @@ impl Default for WebConfig {
             notify_on_error: true,
             notify_on_wake_fire: true,
             mcp_enabled: false,
+            auto_open_diff_pane: false,
+            auto_open_terminal_pane: false,
+            auto_open_plugin_panes: false,
         }
     }
 }
@@ -5453,19 +5516,28 @@ mod tests {
             pin_model: model.is_some(),
             ..Default::default()
         };
-        let cases: [(&[(&str, Option<&str>)], Option<&str>); 4] = [
-            (&[("claude", Some("canon"))], Some("canon")),
-            (&[("claude-code", Some("alias"))], Some("alias")),
+        // The key is where a write for `claude-code` lands, so it reads back.
+        type Entries<'a> = &'a [(&'a str, Option<&'a str>)];
+        let cases: [(Entries, Option<&str>, &str); 5] = [
+            (&[("claude", Some("canon"))], Some("canon"), "claude"),
+            (
+                &[("claude-code", Some("alias"))],
+                Some("alias"),
+                "claude-code",
+            ),
             (
                 &[("claude", Some("canon")), ("claude-code", Some("alias"))],
                 Some("alias"),
+                "claude-code",
             ),
             (
                 &[("claude", Some("canon")), ("claude-code", None)],
                 Some("canon"),
+                "claude",
             ),
+            (&[], None, "claude-code"),
         ];
-        for (entries, want) in cases {
+        for (entries, want, key) in cases {
             let mut config = AcpConfig::default();
             for (key, model) in entries {
                 config.acp_defaults.insert(key.to_string(), entry(*model));
@@ -5482,6 +5554,12 @@ mod tests {
                 want,
                 "{entries:?}"
             );
+            assert_eq!(
+                config.acp_defaults_key_for("claude-code"),
+                key,
+                "{entries:?}"
+            );
+            assert_eq!(config.acp_defaults_key_for("codex"), "codex", "{entries:?}");
         }
     }
 

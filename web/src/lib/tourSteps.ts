@@ -1,5 +1,6 @@
 // Engine-independent tour steps. Attach anchors only via `tourAnchor()` so the drift guard in tourSteps.test.ts catches renames.
 
+import type { InstallHint } from "./platform";
 import type { ShortcutId } from "./shortcuts";
 
 /** Values land in the DOM as `data-tour`; keep them on stable region containers. */
@@ -9,7 +10,7 @@ export const TOUR_ANCHORS = {
   sidebar: "sidebar",
   sidebarSettings: "sidebar-settings",
   dashboardNewSession: "dashboard-new-session",
-  rightPanel: "right-panel",
+  diffToggle: "diff-toggle",
   composer: "acp-composer",
   modePicker: "acp-mode-picker",
   queueSend: "acp-queue-send",
@@ -36,7 +37,45 @@ export interface TourStep {
   shortcutHints?: readonly TourShortcutHint[];
   writableOnly?: boolean;
   desktopOnly?: boolean;
+  /** Adds the install and notifications steps when the page is a phone's browser tab. */
+  installHint?: true;
 }
+
+/** One platform's notification steps, shared by the install banner, Settings › Notifications and the tour. */
+export interface InstallSteps {
+  /** The banner's text after "Get notifications on this device." For `push`, Settings › Notifications is its link. */
+  banner: { path?: string; text: string };
+  /** The steps Settings › Notifications lists; `push` has none, since its Enable button is the step. */
+  settings: readonly string[];
+  /** The tour's last-step line. */
+  tour: string;
+}
+
+export const INSTALL_STEPS: Record<InstallHint, InstallSteps> = {
+  ios: {
+    banner: { path: "Share › Add to Home Screen", text: "Open AoE, sign in, and turn them on in Settings." },
+    settings: [
+      "Tap Share › Add to Home Screen.",
+      "Open AoE from your Home Screen and sign in.",
+      "Come back here and tap Enable notifications.",
+    ],
+    tour: "For notifications, tap Share › Add to Home Screen, open AoE, sign in, and turn them on in Settings.",
+  },
+  push: {
+    banner: { text: "Turn them on in Settings › Notifications." },
+    settings: [],
+    tour: "For notifications, turn them on in Settings › Notifications.",
+  },
+  other: {
+    banner: { text: "Install AoE from your browser's menu. Open AoE, sign in, and turn them on in Settings." },
+    settings: [
+      "Install AoE from your browser's menu.",
+      "Open AoE and sign in.",
+      "Come back here and tap Enable notifications.",
+    ],
+    tour: "For notifications, install AoE from your browser's menu, open it, sign in, and turn them on in Settings.",
+  },
+};
 
 /** Skips inert retained views, whose hidden anchors would otherwise match first and end the tour. */
 export function tourSelector(anchor: TourAnchorId): string {
@@ -89,10 +128,10 @@ export const TOUR_STEPS: readonly TourStep[] = [
   },
   {
     id: "right-panel",
-    anchor: TOUR_ANCHORS.rightPanel,
+    anchor: TOUR_ANCHORS.diffToggle,
     scopes: ["session", "structured-view"],
     title: "Diff and review",
-    body: "Review the agent's file changes and send comments back without leaving the session.",
+    body: "Open the diff here to review the agent's file changes and send comments back without leaving the session.",
     shortcutHints: [
       { id: "diff", verb: "toggles the diff" },
       { id: "rightPanel", verb: "toggles the panel" },
@@ -126,6 +165,7 @@ export const TOUR_STEPS: readonly TourStep[] = [
     scopes: ["dashboard", "session", "structured-view"],
     title: "Replay this tour any time",
     body: "Reopen this walkthrough whenever you like from here: More, then Show tutorial.",
+    installHint: true,
   },
 ] as const;
 

@@ -5056,6 +5056,154 @@ async fn list_sessions_flags_only_terminal_sessions_when_structured_view_is_off(
     assert_eq!(off, [("svo-terminal", true), ("svo-structured", false)]);
 }
 
+/// A structured `fork_from` runs the agent of the row that recorded the
+/// conversation, since the TUI and web forks send only the parent's tool.
+#[test]
+fn a_structured_fork_runs_the_parents_agent() {
+    let row = |tool: &str, agent_name: Option<&str>, acp: &str| {
+        let mut inst = make_test_instance();
+        inst.tool = tool.into();
+        inst.agent_name = agent_name.map(Into::into);
+        inst.acp_session_id = Some(acp.into());
+        inst.source_profile = "work".into();
+        inst
+    };
+    let rows = [
+        row("claude-acct", None, "tool-only"),
+        row("claude", Some("claude-acct"), "named"),
+        row("claude", None, "builtin"),
+        row("claude", None, "ambiguous"),
+        row("claude", Some("claude-acct"), "ambiguous"),
+        row("claude", Some("claude-acct"), "ambiguous-reversed"),
+        row("claude", None, "ambiguous-reversed"),
+        row("claude-acct", None, "tool-first"),
+        row("claude", Some("claude-acct"), "tool-first"),
+        row("claude", Some("claude-acct"), "named-first"),
+        row("claude-acct", None, "named-first"),
+    ];
+    let ok = |agent: Option<&str>| Ok(agent.map(str::to_string));
+    for (parent, tool, agent_name, want) in [
+        ("tool-only", "claude-acct", None, ok(None)),
+        ("named", "claude", None, ok(Some("claude-acct"))),
+        (
+            "named",
+            "claude",
+            Some("claude-acct"),
+            ok(Some("claude-acct")),
+        ),
+        ("named", "claude", Some("claude"), Err(())),
+        // Naming the parent's agent as the tool runs that same agent.
+        ("named", "claude-acct", None, ok(None)),
+        ("builtin", "claude", None, ok(None)),
+        ("builtin", "claude-acct", None, Err(())),
+        ("ambiguous", "claude", None, Err(())),
+        ("ambiguous-reversed", "claude", None, Err(())),
+        // Rows agreeing on the agent resolve the same in either order.
+        ("tool-first", "claude", None, ok(Some("claude-acct"))),
+        ("named-first", "claude", None, ok(Some("claude-acct"))),
+        ("tool-first", "claude-acct", None, ok(None)),
+        ("named-first", "claude-acct", None, ok(None)),
+        ("unrecorded", "claude", Some("x"), ok(Some("x"))),
+    ] {
+        assert_eq!(
+            create::structured_fork_agent_name(&rows, parent, "work", tool, agent_name)
+                .map_err(|_| ()),
+            want,
+            "{parent} / {tool} / {agent_name:?}"
+        );
+    }
+    // Two profiles can share a custom alias with different commands and stores,
+    // so only a built-in parent forks into another profile.
+    for (parent, tool) in [("tool-only", "claude-acct"), ("named", "claude")] {
+        let refused = create::structured_fork_agent_name(&rows, parent, "home", tool, None);
+        assert!(
+            refused.is_err_and(|message| message.contains("profile")),
+            "{parent}"
+        );
+    }
+    assert_eq!(
+        create::structured_fork_agent_name(&rows, "builtin", "home", "claude", None),
+        Ok(None)
+    );
+}
+
+/// Both fork routes hold a custom parent to its own agent and profile: two
+/// profiles can share an alias that launches different commands and stores.
+#[tokio::test]
+#[serial_test::serial]
+async fn create_holds_a_structured_fork_to_the_parents_agent_and_profile() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_config(|c| {
+        c.session
+            .agent_acp_cmd
+            .insert("claude-acct".into(), "/state/acct-acp.sh".into());
+        c.session
+            .agent_execution_as
+            .insert("claude-acct".into(), "claude".into());
+        c.session
+            .agent_config_dir
+            .insert("claude-acct".into(), "~/.claude-acct".into());
+    })
+    .unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let acp_id = "11111111-1111-4111-8111-111111111111";
+    let mut parent = make_test_instance();
+    parent.source_profile = "work".into();
+    parent.tool = "claude".into();
+    parent.agent_name = Some("claude-acct".into());
+    parent.view = crate::session::View::Structured;
+    parent.acp_session_id = Some(acp_id.into());
+    let parent_id = parent.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![parent]);
+
+    // `fork_from`, from the served "test" profile.
+    for (agent_name, refusal) in [
+        ("claude", "the agent of the session it forks"),
+        ("claude-acct", "the profile of the session it forks"),
+    ] {
+        let response = create::create_session(
+            State(state.clone()),
+            axum::extract::Query(create::CreateSessionQuery { wait: None }),
+            None,
+            None,
+            axum::http::HeaderMap::new(),
+            Ok(Json(create_body_from_json(serde_json::json!({
+                "path": project.path(), "tool": "claude", "agent_name": agent_name,
+                "view": "structured", "fork_from": acp_id,
+            })))),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{agent_name}");
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains(refusal), "{agent_name}: {body}");
+    }
+
+    // `fork_session_id`.
+    let body = |profile: &str| {
+        create_body_from_json(serde_json::json!({
+            "path": project.path(), "profile": profile, "tool": "claude",
+            "agent_name": "claude-acct", "view": "structured",
+        }))
+    };
+    let refusal = create::resolve_canonical_fork_seed(&state, &body("test"), &parent_id)
+        .await
+        .unwrap_err();
+    assert_eq!(refusal.status(), StatusCode::CONFLICT);
+    let seed = create::resolve_canonical_fork_seed(&state, &body("work"), &parent_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        seed,
+        crate::session::ForkSeed::Structured {
+            parent_acp_session_id: acp_id.into(),
+        }
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn list_sessions_judges_custom_agent_capability_by_the_agent_name() {
@@ -5065,6 +5213,15 @@ async fn list_sessions_judges_custom_agent_capability_by_the_agent_name() {
         c.session
             .agent_acp_cmd
             .insert("acp-helper".into(), "acp-helper --acp".into());
+        c.session
+            .agent_acp_cmd
+            .insert("claude-acct".into(), "/state/acct-acp.sh".into());
+        c.session
+            .agent_execution_as
+            .insert("claude-acct".into(), "claude".into());
+        c.session
+            .agent_config_dir
+            .insert("claude-acct".into(), "~/.claude-acct".into());
     })
     .unwrap();
 
@@ -5079,6 +5236,7 @@ async fn list_sessions_judges_custom_agent_capability_by_the_agent_name() {
     let state = crate::server::test_support::build_test_app_state(vec![
         mk("named-agent", Some("acp-helper")),
         mk("tool-only", None),
+        mk("claude-wrapper", Some("claude-acct")),
     ]);
 
     let response = list_sessions(
@@ -5095,9 +5253,16 @@ async fn list_sessions_judges_custom_agent_capability_by_the_agent_name() {
     let capable: Vec<_> = envelope
         .sessions
         .iter()
-        .map(|s| (s.id.as_str(), s.acp_capable))
+        .map(|s| (s.id.as_str(), s.acp_capable, s.acp_can_fork))
         .collect();
-    assert_eq!(capable, [("named-agent", true), ("tool-only", false)]);
+    assert_eq!(
+        capable,
+        [
+            ("named-agent", true, false),
+            ("tool-only", false, false),
+            ("claude-wrapper", true, true),
+        ]
+    );
 }
 
 /// The list advertises the solo commands of the agent that classifies the session's prompts:
@@ -7617,7 +7782,7 @@ async fn failed_delete_notifies_plugins_of_the_error() {
                     .find(|row| row.id == "sess-delete-error")
                     .unwrap();
                 row.status = Status::Error;
-                row.last_error = Some("boom".into());
+                row.last_error.set("boom");
                 Ok(())
             })
             .unwrap();
@@ -14275,6 +14440,94 @@ async fn create_with_a_parent_joins_its_group_one_level_deep() {
             state
                 .acp_event_store
                 .replay_from(id, 0)
+                .iter()
+                .any(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
+        })
+        .await;
+    }
+}
+
+/// A structured spawn starts on the default its Session route reports, so a detect-as Session
+/// starts on its base's default and never on an entry saved under its own name.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_structured_spawn_starts_on_the_default_its_session_route_reports() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    crate::session::config::update_config(|config| {
+        config
+            .session
+            .custom_agents
+            .insert("corp-claude".into(), "claude".into());
+        config
+            .session
+            .agent_detect_as
+            .insert("corp-claude".into(), "claude".into());
+        config.acp.acp_defaults = serde_json::from_value(serde_json::json!({
+            "claude": {"model": "base"},
+            "corp-claude": {"model": "never-read"},
+        }))
+        .unwrap();
+    })
+    .unwrap();
+    crate::session::Storage::new_unwatched("test").unwrap();
+    let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+    let state = crate::server::test_support::build_test_app_state_impl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |_| {},
+        |supervisor| supervisor.with_launcher(launcher),
+    );
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+    for tool in ["claude", "corp-claude"] {
+        let (status, session) = post_create(
+            &state,
+            serde_json::json!({
+                "title": tool, "path": "", "tool": tool, "scratch": true,
+                "view": "structured", "profile": "test",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{tool}: {session}");
+        let id = session["id"].as_str().unwrap().to_string();
+        let row = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id)
+            .cloned()
+            .unwrap();
+        assert_eq!(row.view, crate::session::View::Structured, "{tool}");
+        let resp = crate::server::api::get_session_agent_default_model(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(id.clone()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "{tool}");
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["agent_key"], "claude", "{tool}");
+        assert_eq!(body["model"], "base", "{tool}");
+        assert_eq!(row.agent_model.as_deref(), Some("base"), "{tool}");
+        wait_for("launcher-rejected startup", || {
+            state
+                .acp_event_store
+                .replay_from(&id, 0)
                 .iter()
                 .any(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
         })

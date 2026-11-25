@@ -305,6 +305,7 @@ function RowModals({
       <SessionGroupModal
         sessionTitle={model.sessionTitle || label}
         currentGroup={model.firstSession?.group_path ?? ""}
+        profile={model.firstSession?.profile}
         onSave={async (group) => {
           if (!sessionId) return false;
           const mutation = await updateSessionGroup(sessionId, group);

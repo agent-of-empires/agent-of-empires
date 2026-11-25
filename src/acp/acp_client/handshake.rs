@@ -13,9 +13,9 @@ use tracing::warn;
 use super::errors::AcpError;
 use crate::acp::agent_profiles::AgentProfile;
 
-/// A fork needs both a requested parent and the agent's fork capability;
-/// otherwise the normal new/load handshake runs, which surfaces an unfulfilled
-/// fork as an empty session rather than corrupting the parent.
+/// A fork needs both a requested parent and the agent's fork capability. A
+/// requested fork the agent cannot run fails the spawn rather than starting an
+/// empty session the user would take for a fork.
 pub(crate) fn should_fork(fork_from: Option<&str>, agent_advertises_fork: bool) -> bool {
     fork_from.is_some_and(|s| !s.is_empty()) && agent_advertises_fork
 }

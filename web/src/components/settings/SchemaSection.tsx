@@ -26,8 +26,8 @@ interface Props {
   /** A settings-search jump: scroll to and highlight the field, opening Advanced if needed. */
   focusRequest?: { section: string; field: string; nonce: number } | null;
   /** CityHall curation: an allowlist and a denylist of field names. */
-  onlyFields?: string[];
-  hideFields?: string[];
+  onlyFields?: readonly string[];
+  hideFields?: readonly string[];
   /** The setup wizard shows rows without their config keys. */
   hideKeys?: boolean;
 }

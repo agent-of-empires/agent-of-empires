@@ -1,6 +1,7 @@
 import { useId, useState, type ReactNode } from "react";
 
 import { rowInputProps, type RowLabel } from "./rowLabel";
+import { isImeComposing } from "../../lib/ime";
 
 const CONTROL = "w-full bg-surface-900 border border-surface-700 rounded-md px-3 py-2 text-sm text-text-primary";
 const FOCUS = "focus:border-brand-600 focus:outline-none";
@@ -201,7 +202,7 @@ export function TextField({
           {...rowInputProps(row)}
           {...draft.props}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
+            if (e.key === "Enter" && !isImeComposing(e) && !e.shiftKey) {
               e.preventDefault();
               draft.commit();
             }
@@ -216,7 +217,7 @@ export function TextField({
           {...rowInputProps(row)}
           {...draft.props}
           onKeyDown={(e) => {
-            if (e.key === "Enter") draft.commit();
+            if (e.key === "Enter" && !isImeComposing(e)) draft.commit();
           }}
           placeholder={placeholder}
           className={cls}
@@ -291,7 +292,7 @@ export function NumberField({
         {...rowInputProps(row)}
         {...draft.props}
         onKeyDown={(e) => {
-          if (e.key === "Enter") draft.commit();
+          if (e.key === "Enter" && !isImeComposing(e)) draft.commit();
         }}
         min={min}
         max={max}
@@ -428,8 +429,7 @@ export function ListField({
             setError(null);
           }}
           onKeyDown={(e) => {
-            // Safari ends a composition with isComposing already false and keyCode 229.
-            if (e.key === "Enter" && !e.nativeEvent.isComposing && e.keyCode !== 229) submit();
+            if (e.key === "Enter" && !isImeComposing(e)) submit();
             if (e.key === "Escape") cancel();
           }}
           placeholder={placeholder}

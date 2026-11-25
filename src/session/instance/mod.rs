@@ -54,6 +54,7 @@ pub(crate) use hooks::HostHookApprovalRequired;
 pub(crate) use status_update::CAPTURE_FAILED_RULE;
 mod identity_sidecar;
 mod kill;
+mod last_error;
 mod launch_command;
 mod prime_capture;
 
@@ -91,6 +92,8 @@ pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservati
 
 #[cfg(test)]
 pub(crate) use identity_sidecar::FAIL_PI_PATH_WRITES;
+pub use last_error::LastError;
+pub(crate) use last_error::TmuxAbsence;
 pub use polling::PollerStart;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome, SessionGone};
 pub use resume::ManagedResumeCause;
@@ -103,6 +106,10 @@ pub(crate) use sid_persist::{
 };
 pub use start::{LaunchSidOutcome, StartOutcome};
 pub(crate) use status::PassiveStatusPatch;
+pub(crate) use status::{
+    reports_tmux_session_gone, REFUSED_RESTART, TMUX_SERVER_UNREACHABLE_LEAD,
+    TMUX_SESSION_GONE_LEAD,
+};
 pub use status::{Status, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR};
 pub(crate) use terminal::ToolLaunchUnavailable;
 #[cfg(test)]
@@ -177,9 +184,11 @@ use launch_command::{
     splice_subcommand_or_append, PreparedLaunch,
 };
 use omp::{gate_omp_launch, wrap_omp_host_launch, wrap_omp_launch};
-use pane_status::{resolve_detected_status, summarize_error_from_pane};
+use pane_status::{pane_error_line, resolve_detected_status, summarize_error_from_pane};
 
-use status::{UNKNOWN_ERROR_WINDOW_CONFIRMED_PRESENT, UNKNOWN_ERROR_WINDOW_NEVER_PRESENT};
+use status::{
+    HANDOFF_ENDED, UNKNOWN_ERROR_WINDOW_CONFIRMED_PRESENT, UNKNOWN_ERROR_WINDOW_NEVER_PRESENT,
+};
 use tmux_session::tmux_env_session_name_for_instance_id;
 use types::{deserialize_session_id, is_zero_u64, is_zero_u8};
 
@@ -217,6 +226,9 @@ pub struct DetectionState {
     /// flipped parked sessions between Idle and Running every few seconds.
     pub pending: Option<Status>,
     pub observation_key: Option<tmux::ObservationKey>,
+    /// Whether the last verdict was an Error for a pane that ended, so a poll that reuses it can
+    /// still reconcile the remedy a refused restart needs.
+    pub ended: bool,
 }
 
 /// A turn queued for delivery once the (resumed) worker is live. See
@@ -1088,7 +1100,7 @@ pub struct Instance {
     pub(crate) pi_session_path: Option<String>,
 
     #[serde(skip)]
-    pub last_error: Option<String>,
+    pub last_error: LastError,
     #[serde(skip)]
     pub(crate) capture_poller: capture_slot::CapturePollerSlot,
     /// Session IDs invalidated at a fresh-generation boundary. Persisting this

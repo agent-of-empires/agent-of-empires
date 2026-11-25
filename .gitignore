@@ -1,5 +1,6 @@
-# Claude artifacts
-.claude/
+# Claude artifacts, except repo-level skills
+.claude/*
+!.claude/skills/
 # Rust build artifacts
 /target/
 # JS / Python tooling artifacts (per-subproject installs in web/, website/, etc.)

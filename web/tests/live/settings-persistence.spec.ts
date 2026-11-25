@@ -400,7 +400,7 @@ test("global settings migrate from profiles and reject stale profile writes", as
   expect(persisted.session.sidebar_position).toBe("right");
 });
 
-test("Terminal UI toggles default on, save off, and persist across reload and restart", async ({ serve, page }) => {
+test("Session machine-wide and Terminal UI toggles persist across reload and restart", async ({ serve, page }) => {
   const profile = await defaultProfile(serve);
   const settingsUrl = `${serve.baseUrl}/api/settings`;
   const machineUrl = `${settingsUrl}?layer=machine`;
@@ -409,6 +409,7 @@ test("Terminal UI toggles default on, save off, and persist across reload and re
   const toggle = (field: string) => page.locator(`[data-settings-field="session.${field}"]`).getByRole("switch");
   const shortcutBar = toggle("show_shortcut_bar");
   const structuredBadge = toggle("show_structured_badge");
+  const strictStaging = toggle("plugin_staging_sandbox");
   const saveToggle = async (locator: Locator) => {
     const [saved] = await Promise.all([
       page.waitForResponse(
@@ -420,6 +421,25 @@ test("Terminal UI toggles default on, save off, and persist across reload and re
   };
 
   await page.goto(`${serve.baseUrl}/settings/session`);
+  await page.getByRole("button", { name: /Advanced/ }).click();
+  await expect(strictStaging).not.toBeChecked();
+  await saveToggle(strictStaging);
+  expect((await getJson(machineUrl)).session.plugin_staging_sandbox).toBe(true);
+  expect((await getJson(effectiveUrl)).session.plugin_staging_sandbox).toBe(true);
+  expect((await getJson(profileUrl)).session?.plugin_staging_sandbox).toBeUndefined();
+  const stagingOverride = await fetch(profileUrl, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session: { plugin_staging_sandbox: false } }),
+  });
+  expect(stagingOverride.status).toBe(400);
+  const invalidStaging = await fetch(settingsUrl, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session: { plugin_staging_sandbox: "true" } }),
+  });
+  expect(invalidStaging.status).toBe(400);
+  expect((await getJson(machineUrl)).session.plugin_staging_sandbox).toBe(true);
   await page.getByRole("button", { name: /Terminal UI/ }).click();
   await expect(shortcutBar).toBeChecked();
   await expect(structuredBadge).toBeChecked();
@@ -443,6 +463,13 @@ test("Terminal UI toggles default on, save off, and persist across reload and re
 
   await serve.restart();
   await page.reload();
+  await page.getByRole("button", { name: /Advanced/ }).click();
+  await expect(strictStaging).toBeChecked();
+  await saveToggle(strictStaging);
+  expect((await getJson(machineUrl)).session.plugin_staging_sandbox).toBe(false);
+  await page.reload();
+  await page.getByRole("button", { name: /Advanced/ }).click();
+  await expect(strictStaging).not.toBeChecked();
   await page.getByRole("button", { name: /Terminal UI/ }).click();
   await expect(shortcutBar).not.toBeChecked();
   await expect(structuredBadge).not.toBeChecked();

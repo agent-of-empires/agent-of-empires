@@ -520,6 +520,12 @@ pub(crate) async fn start_server(
     crate::process::systemd::mark_daemon();
     raise_fd_limit();
 
+    if !read_only {
+        if let Err(error) = crate::plugin::install::recover_stale_publication() {
+            tracing::warn!(target: "plugin.install", %error, "plugin publication recovery is fenced");
+        }
+    }
+
     // Single live `FileWatchService` per daemon.
     let file_watch = FileWatchService::new().unwrap_or_else(|e| {
         tracing::warn!(

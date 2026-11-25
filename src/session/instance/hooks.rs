@@ -2070,7 +2070,7 @@ mod tests {
                 let stored = storage.load().unwrap().remove(0);
                 assert!(stored.ensure_startable() == Err(want), "{label}");
                 assert_eq!(stored.lifecycle_reservation, None, "{label}");
-                assert_eq!(stored.last_error, None, "{label}");
+                assert_eq!(stored.last_error.as_deref(), None, "{label}");
                 let parked = if restart {
                     Status::Idle
                 } else {

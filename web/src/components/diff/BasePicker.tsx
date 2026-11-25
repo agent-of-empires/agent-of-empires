@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { fetchBranches, setSessionDiffBase, type BranchInfo } from "../../lib/api";
+import { isImeComposing } from "../../lib/ime";
 
 interface BasePickerProps {
   sessionId: string;
@@ -90,7 +91,7 @@ export function BasePicker({ sessionId, repoPath, currentBase, hasOverride, repo
               } else if (e.key === "ArrowUp") {
                 e.preventDefault();
                 setHighlightIdx((i) => Math.max(i - 1, 0));
-              } else if (e.key === "Enter") {
+              } else if (e.key === "Enter" && !isImeComposing(e)) {
                 e.preventDefault();
                 const pick = suggestions[highlightIdx];
                 if (pick) void apply(pick.name);

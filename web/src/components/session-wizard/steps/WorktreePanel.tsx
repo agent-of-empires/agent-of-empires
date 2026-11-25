@@ -4,6 +4,7 @@ import { useBranchSuggestions } from "./branchSuggestions";
 import { ToggleRow } from "./Toggle";
 import type { WizardData } from "../wizardReducer";
 import { hasFinePointer } from "../../../lib/platform";
+import { isImeComposing } from "../../../lib/ime";
 
 interface Props {
   data: WizardData;
@@ -150,7 +151,7 @@ function BaseBranchPicker({ data, onChange }: { data: WizardData; onChange: (fie
             } else if (e.key === "ArrowUp") {
               e.preventDefault();
               setHighlightIdx((i) => Math.max(i - 1, 0));
-            } else if (e.key === "Enter" && suggestions[highlightIdx]) {
+            } else if (e.key === "Enter" && !isImeComposing(e) && suggestions[highlightIdx]) {
               e.preventDefault();
               choose(suggestions[highlightIdx].name);
             } else if (e.key === "Escape") {
