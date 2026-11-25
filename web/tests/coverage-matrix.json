@@ -2571,7 +2571,7 @@
       "kind": "mocked-playwright",
       "risk": "low",
       "specs": ["tests/sidebar-chrome.spec.ts"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/SidebarNav.tsx"]
     },
     {
       "id": "sidebar.reorder-stationary-click",
