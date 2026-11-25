@@ -3,6 +3,7 @@ import { fetchBranches, type BranchInfo } from "../../../lib/api";
 import { hasFinePointer } from "../../../lib/platform";
 import { ProjectSearchList } from "./ProjectSearchList";
 import { useProjectPicker } from "./projectPicker";
+import { isImeComposing } from "../../../lib/ime";
 
 interface Props {
   profile: string | undefined;
@@ -239,7 +240,7 @@ export function ExtraReposPicker({
           onChange={(e) => setFreeText(e.target.value)}
           ref={pathRef}
           onKeyDown={(e) => {
-            if (e.key === "Enter") {
+            if (e.key === "Enter" && !isImeComposing(e)) {
               e.preventDefault();
               addFreeText();
             }

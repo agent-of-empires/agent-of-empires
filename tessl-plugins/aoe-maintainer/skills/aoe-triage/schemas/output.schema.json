@@ -1,0 +1,151 @@
+{
+  "type": "object",
+  "required": [
+    "mode",
+    "dryRun",
+    "projectFields",
+    "alreadyTriaged",
+    "issues",
+    "skipped"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": [
+        "issue",
+        "sweep"
+      ]
+    },
+    "dryRun": {
+      "type": "boolean"
+    },
+    "projectFields": {
+      "description": "written: at least one board field was written. planned: the board was reachable and fields were needed, but DRY_RUN made no writes. failed: the board was reachable but every needed write failed with a non-permission error or was skipped after an incomplete board read, recorded in each issue's error. unavailable: the token could not read or write the board, so only labels were set. not_needed: no worked issue needed a board field.",
+      "type": "string",
+      "enum": [
+        "written",
+        "planned",
+        "failed",
+        "unavailable",
+        "not_needed"
+      ]
+    },
+    "projectError": {
+      "description": "The exact error from the failed board call, when projectFields is unavailable.",
+      "type": "string"
+    },
+    "alreadyTriaged": {
+      "description": "Count of open issues checked and found fully triaged.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "issues": {
+      "description": "Every issue this run wrote to, or would write to in a dry run.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "number",
+          "outcome",
+          "labelsAdded",
+          "labelsRemoved",
+          "comment"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "number": {
+            "type": "integer"
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "triaged",
+              "planned",
+              "needs_info",
+              "duplicate",
+              "failed"
+            ]
+          },
+          "labelsAdded": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "labelsRemoved": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "project": {
+            "description": "Board fields set, or planned in a dry run. Absent when none were.",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "Status": {
+                "type": "string"
+              },
+              "Priority": {
+                "type": "string"
+              },
+              "Size": {
+                "type": "string"
+              },
+              "Roadmap state": {
+                "type": "string"
+              }
+            }
+          },
+          "comment": {
+            "type": "string",
+            "enum": [
+              "none",
+              "needs_info",
+              "duplicate"
+            ]
+          },
+          "duplicateOf": {
+            "type": "integer"
+          },
+          "flags": {
+            "description": "Existing fields that look wrong, left for a maintainer.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "error": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "skipped": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "number",
+          "reason"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "number": {
+            "type": "integer"
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "waiting_on_reporter",
+              "over_cap",
+              "not_open_issue"
+            ]
+          }
+        }
+      },
+      "description": "Issues that need triage but were not worked this run."
+    }
+  }
+}

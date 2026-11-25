@@ -5,13 +5,17 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 vi.mock("../../lib/snippetHighlighter", () => ({
+  peekHighlight: vi.fn((): string | undefined => undefined),
   highlightSnippet: vi.fn().mockResolvedValue(null),
   getSnippetHighlighter: vi.fn().mockResolvedValue(null),
   langHintForPath: () => "",
 }));
 
+const { shikiThemeRef } = vi.hoisted(() => ({
+  shikiThemeRef: { current: { theme: "dark-plus", appearance: "dark" } },
+}));
 vi.mock("../../hooks/useShikiTheme", () => ({
-  useShikiTheme: () => ({ theme: "dark-plus", appearance: "dark" }),
+  useShikiTheme: () => shikiThemeRef.current,
 }));
 
 vi.mock("../../lib/clipboard", () => ({ writeClipboard: vi.fn().mockResolvedValue(true) }));
@@ -33,7 +37,7 @@ import {
   type ToolOutputBlock,
 } from "../../lib/acpTypes";
 import { writeClipboard } from "../../lib/clipboard";
-import { highlightSnippet } from "../../lib/snippetHighlighter";
+import { highlightSnippet, peekHighlight } from "../../lib/snippetHighlighter";
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
 import { buildSkillIndex, type SkillIndex } from "../../lib/skillProvenance";
@@ -467,7 +471,7 @@ describe("ToolCard expanded bodies", () => {
     const { getByTestId, toggle } = renderCard(tool);
     toggle();
     const body = getByTestId("memory-recall-synthesized");
-    expect(body.querySelector("img")?.getAttribute("onerror")).toBeNull();
+    expect(body.querySelector("img")).toBeNull();
     expect(body.innerHTML).not.toContain("onerror");
     expect(body.innerHTML).not.toContain("javascript:");
   });
@@ -1336,6 +1340,9 @@ describe("HighlightedBlock stale-content transitions (#3974)", () => {
   afterEach(() => {
     vi.mocked(highlightSnippet).mockReset();
     vi.mocked(highlightSnippet).mockResolvedValue(null);
+    vi.mocked(peekHighlight).mockReset();
+    vi.mocked(peekHighlight).mockReturnValue(undefined);
+    shikiThemeRef.current = { theme: "dark-plus", appearance: "dark" };
   });
 
   const readCard = (path: string, body: string) =>
@@ -1345,6 +1352,33 @@ describe("HighlightedBlock stale-content transitions (#3974)", () => {
         result={makeCompletion({ text: body })}
       />,
     );
+
+  it("keeps a mount-time cache hit while an uncached theme is pending", async () => {
+    vi.mocked(peekHighlight).mockImplementation((_code, opts) =>
+      opts?.theme === "dark-plus" ? '<pre class="shiki">theme A</pre>' : undefined,
+    );
+    const pending = Promise.withResolvers<string | null>();
+    const started = Promise.withResolvers<void>();
+    vi.mocked(highlightSnippet).mockImplementationOnce(() => {
+      started.resolve();
+      return pending.promise;
+    });
+
+    const { container, rerender } = render(readCard("/tmp/a.rs", "fn main() {}"));
+    fireEvent.click(container.querySelector("button")!);
+    expect(container.textContent).toContain("theme A");
+
+    shikiThemeRef.current = { theme: "light-plus", appearance: "light" };
+    rerender(readCard("/tmp/a.rs", "fn main() {}"));
+    await started.promise;
+    expect(container.textContent).toContain("theme A");
+
+    pending.resolve('<pre class="shiki">theme B</pre>');
+    await waitFor(() => {
+      expect(container.textContent).toContain("theme B");
+    });
+    expect(container.textContent).not.toContain("theme A");
+  });
 
   it("clears highlighted output when a reused read card's file becomes extensionless", async () => {
     vi.mocked(highlightSnippet).mockResolvedValueOnce('<pre class="shiki">highlighted rust</pre>');

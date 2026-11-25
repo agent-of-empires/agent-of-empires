@@ -1,0 +1,14 @@
+{
+  "name": "New code does not split a doc comment from its item",
+  "instruction": "An added Rust item goes above an existing doc comment block, never between that doc comment and the item it documents.",
+  "relevant_when": "A Rust patch has a hunk where an unchanged /// doc comment line is directly followed by added lines that start a new item (a function, test, attribute such as #[test], struct, enum, impl, const, static, type or module).",
+  "context": "Rust attaches /// lines to the next item, so inserting an item between a doc comment and the item it describes moves that documentation onto the new item and leaves the original undocumented. No compiler or clippy lint catches it. Not violations: a new item placed above the existing doc block, with or without its own new doc comment; a doc comment that the same patch edits or moves together with its item; added lines that continue the documented item itself, such as attributes or a body edit of that item.",
+  "scope": "diff",
+  "scope_reason": "The defect is visible only in a hunk: unchanged doc comment context followed by added item lines.",
+  "checklist": [
+    {
+      "name": "doc-comment-not-displaced",
+      "rule": "No hunk shows an unchanged /// doc comment immediately followed by added lines that start a different item, while the item the comment describes (by name, or by behavior its text names) follows those added lines. Not applicable when no added item starts directly below an unchanged doc comment."
+    }
+  ]
+}

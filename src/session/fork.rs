@@ -174,7 +174,8 @@ fn builtin_acp_registry() -> &'static crate::acp::AgentRegistry {
 }
 
 /// True when `tool`/`agent_name` can run the structured ACP `session/fork` handshake: it maps to a
-/// built-in ACP adapter AND that adapter is verified to implement ACP `session/fork`.
+/// built-in ACP adapter AND that adapter is verified to implement ACP `session/fork`. A custom
+/// agent needs its config, so [`custom_structured_fork_capable`] answers for it.
 ///
 /// Whether an agent can fork does not depend on which generation is installed,
 /// so these two predicates read the descriptor directly instead of probing the
@@ -190,6 +191,68 @@ pub fn structured_fork_capable(tool: &str, agent_name: Option<&str>) -> bool {
             }
             strategy => matches!(strategy, ForkStrategy::ClaudeFork),
         })
+}
+
+/// True when a custom agent's own `agent_acp_cmd` can run `session/fork`: the
+/// wrapper declares the `agent_execution_as` and `agent_config_dir` contract for
+/// a native agent whose adapter forks. `agent_detect_as` proves nothing about
+/// what the command runs, and a registry name never launches its
+/// `agent_acp_cmd`, so neither qualifies.
+pub fn custom_structured_fork_capable(
+    tool: &str,
+    agent_name: Option<&str>,
+    session: &crate::session::config::SessionConfig,
+) -> bool {
+    let resolved = agent_name.filter(|s| !s.is_empty()).unwrap_or(tool);
+    builtin_acp_registry().get(resolved).is_none()
+        && session
+            .agent_acp_cmd
+            .get(resolved)
+            .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(resolved, cmd).is_ok())
+        && session
+            .agent_config_dir
+            .get(resolved)
+            .is_some_and(|dir| crate::session::config::is_resolvable_agent_config_dir(dir))
+        && session
+            .agent_execution_as
+            .get(resolved)
+            .is_some_and(|base| structured_fork_capable(base, None))
+}
+
+/// Whether a structured fork of a parent running `tool`/`agent_name` in
+/// `parent_profile` may run in `profile`. A built-in launches the same adapter
+/// everywhere, but a custom agent launches what its profile declares, and a
+/// repository cannot override those keys, so the profile fixes its command and
+/// store.
+pub fn structured_fork_profile_compatible(
+    tool: &str,
+    agent_name: Option<&str>,
+    parent_profile: &str,
+    profile: &str,
+) -> bool {
+    structured_fork_capable(tool, agent_name)
+        || crate::session::config::effective_profile(parent_profile)
+            == crate::session::config::effective_profile(profile)
+}
+
+/// Whether the agent can run a structured fork for `profile` and the project at
+/// `project_path`, reading config only when the agent is not a built-in.
+pub fn structured_fork_capable_in(
+    profile: &str,
+    project_path: &std::path::Path,
+    tool: &str,
+    agent_name: Option<&str>,
+) -> bool {
+    structured_fork_capable(tool, agent_name)
+        || custom_structured_fork_capable(
+            tool,
+            agent_name,
+            &crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                profile,
+                project_path,
+            )
+            .session,
+        )
 }
 
 /// Whether a canonical native agent supports terminal forking. An agent that
@@ -443,6 +506,118 @@ mod tests {
         assert!(!structured_fork_capable("pi", None));
         assert!(!structured_fork_capable("custom", Some("pi")));
         assert!(structured_fork_capable("claude", None));
+    }
+
+    /// A custom agent forks through its own adapter only when it declares the
+    /// execution contract for a native agent whose adapter forks.
+    #[test]
+    fn a_custom_agent_forks_structured_only_under_a_forking_execution_contract() {
+        let mut session = crate::session::config::SessionConfig::default();
+        for (name, acp_cmd, execution_as, config_dir) in [
+            (
+                "claude-acct",
+                Some("/state/wrappers/acct-acp.sh"),
+                Some("claude"),
+                Some("~/.claude-acct"),
+            ),
+            (
+                "codex-acct",
+                Some("/state/wrappers/codex-acp.sh"),
+                Some("codex"),
+                Some("~/.codex-acct"),
+            ),
+            ("no-acp-cmd", None, Some("claude"), Some("~/.a")),
+            (
+                "bad-acp-cmd",
+                Some("'unterminated"),
+                Some("claude"),
+                Some("~/.a"),
+            ),
+            ("no-config-dir", Some("wrapper-acp"), Some("claude"), None),
+            // The launcher ignores a directory it cannot resolve.
+            (
+                "empty-config-dir",
+                Some("wrapper-acp"),
+                Some("claude"),
+                Some(""),
+            ),
+            (
+                "relative-config-dir",
+                Some("wrapper-acp"),
+                Some("claude"),
+                Some(".claude-acct"),
+            ),
+            ("detect-only", Some("wrapper-acp"), None, Some("~/.a")),
+            ("pi", Some("wrapper-acp"), Some("claude"), Some("~/.a")),
+        ] {
+            if let Some(cmd) = acp_cmd {
+                session.agent_acp_cmd.insert(name.into(), cmd.into());
+            }
+            if let Some(base) = execution_as {
+                session.agent_execution_as.insert(name.into(), base.into());
+            }
+            if let Some(dir) = config_dir {
+                session.agent_config_dir.insert(name.into(), dir.into());
+            }
+            session.agent_detect_as.insert(name.into(), "claude".into());
+        }
+        let cases = [
+            ("claude-acct", None, true),
+            ("plain-tool", Some("claude-acct"), true),
+            ("claude-acct", Some(""), true),
+            ("codex-acct", None, false),
+            ("no-acp-cmd", None, false),
+            ("bad-acp-cmd", None, false),
+            ("no-config-dir", None, false),
+            ("empty-config-dir", None, false),
+            ("relative-config-dir", None, false),
+            ("detect-only", None, false),
+            // A registry name launches the registry adapter, never its acp cmd.
+            ("pi", None, false),
+            ("claude", None, false),
+        ];
+        for (tool, agent_name, capable) in cases {
+            assert_eq!(
+                custom_structured_fork_capable(tool, agent_name, &session),
+                capable,
+                "{tool} / {agent_name:?}"
+            );
+        }
+        assert!(!structured_fork_capable("claude-acct", None));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn structured_fork_capable_in_reads_the_custom_agent_from_config() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let path = std::path::Path::new("/nonexistent");
+        assert!(structured_fork_capable_in("default", path, "claude", None));
+        assert!(!structured_fork_capable_in("default", path, "pi", None));
+        assert!(!structured_fork_capable_in(
+            "default",
+            path,
+            "claude-acct",
+            None
+        ));
+        crate::session::config::update_config(|config| {
+            let session = &mut config.session;
+            session
+                .agent_acp_cmd
+                .insert("claude-acct".into(), "/state/wrappers/acct-acp.sh".into());
+            session
+                .agent_execution_as
+                .insert("claude-acct".into(), "claude".into());
+            session
+                .agent_config_dir
+                .insert("claude-acct".into(), "~/.claude-acct".into());
+        })
+        .unwrap();
+        assert!(structured_fork_capable_in(
+            "default",
+            path,
+            "claude-acct",
+            None
+        ));
     }
 
     /// A binding a migration left unattributed forks when the row's own agent

@@ -134,13 +134,13 @@ describe("MobileMainPane", () => {
     expect(screen.getByTestId("paired-shell")).toBeDefined();
   });
 
-  it("passes the active session to the agents and files panes", () => {
+  it("passes the active session to the agents and files panes", async () => {
     for (const [view, testId] of [
       ["agents", "background-agents-panel"],
       ["files", "files-pane"],
     ] as const) {
       setup({ view, activeSessionId: "s1" });
-      expect(screen.getByTestId(testId).textContent).toBe("s1");
+      expect((await screen.findByTestId(testId)).textContent).toBe("s1");
       expect(screen.getByTestId("mobile-back-to-agent")).toBeDefined();
       cleanup();
     }
@@ -153,12 +153,12 @@ describe("MobileMainPane", () => {
     cleanup();
   });
 
-  it("shows the diff list, or the viewer when a file is selected", () => {
+  it("shows the diff list, or the viewer when a file is selected", async () => {
     setup({ view: "diff" });
     expect(screen.getByTestId("diff-list")).toBeDefined();
     cleanup();
     setup({ view: "diff", selectedFilePath: "src/foo.ts" });
-    expect(screen.getByTestId("diff-viewer")).toBeDefined();
+    expect(await screen.findByTestId("diff-viewer")).toBeDefined();
     expect(screen.queryByTestId("diff-list")).toBeNull();
   });
 
@@ -191,16 +191,16 @@ describe("MobileMainPane", () => {
     expect(screen.getByTestId("comments-banner")).toBeDefined();
   });
 
-  it("renders the send dialog when open", () => {
+  it("renders the send dialog when open", async () => {
     setup({
       view: "diff",
       commentsEnabled: true,
       sendDialogOpen: true,
     });
-    expect(screen.getByTestId("send-dialog")).toBeDefined();
+    expect(await screen.findByTestId("send-dialog")).toBeDefined();
   });
 
-  it("on send clears comments + drafts, closes dialog and file, and returns only terminal sessions to agent", () => {
+  it("on send clears comments + drafts, closes dialog and file, and returns only terminal sessions to agent", async () => {
     for (const [view, returnsToAgent] of [
       ["structured", false],
       ["terminal", true],
@@ -217,7 +217,7 @@ describe("MobileMainPane", () => {
         onCloseSendDialog,
         onClearSelectedFile,
       });
-      fireEvent.click(screen.getByTestId("send-dialog"));
+      fireEvent.click(await screen.findByTestId("send-dialog"));
       expect(store.clearComments).toHaveBeenCalled();
       expect(store.setIntroDraft).toHaveBeenCalledWith("");
       expect(onCloseSendDialog).toHaveBeenCalled();
@@ -227,7 +227,7 @@ describe("MobileMainPane", () => {
     }
   });
 
-  it("keeps comments when clearAfterSend is off while closing the dialog", () => {
+  it("keeps comments when clearAfterSend is off while closing the dialog", async () => {
     const onCloseSendDialog = vi.fn();
     const store = makeStore({ clearAfterSend: false });
     setup({
@@ -237,7 +237,7 @@ describe("MobileMainPane", () => {
       diffComments: store,
       onCloseSendDialog,
     });
-    fireEvent.click(screen.getByTestId("send-dialog"));
+    fireEvent.click(await screen.findByTestId("send-dialog"));
     expect(store.clearComments).not.toHaveBeenCalled();
     expect(onCloseSendDialog).toHaveBeenCalled();
   });

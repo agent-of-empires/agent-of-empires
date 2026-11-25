@@ -160,7 +160,6 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/reclaim-ownership",
             post(api::reclaim_session_ownership).layer(read_only.clone()),
         )
-        .route("/api/sessions/{id}/color", patch(api::update_session_color))
         .route(
             "/api/sessions/{id}/archive",
             patch(api::update_session_archive),

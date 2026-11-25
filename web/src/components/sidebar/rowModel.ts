@@ -10,13 +10,6 @@ import {
 } from "../../lib/sidebarOptimistic";
 import { resolveActionTargets } from "./sessionActionTargets";
 
-/** Mirrors the Rust `SESSION_COLORS` list. */
-export const SESSION_COLOR_OPTIONS: { key: string; label: string; dotClass: string }[] = [
-  { key: "red", label: "Red · needs attention", dotClass: "bg-red-500" },
-  { key: "amber", label: "Amber · working", dotClass: "bg-amber-400" },
-  { key: "green", label: "Green · done", dotClass: "bg-green-500" },
-];
-
 export type NotifyPreset = "off" | "default" | "all";
 
 /** Mixed per-event overrides read as "default", which resets them cleanly when picked. */
@@ -73,7 +66,6 @@ export function deriveRowModel(
   const branchLabel = workspace.branch ?? null;
   const label =
     sessions.length === 1 ? sessionTitle || branchLabel || "default" : branchLabel || sessionTitle || "default";
-  const sessionColor = sessions.map((s) => s.color).find((c) => c != null) ?? null;
   const isPinned = sessions.some((s) => s.pinned_at != null);
   const isArchived = sessions.some((s) => s.archived_at != null);
   const snoozedUntil = sessions.find((s) => s.snoozed_until)?.snoozed_until ?? null;
@@ -109,8 +101,6 @@ export function deriveRowModel(
       idleDecayWindowMs,
     ),
     isFavorited: sessions.some((s) => s.favorited),
-    sessionColor,
-    sessionColorDot: SESSION_COLOR_OPTIONS.find((o) => o.key === sessionColor)?.dotClass ?? null,
     isPinned,
     isArchived,
     effectivePinned: effectivePinnedOf(optimistic, isPinned),

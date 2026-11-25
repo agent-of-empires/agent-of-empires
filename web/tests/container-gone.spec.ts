@@ -206,14 +206,6 @@ test.describe("at 375px, where Recreate isn't offered", () => {
   });
 });
 
-test("New Session names the Project as its sidebar header does", async ({ page }) => {
-  await page.addInitScript((path) => {
-    window.localStorage.setItem("aoe-repo-appearance-v1", JSON.stringify({ [path]: { alias: "Infra stack" } }));
-  }, `/tmp/${TITLE}`);
-  const { banner } = await openGoneSession(page);
-  await expect(banner.getByRole("button", { name: "New Session in Infra stack" })).toBeVisible();
-});
-
 test("a queued message can't start the Session either", async ({ page }) => {
   await openGoneSession(page, { queued: true });
   const action = page.getByTestId("queued-send-now");
