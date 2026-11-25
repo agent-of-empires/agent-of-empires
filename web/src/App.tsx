@@ -25,6 +25,7 @@ import { CloseOnEscape } from "./components/diff/comments/CloseOnEscape";
 import { useSessions } from "./hooks/useSessions";
 import { useAttentionCounts } from "./hooks/useAttentionCounts";
 import { useStatusSounds } from "./hooks/useStatusSounds";
+import { onSoundBlocked } from "./lib/soundPlayer";
 import { useSessionStatusStream } from "./hooks/useSessionStatusStream";
 import { useDashboardPresence } from "./hooks/useDashboardPresence";
 import { useWizardReopen } from "./hooks/app/useWizardReopen";
@@ -539,6 +540,10 @@ function AppContent({
     [cancelCue, applyPushedStatus],
   );
   useSessionStatusStream({ onStatus: onPushedStatus, onSoundDue, onResync: refreshSessions });
+  useEffect(
+    () => onSoundBlocked(() => createToasts(focusMode)?.info("Click anywhere on this page to turn on sounds.")),
+    [focusMode],
+  );
   const attentionBadgeColors = useMemo(() => getAttentionBadgeColors(resolvedTheme), [resolvedTheme]);
 
   // Remember the active session and restore it on a PWA relaunch (#2103). A focus window is not the main window.

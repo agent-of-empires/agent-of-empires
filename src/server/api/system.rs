@@ -3032,58 +3032,21 @@ pub async fn update_profile_settings(
 
 // --- Sounds ---
 
-pub async fn list_sounds() -> Json<Vec<String>> {
-    Json(crate::sound::list_available_sounds())
-}
-
-/// Serve a sound file by name so the acp's browser-side approval
-/// player can fetch it from the same origin as the dashboard. The name
-/// is validated against `list_available_sounds()` to block path
-/// traversal: an attacker who can hit `/api/sounds/file/<x>` cannot
-/// read arbitrary disk paths, only files already present in the user's
-/// `sounds/` directory.
-pub async fn serve_sound_file(
-    axum::extract::Path(name): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    // `list_available_sounds` does a sync `read_dir`, so validation stays on
-    // the blocking pool; the file read uses `tokio::fs::read`.
-    let lookup_name = name.clone();
-    let validated = tokio::task::spawn_blocking(move || {
-        if !crate::sound::list_available_sounds().contains(&lookup_name) {
-            return None;
-        }
-        crate::sound::get_sounds_dir().map(|dir| dir.join(&lookup_name))
-    })
-    .await;
-
-    let path = match validated {
-        Ok(Some(p)) => p,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+/// `GET /api/sounds/{event}`: a built-in sound for the dashboard to play. The
+/// bytes are fixed per build, so the browser may cache them.
+pub async fn serve_sound(
+    axum::extract::Path(event): axum::extract::Path<String>,
+) -> axum::response::Response {
+    let Some(event) = crate::sound::SoundEvent::parse(&event) else {
+        return StatusCode::NOT_FOUND.into_response();
     };
-
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(b) => b,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
-    };
-
-    let content_type = match std::path::Path::new(&name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("ogg") => "audio/ogg",
-        _ => "audio/wav",
-    };
-
     (
         StatusCode::OK,
         [
-            (axum::http::header::CONTENT_TYPE, content_type),
-            (axum::http::header::CACHE_CONTROL, "private, max-age=3600"),
+            (axum::http::header::CONTENT_TYPE, "audio/wav"),
+            (axum::http::header::CACHE_CONTROL, "private, max-age=86400"),
         ],
-        bytes,
+        event.wav(),
     )
         .into_response()
 }
@@ -4651,24 +4614,18 @@ command = "zzzeta"
     }
 
     #[tokio::test]
-    async fn serve_sound_file_rejects_unknown_name() {
-        let resp = serve_sound_file(axum::extract::Path("does-not-exist-xyz.wav".to_string()))
-            .await
-            .into_response();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
+    async fn serve_sound_serves_events_and_refuses_anything_else() {
+        let resp = serve_sound(axum::extract::Path("idle".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(&body[..], crate::sound::SoundEvent::Idle.wav());
 
-    #[tokio::test]
-    async fn serve_sound_file_rejects_path_traversal() {
-        let resp = serve_sound_file(axum::extract::Path("../../../etc/passwd".to_string()))
-            .await
-            .into_response();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        // A NOT_FOUND that somehow still streamed a body would be a
-        // worse failure than the wrong status, so assert the body is
-        // empty rather than just "not /etc/passwd".
-        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
-        assert!(body.is_empty(), "unexpected body bytes: {body:?}");
+        for name in ["idle.wav", "../../../etc/passwd", "IDLE "] {
+            let resp = serve_sound(axum::extract::Path(name.to_string())).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{name}");
+            let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+            assert!(body.is_empty(), "{name}: unexpected body bytes");
+        }
     }
     /// A PATCH whose connection dropped can commit after the client's newer edit of the
     /// same leaf; the stamp makes the server drop it instead of restoring the old value.

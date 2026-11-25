@@ -388,8 +388,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/theme/current", get(api::get_current_theme))
         // Dedicated, non-elevated global-theme write.
         .route("/api/theme", patch(api::update_theme))
-        .route("/api/sounds", get(api::list_sounds))
-        .route("/api/sounds/file/{name}", get(api::serve_sound_file))
+        .route("/api/sounds/{event}", get(api::serve_sound))
         // Push notifications
         .route("/api/push/status", get(push::get_status))
         .route(

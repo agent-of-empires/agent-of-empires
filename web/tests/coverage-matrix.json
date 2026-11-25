@@ -1239,9 +1239,16 @@
         "src/lib/statusSounds.test.ts",
         "src/hooks/useStatusSounds.test.ts",
         "src/hooks/useSessionStatusStream.test.ts",
-        "src/hooks/useSessions.test.ts"
+        "src/hooks/useSessions.test.ts",
+        "src/lib/soundPlayer.test.ts"
       ],
-      "components": ["web/src/lib/statusSounds.ts", "web/src/hooks/useStatusSounds.ts", "web/src/lib/soundPlayer.ts"]
+      "components": [
+        "web/src/lib/statusSounds.ts",
+        "web/src/hooks/useStatusSounds.ts",
+        "web/src/lib/soundPlayer.ts",
+        "web/src/App.tsx"
+      ],
+      "notes": "Sounds are built in and fetched per event from `/api/sounds/{event}`. They play through one Web Audio context that the page's first click or key press resumes; a sound that comes first stays silent and shows a one-time toast asking for a click. The Daemon plays the host sounds itself (`server::sound_cues`)."
     },
     {
       "id": "notifications.linked-toasts",

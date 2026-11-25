@@ -1,7 +1,9 @@
 //! Playback backend: picks afplay / paplay / aplay and runs them.
 
+use std::path::PathBuf;
+
 use super::config::is_default_volume;
-use super::discovery::find_sound_file;
+use super::SoundEvent;
 
 fn get_audio_command(path: &str, volume: f64) -> Result<(String, Vec<String>), std::io::Error> {
     if cfg!(target_os = "macos") {
@@ -63,15 +65,27 @@ fn warn_aplay_volume_once(volume: f64) {
     }
 }
 
-pub fn play_sound_blocking(name: &str, volume: f64) -> Result<(), std::io::Error> {
-    let Some(path) = find_sound_file(name) else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("Sound file not found: {}", name),
-        ));
-    };
+/// The players read a path, so each built-in sound is written once under the
+/// app dir. The length in the name replaces a file from an older build.
+fn sound_file(event: SoundEvent) -> std::io::Result<PathBuf> {
+    let bytes = event.wav();
+    let dir = crate::session::get_app_dir()
+        .map_err(std::io::Error::other)?
+        .join("sound-cache");
+    let path = dir.join(format!("{}-{}.wav", event.as_str(), bytes.len()));
+    if path.exists() {
+        return Ok(path);
+    }
+    std::fs::create_dir_all(&dir)?;
+    // Written aside and renamed, so a concurrent play never reads a partial file.
+    let staging = dir.join(format!(".{}.{}", event.as_str(), std::process::id()));
+    std::fs::write(&staging, bytes)?;
+    std::fs::rename(&staging, &path)?;
+    Ok(path)
+}
 
-    let path_str = path.to_string_lossy().to_string();
+pub fn play_blocking(event: SoundEvent, volume: f64) -> Result<(), std::io::Error> {
+    let path_str = sound_file(event)?.to_string_lossy().to_string();
     let (cmd, args) = get_audio_command(&path_str, volume)?;
 
     let output = std::process::Command::new(cmd)
@@ -90,31 +104,19 @@ pub fn play_sound_blocking(name: &str, volume: f64) -> Result<(), std::io::Error
     }
 }
 
-pub fn play_sound(name: &str, volume: f64) {
-    let Some(path) = find_sound_file(name) else {
-        tracing::debug!(target: "sound.playback", "Sound file not found: {}", name);
-        return;
-    };
-
-    let path_str = path.to_string_lossy().to_string();
-
+/// Plays on a background thread. Only the first failure warns, since a host
+/// with no audio would otherwise log one on every status change.
+pub fn play(event: SoundEvent, volume: f64) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
     std::thread::spawn(move || {
-        let (cmd, args) = match get_audio_command(&path_str, volume) {
-            Ok(result) => result,
-            Err(e) => {
-                tracing::warn!(target: "sound.playback", "Audio player not available: {}", e);
-                return;
-            }
+        let Err(e) = play_blocking(event, volume) else {
+            return;
         };
-
-        let result = std::process::Command::new(cmd)
-            .args(&args)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output();
-
-        if let Err(e) = result {
-            tracing::debug!(target: "sound.playback", "Failed to play sound: {}", e);
+        if WARNED.swap(true, Ordering::Relaxed) {
+            tracing::debug!(target: "sound.playback", sound = event.as_str(), "Sound playback failed: {e}");
+        } else {
+            tracing::warn!(target: "sound.playback", sound = event.as_str(), "Sound playback failed: {e}");
         }
     });
 }

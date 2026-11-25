@@ -552,8 +552,6 @@ pub struct HomeView {
     pub(super) terminal_modes: HashMap<String, TerminalMode>,
     pub(super) default_terminal_mode: TerminalMode,
 
-    pub(super) sound_config: crate::sound::SoundConfig,
-
     pub(super) idle_decay_window: std::time::Duration,
 
     pub(super) strict_hotkeys: bool,

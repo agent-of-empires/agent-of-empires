@@ -1,46 +1,39 @@
 # Sound Effects
 
-AoE can play a sound when a session changes state (start, running, waiting, idle, error), on the machine running aoe, in the web dashboard, or both. The structured view also plays a browser-side chime when a pending approval or question lands.
-
-```bash
-aoe sounds install       # download the CC0 pack into your config dir
-aoe sounds list
-aoe sounds test start
-```
-
-The install downloads about ten CC0 RPG effects from the [80 CC0 RPG SFX](https://opengameart.org/content/80-cc0-rpg-sfx) pack by SubspaceAudio into `~/.config/agent-of-empires/sounds/` (Linux) or `~/.agent-of-empires/sounds/` (macOS). Then enable sounds in the TUI settings (`s`, Sound category) or in `config.toml`:
+AoE can play a sound when a session changes state (start, running, waiting, idle, error), on the machine running aoe, in the web dashboard, or both. The structured view also plays a chime in the browser when a pending approval or question lands. The sounds are built into aoe, so there is nothing to install. Turn them on in Settings (Sound) in the TUI or the dashboard, or in `config.toml`:
 
 ```toml
 [sound]
-enabled = true
-on_error = "error"        # unset transitions play a random sound
-on_approval = "approval"  # structured view only; plays in the browser
+enabled = true            # off by default
 server_enabled = true     # play status sounds on the machine running aoe
 browser_enabled = true    # play status sounds in the web dashboard
 server_volume = 1.0       # 0.1 to 1.5
-browser_volume = 1.0      # 0.1 to 1.5, browsers cap at 1.0
+browser_volume = 1.0      # 0.1 to 1.5
 browser_scope = "all"     # all, other_sessions or hidden_tab
 server_idle_enabled = true    # also server_{start,running,waiting,error}_enabled
 browser_idle_enabled = true   # also browser_{approval,waiting,error}_enabled
 ```
 
-Each transition plays its per-transition override when one is set, and a random sound from your sounds directory otherwise, so setting the same file on every transition gives you one signature sound. Add your own `.wav` or `.ogg` files to the sounds directory and reference them by filename without the extension. A profile's `[sound]` section overrides the global one.
+A profile's `[sound]` section overrides the global one.
+
+```bash
+aoe sounds test           # play the idle sound on this machine
+aoe sounds test error     # or start, running, waiting, approval
+```
 
 ## Playback
 
-Sounds are files in the sounds folder on the machine running aoe, for both targets. `aoe sounds install` on that machine fetches a starter pack, or add your own. With no files installed, or `enabled` off (the default), nothing plays anywhere, the browser included. The dashboard cannot install them for you.
-
 Status sounds play in two places, each with its own switch under the master `enabled`:
 
-- **Server** (`server_enabled`): the machine running aoe, through `afplay` on macOS and `aplay` or `paplay` on Linux (`apt install alsa-utils pulseaudio-utils`). Only the TUI triggers these, and audio does not work over SSH.
-- **Browser** (`browser_enabled`): any open dashboard tab plays the waiting, idle and error sounds for every session, terminal or structured. Use this when `aoe serve` runs on a remote box. Start and running stay server-only. A tab ignores statuses that were already there when it loaded, and a status has to hold for a moment (5s for waiting, 2s for idle and error) before it sounds, so a flapping session stays quiet. A waiting sound is skipped right after the approval chime for the same session.
+- **Server** (`server_enabled`): the aoe daemon plays them on its own machine, through `afplay` on macOS and `aplay` or `paplay` on Linux (`apt install alsa-utils pulseaudio-utils`). They play whether you use the TUI, the dashboard, or neither, and use the `[sound]` settings of each session's profile. Audio does not work over SSH.
+- **Browser** (`browser_enabled`): any open dashboard tab plays the waiting, idle and error sounds for every session, terminal or structured. Use this when `aoe serve` runs on a remote box. Start and running stay server-only. A tab ignores statuses that were already there when it loaded.
 
-Each event has an on/off switch per target (under Advanced in settings), all on by default. `browser_scope` limits which sessions sound in the browser: `other_sessions` stays silent for the session open in that tab, and `hidden_tab` sounds only while the tab is hidden. Both apply to the approval chime too.
+A waiting, idle or error status has to hold for a moment (5s for waiting, 2s for idle and error) before it sounds, on both targets, so a flapping session stays quiet. Sessions that are archived, snoozed, ignored or trashed stay silent, and so do sessions you have muted for push notifications (`notify_on_*` set to false). Sessions that reach the same status together play one sound. A waiting sound in the browser is skipped right after the approval chime for the same session.
 
-The browser uses the settings of the profile `aoe serve` runs under, so that profile's `[sound]` overrides apply there. Sessions you have muted for push notifications (`notify_on_*` set to false) stay silent in the browser too. If you run the TUI and a dashboard tab together, or two dashboard tabs, each plays its own sound; turn off `server_enabled` or `browser_enabled`, or close the extra tab. The server pushes status moves and sound cues to the dashboard over a WebSocket, so a hidden tab sounds on time even though browsers slow its timers; the dashboard's 3-second session refresh covers everything else, and the full list is refetched after a dropped connection. Simultaneous cues for the same event play one sound. Browsers also enforce an autoplay policy, so the first sound after a page load may stay silent until you interact with the tab; the push notification still fires when no dashboard is in the foreground.
+Each event has an on/off switch per target (under Advanced in settings), all on by default. `browser_scope` limits which sessions sound in the browser: `other_sessions` stays silent for the session open in that tab, and `hidden_tab` sounds only while the tab is hidden. Both apply to the approval chime too. The browser uses the settings of the profile `aoe serve` runs under.
 
-`on_approval` plays only in the browser, and only for structured sessions.
+If the dashboard runs on the same machine as aoe, both targets play each sound; turn off `server_enabled` or `browser_enabled`. The server pushes sound cues to the dashboard over a WebSocket, so a hidden tab sounds on time even though browsers slow its timers. Browsers only play sound once you have clicked or typed in the page, so after a reload the dashboard asks for a click if a sound comes first; the push notification still fires when no dashboard is in the foreground.
 
-If nothing plays, check that the files exist and are readable with a `.wav` or `.ogg` extension, that sounds are enabled in Settings, and that the player works directly (`aplay ~/.config/agent-of-empires/sounds/start.wav`). Restart the TUI to refresh the sound list, and check `aoe logs` with `AGENT_OF_EMPIRES_DEBUG=1`.
+If nothing plays on the server, run `aoe sounds test` there and check `aoe logs` with `AGENT_OF_EMPIRES_DEBUG=1`.
 
-The bundled sounds are CC0 1.0 Universal (public domain); no attribution required.
+The sounds are from the CC0 [80 CC0 RPG SFX](https://opengameart.org/content/80-cc0-rpg-sfx) pack by SubspaceAudio (public domain; no attribution required).
