@@ -446,6 +446,45 @@ describe("applyEvent / subagent roster", () => {
     expect(card).toMatchObject({ status: "done", report: "", earlierReport: "first report" });
   });
 
+  it("keeps a resume adopted mid-run so a text-only second run still settles past the first result", () => {
+    const launch: ToolCall = { id: "task-1", name: "Explore", kind: "think", args_preview: "{}", started_at: "t0" };
+    const first: ActivityRow = {
+      id: "done-task-1",
+      kind: "tool_complete",
+      toolCallId: "task-1",
+      text: "first report",
+      at: "2026-01-01T00:02:00Z",
+    };
+    const child = {
+      session_id: "child-1",
+      parent_session_id: "root",
+      parent_tool_call_id: "task-1",
+      state: "running",
+      cancel_capable: true,
+      background: true,
+    };
+    const reload = (rows: ActivityRow[]) =>
+      applyReducedState(
+        { ...emptyAcpState(), activity: rows },
+        reducedState({ subagents: [child] as ReducedState["subagents"] }),
+      );
+
+    const resumed = ev(
+      reload([first]),
+      5,
+      update("idle", "2026-01-01T00:05:00Z", { stop_reason: "end_turn", background: true }),
+    );
+    expect(resumed.subagents[0]!.running_since! > first.at!).toBe(true);
+    expect(fromInline(launch, first, [], resumed.subagents[0]!)).toMatchObject({
+      status: "done",
+      report: "",
+      earlierReport: "first report",
+    });
+
+    // A first run that is merely active at reload has no result yet, so no resume is inferred.
+    expect(reload([]).subagents[0]!.running_since).toBeUndefined();
+  });
+
   it("maps the state onto the matching background agent, including idle then running again", () => {
     const agentAfter = (...events: AcpEvent[]) => run(launched, ...events).backgroundAgents[0];
     expect(agentAfter(update("requires_action", "t1"))).toMatchObject({ status: "requires_action", endedAt: null });

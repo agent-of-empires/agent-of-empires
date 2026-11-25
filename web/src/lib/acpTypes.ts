@@ -1667,7 +1667,7 @@ export function applyReducedState(
   ]);
   const locallyResolved = state.locallyResolved.filter((nonce) => stillPending.has(nonce));
   const resolved = new Set(locallyResolved);
-  return {
+  return stampAdoptedResumes({
     ...state,
     agent: reduced.agent,
     model: reduced.model,
@@ -1700,7 +1700,28 @@ export function applyReducedState(
     workflowRuns: restoreWorkflowRuns(state.workflowRuns, reduced.workflow_runs ?? []),
     subagents: mergeSubagents(state.subagents, reduced.subagents ?? [], seq === undefined || seq >= state.lastSeq),
     locallyResolved,
-  };
+  });
+}
+
+/**
+ * A child adopted active with no event stamp, whose launch call already has a result, was resumed: stamp it at
+ * adoption so a later idle still reads as past that result. Cold loads and snapshots carry no event times.
+ */
+export function stampAdoptedResumes(state: AcpState): AcpState {
+  const unstamped = state.subagents.filter(
+    (r) => (r.state === "running" || r.state === "requires_action") && !r.running_since && r.parent_tool_call_id,
+  );
+  if (unstamped.length === 0) return state;
+  const resulted = new Set(
+    state.activity
+      .filter((r) => r.kind === "tool_complete" || r.kind === "tool_error")
+      .map((r) => r.toolCallId ?? r.id.replace(/^(done|stopped)-/, "")),
+  );
+  const now = new Date().toISOString();
+  const subagents = state.subagents.map((r) =>
+    unstamped.includes(r) && resulted.has(r.parent_tool_call_id!) ? { ...r, running_since: now } : r,
+  );
+  return subagents.some((r, i) => r !== state.subagents[i]) ? { ...state, subagents } : state;
 }
 
 /** A snapshot older than a finish already applied must not reopen the shell.
