@@ -363,7 +363,7 @@ pub async fn spawn_acp(
         );
     }
     drop(exclusion);
-    if let Err(e) = state.acp_supervisor.spawn_inner(request, reservation).await {
+    if let Err(e) = Box::pin(state.acp_supervisor.spawn_inner(request, reservation)).await {
         return supervisor_error_response("spawn failed", &e);
     }
     Json(SpawnAcpResponse {
@@ -845,7 +845,7 @@ async fn restart_acp_inner(
         );
     }
     drop(exclusion);
-    let launched = state.acp_supervisor.spawn_inner(request, reservation).await;
+    let launched = Box::pin(state.acp_supervisor.spawn_inner(request, reservation)).await;
     match launched {
         Ok(()) => Json(SpawnAcpResponse {
             session_id: id,
@@ -1737,7 +1737,7 @@ pub async fn switch_acp_agent(
     let launch_lease = reservation.lease().clone();
     let launch_epoch = launch_lease.epoch();
     drop(exclusion);
-    if let Err(e) = state.acp_supervisor.spawn_inner(request, reservation).await {
+    if let Err(e) = Box::pin(state.acp_supervisor.spawn_inner(request, reservation)).await {
         return supervisor_error_response("spawn failed", &e);
     }
     let _exclusion =
@@ -2069,7 +2069,7 @@ pub async fn switch_acp_provider(
         return resp;
     }
     drop(exclusion);
-    if let Err(e) = state.acp_supervisor.spawn_inner(request, reservation).await {
+    if let Err(e) = Box::pin(state.acp_supervisor.spawn_inner(request, reservation)).await {
         return supervisor_error_response("spawn failed after provider switch", &e);
     }
     tracing::info!(

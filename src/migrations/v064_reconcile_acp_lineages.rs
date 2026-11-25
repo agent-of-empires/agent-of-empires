@@ -2,6 +2,8 @@
 
 use anyhow::Result;
 
+use super::v055_acp_event_scope::{resolve_database_path, snapshot};
+
 pub fn run() -> Result<()> {
     super::v054_acp_establishment::run()?;
     super::v055_acp_event_scope::run()?;
@@ -21,11 +23,9 @@ pub fn run() -> Result<()> {
 
 pub(super) fn autonomous_pending() -> Result<bool> {
     let path = crate::session::get_app_dir()?.join("acp_events.db");
-    match std::fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-        Ok(metadata) => anyhow::ensure!(metadata.is_file(), "ACP database is not a regular file"),
-    }
+    let Some(path) = resolve_database_path(&path)? else {
+        return Ok(false);
+    };
     let conn = rusqlite::Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
@@ -41,11 +41,9 @@ pub(super) fn autonomous_pending() -> Result<bool> {
 pub(super) fn reconcile_autonomous_metadata() -> Result<()> {
     use crate::acp::event_store::{EventStore, EventTableShape};
     let path = crate::session::get_app_dir()?.join("acp_events.db");
-    match std::fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-        Ok(metadata) => anyhow::ensure!(metadata.is_file(), "ACP database is not a regular file"),
-    }
+    let Some(path) = resolve_database_path(&path)? else {
+        return Ok(());
+    };
     let mut conn = rusqlite::Connection::open_with_flags(
         &path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
@@ -66,7 +64,7 @@ pub(super) fn reconcile_autonomous_metadata() -> Result<()> {
     if present {
         return EventStore::validate_autonomous_commit_schema(&conn);
     }
-    super::v055_acp_event_scope::snapshot(&conn, &path)?;
+    snapshot(&conn, &path)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     tx.execute_batch(
         "ALTER TABLE acp_establishment_commit ADD COLUMN autonomous_commit_json TEXT;",
