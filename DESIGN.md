@@ -104,9 +104,11 @@ content. It is denser and quieter than the marketing site.
   (Diff, Files, Background, plugins); the terminal sits in the bottom dock.
   Below 1100px the right dock overlays the main area as a sheet rather than
   squeezing a third column.
-- The header toggles regions, not individual panes: one button shows or hides
-  the review panel, one the terminal. Panes inside the review panel open from
-  its own Panes menu, so plugin panes never widen the header.
+- Follow the conventions of Claude Code desktop, VS Code and Conductor rather
+  than inventing controls. The header toggles regions, not individual panes:
+  a terminal icon, then the review panel's split button (panel icon toggles it,
+  chevron opens a menu of its panes). An open toggle is tinted with the brand
+  accent, not filled; tooltips name the action and its shortcut.
 
 If a visual change requires an exception, update this document with the new
 rule as part of the change.

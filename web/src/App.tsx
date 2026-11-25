@@ -208,7 +208,6 @@ import { DiffPane } from "./components/DiffPane";
 import { FilesPane } from "./components/FilesPane";
 import { FileContentViewer } from "./components/diff/FileContentViewer";
 import { MainViewTabs } from "./components/MainViewTabs";
-import type { PaneMenuControl } from "./components/PaneMenu";
 import { MAIN_VIEW_IDS } from "./lib/mainViewIds";
 import { DiffScopeContext, loadDiffScope, saveDiffScope, type DiffScope, type DiffScopeState } from "./lib/diffScope";
 import { PairedShellPane, ShellModeToggle } from "./components/PairedTerminal";
@@ -849,13 +848,8 @@ function AppContent({
     !!activeSessionId &&
     sessionTerminals(paneLayout, activeSessionId).some(({ dock }) => !isDockCollapsed(paneLayout, dock));
 
-  // Activity-bar entries are pane KINDS (diff, terminal, each plugin), not
-  // individual tabs; the strip's +/x manage terminal instances.
-  const isPaneOpen = (kind: string): boolean => {
-    if (kind === "terminal") return terminalOpen;
-    const dock = dockOf(paneLayout, kind);
-    return dock !== null && !isDockCollapsed(paneLayout, dock);
-  };
+  // Header toggles act on pane KINDS (diff, terminal, each plugin), not individual tabs; the strip's +/x
+  // manage terminal instances.
   const togglePaneAny = useCallback(
     (kind: string) => {
       if (kind === "files") reportFeatureUse("files_pane");
@@ -1007,10 +1001,9 @@ function AppContent({
     ],
     [caps.canUseDiff, caps.cityhall, view, pluginPanes],
   );
-  // On desktop the header toggles the terminal and the whole right dock; the other panes open from the dock's
-  // pane menu, so plugin panes add a menu entry rather than header width.
-  const headerPaneIds = useMemo(() => (caps.canUseTerminal ? ["terminal"] : []), [caps.canUseTerminal]);
-  const paneMenu = useMemo<PaneMenuControl>(
+  // On desktop the header toggles the terminal and the review panel; the panel's menu opens each of its panes,
+  // so plugin panes add a menu entry rather than header width.
+  const paneMenu = useMemo(
     () => ({
       paneIds: dockPaneIds,
       descriptorFor: paneDescriptor,
@@ -1018,7 +1011,7 @@ function AppContent({
         const dock = dockOf(paneLayout, id);
         return dock !== null && !isDockCollapsed(paneLayout, dock);
       }),
-      onToggle: togglePaneAny,
+      onTogglePane: togglePaneAny,
     }),
     [dockPaneIds, paneDescriptor, paneLayout, togglePaneAny],
   );
@@ -2491,7 +2484,6 @@ function AppContent({
                   onMove={movePaneAny}
                   onClose={closePaneAny}
                   {...dockControls("right")}
-                  paneMenu={paneMenu}
                   maximize={
                     rightDockSheet
                       ? undefined
@@ -2960,13 +2952,13 @@ function AppContent({
                 onToggleSidebar={handleToggleSidebar}
                 onOpenPalette={() => setShowPalette(true)}
                 onToggleDiff={toggleDiff}
-                paneIds={headerPaneIds}
-                paneDescriptor={paneDescriptor}
-                isPaneOpen={isPaneOpen}
-                onTogglePane={togglePaneAny}
-                rightDock={
+                terminal={
+                  caps.canUseTerminal ? { open: terminalOpen, onToggle: () => togglePaneAny("terminal") } : undefined
+                }
+                panels={
                   dockPaneIds.length > 0
                     ? {
+                        ...paneMenu,
                         open: !rightDockCollapsed,
                         onToggle: toggleRightDock,
                         badge: caps.canUseDiff ? diffFiles.length : 0,

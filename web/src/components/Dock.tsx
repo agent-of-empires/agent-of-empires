@@ -8,7 +8,6 @@ import { FileEditorPaneContext } from "../lib/fileEditGuard";
 import type { DockLocation } from "../lib/panes";
 import { usePaneDnd, type PaneTabData, type SplitDropData } from "./paneDnd";
 import { PaneIcon } from "./PaneIcon";
-import { PaneMenu, type PaneMenuControl } from "./PaneMenu";
 
 export interface PaneDisplay {
   title: string;
@@ -33,8 +32,6 @@ export interface DockControls {
   terminalSwitcher?: ReactNode;
   /** Lets the dock take the whole main area and give it back. */
   maximize?: { maximized: boolean; onToggle: () => void };
-  /** Opens and closes panes from this dock's strip. */
-  paneMenu?: PaneMenuControl;
 }
 
 interface Props extends DockControls {
@@ -168,7 +165,6 @@ export function Dock({
   tabActions,
   terminalSwitcher,
   maximize,
-  paneMenu,
 }: Props) {
   const { activeTab, source, dropTarget } = usePaneDnd();
   const { setNodeRef: setGroupRef } = useDroppable({
@@ -233,7 +229,6 @@ export function Dock({
           >
             <MoveIcon className="size-3.5" aria-hidden />
           </button>
-          {paneMenu && <PaneMenu {...paneMenu} className={btn} />}
           {maximize && (
             <button
               type="button"

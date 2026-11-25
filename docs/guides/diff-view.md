@@ -32,7 +32,7 @@ Base changes save through the Daemon for the original session and profile. The T
 
 The changed-files list has two layouts, toggled in its header: **flat** lists every path, **tree** nests them under collapsible directories with per-directory file counts and `+`/`-` stats. Arrow keys move the selection, left and right expand or collapse a directory, and Enter or Space opens a file. Per-repo collapse state persists to your web settings. Right-click a file or folder for **Copy relative path**. On a file, **Open file** opens its current working-tree copy in a new browser tab. It is disabled for deleted files.
 
-The **Files** pane (in the review panel's **Panes** menu) browses the session's whole working directory, not just its git changes, so it lists files even in a non-git scratch session. Right-click a file there for the same **Open file** and **Copy relative path** actions. Markdown renders as HTML with a **Rendered** / **Raw** toggle, in this pane and from the diff list. Files an agent cites that live outside the session's repo open only when that agent actually read or wrote them during this session: the dashboard cannot open an arbitrary host path.
+The **Files** pane (in the menu beside the review panel button) browses the session's whole working directory, not just its git changes, so it lists files even in a non-git scratch session. Right-click a file there for the same **Open file** and **Copy relative path** actions. Markdown renders as HTML with a **Rendered** / **Raw** toggle, in this pane and from the diff list. Files an agent cites that live outside the session's repo open only when that agent actually read or wrote them during this session: the dashboard cannot open an arbitrary host path.
 
 ### "Open file" and the raw route
 

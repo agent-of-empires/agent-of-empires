@@ -5,8 +5,7 @@ import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { PluginHeaderStartSegments, PluginStatusBarSegments } from "./plugin/PluginSlots";
 import { PluginPageButtons } from "./plugin/PluginPageButtons";
-import { ActivityBar, RightDockToggle } from "./ActivityBar";
-import type { PaneDisplay } from "./Dock";
+import { PanelControl, TerminalToggle, type PanelControlProps } from "./PanelControl";
 import { useWebSettings } from "../hooks/useWebSettings";
 import type { AttentionBadgeColors } from "../lib/attentionBadgeColors";
 import { StrokeIcon } from "./icons";
@@ -18,17 +17,12 @@ interface Props {
   activeSession: SessionResponse | null;
   onToggleSidebar: () => void;
   onOpenPalette: () => void;
-  /** Mobile (below md): opens the view picker. The desktop activity bar uses
-   *  `onTogglePane` instead. */
+  /** Mobile (below md): opens the view picker. Desktop uses `terminal` and `panels`. */
   onToggleDiff: () => void;
-  /** The panes with their own header toggle: the terminal, whose bottom dock has no other control. The rest
-   *  open from the right dock's pane menu. */
-  paneIds: string[];
-  paneDescriptor: (id: string) => PaneDisplay;
-  isPaneOpen: (id: string) => boolean;
-  onTogglePane: (id: string) => void;
-  /** The right dock's show/hide toggle; omitted where the Session has no review panel. */
-  rightDock?: { open: boolean; onToggle: () => void; badge: number };
+  /** The terminal toggle; omitted where the Session cannot open one. */
+  terminal?: { open: boolean; onToggle: () => void };
+  /** The review panel toggle and its pane menu; omitted where the Session has no review panel. */
+  panels?: PanelControlProps;
   onOpenHelp: () => void;
   onOpenAbout: () => void;
   onStartTutorial: () => void;
@@ -68,11 +62,8 @@ export function TopBar({
   onToggleSidebar,
   onOpenPalette,
   onToggleDiff,
-  paneIds,
-  paneDescriptor,
-  isPaneOpen,
-  onTogglePane,
-  rightDock,
+  terminal,
+  panels,
   onOpenHelp,
   onOpenAbout,
   onStartTutorial,
@@ -243,9 +234,9 @@ export function TopBar({
 
         {activeWorkspace && activeSession && (
           <>
-            {/* Desktop: per-pane toggles. */}
-            <ActivityBar paneIds={paneIds} descriptorFor={paneDescriptor} isOpen={isPaneOpen} onToggle={onTogglePane} />
-            {rightDock && <RightDockToggle {...rightDock} />}
+            {/* Desktop: the terminal, then the review panel with its pane menu. */}
+            {terminal && <TerminalToggle {...terminal} />}
+            {panels && <PanelControl {...panels} />}
             <button
               onClick={onToggleDiff}
               className="md:hidden w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors text-text-secondary hover:text-text-primary hover:bg-surface-700/50"
