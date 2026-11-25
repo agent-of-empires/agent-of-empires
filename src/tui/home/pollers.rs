@@ -187,6 +187,12 @@ impl HomeView {
                 mcp_summaries,
                 fingerprint,
             } => {
+                // Never replace a dialog the user has not seen, such as "Prompt not delivered".
+                if self.has_non_live_send_overlay() {
+                    let message = "The repository hooks need review. Close the open dialog, then press Enter again.";
+                    say(self, message.to_string(), true);
+                    return;
+                }
                 let changed = self.suggestions_feed.take_hooks_changed();
                 let mut message = String::from(if changed {
                     "The hooks changed since you reviewed them. This repository runs:\n\n"

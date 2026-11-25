@@ -723,6 +723,29 @@ fn hooks_that_need_trust_show_a_review_and_approving_starts_with_its_fingerprint
 
 #[test]
 #[serial]
+fn a_hooks_review_does_not_replace_an_open_dialog() {
+    let answer = StartAnswer::NeedsTrust {
+        mcp_summaries: vec![],
+        commands: vec!["on create: make setup".into()],
+        fingerprint: serde_json::json!({ "project_path": "/repo" }),
+    };
+    let (mut env, requests) = expanded_env_answering(2, answer);
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Enter), None);
+    });
+    assert_eq!(next_request(&requests), "start gh/i0");
+    env.view.confirm_dialog = Some(crate::tui::dialogs::ConfirmDialog::new(
+        "Prompt not delivered",
+        "",
+        "other",
+    ));
+    poll_until(&mut env, |env| pane_error(env).is_some());
+    assert_eq!(env.view.confirm_dialog.as_ref().unwrap().action(), "other");
+    assert!(pane_error(&env).unwrap().contains("hooks need review"));
+}
+
+#[test]
+#[serial]
 fn the_hooks_review_lists_the_mcp_servers_the_daemon_summarised() {
     let answer = StartAnswer::NeedsTrust {
         commands: vec!["on create: make setup".into()],
