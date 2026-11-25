@@ -2489,6 +2489,131 @@ sandbox = "unsupported"
         .unwrap();
     }
 
+    /// A host launch prepares Pi's sidecar and OMP's marker in the host hook dir, so the launch's
+    /// switch away from a stale sandbox dir removes nothing they point into. A sandboxed launch
+    /// prepares them in the container and leaves the hook dirs alone.
+    #[test]
+    #[serial_test::serial]
+    fn identity_paths_are_prepared_on_the_launchs_own_side() {
+        use crate::hooks::dir_guard::sandbox_hook_base_path;
+        // (case, tool, sandboxed)
+        for (case, tool, sandboxed) in [
+            ("pi-host", "pi", false),
+            ("omp-host", "omp", false),
+            ("pi-sandboxed", "pi", true),
+            ("omp-sandboxed", "omp", true),
+        ] {
+            let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+            let temp_home = tempfile::tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_home(temp_home.path());
+            let project = temp_home.path().join("proj");
+            std::fs::create_dir_all(&project).unwrap();
+            let mut inst = tool_instance(tool, project.to_str().unwrap());
+            let bin = temp_home.path().join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let stub = bin.join("pi");
+            std::fs::write(
+                &stub,
+                "#!/bin/sh\nprintf '%s\\n' '  -e, --extension <path>'\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+            let path = format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let _path = crate::session::test_support::EnvGuard::set(&[("PATH", path.as_str())]);
+            crate::agents::forget_agent_help_for_test();
+            let config = sandboxed.then(|| {
+                let mut sandbox = test_sandbox(&format!("aoe-{case}"), Some("/workspace"));
+                sandbox.extra_env = Some(vec![
+                    "PI_CODING_AGENT_SESSION_DIR=/root/.pi/agent/sessions".to_string(),
+                ]);
+                inst.sandbox_info = Some(sandbox);
+                admit_sandbox_fixture(&inst);
+                inst.build_container_config_for_test().unwrap()
+            });
+            let _transport = config.as_ref().map(|config| {
+                install_container_transport(
+                    temp_home.path(),
+                    &format!("aoe-{case}"),
+                    &config.volumes,
+                )
+            });
+            // The row was sandboxed before: only its sandbox hook dir exists.
+            crate::hooks::switch_instance_dir(&inst.id, crate::hooks::HookBase::Sandbox).unwrap();
+            let host_dir = crate::hooks::hook_base_path().join(&inst.id);
+            let sandbox_dir = sandbox_hook_base_path().unwrap().join(&inst.id);
+
+            let prepared = if tool == "pi" {
+                let (_, env) = inst
+                    .identity_extension_launch()
+                    .expect("a Pi identity launch");
+                let value = env.trim().strip_prefix("AOE_SESSION_ID_FILE=").unwrap();
+                value.trim_matches('\'').to_string()
+            } else {
+                let context = crate::session::capture::resolve_omp_store_layout_with_environment(
+                    std::collections::HashMap::from([(
+                        "HOME".into(),
+                        temp_home.path().display().to_string(),
+                    )]),
+                    &inst.project_path,
+                    &inst.omp_capture_options().unwrap(),
+                )
+                .unwrap();
+                inst.resolve_omp_capture_plan(&context, None)
+                    .expect("an OMP launch plan")
+                    .launch_marker
+            };
+            let prepared = std::path::PathBuf::from(prepared);
+
+            if let Some(config) = &config {
+                assert!(
+                    sandbox_dir.is_dir(),
+                    "{case}: the sandbox hook dir is untouched"
+                );
+                assert!(!host_dir.exists(), "{case}: no host hook dir is made");
+                if tool == "pi" {
+                    assert_eq!(
+                        prepared,
+                        std::path::Path::new(
+                            crate::session::config::container_config::PI_SIDECAR_DIR_IN_CONTAINER
+                        )
+                        .join(&inst.id)
+                        .join("session_id"),
+                        "{case}"
+                    );
+                } else {
+                    assert_eq!(
+                        prepared.to_str(),
+                        Some(crate::session::capture::omp_sandbox_launch_marker(&inst.id).as_str()),
+                        "{case}"
+                    );
+                    assert!(
+                        !config
+                            .volumes
+                            .iter()
+                            .any(|mount| prepared.starts_with(&mount.container_path)),
+                        "{case}: the marker is private to the container"
+                    );
+                }
+            } else {
+                assert_eq!(
+                    prepared.parent(),
+                    Some(std::fs::canonicalize(&host_dir).unwrap().as_path()),
+                    "{case}: prepared in the host hook dir"
+                );
+                assert!(
+                    !sandbox_dir.exists(),
+                    "{case}: the stale sandbox dir is gone"
+                );
+            }
+            crate::hooks::dir_guard::remove_instance_dir(&inst.id).unwrap();
+        }
+    }
+
     // The sidecar env var has to survive into the docker argv; no CI container would catch it.
     #[test]
     #[serial_test::serial]

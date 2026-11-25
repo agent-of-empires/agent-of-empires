@@ -33,8 +33,8 @@ pub(crate) use command::{identity_field_name, identity_publisher_arg};
 pub(crate) use config_io::with_config_lock_policy;
 pub use config_io::SymlinkPolicy;
 pub(crate) use dir_guard::{
-    ensure_instance_dir_path, hook_base_path, session_id_leaf, switch_instance_dir,
-    unlink_session_id_via_guard, write_session_id_via_guard, HookBase,
+    ensure_instance_dir_path, hook_base_path, host_launch_instance_dir_path, session_id_leaf,
+    switch_instance_dir, unlink_session_id_via_guard, write_session_id_via_guard, HookBase,
 };
 pub(crate) use status_file::{
     read_hook_session_id_within, read_hook_sidecar_at, SESSION_ID_SIDECAR_MAX_AGE,

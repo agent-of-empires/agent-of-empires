@@ -73,7 +73,7 @@ impl Instance {
                 return None;
             }
             let extension = launch_command::session_identity_extension_path().ok()?;
-            let sidecar = crate::hooks::ensure_instance_dir_path(&self.id)
+            let sidecar = crate::hooks::host_launch_instance_dir_path(&self.id)
                 .ok()?
                 .join("session_id");
             return Some((

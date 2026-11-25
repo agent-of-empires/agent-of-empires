@@ -203,7 +203,7 @@ impl Instance {
         let launch_marker = if self.is_sandboxed() {
             omp_sandbox_launch_marker(&self.id)
         } else {
-            match crate::hooks::ensure_instance_dir_path(&self.id) {
+            match crate::hooks::host_launch_instance_dir_path(&self.id) {
                 Ok(path) => path.join("omp_launch").to_string_lossy().into_owned(),
                 Err(error) => {
                     tracing::warn!(

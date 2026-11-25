@@ -658,6 +658,16 @@ pub(crate) fn ensure_instance_dir_path(instance_id: &str) -> Result<PathBuf> {
         .with_context(|| format!("canonicalize hook dir {}", lexical.display()))
 }
 
+/// The hook dir a host launch prepares its paths in: the host one, switched to now so the
+/// launch's own switch removes nothing they point into. When the switch can't run, the
+/// launch's can't either, so the existing dir stays and is used.
+pub(crate) fn host_launch_instance_dir_path(instance_id: &str) -> Result<PathBuf> {
+    switch_instance_dir(instance_id, HookBase::Host).or_else(|error| {
+        tracing::warn!(target: "hooks.guard", "host hook dir switch failed: {error:#}");
+        ensure_instance_dir_path(instance_id)
+    })
+}
+
 // Cleanup.
 
 /// Remove the per-instance subdir and its files without following symlinks,
