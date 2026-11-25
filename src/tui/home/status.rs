@@ -345,8 +345,7 @@ impl HomeView {
                 .worktree_info
                 .as_ref()
                 .map(|worktree| worktree.branch.as_str());
-            instance.color != row.color
-                || instance.command != row.command
+            instance.command != row.command
                 || instance.extra_args != row.extra_args
                 || instance.yolo_mode != row.yolo_mode
                 || instance.scratch != row.scratch
@@ -587,7 +586,6 @@ impl HomeView {
             instance.agent_pane.clone_from(&row.agent_pane);
             instance.auxiliary.clone_from(&row.auxiliary);
             instance.unread = row.unread;
-            instance.color.clone_from(&row.color);
             instance.yolo_mode = row.yolo_mode;
             instance.scratch = row.scratch;
             instance.notify_on_waiting = row.notify_on_waiting;

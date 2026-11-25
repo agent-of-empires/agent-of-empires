@@ -2,14 +2,12 @@ import { useLayoutEffect, useReducer, useRef, useState, type ReactNode } from "r
 import { createPortal } from "react-dom";
 import {
   attachSessionProject,
-  setSessionColor,
   setSessionNotifications,
   type RuntimeCursor,
   type SessionMutation,
   type SessionReceipt,
   type SessionSettingOutcome,
 } from "../../lib/api";
-import { reportFeatureUse } from "../../lib/featureUse";
 import type { SessionResponse } from "../../lib/types";
 import { reportError } from "../../lib/toastBus";
 import { AddProjectModal } from "./AddProjectModal";
@@ -42,18 +40,11 @@ const observed = (pending: PendingSetting, rows: Record<string, RuntimeCursor>) 
   pending.receipts !== null &&
   pending.receipts.every(({ id, cursor }) => rows[id]?.epoch === cursor.epoch && rows[id].revision >= cursor.revision);
 const canonicalSetting = (record: PendingSetting, sessions: SessionResponse[]): Value => {
-  if (record.kind === "color") {
-    for (const target of record.targets) {
-      const row = sessions.find((row) => row.id === target.id);
-      if (row?.color != null) return row.color;
-    }
-    return null;
-  }
   const row = sessions.find((row) => row.id === record.targets[0]?.id);
   return detectNotifyPreset([row?.notify_on_waiting, row?.notify_on_idle, row?.notify_on_error]);
 };
 
-/** Own only attach results and the two accepted setting queues, above visual grouping and routes. */
+/** Own only attach results and the accepted notifications queue, above visual grouping and routes. */
 export function SessionActionProvider({
   children,
   sessions,
@@ -165,7 +156,6 @@ export function SessionActionProvider({
       }
       const previous = active(kind, selected, server);
       if (Object.is(next, previous ? previous.value : server)) return;
-      if (kind === "color") reportFeatureUse("session_color");
       const targets = selected.map((target) => ({ ...target }));
       const key = batchKey(kind, targets);
       const sent = [...(previous?.sent ?? [])];
@@ -191,10 +181,7 @@ export function SessionActionProvider({
             targets.map(async (target): Promise<SessionSettingOutcome> => {
               if (record.invalidated || !sameIdentity(target)) return { outcome: "uncertain" };
               if (authority.current.readOnly) return { outcome: "rejected" };
-              const result =
-                kind === "color"
-                  ? await setSessionColor(target.id, next as SettingValues["color"], target.epoch)
-                  : await setSessionNotifications(target.id, next as SettingValues["notifications"], target.epoch);
+              const result = await setSessionNotifications(target.id, next, target.epoch);
               if (record.invalidated || !sameIdentity(target)) return { outcome: "uncertain" };
               if (result.outcome === "committed") authority.current.onSessionMutation(result.mutation);
               return result;
@@ -216,7 +203,7 @@ export function SessionActionProvider({
             reportError(
               results.some((result) => result.outcome === "uncertain")
                 ? "The setting outcome is unconfirmed. Check canonical state before retrying."
-                : `Could not change ${kind === "color" ? "the session color" : "notifications"}. Please try again.`,
+                : "Could not change notifications. Please try again.",
             );
           }
           changed();

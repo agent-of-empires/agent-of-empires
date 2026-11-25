@@ -23,7 +23,7 @@ function order() {
     if (id === undefined) out.push("|");
     else if (id.endsWith("-target") || id === "summary" || id === "close") continue;
     else {
-      const token = id.startsWith("notify-") ? "notify" : id.startsWith("color-") ? "color" : id;
+      const token = id.startsWith("notify-") ? "notify" : id;
       if (out.at(-1) !== token) out.push(token);
     }
   }
@@ -42,7 +42,7 @@ const open = (sessions: Partial<SessionResponse>[], options: object = {}) =>
 describe("Session menu tiers", () => {
   it("orders items by tier, with separators only between tiers that show something", () => {
     const quick = "pin archive snooze unread";
-    const tail = "notify color | delete";
+    const tail = "notify | delete";
     // More opens on the window entries, their own tier.
     const more = "more show-only own-window |";
     // (state, sessions, options, header line, order with More open)

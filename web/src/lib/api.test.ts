@@ -1833,41 +1833,33 @@ describe("runtime snapshots and cancellation", () => {
     ["zero revision", { "aoe-runtime-epoch": "boot", "aoe-runtime-revision": "0" }],
     ["another epoch", { "aoe-runtime-epoch": "successor", "aoe-runtime-revision": "1" }],
   ])("does not claim a setting committed without its original runtime receipt (%s)", async (_name, headers) => {
-    for (const call of [
-      () => api.setSessionColor("s1", null, "boot"),
-      () => api.setSessionNotifications("s1", "default", "boot"),
-    ]) {
-      fetchSpy.mockResolvedValueOnce(
-        new Response(JSON.stringify(session), { headers: headers as Record<string, string> }),
-      );
-      expect(await call()).toEqual({ outcome: "uncertain" });
-    }
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify(session), { headers: headers as Record<string, string> }),
+    );
+    expect(await api.setSessionNotifications("s1", "default", "boot")).toEqual({ outcome: "uncertain" });
   });
 
   it.each([400, 401, 403, 409, 500, 503])(
     "distinguishes setting rejection from unconfirmed writes (%s)",
     async (status) => {
-      for (const call of [
-        () => api.setSessionColor("s1", null, "boot"),
-        () => api.setSessionNotifications("s1", "all", "boot"),
-      ]) {
-        fetchSpy.mockResolvedValueOnce(empty(status));
-        expect(await call()).toEqual({ outcome: status >= 500 ? "uncertain" : "rejected" });
-      }
+      fetchSpy.mockResolvedValueOnce(empty(status));
+      expect(await api.setSessionNotifications("s1", "all", "boot")).toEqual({
+        outcome: status >= 500 ? "uncertain" : "rejected",
+      });
     },
   );
 
   it("does not attest another session or a missing canonical row", async () => {
     for (const body of [null, {}, { ...session, id: "replacement" }]) {
       fetchSpy.mockResolvedValueOnce(runtimeJson(body));
-      expect(await api.setSessionColor("s1", null, "boot")).toEqual({ outcome: "uncertain" });
+      expect(await api.setSessionNotifications("s1", "off", "boot")).toEqual({ outcome: "uncertain" });
     }
   });
 
   it("preserves u64 revision precision and the canonical returned fields, including optional outcome", async () => {
-    const canonical = { ...session, color: "green", outcome: { acknowledged: true } };
+    const canonical = { ...session, notify_on_idle: true, outcome: { acknowledged: true } };
     fetchSpy.mockResolvedValueOnce(runtimeJson(canonical));
-    expect(await api.setSessionColor("s1", null, "boot")).toEqual({
+    expect(await api.setSessionNotifications("s1", "all", "boot")).toEqual({
       outcome: "committed",
       mutation: { session: canonical, cursor },
     });

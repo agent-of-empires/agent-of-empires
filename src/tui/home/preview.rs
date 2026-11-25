@@ -1,7 +1,5 @@
 //! The preview pane's text view, its selection, and the cache behind it.
 
-use std::collections::HashSet;
-
 use ratatui::layout::{Position, Rect};
 
 /// The output pane's text layout, captured at render time so input handlers can map screen
@@ -120,12 +118,9 @@ pub(in crate::tui) struct PreviewCache {
     /// Parsed `content`, cleared by `store_capture` so ANSI parsing runs at
     /// most once per content change instead of on every render.
     pub(in crate::tui) parsed_text: Option<ratatui::text::Text<'static>>,
-    /// OSC 8 targets for the pane, kept beside the text because neither the
-    /// vt100 grid nor a ratatui cell can carry a hyperlink.
-    pub(in crate::tui) links: Vec<crate::tmux::osc8::PaneLink>,
-    /// Pane link generation `links` was collected at; a target can change
-    /// while the rendered grid stays byte-identical.
-    pub(in crate::tui) links_generation: u64,
+    /// OSC 8 runs in `content` by row, kept beside the text because a
+    /// ratatui cell cannot carry a hyperlink.
+    pub(in crate::tui) links: Vec<crate::tmux::osc8::RowLink>,
 }
 
 impl PreviewCache {
@@ -137,46 +132,19 @@ impl PreviewCache {
             self.links.clear();
             return;
         }
-        let generation = self
-            .capture_target
-            .as_deref()
-            .map_or(0, crate::tmux::pane_links_generation);
-        if self.parsed_text.is_none() {
-            self.parsed_text = Some(crate::tui::components::preview::parse_output_text(
-                &self.content,
-            ));
-        } else if generation == self.links_generation {
+        if self.parsed_text.is_some() {
             return;
         }
+        self.parsed_text = Some(crate::tui::components::preview::parse_output_text(
+            &self.content,
+        ));
         self.links = self.collect_links();
-        self.links_generation = generation;
     }
 
-    /// Links from the VT channel (which taps the raw stream, since the grid
-    /// drops OSC 8) plus any still present in captured `content`.
-    fn collect_links(&self) -> Vec<crate::tmux::osc8::PaneLink> {
+    fn collect_links(&self) -> Vec<crate::tmux::osc8::RowLink> {
         use crate::tmux::osc8;
 
-        let mut links = self
-            .capture_target
-            .as_deref()
-            .map(crate::tmux::pane_links)
-            .unwrap_or_default();
-        let from_channel = links.len();
-        // Dedupe on (text, uri): two texts pointing at one URL are separate
-        // clickable runs. Capped like the channel's own table.
-        let mut seen: HashSet<(String, String)> = links
-            .iter()
-            .map(|l| (l.text.clone(), l.uri.clone()))
-            .collect();
-        for link in osc8::extract_links(self.content.as_bytes()) {
-            if links.len() >= osc8::MAX_PANE_LINKS {
-                break;
-            }
-            if seen.insert((link.text.clone(), link.uri.clone())) {
-                links.push(link);
-            }
-        }
+        let links = osc8::row_links(&self.content);
         let pane = self.capture_target.as_deref().unwrap_or("<none>");
         if links.is_empty() {
             if osc8::has_hyperlink(self.content.as_bytes()) {
@@ -191,13 +159,18 @@ impl PreviewCache {
             tracing::debug!(
                 target: "tui.preview_links",
                 pane,
-                from_channel,
-                from_content = links.len() - from_channel,
                 texts = ?links.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
                 "preview: collected pane hyperlinks"
             );
         }
         links
+    }
+
+    /// The OSC 8 runs on content line `row`.
+    pub(in crate::tui) fn links_on(&self, row: usize) -> &[crate::tmux::osc8::RowLink] {
+        let from = self.links.partition_point(|l| l.row < row);
+        let to = self.links.partition_point(|l| l.row <= row);
+        &self.links[from..to]
     }
 
     /// Whether no frame has landed yet for session `id`.
