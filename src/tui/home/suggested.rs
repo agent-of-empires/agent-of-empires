@@ -73,6 +73,8 @@ impl HomeView {
         }
         self.ensure_suggestions_view();
         self.system_health_open = false;
+        // A Trash transcript reader would otherwise take the keys first.
+        self.retained_focus = None;
         self.suggestions_focused = true;
     }
 

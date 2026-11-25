@@ -315,6 +315,34 @@ fn a_dialog_over_the_focused_pane_takes_the_keys() {
     assert_eq!(view.selected_key(), Some(("gh".into(), "i0".into())));
 }
 
+/// Focusing the pane releases a focused Trash transcript reader, so the pane
+/// gets the keys at once and one Esc leaves it.
+#[test]
+#[serial]
+fn focusing_the_pane_releases_a_focused_trash_reader() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.mutate_instance(&id, |inst| {
+        inst.trashed_at = Some(crate::time::Timestamp::now())
+    });
+    env.view.trashed_section_collapsed = false;
+    let mut hidden = snapshot(3, &[]);
+    hidden["prefs"]["sidebar"] = false.into();
+    env.view.suggestions_feed.set_snapshot_for_test(hidden);
+    env.view.rebuild_flat_items();
+    env.view.select_session_by_id(&id);
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(env.view.retained_reader_focused());
+
+    env.view.focus_suggestions();
+    assert!(!env.view.retained_reader_focused());
+    env.view.handle_key(key(KeyCode::Char('j')), None);
+    let view = env.view.suggestions_view.as_ref().unwrap();
+    assert_eq!(view.selected_key(), Some(("gh".into(), "i1".into())));
+    env.view.handle_key(key(KeyCode::Esc), None);
+    assert!(!env.view.suggestions_focused, "one Esc leaves the pane");
+}
+
 fn expanded_env(count: usize) -> (TestEnv, mpsc::Receiver<String>) {
     let started = StartAnswer::Started {
         session_id: "s-new".into(),
