@@ -81,6 +81,7 @@ export interface SidebarMockOptions {
   /** Defaults to Repository and Custom. */
   view?: SidebarView;
   readOnly?: boolean;
+  cityhall?: boolean;
   /** A successful PUT replaces the served ordering, like the real server. */
   persistPutOrdering?: boolean;
 }
@@ -159,6 +160,7 @@ export async function installSidebarMocks(page: Page, opts: SidebarMockOptions):
     r.fulfill({
       json: {
         read_only: handle.readOnly,
+        cityhall_mode: !!opts.cityhall,
         auth_mode: "none",
         behind_tunnel: false,
         profile: "default",

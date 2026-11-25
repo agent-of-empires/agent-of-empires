@@ -3495,6 +3495,41 @@ fn repository_mode_orders_and_moves_nested_groups_by_the_group_order() {
     }
 }
 
+/// Under My groups and Name a nested Group header moves, starting from the headers on screen.
+#[test]
+#[serial]
+fn my_groups_moves_a_nested_header_under_name() {
+    use crate::daemon::{NamespaceMutation, ReorderBody};
+    use crate::session::config::{GroupByMode, SortOrder};
+
+    let mut env = seeded_env(
+        test_home(),
+        &[
+            instance_in("c1", "/tmp/alpha", "beta/child"),
+            instance_in("d1", "/tmp/alpha", "beta/delta"),
+        ],
+        false,
+    );
+    let view = &mut env.view;
+    view.group_by = GroupByMode::Group;
+    view.sort_order = SortOrder::Name;
+    let order =
+        ["beta", "beta/delta", "beta/child"].map(|p| Group::new(p.rsplit('/').next().unwrap(), p));
+    view.group_trees.insert(
+        "test".into(),
+        GroupTree::new_with_group_paths(std::iter::empty(), &order),
+    );
+    view.rebuild_flat_items();
+    let mut respond = view.session_feed.namespace_driver_for_test();
+    view.selected_group = Some("beta/delta".into());
+    view.move_row_at_cursor(-1).unwrap();
+    assert!(matches!(
+        respond(Err("refused".into())),
+        Some(NamespaceMutation::Reorder(ReorderBody::Group { group, siblings: Some(siblings), .. }))
+            if group.path == "beta/delta" && siblings == ["beta/child", "beta/delta"]
+    ));
+}
+
 /// A group that exists only because a session names it has no `groups.json` row yet. Moving
 /// it must still persist the new order, or the next load rebuilds the original one.
 #[tokio::test]

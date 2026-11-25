@@ -186,7 +186,7 @@ export function useSessions() {
   /**
    * Applies a grouping or sort pick at once. The write is sent after the earlier picks' writes, waits for `after`,
    * and is dropped when that fails; a field picked again meanwhile is left to the newer pick. Either way the next
-   * poll restores what the Daemon holds.
+   * poll restores what the Daemon holds. Resolves with the receipt, or null when nothing was saved.
    */
   const changeSidebarView = useCallback(
     async (patch: Partial<SidebarView>, after?: Promise<RuntimeCursor | null>) => {
@@ -204,6 +204,7 @@ export function useSessions() {
       });
       noteWriteEpoch(receipt);
       holdSettled(viewHold.current, receipt);
+      return receipt;
     },
     [noteWriteEpoch],
   );

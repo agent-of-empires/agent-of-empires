@@ -43,7 +43,10 @@ interface Options {
   ) => Promise<RuntimeCursor | null>;
   changeOrdering: (patch: WorkspaceOrderingPatch) => Promise<RuntimeCursor | null>;
   orderingSaving: () => boolean;
-  changeSidebarView: (patch: Partial<SidebarView>, after?: Promise<RuntimeCursor | null>) => Promise<void>;
+  changeSidebarView: (
+    patch: Partial<SidebarView>,
+    after?: Promise<RuntimeCursor | null>,
+  ) => Promise<RuntimeCursor | null>;
   onSharedRead: (listener: (read: SharedRead) => void) => () => void;
 }
 
@@ -64,9 +67,20 @@ interface UndoOffer {
 
 const sameList = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
 
+/** Whether the paths `now` and `wrote` share stand among their siblings in the same order in both. */
+function sameSiblingOrder(now: readonly string[], wrote: readonly string[]): boolean {
+  const kept = now.filter((p) => wrote.includes(p));
+  const expected = wrote.filter((p) => now.includes(p));
+  const under = (list: string[], parent: string) => list.filter((p) => parentPath(p) === parent);
+  return [...new Set(expected.map(parentPath))].every((parent) =>
+    sameList(under(kept, parent), under(expected, parent)),
+  );
+}
+
 /**
  * Whether `read` still holds what `left` names, adopting the Daemon's copy of each value the first time a read
- * shows it: the Daemon lists rows the written order lacks first and keeps Groups the sidebar does not show.
+ * shows it: the Daemon lists rows the written order lacks first and keeps Groups the sidebar does not show, so the
+ * first read is checked only for what the change wrote.
  */
 function stillLeft(watch: NonNullable<UndoOffer["watch"]>, read: SharedRead): boolean {
   const { left, seen } = watch;
@@ -79,8 +93,10 @@ function stillLeft(watch: NonNullable<UndoOffer["watch"]>, read: SharedRead): bo
     let same: boolean;
     if (field === "groups") {
       const groups = now as GroupOrder;
-      same = first || Object.entries(wrote as GroupOrder).every(([p, paths]) => sameList(groups[p] ?? [], paths));
-      if (first) left.groups = Object.fromEntries(Object.keys(wrote).map((p) => [p, groups[p] ?? []]));
+      same = Object.entries(wrote as GroupOrder).every(([p, paths]) =>
+        (first ? sameSiblingOrder : sameList)(groups[p] ?? [], paths),
+      );
+      if (first && same) left.groups = Object.fromEntries(Object.keys(wrote).map((p) => [p, groups[p] ?? []]));
     } else if (field === "sort") {
       same = now === wrote;
     } else {
@@ -213,6 +229,17 @@ export function useSidebarModel({
     [moveGroup],
   );
 
+  /** Writes `previous` back over a change that left the Groups as `groups`; resolves null when a write failed. */
+  const putBack = useCallback(
+    (previous: Shared, groups: GroupOrder, receipt: RuntimeCursor) => {
+      const { groups: previousGroups, sort: previousSort, ...patch } = previous;
+      const ordered = Object.keys(patch).length > 0 ? changeOrdering(patch) : Promise.resolve(receipt);
+      const undone = settleAll([ordered, ...restoreGroups(groups, previousGroups ?? {}, ordered)]);
+      return previousSort ? changeSidebarView({ sort: previousSort }, undone) : undone;
+    },
+    [changeOrdering, restoreGroups, changeSidebarView],
+  );
+
   const offerUndo = useCallback(
     (message: string, write: Promise<RuntimeCursor | null>, wrote: Shared, previous: Shared) => {
       const offer = undoOffer.current;
@@ -224,15 +251,12 @@ export function useSidebarModel({
         offer.dismiss = toastBus.handler?.infoAction(message, "Undo", () => {
           if (refuseWhileSaving()) return false;
           dropUndo();
-          const { groups, sort: previousSort, ...patch } = previous;
-          const ordered = Object.keys(patch).length > 0 ? changeOrdering(patch) : Promise.resolve(receipt);
           // While the offer stands, the Groups are as the change left them.
-          const undone = settleAll([ordered, ...restoreGroups(watch.left.groups ?? {}, groups ?? {}, ordered)]);
-          if (previousSort) void changeSidebarView({ sort: previousSort }, undone);
+          void putBack(previous, watch.left.groups ?? {}, receipt);
         });
       });
     },
-    [refuseWhileSaving, dropUndo, changeOrdering, restoreGroups, changeSidebarView],
+    [refuseWhileSaving, dropUndo, putBack],
   );
 
   const selectGroupBy = useCallback(
@@ -274,7 +298,8 @@ export function useSidebarModel({
     }),
     [displayGroups, workspaceOrdering, groupBy, repo.groups, repositoryOrder],
   );
-  /** Each profile's Group moves that keep the headers in the name order Name shows them in. */
+  /** Each profile's Group moves that keep the headers in the name order Name shows them in, and how many profiles
+   *  the headers show. */
   const onScreenGroupMoves = useCallback(() => {
     const shown = new Map<string, string[]>();
     for (const g of displayGroups) {
@@ -283,16 +308,44 @@ export function useSidebarModel({
         shown.set(s.profile, [...(shown.get(s.profile) ?? []), g.groupPath]);
       }
     }
-    return [...shown].flatMap(([profile, paths]) =>
+    const moves = [...shown].flatMap(([profile, paths]) =>
       arrangeGroups(groupOrder[profile] ?? [], paths, compareNames).map((m) => ({ profile, ...m })),
     );
+    return { moves, profiles: shown.size };
   }, [displayGroups, groupOrder]);
+  /** Whether the Group headers keep their place on screen once each profile's Group order is `after`. */
+  const keepsHeaderOrder = useCallback(
+    (after: GroupOrder) => {
+      const compare = groupPathComparator(mergeGroupOrder(after));
+      const lists = groupBy === "project" ? nested.groups.map((n) => n.subgroups) : [session.groups];
+      return lists.every((list) => {
+        const paths = list.flatMap((g) => (g.groupPath ? [g.groupPath] : []));
+        return paths.every((p, i) => i === 0 || compare(paths[i - 1]!, p) < 0);
+      });
+    },
+    [groupBy, nested.groups, session.groups],
+  );
   const commit = useCallback(
     (patch: WorkspaceOrderingPatch) => {
+      if (!frozen) {
+        dropUndo();
+        void changeOrdering(patch);
+        return;
+      }
+      const { moves, profiles: shownProfiles } = onScreenGroupMoves();
+      const profiles = [...new Set(moves.map((m) => m.profile))];
+      const groupsAfter = Object.fromEntries(
+        profiles.map((p) => [p, moves.findLast((m) => m.profile === p)!.move.order]),
+      );
+      // Custom lists each profile's Groups after the previous profile's, which may not keep a merged name order.
+      if (shownProfiles > 1 && !keepsHeaderOrder({ ...groupOrder, ...groupsAfter })) {
+        reportInfo("Pick Custom first: Groups of several profiles can't keep this order");
+        return;
+      }
       dropUndo();
+      const offer = undoOffer.current;
+      const seq = offer.seq;
       const write = changeOrdering(patch);
-      if (!frozen) return;
-      const moves = onScreenGroupMoves();
       const wrote: Shared = { ...patch, sort: "custom" };
       const previous: Shared = {
         ...(patch.order && { order: workspaceOrdering }),
@@ -300,30 +353,46 @@ export function useSidebarModel({
         sort: "name",
       };
       if (moves.length > 0) {
-        const profiles = [...new Set(moves.map((m) => m.profile))];
-        wrote.groups = Object.fromEntries(profiles.map((p) => [p, moves.findLast((m) => m.profile === p)!.move.order]));
+        wrote.groups = groupsAfter;
         previous.groups = Object.fromEntries(profiles.map((p) => [p, groupOrder[p] ?? []]));
       }
-      const all = settleAll([write, ...moves.map((m) => moveGroup(m.profile, m.path, m.move, write))]);
-      offerUndo("Sorted by Custom now", all, wrote, previous);
+      const writes = [write, ...moves.map((m) => moveGroup(m.profile, m.path, m.move, write))];
       switching.current = true;
-      void changeSidebarView({ sort: "custom" }, all).finally(() => (switching.current = false));
+      const switched = changeSidebarView({ sort: "custom" }, settleAll(writes));
+      offerUndo("Sorted by Custom now", switched, wrote, previous);
+      // The orders and the sort land together: when the switch fails after a write landed, the orders go back.
+      void Promise.all([switched, ...writes])
+        .then(([receipt, ...receipts]) => {
+          const landed = receipts.find((r) => r !== null);
+          if (receipt || !landed || offer.seq !== seq) return;
+          return putBack({ ...previous, sort: undefined }, wrote.groups ?? {}, landed).then((undone) =>
+            reportInfo(
+              undone
+                ? "Couldn't switch to Custom, so nothing moved"
+                : "Couldn't switch to Custom; part of the move saved",
+            ),
+          );
+        })
+        .finally(() => (switching.current = false));
     },
     [
       frozen,
       dropUndo,
       changeOrdering,
       onScreenGroupMoves,
+      keepsHeaderOrder,
       workspaceOrdering,
       repositoryOrder,
       groupOrder,
       moveGroup,
       offerUndo,
+      putBack,
       changeSidebarView,
     ],
   );
 
   const resetCustomOrder = useCallback(() => {
+    if (refuseWhileSaving()) return;
     dropUndo();
     const cleared = { order: [], repositories: [] };
     offerUndo(
@@ -335,7 +404,7 @@ export function useSidebarModel({
         repositories: repositoryOrder,
       },
     );
-  }, [dropUndo, changeOrdering, offerUndo, workspaceOrdering, repositoryOrder]);
+  }, [refuseWhileSaving, dropUndo, changeOrdering, offerUndo, workspaceOrdering, repositoryOrder]);
 
   /** Moves a row next to `overId`, after it when the drag went down. */
   const moveWorkspace = useCallback(

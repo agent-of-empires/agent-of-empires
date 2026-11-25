@@ -482,6 +482,30 @@ test.describe("My groups headers", () => {
     expect(handle.viewPatches).toEqual([]);
   });
 
+  test("a CityHall client moves a Group header onto its sibling in one request", async ({ page }) => {
+    const handle = await openDesktop(page, grouped, {
+      groupOrder,
+      cityhall: true,
+      view: { group_by: "group", sort: "custom" },
+    });
+    await waitForResponseBody(page, "/api/about");
+    await expect.poll(() => names(page), { timeout: 8_000 }).toEqual(["alpha", "beta", "gamma"]);
+    await expect(page.locator(WRAPPERS)).toHaveCount(0);
+    await dragHeader(page, 2, 1);
+    await expect.poll(() => names(page), { timeout: 4_000 }).toEqual(["alpha", "gamma", "beta"]);
+    await expect
+      .poll(() => handle.reorders, { timeout: 4_000 })
+      .toEqual([
+        {
+          target: "group",
+          group: { profile: "default", path: "gamma" },
+          direction: "up",
+          siblings: ["alpha", "beta", "gamma"],
+        },
+      ]);
+    expect(handle.puts).toEqual([]);
+  });
+
   test("a read-only viewer gets no draggable Group header", async ({ page }) => {
     await openDesktop(page, grouped, { groupOrder, readOnly: true, view: { group_by: "group", sort: "custom" } });
     await waitForResponseBody(page, "/api/about");

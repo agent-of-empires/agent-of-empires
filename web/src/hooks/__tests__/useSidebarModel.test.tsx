@@ -268,19 +268,25 @@ describe("the shared sidebar view", () => {
         HttpResponse.json({}, { headers: { "aoe-runtime-epoch": "reboot", "aoe-runtime-revision": "1" } }),
       ),
     );
-    const seen = vi.fn();
-    server.events.on("request:start", seen);
+    // The stale read would put back a grouping and sort this Client never picked.
+    stale.sidebar_view = { group_by: "group", sort: "custom" };
+    // A failed read first, so the held read's commit shows as the error clearing even when it is rejected.
+    server.use(http.get("*/api/sessions", () => new HttpResponse(null, { status: 500 }), { once: true }));
     act(() => void result.current.sessions.refresh());
-    await waitFor(() => expect(seen).toHaveBeenCalled());
+    await waitFor(() => expect(result.current.sessions.error).toBe(true));
+    const reads: string[] = [];
+    const listen = ({ request }: { request: Request }) => {
+      if (request.method === "GET" && new URL(request.url).pathname === "/api/sessions") reads.push(request.url);
+    };
+    server.events.on("request:start", listen);
+    act(() => void result.current.sessions.refresh());
+    await waitFor(() => expect(reads).toHaveLength(1));
+    server.events.removeListener("request:start", listen);
     await act(async () => result.current.sessions.changeSidebarView({ sort: "name" }));
-    const answered = vi.fn();
-    server.events.on("response:mocked", answered);
     await act(async () => release());
-    await waitFor(() => expect(answered).toHaveBeenCalled());
-    server.events.removeListener("request:start", seen);
-    server.events.removeListener("response:mocked", answered);
-    await act(async () => {});
+    await waitFor(() => expect(result.current.sessions.error).toBe(false));
     expect(result.current.model.sort).toBe("name");
+    expect(result.current.model.groupBy).toBe("project");
   });
 
   it("puts a failed pick back on the next poll", async () => {
@@ -349,6 +355,24 @@ describe("the shared Custom order", () => {
     await waitFor(() => expect(result.current.model.sort).toBe("name"));
     expect(writes).toEqual([]);
     expect(rows(result)).toEqual(["/r/Alpha::a1", "/r/beta::b1", "/r/beta::b2"]);
+  });
+
+  it("under Name, puts the order back and says so when the switch to Custom fails", async () => {
+    daemon.sidebar_view = { group_by: "project", sort: "name" };
+    const before = [...daemon.workspace_ordering];
+    server.use(
+      http.patch("*/api/sidebar-view", async ({ request }) => {
+        writes.push({ method: "PATCH", body: await request.json() });
+        return new HttpResponse(null, { status: 500 });
+      }),
+    );
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toEqual(["/r/Alpha::a1", "/r/beta::b1", "/r/beta::b2"]));
+    await act(async () => result.current.model.moveWorkspace("/r/beta::b2", "/r/beta::b1", false));
+    await waitFor(() => expect(toasts.info).toHaveBeenCalledWith("Couldn't switch to Custom, so nothing moved"));
+    expect(writes.map((w) => w.method)).toEqual(["PUT", "PATCH", "PUT"]);
+    expect(daemon.workspace_ordering).toEqual(before);
+    expect(toasts.undo).toEqual([]);
   });
 
   it("under Name, a drag's switch to Custom waits for its order, refuses another move, and yields to a newer pick", async () => {
@@ -470,7 +494,7 @@ describe("write order", () => {
     await waitFor(() => expect(rows(result)).toHaveLength(3));
     const releases = heldWrites("put", "*/api/workspace-ordering");
     act(() => void result.current.sessions.changeOrdering({ repositories: ["/r/Alpha", "/r/beta"] }));
-    act(() => result.current.model.resetCustomOrder());
+    act(() => void result.current.sessions.changeOrdering({ order: [], repositories: [] }));
     await waitFor(() => expect(writes).toHaveLength(1));
     await pollAt(result, 2);
     expect(writes).toHaveLength(1);
@@ -484,7 +508,7 @@ describe("write order", () => {
     expect(daemon.repository_order).toEqual([]);
   });
 
-  it("refuses a move while the last one is saving, with a notice", async () => {
+  it("refuses a move or a Reset while the last move is saving, with a notice", async () => {
     const { result } = mount();
     await waitFor(() => expect(headers(result)).toEqual(["/r/beta", "/r/Alpha"]));
     const releases = heldWrites("put", "*/api/workspace-ordering");
@@ -492,9 +516,14 @@ describe("write order", () => {
     await waitFor(() => expect(writes).toHaveLength(1));
     act(() => result.current.model.moveWorkspace("/r/beta::b2", "/r/beta::b1", true));
     expect(toasts.info).toHaveBeenCalledWith("The last move is still saving");
+    toasts.info.mockClear();
+    act(() => result.current.model.resetCustomOrder());
+    expect(toasts.info).toHaveBeenCalledWith("The last move is still saving");
+    expect(headers(result)).toEqual(["/r/Alpha", "/r/beta"]);
     await act(async () => releases[0]!());
     await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
     expect(writes).toHaveLength(1);
+    expect(toasts.undo).toEqual([]);
     act(() => result.current.model.moveWorkspace("/r/beta::b2", "/r/beta::b1", true));
     await waitFor(() => expect(writes).toHaveLength(2));
   });
@@ -668,6 +697,63 @@ describe("Group headers", () => {
     expect(writes[4]).toMatchObject({ method: "POST", body: { group: { path: "zeta" } } });
     expect(daemon.group_order.default).toEqual(["zeta", "alpha", "alpha/inner", "mid", "loose"]);
     expect(writes[5]).toEqual({ method: "PATCH", body: { sort: "name" } });
+  });
+
+  it("drop the Undo when the first read shows another Client rearranged them", async () => {
+    daemon.sidebar_view = { group_by: "group", sort: "name" };
+    const { result } = mount();
+    await waitFor(() => expect(groupHeaders(result)).toHaveLength(5));
+    await act(async () => result.current.model.moveWorkspace("/r/one::zeta", "/r/one::mid", false));
+    await waitFor(() => expect(toasts.undo).toHaveLength(1));
+    daemon.group_order.default = ["zeta", "mid", "alpha", "alpha/inner", "loose"];
+    await pollAt(result, daemon.revision + 1);
+    expect(toasts.undo[0]!.dismissed).toBe(true);
+  });
+
+  it("put the order back when a Group move fails during a switch from Name", async () => {
+    daemon.sidebar_view = { group_by: "group", sort: "name" };
+    const before = [...daemon.workspace_ordering];
+    server.use(http.post("*/api/reorder", () => new HttpResponse(null, { status: 500 }), { once: true }));
+    const { result } = mount();
+    await waitFor(() => expect(groupHeaders(result)).toHaveLength(5));
+    await act(async () => result.current.model.moveWorkspace("/r/one::zeta", "/r/one::mid", false));
+    await waitFor(() => expect(toasts.info).toHaveBeenCalledWith("Couldn't switch to Custom, so nothing moved"));
+    expect(writes.map((w) => w.method)).toEqual(["PUT", "PUT", "POST"]);
+    expect(daemon.workspace_ordering).toEqual(before);
+    expect(toasts.undo).toEqual([]);
+    await pollAt(result, daemon.revision);
+    expect(result.current.model.sort).toBe("name");
+  });
+
+  it("refuse a switch from Name that would reorder the Groups of several profiles", async () => {
+    for (const [order, refused] of [
+      [{ default: ["zeta"], work: ["alpha"] }, true],
+      [{ default: ["alpha"], work: ["zeta"] }, false],
+    ] as const) {
+      writes.length = 0;
+      toasts.info.mockClear();
+      const [first, second] = Object.keys(order).map((profile) => order[profile as keyof typeof order][0]);
+      daemon.sessions = [
+        { ...grouped("one", first), profile: "default" },
+        { ...grouped("two", first), profile: "default" },
+        { ...grouped("three", second), profile: "work" },
+      ];
+      daemon.workspace_ordering = daemon.sessions.map(wsId);
+      daemon.group_order = { ...order };
+      daemon.sidebar_view = { group_by: "group", sort: "name" };
+      const { result, unmount } = mount();
+      await waitFor(() => expect(groupHeaders(result)).toEqual(["alpha", "zeta"]));
+      await act(async () => result.current.model.moveWorkspace("/r/one::two", "/r/one::one", false));
+      if (refused) {
+        expect(toasts.info).toHaveBeenCalledWith("Pick Custom first: Groups of several profiles can't keep this order");
+        expect(writes).toEqual([]);
+        expect(result.current.model.sort).toBe("name");
+      } else {
+        await waitFor(() => expect(writes.map((w) => w.method)).toEqual(["PUT", "PATCH"]));
+        expect(groupHeaders(result)).toEqual(["alpha", "zeta"]);
+      }
+      unmount();
+    }
   });
 
   it("are not moved under Name, which points to Custom, nor across parents", async () => {

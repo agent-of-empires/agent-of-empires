@@ -732,7 +732,9 @@ impl HomeView {
     fn move_header_row(&mut self, path: &str, delta: isize) -> anyhow::Result<()> {
         let nested = super::rows::split_project_view_path(path).1.is_some();
         if self.group_by == GroupByMode::Group || nested {
-            if nested && self.sort_order != SortOrder::Custom {
+            // Under Repository a nested header moves only under Custom; My groups switches from Name.
+            if nested && self.group_by != GroupByMode::Group && self.sort_order != SortOrder::Custom
+            {
                 self.flash_status("Pick the Custom sort (o) to arrange groups by hand");
                 return Ok(());
             }

@@ -56,6 +56,7 @@ const GLOBAL_ENTRIES = [
       options: [
         { value: "running", label: "Running", tone: "success" },
         { value: "idle", label: "Idle" },
+        { value: "failed", label: "Failed" },
       ],
     },
   },
@@ -139,6 +140,11 @@ test.describe("Plugin sort-key and filter-facet slots (#2401)", () => {
     // Deselecting restores all three rows.
     await page.locator("[data-testid='sidebar-facet-option-by-status-running']").click();
     await expect.poll(() => readWorkspaceTitles(page), { timeout: 4000 }).toHaveLength(3);
+
+    // A facet no row matches says so without pointing at Needs you.
+    await page.locator("[data-testid='sidebar-facet-option-by-status-failed']").click();
+    await expect(page.getByText("No matching sessions")).toBeVisible();
+    await expect(page.getByText("Nothing needs you")).toHaveCount(0);
   });
 
   test("a long plugin sort label gives way before the grouping in the 276px sidebar", async ({ page }) => {
