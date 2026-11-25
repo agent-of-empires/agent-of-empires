@@ -156,6 +156,11 @@ impl CommandPaletteDialog {
         dialog
     }
 
+    #[cfg(test)]
+    pub fn entry_ids(&self) -> Vec<&'static str> {
+        self.entries.iter().map(|e| e.id).collect()
+    }
+
     pub fn handle_click(&mut self, col: u16, row: u16) -> DialogResult<PaletteAction> {
         if !self
             .dialog_area

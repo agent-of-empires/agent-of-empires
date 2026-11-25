@@ -351,32 +351,126 @@ fn focusing_the_pane_releases_a_focused_trash_reader() {
     assert!(!env.view.suggestions_focused, "one Esc leaves the pane");
 }
 
-/// Focusing the pane releases a focused Trash transcript reader, so the pane
-/// gets the keys at once and one Esc leaves it.
+/// When the row goes away under the focused pane (`h` turned the pref off, or
+/// the suggestions belong to another profile), the pane stays until Esc, which
+/// lands on a valid neighbouring row.
 #[test]
 #[serial]
-fn focusing_the_pane_releases_a_focused_trash_reader() {
-    let mut env = create_test_env_with_sessions(2);
-    let id = env.view.instance_at(0).id.clone();
-    env.view.mutate_instance(&id, |inst| {
-        inst.trashed_at = Some(crate::time::Timestamp::now())
-    });
-    env.view.trashed_section_collapsed = false;
-    let mut hidden = snapshot(3, &[]);
-    hidden["prefs"]["sidebar"] = false.into();
-    env.view.suggestions_feed.set_snapshot_for_test(hidden);
-    env.view.rebuild_flat_items();
-    env.view.select_session_by_id(&id);
-    env.view.handle_key(key(KeyCode::Enter), None);
-    assert!(env.view.retained_reader_focused());
+fn the_row_vanishing_under_the_focused_pane_leaves_a_valid_cursor() {
+    for case in ["pref off", "other profile"] {
+        let (mut env, _requests) = expanded_env(2);
+        let mut snap = snapshot(2, &[]);
+        if case == "pref off" {
+            snap["prefs"]["sidebar"] = false.into();
+        } else {
+            let mine = env.view.instance_at(0).source_profile.clone();
+            env.view.active_profile = Some(mine);
+            snap["profile"] = "theirs".into();
+        }
+        env.view.suggestions_feed.set_snapshot_for_test(snap);
+        env.view.apply_suggestions_results();
+        // What a poll that brings this snapshot does.
+        env.view.rebuild_flat_items_keeping_cursor();
+        env.view.update_selected();
+        assert!(suggested_rows(&env).is_empty(), "{case}");
+        assert!(env.view.suggestions_pane_shown(), "{case}: the pane stays");
 
-    env.view.focus_suggestions();
-    assert!(!env.view.retained_reader_focused());
-    env.view.handle_key(key(KeyCode::Char('j')), None);
-    let view = env.view.suggestions_view.as_ref().unwrap();
-    assert_eq!(view.selected_key(), Some(("gh".into(), "i1".into())));
-    env.view.handle_key(key(KeyCode::Esc), None);
-    assert!(!env.view.suggestions_focused, "one Esc leaves the pane");
+        env.view.handle_key(key(KeyCode::Esc), None);
+        assert!(!env.view.suggestions_pane_shown(), "{case}");
+        let Some(Item::Session { id, .. }) = env.view.flat_items.get(env.view.cursor) else {
+            panic!("{case}: the cursor is on no session row");
+        };
+        assert_eq!(
+            env.view.selected_session.as_deref(),
+            Some(id.as_str()),
+            "{case}"
+        );
+    }
+}
+
+/// Home's own keys do nothing to Home while the pane has the keys.
+#[test]
+#[serial]
+fn home_keys_do_not_reach_home_while_the_pane_is_focused() {
+    let (mut env, _requests) = expanded_env(2);
+    let (cursor, width) = (env.view.cursor, env.view.list_width);
+    for code in [
+        KeyCode::Char('n'),
+        KeyCode::Char('d'),
+        KeyCode::Char('D'),
+        KeyCode::Delete,
+        KeyCode::Char('l'),
+    ] {
+        with_authenticated_local_project_registry(&mut env.view, |view| {
+            view.handle_key(key(code), None);
+        });
+        assert!(env.view.suggestions_focused, "{code:?}");
+        assert!(
+            !env.view.has_non_live_send_overlay(),
+            "{code:?} opened a dialog"
+        );
+        assert!(env.view.new_dialog.is_none(), "{code:?}");
+        assert_eq!(
+            (env.view.cursor, env.view.list_width),
+            (cursor, width),
+            "{code:?}"
+        );
+    }
+}
+
+/// Strict mode moves the pane's letters: `E`, `Ctrl+N`, `H` and `R` act, and
+/// the bare letters before them do nothing.
+#[test]
+#[serial]
+fn strict_mode_pane_keys_take_shift_or_ctrl() {
+    for (press, expected) in [
+        (key(KeyCode::Char('E')), "prepare gh/i0"),
+        (
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            "prepare gh/i0",
+        ),
+        (key(KeyCode::Char('H')), "show on home false"),
+        // `R` asks providers to refresh, which is not recorded, then reloads.
+        (key(KeyCode::Char('R')), "load"),
+    ] {
+        let (mut env, requests) = expanded_env(2);
+        env.view.strict_hotkeys = true;
+        env.view.ensure_suggestions_view();
+        with_authenticated_local_project_registry(&mut env.view, |view| {
+            for bare in ['e', 'N', 'h'] {
+                view.handle_key(key(KeyCode::Char(bare)), None);
+            }
+            view.handle_key(press, None);
+        });
+        // A queued request goes out when a poll takes the one before it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let sent = loop {
+            if let Ok(request) = requests.try_recv() {
+                break request;
+            }
+            env.view.apply_suggestions_results();
+            assert!(Instant::now() < deadline, "{press:?}: nothing sent");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(sent, expected, "{press:?}");
+    }
+}
+
+/// On the unfocused row Ctrl+K opens Home's palette, which has no source entry.
+#[test]
+#[serial]
+fn ctrl_k_on_the_unfocused_row_opens_homes_palette_without_the_source() {
+    let mut env = create_test_env_with_sessions(1);
+    env.view
+        .suggestions_feed
+        .set_snapshot_for_test(snapshot(1, &[]));
+    env.view.rebuild_flat_items();
+    select_suggested_row(&mut env);
+    env.view.handle_key(ctrl_k(), None);
+    let palette = env.view.command_palette.as_ref().expect("Home's palette");
+    let ids = palette.entry_ids();
+    assert!(ids.contains(&"suggestions"), "{ids:?}");
+    assert!(!ids.contains(&"open-suggestion-source"), "{ids:?}");
 }
 
 fn expanded_env(count: usize) -> (TestEnv, mpsc::Receiver<String>) {
