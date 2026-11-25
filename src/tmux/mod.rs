@@ -17,6 +17,7 @@ mod tool_session;
 pub(crate) mod utils;
 #[cfg(unix)]
 pub(crate) mod vt;
+pub(crate) mod wraps;
 
 pub use composite::PaneGeom;
 pub use detect::{HookObservation, InputLine, Observation, ObservationKey};
@@ -32,36 +33,6 @@ pub(crate) use tool_session::{LegacyToolScope, LegacyToolUnavailable};
 pub use utils::{attach_return_hint, first_pane_id, tmux_prefix_display};
 
 pub(crate) use session_kind::{append_session_kind_args, SessionKind};
-
-/// OSC 8 hyperlinks the live VT channel for `session` has seen, oldest first.
-/// Always empty off unix, where there is no channel and the capture fallback
-/// carries the sequences in the frame text.
-/// How many times `session`'s advertised links have changed. Zero off unix and
-/// whenever no channel is armed, which is stable, so a consumer comparing it
-/// against its own copy simply never re-collects on those transports.
-pub(crate) fn pane_links_generation(session: &str) -> u64 {
-    #[cfg(unix)]
-    {
-        vt::pane_links_generation(session)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = session;
-        0
-    }
-}
-
-pub(crate) fn pane_links(session: &str) -> Vec<osc8::PaneLink> {
-    #[cfg(unix)]
-    {
-        vt::pane_links(session)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = session;
-        Vec::new()
-    }
-}
 
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]

@@ -99,18 +99,18 @@ pub(crate) use instance::{
     host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,
     host_hook_post_install_notes,
 };
-pub use instance::{
-    is_valid_session_color, AuxiliaryObservation, AuxiliaryTarget, ConversationBinding,
-    ConversationProvenance, DetectionState, EnsureReadyError, EnsureReadyOutcome, ExecutionBinding,
-    ExecutionLocation, Instance, LaunchSidOutcome, LegacyToolAdoption, LegacyToolIdentity,
-    LegacyToolObservation, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
-    ManagedResumeCause, PaneObservation, PanePresence, PendingInitialTurn, PluginCreateIdempotency,
-    PollerStart, SandboxInfo, SandboxLoginRequired, SandboxLoginUnsupported, SessionBucket,
-    SessionGone, StartBlocked, StartOutcome, Status, TerminalInfo, TmuxServerIdentity, View,
-    WorkspaceInfo, WorkspaceRepo, WorktreeInfo, MAX_INITIAL_PROMPT_BYTES, SESSION_COLORS,
-    TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR,
-};
 pub(crate) use instance::{reports_tmux_session_gone, resolved_agent_for, UNBOUND_STORE_HINT};
+pub use instance::{
+    AuxiliaryObservation, AuxiliaryTarget, ConversationBinding, ConversationProvenance,
+    DetectionState, EnsureReadyError, EnsureReadyOutcome, ExecutionBinding, ExecutionLocation,
+    Instance, LaunchSidOutcome, LegacyToolAdoption, LegacyToolIdentity, LegacyToolObservation,
+    LifecycleOperation, LifecycleReservation, LifecycleReservationError, ManagedResumeCause,
+    PaneObservation, PanePresence, PendingInitialTurn, PluginCreateIdempotency, PollerStart,
+    SandboxInfo, SandboxLoginRequired, SandboxLoginUnsupported, SessionBucket, SessionGone,
+    StartBlocked, StartOutcome, Status, TerminalInfo, TmuxServerIdentity, View, WorkspaceInfo,
+    WorkspaceRepo, WorktreeInfo, MAX_INITIAL_PROMPT_BYTES, TMUX_SERVER_UNREACHABLE_ERROR,
+    TMUX_SESSION_GONE_ERROR,
+};
 pub(crate) use instance::{
     ConversationState, LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy,
     ResumeLaunchOptions, ResumeProfileConfig, TerminalContextResume,

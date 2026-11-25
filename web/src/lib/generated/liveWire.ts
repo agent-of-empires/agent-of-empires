@@ -24,7 +24,13 @@ mouse: boolean,
 /**
  * SGR (1006) mouse encoding rather than legacy X10.
  */
-mouseSgr: boolean, pane0: LivePane0 | null, };
+mouseSgr: boolean, pane0: LivePane0 | null, 
+/**
+ * Rows of the window, after this message applies, whose line continues on
+ * the next row (a soft wrap), ascending. Absent when none do, or when the
+ * transport cannot tell (a composited split window).
+ */
+wrapped?: Array<number>, };
 
 export type LiveTransportReason = "pipe_owned";
 
@@ -50,7 +56,13 @@ mouse: boolean,
 /**
  * SGR (1006) mouse encoding rather than legacy X10.
  */
-mouseSgr: boolean, pane0: LivePane0 | null, } | { "type": "patch", seq: number, base: number, shift: number, lines: Array<[number, string]>, 
+mouseSgr: boolean, pane0: LivePane0 | null, 
+/**
+ * Rows of the window, after this message applies, whose line continues on
+ * the next row (a soft wrap), ascending. Absent when none do, or when the
+ * transport cannot tell (a composited split window).
+ */
+wrapped?: Array<number>, } | { "type": "patch", seq: number, base: number, shift: number, lines: Array<[number, string]>, 
 /**
  * Rows of live screen at the end of `content`; the rest is history.
  */
@@ -70,6 +82,12 @@ mouse: boolean,
 /**
  * SGR (1006) mouse encoding rather than legacy X10.
  */
-mouseSgr: boolean, pane0: LivePane0 | null, } | { "type": "size_owner", is_owner: boolean, owner?: LiveOwnerKind, } | { "type": "clipboard", text: string, } | { "type": "transport", grid: boolean, reason?: LiveTransportReason, };
+mouseSgr: boolean, pane0: LivePane0 | null, 
+/**
+ * Rows of the window, after this message applies, whose line continues on
+ * the next row (a soft wrap), ascending. Absent when none do, or when the
+ * transport cannot tell (a composited split window).
+ */
+wrapped?: Array<number>, } | { "type": "size_owner", is_owner: boolean, owner?: LiveOwnerKind, } | { "type": "clipboard", text: string, } | { "type": "transport", grid: boolean, reason?: LiveTransportReason, };
 
 export type LiveClientMessage = { "type": "resize", cols: number, rows: number, } | { "type": "window", lines: number, } | { "type": "cadence", fast: boolean, } | { "type": "claim_if_vacant" } | { "type": "claim" } | { "type": "caps", deflate: boolean, patch: boolean, } | { "type": "resync" } | { "type": "paste", text: string, submit: boolean, };
