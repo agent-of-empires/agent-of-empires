@@ -260,6 +260,9 @@ impl HomeView {
                 .is_some_and(|inst| !inst.needs_you())
         {
             self.rebuild_flat_items_keeping_cursor();
+            // The rebuild can drop the header under the cursor, leaving the selection on a row
+            // no longer listed.
+            self.update_selected();
         }
     }
 
@@ -356,7 +359,6 @@ impl HomeView {
         let mut grouped: Vec<Instance> = self
             .cloned_instances_in_active_view()
             .into_iter()
-            .filter(|inst| !needs_you_only || self.listed_by_needs_you(inst))
             .map(|mut inst| {
                 inst.group_path = if inst.is_archived() || inst.is_trashed() {
                     project_group_key(&inst)
@@ -442,9 +444,31 @@ impl HomeView {
         for (path, _) in self.project_group_collapsed.iter().filter(|(_, &c)| c) {
             tree.set_collapsed(path, true);
         }
-        // Seeded before hiding, so a header whose sessions are all hidden keeps its place.
+        // Seeded before filtering, so a header keeps its place while its sessions are hidden.
+        let listed_paths = needs_you_only.then(|| {
+            grouped.retain(|inst| self.listed_by_needs_you(inst));
+            let mut paths = HashSet::new();
+            for inst in grouped
+                .iter()
+                .filter(|i| !i.is_archived() && !i.is_trashed())
+            {
+                let path = inst.group_path.as_str();
+                paths.extend(
+                    path.match_indices('/')
+                        .map(|(at, _)| path[..at].to_string()),
+                );
+                paths.insert(path.to_string());
+            }
+            paths
+        });
         let grouped = self.shown_in_groups(grouped, hide_stopped);
         let mut items = flatten_tree(&tree, &grouped, self.sort_order);
+        if let Some(paths) = listed_paths {
+            items.retain(|item| match item {
+                Item::Group { path, .. } => paths.contains(path),
+                Item::Session { .. } | Item::Suggested { .. } => true,
+            });
+        }
         self.append_suggested(&mut items);
         append_archived_section_by_project(
             &mut items,

@@ -872,3 +872,98 @@ fn revealing_a_session_the_needs_you_filter_hides_turns_the_filter_off() {
     assert!(!env.view.needs_you_only);
     assert_eq!(env.view.selected_session.as_deref(), Some(live.as_str()));
 }
+
+/// The palette's needs-you command works while a Trash row is selected, as the `y` filter does.
+#[test]
+#[serial]
+fn the_needs_you_command_runs_with_a_trash_row_selected() {
+    let mut env = env_with_stopped(false);
+    let id = select_session(&mut env, "util-live");
+    env.view.mutate_instance(&id, |inst| {
+        inst.trashed_at = Some(crate::time::Timestamp::now())
+    });
+    env.view.trashed_section_collapsed = false;
+    env.view.rebuild_flat_items();
+    env.view.select_session_by_id(&id);
+    assert!(env.view.selected_is_trashed());
+
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        None,
+    );
+    for ch in "only sessions that need you".chars() {
+        env.view.handle_key(key(KeyCode::Char(ch)), None);
+    }
+    env.view.handle_key(key(KeyCode::Enter), None);
+
+    assert!(env.view.needs_you_only);
+}
+
+/// Under Repository, stepping from a kept session onto its own header drops both, and the
+/// selection follows the cursor to the header now under it rather than naming the gone one.
+#[test]
+#[serial]
+fn leaving_a_kept_session_for_its_dropped_header_selects_the_row_under_the_cursor() {
+    let instances = [
+        with_status(Instance::new("alpha", "/tmp/alpha"), Status::Waiting),
+        with_status(Instance::new("beta", "/tmp/beta"), Status::Waiting),
+    ];
+    let mut env = seeded_env(test_home(), &instances, false);
+    env.view.apply_group_by(GroupByMode::Project);
+    env.view.toggle_needs_you_only();
+    let Item::Session { id: kept, .. } = env.view.flat_items[1].clone() else {
+        panic!("a session under the first header");
+    };
+    let Item::Group { path: other, .. } = env.view.flat_items[2].clone() else {
+        panic!("a second header");
+    };
+    env.view.cursor = 1;
+    env.view.update_selected();
+    publish_statuses(&mut env.view, &[(&kept, Status::Running)]);
+
+    env.view.cursor = 0;
+    env.view.update_selected();
+
+    assert!(
+        matches!(&env.view.flat_items[env.view.cursor], Item::Group { path, .. } if *path == other)
+    );
+    assert_eq!(env.view.selected_group.as_deref(), Some(other.as_str()));
+    assert_eq!(env.view.selected_session, None);
+}
+
+/// Under Custom, a repository nobody has moved keeps its place by its newest session even when
+/// that session stops needing you and drops out of the needs-you filter.
+#[test]
+#[serial]
+fn a_repository_keeps_its_place_when_its_newest_session_drops_out() {
+    let at = |secs| crate::time::Timestamp::from_unix_secs(secs).unwrap();
+    let mut instances = [
+        with_status(Instance::new("alpha-new", "/tmp/alpha"), Status::Waiting),
+        with_status(Instance::new("alpha-old", "/tmp/alpha"), Status::Waiting),
+        with_status(Instance::new("beta", "/tmp/beta"), Status::Waiting),
+    ];
+    for (inst, secs) in instances.iter_mut().zip([4_000, 1_000, 3_000]) {
+        inst.created_at = at(secs);
+    }
+    let mut env = seeded_env(test_home(), &instances, false);
+    env.view.sort_order = SortOrder::Custom;
+    env.view.apply_group_by(GroupByMode::Project);
+    env.view.toggle_needs_you_only();
+    let headers = |view: &HomeView| -> Vec<String> {
+        view.flat_items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Group { path, .. } => Some(path.clone()),
+                Item::Session { .. } => None,
+            })
+            .collect()
+    };
+    assert_eq!(headers(&env.view), ["alpha", "beta"]);
+
+    let newest = select_session(&mut env, "alpha-new");
+    select_session(&mut env, "beta");
+    publish_statuses(&mut env.view, &[(&newest, Status::Running)]);
+
+    assert_eq!(headers(&env.view), ["alpha", "beta"]);
+    assert_eq!(session_titles(&env.view), ["alpha-old", "beta"]);
+}
