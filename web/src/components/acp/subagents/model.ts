@@ -153,13 +153,13 @@ function backgroundTool(t: BackgroundAgentTool, i: number, ended: boolean): Acti
 /** The later of two ISO times, ignoring a missing one. */
 const latest = (a?: string, b?: string) => (a && b ? (a > b ? a : b) : (a ?? b));
 
-/** A background child's launch result is stale once the child runs again: it is active now,
- *  or idle after it resumed (a child call, or a running update, past the result). */
+/** A background child's launch result is stale once the child runs again: it is active now, or idle
+ *  after a later run (the daemon's run count, or a child call past the result). */
 function resultSuperseded(result: ActivityRow, children: ToolCardProps[], roster: RosterEntry): boolean {
   if (roster.state === "running" || roster.state === "requires_action") return true;
   if (roster.state !== "idle") return false;
   const end = result.at ? Date.parse(result.at) : NaN;
-  return Date.parse(roster.running_since ?? "") > end || children.some((c) => Date.parse(c.tool.started_at) > end);
+  return (roster.runs ?? 1) > 1 || children.some((c) => Date.parse(c.tool.started_at) > end);
 }
 
 /** A sync Task or delegation: its own call and result plus the calls it made. A background

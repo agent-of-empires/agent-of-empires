@@ -374,7 +374,7 @@ describe("applyEvent / subagent roster", () => {
     ]);
   });
 
-  it("stamps when a child last started running and when it last went idle", () => {
+  it("counts a run per idle to active transition and stamps when the child last went idle", () => {
     const states = (...events: AcpEvent[]) => {
       let s = emptyAcpState();
       return events.map((e, i) => {
@@ -382,7 +382,7 @@ describe("applyEvent / subagent roster", () => {
         return s.subagents[0]!;
       });
     };
-    const [r1, r2, r3, r4, r5, r6] = states(
+    const rs = states(
       update("running", "t1"),
       update("requires_action", "t2"),
       update("idle", "t3"),
@@ -390,13 +390,13 @@ describe("applyEvent / subagent roster", () => {
       update("idle", "t5"),
       update("idle", "t6", { title: "renamed" }),
     );
-    expect([r1, r2, r3, r4, r5, r6].map((r) => [r.running_since, r.idle_since])).toEqual([
-      ["t1", undefined],
-      ["t1", undefined],
-      ["t1", "t3"],
-      ["t4", undefined],
-      ["t4", "t5"],
-      ["t4", "t5"],
+    expect(rs.map((r) => [r.runs, r.idle_since])).toEqual([
+      [1, undefined],
+      [1, undefined],
+      [1, "t3"],
+      [2, undefined],
+      [2, "t5"],
+      [2, "t5"],
     ]);
   });
 
@@ -419,6 +419,10 @@ describe("applyEvent / subagent roster", () => {
       ),
     );
     expect(resumed).toMatchObject({ status: "done", report: "", earlierReport: "first report", endedAt: t(5) });
+    expect(
+      roster(update("running", t(1)), update("idle", t(2), idle), update("running", t(4)), update("idle", t(5), idle))
+        .runs,
+    ).toBe(2);
 
     const once = fromInline(
       launch,
@@ -439,14 +443,16 @@ describe("applyEvent / subagent roster", () => {
       update("idle", t(2), { stop_reason: "end_turn", background: true }),
       update("running", t(4), { background: true }),
     );
-    const { running_since: _r, idle_since: _i, updated_at: _u, ...bare } = held.subagents[0] as Record<string, unknown>;
-    const reduced = reducedState({ subagents: [{ ...bare, state: "idle", stop_reason: "end_turn" }] as never });
+    const { idle_since: _i, updated_at: _u, ...bare } = held.subagents[0] as Record<string, unknown>;
+    const reduced = reducedState({
+      subagents: [{ ...bare, runs: 1, state: "idle", stop_reason: "end_turn" }] as never,
+    });
     const merged = applyReducedState(held, reduced, [], held.lastSeq).subagents[0]!;
     const card = fromInline(launch, first, [], merged);
     expect(card).toMatchObject({ status: "done", report: "", earlierReport: "first report" });
   });
 
-  it("keeps a resume adopted mid-run so a text-only second run still settles past the first result", () => {
+  it("reads a resume from the snapshot's run count on a cold load, with no event times", () => {
     const launch: ToolCall = { id: "task-1", name: "Explore", kind: "think", args_preview: "{}", started_at: "t0" };
     const first: ActivityRow = {
       id: "done-task-1",
@@ -459,30 +465,25 @@ describe("applyEvent / subagent roster", () => {
       session_id: "child-1",
       parent_session_id: "root",
       parent_tool_call_id: "task-1",
-      state: "running",
+      state: "idle",
+      stop_reason: "end_turn",
       cancel_capable: true,
       background: true,
     };
-    const reload = (rows: ActivityRow[]) =>
+    const cold = (runs: number) =>
       applyReducedState(
-        { ...emptyAcpState(), activity: rows },
-        reducedState({ subagents: [child] as ReducedState["subagents"] }),
-      );
+        { ...emptyAcpState(), activity: [first] },
+        reducedState({ subagents: [{ ...child, runs }] as ReducedState["subagents"] }),
+      ).subagents[0]!;
 
-    const resumed = ev(
-      reload([first]),
-      5,
-      update("idle", "2026-01-01T00:05:00Z", { stop_reason: "end_turn", background: true }),
-    );
-    expect(resumed.subagents[0]!.running_since! > first.at!).toBe(true);
-    expect(fromInline(launch, first, [], resumed.subagents[0]!)).toMatchObject({
+    expect(fromInline(launch, first, [], cold(2))).toMatchObject({
       status: "done",
       report: "",
       earlierReport: "first report",
     });
-
-    // A first run that is merely active at reload has no result yet, so no resume is inferred.
-    expect(reload([]).subagents[0]!.running_since).toBeUndefined();
+    const once = fromInline(launch, first, [], cold(1));
+    expect(once).toMatchObject({ status: "done", report: "first report" });
+    expect(once.earlierReport).toBeUndefined();
   });
 
   it("maps the state onto the matching background agent, including idle then running again", () => {

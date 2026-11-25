@@ -4,7 +4,6 @@ import {
   appendElicitationAnswerRow,
   applyEvent,
   applyReducedState,
-  stampAdoptedResumes,
   deriveTurnActive,
   emptyAcpState,
   mergePrependedActivity,
@@ -228,7 +227,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
       // Frames feed control state; the transcript comes from the server-folded rows.
       let next = action.frames.reduce(applyEvent, state);
       if (action.rows && action.rows.length > 0)
-        next = stampAdoptedResumes(withServerRows(next, mergeServerRows(next.activity, action.rows)));
+        next = withServerRows(next, mergeServerRows(next.activity, action.rows));
       if (action.oldestSeq != null && state.oldestSeq === 0) return { ...next, oldestSeq: action.oldestSeq };
       return next;
     }

@@ -754,8 +754,8 @@ export interface SubagentRecord {
   background?: boolean;
   /** Client-only: when the child last went idle, from the event's `at`; kept across metadata-only updates, absent on a cold load. */
   idle_since?: string;
-  /** Client-only: when the child last started running again; kept while idle so a later finish can be compared. */
-  running_since?: string;
+  /** Number of runs: 1 is the first, each later idle -> active transition adds one. Daemon-published. */
+  runs?: number;
 }
 
 export interface BackgroundAgentTool {
@@ -1546,11 +1546,11 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     }
     const i = next.subagents.findIndex((s) => s.session_id === subagent.session_id);
     const prev = next.subagents[i];
-    const active = (r?: SubagentRecord) => r?.state === "running" || r?.state === "requires_action";
+    const resumed = prev?.state === "idle" && (subagent.state === "running" || subagent.state === "requires_action");
     const stamped: SubagentRecord = {
       ...subagent,
       idle_since: subagent.state === "idle" ? (prev?.state === "idle" ? prev.idle_since : at) : undefined,
-      running_since: active(subagent) && !active(prev) ? at : prev?.running_since,
+      runs: prev ? (prev.runs ?? 1) + (resumed ? 1 : 0) : subagent.runs || 1,
     };
     next.subagents = i >= 0 ? next.subagents.map((s, idx) => (idx === i ? stamped : s)) : [...next.subagents, stamped];
     return next;
@@ -1643,10 +1643,10 @@ function mergeSubagents(
     ...held.map((r) => {
       const fresh = snapshotIsNewer ? fromSnapshot.get(r.session_id) : undefined;
       if (!fresh) return r;
-      // Stamps come from event times, which the snapshot lacks. A seen resume (running_since) stays evidence
-      // whatever state the snapshot reports; the idle stamp holds only while the state agrees.
+      // The idle stamp comes from an event time the snapshot lacks, so it holds only while the state agrees.
+      // Runs only grow, so a seen resume survives a snapshot that predates it.
       const idle_since = fresh.state === r.state ? r.idle_since : undefined;
-      return { ...fresh, idle_since, running_since: r.running_since };
+      return { ...fresh, idle_since, runs: Math.max(r.runs ?? 0, fresh.runs ?? 0) || undefined };
     }),
     ...snapshot.filter((r) => !heldIds.has(r.session_id)),
   ];
@@ -1667,7 +1667,7 @@ export function applyReducedState(
   ]);
   const locallyResolved = state.locallyResolved.filter((nonce) => stillPending.has(nonce));
   const resolved = new Set(locallyResolved);
-  return stampAdoptedResumes({
+  return {
     ...state,
     agent: reduced.agent,
     model: reduced.model,
@@ -1700,28 +1700,7 @@ export function applyReducedState(
     workflowRuns: restoreWorkflowRuns(state.workflowRuns, reduced.workflow_runs ?? []),
     subagents: mergeSubagents(state.subagents, reduced.subagents ?? [], seq === undefined || seq >= state.lastSeq),
     locallyResolved,
-  });
-}
-
-/**
- * A child adopted active with no event stamp, whose launch call already has a result, was resumed: stamp it at
- * adoption so a later idle still reads as past that result. Cold loads and snapshots carry no event times.
- */
-export function stampAdoptedResumes(state: AcpState): AcpState {
-  const unstamped = state.subagents.filter(
-    (r) => (r.state === "running" || r.state === "requires_action") && !r.running_since && r.parent_tool_call_id,
-  );
-  if (unstamped.length === 0) return state;
-  const resulted = new Set(
-    state.activity
-      .filter((r) => r.kind === "tool_complete" || r.kind === "tool_error")
-      .map((r) => r.toolCallId ?? r.id.replace(/^(done|stopped)-/, "")),
-  );
-  const now = new Date().toISOString();
-  const subagents = state.subagents.map((r) =>
-    unstamped.includes(r) && resulted.has(r.parent_tool_call_id!) ? { ...r, running_since: now } : r,
-  );
-  return subagents.some((r, i) => r !== state.subagents[i]) ? { ...state, subagents } : state;
+  };
 }
 
 /** A snapshot older than a finish already applied must not reopen the shell.

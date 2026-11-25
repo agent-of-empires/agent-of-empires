@@ -183,11 +183,11 @@ describe("fromInline resumed background child", () => {
     expect(record.earlierReport).toBe("");
   });
 
-  it("settles a text-only resume from its running stamp, ending at the idle stamp", () => {
+  it("settles a text-only resume from the daemon's run count, ending at the idle stamp", () => {
     const idle = roster({
       state: "idle",
       stop_reason: "end_turn",
-      running_since: "2026-01-01T00:02:00Z",
+      runs: 2,
       idle_since: "2026-01-01T00:04:00Z",
     });
     const record = fromInline(launch, first, [], idle);
@@ -212,9 +212,9 @@ describe("fromInline resumed background child", () => {
     expect(record.earlierReport).toBe("");
   });
 
-  it("keeps the report when the child last ran before its result, or carries no stamps", () => {
-    const before = roster({ state: "idle", stop_reason: "end_turn", running_since: "2026-01-01T00:00:30Z" });
-    for (const idle of [before, roster({ state: "idle", stop_reason: "end_turn" })]) {
+  it("keeps the first report of a child that ran once, or carries no run count", () => {
+    const once = roster({ state: "idle", stop_reason: "end_turn", runs: 1 });
+    for (const idle of [once, roster({ state: "idle", stop_reason: "end_turn" })]) {
       const record = fromInline(launch, first, [], idle);
       expect(record.report).toBe("first report");
       expect(record.earlierReport).toBeUndefined();

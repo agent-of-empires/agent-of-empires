@@ -3198,10 +3198,12 @@
       "risk": "medium",
       "specs": [
         "src/components/acp/subagents/model.test.ts",
+        "src/lib/acpTypes.reducer.test.ts",
         "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx"
       ],
       "components": [
         "web/src/components/acp/subagents/model.ts",
+        "web/src/lib/acpTypes.ts",
         "web/src/components/acp/subagents/SubagentDetail.tsx"
       ],
       "notes": "A resumed background sub-agent shows running or waiting with Stop, and a second finish shows its stop reason with the first report under earlier output. Foreground and never-resumed cards are unchanged."
