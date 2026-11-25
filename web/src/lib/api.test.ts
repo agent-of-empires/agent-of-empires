@@ -691,6 +691,12 @@ const requestCases: RequestCase[] = [
     { body: { fingerprint: "fp" }, result: { kind: "ok" } },
   ],
   ["POST /api/sandbox/image-pull", () => api.pullSandboxImage(), { result: { ok: true } }],
+  // The accepted reply names the image the Daemon pulled, which may be a default changed since the click.
+  [
+    "POST /api/sandbox/image-pull",
+    () => api.pullSandboxImage(),
+    { respond: json({ image: "sb:2", pull: { state: "running" } }, 202), result: { ok: true, image: "sb:2" } },
+  ],
   // A refusal carries the Daemon's reason for the banner to show.
   [
     "POST /api/sandbox/image-pull",

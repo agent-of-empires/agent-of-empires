@@ -1764,9 +1764,14 @@ export async function fetchSandboxImageStatus(
   return { error: stringField(reply.payload, "error") ?? `http_${reply.status}` };
 }
 
-/** `message` explains a refusal: the gate is off, read-only, or the configuration is unreadable. */
-export function pullSandboxImage(): Promise<{ ok: boolean; message?: string }> {
-  return okWithMessage("/api/sandbox/image-pull", { method: "POST" });
+/** Pulls the default image as of the request's arrival; `image` is the one the Daemon took. `message`
+ *  explains a refusal: the gate is off, read-only, or the configuration is unreadable. */
+export async function pullSandboxImage(): Promise<{ ok: boolean; image?: string; message?: string }> {
+  const reply = await send("/api/sandbox/image-pull", { method: "POST" }).catch(() => null);
+  if (!reply) return { ok: false };
+  if (!reply.ok) return { ok: false, message: stringField(reply.payload, "message") };
+  const image = stringField(reply.payload, "image");
+  return image === undefined ? { ok: true } : { ok: true, image };
 }
 
 /** Cancels `image`'s pull for every client; `pull` is the state it ended in, only when the reply is

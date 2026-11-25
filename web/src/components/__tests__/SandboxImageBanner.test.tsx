@@ -10,7 +10,9 @@ import { notifySandboxImagePullStarted, notifySandboxImagePulled } from "../../l
 import { CANCEL_NOT_READY, SandboxImageBanner } from "../SandboxImageBanner";
 
 const fetchSandboxImageStatus = vi.fn();
-const pullSandboxImage = vi.fn((): Promise<{ ok: boolean; message?: string }> => Promise.resolve({ ok: true }));
+const pullSandboxImage = vi.fn((): Promise<{ ok: boolean; image?: string; message?: string }> =>
+  Promise.resolve({ ok: true }),
+);
 const dismissSandboxImage = vi.fn(() => Promise.resolve(true));
 const cancelSandboxImagePull = vi.fn(
   (_image: string): Promise<{ ok: boolean; pull?: SandboxImagePull; message?: string }> =>
@@ -699,6 +701,50 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
     await mount({ ...running(), image: "ghcr.io/example/other:1" });
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(cancelSandboxImagePull).toHaveBeenCalledWith("ghcr.io/example/other:1");
+  });
+
+  it("ties Update now and its Cancel to the image it pulled when the default changes before the reply", async () => {
+    const OTHER = "ghcr.io/example/other:1";
+    const cancelButton = () => screen.queryByRole("button", { name: "Cancel" }) as HTMLButtonElement | null;
+    // The Daemon pulls the default as of the request's arrival: A if it came before the change, B after.
+    for (const pulled of [IMAGE, OTHER]) {
+      const { unmount } = await mount(status());
+      let reply!: (r: { ok: boolean; image?: string }) => void;
+      pullSandboxImage.mockImplementationOnce(() => new Promise((resolve) => (reply = resolve)));
+      fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+      // The default is now B, which no pull has started for; a poll lands before the reply.
+      fetchSandboxImageStatus.mockResolvedValue(status({ image: OTHER, remote_digest: "sha256:b" }));
+      await pollAfter(2000);
+      expect(banner()?.textContent, `${pulled}: B before the reply`).toBe("Sandbox image update available");
+      // Hold the poll the reply triggers, so only the reply decides what shows.
+      let fresh!: (s: SandboxImageStatus) => void;
+      fetchSandboxImageStatus.mockImplementationOnce(() => new Promise((resolve) => (fresh = resolve)));
+      await act(async () => reply({ ok: true, image: pulled }));
+      if (pulled === IMAGE) {
+        expect(banner()?.textContent, "A's acceptance put B's banner on").toBe("Sandbox image update available");
+        expect(cancelButton(), "A's acceptance offered Cancel for B").toBeNull();
+        // B's last outcome predates this click, so the offer shows rather than it.
+        await act(async () =>
+          fresh(
+            status({
+              image: OTHER,
+              remote_digest: "sha256:b",
+              pull: { state: "failed", reason: "other", message: FAILED, error: "old" },
+            }),
+          ),
+        );
+        expect(banner()?.textContent, "B's older outcome showed as this click's").toBe(
+          "Sandbox image update available",
+        );
+      } else {
+        expect(banner()?.textContent).toBe(DOWNLOADING);
+        expect(cancelButton()?.disabled, "Cancel not ready for the pull the Daemon accepted").toBe(false);
+        fireEvent.click(cancelButton()!);
+        expect(cancelSandboxImagePull).toHaveBeenCalledWith(OTHER);
+      }
+      unmount();
+      cancelSandboxImagePull.mockClear();
+    }
   });
 
   it("drops a Cancel once the banner shows another image, so its reply and refusal stay off it", async () => {
