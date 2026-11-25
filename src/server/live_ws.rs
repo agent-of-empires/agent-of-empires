@@ -33,13 +33,17 @@
 //!   same origin when forwarding pointer cells. Single-pane frames serialize
 //!   `pane0` as `null`. The origin fields are optional for older clients and
 //!   default to zero for frames from older servers. Every frame carries a
-//!   monotonic `seq`.
+//!   monotonic `seq`. `wrapped`, when present, lists the rows whose line
+//!   continues on the next row (a soft wrap), so the client can join them
+//!   before finding URLs. Rows carry OSC 8 hyperlinks on both transports, each
+//!   row opening and closing its own.
 //!   `{"type":"patch","seq":..,"base":..,"shift":k,"lines":[[i,"<ANSI>"],..],
 //!     ...same geometry/cursor/flag fields as a frame}`: sent instead of a
 //!   frame when the client advertised `caps.patch` and few rows changed. The
 //!   client drops the first `shift` rows of its previous window (history
 //!   grew by that many lines), appends `shift` blank rows, then replaces the
-//!   listed rows. `base` names the `seq` the patch applies to; a client that
+//!   listed rows; `wrapped` describes the whole patched window. `base` names
+//!   the `seq` the patch applies to; a client that
 //!   is not at `base` sends `{"type":"resync"}` and receives a full frame.
 //!   `{"type":"size_owner","is_owner":bool,"owner"?:"web"|"tui"}`: whether
 //!     this client holds the session's size-owner lock. Only the owner
@@ -788,9 +792,9 @@ impl FrameDeflater {
 /// One iteration's fetch result, normalizing the vt100-grid sample and the
 /// legacy capture-pane fork onto the same downstream publish/death logic.
 enum CaptureOutcome {
-    /// A renderable frame: ANSI content plus the (already reliability-filtered)
-    /// cursor.
-    Frame(String, Option<crate::tmux::PaneCursor>),
+    /// A renderable frame: ANSI content, the cursor (reliability-filtered
+    /// before publishing), and the rows that soft-wrap.
+    Frame(String, Option<crate::tmux::PaneCursor>, Vec<u32>),
     /// The pane looks gone (dead channel, or an empty capture). Counts toward
     /// the dead-probe threshold before the connection closes.
     Dead,
@@ -1161,7 +1165,7 @@ async fn handle_live_ws_inner(
             (None, Instant::now() - PANE_COUNT_PROBE_INTERVAL);
         #[cfg(unix)]
         let mut first_publish_wait_started: Option<Instant> = None;
-        let mut last_published: Option<(String, Option<crate::tmux::PaneCursor>)> = None;
+        let mut last_published: Option<(String, Option<crate::tmux::PaneCursor>, Vec<u32>)> = None;
         // Announced on the first frame and whenever it flips, so a client can
         // report the transport rather than infer it.
         let mut announced_transport: Option<(bool, Option<LiveTransportReason>)> = None;
@@ -1268,7 +1272,7 @@ async fn handle_live_ws_inner(
                         {
                             Ok(sample) => {
                                 grid_incomplete = sample.incomplete;
-                                CaptureOutcome::Frame(sample.content, sample.cursor)
+                                CaptureOutcome::Frame(sample.content, sample.cursor, sample.wrapped)
                             }
                             Err(_) => break,
                         }
@@ -1276,16 +1280,22 @@ async fn handle_live_ws_inner(
                     _ => {
                         let name = capture_tmux.clone();
                         match tokio::task::spawn_blocking(move || {
-                            crate::tmux::Session::from_name(&name)
-                                .capture_window_composited_with_cursor(lines)
+                            crate::tmux::Session::from_name(&name).capture_window_with_wraps(lines)
                         })
                         .await
                         {
-                            Ok(Ok((content, cursor)))
-                                if !content.is_empty()
-                                    || cursor.as_ref().is_some_and(|c| c.position_reliable) =>
+                            Ok(Ok(capture))
+                                if !capture.content.is_empty()
+                                    || capture
+                                        .cursor
+                                        .as_ref()
+                                        .is_some_and(|c| c.position_reliable) =>
                             {
-                                CaptureOutcome::Frame(content, cursor)
+                                CaptureOutcome::Frame(
+                                    capture.content,
+                                    capture.cursor,
+                                    capture.wrapped,
+                                )
                             }
                             Ok(Ok(_)) => CaptureOutcome::Dead,
                             _ => break,
@@ -1297,16 +1307,15 @@ async fn handle_live_ws_inner(
             {
                 let name = capture_tmux.clone();
                 outcome = match tokio::task::spawn_blocking(move || {
-                    crate::tmux::Session::from_name(&name)
-                        .capture_window_composited_with_cursor(lines)
+                    crate::tmux::Session::from_name(&name).capture_window_with_wraps(lines)
                 })
                 .await
                 {
-                    Ok(Ok((content, cursor)))
-                        if !content.is_empty()
-                            || cursor.as_ref().is_some_and(|c| c.position_reliable) =>
+                    Ok(Ok(capture))
+                        if !capture.content.is_empty()
+                            || capture.cursor.as_ref().is_some_and(|c| c.position_reliable) =>
                     {
-                        CaptureOutcome::Frame(content, cursor)
+                        CaptureOutcome::Frame(capture.content, capture.cursor, capture.wrapped)
                     }
                     Ok(Ok(_)) => CaptureOutcome::Dead,
                     _ => break,
@@ -1347,7 +1356,7 @@ async fn handle_live_ws_inner(
             stats.sample_micros += sample_started.elapsed().as_micros() as u64;
 
             match outcome {
-                CaptureOutcome::Frame(content, cursor) => {
+                CaptureOutcome::Frame(content, cursor, wrapped) => {
                     dead_probes = 0;
                     let cursor = cursor.filter(|c| c.position_reliable);
                     // Keep the size-owner lock alive while we hold it, and
@@ -1644,7 +1653,7 @@ async fn handle_live_ws_inner(
                             break;
                         }
                     }
-                    let frame = (content, cursor);
+                    let frame = (content, cursor, wrapped);
                     // A resync republishes even when the frame is unchanged.
                     let force_full = capture_settings.force_full.swap(false, Ordering::Relaxed);
                     if force_full || last_published.as_ref() != Some(&frame) {
@@ -1668,9 +1677,9 @@ async fn handle_live_ws_inner(
                         let json = match patch {
                             Some((changed, shift)) => {
                                 stats.patches += 1;
-                                patch_json(&changed, shift, seq, frame.1.as_ref())
+                                patch_json(&changed, shift, seq, frame.1.as_ref(), &frame.2)
                             }
-                            None => frame_json(&frame.0, frame.1.as_ref(), seq),
+                            None => frame_json(&frame.0, frame.1.as_ref(), seq, &frame.2),
                         };
                         last_sent = Some((lines.iter().map(|l| l.to_string()).collect(), history));
                         stats.publishes += 1;
@@ -2141,7 +2150,7 @@ fn live_json(message: &LiveServerMessage) -> String {
 }
 
 /// The geometry, cursor and mode fields every frame and patch carries.
-fn frame_meta(cursor: Option<&crate::tmux::PaneCursor>) -> LivePaneMeta {
+fn frame_meta(cursor: Option<&crate::tmux::PaneCursor>, wrapped: &[u32]) -> LivePaneMeta {
     // The cursor is pane relative while composited content uses the window grid.
     let pane0 = cursor.and_then(|c| c.composite_pane0);
     let (origin_x, origin_y) = pane0.map_or((0, 0), |p| (p.left, p.top));
@@ -2163,6 +2172,7 @@ fn frame_meta(cursor: Option<&crate::tmux::PaneCursor>) -> LivePaneMeta {
             left: p.left,
             top: p.top,
         }),
+        wrapped: wrapped.to_vec(),
     }
 }
 
@@ -2172,21 +2182,27 @@ fn patch_json(
     shift: usize,
     seq: u64,
     cursor: Option<&crate::tmux::PaneCursor>,
+    wrapped: &[u32],
 ) -> String {
     live_json(&LiveServerMessage::Patch {
         seq,
         base: seq - 1,
         shift,
         lines: changed.iter().map(|(i, row)| (*i, (*row).into())).collect(),
-        meta: frame_meta(cursor),
+        meta: frame_meta(cursor, wrapped),
     })
 }
 
-fn frame_json(content: &str, cursor: Option<&crate::tmux::PaneCursor>, seq: u64) -> String {
+fn frame_json(
+    content: &str,
+    cursor: Option<&crate::tmux::PaneCursor>,
+    seq: u64,
+    wrapped: &[u32],
+) -> String {
     live_json(&LiveServerMessage::Frame {
         seq,
         content: content.into(),
-        meta: frame_meta(cursor),
+        meta: frame_meta(cursor, wrapped),
     })
 }
 
@@ -2368,7 +2384,7 @@ mod tests {
                 position_reliable: true,
                 composite_pane0: pane0,
             };
-            let json = frame_json("hello\nworld", Some(&cursor), 1);
+            let json = frame_json("hello\nworld", Some(&cursor), 1, &[]);
             let v: serde_json::Value = serde_json::from_str(&json).unwrap();
             assert_eq!(v["type"], "frame");
             assert_eq!(v["content"], "hello\nworld");
@@ -2400,7 +2416,7 @@ mod tests {
             composite_pane0: None,
         };
         let v: serde_json::Value =
-            serde_json::from_str(&frame_json("x", Some(&cursor), 1)).unwrap();
+            serde_json::from_str(&frame_json("x", Some(&cursor), 1, &[])).unwrap();
         assert_eq!(v["altScreen"], true);
         assert_eq!(v["mouse"], true);
         assert_eq!(v["mouseSgr"], false);
@@ -2423,14 +2439,14 @@ mod tests {
             composite_pane0: None,
         };
         let v: serde_json::Value =
-            serde_json::from_str(&frame_json("x", Some(&cursor), 1)).unwrap();
+            serde_json::from_str(&frame_json("x", Some(&cursor), 1, &[])).unwrap();
         assert!(v["cursor"].is_null());
         assert_eq!(v["rows"], 46);
     }
 
     #[test]
     fn frame_json_null_cursor() {
-        let v: serde_json::Value = serde_json::from_str(&frame_json("x", None, 1)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&frame_json("x", None, 1, &[])).unwrap();
         assert!(v["cursor"].is_null());
         assert_eq!(v["rows"], 0);
     }
@@ -2452,7 +2468,8 @@ mod tests {
             composite_pane0: None,
         };
         let v: serde_json::Value =
-            serde_json::from_str(&patch_json(&[(1, "B"), (3, "e")], 1, 7, Some(&cursor))).unwrap();
+            serde_json::from_str(&patch_json(&[(1, "B"), (3, "e")], 1, 7, Some(&cursor), &[]))
+                .unwrap();
         assert_eq!(v["type"], "patch");
         assert_eq!(v["seq"], 7);
         assert_eq!(v["base"], 6);
@@ -2505,13 +2522,13 @@ mod tests {
         let screen: String = (0..50)
             .map(|i| format!("\x1b[38;5;208mline {i} with some agent output text\x1b[0m\n"))
             .collect();
-        let frame1 = frame_json(&screen, None, 1);
+        let frame1 = frame_json(&screen, None, 1, &[]);
         // Frame 2.
         let scrolled = format!(
             "{}\x1b[38;5;208mline 50 with some agent output text\x1b[0m\n",
             screen.split_once('\n').unwrap().1
         );
-        let frame2 = frame_json(&scrolled, None, 2);
+        let frame2 = frame_json(&scrolled, None, 2, &[]);
 
         let mut d = FrameDeflater::new();
         let c1 = d.frame(&frame1).unwrap();

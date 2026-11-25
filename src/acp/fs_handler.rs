@@ -1,11 +1,16 @@
 //! Handlers for ACP `fs/*` requests delegated by agents.
-//! Every access resolves (following symlinks) inside the session roots and is logged.
+//! Every access is opened relative to a session root directory descriptor,
+//! never through a symlink, and is logged.
 
-use std::io;
-use std::path::{Path, PathBuf};
+use std::io::{self, Read};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
+use nix::errno::Errno;
 use thiserror::Error;
 use tracing::info;
+
+use crate::session::AnchoredDir;
 
 #[derive(Debug, Error)]
 pub enum FsError {
@@ -61,43 +66,95 @@ impl SandboxPathMap {
     }
 }
 
+/// An allowed root opened once, so later renames or symlink swaps of its
+/// pathname cannot change which directory requests resolve against.
+#[derive(Debug, Clone)]
+struct PinnedRoot {
+    canonical: PathBuf,
+    dir: Option<Arc<AnchoredDir>>,
+}
+
 /// Per-session allowed-roots policy.
 #[derive(Debug, Clone)]
 pub struct FsPolicy {
     pub allowed_roots: Vec<PathBuf>,
+    pinned: Vec<PinnedRoot>,
     /// When set, agent-reported paths are translated through this map
     /// before the inside-roots check.
     pub sandbox_map: Option<SandboxPathMap>,
 }
 
 impl FsPolicy {
+    /// Pins every root that opens now; build the policy before untrusted
+    /// code can touch the roots.
     pub fn new(roots: Vec<PathBuf>) -> Self {
+        let pinned = roots
+            .iter()
+            .map(|root| {
+                let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+                let dir = AnchoredDir::open_traversal(&canonical).ok().map(Arc::new);
+                PinnedRoot { canonical, dir }
+            })
+            .collect();
         Self {
             allowed_roots: roots,
+            pinned,
             sandbox_map: None,
         }
     }
 
-    pub fn with_sandbox_map(roots: Vec<PathBuf>, map: SandboxPathMap) -> Self {
-        Self {
-            allowed_roots: roots,
-            sandbox_map: Some(map),
-        }
+    pub fn with_map(mut self, map: SandboxPathMap) -> Self {
+        self.sandbox_map = Some(map);
+        self
     }
 
-    /// Returns the path canonicalized iff it is inside one of the allowed
-    /// roots.
-    pub fn resolve_inside(&self, path: &Path) -> Result<PathBuf, FsError> {
+    fn translate(&self, path: &Path) -> Result<PathBuf, FsError> {
         if !path.is_absolute() {
             return Err(FsError::NotAbsolute(path.to_path_buf()));
         }
-        let translated: PathBuf;
-        let path = if let Some(map) = &self.sandbox_map {
-            translated = map.translate_to_host(path);
-            translated.as_path()
-        } else {
-            path
-        };
+        Ok(match &self.sandbox_map {
+            Some(map) => map.translate_to_host(path),
+            None => path.to_path_buf(),
+        })
+    }
+
+    /// Return the pinned root holding `path` and the path relative to it.
+    /// Opens walk that relative path with `O_NOFOLLOW` per component, so a
+    /// swapped directory cannot redirect them.
+    fn anchor(&self, path: &Path) -> Result<(Arc<AnchoredDir>, PathBuf), FsError> {
+        let mut normal = PathBuf::new();
+        for component in self.translate(path)?.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if !normal.pop() {
+                        return Err(FsError::OutsideRoots(path.to_path_buf()));
+                    }
+                }
+                other => normal.push(other),
+            }
+        }
+        for (root, pinned) in self.allowed_roots.iter().zip(&self.pinned) {
+            for prefix in [root.as_path(), pinned.canonical.as_path()] {
+                if let Ok(relative) = normal.strip_prefix(prefix) {
+                    let dir = pinned.dir.clone().ok_or_else(|| {
+                        FsError::Io(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("session root was not available: {}", root.display()),
+                        ))
+                    })?;
+                    return Ok((dir, relative.to_path_buf()));
+                }
+            }
+        }
+        Err(FsError::OutsideRoots(normal))
+    }
+
+    /// Returns the path canonicalized iff it is inside one of the allowed
+    /// roots. A check only: it does not protect a later open of the path.
+    pub fn resolve_inside(&self, path: &Path) -> Result<PathBuf, FsError> {
+        let translated = self.translate(path)?;
+        let path = translated.as_path();
         let canonical = if path.exists() {
             path.canonicalize()?
         } else if let Some(parent) = path.parent() {
@@ -118,9 +175,8 @@ impl FsPolicy {
             }
         }
 
-        for root in &self.allowed_roots {
-            let root_canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if canonical.starts_with(&root_canonical) {
+        for pinned in &self.pinned {
+            if canonical.starts_with(&pinned.canonical) {
                 return Ok(canonical);
             }
         }
@@ -128,10 +184,22 @@ impl FsPolicy {
     }
 }
 
+fn anchored_error(error: anyhow::Error, path: &Path) -> FsError {
+    match error.downcast_ref::<Errno>() {
+        Some(Errno::ELOOP) => FsError::SymlinkInPath(path.to_path_buf()),
+        Some(errno) => FsError::Io(io::Error::from(*errno)),
+        None => FsError::Io(io::Error::other(format!("{error:#}"))),
+    }
+}
+
 /// Implementation of ACP `fs/read_text_file`.
 pub fn handle_read(policy: &FsPolicy, session_id: &str, path: &Path) -> Result<String, FsError> {
-    let resolved = policy.resolve_inside(path)?;
-    let text = read_no_follow(&resolved)?;
+    let (root, relative) = policy.anchor(path)?;
+    let resolved = root.path().join(&relative);
+    let mut text = String::new();
+    root.open_file(&relative, false)
+        .map_err(|e| anchored_error(e, &resolved))?
+        .read_to_string(&mut text)?;
     info!(target: "acp.fs", session = %session_id, path = %resolved.display(), bytes = text.len(), "fs/read");
     Ok(text)
 }
@@ -143,11 +211,12 @@ pub fn handle_write(
     path: &Path,
     contents: &str,
 ) -> Result<(), FsError> {
-    let resolved = policy.resolve_inside(path)?;
-    if let Some(parent) = resolved.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    write_no_follow(&resolved, contents)?;
+    use std::io::Write;
+    let (root, relative) = policy.anchor(path)?;
+    let resolved = root.path().join(&relative);
+    root.open_file(&relative, true)
+        .map_err(|e| anchored_error(e, &resolved))?
+        .write_all(contents.as_bytes())?;
     info!(
         target: "acp.fs",
         session = %session_id,
@@ -156,45 +225,6 @@ pub fn handle_write(
         "fs/write"
     );
     Ok(())
-}
-
-/// Open with `O_NOFOLLOW` so the kernel itself refuses to follow a
-/// symlink at the leaf.
-#[cfg(unix)]
-fn read_no_follow(path: &Path) -> io::Result<String> {
-    use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
-        .open(path)?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf)?;
-    Ok(buf)
-}
-
-#[cfg(not(unix))]
-fn read_no_follow(path: &Path) -> io::Result<String> {
-    std::fs::read_to_string(path)
-}
-
-#[cfg(unix)]
-fn write_no_follow(path: &Path, contents: &str) -> io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
-        .open(path)?;
-    file.write_all(contents.as_bytes())?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_no_follow(path: &Path, contents: &str) -> io::Result<()> {
-    std::fs::write(path, contents)
 }
 
 #[cfg(test)]
@@ -208,7 +238,7 @@ mod tests {
         std::fs::write(root.join("file.txt"), "hello").unwrap();
         let canonical = root.canonicalize().unwrap();
         let map = SandboxPathMap::new(vec![(PathBuf::from("/workspace/proj"), root.clone())]);
-        let policy = FsPolicy::with_sandbox_map(vec![root.clone()], map);
+        let policy = FsPolicy::new(vec![root.clone()]).with_map(map);
         for inside in [
             root.join("file.txt"),
             PathBuf::from("/workspace/proj/file.txt"),
@@ -245,11 +275,11 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &escape).unwrap();
         assert!(matches!(
             handle_read(&policy, "s-1", &escape),
-            Err(FsError::OutsideRoots(_))
+            Err(FsError::SymlinkInPath(_))
         ));
         assert!(matches!(
             handle_write(&policy, "s-1", &escape, "owned"),
-            Err(FsError::OutsideRoots(_))
+            Err(FsError::SymlinkInPath(_))
         ));
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "secret");
 
@@ -259,13 +289,156 @@ mod tests {
             handle_write(&policy, "s-1", &dangling, "x"),
             Err(FsError::SymlinkInPath(_))
         ));
+    }
 
-        let link = temp.path().join("link");
-        std::os::unix::fs::symlink(&path, &link).unwrap();
-        assert!(
-            read_no_follow(&link).is_err(),
-            "O_NOFOLLOW must refuse a symlinked leaf"
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_directories_are_refused_even_inside_the_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let policy = FsPolicy::new(vec![root.clone()]);
+        std::fs::create_dir(root.join("real")).unwrap();
+        std::fs::write(root.join("real/f.txt"), "in").unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+
+        assert!(handle_read(&policy, "s", &root.join("link/f.txt")).is_err());
+        assert!(handle_write(&policy, "s", &root.join("link/f.txt"), "x").is_err());
+        assert!(handle_write(&policy, "s", &root.join("link/new/f.txt"), "x").is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("real/f.txt")).unwrap(),
+            "in"
         );
+        assert!(!root.join("real/new").exists());
+
+        handle_write(&policy, "s", &root.join("a/./b/../c/f.txt"), "ok").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("a/c/f.txt")).unwrap(),
+            "ok"
+        );
+        assert!(matches!(
+            handle_read(&policy, "s", &root.join("../outside.txt")),
+            Err(FsError::OutsideRoots(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_the_root_after_the_policy_is_built_is_not_followed() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().canonicalize().unwrap();
+        let root = parent.join("wt");
+        let moved = parent.join("moved");
+        let outside = parent.join("outside");
+        for dir in [&root, &outside] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        std::fs::write(root.join("f.txt"), "in").unwrap();
+        std::fs::write(outside.join("f.txt"), "secret").unwrap();
+        let policy = FsPolicy::new(vec![root.clone()]);
+
+        std::fs::rename(&root, &moved).unwrap();
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+
+        assert_eq!(
+            handle_read(&policy, "s", &root.join("f.txt")).unwrap(),
+            "in"
+        );
+        handle_write(&policy, "s", &root.join("f.txt"), "new").unwrap();
+        handle_write(&policy, "s", &root.join("d/g.txt"), "new").unwrap();
+        assert_eq!(std::fs::read_to_string(moved.join("f.txt")).unwrap(), "new");
+        assert!(moved.join("d/g.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("f.txt")).unwrap(),
+            "secret"
+        );
+        assert!(!outside.join("d").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_inside_compares_against_the_pinned_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().canonicalize().unwrap();
+        let (root, outside) = (parent.join("wt"), parent.join("outside"));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(root.join("f.txt"), "in").unwrap();
+        std::fs::write(outside.join("f.txt"), "secret").unwrap();
+        let policy = FsPolicy::new(vec![root.clone()]);
+        assert!(policy.resolve_inside(&root.join("f.txt")).is_ok());
+
+        std::fs::rename(&root, parent.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+
+        assert!(matches!(
+            policy.resolve_inside(&root.join("f.txt")),
+            Err(FsError::OutsideRoots(_))
+        ));
+    }
+
+    /// Supplemental: a directory flipping to a symlink to an outside
+    /// directory while writes run must never redirect a write there.
+    #[cfg(unix)]
+    #[test]
+    fn swapping_a_directory_for_a_symlink_never_escapes_the_root() {
+        use std::fs;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        const CYCLES: usize = 20;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().to_path_buf();
+        let policy = FsPolicy::new(vec![root.clone()]);
+        fs::create_dir(root.join("a")).unwrap();
+
+        // Phase A: no swapper, `a` is a real directory.
+        handle_write(&policy, "s", &root.join("a/f.txt"), "in").unwrap();
+        handle_write(&policy, "s", &root.join("a/d/f.txt"), "in").unwrap();
+
+        // Phase B: writes race the swapper.
+        let done = AtomicBool::new(false);
+        let (cycle_tx, cycle_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let (a, a_real) = (root.join("a"), root.join("a_real"));
+                while !done.load(Ordering::SeqCst) {
+                    let cycle = fs::rename(&a, &a_real)
+                        .and_then(|()| std::os::unix::fs::symlink(&outside, &a))
+                        .and_then(|()| fs::remove_file(&a))
+                        .and_then(|()| fs::rename(&a_real, &a));
+                    if cycle.is_ok() {
+                        let _ = cycle_tx.send(());
+                        continue;
+                    }
+                    // A writer may have recreated `a` mid-cycle: drop any stray
+                    // symlink or writer-made dir so `a_real` moves back.
+                    if a.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+                        let _ = fs::remove_file(&a);
+                    }
+                    if a_real.exists() {
+                        let _ = fs::remove_dir_all(&a);
+                        let _ = fs::rename(&a_real, &a);
+                    }
+                    let _ = fs::create_dir(&a);
+                }
+            });
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut cycles = 0;
+            while cycles < CYCLES {
+                if Instant::now() > deadline {
+                    done.store(true, Ordering::SeqCst);
+                    panic!("swapper completed {cycles}/{CYCLES} cycles within 30s");
+                }
+                while cycle_rx.try_recv().is_ok() {
+                    cycles += 1;
+                }
+                let _ = handle_write(&policy, "s", &root.join("a/f.txt"), "pwn");
+                let _ = handle_write(&policy, "s", &root.join("a/d/f.txt"), "pwn");
+            }
+            done.store(true, Ordering::SeqCst);
+        });
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
     }
 
     #[test]
@@ -290,6 +463,35 @@ mod tests {
                 PathBuf::from(host),
                 "{container}"
             );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn search_only_root_or_parent_is_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        let root = parent.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("f.txt"), "hello").unwrap();
+        for search_only in [root.clone(), parent.clone()] {
+            let _restore = Restore(search_only.clone());
+            std::fs::set_permissions(&search_only, std::fs::Permissions::from_mode(0o100)).unwrap();
+            let policy = FsPolicy::new(vec![root.clone()]);
+            let text = handle_read(&policy, "s", &root.join("f.txt")).unwrap();
+            assert_eq!(text, "hello", "search-only {search_only:?}");
         }
     }
 }

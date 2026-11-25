@@ -125,6 +125,23 @@ describe("ToastProvider", () => {
     expect(screen.queryByText("boom")).toBeNull();
   });
 
+  it("shows an info action toast as a status whose button runs once, and times it out like any info toast", () => {
+    renderProvider();
+    const openDefaults = vi.fn();
+    act(() => {
+      toastBus.handler?.infoAction("Saved", "Agent defaults ›", openDefaults);
+      toastBus.handler?.infoAction("Saved again", "Agent defaults ›", vi.fn());
+    });
+    expect(screen.queryByRole("alert")).toBeNull();
+    fireEvent.click(within(screen.getAllByRole("status")[0]!).getByRole("button", { name: "Agent defaults ›" }));
+    expect(openDefaults).toHaveBeenCalledOnce();
+    expect(screen.queryByText("Saved")).toBeNull();
+    act(() => vi.advanceTimersByTime(5999));
+    expect(screen.queryByText("Saved again")).toBeTruthy();
+    act(() => vi.advanceTimersByTime(1));
+    expect(screen.queryByText("Saved again")).toBeNull();
+  });
+
   it("removes a toast after its 6s lifetime elapses", () => {
     renderProvider();
     act(() => toastBus.handler?.info("temporary"));

@@ -12,6 +12,7 @@ import type {
   ElicitationResolution,
 } from "../../lib/acpTypes";
 import { OFFLINE_TITLE, useServerDown } from "../../lib/connectionState";
+import { isImeComposing } from "../../lib/ime";
 
 interface Props {
   elicitation: Elicitation;
@@ -347,7 +348,7 @@ function QuestionField({
           disabled={disabled}
           onChange={(e) => onSetSingle(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key !== "Enter" || e.shiftKey || e.nativeEvent.isComposing) return;
+            if (e.key !== "Enter" || e.shiftKey || isImeComposing(e)) return;
             e.preventDefault();
             e.currentTarget.form?.requestSubmit();
           }}

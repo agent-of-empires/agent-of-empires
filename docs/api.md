@@ -410,7 +410,7 @@ read `sessions`; the array is never returned unwrapped.
 `aoe-runtime-epoch` and `aoe-runtime-revision` identify the exact returned
 snapshot. Revisions are decimal unsigned 64-bit integers; clients must preserve
 their precision. A stale list must not replace newer canonical rows or ordering.
-Color and notification mutation receipts identify one session: another session
+Notification mutation receipts identify one session: another session
 at a higher revision cannot satisfy that receipt.
 
 **Query parameters**
@@ -1158,6 +1158,8 @@ replacement state requires fresh consent.
 `DELETE /api/sessions/:id/acp` is a durable user stop, not a daemon detach. It commits the native stopped/dormant generation before retiring the captured original worker and returns `204` only after retirement is proven. Generic `POST /api/sessions/:id/stop` uses the same structured-worker stop boundary.
 
 Admitted stop work survives HTTP cancellation; its committed native fence survives daemon reconstruction. Automatic reconciliation does not resume a committed stop. A later explicit spawn, start, restart, backend/provider switch or accepted prompt proves original retirement before consuming only its observed stop generation and token; a newer stop wins. A `no_revive` prompt cannot clear the stop.
+
+A new prompt sent from the dashboard, TUI or CLI to a stopped session (`POST /api/sessions/{id}/acp/prompt` without `no_revive` or a queued prompt id) starts it. If a newer stop wins that start, the answer is `409` with header `aoe-error-code: resume_failed` and a `stop_fenced: ...` body. The prompt is not queued, so do not retry it automatically. Prompts from other origins stay queued behind the stop until an explicit start.
 
 If a write commits but canonical publication fails, the stop remains durable and the response reports an unconfirmed outcome. Unproven retirement remains pending rather than reporting success. Daemon detach, idle shutdown and internal provider teardown do not independently create user-stop intent. Reversible stop preserves native transcript history.
 

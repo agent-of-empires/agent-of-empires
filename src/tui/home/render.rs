@@ -3902,13 +3902,14 @@ impl HomeView {
                 .unwrap_or_else(|e| e.into_inner()),
         );
         for row_offset in 0..pane.height {
-            let Some(line) = text.lines.get(view.first_line + row_offset as usize) else {
+            let index = view.first_line + row_offset as usize;
+            let Some(line) = text.lines.get(index) else {
                 break;
             };
             for span in crate::tui::links::link_spans_for_line(
                 line,
                 pane.width,
-                &cache.links,
+                cache.links_on(index),
                 &self.preview_link_prefixes,
             ) {
                 for col in span.start..span.end {
