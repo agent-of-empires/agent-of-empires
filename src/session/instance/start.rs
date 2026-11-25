@@ -2085,10 +2085,11 @@ else:
                         initial_births[0]["pid"].as_u64(),
                         Some(u64::from(native_pid))
                     );
+                    let retry = instance.start_with_size_opts(None, false).unwrap_err();
                     assert_eq!(
-                        instance.start_with_size_opts(None, false).unwrap(),
-                        LaunchSidOutcome::Skipped,
-                        "a refused publication must not admit another physical launch"
+                        retry.downcast_ref::<LaunchIndeterminateCause>(),
+                        Some(&LaunchIndeterminateCause::OwnershipUnproven),
+                        "a refused publication must not authorize reuse or another launch"
                     );
                     let after = storage.load().unwrap().remove(0);
                     assert_eq!(after.lifecycle_generation, generation);
