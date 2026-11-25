@@ -69,6 +69,27 @@ describe("useSandboxImageRowStatus", () => {
     expect(result.current?.label).toBe("Up to date");
   });
 
+  it("drops the previous profile's reply on a profile switch, until the new profile's check answers", async () => {
+    fetchStatus.mockResolvedValueOnce(status({ state: "available", remote_digest: "sha256:b" }));
+    const { result, rerender } = renderHook(({ profile }) => useSandboxImageRowStatus("", true, profile), {
+      initialProps: { profile: "work" },
+    });
+    await settle();
+    expect(result.current?.label).toBe("Update available");
+
+    let answerSecond: (s: SandboxImageStatus) => void = () => {};
+    fetchStatus.mockReturnValueOnce(new Promise((resolve) => (answerSecond = resolve)));
+    rerender({ profile: "home" });
+    // The debounced request has not even been sent: work's "available" must not stand for home.
+    expect(result.current).toBeNull();
+    await act(async () => vi.advanceTimersByTime(IMAGE_RECHECK_MS));
+    expect(fetchStatus.mock.calls.slice(1)).toEqual([[undefined, { fresh: false, profile: "home" }]]);
+    // Sent but unanswered.
+    expect(result.current).toBeNull();
+    await act(async () => answerSecond(status({ state: "current" })));
+    expect(result.current?.label).toBe("Up to date");
+  });
+
   it("waits for typing to stop while the first check is pending, and drops that late answer", async () => {
     let answerFirst: (s: SandboxImageStatus) => void = () => {};
     fetchStatus.mockReturnValueOnce(new Promise((resolve) => (answerFirst = resolve)));

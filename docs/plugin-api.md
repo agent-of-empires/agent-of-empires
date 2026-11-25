@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `22`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `25`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -19,7 +19,7 @@ Each key below notes the `api_version` it needs. Target the newest schema your p
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 22
+api_version = 25
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 capabilities = ["runtime.worker"]
@@ -30,11 +30,12 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `22`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `25`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). A manifest with `[runtime]` must declare `runtime.worker`. Static contributions need none; provider-native agent status and replies require `session.integration`. |
 | `screenshots` | array | no | Up to 8. Requires `api_version >= 5`. See [Screenshots](#screenshots). |
+| `suggestions` | table | no | Suggested-session sources the worker publishes. Requires `api_version >= 23` and `runtime.worker`. See [Suggested sessions](#suggested-sessions). |
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
 | `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; the launch, detection, and reply-fallback extensions require API 21, and the session-id capture extension requires API 22, each with a host implementing them. Provider-native status and replies require `session.integration`. |
 
@@ -154,7 +155,7 @@ Capabilities gate plugin resource access and host interactions. They are prompte
 | Capability | Grants |
 |---|---|
 | `runtime.worker` | Launching a plugin worker and using its base host RPCs. Required for either runtime kind. |
-| `session.read` | Reading sessions of the host's profile: the attached session, `sessions.list`, and the `session.status.changed` (`api_version >= 14`) and `session.lifecycle.changed` (`api_version >= 19`) notifications. |
+| `session.read` | Reading sessions of the host's profile: the attached session, `sessions.list`, `projects.list` (`api_version >= 23`, the registered projects), and the `session.status.changed` (`api_version >= 14`) and `session.lifecycle.changed` (`api_version >= 19`) notifications. |
 | `session.write` | Mutating any session of the profile: `session.meta.set`/`cas`, `session.capture.set` for a tool the plugin owns and declares `session_id` for, and archive/trash from a plugin page. |
 | `config.read` | Reading host or other-plugin configuration (not the plugin's own settings). |
 | `config.write` | Writing host or other-plugin configuration. |
@@ -175,12 +176,13 @@ Capabilities gate plugin resource access and host interactions. They are prompte
 | `session.unattended` | Creating a session in a host-classified *unattended* approval mode. A distinct, high-severity grant, never implied by `session.create` or `session.prompt` (`api_version >= 9`). See [Session-driving RPCs](#session-driving-rpcs). |
 | `session.message` | Pushing a text message into **any** session, including ones the plugin did not create, via `sessions.message.send`. A structured session shows the message as sent by the plugin, and the call reaches sessions the plugin did not create, so it is a separate grant, never implied by `session.prompt` (`api_version >= 15`). |
 | `session.integration` | Provider-native status and user-requested replies for an agent (`api_version >= 19`). Launch-only agent metadata does not require this capability. |
+| `mcp.rewrite` | Serving the `mcp.rewrite` hook. The worker receives each session's resolved MCP server definitions **including secret env and header values**, and returns the set AoE forwards to the agent (`api_version >= 24`). A distinct, high-severity grant, never implied by another. See [Hooks](#hooks). |
 
 A capability this host version does not recognize is rejected, not granted.
 
 ## Commands
 
-Palette and CLI entries, namespaced by the host as `plugin.<id>.<command-id>`.
+Palette entries, namespaced by the host as `plugin.<id>.<command-id>`. A command with no `action` is delivered to the worker as a `plugin.command.invoke` notification. The CLI lists them in `aoe --help` but cannot run them yet. A command whose name a core subcommand or an earlier plugin already uses is not listed.
 
 ```toml
 [[commands]]
@@ -350,6 +352,8 @@ With `api_version >= 9` a worker can discover ACP capabilities and create host-o
 | `sessions.turn.send` | `session.prompt` | Deliver a turn to a session **this plugin created**. |
 | `sessions.message.send` | `session.message` | Deliver a short text message to **any** session, like `aoe send`. See [Messaging any session](#messaging-any-session). `api_version >= 15`. |
 | `plugin.storage.get` / `set` / `cas` / `remove` | `runtime.worker` | Plugin-private durable key/value storage (see [Plugin storage](#plugin-storage)). |
+| `suggestions.set` / `error` / `sources` / `checks.set` | `runtime.worker` | Publish suggested sessions (see [Suggested sessions](#suggested-sessions)). `api_version >= 23`. Not served until the store layer lands. |
+| `projects.list` | `session.read` | Registered projects of the host profile, `{ projects: [{ name, path }] }`. `api_version >= 23`. |
 
 **Project selection (`api_version >= 11`).** `sessions.create` takes an optional `project_path` (the trust-checked primary repo) and `extra_project_paths` (the other repos of a multi-repo session). Omitting `project_path` creates a **scratch** session: a throwaway directory with no repository, so extras alongside it are refused. Every path is canonicalized and existence-checked host-side, fail-closed and capped per call.
 
@@ -361,7 +365,7 @@ With `api_version >= 9` a worker can discover ACP capabilities and create host-o
 
 **Ownership.** `sessions.turn.send` reaches only a session the calling plugin created. To reach any other session, use `sessions.message.send`.
 
-**Busy sessions.** A turn aimed at an agent already running a non-steerable turn (or cancelling, or compacting) is refused with a retryable `agent_busy` rather than dropped. So is a `/compact` or `/clear` aimed at any running turn, steerable or not, since such a command runs on its own turn. A stopped or dormant session is not busy: the host wakes it the way a user prompt does, closes any turn the previous worker left open, resumes the worker, and waits. An archived or trashed session is never woken; the turn fails with `session_archived` or `session_trashed`.
+**Busy sessions.** A turn aimed at an agent already running a non-steerable turn (or cancelling, or compacting) is refused with a retryable `agent_busy` rather than dropped. So is a `/compact` or `/clear` aimed at any running turn, steerable or not, since such a command runs on its own turn. A stopped or dormant session is not busy: the host wakes it the way a user prompt does, closes any turn the previous worker left open, resumes the worker, and waits. An archived or trashed session is never woken; the turn fails with `session_archived` or `session_trashed`. An ignored session fails with `ignored` and keeps its marker.
 
 **Idempotency.** `sessions.create` takes a plugin-scoped `idempotency_key`: retrying with the same key and payload returns the existing session (`created: false`), while a different payload under that key is a conflict.
 
@@ -394,6 +398,7 @@ Status notifications follow canonical row adoption. Rejected or stale operations
 | `session_not_found` | No such session, which is also what a hard-deleted session looks like. |
 | `session_archived` | The session is archived; it is never woken. Skip it and keep the registration. |
 | `session_trashed` | The session is in the trash; it is never woken. |
+| `ignored` | The session is managed by another session and ignored; a plugin send is never delivered or allowed to clear the marker. A person must unignore it or reclaim ownership first. |
 | `rate_limited` | More than 600 messages per rolling hour for this plugin. A bucket of its own, separate from turns. |
 | `resume_failed` | A terminal session's agent could not resume. `data.resume_session_id` holds the preserved session id. |
 | `session_not_running` | A terminal pane vanished between the revive and the send. |
@@ -407,6 +412,55 @@ Status notifications follow canonical row adoption. Rejected or stale operations
 
 **Timing.** The call is synchronous. It returns, or fails with `delivery_timeout`, within 25 seconds (a 10 second worker-ready wait plus 15 seconds for a terminal resume), so a worker may call it from a scheduler loop.
 
+## Hooks
+
+### `[hooks.mcp_rewrite]` (`api_version >= 24`)
+
+Lets a worker rewrite the MCP servers AoE forwards to a session's agent. Requires the `mcp.rewrite` capability and a `[runtime]` worker. The hook runs only while the plugin is active: enabled, loaded, and with a grant covering the current manifest hash. While it is inactive (disabled, failed to load, or awaiting re-approval after an update changed its manifest) no hook runs and sandboxes get the full resolved set.
+
+```toml
+[hooks.mcp_rewrite]
+applies_to = "sandbox"   # "sandbox" (default) or "all"
+timeout_ms = 5000        # 1..=30000
+order = 0                # lower runs first; ties break by plugin id
+```
+
+Plugins that inject servers should keep the default or a negative `order`. A plugin that must see everything the others add, such as a security proxy, should declare a high `order` (for example `1000`) so it runs last.
+
+After AoE merges the MCP layers and before it hands the set to the agent, on every launch and respawn, the host sends the worker a `mcp.rewrite` request. It is a host-initiated JSON-RPC request whose `id` is a string of the form `h-<n>`. The worker answers with a JSON-RPC response carrying the same string `id` and either a `result` (the edit below) or an `error` object. A worker that is still starting is waited for until `timeout_ms` elapses.
+
+```json
+{
+  "session_id": "…", "agent": "…", "sandboxed": true,
+  "profile": null, "cwd": "/path",
+  "sandbox": {
+    "container_workdir": "/workspace/foo",
+    "mounts": [ { "host": "/abs/host/foo", "container": "/workspace/foo", "read_only": false } ]
+  },
+  "servers": [
+    { "name": "docs", "type": "http", "url": "https://…", "headers": { "Authorization": "Bearer …" } },
+    { "name": "fs", "type": "stdio", "command": "…", "args": [], "env": { "K": "V" } }
+  ]
+}
+```
+
+`sandbox` is present only when `sandboxed` is true. `mounts` are the volumes AoE creates the container with, so a plugin can map container paths back to the host: a linked worktree lists both the worktree and its main repo, and a workspace (multi-repo) session lists the workspace directory plus every main repo outside it. Host paths are sent as they are: not redacted, and not secret. `container_workdir` is the directory the agent runs in, or `null` when AoE cannot determine it. When AoE cannot compute the mounts, `mounts` is empty and the session is still reported as sandboxed.
+
+The `result` is an edit; unknown fields are rejected:
+
+```json
+{
+  "drop": ["fs"],
+  "add": [ { "name": "docs", "type": "http", "url": "http://gateway/mcp/docs" } ]
+}
+```
+
+`drop` is a list of names or `"*"`. `add` entries use the standard `mcpServers` shape plus `name`; an added server replaces any server of the same name, and a later duplicate in `add` wins. Plugins run in ascending `order`, ties broken by plugin id, each seeing the previous result.
+
+A sandboxed session whose hook fails (no worker within the timeout, error reply, invalid reply) is given **no** MCP servers, and AoE raises a notification attributed to the plugin. A sandboxed session with an applicable hook also gets no servers when the plugin host could not start. An `error` reply is reported as a rejection without the worker's text, so a worker cannot write into AoE's logs or notifications through it. Other sessions keep their resolved set.
+
+AoE does not copy host MCP definitions into a Claude sandbox's agent store, though `.mcp.json` files inside the copied Claude `plugins/` directory are copied as they are. Other agents' MCP-bearing config files are still copied into their sandbox stores verbatim, so for those agents the hook alone does not keep host MCP secrets out of the sandbox.
+
 ## Plugin storage
 
 A worker has a host-backed private key/value store, namespaced by its plugin id, that survives daemon and worker restarts (unlike the install directory, which an upgrade can replace). It needs no capability beyond `runtime.worker`, since a plugin can only reach its own namespace.
@@ -419,6 +473,113 @@ A worker has a host-backed private key/value store, namespaced by its plugin id,
 | `plugin.storage.remove` | `{ key }` | `{ removed }` |
 
 Quotas per plugin: 64 keys, 256-byte keys, 64 KiB values. `cas` (compare-and-swap) enables safe concurrent updates: the write applies only when the stored value equals `expected`.
+
+## Suggested sessions
+
+> **Availability:** the `[suggestions]` manifest block and the worker types in `aoe-plugin-api` are available now. The `suggestions.*` RPCs, the `/api/suggestions` routes and the web and TUI workflows below are not served by this host until the store layer of the suggested-sessions stack (#5595) lands.
+
+For using suggestions from the web dashboard and the TUI, see the suggested sessions guide.
+
+A worker declares the criteria it publishes in a `[suggestions]` block:
+
+```toml
+[suggestions]
+uses_agent = true                # optional; the provider runs an agent itself
+[[suggestions.sources]]
+criterion = "review_requested"   # stable key, matches each item's `criterion`
+label = "Review requests"        # plural, user-facing
+description = "Open PRs where your review is requested."
+variables = ["pr_number", "repo"]   # `[a-z0-9_]+`, carried by every item
+[[suggestions.sources]]
+criterion = "ci_failed"
+label = "Failing checks on your PRs"
+default_enabled = false
+```
+
+Plugin [settings](#settings) whose key starts with `suggestion_` also show in Settings › Suggestions, in a "<plugin name> source settings" section unfolded even when `advanced = true`. They remain on the plugin's settings page and save to the same place.
+
+`uses_agent` (default `false`) is informational: Settings shows that the provider spends the user's agent usage, and the host changes nothing. At least one source is required. Criteria are unique, non-empty and at most 256 bytes; labels are non-empty. The block grants no session authority: it needs only `runtime.worker`, not `session.create` or `session.prompt`.
+
+| Method | Params | Result |
+|---|---|---|
+| `suggestions.sources` | `{}` | `{ sources: [{ criterion, enabled }] }` |
+| `suggestions.set` | `{ items }` | `{ ok, accepted, dropped }` |
+| `suggestions.error` | `{ message, fix?: { label, method } }` | `{ ok }` |
+| `suggestions.checks.set` | `{ checks }` | `{ ok, stored }` |
+
+Call `suggestions.sources` before discovering and skip every criterion that is not enabled. A source is enabled when the user's stored switch says so, else when its `default_enabled` (default `true`) does. The host sends the `suggestions.refresh` notification with `{ refresh_minutes }`, the user's refresh interval (5, 15, 30, 60 or 120; 15 until they choose); on it, discover again and call `suggestions.set` or `suggestions.error`. `refresh_minutes` is a hint for how often to discover on your own: refresh less often if your rate limits need it, never more often. The host re-sends `suggestions.refresh` when the user changes it, but not when a worker starts, so use 15 until the first one arrives.
+
+An item is `{ id, title, reason, source_url, source_ref, preview, project?, mapping_key?, criterion, stale?, variables, draft: { title, prompt } }`. `variables` holds exactly the names the item's source declares. Clients may show `source_ref` as a short human-readable reference, cutting the text before a trailing `#…` first, so send a compact one such as `owner/repo#123`, not a URL; `source_url` is the link. Treat `preview`, `variables` and `draft` as untrusted source content. `projects.list` returns the registered projects so a provider can map its own keys to a `project` name or path. A user's [mapping](#project-mappings) for `mapping_key` takes precedence over `project`.
+
+`suggestions.set` fails with invalid-params, and publishes nothing, when:
+
+- an item names an undeclared `criterion`, or its `variables` differ from the source's declaration;
+- `source_url` is not an http(s) URL, or has an empty host, userinfo, percent-encoding in the host, or non-ASCII characters;
+- `id`, `title` or `source_ref` is empty, `mapping_key` is present but empty, or an `id` repeats;
+- there are more than 500 items, or a string exceeds its bound (`id` and `mapping_key` 256 bytes, `title` and `draft.title` 512, `reason`, `source_url`, `source_ref` and each variable value 2 KiB, `preview` 16 KiB, `draft.prompt` 64 KiB, `project` 4 KiB).
+
+After validation, items of a source that is not enabled are dropped and counted in `dropped`. `stale: true` marks an item whose source closed or changed; clients dim it and offer only Dismiss, and put the explanation in `reason`. Core drops a stale item, counted in `dropped`, at the first publish more than 24 hours after the one that first marked it stale, and keeps dropping it while the provider publishes it stale. Publishing it without `stale` starts it over. `suggestions.error` messages are limited to 4096 bytes.
+
+Each `suggestions.set` replaces the provider's whole set, so an empty `items` clears it and an item left out disappears. `suggestions.error` records the failure on the provider and keeps the last published items; the next successful `suggestions.set` clears it. A user's dismissal is stored by provider and item `id`, survives republishing and never changes the source, so reuse an `id` only for the same suggestion.
+
+### Setup checks
+
+A provider that cannot publish reports why with `suggestions.checks.set`, so the user sees what to fix instead of only a `suggestions.error` message. A check is `{ id, label, status, detail?, fix? }`, where `status` is `ok`, `warn` or `fail`, and `detail` and `fix` are plain display text the host never executes. Core never handles the credentials a check inspects.
+
+Each call replaces the provider's whole list. It fails with invalid-params, and stores nothing, for more than 32 checks, an empty `id` or `label`, a repeated `id`, or a string over its bound (`id` 256 bytes, `label` 512, `detail` and `fix` 2 KiB). When the host sends the `suggestions.checks.run` notification (`{}`), run the checks again and call `suggestions.checks.set`. The host does not send it on its own.
+
+### Suggestions API
+
+Suggestions are stored per profile. The routes below list and act on them; none starts a session. Mutations return 403 `read_only` in read-only mode and are refused in CityHall mode; the `GET` routes below stay readable in both. Item bodies name an item by `{ "provider_id", "id" }`, since an `id` is only unique within a provider.
+
+| Route | Body | Result |
+|---|---|---|
+| `GET /api/suggestions` | none | `{ providers: [{ id, name, enabled, status, error?, updated_at?, refreshing, sources: [{ criterion, label, description, variables, enabled }], checks: [{ id, label, status, detail, fix }] }], items, prefs: { homepage, sidebar, refresh_minutes, start_without_review, show_source_ref, provider_order } }` |
+| `POST /api/suggestions/refresh` | none | `{ ok, notified }` |
+| `POST /api/suggestions/checks/run` | none | `{ ok, notified }` |
+| `POST /api/suggestions/dismiss` | `{ provider_id, id }` | `{ ok }` |
+| `POST /api/suggestions/undismiss` | `{ provider_id, id }` | `{ ok }` |
+| `PATCH /api/suggestions/sources` | `{ provider_id, criterion, enabled }` | `{ provider_id, criterion, enabled }` |
+| `PATCH /api/suggestions/prefs` | any of `{ homepage, sidebar, refresh_minutes, start_without_review, show_source_ref, provider_order, provider_enabled }` | `{ ok }` |
+| `GET /api/suggestions/templates` | query `provider_id` and `criterion`, or neither | one: `{ provider_id, criterion, template, default }`; none: `{ templates: [{ provider_id, criterion, template }] }` |
+| `PUT /api/suggestions/templates` | `{ provider_id, criterion, template }` | `{ provider_id, criterion, template, default }` |
+| `DELETE /api/suggestions/templates` | `{ provider_id, criterion }` | `{ ok }` |
+| `POST /api/suggestions/fix` | `{ provider_id }` | `{ ok, notified }` |
+| `POST /api/suggestions/prepare` | `{ provider_id, id }` | `{ title, initial_prompt, templated, template_criterion, source_ref, project, extra_projects, tool, yolo, sandbox, worktree }` |
+| `GET /api/suggestions/mappings` | none | `{ mappings: [{ provider_id, mapping_key, projects }] }` |
+| `PUT /api/suggestions/mappings` | `{ provider_id, mapping_key, projects }` | `{ provider_id, mapping_key, projects }` |
+| `DELETE /api/suggestions/mappings?provider_id=&mapping_key=` | none | `{ ok, deleted }` |
+| `GET /api/suggestions/projects` | none | `{ projects: [{ name, path, origin }] }` |
+
+Providers are listed in the user's `provider_order`; a provider never ordered follows, sorted by id. `prefs` defaults to `{ homepage: true, sidebar: false, refresh_minutes: 15, start_without_review: false, show_source_ref: true, provider_order: [] }` and is per profile. `start_without_review` lets the web Start button create the session from the prepared draft instead of opening the wizard; clients only do so when `prepare` returns `templated: true` and a `project`. `show_source_ref` makes the web and TUI suggestion rows show each item's `source_ref`. `PATCH /api/suggestions/prefs` is partial: `refresh_minutes` is one of 5, 15, 30, 60 or 120, `provider_order` must list every provider exactly once, and `provider_enabled` maps provider ids to booleans. Other values fail with 400 `validation_failed`, and nothing is stored. `refresh_minutes` is a hint for plugins; core does not schedule refreshes yet. The route is denied in read-only (403 `read_only`) and CityHall mode.
+
+`suggestions.error` may carry a `fix`: a `label` (non-empty, at most 64 bytes) shown on a button beside the error, and a `method` named `suggestions.fix.<name>` (at most 64 bytes, `a-z 0-9 . _ -`). Anything else fails with invalid params and stores nothing. `POST /api/suggestions/fix` sends that method, with `{}`, to the provider's worker as a notification; clients never choose the method, and the route fails with 400 `validation_failed` when the provider has no fix. The worker should open its own fix flow and publish again afterwards. The fix is dropped on the provider's next `suggestions.set` or `suggestions.error`. `GET /api/suggestions` lists `uses_agent: true` and `fix: { label }` (error only) on a provider; the method is never exposed. The route is denied in read-only (403 `read_only`) and CityHall mode.
+
+A provider's `status` is `pending` before its first publish, `ok`, or `error`. Uninstalling a plugin, or updating it to a build whose `[suggestions]` block differs, clears its items, checks and status so it is `pending` again until its next publish; source switches, dismissals, templates and mappings are kept. Each item is the published item plus `provider_id` and `dismissed`; dismissed items are still returned. Items of a disabled source or provider are hidden, and `refresh` skips a disabled provider. `updated_at` is Unix seconds of the provider's last report. `refresh`, a `sources` change and a `refresh_minutes` change send `suggestions.refresh` to the affected workers.
+
+`refreshing` is true while a refresh the host requested is unanswered, for at most two minutes, and is not stored. Each item has `resolved_project: { name, path }`, or `null`, the registered project a [mapping](#project-mappings) or the unambiguous `project` hint resolves to; group by `path`, never by the provider's `project` text.
+
+`POST /api/sessions` accepts an optional `suggestion: { provider_id, id }`, stored on the session. An item carries `started_session: { id, title, status, archived, created_at }` for the oldest non-trashed session in the profile that names it; trashing that session drops the link, and archiving keeps it. Clients omit `suggestion` to start another session without linking it.
+
+`prepare` resolves settings through the normal repo and profile config. `project` is `{ name, path }` or `null`, resolved in this order: the user's mapping for the item's `mapping_key`, then the item's `project` hint (exactly one registered project by name or exact path), else `null`; an item is never given a scratch project.
+
+`templated` is `true` when a stored template produced `initial_prompt`, `false` when it is the provider's `draft.prompt`. `template_criterion` is then the item's criterion, else `null`.
+
+A template is stored per profile and criterion and replaces the provider's `draft.prompt` in `prepare`'s `initial_prompt`, nowhere else. `{name}` expands to the item's variable of that name, scanning left to right (`{a{pr_number}}` becomes `{a42}`); unknown names and stray braces stay as typed, and expanded values are never scanned again. No stored template (`default: true`) uses `draft.prompt`; an empty template gives an empty prompt, so a client must then omit `initial_prompt` when creating the session, which rejects a blank one. A template and its expansion are each limited to 64 KiB; `prepare` fails with 400 `validation_failed` when the expansion is longer.
+
+`GET` without parameters lists every stored template of the profile, including those of a disabled plugin or a criterion it no longer declares. `DELETE` checks neither, so any listed template can be removed and deleting an absent one succeeds.
+
+Errors: 404 `unknown_provider` (no active plugin provides suggestions under that id), 409 `stale_suggestion` (the item is no longer published, or its source is disabled), 400 `validation_failed` (`criterion` not declared by the provider, or a template or its expansion over 64 KiB), 400 `stale` (`prepare` only: the item is marked stale because its source closed or changed), 403 `read_only`.
+
+The TUI lists suggestions from Home with `S` (`Ctrl+S` in strict mode). The view shows each item's `preview` and prompt as plain text; the first Enter resolves `prepare` and shows its final `initial_prompt` (after any template); a second Enter opens the new-session dialog prefilled with it, and an item whose `project` is `null` cannot be started. The dialog's Prompt row, which is always present and editable, holds that prompt; for a suggestion it is labelled with the provider and Ctrl+P on it shows the item's `preview` as source text. `r` only asks providers to refresh; `l` reloads the list. Items keep the order of the snapshot. Home also lists a collapsed **Suggested (N)** group above Trash, absent when there are no open suggestions. Enter expands it to the first 3 items and a "View all" row that opens the view above; Enter on an item prepares it and opens the prefilled dialog directly, `z` (`Z` in strict mode) dismisses it, and `N` (`Ctrl+N`) starts a blank session. `Ctrl+K` lists "Suggested sessions"; on a suggestion row, or on the selected item in the view, it also lists "Open in <provider>", which opens the item's `source_url`. Every TUI key is provisional pending #4597: `S` / `Ctrl+S` to open, `z` / `N` on a Home row, and `x` (dismiss), `d` (dismissed), `r` and `l` inside the view may move.
+
+### Project mappings
+
+An item may carry an opaque `mapping_key` (a repository, a team). Core stores, per profile, an ordered list of registered project paths for each `(provider_id, mapping_key)`; the first is the primary project and the rest come back as `extra_projects`. A mapping whose primary path no longer names exactly one registered project is ignored and the hint applies instead; stale extras are dropped, and an extra is never promoted. `GET` returns the stored paths as they are, including mappings of providers that are no longer active, and `DELETE` removes them; both stay allowed so stale rows can be repaired (`DELETE` is refused in CityHall mode).
+
+`GET /api/suggestions/projects` lists the registered projects of the suggestions profile, the ones a mapping may name. `origin` is the `owner/repo` of the project's git `origin` remote, case as written, or `null` when the project is not a repository, has no `origin`, or the URL is not a hosted `owner/repo`. The host is not checked. Clients use it to propose mappings; it changes nothing.
+
+`PUT` replaces the list. `projects` holds 1 to 16 distinct registered projects, each named by its path, and is stored as the registered paths. Errors: 404 `unknown_provider`, 400 `validation_failed` (empty or oversized key, bad list, a path that is not exactly one registered project), 403 `read_only`. Mutations are refused in CityHall mode.
 
 ## UI slots
 
@@ -451,6 +612,7 @@ id = "my_pane"
 | `detail-badge` | per-session | A badge in the session detail view. |
 | `pane` | per-session | A dockable tool-window pane (requires `api_version >= 3`). See [Pane payload](#pane-payload). |
 | `home-pane` | global | A host-wide docked pane on the dashboard overview and the structured-view pane overlay, carrying the same block vocabulary as `pane` but session-less (requires `api_version >= 13`). Several plugins' home panes stack in snapshot order. |
+| `composer-status` | per-session | A read-only badge in the ACP composer footer beside the context hint, web only (requires `api_version >= 25`). |
 | `composer-action` | per-session | A button beside the ACP composer controls (requires `api_version >= 8`). |
 | `page` | global | A full dashboard view rendered from a plugin HTML file (requires `api_version >= 16`). Optional pushed state is opaque to the host. See [Pages](#pages). |
 | `notification` | n/a | A transient notification pushed via `ui.notify`; gated by the `notifications` capability, not a slot declaration. |
@@ -544,9 +706,9 @@ With `api_version >= 20`, `ui.notify` takes an optional `link: { "page", "value"
 
 ### Badge payload
 
-`status-bar`, `header-start`, `row-badge` and `detail-badge` take either one badge, `{ text?, icon?, tone?, href?, tooltip? }` (`status-bar`, `header-start` and `detail-badge` require `text` or `items`), or an `items` list of such badges that replaces the top-level fields. `items: []` clears the badge. Row badges also accept `presentation?` on the badge and its items, as described below.
+`status-bar`, `header-start`, `row-badge`, `detail-badge` and `composer-status` take either one badge, `{ text?, icon?, tone?, href?, tooltip? }` (`status-bar`, `header-start`, `detail-badge` and `composer-status` require `text` or `items`), or an `items` list of such badges that replaces the top-level fields. `items: []` clears the badge. Row badges also accept `presentation?` on the badge and its items, as described below.
 
-`status-bar`, `header-start` and `detail-badge` also take an integer `order`, default 0, lowest first; ties keep plugin id then entry id order. In the terminal UI they render as text and tone in the status line, `header-start` first; icons, tooltips and links are web only.
+`status-bar`, `header-start`, `detail-badge` and `composer-status` also take an integer `order`, default 0, lowest first; ties keep plugin id then entry id order. In the terminal UI they render as text and tone in the status line, `header-start` first; icons, tooltips and links are web only. `composer-status` has no terminal rendering.
 
 `row-badge` items on terminal session rows render items with `text` or `tooltip`, using `tooltip` when `text` is absent. With no `items` list, the top-level `row-badge` uses `tooltip` as a fallback label for missing `text`. `row-column` renders text only; the TUI omits icons and links. The status strip is right-aligned. In the local session list, it appears before the activity age when enabled, and its bounded lane considers one item per plugin before considering a second item from any plugin. Items may be truncated or omitted when space runs out.
 
@@ -628,7 +790,7 @@ An `href` renders as a link only when it is an `http(s)` URL or a path starting 
 
 #### Pane actions
 
-Clicking an `action` block, or a `row` carrying a `method`, POSTs to `/api/plugins/{id}/action` with `{ method, params, session_id }`. `params` is the block's own `params` object, forwarded verbatim, so one method can serve every row in a list:
+Clicking an `action` block, or a `row` carrying a `method`, POSTs to `/api/plugins/{id}/action` with `{ method, params, session_id }`. `params` is the block's own `params` object, forwarded as given apart from the host-owned `session_id` and `origin`. The host also removes `composer` unless the plugin declares the composer-read capability. One method can serve every row in a list:
 
 ```json
 { "kind": "row", "label": "warn when daemon is stale", "prefix": "#3231",
@@ -636,6 +798,14 @@ Clicking an `action` block, or a `row` carrying a `method`, POSTs to `/api/plugi
 ```
 
 The host merges in the authoritative `session_id` (a plugin cannot spoof it) and delivers the call as a **fire-and-forget JSON-RPC notification**: no reply, no return value. The worker does its work and re-pushes its UI state, and the clicked control spins until the plugin's UI revision moves, with a 15s timeout. Actions are read-write-mode only and are not passphrase gated, so treat every method as reachable by anyone who can use the dashboard.
+
+The host also sets `params.origin`, overwriting any client value. It is session provenance, not proof of human intent:
+
+- `dashboard`: the request carried a signed-in browser login. Programmatic callers holding that session can send it too.
+- `socket`: a process on the daemon's Unix socket (same user, such as a coding agent).
+- `token`: any other caller (access token, or `--auth none`).
+
+A plugin that needs a person to approve something must not rely on `origin` alone; it needs its own trusted confirmation step. `params` must be a JSON object, `null` or omitted; anything else gets `400`.
 
 The TUI renders panes read-only: it draws the text of every kind (dropping icons, hrefs, and tooltips, and stacking `columns`) but cannot fire an action, so `action` blocks appear as inert `[action] <label>` labels.
 
@@ -682,7 +852,7 @@ To mutate the draft, include a `draft_operation` in the pushed payload, which re
 
 ## Status
 
-Status segments the plugin contributes, consumed by the status surface. Requires `api_version >= 4`.
+Reserved. The manifest accepts `[[status]]` (with `api_version >= 4`) but no host surface reads it yet; use a `status-bar` [UI slot](#ui-slots) for visible status.
 
 ```toml
 [[status]]

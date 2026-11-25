@@ -63,7 +63,7 @@ fn check_row(row: &Instance, cityhall: bool) -> Result<()> {
         check_structured(row)?;
     }
     if matches!(row.status, Status::Creating | Status::Deleting)
-        || row.has_fresh_lifecycle_reservation(chrono::Utc::now())
+        || row.has_fresh_lifecycle_reservation(crate::time::Timestamp::now())
     {
         return Err(reject(StatusCode::CONFLICT, "Session lifecycle is busy"));
     }

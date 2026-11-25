@@ -21,7 +21,7 @@ use rmcp::{
     ServerHandler,
 };
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::api::sessions::{
     list_sessions_envelope, session_response_from_instance, SessionFilter, SessionsView,
@@ -53,6 +53,14 @@ struct ListSessionsParams {
     group: Option<String>,
     /// Only direct children of the session with this id.
     children_of: Option<String>,
+}
+
+/// `whoami`'s result. MCP 2025-06-18 requires an object for `outputSchema` and
+/// `structuredContent`, so the optional session is a field rather than the whole result.
+#[derive(Debug, Serialize, JsonSchema)]
+struct WhoAmI {
+    /// The calling session, or null when the caller is not a session AoE launched.
+    session: Option<SessionResponse>,
 }
 
 #[derive(Clone)]
@@ -90,17 +98,17 @@ impl McpServer {
     }
 
     #[rmcp::tool(
-        description = "The calling session, or null when the caller is not a session AoE launched."
+        description = "`{session}`: the calling session, or null when the caller is not a session AoE launched."
     )]
-    async fn whoami(&self, context: RequestContext<RoleServer>) -> Json<Option<SessionResponse>> {
+    async fn whoami(&self, context: RequestContext<RoleServer>) -> Json<WhoAmI> {
         let Some(id) = caller_session_id(&context) else {
-            return Json(None);
+            return Json(WhoAmI { session: None });
         };
         let instances = self.state.instances.read().await;
-        let response = instances.iter().find(|inst| inst.id == id).map(|inst| {
+        let session = instances.iter().find(|inst| inst.id == id).map(|inst| {
             session_response_from_instance(inst, crate::claude_settings::read_tui_fullscreen())
         });
-        Json(response)
+        Json(WhoAmI { session })
     }
 }
 

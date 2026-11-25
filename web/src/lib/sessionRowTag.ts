@@ -35,7 +35,12 @@ export function useSessionRowTagMode(): SessionRowTagMode {
   return useContext(SessionRowTagContext);
 }
 
-export function computeSessionRowTag(workspace: Workspace, mode: SessionRowTagMode): SessionRowTag | null {
+/** `rowLabel` is the row's visible name; a branch tag that only repeats it is dropped. */
+export function computeSessionRowTag(
+  workspace: Workspace,
+  mode: SessionRowTagMode,
+  rowLabel?: string,
+): SessionRowTag | null {
   const primary = workspace.sessions[0];
   if (!primary) return null;
 
@@ -49,8 +54,10 @@ export function computeSessionRowTag(workspace: Workspace, mode: SessionRowTagMo
     }
     case "sandbox":
       return primary.is_sandboxed ? { content: "sb", title: "Sandboxed", kind: mode } : null;
-    case "branch":
-      return branchRowTag(workspace);
+    case "branch": {
+      const tag = branchRowTag(workspace);
+      return tag && tag.title === rowLabel ? null : tag;
+    }
   }
 }
 

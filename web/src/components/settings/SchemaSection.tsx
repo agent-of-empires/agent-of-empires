@@ -26,8 +26,8 @@ interface Props {
   /** A settings-search jump: scroll to and highlight the field, opening Advanced if needed. */
   focusRequest?: { section: string; field: string; nonce: number } | null;
   /** CityHall curation: an allowlist and a denylist of field names. */
-  onlyFields?: string[];
-  hideFields?: string[];
+  onlyFields?: readonly string[];
+  hideFields?: readonly string[];
   /** The setup wizard shows rows without their config keys. */
   hideKeys?: boolean;
 }
@@ -41,7 +41,10 @@ function listValidator(validation: SettingsValidation): ((value: string) => stri
       return (v) =>
         /^[A-Za-z_][A-Za-z0-9_]*(=.*)?$/.test(v) ? null : "Must be KEY or KEY=VALUE (letters, digits, underscores)";
     case "port_mapping_list":
-      return (v) => (/^\d+:\d+$/.test(v) ? null : "Must be port:port (e.g. 3000:3000)");
+      return (v) =>
+        /^\d+:\d+$/.test(v) && v.split(":").every((p) => Number(p) <= 65535)
+          ? null
+          : "Must be port:port, ports up to 65535 (e.g. 3000:3000)";
     case "volume_ignore_list":
       return (v) =>
         v.trim() === "" || v.startsWith("/") || /[:\\\0]/.test(v) || v.split("/").includes("..")

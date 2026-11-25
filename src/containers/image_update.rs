@@ -483,6 +483,13 @@ mod tests {
                 false,
             ),
             (
+                "ghcr.io/agent-of-empires/aoe-sandbox:1.19.0",
+                "ghcr.io",
+                "agent-of-empires/aoe-sandbox",
+                "1.19.0",
+                false,
+            ),
+            (
                 "ghcr.io/agent-of-empires/aoe-sandbox",
                 "ghcr.io",
                 "agent-of-empires/aoe-sandbox",

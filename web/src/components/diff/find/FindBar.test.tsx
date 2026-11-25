@@ -20,6 +20,11 @@ function setup() {
   return { onJump, onClose, input };
 }
 
+const IME_ENTER = [
+  ["keyCode 229", { key: "Enter", keyCode: 229 }],
+  ["isComposing", { key: "Enter", isComposing: true }],
+] as const;
+
 describe("FindBar", () => {
   it("jumps to the first match and shows the count", () => {
     const { onJump, input } = setup();
@@ -41,6 +46,15 @@ describe("FindBar", () => {
     fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
     fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
     expect(screen.getByText("3/3")).toBeTruthy();
+  });
+
+  it.each(IME_ENTER)("ignores Enter while an IME composes (%s)", (_n, init) => {
+    const { input } = setup();
+    fireEvent.change(input, { target: { value: "beta" } });
+    fireEvent.keyDown(input, init);
+    expect(screen.getByText("1/3")).toBeTruthy();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.getByText("2/3")).toBeTruthy();
   });
 
   it("shows 0/0 with no matches and reports null to the host", () => {

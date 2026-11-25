@@ -460,7 +460,7 @@ mod tests {
             prompt: "p".into(),
             model: "m".into(),
             output_file: "/home/user/.aoe/transcripts/a1.jsonl".into(),
-            started_at: chrono::Utc::now(),
+            started_at: crate::time::Timestamp::now(),
             workflow: None,
         });
         let workflow = frame(Event::BackgroundTaskStarted {

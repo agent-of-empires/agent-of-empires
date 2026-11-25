@@ -22,7 +22,7 @@ use crate::session::Instance;
 pub(super) struct ResumeTarget {
     pub(super) id: String,
     pub(super) lifecycle_generation: u64,
-    pub(super) created_at: chrono::DateTime<chrono::Utc>,
+    pub(super) created_at: crate::time::Timestamp,
     pub(super) native_scope: Option<crate::acp::state::NativeObservationScope>,
     tool: String,
     agent_override: Option<String>,
@@ -190,7 +190,12 @@ pub(super) async fn requeue_interrupted_monitor(state: &AppState, session_id: &s
     }
     state
         .session_service
-        .set_pending_initial_turn(session_id, MONITOR_RESTART_REMINDER.to_string(), vec![])
+        .set_pending_initial_turn(
+            session_id,
+            MONITOR_RESTART_REMINDER.to_string(),
+            vec![],
+            crate::daemon::PromptOrigin::Aoe,
+        )
         .await;
     tracing::debug!(target: "acp.supervisor", session = %session_id, "queued monitor re-arm reminder");
 }
@@ -225,17 +230,23 @@ async fn admit(
     }
 }
 
-/// A refused admission ends the attempt without a spawn, so it is the only
-/// record of why a counted attempt did nothing. A concurrent shutdown or a
-/// pending teardown is routine; anything else is logged where it is seen.
-fn log_refused_admission(id: &str, what: &str, error: &SupervisorError) {
-    match error {
-        SupervisorError::SpawnCancelled(_) | SupervisorError::TeardownPending(_) => {
+/// Record why admission did not produce a spawn, and whether reconciliation
+/// should re-arm the session and keep or refund the attempt's budget charge.
+fn refused_admission(id: &str, what: &str, error: SupervisorError) -> ResumeOutcome {
+    match &error {
+        SupervisorError::SpawnCancelled(_)
+        | SupervisorError::PurgeInProgress(_)
+        | SupervisorError::TeardownPending(_) => {
             tracing::debug!(target: "acp.supervisor", session = %id, "{what} not admitted: {error}");
         }
         _ => {
             tracing::warn!(target: "acp.supervisor", session = %id, "{what} not admitted: {error}");
         }
+    }
+    match error {
+        SupervisorError::PurgeInProgress(_) => ResumeOutcome::AdmissionDeferred,
+        SupervisorError::TeardownPending(_) => ResumeOutcome::Retry,
+        _ => ResumeOutcome::SpawnFinished,
     }
 }
 
@@ -311,14 +322,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
                 lifecycle_generation: target.lifecycle_generation,
             }
         }
-        Err(error) => {
-            log_refused_admission(&id, "resume", &error);
-            // A durable stop fence is terminal; only a pending teardown clears.
-            return match error {
-                SupervisorError::TeardownPending(_) => ResumeOutcome::Retry,
-                _ => ResumeOutcome::SpawnFinished,
-            };
-        }
+        Err(error) => return refused_admission(&id, "resume", error),
     };
     reservation.expected_lifecycle_generation = Some(target.lifecycle_generation);
     let mut originating_lease = reservation.lease().clone();
@@ -428,10 +432,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
                             lifecycle_generation: target.lifecycle_generation,
                         }
                     }
-                    Err(error) => {
-                        log_refused_admission(&id, "fallback spawn", &error);
-                        return ResumeOutcome::SpawnFinished;
-                    }
+                    Err(error) => return refused_admission(&id, "fallback spawn", error),
                 };
                 reservation.expected_lifecycle_generation = Some(target.lifecycle_generation);
                 originating_lease = reservation.lease().clone();
@@ -508,6 +509,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
                 lifecycle_generation: target.lifecycle_generation,
             }
         }
+        Err(SupervisorError::TeardownPending(_)) => return ResumeOutcome::Retry,
         // The supervisor already parked the session; a startup error would bury it.
         Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::RateLimited(_))) | Ok(()) => {}
         Err(e) => report_spawn_failure(&state.session_service, &target, &agent, &e).await,
@@ -598,6 +600,7 @@ async fn build_spawn_request(
         claude_store_pin,
         instance,
         prior_conversation,
+        workspace_info,
     ) = {
         let instances = service.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
@@ -623,6 +626,7 @@ async fn build_spawn_request(
             inst.clone(),
             target.stored_acp_session_id.is_none()
                 && (inst.agent_session_id.is_some() || inst.pi_session_path.is_some()),
+            inst.workspace_info.clone(),
         )
     };
     let config_path = instance.repo_config_path().to_path_buf();
@@ -709,6 +713,7 @@ async fn build_spawn_request(
         fork_from,
         sandbox_continuation,
         sandbox_info,
+        workspace_info,
         source_profile: Some(target.source_profile.clone()),
         yolo_mode: target.yolo_mode,
         acp_mode_id,
@@ -852,6 +857,20 @@ pub(crate) async fn trigger_resume_background(
     origin: LaunchOrigin,
     reservation: Option<crate::acp::supervisor::ResumeReservation>,
 ) -> Result<ResumeTrigger, SupervisorError> {
+    trigger_resume_observing(service, id, authority, origin, reservation, None, None).await
+}
+
+/// [`trigger_resume_background`] admitting against a stop intent the caller already
+/// observed (`Some`), so a newer stop is refused instead of cleared.
+pub(crate) async fn trigger_resume_observing(
+    service: &Arc<SessionService>,
+    id: &str,
+    authority: crate::process::worker_registry::ResumeAuthority,
+    origin: LaunchOrigin,
+    reservation: Option<crate::acp::supervisor::ResumeReservation>,
+    observed_stop: Option<Option<crate::process::worker_registry::StopIntent>>,
+    stop_refused: Option<tokio::sync::oneshot::Sender<SupervisorError>>,
+) -> Result<ResumeTrigger, SupervisorError> {
     if service
         .instances
         .read()
@@ -889,7 +908,7 @@ pub(crate) async fn trigger_resume_background(
         }
         None => match service
             .acp_supervisor
-            .begin_resume(id, spawn_kind(has_stored_id), authority)
+            .begin_resume_observing(id, spawn_kind(has_stored_id), authority, observed_stop)
             .await?
         {
             ResumeReservationOutcome::Reserved(reservation) => reservation,
@@ -920,6 +939,11 @@ pub(crate) async fn trigger_resume_background(
                 // parked session. Same exemption `resume_one` makes.
                 Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::RateLimited(_)))
                 | Ok(()) => {}
+                Err(error @ SupervisorError::StopSuperseded(_)) => {
+                    if let Some(reply) = stop_refused {
+                        let _ = reply.send(error);
+                    }
+                }
                 Err(e) => report_spawn_failure(&service, &target, &agent, &e).await,
             }
         },
@@ -1043,6 +1067,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(req.model.as_deref(), Some("claude-opus-5"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn build_spawn_request_carries_the_workspace_layout() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut ws = crate::server::test_support::workspace_instance(
+            "ws-resume",
+            std::path::Path::new("/tmp/aoe-ws-resume"),
+        );
+        ws.id = "sess-ws-resume".to_string();
+        ws.source_profile = "default".into();
+        ws.view = crate::session::View::Structured;
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![ws.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![ws.clone()]);
+
+        // The target snapshot carries no workspace; the request must read the live row.
+        let mut target = ResumeTarget::from_instance(&ws);
+        target.project_path = "/tmp/aoe-ws-resume-stale".to_string();
+        let req = build_spawn_request(&state.session_service, &target, LaunchOrigin::Unattended)
+            .await
+            .unwrap();
+        crate::server::test_support::assert_carries_workspace(
+            req.workspace_info.as_ref(),
+            &ws,
+            "build_spawn_request",
+        );
     }
 
     /// #4127: a request is not an observation. Building one derives the route
@@ -1207,6 +1258,7 @@ mod tests {
                 merged_prompt_ids: Vec::new(),
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
             crate::acp::Event::AgentMessageChunk {
                 text: "woken".into(),
@@ -1318,6 +1370,19 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn pending_retirement_after_snapshot_retries_without_refunding() {
+        let id = "sess-pending-retirement";
+        let (_home, state, _project) = test_state(id);
+        let target = ResumeTarget::from_instance(&state.instances.read().await[0]);
+        let stopping = state.acp_supervisor.test_hold_stopping(id).unwrap();
+
+        let outcome = resume_one(Arc::clone(&state), target).await;
+        assert!(matches!(outcome, ResumeOutcome::Retry));
+        state.acp_supervisor.test_settle_stopping(&stopping);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn requeue_interrupted_monitor_queues_only_over_an_armed_monitor() {
         // (armed, description): `None` is how a background command arms.
         for (armed, description) in [
@@ -1378,6 +1443,7 @@ mod tests {
                     prompt_id: None,
                     synthesized: false,
                     origin_plugin: None,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 },
             )
             .unwrap();
@@ -1494,6 +1560,7 @@ mod tests {
                 merged_prompt_ids: Vec::new(),
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
             Event::Stopped {
                 reason: "prompt_complete".into(),

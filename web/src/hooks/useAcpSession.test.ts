@@ -8,7 +8,7 @@ import { emptyAcpState, nativeInputAvailable, type SubagentRecord } from "../lib
 import { STATE_TTL_MS, STORAGE_KEY_PREFIX, getLiveQueueCount } from "../lib/acpStateStorage";
 import { listServerQueue, reportAcpInteraction, type ServerQueuedPrompt } from "../lib/api";
 import type { SessionResponse } from "../lib/types";
-import { cacheGet } from "./acpSession/stateCache";
+import { cacheGet, cacheSet } from "./acpSession/stateCache";
 import { useCancelEscalation } from "../components/acp/useCancelEscalation";
 import { BackgroundAgentsPanel } from "../components/acp/BackgroundAgentsPanel";
 import { ACP_DIAL_TIMEOUT_MS, ACP_MAX_RETRIES, ACP_WS_STALE_MS, acpRetryDelayMs } from "./acpSession/useAcpConnection";
@@ -25,7 +25,7 @@ import {
   type Route,
 } from "./__tests__/acpHarness";
 import { useQueuedCounts } from "./useAcpQueueCount";
-import { clearAcpCache, useAcpSession } from "./useAcpSession";
+import { clearAcpCache, pendingRowIds, pendingRowsChanged, useAcpSession } from "./useAcpSession";
 
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
@@ -602,7 +602,80 @@ describe("recent-first cold open + loadOlder (#2236)", () => {
   });
 });
 
+describe("persist flush on cleanup", () => {
+  const storedKey = (id: string) => `${STORAGE_KEY_PREFIX}${id}`;
+  const seed = (id: string) => cacheSet(id, { ...emptyAcpState(), lastSeq: 7 });
+
+  it("writes pending state on unmount, before the throttle expires", async () => {
+    installAcpFakes();
+    seed("sess-unmount");
+    const { unmount } = render("sess-unmount");
+    await flushAsync();
+    expect(localStorage.getItem(storedKey("sess-unmount"))).toBeNull();
+    unmount();
+    expect(JSON.parse(localStorage.getItem(storedKey("sess-unmount"))!).state.lastSeq).toBe(7);
+  });
+
+  it("persists a queue confirmation at once, so another window cannot read the row as unconfirmed", async () => {
+    const id = "sess-confirm";
+    const queuedAt = "2026-01-01T00:00:00.000Z";
+    installAcpFakes(({ url, method }) =>
+      url.endsWith("/queue") && method === "POST"
+        ? json({ id: "u1", seq: 1, text: "u1", created_at: queuedAt })
+        : undefined,
+    );
+    cacheSet(id, { ...emptyAcpState(), queuedPrompts: [{ id: "u1", text: "u1", queuedAt, pending: true }] });
+    const hook = render(id, "running");
+    await flushAsync();
+    lastSocket().open();
+    lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: true }));
+    await waitFor(() => expect(hook.result.current.state.queuedPrompts).toMatchObject([{ id: "u1", pending: false }]));
+    expect(JSON.parse(localStorage.getItem(storedKey(id))!).state.queuedPrompts).toMatchObject([
+      { id: "u1", pending: false },
+    ]);
+    hook.unmount();
+  });
+
+  it("writes the previous session's pending state on a session switch", async () => {
+    installAcpFakes();
+    seed("sess-a");
+    const { rerender } = renderHook(({ id }: { id: string }) => useAcpSession(id), {
+      initialProps: { id: "sess-a" },
+      wrapper: profileWrapper,
+    });
+    await flushAsync();
+    expect(localStorage.getItem(storedKey("sess-a"))).toBeNull();
+    rerender({ id: "sess-b" });
+    expect(JSON.parse(localStorage.getItem(storedKey("sess-a"))!).state.lastSeq).toBe(7);
+  });
+});
+
+describe("pendingRowsChanged", () => {
+  const queuedAt = "2026-01-01T00:00:00.000Z";
+  const row = (id: string, pending?: boolean) => ({ id, text: id, queuedAt, pending });
+  const withRows = (...rows: ReturnType<typeof row>[]) => ({ ...emptyAcpState(), queuedPrompts: rows });
+
+  it("flags an enqueue, and a confirmation by row identity even when another row is enqueued in the same render", () => {
+    const before = pendingRowIds(withRows(row("a", true)));
+    expect(pendingRowsChanged(before, withRows(row("a", false), row("b", true)))).toBe(true);
+    expect(pendingRowsChanged(before, withRows(row("a", true), row("b", true)))).toBe(true);
+    expect(pendingRowsChanged(before, withRows())).toBe(true);
+    expect(pendingRowsChanged(before, withRows(row("a", true)))).toBe(false);
+    expect(pendingRowsChanged(before, withRows(row("a", true), row("c", false)))).toBe(false);
+  });
+});
+
 describe("sendPrompt outcomes", () => {
+  it("identifies the dashboard as the prompt's origin", async () => {
+    calls = installAcpFakes(({ url }) =>
+      url.includes("/acp/prompt") ? json({ disposition: "sent" }, 202) : undefined,
+    );
+    const { result, unmount } = await openSession("s-1");
+    await act(() => result.current.sendPrompt("hello"));
+    expect(posts("/acp/prompt")[0]!.headers["X-Aoe-Prompt-Origin"]).toBe("dashboard");
+    unmount();
+  });
+
   it.each([
     ["a 500", () => new Response("boom", { status: 500 })],
     [
@@ -768,6 +841,27 @@ describe("sendPrompt outcomes", () => {
     await flushAsync();
     expect(posts("/queue")).toHaveLength(0);
     expect(result.current.state.interactionError?.message).toMatch(/capacity/i);
+  });
+
+  // A newer stop refused the prompt's start: a non-retryable 409, so the prompt is rejected with
+  // its banner and is never re-queued, where it could be delivered after a later start.
+  it("rejects a 409 resume_failed prompt without queueing it", async () => {
+    calls = installAcpFakes(({ url, method }) => {
+      if (url.includes("/acp/replay")) return json({ frames: [], lost: false, highest_seq: 0 });
+      if (url.includes("/acp/prompt")) {
+        return new Response("stop_fenced: the session was stopped again; start it to send this message", {
+          status: 409,
+          headers: { "AoE-Error-Code": "resume_failed" },
+        });
+      }
+      if (url.includes("/queue") && method === "GET") return json([]);
+      return undefined;
+    });
+    const { result } = await openSessionWithReceipt({ ready: false, wakeEligible: true }, "sess-stop-fenced", "absent");
+    await act(() => result.current.sendPrompt("too late"));
+    await flushAsync();
+    expect(posts("/queue")).toHaveLength(0);
+    expect(result.current.state.interactionError?.message).toMatch(/stop_fenced/);
   });
 
   // Both park kinds are sendable at `dispatch::decide`, and a still-limited spawn answers 503
@@ -2105,7 +2199,7 @@ describe("live panel cancellation authority", () => {
     });
     await flushAsync();
     expect(posts("/cancel")).toEqual([
-      { method: "POST", url: `/api/sessions/${id}/acp/subagents/${childId}/cancel`, body: null },
+      { method: "POST", url: `/api/sessions/${id}/acp/subagents/${childId}/cancel`, body: null, headers: {} },
     ]);
     await waitFor(() => expect(region.textContent).not.toContain("Native input is not currently confirmed"));
     expect(sockets).toHaveLength(1);
@@ -2131,12 +2225,12 @@ describe("live panel cancellation authority", () => {
     }
     await flushAsync();
     expect(posts(`/acp/subagents/${childId}/cancel`)).toEqual([
-      { method: "POST", url: `/api/sessions/${id}/acp/subagents/${childId}/cancel`, body: null },
-      { method: "POST", url: `/api/sessions/${id}/acp/subagents/${childId}/cancel`, body: null },
+      { method: "POST", url: `/api/sessions/${id}/acp/subagents/${childId}/cancel`, body: null, headers: {} },
+      { method: "POST", url: `/api/sessions/${id}/acp/subagents/${childId}/cancel`, body: null, headers: {} },
     ]);
     expect(posts("/acp/cancel")).toEqual([
-      { method: "POST", url: `/api/sessions/${id}/acp/cancel`, body: null },
-      { method: "POST", url: `/api/sessions/${id}/acp/cancel`, body: null },
+      { method: "POST", url: `/api/sessions/${id}/acp/cancel`, body: null, headers: {} },
+      { method: "POST", url: `/api/sessions/${id}/acp/cancel`, body: null, headers: {} },
     ]);
     expect(sockets).toHaveLength(1);
     view.unmount();
@@ -2209,7 +2303,7 @@ describe("live panel cancellation authority", () => {
       fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
       await flushAsync();
       expect(posts("/cancel")).toEqual([
-        { method: "POST", url: `/api/sessions/${nextId}/acp/subagents/${childId}/cancel`, body: null },
+        { method: "POST", url: `/api/sessions/${nextId}/acp/subagents/${childId}/cancel`, body: null, headers: {} },
       ]);
       view.unmount();
       current.unmount();

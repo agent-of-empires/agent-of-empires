@@ -53,15 +53,18 @@ test.describe("sidebar legend on desktop", () => {
     // Blank space takes no focus, so it returns to "?".
     await expect(toggle).toBeFocused();
 
-    // A control clicked outside keeps the focus it took. Compact mode keeps "?", where the
-    // glyph is the only signal left on a row.
+    // A control clicked outside keeps the focus it took.
     await toggle.click();
     await expect(legend).toBeVisible();
     await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
-    const compact = page.getByRole("button", { name: "Compact sidebar" });
-    await compact.click();
+    await page.getByRole("button", { name: "Filter sessions" }).click();
     await expect(legend).toBeHidden();
-    await expect(page.getByRole("button", { name: "Expand sidebar" })).toBeFocused();
+    await expect(page.getByTestId("sidebar-filter-input")).toBeFocused();
+
+    // The compact rail keeps "?", where the glyph is the only signal left on a row.
+    await page.getByRole("separator", { name: "Resize sidebar" }).focus();
+    await page.keyboard.press("Home");
+    await expect(page.locator('[data-tour="sidebar"]')).toHaveAttribute("data-compact", "true");
     await toggle.click();
     await expect(legend).toBeVisible();
   });

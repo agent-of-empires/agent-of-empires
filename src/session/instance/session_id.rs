@@ -444,7 +444,7 @@ impl Instance {
                     .try_acquire_lifecycle_reservation(
                         LifecycleOperation::Capture,
                         Self::LIFECYCLE_RESERVATION_TTL,
-                        Utc::now(),
+                        Timestamp::now(),
                     )
                     .map_err(|error| anyhow::anyhow!("capture blocked: {error}"))
             })?;
@@ -742,6 +742,19 @@ impl Instance {
                 .flatten(),
             None => self.existing_session_selector(&words, self.default_selector_agent()),
         }
+    }
+
+    /// Whether every Terminal launch refuses this row (`apply_session_flags_in`): its command or
+    /// arguments pick a conversation with the agent's own session flag while AoE holds one.
+    pub(crate) fn command_selector_refuses_launch(&self) -> bool {
+        self.conversation_state().resumes() && self.command_session_selector().is_some()
+    }
+
+    /// Why such a launch is refused and both ways out, for a Session named by `session_id`.
+    pub(crate) fn command_selector_remedy(session_id: &str) -> String {
+        format!(
+            "its command picks a conversation with its own session flag, and AoE holds one for it too. Restart the Session with the session flag removed from its command or arguments, or run `aoe session set-session-id {session_id} \"\"` and restart it to run its command as written."
+        )
     }
 
     fn existing_session_selector(
@@ -1789,7 +1802,7 @@ work-opencode = "opencode"
         let mut creating = base.clone();
         creating.status = Status::Creating;
         let mut archived = base.clone();
-        archived.archived_at = Some(Utc::now());
+        archived.archived_at = Some(Timestamp::now());
 
         for (reason, instance) in [
             ("stored identity", with_id),

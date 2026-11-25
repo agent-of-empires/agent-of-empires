@@ -556,7 +556,7 @@ fn collect_tmux_states(instances: &mut [Instance]) -> Vec<TmuxState> {
         states.push(TmuxState {
             session_name: name.clone(),
             status: inst.status,
-            pid: crate::process::get_pane_pid(&name),
+            pid: pane_pid_or(meta.get(&name), || crate::process::get_pane_pid(&name)),
             activity_epoch: crate::tmux::session_activity(&name),
             agent,
         });
@@ -575,13 +575,32 @@ fn collect_tmux_states(instances: &mut [Instance]) -> Vec<TmuxState> {
             } else {
                 Status::Idle
             },
-            pid: crate::process::get_pane_pid(name),
+            pid: pane_pid_or(Some(m), || crate::process::get_pane_pid(name)),
             activity_epoch: crate::tmux::session_activity(name),
             agent: m.pane_current_command.clone().unwrap_or_default(),
         });
     }
 
     states
+}
+
+/// The snapshot only holds pane 0, so a session it lacks or whose pane 0 came
+/// from a later window (for example a first window with pane-base-index 1)
+/// goes to the per-session probe.
+fn pane_pid_or(
+    meta: Option<&crate::tmux::PaneMetadata>,
+    probe: impl FnOnce() -> Option<u32>,
+) -> Option<u32> {
+    match meta {
+        Some(meta) if meta.first_window => live_pane_pid(meta),
+        _ => probe(),
+    }
+}
+
+/// Same filter as `process::get_pane_pid`, read from the batched snapshot.
+fn live_pane_pid(meta: &crate::tmux::PaneMetadata) -> Option<u32> {
+    meta.pane_pid
+        .filter(|pid| !meta.pane_dead && *pid > 0 && i32::try_from(*pid).is_ok())
 }
 
 fn acp_state_from_record(rec: crate::process::worker_registry::WorkerRecord) -> AcpState {
@@ -639,7 +658,7 @@ fn collect_rows(
         .map(|i| InstanceRow {
             id: i.id.clone(),
             title: i.title.clone(),
-            created_at_epoch: i.created_at.timestamp().max(0) as u64,
+            created_at_epoch: i.created_at.as_unix_secs().max(0) as u64,
         })
         .collect();
 
@@ -792,7 +811,7 @@ fn detail_row(profile: &str, profile_explicit: bool, identifier: &str) -> Result
         Substrate::Tmux
     };
     let (id, title, tool) = (inst.id.clone(), inst.title.clone(), inst.tool.clone());
-    let created = inst.created_at.timestamp().max(0) as u64;
+    let created = inst.created_at.as_unix_secs().max(0) as u64;
 
     let rows = collect_rows(&mut instances, SubstrateFilter::All, true);
     Ok(pick_row(rows, &id, substrate).unwrap_or(Row {
@@ -891,6 +910,40 @@ mod tests {
             title: title.to_string(),
             created_at_epoch: CREATED_AT,
         }
+    }
+
+    #[test]
+    fn pane_pid_matches_the_per_session_probe() {
+        let meta = |pane_dead, pane_pid| crate::tmux::PaneMetadata {
+            server: None,
+            session_id: "$1".into(),
+            pane_id: "%1".into(),
+            session_kind: None,
+            tool_owner: crate::tmux::ToolPaneOwner::Unmarked,
+            pane_dead,
+            pane_current_command: None,
+            pane_start_command_is_protected: false,
+            pane_pid,
+            first_window: true,
+            pane_title: None,
+            window_activity: None,
+            window_size: None,
+        };
+        for (pane_dead, pane_pid, expected) in [
+            (false, Some(4242), Some(4242)),
+            (true, Some(4242), None),
+            (false, Some(0), None),
+            (false, Some(u32::MAX), None),
+            (false, None, None),
+        ] {
+            let found = meta(pane_dead, pane_pid);
+            assert_eq!(live_pane_pid(&found), expected);
+            assert_eq!(pane_pid_or(Some(&found), || panic!("probed")), expected);
+        }
+        assert_eq!(pane_pid_or(None, || Some(7)), Some(7));
+        let mut later_window = meta(false, Some(4242));
+        later_window.first_window = false;
+        assert_eq!(pane_pid_or(Some(&later_window), || Some(7)), Some(7));
     }
 
     fn tmux_state(name: &str, status: Status) -> TmuxState {

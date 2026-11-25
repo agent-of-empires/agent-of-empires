@@ -67,21 +67,22 @@ impl std::error::Error for LifecycleReservationError {}
 pub struct LifecycleReservation {
     pub op: LifecycleOperation,
     pub generation: u64,
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
 }
 
 impl Instance {
     /// Ordinary crashed owners expire; generation checks fence late commits.
-    pub const LIFECYCLE_RESERVATION_TTL: chrono::Duration = chrono::Duration::minutes(10);
+    pub const LIFECYCLE_RESERVATION_TTL: crate::time::Duration = crate::time::Duration::minutes(10);
 
     /// Sandbox Launch leases share this floor with native preparation requests.
-    pub(crate) const SANDBOX_PREPARATION_WINDOW: chrono::Duration = chrono::Duration::minutes(30);
+    pub(crate) const SANDBOX_PREPARATION_WINDOW: crate::time::Duration =
+        crate::time::Duration::minutes(30);
 
     fn lifecycle_reservation_ttl(
         &self,
         holder: LifecycleOperation,
-        ttl: chrono::Duration,
-    ) -> chrono::Duration {
+        ttl: crate::time::Duration,
+    ) -> crate::time::Duration {
         if holder == LifecycleOperation::Launch && self.is_sandboxed() {
             ttl.max(Self::SANDBOX_PREPARATION_WINDOW)
         } else {
@@ -91,8 +92,8 @@ impl Instance {
 
     fn next_available_lifecycle_generation(
         &self,
-        ttl: chrono::Duration,
-        now: DateTime<Utc>,
+        ttl: crate::time::Duration,
+        now: Timestamp,
     ) -> Result<u64, LifecycleReservationError> {
         if self.terminal_handoff.is_some() {
             return Err(LifecycleReservationError::Busy(LifecycleOperation::Launch));
@@ -117,8 +118,8 @@ impl Instance {
     pub fn try_acquire_lifecycle_reservation(
         &mut self,
         operation: LifecycleOperation,
-        ttl: chrono::Duration,
-        now: DateTime<Utc>,
+        ttl: crate::time::Duration,
+        now: Timestamp,
     ) -> Result<u64, LifecycleReservationError> {
         if operation != LifecycleOperation::Trash && self.has_pending_trash() {
             return Err(LifecycleReservationError::Busy(LifecycleOperation::Trash));
@@ -173,7 +174,7 @@ impl Instance {
     pub(crate) fn retire_trash_reservation_if_owned(
         &mut self,
         generation: u64,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> bool {
         if !self.has_pending_trash()
             || !self.lifecycle_reservation_is_owned(LifecycleOperation::Trash, generation)
@@ -186,7 +187,7 @@ impl Instance {
         true
     }
 
-    pub fn has_fresh_lifecycle_reservation(&self, now: DateTime<Utc>) -> bool {
+    pub fn has_fresh_lifecycle_reservation(&self, now: Timestamp) -> bool {
         matches!(
             &self.lifecycle_reservation,
             Some(reservation)
@@ -196,7 +197,7 @@ impl Instance {
         )
     }
 
-    pub(crate) fn has_fresh_launch_reservation(&self, now: DateTime<Utc>) -> bool {
+    pub(crate) fn has_fresh_launch_reservation(&self, now: Timestamp) -> bool {
         self.has_fresh_lifecycle_reservation(now)
             && self
                 .lifecycle_reservation
@@ -235,7 +236,7 @@ impl Instance {
         let generation = match self.try_acquire_lifecycle_reservation(
             LifecycleOperation::Launch,
             Self::LIFECYCLE_RESERVATION_TTL,
-            Utc::now(),
+            Timestamp::now(),
         ) {
             Ok(generation) => generation,
             Err(error) => {
@@ -248,7 +249,7 @@ impl Instance {
         self.status = Status::Idle;
         self.idle_dormant_since = None;
         self.idle_entered_at = None;
-        self.last_error = None;
+        self.last_error.clear();
         self.last_error_evidence = None;
         self.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
         Ok(generation)
@@ -258,8 +259,8 @@ impl Instance {
     /// deliberately retained as the monotonic cache/result revision.
     pub fn clear_expired_lifecycle_reservation(
         &mut self,
-        ttl: chrono::Duration,
-        now: DateTime<Utc>,
+        ttl: crate::time::Duration,
+        now: Timestamp,
     ) -> bool {
         if self.terminal_handoff.is_some() || self.has_pending_trash() {
             return false;
@@ -282,6 +283,7 @@ impl Instance {
         storage: &dyn crate::session::SessionStore,
         generation: u64,
         restart: bool,
+        expected: Option<&ConversationState>,
     ) -> Result<()> {
         let committed = storage.update(|instances, _groups| {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
@@ -290,6 +292,10 @@ impl Instance {
             if !stored.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation) {
                 return Ok(false);
             }
+            anyhow::ensure!(
+                expected.is_none_or(|expected| expected.matches_launch_observation(stored)),
+                LaunchIndeterminateCause::OwnershipUnproven
+            );
             stored.status = self.status;
             stored.idle_entered_at = self.idle_entered_at;
             stored.last_accessed_at = self.last_accessed_at;
@@ -303,11 +309,13 @@ impl Instance {
                 stored.resume_probe_failed_sid = self.resume_probe_failed_sid.clone();
             }
             stored.first_launch_names_agent = false;
+            stored.unproven_native_birth_generation = None;
             stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
             Ok(true)
         })?;
         anyhow::ensure!(committed, LifecycleReservationError::Superseded);
         self.lifecycle_reservation = None;
+        self.unproven_native_birth_generation = None;
         self.first_launch_names_agent = false;
         Ok(())
     }
@@ -319,7 +327,7 @@ impl Instance {
         probe: &resume::LaunchProbe,
         sandbox_prior: Option<&resume::LaunchSandboxSnapshot>,
     ) -> Result<()> {
-        let status = storage.update(|rows, _| {
+        let (status, unproven_birth) = storage.update(|rows, _| {
             let row = rows
                 .iter_mut()
                 .find(|row| row.id == self.id)
@@ -329,6 +337,10 @@ impl Instance {
                 LifecycleReservationError::Superseded
             );
             if probe.expected.matches_launch_observation(row) {
+                if probe.pane.is_some() && row.unproven_native_birth_generation == Some(generation)
+                {
+                    row.unproven_native_birth_generation = None;
+                }
                 row.capture_started_at = self.capture_started_at;
                 row.started_at = self.started_at;
                 row.launch_executable.clone_from(&self.launch_executable);
@@ -358,9 +370,10 @@ impl Instance {
                 row.status = Status::Starting;
             }
             row.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
-            Ok(row.status)
+            Ok((row.status, row.unproven_native_birth_generation))
         })?;
         self.lifecycle_reservation = None;
+        self.unproven_native_birth_generation = unproven_birth;
         self.status = status;
         Ok(())
     }
@@ -442,7 +455,7 @@ impl Instance {
         storage: &dyn crate::session::SessionStore,
     ) -> Result<u64> {
         storage.check_available()?;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let generation = storage.update(|instances, _groups| {
             let stored = instances
                 .iter_mut()
@@ -479,7 +492,7 @@ impl Instance {
         operation: LifecycleOperation,
         status: Option<Status>,
     ) -> Result<u64> {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut acquired = None;
         storage.update(|instances, _groups| {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
@@ -784,7 +797,7 @@ impl Instance {
         });
         let scope_failure = cleanup.and_then(|probe| self.clean_failed_launch_runtime(probe).err());
         self.last_error_evidence = None;
-        self.last_error = Some(
+        self.last_error.set(
             if let Some(refusal) = error.downcast_ref::<ManagedResumeRefused>() {
                 tracing::warn!(
                     target: "session.store",
@@ -842,8 +855,8 @@ mod tests {
 
     #[test]
     fn sandbox_preparation_reservation_outlives_ordinary_recovery_without_blocking_it() {
-        let now = Utc::now();
-        let acquired = now - chrono::Duration::minutes(11);
+        let now = Timestamp::now();
+        let acquired = now - crate::time::Duration::minutes(11);
         for (sandboxed, operation) in [
             (true, LifecycleOperation::Launch),
             (false, LifecycleOperation::Launch),
@@ -901,9 +914,9 @@ mod tests {
             if protected {
                 owner.sandbox_store_generation = 2;
                 assert!(owner.has_fresh_lifecycle_reservation(now));
-                let expired = acquired + chrono::Duration::minutes(30);
+                let expired = acquired + crate::time::Duration::minutes(30);
                 assert!(!owner.has_fresh_lifecycle_reservation(expired));
-                let longer = chrono::Duration::minutes(31);
+                let longer = crate::time::Duration::minutes(31);
                 assert!(!owner.clear_expired_lifecycle_reservation(longer, expired));
                 assert_eq!(
                     owner.try_acquire_lifecycle_reservation(
@@ -1057,7 +1070,7 @@ mod tests {
                     LifecycleOperation::Stop
                 },
                 generation: row.lifecycle_generation,
-                at: Utc::now(),
+                at: Timestamp::now(),
             });
             let before = serde_json::to_value(&row).unwrap();
             let observed = if case == "superseded" {
@@ -1088,14 +1101,16 @@ mod tests {
             row.source_profile = storage.profile().into();
             row.lifecycle_generation = 7;
             row.status = Status::Idle;
-            row.idle_entered_at = Some(Utc::now() - chrono::Duration::minutes(5));
+            row.idle_entered_at = Some(Timestamp::now() - crate::time::Duration::minutes(5));
             row.lifecycle_reservation = marker.map(|inert| LifecycleReservation {
                 op: LifecycleOperation::Stop,
                 generation: if inert { 6 } else { 7 },
                 at: if inert {
-                    Utc::now()
+                    Timestamp::now()
                 } else {
-                    Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1)
+                    Timestamp::now()
+                        - Instance::LIFECYCLE_RESERVATION_TTL
+                        - crate::time::Duration::seconds(1)
                 },
             });
             storage
@@ -1162,7 +1177,7 @@ mod tests {
             row.lifecycle_reservation = Some(LifecycleReservation {
                 op: operation,
                 generation: 7,
-                at: Utc::now(),
+                at: Timestamp::now(),
             });
             storage
                 .update(|rows, _| {
@@ -1272,7 +1287,7 @@ mod tests {
                     row.try_acquire_lifecycle_reservation(
                         LifecycleOperation::Launch,
                         Instance::LIFECYCLE_RESERVATION_TTL,
-                        Utc::now(),
+                        Timestamp::now(),
                     )?;
                     row.title = "peer-owned".into();
                     Ok(())
@@ -1350,8 +1365,8 @@ mod tests {
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
         let profile = "lifecycle-busy-reservation";
         let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
-        let now = Utc::now();
-        let stale = now - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1);
+        let now = Timestamp::now();
+        let stale = now - Instance::LIFECYCLE_RESERVATION_TTL - crate::time::Duration::seconds(1);
         let mut cases = [
             ("unleased", Status::Starting, None, 0, true),
             (
@@ -1487,7 +1502,7 @@ mod tests {
         busy.lifecycle_reservation = Some(LifecycleReservation {
             op: LifecycleOperation::Launch,
             generation: 1,
-            at: Utc::now(),
+            at: Timestamp::now(),
         });
         storage
             .update(|instances, _groups| {
@@ -1665,9 +1680,8 @@ mod tests {
                 instance.launch_executable = Some(executable.clone());
                 instance.launch_resolved_executable = Some(root.path().join("prior-agent"));
                 instance.started_at = Some(
-                    chrono::DateTime::<Utc>::from(
-                        std::fs::metadata(&executable).unwrap().modified().unwrap(),
-                    ) + chrono::Duration::seconds(1),
+                    Timestamp::from(std::fs::metadata(&executable).unwrap().modified().unwrap())
+                        + crate::time::Duration::seconds(1),
                 );
                 let storage =
                     crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
@@ -1939,7 +1953,7 @@ mod tests {
             "the launch being built still carries it"
         );
         first
-            .commit_lifecycle_launch(&storage, generation, false)
+            .commit_lifecycle_launch(&storage, generation, false, None)
             .unwrap();
         let disk = storage
             .load()
@@ -1986,11 +2000,11 @@ mod tests {
         let capture_floor = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_234_567);
         committed.status = Status::Running;
         committed.capture_started_at = Some(capture_floor);
-        let launched_at = DateTime::from_timestamp(1_234_567, 0).unwrap();
+        let launched_at = Timestamp::from_unix_secs(1_234_567).unwrap();
         committed.started_at = Some(launched_at);
         committed.launch_executable = Some("/opt/agent/bin/claude".into());
         committed
-            .commit_lifecycle_launch(&storage, reserved_generation, false)
+            .commit_lifecycle_launch(&storage, reserved_generation, false, None)
             .unwrap();
         let disk = storage
             .load()
@@ -2032,7 +2046,7 @@ mod tests {
             })
             .unwrap();
         let error = stale
-            .commit_lifecycle_launch(&storage, stale_token, false)
+            .commit_lifecycle_launch(&storage, stale_token, false, None)
             .unwrap_err();
         assert!(matches!(
             error.downcast_ref::<LifecycleReservationError>(),
@@ -2085,7 +2099,7 @@ mod tests {
         assert_eq!(parsed.lifecycle_reservation, None);
 
         let mut instance = Instance::new("s", "/tmp/x");
-        let now = Utc::now();
+        let now = Timestamp::now();
         let generation = instance
             .try_acquire_lifecycle_reservation(
                 LifecycleOperation::Purge,
@@ -2107,7 +2121,7 @@ mod tests {
 
     #[test]
     fn lifecycle_reservation_excludes_peers_and_uses_generation_as_identity() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut instance = Instance::new("s", "/tmp/x");
         let generation = instance
             .try_acquire_lifecycle_reservation(
@@ -2128,7 +2142,7 @@ mod tests {
                 instance.try_acquire_lifecycle_reservation(
                     contender,
                     Instance::LIFECYCLE_RESERVATION_TTL,
-                    now + chrono::Duration::seconds(1),
+                    now + crate::time::Duration::seconds(1),
                 ),
                 Err(LifecycleReservationError::Busy(LifecycleOperation::Purge)),
                 "{contender:?} must not replace a live peer reservation",
@@ -2144,14 +2158,14 @@ mod tests {
 
     #[test]
     fn unfinished_trash_survives_expiry_and_blocks_other_lifecycles() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let ttl = Instance::LIFECYCLE_RESERVATION_TTL;
         for (trashed, current) in [(true, true), (true, false), (false, true)] {
             let mut row = Instance::new("unfinished trash", "/tmp/unfinished-trash");
             row.try_acquire_lifecycle_reservation(
                 LifecycleOperation::Trash,
                 ttl,
-                now - ttl - chrono::Duration::seconds(1),
+                now - ttl - crate::time::Duration::seconds(1),
             )
             .unwrap();
             if trashed {
@@ -2203,13 +2217,13 @@ mod tests {
     #[test]
     fn expired_lifecycle_reservation_is_recoverable_without_reusing_generation() {
         let ttl = Instance::LIFECYCLE_RESERVATION_TTL;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut instance = Instance::new("s", "/tmp/x");
         let old_generation = instance
             .try_acquire_lifecycle_reservation(
                 LifecycleOperation::Purge,
                 ttl,
-                now - ttl - chrono::Duration::seconds(1),
+                now - ttl - crate::time::Duration::seconds(1),
             )
             .expect("first operation acquires");
         let new_generation = instance

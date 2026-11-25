@@ -199,8 +199,29 @@ pub async fn ensure_session(
     .await
 }
 
+pub(crate) fn ready_agent_session_for_automatic_input(
+    instance: &Instance,
+) -> anyhow::Result<Option<String>> {
+    Ok(ready_agent_target_for_automatic_input(instance)?.map(|(name, _)| name))
+}
+
+pub(crate) fn ready_agent_target_for_automatic_input(
+    instance: &Instance,
+) -> anyhow::Result<Option<(String, Arc<crate::session::LegacyToolObservation>)>> {
+    Ok(observe_agent_target(instance, false)?
+        .filter(|(_, _, ready)| *ready)
+        .map(|(name, physical, _)| (name, physical)))
+}
+
 pub(super) fn physical_agent_target(
     instance: &Instance,
+) -> anyhow::Result<Option<(String, Arc<crate::session::LegacyToolObservation>, bool)>> {
+    observe_agent_target(instance, true)
+}
+
+fn observe_agent_target(
+    instance: &Instance,
+    trust_hook_status: bool,
 ) -> anyhow::Result<Option<(String, Arc<crate::session::LegacyToolObservation>, bool)>> {
     let panes = crate::tmux::batch_pane_metadata()?;
     let Some((name, pane)) =
@@ -211,7 +232,7 @@ pub(super) fn physical_agent_target(
     if pane.pane_dead {
         return Ok(None);
     }
-    let ready = instance.pane_is_ready(pane)?;
+    let ready = instance.pane_is_ready(pane, trust_hook_status)?;
     let physical = pane
         .physical_observation()
         .ok_or(crate::session::LaunchIndeterminateCause::OwnershipUnproven)?;
@@ -236,14 +257,14 @@ pub(super) fn indeterminate_launch_response(
 }
 
 pub(super) struct PreparedAgentTarget {
-    pub(super) created_at: chrono::DateTime<chrono::Utc>,
+    pub(super) created_at: crate::time::Timestamp,
     pub(super) target: crate::daemon::TerminalTarget,
     pub(super) native: crate::server::session_store::NativeSessionStore,
 }
 
 impl PreparedAgentTarget {
     pub(super) fn captured(
-        created_at: chrono::DateTime<chrono::Utc>,
+        created_at: crate::time::Timestamp,
         generation: u64,
         profile: String,
         pane: crate::session::PaneObservation,
@@ -395,7 +416,7 @@ pub(super) async fn prepared_agent_target_response(
     }
     if !snapshot.value.contents.sessions.iter().any(|row| {
         row.id == id
-            && row.created_at.parse::<chrono::DateTime<chrono::Utc>>().ok() == Some(created_at)
+            && crate::time::Timestamp::parse_rfc3339(&row.created_at).ok() == Some(created_at)
             && row.lifecycle_generation == target.lifecycle_generation
             && row.profile == target.profile
             && row.agent_pane.physical == target.physical
@@ -417,7 +438,7 @@ pub(super) async fn prepared_agent_target_response(
             crate::session::StartOutcome::Resumed => "resumed",
             crate::session::StartOutcome::Fresh => "fresh",
             crate::session::StartOutcome::ResumeFailed { .. } => "resume_failed",
-            crate::session::StartOutcome::Indeterminate { .. } => unreachable!("indeterminate launch cannot produce a ready target"),
+            crate::session::StartOutcome::Indeterminate { cause } => return indeterminate_launch_response(cause),
             crate::session::StartOutcome::FreshAfterFailedResume { sid } => {
                 body["message"] = format!("Started fresh; the prior conversation {sid} remains available in the agent's history.").into();
                 body["prior_session_id"] = sid.into();

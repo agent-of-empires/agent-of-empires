@@ -2,7 +2,7 @@
 
 import { StrictMode, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen, waitFor, within } from "@testing-library/react";
 
 import { SessionWizard, type WizardPrefill } from "../SessionWizard";
 import { initialData } from "../wizardReducer";
@@ -28,6 +28,7 @@ import type { AgentInfo, DockerStatusResponse } from "../../../lib/types";
 import { SANDBOX_IMAGE_PULLED_EVENT } from "../../../lib/sandboxImageEvents";
 
 const createSession = vi.fn();
+const onOpenSettingsTab = vi.fn();
 const reviewCreationTrust = vi.fn();
 const FINGERPRINT = {
   project_path: "/tmp/proj",
@@ -108,8 +109,10 @@ function renderWizard(prefill: WizardPrefill = { path: "/tmp/proj", tool: "claud
   const onCreated = vi.fn();
   const onClose = vi.fn();
   const onCreatedInBackground = vi.fn();
+  onOpenSettingsTab.mockClear();
   render(
     <SessionWizard
+      onOpenSettingsTab={onOpenSettingsTab}
       servedProfile={servedProfile}
       onClose={onClose}
       onCreated={onCreated}
@@ -127,6 +130,15 @@ const launch = async () => {
   fireEvent.click(button);
 };
 const payload = (call = 0) => createSession.mock.calls[call]![0];
+
+describe("SessionWizard dialog semantics", () => {
+  it("is a modal dialog named by its heading", async () => {
+    renderWizard();
+    const dialog = screen.getByRole("dialog", { name: "New session" });
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    await screen.findByRole("switch", { name: "Yolo mode" });
+  });
+});
 
 describe("SessionWizard native import late defaults", () => {
   it.each([true, false])(
@@ -570,6 +582,29 @@ describe("SessionWizard rows", () => {
     expect((screen.getByRole("switch", { name: "Create a worktree" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
+  it.each([
+    ["on", { path: "/tmp/proj", tool: "claude", worktreeEnabled: true }, null, "new branch"],
+    ["off", { path: "/tmp/proj", tool: "claude", worktreeEnabled: false }, null, "run in the repo folder"],
+    ["not a git repository", { path: "/tmp/plain" }, null, "not a git repository"],
+    ["scratch", { scratch: true }, null, "not for scratch sessions"],
+    ["host-only", { path: "/tmp/proj", tool: "settl" }, [agent("settl", { host_only: true })], "runs on the host only"],
+  ] as const)("explains worktrees from the row when it is %s", async (_state, prefill, agents, summary) => {
+    if (agents) vi.mocked(fetchProfileAgents).mockResolvedValueOnce([...agents]);
+    const { onClose } = renderWizard({ ...prefill });
+    const row = screen.getByTestId("wizard-worktree-row");
+    await waitFor(() => expect(row.textContent).toContain(summary));
+    fireEvent.click(within(row).getByRole("button", { name: "What's a worktree?" }));
+    const dialog = await screen.findByRole("dialog", { name: "What's a worktree?" });
+    const link = within(dialog).getByRole("link", { name: "Worktree settings ›" });
+    expect(link.getAttribute("href")).toBe("/settings/worktree");
+    // A Ctrl-click is left to the browser, which opens a new tab.
+    fireEvent.click(link, { ctrlKey: true });
+    expect(onOpenSettingsTab).not.toHaveBeenCalled();
+    fireEvent.click(link);
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(onOpenSettingsTab).toHaveBeenCalledExactlyOnceWith("worktree");
+  });
+
   // A blocked switch left on shows on, matching the create payload, and can be turned off.
   it.each([
     [[agent("settl", { host_only: true })], "Run in a safe container", "settl runs on the host only"],
@@ -704,6 +739,7 @@ describe("SessionWizard under StrictMode", () => {
     render(
       <StrictMode>
         <SessionWizard
+          onOpenSettingsTab={onOpenSettingsTab}
           servedProfile="default"
           onClose={vi.fn()}
           onCreated={onCreated}
@@ -898,6 +934,7 @@ describe("SessionWizard unknown create outcome", () => {
     const onCreatedInBackground = vi.fn();
     const view = render(
       <SessionWizard
+        onOpenSettingsTab={onOpenSettingsTab}
         servedProfile="default"
         onClose={() => view.unmount()}
         onCreated={vi.fn()}
@@ -949,7 +986,15 @@ describe("SessionWizard unknown create outcome", () => {
   it("a wizard reopened from a failure sends its own form, not a closed wizard's unresolved create", async () => {
     const { key } = await launchInBackgroundAndClose();
     const restore = { data: { ...initialData, path: "/tmp/other", tool: "claude" }, failure: REFUSED.failure };
-    render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
+    render(
+      <SessionWizard
+        onOpenSettingsTab={onOpenSettingsTab}
+        servedProfile="default"
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+        restore={restore}
+      />,
+    );
     expect(screen.queryByText(/may still be created/)).toBeNull();
     const before = createSession.mock.calls.length;
     createSession.mockResolvedValue({ ok: true, session: { id: "s2" } });
@@ -971,6 +1016,7 @@ describe("SessionWizard unknown create outcome", () => {
     createSession.mockReturnValue(new Promise((r) => (finish = r)));
     render(
       <SessionWizard
+        onOpenSettingsTab={onOpenSettingsTab}
         servedProfile="default"
         onClose={vi.fn()}
         onCreated={vi.fn()}
@@ -1078,11 +1124,20 @@ describe("SessionWizard served-profile authority", () => {
   it("waits for served registry scope instead of guessing the machine default", async () => {
     vi.mocked(fetchProfiles).mockResolvedValueOnce(profiles as never);
     vi.mocked(fetchSettings).mockResolvedValue({});
-    const view = render(<SessionWizard onClose={() => {}} onCreated={() => {}} />);
+    const view = render(
+      <SessionWizard onOpenSettingsTab={onOpenSettingsTab} onClose={() => {}} onCreated={() => {}} />,
+    );
     await waitFor(() => expect(fetchProfiles).toHaveBeenCalled());
     expect(fetchSettings).not.toHaveBeenCalled();
     expect(fetchProjects).not.toHaveBeenCalled();
-    view.rerender(<SessionWizard servedProfile="Alpha" onClose={() => {}} onCreated={() => {}} />);
+    view.rerender(
+      <SessionWizard
+        onOpenSettingsTab={onOpenSettingsTab}
+        servedProfile="Alpha"
+        onClose={() => {}}
+        onCreated={() => {}}
+      />,
+    );
     await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("Alpha"));
     await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "Alpha" }));
   });
@@ -1100,6 +1155,7 @@ describe("SessionWizard served-profile authority", () => {
       publish = setServed;
       return (
         <SessionWizard
+          onOpenSettingsTab={onOpenSettingsTab}
           servedProfile={served}
           onRetryServedProfile={retry}
           prefill={{ path: "/tmp/proj", tool: "claude" }}
@@ -1140,6 +1196,7 @@ describe("SessionWizard served-profile authority", () => {
           publish = setServed;
           return (
             <SessionWizard
+              onOpenSettingsTab={onOpenSettingsTab}
               servedProfile={served}
               onRetryServedProfile={retry}
               prefill={{ path: "/tmp/proj", tool: "claude", profile: "Beta", yoloMode: true }}
@@ -1186,7 +1243,15 @@ describe("SessionWizard Docker readiness", () => {
       data: { ...initialData, path: "/tmp/proj", tool: "claude", sandboxEnabled: true },
       failure: { code: "hook_failed", stage: "running_hooks", message: "exit 1", reference: null },
     };
-    render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
+    render(
+      <SessionWizard
+        onOpenSettingsTab={onOpenSettingsTab}
+        servedProfile="default"
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+        restore={restore}
+      />,
+    );
     const action = (id: string) => screen.getByTestId(`create-failure-${id}`) as HTMLButtonElement;
     await waitFor(() => expect(screen.getByTestId("wizard-agent-row").textContent).toContain("claude"));
     await act(async () => {});
@@ -1266,7 +1331,7 @@ describe("SessionWizard Group field", () => {
   it("refetches Groups when the served profile changes, dropping the old list first", async () => {
     vi.mocked(fetchGroups).mockResolvedValueOnce([{ path: "alpha-group", session_count: 1 }]);
     const props = { onClose: () => {}, onCreated: () => {}, prefill: { path: "/tmp/proj", tool: "claude" } };
-    const view = render(<SessionWizard servedProfile="Alpha" {...props} />);
+    const view = render(<SessionWizard onOpenSettingsTab={onOpenSettingsTab} servedProfile="Alpha" {...props} />);
     const field = await screen.findByRole("combobox", { name: "Group" });
     fireEvent.focus(field);
     await screen.findByRole("option", { name: "alpha-group · 1 session" });
@@ -1274,7 +1339,7 @@ describe("SessionWizard Group field", () => {
     let release: (groups: { path: string; session_count: number }[]) => void = () => {};
     vi.mocked(fetchGroups).mockReturnValueOnce(new Promise((resolve) => (release = resolve)));
     const calls = vi.mocked(fetchGroups).mock.calls.length;
-    view.rerender(<SessionWizard servedProfile="Beta" {...props} />);
+    view.rerender(<SessionWizard onOpenSettingsTab={onOpenSettingsTab} servedProfile="Beta" {...props} />);
     await waitFor(() => expect(vi.mocked(fetchGroups).mock.calls.length).toBe(calls + 1));
     fireEvent.focus(field);
     expect(screen.queryByRole("option", { name: /alpha-group/ })).toBeNull();
@@ -1531,7 +1596,15 @@ describe("SessionWizard Yolo mode", () => {
     vi.mocked(fetchProfileAgents)
       .mockResolvedValueOnce(null)
       .mockReturnValueOnce(new Promise(() => {}));
-    render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} nameOnly />);
+    render(
+      <SessionWizard
+        onOpenSettingsTab={onOpenSettingsTab}
+        servedProfile="default"
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+        nameOnly
+      />,
+    );
     await waitFor(() => expect(fetchProfileAgents).toHaveBeenCalled());
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
@@ -1582,11 +1655,25 @@ describe("SessionWizard Sandbox image status", () => {
     renderWizard();
     const row = screen.getByTestId("wizard-sandbox-row");
     await waitFor(() => expect(row.textContent).toContain("Update available · ghcr.io/x/sb:1"));
-    expect(vi.mocked(fetchSandboxImageStatus).mock.calls).toEqual([["ghcr.io/x/sb:1", { fresh: true }]]);
+    expect(vi.mocked(fetchSandboxImageStatus).mock.calls).toEqual([
+      ["ghcr.io/x/sb:1", { fresh: true, profile: "default" }],
+    ]);
 
     fireEvent.click(screen.getByRole("switch", { name: "Run in a safe container" }));
     expect(row.textContent).toContain("run on the host");
     expect(row.textContent).not.toContain("Update available");
+  });
+
+  it("asks for the served profile's automatic image when no image is set", async () => {
+    vi.mocked(fetchDockerStatus).mockResolvedValue({ available: true, runtime: "docker", runtime_name: "Docker" });
+    vi.mocked(fetchSettings).mockResolvedValueOnce({ sandbox: { enabled_by_default: true } } as never);
+    vi.mocked(fetchSandboxImageStatus).mockResolvedValueOnce({
+      image: "ghcr.io/x/sb:2",
+      state: "current",
+    } as never);
+    renderWizard();
+    await waitFor(() => expect(vi.mocked(fetchSandboxImageStatus)).toHaveBeenCalled());
+    expect(vi.mocked(fetchSandboxImageStatus).mock.calls[0]).toEqual([undefined, { fresh: true, profile: "default" }]);
   });
 });
 
@@ -1873,7 +1960,15 @@ describe("SessionWizard create failures", () => {
     createSession.mockResolvedValueOnce(
       failure("hook_failed", "running_hooks", "An on_create hook exited with code 1."),
     );
-    render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} nameOnly />);
+    render(
+      <SessionWizard
+        onOpenSettingsTab={onOpenSettingsTab}
+        servedProfile="default"
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+        nameOnly
+      />,
+    );
     await launch();
     await screen.findByTestId("create-failure");
     expect(screen.getByTestId("create-failure-try_again")).toBeTruthy();
@@ -1911,6 +2006,7 @@ describe("SessionWizard create failures", () => {
     const onReopenFailure = vi.fn();
     render(
       <SessionWizard
+        onOpenSettingsTab={onOpenSettingsTab}
         servedProfile="default"
         onClose={vi.fn()}
         onCreated={vi.fn()}
@@ -1945,7 +2041,15 @@ describe("SessionWizard create failures", () => {
     expect(restore.failure).toEqual(sent.failure);
     expect(restore.data.path).toBe("/tmp/proj");
 
-    render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
+    render(
+      <SessionWizard
+        onOpenSettingsTab={onOpenSettingsTab}
+        servedProfile="default"
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+        restore={restore}
+      />,
+    );
     expect(box().textContent).toContain("The Working directory is missing");
     expect(screen.getByTestId("wizard-project-row").textContent).toContain("not found where the Daemon runs");
     fireEvent.click(screen.getByTestId("create-failure-choose_project"));
@@ -1990,7 +2094,15 @@ describe("SessionWizard create failures", () => {
         expect(payload(0).view).toBe("structured");
         let answer!: (v: AgentInfo[]) => void;
         vi.mocked(fetchProfileAgents).mockReturnValueOnce(new Promise((r) => (answer = r)));
-        render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
+        render(
+          <SessionWizard
+            onOpenSettingsTab={onOpenSettingsTab}
+            servedProfile="default"
+            onClose={vi.fn()}
+            onCreated={vi.fn()}
+            restore={restore}
+          />,
+        );
         release = () => answer([helper]);
       }
       const sent = createSession.mock.calls.length;
@@ -2049,6 +2161,7 @@ describe("SessionWizard create failures", () => {
       const onCreatedInBackground = vi.fn();
       const view = render(
         <SessionWizard
+          onOpenSettingsTab={onOpenSettingsTab}
           servedProfile="default"
           onClose={() => view.unmount()}
           onCreated={vi.fn()}
@@ -2078,7 +2191,15 @@ describe("SessionWizard create failures", () => {
       const restore = onReopenFailure.mock.calls[0]![0];
       expect(restore.progress).toEqual(late);
 
-      render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
+      render(
+        <SessionWizard
+          onOpenSettingsTab={onOpenSettingsTab}
+          servedProfile="default"
+          onClose={vi.fn()}
+          onCreated={vi.fn()}
+          restore={restore}
+        />,
+      );
       expect(screen.getByTestId("create-failure-output").textContent).toContain("npm ERR! late");
     });
 
@@ -2116,6 +2237,7 @@ describe("SessionWizard create failures", () => {
     it("never polls when closed without a create", async () => {
       const view = render(
         <SessionWizard
+          onOpenSettingsTab={onOpenSettingsTab}
           servedProfile="default"
           onClose={() => view.unmount()}
           onCreated={vi.fn()}
@@ -2135,7 +2257,15 @@ describe("SessionWizard create failures", () => {
       data: { ...initialData, path: "/tmp/proj", tool: "claude" },
       failure: failure("create_failed", "preparing", "boom").failure,
     };
-    render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
+    render(
+      <SessionWizard
+        onOpenSettingsTab={onOpenSettingsTab}
+        servedProfile="default"
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+        restore={restore}
+      />,
+    );
     expect(box().textContent).toContain("boom");
     expect(await screen.findByText(/Couldn't load the agent list/)).toBeTruthy();
   });
@@ -2151,7 +2281,15 @@ describe("SessionWizard create failures", () => {
       data: { ...initialData, path: "/tmp/proj", tool: "claude", sandboxEnabled: true },
       failure: UNAVAILABLE.failure,
     };
-    render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
+    render(
+      <SessionWizard
+        onOpenSettingsTab={onOpenSettingsTab}
+        servedProfile="default"
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+        restore={restore}
+      />,
+    );
     fireEvent.click(await screen.findByTestId("create-failure-retry_runtime"));
     await waitFor(() => expect(createSession).toHaveBeenCalledOnce());
     await act(async () => mount({ available: false, runtime: "docker", runtime_name: "Docker" }));

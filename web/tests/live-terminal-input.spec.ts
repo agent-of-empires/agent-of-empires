@@ -230,8 +230,8 @@ const mouseBytes = (h: MockHandle) => liveTexts(h).filter((s) => /\x1b\[</.test(
 /** Centre of `selector`, once the point actually hits it. The mobile sidebar is
  *  an overlay with a 300ms slide-out and `toBeVisible` does not hit-test, so
  *  without this a tap lands on the closing sidebar. */
-async function hittableCentre(page: Page, selector: string) {
-  const box = (await page.locator(selector).first().boundingBox())!;
+async function hittableCentre(page: Page, selector: string, nth = 0) {
+  const box = (await page.locator(selector).nth(nth).boundingBox())!;
   const point = [box.x + box.width / 2, box.y + box.height / 2] as const;
   await expect
     .poll(
@@ -247,7 +247,14 @@ async function hittableCentre(page: Page, selector: string) {
   return point;
 }
 
-async function setupLink(page: Page, mobile: boolean) {
+/** Pane rows under the prompt, the URL they print, and the rows the server flags as soft-wrapped. */
+type LinkFrame = { lines: string[]; href: string; wrapped?: number[] };
+
+async function setupLink(
+  page: Page,
+  mobile: boolean,
+  frame: LinkFrame = { lines: [`see ${LINK} for details`], href: LINK },
+) {
   // Route on the CONTEXT, not the page: the link opens a new tab, and a
   // page-scoped route would leave that tab to hit the real network.
   await page
@@ -264,15 +271,16 @@ async function setupLink(page: Page, mobile: boolean) {
   await page.locator("[data-live-terminal]").first().waitFor({ state: "visible", timeout: 10_000 });
   await handle.waitForLiveReady();
   await handle.pushLiveFrame({
-    content: [PROMPT, `see ${LINK} for details`, ...Array<string>(22).fill("")].join("\n") + "\n",
+    content: [PROMPT, ...frame.lines, ...Array<string>(23 - frame.lines.length).fill("")].join("\n") + "\n",
     rows: 24,
+    wrapped: frame.wrapped,
     history: 0,
     altScreen: true,
     mouse: true,
     mouseSgr: true,
   });
   await expect(scroller(page)).toHaveClass(/overflow-hidden/);
-  await expect(page.locator(`a[href="${LINK}"]`).first()).toBeVisible();
+  await expect(page.locator(`a[href="${frame.href}"]`).first()).toBeVisible();
   return handle;
 }
 
@@ -289,6 +297,23 @@ test.describe("Live terminal link clicks (desktop)", () => {
     expect(popup.url()).toBe(LINK);
     // The press that opened the link is the browser's, not the app's.
     expect(mouseBytes(handle)).toHaveLength(0);
+  });
+});
+
+test.describe("Live terminal wrapped link (desktop)", () => {
+  test.use(DESKTOP);
+
+  const href = "https://example.com/pull/1375/files";
+  // Row 1 soft-wraps onto row 2 mid-URL, as tmux reports it in `wrapped`.
+  const frame = { lines: ["see https://example.com/pull/", "1375/files for details"], href, wrapped: [1] };
+
+  test("a click on the continuation row opens the whole URL", async ({ page }) => {
+    await setupLink(page, false, frame);
+    await expect(page.locator(`a[href="${href}"]`)).toHaveText(["https://example.com/pull/", "1375/files"]);
+    const [x, y] = await hittableCentre(page, `a[href="${href}"]`, 1);
+    const [popup] = await Promise.all([page.context().waitForEvent("page"), page.mouse.click(x, y)]);
+    await popup.waitForLoadState();
+    expect(popup.url()).toBe(href);
   });
 });
 
@@ -332,6 +357,23 @@ test.describe("Live terminal grid inset (touch)", () => {
     const cols = Math.floor(g.gridWidth / g.cell);
     expect(Math.floor(g.paneWidth / g.cell) - cols).toBeLessThanOrEqual(1);
     await expect.poll(() => lastResizeCols(handle)).toBe(cols);
+  });
+});
+
+test.describe("Live terminal bundled font", () => {
+  test.use(DESKTOP);
+
+  test("JetBrains Mono loads from the bundle and sizes rows from its metrics", async ({ page }) => {
+    await openLiveTerminal(page, { settings: { desktopFontSize: 14, terminalFontFamily: "JetBrains Mono" } });
+    // check() also passes for an unregistered family, so require the bundled face itself.
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          [...document.fonts].some((f) => f.family === "JetBrains Mono" && f.weight === "400" && f.status === "loaded"),
+        ),
+      )
+      .toBe(true);
+    await expect(scroller(page)).toHaveCSS("line-height", "18px");
   });
 });
 

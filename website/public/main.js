@@ -8,7 +8,7 @@ function switchDemo(which) {
   var demos = {
     tui: {
       src: '/assets/demo.gif',
-      alt: 'Agent of Empires TUI showing session management with Claude Code, git worktree creation, and Docker container status indicators',
+      alt: 'Agent of Empires TUI: creating a Claude Code session and prompting it in live mode',
       label: 'aoe · session manager',
     },
     web: {

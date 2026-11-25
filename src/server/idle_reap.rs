@@ -29,7 +29,7 @@ pub(super) async fn reap_idle_sessions(
         _ => return,
     };
 
-    let now = chrono::Utc::now();
+    let now = crate::time::Timestamp::now();
     let instances = { state.instances.read().await.clone() };
 
     // Resolve each distinct profile's threshold once, off the async runtime.

@@ -85,4 +85,53 @@ describe("StructuredViewDisplaySettings localStorage contract", () => {
       cleanup();
     }
   });
+
+  it("commits the initial history window on blur or Enter, clamped, backfilling 150 for old blobs", () => {
+    window.localStorage.setItem(KEY, JSON.stringify({ mobileFontSize: 8 }));
+    const { getByLabelText } = render(<StructuredViewDisplaySettings />);
+    const input = getByLabelText("Initial visible history (rows)") as HTMLInputElement;
+    expect(input.value).toBe("150");
+
+    // Type digit by digit: no intermediate value may be clamped or stored.
+    for (const partial of ["3", "30", "300"]) {
+      fireEvent.change(input, { target: { value: partial } });
+      expect(input.value).toBe(partial);
+    }
+    expect(readStored().structuredHistoryWindow).toBeUndefined();
+    fireEvent.blur(input);
+    expect(readStored().structuredHistoryWindow).toBe(300);
+
+    for (const [typed, expected] of [
+      ["5", 50],
+      ["9999", 1000],
+      ["", 150],
+    ] as const) {
+      fireEvent.change(input, { target: { value: typed } });
+      fireEvent.blur(input);
+      expect(readStored().structuredHistoryWindow, typed).toBe(expected);
+      expect(input.value).toBe(String(expected));
+    }
+
+    fireEvent.change(input, { target: { value: "200" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(readStored().structuredHistoryWindow).toBe(200);
+
+    window.localStorage.setItem(KEY, JSON.stringify({ structuredHistoryWindow: "junk" }));
+    expect(getWebSettingsSnapshot().structuredHistoryWindow).toBe(150);
+  });
+});
+
+describe("StructuredViewDisplaySettings IME composition", () => {
+  it.each([
+    ["keyCode 229", { key: "Enter", keyCode: 229 }],
+    ["isComposing", { key: "Enter", isComposing: true }],
+  ])("does not commit the history window on Enter while composing (%s)", (_n, init) => {
+    const { getByLabelText } = render(<StructuredViewDisplaySettings />);
+    const input = getByLabelText("Initial visible history (rows)") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "200" } });
+    fireEvent.keyDown(input, init);
+    expect(readStored().structuredHistoryWindow).toBeUndefined();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(readStored().structuredHistoryWindow).toBe(200);
+  });
 });

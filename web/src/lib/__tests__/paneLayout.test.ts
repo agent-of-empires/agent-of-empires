@@ -18,8 +18,10 @@ import {
   seedLayout,
   setActive,
   setDockCollapsed,
+  sweepOrphanPaneLayouts,
   syncPluginTabs,
   usePaneLayout,
+  type AutoPane,
   type DockLayout,
   type PlaceTarget,
 } from "../paneLayout";
@@ -137,32 +139,22 @@ describe("pane layout pure ops", () => {
   });
 });
 
-describe("usePaneLayout migration + persistence", () => {
-  const hook = (session = "s1") => renderHook(() => usePaneLayout(session)).result;
-  const persistV2 = (right: { tabs: string[]; active: string }[], bottom: { tabs: string[]; active: string }[] = []) =>
-    localStorage.setItem(
-      "aoe-pane-layout-v2",
-      JSON.stringify({
-        version: 2,
-        template: { right: [], bottom: [], nextTerminalIndex: 1, closedPlugins: [] },
-        sessions: { s1: { right, bottom, nextTerminalIndex: 1, closedPlugins: [] } },
-      }),
-    );
+const CLOSED = { diff: false, terminal: false };
+const OPEN = { diff: true, terminal: true };
+const V3_KEY = "aoe-pane-layout-v3";
+const persistV3 = (sessions: Record<string, unknown>) =>
+  localStorage.setItem(V3_KEY, JSON.stringify({ version: 3, sessions }));
+const savedSessions = () => Object.keys(JSON.parse(localStorage.getItem(V3_KEY) ?? "{}").sessions ?? {});
+const NO_PLUGINS: AutoPane[] = [];
+const PLUGIN: AutoPane[] = [{ id: "plugin:p:a", defaultDock: "right" }];
 
-  it("migrates the v1 layout to per-dock tabs", () => {
-    localStorage.setItem(
-      "aoe-pane-layout",
-      JSON.stringify({ diff: { open: true, dock: "right" }, terminal: { open: true, dock: "bottom" } }),
-    );
-    const { layout: l } = hook().current;
-    expect([dockTabs(l, "right"), dockTabs(l, "bottom")]).toEqual([["diff"], ["terminal:0"]]);
-  });
-
-  it("migrates the legacy collapsed flag to empty docks", () => {
-    localStorage.setItem("aoe-right-collapsed", "1");
-    const { layout: l } = hook().current;
-    expect([l.right, l.bottom]).toEqual([[], []]);
-  });
+describe("usePaneLayout persistence", () => {
+  const hook = (session = "s1", prefs = CLOSED) =>
+    renderHook(() => usePaneLayout(session, false, prefs, NO_PLUGINS)).result;
+  const persistGroups = (
+    right: { tabs: string[]; active: string }[],
+    bottom: { tabs: string[]; active: string }[] = [],
+  ) => persistV3({ s1: { right, bottom, nextTerminalIndex: 1, closedPlugins: [] } });
 
   it("keeps terminals and collapse state per session and persists them", () => {
     const result = hook();
@@ -177,12 +169,45 @@ describe("usePaneLayout migration + persistence", () => {
     ]);
   });
 
-  it("syncPlugins adds a tab without revealing a collapsed dock", () => {
-    const result = hook();
+  it("shows an auto-opened plugin without saving it, and saves it with the user's next change", () => {
+    const { result, rerender } = renderHook(({ prefs }) => usePaneLayout("s1", false, prefs, PLUGIN), {
+      initialProps: { prefs: CLOSED },
+    });
+    expect(dockTabs(result.current.layout, "right")).toEqual(["plugin:p:a"]);
+    rerender({ prefs: OPEN });
+    expect(dockTabs(result.current.layout, "right")).toEqual(["diff", "terminal:0", "plugin:p:a"]);
+    expect(savedSessions()).toEqual([]);
+
     act(() => result.current.setDockCollapsed("right", true));
-    act(() => result.current.syncPlugins([{ id: "plugin:p:a", defaultDock: "right" }]));
-    expect(dockOf(result.current.layout, "plugin:p:a")).toBe("right");
+    expect(JSON.parse(localStorage.getItem(V3_KEY)!).sessions.s1.right[0].tabs).toEqual([
+      "diff",
+      "terminal:0",
+      "plugin:p:a",
+    ]);
     expect(isDockCollapsed(result.current.layout, "right")).toBe(true);
+  });
+
+  it("finishes a deferred close with the derivation of the Session that started it", async () => {
+    const { result, rerender } = renderHook(
+      ({ session, outside }) => usePaneLayout(session, outside, OPEN, NO_PLUGINS),
+      { initialProps: { session: "s1", outside: false } },
+    );
+    let finish!: (ok: boolean) => void;
+    act(() => result.current.closeTab("terminal:0", () => new Promise((r) => (finish = r))));
+    rerender({ session: "s2", outside: true });
+    await act(async () => finish(true));
+    expect(JSON.parse(localStorage.getItem(V3_KEY)!).sessions.s1.right[0].tabs).toEqual(["diff"]);
+  });
+
+  it("adds a newly loaded plugin to a saved layout unless the user closed it", () => {
+    const { result, rerender } = renderHook(({ plugins }) => usePaneLayout("s1", false, CLOSED, plugins), {
+      initialProps: { plugins: NO_PLUGINS },
+    });
+    act(() => result.current.toggleKind("terminal", "right"));
+    rerender({ plugins: PLUGIN });
+    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:0", "plugin:p:a"]);
+    act(() => result.current.closeTab("plugin:p:a"));
+    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:0"]);
   });
 
   it.each([
@@ -199,13 +224,13 @@ describe("usePaneLayout migration + persistence", () => {
   });
 
   it("drops tab ids duplicated across docks or within a group on load", () => {
-    persistV2([{ tabs: ["diff", "diff", "terminal:0"], active: "diff" }], [{ tabs: ["diff"], active: "diff" }]);
+    persistGroups([{ tabs: ["diff", "diff", "terminal:0"], active: "diff" }], [{ tabs: ["diff"], active: "diff" }]);
     const { layout: l } = hook().current;
     expect([dockTabs(l, "right"), dockTabs(l, "bottom")]).toEqual([["diff", "terminal:0"], []]);
   });
 
   it("loads multiple persisted groups per dock without merging them", () => {
-    persistV2([
+    persistGroups([
       { tabs: ["diff"], active: "diff" },
       { tabs: ["terminal:0"], active: "terminal:0" },
     ]);
@@ -216,123 +241,89 @@ describe("usePaneLayout migration + persistence", () => {
   });
 
   it("toggleKind adds then removes the terminal tabs", () => {
-    localStorage.setItem("aoe-right-collapsed", "1");
     const result = hook();
     act(() => result.current.toggleKind("terminal", "right"));
     expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:0"]);
     act(() => result.current.toggleKind("terminal", "right"));
     expect(dockTabs(result.current.layout, "right")).toEqual([]);
   });
+
+  it("saves nothing until the user changes a layout, so the defaults keep applying", () => {
+    const { result, rerender } = renderHook(({ prefs }) => usePaneLayout("s1", false, prefs, NO_PLUGINS), {
+      initialProps: { prefs: OPEN },
+    });
+    expect(savedSessions()).toEqual([]);
+    rerender({ prefs: CLOSED });
+    expect(dockTabs(result.current.layout, "right")).toEqual([]);
+
+    act(() => result.current.toggleKind("terminal", "right"));
+    rerender({ prefs: OPEN });
+    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:0"]);
+    expect(savedSessions()).toEqual(["s1"]);
+  });
+
+  it("sweeps saved layouts of sessions that are gone, keeping the live ones in view", () => {
+    persistGroups([{ tabs: ["terminal:0"], active: "terminal:0" }]);
+    const result = hook("s1", OPEN);
+    const other = hook("s2");
+    act(() => other.current.toggleKind("diff", "right"));
+    act(() => sweepOrphanPaneLayouts(new Set(["s1"])));
+    expect(savedSessions()).toEqual(["s1"]);
+    act(() => sweepOrphanPaneLayouts(new Set()));
+    expect(dockTabs(result.current.layout, "right")).toEqual(["diff", "terminal:0"]);
+  });
+});
+
+describe("usePaneLayout upgrade from v2", () => {
+  const V2_KEY = "aoe-pane-layout-v2";
+  const shells = (l: DockLayout) => [dockTabs(l, "right"), dockTabs(l, "bottom"), l.nextTerminalIndex];
+
+  it("keeps the terminals of a v2 Session so a new tab never reuses a live shell, and writes v3 before deleting v2", () => {
+    let terminals = layout(["diff", "terminal:0"]);
+    terminals = addTerminal(terminals, "right").layout;
+    terminals = addTerminal(terminals, "bottom").layout;
+    localStorage.setItem(
+      V2_KEY,
+      JSON.stringify({ version: 2, template: emptyLayout(), sessions: { s1: terminals, s2: layout(["diff"]) } }),
+    );
+    const { result } = renderHook(() => usePaneLayout("s1", false, CLOSED, NO_PLUGINS));
+    expect(shells(result.current.layout)).toEqual([["diff", "terminal:0", "terminal:1"], ["terminal:2"], 3]);
+
+    act(() => sweepOrphanPaneLayouts(new Set(["s1", "s2"])));
+    expect(savedSessions()).toEqual(["s1"]);
+    expect(localStorage.getItem(V2_KEY)).toBeNull();
+    act(() => result.current.addTerminal("right"));
+    expect(dockTabs(result.current.layout, "right")).toContain("terminal:3");
+  });
 });
 
 describe("usePaneLayout outside a repository (#4574)", () => {
-  const seededTemplate = () =>
-    localStorage.setItem(
-      "aoe-pane-layout-v2",
-      JSON.stringify({
-        version: 2,
-        template: { ...layout(["diff", "terminal:0"]), nextTerminalIndex: 1 },
-        sessions: {},
-      }),
-    );
-
   it.each([
-    // [outside, autoOpenTerminalPane, seeded tabs]
+    // [outside, terminal default, seeded tabs]
     [false, true, ["diff", "terminal:0"]],
     // Not yet known: Diff waits for the Session row.
     [null, true, ["terminal:0"]],
     [true, true, ["terminal:0"]],
     [true, false, []],
-  ])("outside=%s terminal=%s seeds %o, whatever autoOpenDiffPane says", (outside, terminal, expected) => {
-    seededTemplate();
-    localStorage.setItem(
-      "aoe-web-settings",
-      JSON.stringify({ autoOpenDiffPane: true, autoOpenTerminalPane: terminal }),
-    );
-    const { result } = renderHook(() => usePaneLayout("s1", outside));
+  ])("outside=%s terminal=%s seeds %o with the Diff default on", (outside, terminal, expected) => {
+    const { result } = renderHook(() => usePaneLayout("s1", outside, { diff: true, terminal }, NO_PLUGINS));
     expect(dockTabs(result.current.layout, "right")).toEqual(expected);
   });
 
-  type Api = ReturnType<typeof usePaneLayout>;
-  const unknownThenKnown = (known: boolean, ...actions: ((api: Api) => void)[]) => {
-    seededTemplate();
-    localStorage.setItem("aoe-web-settings", JSON.stringify({ autoOpenDiffPane: true, autoOpenTerminalPane: true }));
-    const { result, rerender } = renderHook(({ outside }) => usePaneLayout("s1", outside), {
-      initialProps: { outside: null as boolean | null },
-    });
-    for (const action of actions) act(() => action(result.current));
-    rerender({ outside: known });
-    return result;
-  };
-
-  it.each([
-    [false, ["diff", "terminal:0", "plugin:p:a"]],
-    [true, ["terminal:0", "plugin:p:a"]],
-  ])("keeps a mutation made while status is unknown, adding Diff only for git (outside=%s)", (known, expected) => {
-    const result = unknownThenKnown(known, (api) => api.openTab("plugin:p:a", "right"));
-    expect(dockTabs(result.current.layout, "right")).toEqual(expected);
-  });
-
-  it("lets a second action see the first while status is unknown", () => {
-    const result = unknownThenKnown(
-      false,
-      (api) => api.setDockCollapsed("right", true),
-      (api) => api.setDockCollapsed("right", false),
-    );
-    expect(isDockCollapsed(result.current.layout, "right")).toBe(false);
-  });
-
-  it("keeps a Diff toggled open while status is unknown", () => {
-    const result = unknownThenKnown(false, (api) => api.toggleKind("diff", "right"));
-    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:0", "diff"]);
-  });
-
-  it("leaves Diff closed when the user closed it while status was unknown", () => {
-    const result = unknownThenKnown(
-      false,
-      (api) => api.toggleKind("diff", "right"),
-      (api) => api.toggleKind("diff", "right"),
-    );
-    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:0"]);
-  });
-
-  it("restores Diff as the active tab after a dock-only action while status was unknown", () => {
-    const result = unknownThenKnown(false, (api) => api.setDockCollapsed("right", true));
-    expect(groups(result.current.layout)).toEqual([[["diff", "terminal:0"], "diff"]]);
-    expect(isDockCollapsed(result.current.layout, "right")).toBe(true);
-  });
-
-  it("still adds Diff for a git Session after a reload inside the unknown window", () => {
-    seededTemplate();
-    localStorage.setItem("aoe-web-settings", JSON.stringify({ autoOpenDiffPane: true, autoOpenTerminalPane: true }));
-    const first = renderHook(() => usePaneLayout("s1", null));
-    act(() => first.result.current.openTab("plugin:p:a", "right"));
-    first.unmount();
-    const reloaded = renderHook(() => usePaneLayout("s1", false));
-    expect(dockTabs(reloaded.result.current.layout, "right")).toEqual(["diff", "terminal:0", "plugin:p:a"]);
-  });
-
-  it("leaves a stored layout alone when status becomes known", () => {
-    localStorage.setItem(
-      "aoe-pane-layout-v2",
-      JSON.stringify({
-        version: 2,
-        template: { ...layout(["diff"]), nextTerminalIndex: 1 },
-        sessions: { s1: { ...layout([]), nextTerminalIndex: 1 } },
-      }),
-    );
-    const { result, rerender } = renderHook(({ outside }) => usePaneLayout("s1", outside), {
+  it("saves what was shown when the user acts while status is unknown", () => {
+    const { result, rerender } = renderHook(({ outside }) => usePaneLayout("s1", outside, OPEN, NO_PLUGINS), {
       initialProps: { outside: null as boolean | null },
     });
     act(() => result.current.openTab("plugin:p:a", "right"));
-    expect(dockTabs(result.current.layout, "right")).toEqual(["plugin:p:a"]);
+    act(() => result.current.setDockCollapsed("right", true));
+    act(() => result.current.setDockCollapsed("right", false));
     rerender({ outside: false });
-    expect(dockTabs(result.current.layout, "right")).toEqual(["plugin:p:a"]);
+    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:0", "plugin:p:a"]);
+    expect(isDockCollapsed(result.current.layout, "right")).toBe(false);
   });
 
   it("applies a flag that arrives after seeding, but never closes a Diff the user opened", () => {
-    seededTemplate();
-    const { result, rerender } = renderHook(({ outside }) => usePaneLayout("s1", outside), {
+    const { result, rerender } = renderHook(({ outside }) => usePaneLayout("s1", outside, OPEN, NO_PLUGINS), {
       initialProps: { outside: false },
     });
     expect(dockTabs(result.current.layout, "right")).toContain("diff");
@@ -346,21 +337,16 @@ describe("usePaneLayout outside a repository (#4574)", () => {
   });
 });
 
-describe("seedLayout (auto-open pane prefs, #3035)", () => {
+describe("seedLayout", () => {
   it.each([
-    [true, true, ["diff", "terminal:0", "terminal:1"]],
-    [false, true, ["terminal:0", "terminal:1"]],
+    [true, true, ["diff", "terminal:0"]],
+    [false, true, ["terminal:0"]],
     [true, false, ["diff"]],
     [false, false, []],
-  ])("diff=%s terminal=%s keeps %o", (diff, terminal, expected) => {
-    const seeded = seedLayout(layout(["diff", "terminal:0", "terminal:1"]), { diff, terminal });
-    expect(dockTabs(seeded, "right")).toEqual(expected);
-    expect(seeded.closedPlugins).toEqual([]);
-  });
-
-  it("is a no-op on an empty template", () => {
-    const seeded = seedLayout(emptyLayout(), { diff: false, terminal: false });
-    expect([dockTabs(seeded, "right"), dockTabs(seeded, "bottom")]).toEqual([[], []]);
+  ])("diff=%s terminal=%s opens %o with the first active", (diff, terminal, expected) => {
+    const seeded = seedLayout({ diff, terminal });
+    expect([dockTabs(seeded, "right"), seeded.right[0]?.active ?? null]).toEqual([expected, expected[0] ?? null]);
+    expect(dockTabs(seeded, "bottom")).toEqual([]);
   });
 });
 
@@ -374,15 +360,17 @@ describe("usePaneLayout file edit guard", () => {
 
   /** A dirty Files editor in the right dock beside a terminal in the bottom dock. */
   function editing(start = layout(["files"], ["terminal:0"]), tabAvailable?: (id: string) => boolean) {
-    localStorage.setItem(
-      "aoe-pane-layout-v2",
-      JSON.stringify({ version: 2, template: emptyLayout(), sessions: { s1: start }, provisional: {} }),
-    );
+    persistV3({ s1: start });
     const discard = vi.fn();
     setFileDraft(key, { original, text: "draft", pendingSave: null });
     const release = registerFileEditor(key, "files", discard);
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
-    return { result: renderHook(() => usePaneLayout("s1", false, tabAvailable)).result, discard, release, confirm };
+    return {
+      result: renderHook(() => usePaneLayout("s1", false, CLOSED, NO_PLUGINS, tabAvailable)).result,
+      discard,
+      release,
+      confirm,
+    };
   }
 
   it("changes the other dock without asking or discarding the visible draft", () => {
