@@ -1,5 +1,4 @@
 import type { OperationErrorEvidence, RateLimitInfo } from "./acpTypes";
-import type { RepoColor } from "./repoAppearance";
 import type { AgentLifecycleInfo } from "./agentProfiles";
 import type { SchemaSettings } from "./generated/settingsKeys";
 
@@ -49,7 +48,6 @@ export interface SessionResponse {
    *  scratch sessions out. */
   scratch: boolean;
   favorited: boolean;
-  color?: string | null;
   urgent?: boolean;
   /** Web pin time; `pinned_at != null` is the pinned state. */
   pinned_at?: string | null;
@@ -285,9 +283,6 @@ export interface RepoGroup {
   id: string;
   repoPath: string;
   displayName: string;
-  defaultDisplayName: string;
-  alias: string | null;
-  color: RepoColor | null;
   remoteOwner: string | null;
   /** "owner@host"; null when `remoteOwner` is null. */
   remoteOwnerKey: string | null;

@@ -81,7 +81,7 @@ use agent_client_protocol::v1::schema::{
 };
 use agent_client_protocol::ByteStreams;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -169,6 +169,10 @@ struct CancelGrace {
 
 /// Resources and turn ownership survive replacement of the control connection.
 struct SessionState {
+    /// Roots pinned once per session. `AcpClient::spawn` pins them before the
+    /// container is queried or the agent runs; a reattach after a daemon
+    /// restart can only pin them on first use.
+    fs_roots: std::sync::OnceLock<FsPolicy>,
     terminals: TerminalManager,
     terminal_claim: Arc<TerminalClaim>,
     cancel_deadline: Arc<std::sync::Mutex<Option<CancelGrace>>>,
@@ -184,9 +188,22 @@ struct SessionState {
     terminal_before_clear: std::sync::Mutex<Option<test_helpers::SdkTestGate>>,
 }
 
+impl SessionState {
+    /// Allowed fs roots are the cwd plus any additional directories. A root
+    /// that cannot be opened now stays unavailable; `spawn` rejects that case.
+    fn pin_fs_roots(&self, cwd: &Path, additional_dirs: &[PathBuf]) -> &FsPolicy {
+        self.fs_roots.get_or_init(|| {
+            let mut roots = vec![cwd.to_path_buf()];
+            roots.extend_from_slice(additional_dirs);
+            FsPolicy::new(roots)
+        })
+    }
+}
+
 impl Default for SessionState {
     fn default() -> Self {
         Self {
+            fs_roots: std::sync::OnceLock::new(),
             terminals: TerminalManager::new(),
             terminal_claim: Arc::new(TerminalClaim::new()),
             cancel_deadline: Arc::default(),
@@ -228,18 +245,17 @@ struct SessionResources {
 }
 
 impl SessionResources {
-    /// Allowed fs roots are the cwd plus any additional directories.
     fn new(
         cwd: PathBuf,
         additional_dirs: Vec<PathBuf>,
         label: String,
         sandbox: Option<(SessionSandbox, SandboxPathMap)>,
+        state: &SessionState,
     ) -> Self {
-        let mut roots = vec![cwd.clone()];
-        roots.extend(additional_dirs);
+        let roots = state.pin_fs_roots(&cwd, &additional_dirs).clone();
         let (sandbox, fs_policy) = match sandbox {
-            Some((handle, path_map)) => (Some(handle), FsPolicy::with_sandbox_map(roots, path_map)),
-            None => (None, FsPolicy::new(roots)),
+            Some((handle, path_map)) => (Some(handle), roots.with_map(path_map)),
+            None => (None, roots),
         };
         Self {
             fs_policy: Arc::new(fs_policy),
@@ -359,8 +375,13 @@ impl Launch {
                 test_options.native_session_seen.take();
             *connection_state.test_update.lock().unwrap() = test_options.update.take();
         }
-        let mut resources =
-            SessionResources::new(self.cwd, self.additional_dirs, label.clone(), self.sandbox);
+        let mut resources = SessionResources::new(
+            self.cwd,
+            self.additional_dirs,
+            label.clone(),
+            self.sandbox,
+            &self.state,
+        );
         resources.terminals = self.state.terminals.clone();
         let params = ConnectionParams {
             event_tx,
@@ -915,6 +936,12 @@ impl AcpClient {
                 path: config.cwd.clone(),
             });
         }
+        // A root missing at pin time would stay unavailable for the session.
+        if let Some(path) = config.additional_dirs.iter().find(|dir| !dir.exists()) {
+            return Err(AcpError::ProjectPathMissing { path: path.clone() });
+        }
+        let state = Arc::<SessionState>::default();
+        state.pin_fs_roots(&config.cwd, &config.additional_dirs);
         let sandbox = match &config.sandbox_info {
             // Resolving the workdir touches git2 and may shell out to docker.
             Some(info) => {
@@ -964,7 +991,7 @@ impl AcpClient {
                 .and_then(|binding| binding.stores.first())
                 .cloned(),
             cancellation: cancellation.clone(),
-            state: Arc::default(),
+            state: state.clone(),
         };
 
         if let Some(socket_path) = config.socket_path.clone() {
@@ -2115,5 +2142,44 @@ mod shutdown_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod fs_roots_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn spawn_rejects_a_missing_additional_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("gone");
+        let mut config = test_helpers::env_test_spawn_config(temp.path().to_path_buf());
+        config.additional_dirs = vec![missing.clone()];
+        match AcpClient::spawn(config, AcpSessionId("s".into())).await {
+            Err(AcpError::ProjectPathMissing { path }) => assert_eq!(path, missing),
+            other => panic!("expected ProjectPathMissing, got {:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn roots_pinned_before_a_swap_keep_resolving_to_the_original_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().canonicalize().unwrap();
+        let (root, moved, outside) = (parent.join("wt"), parent.join("moved"), parent.join("out"));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(root.join("f.txt"), "in").unwrap();
+        std::fs::write(outside.join("f.txt"), "secret").unwrap();
+        let state = SessionState::default();
+        state.pin_fs_roots(&root, &[]);
+
+        std::fs::rename(&root, &moved).unwrap();
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+
+        // Later construction reuses the pin instead of re-resolving the path.
+        let resources = SessionResources::new(root.clone(), Vec::new(), "s".into(), None, &state);
+        let text =
+            crate::acp::fs_handler::handle_read(&resources.fs_policy, "s", &root.join("f.txt"));
+        assert_eq!(text.unwrap(), "in");
     }
 }

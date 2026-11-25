@@ -186,6 +186,15 @@ impl Instance {
         // Capture state and identity together; a replacement after this observation
         // must not become the corpse this call is authorized to retire.
         let Some(admission) = self.admit_native_start()? else {
+            let unproven_birth = if require_tracked_row {
+                self.unproven_native_birth_generation.is_some()
+            } else {
+                storage
+                    .load()?
+                    .iter()
+                    .any(|row| row.id == self.id && row.unproven_native_birth_generation.is_some())
+            };
+            anyhow::ensure!(!unproven_birth, LaunchIndeterminateCause::OwnershipUnproven);
             if let Some((key, _)) = handoff {
                 self.complete_terminal_handoff_live_in(storage, key)?;
             }
@@ -979,6 +988,9 @@ impl Instance {
                         .expect("validated handoff")
                         .launch = handoff_launch.clone();
                 }
+                if handoff_key.is_none() {
+                    row.unproven_native_birth_generation = Some(generation);
+                }
                 if let Some(resolved) = resolved_scopes.as_ref() {
                     if row.terminal_scopes == recorded_scopes {
                         row.terminal_scopes = Some(resolved.clone());
@@ -995,6 +1007,9 @@ impl Instance {
                 }
                 Ok(scopes.clone())
             })?);
+            if handoff_key.is_none() {
+                self.unproven_native_birth_generation = Some(generation);
+            }
             if handoff_key.is_some() {
                 self.terminal_handoff
                     .as_mut()
@@ -2299,10 +2314,11 @@ else:
                         initial_births[0]["pid"].as_u64(),
                         Some(u64::from(native_pid))
                     );
+                    let retry = instance.start_with_size_opts(None, false).unwrap_err();
                     assert_eq!(
-                        instance.start_with_size_opts(None, false).unwrap(),
-                        LaunchSidOutcome::Skipped,
-                        "a refused publication must not admit another physical launch"
+                        retry.downcast_ref::<LaunchIndeterminateCause>(),
+                        Some(&LaunchIndeterminateCause::OwnershipUnproven),
+                        "a refused publication must not authorize reuse or another launch"
                     );
                     let after = storage.load().unwrap().remove(0);
                     assert_eq!(after.lifecycle_generation, generation);

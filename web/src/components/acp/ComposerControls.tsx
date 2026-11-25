@@ -330,10 +330,8 @@ export function UsageHint({ usage }: { usage: AcpState["sessionUsage"] }) {
     `Context window: ${usage.used.toLocaleString()} of ${usage.size.toLocaleString()} tokens used (${pct}%). ` +
     `Color warns as the window fills.` +
     (cost ? ` ${cost} is cumulative session spend since the last /clear or /compact.` : "");
-  // Last in the wrapping cluster: on a narrow footer it takes its own row
-  // instead of pushing Stop and Send off screen.
   return (
-    <span className="ml-auto pl-2">
+    <span className="shrink-0">
       <Tooltip text={explanation} multiline>
         <span
           data-testid="composer-usage"

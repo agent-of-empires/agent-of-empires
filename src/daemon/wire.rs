@@ -835,13 +835,6 @@ pub struct UpdateFavoriteBody {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct UpdateColorBody {
-    /// A palette color, or null to clear the label.
-    #[serde(default)]
-    pub color: Option<String>,
-}
-
-#[derive(Serialize, Deserialize)]
 pub struct UpdateSnoozeBody {
     /// Positive minutes within the shared snooze bounds, or null to unsnooze.
     #[serde(default)]
@@ -1252,11 +1245,6 @@ pub struct SessionResponse {
     pub favorited: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub favorited_at: Option<String>,
-    /// Per-session color label (`red` / `amber` / `green`), or omitted when
-    /// unset. Rendered as a colored status dot in the web sidebar; set via the
-    /// sidebar context menu or `aoe session color`. See #2383.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub color: Option<String>,
     /// True when the agent has flagged this session as urgent via the
     /// `attention-urgent` hook (read from `/tmp/aoe-hooks-<euid>/{id}/attention.json`
     /// by `Instance::is_urgent()`). The web sidebar's Attention sort floats

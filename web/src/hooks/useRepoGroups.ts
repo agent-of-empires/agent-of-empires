@@ -1,12 +1,6 @@
 import { useCallback, useMemo, useState } from "react";
 import type { ProjectInfo, Workspace, RepoGroup } from "../lib/types";
 import { mergeRegisteredProjects, unpinnedSavedProjects } from "../lib/registeredProjects";
-import {
-  applyRepoAppearanceUpdate,
-  loadRepoAppearances,
-  persistRepoAppearances,
-  type RepoAppearanceUpdate,
-} from "../lib/repoAppearance";
 import { loadRepoGroupOrder, persistRepoGroupOrder } from "../lib/repoGroupOrder";
 import { useCollapsedKeys } from "./useCollapsedKeys";
 import { compareSortValues } from "../lib/pluginUi";
@@ -48,11 +42,9 @@ export function useRepoGroups(
   groups: RepoGroup[];
   savedProjects: RepoGroup[];
   toggleRepoCollapsed: (repoId: string) => void;
-  updateRepoAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
   reorderRepoGroups: (orderedGroupIds: string[]) => void;
 } {
   const { isCollapsed, toggle: toggleRepoCollapsed } = useCollapsedKeys("aoe-repo-collapsed-");
-  const [appearanceMap, setAppearanceMap] = useState(loadRepoAppearances);
   const [groupOrder, setGroupOrder] = useState<string[]>(loadRepoGroupOrder);
 
   const { groups, savedProjects } = useMemo(() => {
@@ -104,17 +96,13 @@ export function useRepoGroups(
     }
 
     const isSyntheticGroup = (id: string) => id === MULTI_REPO_GROUP_ID || id === SCRATCH_GROUP_ID;
-    const makeGroup = (id: string, list: Workspace[], defaultDisplayName: string): RepoGroup => {
+    const makeGroup = (id: string, list: Workspace[], displayName: string): RepoGroup => {
       const sorted = sortWorkspaces(list);
-      const appearance = appearanceMap[id];
       const owner = isSyntheticGroup(id) ? null : sorted[0]?.sessions[0];
       return {
         id,
         repoPath: id,
-        displayName: appearance?.alias ?? defaultDisplayName,
-        defaultDisplayName,
-        alias: appearance?.alias ?? null,
-        color: appearance?.color ?? null,
+        displayName,
         remoteOwner: owner?.remote_owner ?? null,
         remoteOwnerKey: owner?.remote_owner_key ?? null,
         workspaces: sorted,
@@ -131,11 +119,7 @@ export function useRepoGroups(
     if (multiRepo.length > 0) repoGroups.push(makeGroup(MULTI_REPO_GROUP_ID, multiRepo, "Multi-repo"));
     if (scratch.length > 0) repoGroups.push(makeGroup(SCRATCH_GROUP_ID, scratch, "Scratch"));
 
-    const merged = mergeRegisteredProjects(repoGroups, [...projects], {
-      alias: (repoPath) => appearanceMap[repoPath]?.alias ?? null,
-      color: (repoPath) => appearanceMap[repoPath]?.color ?? null,
-      collapsed: isCollapsed,
-    });
+    const merged = mergeRegisteredProjects(repoGroups, [...projects], isCollapsed);
 
     const isRegisteredEmpty = (g: RepoGroup) => g.workspaces.length === 0 && g.registeredProjects.length > 0;
 
@@ -197,15 +181,7 @@ export function useRepoGroups(
       return a.repoPath.localeCompare(b.repoPath);
     });
 
-    const savedProjects = unpinnedSavedProjects(
-      repoGroups,
-      [...projects],
-      {
-        alias: (repoPath) => appearanceMap[repoPath]?.alias ?? null,
-        color: (repoPath) => appearanceMap[repoPath]?.color ?? null,
-      },
-      { drawsRepoHeaders },
-    );
+    const savedProjects = unpinnedSavedProjects(repoGroups, [...projects], { drawsRepoHeaders });
 
     return { groups: merged, savedProjects };
   }, [
@@ -216,18 +192,9 @@ export function useRepoGroups(
     pluginAttention,
     projects,
     isCollapsed,
-    appearanceMap,
     groupOrder,
     drawsRepoHeaders,
   ]);
-
-  const updateRepoAppearance = useCallback((repoId: string, update: RepoAppearanceUpdate) => {
-    setAppearanceMap((prev) => {
-      const next = applyRepoAppearanceUpdate(prev, repoId, update);
-      persistRepoAppearances(next);
-      return next;
-    });
-  }, []);
 
   const reorderRepoGroups = useCallback((orderedGroupIds: string[]) => {
     setGroupOrder(orderedGroupIds);
@@ -238,7 +205,6 @@ export function useRepoGroups(
     groups,
     savedProjects,
     toggleRepoCollapsed,
-    updateRepoAppearance,
     reorderRepoGroups,
   };
 }

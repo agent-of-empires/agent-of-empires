@@ -6027,4 +6027,272 @@ mod tests {
         );
         assert!(worker_registry::is_record_live(&replacement.record));
     }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_binding_checkpoint_rejects_a_successor_and_never_enriches_its_selected_route() {
+        use crate::acp::control_protocol::{NativeReplayDelivery, SessionReplayed};
+        use crate::acp::establishment::{
+            AcpEstablishment, EstablishmentRefusal, NativeEstablishmentOutcome,
+            NativeEstablishmentReceipt, NativeReplayClosure,
+        };
+        use crate::acp::event_sender::{EventSender, ProjectionState};
+        use crate::session::SessionStore as _;
+        for case in [
+            "successor",
+            "same_sid",
+            "route_marker",
+            "legacy_store",
+            "journal_owner",
+        ] {
+            let (_home, tmp) = isolate_home();
+            let mut row =
+                crate::session::Instance::new("binding-checkpoint", tmp.path().to_str().unwrap());
+            row.source_profile = "default".into();
+            row.view = crate::session::View::Structured;
+            row.tool = "claude".into();
+            row.acp_session_id = Some("selected-native".into());
+            row.agent_session_id = Some("selected-native".into());
+            row.last_error.set("historical diagnostic");
+            let route = crate::session::ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec![tmp.path().join("original-store")],
+                configuration: Vec::new(),
+                cwd: tmp.path().into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: (case != "legacy_store").then_some(false),
+            };
+            let observed = crate::session::ExecutionBinding {
+                exported_default_store: Some(case == "legacy_store"),
+                ..route.clone()
+            };
+            row.agent_session_binding = Some(crate::session::ConversationBinding {
+                session_id: "selected-native".into(),
+                execution: Some(route.clone()),
+                provenance: crate::session::ConversationProvenance::Observed,
+                transcript_path: None,
+            });
+            let storage = crate::session::Storage::new_unwatched(&row.source_profile).unwrap();
+            let attempt = row.arm_acp_establishment(&storage, None).unwrap();
+            let attempt = Arc::new(
+                row.bind_acp_producer(&storage, &attempt, uuid::Uuid::new_v4())
+                    .unwrap(),
+            );
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                &row.source_profile,
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            state.acp_supervisor.test_insert_worker(&row.id).await;
+            let lease = state.acp_supervisor.current_lease(&row.id).unwrap();
+            state.acp_supervisor.test_bind_native_scope(&lease, &row);
+            // Supply the authenticated original response and its empty replay at the SDK boundary.
+            let owner = RunnerIdentity {
+                pid: i32::MAX as u32,
+                generation: 7,
+                birth_fingerprint: Some(
+                    crate::process::process_birth_identity(std::process::id())
+                        .unwrap()
+                        .expect("current test process has an attested birth")
+                        .fingerprint(),
+                ),
+            };
+            assert!(lease.record_runner(owner));
+            lease.record_prime(PrimeOwnership::NotPrime);
+            let projection = Arc::new(ProjectionState::new(Some(Arc::clone(&attempt))));
+            assert!(projection.observe_original_invocation(Arc::clone(&attempt)));
+            let closure = NativeReplayClosure {
+                notifications: 0,
+                closed: true,
+                lost: false,
+            };
+            let range = NativeReplayDelivery::original(closure);
+            assert!(projection.receipt(
+                Arc::new(NativeEstablishmentReceipt {
+                    attempt: Arc::clone(&attempt),
+                    owner,
+                    store: Some(observed),
+                    outcome: NativeEstablishmentOutcome::Succeeded {
+                        session_id: "selected-native".into(),
+                    },
+                    replay: closure,
+                }),
+                true,
+                range,
+            ));
+            projection.close_wire(attempt.id, closure, range);
+            projection.wire_forwarded(&SessionReplayed {
+                attempt_id: attempt.id,
+                closure,
+                delivery: range,
+            });
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            let events = EventSender::tracked(tx, Arc::clone(&projection), Some(owner));
+            let delivery = events.close_establishment(None).await.unwrap();
+            assert!(delivery.complete);
+            assert!(rx.try_recv().is_ok());
+            lease
+                .retirement()
+                .retain_establishment_projection(projection);
+            tokio::task::spawn_blocking(move || {
+                let native = crate::server::session_store::NativeSessionStore::open(
+                    state.clone(),
+                    &row.source_profile,
+                    None,
+                )
+                .unwrap();
+                let target = state.acp_supervisor.capture_retirement(&row.id).unwrap();
+                let checkpoint = target
+                    .prepare_binding_checkpoint(&row, native.storage())
+                    .unwrap()
+                    .unwrap();
+                let retirement = crate::server::acp_events::BindingRetirement::captured(
+                    &state,
+                    target,
+                    Some(checkpoint),
+                );
+                retirement.activate();
+                if case == "successor" {
+                    let successor = tokio::runtime::Handle::current()
+                        .block_on(state.acp_supervisor.test_respawn_worker(&row.id));
+                    assert_ne!(successor, lease.epoch());
+                    assert_eq!(
+                        native.load().unwrap()[0].lifecycle_generation,
+                        row.lifecycle_generation
+                    );
+                    let error = crate::server::acp_events::commit_retired_binding(
+                        &native,
+                        &row.id,
+                        &retirement,
+                    )
+                    .unwrap_err();
+                    assert!(matches!(
+                        error.downcast_ref::<crate::session::LifecycleReservationError>(),
+                        Some(crate::session::LifecycleReservationError::Superseded)
+                    ));
+                } else {
+                    tokio::runtime::Handle::current()
+                        .block_on(state.acp_supervisor.shutdown_captured_and_wait(
+                            &row.id,
+                            &retirement.target,
+                            Duration::from_secs(5),
+                        ))
+                        .unwrap();
+                    if case == "journal_owner" {
+                        let mut journal_target = retirement.target.clone();
+                        journal_target.claim_journal_ack();
+                        tokio::runtime::Handle::current().block_on(
+                            crate::server::acp_events::commit_background_bindings(&state),
+                        );
+                        assert_eq!(
+                            native.load().unwrap()[0].acp_establishment,
+                            row.acp_establishment,
+                            "maintenance must not substitute for the journal's own checkpoint"
+                        );
+                        assert_eq!(
+                            state.acp_supervisor.current_lease(&row.id).as_ref(),
+                            Some(&lease)
+                        );
+                        crate::server::acp_events::commit_retired_binding(
+                            &native,
+                            &row.id,
+                            &retirement,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            native.load().unwrap()[0].acp_establishment,
+                            Some(AcpEstablishment::Applied {
+                                attempt_id: attempt.id,
+                            })
+                        );
+                        state
+                            .acp_supervisor
+                            .acknowledge_retirement(&journal_target)
+                            .unwrap();
+                        return;
+                    }
+                    if case != "legacy_store" {
+                        (&native as &dyn crate::session::SessionStore)
+                            .update(|rows, _| {
+                                // Explicit selection withdraws the original attempt's authority.
+                                rows[0].acp_establishment = None;
+                                let binding = rows[0].agent_session_binding.as_mut().unwrap();
+                                if case == "same_sid" {
+                                    binding.provenance =
+                                        crate::session::ConversationProvenance::Asserted;
+                                    binding.execution.as_mut().unwrap().stores =
+                                        vec![tmp.path().join("new-selected-store")];
+                                }
+                                let route = binding.execution.as_mut().unwrap();
+                                route.exported_default_store = Some(true);
+                                Ok(())
+                            })
+                            .unwrap();
+                    }
+                    let diagnostic_before = state.instances.blocking_read()[0].last_error.clone();
+                    let committed = crate::server::acp_events::commit_retired_binding(
+                        &native,
+                        &row.id,
+                        &retirement,
+                    );
+                    if case == "legacy_store" {
+                        committed.unwrap();
+                    } else {
+                        assert!(matches!(
+                            committed
+                                .unwrap_err()
+                                .downcast_ref::<EstablishmentRefusal>(),
+                            Some(EstablishmentRefusal::Superseded)
+                        ));
+                    }
+                    let current = native.load().unwrap().remove(0);
+                    let binding = current.agent_session_binding.unwrap();
+                    let expected_provenance = if case == "same_sid" {
+                        crate::session::ConversationProvenance::Asserted
+                    } else {
+                        crate::session::ConversationProvenance::Observed
+                    };
+                    assert_eq!(binding.provenance, expected_provenance);
+                    let route = binding.execution.unwrap();
+                    let selected_store = if case == "same_sid" {
+                        "new-selected-store"
+                    } else {
+                        "original-store"
+                    };
+                    assert_eq!(route.stores, [tmp.path().join(selected_store)]);
+                    assert_eq!(route.exported_default_store, Some(true));
+                    assert_eq!(current.acp_session_id, row.acp_session_id);
+                    assert_eq!(
+                        state.instances.blocking_read()[0].last_error,
+                        diagnostic_before
+                    );
+                    if case == "legacy_store" {
+                        assert_eq!(
+                            current.acp_establishment,
+                            Some(AcpEstablishment::Applied {
+                                attempt_id: attempt.id,
+                            })
+                        );
+                        state
+                            .acp_supervisor
+                            .acknowledge_retirement(&retirement.target)
+                            .unwrap();
+                    } else {
+                        assert_eq!(current.acp_establishment, None);
+                        assert!(matches!(
+                            state
+                                .acp_supervisor
+                                .acknowledge_retirement(&retirement.target),
+                            Err(SupervisorError::TeardownPending(_))
+                        ));
+                    }
+                }
+                tokio::runtime::Handle::current().block_on(state.acp_supervisor.detach_all());
+            })
+            .await
+            .unwrap();
+        }
+    }
 }

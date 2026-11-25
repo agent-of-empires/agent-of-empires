@@ -544,6 +544,9 @@ impl Instance {
     }
 
     pub(super) fn probe_failure_cause(&self, error: anyhow::Error) -> LaunchIndeterminateCause {
+        if let Some(&cause) = error.downcast_ref::<LaunchIndeterminateCause>() {
+            return cause;
+        }
         let cause = if error.chain().any(|source| {
             source
                 .downcast_ref::<std::io::Error>()
@@ -693,8 +696,8 @@ impl Instance {
                 Ok(false) => StartOutcome::Indeterminate {
                     cause: LaunchIndeterminateCause::StabilizationExpired,
                 },
-                Err(_) => StartOutcome::Indeterminate {
-                    cause: LaunchIndeterminateCause::ObservationFailed,
+                Err(error) => StartOutcome::Indeterminate {
+                    cause: self.probe_failure_cause(error),
                 },
             });
         }
@@ -4294,7 +4297,7 @@ exec sleep 60
             Some(&LaunchIndeterminateCause::OwnershipUnproven),
             "{error:#}"
         );
-        let stored = storage.load().unwrap().remove(0);
+        let mut stored = storage.load().unwrap().remove(0);
         assert_eq!(stored.conversation_state(), prior);
         assert_eq!(
             serde_json::to_value(&stored.active_execution).unwrap(),
@@ -4302,6 +4305,17 @@ exec sleep 60
         );
         assert_eq!(stored.last_start_time, prior_start);
         assert_eq!(instance.conversation_state(), prior);
+        assert!(matches!(
+            stored.ensure_pane_ready().unwrap(),
+            super::super::EnsureReadyOutcome::Indeterminate {
+                cause: LaunchIndeterminateCause::OwnershipUnproven,
+            }
+        ));
+        assert!(matches!(
+            stored.native_input_fence(true).unwrap_err().downcast_ref(),
+            Some(LaunchIndeterminateCause::OwnershipUnproven)
+        ));
+        assert_eq!(std::fs::read(&births).unwrap(), b"x");
     }
 
     #[test]

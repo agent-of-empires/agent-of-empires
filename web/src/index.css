@@ -44,6 +44,29 @@
   font-display: swap;
 }
 
+/* JetBrains Mono, an optional terminal font (Ghostty's default). OFL: /fonts/JetBrainsMono-OFL.txt */
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("/fonts/JetBrainsMono-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("/fonts/JetBrainsMono-Bold.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("/fonts/JetBrainsMono-Italic.woff2") format("woff2");
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+
 @import "tailwindcss";
 
 /* Build-time fallback palette. Mirrors the `zinc` builtin theme
@@ -215,6 +238,12 @@ body {
   touch-action: pan-y pinch-zoom;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+/* Grayscale smoothing thins monospace stems on macOS; terminal text uses the platform default like native terminals. */
+[data-live-terminal] {
+  -webkit-font-smoothing: auto;
+  -moz-osx-font-smoothing: auto;
 }
 
 #root {
@@ -480,20 +509,32 @@ html[data-ios-standalone]:not([data-editing]) {
   font-size: 0.86em; /* 12px at the 14px default */
 }
 
-/* Subtle scrollbar styling */
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+/* Subtle scrollbar styling. The webkit rules are the fallback for engines
+   without scrollbar-color. */
+:root {
+  scrollbar-color: var(--color-surface-700) transparent;
 }
-::-webkit-scrollbar-track {
-  background: transparent;
+/* Gated: Safari 18.2+ honors scrollbar-width without scrollbar-color, which disables the webkit rules. */
+@supports (scrollbar-color: auto) {
+  * {
+    scrollbar-width: thin;
+  }
 }
-::-webkit-scrollbar-thumb {
-  background: var(--color-surface-700);
-  border-radius: 3px;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: var(--color-text-dim);
+@supports not (scrollbar-color: auto) {
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-surface-700);
+    border-radius: 3px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-text-dim);
+  }
 }
 
 /* Dialog/panel entrance animation */

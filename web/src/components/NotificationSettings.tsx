@@ -1,10 +1,13 @@
 import { usePushSubscription } from "../hooks/usePushSubscription";
+import { installHint } from "../lib/platform";
 import { deniedGuidance, type PushHealth } from "../lib/pushHealth";
+import { INSTALL_STEPS } from "../lib/tourSteps";
 
 // Push-notifications settings section.
 
 export function NotificationSettings() {
   const { state, health, enable, disable, sendTest } = usePushSubscription();
+  const hint = installHint();
 
   const isBusy =
     state.kind === "asking" ||
@@ -55,7 +58,8 @@ export function NotificationSettings() {
         )}
       </div>
 
-      {state.kind === "unsupported" && state.reason === "ios-not-standalone" && <IOSInstallHelp />}
+      {/* The install banner's × promises these steps here, so the platform decides them, not the push state. */}
+      {(hint === "ios" || hint === "other") && <InstallHelp hint={hint} />}
     </section>
   );
 }
@@ -114,8 +118,15 @@ function StatusRow({ state }: { state: ReturnType<typeof usePushSubscription>["s
       if (state.reason === "ios-not-standalone") {
         return (
           <p className="text-sm text-text-secondary">
-            Push notifications on iPhone require the app to be installed from Safari via Share, then Add to Home Screen.
-            Open the installed app to enable.
+            Push notifications on iPhone and iPad require the app to be installed from Safari via Share, then Add to
+            Home Screen. Open the installed app to enable.
+          </p>
+        );
+      }
+      if (installHint() === "other") {
+        return (
+          <p className="text-sm text-text-secondary">
+            Push notifications in this browser need AoE installed. Install it, then turn them on from the installed app.
           </p>
         );
       }
@@ -138,17 +149,16 @@ function HealthRow({ health }: { health: PushHealth }) {
   return <p className="mt-2 text-sm text-status-waiting">{message}</p>;
 }
 
-function IOSInstallHelp() {
+function InstallHelp({ hint }: { hint: "ios" | "other" }) {
   return (
     <details className="mt-3 text-sm text-text-secondary">
-      <summary className="cursor-pointer select-none">How to install on iPhone</summary>
+      <summary className="cursor-pointer select-none">
+        {hint === "ios" ? "How to install on iPhone or iPad" : "How to install"}
+      </summary>
       <ol className="mt-2 ml-5 list-decimal space-y-1">
-        <li>Tap the Share icon at the bottom of Safari.</li>
-        <li>
-          Scroll down and tap <em>Add to Home Screen</em>.
-        </li>
-        <li>Open the app from your Home Screen (not Safari), then come back to this page.</li>
-        <li>Tap Enable notifications.</li>
+        {INSTALL_STEPS[hint].settings.map((step) => (
+          <li key={step}>{step}</li>
+        ))}
       </ol>
     </details>
   );

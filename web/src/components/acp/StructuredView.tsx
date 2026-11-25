@@ -64,6 +64,10 @@ interface Props {
   rateLimitFailoverTo?: string;
   /** The profile's Structured view settings; null where Settings can't be edited. */
   settingsHref?: string | null;
+  /** The profile's Agent defaults row; null where Settings can't be edited. */
+  agentDefaultsHref?: string | null;
+  /** Opens a Settings link in the app. */
+  onOpenSettings?: (href: string) => void;
   /** Session `tool` registry key; selects the AgentProfile. */
   tool: string | null | undefined;
   /** Resolved ACP agent key; the switch-agent modal's fallback before any `AgentSwitched`. */
@@ -473,6 +477,16 @@ function ComposerDock({
   const compactAliases = useCompactAliases();
   // The Daemon's solo commands: they run as their own turn, never steered into one.
   const soloAliases = useMemo(() => [...clearAliases, ...compactAliases], [clearAliases, compactAliases]);
+  const { agentDefaultsHref, onOpenSettings } = view;
+  const currentAgent = state.agent ?? acpAgent;
+  // The Daemon resolves which profile and Agent the default saves under, as the spawn does.
+  const modelDefault = useMemo(
+    () =>
+      agentDefaultsHref && onOpenSettings && currentAgent
+        ? { sessionId, agent: currentAgent, open: () => onOpenSettings(agentDefaultsHref) }
+        : null,
+    [sessionId, agentDefaultsHref, onOpenSettings, currentAgent],
+  );
   // A send would start the Session, which rebuilds the container without Recreate's warning.
   const blockedReason =
     state.startupError && state.startupCause?.kind === "container_missing"
@@ -616,6 +630,7 @@ function ComposerDock({
           primerPrefill={primerPrefill}
           queuedPrompts={state.queuedPrompts}
           editQueuedPrompt={ctx.editQueuedPrompt}
+          modelDefault={modelDefault}
         />
       </CollapsibleRegion>
     </>

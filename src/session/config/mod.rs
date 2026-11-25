@@ -1081,7 +1081,7 @@ pub struct AppStateConfig {
     /// Server-side mirror of the web dashboard's syncable UI state, keyed by
     /// the frontend's localStorage key (the value is the opaque string the
     /// browser stored). Single-tenant: there is one user, so these prefs
-    /// (sidebar sort/axis, tool density, repo appearance/order, group collapse,
+    /// (sidebar sort/axis, tool density, repo order, group collapse,
     /// last-used tool, welcome-seen, etc.) live here so they follow the user
     /// across browsers and devices instead of being trapped in per-browser
     /// localStorage. The server never interprets the values; the web owns the
@@ -1942,27 +1942,6 @@ pub struct SessionConfig {
     )]
     pub unread_indicator: bool,
 
-    /// Show per-session color labels: the colored dot on sidebar rows and the
-    /// `Color` section in the session context menu. Turning this off hides
-    /// them without forbidding anything, `aoe session color` and the REST
-    /// endpoint keep working and stored values are preserved, so flipping back
-    /// reveals them again.
-    ///
-    /// `global_only`: the dashboard resolves one settings object for the whole
-    /// client, not one per workspace, and the sidebar mixes sessions from
-    /// several profiles in the all-profiles view. A per-profile override would
-    /// advertise semantics the web cannot honor.
-    #[serde(default = "default_true")]
-    #[setting(
-        label = "Session colors",
-        widget = "toggle",
-        web_only,
-        category = "Interaction",
-        global_only,
-        summary = "A colored dot on each row, and Color in the Session menu."
-    )]
-    pub show_session_colors: bool,
-
     /// Pin favorited sessions to the top of their sibling scope in every sort
     /// order of the TUI session list, not just Attention. A group holding a
     /// favorited session is pinned the same way. When on (default), favoriting
@@ -2060,9 +2039,10 @@ pub struct AcpAgentDefaults {
     /// agent runs on `model`: [`resolve_spawn_model_effort`] replaces any
     /// other value at creation and respawn, plugin `sessions.create` refuses
     /// one (`model_pinned`), and the plugin settings model picker offers only
-    /// the pin. A running session's live model switch is separate. Meaningless
-    /// without a non-empty `model`; global/profile only, like the rest of
-    /// `acp`.
+    /// the pin. A running session's live model switch is separate. Pins
+    /// nothing at spawn without a non-empty `model`, though the Agent default
+    /// model API still reports it as pinned and refuses to set a model;
+    /// global/profile only, like the rest of `acp`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pin_model: bool,
 
@@ -2405,7 +2385,6 @@ impl Default for SessionConfig {
             click_action: ClickAction::default(),
             confirm_before_quit: true,
             unread_indicator: true,
-            show_session_colors: true,
             favorites_first: true,
             show_tips: true,
             show_shortcut_bar: true,

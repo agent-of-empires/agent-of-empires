@@ -1,0 +1,71 @@
+# Tessl Code Review profile: the six tessl/code-review defaults, with the
+# security lens on every file, plus the AoE lenses. Keep every default
+# listed: this list replaces the built-in set.
+# https://docs.tessl.io/reference/configuration.md#tessl-code-reviewyml
+schemaVersion: 1
+effort: adaptive
+# Generated files; CI regenerates or checks them.
+ignore:
+  - docs/cli/reference.md
+  - web/src/lib/generated/**
+  - CHANGELOG.md
+lenses:
+  - ref: tessl/code-review@0.5.2#review-plugin-content
+    globs:
+      - tessl-plugins/aoe-maintainer/**
+  - ref: tessl/code-review@0.5.2#review-markdown
+    globs:
+      - '**/*.md'
+      - '!tessl-plugins/aoe-maintainer/**'
+  - ref: tessl/code-review@0.5.2#review-correctness-and-data-integrity
+    globs:
+      - '**'
+      - '!**/*.md'
+      - '!tessl-plugins/aoe-maintainer/**'
+  - ref: tessl/code-review@0.5.2#review-maintainability-and-code-quality
+    globs:
+      - '**'
+      - '!**/*.md'
+      - '!tessl-plugins/aoe-maintainer/**'
+  - ref: tessl/code-review@0.5.2#review-scale-and-resilience
+    globs:
+      - '**'
+      - '!**/*.md'
+      - '!tessl-plugins/aoe-maintainer/**'
+  # Skills, rules and agent instructions steer runs that hold write tokens.
+  - ref: tessl/code-review@0.5.2#review-security-and-privacy
+    globs:
+      - '**'
+  - ref: ./tessl-plugins/aoe-maintainer/lenses/aoe-invariants/SKILL.md
+  - ref: ./tessl-plugins/aoe-maintainer/lenses/aoe-test-evidence/SKILL.md
+    globs:
+      - src/**
+      - tests/**
+      - web/**
+      - acp-worker/**
+      - aoe-plugin-api/**
+      - xtask/**
+      - scripts/**
+      - '!**/*.md'
+  - ref: ./tessl-plugins/aoe-maintainer/lenses/aoe-runtime-lifecycle/SKILL.md
+    globs:
+      - src/**
+      - web/src/**
+      - acp-worker/**
+      - '!src/migrations/**'
+  - ref: ./tessl-plugins/aoe-maintainer/lenses/aoe-sandbox-boundary/SKILL.md
+    globs:
+      - src/**
+      - docker/**
+      - acp-worker/**
+      - '!src/tui/**'
+  - ref: ./tessl-plugins/aoe-maintainer/lenses/aoe-keyboard-focus/SKILL.md
+    globs:
+      - web/src/**
+      - src/tui/**
+      - '!web/src/lib/generated/**'
+      - '!**/*.test.ts'
+      - '!**/*.test.tsx'
+      - '!**/__tests__/**'
+      - '!src/tui/**/tests/**'
+      - '!src/tui/**/tests.rs'

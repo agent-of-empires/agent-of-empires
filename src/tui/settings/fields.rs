@@ -1693,7 +1693,6 @@ mod tests {
                     "session.live_send_exit_chord",
                     "session.mouse_capture",
                     "session.host_tab_title",
-                    "session.show_session_colors",
                 ][..],
             ),
             (SettingsCategory::Session, &["environment"][..]),

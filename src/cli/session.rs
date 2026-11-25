@@ -91,13 +91,6 @@ pub enum SessionCommands {
     /// Clear the favorite flag on a session.
     Unfavorite(SessionIdArgs),
 
-    /// Set (or clear) a per-session color label, rendered as a colored dot in
-    /// the web sidebar for at-a-glance status signaling. Intended for a
-    /// running agent to flag its own state, e.g.
-    /// `aoe session color $(aoe session current -q) red`. Colors: `red`
-    /// (needs attention), `amber` (working), `green` (done); `none` clears it.
-    Color(SetColorArgs),
-
     /// Archive a session: sink it in the Attention sort and tear down its
     /// tmux sessions. Worktree, branch, container preserved. `--no-kill`
     /// skips tmux teardown. See #1868.
@@ -396,15 +389,6 @@ pub struct SetBaseArgs {
     pub repo: Option<String>,
 }
 
-#[derive(Args)]
-pub struct SetColorArgs {
-    /// Session ID or title
-    pub identifier: String,
-    /// Color label: `red` (needs attention), `amber` (working), `green`
-    /// (done), or `none`/`clear` to remove the label.
-    pub color: String,
-}
-
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
     match command {
@@ -430,7 +414,6 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Unfavorite(args) => {
             mark_session(profile, args, "Unfavorited", Instance::unfavorite).await
         }
-        SessionCommands::Color(args) => set_color_session(profile, args).await,
         SessionCommands::Archive(args) => archive_session(profile, args).await,
         SessionCommands::Unarchive(args) => {
             mark_session(profile, args, "Unarchived", Instance::unarchive).await
@@ -459,29 +442,6 @@ async fn mark_session(
         })
     })?;
     println!("{verb}: {title}");
-    Ok(())
-}
-
-async fn set_color_session(profile: &str, args: SetColorArgs) -> Result<()> {
-    let normalized = args.color.trim().to_lowercase();
-    let new_color = match normalized.as_str() {
-        "none" | "clear" | "" => None,
-        other => Some(other.to_string()),
-    };
-
-    let storage = Storage::open_unwatched(profile)?;
-    let (title, color) = storage.update(|instances, _groups| {
-        super::patch_instance(instances, &args.identifier, |inst| {
-            inst.set_color(new_color.clone())
-                .map_err(|e| anyhow::anyhow!(e))?;
-            Ok((inst.title.clone(), inst.color.clone()))
-        })
-    })?;
-
-    match color {
-        Some(c) => println!("✓ Set color for '{}': {}", title, c),
-        None => println!("✓ Cleared color for '{}'", title),
-    }
     Ok(())
 }
 
@@ -1765,6 +1725,13 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
 
     crate::session::config::profile_config::resolve_config_or_warn(profile);
 
+    if inst.is_structured() {
+        eprintln!(
+            "Structured session: there is no terminal pane to capture. Read the transcript with `aoe acp history {}`.",
+            inst.id
+        );
+    }
+
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
 
     let (content, status) = if !tmux_session.exists() {
@@ -2850,8 +2817,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                     anyhow::ensure!(crate::process::systemd::scope_stopped(&inst.id, scope)?,
                         "terminal target scope remains live; complete its explicit shutdown before selecting a target");
                 }
-                let launch = pending.launch.as_ref().context(
-                    "terminal handoff has no pre-birth checkpoint; cannot prove an unknown birth absent")?;
+                if let Some(launch) = pending.launch.as_ref() {
                 let socket = launch.receipt.as_ref().map(|receipt| receipt.server.socket.as_str())
                     .or_else(|| launch.birth_inventory.as_ref().map(|inventory| inventory.socket()))
                     .context("terminal handoff has no captured physical socket; restore its original ownership evidence")?;
@@ -2870,6 +2836,13 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                     complete.ensure_only_preexisting_panes(
                         launch.birth_inventory.as_ref().context("missing pre-birth physical inventory")?,
                     )?;
+                }
+                } else {
+                    anyhow::ensure!(
+                        stage == crate::session::TerminalHandoffStage::TerminalCommitOwed
+                            && !pending.launch_started,
+                        "terminal handoff has no pre-birth checkpoint; cannot prove an unknown birth absent"
+                    );
                 }
             }
             inst.source_profile = storage.profile().to_string();
@@ -3704,7 +3677,7 @@ mod start_blocked_tests {
 
 #[cfg(test)]
 mod session_mutation_tests {
-    use super::{set_color_session, set_session_id, SetColorArgs, SetSessionIdArgs};
+    use super::{set_session_id, SetSessionIdArgs};
     use crate::session::{Instance, ResumeIntent, Storage};
     use serial_test::serial;
     use tempfile::tempdir;
@@ -3806,6 +3779,78 @@ mod session_mutation_tests {
 
     #[tokio::test]
     #[serial]
+    async fn set_session_id_repairs_a_retired_handoff_before_birth() {
+        use crate::session::{
+            TerminalHandoffContext, TerminalHandoffIntent, TerminalHandoffOutcome,
+            TerminalHandoffStage,
+        };
+
+        let temp = tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "repair-unborn-handoff";
+        let mut row = Instance::new("handoff", temp.path().to_str().unwrap());
+        row.view = crate::session::View::Structured;
+        row.source_profile = profile.into();
+        row.lifecycle_generation = 1;
+        row.terminal_scopes = Some(Vec::new());
+        let (_, id) = seed(profile, row.clone());
+        let storage = Storage::open_unwatched(profile).unwrap();
+        let intent_id = uuid::Uuid::new_v4();
+        row.terminal_handoff = Some(Box::new(TerminalHandoffIntent {
+            id: intent_id,
+            profile: profile.into(),
+            profile_identity: storage.bound_profile_identity().unwrap(),
+            generation: 1,
+            target_generation: 1,
+            stage: TerminalHandoffStage::TerminalCommitOwed,
+            context: TerminalHandoffContext::Discard,
+            source_acp_session_id: None,
+            source_event_seq: 0,
+            final_event_seq: Some(0),
+            source_conversation: row.conversation_state(),
+            runner: crate::session::purge_owners::RunnerCapture::Uncaptured {
+                scopes: Vec::new(),
+                producer_epoch: None,
+                producer_id: None,
+                prime: crate::acp::runner_lifecycle::PrimeOwnership::NotPrime,
+            },
+            unborn_fence: None,
+            terminal: None,
+            outcome: TerminalHandoffOutcome::Fresh,
+            launch_required: true,
+            launch_started: false,
+            launch: None,
+            selector_ended: false,
+        }));
+        storage
+            .update(|rows, _| {
+                rows[0].terminal_handoff = row.terminal_handoff.take();
+                Ok(())
+            })
+            .unwrap();
+        let args = || SetSessionIdArgs {
+            identifier: id.clone(),
+            session_id: String::new(),
+            store: None,
+        };
+        set_session_id(profile, args()).await.unwrap();
+        let repaired = stored(&storage, &id);
+        let handoff = repaired.terminal_handoff.unwrap();
+        assert_eq!(handoff.id, intent_id);
+        assert_eq!(handoff.generation, 2);
+        assert_eq!(handoff.terminal.unwrap().intent, ResumeIntent::Cleared);
+        storage
+            .update(|rows, _| {
+                rows[0].terminal_handoff.as_mut().unwrap().launch_started = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(set_session_id(profile, args()).await.is_err());
+        assert_eq!(stored(&storage, &id).lifecycle_generation, 2);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn set_session_id_clears_sandboxed_transcript_targets_without_rebinding() {
         let temp = tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
@@ -3887,64 +3932,6 @@ mod session_mutation_tests {
         assert_eq!(
             row.agent_session_id, None,
             "rejected call must not mutate sid"
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn set_color_normalizes_clears_and_rejects_unknown_values() {
-        let temp = tempdir().unwrap();
-        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
-
-        let (storage, id) = seed("set-color", Instance::new("color_session", "/tmp/x"));
-        let set = |color: &str| {
-            set_color_session(
-                "set-color",
-                SetColorArgs {
-                    identifier: id.clone(),
-                    color: color.to_string(),
-                },
-            )
-        };
-
-        set("Red")
-            .await
-            .expect("palette names are case-insensitive");
-        assert_eq!(stored(&storage, &id).color.as_deref(), Some("red"));
-
-        set("chartreuse")
-            .await
-            .expect_err("unknown color must error");
-        assert_eq!(stored(&storage, &id).color.as_deref(), Some("red"));
-
-        set("none").await.unwrap();
-        assert_eq!(stored(&storage, &id).color, None);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn set_color_refuses_unknown_profile_without_vivifying_it() {
-        let _guard = crate::session::test_support::isolate_app_dir();
-        let profiles = crate::session::get_app_dir().unwrap().join("profiles");
-        std::fs::create_dir_all(profiles.join("real")).unwrap();
-
-        let msg = set_color_session(
-            "ghost-profile",
-            SetColorArgs {
-                identifier: "whatever".to_string(),
-                color: "red".to_string(),
-            },
-        )
-        .await
-        .expect_err("unknown profile must error")
-        .to_string();
-        assert!(
-            msg.contains("does not exist"),
-            "expected the unknown-profile error, got: {msg}"
-        );
-        assert!(
-            !profiles.join("ghost-profile").exists(),
-            "set-color must not mint profiles/ghost-profile"
         );
     }
 }
