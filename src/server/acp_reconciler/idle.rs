@@ -58,6 +58,11 @@ pub(super) async fn repair_missing_terminal(state: &Arc<AppState>) {
         {
             continue;
         }
+        // Before the probes, so a prompt admitted during them fails the stop.
+        let observed = state
+            .acp_supervisor
+            .running_lease(&id)
+            .map(|lease| (lease.admissions(), lease));
         let probe = query_store(&state.acp_event_store, &id, "terminal-repair", |s, id| {
             (
                 s.terminal_repair_probe(id),
@@ -96,7 +101,14 @@ pub(super) async fn repair_missing_terminal(state: &Arc<AppState>) {
             .as_deref()
             .and_then(crate::acp::state::RateLimitInfo::from_agent_text)
         {
-            park_limited_agent_turn(state, &id, info, latest.latest_seq).await;
+            // An admission marks the baseline before its prompt is stored, so a
+            // recent one may be a prompt the log does not show yet.
+            if observed.as_ref().is_some_and(|(_, lease)| {
+                now_ms.saturating_sub(lease.idle_baseline_ms()) < grace_ms
+            }) {
+                continue;
+            }
+            park_limited_agent_turn(state, &id, info, latest.latest_seq, observed).await;
             continue;
         }
         // Conditional on `latest_seq` (not the substantive seq, which ambient
@@ -125,12 +137,11 @@ async fn park_limited_agent_turn(
     id: &str,
     info: crate::acp::state::RateLimitInfo,
     latest_seq: u64,
+    observed: Option<(u64, crate::acp::runner_lifecycle::Lease)>,
 ) {
     let supervisor = &state.acp_supervisor;
-    let observed = supervisor
-        .running_lease(id)
-        .map(|lease| (lease.admissions(), lease));
     let status = info.status.clone();
+    // Only a stored park lets the reaper resume what the stop interrupts.
     if !supervisor.publish_if_seq(id, &crate::acp::Event::RateLimit { info }, latest_seq) {
         return;
     }
@@ -863,61 +874,79 @@ mod tests {
         }
     }
 
-    /// The production shape: a live worker is stopped, leaving a workerless
-    /// park for the reaper (#5990).
+    /// The production shape: a live worker is stopped with a `rate_limited`
+    /// terminal, leaving a workerless park for the reaper (#5990). A prompt
+    /// admitted but not yet stored keeps the worker.
     #[tokio::test]
     #[serial_test::serial]
     async fn terminal_repair_stops_the_worker_of_a_limited_agent_turn() {
-        let id = "acp-limited-live";
-        let (_home, state, _project) = super::super::test_fixtures::test_state(id);
-        state.instances.write().await[0].status = crate::session::Status::Running;
-        state.acp_supervisor.test_insert_worker(id).await;
-        let at_ms = Timestamp::now().as_millis() - 120_000;
-        let events = [
-            Event::Stopped {
-                reason: "prompt_complete".to_string(),
-            },
-            Event::AgentMessageChunk {
-                text: "You've hit your 5-hour limit · resets 10pm (America/New_York)".to_string(),
-                message_id: None,
-            },
-            Event::UsageUpdated {
-                usage: SessionUsage {
-                    used: 1,
-                    size: 10,
-                    cost: Some(UsageCost {
-                        amount: 0.1,
-                        currency: "USD".to_string(),
-                    }),
+        for admitted_unstored in [false, true] {
+            let id = "acp-limited-live";
+            let (_home, state, _project) = super::super::test_fixtures::test_state(id);
+            state.instances.write().await[0].status = crate::session::Status::Running;
+            let sup = &state.acp_supervisor;
+            sup.test_insert_worker(id).await;
+            let lease = sup.running_lease(id).unwrap();
+            lease.test_backdate_idle_baseline(Timestamp::now().as_millis() - 3_600_000);
+            if admitted_unstored {
+                sup.test_note_admission(id);
+            }
+            let at_ms = Timestamp::now().as_millis() - 120_000;
+            let events = [
+                Event::Stopped {
+                    reason: "prompt_complete".to_string(),
                 },
-            },
-        ];
-        for (idx, event) in events.iter().enumerate() {
-            state
-                .acp_event_store
-                .record_at(id, idx as u64 + 1, event, at_ms)
+                Event::AgentMessageChunk {
+                    text: "You've hit your 5-hour limit · resets 10pm (America/New_York)"
+                        .to_string(),
+                    message_id: None,
+                },
+                Event::UsageUpdated {
+                    usage: SessionUsage {
+                        used: 1,
+                        size: 10,
+                        cost: Some(UsageCost {
+                            amount: 0.1,
+                            currency: "USD".to_string(),
+                        }),
+                    },
+                },
+            ];
+            for (idx, event) in events.iter().enumerate() {
+                state
+                    .acp_event_store
+                    .record_at(id, idx as u64 + 1, event, at_ms)
+                    .unwrap();
+            }
+            let last_seq = events.len() as u64;
+            sup.hydrate_seqs([(id.to_string(), last_seq)]);
+
+            repair_missing_terminal(&state).await;
+
+            let store = &state.acp_event_store;
+            let tail = store.replay_from(id, last_seq).len();
+            if admitted_unstored {
+                assert!(sup.is_running(id).await);
+                assert_eq!(tail, 0);
+                continue;
+            }
+            assert!(!sup.is_running(id).await);
+            // A test worker's stop publishes nothing, so the reason it asked for
+            // is read from the lease and the closing event recorded here.
+            assert_eq!(lease.test_stop_reason().as_deref(), Some("rate_limited"));
+            assert_eq!(tail, 1, "RateLimit");
+            store
+                .record_at(
+                    id,
+                    last_seq + 2,
+                    &Event::Stopped {
+                        reason: "rate_limited".to_string(),
+                    },
+                    Timestamp::now().as_millis(),
+                )
                 .unwrap();
+            assert!(store.rate_limit_park(id).is_some());
+            assert!(store.rate_limit_interrupted_agent_turn(id));
         }
-        let last_seq = events.len() as u64;
-        state
-            .acp_supervisor
-            .hydrate_seqs([(id.to_string(), last_seq)]);
-
-        repair_missing_terminal(&state).await;
-
-        assert!(!state.acp_supervisor.is_running(id).await);
-        // A test worker's stop publishes no closing events, so only the
-        // `RateLimit` lands here; a real worker's stop adds `rate_limited`.
-        let tail: Vec<&str> = state
-            .acp_event_store
-            .replay_from(id, last_seq)
-            .iter()
-            .map(|(_, e)| match e {
-                Event::RateLimit { .. } => "RateLimit",
-                _ => "other",
-            })
-            .collect();
-        assert_eq!(tail, ["RateLimit"]);
-        assert!(state.acp_event_store.rate_limit_park(id).is_some());
     }
 }

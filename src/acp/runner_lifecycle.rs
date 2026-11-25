@@ -232,6 +232,17 @@ impl Lease {
             .store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// The closing `Stopped` reason a stop asked for, published or not.
+    #[cfg(test)]
+    pub(crate) fn test_stop_reason(&self) -> Option<String> {
+        self.construction
+            .stop_completion
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|debt| debt.reason.clone())
+    }
+
     /// An attach observes the original runner until installation or an explicit stop.
     pub(crate) fn is_borrowed_attach(&self) -> bool {
         !self
