@@ -266,8 +266,8 @@ impl Instance {
         self.archived_at.is_some()
     }
 
-    /// Rank among siblings under `SortOrder::Custom`: rows never moved first, newest first,
-    /// then by `sort_index`. The display and the Daemon's reorder must share it.
+    /// Rank among siblings under `SortOrder::Custom`: by the Daemon-derived `sort_index`,
+    /// rows without one (not yet ranked by a snapshot) first, newest first.
     pub fn custom_order_key(&self) -> (bool, Option<u32>, std::cmp::Reverse<Timestamp>) {
         (
             self.sort_index.is_some(),

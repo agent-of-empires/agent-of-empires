@@ -3,11 +3,13 @@
 //! The TUI kept its Custom order as a `sort_index` on each `sessions.json` row, and the
 //! dashboard kept its own in `workspace-ordering.json` (rows) and in `state.toml`'s
 //! `web_ui_state` (`aoe-repo-group-order-v1`, Repository headers). `workspace-ordering.json`
-//! is now the one store. A TUI order seeds it only where the dashboard has none, so the
-//! dashboard's wins. With neither, the removed sort v064 left in `legacy_sort_order` seeds
-//! it, so the list keeps the order it had. The dashboard's header order is copied, not
-//! removed, because the dashboard still reads it. `sort_index` and `legacy_sort_order` are
-//! dropped only after the shared order is written, so an interrupted run retries from them.
+//! is now the one store. Where the dashboard has none, the sort v064 left in
+//! `legacy_sort_order` seeds it, so the list keeps the order it had: the TUI order under
+//! Custom, the removed sort's order under Oldest or Last activity, and nothing otherwise.
+//! A `sort_index` left from an earlier Custom stint is not what the user saw, so it is
+//! dropped unused. The dashboard's header order is copied, not removed, because the
+//! dashboard still reads it. `sort_index` and `legacy_sort_order` are dropped only after
+//! the shared order is written, so an interrupted run retries from them.
 //! A `sessions.json` that cannot be read is left for its owner's recovery path, and its
 //! rows count as never moved.
 
@@ -97,13 +99,11 @@ fn run_in(app_dir: &Path) -> Result<()> {
         .as_deref()
         .and_then(|sort| legacy_rank(live, sort))
         .unwrap_or_default();
-    let legacy_rows = dedup(legacy.iter().map(|row| row.workspace.clone()));
     let legacy_repositories = dedup(legacy.iter().map(|row| row.repository.clone()));
     if ordering.order.is_empty() {
-        let seeded = if tui_order.is_empty() {
-            legacy_rows
-        } else {
-            tui_order
+        let seeded = match legacy_sort.as_deref() {
+            Some("custom") => tui_order,
+            _ => dedup(legacy.iter().map(|row| row.workspace.clone())),
         };
         if !seeded.is_empty() {
             ordering.order = seeded;
@@ -146,8 +146,9 @@ fn run_in(app_dir: &Path) -> Result<()> {
 }
 
 /// Live rows in the order the removed sort `sort` showed them, or `None` for a sort with
-/// nothing to seed; see v064's `legacy_seed`. Deduplicated, a workspace or repository then
-/// ranks by its newest session for last activity and by its oldest for oldest.
+/// nothing to seed; see v064's `tui_effective_sort`. Deduplicated, a workspace or
+/// repository then ranks by its newest session for last activity and by its oldest for
+/// oldest.
 fn legacy_rank(mut live: Vec<LiveRow>, sort: &str) -> Option<Vec<LiveRow>> {
     match sort {
         "oldest" => live.sort_by_key(|row| (row.created.is_none(), row.created)),
@@ -289,7 +290,7 @@ mod tests {
         );
         fs::write(
             dir.path().join("state.toml"),
-            "[web_ui_state]\n\"aoe-repo-group-order-v1\" = '[\"/r/two\",\"/r/one\"]'\n",
+            format!("{LEGACY_SORT_KEY} = \"custom\"\n[web_ui_state]\n\"aoe-repo-group-order-v1\" = '[\"/r/two\",\"/r/one\"]'\n"),
         )
         .unwrap();
 
@@ -347,6 +348,11 @@ mod tests {
                 dir.path(),
                 serde_json::json!([{"id": "a", "project_path": "/r/one", "sort_index": 0}]),
             );
+            fs::write(
+                dir.path().join("state.toml"),
+                format!("{LEGACY_SORT_KEY} = \"custom\"\n"),
+            )
+            .unwrap();
             let (file, content) = broken.split_once(':').unwrap_or((broken, ""));
             let path = dir.path().join(file);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -388,6 +394,11 @@ mod tests {
         fs::write(
             dir.path().join("workspace-ordering.json"),
             r#"{"order": ["/r/web::main"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("state.toml"),
+            format!("{LEGACY_SORT_KEY} = \"custom\"\n"),
         )
         .unwrap();
         run_in(dir.path()).unwrap();
@@ -493,23 +504,50 @@ mod tests {
         }
     }
 
-    /// A TUI Custom order is what the user arranged by hand, so it is kept over a removed sort.
+    /// `sort_index` seeds the order only when Custom was the sort on screen; a stale one
+    /// from an earlier Custom stint gives way to the sort the user had.
     #[test]
-    fn a_tui_order_wins_over_the_removed_sort() {
-        let dir = tempfile::tempdir().unwrap();
-        seed(
-            dir.path(),
-            serde_json::json!([
-                {"id": "a", "project_path": "/r/a", "sort_index": 0, "created_at": "2026-01-02T00:00:00Z"},
-                {"id": "b", "project_path": "/r/b", "created_at": "2026-01-01T00:00:00Z"},
-            ]),
-        );
-        fs::write(
-            dir.path().join("state.toml"),
-            format!("{LEGACY_SORT_KEY} = \"oldest\"\n"),
-        )
-        .unwrap();
-        run_in(dir.path()).unwrap();
-        assert_eq!(ordering(dir.path()).order, ["/r/a::__session__::a"]);
+    fn a_tui_order_seeds_only_under_custom() {
+        let (a, b) = ("/r/a::__session__::a", "/r/b::__session__::b");
+        for (legacy, web_order, expected) in [
+            ("custom", None, vec![a]),
+            ("newest", None, vec![]),
+            ("oldest", None, vec![b, a]),
+            (
+                "custom",
+                Some(r#"{"order": ["/r/web::main"]}"#),
+                vec!["/r/web::main"],
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            seed(
+                dir.path(),
+                serde_json::json!([
+                    {"id": "a", "project_path": "/r/a", "sort_index": 0, "created_at": "2026-01-02T00:00:00Z"},
+                    {"id": "b", "project_path": "/r/b", "created_at": "2026-01-01T00:00:00Z"},
+                ]),
+            );
+            fs::write(
+                dir.path().join("state.toml"),
+                format!("{LEGACY_SORT_KEY} = \"{legacy}\"\n"),
+            )
+            .unwrap();
+            if let Some(order) = web_order {
+                fs::write(dir.path().join("workspace-ordering.json"), order).unwrap();
+            }
+            run_in(dir.path()).unwrap();
+            let seeded = if expected.is_empty() {
+                assert!(
+                    !dir.path().join("workspace-ordering.json").exists(),
+                    "{legacy}"
+                );
+                Vec::new()
+            } else {
+                ordering(dir.path()).order
+            };
+            assert_eq!(seeded, expected, "{legacy} {web_order:?}");
+            let rows = fs::read_to_string(dir.path().join("profiles/main/sessions.json")).unwrap();
+            assert!(!rows.contains("sort_index"), "{legacy}");
+        }
     }
 }

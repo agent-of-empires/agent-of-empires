@@ -6,8 +6,8 @@
 //! choices map to the nearest kept one. A TUI user who never picked a grouping keeps
 //! Groups, the TUI's old default; everyone else gets the new Repository default. The
 //! org and status collapse lists go with their groupings. The web keys stay, since the
-//! dashboard still reads them. A removed sort that v065 can seed as a Custom order is kept
-//! in `legacy_sort_order` for v065, which removes it.
+//! dashboard still reads them. The sort in effect before the fold is kept in
+//! `legacy_sort_order` so v065 can seed the Custom order that matches it; v065 removes it.
 
 use anyhow::Result;
 use std::path::Path;
@@ -62,7 +62,10 @@ fn migrate(state: &mut toml::Table) -> bool {
         .as_ref()
         .map(|_| "custom")
         .or_else(|| tui_sort.map(tui_sort_order));
-    let legacy = web_sort.as_deref().or(tui_sort).and_then(legacy_seed);
+    let legacy = match web_sort.as_deref() {
+        Some(web) => web_effective_sort(web),
+        None => tui_effective_sort(tui_sort.unwrap_or("newest")),
+    };
 
     match group {
         Some(group) => state.insert("group_by".into(), group.into()),
@@ -72,11 +75,9 @@ fn migrate(state: &mut toml::Table) -> bool {
         Some(sort) => state.insert("sort_order".into(), sort.into()),
         None => state.remove("sort_order"),
     };
-    if let Some(legacy) = legacy {
-        state
-            .entry(LEGACY_SORT_KEY)
-            .or_insert_with(|| legacy.into());
-    }
+    state
+        .entry(LEGACY_SORT_KEY)
+        .or_insert_with(|| legacy.into());
     state.remove("org_group_collapsed");
     state.remove("status_group_collapsed");
 
@@ -103,14 +104,24 @@ fn tui_group_by(mode: &str) -> &'static str {
     }
 }
 
-/// The order v065 seeds for a removed sort, in place of Custom's newest-first default.
-/// Attention ranked rows by live status, which no stored order can follow, so it seeds
-/// last activity, the stable order closest to it.
-fn legacy_seed(sort: &str) -> Option<&'static str> {
+/// The sort a TUI user saw, for v065. Only `custom` means its `sort_index` was the order
+/// on screen. Attention ranked rows by live status, which no stored order can follow, so
+/// it becomes last activity, the stable order closest to it.
+fn tui_effective_sort(sort: &str) -> &'static str {
     match sort {
-        "oldest" => Some("oldest"),
-        "last_activity" | "lastActivity" | "attention" => Some("last_activity"),
-        _ => None,
+        "custom" => "custom",
+        "oldest" => "oldest",
+        "last_activity" | "attention" => "last_activity",
+        "a_z" | "az" | "z_a" | "za" | "name" => "name",
+        _ => "newest",
+    }
+}
+
+/// The sort a web pick showed, for v065. Manual's drag order is already in the shared store.
+fn web_effective_sort(sort: &str) -> &'static str {
+    match sort {
+        "lastActivity" | "attention" => "last_activity",
+        _ => "manual",
     }
 }
 
@@ -185,7 +196,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_a_seedable_legacy_sort_for_v065() {
+    fn keeps_the_effective_sort_for_v065() {
         let web = |sort: &str| format!("[web_ui_state]\n\"aoe-sidebar-sort-mode\" = \"{sort}\"\n");
         for (input, legacy) in [
             ("sort_order = \"oldest\"\n".to_string(), Some("oldest")),
@@ -194,12 +205,17 @@ mod tests {
                 Some("last_activity"),
             ),
             ("sort_order = \"attention\"\n".into(), Some("last_activity")),
-            ("sort_order = \"newest\"\n".into(), None),
-            ("sort_order = \"a_z\"\n".into(), None),
+            ("sort_order = \"newest\"\n".into(), Some("newest")),
+            ("has_seen_welcome = true\n".into(), Some("newest")),
+            ("sort_order = \"custom\"\n".into(), Some("custom")),
+            ("sort_order = \"a_z\"\n".into(), Some("name")),
             (web("lastActivity"), Some("last_activity")),
             (web("attention"), Some("last_activity")),
-            // The web's pick wins, and its drag order is already in the shared store.
-            (format!("sort_order = \"oldest\"\n{}", web("manual")), None),
+            // The web's pick wins over the TUI's.
+            (
+                format!("sort_order = \"custom\"\n{}", web("manual")),
+                Some("manual"),
+            ),
         ] {
             let out = run_on(&input);
             let table: toml::Table = out.parse().unwrap();

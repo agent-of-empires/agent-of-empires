@@ -28,8 +28,7 @@ impl HomeView {
     pub(super) fn move_row_at_cursor(&mut self, delta: isize) -> anyhow::Result<()> {
         anyhow::ensure!(delta == -1 || delta == 1, "Invalid row direction");
         // Each move is built from the applied order, so wait until the last one shows.
-        if self.session_feed.ordering_pending() {
-            self.flash_status("The last move is still saving");
+        if self.refuse_while_a_move_saves() {
             return Ok(());
         }
         if let Some(path) = self.selected_group.clone() {
@@ -38,43 +37,71 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
-        let Some(at) = self.session_row(&id) else {
+        let (Some(at), Some(workspace)) = (
+            self.session_row(&id),
+            self.get_instance(&id).map(Instance::workspace_id),
+        ) else {
             return Ok(());
         };
-        match self.sibling_session(at, delta) {
-            Some(neighbour) => self.swap_workspaces(&id, &neighbour),
-            None if self.group_by == GroupByMode::Group => self.carry_session(&id, delta),
-            None => Ok(()),
+        match self.sibling_session(at, delta, &workspace) {
+            (Some(neighbour), _) => self.swap_workspaces(&workspace, &neighbour),
+            (None, true) => {
+                self.flash_status("Sessions on the same branch move together");
+                Ok(())
+            }
+            (None, false) if self.group_by == GroupByMode::Group => self.carry_session(&id, delta),
+            (None, false) => Ok(()),
         }
     }
 
-    /// The session row next to `at` under the same header, if any. A header's own sessions
-    /// come before its child headers, so a header at the row's depth ends the run.
-    fn sibling_session(&self, at: usize, delta: isize) -> Option<String> {
-        let depth = self.flat_items.get(at)?.depth();
+    /// Flash and return true while an order write or a carry or group move is unapplied,
+    /// since a move built before it shows would undo it.
+    fn refuse_while_a_move_saves(&mut self) -> bool {
+        let pending = self.session_feed.ordering_pending()
+            || matches!(
+                self.pending_namespace_intent,
+                Some(NamespaceIntent::ReorderSession { .. } | NamespaceIntent::ReorderGroup)
+            );
+        if pending {
+            self.flash_status("The last move is still saving");
+        }
+        pending
+    }
+
+    /// The nearest session row from `at` under the same header on another workspace than
+    /// `workspace`, and whether rows on `workspace` were passed to reach it. A header's own
+    /// sessions come before its child headers, so a header at the row's depth ends the run.
+    fn sibling_session(&self, at: usize, delta: isize, workspace: &str) -> (Option<String>, bool) {
+        let Some(depth) = self.flat_items.get(at).map(Item::depth) else {
+            return (None, false);
+        };
+        let mut passed = false;
         let mut cursor = at;
-        loop {
-            cursor = cursor.checked_add_signed(delta)?;
-            match self.flat_items.get(cursor)? {
-                Item::Session { id, depth: d } if *d == depth => return Some(id.clone()),
-                Item::Session { depth: d, .. } if *d > depth => continue,
-                Item::Group { depth: d, .. } if *d > depth => continue,
-                _ => return None,
+        while let Some(next) = cursor.checked_add_signed(delta) {
+            cursor = next;
+            match self.flat_items.get(cursor) {
+                Some(Item::Session { id, depth: d }) if *d == depth => {
+                    let other = self.get_instance(id).map(Instance::workspace_id);
+                    if other.as_deref() != Some(workspace) {
+                        return (Some(id.clone()), passed);
+                    }
+                    passed = true;
+                }
+                Some(Item::Session { depth: d, .. } | Item::Group { depth: d, .. })
+                    if *d > depth => {}
+                _ => break,
             }
         }
+        (None, passed)
     }
 
-    /// Swap two rows' workspaces in the shared order, or in the order on screen when the
-    /// list is sorted by Name, which then switches to Custom.
-    fn swap_workspaces(&mut self, id: &str, neighbour: &str) -> anyhow::Result<()> {
-        let workspace = |view: &Self, id: &str| view.get_instance(id).map(Instance::workspace_id);
-        let (Some(a), Some(b)) = (workspace(self, id), workspace(self, neighbour)) else {
+    /// Swap workspace `a` with `neighbour`'s in the shared order, or in the order on screen
+    /// when the list is sorted by Name, which then switches to Custom.
+    fn swap_workspaces(&mut self, a: &str, neighbour: &str) -> anyhow::Result<()> {
+        let Some(b) = self.get_instance(neighbour).map(Instance::workspace_id) else {
             return self.refresh_after_stale_move();
         };
-        if a == b {
-            self.flash_status("Sessions on the same branch move together");
-            return Ok(());
-        }
+        let a = a.to_owned();
         let freeze = self.sort_order != SortOrder::Custom;
         let mut order = if freeze {
             self.displayed_workspace_order()
@@ -111,8 +138,7 @@ impl HomeView {
     /// Clear the shared Custom order, so rows and headers sit newest first again.
     pub(super) fn reset_custom_order(&mut self) -> anyhow::Result<()> {
         // A pending move may switch the sort to Custom once its own write commits.
-        if self.session_feed.ordering_pending() {
-            self.flash_status("The last move is still saving");
+        if self.refuse_while_a_move_saves() {
             return Ok(());
         }
         let change = OrderChange::Reset(self.order_undo_point());
@@ -121,8 +147,7 @@ impl HomeView {
 
     /// Write back the order, and the sort, from before the last switch to Custom or reset.
     pub(super) fn undo_order_change(&mut self) -> anyhow::Result<()> {
-        if self.session_feed.ordering_pending() {
-            self.flash_status("The last move is still saving");
+        if self.refuse_while_a_move_saves() {
             return Ok(());
         }
         let Some(undo) = self.order_undo.clone() else {
@@ -573,6 +598,116 @@ mod tests {
             assert_eq!(view.selected_session.as_deref(), Some(id.as_str()));
         }
         assert!(view.info_dialog.is_none());
+    }
+
+    /// A move passes the other sessions on its branch, which travel with it, and waits while
+    /// a carry is unapplied, since a move built before it shows would undo it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_move_passes_its_branch_and_waits_for_a_carry() {
+        use crate::tui::session_feed::ViewWrite;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("reorder").unwrap();
+        let branch_row = |title: &str| {
+            let mut row = Instance::new(title, "/tmp/repo");
+            row.group_path = "aaa".into();
+            row.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: "feat".into(),
+                main_repo_path: "/tmp/repo".into(),
+                managed_by_aoe: true,
+                created_at: crate::time::Timestamp::now(),
+                base_branch: None,
+            });
+            row
+        };
+        let (one, two) = (branch_row("one"), branch_row("two"));
+        let mut other = Instance::new("other", "/tmp/other");
+        other.group_path = "aaa".into();
+        let (branch, other_workspace) = (one.workspace_id(), other.workspace_id());
+        storage
+            .update(|rows, groups| {
+                *rows = vec![one.clone(), two.clone(), other.clone()];
+                *groups = vec![crate::session::Group::new("aaa", "aaa")];
+                Ok(())
+            })
+            .unwrap();
+        let state = native_state(&["reorder"]).await;
+        let (status, _, _) = request_with_headers(
+            &state,
+            "PUT",
+            "/api/workspace-ordering",
+            serde_json::json!({ "order": [&branch, &other_workspace] }),
+        )
+        .await;
+        assert!(status.is_success());
+        let mut view = HomeView::new_for_test(
+            Some("reorder".into()),
+            crate::tmux::AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        apply_published(&mut view, &state).await;
+        view.sort_order = SortOrder::Custom;
+        view.group_by = GroupByMode::Group;
+        view.flat_items = view.build_flat_items();
+        let sessions: Vec<String> = view
+            .flat_items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sessions.len(), 3);
+        assert_eq!(sessions[2], other.id, "the branch's rows lead");
+        let mut capture = view.session_feed.view_write_driver_for_test();
+        let flash = |view: &HomeView| view.status_flash.as_ref().map(|f| f.text.clone());
+
+        view.select_session_by_id(&sessions[0]);
+        view.pending_namespace_intent = Some(NamespaceIntent::ReorderSession {
+            id: other.id.clone(),
+        });
+        view.move_row_at_cursor(1).unwrap();
+        assert_eq!(
+            flash(&view).as_deref(),
+            Some("The last move is still saving")
+        );
+        view.status_flash = None;
+        view.reset_custom_order().unwrap();
+        assert_eq!(
+            flash(&view).as_deref(),
+            Some("The last move is still saving")
+        );
+        view.status_flash = None;
+        view.undo_order_change().unwrap();
+        assert_eq!(
+            flash(&view).as_deref(),
+            Some("The last move is still saving")
+        );
+        assert!(
+            capture().is_none(),
+            "nothing is written while the carry is unapplied"
+        );
+        view.pending_namespace_intent = None;
+
+        // With no other branch above, the move has nowhere to go and does not carry.
+        view.select_session_by_id(&sessions[1]);
+        view.move_row_at_cursor(-1).unwrap();
+        assert_eq!(
+            flash(&view).as_deref(),
+            Some("Sessions on the same branch move together")
+        );
+        assert!(capture().is_none());
+        assert!(view.pending_namespace_intent.is_none());
+
+        view.select_session_by_id(&sessions[0]);
+        view.move_row_at_cursor(1).unwrap();
+        match capture().map(|captured| captured.write) {
+            Some(ViewWrite::Ordering(patch)) => {
+                assert_eq!(patch.order, Some(vec![other_workspace, branch]));
+            }
+            other => panic!("expected one shared-order write, got {other:?}"),
+        }
     }
 
     #[tokio::test]
