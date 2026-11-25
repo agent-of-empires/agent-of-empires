@@ -21,6 +21,8 @@ use super::registry::ValidationState;
 use super::source::PluginSource;
 use super::NodeEnv;
 
+mod publication;
+
 pub enum OperationLog {
     Inherit,
     File(std::fs::File),
@@ -131,7 +133,18 @@ struct StagingEvidence {
     mount: PathBuf,
     directory_identity: (u64, u64),
     mount_identity: (u64, u64),
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    removal: Option<StagingRemovalProof>,
     custody: crate::process::StagingCustody,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagingRemovalProof {
+    plugins_identity: (u64, u64),
+    plugins_created: std::time::SystemTime,
+    directory_created: std::time::SystemTime,
+    mount_created: std::time::SystemTime,
 }
 
 fn staging_directory_identity(directory: &crate::session::AnchoredDir) -> Result<(u64, u64)> {
@@ -143,7 +156,7 @@ fn staging_directory_identity(directory: &crate::session::AnchoredDir) -> Result
 
 fn staging_evidence(
     root: &crate::session::AnchoredDir,
-) -> Result<(StagingEvidence, Vec<crate::process::StagingProcess>)> {
+) -> Result<(StagingEvidence, Vec<crate::process::StagingProcess>, bool)> {
     use std::io::Read as _;
     let file = root
         .open_regular(Path::new(STAGING_MARKER), 1024 * 1024)?
@@ -197,7 +210,14 @@ fn staging_evidence(
         "invalid staging owner birth identity"
     );
     let mut writers = Vec::new();
+    let mut cleanup_started = false;
     for line in lines {
+        anyhow::ensure!(!cleanup_started, "records after staging cleanup intent");
+        if line == b"D" {
+            anyhow::ensure!(evidence.removal.is_some(), "missing staging removal proof");
+            cleanup_started = true;
+            continue;
+        }
         let mut fields = std::str::from_utf8(line)?.split_ascii_whitespace();
         if line == b"U" {
             evidence.custody = crate::process::StagingCustody::Uncertain;
@@ -224,7 +244,7 @@ fn staging_evidence(
             },
         });
     }
-    Ok((evidence, writers))
+    Ok((evidence, writers, cleanup_started))
 }
 
 pub(crate) fn record_staging_custody(
@@ -237,9 +257,9 @@ pub(crate) fn record_staging_custody(
         .and_then(Path::parent)
         .context("staging mount has no application root")?;
     let root = crate::session::AnchoredDir::open(app)?;
-    let (mut evidence, writers) = staging_evidence(&root)?;
+    let (mut evidence, writers, cleanup_started) = staging_evidence(&root)?;
     anyhow::ensure!(
-        writers.is_empty(),
+        writers.is_empty() && !cleanup_started,
         "staging custody cannot replace admitted writers"
     );
     anyhow::ensure!(
@@ -256,22 +276,21 @@ pub(crate) fn record_staging_custody(
         .replace(&bytes)?;
     root.sync()
         .context("persisting staging custody replacement")?;
-    open_staging_journal(&root, app)
+    open_staging_journal(&root)
 }
 
-fn open_staging_journal(root: &crate::session::AnchoredDir, app: &Path) -> Result<std::fs::File> {
-    use nix::fcntl::{open, openat, OFlag};
+fn open_staging_journal(root: &crate::session::AnchoredDir) -> Result<std::fs::File> {
+    use nix::fcntl::{openat, OFlag};
     use nix::sys::stat::Mode;
     use std::os::unix::fs::MetadataExt as _;
-    let parent = open(
-        app,
-        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    )?;
     let fd = openat(
-        &parent,
+        root.descriptor(),
         STAGING_MARKER,
-        OFlag::O_WRONLY | OFlag::O_APPEND | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        OFlag::O_WRONLY
+            | OFlag::O_APPEND
+            | OFlag::O_NOFOLLOW
+            | OFlag::O_CLOEXEC
+            | OFlag::O_NONBLOCK,
         Mode::empty(),
     )?;
     let journal = std::fs::File::from(fd);
@@ -292,14 +311,15 @@ pub(super) fn mark_staging_publication(marker: &Path) -> Result<()> {
         .parent()
         .context("staging marker has no application root")?;
     let root = crate::session::AnchoredDir::open(app)?;
-    let (evidence, _) = staging_evidence(&root)?;
+    let (evidence, _, cleanup_started) = staging_evidence(&root)?;
     anyhow::ensure!(
-        evidence.owner_pid == std::process::id()
+        !cleanup_started
+            && evidence.owner_pid == std::process::id()
             && crate::process::process_birth_identity(evidence.owner_pid)?.as_ref()
                 == Some(&evidence.owner_birth),
         "staging publication owner changed"
     );
-    let mut journal = open_staging_journal(&root, app)?;
+    let mut journal = open_staging_journal(&root)?;
     journal.write_all(b"U\n")?;
     journal.sync_all()?;
     Ok(())
@@ -310,7 +330,7 @@ fn recover_staging(root_path: &Path) -> Result<()> {
     let marker_identity = root
         .entry_stat(Path::new(STAGING_MARKER))?
         .context("staging marker disappeared before recovery")?;
-    let (evidence, writers) = staging_evidence(&root)?;
+    let (evidence, writers, cleanup_started) = staging_evidence(&root)?;
     let boot = crate::process::boot_id().context("plugin staging boot identity unavailable")?;
     let previous_boot = boot != evidence.owner_birth.boot_id;
     #[cfg(target_os = "linux")]
@@ -334,50 +354,116 @@ fn recover_staging(root_path: &Path) -> Result<()> {
         }
     }
     crate::process::prove_staging_custody_gone(&evidence.custody, &writers, previous_boot)?;
-    let mut components = evidence.mount.components();
-    anyhow::ensure!(
-        components
-            .next()
-            .is_some_and(|part| part.as_os_str() == "plugins")
-            && components.next().is_some_and(|part| part
-                .as_os_str()
-                .to_str()
-                .is_some_and(|name| name.starts_with(".staging-")))
-            && components
-                .next()
-                .is_some_and(|part| part.as_os_str() == "volume")
-            && components.next().is_none(),
-        "plugin staging evidence names an unexpected mount"
-    );
-    let directory = evidence
-        .mount
-        .parent()
-        .context("missing staging directory")?;
-    let anchored = root.child(directory)?;
-    let mount = anchored.child(Path::new("volume"))?;
-    anyhow::ensure!(
-        staging_directory_identity(&anchored)? == evidence.directory_identity
-            && staging_directory_identity(&mount)? == evidence.mount_identity
-            && mount.read_dir_complete(Path::new(""), 1)?.is_empty()
-            && anchored.read_dir_complete(Path::new(""), 2)?
-                == [std::ffi::OsString::from("volume")],
-        "plugin staging mount or directory identity changed"
-    );
-    crate::process::prove_staging_host_mount_absent(&root_path.join(&evidence.mount))?;
-    // Kernel resources are gone. Leave the empty anchored directories untouched;
-    // marker retirement must not gain recursive deletion authority.
-    let current = root
-        .entry_stat(Path::new(STAGING_MARKER))?
-        .context("staging marker disappeared during recovery")?;
-    anyhow::ensure!(
-        current.st_dev == marker_identity.st_dev
-            && current.st_ino == marker_identity.st_ino
-            && current.st_mode == marker_identity.st_mode,
-        "staging marker identity changed during recovery"
-    );
+    let directory = staging_directory_leaf(&evidence.mount)?;
+    let check_marker = || -> Result<()> {
+        let current = root
+            .entry_stat(Path::new(STAGING_MARKER))?
+            .context("staging marker disappeared during recovery")?;
+        anyhow::ensure!(
+            current.st_dev == marker_identity.st_dev
+                && current.st_ino == marker_identity.st_ino
+                && current.st_mode == marker_identity.st_mode,
+            "staging marker identity changed during recovery"
+        );
+        Ok(())
+    };
+    let plugins = root.child(Path::new("plugins"))?;
+    if let Some(proof) = &evidence.removal {
+        root.require_owned_directory()?;
+        plugins.require_owned_directory()?;
+        anyhow::ensure!(
+            staging_directory_identity(&plugins)? == proof.plugins_identity
+                && plugins.created() == Some(proof.plugins_created),
+            "plugin staging parent identity changed"
+        );
+    }
+    if !cleanup_started || plugins.entry_stat(directory)?.is_some() {
+        let stage = plugins.child(directory)?;
+        anyhow::ensure!(
+            staging_directory_identity(&stage)? == evidence.directory_identity,
+            "plugin staging directory identity changed"
+        );
+        crate::process::prove_staging_host_mount_absent(plugins.descriptor(), stage.descriptor())?;
+        if let Some(proof) = &evidence.removal {
+            stage.require_owned_directory()?;
+            anyhow::ensure!(
+                stage.created() == Some(proof.directory_created),
+                "plugin staging directory birth changed"
+            );
+        }
+
+        let volume = Path::new("volume");
+        let mount = if !cleanup_started || stage.entry_stat(volume)?.is_some() {
+            let mount = stage.child(volume)?;
+            anyhow::ensure!(
+                staging_directory_identity(&mount)? == evidence.mount_identity
+                    && mount.read_dir_complete(Path::new(""), 1)?.is_empty()
+                    && stage.read_dir_complete(Path::new(""), 2)?
+                        == [std::ffi::OsString::from("volume")],
+                "plugin staging mount changed or staging is not empty"
+            );
+            crate::process::prove_staging_host_mount_absent(
+                stage.descriptor(),
+                mount.descriptor(),
+            )?;
+            Some(mount)
+        } else {
+            None
+        };
+        if let Some(proof) = &evidence.removal {
+            if let Some(mount) = &mount {
+                mount.require_owned_directory()?;
+                anyhow::ensure!(
+                    mount.created() == Some(proof.mount_created),
+                    "plugin staging mount birth changed"
+                );
+            }
+            // Persist intent before either rmdir, so a retry need not infer deletion.
+            let mut journal = open_staging_journal(&root)?;
+            check_marker()?;
+            if !cleanup_started {
+                journal.write_all(b"D\n")?;
+            }
+            journal.sync_all()?;
+            root.require_current_child(Path::new("plugins"), &plugins)?;
+            if let Some(mount) = &mount {
+                plugins.require_current_child(directory, &stage)?;
+                stage.remove_empty_child(volume, mount)?;
+            }
+            stage.sync()?;
+            plugins.remove_empty_child(directory, &stage)?;
+        }
+    }
+    if evidence.removal.is_some() {
+        plugins.sync()?;
+    }
+    check_marker()?;
     root.remove_file(Path::new(STAGING_MARKER))?;
     root.sync()?;
     Ok(())
+}
+
+fn staging_directory_leaf(mount: &Path) -> Result<&Path> {
+    use std::path::Component::Normal;
+
+    let mut components = mount.components();
+    let (Some(Normal(plugins)), Some(Normal(directory)), Some(Normal(volume)), None) = (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    ) else {
+        bail!("plugin staging evidence names an unexpected mount");
+    };
+    anyhow::ensure!(
+        plugins == "plugins"
+            && directory
+                .to_str()
+                .is_some_and(|name| name.starts_with(".staging-"))
+            && volume == "volume",
+        "plugin staging evidence names an unexpected mount"
+    );
+    Ok(Path::new(directory))
 }
 
 pub(super) fn create_staging_marker(marker: &Path, mount: &Path) -> Result<()> {
@@ -389,9 +475,26 @@ pub(super) fn create_staging_marker(marker: &Path, mount: &Path) -> Result<()> {
         .context("plugin staging marker has no parent")?;
     let root = crate::session::AnchoredDir::open(parent)?;
     let relative = mount.strip_prefix(parent)?;
-    let directory = relative
-        .parent()
-        .context("staging mount has no directory")?;
+    let directory = staging_directory_leaf(relative)?;
+    let plugins = root.child(Path::new("plugins"))?;
+    let stage = plugins.child(directory)?;
+    let mount_dir = stage.child(Path::new("volume"))?;
+    let owned = [&root, &plugins, &stage, &mount_dir]
+        .into_iter()
+        .all(|dir| dir.require_owned_directory().is_ok());
+    let removal = match (plugins.created(), stage.created(), mount_dir.created()) {
+        (Some(plugins_created), Some(directory_created), Some(mount_created)) if owned => {
+            stage.sync()?;
+            plugins.sync()?;
+            Some(StagingRemovalProof {
+                plugins_identity: staging_directory_identity(&plugins)?,
+                plugins_created,
+                directory_created,
+                mount_created,
+            })
+        }
+        _ => None,
+    };
     let evidence_record = StagingEvidence {
         schema: 1,
         owner_pid: std::process::id(),
@@ -400,8 +503,9 @@ pub(super) fn create_staging_marker(marker: &Path, mount: &Path) -> Result<()> {
         #[cfg(target_os = "linux")]
         owner_scope: crate::process::StagingRecoveryScope::capture()?,
         mount: relative.to_path_buf(),
-        directory_identity: staging_directory_identity(&root.child(directory)?)?,
-        mount_identity: staging_directory_identity(&root.child(relative)?)?,
+        directory_identity: staging_directory_identity(&stage)?,
+        mount_identity: staging_directory_identity(&mount_dir)?,
+        removal,
         custody: crate::process::StagingCustody::Prepared,
     };
     let mut evidence = root
@@ -468,7 +572,7 @@ fn check_recovery_evidence_inner(allow_live_staging: bool) -> Result<()> {
         bail!("plugin recovery is required in this Daemon process; stop the Daemon, verify owned commands have exited and restore the installation before restarting");
     }
     let live = LIVE_STAGING.lock();
-    for name in [RECOVERY_MARKER, STAGING_MARKER] {
+    for name in [RECOVERY_MARKER, STAGING_MARKER, publication::MARKER] {
         let evidence = root.join(name);
         if name == STAGING_MARKER && allow_live_staging && live.contains(&evidence) {
             continue;
@@ -482,6 +586,16 @@ fn check_recovery_evidence_inner(allow_live_staging: bool) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn recover_stale_publication() -> Result<()> {
+    let app = crate::session::get_app_dir()?;
+    if !publication::exists(&app)? {
+        return Ok(());
+    }
+    let _operation = crate::session::try_acquire_storage_flock(&app, OPERATION_LOCK)?
+        .context("another plugin operation owns publication recovery")?;
+    publication::recover(&app)
+}
+
 pub(crate) fn begin_operation() -> Result<Arc<StorageFlock>> {
     let root = crate::session::get_app_dir()?;
     #[cfg(test)]
@@ -492,6 +606,7 @@ pub(crate) fn begin_operation() -> Result<Arc<StorageFlock>> {
         .ok_or_else(|| {
             anyhow!("another plugin operation is running; inspect its outcome before retrying")
         })?;
+    publication::recover(&root).context("recovering interrupted plugin publication")?;
     if !LIVE_STAGING.lock().contains(&root.join(STAGING_MARKER))
         && std::fs::symlink_metadata(root.join(STAGING_MARKER)).is_ok()
     {
@@ -800,6 +915,7 @@ async fn prepare_install(
     result
 }
 
+#[derive(Serialize)]
 struct PriorMetadata {
     config: Option<PluginConfig>,
     locked: Option<LockedPlugin>,
@@ -869,10 +985,43 @@ fn apply_prepared_install(
         "installing {} {}",
         p.id, p.fetched.manifest.version
     ));
-    move_into_place(&p.fetched, &final_dir)?;
+    if p.fetched.journals_publication() {
+        with_publication_transaction(&p.fetched, &final_dir, &prior, false, |tree, journal| {
+            place_publication_tree(journal.as_deref(), tree, &final_dir)?;
+            settle_install(p, &final_dir, node_env, log, &prior, journal)
+        })?;
+    } else {
+        move_into_place(&p.fetched, &final_dir)?;
+        settle_install(p, &final_dir, node_env, log, &prior, None)?;
+    }
+    super::reload_registry();
+    log.line(&format!(
+        "installed {} {}",
+        p.id, p.fetched.manifest.version
+    ));
+    tracing::info!(target: "plugin.install", plugin = %p.id, version = %p.fetched.manifest.version, "plugin installed");
+
+    Ok(InstallReport {
+        id: p.id.clone(),
+        version: p.fetched.manifest.version.clone(),
+        capabilities: p.capabilities.clone(),
+        granted: true,
+        validation: p.validation,
+    })
+}
+
+fn settle_install(
+    p: &PreparedInstall,
+    final_dir: &Path,
+    node_env: &NodeEnv,
+    log: &OperationLog,
+    prior: &PriorMetadata,
+    mut journal: Option<&mut publication::Journal>,
+) -> Result<()> {
+    before_publication_build(&mut journal, final_dir, &p.fetched.manifest)?;
     if let Err(e) = build_in_place(
         &p.id,
-        &final_dir,
+        final_dir,
         &p.fetched.manifest,
         node_env,
         log,
@@ -883,7 +1032,7 @@ fn apply_prepared_install(
         {
             return Err(e);
         }
-        remove_owned_tree(&final_dir).map_err(|error| {
+        remove_published_tree(journal.as_deref(), final_dir).map_err(|error| {
             super::execution::RecoveryRequired(format!(
                 "removing failed install {}: {error}; original failure: {e:#}",
                 final_dir.display()
@@ -892,9 +1041,10 @@ fn apply_prepared_install(
         return Err(e);
     }
 
+    #[cfg(test)]
+    fetch::test_gate::reach(final_dir, "metadata-commit");
+    publication_working(&mut journal, final_dir)?;
     let persisted = (|| -> Result<()> {
-        #[cfg(test)]
-        fetch::test_gate::reach(&final_dir, "metadata-commit");
         persist_install(
             &p.persisted_source,
             &p.id,
@@ -911,9 +1061,9 @@ fn apply_prepared_install(
     })();
     if let Err(e) = persisted {
         #[cfg(test)]
-        fetch::test_gate::reach(&final_dir, "rollback");
+        fetch::test_gate::reach(final_dir, "rollback");
         let metadata = prior.restore(&p.id);
-        let tree = remove_owned_tree(&final_dir);
+        let tree = remove_published_tree(journal.as_deref(), final_dir);
         if metadata.is_err() || tree.is_err() {
             return Err(super::execution::RecoveryRequired(format!(
                 "install {} failed: {e:#}; metadata restoration: {metadata:?}; tree restoration: {tree:?}", p.id
@@ -921,20 +1071,7 @@ fn apply_prepared_install(
         }
         return Err(e);
     }
-    super::reload_registry();
-    log.line(&format!(
-        "installed {} {}",
-        p.id, p.fetched.manifest.version
-    ));
-    tracing::info!(target: "plugin.install", plugin = %p.id, version = %p.fetched.manifest.version, "plugin installed");
-
-    Ok(InstallReport {
-        id: p.id.clone(),
-        version: p.fetched.manifest.version.clone(),
-        capabilities: p.capabilities.clone(),
-        granted: true,
-        validation: p.validation,
-    })
+    publication_committed(journal, final_dir)
 }
 
 pub async fn install(input: &str, assume_yes: bool, dev: bool) -> Result<InstallReport> {
@@ -2029,13 +2166,28 @@ fn confirm_capabilities(
 /// Remove only an AoE-owned tree. Never follow links or chmod a pathname:
 /// legacy dev-install links are unlinked without touching their user-owned target.
 pub(super) fn remove_owned_tree(path: &Path) -> Result<()> {
+    remove_owned_tree_inner(path, None)
+}
+
+fn remove_owned_tree_checked(
+    parent: &crate::session::AnchoredDir,
+    leaf: &Path,
+    tree: publication::Identity,
+) -> Result<()> {
+    remove_owned_tree_inner(&parent.path().join(leaf), Some((parent, tree)))
+}
+
+fn remove_owned_tree_inner(
+    path: &Path,
+    expected: Option<(&crate::session::AnchoredDir, publication::Identity)>,
+) -> Result<()> {
     use nix::dir::Dir;
     use nix::errno::Errno;
     use nix::fcntl::{open, openat, AtFlags, OFlag};
     use nix::sys::stat::{fchmod, fstat, fstatat, FileStat, Mode};
     use nix::unistd::{geteuid, unlinkat, UnlinkatFlags};
     use std::ffi::CStr;
-    use std::os::fd::OwnedFd;
+    use std::os::fd::{AsFd, OwnedFd};
 
     fn same_entry(left: &FileStat, right: &FileStat) -> bool {
         left.st_dev == right.st_dev
@@ -2043,13 +2195,24 @@ pub(super) fn remove_owned_tree(path: &Path) -> Result<()> {
             && left.st_mode & libc::S_IFMT == right.st_mode & libc::S_IFMT
     }
 
-    fn remove(parent: &OwnedFd, name: &CStr, device: libc::dev_t, root: bool) -> Result<()> {
+    fn remove(
+        parent: &OwnedFd,
+        name: &CStr,
+        device: libc::dev_t,
+        root: bool,
+        expected: Option<publication::Identity>,
+        verify_mount: bool,
+    ) -> Result<()> {
         let observed = match fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
             Ok(stat) => stat,
-            Err(Errno::ENOENT) => return Ok(()),
+            Err(Errno::ENOENT) if expected.is_none() => return Ok(()),
             Err(error) => return Err(error).context("inspecting owned cleanup entry"),
         };
         let kind = observed.st_mode & libc::S_IFMT;
+        anyhow::ensure!(
+            expected.is_none() || kind == libc::S_IFDIR,
+            "owned cleanup root identity changed"
+        );
         match kind {
             libc::S_IFDIR => {
                 if observed.st_uid != geteuid().as_raw() || device != observed.st_dev {
@@ -2066,6 +2229,15 @@ pub(super) fn remove_owned_tree(path: &Path) -> Result<()> {
                 if !same_entry(&observed, &opened) || opened.st_uid != geteuid().as_raw() {
                     bail!("owned cleanup directory changed before opening");
                 }
+                if let Some(expected) = expected {
+                    anyhow::ensure!(
+                        publication::Identity::capture(fd.as_fd())? == expected,
+                        "owned cleanup root identity changed"
+                    );
+                }
+                if verify_mount {
+                    crate::process::prove_same_mount(parent.as_fd(), fd.as_fd())?;
+                }
                 if opened.st_mode & 0o700 != 0o700 {
                     fchmod(&fd, Mode::from_bits_truncate(opened.st_mode | 0o700))
                         .context("restoring owner access to owned cleanup directory")?;
@@ -2075,7 +2247,7 @@ pub(super) fn remove_owned_tree(path: &Path) -> Result<()> {
                     let entry = entry.context("reading owned cleanup directory")?;
                     let name = entry.file_name();
                     if name.to_bytes() != b"." && name.to_bytes() != b".." {
-                        remove(&fd, name, opened.st_dev, false)?;
+                        remove(&fd, name, opened.st_dev, false, None, verify_mount)?;
                     }
                 }
                 let current = fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW)?;
@@ -2105,25 +2277,46 @@ pub(super) fn remove_owned_tree(path: &Path) -> Result<()> {
     } else {
         parent
     };
-    let parent = match open(
-        parent,
-        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(Errno::ENOENT) => return Ok(()),
-        Err(error) => return Err(error).context("opening owned cleanup parent"),
+    let parent = if let Some((anchor, _)) = expected {
+        anchor.descriptor().try_clone_to_owned()?
+    } else {
+        match open(
+            parent,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::ENOENT) => return Ok(()),
+            Err(error) => return Err(error).context("opening owned cleanup parent"),
+        }
     };
     use std::os::unix::ffi::OsStrExt;
     let leaf = std::ffi::CString::new(leaf.as_bytes())?;
-    remove(&parent, &leaf, fstat(&parent)?.st_dev, true)
-        .with_context(|| format!("removing owned tree {}", path.display()))
+    let observed = fstat(&parent)?;
+    remove(
+        &parent,
+        &leaf,
+        observed.st_dev,
+        true,
+        expected.map(|(_, tree)| tree),
+        expected.is_some(),
+    )
+    .with_context(|| format!("removing owned tree {}", path.display()))
 }
 
 fn with_publication<T>(
     fetched: &FetchedPlugin,
     final_dir: &Path,
     publish: impl FnOnce(&Path) -> Result<T>,
+) -> Result<T> {
+    with_publication_copy(fetched, final_dir, None, |tree, _| publish(tree))
+}
+
+fn with_publication_copy<T>(
+    fetched: &FetchedPlugin,
+    final_dir: &Path,
+    transaction: Option<(&PriorMetadata, bool)>,
+    publish: impl FnOnce(&Path, Option<&mut publication::Journal>) -> Result<T>,
 ) -> Result<T> {
     fetched.begin_publication()?;
     let parent = final_dir
@@ -2136,14 +2329,27 @@ fn with_publication<T>(
         .tempdir_in(parent)
         .context("creating destination-local plugin publication directory")?
         .keep();
+    let mut journal = None;
     let result = super::execution::catch_panic(|| {
         let tree = directory.join("tree");
         fetched.copy_for_publication(&tree)?;
-        publish(&tree)
+        if let Some((prior, update)) = transaction {
+            journal = Some(publication::Journal::prepare(
+                final_dir, &tree, prior, update,
+            )?);
+        }
+        publish(&tree, journal.as_mut())
     });
+    if transaction.is_some() && super::execution::needs_recovery(&result) {
+        return result;
+    }
     #[cfg(test)]
     fetch::test_gate::reach(final_dir, "publication-cleanup");
-    if let Err(cleanup) = remove_owned_tree(&directory) {
+    let cleanup = match &journal {
+        Some(journal) => journal.clean_container(final_dir),
+        None => remove_owned_tree(&directory),
+    };
+    if let Err(cleanup) = cleanup {
         return Err(super::execution::RecoveryRequired(format!(
             "plugin publication cleanup unproven at {}: {cleanup:#}; publication outcome: {}",
             directory.display(),
@@ -2154,10 +2360,85 @@ fn with_publication<T>(
         ))
         .into());
     }
-    result
+    if let Some(journal) = journal {
+        journal
+            .finish(final_dir, result.is_ok())
+            .map_err(publication_error)?;
+    }
+    result.map_err(|error| {
+        if error.is::<publication::PriorBackup>() {
+            publication_error(error)
+        } else {
+            error
+        }
+    })
+}
+
+fn publication_error(error: anyhow::Error) -> anyhow::Error {
+    super::execution::RecoveryRequired(format!("plugin publication ownership unproven: {error:#}"))
+        .into()
+}
+
+fn with_publication_transaction<T>(
+    fetched: &FetchedPlugin,
+    final_dir: &Path,
+    prior: &PriorMetadata,
+    update: bool,
+    publish: impl FnOnce(&Path, Option<&mut publication::Journal>) -> Result<T>,
+) -> Result<T> {
+    let transaction = fetched.journals_publication().then_some((prior, update));
+    with_publication_copy(fetched, final_dir, transaction, publish)
+}
+
+fn before_publication_build(
+    journal: &mut Option<&mut publication::Journal>,
+    final_dir: &Path,
+    manifest: &PluginManifest,
+) -> Result<()> {
+    if build_steps(manifest).iter().any(|step| {
+        step.platforms.is_empty() || step.platforms.iter().any(|os| os == std::env::consts::OS)
+    }) {
+        publication_working(journal, final_dir)?;
+    }
+    Ok(())
+}
+
+fn publication_working(
+    journal: &mut Option<&mut publication::Journal>,
+    final_dir: &Path,
+) -> Result<()> {
+    if let Some(journal) = journal {
+        journal.working(final_dir).map_err(publication_error)?;
+    }
+    Ok(())
+}
+
+fn publication_committed(
+    journal: Option<&mut publication::Journal>,
+    final_dir: &Path,
+) -> Result<()> {
+    if let Some(journal) = journal {
+        journal.committed(final_dir).map_err(publication_error)?;
+    }
+    Ok(())
+}
+
+fn remove_published_tree(journal: Option<&publication::Journal>, final_dir: &Path) -> Result<()> {
+    match journal {
+        Some(journal) => journal.remove_installed(final_dir),
+        None => remove_owned_tree(final_dir),
+    }
 }
 
 fn rename_publication_tree(tree: &Path, destination: &Path) -> Result<()> {
+    place_publication_tree(None, tree, destination)
+}
+
+fn place_publication_tree(
+    journal: Option<&publication::Journal>,
+    tree: &Path,
+    destination: &Path,
+) -> Result<()> {
     use nix::fcntl::{open, OFlag};
     use nix::sys::stat::{fchmod, fstat, Mode};
 
@@ -2170,8 +2451,11 @@ fn rename_publication_tree(tree: &Path, destination: &Path) -> Result<()> {
     let mode = Mode::from_bits_truncate(fstat(&directory)?.st_mode);
     // Moving a directory across parents can require updating its read-only `..`.
     fchmod(&directory, mode | Mode::S_IWUSR)?;
-    let result = std::fs::rename(tree, destination)
-        .with_context(|| format!("publishing plugin into {}", destination.display()));
+    let result = match journal {
+        Some(journal) => journal.place(destination),
+        None => std::fs::rename(tree, destination).map_err(Into::into),
+    }
+    .with_context(|| format!("publishing plugin into {}", destination.display()));
     if let Err(error) = fchmod(&directory, mode) {
         return Err(super::execution::RecoveryRequired(format!(
             "restoring publication root permissions for {} -> {}: {error}; rename outcome: {result:?}",
@@ -2311,17 +2595,28 @@ fn replace_and_build(
 
     // Copy and verify before displacing the prior installation. Rename stays on
     // the destination filesystem even when acquisition used a private mount.
-    with_publication(fetched, final_dir, |tree| {
-        let had_prior = final_dir.exists();
+    with_publication_transaction(fetched, final_dir, prior, true, |tree, mut journal| {
+        let had_prior = match journal.as_deref() {
+            Some(journal) => journal.has_prior_tree(),
+            None => final_dir.exists(),
+        };
         if had_prior {
             #[cfg(test)]
             fetch::test_gate::reach(final_dir, "publication-backup");
-            std::fs::rename(final_dir, &backup_dir)
-                .with_context(|| format!("backing up current {plugin_id} before update"))?;
+            match journal.as_deref() {
+                Some(journal) => journal.displace(final_dir),
+                None => std::fs::rename(final_dir, &backup_dir).map_err(Into::into),
+            }
+            .with_context(|| format!("backing up current {plugin_id} before update"))?;
         }
+        #[cfg(test)]
+        fetch::test_gate::reach(final_dir, "publication-displaced");
 
+        let mut placed = false;
         let place_and_build = (|| -> Result<()> {
-            rename_publication_tree(tree, final_dir)?;
+            place_publication_tree(journal.as_deref(), tree, final_dir)?;
+            placed = true;
+            before_publication_build(&mut journal, final_dir, &fetched.manifest)?;
             build_in_place(
                 plugin_id,
                 final_dir,
@@ -2332,7 +2627,9 @@ fn replace_and_build(
             )?;
             #[cfg(test)]
             fetch::test_gate::reach(final_dir, "metadata-commit");
-            commit_metadata()
+            publication_working(&mut journal, final_dir)?;
+            commit_metadata()?;
+            publication_committed(journal.as_deref_mut(), final_dir)
         })();
 
         match place_and_build {
@@ -2340,7 +2637,11 @@ fn replace_and_build(
                 if had_prior {
                     #[cfg(test)]
                     fetch::test_gate::reach(final_dir, "backup-cleanup");
-                    if let Err(error) = remove_owned_tree(&backup_dir) {
+                    let cleanup = match journal.as_deref() {
+                        Some(journal) => journal.remove_backup(&backup_dir),
+                        None => remove_owned_tree(&backup_dir),
+                    };
+                    if let Err(error) = cleanup {
                         return Err(super::execution::RecoveryRequired(format!(
                         "update {plugin_id} committed, but backup cleanup at {} failed: {error}; do not restore this backup over the committed installation",
                         backup_dir.display()
@@ -2358,20 +2659,26 @@ fn replace_and_build(
                 #[cfg(test)]
                 fetch::test_gate::reach(final_dir, "rollback");
                 let metadata = prior.restore(plugin_id);
-                remove_owned_tree(final_dir).map_err(|error| {
-                super::execution::RecoveryRequired(format!(
-                    "removing failed update {}: {error}; original failure: {e:#}; metadata restoration: {metadata:?}",
-                    final_dir.display()
-                ))
-            })?;
+                if placed || journal.is_none() {
+                    remove_published_tree(journal.as_deref(), final_dir).map_err(|error| {
+                        super::execution::RecoveryRequired(format!(
+                            "removing failed update {}: {error}; original failure: {e:#}; metadata restoration: {metadata:?}",
+                            final_dir.display()
+                        ))
+                    })?;
+                }
                 if had_prior {
-                    std::fs::rename(&backup_dir, final_dir).map_err(|error| {
-                    super::execution::RecoveryRequired(format!(
-                        "restoring {} from {}: {error}; original failure: {e:#}; metadata restoration: {metadata:?}",
-                        final_dir.display(),
-                        backup_dir.display()
-                    ))
-                })?;
+                    let restore = match journal.as_deref() {
+                        Some(journal) => journal.restore_backup(final_dir),
+                        None => std::fs::rename(&backup_dir, final_dir).map_err(Into::into),
+                    };
+                    restore.map_err(|error| {
+                        super::execution::RecoveryRequired(format!(
+                            "restoring {} from {}: {error}; original failure: {e:#}; metadata restoration: {metadata:?}",
+                            final_dir.display(),
+                            backup_dir.display()
+                        ))
+                    })?;
                 }
                 if let Err(error) = metadata {
                     return Err(super::execution::RecoveryRequired(format!(
@@ -2455,6 +2762,422 @@ mod tests {
     use aoe_plugin_api::UiSlot;
     use serial_test::serial;
 
+    const PUBLICATION_ID: &str = "acme.journal";
+    const PUBLICATION_SOURCE: &str = "gh:acme/journal";
+
+    #[tokio::test]
+    #[serial]
+    async fn publication_preparation_refusal_cleans_unjournaled_copy() {
+        let _home = isolate_app_dir();
+        let app = crate::session::get_app_dir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("aoe-plugin.toml"),
+            "id = \"acme.journal\"\nname = \"Journal\"\nversion = \"2.0.0\"\napi_version = 2\n",
+        )
+        .unwrap();
+        let operation = begin_operation().unwrap();
+        let fetched = fetch::fetch(
+            &PluginSource::Local(source.path().to_owned()),
+            Some(operation.clone()),
+        )
+        .await
+        .unwrap();
+        let plugins = super::super::plugins_dir().unwrap();
+        let final_dir = plugins.join(PUBLICATION_ID);
+        let backup = plugins.join(format!("{PUBLICATION_ID}.bak"));
+        std::fs::create_dir(&backup).unwrap();
+        std::fs::write(backup.join("payload"), b"prior").unwrap();
+        let prior = PriorMetadata::capture(PUBLICATION_ID).unwrap();
+        // Exercise the journal transaction without depending on a Git clone.
+        let result: Result<()> =
+            with_publication_copy(&fetched, &final_dir, Some((&prior, true)), |_, _| {
+                panic!("a backup obstruction must prevent publication")
+            });
+        assert!(super::super::execution::needs_recovery(&result));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("publication backup already exists"));
+        let marker = app.join(publication::MARKER);
+        assert!(!marker.exists());
+        assert!(!final_dir.exists());
+        assert_eq!(std::fs::read(backup.join("payload")).unwrap(), b"prior");
+        std::fs::rename(&backup, &final_dir).unwrap();
+        let result: Result<()> =
+            with_publication_copy(&fetched, &final_dir, Some((&prior, false)), |_, _| {
+                panic!("an occupied install destination must prevent publication")
+            });
+        assert!(!super::super::execution::needs_recovery(&result));
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "plugin destination already exists"
+        );
+        assert!(!marker.exists());
+        assert_eq!(std::fs::read(final_dir.join("payload")).unwrap(), b"prior");
+        assert!(std::fs::read_dir(&plugins).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".publish-")
+        }));
+        assert!(check_recovery_evidence().is_ok());
+
+        std::fs::write(&marker, b"existing evidence").unwrap();
+        let result: Result<()> =
+            with_publication_copy(&fetched, &final_dir, Some((&prior, true)), |_, _| {
+                panic!("existing evidence must prevent publication")
+            });
+        assert!(super::super::execution::needs_recovery(&result));
+        assert_eq!(std::fs::read(&marker).unwrap(), b"existing evidence");
+        assert!(check_recovery_evidence().is_err());
+        fetched.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "subprocess fixture for publication crash recovery"]
+    async fn publication_crash_child() {
+        use std::os::unix::net::UnixStream;
+
+        let Some(home) = std::env::var_os("AOE_PUBLICATION_CRASH_HOME") else {
+            return;
+        };
+        let _home = crate::session::test_support::isolate_app_dir_at(Path::new(&home));
+        let phase = std::env::var("AOE_PUBLICATION_CRASH_PHASE").unwrap();
+        let _operation = begin_operation().unwrap();
+        let final_dir = super::super::plugins_dir().unwrap().join(PUBLICATION_ID);
+        let fetched = fetch::stage_remote_fixture(
+            PluginSource::parse(PUBLICATION_SOURCE).unwrap(),
+            Path::new(&std::env::var_os("AOE_PUBLICATION_CRASH_REPO").unwrap()),
+        )
+        .unwrap();
+        assert!(fetched.journals_publication());
+        let mut gate = fetch::test_gate::install(
+            &final_dir,
+            match phase.as_str() {
+                "install-ready" => "metadata-commit",
+                "install-committed" => "publication-cleanup",
+                "update-displaced" => "publication-displaced",
+                "update-committed" => "backup-cleanup",
+                "update-partial" => "publication-partial-metadata",
+                _ => panic!("unknown crash phase"),
+            },
+        );
+        let task = tokio::task::spawn_blocking(move || {
+            let manifest_hash = PluginManifest::hash_bytes(&fetched.manifest_bytes);
+            if phase.starts_with("install") {
+                let prepared = PreparedInstall {
+                    persisted_source: PUBLICATION_SOURCE.to_owned(),
+                    unverified: true,
+                    notice: String::new(),
+                    fetched,
+                    featured_verified: false,
+                    dev: false,
+                    id: PUBLICATION_ID.to_owned(),
+                    capabilities: Vec::new(),
+                    manifest_hash,
+                    fingerprint: String::new(),
+                    validation: install_validation(false, false, PUBLICATION_SOURCE),
+                };
+                apply_prepared_install(&prepared, &NodeEnv::new(), &OperationLog::Inherit).unwrap();
+            } else {
+                std::fs::create_dir(&final_dir).unwrap();
+                std::fs::write(final_dir.join("payload"), b"old").unwrap();
+                persist_install(PUBLICATION_SOURCE, PUBLICATION_ID, &[], "old", false).unwrap();
+                write_lock(PUBLICATION_ID, &fetched, "old", "unpinned").unwrap();
+                let prior = PriorMetadata::capture(PUBLICATION_ID).unwrap();
+                replace_and_build(
+                    PUBLICATION_ID,
+                    &fetched,
+                    &final_dir,
+                    &NodeEnv::new(),
+                    &OperationLog::Inherit,
+                    || {
+                        persist_update(PUBLICATION_ID, "gh:acme/journal@new", None)?;
+                        fetch::test_gate::reach(&final_dir, "publication-partial-metadata");
+                        write_lock(PUBLICATION_ID, &fetched, &manifest_hash, "unpinned")
+                    },
+                    &prior,
+                )
+                .unwrap();
+            }
+        });
+        (&mut gate.entered).await.unwrap();
+        let mut control =
+            UnixStream::connect(std::env::var_os("AOE_PUBLICATION_CRASH_CONTROL").unwrap())
+                .unwrap();
+        control.write_all(b"R").unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "subprocess fixture for writable daemon startup"]
+    async fn publication_restart_child() {
+        let Some(home) = std::env::var_os("AOE_PUBLICATION_CRASH_HOME") else {
+            return;
+        };
+        let _home = crate::session::test_support::isolate_app_dir_at(Path::new(&home));
+        let transaction = crate::daemon::lifecycle::Transaction::try_acquire().unwrap();
+        let _lifetime = transaction.lifetime().unwrap();
+        crate::server::start_server(
+            crate::server::ServerConfig {
+                profile: "",
+                host: "127.0.0.1",
+                port: 0,
+                core_only: true,
+                read_acquisition: false,
+                auth_mode: crate::cli::serve::AuthMode::None,
+                read_only: false,
+                remote: false,
+                tunnel_name: None,
+                tunnel_url: None,
+                no_tailscale: true,
+                funnel_port: 443,
+                is_daemon: true,
+                passphrase: None,
+                behind_proxy: false,
+                allow_plaintext_remote: false,
+                open_browser: false,
+                extra_allowed_hosts: Vec::new(),
+                extra_allowed_origins: Vec::new(),
+            },
+            transaction,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn default_remote_publication_reconciles_after_crash() {
+        use crate::git::test_support::run_git;
+        use std::io::Read as _;
+        use std::os::unix::net::{UnixDatagram, UnixListener};
+        use std::time::{Duration, Instant};
+
+        struct Daemon(std::process::Child);
+        impl Drop for Daemon {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let fixture = tempfile::tempdir_in("/tmp").unwrap();
+        let repo = fixture.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(
+            repo.join("aoe-plugin.toml"),
+            "id = \"acme.journal\"\nname = \"Journal\"\nversion = \"2.0.0\"\napi_version = 2\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("payload"), b"new").unwrap();
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-qm", "fixture"]);
+
+        for (case, phase) in [
+            ("install-ready", "install-ready"),
+            ("install-committed", "install-committed"),
+            ("update-displaced", "update-displaced"),
+            ("update-committed", "update-committed"),
+            ("update-partial", "update-partial"),
+            ("replaced-tree", "install-ready"),
+            ("changed-birth", "install-ready"),
+        ] {
+            let home = fixture.path().join(case);
+            let _home = crate::session::test_support::isolate_app_dir_at(&home);
+            let app = crate::session::get_app_dir().unwrap();
+            let plugins = app.join("plugins");
+            let installed = plugins.join(PUBLICATION_ID);
+            let backup = plugins.join(format!("{PUBLICATION_ID}.bak"));
+            let marker = app.join(publication::MARKER);
+            let socket = home.join("control");
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut daemon = Daemon(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "plugin::install::tests::publication_crash_child",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("AOE_PUBLICATION_CRASH_HOME", &home)
+                    .env("AOE_PUBLICATION_CRASH_PHASE", phase)
+                    .env("AOE_PUBLICATION_CRASH_REPO", &repo)
+                    .env("AOE_PUBLICATION_CRASH_CONTROL", &socket)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_TEMPLATE_DIR", "")
+                    .env_remove("GIT_CONFIG")
+                    .env_remove("GIT_CONFIG_COUNT")
+                    .env_remove("GIT_CONFIG_PARAMETERS")
+                    .env_remove("GIT_ALLOW_PROTOCOL")
+                    .env_remove("GIT_PROTOCOL_FROM_USER")
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut control = loop {
+                match listener.accept() {
+                    Ok((control, _)) => break control,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(
+                            daemon.0.try_wait().unwrap().is_none(),
+                            "{case} exited before gate"
+                        );
+                        assert!(Instant::now() < deadline, "{case} did not reach gate");
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("{case}: {error}"),
+                }
+            };
+            control.set_nonblocking(false).unwrap();
+            control
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut ready = [0];
+            control.read_exact(&mut ready).unwrap();
+            assert_eq!(ready, *b"R");
+            let mut evidence = std::fs::read(&marker).unwrap();
+            assert!(recover_stale_publication().is_err(), "{case}: live owner");
+            assert!(check_recovery_evidence().is_err(), "{case}: worker launch");
+            if phase == "update-displaced" {
+                assert!(!installed.exists());
+            } else {
+                assert_eq!(std::fs::read(installed.join("payload")).unwrap(), b"new");
+            }
+            if phase.starts_with("update") {
+                assert_eq!(std::fs::read(backup.join("payload")).unwrap(), b"old");
+            }
+            daemon.0.kill().unwrap();
+            assert!(!daemon.0.wait().unwrap().success());
+
+            if case == "replaced-tree" {
+                std::fs::rename(&installed, installed.with_file_name("held")).unwrap();
+                std::fs::create_dir(&installed).unwrap();
+                std::fs::write(installed.join("payload"), b"foreign").unwrap();
+            } else if case == "changed-birth" {
+                let mut record: serde_json::Value = serde_json::from_slice(&evidence).unwrap();
+                record["new_tree"]["birth"] =
+                    serde_json::json!({"secs_since_epoch": 1, "nanos_since_epoch": 0});
+                evidence = serde_json::to_vec(&record).unwrap();
+                evidence.push(b'\n');
+                std::fs::write(&marker, &evidence).unwrap();
+            }
+            if matches!(case, "update-partial" | "replaced-tree" | "changed-birth") {
+                assert!(
+                    recover_stale_publication().is_err(),
+                    "{case}: ambiguous state must stay fenced"
+                );
+                assert_eq!(std::fs::read(&marker).unwrap(), evidence);
+                assert!(begin_operation().is_err());
+                assert!(check_recovery_evidence().is_err());
+                if case == "update-partial" {
+                    assert_eq!(std::fs::read(backup.join("payload")).unwrap(), b"old");
+                    assert_eq!(std::fs::read(installed.join("payload")).unwrap(), b"new");
+                    let metadata = PriorMetadata::capture(PUBLICATION_ID).unwrap();
+                    assert_eq!(
+                        metadata.config.unwrap().source.as_deref(),
+                        Some("gh:acme/journal@new")
+                    );
+                    assert_eq!(metadata.locked.unwrap().manifest_hash, "old");
+                } else if case == "replaced-tree" {
+                    assert_eq!(
+                        std::fs::read(installed.join("payload")).unwrap(),
+                        b"foreign"
+                    );
+                } else {
+                    assert_eq!(std::fs::read(installed.join("payload")).unwrap(), b"new");
+                }
+                continue;
+            }
+
+            let notify_path = home.join("notify");
+            let notify = UnixDatagram::bind(&notify_path).unwrap();
+            notify
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let mut restarted = Daemon(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "plugin::install::tests::publication_restart_child",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("AOE_PUBLICATION_CRASH_HOME", &home)
+                    .env("AOE_TMUX_SOCKET", home.join("tmux.sock"))
+                    .env("NOTIFY_SOCKET", &notify_path)
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut message = [0; 256];
+            loop {
+                match notify.recv(&mut message) {
+                    Ok(len) if message[..len].starts_with(b"READY=1\n") => break,
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(error) => panic!("{case}: receiving daemon readiness: {error}"),
+                }
+                assert!(
+                    restarted.0.try_wait().unwrap().is_none(),
+                    "{case}: restarted daemon exited before readiness"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "{case}: daemon startup timed out"
+                );
+            }
+            // Check durable state before any plugin operation can recover it.
+            assert!(!marker.exists());
+            assert!(!backup.exists());
+            assert!(std::fs::read_dir(&plugins).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".publish-")
+            }));
+            let metadata = PriorMetadata::capture(PUBLICATION_ID).unwrap();
+            match case {
+                "install-ready" => {
+                    assert!(!installed.exists());
+                    assert!(metadata.config.is_none() && metadata.locked.is_none());
+                }
+                "update-displaced" => {
+                    assert_eq!(std::fs::read(installed.join("payload")).unwrap(), b"old");
+                    assert!(metadata.config.unwrap().grant.is_some());
+                    assert_eq!(metadata.locked.unwrap().manifest_hash, "old");
+                }
+                _ => {
+                    assert_eq!(std::fs::read(installed.join("payload")).unwrap(), b"new");
+                    let config = metadata.config.unwrap();
+                    let locked = metadata.locked.unwrap();
+                    assert_eq!(locked.version, "2.0.0");
+                    assert_eq!(
+                        locked.manifest_hash,
+                        PluginManifest::hash_bytes(
+                            &std::fs::read(installed.join("aoe-plugin.toml")).unwrap()
+                        )
+                    );
+                    assert_eq!(config.grant.is_some(), case == "install-committed");
+                }
+            }
+            drop(restarted);
+            assert!(check_recovery_evidence().is_ok());
+            assert!(begin_operation().is_ok());
+        }
+    }
+
     #[test]
     #[ignore = "subprocess fixture for staging crash recovery"]
     fn staging_crash_child() {
@@ -2522,8 +3245,9 @@ mod tests {
         }
     }
 
-    fn crash_staging_and_recover(phase: &str) {
+    fn crash_staging_and_recover(phase: &str, legacy: bool, plugins_mode: u32) {
         use std::io::Read as _;
+        use std::os::unix::fs::PermissionsExt as _;
         use std::os::unix::net::UnixListener;
         use std::time::{Duration, Instant};
         struct Daemon(std::process::Child);
@@ -2535,6 +3259,9 @@ mod tests {
         }
         let _home = isolate_app_dir();
         let root = crate::session::get_app_dir().unwrap();
+        let plugins = root.join("plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+        std::fs::set_permissions(&plugins, std::fs::Permissions::from_mode(plugins_mode)).unwrap();
         let control_dir = tempfile::tempdir_in("/tmp").unwrap();
         let socket = control_dir.path().join("control");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -2587,6 +3314,7 @@ mod tests {
             recover_staging(&root).is_err(),
             "live owner must retain staging"
         );
+        assert!(root.join("plugins/.staging-crash/volume").is_dir());
         assert!(begin_operation().is_err());
         let anchored = crate::session::AnchoredDir::open(&root).unwrap();
         let original = anchored
@@ -2596,7 +3324,7 @@ mod tests {
 
         #[cfg(target_os = "linux")]
         if phase == "writers" {
-            let (evidence, writers) = staging_evidence(&anchored).unwrap();
+            let (evidence, writers, _) = staging_evidence(&anchored).unwrap();
             let crate::process::StagingCustody::LinuxPidNamespace { init, .. } = evidence.custody
             else {
                 panic!("missing PID namespace custody")
@@ -2697,7 +3425,7 @@ mod tests {
                 original
             );
         }
-        let (mut evidence, _) = staging_evidence(&anchored).unwrap();
+        let (mut evidence, _, _) = staging_evidence(&anchored).unwrap();
         evidence.owner_pid = std::process::id();
         evidence.owner_birth = crate::process::process_birth_identity(std::process::id())
             .unwrap()
@@ -2763,10 +3491,45 @@ mod tests {
             .unwrap()
             .replace(&original)
             .unwrap();
-        if phase == "prepared" {
+        let stage = root.join("plugins/.staging-crash");
+        let mount = stage.join("volume");
+        let unrelated = root.join("plugins/.staging-unrelated");
+        std::fs::create_dir(&unrelated).unwrap();
+        let (mut evidence, _, _) = staging_evidence(&anchored).unwrap();
+        let may_remove = !legacy
+            && plugins_mode & 0o022 == 0
+            && [&root.join("plugins"), &stage, &mount].iter().all(|path| {
+                std::fs::metadata(path)
+                    .and_then(|metadata| metadata.created())
+                    .is_ok()
+            });
+        if plugins_mode & 0o022 != 0 {
+            assert!(evidence.removal.is_none());
+        }
+        if legacy {
+            evidence.removal = None;
+            save_header(&evidence);
+        }
+        if phase == "prepared" && !legacy {
             let outside = tempfile::tempdir().unwrap();
             std::fs::write(outside.path().join("retained"), b"untouched").unwrap();
-            let mount = root.join("plugins/.staging-crash/volume");
+            let empty_replacement = stage.with_file_name(".staging-replacement");
+            std::fs::rename(&stage, &empty_replacement).unwrap();
+            std::fs::create_dir_all(&mount).unwrap();
+            assert!(recover_staging(&root).is_err());
+            assert!(mount.is_dir(), "replacement stage must survive");
+            std::fs::remove_dir(&mount).unwrap();
+            std::fs::remove_dir(&stage).unwrap();
+            std::fs::rename(&empty_replacement, &stage).unwrap();
+
+            for dir in [&stage, &mount] {
+                let retained = dir.join("retained");
+                std::fs::write(&retained, b"untouched").unwrap();
+                assert!(recover_staging(&root).is_err());
+                assert_eq!(std::fs::read(&retained).unwrap(), b"untouched");
+                assert!(mount.is_dir(), "nonempty staging must remain intact");
+                std::fs::remove_file(retained).unwrap();
+            }
             let saved = mount.with_file_name("saved");
             std::fs::rename(&mount, &saved).unwrap();
             std::os::unix::fs::symlink(outside.path(), &mount).unwrap();
@@ -2779,7 +3542,67 @@ mod tests {
                 b"untouched"
             );
             std::fs::remove_file(&mount).unwrap();
+            assert!(
+                recover_staging(&root).is_err(),
+                "missing mount without cleanup intent"
+            );
             std::fs::rename(&saved, &mount).unwrap();
+
+            if let Some(proof) = evidence.removal.as_mut() {
+                proof.directory_created += Duration::from_secs(1);
+                save_header(&evidence);
+                assert!(recover_staging(&root).is_err());
+                assert!(
+                    mount.is_dir(),
+                    "device and inode alone cannot authorize removal"
+                );
+                anchored
+                    .bind_file(std::ffi::OsStr::new(STAGING_MARKER))
+                    .unwrap()
+                    .replace(&original)
+                    .unwrap();
+            }
+        }
+        if may_remove && phase == "prepared" {
+            use std::os::unix::fs::PermissionsExt;
+
+            let permissions = std::fs::metadata(&mount).unwrap().permissions();
+            std::fs::set_permissions(
+                &mount,
+                std::fs::Permissions::from_mode(permissions.mode() | 0o022),
+            )
+            .unwrap();
+            let error = recover_staging(&root).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "anchored directory is not owned or permits shared writes"
+            );
+            assert!(mount.is_dir(), "shared-writable mount must survive");
+            assert_eq!(
+                anchored
+                    .read_regular(Path::new(STAGING_MARKER), 1024 * 1024)
+                    .unwrap()
+                    .unwrap(),
+                original
+            );
+            std::fs::set_permissions(&mount, permissions).unwrap();
+
+            crate::session::anchored_fs::FAIL_SYNC_ONCE.set(Some(stage.clone()));
+            assert!(recover_stale_staging().is_err());
+            assert!(
+                stage.is_dir(),
+                "cleanup was interrupted after mountpoint removal"
+            );
+            assert!(!mount.exists());
+            assert!(root.join(STAGING_MARKER).exists());
+            std::fs::rename(&unrelated, &mount).unwrap();
+            assert!(recover_stale_staging().is_err());
+            assert!(mount.is_dir(), "a retry must preserve a replacement mount");
+            std::fs::rename(&mount, &unrelated).unwrap();
+            crate::session::anchored_fs::FAIL_SYNC_ONCE.set(Some(root.join("plugins")));
+            assert!(recover_stale_staging().is_err());
+            assert!(!stage.exists());
+            assert!(root.join(STAGING_MARKER).exists());
         }
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -2797,18 +3620,33 @@ mod tests {
         assert!(check_recovery_evidence().is_ok());
         assert!(begin_operation().is_ok());
         assert!(!root.join(STAGING_MARKER).exists());
+        if may_remove {
+            assert!(std::fs::symlink_metadata(&stage)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound));
+        } else {
+            assert!(
+                mount.is_dir(),
+                "a journal without deletion authority cannot remove staging"
+            );
+        }
         assert!(
-            std::fs::read_dir(root.join("plugins/.staging-crash/volume"))
-                .unwrap()
-                .next()
-                .is_none()
+            unrelated.is_dir(),
+            "recovery must not scan other staging directories"
         );
     }
 
     #[test]
     #[serial]
     fn startup_reclaims_preacquisition_after_real_daemon_crash() {
-        crash_staging_and_recover("prepared");
+        for mode in [0o755, 0o775] {
+            crash_staging_and_recover("prepared", false, mode);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn startup_reclaims_legacy_journal_without_removing_staging_directory() {
+        crash_staging_and_recover("prepared", true, 0o755);
     }
 
     #[test]
@@ -2817,8 +3655,48 @@ mod tests {
     #[ignore = "requires private user/PID/mount namespaces, nsenter, Git, and bubblewrap"]
     fn startup_reclaims_bounded_linux_volume_after_real_daemon_crash() {
         for phase in ["volume", "writers"] {
-            crash_staging_and_recover(phase);
+            crash_staging_and_recover(phase, false, 0o755);
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires mount --bind in a private mount namespace"]
+    fn journal_cleanup_refuses_same_device_bind_mount() {
+        use crate::session::AnchoredDir;
+
+        struct Mounted(PathBuf);
+        impl Drop for Mounted {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("umount").arg(&self.0).status();
+            }
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = AnchoredDir::open(fixture.path()).unwrap();
+        let tree = root.create_child(Path::new("tree")).unwrap();
+        let outside = root.create_child(Path::new("outside")).unwrap();
+        let mount = tree.create_child(Path::new("mount")).unwrap();
+        let outside_file = outside.path().join("retain");
+        std::fs::write(&outside_file, b"outside").unwrap();
+        assert_eq!(tree.identity().unwrap().0, outside.identity().unwrap().0);
+
+        let status = std::process::Command::new("mount")
+            .arg("--bind")
+            .arg(outside.path())
+            .arg(mount.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let _mount = Mounted(mount.path().to_path_buf());
+        let error = remove_owned_tree_checked(
+            &root,
+            Path::new("tree"),
+            publication::Identity::capture(tree.descriptor()).unwrap(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("operation crosses a host mount"));
+        assert_eq!(std::fs::read(&outside_file).unwrap(), b"outside");
     }
 
     #[test]

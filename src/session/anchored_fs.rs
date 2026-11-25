@@ -461,15 +461,21 @@ impl AnchoredDir {
 
     /// Follow ancestors, but never a symlink at the anchor leaf or below it.
     pub(crate) fn open(path: &Path) -> Result<Self> {
-        Self::open_with_root_links(path, false)
+        Self::open_with_root_links(path, false, false)
+    }
+
+    /// Like `open`, but on Linux a search-only root or parent yields an
+    /// `O_PATH` descriptor, which cannot be fsynced.
+    pub(crate) fn open_traversal(path: &Path) -> Result<Self> {
+        Self::open_with_root_links(path, false, true)
     }
 
     /// Follow a user-managed profile reference, retaining its pathname for revalidation.
     pub(crate) fn open_reference(path: &Path) -> Result<Self> {
-        Self::open_with_root_links(path, true)
+        Self::open_with_root_links(path, true, false)
     }
 
-    fn open_with_root_links(path: &Path, follow_root: bool) -> Result<Self> {
+    fn open_with_root_links(path: &Path, follow_root: bool, traversal: bool) -> Result<Self> {
         let root = path.to_path_buf();
         for component in path.components() {
             if !matches!(
@@ -482,10 +488,17 @@ impl AnchoredDir {
                 );
             }
         }
-        let resolving = OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_RDONLY;
+        let resolving = OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+        let acquire = |flags: OFlag, open_fd: &dyn Fn(OFlag) -> nix::Result<OwnedFd>| {
+            if traversal {
+                open_dir_or_path(flags, open_fd)
+            } else {
+                open_fd(flags | OFlag::O_RDONLY)
+            }
+        };
         let (Some(parent), Some(leaf)) = (path.parent(), path.file_name()) else {
             // A bare root such as `/` or `.` has no leaf to guard.
-            let fd = open(path, resolving, Mode::empty())
+            let fd = acquire(resolving, &|flags| open(path, flags, Mode::empty()))
                 .with_context(|| format!("opening anchored root {}", root.display()))?;
             return Ok(Self { root, fd });
         };
@@ -494,18 +507,16 @@ impl AnchoredDir {
         } else {
             parent
         };
-        let parent_fd = open(parent, resolving, Mode::empty())
+        let parent_fd = acquire(resolving, &|flags| open(parent, flags, Mode::empty()))
             .with_context(|| format!("opening anchored root parent {}", parent.display()))?;
-        let fd = openat(
-            &parent_fd,
-            leaf,
-            if follow_root {
-                resolving
-            } else {
-                resolving | OFlag::O_NOFOLLOW
-            },
-            Mode::empty(),
-        )
+        let leaf_flags = if follow_root {
+            resolving
+        } else {
+            resolving | OFlag::O_NOFOLLOW
+        };
+        let fd = acquire(leaf_flags, &|flags| {
+            openat(&parent_fd, leaf, flags, Mode::empty())
+        })
         .with_context(|| format!("opening anchored root {}", root.display()))?;
         Ok(Self { root, fd })
     }
@@ -547,6 +558,27 @@ impl AnchoredDir {
     pub(crate) fn identity(&self) -> Result<(libc::dev_t, libc::ino_t)> {
         let stat = fstat(&self.fd)?;
         Ok((stat.st_dev, stat.st_ino))
+    }
+
+    pub(crate) fn created(&self) -> Option<std::time::SystemTime> {
+        File::from(self.fd.try_clone().ok()?)
+            .metadata()
+            .ok()?
+            .created()
+            .ok()
+    }
+
+    pub(crate) fn descriptor(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.fd)
+    }
+
+    pub(crate) fn require_owned_directory(&self) -> Result<()> {
+        let stat = fstat(&self.fd)?;
+        anyhow::ensure!(
+            stat.st_uid == nix::unistd::geteuid().as_raw() && stat.st_mode & 0o022 == 0,
+            "anchored directory is not owned or permits shared writes"
+        );
+        Ok(())
     }
 
     pub(crate) fn sync(&self) -> Result<()> {
@@ -650,6 +682,37 @@ impl AnchoredDir {
             Err(Errno::EEXIST) => Ok(None),
             Err(error) => Err(error).context("creating anchored file"),
         }
+    }
+
+    /// Open the regular file `relative` with `O_NOFOLLOW` on every component.
+    /// A write creates missing parents and the file, then truncates it after
+    /// the type check, so a special file is never truncated.
+    pub(crate) fn open_file(&self, relative: &Path, write: bool) -> Result<File> {
+        let (parent, leaf) = if write {
+            self.open_parent_creating(relative)?
+        } else {
+            self.open_parent(relative)?
+        };
+        let access = if write {
+            OFlag::O_WRONLY | OFlag::O_CREAT
+        } else {
+            OFlag::O_RDONLY
+        };
+        let fd = openat(
+            &parent,
+            leaf.as_os_str(),
+            access | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+            Mode::from_bits_truncate(0o666),
+        )
+        .context("opening anchored file")?;
+        if fstat(&fd)?.st_mode & nix::libc::S_IFMT != nix::libc::S_IFREG {
+            bail!("anchored path is not a regular file");
+        }
+        let file = File::from(fd);
+        if write {
+            file.set_len(0).context("truncating anchored file")?;
+        }
+        Ok(file)
     }
 
     pub(crate) fn read_dir(&self, relative: &Path, max_entries: usize) -> Result<Vec<OsString>> {
@@ -871,12 +934,49 @@ impl AnchoredDir {
         }
     }
 
+    pub(crate) fn rename_child_exclusive(
+        &self,
+        from: &Path,
+        destination: &Self,
+        to: &Path,
+    ) -> Result<()> {
+        let (source, from) = self.open_parent(from)?;
+        let (destination, to) = destination.open_parent(to)?;
+        crate::process::rename_exclusive(&source, &from, &destination, &to)
+            .context("renaming anchored entry without replacement")
+    }
+
+    pub(crate) fn remove_empty_dir(&self, relative: &Path) -> Result<()> {
+        let (parent, leaf) = self.open_parent(relative)?;
+        unlinkat(&parent, leaf.as_os_str(), UnlinkatFlags::RemoveDir)
+            .context("removing empty anchored directory")
+    }
+
     pub(crate) fn remove_file(&self, relative: &Path) -> Result<()> {
         let (parent, leaf) = self.open_parent(relative)?;
         match unlinkat(&parent, leaf.as_os_str(), UnlinkatFlags::NoRemoveDir) {
             Ok(()) | Err(Errno::ENOENT) => Ok(()),
             Err(error) => Err(error).context("removing anchored file"),
         }
+    }
+
+    pub(crate) fn require_current_child(&self, leaf: &Path, child: &Self) -> Result<()> {
+        let (device, inode) = child.identity()?;
+        let entry = self
+            .entry_stat(leaf)?
+            .context("anchored directory disappeared")?;
+        anyhow::ensure!(
+            (entry.st_dev, entry.st_ino) == (device, inode)
+                && entry.st_mode & libc::S_IFMT == libc::S_IFDIR,
+            "anchored directory changed before removal"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn remove_empty_child(&self, leaf: &Path, child: &Self) -> Result<()> {
+        self.require_current_child(leaf, child)?;
+        unlinkat(&self.fd, leaf, UnlinkatFlags::RemoveDir)
+            .context("removing empty anchored directory")
     }
 
     /// Publish a complete regular file. A seed never replaces any existing
@@ -1230,27 +1330,53 @@ impl AnchoredDir {
         Ok(current)
     }
 
+    fn open_parent_creating(&self, relative: &Path) -> Result<(OwnedFd, std::ffi::OsString)> {
+        let mut components = normal_components(relative)?;
+        let Some(leaf) = components.pop() else {
+            bail!("anchored file path has no leaf");
+        };
+        let mut current = openat_dir(&self.fd, ".")?;
+        for component in components {
+            match mkdirat(&current, component.as_os_str(), Mode::S_IRWXU) {
+                Ok(()) | Err(Errno::EEXIST) => {}
+                Err(error) => return Err(error).context("creating anchored directory"),
+            }
+            current = openat_dir(&current, component.as_os_str())
+                .context("opening anchored parent component")?;
+        }
+        Ok((current, leaf))
+    }
+
     fn open_parent(&self, relative: &Path) -> Result<(OwnedFd, std::ffi::OsString)> {
         let mut components = normal_components(relative)?;
         let Some(leaf) = components.pop() else {
             bail!("anchored file path has no leaf");
         };
-        let mut current = openat(
-            &self.fd,
-            ".",
-            OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
-            Mode::empty(),
-        )?;
+        let mut current = openat_dir(&self.fd, ".")?;
         for component in components {
-            current = openat(
-                &current,
-                component.as_os_str(),
-                OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
-                Mode::empty(),
-            )
-            .context("opening anchored parent component")?;
+            current = openat_dir(&current, component.as_os_str())
+                .context("opening anchored parent component")?;
         }
         Ok((current, leaf))
+    }
+}
+
+/// Open a directory without following a symlink. On Linux a search-only
+/// directory (mode 0o100) rejects `O_RDONLY`, so fall back to `O_PATH`, which
+/// still works as a dirfd for `openat` and `mkdirat`.
+fn openat_dir<P: ?Sized + nix::NixPath>(dir: &OwnedFd, name: &P) -> nix::Result<OwnedFd> {
+    let flags = OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    open_dir_or_path(flags, &|flags| openat(dir, name, flags, Mode::empty()))
+}
+
+fn open_dir_or_path(
+    flags: OFlag,
+    open_fd: &dyn Fn(OFlag) -> nix::Result<OwnedFd>,
+) -> nix::Result<OwnedFd> {
+    match open_fd(flags | OFlag::O_RDONLY) {
+        #[cfg(target_os = "linux")]
+        Err(Errno::EACCES) => open_fd(flags | OFlag::O_PATH),
+        result => result,
     }
 }
 
@@ -1280,6 +1406,26 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_file_descends_through_a_search_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::geteuid().is_root() {
+            return; // Root bypasses the permissions exercised below.
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("f.txt"), b"hello").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o100)).unwrap();
+        let root = AnchoredDir::open(temporary.path()).unwrap();
+        let result = root.open_file(Path::new("a/f.txt"), false);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut contents = String::new();
+        result.unwrap().read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "hello");
+    }
 
     #[test]
     fn data_file_stamp_requires_a_fresh_readable_open() {

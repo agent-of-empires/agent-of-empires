@@ -80,8 +80,9 @@ for (const [axis, compact] of [
     await page.goto("/");
     await showAxis(page, axis);
     if (compact) {
-      await page.getByRole("button", { name: "Compact sidebar" }).click();
-      await expect(page.getByRole("button", { name: "Expand sidebar" })).toBeVisible();
+      await page.getByRole("separator", { name: "Resize sidebar" }).focus();
+      await page.keyboard.press("Home");
+      await expect(page.locator('[data-tour="sidebar"]')).toHaveAttribute("data-compact", "true");
     }
     const headers = page.getByTestId("sidebar-group-header");
     await expect(headers).toHaveCount(2);

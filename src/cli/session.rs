@@ -91,13 +91,6 @@ pub enum SessionCommands {
     /// Clear the favorite flag on a session.
     Unfavorite(SessionIdArgs),
 
-    /// Set (or clear) a per-session color label, rendered as a colored dot in
-    /// the web sidebar for at-a-glance status signaling. Intended for a
-    /// running agent to flag its own state, e.g.
-    /// `aoe session color $(aoe session current -q) red`. Colors: `red`
-    /// (needs attention), `amber` (working), `green` (done); `none` clears it.
-    Color(SetColorArgs),
-
     /// Archive a session: sink it in the Attention sort and tear down its
     /// tmux sessions. Worktree, branch, container preserved. `--no-kill`
     /// skips tmux teardown. See #1868.
@@ -396,15 +389,6 @@ pub struct SetBaseArgs {
     pub repo: Option<String>,
 }
 
-#[derive(Args)]
-pub struct SetColorArgs {
-    /// Session ID or title
-    pub identifier: String,
-    /// Color label: `red` (needs attention), `amber` (working), `green`
-    /// (done), or `none`/`clear` to remove the label.
-    pub color: String,
-}
-
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
     match command {
@@ -430,7 +414,6 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Unfavorite(args) => {
             mark_session(profile, args, "Unfavorited", Instance::unfavorite).await
         }
-        SessionCommands::Color(args) => set_color_session(profile, args).await,
         SessionCommands::Archive(args) => archive_session(profile, args).await,
         SessionCommands::Unarchive(args) => {
             mark_session(profile, args, "Unarchived", Instance::unarchive).await
@@ -459,29 +442,6 @@ async fn mark_session(
         })
     })?;
     println!("{verb}: {title}");
-    Ok(())
-}
-
-async fn set_color_session(profile: &str, args: SetColorArgs) -> Result<()> {
-    let normalized = args.color.trim().to_lowercase();
-    let new_color = match normalized.as_str() {
-        "none" | "clear" | "" => None,
-        other => Some(other.to_string()),
-    };
-
-    let storage = Storage::open_unwatched(profile)?;
-    let (title, color) = storage.update(|instances, _groups| {
-        super::patch_instance(instances, &args.identifier, |inst| {
-            inst.set_color(new_color.clone())
-                .map_err(|e| anyhow::anyhow!(e))?;
-            Ok((inst.title.clone(), inst.color.clone()))
-        })
-    })?;
-
-    match color {
-        Some(c) => println!("✓ Set color for '{}': {}", title, c),
-        None => println!("✓ Cleared color for '{}'", title),
-    }
     Ok(())
 }
 
@@ -1555,18 +1515,20 @@ fn wait_decision(
     }
 }
 
-/// Confirmed absence only. An unreachable tmux server leaves a plain `Error`, and a launch that
-/// holds the reservation has not created its pane yet.
-fn is_terminated(
+/// Confirmed absence only: a gone pane's latch, unless tmux now reports the session present. An
+/// unreachable tmux server leaves a plain `Error`, and a launch that holds the reservation has not
+/// created its pane yet.
+pub(crate) fn is_terminated(
     status: Status,
-    last_error: Option<&str>,
+    last_error: &crate::session::LastError,
     launching: bool,
     existence: crate::tmux::SessionExistence,
 ) -> bool {
     !launching
         && (status == Status::Stopped
             || (status == Status::Error
-                && last_error == Some(crate::session::TMUX_SESSION_GONE_ERROR))
+                && existence != crate::tmux::SessionExistence::Present
+                && crate::session::reports_tmux_session_gone(last_error))
             // A capture that loses a vanishing pane reads as Idle, so recheck the pane itself.
             || existence == crate::tmux::SessionExistence::Absent)
 }
@@ -1577,7 +1539,7 @@ fn confirmed_terminated(inst: &Instance) -> bool {
         .map_or(crate::tmux::SessionExistence::Unknown, |s| s.existence());
     is_terminated(
         inst.status,
-        inst.last_error.as_deref(),
+        &inst.last_error,
         inst.has_fresh_launch_reservation(crate::time::Timestamp::now()),
         existence,
     )
@@ -1675,6 +1637,13 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
     };
 
     crate::session::config::profile_config::resolve_config_or_warn(profile);
+
+    if inst.is_structured() {
+        eprintln!(
+            "Structured session: there is no terminal pane to capture. Read the transcript with `aoe acp history {}`.",
+            inst.id
+        );
+    }
 
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
 
@@ -3441,7 +3410,7 @@ mod start_blocked_tests {
 
 #[cfg(test)]
 mod session_mutation_tests {
-    use super::{set_color_session, set_session_id, SetColorArgs, SetSessionIdArgs};
+    use super::{set_session_id, SetSessionIdArgs};
     use crate::session::{Instance, ResumeIntent, Storage};
     use serial_test::serial;
     use tempfile::tempdir;
@@ -3626,64 +3595,6 @@ mod session_mutation_tests {
             "rejected call must not mutate sid"
         );
     }
-
-    #[tokio::test]
-    #[serial]
-    async fn set_color_normalizes_clears_and_rejects_unknown_values() {
-        let temp = tempdir().unwrap();
-        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
-
-        let (storage, id) = seed("set-color", Instance::new("color_session", "/tmp/x"));
-        let set = |color: &str| {
-            set_color_session(
-                "set-color",
-                SetColorArgs {
-                    identifier: id.clone(),
-                    color: color.to_string(),
-                },
-            )
-        };
-
-        set("Red")
-            .await
-            .expect("palette names are case-insensitive");
-        assert_eq!(stored(&storage, &id).color.as_deref(), Some("red"));
-
-        set("chartreuse")
-            .await
-            .expect_err("unknown color must error");
-        assert_eq!(stored(&storage, &id).color.as_deref(), Some("red"));
-
-        set("none").await.unwrap();
-        assert_eq!(stored(&storage, &id).color, None);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn set_color_refuses_unknown_profile_without_vivifying_it() {
-        let _guard = crate::session::test_support::isolate_app_dir();
-        let profiles = crate::session::get_app_dir().unwrap().join("profiles");
-        std::fs::create_dir_all(profiles.join("real")).unwrap();
-
-        let msg = set_color_session(
-            "ghost-profile",
-            SetColorArgs {
-                identifier: "whatever".to_string(),
-                color: "red".to_string(),
-            },
-        )
-        .await
-        .expect_err("unknown profile must error")
-        .to_string();
-        assert!(
-            msg.contains("does not exist"),
-            "expected the unknown-profile error, got: {msg}"
-        );
-        assert!(
-            !profiles.join("ghost-profile").exists(),
-            "set-color must not mint profiles/ghost-profile"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -3843,8 +3754,8 @@ mod import_tests {
 mod wait_decision_tests {
     use super::{adopt_stored, is_terminated, wait_decision, WaitDecision};
     use crate::session::{
-        Instance, LifecycleOperation, Status, TMUX_SERVER_UNREACHABLE_ERROR,
-        TMUX_SESSION_GONE_ERROR,
+        Instance, LastError, LifecycleOperation, Status, TmuxAbsence,
+        TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR, TMUX_SESSION_GONE_LEAD,
     };
     use std::time::Duration;
 
@@ -3901,35 +3812,41 @@ mod wait_decision_tests {
     #[test]
     fn only_confirmed_absence_is_termination() {
         use crate::tmux::SessionExistence::{Absent, Present, Unknown};
+        let latched = |absence, message: &str| {
+            let mut error = LastError::default();
+            error.latch_tmux(absence, message);
+            error
+        };
+        let gone = latched(TmuxAbsence::Gone, TMUX_SESSION_GONE_ERROR);
+        // What a live pane printed, however it begins, is no latch.
+        let printed = {
+            let mut error = LastError::default();
+            error.set(format!("{TMUX_SESSION_GONE_LEAD} Exiting."));
+            error
+        };
+        let none = LastError::default();
         let cases = [
-            (Status::Stopped, None, false, Present, true),
+            (Status::Stopped, &none, false, Present, true),
+            // tmux reports the session again, so its pane is no longer gone
+            (Status::Error, &gone, false, Present, false),
+            // the tmux server exits with its last session, so a later poll can't reach it
+            (Status::Error, &gone, false, Unknown, true),
             (
                 Status::Error,
-                Some(TMUX_SESSION_GONE_ERROR),
-                false,
-                Present,
-                true,
-            ),
-            (
-                Status::Error,
-                Some(TMUX_SERVER_UNREACHABLE_ERROR),
+                &latched(TmuxAbsence::Unreachable, TMUX_SERVER_UNREACHABLE_ERROR),
                 false,
                 Unknown,
                 false,
             ),
-            (Status::Error, None, false, Unknown, false),
-            (
-                Status::Idle,
-                Some(TMUX_SESSION_GONE_ERROR),
-                false,
-                Present,
-                false,
-            ),
+            (Status::Error, &printed, false, Present, false),
+            (Status::Error, &printed, false, Unknown, false),
+            (Status::Error, &none, false, Unknown, false),
+            (Status::Idle, &gone, false, Unknown, false),
             // a capture that lost the pane reads Idle; the pane check still catches it
-            (Status::Idle, None, false, Absent, true),
+            (Status::Idle, &none, false, Absent, true),
             // a launch holding its reservation has no pane yet
-            (Status::Starting, None, true, Absent, false),
-            (Status::Stopped, None, true, Absent, false),
+            (Status::Starting, &none, true, Absent, false),
+            (Status::Stopped, &none, true, Absent, false),
         ];
         for (status, last_error, launching, existence, want) in cases {
             assert_eq!(

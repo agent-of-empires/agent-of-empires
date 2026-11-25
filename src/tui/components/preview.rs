@@ -441,7 +441,7 @@ impl Preview {
         }
         let inner = output;
 
-        if let Some(error) = &instance.last_error {
+        if let Some(error) = instance.last_error.as_deref() {
             let mut error_lines: Vec<Line> = vec![
                 Line::from(Span::styled(
                     "Error:",

@@ -49,6 +49,13 @@ pub struct PluginCommandView {
 enum ReplayKind {
     Live,
     Rows,
+    RetainedSnapshot,
+}
+
+pub(crate) struct RetainedReplay {
+    pub transcript: crate::acp::transcript::RetainedTranscript,
+    pub highest_seq: u64,
+    pub incomplete: bool,
 }
 #[derive(serde::Deserialize)]
 struct PluginCommandsEnvelope {
@@ -205,6 +212,18 @@ impl HttpClient {
         loop {
             let page = if matches!(kind, ReplayKind::Rows) {
                 self.replay_rows_page(session_id, cursor, page_size).await?
+            } else if matches!(kind, ReplayKind::RetainedSnapshot) {
+                let url = format!(
+                    "{}/api/sessions/{}/acp/replay?since={cursor}&limit={page_size}&view=retained",
+                    self.endpoint.base_url,
+                    path_segment(session_id)?,
+                );
+                let response = check_status(self.execute(self.http.get(&url)).await?, session_id)?;
+                let page = decode_replay(response).await?;
+                if page.history_identity.is_none() {
+                    return Err(HttpError::Transport);
+                }
+                page
             } else {
                 self.replay_page(session_id, cursor, page_size).await?
             };
@@ -292,6 +311,43 @@ impl HttpClient {
             })
             .await?;
         Ok((rows, lost))
+    }
+
+    /// Read through the first page's high-water mark, tolerating live appends.
+    pub(crate) async fn replay_retained_snapshot_since(
+        &self,
+        session_id: &str,
+        since: u64,
+        page_size: u64,
+    ) -> Result<RetainedReplay, HttpError> {
+        let mut builder = crate::acp::transcript::RetainedTranscriptBuilder::default();
+        let mut last_seen = since;
+        let mut highest_seq = 0;
+        let mut incomplete = false;
+        let (_, _, lost) = self
+            .replay_pages(
+                session_id,
+                since,
+                page_size,
+                ReplayKind::RetainedSnapshot,
+                |page, cap| {
+                    highest_seq = cap;
+                    for frame in page.frames {
+                        if frame.seq <= last_seen || frame.seq > cap {
+                            continue;
+                        }
+                        incomplete |= frame.seq != last_seen.saturating_add(1);
+                        last_seen = frame.seq;
+                        builder.apply(frame.seq, &frame.event);
+                    }
+                },
+            )
+            .await?;
+        Ok(RetainedReplay {
+            transcript: builder.finish(),
+            highest_seq,
+            incomplete: incomplete || lost || last_seen < highest_seq,
+        })
     }
 
     /// Start one bounded read of a pinned retained transcript source.

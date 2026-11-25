@@ -345,8 +345,7 @@ impl HomeView {
                 .worktree_info
                 .as_ref()
                 .map(|worktree| worktree.branch.as_str());
-            instance.color != row.color
-                || instance.command != row.command
+            instance.command != row.command
                 || instance.extra_args != row.extra_args
                 || instance.yolo_mode != row.yolo_mode
                 || instance.scratch != row.scratch
@@ -587,13 +586,15 @@ impl HomeView {
             instance.agent_pane.clone_from(&row.agent_pane);
             instance.auxiliary.clone_from(&row.auxiliary);
             instance.unread = row.unread;
-            instance.color.clone_from(&row.color);
             instance.yolo_mode = row.yolo_mode;
             instance.scratch = row.scratch;
             instance.notify_on_waiting = row.notify_on_waiting;
             instance.notify_on_idle = row.notify_on_idle;
             instance.notify_on_error = row.notify_on_error;
-            instance.last_error.clone_from(&row.last_error);
+            match row.last_error.as_deref() {
+                Some(error) => instance.last_error.set(error),
+                None => instance.last_error.clear(),
+            }
             instance.pane_dead_observed = row.pane_dead_observed;
             if let Some(status) = Status::from_api_str(&row.status) {
                 instance.status = status;
@@ -944,13 +945,16 @@ impl HomeView {
             return false;
         };
         let mut changed = instance.status != status
-            || instance.last_error != row.last_error
+            || instance.last_error.as_deref() != row.last_error.as_deref()
             || instance.pane_dead_observed != row.pane_dead_observed;
         if instance.status != status {
             crate::sound::play_for_transition(instance.status, status, &self.sound_config);
         }
         instance.status = status;
-        instance.last_error.clone_from(&row.last_error);
+        match row.last_error.as_deref() {
+            Some(error) => instance.last_error.set(error),
+            None => instance.last_error.clear(),
+        }
         instance.pane_dead_observed = row.pane_dead_observed;
         if row.view != crate::session::View::Structured
             || row.archived_at.is_some()

@@ -1,0 +1,14 @@
+{
+  "name": "Client writes go through a Daemon endpoint",
+  "instruction": "New Client code in the CLI or TUI changes Session state and Daemon-read config by calling a Daemon endpoint, not by writing storage or config files itself.",
+  "relevant_when": "A patch under src/cli/ or src/tui/ adds a call that writes Session state or config the Daemon reads, such as a mutating Storage method (save, update, remove, or a write through Storage::open_unwatched or Storage::new_unwatched), update_config, save_config, save_profile_config, or a direct write to sessions.json, groups.json, projects.json or a profile config.toml.",
+  "context": "AGENTS.md (Daemon and Clients) and ADR 0004: the Daemon is becoming the single owner of Session runtime state and the config it reads; an out-of-band Client write causes stale reloads and races (#4035, #2541). Put the change behind a Daemon endpoint and call it from the Client. Allowed local writes per ADR 0004: Client assets (theme export, sounds install), files on the Daemon host (init, hooks approve), Daemon and install management (killall, update, uninstall, migrate, sandbox reclaim, acp recover, serve), update_app_state for Client-only bookkeeping in state.toml, and code that only moves or reformats an existing write.",
+  "scope": "diff",
+  "scope_reason": "Many existing CLI commands still write locally while migration proceeds per command, so only writes a change adds are judged.",
+  "checklist": [
+    {
+      "name": "no-new-out-of-band-write",
+      "rule": "No added line in src/cli/ or src/tui/ introduces a new direct write of Session state or Daemon-read config. Not applicable when the write sits in one of the local-only commands or targets listed in context, or when the same write is removed elsewhere in the patch."
+    }
+  ]
+}

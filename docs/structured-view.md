@@ -64,7 +64,7 @@ Container images must provide Bash and GNU grep for scoped process inspection, p
 
 On Apple Container, worker descriptor snapshots are streamed as a tar archive by the guest Python helper. Symlinks and non-regular descriptors are refused; no host copy destination is used.
 
-CLI stop and kill persist a stop intent before signalling. Reattachment, automatic respawn, queued turns, and runner publication respect that fence. Only an explicit resume after settled retirement can clear the stop intent it observed; a newer stop remains authoritative. A stopped session with queued prompts shows a startup banner saying the prompts wait until the session is started again. For a tracked runtime that cannot prove settlement, externally stop only that execution on its original host or pinned container and retry `aoe acp stop <id>`.
+CLI stop and kill persist a stop intent before signalling. Reattachment, automatic respawn, queued turns, and runner publication respect that fence. Only an explicit resume after settled retirement can clear the stop intent it observed; a newer stop remains authoritative. A message typed into a stopped session from the dashboard, TUI or CLI starts it as an explicit resume; already-queued prompts and MCP, plugin or automated prompts keep waiting behind the fence and a stopped session with queued prompts shows a startup banner saying so, while `no_revive` senders are refused. For a tracked runtime that cannot prove settlement, externally stop only that execution on its original host or pinned container and retry `aoe acp stop <id>`.
 
 A legacy Prime record without an attested native cleanup route cannot be retired automatically. Upgrades pin an existing control receipt only when it matches the recorded execution route; otherwise the route and ownership record remain intact with an unknown control path. First identify its original host or container and externally stop every native worker and service belonging to that execution. If that scope cannot be identified or its shutdown cannot be confirmed, retain the record. Do not use a global Prime shutdown that would affect unrelated executions.
 
@@ -312,7 +312,7 @@ Every structured-view operation has a matching `aoe acp <verb>` against the same
 
 | Verb | What it does |
 |------|--------------|
-| `aoe acp history <id>` | Dump the persisted transcript |
+| `aoe acp history <id>` | Print the transcript: whole agent messages, user prompts, one line per tool call. `--last N` and `--role user,agent,tool,notice` select entries; `--json` emits raw frames |
 | `aoe acp status <id>` | Print highest/lowest seq and the daemon source |
 | `aoe acp prompt <id> <text>` | Send a prompt (`-` reads stdin) |
 | `aoe acp approve <id> <nonce> [--always\|--deny\|--option <id>]` | Resolve a pending approval |

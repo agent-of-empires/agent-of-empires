@@ -11,11 +11,16 @@ import remarkGfm from "remark-gfm";
 
 import type { FileRefSession } from "../../lib/fileRef";
 
+const { shikiThemeRef } = vi.hoisted(() => ({
+  shikiThemeRef: { current: { theme: "vitesse-dark", appearance: "dark" } },
+}));
+
 vi.mock("../../hooks/useShikiTheme", () => ({
-  useShikiTheme: () => ({ theme: "vitesse-dark", appearance: "dark" }),
+  useShikiTheme: () => shikiThemeRef.current,
 }));
 
 vi.mock("../../lib/snippetHighlighter", () => ({
+  peekHighlight: vi.fn((): string | undefined => undefined),
   highlightSnippet: vi.fn().mockResolvedValue("<pre><code>highlighted</code></pre>"),
 }));
 
@@ -59,7 +64,7 @@ vi.mock("../../lib/clipboard", () => ({
 
 import { Markdown, remarkPluginsFor } from "./Markdown";
 import { AcpFileRefContext } from "./AcpFileRefContext";
-import { highlightSnippet } from "../../lib/snippetHighlighter";
+import { highlightSnippet, peekHighlight } from "../../lib/snippetHighlighter";
 import { writeClipboard } from "../../lib/clipboard";
 import type { SyntaxHighlighterProps } from "@assistant-ui/react-markdown";
 import { renderWithLateResolution } from "../../__tests__/lateResolution";
@@ -311,6 +316,36 @@ describe("ShikiSyntaxHighlighter stale-content transitions (#3974)", () => {
   afterEach(() => {
     vi.mocked(highlightSnippet).mockReset();
     vi.mocked(highlightSnippet).mockResolvedValue("<pre><code>highlighted</code></pre>");
+    vi.mocked(peekHighlight).mockReset();
+    vi.mocked(peekHighlight).mockReturnValue(undefined);
+    shikiThemeRef.current = { theme: "vitesse-dark", appearance: "dark" };
+  });
+
+  it("keeps a mount-time cache hit while an uncached theme is pending", async () => {
+    vi.mocked(peekHighlight).mockImplementation((_code, opts) =>
+      opts?.theme === "vitesse-dark" ? '<pre class="shiki">theme A</pre>' : undefined,
+    );
+    const pending = Promise.withResolvers<string | null>();
+    const started = Promise.withResolvers<void>();
+    vi.mocked(highlightSnippet).mockImplementationOnce(() => {
+      started.resolve();
+      return pending.promise;
+    });
+    const Comp = getSyntaxHighlighter();
+
+    const { container, rerender } = render(<Comp language="rust" code="fn main() {}" />);
+    expect(container.textContent).toContain("theme A");
+
+    shikiThemeRef.current = { theme: "vitesse-light", appearance: "light" };
+    rerender(<Comp language="rust" code="fn main() {}" />);
+    await started.promise;
+    expect(container.textContent).toContain("theme A");
+
+    pending.resolve('<pre class="shiki">theme B</pre>');
+    await waitFor(() => {
+      expect(container.textContent).toContain("theme B");
+    });
+    expect(container.textContent).not.toContain("theme A");
   });
 
   it("clears highlighted output when a reused block transitions to unfenced text", async () => {

@@ -574,7 +574,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                     generation,
                     super::Status::Error,
                 ) {
-                    stored.last_error = Some(errors.join("; "));
+                    stored.last_error.set(errors.join("; "));
                     if !errors.is_empty() && stored.same_trash_lifecycle(&self.request().instance) {
                         stored.record_failed_purge(forced);
                     }

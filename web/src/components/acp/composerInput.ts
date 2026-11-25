@@ -69,8 +69,11 @@ export function composerWrapperLayout(opts: { keyboardOpen: boolean; accessoryBa
   };
 }
 
-/** Auto-grow the textarea up to ~6 lines. */
-export function fitTextarea(el: HTMLTextAreaElement) {
+const supportsFieldSizing = typeof CSS !== "undefined" && CSS.supports("field-sizing", "content");
+
+/** JS grow-to-cap fallback; a no-op where CSS `field-sizing: content` sizes the textarea. */
+export function fitTextareaFallback(el: HTMLTextAreaElement, supported = supportsFieldSizing) {
+  if (supported) return;
   // Collapsing to measure would grow the transcript viewport and clamp its scrollTop, stranding a pinned transcript short of the bottom.
   const parent = el.parentElement;
   if (parent) parent.style.minHeight = `${parent.offsetHeight}px`;
@@ -139,7 +142,7 @@ export function insertRawTextAtCaret(ta: HTMLTextAreaElement, text: string, repl
     "insertText",
     text,
   );
-  fitTextarea(ta);
+  fitTextareaFallback(ta);
 }
 
 /** Client-side mirror of the server's per-prompt attachment cap. */

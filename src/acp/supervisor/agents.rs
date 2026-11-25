@@ -497,17 +497,30 @@ mod tests {
             .insert("oc-superpowers".into(), "ocp run sp acp".into());
         cfg.agent_detect_as
             .insert("lenovo-claude".into(), "claude".into());
+        // A declared Claude wrapper, as a structured fork requires, still
+        // launches its own command rather than the base adapter.
+        cfg.agent_acp_cmd
+            .insert("claude-acct".into(), "/state/acct-acp.sh".into());
+        for map in [&mut cfg.agent_detect_as, &mut cfg.agent_execution_as] {
+            map.insert("claude-acct".into(), "claude".into());
+        }
 
         #[derive(Debug)]
         enum Want {
             Registry,
-            Custom,
+            Custom(&'static str),
             NotAllowed,
             Unknown,
         }
         let cases = [
             (false, &[][..], "claude", Want::Registry),
-            (false, &[][..], "oc-superpowers", Want::Custom),
+            (false, &[][..], "oc-superpowers", Want::Custom("ocp")),
+            (
+                false,
+                &[][..],
+                "claude-acct",
+                Want::Custom("/state/acct-acp.sh"),
+            ),
             (false, &[][..], "lenovo-claude", Want::Registry),
             (false, &[][..], "no-such-agent", Want::Unknown),
             (true, &["claude"][..], "claude", Want::Registry),
@@ -516,7 +529,7 @@ mod tests {
                 true,
                 &["oc-superpowers"][..],
                 "oc-superpowers",
-                Want::Custom,
+                Want::Custom("ocp"),
             ),
             (true, &["claude"][..], "oc-superpowers", Want::NotAllowed),
             (
@@ -538,10 +551,10 @@ mod tests {
                     let (_, from_registry) = got.unwrap_or_else(|e| panic!("{label}: {e}"));
                     assert!(from_registry, "{label}: expected a registry spec");
                 }
-                Want::Custom => {
+                Want::Custom(command) => {
                     let (spec, from_registry) = got.unwrap_or_else(|e| panic!("{label}: {e}"));
                     assert!(!from_registry, "{label}: expected a custom spec");
-                    assert_eq!(spec.command, "ocp", "{label}");
+                    assert_eq!(spec.command, command, "{label}");
                 }
                 Want::NotAllowed => assert!(
                     matches!(got, Err(SupervisorError::AgentNotAllowed(ref n)) if n == name),
@@ -637,6 +650,19 @@ mod tests {
             let got = sup.pick_agent_for_tool(tool, None, "", tmp.path()).await;
             assert_eq!(got, expected, "default={configured:?} tool={tool}");
         }
+
+        // A wrapper's own acp cmd wins over the base it is declared to run.
+        std::fs::write(
+            &cfg_path,
+            "[session.agent_acp_cmd]\nclaude-acct = \"/state/acct-acp.sh\"\n\
+             [session.agent_detect_as]\nclaude-acct = \"claude\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            sup.pick_agent_for_tool("claude-acct", None, "", tmp.path())
+                .await,
+            "claude-acct"
+        );
     }
 
     #[tokio::test]

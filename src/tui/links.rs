@@ -1,18 +1,10 @@
-//! Finding the links on a rendered preview row: the OSC 8 targets the pane
-//! advertised, then plain URLs in the row's own text. An advertised target wins
-//! wherever the two overlap, since a bare match is only inference.
+//! Finding the links on a rendered preview row: the OSC 8 runs the pane
+//! advertised there, then plain URLs in the row's own text. An advertised
+//! target wins wherever the two overlap, since a bare match is only inference.
 //!
-//! Neither the vt100 grid nor a ratatui cell can carry a hyperlink, so OSC 8
-//! targets ride alongside the text (`PreviewCache::links`) and are re-anchored
-//! here to the row showing them.
-//!
-//! Matching on text has a known limit: the pane's table outlives the row that
-//! filled it, so a link once printed as `[docs](x)` makes every later standalone
-//! `docs` on screen resolve to `x`. `MIN_LINK_TEXT` and word alignment rule out
-//! the worst of it, but not a common word. Hovering shows the target first and
-//! only a [`crate::util::is_openable_link`] target ever opens, which keeps this
-//! misleading rather than dangerous; removing it needs per-cell positions
-//! `vt100` does not keep.
+//! A ratatui cell cannot carry a hyperlink, so each row's OSC 8 runs ride
+//! alongside the text (`PreviewCache::links`) at the character offset the frame
+//! put them, and are placed here by the columns those characters paint.
 //!
 //! The result never overlaps itself: the painter and the click hit-test must
 //! agree about which candidate owns a cell, or the terminal advertises one
@@ -35,68 +27,62 @@ pub(crate) struct LinkSpan {
 /// itself, which keeps a Wikipedia-style `..._(disambiguation)` intact.
 const TRAILING_TRIM: &[char] = &['.', ',', ';', ':', '!', '?', '\'', '"', '>', ')', ']', '}'];
 
-/// Find where `links` and any bare URLs sit on one rendered row.
+/// Find where `links`, the OSC 8 runs the frame put on this row, and any bare
+/// URLs sit on one rendered row.
 ///
 /// Only a link [`crate::util::is_openable_link`] accepts under `extra_prefixes`
 /// is placed, so the painter, the click hit-test and the OSC 8 re-emitted to the
-/// host terminal all see the same set.
-///
-/// Matching on text is what makes the OSC 8 half survive scrolling, a reseed
-/// from `capture-pane`, or the sequence having left the stream: none of those
-/// preserve cell positions. A link whose text wraps two rows matches on neither.
+/// host terminal all see the same set. A run whose text the row does not show
+/// where the frame put it is not placed. A bare URL wrapped by the pane is cut
+/// at the edge rather than joined.
 pub(crate) fn link_spans_for_line(
     line: &ratatui::text::Line,
     width: u16,
-    links: &[crate::tmux::osc8::PaneLink],
+    links: &[crate::tmux::osc8::RowLink],
     extra_prefixes: &[String],
 ) -> Vec<LinkSpan> {
     if width == 0 {
         return Vec::new();
     }
     // Cheap reject before building the column map, which allocates a scratch
-    // buffer per row. Almost no row holds a link, and painting only truncates, so
-    // a needle absent from the raw text cannot appear in the painted row.
-    // `matchable` rejects empty needles, which `contains("")` would match on every
-    // row, defeating the reject entirely.
+    // buffer per row. Almost no row holds a link.
     let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    let usable: Vec<&crate::tmux::osc8::PaneLink> = links
+    let usable: Vec<&crate::tmux::osc8::RowLink> = links
         .iter()
-        .filter(|l| {
-            let needle = matchable(l);
-            !needle.is_empty()
-                && plain.contains(needle)
-                && crate::util::is_openable_link(&l.uri, extra_prefixes)
-        })
+        .filter(|l| crate::util::is_openable_link(&l.uri, extra_prefixes))
         .collect();
     if usable.is_empty() && !holds_scheme(&plain) {
         return Vec::new();
     }
 
-    let columns = line_columns(line, width);
     let mut candidates: Vec<Candidate> = Vec::new();
-
-    // Newest last in the table, so a later index is the more recent print.
-    for (rank, link) in usable.iter().enumerate() {
-        let needle = matchable(link);
-        let mut from = 0;
-        while let Some(offset) = columns.text[from..].find(needle) {
-            let start = from + offset;
-            let end = start + needle.len();
-            if word_aligned(&columns.text, start, end) {
+    if !usable.is_empty() {
+        let chars: Vec<char> = plain.chars().collect();
+        let (columns, painted) = char_columns(line, width);
+        for (rank, link) in usable.iter().enumerate() {
+            let len = link.text.chars().count();
+            let shown = chars
+                .get(link.start..link.start + len)
+                .is_some_and(|run| run.iter().copied().eq(link.text.chars()));
+            let (Some(Some(start)), true) = (columns.get(link.start), shown) else {
+                continue;
+            };
+            let end = columns[link.start + len].unwrap_or(painted);
+            if end > *start {
                 candidates.push(Candidate {
                     span: LinkSpan {
-                        start: columns.column_at(start),
-                        end: columns.column_at(end),
+                        start: *start,
+                        end,
                         uri: link.uri.clone(),
                     },
                     advertised: true,
                     rank,
                 });
             }
-            from = end;
         }
     }
 
+    let columns = line_columns(line, width);
     for (start, end) in bare_url_ranges(&columns.text) {
         let end_column = columns.column_at(end);
         // `columns.text` is the row as painted, so it stops where the pane does.
@@ -104,9 +90,7 @@ pub(crate) fn link_spans_for_line(
         // opening `https://example.com/log` for `https://example.com/logout` is a
         // wrong action, not a missing one. The boundary is not always `width`: a
         // wide grapheme that does not fit leaves the text a column short. Refuse
-        // anything reaching the end of a clipped row or the pane edge. An
-        // advertised target cannot hit this; a truncated label simply fails to
-        // match.
+        // anything reaching the end of a clipped row or the pane edge.
         if end_column >= width || (columns.is_clipped() && end == columns.text.len()) {
             continue;
         }
@@ -124,12 +108,41 @@ pub(crate) fn link_spans_for_line(
     resolve_overlaps(candidates)
 }
 
+/// The column each `char` of `line` starts painting at (one past the last
+/// included), `None` past what fits in `width`, and the columns painted. Same
+/// grapheme and width rules as [`line_columns`].
+fn char_columns(line: &ratatui::text::Line, width: u16) -> (Vec<Option<u16>>, u16) {
+    use ratatui::buffer::CellWidth;
+    use unicode_segmentation::UnicodeSegmentation;
+
+    let mut at = Vec::new();
+    let mut col = 0u16;
+    let mut clipped = false;
+    for span in &line.spans {
+        for grapheme in span.content.graphemes(true) {
+            let cells = if grapheme.contains(char::is_control) {
+                0
+            } else {
+                grapheme.cell_width()
+            };
+            clipped |= col + cells > width;
+            let start = (!clipped).then_some(col);
+            at.extend(std::iter::repeat_n(start, grapheme.chars().count()));
+            if !clipped {
+                col += cells;
+            }
+        }
+    }
+    at.push((!clipped).then_some(col));
+    (at, col)
+}
+
 /// A span before precedence has been applied.
 struct Candidate {
     span: LinkSpan,
     /// The pane said so, rather than the row text implying it.
     advertised: bool,
-    /// Position in the pane's link table; higher is more recently printed.
+    /// Position in the frame's link list; higher is lower on the pane.
     rank: usize,
 }
 
@@ -158,42 +171,6 @@ fn resolve_overlaps(mut candidates: Vec<Candidate>) -> Vec<LinkSpan> {
     }
     kept.sort_by_key(|s| s.start);
     kept
-}
-
-/// Shortest link text worth matching. Text matching cannot tell one occurrence
-/// of `1` from another, and a spurious span steals a click from the agent's own
-/// mouse handling, so anything this short is left to the host terminal.
-const MIN_LINK_TEXT: usize = 3;
-
-/// The text of `link` if it is long enough to identify a run on a row.
-fn matchable(link: &crate::tmux::osc8::PaneLink) -> &str {
-    let text = link.text.trim();
-    if text.chars().count() < MIN_LINK_TEXT {
-        return "";
-    }
-    text
-}
-
-/// Whether `text[start..end]` stands alone rather than sitting inside a longer
-/// word, so a `repo` link does not arm every `repository` on the row.
-fn word_aligned(text: &str, start: usize, end: usize) -> bool {
-    let before_ok = text[..start]
-        .chars()
-        .next_back()
-        .is_none_or(|c| !c.is_alphanumeric());
-    let after_ok = text[end..]
-        .chars()
-        .next()
-        .is_none_or(|c| !c.is_alphanumeric());
-    let starts_word = text[start..end]
-        .chars()
-        .next()
-        .is_some_and(char::is_alphanumeric);
-    let ends_word = text[start..end]
-        .chars()
-        .next_back()
-        .is_some_and(char::is_alphanumeric);
-    (!starts_word || before_ok) && (!ends_word || after_ok)
 }
 
 /// Whether `text` holds anything that could open a URL, matched without
@@ -262,21 +239,30 @@ mod tests {
     use ratatui::style::{Color, Style};
     use ratatui::text::{Line, Span};
 
-    fn link(text: &str, uri: &str) -> crate::tmux::osc8::PaneLink {
-        crate::tmux::osc8::PaneLink {
+    fn link(start: usize, text: &str, uri: &str) -> crate::tmux::osc8::RowLink {
+        crate::tmux::osc8::RowLink {
+            row: 0,
+            start,
             text: text.to_string(),
             uri: uri.to_string(),
         }
     }
 
-    fn spans(row: &str, width: u16, links: &[crate::tmux::osc8::PaneLink]) -> Vec<LinkSpan> {
+    fn spans(row: &str, width: u16, links: &[crate::tmux::osc8::RowLink]) -> Vec<LinkSpan> {
         link_spans_for_line(&Line::from(row.to_string()), width, links, &[])
+    }
+
+    fn placed(found: &[LinkSpan]) -> Vec<(u16, u16, &str)> {
+        found
+            .iter()
+            .map(|s| (s.start, s.end, s.uri.as_str()))
+            .collect()
     }
 
     #[test]
     fn a_non_web_target_is_placed_only_under_an_allowed_prefix() {
         let line = Line::from("see notes/a.md here");
-        let links = [link("notes/a.md", "vscode://file/Users/u/notes/a.md")];
+        let links = [link(4, "notes/a.md", "vscode://file/Users/u/notes/a.md")];
         assert!(link_spans_for_line(&line, 40, &links, &[]).is_empty());
         let found = link_spans_for_line(&line, 40, &links, &["vscode://file/".to_string()]);
         assert_eq!(found.len(), 1);
@@ -284,52 +270,90 @@ mod tests {
     }
 
     #[test]
-    fn osc8_spans_locate_the_target_by_display_column() {
-        let links = vec![link("the AoE repo", "https://example.com/aoe")];
-        // (row text, pane width, expected `[start, end)` column spans)
-        type Case = (&'static str, u16, Vec<(u16, u16)>);
-        let cases: [Case; 5] = [
-            // The reported case: the visible text hides the target.
-            ("see the AoE repo now", 40, vec![(4, 16)]),
-            // Wide graphemes occupy both of their columns, so the span starts
-            // and ends where the terminal painted the text.
-            ("漢字 the AoE repo", 40, vec![(5, 17)]),
-            // Two prints of the same link are two spans.
-            ("the AoE repo the AoE repo", 40, vec![(0, 12), (13, 25)]),
-            // Text that scrolled away or never matched marks nothing.
-            ("unrelated output", 40, vec![]),
-            // A row too narrow to hold the whole text has no span on it.
-            ("the AoE repo", 6, vec![]),
+    fn osc8_runs_are_placed_where_the_frame_put_them() {
+        const A: &str = "https://a.example";
+        const B: &str = "https://b.example";
+        type Case = (
+            &'static str,
+            &'static str,
+            u16,
+            Vec<crate::tmux::osc8::RowLink>,
+            Vec<(u16, u16, &'static str)>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "the visible text hides the target",
+                "see the AoE repo now",
+                40,
+                vec![link(4, "the AoE repo", A)],
+                vec![(4, 16, A)],
+            ),
+            (
+                "wide graphemes occupy both of their columns",
+                "\u{6f22}\u{5b57} the AoE repo",
+                40,
+                vec![link(3, "the AoE repo", A)],
+                vec![(5, 17, A)],
+            ),
+            (
+                "a repeated label keeps each run's own target",
+                "see docs and docs",
+                40,
+                vec![link(4, "docs", A), link(13, "docs", B)],
+                vec![(4, 8, A), (13, 17, B)],
+            ),
+            (
+                "the same text outside the run stays plain",
+                "docs: see docs",
+                40,
+                vec![link(10, "docs", A)],
+                vec![(10, 14, A)],
+            ),
+            (
+                "a short wrapped tail is still a link",
+                "er, and then",
+                40,
+                vec![link(0, "er", A)],
+                vec![(0, 2, A)],
+            ),
+            (
+                "a run the row does not show there is not placed",
+                "see the docs",
+                40,
+                vec![link(4, "docs", A)],
+                vec![],
+            ),
+            (
+                "a run the pane edge cuts is placed up to the edge",
+                "the AoE repo",
+                6,
+                vec![link(0, "the AoE repo", A)],
+                vec![(0, 6, A)],
+            ),
+            (
+                "a run past the pane edge is not placed",
+                "the AoE repo",
+                3,
+                vec![link(4, "AoE", A)],
+                vec![],
+            ),
         ];
-        for (row, width, expected) in cases {
-            let found = spans(row, width, &links);
-            assert_eq!(
-                found.iter().map(|s| (s.start, s.end)).collect::<Vec<_>>(),
-                expected,
-                "{row:?} at width {width}"
-            );
-            assert!(found.iter().all(|s| s.uri == "https://example.com/aoe"));
+        for (name, row, width, links, want) in cases {
+            assert_eq!(placed(&spans(row, width, &links)), want, "{name}");
         }
     }
 
     #[test]
     fn osc8_spans_ignore_styling_around_the_text() {
-        // `ansi-to-tui` splits a styled row into several spans; the match runs
-        // over the painted cells, not one span's string.
+        // `ansi-to-tui` splits a styled row into several spans; the run's
+        // offset counts the characters of all of them.
         let line = Line::from(vec![
             Span::raw("see "),
             Span::styled("the AoE", Style::default().fg(Color::Green)),
             Span::raw(" repo"),
         ]);
-        let found = link_spans_for_line(&line, 40, &[link("the AoE repo", "https://a.co")], &[]);
-        assert_eq!(
-            found,
-            vec![LinkSpan {
-                start: 4,
-                end: 16,
-                uri: "https://a.co".to_string(),
-            }]
-        );
+        let found = link_spans_for_line(&line, 40, &[link(4, "the AoE repo", "https://a.co")], &[]);
+        assert_eq!(placed(&found), vec![(4, 16, "https://a.co")]);
     }
 
     #[test]
@@ -367,76 +391,8 @@ mod tests {
             ("nothing here", vec![]),
         ];
         for (row, expected) in cases {
-            let found = spans(row, 60, &[]);
-            assert_eq!(
-                found
-                    .iter()
-                    .map(|s| (s.start, s.end, s.uri.as_str()))
-                    .collect::<Vec<_>>(),
-                expected,
-                "{row:?}"
-            );
+            assert_eq!(placed(&spans(row, 60, &[])), expected, "{row:?}");
         }
-    }
-
-    #[test]
-    fn the_same_text_twice_resolves_to_one_target_everywhere() {
-        // An agent that prints [docs](A) then [docs](B) leaves both in the
-        // table. Whatever the painter, the OSC 8 emission and the click agree
-        // on, they must agree: a click opening A while the terminal reports B
-        // on hover is a silent shadowing vector.
-        let found = spans(
-            "see the docs now",
-            40,
-            &[
-                link("the docs", "https://a.example"),
-                link("the docs", "https://b.example"),
-            ],
-        );
-        assert_eq!(found.len(), 1, "one span owns those cells: {found:?}");
-        // The more recently printed target wins.
-        assert_eq!(found[0].uri, "https://b.example");
-    }
-
-    #[test]
-    fn a_longer_link_text_owns_cells_a_shorter_one_sits_inside() {
-        let found = spans(
-            "open the AoE repo now",
-            40,
-            &[
-                link("repo", "https://short.example"),
-                link("the AoE repo", "https://long.example"),
-            ],
-        );
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].uri, "https://long.example");
-        assert_eq!((found[0].start, found[0].end), (5, 17));
-    }
-
-    #[test]
-    fn short_and_mid_word_texts_do_not_arm_spans() {
-        // A spurious span steals the click from a mouse-tracking agent, so
-        // text this weak is left to the host terminal.
-        assert!(
-            spans(
-                "step 1 of 11 (1 done)",
-                40,
-                &[link("1", "https://a.example")]
-            )
-            .is_empty(),
-            "a single character identifies nothing"
-        );
-        assert!(
-            spans("that is okay", 40, &[link("ok", "https://a.example")]).is_empty(),
-            "two characters identify nothing"
-        );
-        assert!(
-            spans("the repository", 40, &[link("repo", "https://a.example")]).is_empty(),
-            "a word fragment is not the link"
-        );
-        // The same text standing alone is a real match.
-        let found = spans("the repo here", 40, &[link("repo", "https://a.example")]);
-        assert_eq!(found.len(), 1, "{found:?}");
     }
 
     #[test]
@@ -455,21 +411,16 @@ mod tests {
         assert_eq!(found[0].uri, "https://example.com/logout");
     }
 
-    /// A label or a URL containing wide graphemes must resolve. Reading the
-    /// painted row back out of a scratch buffer used to insert a space after
-    /// every wide cell, so neither could ever match.
     #[test]
-    fn wide_graphemes_do_not_break_matching() {
+    fn wide_graphemes_do_not_break_placement() {
         let found = spans(
             "見る 日本語ドキュメント です",
             60,
-            &[link("日本語ドキュメント", "https://example.com/ja")],
+            &[link(3, "日本語ドキュメント", "https://example.com/ja")],
         );
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].uri, "https://example.com/ja");
         // 見る = 4 columns, space = 1, so the label starts at column 5 and
         // spans 9 wide graphemes = 18 columns.
-        assert_eq!((found[0].start, found[0].end), (5, 23));
+        assert_eq!(placed(&found), vec![(5, 23, "https://example.com/ja")]);
 
         // The same for a bare URL carrying a wide path segment.
         let bare = spans("see https://example.com/日本 now", 60, &[]);
@@ -485,6 +436,7 @@ mod tests {
             "https://example.com/shown",
             60,
             &[link(
+                0,
                 "https://example.com/shown",
                 "https://example.com/real",
             )],
@@ -498,16 +450,14 @@ mod tests {
         let found = spans(
             "the AoE repo and https://example.com/b",
             60,
-            &[link("the AoE repo", "https://example.com/a")],
+            &[link(0, "the AoE repo", "https://example.com/a")],
         );
         assert_eq!(
-            found
-                .iter()
-                .map(|s| s.uri.as_str())
-                .collect::<std::collections::HashSet<_>>(),
-            ["https://example.com/a", "https://example.com/b"]
-                .into_iter()
-                .collect()
+            placed(&found),
+            vec![
+                (0, 12, "https://example.com/a"),
+                (17, 38, "https://example.com/b")
+            ]
         );
     }
 }

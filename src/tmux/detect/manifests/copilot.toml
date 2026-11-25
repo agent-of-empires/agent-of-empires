@@ -15,6 +15,20 @@ contains_any = [
   "esc to cancel",
 ]
 
+[[rules]]
+extends = "approval_choice"
+id = "approval_choice"
+priority = 950
+
+# The permission dialog's choice rows, which name the tool mid-label.
+[[rules]]
+id = "permission_choice"
+state = "waiting"
+priority = 945
+region = "whole_recent"
+visible = true
+line_regex = ['(?i)^[\s\x{2502}]*(?:[\x{276F}\x{203A}>]\s*)?\d\.\s+(?:yes, and approve\b.*\bfor the rest of the running session|no, and tell copilot what to do differently)']
+
 # The parked footer (`/ commands · ? help · tab next tab`), or the input prompt
 # itself.
 [[rules]]

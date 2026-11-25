@@ -134,6 +134,48 @@ pub(crate) struct UnfinishedToolOutput<Text = String> {
     pub(crate) first_seq: u64,
 }
 
+#[derive(Default)]
+pub(crate) struct RetainedTranscript {
+    pub rows: Vec<TranscriptRow>,
+    pub row_seq: std::collections::HashMap<String, u64>,
+    pub tool_start_seq: std::collections::HashMap<String, u64>,
+}
+
+#[derive(Default)]
+pub(crate) struct RetainedTranscriptBuilder {
+    model: TranscriptModel,
+    transcript: RetainedTranscript,
+}
+
+impl RetainedTranscriptBuilder {
+    pub(crate) fn apply(&mut self, seq: u64, event: &Event) {
+        let explicit_start = matches!(event, Event::ToolCallStarted { .. });
+        for delta in self.model.apply_event(seq, event) {
+            let row = match delta {
+                TranscriptDelta::Append(row) => {
+                    self.transcript.row_seq.insert(row.id.clone(), seq);
+                    row
+                }
+                TranscriptDelta::Patch { row, .. } => row,
+                TranscriptDelta::Remove(id) => {
+                    self.transcript.row_seq.remove(&id);
+                    continue;
+                }
+            };
+            if explicit_start && row.kind == TranscriptRowKind::ToolStart {
+                if let Some(id) = row.tool_call_id {
+                    self.transcript.tool_start_seq.insert(id, seq);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> RetainedTranscript {
+        self.transcript.rows = self.model.into_rows();
+        self.transcript
+    }
+}
+
 /// Folds ACP events through the shared transcript reducer.
 #[derive(Debug, Clone, Default)]
 pub struct TranscriptModel {
