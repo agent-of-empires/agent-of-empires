@@ -846,6 +846,17 @@ impl GroupByMode {
     }
 }
 
+/// Decodes an optional value, reading one this build cannot decode (such as a removed enum
+/// variant) as `None`.
+fn unknown_as_none<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Option::<toml::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| value.try_into().ok()))
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppStateConfig {
     #[serde(default)]
@@ -931,10 +942,20 @@ pub struct AppStateConfig {
     #[serde(default)]
     pub has_acknowledged_volume_ignores_globs: bool,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Lenient so a removed order still loads before migration v064 rewrites it.
+    #[serde(
+        default,
+        deserialize_with = "unknown_as_none",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub sort_order: Option<SortOrder>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Lenient so a removed grouping still loads before migration v064 rewrites it.
+    #[serde(
+        default,
+        deserialize_with = "unknown_as_none",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub group_by: Option<GroupByMode>,
 
     /// Last directory the user navigated to in the new-session dir picker.
@@ -1557,9 +1578,9 @@ pub struct SessionConfig {
     pub strict_hotkeys: bool,
 
     /// Default snooze for `aoe session snooze` (1-43200 min, picker overrides).
-    /// During the snooze window the session is treated like archive: sinks to
-    /// the bottom, renders italic+dim with a `z ` prefix, then rejoins the
-    /// active list when the timer expires.
+    /// The TUI keeps a snoozed row in place, dimmed with a `z ` prefix and its
+    /// remaining time; the web dashboard sinks it. Either way it returns to
+    /// normal when the timer expires.
     #[serde(default = "default_snooze_duration_minutes")]
     #[setting(
         label = "Snooze for",
@@ -1567,7 +1588,7 @@ pub struct SessionConfig {
         min = 1,
         max = 43200,
         validate = "range:1:43200",
-        summary = "How long a Snooze lasts. Snoozed Sessions sink to the bottom and come back when it ends."
+        summary = "How long a Snooze lasts. Snoozed Sessions come back to normal when it ends."
     )]
     pub snooze_duration_minutes: u32,
 
@@ -5816,6 +5837,34 @@ mod tests {
 
         update_app_state(|state| state.has_seen_welcome = true).unwrap();
         assert!(Config::load().unwrap().app_state.has_seen_welcome);
+    }
+
+    /// Removed sorts and groupings read as unpicked, so Config loads before v064 rewrites them.
+    #[test]
+    fn removed_sort_and_grouping_values_load_as_unpicked() {
+        for (sort, group) in [
+            ("newest", "manual"),
+            ("oldest", "org"),
+            ("attention", "status"),
+            ("last_activity", "manual"),
+            ("a_z", "org"),
+            ("z_a", "status"),
+        ] {
+            let state: AppStateConfig = toml::from_str(&format!(
+                "sort_order = \"{sort}\"\ngroup_by = \"{group}\"\nhas_seen_welcome = true\n"
+            ))
+            .unwrap();
+            assert_eq!(
+                (state.sort_order, state.group_by),
+                (None, None),
+                "{sort}/{group}"
+            );
+            assert!(state.has_seen_welcome);
+        }
+        let state: AppStateConfig =
+            toml::from_str("sort_order = \"name\"\ngroup_by = \"group\"\n").unwrap();
+        assert_eq!(state.sort_order, Some(SortOrder::Name));
+        assert_eq!(state.group_by, Some(GroupByMode::Group));
     }
 
     /// A blank or absent `default_image` is the automatic image; a request

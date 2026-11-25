@@ -1156,6 +1156,36 @@ fn test_archive_selected_group_project_mode() {
     assert_eq!(submitted, expected);
 }
 
+/// Under Repository, rename and delete refuse every header, naming a nested Group as the
+/// user's own rather than as automatic.
+#[test]
+#[serial]
+fn repository_mode_header_refusals_name_what_was_selected() {
+    let (_temp, _guard) = test_home();
+    let mut view = test_view(Some("test"));
+    view.group_by = crate::session::config::GroupByMode::Project;
+    let archived = crate::session::archived_project_sub_path("alpha");
+    for (path, title) in [
+        ("alpha", "Cannot Modify Repository Headers"),
+        (archived.as_str(), "Cannot Modify Repository Headers"),
+        ("alpha/work", "Manage Groups Under My Groups"),
+    ] {
+        for open in [
+            HomeView::open_rename_for_selected,
+            HomeView::open_delete_for_selected,
+        ] {
+            view.info_dialog = None;
+            view.selected_group = Some(path.to_string());
+            open(&mut view);
+            assert_eq!(
+                view.info_dialog.as_ref().map(|d| d.title()),
+                Some(title),
+                "{path}"
+            );
+        }
+    }
+}
+
 /// The group-level prompt opens a confirmation carrying the `archive_group` action and
 /// counts only active members, and no-ops silently when nothing is left to archive.
 #[test]

@@ -4989,18 +4989,26 @@ impl HomeView {
         }
     }
 
-    /// Info-dialog copy for a rename/delete attempted on a header the Repository grouping
-    /// derives, where there is no user-owned group to act on. `None` under My groups, where
-    /// the caller proceeds with its normal flow.
-    fn automatic_group_hint(&self) -> Option<(String, String)> {
+    /// Info-dialog copy for a rename/delete attempted on a header under the Repository grouping.
+    /// `None` under My groups, where the caller proceeds with its normal flow.
+    fn automatic_group_hint(&self, path: &str) -> Option<(String, String)> {
         if self.group_by == GroupByMode::Group {
             return None;
         }
         let toggle = if self.strict_hotkeys { "Ctrl+G" } else { "'g'" };
-        Some((
-            "Cannot Modify Repository Headers".to_string(),
-            format!("Repository headers are automatic. Press {toggle} and pick My groups to manage groups."),
-        ))
+        let nested_group = !crate::session::is_synthetic_project_header(path)
+            && super::rows::split_project_view_path(path).1.is_some();
+        Some(if nested_group {
+            (
+                "Manage Groups Under My Groups".to_string(),
+                format!("This is one of your Groups. Press {toggle} and pick My groups to rename or delete it."),
+            )
+        } else {
+            (
+                "Cannot Modify Repository Headers".to_string(),
+                format!("Repository headers are automatic. Press {toggle} and pick My groups to manage groups."),
+            )
+        })
     }
 
     fn collapse_group_at_cursor(&mut self) {
@@ -6053,7 +6061,7 @@ impl HomeView {
             self.group_rename_context = None;
             self.rename_dialog = Some(dialog);
         } else if let Some(group_path) = &self.selected_group {
-            if let Some((title, hint)) = self.automatic_group_hint() {
+            if let Some((title, hint)) = self.automatic_group_hint(group_path) {
                 self.info_dialog = Some(InfoDialog::new(&title, &hint));
                 return;
             }
@@ -6250,7 +6258,7 @@ impl HomeView {
                 }
             }
         } else if let Some(group_path) = &self.selected_group {
-            if let Some((title, hint)) = self.automatic_group_hint() {
+            if let Some((title, hint)) = self.automatic_group_hint(group_path) {
                 self.info_dialog = Some(InfoDialog::new(&title, &hint));
                 return;
             }
