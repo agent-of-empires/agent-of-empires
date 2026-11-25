@@ -333,6 +333,16 @@ pub struct WorkspaceOrderingPatch {
     pub base: Option<WorkspaceOrderingBase>,
 }
 
+/// The row order a move under Name or Newest first shows, which it commits as the shared
+/// Custom order with the move. The move is refused as stale once `base` no longer matches
+/// the stored orders.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenOrder {
+    pub order: Vec<String>,
+    pub base: WorkspaceOrderingBase,
+}
+
 /// The stored row and Repository header orders, as published in a runtime snapshot.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -431,12 +441,16 @@ pub enum ReorderBody {
         id: String,
         profile: String,
         source_group: String,
-        destination: String,
+        /// Omitted, the source group, which leaves the row where it is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        destination: Option<String>,
         direction: MoveDirection,
         /// Every header path in the order the Client shows them, which the stored group
         /// order then keeps. Omitted, the stored order stays.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         headers: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        freeze: Option<FrozenOrder>,
     },
     Group {
         group: GroupLocation,
@@ -446,6 +460,8 @@ pub enum ReorderBody {
         /// order.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         siblings: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        freeze: Option<FrozenOrder>,
     },
 }
 

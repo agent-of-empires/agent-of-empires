@@ -714,6 +714,31 @@ pub(crate) fn writable_repository_order(mut order: Vec<String>) -> Vec<String> {
     order
 }
 
+/// The 413 response for an order longer, or with an entry longer, than a write accepts.
+pub(crate) fn oversized_order(list: &[String]) -> Option<axum::response::Response> {
+    let message = if list.len() > MAX_ORDER_ENTRIES {
+        format!(
+            "order has {} entries, max is {}",
+            list.len(),
+            MAX_ORDER_ENTRIES
+        )
+    } else {
+        let bad = list.iter().find(|e| e.len() > MAX_ORDER_ENTRY_LEN)?;
+        format!(
+            "order entry is {} bytes, max is {}",
+            bad.len(),
+            MAX_ORDER_ENTRY_LEN
+        )
+    };
+    Some(
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({ "message": message })),
+        )
+            .into_response(),
+    )
+}
+
 #[derive(serde::Serialize)]
 struct WorkspaceOrderingResponse<'a> {
     order: &'a [String],
@@ -737,25 +762,12 @@ pub async fn update_workspace_ordering(
         Err(rej) => return rej.into_response(),
     };
 
-    for list in [&body.order, &body.repositories].into_iter().flatten() {
-        if list.len() > MAX_ORDER_ENTRIES {
-            return (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                Json(serde_json::json!({
-                    "message": format!("order has {} entries, max is {}", list.len(), MAX_ORDER_ENTRIES)
-                })),
-            )
-                .into_response();
-        }
-        if let Some(bad) = list.iter().find(|e| e.len() > MAX_ORDER_ENTRY_LEN) {
-            return (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                Json(serde_json::json!({
-                    "message": format!("order entry is {} bytes, max is {}", bad.len(), MAX_ORDER_ENTRY_LEN)
-                })),
-            )
-                .into_response();
-        }
+    if let Some(refused) = [&body.order, &body.repositories]
+        .into_iter()
+        .flatten()
+        .find_map(|list| oversized_order(list))
+    {
+        return refused;
     }
     // A request dropped while it waits for the guards leaves nothing behind; once it holds
     // them, the spawned commit owns them through reconciliation.

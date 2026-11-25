@@ -1161,9 +1161,16 @@ impl HomeView {
         let namespace = self.session_feed.drain_namespace_result();
         let mut changed = !row_outcomes.is_empty() || namespace.is_some();
         match self.session_feed.drain_workspace_ordering_result() {
-            Some(Err(error)) => {
+            Some(Err(failure)) => {
                 self.pending_order_change = None;
-                self.flash_status(format!("Order not saved: {error}"));
+                self.flash_status(match failure {
+                    crate::tui::session_feed::ViewWriteFailure::Refused(error) => {
+                        format!("Order not saved: {error}")
+                    }
+                    crate::tui::session_feed::ViewWriteFailure::Unconfirmed(error) => format!(
+                        "Order change unconfirmed ({error}); check the list before moving again"
+                    ),
+                });
                 changed = true;
             }
             Some(Ok(crate::tui::session_feed::ViewWriteSettled::Applied(receipt))) => {
@@ -1181,9 +1188,16 @@ impl HomeView {
             _ => {}
         }
         if let Some(result) = self.session_feed.drain_sidebar_view_result() {
-            if let Err(error) = result {
-                self.flash_status(format!("Grouping and sort not saved: {error}"));
-                changed = true;
+            match result {
+                Err(error) => {
+                    if !self.sort_restore_failed(&error) {
+                        self.flash_status(format!("Grouping and sort not saved: {error}"));
+                    }
+                    changed = true;
+                }
+                // A queued pick still on its way may carry the sort Undo restores.
+                Ok(()) if !self.session_feed.sidebar_view_pending() => self.sort_restore = None,
+                Ok(()) => {}
             }
             // Snapshots applied while the write was pending were not shown or recorded, so
             // converge on the Daemon's value, which may carry another Client's change.
@@ -1339,15 +1353,15 @@ impl HomeView {
                     }
                     NamespaceOutcome::Reordered(outcome) => match outcome {
                         ReorderOutcome::Moved { destination } => {
-                            let freeze = match intent {
-                                Some(NamespaceIntent::ReorderSession { id, freeze }) => {
+                            let switch = match intent {
+                                Some(NamespaceIntent::ReorderSession { id, switch }) => {
                                     self.follow_committed_reorder(&id, destination.as_ref());
-                                    freeze
+                                    switch
                                 }
-                                Some(NamespaceIntent::ReorderGroup { freeze }) => {
+                                Some(NamespaceIntent::ReorderGroup { switch }) => {
                                     self.rebuild_flat_items_keeping_cursor();
                                     self.update_selected();
-                                    freeze
+                                    switch
                                 }
                                 _ => {
                                     self.rebuild_flat_items_keeping_cursor();
@@ -1355,8 +1369,8 @@ impl HomeView {
                                     None
                                 }
                             };
-                            if let Some(order) = freeze {
-                                self.switch_to_custom_after_move(order);
+                            if let Some(change) = switch {
+                                self.order_change_committed(change, &receipt.cursor);
                             }
                         }
                         ReorderOutcome::AtEdge => {}

@@ -183,14 +183,14 @@ pub(super) enum NamespaceIntent {
     Plain,
     ProfileCreated(String),
     ProfileDeleted(String),
-    /// `freeze` is the order on screen under Name, written once the move commits so the
-    /// list switches to Custom looking as it did.
+    /// `switch` turns the sort to Custom once a move under Name or Newest first commits
+    /// the order on screen with it.
     ReorderSession {
         id: String,
-        freeze: Option<Vec<String>>,
+        switch: Option<reorder::OrderChange>,
     },
     ReorderGroup {
-        freeze: Option<Vec<String>>,
+        switch: Option<reorder::OrderChange>,
     },
 }
 
@@ -305,8 +305,10 @@ pub struct HomeView {
     pub(in crate::tui) observed_sidebar_view: Option<crate::session::config::SidebarView>,
     /// An order write that offers Undo once it commits.
     pending_order_change: Option<reorder::OrderChange>,
-    /// What "Undo last order change" writes back.
+    /// What "Undo switch to Custom" writes back.
     order_undo: Option<reorder::UndoPoint>,
+    /// The sort an Undo is writing back, kept until that write settles.
+    sort_restore: Option<crate::session::config::SortOrder>,
     session_feed_reload_retry_at: Option<std::time::Instant>,
     session_feed_failed_cursor: Option<crate::daemon::RuntimeCursor>,
     canonical_metadata_lag: Option<CanonicalMetadataLagState>,

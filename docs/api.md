@@ -452,14 +452,17 @@ The response is an object, not a bare array:
   workspace's position in this list.
 - `repository_order`: repository paths in the shared Custom order of the
   Repository headers; headers not listed come first, newest first.
-- `sidebar_view`: the grouping and sort every Client shows (see
-  `PATCH /api/sidebar-view`).
+- `sidebar_view`: the grouping and sort the Daemon publishes, which the TUI
+  follows (see `PATCH /api/sidebar-view`).
 
 `PUT /api/workspace-ordering` takes `{"order": [...], "repositories": [...]}`;
 an omitted list keeps its value and an empty one clears it. An optional
 `"base": {"order": [...], "repositories": [...]}` names the stored orders the
 write was built from; when either no longer matches, the write is refused with
-409.
+409. Take `base.order` from the runtime snapshot's `placed_workspaces` and
+`base.repositories` from its `repository_order`, not from `workspace_ordering`,
+which also lists workspaces never placed. The response holds the merged `order`
+and the stored `repositories`, so its `order` is not the next write's base.
 
 Clients written against the historical bare-array response must be updated to
 read `sessions`; the array is never returned unwrapped.

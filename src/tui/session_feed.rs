@@ -281,6 +281,23 @@ enum PendingWrite {
     Committed(RuntimeCursor),
 }
 
+/// Why a shared-order or sidebar-view write did not settle.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ViewWriteFailure {
+    /// The Daemon refused it.
+    Refused(String),
+    /// The reply was lost, so it may have committed.
+    Unconfirmed(String),
+}
+
+impl std::fmt::Display for ViewWriteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(message) | Self::Unconfirmed(message) => f.write_str(message),
+        }
+    }
+}
+
 /// How a shared-order or sidebar-view write the Daemon accepted settled.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ViewWriteSettled {
@@ -343,6 +360,12 @@ impl CapturedViewWrite {
             .map_err(CommandFailure::Rejected);
         assert!(self.reply.send(reply).is_ok());
         self.write
+    }
+
+    /// Ends the write as if its reply were lost after the Daemon admitted it.
+    pub fn finish_unconfirmed(self, message: &str) {
+        let reply = Err(CommandFailure::Unknown(message.into()));
+        assert!(self.reply.send(reply).is_ok());
     }
 }
 
@@ -1287,7 +1310,7 @@ impl SessionFeed {
         let result = self.poll_write(&mut slot);
         self.pending_sidebar_view = slot;
         // The view converges on whichever Daemon's value is applied.
-        let result = result?.map(|_| ());
+        let result = result?.map(|_| ()).map_err(|failure| failure.to_string());
         let Some(queued) = self.queued_sidebar_view.take() else {
             return Some(result);
         };
@@ -1312,7 +1335,7 @@ impl SessionFeed {
     /// superseded receipt apart so the move it confirms does not continue.
     pub(crate) fn drain_workspace_ordering_result(
         &mut self,
-    ) -> Option<Result<ViewWriteSettled, String>> {
+    ) -> Option<Result<ViewWriteSettled, ViewWriteFailure>> {
         let mut slot = self.pending_ordering.take();
         let result = self.poll_write(&mut slot);
         self.pending_ordering = slot;
@@ -1322,7 +1345,7 @@ impl SessionFeed {
     fn poll_write(
         &self,
         slot: &mut Option<PendingWrite>,
-    ) -> Option<Result<ViewWriteSettled, String>> {
+    ) -> Option<Result<ViewWriteSettled, ViewWriteFailure>> {
         let failure = match slot.as_mut()? {
             PendingWrite::Sent(receiver) => match receiver.try_recv() {
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return None,
@@ -1331,12 +1354,11 @@ impl SessionFeed {
                     return self.poll_write(slot);
                 }
                 Ok(Err(
-                    CommandFailure::Rejected(message)
-                    | CommandFailure::CreateHookFailed(message)
-                    | CommandFailure::Unknown(message),
-                )) => message,
+                    CommandFailure::Rejected(message) | CommandFailure::CreateHookFailed(message),
+                )) => ViewWriteFailure::Refused(message),
+                Ok(Err(CommandFailure::Unknown(message))) => ViewWriteFailure::Unconfirmed(message),
                 Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                    "the runtime connection closed".to_string()
+                    ViewWriteFailure::Unconfirmed("the runtime connection closed".to_string())
                 }
             },
             PendingWrite::Committed(cursor) => {

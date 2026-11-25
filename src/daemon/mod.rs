@@ -40,7 +40,7 @@ pub use wire::{
     CreateProjectBody, CreateSessionBody, CreationTrustFingerprint, CreationTrustRequest,
     CreationTrustReview, DefaultProfileBody, DeleteGroupBody, DeleteGroupMode, DeleteGroupOutcome,
     DeleteProfileQuery, DeleteSessionBody, EmptyTrashBody, EmptyTrashOutcome, EnsureToolBody,
-    GroupLocation, GroupSessionFailure, GroupSessionFailureCode, GroupSessionOutcome,
+    FrozenOrder, GroupLocation, GroupSessionFailure, GroupSessionFailureCode, GroupSessionOutcome,
     ListSessionsQuery, MoveDirection, MoveGroupBody, PendingApproval, PlanSummary,
     PromptAttachmentKind, PromptAttachmentRef, PromptOrigin, PurgeOutcome, QueuedPromptEntry,
     ReclaimOwnershipBody, RenameOutcome, RenameProfileBody, RenameSessionBody, ReorderBody,

@@ -3721,11 +3721,6 @@ impl HomeView {
             ActionId::Tips => self.open_tips_dialog(),
             ActionId::Fork => self.open_fork_from_selection(),
             ActionId::EmptyTrash => self.prompt_empty_trash(),
-            ActionId::ResetCustomOrder => {
-                if let Err(e) = self.reset_custom_order() {
-                    self.info_dialog = Some(InfoDialog::new("Order not reset", &e.to_string()));
-                }
-            }
             ActionId::UndoOrderChange => {
                 if let Err(e) = self.undo_order_change() {
                     self.info_dialog = Some(InfoDialog::new("Order not restored", &e.to_string()));

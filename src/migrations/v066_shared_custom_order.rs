@@ -5,15 +5,16 @@
 //! `web_ui_state` (`aoe-repo-group-order-v1`, Repository headers). `workspace-ordering.json`
 //! is now the one store. Where the dashboard has none, the sort v064 left in
 //! `legacy_sort_order` seeds it, so the list keeps the order it had: the TUI order under
-//! Custom, the removed sort's order under Oldest or Last activity, and nothing otherwise.
+//! Custom, the removed sort's order under Oldest or Last activity, and nothing otherwise:
+//! Newest first and Name are sorts of their own.
 //! A `sort_index` left from an earlier Custom stint is not what the user saw, so it is
 //! dropped unused. The dashboard's header order is copied, not removed, because the
 //! dashboard still reads it. `sort_index` and `legacy_sort_order` are dropped only after
 //! the shared order is written, so an interrupted run retries from them. An install that
 //! ran an earlier v064 without `legacy_sort_order` falls back to the sort v064 left.
 //! A `sessions.json` that cannot be read is left untouched and the run completes without
-//! it; the sort is kept in `PENDING_FILE`, and `aoe migrate` adds the repaired profile's
-//! order to the shared one.
+//! it; the sort and the skipped files are kept in `PENDING_FILE`, and a later run, `aoe
+//! migrate` or a retried upgrade, adds only those profiles' order to the shared one.
 
 use super::sessions_file;
 use super::v064_shared_sidebar_view::{web_effective_sort, LEGACY_SORT_KEY, WEB_SORT_KEY};
@@ -26,7 +27,8 @@ use std::path::Path;
 use tracing::{info, warn};
 
 const WEB_REPO_ORDER_KEY: &str = "aoe-repo-group-order-v1";
-/// The legacy sort, kept while a skipped `sessions.json` still owes its order.
+/// The legacy sort on its first line, then the `sessions.json` paths, relative to the app
+/// directory, that still owe their order.
 const PENDING_FILE: &str = ".v065_custom_order_pending";
 
 pub fn run() -> Result<()> {
@@ -55,20 +57,38 @@ struct LiveRow {
 
 fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
     let pending_path = app_dir.join(PENDING_FILE);
-    let pending = read_if_present(&pending_path)?.map(|sort| sort.trim().to_owned());
+    let pending_file = read_if_present(&pending_path)?;
+    let mut pending_lines = pending_file.as_deref().map(str::lines);
+    let pending = pending_lines
+        .as_mut()
+        .and_then(Iterator::next)
+        .map(|sort| sort.trim().to_owned());
+    // Profiles an earlier run migrated are done; only the skipped ones still seed.
+    let owed: Option<Vec<&str>> = pending_lines.map(|lines| lines.map(str::trim).collect());
     if pass == Pass::Recovery && pending.is_none() {
         return Ok(());
     }
     let mut placed: Vec<(u64, Option<Timestamp>, String)> = Vec::new();
     let mut live: Vec<LiveRow> = Vec::new();
     let mut to_strip: Vec<(std::path::PathBuf, String)> = Vec::new();
-    let mut skipped = false;
+    let mut skipped: Vec<String> = Vec::new();
     for path in sessions_file::session_files(app_dir)? {
+        let relative = path
+            .strip_prefix(app_dir)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+        if owed
+            .as_ref()
+            .is_some_and(|owed| !owed.contains(&relative.as_str()))
+        {
+            continue;
+        }
         let (content, rows) = match read_session_rows(&path) {
             SessionList::Rows(content, rows) => (content, rows),
             SessionList::Missing => continue,
             SessionList::Unreadable => {
-                skipped = true;
+                skipped.push(relative);
                 continue;
             }
         };
@@ -116,7 +136,7 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
             .clone()
             .or(pending)
             .or_else(|| sort_left_by_v064(state.as_ref())),
-        Pass::Recovery => pending,
+        Pass::Recovery => pending.clone(),
     };
 
     let ordering_path = app_dir.join("workspace-ordering.json");
@@ -143,11 +163,12 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
         (&mut ordering.order, seeded),
         (&mut ordering.repositories, seeded_repositories),
     ] {
-        let next = match pass {
-            Pass::Upgrade if current.is_empty() => seeded,
-            Pass::Upgrade => continue,
-            // Earlier entries keep their place, which the user may have moved since.
-            Pass::Recovery => add_missing(current, &seeded),
+        let next = match (pass, &owed) {
+            (Pass::Upgrade, None) if current.is_empty() => seeded,
+            (Pass::Upgrade, None) => continue,
+            // Earlier entries keep their place, which the user may have moved since. A
+            // retried upgrade adds the profiles an earlier run skipped the same way.
+            _ => add_missing(current, &seeded),
         };
         if !next.is_empty() && next != *current {
             *current = next;
@@ -172,9 +193,12 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
     }
     // `state.toml` drops keys this binary does not know on its next save, so the pending
     // sort lives in its own file.
-    match (&legacy_sort, skipped) {
-        (Some(sort), true) => crate::session::atomic_write(&pending_path, sort.as_bytes())?,
-        _ if pass == Pass::Recovery => fs::remove_file(&pending_path)?,
+    match &legacy_sort {
+        Some(sort) if !skipped.is_empty() => crate::session::atomic_write(
+            &pending_path,
+            format!("{sort}\n{}\n", skipped.join("\n")).as_bytes(),
+        )?,
+        _ if owed.is_some() => fs::remove_file(&pending_path)?,
         _ => {}
     }
     if in_state.is_some() {
@@ -474,7 +498,11 @@ mod tests {
             );
             assert!(read_back(), "{broken}");
             let pending = dir.path().join(PENDING_FILE);
-            assert_eq!(fs::read_to_string(&pending).unwrap(), "custom", "{broken}");
+            assert_eq!(
+                fs::read_to_string(&pending).unwrap(),
+                "custom\nprofiles/other/sessions.json\n",
+                "{broken}"
+            );
             assert!(!fs::read_to_string(dir.path().join("state.toml"))
                 .unwrap()
                 .contains(LEGACY_SORT_KEY));
@@ -525,7 +553,58 @@ mod tests {
         let pending = dir.path().join(PENDING_FILE);
         for _ in 0..2 {
             run_in(dir.path(), Pass::Upgrade).unwrap();
-            assert_eq!(fs::read_to_string(&pending).unwrap(), "oldest");
+            assert_eq!(
+                fs::read_to_string(&pending).unwrap(),
+                "oldest\nprofiles/other/sessions.json\n"
+            );
+        }
+    }
+
+    /// A run after one that skipped a profile seeds from that profile alone, whether it is
+    /// `aoe migrate` or a retried upgrade: the repaired profile joins the stored order
+    /// before its `sort_index` goes, and a profile that already migrated adds nothing.
+    #[test]
+    fn a_later_run_seeds_only_the_skipped_profiles() {
+        for pass in [Pass::Upgrade, Pass::Recovery] {
+            let dir = tempfile::tempdir().unwrap();
+            seed(
+                dir.path(),
+                serde_json::json!([{"id": "a", "project_path": "/r/a", "sort_index": 0,
+                    "created_at": "2026-01-01T00:00:00Z"}]),
+            );
+            let other = dir.path().join("profiles/other/sessions.json");
+            fs::create_dir_all(&other).unwrap();
+            fs::write(
+                dir.path().join("state.toml"),
+                format!("{LEGACY_SORT_KEY} = \"oldest\"\n"),
+            )
+            .unwrap();
+            run_in(dir.path(), Pass::Upgrade).unwrap();
+            assert_eq!(ordering(dir.path()).order, ["/r/a::__session__::a"]);
+
+            // A session created since in the migrated profile stays unplaced.
+            seed(
+                dir.path(),
+                serde_json::json!([
+                    {"id": "a", "project_path": "/r/a", "created_at": "2026-01-01T00:00:00Z"},
+                    {"id": "n", "project_path": "/r/n", "created_at": "2025-01-01T00:00:00Z"},
+                ]),
+            );
+            fs::remove_dir(&other).unwrap();
+            fs::write(
+                &other,
+                serde_json::json!([{"id": "b", "project_path": "/r/b", "sort_index": 0,
+                    "created_at": "2026-01-02T00:00:00Z"}])
+                .to_string(),
+            )
+            .unwrap();
+            run_in(dir.path(), pass).unwrap();
+            assert_eq!(
+                ordering(dir.path()).order,
+                ["/r/b::__session__::b", "/r/a::__session__::a"]
+            );
+            assert!(!fs::read_to_string(&other).unwrap().contains("sort_index"));
+            assert!(!dir.path().join(PENDING_FILE).exists());
         }
     }
 

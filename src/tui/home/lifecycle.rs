@@ -79,6 +79,7 @@ impl HomeView {
             observed_sidebar_view: None,
             pending_order_change: None,
             order_undo: None,
+            sort_restore: None,
             repository_order: Vec::new(),
             observed_workspace_ordering: crate::session::load_workspace_ordering()
                 .map(|ordering| ordering.order)
