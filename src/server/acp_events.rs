@@ -805,6 +805,16 @@ impl RetryAttempt {
         self.rolled_back
     }
 
+    /// Marks `id`'s attempt rolled back, keeping its epoch and watermark.
+    pub(crate) fn mark_rolled_back_for_test(retry_starting: &RetryStarting, id: &str) {
+        retry_starting
+            .lock()
+            .unwrap()
+            .get_mut(id)
+            .expect("a Retry owns the row")
+            .rolled_back = true;
+    }
+
     pub(crate) fn rolled_back_for_test() -> Self {
         Self {
             attempt: 0,
@@ -844,27 +854,30 @@ impl RetryAttempt {
     }
 }
 
-/// The seq a fold's projection speaks for, for [`retired_before_retry`]. While a Retry owns the
-/// row only a status-bearing event up to the fold's `last_seq` counts: an unrelated one, such as
-/// a summary, advances `last_seq` without the new worker reporting.
-pub(crate) async fn newest_status_seq(
+/// The seq a fold's projection speaks for, for [`retired_before_retry`]: `last_seq`, unless a
+/// Retry owns the row and no status-bearing event lies past its cutoff, when it is `None`: the
+/// projection is the retired worker's alone. An unrelated event, such as a summary, advances
+/// `last_seq` without the new worker reporting. `None` is not a seq because the cutoff it was
+/// judged against can be an install's provisional one, which a later read no longer sees.
+pub(crate) async fn status_evidence_seq(
     retry_starting: &RetryStarting,
     service: &crate::server::session_service::SessionService,
     id: &str,
     last_seq: u64,
-) -> u64 {
+) -> Option<u64> {
     let retired = service.acp_supervisor.retired_through(id);
-    let watermark = retry_starting
+    let cutoff = retry_starting
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(id)
         .map(|owner| owner.retired_through(retired));
-    match watermark {
-        Some(watermark) if !service.reports_status_after(id, watermark, last_seq).await => {
-            watermark
-        }
-        _ => last_seq,
-    }
+    let evidence = match cutoff {
+        Some(cutoff) if !service.reports_status_after(id, cutoff, last_seq).await => None,
+        _ => Some(last_seq),
+    };
+    #[cfg(test)]
+    retry_test_gate::RevertGate::wait(&format!("{id}#evidence")).await;
+    evidence
 }
 
 /// Forget a Retry's attempt once its row has left `Starting`.
@@ -1272,8 +1285,11 @@ pub(super) async fn recover_structured_unread_after_lag(
             continue;
         }
         let projected = fold.sidebar_status();
-        let newest_status_seq =
-            newest_status_seq(retry_starting, service, &id, fold.last_seq).await;
+        let Some(newest_status_seq) =
+            status_evidence_seq(retry_starting, service, &id, fold.last_seq).await
+        else {
+            continue;
+        };
         // Same snapshot-around-apply as the live path, so "the transition that
         // was actually applied" means the same thing in both.
         let unread_profile = {
@@ -1495,7 +1511,8 @@ pub(crate) mod retry_test_gate {
     /// Test-only: parks a Retry for `id` until released: its rollback, before it takes
     /// `instances`; with `id#mode`, a spawn applying its mode to an installed worker; or with
     /// `id#launched`, a spawn past both; with `id#retire`, an install between publishing for the
-    /// retired worker and its final cutoff. Dropping the gate releases a parked Retry.
+    /// retired worker and its final cutoff; with `id#evidence`, a status read between its scan
+    /// and its apply. Dropping the gate releases a parked Retry.
     pub(crate) struct RevertGate {
         id: String,
         release: Option<oneshot::Sender<()>>,

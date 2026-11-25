@@ -1075,6 +1075,124 @@ mod tests {
         }
     }
 
+    /// #5921: a status read that scans while an install holds its provisional cutoff and applies
+    /// after the final one is written leaves the Retry's Starting, and its owner, alone: the scan
+    /// found no status evidence, which is not a seq newer than the cutoff.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_scan_inside_the_retire_fence_leaves_starting() {
+        use crate::acp::Event;
+        use crate::server::acp_events::retry_test_gate::RevertGate;
+        use crate::session::Status::{Error, Starting};
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        // (case, the status read, whether the attempt is rolled back, the retired worker's last
+        // event)
+        for (case, seed, rolled, last) in [
+            (
+                "lag",
+                false,
+                false,
+                Event::Stopped {
+                    reason: "end_turn".into(),
+                },
+            ),
+            (
+                "seed",
+                true,
+                false,
+                Event::Stopped {
+                    reason: "end_turn".into(),
+                },
+            ),
+            (
+                "rolled-back",
+                false,
+                true,
+                Event::startup_error("adapter exited"),
+            ),
+        ] {
+            let id = format!("sess-5921-fence-{case}");
+            let launcher = crate::server::test_support::succeeding_launcher();
+            let state = errored_retry_state_with(project.path(), &id, launcher, None).await;
+            state.acp_event_store.record(&id, 1, &last).unwrap();
+            state.acp_supervisor.hydrate_seqs([(id.clone(), 1)]);
+            let mut changes = state.status_tx.subscribe();
+            let (install, installing) = RevertGate::arm(&format!("{id}#retire"));
+            let mut launch = Box::pin(spawn_acp(
+                State(state.clone()),
+                Path(id.clone()),
+                retry_request(),
+            ));
+            tokio::select! {
+                response = &mut launch => panic!("{case}: launch ended before the gate: {}", response.into_response().status()),
+                parked = tokio::time::timeout(std::time::Duration::from_secs(10), installing) => {
+                    parked.expect("the install reaches the gate").expect("gate open");
+                }
+            }
+            assert_eq!(next_change(&mut changes).await, (Error, Starting), "{case}");
+            let (epoch, fence) = state.acp_supervisor.retired_through(&id).expect("a fence");
+            assert_eq!(fence, u64::MAX, "{case}: the provisional cutoff");
+            if rolled {
+                crate::server::acp_events::RetryAttempt::mark_rolled_back_for_test(
+                    &state.retry_starting,
+                    &id,
+                );
+            }
+
+            let (read, scanned) = RevertGate::arm(&format!("{id}#evidence"));
+            let status_read = tokio::spawn({
+                let state = state.clone();
+                let id = id.clone();
+                async move {
+                    if seed {
+                        crate::server::acp_reconciler::seed_in_flight_status(&state, &id).await;
+                    } else {
+                        crate::server::acp_events::recover_structured_unread_after_lag(
+                            &state.instances,
+                            &state.session_service,
+                            &state.instance_locks,
+                            crate::file_watch::FileWatchService::noop(),
+                            &state.status_tx,
+                            &state.retry_starting,
+                        )
+                        .await;
+                    }
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), scanned)
+                .await
+                .expect("the status read scans")
+                .expect("gate open");
+            install.release();
+            let response = launch.await.into_response();
+            assert!(
+                response.status().is_success(),
+                "{case}: {}",
+                response.status()
+            );
+            let (now_epoch, cutoff) = state.acp_supervisor.retired_through(&id).expect("a cutoff");
+            assert!(
+                now_epoch == epoch && cutoff != u64::MAX,
+                "{case}: the final cutoff is written: {cutoff}"
+            );
+            read.release();
+            status_read.await.unwrap();
+
+            // Every change the status read makes is sent before it returns.
+            assert!(
+                changes.try_recv().is_err(),
+                "{case}: the status read moved the row"
+            );
+            assert_eq!(state.instances.read().await[0].status, Starting, "{case}");
+            assert_eq!(
+                rolled_back(&state, &id),
+                Some(rolled),
+                "{case}: the owner survives"
+            );
+        }
+    }
+
     /// #4116: a peer archive committed while the `before_session` hook runs (after the handler's
     /// recheck) still refuses the launch, on both the spawn and the agent-switch endpoint.
     #[tokio::test]

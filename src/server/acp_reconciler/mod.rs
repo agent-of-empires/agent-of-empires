@@ -4,6 +4,8 @@ mod idle;
 mod rate_limit;
 mod resume;
 #[cfg(test)]
+pub(crate) use resume::seed_in_flight_status;
+#[cfg(test)]
 mod test_fixtures;
 
 use std::collections::{HashMap, HashSet};

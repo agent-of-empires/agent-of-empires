@@ -383,18 +383,21 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
     ResumeOutcome::SpawnFinished
 }
 
-async fn seed_in_flight_status(state: &AppState, id: &str) {
+pub(crate) async fn seed_in_flight_status(state: &AppState, id: &str) {
     let fold = state.session_service.fold_control_state(id).await;
     if fold.last_seq == 0 {
         return;
     }
-    let newest = crate::server::acp_events::newest_status_seq(
+    let Some(newest) = crate::server::acp_events::status_evidence_seq(
         &state.retry_starting,
         &state.session_service,
         id,
         fold.last_seq,
     )
-    .await;
+    .await
+    else {
+        return;
+    };
     let mut instances = state.instances.write().await;
     if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
         if !crate::server::acp_events::retired_before_retry(
