@@ -681,10 +681,15 @@ fn needs_you_counts_on_headers_and_filters_the_list() {
     assert!(header_text(&env.view, "util").contains("util (3) \u{25cf}1"));
     assert!(header_text(&env.view, "ops").contains("ops (2) \u{25cf}1"));
 
+    // A finished turn nobody has looked at yet needs you too.
+    let unread = select_session(&mut env, "util-live");
+    env.view.mutate_instance(&unread, |inst| inst.unread = true);
+    assert!(header_text(&env.view, "util").contains("util (3) \u{25cf}2"));
+
     env.view.toggle_needs_you_only();
     let mut shown = session_titles(&env.view);
     shown.sort();
-    assert_eq!(shown, ["ops-stopped-b", "util-stopped-a"]);
+    assert_eq!(shown, ["ops-stopped-b", "util-live", "util-stopped-a"]);
 
     env.view.toggle_needs_you_only();
     assert_eq!(session_titles(&env.view).len(), 6);

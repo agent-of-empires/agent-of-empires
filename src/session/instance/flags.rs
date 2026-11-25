@@ -486,14 +486,16 @@ impl Instance {
         self.snoozed_until.filter(|t| *t > Timestamp::now())
     }
 
-    /// Waiting on a person, in Error, or flagged urgent, and not put away. The web
-    /// dashboard's `sessionNeedsAttention` reads the same states.
+    /// Waiting on a person, in Error, flagged urgent, or finished and not yet seen (with the
+    /// unread indicator on), and not put away. The web dashboard's `sessionNeedsAttention`
+    /// reads the same states.
     pub fn needs_you(&self) -> bool {
         !self.is_dismissed()
             && (matches!(
                 self.status,
                 crate::session::Status::Waiting | crate::session::Status::Error
-            ) || self.is_urgent())
+            ) || self.is_urgent()
+                || (crate::session::unread_enabled() && self.is_unread()))
     }
 
     /// Combined "don't bother me" sink-state check: trashed, snoozed,
