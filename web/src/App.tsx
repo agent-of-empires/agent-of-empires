@@ -1053,7 +1053,14 @@ function AppContent({
     () => ({ scope: diffScope, requested: requestedDiffScope, lastTurnAt, onChange: pickDiffScope }),
     [diffScope, requestedDiffScope, lastTurnAt, pickDiffScope],
   );
-  // Fetched once per Session even while Diff is closed, so the count is as of opening it.
+  // Dock tabs name a count beside the label, as Conductor's `Changes 74` does.
+  const dockDescriptor = useCallback(
+    (id: string): PaneDisplay => {
+      const desc = paneDescriptor(id);
+      return id === "diff" && diffFiles.length > 0 ? { ...desc, badge: String(diffFiles.length) } : desc;
+    },
+    [paneDescriptor, diffFiles.length],
+  );
 
   // Diff-viewer comments (#928). Session-scoped. The
   // banner lives in the diff pane while the inline UI lives inside
@@ -2363,7 +2370,7 @@ function AppContent({
     });
     return (
       <div className="flex-1 flex flex-col min-h-0">
-        <PaneDndController groupsByDock={groupsByDock} descriptorFor={paneDescriptor} onPlaceTab={placeVisibleTab}>
+        <PaneDndController groupsByDock={groupsByDock} descriptorFor={dockDescriptor} onPlaceTab={placeVisibleTab}>
           <ContentSplit
             collapsed={rightDockCollapsed}
             onToggleCollapse={toggleRightDock}
@@ -2485,7 +2492,7 @@ function AppContent({
                 <DockGroups
                   location="right"
                   groups={rightGroups}
-                  descriptorFor={paneDescriptor}
+                  descriptorFor={dockDescriptor}
                   renderBody={renderPaneBody}
                   onActivate={(id) => activateTab("right", id)}
                   onMove={movePaneAny}
@@ -2503,7 +2510,7 @@ function AppContent({
           {bottomGroups.length > 0 && (
             <BottomDock
               groups={bottomGroups}
-              descriptorFor={paneDescriptor}
+              descriptorFor={dockDescriptor}
               renderBody={renderPaneBody}
               onActivate={(id) => activateTab("bottom", id)}
               onMove={movePaneAny}

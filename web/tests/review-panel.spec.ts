@@ -21,6 +21,8 @@ test.beforeEach(async ({ page }) => {
 test("a picked file opens as a tab beside the Agent, which keeps it until closed", async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 720 });
   await openDiffSession(page);
+  // The Diff tab counts the changed files beside its label.
+  await expect(page.getByTestId("pane-tab-diff")).toContainText("Diff2");
   await expect(page.getByTestId("main-view-tabs")).toHaveCount(0);
   await openDiffFile(page, "example.ts");
 
