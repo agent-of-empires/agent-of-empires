@@ -258,8 +258,14 @@ describe("attention badges and jump", () => {
     [{ status: "Waiting", ...archived }, false],
     [{ status: "Error", snoozed_until: "2025-01-01T00:00:00Z" }, false],
     [{ status: "Running", urgent: true, trashed_at: TS }, false],
-  ])("sessionNeedsAttention(%o) is %s", (over, expected) => {
-    expect(sessionNeedsAttention(session(over))).toBe(expected);
+    [{ status: "Idle", unread: true }, true],
+    [{ status: "Idle", unread: true, ...archived }, false],
+  ])("sessionNeedsAttention(%o) is %s with the unread indicator on", (over, expected) => {
+    expect(sessionNeedsAttention(session(over), undefined, true)).toBe(expected);
+  });
+
+  it("leaves an unread session out while the unread indicator is off", () => {
+    expect(sessionNeedsAttention(session({ status: "Idle", unread: true }))).toBe(false);
   });
 
   it("workspaceAttentionCount counts only attention-needing sessions", () => {

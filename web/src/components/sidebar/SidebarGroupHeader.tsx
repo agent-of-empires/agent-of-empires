@@ -4,6 +4,7 @@ import { archivableWorkspaces, type SidebarGroup } from "../../lib/sidebarGroups
 import { SCRATCH_GROUP_ID } from "../../hooks/useRepoGroups";
 import { STATUS_DOT_CLASS } from "../../lib/session";
 import { usePluginAttention } from "../../lib/pluginUiContext";
+import { useUnreadIndicatorEnabled } from "../../lib/unreadIndicator";
 import {
   attentionBadgeText,
   workspaceAttentionCount,
@@ -43,6 +44,7 @@ interface Props {
 export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props) {
   const { group, hasActiveChild, onClick, onNewSession, offline, dragHandle, rowsId } = props;
   const pluginAttention = usePluginAttention();
+  const unreadCounts = useUnreadIndicatorEnabled();
   const archivableCount = props.onArchiveAll ? archivableWorkspaces(group).length : 0;
   const canPin = !!props.onPin && group.capabilities.create === "repo" && !!group.repoPath && !group.pinned;
   const canUnpin = !!props.onUnpin && group.kind === "repo" && group.pinned;
@@ -79,7 +81,7 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
   // Sunk workspaces render in the footer, so they do not count toward the visible total.
   const sessionCount = group.workspaces.filter((v) => !workspaceIsSunk(v.workspace)).length;
   const attentionCount = group.workspaces.reduce(
-    (n, v) => n + workspaceAttentionCount(v.workspace, pluginAttention),
+    (n, v) => n + workspaceAttentionCount(v.workspace, pluginAttention, unreadCounts),
     0,
   );
   const errorCount = group.workspaces.reduce((n, v) => n + workspaceErrorCount(v.workspace), 0);

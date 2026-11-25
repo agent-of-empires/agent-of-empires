@@ -45,26 +45,46 @@ describe("sunkViews", () => {
     expect(sunkViews(groups)).toEqual([]);
   });
 
-  it("orders rows newest sunk first across groups, whatever the group order", () => {
+  it("lists archived rows newest first, then snoozed rows soonest wake first, whatever the group order", () => {
     const row = (groupId: string, id: string, sessions: SessionStub[]) => ({
       key: `${groupId}::${id}`,
       workspace: workspace(id, sessions),
     });
     const groups = [
       group("a", [
-        row("a", "old", [{ id: "s1", archived_at: "2026-01-01T00:00:00Z", last_accessed_at: "2026-06-01T00:00:00Z" }]),
-        row("a", "stale", [{ id: "s2", archived_at: "2026-01-01T00:00:00Z" }]),
+        row("a", "late-wake", [{ id: "s1", snoozed_until: "2027-06-01T00:00:00Z" }]),
+        row("a", "old", [{ id: "s2", archived_at: "2026-01-01T00:00:00Z", last_accessed_at: "2026-06-01T00:00:00Z" }]),
+        row("a", "stale", [{ id: "s3", archived_at: "2026-01-01T00:00:00Z" }]),
       ]),
       group("b", [
-        row("b", "snoozed", [{ id: "s3", snoozed_until: "2026-03-01T00:00:00Z" }]),
+        row("b", "soon-wake", [{ id: "s4", snoozed_until: "2027-01-01T00:00:00Z" }]),
         row("b", "mixed", [
-          { id: "s4", archived_at: "2026-01-01T00:00:00Z" },
-          { id: "s5", archived_at: "2026-04-01T00:00:00Z" },
+          { id: "s5", archived_at: "2026-01-01T00:00:00Z" },
+          { id: "s6", archived_at: "2026-04-01T00:00:00Z" },
+        ]),
+        row("b", "trashed-and-snoozed", [
+          { id: "s7", trashed_at: "2026-02-01T00:00:00Z" },
+          { id: "s8", snoozed_until: "2027-03-01T00:00:00Z" },
         ]),
       ]),
     ];
-    // archived_at wins over later activity; ties keep group order.
-    expect(sunkViews(groups).map((v) => v.workspace.id)).toEqual(["mixed", "snoozed", "old", "stale"]);
+    // A future wake time never outranks an archive; archived_at wins over later activity; ties keep group order.
+    expect(sunkViews(groups).map((v) => v.workspace.id)).toEqual([
+      "mixed",
+      "old",
+      "stale",
+      "soon-wake",
+      "trashed-and-snoozed",
+      "late-wake",
+    ]);
+    expect(renderedOrder([], false, true, groups)).toEqual([
+      "b::mixed",
+      "a::old",
+      "a::stale",
+      "b::soon-wake",
+      "b::trashed-and-snoozed",
+      "a::late-wake",
+    ]);
   });
 });
 

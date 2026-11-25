@@ -6,6 +6,7 @@ import type { RuntimeCursor, SidebarView, WorkspaceOrderingPatch } from "../../l
 import { reportFeatureUse } from "../../lib/featureUse";
 import { buildSortValueMap, pluginSortSpecs } from "../../lib/pluginUi";
 import { usePluginUiEntries } from "../../lib/pluginUiContext";
+import { reportInfo, toastBus } from "../../lib/toastBus";
 import { keepUnshown, moveId, orderStartingWith } from "../../lib/sidebarReorder";
 import { workspaceComparator, type PluginSortContext } from "../../lib/sidebarSort";
 import { GROUP_BY_FEATURE, SORT_FEATURE, type SidebarGroupBy, type SidebarSort } from "../../lib/sidebarView";
@@ -24,6 +25,7 @@ interface Options {
   workspaceOrdering: string[];
   repositoryOrder: string[];
   changeOrdering: (patch: WorkspaceOrderingPatch) => Promise<RuntimeCursor | null>;
+  orderingSaving: () => boolean;
   changeSidebarView: (patch: Partial<SidebarView>, after?: Promise<RuntimeCursor | null>) => Promise<void>;
 }
 
@@ -34,6 +36,7 @@ export function useSidebarModel({
   workspaceOrdering,
   repositoryOrder,
   changeOrdering,
+  orderingSaving,
   changeSidebarView,
 }: Options) {
   const pluginUiEntries = usePluginUiEntries();
@@ -84,6 +87,41 @@ export function useSidebarModel({
   );
   const attentionJump = useAttentionJump(displayGroups);
 
+  // Like the TUI, a move is refused while the last one is saving, so it never builds on a write that may fail.
+  const switching = useRef(false);
+  const refuseWhileSaving = useCallback(() => {
+    if (!switching.current && !orderingSaving()) return false;
+    reportInfo("The last move is still saving");
+    return true;
+  }, [orderingSaving]);
+
+  // One level of Undo for the order changes that rewrite more than the dragged item, offered once the write
+  // lands. The next order or sort change drops it.
+  const undoOffer = useRef<{ seq: number; dismiss?: () => void }>({ seq: 0 });
+  const dropUndo = useCallback(() => {
+    const offer = undoOffer.current;
+    offer.seq += 1;
+    offer.dismiss?.();
+    offer.dismiss = undefined;
+  }, []);
+  const offerUndo = useCallback(
+    (message: string, write: Promise<RuntimeCursor | null>, restoreName: boolean) => {
+      const offer = undoOffer.current;
+      const seq = offer.seq;
+      const previous = { order: workspaceOrdering, repositories: repositoryOrder };
+      void write.then((receipt) => {
+        if (!receipt || offer.seq !== seq) return;
+        offer.dismiss = toastBus.handler?.infoAction(message, "Undo", () => {
+          if (refuseWhileSaving()) return false;
+          dropUndo();
+          const undone = changeOrdering(previous);
+          if (restoreName) void changeSidebarView({ sort: "name" }, undone);
+        });
+      });
+    },
+    [workspaceOrdering, repositoryOrder, refuseWhileSaving, dropUndo, changeOrdering, changeSidebarView],
+  );
+
   const selectGroupBy = useCallback(
     (next: SidebarGroupBy) => {
       reportFeatureUse(GROUP_BY_FEATURE[next]);
@@ -95,15 +133,16 @@ export function useSidebarModel({
     (next: SidebarSort) => {
       reportFeatureUse(SORT_FEATURE[next]);
       setPluginSortRef(null);
-      if (next !== sort) void changeSidebarView({ sort: next });
+      if (next === sort) return;
+      dropUndo();
+      void changeSidebarView({ sort: next });
     },
-    [sort, changeSidebarView],
+    [sort, dropUndo, changeSidebarView],
   );
   const selectPluginSort = useCallback((ref: PluginSortRef) => {
     reportFeatureUse("sort_plugin");
     setPluginSortRef(ref);
   }, []);
-  const resetCustomOrder = useCallback(() => void changeOrdering({ order: [], repositories: [] }), [changeOrdering]);
 
   // Under Name a drag switches to Custom starting from the order on screen, so nothing else moves.
   const frozen = sort === "name" && !pluginSort;
@@ -122,41 +161,46 @@ export function useSidebarModel({
     }),
     [displayGroups, workspaceOrdering, groupBy, repo.groups, repositoryOrder],
   );
-  // Like the TUI, a move waits while a switch to Custom is saving, so it never builds on a switch that may fail.
-  const switching = useRef(false);
   const commit = useCallback(
     (patch: WorkspaceOrderingPatch) => {
+      dropUndo();
       const write = changeOrdering(patch);
       if (!frozen) return;
+      offerUndo("Sorted by Custom now", write, true);
       switching.current = true;
       void changeSidebarView({ sort: "custom" }, write).finally(() => (switching.current = false));
     },
-    [frozen, changeOrdering, changeSidebarView],
+    [frozen, dropUndo, changeOrdering, offerUndo, changeSidebarView],
   );
+
+  const resetCustomOrder = useCallback(() => {
+    dropUndo();
+    offerUndo("Custom order reset", changeOrdering({ order: [], repositories: [] }), false);
+  }, [dropUndo, changeOrdering, offerUndo]);
 
   /** Moves a row next to `overId`, after it when the drag went down. */
   const moveWorkspace = useCallback(
     (activeId: string, overId: string, after: boolean) => {
-      if (switching.current) return;
+      if (refuseWhileSaving()) return;
       reportFeatureUse("row_reorder");
       // A reset lists nothing until the next poll, and moving next to an unlisted row needs it listed.
       const listed = workspaceOrdering.includes(activeId) && workspaceOrdering.includes(overId);
       const base = frozen ? onScreenOrder() : { order: listed ? workspaceOrdering : onScreenOrder().order };
       commit({ ...base, order: moveId(base.order ?? [], activeId, overId, after) });
     },
-    [frozen, workspaceOrdering, onScreenOrder, commit],
+    [refuseWhileSaving, frozen, workspaceOrdering, onScreenOrder, commit],
   );
 
   /** Moves a Repository header next to `overId`, after it when the drag went down. */
   const moveRepository = useCallback(
     (activeId: string, overId: string, after: boolean) => {
-      if (switching.current) return;
+      if (refuseWhileSaving()) return;
       const headers = repo.groups.map((g) => g.id);
       const moved = moveId(headers, activeId, overId, after).filter((id) => !isSyntheticGroup(id));
       const repositories = keepUnshown(moved, repositoryOrder);
       commit(frozen ? { ...onScreenOrder(), repositories } : { repositories });
     },
-    [repo.groups, repositoryOrder, frozen, onScreenOrder, commit],
+    [refuseWhileSaving, repo.groups, repositoryOrder, frozen, onScreenOrder, commit],
   );
 
   return {

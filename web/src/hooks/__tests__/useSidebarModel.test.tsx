@@ -6,6 +6,7 @@ import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SidebarView } from "../../lib/api";
 import { reportFeatureUse } from "../../lib/featureUse";
+import { toastBus, type ToastApi } from "../../lib/toastBus";
 import type { SessionResponse } from "../../lib/types";
 import { useSidebarModel } from "../app/useSidebarModel";
 import { useSessions } from "../useSessions";
@@ -57,11 +58,51 @@ const server = setupServer(
   }),
 );
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
-afterEach(() => server.resetHandlers());
+afterEach(() => {
+  server.resetHandlers();
+  toastBus.handler = null;
+});
 afterAll(() => server.close());
+
+/** The toasts a hook raised; `undo` runs the newest Undo offer as its button would. */
+const toasts = {
+  info: vi.fn(),
+  undo: [] as { message: string; run: () => boolean | void; dismissed: boolean }[],
+};
+const toastApi = {
+  info: toasts.info,
+  infoAction: (message: string, _label: string, run: () => boolean | void) => {
+    const offer = { message, run, dismissed: false };
+    toasts.undo.push(offer);
+    return () => void (offer.dismissed = true);
+  },
+} as unknown as ToastApi;
+
+/** A handler that answers its requests only once released, in the order they arrived. */
+function heldWrites(method: "patch" | "put", path: string) {
+  const releases: (() => void)[] = [];
+  server.use(
+    http[method](path, async ({ request }) => {
+      const body = (await request.json()) as Record<string, unknown>;
+      writes.push({ method: method.toUpperCase(), body });
+      await new Promise<void>((r) => releases.push(r));
+      if (method === "patch") daemon.sidebar_view = { ...daemon.sidebar_view, ...body };
+      else {
+        if (body.order) daemon.workspace_ordering = body.order as string[];
+        if (body.repositories) daemon.repository_order = body.repositories as string[];
+      }
+      daemon.revision += 1;
+      return HttpResponse.json({}, { headers: runtime(daemon.revision) });
+    }),
+  );
+  return releases;
+}
 
 beforeEach(() => {
   localStorage.clear();
+  toasts.info.mockClear();
+  toasts.undo.length = 0;
+  toastBus.handler = toastApi;
   writes.length = 0;
   vi.mocked(reportFeatureUse).mockClear();
   const sessions = [
@@ -89,6 +130,7 @@ function mount() {
       workspaceOrdering: sessions.workspaceOrdering,
       repositoryOrder: sessions.repositoryOrder,
       changeOrdering: sessions.changeOrdering,
+      orderingSaving: sessions.orderingSaving,
       changeSidebarView: sessions.changeSidebarView,
     });
     return { sessions, model };
@@ -262,9 +304,12 @@ describe("the shared Custom order", () => {
     act(() => result.current.model.moveRepository("/r/beta", "/r/Alpha", false));
     expect(headers(result)).toEqual(["/r/Alpha", "/r/beta"]);
 
+    // The newer pick waits behind the switch it supersedes, so it reaches the Daemon last.
     act(() => result.current.model.selectSort("name"));
-    await waitFor(() => expect(writes).toHaveLength(2));
+    await pollAt(result, 2);
+    expect(writes).toHaveLength(1);
     await act(async () => release());
+    await waitFor(() => expect(writes).toHaveLength(2));
     await pollAt(result, 6);
     expect(writes.map((w) => w.method)).toEqual(["PUT", "PATCH"]);
     expect(writes[1]!.body).toEqual({ sort: "name" });
@@ -314,5 +359,124 @@ describe("the shared Custom order", () => {
     await act(async () => result.current.model.moveWorkspace("/r/beta::b1", "/r/beta::b2", false));
     expect(writes[1]).toEqual({ method: "PUT", body: { order: ["/r/beta::b1", "/r/beta::b2", "/r/Alpha::a1"] } });
     expect(rows(result)).toEqual(["/r/beta::b1", "/r/beta::b2", "/r/Alpha::a1"]);
+  });
+});
+
+describe("write order", () => {
+  it("sends each sort pick only after the previous one answered, so the latest pick lands last", async () => {
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    const releases = heldWrites("patch", "*/api/sidebar-view");
+    act(() => result.current.model.selectSort("name"));
+    await waitFor(() => expect(writes).toHaveLength(1));
+    act(() => result.current.model.selectGroupBy("group"));
+    act(() => result.current.model.selectSort("custom"));
+    await pollAt(result, 2);
+    expect(writes).toHaveLength(1);
+
+    await act(async () => releases[0]!());
+    await waitFor(() => expect(writes).toHaveLength(2));
+    await act(async () => releases[1]!());
+    await waitFor(() => expect(writes).toHaveLength(3));
+    await act(async () => releases[2]!());
+    expect(writes.map((w) => w.body)).toEqual([{ sort: "name" }, { group_by: "group" }, { sort: "custom" }]);
+    await pollAt(result, 10);
+    expect(daemon.sidebar_view).toEqual({ group_by: "group", sort: "custom" });
+    expect(result.current.model.sort).toBe("custom");
+  });
+
+  it("sends each ordering write after the previous one answered", async () => {
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    const releases = heldWrites("put", "*/api/workspace-ordering");
+    act(() => void result.current.sessions.changeOrdering({ repositories: ["/r/Alpha", "/r/beta"] }));
+    act(() => result.current.model.resetCustomOrder());
+    await waitFor(() => expect(writes).toHaveLength(1));
+    await pollAt(result, 2);
+    expect(writes).toHaveLength(1);
+    await act(async () => releases[0]!());
+    await waitFor(() => expect(writes).toHaveLength(2));
+    await act(async () => releases[1]!());
+    expect(writes.map((w) => w.body)).toEqual([
+      { repositories: ["/r/Alpha", "/r/beta"] },
+      { order: [], repositories: [] },
+    ]);
+    expect(daemon.repository_order).toEqual([]);
+  });
+
+  it("refuses a move while the last one is saving, with a notice", async () => {
+    const { result } = mount();
+    await waitFor(() => expect(headers(result)).toEqual(["/r/beta", "/r/Alpha"]));
+    const releases = heldWrites("put", "*/api/workspace-ordering");
+    act(() => result.current.model.moveRepository("/r/Alpha", "/r/beta", false));
+    await waitFor(() => expect(writes).toHaveLength(1));
+    act(() => result.current.model.moveWorkspace("/r/beta::b2", "/r/beta::b1", true));
+    expect(toasts.info).toHaveBeenCalledWith("The last move is still saving");
+    await act(async () => releases[0]!());
+    await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
+    expect(writes).toHaveLength(1);
+    act(() => result.current.model.moveWorkspace("/r/beta::b2", "/r/beta::b1", true));
+    await waitFor(() => expect(writes).toHaveLength(2));
+  });
+});
+
+describe("Undo", () => {
+  it("after a drag under Name switched to Custom, puts back the order, the repositories and Name", async () => {
+    daemon.sidebar_view = { group_by: "project", sort: "name" };
+    const before = { order: [...daemon.workspace_ordering], repositories: [...daemon.repository_order] };
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toEqual(["/r/Alpha::a1", "/r/beta::b1", "/r/beta::b2"]));
+    await act(async () => result.current.model.moveWorkspace("/r/beta::b2", "/r/beta::b1", false));
+    await waitFor(() => expect(toasts.undo.map((u) => u.message)).toEqual(["Sorted by Custom now"]));
+    await waitFor(() => expect(writes).toHaveLength(2));
+
+    await act(async () => void toasts.undo[0]!.run());
+    await waitFor(() => expect(writes).toHaveLength(4));
+    expect(writes.slice(2)).toEqual([
+      { method: "PUT", body: before },
+      { method: "PATCH", body: { sort: "name" } },
+    ]);
+    expect(result.current.model.sort).toBe("name");
+    // Single level: the Undo offers nothing further.
+    expect(toasts.undo).toHaveLength(1);
+  });
+
+  it("after Reset, puts back the previous lists, and is held while a write is saving", async () => {
+    const before = { order: [...daemon.workspace_ordering], repositories: [...daemon.repository_order] };
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    await act(async () => result.current.model.resetCustomOrder());
+    await waitFor(() => expect(toasts.undo.map((u) => u.message)).toEqual(["Custom order reset"]));
+
+    const releases = heldWrites("put", "*/api/workspace-ordering");
+    act(() => void result.current.sessions.changeOrdering({ repositories: ["/r/beta"] }));
+    await waitFor(() => expect(writes).toHaveLength(2));
+    let kept: boolean | void = undefined;
+    act(() => void (kept = toasts.undo[0]!.run()));
+    expect(kept).toBe(false);
+    expect(toasts.info).toHaveBeenCalledWith("The last move is still saving");
+    await act(async () => releases[0]!());
+    await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
+
+    server.resetHandlers();
+    await act(async () => void toasts.undo[0]!.run());
+    await waitFor(() => expect(writes).toHaveLength(3));
+    expect(writes[2]).toEqual({ method: "PUT", body: before });
+    expect(writes.map((w) => w.method)).not.toContain("PATCH");
+  });
+
+  it("is dropped by the next order change, and not offered when the write fails", async () => {
+    const { result } = mount();
+    await waitFor(() => expect(headers(result)).toEqual(["/r/beta", "/r/Alpha"]));
+    await act(async () => result.current.model.resetCustomOrder());
+    await waitFor(() => expect(toasts.undo).toHaveLength(1));
+    await act(async () => result.current.model.moveRepository("/r/Alpha", "/r/beta", false));
+    expect(toasts.undo[0]!.dismissed).toBe(true);
+
+    server.use(http.put("*/api/workspace-ordering", () => new HttpResponse(null, { status: 500 })));
+    await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
+    await act(async () => result.current.model.resetCustomOrder());
+    await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
+    expect(toasts.undo).toHaveLength(1);
   });
 });

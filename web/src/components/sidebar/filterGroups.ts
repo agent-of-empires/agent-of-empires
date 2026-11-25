@@ -60,20 +60,29 @@ export function visibleSubgroups(groups: NestedSidebarGroup[], expandAll: boolea
   return groups.flatMap((ng) => (expandAll || !ng.repo.collapsed ? ng.subgroups : []));
 }
 
-function sinkTimeMs(ws: Workspace): number {
-  let best = Number.NEGATIVE_INFINITY;
-  for (const s of ws.sessions) {
-    const ts = s.archived_at ?? s.snoozed_until ?? s.last_accessed_at;
-    const ms = ts ? Date.parse(ts) : Number.NaN;
-    if (ms > best) best = ms;
-  }
-  return best;
+/** Footer order: archived rows newest archived first, then snoozed rows soonest wake first, then the rest newest
+ *  accessed first. A snooze time is when it wakes, so it never competes with an archive time. */
+function sinkRank(ws: Workspace): [bucket: number, key: number] {
+  const times = (pick: (s: Workspace["sessions"][number]) => string | null | undefined) =>
+    ws.sessions.flatMap((s) => {
+      const ms = Date.parse(pick(s) ?? "");
+      return Number.isFinite(ms) ? [ms] : [];
+    });
+  // An empty list gives -Infinity from max and Infinity from min, so an unparsable time sorts last.
+  if (ws.sessions.some((s) => s.archived_at != null)) return [0, -Math.max(...times((s) => s.archived_at))];
+  if (ws.sessions.some((s) => s.snoozed_until != null)) return [1, Math.min(...times((s) => s.snoozed_until))];
+  return [2, -Math.max(...times((s) => s.last_accessed_at))];
+}
+
+function compareSunk(a: Workspace, b: Workspace): number {
+  const [ab, ak] = sinkRank(a);
+  const [bb, bk] = sinkRank(b);
+  return ab - bb || (ak === bk ? 0 : ak < bk ? -1 : 1);
 }
 
 // Deduped by workspace: My groups slices one workspace into a Group per session group, so the
 // footer lists it once with every archived session from those slices. First slice wins for
-// the row identity. Rows sort newest sunk first across groups, whatever the sidebar sort, matching
-// the TUI's Archived section.
+// the row identity. Rows follow `compareSunk` across groups, whatever the sidebar sort.
 export const sunkViews = (groups: SidebarGroup[]) => {
   const byId = new Map<string, SidebarWorkspaceView>();
   for (const g of groups) {
@@ -94,7 +103,7 @@ export const sunkViews = (groups: SidebarGroup[]) => {
       }
     }
   }
-  return [...byId.values()].sort((a, b) => sinkTimeMs(b.workspace) - sinkTimeMs(a.workspace) || 0);
+  return [...byId.values()].sort((a, b) => compareSunk(a.workspace, b.workspace));
 };
 
 /** Rendered row keys in render order, so Shift+click ranges only span visible rows. `allGroups`

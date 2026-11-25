@@ -185,18 +185,33 @@ export function triageMenuShape(state: TriageState): TriageMenuShape {
   }
 }
 
-/** A live session that is Waiting, in Error, flagged urgent, or carries a plugin danger/warn tone. Shared by badges, markers, and jump-to-next so counts match. */
-export function sessionNeedsAttention(s: SessionResponse, pluginAttention?: ReadonlySet<string>): boolean {
+/** A live session that is Waiting, in Error, flagged urgent, carries a plugin danger/warn tone, or, with
+ *  `unreadCounts` (the unread indicator on), finished unseen. Matches the TUI's `Instance::needs_you`. */
+export function sessionNeedsAttention(
+  s: SessionResponse,
+  pluginAttention?: ReadonlySet<string>,
+  unreadCounts = false,
+): boolean {
   if (s.archived_at != null || s.ignored_at != null || s.snoozed_until != null || s.trashed_at != null) {
     return false;
   }
-  return s.status === "Waiting" || s.status === "Error" || s.urgent === true || pluginAttention?.has(s.id) === true;
+  return (
+    s.status === "Waiting" ||
+    s.status === "Error" ||
+    s.urgent === true ||
+    pluginAttention?.has(s.id) === true ||
+    (unreadCounts && s.unread === true)
+  );
 }
 
-export function workspaceAttentionCount(ws: Workspace, pluginAttention?: ReadonlySet<string>): number {
+export function workspaceAttentionCount(
+  ws: Workspace,
+  pluginAttention?: ReadonlySet<string>,
+  unreadCounts = false,
+): number {
   let n = 0;
   for (const s of ws.sessions) {
-    if (sessionNeedsAttention(s, pluginAttention)) n += 1;
+    if (sessionNeedsAttention(s, pluginAttention, unreadCounts)) n += 1;
   }
   return n;
 }

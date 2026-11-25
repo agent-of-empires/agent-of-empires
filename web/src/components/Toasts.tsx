@@ -144,12 +144,13 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const pushInfoAction = useCallback(
-    (message: string, label: string, run: () => void) => {
+    (message: string, label: string, run: () => boolean | void) => {
       const id = nextId.current++;
       setToasts((t) => [...t, { id, kind: "info", message, action: { label, run } }]);
       scheduleDismiss(id);
+      return () => dismiss(id);
     },
-    [scheduleDismiss],
+    [scheduleDismiss, dismiss],
   );
 
   const api = useMemo<ToastApi>(

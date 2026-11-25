@@ -45,3 +45,14 @@ export function pollMayReplace(hold: WriteHold, cursor: RuntimeCursor): boolean 
   const receipt = hold.receipt;
   return !receipt || receipt.epoch !== cursor.epoch || cursor.revision >= receipt.revision;
 }
+
+/** Runs writes of one Daemon value one after another in call order, so an older write never lands after a newer
+ *  one. Each write keeps its own deadline, which starts when it is sent. */
+export function newWriteQueue() {
+  let tail: Promise<unknown> = Promise.resolve();
+  return <T>(write: () => Promise<T>): Promise<T> => {
+    const next = tail.then(write, write);
+    tail = next.catch(() => {});
+    return next;
+  };
+}

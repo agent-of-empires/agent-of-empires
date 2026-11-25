@@ -11,8 +11,9 @@ export interface ToastApi {
   /** An error toast with one button, such as reopening what failed. It is dismissed once
    *  used, unless `onAction` returns false to keep it for later. */
   action: (message: string, label: string, onAction: () => boolean | void) => void;
-  /** An info toast with one button, such as a link to where the change lives. It times out like any info toast. */
-  infoAction: (message: string, label: string, onAction: () => void) => void;
+  /** An info toast with one button, such as a link to where the change lives or an Undo. It times out like any
+   *  info toast, is dismissed once used unless `onAction` returns false, and the returned function dismisses it. */
+  infoAction: (message: string, label: string, onAction: () => boolean | void) => () => void;
 }
 
 interface ToastBus {

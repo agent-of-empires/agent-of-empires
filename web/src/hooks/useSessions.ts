@@ -12,7 +12,14 @@ import {
   type WorkspaceOrderingPatch,
 } from "../lib/api";
 import { noteDaemonChanged, setServerDown } from "../lib/connectionState";
-import { DEFAULT_SIDEBAR_VIEW, holdSettled, holdStarted, newWriteHold, pollMayReplace } from "../lib/sidebarView";
+import {
+  DEFAULT_SIDEBAR_VIEW,
+  holdSettled,
+  holdStarted,
+  newWriteHold,
+  newWriteQueue,
+  pollMayReplace,
+} from "../lib/sidebarView";
 
 const POLL_INTERVAL = 3000;
 const POLL_DEADLINE_MS = 15000;
@@ -60,6 +67,8 @@ export function useSessions() {
   const orderHold = useRef(newWriteHold());
   const repositoryHold = useRef(newWriteHold());
   const viewHold = useRef(newWriteHold());
+  const orderingWrites = useRef(newWriteQueue());
+  const viewWrites = useRef(newWriteQueue());
   // The newest pick of each view field, so a write that waited cannot overwrite a later pick.
   const viewPicks = useRef<{ seq: number; latest: Partial<Record<keyof SidebarView, number>> }>({ seq: 0, latest: {} });
   const [error, setError] = useState(false);
@@ -107,14 +116,18 @@ export function useSessions() {
       holds.push(repositoryHold.current);
     }
     holds.forEach(holdStarted);
-    const receipt = await updateWorkspaceOrdering(patch);
+    const receipt = await orderingWrites.current(() => updateWorkspaceOrdering(patch));
     for (const hold of holds) holdSettled(hold, receipt);
     return receipt;
   }, []);
 
+  /** Whether an ordering write is queued or in flight. */
+  const orderingSaving = useCallback(() => orderHold.current.pending + repositoryHold.current.pending > 0, []);
+
   /**
-   * Applies a grouping or sort pick at once. The write waits for `after` and is dropped when that fails; a field
-   * picked again meanwhile is left to the newer pick. Either way the next poll restores what the Daemon holds.
+   * Applies a grouping or sort pick at once. The write is sent after the earlier picks' writes, waits for `after`,
+   * and is dropped when that fails; a field picked again meanwhile is left to the newer pick. Either way the next
+   * poll restores what the Daemon holds.
    */
   const changeSidebarView = useCallback(async (patch: Partial<SidebarView>, after?: Promise<RuntimeCursor | null>) => {
     setSidebarView((prev) => ({ ...prev, ...patch }));
@@ -123,10 +136,13 @@ export function useSessions() {
     const fields = Object.keys(patch) as (keyof SidebarView)[];
     for (const field of fields) picks.latest[field] = pick;
     holdStarted(viewHold.current);
-    const ready = !after || (await after) !== null;
-    const current = fields.filter((field) => picks.latest[field] === pick);
-    const send = Object.fromEntries(current.map((field) => [field, patch[field]]));
-    holdSettled(viewHold.current, ready && current.length > 0 ? await updateSidebarView(send) : null);
+    const receipt = await viewWrites.current(async () => {
+      const ready = !after || (await after) !== null;
+      const current = fields.filter((field) => picks.latest[field] === pick);
+      const send = Object.fromEntries(current.map((field) => [field, patch[field]]));
+      return ready && current.length > 0 ? updateSidebarView(send) : null;
+    });
+    holdSettled(viewHold.current, receipt);
   }, []);
 
   const applyResult = useCallback(
@@ -432,6 +448,7 @@ export function useSessions() {
     repositoryOrder,
     sidebarView,
     changeOrdering,
+    orderingSaving,
     changeSidebarView,
     error,
     loaded,
