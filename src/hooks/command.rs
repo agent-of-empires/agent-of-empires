@@ -261,10 +261,11 @@ fn hook_command_session_id_sandbox(
          LS=$(LC_ALL=C ls -ldn \"$D\" 2>/dev/null) || exit 0; \
          set -- $LS; M=\"$1\"; \
          case \"$M\" in drwx------|drwx------.|drwx------+|drwx------@) ;; *) exit 0 ;; esac; \
-         {publisher_guard}B=\"${{AOE_AGENT_BIN:-}}\"; N=0; P=$PPID; \
-         while [ -n \"$B\" ] && [ \"${{P:-0}}\" -gt 0 ]; do \
+         {publisher_guard}B=\"${{AOE_AGENT_BIN:-}}\"; Q=\"${{AOE_AGENT_PROGRAM:-}}\"; N=0; P=$PPID; \
+         while {{ [ -n \"$B\" ] || [ -n \"$Q\" ]; }} && [ \"${{P:-0}}\" -gt 0 ]; do \
          A=$(tr \"\\0\" \"\\n\" < /proc/$P/cmdline 2>/dev/null | head -n 1); \
-         [ \"${{A##*/}}\" = \"$B\" ] && N=$((N + 1)); \
+         A=\"${{A##*/}}\"; \
+         {{ {{ [ -n \"$B\" ] && [ \"$A\" = \"$B\" ]; }} || {{ [ -n \"$Q\" ] && [ \"$A\" = \"$Q\" ]; }}; }} && N=$((N + 1)); \
          P=$(sed -n \"s/^PPid:[[:space:]]*//p\" /proc/$P/status 2>/dev/null); \
          done; \
          [ \"$N\" -le 1 ] || exit 0; \
@@ -412,6 +413,7 @@ mod tests {
                     &common[..],
                     &[
                         "D=\"/tmp/aoe-hooks/$AOE_INSTANCE_ID\"",
+                        "Q=\"${AOE_AGENT_PROGRAM:-}\"",
                         "command -v jq >/dev/null 2>&1 || exit 0",
                         "jq -r ",
                         ".session_id|type",
@@ -897,10 +899,32 @@ mod tests {
             None,
         );
         let payload = r#"{"session_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}"#;
-        for (id, script, writes) in [
-            ("pane_agent", r#"eval "$HOOK"; true"#, true),
+        for (id, agent_bin, agent_program, script, writes) in [
+            (
+                "pane_agent",
+                "aoe-fake-agent",
+                None,
+                r#"eval "$HOOK"; true"#,
+                true,
+            ),
             (
                 "nested_agent",
+                "aoe-fake-agent",
+                None,
+                r#""$AGENT" -c 'eval "$HOOK"; true'; true"#,
+                false,
+            ),
+            (
+                "pane_fallback_program",
+                "agent",
+                Some("aoe-fake-agent"),
+                r#"eval "$HOOK"; true"#,
+                true,
+            ),
+            (
+                "nested_fallback_program",
+                "agent",
+                Some("aoe-fake-agent"),
                 r#""$AGENT" -c 'eval "$HOOK"; true'; true"#,
                 false,
             ),
@@ -908,7 +932,11 @@ mod tests {
             run_hook(&agent, script, id, payload, |c| {
                 c.env("AGENT", &agent)
                     .env("HOOK", &hook)
-                    .env("AOE_AGENT_BIN", "aoe-fake-agent");
+                    .env("AOE_AGENT_BIN", agent_bin)
+                    .env_remove("AOE_AGENT_PROGRAM");
+                if let Some(program) = agent_program {
+                    c.env("AOE_AGENT_PROGRAM", program);
+                }
             });
             assert_eq!(
                 tmp.path().join(id).join("session_id").exists(),

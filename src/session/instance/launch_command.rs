@@ -262,9 +262,11 @@ fn apply_first_launch_agent_name(
     }
     // Only an attested direct host executable admits name injection.
     let Some(execution) = execution.filter(|execution| {
-        execution
-            .inputs
-            .runs_host_path_binary(agent.binary, &execution.program)
+        agent.candidate_binaries().any(|bin| {
+            execution
+                .inputs
+                .runs_host_path_binary(bin, &execution.program)
+        })
     }) else {
         return;
     };
@@ -298,7 +300,11 @@ fn apply_no_daemon_flag(
     let Some(invocation) = parse_launch_command(&inst.get_tool_command()) else {
         return;
     };
-    if invocation.words.first().map(String::as_str) != Some(agent.binary) {
+    if !invocation
+        .words
+        .first()
+        .is_some_and(|word| agent.matches_binary(word))
+    {
         return;
     }
     insert_no_daemon_flag(cmd, agent, program, &probe);

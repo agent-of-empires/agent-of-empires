@@ -1525,11 +1525,26 @@ impl Instance {
                 .push((crate::hooks::SESSION_SOURCE_ENV.into(), source.to_owned()));
         }
         // The container has no launch pid, so the session-id hook identifies a
-        // nested agent by this binary name instead.
+        // nested agent by this binary name (and any fallback/renamed program)
+        // instead.
         if let Some(agent) = agent {
             environment
                 .env
                 .push(("AOE_AGENT_BIN".into(), agent.binary.to_owned()));
+            if let Some(program) =
+                super::launch_command::parse_launch_command(&self.get_tool_command())
+                    .and_then(|parsed| {
+                        parsed.words.first().and_then(|word| {
+                            std::path::Path::new(word)
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .map(str::to_owned)
+                        })
+                    })
+                    .filter(|name| !name.is_empty() && name != agent.binary)
+            {
+                environment.env.push(("AOE_AGENT_PROGRAM".into(), program));
+            }
         }
         if let Some((key, value)) = agent.and_then(|agent| {
             agent
@@ -2082,6 +2097,22 @@ impl Instance {
             program.is_absolute() && program.to_str().is_some(),
             "native program must have an absolute UTF-8 path"
         );
+        if let Some(docker_env) = inputs.docker_env.as_mut() {
+            docker_env.env.retain(|(key, _)| key != "AOE_AGENT_PROGRAM");
+            inputs.environment.remove("AOE_AGENT_PROGRAM");
+            if let Some(name) = program
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty() && *name != agent.binary)
+            {
+                docker_env
+                    .env
+                    .push(("AOE_AGENT_PROGRAM".into(), name.to_owned()));
+                inputs
+                    .environment
+                    .insert("AOE_AGENT_PROGRAM".into(), name.to_owned());
+            }
+        }
         let mut prime = None;
         let mut prime_runtime = None;
         let value = |key: &str| inputs.environment.get(key).cloned();
