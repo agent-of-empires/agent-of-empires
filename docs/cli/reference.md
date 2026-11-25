@@ -34,8 +34,8 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe session set-base`↴](#aoe-session-set-base)
 * [`aoe session snooze`↴](#aoe-session-snooze)
 * [`aoe session unsnooze`↴](#aoe-session-unsnooze)
-* [`aoe session favorite`↴](#aoe-session-favorite)
-* [`aoe session unfavorite`↴](#aoe-session-unfavorite)
+* [`aoe session pin`↴](#aoe-session-pin)
+* [`aoe session unpin`↴](#aoe-session-unpin)
 * [`aoe session archive`↴](#aoe-session-archive)
 * [`aoe session unarchive`↴](#aoe-session-unarchive)
 * [`aoe session restore`↴](#aoe-session-restore)
@@ -472,8 +472,8 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `set-base` — Set or clear the per-session diff base branch. The diff view compares the worktree against this ref instead of the auto-detected default. Useful when the PR target differs from the project default (stacked PRs, hotfix off `release/*`, renamed default branch). See #970
 * `snooze` — Snooze a session for a duration (temporary archive, auto wakes)
 * `unsnooze` — Wake a snoozed session immediately
-* `favorite` — Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope under the Name and Newest first sorts and show a `✦` in the session list gutter; Custom keeps the order you arranged. A snoozed favorite keeps its place
-* `unfavorite` — Clear the favorite flag on a session
+* `pin` — Pin a session to the top of its header in the session list and the web dashboard, under every sort. Pinning cancels archive, ignore and snooze; archiving, ignoring or snoozing it clears the pin
+* `unpin` — Unpin a session
 * `archive` — Archive a session: move it to the Archived section and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
 * `unarchive` — Unarchive a session, returning it to its place in the list
 * `restore` — Restore a trashed session, returning it to its prior bucket with its transcript and metadata intact. See #2489
@@ -743,11 +743,11 @@ Wake a snoozed session immediately
 
 
 
-## `aoe session favorite`
+## `aoe session pin`
 
-Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope under the Name and Newest first sorts and show a `✦` in the session list gutter; Custom keeps the order you arranged. A snoozed favorite keeps its place
+Pin a session to the top of its header in the session list and the web dashboard, under every sort. Pinning cancels archive, ignore and snooze; archiving, ignoring or snoozing it clears the pin
 
-**Usage:** `aoe session favorite <IDENTIFIER>`
+**Usage:** `aoe session pin <IDENTIFIER>`
 
 ###### **Arguments:**
 
@@ -755,11 +755,11 @@ Mark a session as a favorite. With `session.favorites_first` on (the default), f
 
 
 
-## `aoe session unfavorite`
+## `aoe session unpin`
 
-Clear the favorite flag on a session
+Unpin a session
 
-**Usage:** `aoe session unfavorite <IDENTIFIER>`
+**Usage:** `aoe session unpin <IDENTIFIER>`
 
 ###### **Arguments:**
 

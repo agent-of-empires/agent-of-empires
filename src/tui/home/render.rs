@@ -12,9 +12,8 @@ use super::bindings::ActionId;
 use super::update_bar::UpdateBar;
 use super::{
     get_indent, live_send, DragKind, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION,
-    ICON_COLLAPSED, ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_FAVORITE,
-    ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_SUGGESTED, ICON_TERMINAL, ICON_TRASH_SECTION,
-    ICON_UNKNOWN, ICON_UNREAD,
+    ICON_COLLAPSED, ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED,
+    ICON_STOPPED, ICON_SUGGESTED, ICON_TERMINAL, ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD,
 };
 use crate::session::config::{GroupByMode, NarrowLayout, RowTagMode, SidebarPosition, SortOrder};
 use crate::session::{Item, Status};
@@ -1677,7 +1676,7 @@ impl HomeView {
         self.shelf_inner_area = shelf_region;
 
         let hover_idx = self.hovered_index();
-        let favorite_gutter = self.favorite_gutter();
+        let pin_gutter = self.pin_gutter();
         let needs_you = self.needs_you_counts();
 
         // --- Workspace list (every row before the shelf) ---
@@ -1721,7 +1720,7 @@ impl HomeView {
                 is_match,
                 theme,
                 inner.width,
-                favorite_gutter,
+                pin_gutter,
                 &needs_you,
             );
             // Selection wins over hover, so the already-selected row under the
@@ -1803,7 +1802,7 @@ impl HomeView {
                     is_match,
                     theme,
                     inner.width,
-                    favorite_gutter,
+                    pin_gutter,
                     &needs_you,
                 );
                 if is_selected || is_hovered {
@@ -1922,15 +1921,10 @@ impl HomeView {
             || serve_open
     }
 
-    /// Reserve the favorite gutter on every row while any session is a pinned favorite,
-    /// so titles stay aligned and collapsing a group does not shift the list. Favorites
-    /// pin only with favorites-first on (the `Context::FavoritesUsable` predicate).
-    pub(super) fn favorite_gutter(&self) -> bool {
-        crate::session::favorites_first()
-            && self
-                .instances
-                .values()
-                .any(crate::session::is_live_favorite)
+    /// Reserve the pin gutter on every row while any session is pinned, so titles stay
+    /// aligned and collapsing a group does not shift the list.
+    pub(super) fn pin_gutter(&self) -> bool {
+        self.instances.values().any(crate::session::is_live_pin)
     }
 
     #[cfg(test)]
@@ -1941,7 +1935,7 @@ impl HomeView {
         is_match: bool,
         theme: &Theme,
         list_width: u16,
-        favorite_gutter: bool,
+        pin_gutter: bool,
     ) -> Line<'static> {
         let needs_you = self.needs_you_counts();
         self.render_list_line(
@@ -1950,7 +1944,7 @@ impl HomeView {
             is_match,
             theme,
             list_width,
-            favorite_gutter,
+            pin_gutter,
             &needs_you,
         )
     }
@@ -1964,7 +1958,7 @@ impl HomeView {
         is_match: bool,
         theme: &Theme,
         list_width: u16,
-        favorite_gutter: bool,
+        pin_gutter: bool,
         attention: &super::rows::NeedsYouCounts,
     ) -> Line<'static> {
         let indent = get_indent(item.depth());
@@ -2180,17 +2174,17 @@ impl HomeView {
         };
 
         let mut line_spans = Vec::with_capacity(6);
-        if favorite_gutter {
-            let favorited = matches!(item, Item::Session { id, .. }
-                if self.get_instance(id).is_some_and(crate::session::is_live_favorite));
-            line_spans.push(if favorited {
-                let star_style = Style::default().fg(theme.favorite);
+        if pin_gutter {
+            let pinned = matches!(item, Item::Session { id, .. }
+                if self.get_instance(id).is_some_and(crate::session::is_live_pin));
+            line_spans.push(if pinned {
+                let pin_style = Style::default().fg(theme.accent);
                 Span::styled(
-                    format!("{ICON_FAVORITE} "),
+                    format!("{ICON_PINNED} "),
                     if is_selected {
-                        selected_row_style(star_style, theme)
+                        selected_row_style(pin_style, theme)
                     } else {
-                        star_style
+                        pin_style
                     },
                 )
             } else {
@@ -4755,12 +4749,8 @@ impl HomeView {
             if self.selected_session.is_some() {
                 let (click, key) = bound(ActionId::ToggleSnooze);
                 groups.push((1, click, mk(&key, "Snooze")));
-            }
-            // Fav follows the key's own gate (`Context::FavoritesUsable`), so the footer
-            // advertises it wherever `f` actually does something.
-            if self.selected_session.is_some() && crate::session::favorites_first() {
-                let (click, key) = bound(ActionId::ToggleFavorite);
-                groups.push((2, click, mk(&key, "Fav")));
+                let (click, key) = bound(ActionId::TogglePin);
+                groups.push((2, click, mk(&key, "Pin")));
             }
 
             // Committed-search cue: search-next cycles matches and `Esc` clears (#3038). The

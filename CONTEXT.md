@@ -59,7 +59,7 @@ _Avoid_: delete, hard delete
 Hiding a Session until a chosen time. Expired snoozes lift on their own.
 
 **Ignored**:
-A Session managed by another Session, hidden from attention without being Archived or Trashed. It stays live, stays in the list, and accepts direct user input, which clears the marker. Non-user sends (MCP `send_to`, plugin messages and turns) are rejected with an `ignored` error until it is unignored or reclaimed. Archive, Pin, Favorite, or Snooze cancels Ignore, and Archive takes precedence over it; Ignoring clears a Pin but changes no other state. Reclaiming ownership clears the manager link and Ignore together.
+A Session managed by another Session, hidden from attention without being Archived or Trashed. It stays live, stays in the list, and accepts direct user input, which clears the marker. Non-user sends (MCP `send_to`, plugin messages and turns) are rejected with an `ignored` error until it is unignored or reclaimed. Archive, Pin, or Snooze cancels Ignore, and Archive takes precedence over it; Ignoring clears a Pin but changes no other state. Reclaiming ownership clears the manager link and Ignore together.
 _Avoid_: archived, snoozed, deleted
 
 **Managed session**:
@@ -69,11 +69,8 @@ A Session whose `parent_session_id` names the Session that created or drives it.
 A Session that is trashed, snoozed, archived or ignored. The "do not bother me" states as one set.
 
 **Pin**:
-Forcing a Session to the top of the dashboard. Pinning cancels Archive, Ignore and Snooze.
-
-**Favorite**:
-A user mark on a Session. Favoriting cancels Archive, Ignore and Snooze, like Pin. In the TUI, favorites-first (on by default) lifts favorites to the top of their scope under the Name and Newest first sorts; Custom keeps the order set by hand. The web sidebar does not order by favorite.
-_Avoid_: star, pin (different concept)
+A user mark that lifts a Session to the top of its header in every Client, under every sort; pinned Sessions keep the sort's order among themselves, and a header holding one does not move. Pinning cancels Archive, Ignore and Snooze; Archive, Ignore and Snooze clear it.
+_Avoid_: favorite, star
 
 **Unread**:
 A Session with output the user has not looked at since it last changed.

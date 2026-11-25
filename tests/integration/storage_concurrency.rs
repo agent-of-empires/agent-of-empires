@@ -159,7 +159,7 @@ fn test_cross_process_blocking_acquire() -> Result<()> {
     let contended = home.join("child-contended");
     let mut child = CliChild(
         std::process::Command::new(aoe_bin())
-            .args(["session", "favorite", &id])
+            .args(["session", "pin", &id])
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("AOE_E2E_STORAGE_LOCK_CONTENDED", &contended)
@@ -188,8 +188,8 @@ fn test_cross_process_blocking_acquire() -> Result<()> {
     assert!(
         final_state
             .iter()
-            .any(|i| i.id == id && i.favorited_at.is_some()),
-        "child's favorite must land after parent releases"
+            .any(|i| i.id == id && i.pinned_at.is_some()),
+        "child's pin must land after parent releases"
     );
     Ok(())
 }

@@ -3708,10 +3708,9 @@ impl HomeView {
                     self.info_dialog = Some(InfoDialog::new("Order not changed", &e.to_string()));
                 }
             }
-            ActionId::ToggleFavorite => {
-                if let Err(e) = self.toggle_favorite_at_cursor() {
-                    self.info_dialog =
-                        Some(InfoDialog::new("Favorite not changed", &e.to_string()));
+            ActionId::TogglePin => {
+                if let Err(e) = self.toggle_pin_at_cursor() {
+                    self.info_dialog = Some(InfoDialog::new("Pin not changed", &e.to_string()));
                 }
             }
             // Snooze shares non-strict `h` with the vim-style collapse, which a header keeps.

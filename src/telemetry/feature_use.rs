@@ -30,7 +30,7 @@ feature_uses! {
     GroupByManual => "group_by_manual",
     GroupByProject => "group_by_project",
     ArchiveToggle => "archive_toggle",
-    FavoriteToggle => "favorite_toggle",
+    PinToggle => "pin_toggle",
     SnoozeToggle => "snooze_toggle",
     UnreadToggle => "unread_toggle",
     RowReorder => "row_reorder",
@@ -80,7 +80,6 @@ feature_uses! {
 /// Web dashboard uses with no TUI counterpart; the shared ones go through [`FeatureUse`] names.
 const WEB_ONLY: &[&str] = &[
     "sort_plugin",
-    "pin_toggle",
     "focus_mode",
     "summarize",
     "files_pane",

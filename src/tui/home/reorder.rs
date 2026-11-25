@@ -87,6 +87,10 @@ impl HomeView {
             return Ok(());
         };
         match self.sibling_session(at, delta, &workspace) {
+            (Some(neighbour), _) if self.is_live_pin(&id) != self.is_live_pin(&neighbour) => {
+                self.flash_status("Pinned rows stay at the top of their header");
+                Ok(())
+            }
             (Some(neighbour), _) => self.place_workspace(at, &id, &workspace, &neighbour, delta),
             (None, true) => {
                 self.flash_status("Sessions on the same branch move together");
@@ -95,6 +99,11 @@ impl HomeView {
             (None, false) if self.group_by == GroupByMode::Group => self.carry_session(&id, delta),
             (None, false) => Ok(()),
         }
+    }
+
+    fn is_live_pin(&self, id: &str) -> bool {
+        self.get_instance(id)
+            .is_some_and(crate::session::is_live_pin)
     }
 
     /// Flash and return true while an order write or a carry or group move is unapplied,

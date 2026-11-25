@@ -2779,18 +2779,6 @@
       "components": ["web/src/lib/longPress.ts", "web/src/components/WorkspaceSidebar.tsx"]
     },
     {
-      "id": "sidebar.favorite-indicator",
-      "kind": "vitest",
-      "risk": "low",
-      "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
-      "components": [
-        "web/src/components/WorkspaceSidebar.tsx",
-        "web/src/components/sidebar/SessionRow.tsx",
-        "web/src/lib/sidebarMarks.ts"
-      ],
-      "reason": "Favorite markers remain distinct from pin in normal and compact rows, including favorite-to-nonfavorite updates, and explain themselves with a Tooltip rather than title."
-    },
-    {
       "id": "sidebar.unread-indicator",
       "kind": "vitest",
       "risk": "medium",

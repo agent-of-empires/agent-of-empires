@@ -763,9 +763,10 @@ fn native_unread_respects_visits_and_canonical_feedback() {
     );
     expect_request(respond(Ok(cursor(2))), &a, true);
     publish(&mut env, 2, true, false);
-    env.view.toggle_favorite_at_cursor().unwrap();
+    env.view.handle_key(key(KeyCode::Char('f')), None);
     assert!(
-        matches!(respond(Err("favorite rejected".into())), Some((id, SessionMutation::Favorite(_))) if id == a)
+        matches!(respond(Err("pin rejected".into())), Some((id, SessionMutation::Pin(body))) if id == a && matches!(body, crate::daemon::UpdatePinBody::Unscoped { pinned: true })),
+        "f asks the Daemon to pin the row"
     );
     env.view.apply_session_feed();
     env.view.info_dialog = None;
@@ -1607,4 +1608,34 @@ fn a_blocked_suggestion_start_keeps_the_view_open_with_the_reason() {
         .as_deref()
         .unwrap()
         .contains("already being created"));
+}
+
+/// A pinned row sits above every unpinned one in its header, so a move across that boundary
+/// would change nothing on screen; it is refused instead of writing the order.
+#[test]
+#[serial]
+fn a_row_does_not_move_across_the_pinned_boundary() {
+    let mut env = create_test_env_with_sessions(2);
+    let pinned = env.view.instance_at(1).id.clone();
+    env.view.mutate_instance(&pinned, |inst| inst.pin());
+    env.view.flat_items = env.view.build_flat_items();
+    let rows: Vec<String> = env
+        .view
+        .flat_items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Session { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows[0], pinned, "the pinned row leads");
+    for (id, delta) in [(&rows[1], -1), (&rows[0], 1)] {
+        env.view.select_session_by_id(id);
+        env.view.move_row_at_cursor(delta).unwrap();
+        assert!(!env.view.session_feed.ordering_pending(), "{delta}");
+        assert_eq!(
+            env.view.status_flash_text(),
+            Some("Pinned rows stay at the top of their header")
+        );
+    }
 }

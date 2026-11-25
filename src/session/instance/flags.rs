@@ -1,4 +1,4 @@
-//! User-facing triage state: archive, trash, favorite, pin, snooze, unread,
+//! User-facing triage state: archive, trash, pin, snooze, unread,
 //! and the idle bookkeeping they read.
 
 use super::*;
@@ -169,9 +169,8 @@ impl Instance {
     /// traffic flows.
     /// User rule (2026-04-23): "messaging should unarchive."
     ///
-    /// `favorited_at` is preserved: fav is a positive "care more" signal,
-    /// orthogonal to the sink states. A favorited session that was snoozed
-    /// stays favorited when the user wakes it.
+    /// `pinned_at` is preserved: a pin is a positive surfacing signal, not a
+    /// sink state.
     pub fn touch_last_accessed(&mut self) {
         self.last_accessed_at = Some(Timestamp::now());
         self.archived_at = None;
@@ -222,14 +221,13 @@ impl Instance {
     /// clearing archive: `is_urgent` returns false while archived, and the
     /// attention sort short-circuits the row to its bottom tier.
     ///
-    /// Cleared by `unarchive`, by `touch_last_accessed`, and by `favorite`
-    /// and `pin`; not by `snooze`.
+    /// Cleared by `unarchive`, by `touch_last_accessed`, and by `pin`; not by
+    /// `snooze`.
     /// `merge_user_action_diff` mirrors those onto disk; #3465 was a status
     /// transition reaching that mirror without a user gesture.
     ///
-    /// Mutual exclusion with `favorite`, `ignore`, `snooze`, and `pin`:
-    /// archiving clears `favorited_at`, `ignored_at`, `snoozed_until`, and
-    /// `pinned_at`. Archive
+    /// Mutual exclusion with `ignore`, `snooze`, and `pin`: archiving clears
+    /// `ignored_at`, `snoozed_until`, and `pinned_at`. Archive
     /// is the strongest dismiss; keeping any other triage flag on a row
     /// the user just sunk produces contradictory state, and the web
     /// sidebar's tier comparator already assumes the server enforces a
@@ -241,7 +239,6 @@ impl Instance {
         super::forget_before_start_resolution(&self.id);
         self.archived_at = Some(Timestamp::now());
         self.ignored_at = None;
-        self.favorited_at = None;
         self.snoozed_until = None;
         self.pinned_at = None;
         self.settle_archived_status();
@@ -280,8 +277,8 @@ impl Instance {
     /// session (handled by the caller: ACP `shutdown`, optional tmux kill)
     /// but keeps every durable artifact so `untrash` can bring it back
     /// intact. A new trash lifecycle receives its own UUID; the
-    /// sibling triage flags (`archived_at`, `favorited_at`, `snoozed_until`,
-    /// `pinned_at`) are left untouched so restore is faithful.
+    /// sibling triage flags (`archived_at`, `snoozed_until`, `pinned_at`) are
+    /// left untouched so restore is faithful.
     /// `effective_bucket()` makes trash win regardless. Idempotent.
     pub fn trash(&mut self) {
         super::forget_before_start_resolution(&self.id);
@@ -335,7 +332,7 @@ impl Instance {
     /// The mutually-exclusive lifecycle bucket a session renders in.
     /// Precedence is `Trashed > Archived > Active`: a trashed row never
     /// shows in active or archived views, and an archived row never shows
-    /// in active views. Snooze/favorite/pin are orthogonal decorations
+    /// in active views. Snooze and pin are orthogonal decorations
     /// within a bucket, not buckets of their own, so they are not consulted
     /// here. Use this instead of bare `!is_archived()` filters so trashed
     /// rows cannot leak into the active list.
@@ -347,34 +344,6 @@ impl Instance {
         } else {
             SessionBucket::Active
         }
-    }
-
-    /// Mark the session favorite. Sibling of `archive`, with opposite semantics.
-    /// Pinning logic lives in `attention_session_key`: favorite is a
-    /// within-tier pin (top of its respective category), not a cross-tier
-    /// promoter. A favorited Running stays in the Running bucket but sorts
-    /// above non-favorited Running peers.
-    ///
-    /// Mutual exclusion with the sink states: favoriting clears `archived_at`,
-    /// `ignored_at`, and `snoozed_until`. Favorite's whole purpose is "surface this row";
-    /// leaving either sink-state flag set would force the row to tier 99 and
-    /// the favorite bias would be suppressed; user presses `f` and sees
-    /// nothing change. The user's explicit rule: "marking as favorite
-    /// unarchives," extended to snooze because snooze shares tier 99 and
-    /// shares the burial outcome.
-    pub fn favorite(&mut self) {
-        self.favorited_at = Some(Timestamp::now());
-        self.archived_at = None;
-        self.ignored_at = None;
-        self.snoozed_until = None;
-    }
-
-    pub fn unfavorite(&mut self) {
-        self.favorited_at = None;
-    }
-
-    pub fn is_favorited(&self) -> bool {
-        self.favorited_at.is_some()
     }
 
     /// Read the agent-raised urgent flag from `attention.json`. Sourced
@@ -400,10 +369,7 @@ impl Instance {
     ///
     /// Clears `ignored_at` and `pinned_at` for the same reason archive does:
     /// snooze is a sink state, and a pinned-yet-snoozed or ignored-yet-snoozed
-    /// row is contradictory. The
-    /// existing favorite mutator is intentionally NOT touched here
-    /// (favorite is the TUI within-tier signal, snoozed favorites keep
-    /// their star when they wake; see field doc for `favorited_at`).
+    /// row is contradictory.
     pub fn snooze(&mut self, minutes: u32) {
         // Saturate: u32 minutes can pass the latest representable instant.
         self.snoozed_until = Some(
@@ -520,16 +486,12 @@ impl Instance {
         })
     }
 
-    /// Mark this session pinned. Pin is a web-only surfacing primitive:
-    /// pinned workspaces sort to the top of the web sidebar (across all
-    /// sort modes), regardless of last-activity. Distinct from
-    /// `favorited_at`, which drives the TUI Attention sort's within-tier
-    /// pin and stays unchanged here (see #1581).
+    /// Mark this session pinned: every Client lifts it to the top of its
+    /// header under every sort.
     ///
     /// Mutual exclusion with the sink states: pinning clears `archived_at`,
-    /// `ignored_at`, and `snoozed_until`. A pinned-yet-sunk row would
-    /// contradict the entire point of pinning (surface this), so the
-    /// sinks come off, identical to how `favorite()` handles it.
+    /// `ignored_at`, and `snoozed_until`, since a pinned-yet-sunk row would
+    /// contradict the point of pinning.
     pub fn pin(&mut self) {
         self.pinned_at = Some(Timestamp::now());
         self.archived_at = None;
@@ -630,8 +592,7 @@ mod tests {
     /// `touch_last_accessed` is what `aoe send` and the TUI dispatch path
     /// call when the user interacts with a session. It must auto-wake
     /// archived and snoozed rows so sending a message to a sunk session
-    /// brings it back, while preserving the favorite flag (favorite is a
-    /// positive "care more" signal, not a sink state).
+    /// brings it back.
     #[test]
     fn test_touch_last_accessed_clears_archived() {
         let mut inst = Instance::new("test", "/tmp/test");
@@ -670,10 +631,6 @@ mod tests {
         );
 
         inst.ignore();
-        inst.favorite();
-        assert!(!inst.is_ignored(), "favorite cancels ignore");
-
-        inst.ignore();
         inst.archive();
         assert!(inst.is_archived());
         assert!(!inst.is_ignored(), "archive takes precedence over ignore");
@@ -703,7 +660,6 @@ mod tests {
         inst.id = "row-id".into();
         inst.parent_session_id = Some("manager".into());
         inst.ignore();
-        inst.favorited_at = Some(Timestamp::now());
         inst.pinned_at = Some(Timestamp::now());
         inst.agent_session_id = Some("native-conversation".into());
         let created_at = inst.created_at;
@@ -718,7 +674,6 @@ mod tests {
             inst.agent_session_id.as_deref(),
             Some("native-conversation")
         );
-        assert!(inst.is_favorited());
         assert!(inst.is_pinned());
         assert!(!inst.is_archived());
         assert!(!inst.is_trashed());
@@ -868,17 +823,6 @@ mod tests {
     }
 
     #[test]
-    fn test_touch_last_accessed_preserves_favorite() {
-        let mut inst = Instance::new("test", "/tmp/test");
-        inst.favorite();
-        assert!(inst.is_favorited());
-        inst.touch_last_accessed();
-        // Favorite is orthogonal to sink states; user interaction must not
-        // clear it.
-        assert!(inst.is_favorited());
-    }
-
-    #[test]
     fn test_archive_clears_snooze() {
         // Direct mutator test (no merge): the data-layer contract is
         // that archive is mutually exclusive with every other triage
@@ -977,20 +921,14 @@ mod tests {
     #[test]
     fn test_trash_preserves_sibling_triage_flags() {
         let mut inst = Instance::new("s", "/tmp/x");
-        inst.favorite();
         inst.pin();
-        assert!(inst.is_favorited());
-        assert!(inst.is_pinned());
-
         inst.trash();
         // Trash wins the bucket but leaves the decorations intact so
-        // restore is faithful (a trashed favorite comes back a favorite).
+        // restore is faithful.
         assert_eq!(inst.effective_bucket(), SessionBucket::Trashed);
-        assert!(inst.is_favorited(), "favorite preserved across trash");
         assert!(inst.is_pinned(), "pin preserved across trash");
 
         inst.untrash();
-        assert!(inst.is_favorited());
         assert!(inst.is_pinned());
     }
 
@@ -1052,25 +990,6 @@ mod tests {
         // Pin is an explicit user surfacing signal, not a sink state.
         // User interaction (send, attach) must NOT clear it.
         assert!(inst.is_pinned());
-    }
-
-    #[test]
-    fn test_pin_and_favorite_coexist() {
-        let mut inst = Instance::new("s", "/tmp/x");
-        inst.favorite();
-        assert!(inst.is_favorited());
-        inst.pin();
-        // Pin and favorite drive different surfaces (TUI Attention vs web
-        // sidebar). They must coexist; pinning does NOT clear favorite.
-        assert!(inst.is_pinned());
-        assert!(inst.is_favorited());
-
-        let mut inst2 = Instance::new("s2", "/tmp/x");
-        inst2.pin();
-        inst2.favorite();
-        // Same in reverse: favoriting does NOT clear pin.
-        assert!(inst2.is_pinned());
-        assert!(inst2.is_favorited());
     }
 
     #[test]

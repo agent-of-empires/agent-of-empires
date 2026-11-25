@@ -64,9 +64,9 @@ pub use config::{
 pub(crate) use environment::user_shell;
 pub use environment::{validate_env_entries, validate_env_entry};
 pub use fork::{ForkDenied, ForkParentRef, ForkSeed};
-/// Shared by the sorter and the row renderer so a row is decorated as a
-/// favorite exactly when it is pinned as one.
-pub(crate) use groups::is_live_favorite;
+/// Shared by the sorter and the row renderer so a row shows the pin mark exactly
+/// when the list lifts it.
+pub(crate) use groups::is_live_pin;
 pub use groups::{
     append_archived_section, append_archived_section_by_project, append_trash_section,
     archived_project_sub_path, flatten_tree, flatten_tree_all_profiles, is_archived_section_path,
@@ -154,22 +154,6 @@ pub fn unread_enabled() -> bool {
 /// Update the cached unread-indicator flag from resolved config.
 pub fn set_unread_enabled(on: bool) {
     UNREAD_ENABLED.store(on, Ordering::Relaxed);
-}
-
-/// Process-wide cache of the `session.favorites_first` toggle (default on).
-/// Refreshed alongside [`set_unread_enabled`] whenever config is applied.
-/// Read on every sort pass, so it is an atomic load rather than a parameter
-/// threaded through the sort helpers.
-static FAVORITES_FIRST: AtomicBool = AtomicBool::new(true);
-
-/// Whether favorited rows pin to the top of their sibling scope under the Name and Newest first sorts.
-pub fn favorites_first() -> bool {
-    FAVORITES_FIRST.load(Ordering::Relaxed)
-}
-
-/// Update the cached favorites-first flag from resolved config.
-pub fn set_favorites_first(on: bool) {
-    FAVORITES_FIRST.store(on, Ordering::Relaxed);
 }
 
 pub(crate) use anchored_fs::ResolvedDataFile;

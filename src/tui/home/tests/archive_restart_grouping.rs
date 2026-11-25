@@ -1699,18 +1699,17 @@ async fn profile_move_group_metadata_survives_reload() {
     );
 }
 
-/// The favorite mark sits in a left gutter that shows only with `session.favorites_first`
-/// and only while a visible row is a live favorite. Every row reserves it so titles stay
-/// aligned. Snooze and ignore prefixes render in every sort.
+/// The pin mark sits in a left gutter that shows only while a visible row is pinned, under
+/// every sort. Every row reserves it so titles stay aligned. Snooze and ignore prefixes
+/// render in every sort.
 #[test]
 #[serial]
-fn favorite_gutter_follows_pin_predicate() {
+fn pin_gutter_marks_pinned_rows_under_every_sort() {
     use crate::session::config::SortOrder;
-    use crate::tui::home::ICON_FAVORITE;
+    use crate::tui::home::ICON_PINNED;
 
-    let original = crate::session::favorites_first();
     let mut env = create_test_env_with_sessions(2);
-    let fav = env.view.instance_at(0).id.clone();
+    let pinned_id = env.view.instance_at(0).id.clone();
     let other = env.view.instance_at(1).id.clone();
     let theme = crate::tui::styles::Theme::default();
     let line = |view: &HomeView, id: &str| {
@@ -1720,7 +1719,7 @@ fn favorite_gutter_follows_pin_predicate() {
             .find(|i| matches!(i, Item::Session { id: sid, .. } if sid == id))
             .cloned()
             .expect("session item present");
-        view.render_item_line(&item, false, false, &theme, 200, view.favorite_gutter())
+        view.render_item_line(&item, false, false, &theme, 200, view.pin_gutter())
     };
     let text = |view: &HomeView, id: &str| -> String {
         line(view, id)
@@ -1729,74 +1728,73 @@ fn favorite_gutter_follows_pin_predicate() {
             .map(|s| s.content.as_ref())
             .collect()
     };
-    let star = format!("{ICON_FAVORITE} ");
+    let mark = format!("{ICON_PINNED} ");
 
-    // (sort, favorites_first, favorited, snoozed, gutter expected)
-    for (sort, first, favorited, snoozed, gutter) in [
-        (SortOrder::Custom, false, true, false, false),
-        (SortOrder::Name, false, true, false, false),
-        (SortOrder::Name, true, true, false, true),
-        (SortOrder::Custom, true, false, false, false),
-        // A snoozed favorite keeps its place but not its mark.
-        (SortOrder::Custom, true, true, true, false),
+    // (sort, pinned, snoozed after pinning, gutter expected)
+    for (sort, pinned, snoozed, gutter) in [
+        (SortOrder::Custom, true, false, true),
+        (SortOrder::Name, true, false, true),
+        (SortOrder::Name, false, false, false),
+        // Snoozing clears the pin, so the row is not marked.
+        (SortOrder::Custom, true, true, false),
     ] {
-        env.view.mutate_instance(&fav, |inst| {
+        env.view.mutate_instance(&pinned_id, |inst| {
             inst.unsnooze();
-            inst.unfavorite();
-            if favorited {
-                inst.favorite();
+            inst.unpin();
+            if pinned {
+                inst.pin();
             }
             if snoozed {
                 inst.snooze(30);
             }
         });
-        // After the env is built: constructing it applies config, which resets the flag.
-        crate::session::set_favorites_first(first);
         env.view.sort_order = sort;
         env.view.flat_items = env.view.build_flat_items();
-        let case = format!("{sort:?} first={first} fav={favorited} snoozed={snoozed}");
+        let case = format!("{sort:?} pinned={pinned} snoozed={snoozed}");
 
-        let (fav_text, other_text) = (text(&env.view, &fav), text(&env.view, &other));
-        assert!(!fav_text.contains("* "), "{case}: old prefix: {fav_text:?}");
-        assert_eq!(fav_text.starts_with(&star), gutter, "{case}: {fav_text:?}");
+        let (pinned_text, other_text) = (text(&env.view, &pinned_id), text(&env.view, &other));
+        assert_eq!(
+            pinned_text.starts_with(&mark),
+            gutter,
+            "{case}: {pinned_text:?}"
+        );
         assert_eq!(
             other_text.starts_with("  "),
             gutter,
             "{case}: {other_text:?}"
         );
         if gutter {
-            let spans = line(&env.view, &fav).spans;
-            assert_eq!(spans[0].style.fg, Some(theme.favorite), "{case}");
+            let spans = line(&env.view, &pinned_id).spans;
+            assert_eq!(spans[0].style.fg, Some(theme.accent), "{case}");
             assert!(
                 spans.iter().all(|s| !s
                     .style
                     .add_modifier
                     .contains(ratatui::style::Modifier::UNDERLINED)),
-                "{case}: favorite rows are not underlined"
+                "{case}: pinned rows are not underlined"
             );
         }
     }
 
-    // A selected star that would vanish on the selection background falls back to text.
+    // A selected mark that would vanish on the selection background falls back to text.
     let mut low_contrast = theme.clone();
-    low_contrast.favorite = low_contrast.session_selection;
+    low_contrast.accent = low_contrast.session_selection;
+    env.view.mutate_instance(&pinned_id, |inst| {
+        inst.unsnooze();
+        inst.pin();
+    });
+    env.view.flat_items = env.view.build_flat_items();
     let item = env
         .view
         .flat_items
         .iter()
-        .find(|i| matches!(i, Item::Session { id: sid, .. } if *sid == fav))
+        .find(|i| matches!(i, Item::Session { id: sid, .. } if *sid == pinned_id))
         .cloned()
         .expect("session item present");
-    env.view.mutate_instance(&fav, |inst| {
-        inst.unsnooze();
-        inst.favorite();
-    });
     let selected = env
         .view
         .render_item_line(&item, true, false, &low_contrast, 200, true);
     assert_eq!(selected.spans[0].style.fg, Some(low_contrast.text));
-
-    crate::session::set_favorites_first(original);
 
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();

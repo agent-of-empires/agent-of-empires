@@ -66,9 +66,8 @@ export interface SessionResponse {
    *  keeping the directory). The wizard's Recent-projects list filters
    *  scratch sessions out. */
   scratch: boolean;
-  favorited: boolean;
   urgent?: boolean;
-  /** Web pin time; `pinned_at != null` is the pinned state. */
+  /** Pin time; `pinned_at != null` is the pinned state, which every Client honors. */
   pinned_at?: string | null;
   archived_at?: string | null;
   /** Ignored because another session manages it; distinct from archive and trash. */

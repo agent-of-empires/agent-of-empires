@@ -48,15 +48,15 @@ pub use wire::{
     SessionLookupError, SessionResponse, SessionsEnvelope, SetWorktreeNameBody, SidebarViewPatch,
     StartSessionBody, StopAuxiliaryBody, TerminalSize, TerminalTarget, TerminalTargetStatus,
     TrashOutcome, TrashRelocationOutcome, TrashSessionBody, Tristate, UpdateArchiveBody,
-    UpdateDiffBaseBody, UpdateFavoriteBody, UpdateGroupBody, UpdateIgnoredBody,
-    UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
-    WorkspaceOrderingBase, WorkspaceOrderingPatch, WorkspaceRepoSummary, WorktreeEditOutcome,
+    UpdateDiffBaseBody, UpdateGroupBody, UpdateIgnoredBody, UpdateNotificationsBody, UpdatePinBody,
+    UpdateSnoozeBody, UpdateUnreadBody, WorkspaceOrderingBase, WorkspaceOrderingPatch,
+    WorkspaceRepoSummary, WorktreeEditOutcome,
 };
 pub use wire::{
     ApplyUpdateBody, InstallPreviewBody, PluginJob, PluginJobAccepted, PluginJobKind, PluginJobLog,
     PluginJobResponse, PluginJobStatus, StartInstallBody,
 };
-pub(crate) use wire::{FavoriteOutcome, FAVORITE_BY_SELECTOR};
+pub(crate) use wire::{PinOutcome, PIN_BY_SELECTOR};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Sandbox copies, image pulls and launch hooks can take minutes.
@@ -144,8 +144,8 @@ pub enum DaemonClientError {
     InvalidMutationReceipt,
     #[error("The selected Daemon does not provide the runtime cursor required by this command. Upgrade the Daemon and run `aoe serve --restart` on its host.")]
     RuntimeCursorUnsupported,
-    #[error("Daemon could not resolve the favorite selector")]
-    FavoriteSelection(SessionLookupError),
+    #[error("Daemon could not resolve the pin selector")]
+    PinSelection(SessionLookupError),
 }
 
 #[derive(Debug, Error)]
@@ -259,7 +259,7 @@ fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &
     }
     match code {
         Some(ApiErrorCode::ReadOnly) => "Daemon is read-only; request refused".into(),
-        Some(ApiErrorCode::FavoriteNamespaceBusy) => "Profile namespace is busy; no favorite change was made.".into(),
+        Some(ApiErrorCode::PinNamespaceBusy) => "Profile namespace is busy; no pin change was made.".into(),
         Some(ApiErrorCode::OutcomeUnconfirmed) =>
             "The change committed, but runtime publication is unconfirmed. Check canonical state before retrying.".into(),
         Some(ApiErrorCode::ManagedResumeRefused(cause)) => cause.message().into(),
@@ -705,13 +705,13 @@ impl DaemonClient {
         })
     }
 
-    pub(crate) async fn set_favorite_by_selector(
+    pub(crate) async fn set_pin_by_selector(
         &self,
-        body: &UpdateFavoriteBody,
+        body: &UpdatePinBody,
         baseline: &RuntimeCursor,
-    ) -> Result<FavoriteOutcome, DaemonClientError> {
-        let url = format!("{}/{FAVORITE_BY_SELECTOR}/favorite", self.sessions_url);
-        let receipt: MutationReceipt<FavoriteOutcome> = self
+    ) -> Result<PinOutcome, DaemonClientError> {
+        let url = format!("{}/{PIN_BY_SELECTOR}/pin", self.sessions_url);
+        let receipt: MutationReceipt<PinOutcome> = self
             .request_mutation_with_outcome(self.http.patch(url).json(body), &baseline.epoch)
             .await?;
         if receipt.cursor.revision <= baseline.revision {
@@ -1266,9 +1266,9 @@ impl DaemonClient {
                     truncated,
                 });
             }
-            if code == Some(ApiErrorCode::FavoriteSelectionRefused) {
+            if code == Some(ApiErrorCode::PinSelectionRefused) {
                 let body = decode_json_bounded(response, MAX_ERROR_BODY_BYTES).await?;
-                return Err(DaemonClientError::FavoriteSelection(body));
+                return Err(DaemonClientError::PinSelection(body));
             }
             if !self.should_read_error_body(code) {
                 return Err(DaemonClientError::Status {
@@ -1871,15 +1871,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn favorite_requires_a_newer_receipt_in_the_selected_epoch() {
+    async fn pin_requires_a_newer_receipt_in_the_selected_epoch() {
         let baseline = RuntimeCursor {
             epoch: "epoch-1".into(),
             revision: 7,
         };
-        let body = UpdateFavoriteBody::Scoped {
+        let body = UpdatePinBody::Scoped {
             profile: "main".into(),
             selector: ".".into(),
-            select_favorited: true,
+            select_pinned: true,
         };
         for (epoch, revision, accepted) in [
             ("epoch-1", "7", false),
@@ -1888,7 +1888,7 @@ mod tests {
         ] {
             let (tx, rx) = tokio::sync::oneshot::channel();
             let base = serve_mutation_once(
-                "/api/sessions/by-selector/favorite",
+                "/api/sessions/by-selector/pin",
                 200,
                 vec![
                     (RUNTIME_EPOCH_HEADER, epoch),
@@ -1899,7 +1899,7 @@ mod tests {
             )
             .await;
             let client = DaemonClient::new(&base, None).unwrap();
-            let result = client.set_favorite_by_selector(&body, &baseline).await;
+            let result = client.set_pin_by_selector(&body, &baseline).await;
             if accepted {
                 assert_eq!(result.unwrap().title, "Committed title");
             } else {
@@ -1919,24 +1919,24 @@ mod tests {
     }
 
     #[test]
-    fn favorite_wire_rejects_partial_and_mixed_selectors() {
+    fn pin_wire_rejects_partial_and_mixed_selectors() {
         for malformed in [
-            serde_json::json!({"profile": "main", "favorited": true}),
-            serde_json::json!({"selector": null, "favorited": true}),
-            serde_json::json!({"select_favorited": null, "favorited": true}),
-            serde_json::json!({"profile": "main", "select_favorited": true}),
-            serde_json::json!({"profile": "main", "selector": "title", "select_favorited": true, "favorited": false}),
-            serde_json::json!({"profile": "main", "selector": "title", "select_favorited": true, "client_tag": "batch"}),
+            serde_json::json!({"profile": "main", "pinned": true}),
+            serde_json::json!({"selector": null, "pinned": true}),
+            serde_json::json!({"select_pinned": null, "pinned": true}),
+            serde_json::json!({"profile": "main", "select_pinned": true}),
+            serde_json::json!({"profile": "main", "selector": "title", "select_pinned": true, "pinned": false}),
+            serde_json::json!({"profile": "main", "selector": "title", "select_pinned": true, "client_tag": "batch"}),
             serde_json::json!(["main", "title", true]),
         ] {
-            assert!(serde_json::from_value::<UpdateFavoriteBody>(malformed).is_err());
+            assert!(serde_json::from_value::<UpdatePinBody>(malformed).is_err());
         }
         assert!(matches!(
-            serde_json::from_str::<UpdateFavoriteBody>(
-                r#"{"favorited":false,"client_tag":{"origin":"batch"}}"#
+            serde_json::from_str::<UpdatePinBody>(
+                r#"{"pinned":false,"client_tag":{"origin":"batch"}}"#
             )
             .unwrap(),
-            UpdateFavoriteBody::Unscoped { favorited: false }
+            UpdatePinBody::Unscoped { pinned: false }
         ));
     }
 

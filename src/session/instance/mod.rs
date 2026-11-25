@@ -584,7 +584,7 @@ pub struct Instance {
 
     /// Managed-session ignore marker. A session driven by another session may
     /// be ignored without being archived or trashed. Ignore is a sink state:
-    /// pin, favorite, archive and snooze clear it, and direct user engagement
+    /// pin, archive and snooze clear it, and direct user engagement
     /// (`touch_last_accessed`) wakes it. MCP routine access and sends refuse
     /// an ignored managed session instead of quietly clearing the marker.
     /// Additive: absent in older `sessions.json` rows, so no migration is
@@ -592,23 +592,13 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignored_at: Option<Timestamp>,
 
-    /// Favorite marker; sibling of archive. When set AND the session is in
-    /// a "needs help" status (Waiting, Error, Idle, Unknown), the session
-    /// pre-empts all non-favorited peers in the same status tier, pinning it
-    /// to the top of the Attention sort. In Running / Stopped / transient
-    /// statuses the flag is visible (⭐ glyph + bold) but does NOT re-rank
-    /// since live work isn't interrupted by a decoration. Opposite of archive.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub favorited_at: Option<Timestamp>,
-
     /// Snooze marker, a "temporary archive." When `snoozed_until` is in the
     /// future, the session sorts to tier 99 alongside archived rows and
     /// renders italic+dim with a `z ` prefix plus a remaining-time readout
     /// in the age column. When the timestamp falls into the past, the
     /// `is_snoozed()` predicate returns false and the row naturally rejoins
     /// the active attention sort (the stale timestamp stays on disk until
-    /// the next mutation rewrites it, which is harmless). Mutually compatible with
-    /// `favorited_at`: a snoozed favorite keeps its star when it wakes up.
+    /// the next mutation rewrites it, which is harmless).
     /// Archive wins over snooze (archiving a snoozed session clears nothing
     /// but renders as archive since is_archived() is checked first).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -638,16 +628,11 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_dormant_since: Option<Timestamp>,
 
-    /// Web-only pin marker. Distinct from `favorited_at`: favorite is the
-    /// TUI attention-sort within-tier pin, while pin is a hard top-of-sort
-    /// surfacing primitive surfaced through the web sidebar (where the TUI's
-    /// Attention sort does not exist). Mutually exclusive with the sink
-    /// states (`archived_at`, `snoozed_until`) via the `pin()` mutator and
-    /// the inverse clear in `archive()` / `snooze()`. Orthogonal to
-    /// `favorited_at` (both can be set; they drive different surfaces).
-    /// Unlike archive/snooze, `pin` is NOT cleared by `touch_last_accessed`
-    /// because it is an explicit persistent surfacing signal, not a sink
-    /// state that "user is engaging" implicitly contradicts. See #1581.
+    /// Pin marker: every Client lifts a pinned row to the top of its header under
+    /// every sort. Mutually exclusive with the sink states (`archived_at`,
+    /// `ignored_at`, `snoozed_until`) via `pin()` and the inverse clear in
+    /// `archive()`, `ignore()` and `snooze()`. Not cleared by
+    /// `touch_last_accessed`: it is an explicit surfacing signal, not a sink.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_at: Option<Timestamp>,
 
@@ -661,9 +646,9 @@ pub struct Instance {
     /// (`session.trash_retention_days`) elapses from `trashed_at`.
     ///
     /// Unlike `archive()`, `trash()` does NOT clear the sibling triage
-    /// timestamps (`archived_at`, `favorited_at`, `snoozed_until`,
-    /// `pinned_at`): trash takes precedence in bucketing while those are
-    /// preserved, so a restored favorite comes back a favorite. Additive:
+    /// timestamps (`archived_at`, `snoozed_until`, `pinned_at`): trash takes
+    /// precedence in bucketing while those are preserved, so a restored pin
+    /// comes back pinned. Additive:
     /// absent in older `sessions.json` rows, so no migration is needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trashed_at: Option<Timestamp>,

@@ -76,7 +76,7 @@ aoe theme list
 aoe theme dir
 ```
 
-Every field is optional. Missing colors fall back to the Empire baseline, except `unread` and `favorite`, which inherit the theme's own `accent`. An omitted `appearance` or `[syntax].shiki_theme` is derived from the theme's background luminance. `appearance = "dark" | "light"` and `[syntax].shiki_theme` (any id [Shiki bundles](https://shiki.style/themes)) drive the dashboard's surface ramp and code highlighting. An unknown `shiki_theme` falls back to `github-dark` or `github-light` by appearance.
+Every field is optional. Missing colors fall back to the Empire baseline, except `unread`, which inherits the theme's own `accent`. An omitted `appearance` or `[syntax].shiki_theme` is derived from the theme's background luminance. `appearance = "dark" | "light"` and `[syntax].shiki_theme` (any id [Shiki bundles](https://shiki.style/themes)) drive the dashboard's surface ramp and code highlighting. An unknown `shiki_theme` falls back to `github-dark` or `github-light` by appearance.
 
 ## Session
 

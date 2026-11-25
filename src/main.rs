@@ -399,8 +399,8 @@ async fn run(
         }
         Some(Commands::Session {
             command:
-                command @ (cli::session::SessionCommands::Favorite(_)
-                | cli::session::SessionCommands::Unfavorite(_)),
+                command @ (cli::session::SessionCommands::Pin(_)
+                | cli::session::SessionCommands::Unpin(_)),
         }) => {
             return exit_zero(
                 cli::session::run(cli.profile.as_deref().unwrap_or_default(), command).await,

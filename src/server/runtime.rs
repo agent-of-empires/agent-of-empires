@@ -1216,7 +1216,8 @@ mod tests {
                 crate::server::api::update_session_pin(
                     State(state),
                     axum::extract::Path(id),
-                    Ok(Json(crate::daemon::UpdatePinBody { pinned })),
+                    axum::http::HeaderMap::new(),
+                    Ok(Json(crate::daemon::UpdatePinBody::Unscoped { pinned })),
                 )
                 .await
                 .into_response()

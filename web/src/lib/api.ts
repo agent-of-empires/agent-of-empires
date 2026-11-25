@@ -3129,9 +3129,7 @@ export async function setSessionDiffBase(
   }
 }
 
-/** Toggle the web-only "pin" marker on a session. Pinned workspaces sink
- *  to the top of the sidebar in all sort modes (manual and lastActivity).
- *  Distinct from the TUI favorite signal. See #1581. */
+/** Pin or unpin a session; every Client lifts a pinned row to the top of its header. */
 export async function setSessionPin(id: string, pinned: boolean): Promise<SessionResponse | null> {
   try {
     return await sessionUpdate(id, "pin", jsonInit("PATCH", { pinned }));

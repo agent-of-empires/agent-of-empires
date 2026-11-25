@@ -99,27 +99,6 @@ impl Drop for EnvGuard {
     }
 }
 
-pub(crate) struct FavoritesFirstGuard {
-    previous: bool,
-    _env: EnvGuard,
-}
-
-impl FavoritesFirstGuard {
-    pub(crate) fn new() -> Self {
-        let env = EnvGuard::read_lock();
-        Self {
-            previous: crate::session::favorites_first(),
-            _env: env,
-        }
-    }
-}
-
-impl Drop for FavoritesFirstGuard {
-    fn drop(&mut self) {
-        crate::session::set_favorites_first(self.previous);
-    }
-}
-
 pub(crate) fn path_prepended(dir: &Path) -> EnvGuard {
     let guard = EnvGuard::read_lock();
     let inherited = std::env::var_os("PATH").filter(|value| !value.is_empty());

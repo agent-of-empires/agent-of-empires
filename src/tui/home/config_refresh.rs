@@ -127,7 +127,6 @@ impl HomeView {
         self.idle_decay_window =
             crate::tui::styles::idle_decay_window(config.theme.idle_decay_minutes);
         crate::session::set_unread_enabled(config.session.unread_indicator);
-        crate::session::set_favorites_first(config.session.favorites_first);
         self.tips_unseen = self.tips_unseen_count(&config);
         self.queue_shortcut_bar_tip(&config);
         let keybind_warnings = install_keybinds(&config);

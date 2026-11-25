@@ -630,19 +630,19 @@ impl HomeView {
         Ok(())
     }
 
-    /// Queue a favorite change; only canonical snapshots update the row.
-    pub(super) fn toggle_favorite_at_cursor(&mut self) -> anyhow::Result<()> {
+    /// Queue a pin change; only canonical snapshots update the row.
+    pub(super) fn toggle_pin_at_cursor(&mut self) -> anyhow::Result<()> {
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
-        let is_fav = match self.instances.get(&id) {
-            Some(i) => i.is_favorited(),
+        let pinned = match self.instances.get(&id) {
+            Some(i) => i.is_pinned(),
             None => return Ok(()),
         };
         self.session_feed.submit(
             id,
-            crate::daemon::SessionMutation::Favorite(crate::daemon::UpdateFavoriteBody::Unscoped {
-                favorited: !is_fav,
+            crate::daemon::SessionMutation::Pin(crate::daemon::UpdatePinBody::Unscoped {
+                pinned: !pinned,
             }),
         )?;
         Ok(())

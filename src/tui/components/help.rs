@@ -449,7 +449,7 @@ mod tests {
 
     #[test]
     fn attention_section_groups_triage_bindings() {
-        // The Attention section bundles snooze/archive/favorite/next-waiting
+        // The Attention section bundles snooze/archive/pin/next-waiting
         // so users see them together instead of scattered across Navigation
         // and Actions.
         for strict in [false, true] {
@@ -459,7 +459,7 @@ mod tests {
                 .find(|(name, _)| name.starts_with("Attention"))
                 .expect("Attention section should exist");
             let (_, keys) = attention;
-            for needle in ["favorite", "Snooze", "Archive", "waiting"] {
+            for needle in ["Toggle pin", "Snooze", "Archive", "waiting"] {
                 assert!(
                     keys.iter().any(|(_, desc)| desc.contains(needle)),
                     "Attention section should mention {needle} (strict={strict})"
@@ -468,7 +468,7 @@ mod tests {
             // And those should no longer live in Actions or Navigation.
             for other_section in ["Navigation", "Actions", "Actions (strict mode)"] {
                 if let Some((_, other)) = all.iter().find(|(n, _)| *n == other_section) {
-                    for needle in ["favorite", "Snooze", "Archive", "waiting"] {
+                    for needle in ["Toggle pin", "Snooze", "Archive", "waiting"] {
                         assert!(
                             !other.iter().any(|(_, desc)| desc.contains(needle)),
                             "{other_section} should not still contain {needle} \

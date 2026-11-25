@@ -255,13 +255,6 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
                   </span>
                 </Tooltip>
               )}
-              {model.isFavorited && (
-                <Tooltip text={meaningText(MARK_MEANING.favorite)}>
-                  <span aria-label="Favorited" data-testid="sidebar-favorite-mark" className="shrink-0 text-favorite">
-                    ✦
-                  </span>
-                </Tooltip>
-              )}
               <span className="truncate" title={label}>
                 {label}
               </span>

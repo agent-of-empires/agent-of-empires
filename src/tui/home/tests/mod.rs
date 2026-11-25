@@ -802,7 +802,7 @@ fn env_running_then_idle() -> (TestEnv, usize, usize) {
 fn rendered_row_text(view: &HomeView, item: &Item) -> String {
     use crate::tui::styles::Theme;
     let theme = Theme::default();
-    view.render_item_line(item, false, false, &theme, 200, view.favorite_gutter())
+    view.render_item_line(item, false, false, &theme, 200, view.pin_gutter())
         .spans
         .iter()
         .map(|s| s.content.as_ref())

@@ -232,16 +232,14 @@ fn running_web_status_survives_a_committed_search_on_a_narrow_footer() {
 
 /// The web dashboard entry and New survive the narrow footers the bar is tuned for: with a
 /// tips badge showing, `R` (strict: Ctrl+R), New and Msg stay at 80 and 60 columns, and
-/// Fav, now below them, is the one that drops.
+/// Pin, now below them, is the one that drops.
 #[test]
 #[serial]
 fn web_entry_and_new_survive_narrow_footers() {
     let mut env = create_test_env_with_sessions(1);
-    let original = crate::session::favorites_first();
-    crate::session::set_favorites_first(true);
     env.view.tips_unseen = 3;
     let plain = |c| (KeyCode::Char(c), KeyModifiers::NONE);
-    for (strict, width, fav_kept) in [
+    for (strict, width, pin_kept) in [
         (false, 120, true),
         (false, 80, false),
         (false, 60, false),
@@ -255,7 +253,7 @@ fn web_entry_and_new_survive_narrow_footers() {
                 .iter()
                 .any(|(k, _)| k.code == code && k.modifiers == modifiers)
         };
-        let (web, new, msg, fav) = if strict {
+        let (web, new, msg, pin) = if strict {
             (
                 (KeyCode::Char('r'), KeyModifiers::CONTROL),
                 plain('N'),
@@ -269,9 +267,8 @@ fn web_entry_and_new_survive_narrow_footers() {
         assert!(shown(web), "web entry kept: {case}");
         assert!(shown(new), "New kept: {case}");
         assert!(shown(msg), "Msg kept: {case}");
-        assert_eq!(shown(fav), fav_kept, "Fav: {case}");
+        assert_eq!(shown(pin), pin_kept, "Pin: {case}");
     }
-    crate::session::set_favorites_first(original);
 }
 
 /// R opens Connections rather than going straight to the Web dashboard; Enter on the Web

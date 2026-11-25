@@ -238,7 +238,7 @@ static CATALOG: &[Tip] = &[
         id: "tui-triage",
         title: "Triage from the keyboard",
         body: "Pick the sort with {sort} and grouping with {group}, and archive a session \
-               with {archive}. Favorite with {favorite} to keep a session within reach, and \
+               with {archive}. Pin with {pin} to keep a session at the top of its header, and \
                snooze with {snooze}.",
         trigger: TipTrigger::Rotation,
         surfaces: &[TipSurface::Tui],

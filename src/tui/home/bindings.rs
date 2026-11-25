@@ -59,7 +59,7 @@ pub enum ActionId {
     Restart,
     Update,
     ToggleArchive,
-    ToggleFavorite,
+    TogglePin,
     MoveRowUp,
     MoveRowDown,
     UndoOrderChange,
@@ -135,7 +135,7 @@ impl ActionId {
             ActionId::NewFromSelection => F::NewFromSelection,
             ActionId::SearchStart => F::Search,
             ActionId::ToggleArchive => F::ArchiveToggle,
-            ActionId::ToggleFavorite => F::FavoriteToggle,
+            ActionId::TogglePin => F::PinToggle,
             ActionId::MoveRowUp | ActionId::MoveRowDown => F::RowReorder,
             ActionId::JumpPrevFinished | ActionId::JumpNextFinished => F::JumpFinished,
             ActionId::ToggleSnooze => F::SnoozeToggle,
@@ -180,7 +180,7 @@ impl ActionId {
                 | Self::Diff
                 | Self::Restart
                 | Self::ToggleArchive
-                | Self::ToggleFavorite
+                | Self::TogglePin
                 | Self::ToggleSnooze
                 | Self::ToggleUnread
                 | Self::ToggleContainer
@@ -277,10 +277,6 @@ pub enum Context {
     /// that session, and must not claim the chord on a group header, where `h` still
     /// collapses the group.
     SessionSelected,
-    /// Favorites are actionable: `session.favorites_first` is on, where they pin under
-    /// the Name and Newest first sorts. Otherwise toggling a favorite would have no visible effect, so the
-    /// key stays inert.
-    FavoritesUsable,
     SearchActive,
     /// The cursor is on a real (non-synthetic) project header in project view.
     ProjectGroupSelected,
@@ -354,7 +350,6 @@ fn context_holds(context: Context, ctx: &Ctx) -> bool {
         Context::Always => true,
         Context::TerminalView => ctx.view_mode == ViewMode::Terminal,
         Context::SessionSelected => ctx.session_selected,
-        Context::FavoritesUsable => crate::session::favorites_first(),
         Context::SearchActive => ctx.has_search,
         Context::ProjectGroupSelected => ctx.project_group_selected,
         Context::UnreadEnabled => crate::session::unread_enabled(),
@@ -723,17 +718,17 @@ pub static BINDINGS: &[Binding] = &[
     },
     // --- attention-sort triage ---
     Binding {
-        id: ActionId::ToggleFavorite,
+        id: ActionId::TogglePin,
         non_strict: &[k('f')],
         strict: &[k('F')],
-        context: Context::FavoritesUsable,
+        context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Attention,
-            desc: "Toggle favorite (pin to top)",
+            desc: "Toggle pin (top of its header)",
         }),
         palette: Some(PaletteMeta {
-            title: "Toggle favorite",
-            keywords: &["star", "pin", "fav"],
+            title: "Toggle pin",
+            keywords: &["pin", "unpin", "favorite", "star"],
             group: PaletteGroup::Actions,
         }),
     },
@@ -1376,7 +1371,7 @@ pub static BINDINGS: &[Binding] = &[
             group: PaletteGroup::Settings,
         }),
     },
-    // Palette-only: Shift+F collides with strict-mode ToggleFavorite under Attention sort
+    // Palette-only: Shift+F collides with strict-mode TogglePin
     // and the home keyspace is saturated, so fork is reached from the palette and the
     // context menu.
     Binding {
@@ -1532,7 +1527,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::Projects => "projects",
         ActionId::Restart => "restart",
         ActionId::ToggleArchive => "archive",
-        ActionId::ToggleFavorite => "favorite",
+        ActionId::TogglePin => "pin",
         ActionId::MoveRowUp => "move-row-up",
         ActionId::MoveRowDown => "move-row-down",
         ActionId::UndoOrderChange => "undo-order-change",
@@ -1809,26 +1804,13 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
-    fn context_guards_gate_favorite_and_terminal_actions() {
-        // Favorite resolves only with `session.favorites_first` on; snooze resolves on a session row.
-        let original = crate::session::favorites_first();
-        crate::session::set_favorites_first(false);
-
+    fn context_guards_gate_snooze_and_terminal_actions() {
         let mut c = ctx();
-        assert_eq!(resolve(&key('f'), false, &c), None);
+        assert_eq!(resolve(&key('f'), false, &c), Some(ActionId::TogglePin));
         assert_eq!(resolve(&key('h'), false, &c), Some(ActionId::ToggleSnooze));
         // Without a session under the cursor `h` is a group collapse, not a snooze.
         c.session_selected = false;
         assert_eq!(resolve(&key('h'), false, &c), None);
-        c.session_selected = true;
-        crate::session::set_favorites_first(true);
-        assert_eq!(
-            resolve(&key('f'), false, &c),
-            Some(ActionId::ToggleFavorite)
-        );
-
-        crate::session::set_favorites_first(original);
 
         // Container toggle only resolves in Terminal view.
         let mut c = ctx();
@@ -1933,7 +1915,7 @@ mod tests {
                 assert_eq!(label(id, strict), expected, "{id:?} strict={strict}");
             }
         }
-        assert_eq!(label(ActionId::ToggleFavorite, false), "f");
+        assert_eq!(label(ActionId::TogglePin, false), "f");
     }
 
     #[test]

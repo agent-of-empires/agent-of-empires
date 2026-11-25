@@ -6,64 +6,8 @@ use super::*;
 pub async fn update_session_pin(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    body: Result<Json<UpdatePinBody>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    if state.read_only {
-        return crate::server::api::read_only_response();
-    }
-    let Json(body) = match body {
-        Ok(b) => b,
-        Err(rej) => return rej.into_response(),
-    };
-
-    let namespace = state.profile_namespace.read().await;
-    let lock = state.instance_lock(&id).await;
-    let _guard = lock.lock().await;
-    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
-        return response;
-    }
-
-    let profile = {
-        let instances = state.instances.read().await;
-        let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return crate::server::api::session_not_found();
-        };
-        inst.source_profile.clone()
-    };
-
-    let pinned = body.pinned;
-
-    let persist_id = id.clone();
-    let committed = commit_profile_update(
-        &state,
-        profile,
-        "pin update",
-        move |instances| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                if pinned {
-                    inst.pin();
-                } else {
-                    inst.unpin();
-                }
-            }
-        },
-        None,
-    )
-    .await;
-    if let Err(response) = committed {
-        return response;
-    }
-    tracing::info!(target: "session.sync", session = %id, field = "pinned", value = pinned, "session updated");
-    drop(_guard);
-    drop(namespace);
-    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
-}
-
-pub async fn update_session_favorite(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
     headers: axum::http::HeaderMap,
-    body: Result<Json<UpdateFavoriteBody>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<UpdatePinBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
         return crate::server::api::read_only_response();
@@ -72,25 +16,25 @@ pub async fn update_session_favorite(
         Ok(body) => body,
         Err(rejection) => return rejection.into_response(),
     };
-    let favorited = match body {
-        UpdateFavoriteBody::Scoped {
+    let pinned = match body {
+        UpdatePinBody::Scoped {
             profile,
             selector,
-            select_favorited,
+            select_pinned,
         } => {
-            use crate::daemon::{ApiErrorCode, FAVORITE_BY_SELECTOR, RUNTIME_EPOCH_HEADER};
-            if id != FAVORITE_BY_SELECTOR {
+            use crate::daemon::{ApiErrorCode, PIN_BY_SELECTOR, RUNTIME_EPOCH_HEADER};
+            if id != PIN_BY_SELECTOR {
                 return StatusCode::BAD_REQUEST.into_response();
             }
             if !headers.contains_key(RUNTIME_EPOCH_HEADER) {
                 return crate::server::api::api_error_with_code_header(
                     ApiErrorCode::RuntimeEpochMismatch,
-                    "An epoch is required for selector-based favorite updates.",
+                    "An epoch is required for selector-based pin updates.",
                 );
             }
-            return update_favorite_by_selector(&state, profile, selector, select_favorited).await;
+            return update_pin_by_selector(&state, profile, selector, select_pinned).await;
         }
-        UpdateFavoriteBody::Unscoped { favorited } => favorited,
+        UpdatePinBody::Unscoped { pinned } => pinned,
     };
 
     let namespace = state.profile_namespace.read().await;
@@ -112,7 +56,7 @@ pub async fn update_session_favorite(
     let committed = commit_profile_update_with_refusal(
         &state,
         profile,
-        "favorite update",
+        "pin update",
         move |instances| {
             let instance = instances
                 .iter_mut()
@@ -121,7 +65,7 @@ pub async fn update_session_favorite(
             if cityhall_mode && !instance.is_structured() {
                 return Err(crate::server::api::cityhall_response());
             }
-            apply_favorite(instance, favorited);
+            apply_pin(instance, pinned);
             Ok(())
         },
         None,
@@ -130,27 +74,27 @@ pub async fn update_session_favorite(
     if let Err(response) = committed {
         return response;
     }
-    tracing::info!(target: "session.sync", session = %id, field = "favorite", value = favorited, "session updated");
+    tracing::info!(target: "session.sync", session = %id, field = "pinned", value = pinned, "session updated");
     drop(guard);
     drop(namespace);
     crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
 }
 
-fn apply_favorite(row: &mut Instance, favorited: bool) {
-    if favorited {
-        row.favorite();
+fn apply_pin(row: &mut Instance, pinned: bool) {
+    if pinned {
+        row.pin();
     } else {
-        row.unfavorite();
+        row.unpin();
     }
 }
 
-async fn update_favorite_by_selector(
+async fn update_pin_by_selector(
     state: &Arc<AppState>,
     mut profile: String,
     selector: String,
-    favorited: bool,
+    pinned: bool,
 ) -> axum::response::Response {
-    use crate::daemon::{ApiErrorCode, FavoriteOutcome, SessionLookupError};
+    use crate::daemon::{ApiErrorCode, PinOutcome, SessionLookupError};
     // A purge can hold a namespace lease past the client's request deadline.
     let admission = tokio::time::timeout(
         std::time::Duration::from_secs(1),
@@ -158,8 +102,8 @@ async fn update_favorite_by_selector(
     );
     let Ok(namespace) = admission.await else {
         return crate::server::api::api_error_with_code_header(
-            ApiErrorCode::FavoriteNamespaceBusy,
-            "Profile namespace is busy; no favorite change was made.",
+            ApiErrorCode::PinNamespaceBusy,
+            "Profile namespace is busy; no pin change was made.",
         );
     };
     {
@@ -168,7 +112,7 @@ async fn update_favorite_by_selector(
             profile.clone_from(&metadata.default_profile);
         }
         if !metadata.profiles.iter().any(|entry| entry.name == profile) {
-            return favorite_selection_refused(crate::daemon::SessionLookupError::ProfileNotFound(
+            return pin_selection_refused(crate::daemon::SessionLookupError::ProfileNotFound(
                 profile,
             ));
         }
@@ -177,14 +121,14 @@ async fn update_favorite_by_selector(
     let committed = commit_profile_update_with_refusal(
         state,
         profile,
-        "favorite update",
+        "pin update",
         move |rows| {
             if cityhall_mode
                 && rows
                     .iter()
                     .any(|row| row.id == selector && !row.is_structured())
             {
-                return Err(favorite_selection_refused(SessionLookupError::NotFound));
+                return Err(pin_selection_refused(SessionLookupError::NotFound));
             }
             let (index, _) = crate::cli::lookup_session(
                 &selector,
@@ -192,10 +136,10 @@ async fn update_favorite_by_selector(
                     .enumerate()
                     .filter(|(_, row)| !cityhall_mode || row.is_structured()),
             )
-            .map_err(favorite_selection_refused)?;
+            .map_err(pin_selection_refused)?;
             let row = &mut rows[index];
-            apply_favorite(row, favorited);
-            Ok(FavoriteOutcome {
+            apply_pin(row, pinned);
+            Ok(PinOutcome {
                 title: row.title.clone(),
             })
         },
@@ -212,15 +156,13 @@ async fn update_favorite_by_selector(
             crate::server::runtime::mutation_response(&snapshot.value.cursor, Json(outcome))
         }
         Err(error) => {
-            tracing::debug!(target: "server.runtime", %error, "favorite publication failed");
+            tracing::debug!(target: "server.runtime", %error, "pin publication failed");
             outcome_unconfirmed_response()
         }
     }
 }
 
-fn favorite_selection_refused(
-    mut error: crate::daemon::SessionLookupError,
-) -> axum::response::Response {
+fn pin_selection_refused(mut error: crate::daemon::SessionLookupError) -> axum::response::Response {
     if let crate::daemon::SessionLookupError::Ambiguous { candidates, .. } = &mut error {
         candidates.sort_unstable();
         // Budget for worst-case JSON escaping within the client's error response limit.
@@ -245,7 +187,7 @@ fn favorite_selection_refused(
             name.push('…');
         }
     }
-    let code = crate::daemon::ApiErrorCode::FavoriteSelectionRefused;
+    let code = crate::daemon::ApiErrorCode::PinSelectionRefused;
     (code.status(), code.header(), Json(error)).into_response()
 }
 

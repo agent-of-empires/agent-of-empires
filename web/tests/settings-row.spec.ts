@@ -39,10 +39,10 @@ const SCHEMA = [
   },
   {
     section: "session",
-    field: "favorites_first",
-    label: "Favorites first",
+    field: "show_tips",
+    label: "Tips",
     widget: { kind: "toggle" },
-    summary: "Favorited Sessions sort to the top of their Group. The Web dashboard uses Pin instead.",
+    summary: "Show an occasional tip in the footer.",
   },
   {
     section: "logging",
@@ -72,7 +72,7 @@ const SCHEMA = [
 
 const SETTINGS = {
   sandbox: { enabled_by_default: false, default_image: "ghcr.io/agent-of-empires/sandbox:latest" },
-  session: { unread_indicator: true, favorites_first: true },
+  session: { unread_indicator: true, show_tips: true },
   logging: { output: "file", rotation: "size" },
 };
 
@@ -100,21 +100,21 @@ test.describe("with a mouse", () => {
 
   test("the key shows on hover and on keyboard focus, and copies", async ({ page }) => {
     await open(page, "session");
-    const key = keyText(page, "session.favorites_first");
-    await expect(page.getByRole("switch", { name: "Favorites first" })).toBeVisible();
+    const key = keyText(page, "session.show_tips");
+    await expect(page.getByRole("switch", { name: "Tips" })).toBeVisible();
     expect(await shown(key)).toBe(false);
     await shot(page, "1280-session");
 
     // Showing a key moves nothing: the hovered row keeps its height and the row below keeps its place.
     const unread = row(page, "session.unread_indicator");
-    const favorites = row(page, "session.favorites_first");
-    const before = [await height(unread), (await favorites.boundingBox())!.y];
+    const tips = row(page, "session.show_tips");
+    const before = [await height(unread), (await tips.boundingBox())!.y];
     await unread.hover();
     await expect.poll(() => shown(keyText(page, "session.unread_indicator"))).toBe(true);
-    expect([await height(unread), (await favorites.boundingBox())!.y]).toEqual(before);
+    expect([await height(unread), (await tips.boundingBox())!.y]).toEqual(before);
     expect(await shown(key)).toBe(false);
 
-    await favorites.hover();
+    await tips.hover();
     await expect.poll(() => shown(key)).toBe(true);
     await shot(page, "1280-session-hover");
     await page.mouse.move(0, 0);
@@ -122,14 +122,14 @@ test.describe("with a mouse", () => {
 
     // Tab from the control above reaches this row's copy button even while the key is hidden.
     await page.getByRole("switch", { name: "Unread marker" }).focus();
-    const copy = row(page, "session.favorites_first").getByRole("button", { name: "Copy config key" });
+    const copy = row(page, "session.show_tips").getByRole("button", { name: "Copy config key" });
     for (let i = 0; i < 5 && !(await copy.evaluate((el) => el === document.activeElement)); i++) {
       await page.keyboard.press("Tab");
     }
     await expect(copy).toBeFocused();
     await expect.poll(() => shown(key)).toBe(true);
 
-    expect(await copiedBy(page, () => page.keyboard.press("Enter"))).toBe("session.favorites_first");
+    expect(await copiedBy(page, () => page.keyboard.press("Enter"))).toBe("session.show_tips");
   });
 });
 
@@ -138,7 +138,7 @@ test.describe("on a phone", () => {
 
   test("the key always shows", async ({ page }) => {
     for (const [tab, key] of [
-      ["session", "session.favorites_first"],
+      ["session", "session.show_tips"],
       ["sandbox", "sandbox.enabled_by_default"],
       ["logging", "logging.rotation"],
     ]) {

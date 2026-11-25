@@ -1265,6 +1265,7 @@ async fn metadata_commit_rejects_partial_rows_without_rewriting_them() -> anyhow
     let response = update_session_pin(
         State(state.clone()),
         Path(id.clone()),
+        axum::http::HeaderMap::new(),
         Ok(Json(serde_json::from_value(
             serde_json::json!({"pinned": true}),
         )?)),
@@ -3839,16 +3840,16 @@ async fn abandon_purge_preserves_read_only_and_cityhall_policy() -> anyhow::Resu
 
 #[tokio::test]
 #[serial_test::serial]
-async fn favorite_selector_refuses_busy_namespace_and_hidden_exact_ids() -> anyhow::Result<()> {
+async fn pin_selector_refuses_busy_namespace_and_hidden_exact_ids() -> anyhow::Result<()> {
     use crate::daemon::{ERROR_CODE_HEADER, RUNTIME_EPOCH_HEADER};
     use crate::server::test_support;
     use tower::ServiceExt;
 
     let _home = crate::session::test_support::isolate_app_dir();
-    let mut hidden = Instance::new("Hidden terminal", "/tmp/hidden-favorite");
+    let mut hidden = Instance::new("Hidden terminal", "/tmp/hidden-pin");
     hidden.view = crate::session::View::Terminal;
     hidden.source_profile = "main".into();
-    let mut visible = Instance::new(&hidden.id, "/tmp/visible-favorite");
+    let mut visible = Instance::new(&hidden.id, "/tmp/visible-pin");
     visible.view = crate::session::View::Structured;
     visible.source_profile = "main".into();
     let rows = vec![hidden.clone(), visible.clone()];
@@ -3866,7 +3867,7 @@ async fn favorite_selector_refuses_busy_namespace_and_hidden_exact_ids() -> anyh
     let request = |id: &str, body: serde_json::Value| {
         axum::http::Request::builder()
             .method("PATCH")
-            .uri(format!("/api/sessions/{id}/favorite"))
+            .uri(format!("/api/sessions/{id}/pin"))
             .header("host", "localhost")
             .header("content-type", "application/json")
             .header(RUNTIME_EPOCH_HEADER, &baseline.epoch)
@@ -3882,7 +3883,7 @@ async fn favorite_selector_refuses_busy_namespace_and_hidden_exact_ids() -> anyh
         request(
             "by-selector",
             serde_json::json!({
-                "profile": "main", "selector": selector, "select_favorited": true
+                "profile": "main", "selector": selector, "select_pinned": true
             }),
         )
     };
@@ -3894,7 +3895,7 @@ async fn favorite_selector_refuses_busy_namespace_and_hidden_exact_ids() -> anyh
     )
     .await??;
     let busy = assert_response_status(busy, StatusCode::CONFLICT, "namespace held").await;
-    assert_eq!(busy.headers()[ERROR_CODE_HEADER], "favorite_namespace_busy");
+    assert_eq!(busy.headers()[ERROR_CODE_HEADER], "pin_namespace_busy");
     drop(held);
 
     let absent = serde_json::to_vec(&crate::daemon::SessionLookupError::NotFound)?;
@@ -3903,7 +3904,7 @@ async fn favorite_selector_refuses_busy_namespace_and_hidden_exact_ids() -> anyh
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(
             response.headers()[ERROR_CODE_HEADER],
-            "favorite_selection_refused"
+            "pin_selection_refused"
         );
         assert_eq!(
             axum::body::to_bytes(response.into_body(), 1024)
@@ -3913,30 +3914,30 @@ async fn favorite_selector_refuses_busy_namespace_and_hidden_exact_ids() -> anyh
         );
     }
     let storage = Storage::open_unwatched("main")?;
-    assert!(storage.load()?.iter().all(|row| !row.is_favorited()));
+    assert!(storage.load()?.iter().all(|row| !row.is_pinned()));
     assert_eq!(state.runtime.publish(&state).await?.value.cursor, baseline);
     let accepted = app.clone().oneshot(scoped(&visible.id)).await?;
     assert_eq!(accepted.status(), StatusCode::OK);
-    let is_favorited = || -> anyhow::Result<bool> {
+    let is_pinned = || -> anyhow::Result<bool> {
         Ok(storage
             .load()?
             .iter()
             .find(|row| row.id == visible.id)
             .unwrap()
-            .is_favorited())
+            .is_pinned())
     };
-    assert!(is_favorited()?);
+    assert!(is_pinned()?);
 
     let legacy = app
         .oneshot(request(
             &visible.id,
             serde_json::json!({
-                "favorited": false, "client_tag": "batch"
+                "pinned": false, "client_tag": "batch"
             }),
         ))
         .await?;
     assert_eq!(legacy.status(), StatusCode::OK);
-    assert!(!is_favorited()?);
+    assert!(!is_pinned()?);
     Ok(())
 }
 
@@ -4072,7 +4073,7 @@ async fn rename_session_rejects_duplicates_and_preserves_newer_cache() {
                 rows.iter_mut()
                     .find(|row| row.id == target_id)
                     .unwrap()
-                    .favorite();
+                    .pin();
                 Ok(())
             })
             .unwrap();
@@ -4083,7 +4084,7 @@ async fn rename_session_rejects_duplicates_and_preserves_newer_cache() {
             .iter_mut()
             .find(|instance| instance.id == target_id)
             .unwrap()
-            .favorite();
+            .pin();
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let response = rename_session(
             State(state.clone()),
@@ -4108,7 +4109,7 @@ async fn rename_session_rejects_duplicates_and_preserves_newer_cache() {
         assert_eq!(target.project_path, "/tmp/repo");
         assert_eq!(target.source_profile, "default");
         assert!(
-            target.is_favorited(),
+            target.is_pinned(),
             "newer cached user action must survive rename publication"
         );
     }
@@ -9669,7 +9670,7 @@ async fn composed_group_only_rename_preserves_authoritative_title_and_peer_field
     let id = stale.id.clone();
     let mut durable = stale.clone();
     durable.title = "durable title".into();
-    durable.favorite();
+    durable.pin();
     let (storage, state) = build_rename_test_state(vec![durable], vec![stale]);
     crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
     let response = rename_session(
@@ -9692,7 +9693,7 @@ async fn composed_group_only_rename_preserves_authoritative_title_and_peer_field
         .unwrap();
     assert_eq!(row.title, "durable title");
     assert_eq!(row.group_path, "assigned");
-    assert!(row.is_favorited());
+    assert!(row.is_pinned());
     let snapshot = state.runtime.snapshot(&state).await?;
     let published = snapshot
         .value
@@ -13588,9 +13589,9 @@ async fn committed_setting_reports_unconfirmed_until_canonical_recovery() -> any
     let response = super::update::commit_profile_update(
         &state,
         "default".into(),
-        "favorite adoption",
+        "pin adoption",
         move |rows| {
-            rows[0].favorited_at = Some(crate::time::Timestamp::now());
+            rows[0].pinned_at = Some(crate::time::Timestamp::now());
             failing_state
                 .canonical_metadata
                 .blocking_write()
@@ -13607,8 +13608,8 @@ async fn committed_setting_reports_unconfirmed_until_canonical_recovery() -> any
     let bytes = axum::body::to_bytes(response.into_body(), 8192).await?;
     let body: serde_json::Value = serde_json::from_slice(&bytes)?;
     assert_eq!(body["error"], "outcome_unconfirmed");
-    assert!(storage.load()?[0].favorited_at.is_some());
-    assert!(state.instances.read().await[0].favorited_at.is_none());
+    assert!(storage.load()?[0].pinned_at.is_some());
+    assert!(state.instances.read().await[0].pinned_at.is_none());
     assert!(matches!(
         *state.canonical_health.read().await,
         crate::daemon::RuntimeHealth::Degraded { .. }
@@ -13630,7 +13631,7 @@ async fn committed_setting_reports_unconfirmed_until_canonical_recovery() -> any
         crate::daemon::RuntimeHealth::Healthy
     );
     let snapshot = state.runtime.snapshot(&state).await?;
-    assert!(snapshot.value.contents.sessions[0].favorited);
+    assert!(snapshot.value.contents.sessions[0].pinned_at.is_some());
     Ok(())
 }
 

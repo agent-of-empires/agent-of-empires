@@ -483,71 +483,31 @@ impl Item {
     }
 }
 
-/// Sort a slice of session references by `sort_order`, reading the
-/// favorites-first preference from config.
+/// Sort a slice of session references by `sort_order`, then lift pinned rows to the top
+/// with a stable pass, so pinned rows keep the sort's order among themselves. The web
+/// dashboard's `workspaceTriageTier` does the same.
 fn sort_sessions(sessions: &mut [&Instance], sort_order: SortOrder) {
-    sort_sessions_inner(sessions, sort_order, crate::session::favorites_first());
-}
-
-/// Pure core of [`sort_sessions`]: takes the favorites-first flag explicitly so tests do not have
-/// to mutate the process-global atomic, which would race with tests running in parallel.
-fn sort_sessions_inner(sessions: &mut [&Instance], sort_order: SortOrder, favorites_first: bool) {
     match sort_order {
-        SortOrder::Custom => {
-            // The user placed these rows by hand; nothing else may reorder them, not even the
-            // favorites pass. Rows never moved sit on top, newest first.
-            sessions.sort_by_key(|i| i.custom_order_key());
-            return;
-        }
+        // Rows never moved sit on top, newest first.
+        SortOrder::Custom => sessions.sort_by_key(|i| i.custom_order_key()),
         SortOrder::Newest => sessions.sort_by_key(|i| Reverse(i.created_at)),
         SortOrder::Name => sessions.sort_by_key(|i| i.title.to_lowercase()),
     }
-    if favorites_first {
-        sessions.sort_by_key(|i| !holds_favorite_place(i));
-    }
+    sessions.sort_by_key(|i| !is_live_pin(i));
 }
 
 /// Sort group references by `sort_order`. Under Custom they keep the order they arrive in.
-fn sort_groups<T, N, P>(
+/// A pinned row does not lift its header.
+fn sort_groups<T>(
     items: &mut [T],
     sort_order: SortOrder,
-    instances: &[Instance],
-    name: N,
-    path: P,
-) where
-    N: Fn(&T) -> &str,
-    P: Fn(&T) -> &str,
-{
-    sort_groups_inner(
-        items,
-        sort_order,
-        instances,
-        name,
-        path,
-        crate::session::favorites_first(),
-    );
-}
-
-/// Pure core of [`sort_groups`]. See [`sort_sessions_inner`] for why the
-/// favorites bias is a second stable pass and why the flag is a parameter.
-fn sort_groups_inner<T, N, P>(
-    items: &mut [T],
-    sort_order: SortOrder,
-    instances: &[Instance],
-    name: N,
-    path: P,
-    favorites_first: bool,
-) where
-    N: Fn(&T) -> &str,
-    P: Fn(&T) -> &str,
-{
+    name: impl Fn(&T) -> &str,
+    newest: impl Fn(&T) -> Option<Timestamp>,
+) {
     match sort_order {
-        SortOrder::Custom => return,
-        SortOrder::Newest => items.sort_by_key(|g| Reverse(newest_member(path(g), instances))),
+        SortOrder::Custom => {}
+        SortOrder::Newest => items.sort_by_key(|g| Reverse(newest(g))),
         SortOrder::Name => items.sort_by_key(|g| name(g).to_lowercase()),
-    }
-    if favorites_first {
-        items.sort_by_key(|g| !has_placed_favorite(path(g), instances));
     }
 }
 
@@ -569,26 +529,9 @@ fn newest_member(path: &str, instances: &[Instance]) -> Option<Timestamp> {
     group_members(path, instances).map(|i| i.created_at).max()
 }
 
-/// True for a favorited session that is actively pinnable: not archived, not trashed, not
-/// snoozed, and not ignored.
-pub(crate) fn is_live_favorite(inst: &Instance) -> bool {
-    !inst.is_archived()
-        && !inst.is_trashed()
-        && !inst.is_snoozed()
-        && !inst.is_ignored()
-        && inst.is_favorited()
-}
-
-/// True for a favorite that keeps its pinned place. Unlike [`is_live_favorite`], a snoozed
-/// favorite holds its place, so snoozing and waking never move rows.
-fn holds_favorite_place(inst: &Instance) -> bool {
-    !inst.is_archived() && !inst.is_trashed() && !inst.is_ignored() && inst.is_favorited()
-}
-
-/// True when the group at `path` (including nested sub-groups) has a member that
-/// [`holds_favorite_place`].
-fn has_placed_favorite(path: &str, instances: &[Instance]) -> bool {
-    group_members(path, instances).any(holds_favorite_place)
+/// A pinned row the list lifts: pinned and in the live list, not archived or trashed.
+pub(crate) fn is_live_pin(inst: &Instance) -> bool {
+    inst.is_pinned() && !inst.is_archived() && !inst.is_trashed()
 }
 
 /// Every profile's rows from `instances`, with headers ranked by `ranked`'s members, so a
@@ -635,18 +578,12 @@ pub fn flatten_tree_all_profiles(
         }
     }
 
-    // Favorites are scoped to each root's own profile, so same-named groups in two profiles
-    // never borrow each other's members.
-    match sort_order {
-        SortOrder::Custom => {}
-        SortOrder::Newest => {
-            all_roots.sort_by_key(|(_, g, _, ranked)| Reverse(newest_member(&g.path, ranked)));
-        }
-        SortOrder::Name => all_roots.sort_by_key(|(_, g, _, _)| g.name.to_lowercase()),
-    }
-    if sort_order != SortOrder::Custom && crate::session::favorites_first() {
-        all_roots.sort_by_key(|(_, g, _, ranked)| !has_placed_favorite(&g.path, ranked));
-    }
+    sort_groups(
+        &mut all_roots,
+        sort_order,
+        |(_, g, _, _)| &g.name,
+        |(_, g, _, ranked)| newest_member(&g.path, ranked),
+    );
 
     for (profile_name, root, listed, ranked) in &all_roots {
         flatten_group(
@@ -694,9 +631,8 @@ pub fn flatten_tree(
     sort_groups(
         &mut roots_to_iterate,
         sort_order,
-        ranked,
         |g| &g.name,
-        |g| &g.path,
+        |g| newest_member(&g.path, ranked),
     );
 
     for root in roots_to_iterate {
@@ -751,9 +687,8 @@ fn flatten_group(
     sort_groups(
         &mut children_to_iterate,
         sort_order,
-        ranked,
         |g| &g.name,
-        |g| &g.path,
+        |g| newest_member(&g.path, ranked),
     );
 
     for child in children_to_iterate {
@@ -990,7 +925,7 @@ mod tests {
     }
 
     /// Under `SortOrder::Custom` a session's stored `sort_index` is the order, and sessions never
-    /// moved sit above every placed one, newest first. Favorites do not reorder either.
+    /// moved sit above every placed one, newest first.
     #[test]
     fn custom_sort_puts_unplaced_first_then_sort_index() {
         let now = Timestamp::now();
@@ -1001,13 +936,12 @@ mod tests {
         placed_first.created_at = now;
         let mut unplaced_old = inst("old", "work");
         unplaced_old.created_at = now - Duration::days(2);
-        unplaced_old.favorite();
         let mut unplaced_new = inst("new", "work");
         unplaced_new.created_at = now - Duration::days(1);
         let instances = [placed_second, unplaced_old, placed_first, unplaced_new];
 
         let mut refs: Vec<&Instance> = instances.iter().collect();
-        sort_sessions_inner(&mut refs, SortOrder::Custom, true);
+        sort_sessions(&mut refs, SortOrder::Custom);
 
         assert_eq!(titles(&refs), ["new", "old", "a", "b"]);
     }
@@ -1229,159 +1163,78 @@ mod tests {
         }
     }
 
+    /// Pinned rows sit at the top of their header under every sort and keep that sort's order
+    /// among themselves; headers holding a pinned row are not lifted.
     #[test]
-    fn live_favorite_excludes_snoozed_ignored_archived_and_trashed() {
+    fn pinned_rows_lead_their_header_under_every_sort() {
         let now = Timestamp::now();
-        let mut fav = inst("fav", "work");
-        fav.favorite();
-        assert!(is_live_favorite(&fav));
-        assert!(has_placed_favorite("work", std::slice::from_ref(&fav)));
-        let mut nested = inst("nested", "work/frontend");
-        nested.favorite();
-        assert!(has_placed_favorite("work", std::slice::from_ref(&nested)));
-        assert!(!has_placed_favorite(
-            "personal",
-            std::slice::from_ref(&nested)
-        ));
-        assert!(!has_placed_favorite("work", &[inst("plain", "work")]));
-
-        fav.snooze(60);
-        assert!(fav.is_favorited(), "snooze must not clear the star");
-        assert!(!is_live_favorite(&fav), "a snoozed favorite drops its star");
-        assert!(
-            holds_favorite_place(&fav) && has_placed_favorite("work", std::slice::from_ref(&fav)),
-            "a snoozed favorite keeps its place"
-        );
-
-        let mut archived = inst("archived", "");
-        archived.favorited_at = Some(now);
-        archived.archived_at = Some(now);
-        let mut trashed = inst("trashed", "");
-        trashed.favorited_at = Some(now);
-        trashed.trashed_at = Some(now);
-        assert!(!holds_favorite_place(&archived) && !holds_favorite_place(&trashed));
-
-        let mut ignored = inst("ignored", "work");
-        ignored.favorite();
-        ignored.ignore();
-        assert!(ignored.is_favorited(), "ignore must not clear the star");
-        assert!(!is_live_favorite(&ignored) && !holds_favorite_place(&ignored));
-        assert!(
-            !has_placed_favorite("work", std::slice::from_ref(&ignored)),
-            "an ignored favorite must not pin its group"
-        );
-    }
-
-    #[test]
-    fn favorites_first_session_sorts() {
-        let aged = |title: &str, days: i64, favorite: bool| {
-            let mut i = inst(title, "");
-            i.created_at = Timestamp::now() - Duration::days(days);
-            if favorite {
-                i.favorite();
+        let row = |title: &str, group: &str, sort_index: Option<u32>, pinned: bool| {
+            let mut i = inst(title, group);
+            i.sort_index = sort_index;
+            i.created_at = now;
+            if pinned {
+                i.pin();
             }
             i
         };
-        let instances = [
-            aged("zebra", 10, true),
-            aged("yak", 0, true),
-            aged("apple", 1, false),
+        let instances = vec![
+            row("delta", "", Some(0), false),
+            row("charlie", "", Some(1), true),
+            row("bravo", "", Some(2), false),
+            row("alpha", "", Some(3), true),
+            row("zulu", "b-group", Some(0), false),
+            row("yankee", "b-group", Some(1), true),
+            row("plain", "a-group", None, false),
         ];
-        for (order, favorites_first, want) in [
-            (SortOrder::Custom, false, ["yak", "apple", "zebra"]),
-            (SortOrder::Custom, true, ["yak", "apple", "zebra"]),
-            (SortOrder::Name, false, ["apple", "yak", "zebra"]),
-            (SortOrder::Name, true, ["yak", "zebra", "apple"]),
-            (SortOrder::Newest, false, ["yak", "apple", "zebra"]),
-            (SortOrder::Newest, true, ["yak", "zebra", "apple"]),
-        ] {
-            let mut refs: Vec<&Instance> = instances.iter().collect();
-            sort_sessions_inner(&mut refs, order, favorites_first);
-            assert_eq!(titles(&refs), want, "{order:?} {favorites_first}");
-        }
-
-        let mut snoozed = aged("snoozed_fav", 10, true);
-        snoozed.snooze(60);
-        let pair = [snoozed, aged("new_plain", 0, false)];
-        let mut refs: Vec<&Instance> = pair.iter().collect();
-        sort_sessions_inner(&mut refs, SortOrder::Name, true);
-        assert_eq!(
-            refs[0].title, "snoozed_fav",
-            "a snoozed favorite keeps its place"
-        );
-    }
-
-    #[test]
-    fn favorites_first_group_sorts() {
-        let member = |title: &str, group: &str, days: i64| {
-            let mut i = inst(title, group);
-            i.created_at = Timestamp::now() - Duration::days(days);
-            i
-        };
-        let sorted_first = |instances: &[Instance], favorites_first: bool| {
-            let mut items = vec![Group::new("old", "old"), Group::new("new", "new")];
-            sort_groups_inner(
-                &mut items,
+        let tree = GroupTree::new_with_groups(&instances, &[]);
+        for (order, ungrouped, b_group, groups) in [
+            (
+                SortOrder::Custom,
+                ["charlie", "alpha", "delta", "bravo"],
+                ["yankee", "zulu"],
+                ["b-group", "a-group"],
+            ),
+            (
                 SortOrder::Name,
-                instances,
-                |g: &Group| g.name.as_str(),
-                |g: &Group| g.path.as_str(),
-                favorites_first,
-            );
-            items[0].path.clone()
-        };
-        let mut old_fav = member("old_fav", "old", 10);
-        old_fav.favorite();
-        let instances = vec![old_fav, member("new_plain", "new", 0)];
-        assert_eq!(sorted_first(&instances, false), "new");
-        assert_eq!(sorted_first(&instances, true), "old");
-
-        let mut archived = instances.clone();
-        archived[0].archive();
-        archived[0].favorited_at = Some(Timestamp::now());
-        assert_eq!(
-            sorted_first(&archived, true),
-            "new",
-            "archived favorite must not pin"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn favorites_first_pins_root_groups_across_profiles() {
-        let _flag = crate::session::test_support::FavoritesFirstGuard::new();
-        let mut old_fav = inst("old_fav", "old");
-        old_fav.source_profile = "p1".to_string();
-        old_fav.created_at = Timestamp::now() - Duration::days(10);
-        old_fav.favorite();
-        let mut new_plain = inst("new_plain", "new");
-        new_plain.source_profile = "p2".to_string();
-
-        let tree = |inst: &Instance| GroupTree::new_with_groups(std::slice::from_ref(inst), &[]);
-        let trees = std::collections::HashMap::from([
-            ("p1".to_string(), tree(&old_fav)),
-            ("p2".to_string(), tree(&new_plain)),
-        ]);
-        let instances = vec![old_fav, new_plain];
-        for (enabled, want) in [(false, "new"), (true, "old")] {
-            crate::session::set_favorites_first(enabled);
-            let items = flatten_tree_all_profiles(&instances, &instances, &trees, SortOrder::Name);
-            assert_eq!(group_names(&items)[0], want, "favorites_first={enabled}");
+                ["alpha", "charlie", "bravo", "delta"],
+                ["yankee", "zulu"],
+                ["a-group", "b-group"],
+            ),
+        ] {
+            let items = flatten_tree(&tree, &instances, &instances, order);
+            let titles = session_titles(&items, &instances);
+            assert_eq!(titles[..4], ungrouped, "{order:?}");
+            let b_titles: Vec<&str> = titles
+                .iter()
+                .copied()
+                .filter(|t| ["zulu", "yankee"].contains(t))
+                .collect();
+            assert_eq!(b_titles, b_group, "{order:?}");
+            assert_eq!(group_names(&items), groups, "{order:?}");
         }
+
+        // A trashed pin is out of the list and an archived row cannot hold one.
+        let mut trashed = row("trashed", "", None, true);
+        trashed.trash();
+        assert!(trashed.is_pinned() && !is_live_pin(&trashed));
+        let mut archived = row("archived", "", None, true);
+        archived.archive();
+        assert!(!is_live_pin(&archived));
     }
 
     #[test]
-    fn favorite_archive_snooze_interactions() {
+    fn pin_archive_snooze_interactions() {
         let mut inst = inst("t", "");
         inst.archive();
-        inst.favorite();
+        inst.pin();
         assert!(
-            inst.is_favorited() && !inst.is_archived(),
-            "favorite clears archive"
+            inst.is_pinned() && !inst.is_archived(),
+            "pin clears archive"
         );
         inst.snooze(30);
-        inst.favorite();
-        assert!(!inst.is_snoozed(), "favorite clears snooze");
+        assert!(!inst.is_pinned(), "snooze clears pin");
+        inst.pin();
+        assert!(!inst.is_snoozed(), "pin clears snooze");
 
         inst.snooze(30);
         inst.archived_at = Some(Timestamp::now());
@@ -1390,6 +1243,6 @@ mod tests {
             !inst.is_archived() && !inst.is_snoozed(),
             "interaction wakes the session"
         );
-        assert!(inst.is_favorited() && inst.last_accessed_at.is_some());
+        assert!(inst.last_accessed_at.is_some());
     }
 }

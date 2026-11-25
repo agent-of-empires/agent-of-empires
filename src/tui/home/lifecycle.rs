@@ -36,7 +36,6 @@ impl HomeView {
         let idle_decay_window =
             crate::tui::styles::idle_decay_window(resolved.theme.idle_decay_minutes);
         crate::session::set_unread_enabled(resolved.session.unread_indicator);
-        crate::session::set_favorites_first(resolved.session.favorites_first);
         crate::session::set_preview_link_prefixes(&resolved.session.preview_link_prefixes);
         let keybind_warnings = super::config_refresh::install_keybinds(&resolved);
         let live_send_chords = live_send::LiveSendChords::from_config(&resolved);

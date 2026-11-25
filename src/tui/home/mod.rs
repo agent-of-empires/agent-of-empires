@@ -65,8 +65,8 @@ use super::settings::SettingsView;
 
 use self::icons::{
     ICON_ARCHIVED_SECTION, ICON_COLLAPSED, ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED,
-    ICON_FAVORITE, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_SUGGESTED, ICON_TERMINAL,
-    ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD, UNREAD_DWELL,
+    ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_SUGGESTED, ICON_TERMINAL, ICON_TRASH_SECTION,
+    ICON_UNKNOWN, ICON_UNREAD, UNREAD_DWELL,
 };
 use self::preview::{PreviewCache, PreviewSelection, PreviewTextView, PreviewTimings};
 use self::rows::{project_group_key, project_view_path};
