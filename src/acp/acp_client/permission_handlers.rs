@@ -822,8 +822,6 @@ mod tests {
             for original in [true, false] {
                 for question in [false, true] {
                     for discard in [false, true] {
-                        let phase = std::cell::Cell::new("creating original");
-                        tokio::time::timeout(Duration::from_secs(30), async {
                             let directory = scope.tempdir();
                             let sid = uuid::Uuid::new_v4().to_string();
                             let callback_id = format!("callback-{sid}");
@@ -851,7 +849,24 @@ mod tests {
                                 },
                             );
                             let mut client = scope.spawn(config, "unpublished-decision").await.unwrap();
-                            let constructor_id = constructor_rx.await.unwrap();
+                            tokio::pin!(constructor_rx);
+                            let constructor_deadline = tokio::time::sleep(Duration::from_secs(10));
+                            tokio::pin!(constructor_deadline);
+                            let constructor_id = loop {
+                                tokio::select! {
+                                    id = &mut constructor_rx => break id.unwrap(),
+                                    () = &mut constructor_deadline =>
+                                        panic!("Native constructor deadline; wire methods: {:?}", native.timeout_methods()),
+                                    event = client.next_event() => match event {
+                                        Some(Event::AgentStartupError { message, .. }) =>
+                                            panic!("Native constructor refused before session/new: {message}"),
+                                        Some(_) => {}
+                                        None => panic!("Native event stream closed before session/new"),
+                                    },
+                                }
+                            };
+                            let phase = std::cell::Cell::new("preparing callback");
+                            tokio::time::timeout(Duration::from_secs(30), async {
                             let state = client.app_state();
                             let mut prompt_id = None;
                             if !original {

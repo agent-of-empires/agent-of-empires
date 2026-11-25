@@ -751,7 +751,16 @@ async fn turn_on_a_park_attaches_the_retained_actor_then_delivers_only_new_expli
                             .await
                             .into_response()
                         };
-                        assert_eq!(response.status(), StatusCode::ACCEPTED);
+                        let status = response.status();
+                        let body = axum::body::to_bytes(response.into_body(), 4096)
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            status,
+                            StatusCode::ACCEPTED,
+                            "{}",
+                            String::from_utf8_lossy(&body)
+                        );
                     })
                     .await;
                 live.client.ready().await;
