@@ -1570,7 +1570,7 @@ oneshot_flag = "-p"
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         make_alien_owned(&path);
 
-        let rejected = check_file(&std::fs::metadata(&path).unwrap());
+        let rejected = check_file(&std::fs::metadata(&path).unwrap(), false);
         chown(
             &path,
             Some(nix::unistd::geteuid()),
