@@ -18,6 +18,7 @@ use axum::http::StatusCode;
 /// Optional body of the routes that take none: the profile the caller selected
 /// its target under.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProfileGuard {
     expected_profile: Option<String>,
 }
@@ -51,7 +52,7 @@ fn wrong_profile(
         super::api_error_with_code_header(
             crate::daemon::ApiErrorCode::ProfileMismatch,
             format!(
-                "This Daemon serves profile {served:?}, not the one you selected; nothing changed"
+                "This Daemon serves profile {served}, not the one you selected; nothing changed"
             ),
         )
     })
@@ -522,7 +523,7 @@ fn link_project(
             return Ok(Err("This suggestion names no repo to link".to_string()));
         };
         // The chosen Project moves to the front; the others stay, minus any
-        // that are no longer registered.
+        // that are no longer registered, up to MAX_MAPPING_PROJECTS.
         let mut projects =
             match suggestions::normalize_mapping(&key, &[path.to_string()], &registered) {
                 Ok(projects) => projects,

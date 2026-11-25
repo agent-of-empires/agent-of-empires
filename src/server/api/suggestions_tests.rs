@@ -633,11 +633,17 @@ async fn a_suggestion_request_for_another_profile_is_refused_untouched() {
             Value::Null,
         ),
     ] {
-        let (status, code, _) = f.call(method, &uri, body).await;
+        let (status, code, answer) = f.call(method, &uri, body).await;
         assert_eq!(
             (status, code.as_str()),
             (StatusCode::CONFLICT, "profile_mismatch"),
             "{uri}"
+        );
+        assert!(
+            answer
+                .to_string()
+                .contains(r#"serves profile default, not"#),
+            "{answer}"
         );
     }
     let (_, _, snapshot) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
@@ -695,7 +701,13 @@ async fn an_empty_json_body_is_accepted_as_no_guard() {
         for body in ["", "  ", "null", "{}"] {
             assert_eq!(send(uri, body).await, StatusCode::OK, "{uri} {body:?}");
         }
-        assert_eq!(send(uri, "[1]").await, StatusCode::BAD_REQUEST, "{uri}");
+        for body in ["[1]", r#"{"expected_profil":"x"}"#] {
+            assert_eq!(
+                send(uri, body).await,
+                StatusCode::BAD_REQUEST,
+                "{uri} {body}"
+            );
+        }
     }
 }
 
