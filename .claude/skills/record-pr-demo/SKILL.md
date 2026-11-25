@@ -65,11 +65,11 @@ Run with `AOE_DEMO_TOKEN_FILE` (or `AOE_DEMO_TOKEN`) and `AOE_DEMO_RAW=<scratch>
 
 ## TUI clips
 
-Run the dev `aoe` in ttyd and drive it with Playwright, as `web/scripts/record-tui-demo.mjs` does (read it for the ttyd and `aoe` setup). Here the script uses `demo-lib.mjs` (`launch`, `caption`) and `convert.sh`, so the clip matches the web ones. Use the step 2 environment and `cd` into a scene repo. ttyd runs a writable shell with your env, so it takes a password:
+Run the dev `aoe` in ttyd and drive it with Playwright, as `web/scripts/record-tui-demo.mjs` does (read it for the ttyd and `aoe` setup). Here the script uses `demo-lib.mjs` (`launch`, `caption`) and `convert.sh`, so the clip matches the web ones. Use the step 2 environment and start ttyd with `--cwd` set to a scene repo (no `cd`, so later steps keep their repo-root paths). ttyd runs a writable shell with your env, so it takes a password:
 
 ```sh
 export TTYD_PW=$(openssl rand -hex 12)
-nohup ttyd --port 7683 --interface 127.0.0.1 -c demo:$TTYD_PW -t rendererType=dom -t fontSize=15 --writable aoe > $DEMO/ttyd.log 2>&1 &
+nohup ttyd --port 7683 --interface 127.0.0.1 --cwd $DEMO/projects/<scene> -c demo:$TTYD_PW -t rendererType=dom -t fontSize=15 --writable aoe > $DEMO/ttyd.log 2>&1 &
 echo $! > $DEMO/ttyd.pid
 ```
 
