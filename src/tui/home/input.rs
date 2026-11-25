@@ -3345,39 +3345,6 @@ impl HomeView {
                 SidebarPosition::Left => self.grow_list(),
                 SidebarPosition::Right => self.shrink_list(),
             },
-            KeyCode::Enter => {
-                if self.focus_suggestions_pane() {
-                    return None;
-                }
-                if self.selected_session.is_some() {
-                    return self.activate_selected_session();
-                } else if let Some(Item::Group { path, .. }) = self.flat_items.get(self.cursor) {
-                    let path = path.clone();
-                    self.toggle_group_collapsed(&path);
-                }
-            }
-            // Tab is the activation key's complement: whichever of live-send and tmux
-            // attach `Enter` doesn't do. Only fires when `live_send` is None.
-            KeyCode::Tab => {
-                if self.selected_is_trashed() {
-                    return None;
-                }
-                let live_key = self.selected_session.as_deref().map(|id| self.live_key(id));
-                // Neither Tab meaning has a pane to reach in a structured view, so the
-                // press takes the session's native view through the same activation as
-                // Enter: that dismisses System Health, which would otherwise leave the
-                // composer it focuses behind a panel the next key cannot reach.
-                if live_key == Some(None) {
-                    return self.activate_selected_session();
-                }
-                if live_key == Some(Some(LiveKey::Enter)) {
-                    if let Some(action) = self.tab_attach_action() {
-                        return Some(action);
-                    }
-                } else if let Some(action) = self.start_live_send() {
-                    return Some(action);
-                }
-            }
             KeyCode::Left | KeyCode::Char('h') => {
                 if let Some(Item::Group {
                     path, collapsed, ..
@@ -3537,6 +3504,7 @@ impl HomeView {
                     | ActionId::PreviewScrollUp
                     | ActionId::PreviewScrollDown
                     | ActionId::DismissUpdateBanner
+                    | ActionId::Activate
             )
         {
             return None;
@@ -3546,6 +3514,31 @@ impl HomeView {
         }
         match id {
             ActionId::Quit => return Some(Action::Quit),
+            ActionId::Activate => {
+                if self.focus_suggestions_pane() {
+                    return None;
+                }
+                if self.selected_session.is_some() {
+                    return self.activate_selected_session();
+                } else if let Some(Item::Group { path, .. }) = self.flat_items.get(self.cursor) {
+                    let path = path.clone();
+                    self.toggle_group_collapsed(&path);
+                }
+            }
+            ActionId::ActivateAlt => {
+                let live_key = self.selected_session.as_deref().map(|id| self.live_key(id));
+                // Neither meaning has a pane to reach in a structured view, so the press
+                // takes the session's native view through the same activation as
+                // `Activate`: that dismisses System Health, which would otherwise leave the
+                // composer it focuses behind a panel the next key cannot reach.
+                if live_key == Some(None) {
+                    return self.activate_selected_session();
+                }
+                if live_key == Some(Some(LiveKey::Enter)) {
+                    return self.tab_attach_action();
+                }
+                return self.start_live_send();
+            }
             ActionId::ResolveIndeterminate => {
                 if self.pending_indeterminate_queue.is_empty()
                     && !self.session_feed.namespace_indeterminate()

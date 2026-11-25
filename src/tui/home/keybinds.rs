@@ -150,8 +150,6 @@ fn navigation_owner(c: &Chord) -> Option<&'static str> {
             | KeyCode::PageDown
             | KeyCode::Home
             | KeyCode::End
-            | KeyCode::Enter
-            | KeyCode::Tab
             | KeyCode::Esc
             | KeyCode::Char('j' | 'k' | 'h' | 'l' | 'G' | '{' | '}' | '<' | '>')
     )
@@ -204,7 +202,12 @@ fn fixed_conflict(id: ActionId, c: &Chord, reserved: &Reserved) -> Option<String
     if is_live_action(id) {
         let typing = matches!(
             c.code,
-            KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete | KeyCode::BackTab
+            KeyCode::Char(_)
+                | KeyCode::Backspace
+                | KeyCode::Delete
+                | KeyCode::Enter
+                | KeyCode::Tab
+                | KeyCode::BackTab
         );
         if typing && !c.ctrl && !c.alt {
             return Some(format!(
@@ -409,7 +412,8 @@ mod tests {
             ("delete", &["x"], "x is bound to stop"),
             ("delete", &["C-k"], "Ctrl+K is bound to command-palette"),
             ("delete", &["j"], "j is reserved for navigation"),
-            ("delete", &["Enter"], "Enter is reserved for navigation"),
+            ("delete", &["Enter"], "Enter is bound to activate"),
+            ("next-finished", &["Tab"], "live mode relays typing"),
             ("delete", &["C-c"], "Ctrl+C is reserved for quit"),
             ("delete", &["M-g"], "Alt+G is the hotkey for tool lazygit"),
             (
@@ -504,7 +508,11 @@ mod tests {
         use super::super::bindings::{label_in, resolve_in, Ctx};
         use crossterm::event::{KeyEvent, KeyModifiers};
         let (km, warnings) = build(
-            &entries(&[("delete", &["C-e"]), ("restart", &[])]),
+            &entries(&[
+                ("delete", &["C-e"]),
+                ("restart", &[]),
+                ("activate", &["C-Enter"]),
+            ]),
             false,
             &reserved(),
         );
@@ -523,6 +531,11 @@ mod tests {
             ),
             (KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), None),
             (KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE), None),
+            (
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+                Some(ActionId::Activate),
+            ),
+            (KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), None),
         ] {
             assert_eq!(resolve_in(&km, &key, false, &ctx), want, "{key:?}");
         }

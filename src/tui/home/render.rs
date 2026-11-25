@@ -4523,9 +4523,18 @@ impl HomeView {
         let mk_key =
             |key: &str| -> Vec<Span<'static>> { vec![Span::styled(key.to_string(), key_style)] };
 
-        // Keys a footer button synthesizes on click, for the few entries outside the registry.
-        let kenter = Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let ktab = Some(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        // The activation keys, shown as one-cell glyphs while on their defaults.
+        let activation = |id: ActionId, default: &str, glyph: &str| {
+            let label = super::bindings::label(id, strict);
+            let label = if label == default {
+                glyph.to_string()
+            } else {
+                label.replace("Ctrl+", "^")
+            };
+            (super::bindings::key_event(id, strict), label)
+        };
+        let (kenter, enter_label) = activation(ActionId::Activate, "Enter", "↵");
+        let (ktab, tab_label) = activation(ActionId::ActivateAlt, "Tab", "⇥ ");
         // Click key and compact label (`^G`) for an action's chord in the active mode.
         let bound = |id: ActionId| {
             (
@@ -4620,21 +4629,24 @@ impl HomeView {
                 ));
                 // No key hint where neither key enters live mode; the row's hints stay.
                 let (click, key) = match self.live_key(self.selected_session.as_deref()?)? {
-                    live_send::LiveKey::Tab => (ktab, "Tab"),
-                    live_send::LiveKey::Enter => (kenter, "↵"),
+                    live_send::LiveKey::Tab => (
+                        ktab,
+                        super::bindings::label(ActionId::ActivateAlt, strict).replace("Ctrl+", "^"),
+                    ),
+                    live_send::LiveKey::Enter => (kenter, enter_label.clone()),
                 };
-                groups.push((0, click, mk(key, "take control")));
+                click?;
+                groups.push((0, click, mk(&key, "take control")));
                 Some(click)
             });
-            if let Some(enter_action_text) = enter_action_text {
-                // U+21B5 keeps Enter to one display cell without shortening its action label.
+            if let (Some(enter_action_text), Some(_)) = (enter_action_text, kenter) {
                 if live_key != Some(kenter) {
-                    groups.push((0, kenter, mk("↵", enter_action_text)));
+                    groups.push((0, kenter, mk(&enter_label, enter_action_text)));
                 }
             }
-            if let Some(tab_action_text) = tab_action_text {
+            if let (Some(tab_action_text), Some(_)) = (tab_action_text, ktab) {
                 if live_key != Some(ktab) {
-                    groups.push((2, ktab, mk("⇥ ", tab_action_text)));
+                    groups.push((2, ktab, mk(&tab_label, tab_action_text)));
                 }
             }
 
@@ -4754,7 +4766,9 @@ impl HomeView {
                     mk("Esc", "Sessions"),
                 ));
             } else {
-                groups.push((0, kenter, mk("↵", "Read")));
+                if kenter.is_some() {
+                    groups.push((0, kenter, mk(&enter_label, "Read")));
+                }
                 let (click, key) = bound(ActionId::ToggleArchive);
                 groups.push((0, click, mk(&key, "Restore")));
                 let (click, key) = bound(ActionId::Delete);

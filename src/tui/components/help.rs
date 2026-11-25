@@ -79,12 +79,15 @@ fn shortcuts(strict: bool, live_on_enter: bool) -> Vec<(&'static str, Vec<(Strin
         }
     }
 
-    // Enter / Tab are structural keys (not relocatable registry actions); they
-    // lead the Actions section and swap descriptions with the attach mode.
-    let mut actions_rows = vec![
-        ("Enter".to_string(), enter_desc.to_string()),
-        ("Tab".to_string(), tab_desc.to_string()),
-    ];
+    // The activation keys lead the Actions section and swap descriptions with the attach mode.
+    let mut actions_rows: Vec<(String, String)> = [
+        (bindings::ActionId::Activate, enter_desc),
+        (bindings::ActionId::ActivateAlt, tab_desc),
+    ]
+    .into_iter()
+    .map(|(id, desc)| (bindings::label(id, strict), desc.to_string()))
+    .filter(|(label, _)| !label.is_empty())
+    .collect();
     actions_rows.append(&mut actions);
 
     // Rows with no single registry binding. Tips has no global hotkey at all

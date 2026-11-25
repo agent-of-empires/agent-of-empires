@@ -782,3 +782,48 @@ fn send_message_keeps_buffered_paste_per_session() {
         "the previous target's unsent draft must survive the switch"
     );
 }
+
+/// `[keybinds]` moves activation off Enter and Tab: the override attaches, the footer
+/// button sends it, and the freed keys do nothing.
+#[test]
+#[serial]
+fn activation_follows_keybind_overrides() {
+    use crate::tui::home::keybinds;
+    use ratatui::{backend::TestBackend, Terminal};
+    let mut env = create_test_env_empty();
+    let config = crate::session::Config {
+        keybinds: [
+            ("activate".to_string(), vec!["C-Enter".to_string()]),
+            ("activate-alt".to_string(), vec![]),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let (keymap, warnings) = keybinds::from_config(&config);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    keybinds::install(keymap);
+    let id = add_session(&mut env.view, "session-one");
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.cursor = 0;
+    env.view.update_selected();
+
+    let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+    let theme = crate::tui::styles::load_theme("empire");
+    let mut terminal = Terminal::new(TestBackend::new(200, 12)).unwrap();
+    terminal
+        .draw(|f| env.view.render(f, f.area(), &theme, None))
+        .unwrap();
+    let buttons: Vec<KeyEvent> = env.view.footer_buttons.iter().map(|(k, _)| *k).collect();
+    assert!(buttons.contains(&ctrl_enter), "{buttons:?}");
+    assert!(
+        !buttons.iter().any(|k| k.code == KeyCode::Tab),
+        "{buttons:?}"
+    );
+
+    assert_eq!(env.view.handle_key(key(KeyCode::Enter), None), None);
+    assert_eq!(env.view.handle_key(key(KeyCode::Tab), None), None);
+    assert_eq!(
+        env.view.handle_key(ctrl_enter, None),
+        Some(Action::AttachSession(id))
+    );
+}
