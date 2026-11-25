@@ -665,6 +665,66 @@ async fn prepare_resolves_the_preset_prompt_and_stale_items() {
     }
 }
 
+/// Start in a Project moves it to the front of the repo's mapping and keeps
+/// the other Projects the user had mapped.
+#[tokio::test]
+#[serial_test::serial]
+async fn start_in_a_project_keeps_the_other_mapped_projects() {
+    let f = fixture();
+    f.seed_item("a", Some("acme/web"), "42");
+    let other = f.repo.parent().unwrap().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    projects::add(
+        "default",
+        ProjectScope::Global,
+        Project::new("other", other.to_string_lossy(), ProjectScope::Global),
+        false,
+    )
+    .unwrap();
+    let canonical = |path: &str| {
+        std::fs::canonicalize(path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    };
+    let (repo, other) = (
+        f.repo.to_string_lossy().into_owned(),
+        other.to_string_lossy().into_owned(),
+    );
+    f.call(
+        Method::PUT,
+        "/api/suggestions/mappings",
+        json!({ "provider_id": PROVIDER, "mapping_key": "acme/web", "projects": [other, repo] }),
+    )
+    .await;
+    // The hooks gate ends the start after the link is saved.
+    std::fs::create_dir_all(f.repo.join(".agent-of-empires")).unwrap();
+    std::fs::write(
+        f.repo.join(".agent-of-empires/config.toml"),
+        "[hooks]\non_create = [\"npm ci\"]\n",
+    )
+    .unwrap();
+    let (status, code, _) = f
+        .call(
+            Method::POST,
+            "/api/suggestions/start",
+            json!({ "provider_id": PROVIDER, "id": "a", "project": { "path": repo } }),
+        )
+        .await;
+    assert_eq!(
+        (status, code.as_str()),
+        (StatusCode::CONFLICT, "hooks_need_trust")
+    );
+    let (_, _, mappings) = f
+        .call(Method::GET, "/api/suggestions/mappings", Value::Null)
+        .await;
+    assert_eq!(
+        mappings["mappings"][0]["projects"],
+        json!([canonical(&repo), canonical(&other)]),
+        "{mappings}"
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn start_refuses_an_unlinked_repo_and_shows_hooks_before_approval() {

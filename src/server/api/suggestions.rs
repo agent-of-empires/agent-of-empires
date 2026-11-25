@@ -431,18 +431,30 @@ fn link_project(
 ) -> anyhow::Result<Result<(), String>> {
     let registered = crate::session::projects::load_merged(&host.suggestions_profile())?;
     host.with_suggestions_db(|conn, profile| {
-        let Some((item, _)) = suggestions::find_item_with_mapping(conn, profile, provider, id)?
+        let Some((item, existing)) =
+            suggestions::find_item_with_mapping(conn, profile, provider, id)?
         else {
             return Ok(Err("That suggestion is no longer published".to_string()));
         };
         let Some(key) = item.mapping_key else {
             return Ok(Err("This suggestion names no repo to link".to_string()));
         };
-        let projects = match suggestions::normalize_mapping(&key, &[path.to_string()], &registered)
-        {
-            Ok(projects) => projects,
-            Err(message) => return Ok(Err(message)),
-        };
+        // The chosen Project moves to the front; the others stay, minus any
+        // that are no longer registered.
+        let mut projects =
+            match suggestions::normalize_mapping(&key, &[path.to_string()], &registered) {
+                Ok(projects) => projects,
+                Err(message) => return Ok(Err(message)),
+            };
+        for extra in existing.unwrap_or_default() {
+            if let Ok(kept) = suggestions::normalize_mapping(&key, &[extra], &registered) {
+                if !projects.contains(&kept[0])
+                    && projects.len() < suggestions::MAX_MAPPING_PROJECTS
+                {
+                    projects.extend(kept);
+                }
+            }
+        }
         suggestions::put_mapping(conn, profile, &provider.id, &key, &projects)?;
         Ok(Ok(()))
     })
