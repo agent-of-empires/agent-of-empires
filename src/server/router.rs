@@ -209,10 +209,6 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(api::recreate_container).layer(read_only.clone()),
         )
         .route(
-            "/api/sessions/{id}/restart-for-update",
-            post(api::restart_for_update).layer(read_only.clone()),
-        )
-        .route(
             "/api/sessions/{id}/terminal",
             post(api::ensure_terminal).delete(api::kill_terminal),
         )

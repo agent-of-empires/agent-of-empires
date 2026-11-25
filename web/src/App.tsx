@@ -133,7 +133,6 @@ import { settleSettingsIntrosReadOnly } from "./lib/settingsIntros";
 import { onSettingsChanged } from "./lib/settingsEvents";
 import { parseSystemHealthEnabled, SystemHealthEnabledContext } from "./lib/systemHealth";
 import { toastBus, reportError } from "./lib/toastBus";
-import { restartForUpdate } from "./lib/restartForUpdate";
 import { startPendingCreates } from "./lib/pendingCreates";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { NAVIGATE_EVENT, OPEN_SESSION_EVENT, openFocusWindow, replaceDocument } from "./lib/sessionRoute";
@@ -2380,7 +2379,6 @@ function AppContent({
                 onDelete: handleDeleteSession,
                 onStop: handleStopSession,
                 onStart: handleStartSession,
-                onRestartForUpdate: restartForUpdate,
                 onSwitchView: handleSwitchView,
                 onCreateSession: handleCreateSession,
               }}
@@ -2848,7 +2846,6 @@ function AppContent({
                 onRetryTrash={handleRetryTrash}
                 onStopSession={handleStopSession}
                 onStartSession={handleStartSession}
-                onRestartForUpdate={restartForUpdate}
                 onSwitchView={handleSwitchView}
                 readOnly={caps.readOnly}
                 canManageProjects={caps.canManageProjects}

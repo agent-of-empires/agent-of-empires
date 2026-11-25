@@ -61,14 +61,6 @@ describe("Session menu tiers", () => {
         "Stopped · Terminal view",
         `${quick} | rename | start | ${more} edit-group add-project | ${tail}`,
       ],
-      // Restart to update leads the Run tier.
-      [
-        "update waiting",
-        [{ status: "Idle", update_restart: true }],
-        {},
-        "Idle · Terminal view",
-        `${quick} | rename | restart-update stop | ${more} edit-group add-project | ${tail}`,
-      ],
       // Recreate container sits last in More, after its own separator.
       [
         "sandboxed",
@@ -126,13 +118,8 @@ describe("Session menu tiers", () => {
     // (Session, [name, description] it offers)
     const cases: [Partial<SessionResponse>, [string, string?][]][] = [
       [
-        { status: "Running", update_restart: true, is_sandboxed: true },
-        [
-          ["Restart to update", "Keeps the conversation"],
-          ["Recreate container", "Resets anything installed inside it"],
-          ["Move to another group"],
-          ["Move to Trash…"],
-        ],
+        { status: "Running", is_sandboxed: true },
+        [["Recreate container", "Resets anything installed inside it"], ["Move to another group"], ["Move to Trash…"]],
       ],
       [{ status: "Stopped", has_managed_worktree: true }, [["Rename workdir"]]],
     ];

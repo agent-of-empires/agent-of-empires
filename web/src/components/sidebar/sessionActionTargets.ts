@@ -5,7 +5,6 @@ import { effectiveArchivedOf, type RowOptimistic } from "../../lib/sidebarOptimi
 export type SessionAction =
   | "stop"
   | "start"
-  | "restartUpdate"
   | "ignore"
   | "reclaimOwnership"
   | "recreateContainer"
@@ -49,7 +48,6 @@ const ELIGIBLE: Record<SessionAction, (s: SessionResponse, archived: boolean) =>
   reclaimOwnership: (s) => !s.trashed_at && (s.parent_session_id != null || s.ignored_at != null),
   // Archived and trashed sessions must be unarchived or restored before they start (#4116).
   start: (s, archived) => s.status === "Stopped" && !archived && !s.trashed_at,
-  restartUpdate: (s) => !!s.update_restart,
   recreateContainer: canRecreateContainer,
   fork: (s) => isStructured(s) && !!s.acp_session_id && !!s.acp_can_fork,
   switchAgent: isStructured,
@@ -75,7 +73,6 @@ export function resolveActionTargets(sessions: SessionResponse[], optimistic: Ro
   return {
     stop: targets("stop"),
     start: targets("start"),
-    restartUpdate: targets("restartUpdate"),
     ignore: targets("ignore"),
     reclaimOwnership: targets("reclaimOwnership"),
     recreateContainer: targets("recreateContainer"),
