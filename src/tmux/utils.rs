@@ -285,6 +285,37 @@ pub fn first_pane_id(session_name: &str) -> Option<String> {
     first_pane_id_with_deadline(session_name, &crate::tmux::TmuxCommandDeadline::new())
 }
 
+/// Whether `session` holds `pane`, a `#{pane_id}`, and on the server `server_pid` when given.
+/// Lists the session's panes rather than resolving `pane`, because a window linked into several
+/// sessions resolves through whichever was active last, and a moved pane keeps its id.
+pub(crate) fn session_holds_pane(
+    session: &str,
+    server_pid: Option<&str>,
+    pane: &str,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) -> bool {
+    let target = format!("={session}:");
+    let mut command = crate::tmux::tmux_query_command();
+    command.args([
+        "list-panes",
+        "-s",
+        "-t",
+        &target,
+        "-F",
+        "#{pid}\t#{pane_id}",
+    ]);
+    deadline.run(&mut command).is_ok_and(|out| {
+        out.status.success()
+            && std::str::from_utf8(&out.stdout).is_ok_and(|lines| {
+                lines.lines().any(|line| {
+                    line.split_once('\t').is_some_and(|(pid, id)| {
+                        id == pane && server_pid.is_none_or(|want| want == pid)
+                    })
+                })
+            })
+    })
+}
+
 pub(crate) fn first_pane_id_with_deadline(
     session_name: &str,
     deadline: &crate::tmux::TmuxCommandDeadline,

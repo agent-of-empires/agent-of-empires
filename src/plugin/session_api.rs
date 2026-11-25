@@ -960,6 +960,7 @@ async fn deliver_message(
         req.message.clone(),
         true,
         true,
+        None,
     )
     .await
     .map_err(|error| map_terminal_error(error.error))?;

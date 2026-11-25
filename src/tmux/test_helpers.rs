@@ -176,3 +176,29 @@ pub(crate) fn after_input_check(pane: &str) {
         hook();
     }
 }
+
+static TEXT_TYPED_HOOKS: std::sync::Mutex<Vec<(String, InputCheckHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Runs `hook` once, after a checked-pane send has typed its text into `pane` and before its
+/// membership check for Enter.
+pub(crate) fn on_text_typed(pane: &str, hook: impl FnOnce() + Send + 'static) {
+    TEXT_TYPED_HOOKS
+        .lock()
+        .unwrap()
+        .push((pane.to_string(), Box::new(hook)));
+}
+
+pub(crate) fn after_text_typed(pane: &str) {
+    let hooks: Vec<InputCheckHook> = {
+        let mut all = TEXT_TYPED_HOOKS.lock().unwrap();
+        let (mine, rest) = std::mem::take(&mut *all)
+            .into_iter()
+            .partition::<Vec<_>, _>(|(watched, _)| watched == pane);
+        *all = rest;
+        mine.into_iter().map(|(_, hook)| hook).collect()
+    };
+    for hook in hooks {
+        hook();
+    }
+}

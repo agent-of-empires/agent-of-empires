@@ -686,7 +686,8 @@ impl Instance {
     /// A status read of this session's pane taken now, through its detection manifest, for
     /// callers outside the poller (`aoe session show`, MCP). `None` when the agent has no
     /// manifest. `reuse` is a capture the caller already took and how many lines it holds; it is
-    /// used when it covers the manifest's scope. Returns the detected status (`None` for an
+    /// used when it covers the manifest's scope. A fresh capture reads `pane` when given, else the
+    /// session's live pane. Returns the detected status (`None` for an
     /// agent-owned viewer, or for a failed capture with nothing to reuse) and the rule that
     /// decided it.
     pub(crate) fn detect_pane_now(
@@ -694,6 +695,7 @@ impl Instance {
         profile: &str,
         session: &tmux::Session,
         reuse: Option<(&str, usize)>,
+        pane: Option<&str>,
     ) -> Option<(Option<Status>, &'static str)> {
         if let Some((status, reported)) =
             crate::plugin::agent_integration::owned_status(self, session.is_pane_dead())
@@ -712,7 +714,11 @@ impl Instance {
         let policy = plan.capture_policy();
         let fresh = match reuse {
             Some((_, lines)) if policy.scope.can_reuse(lines) => None,
-            _ => session.try_capture_pane(policy.scope.lines()).ok(),
+            _ => match pane {
+                Some(pane) => session.try_capture_pane_in(pane, policy.scope.lines()),
+                None => session.try_capture_pane(policy.scope.lines()),
+            }
+            .ok(),
         };
         let Some(content) = detection_content(fresh.as_deref(), reuse) else {
             return Some((None, CAPTURE_FAILED_RULE));

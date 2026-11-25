@@ -43,12 +43,15 @@ pub(crate) struct TerminalSendError {
 }
 
 /// Revive through the native lifecycle command, then send under immutable pane ownership.
+/// `checked_pane` is a pane the caller already checked (MCP's dialog check): the send then
+/// addresses only that pane instead of resolving the live one.
 pub(crate) async fn send_terminal_message(
     service: &SessionService,
     id: &str,
     message: String,
     revive: bool,
     refuse_if_ignored: bool,
+    checked_pane: Option<String>,
 ) -> Result<bool, TerminalSendError> {
     let mut committed_cursor = None;
     send_terminal_message_inner(
@@ -57,6 +60,7 @@ pub(crate) async fn send_terminal_message(
         message,
         revive,
         refuse_if_ignored,
+        checked_pane,
         &mut committed_cursor,
     )
     .await
@@ -72,6 +76,7 @@ async fn send_terminal_message_inner(
     message: String,
     revive: bool,
     refuse_if_ignored: bool,
+    checked_pane: Option<String>,
     committed_cursor: &mut Option<(axum::http::HeaderValue, axum::http::HeaderValue)>,
 ) -> Result<bool, SendKeysError> {
     let state = service.native_state().map_err(SendKeysError::Tmux)?;
@@ -224,9 +229,12 @@ async fn send_terminal_message_inner(
             );
             let session = instance.tmux_session()?;
             // Readiness, the draft check and the keys all address this one pane.
-            let pane = session
-                .live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())
-                .map_err(|_| TerminalNotRunning)?;
+            let pane = match checked_pane {
+                Some(pane) => pane,
+                None => session
+                    .live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())
+                    .map_err(|_| TerminalNotRunning)?,
+            };
             session
                 .wait_until_ready_in(
                     &pane,
@@ -406,7 +414,16 @@ pub async fn send_message(
     }
 
     let revive = req.revive;
-    match send_terminal_message(&state.session_service, &id, req.message, revive, false).await {
+    match send_terminal_message(
+        &state.session_service,
+        &id,
+        req.message,
+        revive,
+        false,
+        None,
+    )
+    .await
+    {
         Ok(_) => {
             tracing::info!(target: "session.lifecycle", session = %id, len, revive, "terminal message sent");
             match state.runtime.publish(&state).await {

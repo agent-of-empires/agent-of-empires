@@ -802,34 +802,6 @@ pub(super) fn server_pid(
     Some(pid.trim_end_matches('\n').to_string())
 }
 
-/// Lists the session's panes rather than resolving `pane`, because a window
-/// linked into several sessions resolves through whichever was active last.
-pub(super) fn session_holds_pane(
-    session: &str,
-    server_pid: &str,
-    pane: &str,
-    deadline: &crate::tmux::TmuxCommandDeadline,
-) -> bool {
-    let target = format!("={session}:");
-    let mut command = crate::tmux::tmux_query_command();
-    command.args([
-        "list-panes",
-        "-s",
-        "-t",
-        &target,
-        "-F",
-        "#{pid}\t#{pane_id}",
-    ]);
-    deadline.run(&mut command).is_ok_and(|out| {
-        out.status.success()
-            && std::str::from_utf8(&out.stdout).is_ok_and(|lines| {
-                lines
-                    .lines()
-                    .any(|line| line.split_once('\t') == Some((server_pid, pane)))
-            })
-    })
-}
-
 /// The held channel's pane, kept after its socket fails while the pane is
 /// still in `session` on the server it was armed on.
 pub(crate) fn channel_pane_id(
@@ -838,7 +810,12 @@ pub(crate) fn channel_pane_id(
 ) -> Option<String> {
     let channel = lookup(session)?;
     (channel.is_alive()
-        || session_holds_pane(session, &channel.server_pid, &channel.target, deadline))
+        || crate::tmux::utils::session_holds_pane(
+            session,
+            Some(&channel.server_pid),
+            &channel.target,
+            deadline,
+        ))
     .then(|| channel.target.clone())
 }
 

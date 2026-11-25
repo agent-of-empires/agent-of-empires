@@ -963,7 +963,7 @@ impl Session {
                     .args(["display-message", "-p", "-t", pane, "#{pane_dead}"])
                     .output()?;
                 if !live.status.success() || String::from_utf8_lossy(&live.stdout).trim() != "0" {
-                    bail!("tmux pane '{pane}' is gone");
+                    bail!("tmux pane '{pane}' is gone or dead");
                 }
                 self.capture_target(pane, 0)
             },
@@ -1576,19 +1576,36 @@ impl Session {
 
         let target =
             self.live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
-        Self::send_keys_to(&target, text, enter_delay_ms)
+        Self::send_keys_to(&target, text, enter_delay_ms, None)
     }
 
     /// [`Self::send_keys_with_delay`] to exactly `pane`, a `#{pane_id}`: text and Enter
-    /// reach the pane that was checked, or fail if it is gone.
+    /// reach the pane that was checked while it is still in this session, or fail. A pane moved
+    /// out after its text was typed keeps the text unsubmitted, rather than submitting it to
+    /// another session's agent.
     pub fn send_keys_to_pane(&self, pane: &str, text: &str, enter_delay_ms: u64) -> Result<()> {
-        if !self.exists() {
-            bail!("Session does not exist: {}", self.name);
+        if !self.holds_pane(pane) {
+            bail!("tmux pane '{pane}' is no longer in session {}", self.name);
         }
-        Self::send_keys_to(pane, text, enter_delay_ms)
+        Self::send_keys_to(pane, text, enter_delay_ms, Some(self))
     }
 
-    fn send_keys_to(target: &str, text: &str, enter_delay_ms: u64) -> Result<()> {
+    fn holds_pane(&self, pane: &str) -> bool {
+        super::utils::session_holds_pane(
+            &self.name,
+            None,
+            pane,
+            &crate::tmux::TmuxCommandDeadline::new(),
+        )
+    }
+
+    /// `checked`, when set, is the session `target` must still be in for Enter.
+    fn send_keys_to(
+        target: &str,
+        text: &str,
+        enter_delay_ms: u64,
+        checked: Option<&Self>,
+    ) -> Result<()> {
         let delivery = submit_text(text);
         tracing::debug!(target: "tmux.command",
             "send_keys_with_delay: bytes={} lines={} paste={} target={}",
@@ -1614,6 +1631,17 @@ impl Session {
 
         if enter_delay_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(enter_delay_ms));
+        }
+        #[cfg(test)]
+        crate::tmux::test_helpers::after_text_typed(target);
+        if let Some(session) = checked {
+            if !session.holds_pane(target) {
+                bail!(
+                    "typed into tmux pane '{target}' but did not submit it: the pane is no longer \
+                     in session {}",
+                    session.name
+                );
+            }
         }
 
         // Enter to submit
@@ -5353,9 +5381,9 @@ mod tests {
             (
                 "session pane membership",
                 Some(
-                    crate::tmux::vt::session_holds_pane(
+                    crate::tmux::utils::session_holds_pane(
                         &session_name,
-                        &server_pid,
+                        Some(&server_pid),
                         &pane,
                         &deadline,
                     )

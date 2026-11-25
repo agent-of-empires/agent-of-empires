@@ -1360,6 +1360,105 @@ async fn terminal_sessions_send_and_read_through_their_pane() {
     pane_shows("from-the-child").await;
 }
 
+/// MCP `send` types into the pane its dialog check read, or refuses, even when the live target
+/// moves to another pane after the check, or the checked pane leaves the session.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_mcp_send_types_into_the_pane_it_checked() {
+    use crate::tmux::test_helpers::{
+        on_input_checked, only_pane_id, split_pane, wait_for_pane_command, TmuxTestSession,
+    };
+    if !crate::tmux::test_helpers::tmux_available() {
+        return;
+    }
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let shows = |pane: &str, text: &str| {
+        crate::tmux::tmux_command()
+            .args(["capture-pane", "-p", "-t", pane])
+            .output()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains(text))
+    };
+    let start_cat = |name: &str| {
+        let mut args: Vec<String> = ["new-session", "-d", "-s", name, "exec cat"]
+            .map(str::to_string)
+            .to_vec();
+        crate::tmux::utils::append_pane_base_index_args(&mut args, name);
+        assert!(crate::tmux::tmux_command()
+            .args(&args)
+            .status()
+            .unwrap()
+            .success());
+    };
+    #[derive(Clone, Copy, PartialEq)]
+    enum Then {
+        Unpin,
+        Kill,
+        Move,
+    }
+    // (case, what happens to the checked pane after the check, besides the pin being dropped)
+    for (case, then) in [
+        ("unpinned", Then::Unpin),
+        ("killed", Then::Kill),
+        ("moved", Then::Move),
+    ] {
+        let mut live = Instance::new("mcp-checked", "/tmp/aoe-mcp-checked");
+        live.source_profile = "default".into();
+        let live_id = live.id.clone();
+        let session = live.tmux_session().unwrap();
+        let (app, _state, _secret) = seeded_app_with_secret(vec![live], false).await;
+        start_cat(session.name());
+        let _cleanup = TmuxTestSession::from_name(session.name());
+        let other = TmuxTestSession::new("mcp_checked_other");
+        start_cat(other.name());
+        let first = only_pane_id(session.name());
+        wait_for_pane_command(&first, "cat");
+        let checked = split_pane(session.name(), "exec cat");
+        wait_for_pane_command(&checked, "cat");
+        let dir = tempfile::tempdir().unwrap();
+        let pin =
+            crate::tmux::vt::register_live_target_for_test(session.name(), dir.path(), &checked);
+        let (target, to) = (checked.clone(), format!("={}:", other.name()));
+        on_input_checked(&checked, move || {
+            drop(pin);
+            let action = match then {
+                Then::Kill => vec!["kill-pane", "-t", &target],
+                Then::Move => vec!["join-pane", "-d", "-s", &target, "-t", &to],
+                Then::Unpin => return,
+            };
+            assert!(crate::tmux::tmux_command()
+                .args(action)
+                .status()
+                .unwrap()
+                .success());
+        });
+
+        let arguments = json!({"session_id": live_id, "message": "typed-by-mcp"});
+        let result = call_result(&app, "send", arguments).await;
+
+        if then == Then::Unpin {
+            assert_eq!(
+                result["structuredContent"]["disposition"], "sent",
+                "{case}: {result}"
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !shows(&checked, "typed-by-mcp") {
+                assert!(std::time::Instant::now() < deadline, "{case}: never typed");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        } else {
+            assert!(error_code(&result).is_some(), "{case}: {result}");
+            assert!(
+                !shows(&checked, "typed-by-mcp"),
+                "{case}: typed after the check"
+            );
+        }
+        assert!(
+            !shows(&first, "typed-by-mcp"),
+            "{case}: typed into the other pane"
+        );
+    }
+}
+
 /// A retried `idempotency_key` answers with the first create's session and delivers nothing:
 /// a terminal pane is not typed into again, and a structured session stores no prompt.
 #[tokio::test]

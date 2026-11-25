@@ -256,7 +256,8 @@ impl McpServer {
                 Some(IGNORED_PROMPT.to_string()),
             ),
             Some(text) => {
-                let readiness = wait_for_input_prompt(&self.state, &session.id).await;
+                let (readiness, checked_pane) =
+                    wait_for_input_prompt(&self.state, &session.id).await;
                 // The wait can outlast a person's ignore, so it is checked again before
                 // the readiness result decides what the caller is told.
                 if self.session_is_ignored(&session.id).await {
@@ -308,6 +309,7 @@ impl McpServer {
                     text.clone(),
                     false,
                     true,
+                    checked_pane,
                 )
                 .await
                 {
@@ -510,9 +512,7 @@ impl McpServer {
         // Keys sent into a dialog answer it (Enter accepts Claude's folder trust), so MCP refuses a
         // pane whose status rules detect one; an agent without status rules gets no check. HTTP
         // `POST /send` is left as is: a person at the dashboard sees the pane.
-        if let Some(refusal) = self.terminal_pane_refusal(&id).await {
-            return Err(Box::new(refusal));
-        }
+        let checked_pane = self.terminal_pane_refusal(&id).await?;
         // No revival: a restarted agent can open on a dialog the check above never saw.
         if let Err(e) = send_terminal_message(
             &self.state.session_service,
@@ -520,6 +520,7 @@ impl McpServer {
             message.clone(),
             false,
             true,
+            checked_pane,
         )
         .await
         {
@@ -602,8 +603,8 @@ impl McpServer {
     /// detect a dialog or question waiting on a person, or its input box holds a person's draft.
     /// A check that fails to run counts as waiting, as does, for an agent with a status manifest,
     /// a pane that can't be captured. `send` is explicit, so an agent without one
-    /// (`NoPromptRule`) is not refused.
-    async fn terminal_pane_refusal(&self, id: &str) -> Option<CallToolResult> {
+    /// (`NoPromptRule`) is not refused. Otherwise answers the pane it checked, for the send.
+    async fn terminal_pane_refusal(&self, id: &str) -> Result<Option<String>, Box<CallToolResult>> {
         let instance = self
             .state
             .instances
@@ -612,22 +613,24 @@ impl McpServer {
             .iter()
             .find(|i| i.id == id)
             .cloned();
-        let instance = instance?;
-        let readiness = tokio::task::spawn_blocking(move || pane_readiness(&instance))
+        let Some(instance) = instance else {
+            return Ok(None);
+        };
+        let (readiness, pane) = tokio::task::spawn_blocking(move || pane_readiness(&instance))
             .await
-            .unwrap_or(PaneReadiness::Unreadable);
+            .unwrap_or((PaneReadiness::Unreadable, None));
         match readiness {
-            PaneReadiness::Drafted => Some(tool_error(
+            PaneReadiness::Drafted => Err(Box::new(tool_error(
                 "input_line_busy",
                 crate::tmux::InputLine::BUSY_MESSAGE,
-            )),
-            readiness if refuses_send(readiness) => Some(tool_error(
+            ))),
+            readiness if refuses_send(readiness) => Err(Box::new(tool_error(
                 "waiting",
                 "The agent is waiting on a dialog or question in its terminal, or its pane could \
                  not be read, so nothing was typed. A person answers a dialog there; retry once \
                  the pane can be read.",
-            )),
-            _ => None,
+            ))),
+            _ => Ok(pane),
         }
     }
 
@@ -701,11 +704,12 @@ enum PaneReadiness {
 }
 
 /// Waits up to [`PROMPT_READY_TIMEOUT`] for a terminal session's agent to reach its input
-/// prompt, so a first prompt is never typed into a dialog. Returns at once on a dialog.
+/// prompt, so a first prompt is never typed into a dialog. Returns at once on a dialog, with the
+/// pane the last check read.
 async fn wait_for_input_prompt(
     state: &std::sync::Arc<crate::server::AppState>,
     id: &str,
-) -> PaneReadiness {
+) -> (PaneReadiness, Option<String>) {
     let deadline = tokio::time::Instant::now() + PROMPT_READY_TIMEOUT;
     loop {
         let instance = state
@@ -716,44 +720,52 @@ async fn wait_for_input_prompt(
             .find(|i| i.id == id)
             .cloned();
         let Some(instance) = instance else {
-            return PaneReadiness::Gone;
+            return (PaneReadiness::Gone, None);
         };
-        let readiness = tokio::task::spawn_blocking(move || pane_readiness(&instance))
+        let checked = tokio::task::spawn_blocking(move || pane_readiness(&instance))
             .await
-            .unwrap_or(PaneReadiness::NotYet);
-        let settled = !matches!(readiness, PaneReadiness::NotYet | PaneReadiness::Unreadable);
+            .unwrap_or((PaneReadiness::NotYet, None));
+        let settled = !matches!(checked.0, PaneReadiness::NotYet | PaneReadiness::Unreadable);
         if settled || tokio::time::Instant::now() >= deadline {
-            return readiness;
+            return checked;
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 }
 
 /// One fresh capture of the agent's pane, decided by its detection manifest, as `aoe session
-/// show` reads it. A stopped session is `Gone` before any capture, whose failure would read as
-/// `Unreadable`.
-fn pane_readiness(instance: &Instance) -> PaneReadiness {
+/// show` reads it, and the pane it read, so the send types into that one. A stopped session is
+/// `Gone` before any capture, whose failure would read as `Unreadable`.
+fn pane_readiness(instance: &Instance) -> (PaneReadiness, Option<String>) {
     if matches!(
         instance.status,
         Status::Error | Status::Stopped | Status::Deleting
     ) {
-        return PaneReadiness::Gone;
+        return (PaneReadiness::Gone, None);
     }
     let Ok(session) = instance.tmux_session() else {
-        return PaneReadiness::Gone;
+        return (PaneReadiness::Gone, None);
     };
     if !session.exists() || session.is_pane_dead() {
-        return PaneReadiness::Gone;
+        return (PaneReadiness::Gone, None);
     }
-    let input_line = session
+    let pane = session
         .live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())
+        .ok();
+    let input_line = pane
+        .as_deref()
         .map_or(crate::tmux::InputLine::Unknown, |pane| {
-            instance.input_line_in(&session, &pane)
+            instance.input_line_in(&session, pane)
         });
-    readiness_of(
-        instance.detect_pane_now(&instance.source_profile, &session, None),
+    let readiness = readiness_of(
+        instance.detect_pane_now(&instance.source_profile, &session, None, pane.as_deref()),
         input_line,
-    )
+    );
+    #[cfg(test)]
+    if let Some(pane) = &pane {
+        crate::tmux::test_helpers::after_input_check(pane);
+    }
+    (readiness, pane)
 }
 
 /// MCP `send` refuses a pane whose status rules detect a dialog, one holding a draft, or one it

@@ -136,6 +136,10 @@ pub(super) fn classify(prompt: &Regex, capture: &str) -> InputLine {
     let (Some(bottom), Some(top)) = (rules.next(), rules.next()) else {
         return InputLine::Unknown;
     };
+    // Adjacent rules leave no row for the prompt.
+    if bottom == top + 1 {
+        return InputLine::Unknown;
+    }
     let (text, cells) = &lines[top + 1];
     let Some(glyph) = prompt.find(text) else {
         return InputLine::Unknown;
@@ -181,6 +185,7 @@ mod tests {
             // A scrollback `❯` line above the box has bright text.
             ("ghost-postturn", InputLine::Empty),
             ("ghost-placeholder", InputLine::Empty),
+            // One character typed over the suggestion: typing removes the ghost, so this is a draft.
             ("ghost-postturn-one-char", InputLine::Draft),
             ("ghost-placeholder-one-char", InputLine::Draft),
             ("draft-cursor-start-2131", InputLine::Draft),
@@ -225,6 +230,11 @@ mod tests {
         ] {
             assert_eq!(claude(&capture), want, "{capture:?}");
         }
+        assert_eq!(
+            classify(&Regex::new("─").unwrap(), &format!("{RULE}\n{RULE}")),
+            InputLine::Unknown,
+            "adjacent rules with a prompt that matches a rule"
+        );
         assert_eq!(
             crate::tmux::detect::input_line("codex", &format!("{RULE}\n❯ typed\n{RULE}")),
             InputLine::Unknown,
