@@ -69,6 +69,12 @@ const waitForItems = (serve: ServeHandle) =>
 
 test("preferences, presets, mappings and dismissals round-trip through the server", async ({ spawnServe, page }) => {
   const serve = await spawnServe({ seedFn: seedProvider });
+  // Providers start off.
+  const on = await api(serve, "/prefs", {
+    method: "PATCH",
+    body: JSON.stringify({ provider_enabled: { "acme.sugg": true } }),
+  });
+  expect(on.status, await on.clone().text()).toBe(200);
   await waitForItems(serve);
 
   const prefs = await api(serve, "/prefs", { method: "PATCH", body: JSON.stringify({ sidebar: true }) });
