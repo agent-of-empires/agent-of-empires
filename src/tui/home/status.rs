@@ -862,6 +862,7 @@ impl HomeView {
                                         self.manual_unread_hold = None;
                                     }
                                 }
+                                self.prompt_failures_seeded = true;
                                 let ids: std::collections::HashSet<_> =
                                     self.instances.keys().map(String::as_str).collect();
                                 self.structured_pending_approvals

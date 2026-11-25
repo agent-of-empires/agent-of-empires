@@ -462,14 +462,21 @@ impl HomeView {
     }
 
     /// Tells the user once when a session was created but its first prompt
-    /// was not delivered, and puts the retained prompt on the clipboard.
+    /// was not delivered, and offers to copy the retained prompt.
     pub(super) fn announce_prompt_failure(&mut self, row: &crate::daemon::SessionResponse) {
         let Some(error) = &row.initial_prompt_error else {
             self.prompt_failures_announced.remove(&row.id);
             return;
         };
+        if !self.prompt_failures_seeded {
+            self.prompt_failures_announced.insert(row.id.clone());
+            return;
+        }
         // Another dialog is open: the next snapshot tries again.
-        if self.prompt_failures_announced.contains(&row.id) || self.info_dialog.is_some() {
+        if self.prompt_failures_announced.contains(&row.id)
+            || self.info_dialog.is_some()
+            || self.confirm_dialog.is_some()
+        {
             return;
         }
         self.prompt_failures_announced.insert(row.id.clone());
@@ -483,14 +490,19 @@ impl HomeView {
         );
         match prompt {
             Some(text) => {
-                crate::tui::clipboard::copy_to_clipboard(&text);
-                message.push_str(
-                    "\n\nThe prompt is copied to your clipboard. Attach the session and paste it.",
+                message.push_str("\n\nCopy the prompt, then attach the session and paste it.");
+                self.undelivered_prompt = Some(text);
+                self.confirm_dialog = Some(
+                    ConfirmDialog::new("Prompt not delivered", &message, "copy_undelivered_prompt")
+                        .neutral()
+                        .buttons("Copy prompt", "Close"),
                 );
             }
-            None => message.push_str("\n\nAttach the session and type the prompt again."),
+            None => {
+                message.push_str("\n\nAttach the session and type the prompt again.");
+                self.info_dialog = Some(InfoDialog::sized_to_fit("Prompt not delivered", &message));
+            }
         }
-        self.info_dialog = Some(InfoDialog::sized_to_fit("Prompt not delivered", &message));
     }
 
     fn commit_created_session(&mut self) -> Option<String> {

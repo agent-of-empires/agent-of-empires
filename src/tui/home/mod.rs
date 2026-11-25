@@ -625,6 +625,10 @@ pub struct HomeView {
     pub(super) suggestions_focused: bool,
     /// Sessions whose undelivered first prompt was already announced.
     pub(super) prompt_failures_announced: std::collections::HashSet<String>,
+    /// False until the first snapshot: failures it already carries are not announced.
+    pub(super) prompt_failures_seeded: bool,
+    /// The prompt the "Prompt not delivered" dialog's Copy button puts on the clipboard.
+    pub(super) undelivered_prompt: Option<String>,
     /// A suggestion to start again once its blocked Session, by id, is in Trash.
     pub(super) start_after_trash: Option<RetryAfterTrash>,
     pub(super) suggestions_feed: super::suggestions::SuggestionsFeed,

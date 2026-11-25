@@ -1137,8 +1137,22 @@ fn an_undelivered_first_prompt_is_announced_once_per_failure() {
     let mut row = crate::server::api::sessions::session_response_from_instance(&instance, false);
     row.initial_prompt_error = Some("the agent was not ready".into());
 
+    // As on launch, before the first snapshot is applied.
+    env.view.prompt_failures_seeded = false;
     env.view.announce_prompt_failure(&row);
-    assert!(env.view.info_dialog.is_some());
+    assert!(
+        env.view.info_dialog.is_none(),
+        "a failure the first snapshot already carries is not announced"
+    );
+    env.view.prompt_failures_seeded = true;
+    env.view.announce_prompt_failure(&row);
+    assert!(env.view.info_dialog.is_none(), "nor on later snapshots");
+
+    row.initial_prompt_error = None;
+    env.view.announce_prompt_failure(&row);
+    row.initial_prompt_error = Some("the agent was not ready".into());
+    env.view.announce_prompt_failure(&row);
+    assert!(env.view.info_dialog.is_some(), "a new failure is announced");
     env.view.info_dialog = None;
     env.view.announce_prompt_failure(&row);
     assert!(
@@ -1146,11 +1160,20 @@ fn an_undelivered_first_prompt_is_announced_once_per_failure() {
         "the same failure is not repeated"
     );
 
+    // With a retained prompt, the clipboard is written only by the Copy button.
+    env.view
+        .instances
+        .get_mut(&row.id)
+        .unwrap()
+        .pending_initial_turn =
+        Some(serde_json::from_value(serde_json::json!({ "text": "fix the bug" })).unwrap());
     row.initial_prompt_error = None;
     env.view.announce_prompt_failure(&row);
     row.initial_prompt_error = Some("the agent was not ready".into());
     env.view.announce_prompt_failure(&row);
-    assert!(env.view.info_dialog.is_some(), "a new failure is announced");
+    let dialog = env.view.confirm_dialog.as_ref().expect("Copy is offered");
+    assert_eq!(dialog.action(), "copy_undelivered_prompt");
+    assert_eq!(env.view.undelivered_prompt.as_deref(), Some("fix the bug"));
 }
 
 #[test]

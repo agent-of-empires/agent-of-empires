@@ -1407,6 +1407,13 @@ impl HomeView {
                 None
             }
             "stop_session" => self.pending_stop_session.take().map(Action::StopSession),
+            "copy_undelivered_prompt" => {
+                if let Some(text) = self.undelivered_prompt.take() {
+                    crate::tui::clipboard::copy_to_clipboard(&text);
+                    self.flash_status("Prompt copied");
+                }
+                None
+            }
             "resume_reveal" => {
                 if let Some(intent) = self.retained_reveal.take() {
                     if let Err(error) = self.continue_reveal(intent) {
