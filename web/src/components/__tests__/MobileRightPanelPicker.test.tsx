@@ -24,6 +24,7 @@ function setup(overrides: Partial<Parameters<typeof MobileRightPanelPicker>[0]> 
       describePane={describePane}
       shellGroups={[]}
       onPickShell={onPickShell}
+      shownShell={null}
       onSelect={onSelect}
       onClose={onClose}
       {...overrides}
@@ -42,6 +43,22 @@ describe("MobileRightPanelPicker", () => {
     expect(row.textContent).toContain("Container");
     fireEvent.click(row);
     expect(onPickShell).toHaveBeenCalledWith(shell);
+  });
+
+  it("marks only the shell the paired view shows, not every shell with a desktop tab", () => {
+    const a = makeSession({ id: "a", title: "A" });
+    const b = makeSession({ id: "b", title: "B" });
+    setup({
+      active: "paired",
+      shellGroups: [
+        { session: a, shells: [{ sessionId: "a", index: 0, mode: "host", open: true }] },
+        { session: b, shells: [{ sessionId: "b", index: 0, mode: "host", open: true }] },
+      ],
+      shownShell: { sessionId: "b", index: 0, mode: "host" },
+    });
+    expect(
+      ["a", "b"].map((id) => screen.getByTestId(`mobile-shell-pick-${id}-0-host`).getAttribute("aria-current")),
+    ).toEqual([null, "true"]);
   });
 
   it("hides gated entries not in availablePanes and marks the active one", () => {

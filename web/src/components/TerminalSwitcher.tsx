@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
+import { createPortal } from "react-dom";
 import { ChevronDown, Plus, SquareTerminal } from "lucide-react";
 
 import { shellLabel, type PairedShell, type PairedShellGroup } from "../lib/pairedShells";
@@ -37,7 +38,8 @@ export function TerminalSwitcherMenu({
   onPick,
   onNew,
   onDone,
-}: TerminalSwitcherProps & { onDone: () => void }) {
+  maxHeight,
+}: TerminalSwitcherProps & { onDone: () => void; maxHeight?: number }) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     ref.current?.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
@@ -52,6 +54,7 @@ export function TerminalSwitcherMenu({
       data-testid="terminal-switcher-menu"
       data-owns-escape="open"
       onKeyDown={moveFocus}
+      style={maxHeight === undefined ? undefined : { maxHeight }}
       className="w-72 max-h-[60vh] overflow-y-auto bg-surface-800 border border-surface-700/50 rounded-md shadow-xl py-1"
     >
       {groups.length === 0 && <div className="px-3 py-1.5 text-[12px] text-text-dim">No paired terminals are open</div>}
@@ -106,14 +109,41 @@ export function TerminalSwitcherMenu({
   );
 }
 
-/** The dock strip's switcher trigger. */
+const MENU_GAP = 4;
+const VIEWPORT_MARGIN = 8;
+
+/** Where the menu fits beside `trigger`: below it unless more room is above, capped to that room. */
+function menuPlacement(trigger: DOMRect): { position: CSSProperties; maxHeight: number } {
+  const below = window.innerHeight - trigger.bottom - MENU_GAP - VIEWPORT_MARGIN;
+  const above = trigger.top - MENU_GAP - VIEWPORT_MARGIN;
+  const up = above > below;
+  const right = Math.max(VIEWPORT_MARGIN, window.innerWidth - trigger.right);
+  return {
+    position: up
+      ? { position: "fixed", right, bottom: window.innerHeight - trigger.top + MENU_GAP }
+      : { position: "fixed", right, top: trigger.bottom + MENU_GAP },
+    maxHeight: Math.max(0, up ? above : below),
+  };
+}
+
+/** The dock strip's switcher trigger. The menu renders in a portal, so the dock's overflow never clips it. */
 export function TerminalSwitcherButton(props: TerminalSwitcherProps) {
   const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-  useOutsideDismiss(open, [ref], () => setOpen(false));
+  const [placement, setPlacement] = useState<ReturnType<typeof menuPlacement> | null>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    setPlacement(open && triggerRef.current ? menuPlacement(triggerRef.current.getBoundingClientRect()) : null);
+  }, [open]);
+  useOutsideDismiss(open, [triggerRef, menuRef], (e) => {
+    setOpen(false);
+    // Escape takes focus from the menu with it; a click elsewhere already moved it.
+    if (e.type === "keydown") triggerRef.current?.focus();
+  });
   return (
-    <div ref={ref} className="relative">
+    <>
       <button
+        ref={triggerRef}
         type="button"
         onClick={() => setOpen((o) => !o)}
         aria-haspopup="menu"
@@ -125,19 +155,26 @@ export function TerminalSwitcherButton(props: TerminalSwitcherProps) {
       >
         <ChevronDown className="size-3.5" aria-hidden />
       </button>
-      {open && (
-        <div className="absolute right-0 top-full mt-1 z-50 animate-fade-in">
-          <TerminalSwitcherMenu {...props} onDone={() => setOpen(false)} />
-        </div>
-      )}
-    </div>
+      {open &&
+        placement &&
+        createPortal(
+          <div ref={menuRef} style={placement.position} className="z-50 animate-fade-in">
+            <TerminalSwitcherMenu {...props} maxHeight={placement.maxHeight} onDone={() => setOpen(false)} />
+          </div>,
+          document.body,
+        )}
+    </>
   );
 }
 
 /** The switcher opened from the keyboard, above the dashboard. */
 export function TerminalSwitcherOverlay({ onClose, ...props }: TerminalSwitcherProps & { onClose: () => void }) {
   const ref = useRef<HTMLDivElement>(null);
-  useOutsideDismiss(true, [ref], onClose);
+  const [returnTo] = useState(() => (document.activeElement instanceof HTMLElement ? document.activeElement : null));
+  useOutsideDismiss(true, [ref], (e) => {
+    onClose();
+    if (e.type === "keydown" && returnTo?.isConnected) returnTo.focus();
+  });
   return (
     <div className="fixed inset-x-0 top-[15vh] z-50 flex justify-center px-4 pointer-events-none">
       <div ref={ref} className="pointer-events-auto animate-fade-in">

@@ -1,5 +1,7 @@
 import { FileText, Sparkles, X } from "lucide-react";
 
+import { MAIN_VIEW_IDS } from "../lib/mainViewIds";
+
 interface Props {
   /** The open file's repo-relative or absolute path. */
   filePath: string;
@@ -30,6 +32,8 @@ export function MainViewTabs({ filePath, fileShown, onShowAgent, onShowFile, onC
           type="button"
           role="tab"
           aria-selected={!fileShown}
+          id={MAIN_VIEW_IDS.agentTab}
+          aria-controls={MAIN_VIEW_IDS.agentPanel}
           data-testid="main-view-tab-agent"
           onClick={onShowAgent}
           className="flex items-center gap-1 pr-1 cursor-pointer"
@@ -43,6 +47,8 @@ export function MainViewTabs({ filePath, fileShown, onShowAgent, onShowFile, onC
           type="button"
           role="tab"
           aria-selected={fileShown}
+          id={MAIN_VIEW_IDS.fileTab}
+          aria-controls={MAIN_VIEW_IDS.filePanel}
           title={filePath}
           data-testid="main-view-tab-file"
           onClick={onShowFile}

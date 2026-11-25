@@ -2,7 +2,7 @@
 // maximizes over the main area, and between md and 1100px it overlays the main area as a sheet.
 // Tab and width logic: MainViewTabs.test.tsx, rightDockMode.test.ts.
 
-import { test, expect } from "./helpers/mockedTest";
+import { test, expect, pressShortcut } from "./helpers/mockedTest";
 import {
   diffFileResponse,
   diffFilesResponse,
@@ -81,4 +81,27 @@ test("between md and 1100px the dock is a sheet that Escape and the backdrop clo
   await openDiffFile(page, "example.ts");
   await expect(sheet).toHaveCount(0);
   await expect(page.getByTestId("main-view-tab-file")).toHaveAttribute("aria-selected", "true");
+});
+
+test("the sheet keeps Tab inside it, and Escape closes Help over it before the sheet", async ({ page }) => {
+  await page.setViewportSize({ width: 1000, height: 720 });
+  await openDiffSession(page);
+  const sheet = page.getByRole("dialog", { name: "Panels" });
+  await expect.poll(() => sheet.evaluate((el) => el.contains(document.activeElement))).toBe(true);
+  const inSheet = () => sheet.evaluate((el) => el.contains(document.activeElement));
+  for (let i = 0; i < 12; i++) {
+    await page.keyboard.press("Tab");
+    expect(await inSheet()).toBe(true);
+  }
+  for (let i = 0; i < 12; i++) {
+    await page.keyboard.press("Shift+Tab");
+    expect(await inSheet()).toBe(true);
+  }
+
+  await page.getByTestId("right-dock-sheet").focus();
+  await pressShortcut(page, "?");
+  await expect(page.getByRole("heading", { name: "Help" })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("heading", { name: "Help" })).not.toBeVisible();
+  await expect(sheet).toBeVisible();
 });

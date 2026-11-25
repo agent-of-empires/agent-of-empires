@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { useFocusTrap } from "../hooks/useFocusTrap";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 
 const SPLIT_STORAGE_KEY = "aoe-split-ratio";
@@ -94,12 +95,16 @@ export function ContentSplit({ left, right, collapsed, onToggleCollapse, sheet =
       if (returnTo?.isConnected) returnTo.focus();
     };
   }, [sheetOpen]);
+  useFocusTrap(() => sheetRef.current, { active: sheetOpen });
 
   const inlineMaximized = maximized && !sheet;
   return (
     <div ref={containerRef} className="flex-1 flex min-h-0 overflow-hidden relative">
       {/* Terminal pane */}
-      <div className={`${inlineMaximized && !collapsed ? "hidden" : "flex"} flex-1 flex-col min-w-0 min-h-0`}>
+      <div
+        className={`${inlineMaximized && !collapsed ? "hidden" : "flex"} flex-1 flex-col min-w-0 min-h-0`}
+        inert={sheetOpen}
+      >
         {left}
       </div>
 

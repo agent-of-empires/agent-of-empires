@@ -16,6 +16,6 @@ describe("rightDockMode", () => {
   });
 
   it("matches the sheet range in CSS pixels", () => {
-    expect(SHEET_MEDIA_QUERY).toBe("(min-width: 768px) and (max-width: 1099px)");
+    expect(SHEET_MEDIA_QUERY).toBe("(768px <= width < 1100px)");
   });
 });

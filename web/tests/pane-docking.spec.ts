@@ -80,13 +80,15 @@ test.describe("Dockable pane system", () => {
   test("a pane moves from the right dock to the bottom dock", async ({ page }) => {
     await openSession(page);
     await page.goto(`/session/${SESSION}`);
+    // The default terminal fills the bottom dock; move it out so Diff is what opens it.
+    await terminalToRight(page);
 
-    await expect(page.getByTestId("bottom-dock-resize")).toHaveCount(0);
-
+    await page.getByTestId("pane-tab-diff").click();
     await page.getByLabel("Move diff to bottom dock").click();
 
     await expect(page.getByTestId("bottom-dock-resize")).toBeVisible();
     await expect(page.getByLabel("Move diff to right dock")).toBeVisible();
+    expect(await dockTabOrder(page, "bottom")).toEqual(["diff"]);
   });
 
   test("a plugin pane renders as a dockable tool-window, its action hits the worker, and it survives a dock collapse", async ({

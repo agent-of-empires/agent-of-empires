@@ -429,7 +429,9 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
       const detail = (e as CustomEvent<FocusTerminalDetail>).detail;
       if (policyRef.current.readOnly || !focusIntentMatches(detail, focusTarget, focusIndex, focusSession)) return;
       // Latch the request's own target, so an indexless one stays open to any paired view.
-      if (!focusSelf()) setPendingTerminalFocus(focusTarget, detail.terminalIndex, detail.sessionId);
+      // Taking focus also settles a latched request for this view, so a later drain cannot reapply it.
+      if (focusSelf()) consumePendingTerminalFocus(focusTarget, focusIndex, focusSession);
+      else setPendingTerminalFocus(focusTarget, detail.terminalIndex, detail.sessionId);
     };
     window.addEventListener(FOCUS_TERMINAL_EVENT, onFocusEvent);
     return () => window.removeEventListener(FOCUS_TERMINAL_EVENT, onFocusEvent);

@@ -60,12 +60,11 @@ pub struct DiffFilesQuery {
     pub scope: DiffScope,
 }
 
-/// A Last turn request for a session with no snapshot since the Daemon started.
+/// A Last turn request for a session with no baseline for its latest turn.
 fn no_turn_snapshot() -> axum::response::Response {
-    api_error(
-        StatusCode::CONFLICT,
-        "no_turn_snapshot",
-        "No turn has started since the daemon started",
+    crate::server::api::api_error_with_code_header(
+        crate::daemon::ApiErrorCode::NoTurnSnapshot,
+        "No baseline for the latest turn",
     )
 }
 
@@ -356,11 +355,15 @@ pub async fn session_diff_files(
                 config_default.as_deref(),
                 path,
             );
+            let base = scope_base(query.scope, &base_branch, &repo.path, snapshot.as_ref());
             let warning = match query.scope {
                 DiffScope::Branch => diff::check_merge_base_status(path, &base_branch),
+                DiffScope::LastTurn if base.is_none() => {
+                    Some("no Last turn baseline for this repo".to_owned())
+                }
                 _ => None,
             };
-            let changed = scope_base(query.scope, &base_branch, &repo.path, snapshot.as_ref())
+            let changed = base
                 .map(|base| {
                     scan_state
                         .changed_files_cached(path, base)

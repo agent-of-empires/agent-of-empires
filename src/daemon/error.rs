@@ -49,6 +49,8 @@ pub enum ApiErrorCode {
     SessionTrashed,
     AccountSwapUnavailable,
     ModelPinned,
+    /// A Last turn diff for a session with no baseline for its latest turn.
+    NoTurnSnapshot,
     UnknownAgent,
     TerminalSwitchRefused(TerminalSwitchReason),
 }
@@ -94,6 +96,7 @@ impl ApiErrorCode {
             Self::SessionTrashed => "session_trashed",
             Self::AccountSwapUnavailable => "account_swap_unavailable",
             Self::ModelPinned => "model_pinned",
+            Self::NoTurnSnapshot => "no_turn_snapshot",
             Self::UnknownAgent => "unknown_agent",
             Self::TerminalSwitchRefused(reason) => reason.as_str(),
         }
@@ -127,7 +130,8 @@ impl ApiErrorCode {
             | Self::SessionArchived
             | Self::SessionTrashed
             | Self::AccountSwapUnavailable
-            | Self::ModelPinned => StatusCode::CONFLICT,
+            | Self::ModelPinned
+            | Self::NoTurnSnapshot => StatusCode::CONFLICT,
             Self::PendingTargetGone => StatusCode::NOT_FOUND,
             Self::TlsRequired => StatusCode::UPGRADE_REQUIRED,
             Self::CreateHookFailed
@@ -211,6 +215,7 @@ impl ApiErrorCode {
             b"session_trashed" => Self::SessionTrashed,
             b"account_swap_unavailable" => Self::AccountSwapUnavailable,
             b"model_pinned" => Self::ModelPinned,
+            b"no_turn_snapshot" => Self::NoTurnSnapshot,
             b"unknown_agent" => Self::UnknownAgent,
             other => Self::TerminalSwitchRefused(
                 TerminalSwitchReason::ALL
@@ -385,6 +390,12 @@ mod tests {
                 Some(ApiErrorCode::ModelPinned),
             ),
             (StatusCode::BAD_REQUEST, "model_pinned", false, None),
+            (
+                StatusCode::CONFLICT,
+                "no_turn_snapshot",
+                false,
+                Some(ApiErrorCode::NoTurnSnapshot),
+            ),
             (
                 StatusCode::BAD_REQUEST,
                 "unknown_agent",

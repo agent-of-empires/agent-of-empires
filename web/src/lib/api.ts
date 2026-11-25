@@ -434,9 +434,20 @@ export async function killTerminal(id: string, index: number): Promise<boolean> 
   }
 }
 
-export function getSessionDiffFiles(id: string, scope: DiffScope = "branch"): Promise<RichDiffFilesResponse | null> {
+/** `"no_turn_snapshot"` when Last turn has no baseline; `null` for any other failure. */
+export async function getSessionDiffFiles(
+  id: string,
+  scope: DiffScope = "branch",
+): Promise<RichDiffFilesResponse | "no_turn_snapshot" | null> {
   const param = scopeParam(scope);
-  return fetchJson<RichDiffFilesResponse>(`/api/sessions/${id}/diff/files${param ? `?scope=${param}` : ""}`);
+  try {
+    const res = await fetch(`/api/sessions/${id}/diff/files${param ? `?scope=${param}` : ""}`);
+    if (res.status === 409 && res.headers.get("aoe-error-code") === "no_turn_snapshot") return "no_turn_snapshot";
+    if (!res.ok) return null;
+    return (await res.json()) as RichDiffFilesResponse;
+  } catch {
+    return null;
+  }
 }
 
 /**

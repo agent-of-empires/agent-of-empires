@@ -73,6 +73,11 @@ export function usePairedTerminalReveal({
       const termDock = dockOf(layout, tabId);
       if (termDock) activateTab(termDock, tabId);
       else openTab(tabId, terminalPlacements(layout)[0]?.dock ?? TERMINAL_DOCK);
+      // A ready shell in a collapsed dock stays mounted, so no mount or ready edge drains the latch: focus it
+      // once the dock has opened.
+      if (termDock && !remounts && isActiveTab(layout, tabId) && isDockCollapsed(layout, termDock)) {
+        requestAnimationFrame(() => dispatchFocusTerminal("paired", shell.index, shell.sessionId));
+      }
     },
     [singlePane, shown, layout, openTab, activateTab, showMobileShell],
   );

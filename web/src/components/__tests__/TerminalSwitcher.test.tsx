@@ -59,6 +59,35 @@ describe("TerminalSwitcher", () => {
     expect(onClose).toHaveBeenCalled();
   });
 
+  it("returns focus to the trigger on Escape, and opens above a trigger near the bottom, capped to the room there", () => {
+    render(<TerminalSwitcherButton groups={groups} onPick={vi.fn()} />);
+    const trigger = screen.getByRole("button", { name: "Switch terminal" });
+    vi.spyOn(trigger, "getBoundingClientRect").mockReturnValue(
+      DOMRect.fromRect({ x: 900, y: window.innerHeight - 40, width: 20, height: 20 }),
+    );
+    fireEvent.click(trigger);
+    const menu = screen.getByRole("menu");
+    // Portalled out of the dock, whose overflow would clip it.
+    expect(menu.parentElement!.parentElement).toBe(document.body);
+    expect(menu.style.maxHeight).toBe(`${window.innerHeight - 40 - 4 - 8}px`);
+    expect(menu.parentElement!.style.bottom).toBe("44px");
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it("the keyboard switcher hands focus back to where it was on Escape", () => {
+    const before = document.createElement("button");
+    document.body.append(before);
+    before.focus();
+    const onClose = vi.fn();
+    render(<TerminalSwitcherOverlay groups={groups} onPick={vi.fn()} onClose={onClose} />);
+    expect(document.activeElement).not.toBe(before);
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    expect([onClose.mock.calls.length, document.activeElement]).toEqual([1, before]);
+    before.remove();
+  });
+
   it("says when no shell is open and offers no new one without a Session", () => {
     render(<TerminalSwitcherOverlay groups={[]} onPick={vi.fn()} onClose={vi.fn()} />);
     expect(screen.getByText("No paired terminals are open")).toBeDefined();

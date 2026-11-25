@@ -266,7 +266,8 @@ export function terminalPlacements(layout: DockLayout): TerminalPlacement[] {
   );
 }
 
-/** `layout` showing the open terminal tabs: others close, missing ones join their dock without taking focus. */
+/** `layout` showing the open terminal tabs in their shared docks and order: others close, missing or moved ones
+ *  join their dock without taking focus. Non-terminal tabs keep their positions. */
 export function withTerminals(layout: DockLayout, terminals: readonly TerminalPlacement[]): DockLayout {
   const open = new Set(terminals.map((t) => t.id));
   let next = layout;
@@ -274,9 +275,50 @@ export function withTerminals(layout: DockLayout, terminals: readonly TerminalPl
     if (!open.has(id)) next = removeTab(next, id);
   }
   for (const t of terminals) {
-    if (!dockOf(next, t.id)) next = addTab(next, t.dock, t.id, false);
+    const dock = dockOf(next, t.id);
+    if (dock === t.dock) continue;
+    if (dock) next = removeTab(next, t.id);
+    next = addTab(next, t.dock, t.id, false);
   }
-  return next;
+  return orderTerminals(next, terminals);
+}
+
+/** Refill each group's terminal slots in the shared order. */
+function orderTerminals(layout: DockLayout, terminals: readonly TerminalPlacement[]): DockLayout {
+  const rank = new Map(terminals.map((t, i) => [t.id, i]));
+  let changed = false;
+  const reorder = (g: PaneGroup): PaneGroup => {
+    const slots = g.tabs.filter(isTerminalTabId);
+    const order = [...slots].sort((a, b) => (rank.get(a) ?? 0) - (rank.get(b) ?? 0));
+    if (order.every((id, i) => id === slots[i])) return g;
+    changed = true;
+    let k = 0;
+    return { ...g, tabs: g.tabs.map((id) => (isTerminalTabId(id) ? order[k++]! : id)) };
+  };
+  const next = { ...layout, right: layout.right.map(reorder), bottom: layout.bottom.map(reorder) };
+  return changed ? next : layout;
+}
+
+/** The shared terminal set after `sessionId` changed `current` to `updated`, before any set was shared (a v3
+ *  upgrade): this Session's terminals, then other saved Sessions' ones it did not close. */
+function firstSharedTerminals(
+  sessions: Record<string, DockLayout>,
+  sessionId: string,
+  current: DockLayout,
+  updated: DockLayout,
+): TerminalPlacement[] {
+  const placements = terminalPlacements(updated);
+  const seen = new Set(placements.map((t) => t.id));
+  for (const { id } of terminalPlacements(current)) seen.add(id);
+  for (const [id, layout] of Object.entries(sessions)) {
+    if (id === sessionId) continue;
+    for (const t of terminalPlacements(layout)) {
+      if (seen.has(t.id)) continue;
+      seen.add(t.id);
+      placements.push(t);
+    }
+  }
+  return placements;
 }
 
 /** The terminal tabs bound to `sessionId`'s shells. */
@@ -571,7 +613,9 @@ export function usePaneLayout(
         return {
           version: 4,
           sessions: { ...s.sessions, [sessionId]: updated },
-          terminals: terminalPlacements(updated),
+          terminals: s.terminals
+            ? terminalPlacements(updated)
+            : firstSharedTerminals(s.sessions, sessionId, current, updated),
         };
       });
     },

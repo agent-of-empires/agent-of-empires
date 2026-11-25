@@ -189,7 +189,7 @@ describe("useDiffFiles", () => {
 describe("useDiffFiles scope", () => {
   it("asks for the picked scope and shows Branch while Last turn has no snapshot", async () => {
     mockGetFiles.mockImplementation(async (_id, scope) =>
-      scope === "last_turn" ? null : resp({ files: [file(`${scope}.ts`)], last_turn_at: null }),
+      scope === "last_turn" ? "no_turn_snapshot" : resp({ files: [file(`${scope}.ts`)], last_turn_at: null }),
     );
     const { result, rerender } = renderHook(({ scope }) => useDiffFiles("s1", true, scope), {
       initialProps: { scope: "uncommitted" as "uncommitted" | "last_turn" },
@@ -201,6 +201,17 @@ describe("useDiffFiles scope", () => {
     await waitFor(() => expect(result.current.files[0]?.path).toBe("branch.ts"));
     expect([result.current.scope, result.current.lastTurnAt]).toEqual(["branch", null]);
     expect(mockGetFiles.mock.calls.map((c) => c[1])).toEqual(["uncommitted", "last_turn", "branch"]);
+  });
+
+  it("keeps Last turn when a Last turn request fails for another reason", async () => {
+    mockGetFiles.mockResolvedValueOnce(resp({ files: [file("turn.ts")], last_turn_at: "2026-11-25T12:00:00Z" }));
+    const { result, unmount } = renderHook(() => useDiffFiles("s1", true, "last_turn"));
+    await waitFor(() => expect(result.current.files[0]?.path).toBe("turn.ts"));
+    mockGetFiles.mockResolvedValueOnce(null);
+    await act(() => result.current.refresh());
+    expect(mockGetFiles.mock.calls.map((c) => c[1])).toEqual(["last_turn", "last_turn"]);
+    expect([result.current.scope, result.current.files[0]?.path]).toEqual(["last_turn", "turn.ts"]);
+    unmount();
   });
 
   it("shows Last turn once a turn has a snapshot", async () => {

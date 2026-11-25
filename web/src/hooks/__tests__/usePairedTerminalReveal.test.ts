@@ -31,6 +31,8 @@ describe("usePairedTerminalReveal", () => {
     remounts?: boolean;
     shows: number;
     focusedNow: boolean;
+    /** Focus dispatched next frame, after a collapsed dock opens around a mounted shell. */
+    focusedNextFrame?: boolean;
     activated?: [string, string];
     opened?: [string, string];
   }>([
@@ -66,12 +68,13 @@ describe("usePairedTerminalReveal", () => {
       focusedNow: true,
     },
     {
-      label: "an active terminal in a collapsed dock is revealed, and focus waits for it",
+      label: "an active terminal in a collapsed dock is revealed and focused once the dock opens",
       singlePane: false,
-      layout: layout([group(["terminal:active:1"])], [], ["right"]),
+      layout: layout([], [group(["terminal:active:1"])], ["bottom"]),
       shows: 1,
       focusedNow: false,
-      activated: ["right", "terminal:active:1"],
+      focusedNextFrame: true,
+      activated: ["bottom", "terminal:active:1"],
     },
     {
       label: "Cmd+` with a terminal shown in each dock focuses the right one by its index",
@@ -103,7 +106,7 @@ describe("usePairedTerminalReveal", () => {
       focusedNow: false,
       opened: ["terminal:active:0", "bottom"],
     },
-  ])("$label", ({ singlePane, layout, remounts, shows, focusedNow, activated, opened }) => {
+  ])("$label", ({ singlePane, layout, remounts, shows, focusedNow, focusedNextFrame, activated, opened }) => {
     const raf = vi.spyOn(window, "requestAnimationFrame").mockImplementation((cb) => {
       cb(0);
       return 0;
@@ -120,11 +123,11 @@ describe("usePairedTerminalReveal", () => {
     if (prepare) expect(prepare.mock.calls).toEqual([[shows]]);
     // Both name the shown terminal, so a second docked one doesn't take the focus.
     expect(focus.dispatchFocusTerminal.mock.calls).toEqual(
-      singlePane || focusedNow ? [["paired", shows, "active"]] : [],
+      singlePane || focusedNow || focusedNextFrame ? [["paired", shows, "active"]] : [],
     );
     // Focus that can't happen now is latched for the shell to take once ready.
     expect(focus.setPendingTerminalFocus.mock.calls).toEqual(focusedNow ? [] : [["paired", shows, "active"]]);
-    expect(raf).toHaveBeenCalledTimes(singlePane ? 1 : 0);
+    expect(raf).toHaveBeenCalledTimes(singlePane || focusedNextFrame ? 1 : 0);
     expect(showMobileShell.mock.calls).toEqual(singlePane ? [[{ sessionId: "active", index: 0 }]] : []);
     expect(activateTab.mock.calls).toEqual(activated ? [activated] : []);
     expect(openTab.mock.calls).toEqual(opened ? [opened] : []);

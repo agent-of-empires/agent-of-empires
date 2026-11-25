@@ -11,4 +11,5 @@ export function rightDockMode(viewportWidth: number): RightDockMode {
   return viewportWidth < INLINE_MIN_WIDTH ? "sheet" : "inline";
 }
 
-export const SHEET_MEDIA_QUERY = `(min-width: ${MD_MIN_WIDTH}px) and (max-width: ${INLINE_MIN_WIDTH - 1}px)`;
+// Range syntax keeps fractional widths just under the inline threshold (zoom, display scaling) in the sheet.
+export const SHEET_MEDIA_QUERY = `(${MD_MIN_WIDTH}px <= width < ${INLINE_MIN_WIDTH}px)`;

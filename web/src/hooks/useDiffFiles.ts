@@ -44,11 +44,12 @@ export function useDiffFiles(
     const reqId = ++requestIdRef.current;
     let shown = requestedScope;
     let resp = await getSessionDiffFiles(capturedSessionId, shown);
-    // Without a turn snapshot the server refuses Last turn; show Branch until a turn starts.
-    if (!resp && shown === "last_turn") {
+    // Only a missing baseline falls back to Branch; any other failure keeps the shown comparison.
+    if (resp === "no_turn_snapshot") {
       shown = "branch";
       resp = await getSessionDiffFiles(capturedSessionId, shown);
     }
+    if (resp === "no_turn_snapshot") resp = null;
     if (reqId !== requestIdRef.current || capturedSessionId !== currentSessionIdRef.current) return;
     if (resp) {
       // Include bases and warning: a base change can leave the file list identical (#3329).

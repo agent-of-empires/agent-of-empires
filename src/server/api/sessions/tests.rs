@@ -8061,6 +8061,30 @@ async fn diff_scopes_compare_against_the_branch_head_or_last_turn() {
         (body["old_content"].as_str(), body["new_content"].as_str()),
         (Some(""), Some("during\n"))
     );
+
+    // A repo the snapshot missed is flagged, not reported as clean.
+    state.turn_snapshots.write().unwrap().insert(
+        id.clone(),
+        crate::server::turn_snapshot::TurnSnapshot {
+            at: crate::time::Timestamp::now(),
+            trees: [("/elsewhere".to_string(), tree)].into(),
+        },
+    );
+    let resp = session_diff_files(
+        State(state.clone()),
+        Path(id.clone()),
+        Query(DiffFilesQuery {
+            scope: DiffScope::LastTurn,
+        }),
+    )
+    .await
+    .into_response();
+    let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["files"], serde_json::json!([]));
+    assert!(body["warning"]
+        .as_str()
+        .is_some_and(|w| w.contains("no Last turn baseline")));
 }
 
 /// An unknown scope is a client error, not a silent Branch diff.

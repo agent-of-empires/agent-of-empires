@@ -336,12 +336,15 @@ describe("usePaneLayout upgrade from v3", () => {
     expect(groups(s1.current.layout)).toEqual([[["terminal:s1:0", "terminal:s1:1"], "terminal:s1:1"]]);
     expect(groups(s2.current.layout)).toEqual([[["diff", "terminal:s2:0"], "terminal:s2:0"]]);
 
-    // The first change makes the changed layout's terminals the shared set.
+    // The first change shares every saved Session's terminals, so it closes none of another Session's.
     act(() => s1.current.setDockCollapsed("bottom", true));
-    expect(dockTabs(s2.current.layout, "right")).toEqual(["diff", "terminal:s1:0", "terminal:s1:1"]);
     expect(saved().terminals).toEqual([
       { id: "terminal:s1:0", dock: "right" },
       { id: "terminal:s1:1", dock: "right" },
+      { id: "terminal:s2:0", dock: "right" },
+    ]);
+    expect(groups(s2.current.layout)).toEqual([
+      [["diff", "terminal:s1:0", "terminal:s1:1", "terminal:s2:0"], "terminal:s2:0"],
     ]);
     act(() => sweepOrphanPaneLayouts(new Set(["s1", "s2"])));
     expect(localStorage.getItem(V3_KEY)).toBeNull();
@@ -393,6 +396,31 @@ describe("terminal tabs across Sessions", () => {
     act(() => fresh.current.toggleKind("terminal", "bottom"));
     expect(docks(fresh.current.layout)).toEqual([["terminal:s1:0"], ["terminal:s2:0"]]);
     expect(docks(s1.current.layout)).toEqual([["terminal:s1:0"], ["terminal:s2:0"]]);
+  });
+
+  it("withTerminals moves and reorders a shared terminal to its shared placement, leaving other tabs and focus", () => {
+    const l = withTerminals(layout(["terminal:s1:0", "diff", "terminal:s1:1"], ["terminal:s1:2"]), [
+      { id: "terminal:s1:1", dock: "right" },
+      { id: "terminal:s1:0", dock: "right" },
+      { id: "terminal:s1:2", dock: "right" },
+    ]);
+    expect([groups(l), dockTabs(l, "bottom")]).toEqual([
+      [[["diff", "terminal:s1:1", "terminal:s1:0", "terminal:s1:2"], "terminal:s1:0"]],
+      [],
+    ]);
+    const same = layout(["diff", "terminal:s1:0"]);
+    expect(withTerminals(same, [{ id: "terminal:s1:0", dock: "right" }])).toBe(same);
+  });
+
+  it("a terminal moved in one Session moves in another, and a change there does not move it back", () => {
+    const s1 = hook("s1");
+    act(() => s1.current.toggleKind("terminal", "bottom"));
+    const s2 = hook("s2");
+    act(() => s2.current.setDockCollapsed("right", true));
+    act(() => s1.current.moveTab("terminal:s1:0", "right"));
+    expect(docks(s2.current.layout)).toEqual([["terminal:s1:0"], []]);
+    act(() => s2.current.setDockCollapsed("right", false));
+    expect(saved().terminals).toEqual([{ id: "terminal:s1:0", dock: "right" }]);
   });
 
   it("withTerminals closes unshared terminal tabs and adds shared ones without taking focus", () => {

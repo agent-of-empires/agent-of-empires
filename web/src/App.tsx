@@ -208,6 +208,7 @@ import { DiffPane } from "./components/DiffPane";
 import { FilesPane } from "./components/FilesPane";
 import { FileContentViewer } from "./components/diff/FileContentViewer";
 import { MainViewTabs } from "./components/MainViewTabs";
+import { MAIN_VIEW_IDS } from "./lib/mainViewIds";
 import { DiffScopeContext, loadDiffScope, saveDiffScope, type DiffScope, type DiffScopeState } from "./lib/diffScope";
 import { PairedShellPane, ShellModeToggle } from "./components/PairedTerminal";
 import { TerminalSwitcherButton, TerminalSwitcherOverlay } from "./components/TerminalSwitcher";
@@ -220,14 +221,7 @@ import {
 } from "./lib/pairedShells";
 import { usePairedShellModes } from "./hooks/usePairedShellModes";
 import { useOpenPairedTerminal, usePairedTerminalReveal } from "./hooks/usePairedTerminalReveal";
-import {
-  BUILTIN_PANES,
-  parseTerminalTabId,
-  terminalTabId,
-  TERMINAL_DOCK,
-  type DockLocation,
-  type TerminalRef,
-} from "./lib/panes";
+import { BUILTIN_PANES, parseTerminalTabId, TERMINAL_DOCK, type DockLocation, type TerminalRef } from "./lib/panes";
 import { MobileRightPanelPicker } from "./components/MobileRightPanelPicker";
 import { MobileMainPane } from "./components/MobileMainPane";
 import { ChromeCollapseHandle, CollapsibleRegion } from "./components/CollapsibleChrome";
@@ -1809,14 +1803,12 @@ function AppContent({
     }
     if (rightDockCollapsed) {
       setDockCollapsed("right", false);
-      if (availableRightGroups.length === 0) {
-        openTab("diff", "right");
-        if (activeSessionId) openTab(terminalTabId(activeSessionId, 0), "right");
-      }
+      // The right dock is the review panel; terminals keep their own dock.
+      if (availableRightGroups.length === 0) openTab("diff", "right");
     } else {
       setDockCollapsed("right", true);
     }
-  }, [isMdUp, rightDockCollapsed, setDockCollapsed, availableRightGroups.length, openTab, activeSessionId]);
+  }, [isMdUp, rightDockCollapsed, setDockCollapsed, availableRightGroups.length, openTab]);
 
   const handlePickView = useCallback(
     (view: RightPanelView) => {
@@ -2136,7 +2128,8 @@ function AppContent({
             setPaletteQuery("");
             return;
           }
-          if (rightSheetOpen) {
+          // Only when the sheet is on top: Escape over Help, Settings or another dialog closes that first.
+          if (rightSheetOpen && !showHelp && !showSessionWizard && !showSettings && !showAbout) {
             setDockCollapsed("right", true);
             return;
           }
@@ -2163,6 +2156,9 @@ function AppContent({
         toggleRightDock,
         showPalette,
         rightSheetOpen,
+        showHelp,
+        showSessionWizard,
+        showAbout,
         setDockCollapsed,
         deletingSessions,
         stoppingSessionId,
@@ -2373,7 +2369,12 @@ function AppContent({
                     onCloseFile={handleCloseFile}
                   />
                 )}
-                <div className={fileShown ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}>
+                <div
+                  className={fileShown ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}
+                  {...(selectedFilePath
+                    ? { id: MAIN_VIEW_IDS.agentPanel, role: "tabpanel", "aria-labelledby": MAIN_VIEW_IDS.agentTab }
+                    : {})}
+                >
                   {activeSession?.view === "structured" ? (
                     <StructuredSessionStack
                       active={!fileShown}
@@ -2439,7 +2440,12 @@ function AppContent({
 
                 {selectedFilePath && activeSessionId && (
                   // Kept mounted behind the Agent tab, so the file keeps its scroll, comments and draft.
-                  <div className={fileShown ? "flex-1 flex flex-col min-h-0 overflow-hidden" : "hidden"}>
+                  <div
+                    id={MAIN_VIEW_IDS.filePanel}
+                    role="tabpanel"
+                    aria-labelledby={MAIN_VIEW_IDS.fileTab}
+                    className={fileShown ? "flex-1 flex flex-col min-h-0 overflow-hidden" : "hidden"}
+                  >
                     {selectedFileExternal ? (
                       <FileContentViewer
                         structured={activeSession?.view === "structured"}
@@ -3216,6 +3222,11 @@ function AppContent({
                   setPickerOpen(false);
                   pickShell(shell);
                 }}
+                shownShell={
+                  rightPanelView === "paired" && mobileShellShown
+                    ? { ...mobileShellShown, mode: shownShellMode(mobileShellShown.sessionId, mobileShellShown.index) }
+                    : null
+                }
                 onSelect={handlePickView}
                 onClose={closePicker}
               />
