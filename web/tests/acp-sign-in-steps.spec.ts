@@ -43,7 +43,7 @@ test("the keyboard opens the steps, Copy takes the command, Open Terminal opens 
 
   await steps.getByRole("button", { name: "Open Terminal" }).click();
   await expect(steps).toBeHidden();
-  await expect(page.getByText("Shell", { exact: true })).toBeVisible();
+  await expect(page.locator('[data-testid^="pane-tab-terminal:"]')).toBeVisible();
   await expect.poll(() => terminals).toContain("terminal");
   expect(terminals).not.toContain("container-terminal");
 
@@ -130,6 +130,6 @@ test("Open Terminal reveals a collapsed dock whose active tab is the terminal", 
     .click();
 
   await expect(handle).toBeVisible();
-  await expect(page.getByText("Shell", { exact: true })).toBeVisible();
+  await expect(page.locator('[data-testid^="pane-tab-terminal:"]')).toBeVisible();
   await expect.poll(() => pairedHasFocus(page)).toBe(true);
 });

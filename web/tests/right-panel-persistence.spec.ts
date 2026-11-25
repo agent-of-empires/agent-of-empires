@@ -75,11 +75,16 @@ test.describe("Side panel defaults", () => {
   test("a layout the user changed survives reload while the others follow the default", async ({ page }) => {
     await boot(page);
     await clickSidebarSession(page, "alpha");
+    await page.getByTestId("pane-toggle-diff").click();
     await page.getByTestId("pane-toggle-terminal").click();
-    await expect(page.getByTestId("pane-tab-terminal:0")).toBeVisible();
+    await expect(page.getByTestId("pane-tab-terminal:alpha:0")).toBeVisible();
     await page.reload();
-    await expect(page.getByTestId("pane-tab-terminal:0")).toBeVisible();
+    await expect(page.getByTestId("pane-tab-diff")).toBeVisible();
+    await expect(page.getByTestId("pane-tab-terminal:alpha:0")).toBeVisible();
+    // Beta keeps its default panels; only alpha's terminal tab, bound to alpha's shell, follows.
     await clickSidebarSession(page, "beta");
-    await expect(dockTabs(page)).toHaveCount(0);
+    await expect(dockTabs(page)).toHaveCount(1);
+    await expect(page.getByTestId("pane-tab-terminal:alpha:0")).toBeVisible();
+    await expect(page.getByTestId("pane-toggle-terminal")).toHaveAttribute("aria-pressed", "false");
   });
 });

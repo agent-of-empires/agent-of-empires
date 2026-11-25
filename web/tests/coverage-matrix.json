@@ -116,6 +116,31 @@
       "notes": "The shell's Host/Container mode is per Session and terminal tab. Revealing it focuses at once only when it is shown and stays mounted; otherwise focus is latched and activateTab reveals the tab, opening a collapsed dock. The focus and the latch name that terminal, so with one shown in each dock, Cmd+` and Open Terminal never land in the other."
     },
     {
+      "id": "terminal.paired-shell-switcher",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/terminal-switcher.spec.ts",
+        "src/components/__tests__/TerminalSwitcher.test.tsx",
+        "src/components/__tests__/MobileRightPanelPicker.test.tsx",
+        "src/components/__tests__/MobileMainPane.test.tsx",
+        "src/lib/__tests__/pairedShells.test.ts",
+        "src/lib/__tests__/paneLayout.test.ts",
+        "src/lib/__tests__/panes.test.ts"
+      ],
+      "components": [
+        "web/src/components/TerminalSwitcher.tsx",
+        "web/src/components/PairedTerminal.tsx",
+        "web/src/components/Dock.tsx",
+        "web/src/components/MobileRightPanelPicker.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/lib/pairedShells.ts",
+        "web/src/lib/paneLayout.ts",
+        "web/src/lib/panes.ts"
+      ],
+      "notes": "A terminal tab is bound to one Session's shell (terminal:<sessionId>:<n>) and stays, still showing that shell, when the sidebar selects another Session; every Session shows the shared terminal tabs while its other panels stay per Session. v3 layouts bind their terminal tabs to the Session they belonged to. The dock switcher and Cmd/Ctrl+Shift+` list every live paired shell from the Daemon's auxiliary observations, the selected Session first; picking one focuses its tab or opens one. The phone picker lists the same shells and shows the pick in the paired view, with Host/Container in its header for sandboxed Sessions."
+    },
+    {
       "id": "app-shell.docks",
       "kind": "vitest",
       "risk": "medium",

@@ -11,7 +11,7 @@ import { mockTerminalApis } from "./helpers/terminal-mocks";
 import { openPanelsByDefault } from "./helpers/apiMocks";
 
 const SESSION = "pinch-test";
-const PANE_LAYOUT_KEY = "aoe-pane-layout-v3";
+const PANE_LAYOUT_KEY = "aoe-pane-layout-v4";
 
 async function rightDockState(page: Page): Promise<{ tabs: string[]; collapsed: boolean } | null> {
   return page.evaluate(
@@ -92,11 +92,11 @@ test("Cmd/Ctrl+Alt+B toggles the right panel and Shift+D the diff pane on a sess
 
   await page.keyboard.press("ControlOrMeta+Alt+b");
   await expect(handle).toBeHidden();
-  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: true });
+  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", `terminal:${SESSION}:0`], collapsed: true });
 
   await page.keyboard.press("ControlOrMeta+Alt+b");
   await expect(handle).toBeVisible();
-  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", "terminal:0"], collapsed: false });
+  await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff", `terminal:${SESSION}:0`], collapsed: false });
 
   // Shift+D toggles the diff pane specifically (not the whole dock); the
   // activity-bar toggle's pressed state reflects whether diff is open.
