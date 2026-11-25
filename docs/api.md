@@ -456,7 +456,10 @@ The response is an object, not a bare array:
   `PATCH /api/sidebar-view`).
 
 `PUT /api/workspace-ordering` takes `{"order": [...], "repositories": [...]}`;
-an omitted list keeps its value and an empty one clears it.
+an omitted list keeps its value and an empty one clears it. An optional
+`"base": {"order": [...], "repositories": [...]}` names the stored orders the
+write was built from; when either no longer matches, the write is refused with
+409.
 
 Clients written against the historical bare-array response must be updated to
 read `sessions`; the array is never returned unwrapped.

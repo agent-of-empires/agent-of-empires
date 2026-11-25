@@ -281,6 +281,15 @@ enum PendingWrite {
     Committed(RuntimeCursor),
 }
 
+/// How a shared-order or sidebar-view write the Daemon accepted settled.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ViewWriteSettled {
+    /// A snapshot at or after this receipt is applied.
+    Applied(RuntimeCursor),
+    /// A replacement Daemon's snapshot arrived first, so the receipt is unconfirmed.
+    Superseded,
+}
+
 struct SessionCommand {
     request: CommandRequest,
     lease: u64,
@@ -1277,7 +1286,8 @@ impl SessionFeed {
         let mut slot = self.pending_sidebar_view.take();
         let result = self.poll_write(&mut slot);
         self.pending_sidebar_view = slot;
-        let result = result?;
+        // The view converges on whichever Daemon's value is applied.
+        let result = result?.map(|_| ());
         let Some(queued) = self.queued_sidebar_view.take() else {
             return Some(result);
         };
@@ -1298,15 +1308,21 @@ impl SessionFeed {
         }
     }
 
-    /// [`Self::drain_sidebar_view_result`] for the shared Custom order.
-    pub(crate) fn drain_workspace_ordering_result(&mut self) -> Option<Result<(), String>> {
+    /// [`Self::drain_sidebar_view_result`] for the shared Custom order, which tells a
+    /// superseded receipt apart so the move it confirms does not continue.
+    pub(crate) fn drain_workspace_ordering_result(
+        &mut self,
+    ) -> Option<Result<ViewWriteSettled, String>> {
         let mut slot = self.pending_ordering.take();
         let result = self.poll_write(&mut slot);
         self.pending_ordering = slot;
         result
     }
 
-    fn poll_write(&self, slot: &mut Option<PendingWrite>) -> Option<Result<(), String>> {
+    fn poll_write(
+        &self,
+        slot: &mut Option<PendingWrite>,
+    ) -> Option<Result<ViewWriteSettled, String>> {
         let failure = match slot.as_mut()? {
             PendingWrite::Sent(receiver) => match receiver.try_recv() {
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return None,
@@ -1329,11 +1345,15 @@ impl SessionFeed {
                     .applied
                     .as_ref()
                     .is_some_and(|snapshot| snapshot.cursor.epoch != cursor.epoch);
-                if !replaced && !self.receipt_applied(cursor) {
+                let settled = if replaced {
+                    ViewWriteSettled::Superseded
+                } else if self.receipt_applied(cursor) {
+                    ViewWriteSettled::Applied(cursor.clone())
+                } else {
                     return None;
-                }
+                };
                 *slot = None;
-                return Some(Ok(()));
+                return Some(Ok(settled));
             }
         };
         *slot = None;
@@ -2640,6 +2660,7 @@ impl SessionFeed {
                 sessions: vec![row],
                 profiles: vec![],
                 workspace_ordering: vec![],
+                placed_workspaces: vec![],
                 repository_order: vec![],
                 global_projects: vec![],
                 sidebar_view: Default::default(),
@@ -3523,6 +3544,7 @@ mod tests {
                 sessions: vec![],
                 profiles: vec![],
                 workspace_ordering: vec![],
+                placed_workspaces: vec![],
                 repository_order: vec![],
                 global_projects: vec![],
                 sidebar_view: Default::default(),

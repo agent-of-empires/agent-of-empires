@@ -299,6 +299,7 @@ impl NativeRuntime {
             sessions,
             profiles: metadata.profiles.clone(),
             workspace_ordering,
+            placed_workspaces: metadata.workspace_ordering.clone(),
             repository_order: metadata.repository_order.clone(),
             global_projects: metadata.global_projects.clone(),
             sidebar_view: metadata.sidebar_view,

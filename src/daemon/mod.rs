@@ -50,7 +50,7 @@ pub use wire::{
     TrashOutcome, TrashRelocationOutcome, TrashSessionBody, Tristate, UpdateArchiveBody,
     UpdateDiffBaseBody, UpdateFavoriteBody, UpdateGroupBody, UpdateIgnoredBody,
     UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
-    WorkspaceOrderingPatch, WorkspaceRepoSummary, WorktreeEditOutcome,
+    WorkspaceOrderingBase, WorkspaceOrderingPatch, WorkspaceRepoSummary, WorktreeEditOutcome,
 };
 pub use wire::{
     ApplyUpdateBody, InstallPreviewBody, PluginJob, PluginJobAccepted, PluginJobKind, PluginJobLog,

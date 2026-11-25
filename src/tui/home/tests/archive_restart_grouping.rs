@@ -653,7 +653,7 @@ fn pinned_project_without_sessions_shows_empty_header() {
         .unwrap();
     env.view.sort_order = crate::session::config::SortOrder::Custom;
     // A stored entry may keep a trailing slash.
-    env.view.repository_order = vec!["/repos/gamma/".into(), alpha];
+    env.view.repository_order = vec![alpha, "/repos/gamma/".into()];
     env.view.flat_items = env.view.build_flat_items();
     let headers: Vec<&str> = env
         .view
@@ -670,8 +670,8 @@ fn pinned_project_without_sessions_shows_empty_header() {
         .collect();
     assert_eq!(
         headers,
-        ["beta", "gamma", "alpha"],
-        "never-moved beta first"
+        ["beta", "alpha", "gamma"],
+        "never-moved beta first; an unranked gamma would precede alpha"
     );
 }
 

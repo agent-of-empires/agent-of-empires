@@ -293,6 +293,7 @@ pub(super) fn fixture_snapshot(
             sessions,
             profiles: fixture_profiles(),
             workspace_ordering: crate::session::load_workspace_ordering().unwrap().order,
+            placed_workspaces: crate::session::load_workspace_ordering().unwrap().order,
             repository_order: crate::session::load_workspace_ordering()
                 .unwrap()
                 .repositories,

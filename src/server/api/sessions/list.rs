@@ -651,23 +651,25 @@ pub(crate) fn compute_merged_ordering(
 }
 
 /// Unknown workspaces precede the manual order, newest session first; ties keep the later
-/// row first. `rows` yields each session's workspace and creation time.
+/// newest row first. `rows` yields each session's workspace and creation time.
 pub(crate) fn merge_workspace_ordering(
     rows: impl IntoIterator<Item = (String, Option<crate::time::Timestamp>)>,
     current_order: &[String],
 ) -> Vec<String> {
     let known: std::collections::HashSet<&str> = current_order.iter().map(String::as_str).collect();
-    let mut new_ids: indexmap::IndexMap<String, Option<crate::time::Timestamp>> =
-        indexmap::IndexMap::new();
-    for (id, created) in rows {
+    let mut new_ids: std::collections::HashMap<String, (Option<crate::time::Timestamp>, usize)> =
+        std::collections::HashMap::new();
+    for (at, (id, created)) in rows.into_iter().enumerate() {
         if known.contains(id.as_str()) {
             continue;
         }
-        let newest = new_ids.entry(id).or_default();
-        *newest = (*newest).max(created);
+        let newest = new_ids.entry(id).or_insert((created, at));
+        if created >= newest.0 {
+            *newest = (created, at);
+        }
     }
-    let mut new_ids: Vec<_> = new_ids.into_iter().rev().collect();
-    new_ids.sort_by_key(|(_, created)| std::cmp::Reverse(*created));
+    let mut new_ids: Vec<_> = new_ids.into_iter().collect();
+    new_ids.sort_by_key(|(_, newest)| std::cmp::Reverse(*newest));
     new_ids
         .into_iter()
         .map(|(id, _)| id)
@@ -691,7 +693,7 @@ pub(crate) fn rank_by_workspace(sessions: &mut [SessionResponse], ordering: &[St
 }
 
 const MAX_ORDER_ENTRIES: usize = 4096;
-const MAX_ORDER_ENTRY_LEN: usize = 1024;
+pub(crate) const MAX_ORDER_ENTRY_LEN: usize = 1024;
 
 /// `order` without repeats or workspaces no session in `sessions` belongs to, and within
 /// what `PUT /api/workspace-ordering` accepts, so rewriting the full order never grows it.
@@ -782,6 +784,20 @@ async fn commit_workspace_ordering(
 ) -> axum::response::Response {
     if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if let Some(base) = &body.base {
+        let metadata = state.canonical_metadata.read().await;
+        if base.order != metadata.workspace_ordering
+            || base.repositories != metadata.repository_order
+        {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "message": "The order changed elsewhere; try again on the refreshed list"
+                })),
+            )
+                .into_response();
+        }
     }
     let result = tokio::task::spawn_blocking(move || {
         crate::session::update_workspace_ordering(move |ordering| {
@@ -1491,12 +1507,12 @@ mod workspace_ordering_tests {
         };
         put(crate::daemon::WorkspaceOrderingPatch {
             order: Some(placed.clone()),
-            repositories: None,
+            ..Default::default()
         })
         .await;
         let response = put(crate::daemon::WorkspaceOrderingPatch {
-            order: None,
             repositories: Some(vec!["/repo/b".into(), "/repo/a".into()]),
+            ..Default::default()
         })
         .await;
 
@@ -1523,6 +1539,27 @@ mod workspace_ordering_tests {
         for (at, expected) in [(3, 0), (2, 1), (1, 2), (0, 3)] {
             assert_eq!(rank(at), Some(expected), "{}", rows[at].title);
         }
+        assert_eq!(snapshot.contents.placed_workspaces, placed);
+
+        // A write built on an order since replaced is refused; one on the stored order lands.
+        for (base, expected) in [
+            (Vec::new(), StatusCode::CONFLICT),
+            (placed.clone(), StatusCode::OK),
+        ] {
+            let patch = crate::daemon::WorkspaceOrderingPatch {
+                order: Some(Vec::new()),
+                repositories: None,
+                base: Some(crate::daemon::WorkspaceOrderingBase {
+                    order: base,
+                    repositories: vec!["/repo/b".into(), "/repo/a".into()],
+                }),
+            };
+            let response = update_workspace_ordering(State(state.clone()), Ok(Json(patch)))
+                .await
+                .into_response();
+            assert_eq!(response.status(), expected);
+        }
+        assert!(crate::session::load_workspace_ordering()?.order.is_empty());
         Ok(())
     }
 
@@ -1595,15 +1632,27 @@ mod workspace_ordering_tests {
         };
         // Storage order is not creation order, e.g. an older row in a later-loaded profile;
         // second precision and sub-second precision compare as times, not strings.
-        let cases = cases.into_iter().chain([(
-            vec![
-                created("s1", "/repo/new", "2026-01-03T00:00:00.5+00:00"),
-                created("s2", "/repo/old", "2026-01-01T00:00:00+00:00"),
-                created("s3", "/repo/mid", "2026-01-03T00:00:00+00:00"),
-            ],
-            vec![],
-            vec!["/repo/new::main", "/repo/mid::main", "/repo/old::main"],
-        )]);
+        let cases = cases.into_iter().chain([
+            (
+                vec![
+                    created("s1", "/repo/new", "2026-01-03T00:00:00.5+00:00"),
+                    created("s2", "/repo/old", "2026-01-01T00:00:00+00:00"),
+                    created("s3", "/repo/mid", "2026-01-03T00:00:00+00:00"),
+                ],
+                vec![],
+                vec!["/repo/new::main", "/repo/mid::main", "/repo/old::main"],
+            ),
+            (
+                // A tie goes to the workspace whose newest row comes later.
+                vec![
+                    created("s1", "/repo/a", "2026-01-01T10:00:00Z"),
+                    created("s2", "/repo/b", "2026-01-01T11:00:00Z"),
+                    created("s3", "/repo/a", "2026-01-01T11:00:00Z"),
+                ],
+                vec![],
+                vec!["/repo/a::main", "/repo/b::main"],
+            ),
+        ]);
         for (sessions, existing, expected) in cases {
             assert_eq!(compute_merged_ordering(&sessions, &existing), expected);
         }

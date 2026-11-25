@@ -238,6 +238,10 @@ pub struct RuntimeContents {
     pub sessions: Vec<SessionResponse>,
     pub profiles: Vec<ProfileSnapshot>,
     pub workspace_ordering: Vec<String>,
+    /// The stored Custom order of rows: the workspaces a move placed. `workspace_ordering`
+    /// puts the unplaced ones first.
+    #[serde(default)]
+    pub placed_workspaces: Vec<String>,
     /// Repository paths in the shared Custom order of the Repository headers.
     #[serde(default)]
     pub repository_order: Vec<String>,

@@ -327,6 +327,18 @@ pub struct WorkspaceOrderingPatch {
     pub order: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repositories: Option<Vec<String>>,
+    /// The stored orders this replacement was built from. When either differs from the
+    /// stored one, the write is refused with 409 so it cannot undo a peer's change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<WorkspaceOrderingBase>,
+}
+
+/// The stored row and Repository header orders, as published in a runtime snapshot.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceOrderingBase {
+    pub order: Vec<String>,
+    pub repositories: Vec<String>,
 }
 
 /// Change the shared grouping, the sort, or both; an absent field keeps its value.
@@ -421,6 +433,10 @@ pub enum ReorderBody {
         source_group: String,
         destination: String,
         direction: MoveDirection,
+        /// Every header path in the order the Client shows them, which the stored group
+        /// order then keeps. Omitted, the stored order stays.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        headers: Option<Vec<String>>,
     },
     Group {
         group: GroupLocation,

@@ -1166,13 +1166,19 @@ impl HomeView {
                 self.flash_status(format!("Order not saved: {error}"));
                 changed = true;
             }
-            Some(Ok(())) => {
+            Some(Ok(crate::tui::session_feed::ViewWriteSettled::Applied(receipt))) => {
                 if let Some(change) = self.pending_order_change.take() {
-                    self.order_change_committed(change);
+                    self.order_change_committed(change, &receipt);
                     changed = true;
                 }
             }
-            None => {}
+            Some(Ok(crate::tui::session_feed::ViewWriteSettled::Superseded))
+                if self.pending_order_change.take().is_some() =>
+            {
+                self.flash_status("The Daemon restarted before the order change showed");
+                changed = true;
+            }
+            _ => {}
         }
         if let Some(result) = self.session_feed.drain_sidebar_view_result() {
             if let Err(error) = result {

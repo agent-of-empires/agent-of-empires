@@ -6,7 +6,8 @@
 use super::*;
 use crate::session::config::{GroupByMode, SortOrder};
 
-/// The shared order and sort from before an order change, which Undo writes back.
+/// The persisted shared order and sort from before an order change, which Undo writes
+/// back. Workspaces no move placed stay unplaced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct OrderUndo {
     order: Vec<String>,
@@ -14,8 +15,8 @@ pub(super) struct OrderUndo {
     sort: SortOrder,
 }
 
-/// A committed switch to Custom or reset, and the order it left, which a peer's later
-/// change makes stale.
+/// A committed switch to Custom or reset, and the merged row order and persisted header
+/// order it left, which a peer's later change makes stale.
 #[derive(Debug)]
 pub(super) struct UndoPoint {
     restore: OrderUndo,
@@ -131,6 +132,23 @@ impl HomeView {
         order.swap(i, j);
         let repositories = (freeze && self.group_by == GroupByMode::Project)
             .then(|| keep_unshown(self.displayed_repository_order(), &self.repository_order));
+        // The write drops what the Daemon refuses; without both rows the swap cannot show.
+        let sessions = self
+            .session_feed
+            .applied_snapshot()
+            .map(|snapshot| snapshot.contents.sessions.clone())
+            .unwrap_or_default();
+        let order = crate::server::api::sessions::writable_workspace_order(&sessions, order);
+        if !order.contains(&a) || !order.contains(&b) {
+            if [&a, &b]
+                .iter()
+                .any(|id| id.len() > crate::server::api::sessions::MAX_ORDER_ENTRY_LEN)
+            {
+                self.flash_status("This row's workspace id is too long for the Custom order");
+                return Ok(());
+            }
+            return self.refresh_after_stale_move();
+        }
         self.submit_custom_order(Some(order), repositories)
     }
 
@@ -165,10 +183,9 @@ impl HomeView {
             self.flash_status("No order change to undo");
             return Ok(());
         };
-        let current = self.order_undo_point();
-        if !same_arrangement(&point.order, &current.order)
-            || !same_arrangement(&point.repositories, &current.repositories)
-        {
+        let (order, repositories) = self.applied_arrangement();
+        // A cleared header order shares no entries with the old one, so compare it whole.
+        if !same_arrangement(&point.order, &order) || point.repositories != repositories {
             self.order_undo = None;
             self.flash_status("The order changed elsewhere, nothing to undo");
             return Ok(());
@@ -190,15 +207,19 @@ impl HomeView {
         change: Option<OrderChange>,
     ) -> anyhow::Result<()> {
         use crate::server::api::sessions::{writable_repository_order, writable_workspace_order};
-        let sessions = self
-            .session_feed
-            .applied_snapshot()
-            .map(|snapshot| snapshot.contents.sessions.clone())
-            .unwrap_or_default();
+        let snapshot = self.session_feed.applied_snapshot();
+        let contents = snapshot.as_ref().map(|snapshot| &snapshot.contents);
+        let sessions = contents.map(|c| c.sessions.as_slice()).unwrap_or_default();
+        // The Daemon refuses the write once a peer has changed the order it replaces.
+        let base = contents.map(|c| crate::daemon::WorkspaceOrderingBase {
+            order: c.placed_workspaces.clone(),
+            repositories: c.repository_order.clone(),
+        });
         self.session_feed
             .submit_workspace_ordering(crate::daemon::WorkspaceOrderingPatch {
-                order: order.map(|order| writable_workspace_order(&sessions, order)),
+                order: order.map(|order| writable_workspace_order(sessions, order)),
                 repositories: repositories.map(writable_repository_order),
+                base,
             })?;
         if !matches!(change, Some(OrderChange::Undo(_))) {
             self.order_undo = None;
@@ -218,13 +239,13 @@ impl HomeView {
         }
     }
 
-    /// The order and sort Undo restores, as the Daemon last published them.
+    /// The persisted order and sort Undo restores, as the Daemon last published them.
     fn order_undo_point(&self) -> OrderUndo {
         let snapshot = self.session_feed.applied_snapshot();
         let contents = snapshot.as_ref().map(|snapshot| &snapshot.contents);
         OrderUndo {
             order: contents
-                .map(|c| c.workspace_ordering.clone())
+                .map(|c| c.placed_workspaces.clone())
                 .unwrap_or_default(),
             repositories: contents
                 .map(|c| c.repository_order.clone())
@@ -233,7 +254,28 @@ impl HomeView {
         }
     }
 
-    pub(super) fn order_change_committed(&mut self, change: OrderChange) {
+    /// The merged row order and the persisted header order the Daemon last published.
+    fn applied_arrangement(&self) -> (Vec<String>, Vec<String>) {
+        let snapshot = self.session_feed.applied_snapshot();
+        let contents = snapshot.as_ref().map(|snapshot| &snapshot.contents);
+        (
+            contents
+                .map(|c| c.workspace_ordering.clone())
+                .unwrap_or_default(),
+            contents
+                .map(|c| c.repository_order.clone())
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Act on an order write whose `receipt` is applied. The Undo point is the order at that
+    /// revision; when a later one is already applied, a peer may have changed it, so none is
+    /// kept.
+    pub(super) fn order_change_committed(
+        &mut self,
+        change: OrderChange,
+        receipt: &crate::daemon::RuntimeCursor,
+    ) {
         let restore = match change {
             OrderChange::SwitchToCustom(undo) => {
                 self.apply_sort_order(SortOrder::Custom);
@@ -253,11 +295,19 @@ impl HomeView {
                 return;
             }
         };
-        let committed = self.order_undo_point();
+        let at_receipt = self
+            .session_feed
+            .applied_snapshot()
+            .is_some_and(|snapshot| snapshot.cursor == *receipt);
+        if !at_receipt {
+            self.order_undo = None;
+            return;
+        }
+        let (order, repositories) = self.applied_arrangement();
         self.order_undo = Some(UndoPoint {
             restore,
-            order: committed.order,
-            repositories: committed.repositories,
+            order,
+            repositories,
         });
     }
 
@@ -364,6 +414,14 @@ impl HomeView {
         let direction = move_direction(delta);
         // Under Name the carried row lands where a Custom carry puts it: at the edge of the
         // destination it enters from, in the order on screen.
+        // Under Name the stored header order takes the one on screen too.
+        let headers = (self.sort_order != SortOrder::Custom).then(|| {
+            groups
+                .iter()
+                .filter(|path| !path.is_empty())
+                .map(|path| (*path).to_owned())
+                .collect()
+        });
         let freeze = (self.sort_order != SortOrder::Custom).then(|| {
             let peers: Vec<String> = self
                 .instances
@@ -388,6 +446,7 @@ impl HomeView {
                 source_group,
                 destination,
                 direction,
+                headers,
             }),
             NamespaceIntent::ReorderSession {
                 id: id.to_owned(),
@@ -582,6 +641,114 @@ mod tests {
                 "{shown:?} over {persisted:?}"
             );
         }
+    }
+
+    /// Undo keeps the stored orders at its receipt's revision: a later frame drops it, a
+    /// cleared header order makes it stale, and a receipt a replacement Daemon's frame
+    /// overtakes does not continue.
+    #[test]
+    #[serial_test::serial]
+    fn the_undo_point_follows_the_stored_orders_at_its_receipt() {
+        use crate::daemon::RuntimeCursor;
+        use crate::tui::session_feed::SessionFeedResult;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut view = HomeView::new_for_test(
+            None,
+            crate::tmux::AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        let mut capture = view.session_feed.view_write_driver_for_test();
+        let publish = |view: &mut HomeView, epoch: &str, revision: u64, repositories: &[&str]| {
+            let mut snapshot =
+                crate::tui::home::tests::fixture_snapshot(Vec::new(), "default", epoch, revision);
+            snapshot.contents.repository_order =
+                repositories.iter().map(|r| r.to_string()).collect();
+            view.session_feed
+                .publish_for_test(SessionFeedResult::Snapshot(std::sync::Arc::new(snapshot)));
+            view.apply_session_feed();
+            RuntimeCursor {
+                epoch: epoch.into(),
+                revision,
+            }
+        };
+        let flash = |view: &HomeView| view.status_flash.as_ref().map(|f| f.text.clone());
+        let restore = OrderUndo {
+            order: Vec::new(),
+            repositories: Vec::new(),
+            sort: SortOrder::Name,
+        };
+        let at = publish(&mut view, "e", 2, &["/r/b", "/r/a"]);
+        let earlier = RuntimeCursor {
+            revision: 1,
+            ..at.clone()
+        };
+        view.order_change_committed(OrderChange::Reset(restore.clone()), &earlier);
+        assert!(
+            view.order_undo.is_none(),
+            "a later frame may hold a peer's order"
+        );
+        view.order_change_committed(OrderChange::Reset(restore), &at);
+        assert!(view.order_undo.is_some());
+        publish(&mut view, "e", 3, &[]);
+        view.undo_order_change().unwrap();
+        assert_eq!(
+            flash(&view).as_deref(),
+            Some("The order changed elsewhere, nothing to undo")
+        );
+        assert!(capture().is_none());
+
+        view.reset_custom_order().unwrap();
+        capture().expect("the reset").finish(Ok(RuntimeCursor {
+            epoch: "old".into(),
+            revision: 9,
+        }));
+        publish(&mut view, "new", 1, &[]);
+        assert!(view.pending_order_change.is_none());
+        assert!(view.order_undo.is_none());
+        assert_eq!(
+            flash(&view).as_deref(),
+            Some("The Daemon restarted before the order change showed")
+        );
+    }
+
+    /// A carry whose order placement fails leaves the row in its source group, so the move
+    /// can be made again.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_carry_whose_placement_fails_does_not_move_the_row() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("reorder").unwrap();
+        let rows: Vec<Instance> = [("one", "aaa"), ("two", "bbb")]
+            .into_iter()
+            .map(|(title, group)| {
+                let mut row = Instance::new(title, &format!("/tmp/{title}"));
+                row.group_path = group.into();
+                row
+            })
+            .collect();
+        let id = rows[0].id.clone();
+        storage
+            .update(|stored, groups| {
+                *stored = rows.clone();
+                *groups = ["aaa", "bbb"]
+                    .map(|path| crate::session::Group::new(path, path))
+                    .into();
+                Ok(())
+            })
+            .unwrap();
+        let state = native_state(&["reorder"]).await;
+        let ordering = crate::session::get_app_dir()
+            .unwrap()
+            .join("workspace-ordering.json");
+        std::fs::create_dir_all(&ordering).unwrap();
+        let body = serde_json::json!({"target":"session","id":id,"profile":"reorder",
+            "source_group":"aaa","destination":"bbb","direction":"down"});
+        let (status, _, value) = request_with_headers(&state, "POST", "/api/reorder", body).await;
+        assert!(!status.is_success(), "{status}: {value}");
+        let (stored, _) = storage.load_with_groups().unwrap();
+        let row = stored.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row.group_path, "aaa");
     }
 
     async fn native_move(group: bool, snapshot_first: bool) {
@@ -872,7 +1039,8 @@ mod tests {
             let body = if carry {
                 view.select_session_by_id(&id);
                 serde_json::json!({"target":"session","id":id,"profile":"reorder",
-                    "source_group":"aaa","destination":"bbb","direction":"down"})
+                    "source_group":"aaa","destination":"bbb","direction":"down",
+                    "headers":["aaa","bbb","ccc"]})
             } else {
                 view.cursor = view
                     .flat_items
@@ -942,7 +1110,7 @@ mod tests {
                 })
                 .collect();
             if carry {
-                assert_eq!(groups, ["ccc", "aaa", "bbb"]);
+                assert_eq!(groups, ["aaa", "bbb", "ccc"]);
                 assert_eq!(titles, ["one", "bee", "zed"]);
             } else {
                 assert_eq!(groups, ["bbb", "aaa", "ccc"]);

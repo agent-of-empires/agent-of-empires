@@ -110,9 +110,11 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
         .and_then(|state| state.get(LEGACY_SORT_KEY))
         .and_then(toml::Value::as_str)
         .map(str::to_owned);
+    // A retried upgrade finds the marker gone but the sort still pending.
     let legacy_sort = match pass {
         Pass::Upgrade => in_state
             .clone()
+            .or(pending)
             .or_else(|| sort_left_by_v064(state.as_ref())),
         Pass::Recovery => pending,
     };
@@ -505,6 +507,25 @@ mod tests {
             assert!(!fs::read_to_string(&path).unwrap().contains("sort_index"));
             assert!(!pending.exists(), "{broken}");
             run_in(dir.path(), Pass::Recovery).unwrap();
+        }
+    }
+
+    /// An upgrade that ran but was not recorded runs again without the marker; the pending
+    /// sort, not the folded `sort_order`, is still the one a skipped profile owes.
+    #[test]
+    fn a_rerun_upgrade_keeps_the_pending_sort() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), serde_json::json!([]));
+        fs::create_dir_all(dir.path().join("profiles/other/sessions.json")).unwrap();
+        fs::write(
+            dir.path().join("state.toml"),
+            format!("sort_order = \"custom\"\n{LEGACY_SORT_KEY} = \"oldest\"\n"),
+        )
+        .unwrap();
+        let pending = dir.path().join(PENDING_FILE);
+        for _ in 0..2 {
+            run_in(dir.path(), Pass::Upgrade).unwrap();
+            assert_eq!(fs::read_to_string(&pending).unwrap(), "oldest");
         }
     }
 

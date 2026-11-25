@@ -483,12 +483,15 @@ pub(in crate::tui::home) async fn settle_reorder(
             .and_then(|at| paths.get(at))
             .cloned()
             .expect("a neighbouring group to carry the session into");
+        let headers = (view.sort_order != crate::session::config::SortOrder::Custom)
+            .then(|| paths.iter().filter(|p| !p.is_empty()).cloned().collect());
         ReorderBody::Session {
             id,
             profile: row.source_profile.clone(),
             source_group: row.group_path.clone(),
             destination,
             direction,
+            headers,
         }
     };
     settle_namespace(state, view, NamespaceMutation::Reorder(request), |view| {
@@ -2819,9 +2822,10 @@ async fn test_ctrl_arrows_under_name_start_custom_from_the_screen_order() {
     .await;
     match writes.as_slice() {
         [ViewWrite::Ordering(patch), ViewWrite::SidebarView(view)] => {
+            // Rows no move placed stay unplaced.
             assert_eq!(
                 patch.order.as_ref(),
-                Some(&before.contents.workspace_ordering)
+                Some(&before.contents.placed_workspaces)
             );
             assert_eq!(
                 patch.repositories.as_ref(),
