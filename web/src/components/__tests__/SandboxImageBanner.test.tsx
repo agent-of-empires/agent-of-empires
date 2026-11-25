@@ -747,6 +747,68 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
     }
   });
 
+  it("keeps another image's pull and outcomes off a pending update", async () => {
+    const OTHER = "ghcr.io/example/other:1";
+    const dismiss = () => fireEvent.click(screen.getByRole("button", { name: "Dismiss sandbox image notice" }));
+    const old: SandboxImagePull[] = [
+      { state: "done" },
+      { state: "failed", reason: "other", message: FAILED, error: "old" },
+      { state: "cancelled" },
+    ];
+    const otherCurrent = (pull: SandboxImagePull) => status({ image: OTHER, state: "current", pull } as never);
+
+    // B running before A's refusal: B's pull shows, but only A's own pull confirms A, so the refusal stands.
+    for (const next of ["dismiss", "poll"]) {
+      const { unmount } = await mount(status());
+      let reply!: (r: { ok: boolean; message?: string }) => void;
+      pullSandboxImage.mockImplementationOnce(() => new Promise((resolve) => (reply = resolve)));
+      fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+      fetchSandboxImageStatus.mockResolvedValue({ ...running(), image: OTHER });
+      await pollAfter(2000);
+      expect(banner()?.textContent, next).toBe(DOWNLOADING);
+      let fresh!: (s: SandboxImageStatus) => void;
+      fetchSandboxImageStatus.mockImplementationOnce(() => new Promise((resolve) => (fresh = resolve)));
+      await act(async () => reply({ ok: false, message: "pulls are off" }));
+      expect(banner()?.textContent, `${next}: A's refusal was dropped`).toBe(FAILED);
+      expect(screen.getByText("pulls are off")).toBeTruthy();
+      if (next === "dismiss") {
+        dismiss();
+        expect(banner()?.textContent, "A's refusal stopped B's pull showing").toBe(DOWNLOADING);
+      } else {
+        await act(async () => fresh({ ...running(), image: OTHER }));
+        expect(banner()?.textContent, "B's next poll cleared A's refusal").toBe(FAILED);
+      }
+      unmount();
+    }
+
+    // After updating A, B is the default and current, with an old outcome: none of it is this click's.
+    for (const pull of old) {
+      const { unmount } = await mount(status());
+      pullSandboxImage.mockResolvedValueOnce({ ok: true, image: IMAGE });
+      fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+      fetchSandboxImageStatus.mockResolvedValue(otherCurrent(pull));
+      await pollAfter(0);
+      expect(banner(), `B's old ${pull.state} showed as this click's`).toBeNull();
+      unmount();
+    }
+
+    // The same through a watched pull: after A was seen running, B's old outcome isn't news either.
+    for (const pull of old) {
+      const { unmount } = await mount(running());
+      fetchSandboxImageStatus.mockResolvedValue(otherCurrent(pull));
+      await pollAfter(2000);
+      expect(banner(), `watched A, then B's old ${pull.state} showed`).toBeNull();
+      unmount();
+    }
+
+    // Control, the same before and after: with no click and nothing seen running, no outcome shows.
+    for (const pull of old) {
+      const { unmount } = await mount(otherCurrent(pull));
+      expect(banner(), `no click, nothing seen: ${pull.state}`).toBeNull();
+      unmount();
+    }
+  });
+
   it("drops a Cancel once the banner shows another image, so its reply and refusal stay off it", async () => {
     const OTHER = "ghcr.io/example/other:1";
     const cancelButton = () => screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement;
