@@ -761,6 +761,22 @@ describe("SuggestionsView", () => {
       expect(onOpenSettings).toHaveBeenCalled();
     });
 
+    it("a disabled provider on a read-only dashboard says it can't be turned on here", async () => {
+      const base = snapshot();
+      fetchSuggestions.mockResolvedValue({
+        ...base,
+        items: [],
+        providers: [...base.providers, { id: "linear", name: "Linear", status: "ok", enabled: false, sources: [] }],
+      });
+      render(<SuggestionsView readOnly onPrepare={vi.fn()} onOpenSession={vi.fn()} onOpenSettings={vi.fn()} />);
+      expect(
+        await screen.findByText(
+          "Linear suggestions are hidden because Linear is off. Read-only: this dashboard can't turn it on.",
+        ),
+      ).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Turn it on" })).toBeNull();
+    });
+
     it("with every provider off, one note turns them all on instead of the per-provider notes", async () => {
       const base = snapshot();
       const off = { ...base.providers[0]!, enabled: false };

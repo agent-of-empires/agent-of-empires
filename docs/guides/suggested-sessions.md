@@ -10,7 +10,7 @@ Suggestions show up in the web dashboard (homepage section, `/suggestions`, and 
 
 With no provider installed, the web homepage and the empty `/suggestions` view offer **Set up suggestions** when a featured plugin exists. The sheet installs the sources you tick, runs each plugin's setup checks (✓, `!`, ✕, with the plugin's fix text and **Check again**), and ends with "Suggestions are on". **Finish later** closes it; the plugin stays installed. **More sources in the Marketplace ›** opens Settings › Plugins › Marketplace filtered to plugins that work with suggestions.
 
-Providers are off until you turn one on, in the setup sheet, in Settings › Suggestions › Sources, or through the API (`PATCH /api/suggestions/prefs` with `provider_enabled`). The sheet turns on each source it installs. To skip the sheet, install a provider with `aoe plugin install` ([Plugins](../plugins.md)), then turn it on. While every installed provider is off, the homepage section and `/suggestions` say so and offer **Turn it on** (**Turn them on** for several); a read-only dashboard says it can't turn them on.
+Providers are off until you turn one on, in the setup sheet, in Settings › Suggestions › Sources, or through the API (`PATCH /api/suggestions/prefs` with `provider_enabled`). The sheet turns on each source it installs, and no other. To skip the sheet, install a provider with `aoe plugin install` ([Plugins](../plugins.md)), then turn it on. While every installed provider is off, the homepage section and `/suggestions` say so and offer **Turn it on** (**Turn them on** for several); a read-only dashboard says it can't turn them on.
 
 ## Web dashboard
 
@@ -53,7 +53,7 @@ If a start fails, the row shows "Couldn't start: <reason>" and what to do, such 
 
 A **stale** item is dimmed and only offers Dismiss: its source closed or changed. It disappears after the plugin has published it stale for 24 hours.
 
-If a provider is switched off, its items are hidden and the view says "<provider> suggestions are hidden because <provider> is off in Settings › Suggestions." with a **Turn it on** link.
+If a provider is switched off, its items are hidden and the view says "<provider> suggestions are hidden because <provider> is off in Settings › Suggestions." with a **Turn it on** link. A read-only dashboard omits the link and says it can't turn the provider on.
 
 ## Settings › Suggestions
 

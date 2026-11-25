@@ -472,8 +472,10 @@ export function SuggestionsView({
                   .filter((p) => !p.enabled)
                   .map((p) => (
                     <li key={p.id} className={SUGGESTION_NOTE_CLASS}>
-                      {p.name} suggestions are hidden because {p.name} is off in Settings › Suggestions.{" "}
-                      {onOpenSettings && (
+                      {readOnly
+                        ? `${p.name} suggestions are hidden because ${p.name} is off. Read-only: this dashboard can't turn it on.`
+                        : `${p.name} suggestions are hidden because ${p.name} is off in Settings › Suggestions. `}
+                      {!readOnly && onOpenSettings && (
                         <button
                           type="button"
                           onClick={onOpenSettings}
