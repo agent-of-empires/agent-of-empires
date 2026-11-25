@@ -122,3 +122,57 @@ pub(crate) fn observe_draft(pane: &str) {
         }
     }
 }
+
+/// Splits `session`'s first window, running `script` in the new pane, and returns its `#{pane_id}`.
+pub(crate) fn split_pane(session: &str, script: &str) -> String {
+    let output = crate::tmux::tmux_command()
+        .args([
+            "split-window",
+            "-d",
+            "-t",
+            &format!("={session}:"),
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "sh",
+            "-c",
+            script,
+        ])
+        .output()
+        .expect("tmux split-window");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("utf8")
+        .trim()
+        .to_string()
+}
+
+type InputCheckHook = Box<dyn FnOnce() + Send>;
+static INPUT_CHECK_HOOKS: std::sync::Mutex<Vec<(String, InputCheckHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Runs `hook` once, between a send's input-line check of `pane` and its keys.
+pub(crate) fn on_input_checked(pane: &str, hook: impl FnOnce() + Send + 'static) {
+    INPUT_CHECK_HOOKS
+        .lock()
+        .unwrap()
+        .push((pane.to_string(), Box::new(hook)));
+}
+
+pub(crate) fn after_input_check(pane: &str) {
+    let hooks: Vec<InputCheckHook> = {
+        let mut all = INPUT_CHECK_HOOKS.lock().unwrap();
+        let (mine, rest) = std::mem::take(&mut *all)
+            .into_iter()
+            .partition::<Vec<_>, _>(|(watched, _)| watched == pane);
+        *all = rest;
+        mine.into_iter().map(|(_, hook)| hook).collect()
+    };
+    for hook in hooks {
+        hook();
+    }
+}

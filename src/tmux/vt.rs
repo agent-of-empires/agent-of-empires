@@ -3789,6 +3789,24 @@ pub(crate) fn register_live_for_test(
     channel
 }
 
+/// A live output-only test double for `name` held on `pane`, a `#{pane_id}`, so the session's
+/// live pane target resolves to it. Dropping the `Arc` unpins it.
+#[cfg(test)]
+pub(crate) fn register_pinned_for_test(
+    name: &str,
+    dir: &std::path::Path,
+    pane: &str,
+) -> Arc<VtChannel> {
+    let (mut channel, lifecycle) = dummy_channel_with_input(name, dir, false);
+    Arc::get_mut(&mut channel).expect("a fresh channel").target = pane.to_string();
+    VtLifecycle::Live.store(&lifecycle);
+    REGISTRY
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), Arc::downgrade(&channel));
+    channel
+}
+
 #[cfg(test)]
 pub(crate) struct HeldVtDrain {
     drain: Arc<Mutex<DrainControl>>,

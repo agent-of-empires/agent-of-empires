@@ -208,11 +208,6 @@ pub(crate) fn ready_agent_session(instance: &Instance) -> anyhow::Result<Option<
     agent_session_in_pane(instance, true)
 }
 
-/// [`ready_agent_session`], as the `#{pane_id}` the check saw.
-pub(crate) fn ready_agent_pane(instance: &Instance) -> anyhow::Result<Option<String>> {
-    Ok(agent_pane_in(instance, true)?.map(|(_, pane_id)| pane_id))
-}
-
 /// Like [`ready_agent_session`] but never trusts a hook status file: an agent
 /// that exited to a live shell leaves it behind, so automatic input must see
 /// the pane itself running something other than a shell.

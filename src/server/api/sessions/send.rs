@@ -218,12 +218,22 @@ async fn send_terminal_message_inner(
                 !instance.is_structured(),
                 "Session no longer has a terminal agent"
             );
-            let pane = super::ensure::ready_agent_pane(&instance)?.ok_or(TerminalNotRunning)?;
-            let session = instance.tmux_session()?;
-            session.wait_until_ready(
-                std::time::Duration::from_secs(5),
-                crate::agents::ready_markers(&instance.tool),
+            anyhow::ensure!(
+                super::ensure::ready_agent_session(&instance)?.is_some(),
+                TerminalNotRunning
             );
+            let session = instance.tmux_session()?;
+            // Readiness, the draft check and the keys all address this one pane.
+            let pane = session
+                .live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())
+                .map_err(|_| TerminalNotRunning)?;
+            session
+                .wait_until_ready_in(
+                    &pane,
+                    std::time::Duration::from_secs(5),
+                    crate::agents::ready_markers(&instance.tool),
+                )
+                .map_err(|_| TerminalNotRunning)?;
             // Typed after a person's unsent text, the message would merge with it on Enter.
             anyhow::ensure!(
                 instance.wait_for_input_line(&session, &pane, INPUT_LINE_WAIT),

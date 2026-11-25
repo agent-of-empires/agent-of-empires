@@ -876,13 +876,48 @@ impl Session {
         ready_markers: &[&str],
         blocked: impl Fn(&str) -> Option<B>,
     ) -> Result<bool, B> {
+        Self::poll_until_ready(max_wait, ready_markers, blocked, || {
+            Ok(self.capture_pane(0).ok())
+        })
+    }
+
+    /// [`Self::wait_until_ready`] reading only `pane`, a `#{pane_id}`. `Err` as soon as the
+    /// pane is gone or dead, rather than at the deadline.
+    pub fn wait_until_ready_in(
+        &self,
+        pane: &str,
+        max_wait: std::time::Duration,
+        ready_markers: &[&str],
+    ) -> Result<bool> {
+        Self::poll_until_ready(
+            max_wait,
+            ready_markers,
+            |_| None,
+            || {
+                let live = crate::tmux::tmux_command()
+                    .args(["display-message", "-p", "-t", pane, "#{pane_dead}"])
+                    .output()?;
+                if !live.status.success() || String::from_utf8_lossy(&live.stdout).trim() != "0" {
+                    bail!("tmux pane '{pane}' is gone");
+                }
+                self.capture_target(pane, 0)
+            },
+        )
+    }
+
+    fn poll_until_ready<B>(
+        max_wait: std::time::Duration,
+        ready_markers: &[&str],
+        blocked: impl Fn(&str) -> Option<B>,
+        capture: impl Fn() -> Result<Option<String>, B>,
+    ) -> Result<bool, B> {
         let poll_interval = std::time::Duration::from_millis(200);
         let deadline = std::time::Instant::now() + max_wait;
         let ready_markers: Vec<String> = ready_markers.iter().map(|m| m.to_lowercase()).collect();
         let mut last: Option<String> = None;
         while std::time::Instant::now() < deadline {
             std::thread::sleep(poll_interval);
-            let Ok(now) = self.capture_pane(0) else {
+            let Some(now) = capture()? else {
                 continue;
             };
             #[cfg(test)]
@@ -6336,5 +6371,69 @@ mod tests {
             !result,
             "respawn_dead_pane should return false for missing session"
         );
+    }
+
+    /// A readiness wait on one pane reads only that pane, and ends with `Err` once the pane is
+    /// gone, well inside its budget.
+    #[test]
+    fn wait_until_ready_in_reads_its_pane_and_stops_when_it_dies() {
+        if !tmux_available() {
+            return;
+        }
+        let budget = std::time::Duration::from_secs(5);
+        // (case, whether the pane is killed at its first capture)
+        for (case, kill) in [("marker", false), ("killed", true)] {
+            let session = TmuxTestSession::new("ready_in");
+            let name = session.name();
+            let mut args: Vec<String> = ["new-session", "-d", "-s", name, "sh", "-c", "exec cat"]
+                .map(String::from)
+                .into();
+            append_pane_base_index_args(&mut args, name);
+            assert!(crate::tmux::tmux_command()
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+            let script = if kill {
+                "exec cat"
+            } else {
+                "echo 'ask anything'; exec cat"
+            };
+            let pane = super::super::test_helpers::split_pane(name, script);
+            let (captured_tx, captured_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let started = std::time::Instant::now();
+            let result = std::thread::scope(|scope| {
+                let pane = &pane;
+                let waiter = scope.spawn(move || {
+                    let _probe = ReadyCaptureGuard::install(ReadyCaptureProbe {
+                        captured: captured_tx,
+                        resume: resume_rx,
+                    });
+                    Session::from_name(name).wait_until_ready_in(pane, budget, &["ask anything"])
+                });
+                while captured_rx.recv_timeout(budget).is_ok() {
+                    if kill {
+                        let _ = crate::tmux::tmux_command()
+                            .args(["kill-pane", "-t", pane])
+                            .status();
+                    }
+                    if resume_tx.send(()).is_err() {
+                        break;
+                    }
+                }
+                waiter.join().unwrap()
+            });
+            if kill {
+                assert!(result.is_err(), "{case}: {result:?}");
+                assert!(started.elapsed() < budget, "{case}: ran to the deadline");
+            } else {
+                assert_eq!(
+                    result.ok(),
+                    Some(true),
+                    "{case}: the first pane has no marker"
+                );
+            }
+        }
     }
 }

@@ -17,6 +17,29 @@ pub(super) fn permission_response_tokens<'a>(
     }
 }
 
+/// Types `message` into the session's live pane, resolved once so the draft check and the keys
+/// address the same pane. `Err` is the dialog text.
+fn deliver_to_live_pane(
+    inst: &crate::session::Instance,
+    tmux: &crate::tmux::Session,
+    check_draft: bool,
+    message: &str,
+    delay: u64,
+) -> Result<(), String> {
+    let failed = |e: anyhow::Error| format!("Failed to send message: {e}");
+    let pane = tmux
+        .live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())
+        .map_err(failed)?;
+    // Checked once: a wait here would freeze the TUI, and the person can see the pane.
+    if check_draft && inst.input_line_in(tmux, &pane) == crate::tmux::InputLine::Draft {
+        return Err(crate::tmux::InputLine::BUSY_MESSAGE.to_string());
+    }
+    #[cfg(test)]
+    crate::tmux::test_helpers::after_input_check(&pane);
+    tmux.send_keys_to_pane(&pane, message, delay)
+        .map_err(failed)
+}
+
 impl HomeView {
     pub fn set_instance_status(&mut self, id: &str, status: crate::session::Status) {
         self.mutate_instance(id, |inst| inst.status = status);
@@ -113,25 +136,11 @@ impl HomeView {
             },
             _ => None,
         };
-        // Checked once: a wait here would freeze the TUI, and the person can see the pane.
-        if matches!(target, live_send::LiveSendTarget::Agent)
-            && tmux_session
-                .live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())
-                .is_ok_and(|pane| {
-                    inst.input_line_in(&tmux_session, &pane) == crate::tmux::InputLine::Draft
-                })
+        let check_draft = matches!(target, live_send::LiveSendTarget::Agent);
+        if let Err(refusal) =
+            deliver_to_live_pane(&inst, &tmux_session, check_draft, message, delay)
         {
-            self.info_dialog = Some(InfoDialog::new(
-                "Send Failed",
-                crate::tmux::InputLine::BUSY_MESSAGE,
-            ));
-            return;
-        }
-        if let Err(e) = tmux_session.send_keys_with_delay(message, delay) {
-            self.info_dialog = Some(InfoDialog::new(
-                "Send Failed",
-                &format!("Failed to send message: {}", e),
-            ));
+            self.info_dialog = Some(InfoDialog::new("Send Failed", &refusal));
             return;
         }
         self.stamp_last_accessed(session_id);
@@ -309,5 +318,74 @@ mod permission_response_tokens_tests {
             permission_response_tokens(&without_always, PermissionResponseChoice::AllowAlways),
             None
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod deliver_to_live_pane_tests {
+    use super::*;
+    use crate::tmux::test_helpers::{on_input_checked, only_pane_id, split_pane, TmuxTestSession};
+
+    fn pane_shows(pane: &str, text: &str) -> bool {
+        crate::tmux::tmux_command()
+            .args(["capture-pane", "-p", "-t", pane])
+            .output()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains(text))
+    }
+
+    /// The keys reach the pane the draft check read, or fail, even when the live target moves
+    /// to another pane between the check and the send.
+    #[test]
+    fn a_send_types_into_the_pane_it_checked() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        // (case, whether the checked pane is killed as the pin is dropped)
+        for (case, kill) in [("unpinned", false), ("killed", true)] {
+            let session = TmuxTestSession::new("tui_send");
+            let mut args: Vec<String> = ["new-session", "-d", "-s", session.name(), "sh", "-c"]
+                .map(String::from)
+                .into();
+            args.push("exec cat".into());
+            crate::tmux::utils::append_pane_base_index_args(&mut args, session.name());
+            assert!(crate::tmux::tmux_command()
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+            let first = only_pane_id(session.name());
+            let checked = split_pane(session.name(), "exec cat");
+            let dir = tempfile::tempdir().unwrap();
+            let pin =
+                crate::tmux::vt::register_pinned_for_test(session.name(), dir.path(), &checked);
+            let target = checked.clone();
+            on_input_checked(&checked, move || {
+                drop(pin);
+                if kill {
+                    let _ = crate::tmux::tmux_command()
+                        .args(["kill-pane", "-t", &target])
+                        .status();
+                }
+            });
+            let inst = crate::session::Instance::new("tui-send", "/tmp");
+            let tmux = crate::tmux::Session::from_name(session.name());
+
+            let sent = deliver_to_live_pane(&inst, &tmux, true, "hello", 0);
+
+            if kill {
+                assert!(sent.is_err(), "{case}: {sent:?}");
+            } else {
+                assert_eq!(sent, Ok(()), "{case}");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !pane_shows(&checked, "hello") {
+                    assert!(std::time::Instant::now() < deadline, "{case}: never typed");
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+            assert!(
+                !pane_shows(&first, "hello"),
+                "{case}: typed into the other pane"
+            );
+        }
     }
 }

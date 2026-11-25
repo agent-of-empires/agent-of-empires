@@ -5565,6 +5565,94 @@ mod tests {
         assert!(status.success());
     }
 
+    /// With the live target pinned to a pane other than pane 0, the draft check and the keys both
+    /// address the pinned pane: a draft in pane 0 alone doesn't refuse the send, one in the pinned
+    /// pane does, and then nothing is typed into either.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn a_terminal_send_checks_and_types_into_the_pinned_pane() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        // (case, whether the draft is in the pinned pane rather than pane 0)
+        for (case, draft_in_pinned) in [("draft-in-pane-0", false), ("draft-in-pinned", true)] {
+            let id = format!("sess-pinned-{case}");
+            let mut inst =
+                terminal_turn_instance(&id, &format!("term-pinned-{case}"), "initial-turn");
+            inst.tool = "claude".into();
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                &inst.source_profile,
+                vec![inst.clone()],
+            );
+            let session = start_terminal_pane(&inst, INPUT_BOX_SCRIPT, false);
+            let tmux = crate::tmux::Session::from_name(session.name());
+            let first = crate::tmux::test_helpers::only_pane_id(session.name());
+            let pinned = crate::tmux::test_helpers::split_pane(session.name(), INPUT_BOX_SCRIPT);
+            let dir = tempfile::tempdir().unwrap();
+            let _pin =
+                crate::tmux::vt::register_pinned_for_test(session.name(), dir.path(), &pinned);
+            let screen = |pane: &str| {
+                crate::tmux::utils::strip_ansi(
+                    &tmux.try_capture_pane_in(pane, 0).unwrap_or_default(),
+                )
+            };
+            let wait_for = |pane: &str, text: &str| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !screen(pane).contains(text) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{case}: {}",
+                        screen(pane)
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            };
+            wait_for(&first, "for shortcuts");
+            wait_for(&pinned, "for shortcuts");
+            let drafted = if draft_in_pinned { &pinned } else { &first };
+            tmux_keys(drafted, &["-l", "half typed"]);
+            wait_for(drafted, "❯ half typed");
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+            let sent = crate::server::api::sessions::send_terminal_message(
+                &state.session_service,
+                &id,
+                "hello".to_string(),
+                false,
+                false,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.error);
+
+            if draft_in_pinned {
+                assert!(
+                    matches!(
+                        sent,
+                        Err(crate::server::api::sessions::SendKeysError::InputLineBusy)
+                    ),
+                    "{case}: {}",
+                    screen(&pinned)
+                );
+                assert!(
+                    !screen(&pinned).contains("hello"),
+                    "{case}: {}",
+                    screen(&pinned)
+                );
+            } else {
+                assert!(sent.is_ok(), "{case}: {}", screen(&pinned));
+                wait_for(&pinned, "❯ hello");
+            }
+            assert!(
+                !screen(&first).contains("hello"),
+                "{case}: {}",
+                screen(&first)
+            );
+        }
+    }
+
     /// A send waits for a person's draft to clear, and refuses one that stays, leaving it as
     /// typed.
     #[tokio::test(flavor = "multi_thread")]
