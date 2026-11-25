@@ -3,8 +3,6 @@
 use anyhow::Result;
 
 pub fn run() -> Result<()> {
-    tracing::info!(
-        "v049: session started_at is recorded on the next launch; existing rows stay unset"
-    );
+    tracing::info!("v049: no data to change");
     Ok(())
 }

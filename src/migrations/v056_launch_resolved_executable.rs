@@ -3,8 +3,6 @@
 use anyhow::Result;
 
 pub fn run() -> Result<()> {
-    tracing::info!(
-        "v056: session launch_resolved_executable is recorded on the next launch; existing rows stay unset"
-    );
+    tracing::info!("v056: no data to change");
     Ok(())
 }

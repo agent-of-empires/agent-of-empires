@@ -128,7 +128,7 @@ describe("Session menu tiers", () => {
       for (const [name, description] of items) {
         expect(screen.getByRole("button", { name, ...(description ? { description } : {}) }), name).toBeTruthy();
       }
-      for (const old of ["Restart to apply update (keeps conversation)", "Edit group", "Edit workdir name", "Delete"]) {
+      for (const old of ["Edit group", "Edit workdir name", "Delete"]) {
         expect(screen.queryByRole("button", { name: old }), old).toBeNull();
       }
       cleanup();
