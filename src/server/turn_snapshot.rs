@@ -95,7 +95,7 @@ pub fn spawn_recorder(state: Arc<AppState>) {
                     Ok(change) => change,
                     Err(RecvError::Lagged(n)) => {
                         tracing::warn!(target: "server.turn_snapshot", lagged = n, "turn snapshot recorder lagged, skipped status changes");
-                        lock(&baselines).forget_all();
+                        forget_turns(&baselines, &task_state.turn_snapshots);
                         continue;
                     }
                     Err(RecvError::Closed) => return,
@@ -127,6 +127,15 @@ pub fn spawn_recorder(state: Arc<AppState>) {
             }
         }
     });
+}
+
+/// After skipped events, no baseline or published snapshot is known to match a turn boundary.
+fn forget_turns(baselines: &Mutex<Baselines>, snapshots: &TurnSnapshots) {
+    lock(baselines).forget_all();
+    snapshots
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
 }
 
 fn lock(baselines: &Mutex<Baselines>) -> std::sync::MutexGuard<'_, Baselines> {
@@ -231,13 +240,23 @@ mod tests {
         b.finish("s", late, tree(4));
         assert_eq!(b.start_turn("s"), Some(tree(4)));
 
-        // A lag drops both finished and in-flight baselines.
+        // A lag drops finished and in-flight baselines and published snapshots.
         let g = b.bump("s");
         b.finish("s", g, tree(5));
         let in_flight = b.bump("t");
-        b.forget_all();
+        let (baselines, snapshots) = (Mutex::new(b), TurnSnapshots::default());
+        snapshots.write().unwrap().insert(
+            "s".into(),
+            TurnSnapshot {
+                at: Timestamp::now(),
+                trees: tree(4),
+            },
+        );
+        forget_turns(&baselines, &snapshots);
+        let mut b = baselines.into_inner().unwrap();
         b.finish("t", in_flight, tree(6));
         assert_eq!((b.start_turn("s"), b.start_turn("t")), (None, None));
+        assert!(snapshots.read().unwrap().is_empty());
 
         // A capture that got no trees leaves nothing to publish.
         let g = b.bump("s");
