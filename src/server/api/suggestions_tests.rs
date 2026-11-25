@@ -444,6 +444,10 @@ async fn the_snapshot_shows_each_kinds_preset_and_what_start_uses() {
         body["items"][0]["start"].get("project").is_none(),
         "unlinked"
     );
+    assert_eq!(
+        body["items"][0]["start"]["prompt"], "Fix #{number}",
+        "the published prompt"
+    );
 
     f.call(
         Method::PUT,
@@ -472,6 +476,18 @@ async fn the_snapshot_shows_each_kinds_preset_and_what_start_uses() {
     for field in ["view", "worktree", "sandbox"] {
         assert!(!start[field].is_null(), "{field}");
     }
+
+    f.call(
+        Method::PUT,
+        "/api/suggestions/presets",
+        preset_body("assigned", "codex", json!("Look at #{number}")),
+    )
+    .await;
+    assert_eq!(
+        snapshot().await["items"][0]["start"]["prompt"],
+        "Look at #42",
+        "the preset template, expanded"
+    );
 }
 
 #[tokio::test]

@@ -252,6 +252,12 @@ pub(crate) fn attach_presets(
         if !project.is_null() {
             start["project"] = project;
         }
+        let variables: BTreeMap<String, String> =
+            serde_json::from_value(item["variables"].clone()).unwrap_or_default();
+        let published = item["draft"]["prompt"].as_str().unwrap_or_default();
+        if let Ok(prompt) = start_prompt(own, &variables, published) {
+            start["prompt"] = json!(prompt);
+        }
         item["start"] = start;
     }
 }
@@ -273,6 +279,26 @@ pub(crate) fn find_item_with_mapping(
     Ok(Some((item, mapped)))
 }
 
+/// The prompt Start sends: the preset's template expanded over the item's
+/// variables, else the one the provider published. A blank expansion is an
+/// empty prompt, as for an empty template: `sessions.create` rejects a blank
+/// but non-empty one.
+fn start_prompt(
+    preset: Option<&Preset>,
+    variables: &BTreeMap<String, String>,
+    published: &str,
+) -> Result<String, PromptTooLong> {
+    let Some(template) = preset.and_then(|p| p.prompt.as_deref()) else {
+        return Ok(published.to_string());
+    };
+    let expanded = expand(template, variables)?;
+    Ok(if expanded.trim().is_empty() {
+        String::new()
+    } else {
+        expanded
+    })
+}
+
 /// Wizard prefill for `item`, resolved through the normal config cascade of its
 /// project, or the saved profile settings when it names none. A stored
 /// `preset` replaces the config defaults, and its prompt the provider's, expanded
@@ -290,20 +316,8 @@ pub(crate) fn prepare(
     if item.stale {
         return Err(PrepareRefusal::Stale);
     }
-    let prompt = match preset.and_then(|p| p.prompt.as_deref()) {
-        Some(t) => {
-            let expanded = expand(t, &item.variables)
-                .map_err(|PromptTooLong| PrepareRefusal::PromptTooLong)?;
-            // Blank is an empty prompt, as for an empty template:
-            // `sessions.create` rejects a blank but non-empty one.
-            if expanded.trim().is_empty() {
-                String::new()
-            } else {
-                expanded
-            }
-        }
-        None => item.draft.prompt.clone(),
-    };
+    let prompt = start_prompt(preset, &item.variables, &item.draft.prompt)
+        .map_err(|PromptTooLong| PrepareRefusal::PromptTooLong)?;
     let registered = projects::load_merged(profile)
         .map_err(|error| PrepareRefusal::Registry(error.to_string()))?;
     let (project, extras) =
