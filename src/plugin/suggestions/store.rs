@@ -233,7 +233,7 @@ pub(crate) fn snapshot(
     let mut per_provider: Vec<Vec<Value>> = Vec::new();
     for &index in &order {
         let provider = &providers[index];
-        let enabled = stored.get(&provider.id).is_none_or(|p| p.0);
+        let enabled = stored.get(&provider.id).is_some_and(|p| p.0);
         let status: Option<(Option<String>, i64)> = conn
             .query_row(
                 "SELECT error, updated_at FROM suggestion_providers WHERE profile = ?1 AND provider_id = ?2",
@@ -469,6 +469,11 @@ mod tests {
             ..provider()
         };
         let providers = [provider(), other];
+        conn.execute_batch(
+            "INSERT INTO suggestion_provider_prefs (profile, provider_id, enabled) VALUES
+             ('p', 'acme.github', 1), ('p', 'acme.other', 1);",
+        )
+        .unwrap();
         let publish_for = |id: &str, ids: &[&str]| {
             let items: Vec<_> = ids.iter().map(|i| item(i, "assigned")).collect();
             set(&conn, "p", id, &spec(), &json!({ "items": items })).unwrap();
@@ -537,6 +542,7 @@ mod tests {
             p
         };
         publish(&conn, "p", &[item("a", "assigned")]);
+        snap(&conn, "p");
         assert_eq!(ids(&snapshot(&conn, "p", &[provider()]).unwrap()), ["a"]);
 
         // The manifest changed, the old worker's rows are still stored.

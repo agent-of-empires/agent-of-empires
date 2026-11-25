@@ -302,13 +302,14 @@ impl PluginHost {
         provider_id: Option<&str>,
         ids: Vec<String>,
     ) -> usize {
-        // An unreadable switch store notifies nobody rather than a provider the user turned off.
-        let disabled = match self
-            .with_suggestions_db_blocking(crate::plugin::suggestions::disabled_providers)
+        // Providers are off until switched on, and an unreadable switch store
+        // notifies nobody.
+        let enabled = match self
+            .with_suggestions_db_blocking(crate::plugin::suggestions::enabled_providers)
             .await
-            .and_then(|disabled| Ok(disabled?))
+            .and_then(|enabled| Ok(enabled?))
         {
-            Ok(disabled) => disabled,
+            Ok(enabled) => enabled,
             Err(error) => {
                 tracing::warn!(
                     "suggestions: provider switches unreadable, skipping {method}: {error}"
@@ -318,7 +319,7 @@ impl PluginHost {
         };
         let mut sent = 0;
         for id in ids {
-            if provider_id.is_some_and(|only| only != id) || disabled.contains(&id) {
+            if provider_id.is_some_and(|only| only != id) || !enabled.contains(&id) {
                 continue;
             }
             let refresh = method == aoe_plugin_api::suggestions::SUGGESTIONS_REFRESH;
@@ -1830,6 +1831,13 @@ mod tests {
             .unwrap()
             .unwrap()
         };
+
+        // Providers start off: no query reaches a worker until it is switched on.
+        assert_eq!(host.refresh_providers(None, ids()).await, 0);
+        assert!(worker.try_recv().is_err());
+        assert!(!apply(
+            json!({ "provider_enabled": { "acme.github": true } })
+        ));
 
         // A PATCH that leaves the interval alone asks for no refresh.
         assert!(!apply(json!({ "homepage": false })));

@@ -156,7 +156,7 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
          CREATE TABLE IF NOT EXISTS suggestion_provider_prefs (
              profile     TEXT NOT NULL,
              provider_id TEXT NOT NULL,
-             enabled     INTEGER NOT NULL DEFAULT 1,
+             enabled     INTEGER NOT NULL DEFAULT 0,
              sort_order  INTEGER NOT NULL DEFAULT 2147483647,
              PRIMARY KEY (profile, provider_id)
          );",
@@ -282,7 +282,14 @@ mod fixtures {
         .unwrap()
     }
 
+    /// The snapshot with the fixture provider switched on, as providers start off.
     pub(super) fn snap(conn: &Connection, profile: &str) -> Value {
+        conn.execute(
+            "INSERT OR IGNORE INTO suggestion_provider_prefs (profile, provider_id, enabled)
+             VALUES (?1, 'acme.github', 1)",
+            [profile],
+        )
+        .unwrap();
         snapshot(conn, profile, &[provider()]).unwrap()
     }
 

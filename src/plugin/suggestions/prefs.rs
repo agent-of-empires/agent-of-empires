@@ -20,7 +20,7 @@ pub struct PrefsPatch {
     pub provider_enabled: Option<BTreeMap<String, bool>>,
 }
 
-/// `(enabled, sort_order)` per stored provider; absent means enabled, last.
+/// `(enabled, sort_order)` per stored provider; absent means off, last.
 pub(super) fn provider_prefs(
     conn: &Connection,
     profile: &str,
@@ -34,13 +34,13 @@ pub(super) fn provider_prefs(
     .collect()
 }
 
-/// Ids of the providers the user switched off.
-pub(crate) fn disabled_providers(
+/// Ids of the providers switched on. A provider with no stored switch is off.
+pub(crate) fn enabled_providers(
     conn: &Connection,
     profile: &str,
 ) -> rusqlite::Result<HashSet<String>> {
     conn.prepare(
-        "SELECT provider_id FROM suggestion_provider_prefs WHERE profile = ?1 AND enabled = 0",
+        "SELECT provider_id FROM suggestion_provider_prefs WHERE profile = ?1 AND enabled = 1",
     )?
     .query_map([profile], |row| row.get(0))?
     .collect()
@@ -160,7 +160,7 @@ pub(crate) fn apply_prefs(
     }
     for (position, id) in patch.provider_order.iter().flatten().enumerate() {
         tx.execute(
-            "INSERT INTO suggestion_provider_prefs (profile, provider_id, sort_order) VALUES (?1, ?2, ?3)
+            "INSERT INTO suggestion_provider_prefs (profile, provider_id, enabled, sort_order) VALUES (?1, ?2, 0, ?3)
              ON CONFLICT (profile, provider_id) DO UPDATE SET sort_order = ?3",
             params![profile, id, position as i64],
         )?;
@@ -271,26 +271,37 @@ mod tests {
     }
 
     #[test]
-    fn disabled_provider_stays_listed_but_hides_items_and_refresh() {
+    fn a_provider_is_off_until_switched_on_and_stays_listed() {
         let conn = store();
+        let known = ["acme.github".to_string()];
+        let apply = |patch: Value| {
+            apply_prefs(&conn, "p", &known, &serde_json::from_value(patch).unwrap())
+                .unwrap()
+                .unwrap()
+        };
+        let shot = || snapshot(&conn, "p", &[provider()]).unwrap();
         publish(&conn, "p", &[item("a", "assigned")]);
-        assert_eq!(ids(&snap(&conn, "p")), ["a"]);
-        assert!(disabled_providers(&conn, "p").unwrap().is_empty());
-
-        let patch = serde_json::from_value(json!({ "provider_enabled": { "acme.github": false } }))
-            .unwrap();
-        apply_prefs(&conn, "p", &["acme.github".to_string()], &patch)
-            .unwrap()
-            .unwrap();
-        let snapshot = snap(&conn, "p");
+        let snapshot = shot();
         assert!(ids(&snapshot).is_empty());
         assert_eq!(snapshot["providers"][0]["enabled"], false);
         assert!(snapshot["providers"][0]["updated_at"].is_i64());
+        assert!(enabled_providers(&conn, "p").unwrap().is_empty());
+
+        // Ordering a provider does not switch it on.
+        apply(json!({ "provider_order": ["acme.github"] }));
+        assert_eq!(shot()["providers"][0]["enabled"], false);
+
+        apply(json!({ "provider_enabled": { "acme.github": true } }));
+        assert_eq!(ids(&shot()), ["a"]);
         assert_eq!(
-            disabled_providers(&conn, "p").unwrap(),
+            enabled_providers(&conn, "p").unwrap(),
             HashSet::from(["acme.github".to_string()])
         );
-        assert!(disabled_providers(&conn, "other").unwrap().is_empty());
+        assert!(enabled_providers(&conn, "other").unwrap().is_empty());
+
+        apply(json!({ "provider_enabled": { "acme.github": false } }));
+        assert!(ids(&shot()).is_empty());
+        assert!(enabled_providers(&conn, "p").unwrap().is_empty());
     }
 
     #[test]

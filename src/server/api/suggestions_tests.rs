@@ -192,6 +192,12 @@ pub(crate) fn seed_item_on(host: &PluginHost, id: &str, mapping_key: Option<&str
     );
     host.with_suggestions_db(|conn, profile| {
         conn.execute(
+            "INSERT OR IGNORE INTO suggestion_provider_prefs (profile, provider_id, enabled)
+             VALUES (?1, ?2, 1)",
+            [profile, PROVIDER],
+        )
+        .unwrap();
+        conn.execute(
             "INSERT OR REPLACE INTO suggestion_providers (profile, provider_id, updated_at)
              VALUES (?1, ?2, 0)",
             [profile, PROVIDER],
@@ -661,6 +667,35 @@ async fn a_suggestion_request_for_another_profile_is_refused_untouched() {
         )
         .await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// An installed provider with no stored switch is listed as off and shows
+/// nothing; the API turns it on.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_provider_is_listed_off_until_the_api_switches_it_on() {
+    let f = fixture();
+    f.seed_item("a", None, "42");
+    f.host.with_suggestions_db(|conn, _| {
+        conn.execute("DELETE FROM suggestion_provider_prefs", [])
+            .unwrap();
+    });
+    let (_, _, snapshot) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
+    assert_eq!(snapshot["providers"][0]["id"], PROVIDER);
+    assert_eq!(snapshot["providers"][0]["enabled"], false);
+    assert_eq!(snapshot["items"], json!([]));
+
+    let (status, _, _) = f
+        .call(
+            Method::PATCH,
+            "/api/suggestions/prefs",
+            json!({ "provider_enabled": { PROVIDER: true } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, _, snapshot) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
+    assert_eq!(snapshot["providers"][0]["enabled"], true);
+    assert_eq!(snapshot["items"][0]["id"], "a");
 }
 
 #[tokio::test]
