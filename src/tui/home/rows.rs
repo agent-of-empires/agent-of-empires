@@ -195,7 +195,7 @@ impl HomeView {
     }
 
     /// Sessions under the header at `path` that need you. Under Repository a header
-    /// holds the rows at or beneath its `repo/group` path; under My groups, its own
+    /// holds the rows at or beneath its `repo/group` path; under Groups, its own
     /// profile's rows at or beneath its group path.
     pub(super) fn needs_you_under(&self, path: &str, profile: Option<&str>) -> usize {
         let prefix = format!("{path}/");
