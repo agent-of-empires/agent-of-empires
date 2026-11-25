@@ -93,7 +93,10 @@ test("file editing is opt-in, persists exact bytes and mode, and guards dirty pa
   expect(unexpectedDialogs).toEqual([]);
   await expect(editor).toHaveValue("changed\nsecond\n");
   page.once("dialog", (dialog) => dialog.dismiss());
-  await page.getByRole("button", { name: "New terminal", exact: true }).first().click();
+  await page
+    .getByRole("button", { name: /^New terminal for / })
+    .first()
+    .click();
   await expect(editor).toHaveValue("changed\nsecond\n");
   const currentUrl = page.url();
   const leaving = page.waitForEvent("dialog");
@@ -290,9 +293,9 @@ test("changing the other dock keeps a visible draft without asking", async ({ pa
     dialogs.push(dialog.message());
     void dialog.dismiss();
   });
-  const newTerminal = page.getByRole("button", { name: "New terminal", exact: true });
+  const newTerminal = page.getByRole("button", { name: "New terminal for file-docks" });
   await newTerminal.last().click();
-  await expect(page.getByRole("tab", { name: "Terminal 2" })).toBeVisible();
+  await expect(page.getByRole("tab", { name: "file-docks · 2" })).toBeVisible();
   expect(dialogs).toEqual([]);
   await expect(editor).toHaveValue("draft");
   // Hiding the edited tab still asks; declining keeps it.
