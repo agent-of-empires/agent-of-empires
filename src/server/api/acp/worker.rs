@@ -121,7 +121,7 @@ pub async fn spawn_acp(
         Err(rej) => return rej.into_response(),
     };
     if req.recovery.is_some() {
-        return restart_acp(State(state), Path(id), Ok(Json(req)))
+        return Box::pin(restart_acp(State(state), Path(id), Ok(Json(req))))
             .await
             .into_response();
     }
