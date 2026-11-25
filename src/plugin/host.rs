@@ -577,10 +577,6 @@ impl PluginHost {
     /// handler calls it to recover a worker without a full restart.
     pub async fn start(self: &Arc<Self>, registry: &PluginRegistry) {
         Self::log_start_observability(registry);
-        // No worker runs yet, so an interrupted update's clear is safe now.
-        for id in crate::plugin::install::owed_suggestions_cleanups() {
-            self.settle_owed_cleanup(&id, false).await;
-        }
         self.reconcile(registry).await;
     }
 
@@ -634,6 +630,16 @@ impl PluginHost {
             .filter(|p| p.manifest.runtime.is_some())
             .map(|p| p.id().to_string())
             .collect();
+
+        // A marker whose worker is not running is owed to nobody else: pay it
+        // before anything launches, so a same-ID reinstall or an uninstalled
+        // disabled provider cannot republish behind a later clear.
+        let running: HashSet<String> = self.state.lock().await.running.keys().cloned().collect();
+        for id in crate::plugin::install::owed_suggestions_cleanups() {
+            if !running.contains(&id) {
+                self.settle_owed_cleanup(&id, false).await;
+            }
+        }
 
         let to_teardown: Vec<(String, RunningWorker)> = {
             let mut table = self.state.lock().await;
@@ -3409,6 +3415,75 @@ variables = []
             .unwrap()
         });
         assert_eq!(left, 0, "the old publication is gone");
+        assert!(!crate::plugin::install::suggestions_cleanup_owed(plugin_id));
+        host.shutdown().await;
+    }
+
+    /// A marker whose worker is not running is settled by the next reconcile:
+    /// for an uninstalled provider that was disabled, and for a same-ID
+    /// reinstall, before the fresh worker launches.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reconcile_settles_an_owed_cleanup_that_no_worker_owns() {
+        use crate::session::update_config;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("XDG_CONFIG_HOME", temp.path().to_path_buf()),
+            ("HOME", temp.path().to_path_buf()),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let plugin_id = "acme.sleeper";
+        install_sleeper(plugin_id);
+        update_config(|config| config.plugins.get_mut(plugin_id).unwrap().enabled = false).unwrap();
+        let host = PluginHost::new(
+            &temp.path().join("host"),
+            "default",
+            None,
+            std::sync::Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        host.start(&crate::plugin::reload_registry()).await;
+        let publish_and_owe = || {
+            host.api.with_suggestions_db(|conn, _| {
+                conn.execute(
+                    "INSERT INTO suggestion_providers (profile, provider_id, updated_at) VALUES ('p', ?1, 0)",
+                    [plugin_id],
+                )
+                .unwrap();
+            });
+            crate::plugin::install::persist_suggestions_cleanup(plugin_id, true).unwrap();
+        };
+        let published = || {
+            host.api.with_suggestions_db(|conn, _| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM suggestion_providers WHERE provider_id = ?1",
+                    [plugin_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+            })
+        };
+
+        // Uninstalled while disabled: no worker was ever retired for it.
+        publish_and_owe();
+        update_config(|config| config.plugins.remove(plugin_id)).unwrap();
+        std::fs::remove_dir_all(crate::plugin::plugins_dir().unwrap().join(plugin_id)).unwrap();
+        host.reconcile(&crate::plugin::reload_registry()).await;
+        assert_eq!(published(), 0);
+        assert!(!crate::plugin::install::suggestions_cleanup_owed(plugin_id));
+
+        // Reinstalled under the same id while the daemon stays up.
+        publish_and_owe();
+        install_sleeper(plugin_id);
+        host.reconcile(&crate::plugin::reload_registry()).await;
+        wait_until("the fresh worker", || async {
+            worker_pid(&host, plugin_id).await.is_some()
+        })
+        .await;
+        assert_eq!(published(), 0, "the old rows were cleared first");
         assert!(!crate::plugin::install::suggestions_cleanup_owed(plugin_id));
         host.shutdown().await;
     }
