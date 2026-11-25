@@ -3,6 +3,7 @@ import { FileDiff, Virtualizer } from "@pierre/diffs/react";
 import { processFile } from "@pierre/diffs";
 import type { DiffLineAnnotation, FileContents, FileDiffOptions, SelectedLineRange } from "@pierre/diffs";
 import { useFileContents } from "../../hooks/useFileContents";
+import { useDiffScopeContext } from "../../lib/diffScope";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { useShikiTheme } from "../../hooks/useShikiTheme";
 import type { UseDiffCommentsResult } from "../../hooks/useDiffComments";
@@ -65,7 +66,8 @@ export function DiffFileViewer({
   commentsEnabled = false,
   commentsStore,
 }: Props) {
-  const { contents, loading, error } = useFileContents(sessionId, filePath, repoName, revision);
+  const { scope } = useDiffScopeContext();
+  const { contents, loading, error } = useFileContents(sessionId, filePath, repoName, revision, scope);
   const { theme } = useShikiTheme();
   const { settings } = useWebSettings();
 

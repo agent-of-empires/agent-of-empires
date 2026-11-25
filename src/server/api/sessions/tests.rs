@@ -6649,9 +6649,13 @@ async fn session_diff_files_flags_a_working_directory_outside_any_repository() {
     let state = crate::server::test_support::build_test_app_state(instances.clone());
 
     for ((label, path, outside), inst) in cases.iter().zip(&instances) {
-        let resp = session_diff_files(State(state.clone()), AxumPath(inst.id.clone()))
-            .await
-            .into_response();
+        let resp = session_diff_files(
+            State(state.clone()),
+            AxumPath(inst.id.clone()),
+            axum::extract::Query(DiffFilesQuery::default()),
+        )
+        .await
+        .into_response();
         let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let base = &body["per_repo_bases"][0];
@@ -7962,6 +7966,115 @@ async fn handlers_take_instance_lock_before_snapshot() {
     }
 }
 
+/// `?scope=` picks what the working tree is compared against; Last turn needs a turn snapshot.
+#[tokio::test]
+#[serial_test::serial]
+async fn diff_scopes_compare_against_the_branch_head_or_last_turn() {
+    use axum::body::to_bytes;
+    use axum::extract::Query;
+
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let (dir, repo) = crate::git::test_support::init_repo();
+    let root = repo.head().unwrap().peel_to_commit().unwrap().id();
+    repo.branch("base", &repo.find_commit(root).unwrap(), false)
+        .unwrap();
+    crate::git::test_support::commit(
+        &repo,
+        Some("HEAD"),
+        &[("branch.txt", b"b\n")],
+        &[root],
+        None,
+    );
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    repo.checkout_head(Some(checkout.force())).unwrap();
+    std::fs::write(dir.path().join("before.txt"), "before\n").unwrap();
+    let mut inst = Instance::new("scopes", dir.path().to_str().unwrap());
+    inst.base_branch_override = Some("base".into());
+    let id = inst.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+    let files = |scope| {
+        let state = state.clone();
+        let id = id.clone();
+        async move {
+            let resp = session_diff_files(State(state), Path(id), Query(DiffFilesQuery { scope }))
+                .await
+                .into_response();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let paths: Vec<String> = body["files"]
+                .as_array()
+                .map(|files| {
+                    files
+                        .iter()
+                        .map(|f| f["path"].as_str().unwrap().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            (status, paths, body["last_turn_at"].is_string())
+        }
+    };
+    assert_eq!(
+        files(DiffScope::Branch).await,
+        (
+            StatusCode::OK,
+            vec!["before.txt".into(), "branch.txt".into()],
+            false
+        )
+    );
+    assert_eq!(
+        files(DiffScope::Uncommitted).await,
+        (StatusCode::OK, vec!["before.txt".into()], false)
+    );
+    assert_eq!(files(DiffScope::LastTurn).await.0, StatusCode::CONFLICT);
+
+    let tree = crate::git::diff::snapshot_worktree(dir.path()).unwrap();
+    state.turn_snapshots.write().unwrap().insert(
+        id.clone(),
+        crate::server::turn_snapshot::TurnSnapshot {
+            at: crate::time::Timestamp::now(),
+            trees: [(dir.path().to_str().unwrap().to_string(), tree)].into(),
+        },
+    );
+    std::fs::write(dir.path().join("during.txt"), "during\n").unwrap();
+    // The scan cache keys on the base, so the new file shows despite the short TTL.
+    assert_eq!(
+        files(DiffScope::LastTurn).await,
+        (StatusCode::OK, vec!["during.txt".into()], true)
+    );
+
+    let resp = session_diff_file(
+        State(state.clone()),
+        Path(id.clone()),
+        Query(FileDiffQuery {
+            path: "during.txt".into(),
+            repo: None,
+            scope: DiffScope::LastTurn,
+        }),
+    )
+    .await
+    .into_response();
+    let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        (body["old_content"].as_str(), body["new_content"].as_str()),
+        (Some(""), Some("during\n"))
+    );
+}
+
+/// An unknown scope is a client error, not a silent Branch diff.
+#[test]
+fn an_unknown_diff_scope_is_rejected() {
+    let parse = |q: &str| {
+        let uri: axum::http::Uri = format!("http://aoe/diff/files?{q}").parse().unwrap();
+        axum::extract::Query::<DiffFilesQuery>::try_from_uri(&uri).map(|q| q.0.scope)
+    };
+    assert_eq!(parse("").unwrap(), DiffScope::Branch);
+    assert_eq!(parse("scope=last_turn").unwrap(), DiffScope::LastTurn);
+    assert!(parse("scope=yesterday").is_err());
+}
+
 /// A workspace row can persist with `repos: []`; a file-diff request that
 /// omits `?repo=` must get a 400 for it, not a panic on the empty repo list.
 #[tokio::test]
@@ -7985,6 +8098,7 @@ async fn diff_file_rejects_workspace_with_no_repos() {
         Query(FileDiffQuery {
             path: "Cargo.toml".to_string(),
             repo: None,
+            scope: DiffScope::Branch,
         }),
     )
     .await
@@ -8061,6 +8175,7 @@ mod open_file {
             Query(FileDiffQuery {
                 path: path.to_string(),
                 repo: repo.map(str::to_string),
+                scope: DiffScope::Branch,
             }),
         )
         .await

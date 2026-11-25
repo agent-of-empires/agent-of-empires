@@ -116,6 +116,26 @@
       "notes": "The shell's Host/Container mode is per Session and terminal tab. Revealing it focuses at once only when it is shown and stays mounted; otherwise focus is latched and activateTab reveals the tab, opening a collapsed dock. The focus and the latch name that terminal, so with one shown in each dock, Cmd+` and Open Terminal never land in the other."
     },
     {
+      "id": "diff.scope",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/diff-scope.spec.ts",
+        "src/components/diff/__tests__/DiffScopePicker.test.tsx",
+        "src/hooks/useDiffFiles.test.ts",
+        "src/lib/__tests__/diffScope.test.ts"
+      ],
+      "components": [
+        "web/src/components/diff/DiffScopePicker.tsx",
+        "web/src/components/diff/DiffFileList.tsx",
+        "web/src/components/diff/DiffFileViewer.tsx",
+        "web/src/hooks/useDiffFiles.ts",
+        "web/src/hooks/useFileContents.ts",
+        "web/src/lib/diffScope.ts"
+      ],
+      "notes": "Branch, Uncommitted and Last turn switch the file list and the viewer's request scope; the base picker shows only for Branch. Last turn is disabled with its reason until the server reports a turn snapshot, and a refused Last turn request falls back to Branch. The pick is remembered per Session in this browser. Server scopes are covered by git::diff and server::api::sessions Rust tests."
+    },
+    {
       "id": "dock.review-panel",
       "kind": "mocked-playwright",
       "risk": "medium",

@@ -81,20 +81,69 @@ pub struct FileDiff {
     pub is_binary: bool,
 }
 
+/// What a diff compares the working tree against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffBase<'a> {
+    /// The merge-base of HEAD and this branch, so only the branch's changes show.
+    Branch(&'a str),
+    /// HEAD, so only uncommitted changes show.
+    Head,
+    /// A tree recorded earlier by [`snapshot_worktree`].
+    Tree(git2::Oid),
+}
+
+fn base_tree<'r>(repo: &'r git2::Repository, base: DiffBase<'_>) -> Result<git2::Tree<'r>> {
+    match base {
+        DiffBase::Branch(branch) => get_merge_base_tree(repo, branch),
+        DiffBase::Head => match repo.head().and_then(|head| head.peel_to_tree()) {
+            Ok(tree) => Ok(tree),
+            // An unborn branch has nothing committed: everything is uncommitted.
+            Err(_) => Ok(repo.find_tree(repo.treebuilder(None)?.write()?)?),
+        },
+        DiffBase::Tree(oid) => Ok(repo.find_tree(oid)?),
+    }
+}
+
+/// The working tree as a tree object, untracked files included and ignored ones not.
+///
+/// Like `git stash create`, it stages into a copy of the index that is never saved, so the user's
+/// index, refs and stash are untouched; only the tree and its new blobs are written to the object
+/// store, unreferenced until garbage collection.
+pub fn snapshot_worktree(repo_path: &Path) -> Result<git2::Oid> {
+    let repo = super::open_repo_at(repo_path)?;
+    let mut index = repo.index()?;
+    index.add_all(["*"], git2::IndexAddOption::DEFAULT, None)?;
+    index.update_all(["*"], None)?;
+    Ok(index.write_tree()?)
+}
+
 /// Changed files between a base branch and the working directory, from the
 /// merge-base of HEAD and the base, so only this branch's changes show.
 pub fn compute_changed_files(repo_path: &Path, base_branch: &str) -> Result<Vec<DiffFile>> {
+    compute_changed_files_against(repo_path, DiffBase::Branch(base_branch))
+}
+
+/// Changed files between `base` and the working directory.
+pub fn compute_changed_files_against(
+    repo_path: &Path,
+    base: DiffBase<'_>,
+) -> Result<Vec<DiffFile>> {
     let repo = super::open_repo_at(repo_path)?;
 
-    let base_tree = get_merge_base_tree(&repo, base_branch)?;
+    let base_tree = base_tree(&repo, base)?;
 
     // Create diff options
     let mut opts = git2::DiffOptions::new();
     opts.include_untracked(true);
     opts.recurse_untracked_dirs(true);
 
-    // Get diff from base tree to working directory (includes index)
-    let diff = repo.diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut opts))?;
+    // Base tree to working directory. A commit base goes through the index, as `git diff <base>`
+    // does. A snapshot holds untracked files the index lacks, which would read as deleted then
+    // re-added, so it compares the working directory directly.
+    let diff = match base {
+        DiffBase::Tree(_) => repo.diff_tree_to_workdir(Some(&base_tree), Some(&mut opts))?,
+        _ => repo.diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut opts))?,
+    };
 
     // Find renames/copies
     let mut find_opts = git2::DiffFindOptions::new();
@@ -319,7 +368,7 @@ pub fn compute_file_diff(
         new_content,
         is_binary,
         status,
-    } = read_file_state(&repo, &workdir, file_path, base_branch)?;
+    } = read_file_state(&repo, &workdir, file_path, DiffBase::Branch(base_branch))?;
 
     if is_binary {
         return Ok(FileDiff {
@@ -435,9 +484,18 @@ pub fn compute_file_contents(
     file_path: &Path,
     base_branch: &str,
 ) -> Result<FileContents> {
+    compute_file_contents_against(repo_path, file_path, DiffBase::Branch(base_branch))
+}
+
+/// [`compute_file_contents`] against any [`DiffBase`].
+pub fn compute_file_contents_against(
+    repo_path: &Path,
+    file_path: &Path,
+    base: DiffBase<'_>,
+) -> Result<FileContents> {
     let repo = super::open_repo_at(repo_path)?;
     let workdir = repo.workdir().ok_or(GitError::NotAGitRepo)?.to_path_buf();
-    let state = read_file_state(&repo, &workdir, file_path, base_branch)?;
+    let state = read_file_state(&repo, &workdir, file_path, base)?;
     // libgit2's xdiff, not the `similar` crate: xdiff is C compiled optimized
     // regardless of cargo profile and carries git's pathological-input
     // heuristics. `similar`'s Myers took ~20s on a +10k/-13k lockfile churn
@@ -481,9 +539,9 @@ fn read_file_state(
     repo: &git2::Repository,
     workdir: &Path,
     file_path: &Path,
-    base_branch: &str,
+    base: DiffBase<'_>,
 ) -> Result<FileState> {
-    let base_tree = get_merge_base_tree(repo, base_branch)?;
+    let base_tree = base_tree(repo, base)?;
 
     // Get old content from base tree (as bytes first to check for binary)
     let old_bytes = get_blob_bytes(repo, &base_tree, file_path);
@@ -796,6 +854,86 @@ mod tests {
         let parents: Vec<&git2::Commit> = parent.iter().collect();
         repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
             .unwrap();
+    }
+
+    #[test]
+    fn each_diff_base_compares_the_working_tree_against_its_own_tree() {
+        let (dir, repo) = setup_test_repo();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("base", &head, false).unwrap();
+        commit_file(&repo, "committed.txt", "on the branch\n", "branch work");
+        fs::write(dir.path().join("test.txt"), "line 1\nchanged\nline 3\n").unwrap();
+        fs::write(dir.path().join("untracked.txt"), "new\n").unwrap();
+        fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(dir.path().join("ignored.txt"), "never\n").unwrap();
+
+        let index_before = fs::read(dir.path().join(".git/index")).unwrap();
+        let snapshot = snapshot_worktree(dir.path()).unwrap();
+        // Staging into a copy leaves the user's index, stash and refs as they were.
+        assert_eq!(
+            fs::read(dir.path().join(".git/index")).unwrap(),
+            index_before
+        );
+        assert!(repo.find_reference("refs/stash").is_err());
+        fs::write(dir.path().join("untracked.txt"), "new\nedited this turn\n").unwrap();
+        fs::write(dir.path().join("turn.txt"), "made this turn\n").unwrap();
+        fs::remove_file(dir.path().join("test.txt")).unwrap();
+
+        let paths = |base| {
+            compute_changed_files_against(dir.path(), base)
+                .unwrap()
+                .into_iter()
+                .map(|f| (f.path.to_string_lossy().into_owned(), f.status))
+                .collect::<Vec<_>>()
+        };
+        use FileStatus::*;
+        assert_eq!(
+            paths(DiffBase::Branch("base")),
+            [
+                (".gitignore".into(), Untracked),
+                ("committed.txt".into(), Added),
+                ("test.txt".into(), Deleted),
+                ("turn.txt".into(), Untracked),
+                ("untracked.txt".into(), Untracked),
+            ]
+        );
+        assert_eq!(
+            paths(DiffBase::Head),
+            [
+                (".gitignore".into(), Untracked),
+                ("test.txt".into(), Deleted),
+                ("turn.txt".into(), Untracked),
+                ("untracked.txt".into(), Untracked),
+            ]
+        );
+        assert_eq!(
+            paths(DiffBase::Tree(snapshot)),
+            [
+                ("test.txt".into(), Deleted),
+                ("turn.txt".into(), Untracked),
+                ("untracked.txt".into(), Modified),
+            ]
+        );
+        let contents = compute_file_contents_against(
+            dir.path(),
+            Path::new("untracked.txt"),
+            DiffBase::Tree(snapshot),
+        )
+        .unwrap();
+        assert_eq!(
+            (contents.old_content.as_str(), contents.new_content.as_str()),
+            ("new\n", "new\nedited this turn\n")
+        );
+    }
+
+    #[test]
+    fn uncommitted_changes_on_an_unborn_branch_are_the_whole_tree() {
+        let dir = TempDir::new().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join("first.txt"), "hello\n").unwrap();
+        let files = compute_changed_files_against(dir.path(), DiffBase::Head).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, Path::new("first.txt"));
     }
 
     /// Only tracked blobs are served: an untracked secret (#1810) and `.git`

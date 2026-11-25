@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { getSessionDiffFiles, reportTelemetrySeen } from "../lib/api";
+import type { DiffScope } from "../lib/diffScope";
 import type { RepoBase, RichDiffFile } from "../lib/types";
 import { useLatestRef } from "./useLatestRef";
 
@@ -13,10 +14,19 @@ interface UseDiffFilesResult {
   loading: boolean;
   revision: number;
   refresh: () => void;
+  /** The scope the files were computed for: Branch while a requested Last turn has no snapshot. */
+  scope: DiffScope;
+  lastTurnAt: string | null;
 }
 
-export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDiffFilesResult {
+export function useDiffFiles(
+  sessionId: string | null,
+  enabled: boolean,
+  requestedScope: DiffScope = "branch",
+): UseDiffFilesResult {
   const [files, setFiles] = useState<RichDiffFile[]>([]);
+  const [scope, setScope] = useState<DiffScope>(requestedScope);
+  const [lastTurnAt, setLastTurnAt] = useState<string | null>(null);
   const [perRepoBases, setPerRepoBases] = useState<RepoBase[]>(DEFAULT_BASES);
   const [warning, setWarning] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -32,7 +42,13 @@ export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDif
     const capturedSessionId = sessionId;
     if (capturedSessionId !== currentSessionIdRef.current) return;
     const reqId = ++requestIdRef.current;
-    const resp = await getSessionDiffFiles(capturedSessionId);
+    let shown = requestedScope;
+    let resp = await getSessionDiffFiles(capturedSessionId, shown);
+    // Without a turn snapshot the server refuses Last turn; show Branch until a turn starts.
+    if (!resp && shown === "last_turn") {
+      shown = "branch";
+      resp = await getSessionDiffFiles(capturedSessionId, shown);
+    }
     if (reqId !== requestIdRef.current || capturedSessionId !== currentSessionIdRef.current) return;
     if (resp) {
       // Include bases and warning: a base change can leave the file list identical (#3329).
@@ -40,9 +56,13 @@ export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDif
         files: resp.files,
         per_repo_bases: resp.per_repo_bases,
         warning: resp.warning ?? null,
+        scope: shown,
+        last_turn_at: resp.last_turn_at ?? null,
       });
       if (fingerprint !== lastFingerprintRef.current) {
         lastFingerprintRef.current = fingerprint;
+        setScope(shown);
+        setLastTurnAt(resp.last_turn_at ?? null);
         setFiles(resp.files);
         setPerRepoBases(resp.per_repo_bases);
         setWarning(resp.warning ?? null);
@@ -54,7 +74,7 @@ export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDif
       }
     }
     setLoading(false);
-  }, [sessionId, enabledRef]);
+  }, [sessionId, enabledRef, requestedScope]);
 
   const [trackedSessionId, setTrackedSessionId] = useState(sessionId);
   if (sessionId !== trackedSessionId) {
@@ -62,6 +82,7 @@ export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDif
     setFiles([]);
     setPerRepoBases(DEFAULT_BASES);
     setWarning(null);
+    setLastTurnAt(null);
     if (sessionId === null) {
       setLoading(false);
       setRevision(0);
@@ -98,5 +119,7 @@ export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDif
     loading,
     revision,
     refresh: fetchFiles,
+    scope,
+    lastTurnAt,
   };
 }

@@ -4,6 +4,8 @@ import { sessionDiffRawFileUrl } from "../../lib/api";
 import { buildDiffTree } from "../../lib/diffTree";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { BasePicker } from "./BasePicker";
+import { DiffScopePicker } from "./DiffScopePicker";
+import { useDiffScopeContext } from "../../lib/diffScope";
 import { FileContextMenu, type PathMenuState } from "./FileContextMenu";
 import { Chevron, FlatList, LineCounts, TreeView } from "./DiffFileRows";
 
@@ -50,6 +52,8 @@ export function DiffFileList({
   baseBranchOverride,
   onBaseBranchChanged,
 }: Props) {
+  // The base branch only applies to the Branch comparison.
+  const { scope } = useDiffScopeContext();
   const isMultiRepo = perRepoBases.length > 1;
   // A one-repo workspace's session path is the workspace dir, not its repo.
   const workspaceRepo = !isMultiRepo && perRepoBases[0]?.repo_name ? perRepoBases[0] : undefined;
@@ -194,7 +198,8 @@ export function DiffFileList({
       <div className="px-3 py-2 border-b border-surface-700/20 shrink-0">
         <div className="flex items-center gap-2 flex-wrap">
           <span className="font-mono text-[11px] uppercase tracking-wider text-text-dim">Changes</span>
-          {isMultiRepo ? (
+          <DiffScopePicker />
+          {scope !== "branch" ? null : isMultiRepo ? (
             <span className={CHIP}>{perRepoBases.length} repos</span>
           ) : sessionId && repoPath ? (
             <BasePicker
@@ -276,6 +281,7 @@ function RepoGroup({
   selectedRepoName: string | undefined;
   onSelectFile: (path: string, repoName?: string) => void;
 }) {
+  const { scope } = useDiffScopeContext();
   const name = repo.repo_name ?? "";
   const ns = `${name}${REPO_NS_SEP}`;
   const localCollapsed = useMemo(
@@ -302,7 +308,7 @@ function RepoGroup({
         </button>
         {repo.base_branch === undefined ? (
           <span className="font-mono text-[10px] text-text-dim">not a git repository</span>
-        ) : sessionId ? (
+        ) : scope !== "branch" ? null : sessionId ? (
           <BasePicker
             sessionId={sessionId}
             repoPath={repo.repo_path}

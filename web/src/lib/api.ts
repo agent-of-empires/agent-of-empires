@@ -27,6 +27,7 @@ import type {
 import type { AcpAttachment, ConfigOptionDescriptor, PromptAttachmentInput } from "./acpTypes";
 import { clearDeviceBindingSecret, getOrCreateDeviceBindingSecret } from "./deviceBinding";
 import { INLINE_ELEVATION_HEADER } from "./fetchInterceptor";
+import { scopeParam, type DiffScope } from "./diffScope";
 
 type Payload = Record<string, unknown>;
 
@@ -433,8 +434,9 @@ export async function killTerminal(id: string, index: number): Promise<boolean> 
   }
 }
 
-export function getSessionDiffFiles(id: string): Promise<RichDiffFilesResponse | null> {
-  return fetchJson<RichDiffFilesResponse>(`/api/sessions/${id}/diff/files`);
+export function getSessionDiffFiles(id: string, scope: DiffScope = "branch"): Promise<RichDiffFilesResponse | null> {
+  const param = scopeParam(scope);
+  return fetchJson<RichDiffFilesResponse>(`/api/sessions/${id}/diff/files${param ? `?scope=${param}` : ""}`);
 }
 
 /**
@@ -446,9 +448,12 @@ export function getSessionFileContents(
   id: string,
   filePath: string,
   repoName?: string,
+  scope: DiffScope = "branch",
 ): Promise<RichFileContentsResponse | null> {
   const params = new URLSearchParams({ path: filePath });
   if (repoName) params.set("repo", repoName);
+  const param = scopeParam(scope);
+  if (param) params.set("scope", param);
   return fetchJson<RichFileContentsResponse>(`/api/sessions/${id}/diff/file?${params.toString()}`);
 }
 

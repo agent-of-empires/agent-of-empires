@@ -41,9 +41,69 @@ pub struct RepoBase {
     pub base_override: Option<String>,
 }
 
+/// What the diff endpoints compare the working tree against: `?scope=`, `branch` when omitted.
+#[derive(Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffScope {
+    /// The merge-base with the session's diff base branch.
+    #[default]
+    Branch,
+    /// HEAD: changes not yet committed.
+    Uncommitted,
+    /// The working tree when the agent's latest turn started; see `turn_snapshot`.
+    LastTurn,
+}
+
+#[derive(Deserialize, Default)]
+pub struct DiffFilesQuery {
+    #[serde(default)]
+    pub scope: DiffScope,
+}
+
+/// A Last turn request for a session with no snapshot since the Daemon started.
+fn no_turn_snapshot() -> axum::response::Response {
+    api_error(
+        StatusCode::CONFLICT,
+        "no_turn_snapshot",
+        "No turn has started since the daemon started",
+    )
+}
+
+/// The tree a scope compares `repo_path` against. `None` for a Last turn repo the snapshot missed.
+fn scope_base<'a>(
+    scope: DiffScope,
+    base_branch: &'a str,
+    repo_path: &str,
+    snapshot: Option<&crate::server::turn_snapshot::TurnSnapshot>,
+) -> Option<crate::git::diff::DiffBase<'a>> {
+    use crate::git::diff::DiffBase;
+    match scope {
+        DiffScope::Branch => Some(DiffBase::Branch(base_branch)),
+        DiffScope::Uncommitted => Some(DiffBase::Head),
+        DiffScope::LastTurn => snapshot
+            .and_then(|s| s.trees.get(repo_path))
+            .map(|tree| DiffBase::Tree(*tree)),
+    }
+}
+
+fn turn_snapshot_of(
+    state: &AppState,
+    id: &str,
+) -> Option<crate::server::turn_snapshot::TurnSnapshot> {
+    state
+        .turn_snapshots
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(id)
+        .cloned()
+}
+
 #[derive(Serialize)]
 pub struct RichDiffFilesResponse {
     pub files: Vec<RichDiffFileInfo>,
+    /// When the latest turn's snapshot was taken, so the client can offer the Last turn scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_turn_at: Option<String>,
     /// One entry per repo whose diff was computed: one element with
     /// `repo_name: None` for single-repo sessions, one per member for workspace
     /// sessions, since each member can have a different default (#1047).
@@ -136,10 +196,10 @@ pub(super) fn validate_diff_path(
 /// One repo's worth of diff context: a name for workspace members, the path
 /// the diff helper walks, and the two base-branch layers that vary per repo.
 #[derive(Clone, Debug)]
-pub(super) struct DiffRepo {
+pub(crate) struct DiffRepo {
     /// Workspace member name, or None for single-repo sessions.
     pub(super) name: Option<String>,
-    pub(super) path: String,
+    pub(crate) path: String,
     /// Explicit override for this entry's diff base, set via
     /// `PATCH /api/sessions/{id}/diff-base`, `aoe session set-base`, or the TUI
     /// diff view's `b` keybind (#970, #3329).
@@ -193,7 +253,7 @@ fn select_diff_repo(
 
 /// The repo entries for one session, split out of [`resolve_diff_repos`] so the
 /// per-repo base plumbing is testable without an `AppState`.
-pub(super) fn diff_repos_of(inst: &crate::session::Instance) -> Vec<DiffRepo> {
+pub(crate) fn diff_repos_of(inst: &crate::session::Instance) -> Vec<DiffRepo> {
     // A session with any repo record lists one entry per repo; a session with
     // none falls back to its project_path.
     let mut repos: Vec<DiffRepo> = inst
@@ -251,6 +311,7 @@ pub(super) fn resolve_diff_base(
 pub async fn session_diff_files(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<DiffFilesQuery>,
 ) -> impl IntoResponse {
     if let Some(resp) = crate::server::api::cityhall_block(&state) {
         return resp;
@@ -259,6 +320,11 @@ pub async fn session_diff_files(
         Ok(c) => c,
         Err(resp) => return resp,
     };
+    let snapshot = turn_snapshot_of(&state, &id);
+    if query.scope == DiffScope::LastTurn && snapshot.is_none() {
+        return no_turn_snapshot();
+    }
+    let last_turn_at = snapshot.as_ref().map(|s| s.at.to_rfc3339());
 
     let scan_state = state.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -290,9 +356,16 @@ pub async fn session_diff_files(
                 config_default.as_deref(),
                 path,
             );
-            let warning = diff::check_merge_base_status(path, &base_branch);
-            let changed = scan_state
-                .changed_files_cached(path, &base_branch)
+            let warning = match query.scope {
+                DiffScope::Branch => diff::check_merge_base_status(path, &base_branch),
+                _ => None,
+            };
+            let changed = scope_base(query.scope, &base_branch, &repo.path, snapshot.as_ref())
+                .map(|base| {
+                    scan_state
+                        .changed_files_cached(path, base)
+                        .unwrap_or_default()
+                })
                 .unwrap_or_default();
 
             for f in changed {
@@ -322,6 +395,7 @@ pub async fn session_diff_files(
 
         RichDiffFilesResponse {
             files: all_files,
+            last_turn_at,
             per_repo_bases,
             warning: if warnings.is_empty() {
                 None
@@ -357,6 +431,8 @@ pub struct FileDiffQuery {
     /// single-repo URL keeps working (#1047).
     #[serde(default)]
     pub repo: Option<String>,
+    #[serde(default)]
+    pub scope: DiffScope,
 }
 
 /// Response for a rejected diff request (bad path, file not changed, etc.).
@@ -386,6 +462,10 @@ pub async fn session_diff_file(
     let base_override = selected_repo.base_override;
     let recorded_base = selected_repo.recorded_base;
     let scan_state = state.clone();
+    let snapshot = turn_snapshot_of(&state, &id);
+    if query.scope == DiffScope::LastTurn && snapshot.is_none() {
+        return no_turn_snapshot();
+    }
 
     let result =
         tokio::task::spawn_blocking(move || -> Result<serde_json::Value, DiffFileError> {
@@ -408,8 +488,10 @@ pub async fn session_diff_file(
             // Files in the changed set are diffed; an in-repo file with no
             // diff is served through the full-file fallback below. The
             // traversal and containment checks are the security boundary.
+            let base = scope_base(query.scope, &base_branch, &project_path, snapshot.as_ref())
+                .ok_or(DiffFileError::NotFound("no turn snapshot for this repo"))?;
             let changed_files = scan_state
-                .changed_files_cached(repo_path, &base_branch)
+                .changed_files_cached(repo_path, base)
                 .map_err(|e| DiffFileError::Internal(e.into()))?;
             let (canonical_path, is_changed) =
                 match validate_diff_path(repo_path, file_path, &changed_files) {
@@ -467,7 +549,7 @@ pub async fn session_diff_file(
             // Hand the client raw old/new text plus a server-computed unified
             // patch, which it renders virtualized and off-main-thread without
             // re-running the diff algorithm.
-            let contents = diff::compute_file_contents(repo_path, file_path, &base_branch)
+            let contents = diff::compute_file_contents_against(repo_path, file_path, base)
                 .map_err(|e| DiffFileError::Internal(e.into()))?;
             // additions/deletions are not computed on this path; reuse the
             // counts the changed-files scan already produced.

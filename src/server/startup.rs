@@ -1146,6 +1146,7 @@ pub(crate) async fn start_server(
         }),
         remote_owner_cache: RwLock::new(std::collections::HashMap::new()),
         changed_files_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
+        turn_snapshots: Default::default(),
         status_tx,
         lifecycle: crate::server::lifecycle_feed::LifecycleFeed::new(),
         acp_events_tx: acp_events_tx.clone(),
@@ -1395,6 +1396,7 @@ pub(crate) async fn start_server(
     // Launch plugin workers for every active plugin that declares a runtime.
     // Non-blocking: each worker runs in its own supervised task. A daemon with
     // no community plugin workers (the common case) does nothing here.
+    crate::server::turn_snapshot::spawn_recorder(state.clone());
     if let Some(host) = state.plugin_host.clone() {
         // Record the sessions on disk before a worker can list them, so a change made after
         // its list is reported against that baseline instead of being absorbed into it.
