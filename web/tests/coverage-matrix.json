@@ -773,7 +773,7 @@
       "risk": "high",
       "specs": ["tests/live/startup-recovery.spec.ts"],
       "components": ["src/server/api/sessions/lifecycle.rs", "src/server/startup_recovery.rs"],
-      "notes": "Missing Idle/Waiting/Running panes resume at Daemon startup, in any profile, and a failed resume leaves no pane. Neither recovery nor an API or CLI restart types anything into the agent. Uses private fake agents."
+      "notes": "Missing Idle/Waiting/Running panes resume at Daemon startup, in any profile, and a failed resume leaves no pane. For terminal sessions, neither recovery nor an API or CLI restart types anything into the agent; Structured restarts are not covered here. Uses private fake agents."
     },
     {
       "id": "settings.list-field",
