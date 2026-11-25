@@ -15,7 +15,7 @@ use ratatui::Frame;
 
 #[cfg(test)]
 use crate::daemon::suggestions::{Draft, Prefs, PreparedProject, ResolvedProject};
-use crate::daemon::suggestions::{Item, Prepared, Provider, Snapshot, Started, WirePreset};
+use crate::daemon::suggestions::{Item, Prepared, Provider, Snapshot, Started};
 
 #[cfg(not(test))]
 use crate::acp::client::locate_daemon;
@@ -133,6 +133,7 @@ fn start_answer(status: u16, body: &serde_json::Value) -> StartAnswer {
             }
         }
         (400, "no_project") => StartAnswer::NoProject,
+        (409, "profile_mismatch") => StartAnswer::Failed(ORIGIN_CHANGED.into()),
         (_, "stale" | "stale_suggestion") => {
             StartAnswer::Failed("That suggestion is no longer open. Reload with r.".into())
         }
@@ -154,7 +155,9 @@ pub(super) struct Origin {
 
 enum Req {
     Load,
-    Refresh,
+    Refresh {
+        origin: Option<Origin>,
+    },
     Dismiss {
         provider_id: String,
         id: String,
@@ -190,12 +193,16 @@ impl Req {
             Req::Dismiss { origin, .. }
             | Req::Prepare { origin, .. }
             | Req::Start { origin, .. }
+            | Req::Refresh { origin }
             | Req::PreTrust { origin }
             | Req::ShowOnHome { origin, .. } => origin.as_ref(),
             _ => None,
         }
     }
 }
+
+const ORIGIN_CHANGED: &str =
+    "The daemon or profile changed since this list loaded. Reload and try again.";
 
 /// Why a request bound to `origin` must not go to `daemon`, which publishes `published`.
 fn origin_error(origin: &Origin, daemon: &str, published: Option<&str>) -> Option<String> {
@@ -205,9 +212,18 @@ fn origin_error(origin: &Origin, daemon: &str, published: Option<&str>) -> Optio
         .as_deref()
         .zip(published)
         .is_some_and(|(shown, now)| shown != now);
-    (moved || switched).then(|| {
-        "The daemon or profile changed since this list loaded. Reload and try again.".to_string()
-    })
+    (moved || switched).then(|| ORIGIN_CHANGED.to_string())
+}
+
+/// A refusal as status text; the daemon's `profile_mismatch` reads as [`ORIGIN_CHANGED`].
+fn refusal(e: crate::daemon::DaemonClientError) -> String {
+    match &e {
+        crate::daemon::DaemonClientError::Status {
+            code: Some(crate::daemon::ApiErrorCode::ProfileMismatch),
+            ..
+        } => ORIGIN_CHANGED.to_string(),
+        _ => e.to_string(),
+    }
 }
 
 enum Res {
@@ -246,7 +262,7 @@ fn failed(req: &Req, message: String) -> Res {
     match req {
         Req::Prepare { .. } => Res::Prepared(Err(message)),
         Req::Start { .. } => Res::Started(Err(message)),
-        Req::Refresh => Res::Refreshed(Err(message)),
+        Req::Refresh { .. } => Res::Refreshed(Err(message)),
         Req::PreTrust { .. } => Res::PreTrusted(Err(message)),
         Req::Load | Req::Dismiss { .. } | Req::ShowOnHome { .. } => Res::Snapshot(Err(message)),
     }
@@ -269,17 +285,20 @@ async fn load(client: &DaemonClient, daemon: &str) -> Result<Snapshot, String> {
     Ok(snapshot)
 }
 
-/// Refuses a request bound to a daemon or profile other than the one answering.
+/// Refuses a request bound to a daemon other than the one answering. The
+/// suggestions API checks the profile itself (`expected_profile`); the
+/// settings API does not, so `check_profile` reads it first.
 #[cfg(not(test))]
 async fn check_bound(
     client: &DaemonClient,
     daemon: &str,
     origin: Option<&Origin>,
+    check_profile: bool,
 ) -> Result<(), String> {
     let Some(origin) = origin else { return Ok(()) };
     let published = match &origin.profile {
-        Some(_) => load(client, daemon).await?.profile,
-        None => None,
+        Some(_) if check_profile => load(client, daemon).await?.profile,
+        _ => None,
     };
     origin_error(origin, daemon, published.as_deref()).map_or(Ok(()), Err)
 }
@@ -295,12 +314,16 @@ async fn run(req: &Req) -> Res {
         Ok(client) => client,
         Err(message) => return failed(req, message),
     };
-    if let Err(message) = check_bound(&client, &daemon, req.origin()).await {
+    let pre_trust = matches!(req, Req::PreTrust { .. });
+    if let Err(message) = check_bound(&client, &daemon, req.origin(), pre_trust).await {
         return failed(req, message);
     }
+    let expected = req.origin().and_then(|o| o.profile.as_deref());
     match req {
         Req::Load => Res::Snapshot(load(&client, &daemon).await),
-        Req::Refresh => Res::Refreshed(client.refresh_suggestions().await.map_err(text)),
+        Req::Refresh { .. } => {
+            Res::Refreshed(client.refresh_suggestions(expected).await.map_err(refusal))
+        }
         Req::PreTrust { .. } => Res::PreTrusted(
             client
                 .patch_settings(
@@ -311,11 +334,15 @@ async fn run(req: &Req) -> Res {
         ),
         Req::ShowOnHome { shown, .. } => {
             match client
-                .set_suggestion_prefs(&serde_json::json!({ "sidebar": shown }))
+                .set_suggestion_prefs(
+                    &serde_json::json!({ "expected_profile": expected, "sidebar": shown }),
+                )
                 .await
             {
                 Ok(()) => Res::Snapshot(load(&client, &daemon).await),
-                Err(e) => Res::Snapshot(Err(format!("Couldn't change the Home row: {e}"))),
+                Err(e) => {
+                    Res::Snapshot(Err(format!("Couldn't change the Home row: {}", refusal(e))))
+                }
             }
         }
         Req::Dismiss {
@@ -324,14 +351,14 @@ async fn run(req: &Req) -> Res {
             dismissed,
             ..
         } => match client
-            .set_suggestion_dismissed(provider_id, id, *dismissed)
+            .set_suggestion_dismissed(expected, provider_id, id, *dismissed)
             .await
         {
             Ok(()) => match load(&client, &daemon).await {
                 Ok(snapshot) => Res::Snapshot(Ok(snapshot)),
                 Err(e) => Res::DismissKept(e),
             },
-            Err(e) => Res::Snapshot(Err(text(e))),
+            Err(e) => Res::Snapshot(Err(refusal(e))),
         },
         Req::Start {
             provider_id,
@@ -339,7 +366,11 @@ async fn run(req: &Req) -> Res {
             review_fingerprint,
             ..
         } => {
-            let mut body = serde_json::json!({ "provider_id": provider_id, "id": id });
+            let mut body = serde_json::json!({
+                "expected_profile": expected,
+                "provider_id": provider_id,
+                "id": id,
+            });
             if let Some(fingerprint) = review_fingerprint {
                 body["approve_hooks"] = true.into();
                 body["review_fingerprint"] = fingerprint.clone();
@@ -349,16 +380,16 @@ async fn run(req: &Req) -> Res {
                     .start_suggestion(&body)
                     .await
                     .map(|(status, body)| start_answer(status, &body))
-                    .map_err(text),
+                    .map_err(refusal),
             )
         }
         Req::Prepare {
             provider_id, id, ..
         } => Res::Prepared(
             client
-                .prepare_suggestion(provider_id, id)
+                .prepare_suggestion(expected, provider_id, id)
                 .await
-                .map_err(text),
+                .map_err(refusal),
         ),
     }
 }
@@ -380,37 +411,6 @@ fn spawn_worker() -> Worker<Req, Res> {
     })
 }
 
-/// Provider text is untrusted: drop control characters (escape sequences) and
-/// bidi overrides, keeping newlines and tabs. A carriage return is dropped, so
-/// CRLF text keeps its line breaks.
-fn plain(s: &str) -> String {
-    s.chars()
-        .filter(|&c| c != '\r')
-        .map(|c| {
-            let hostile = (c.is_control() && c != '\n' && c != '\t')
-                || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
-            if hostile {
-                '\u{fffd}'
-            } else {
-                c
-            }
-        })
-        .collect()
-}
-
-/// `plain` for text shown on a single line: line breaks cannot start a second
-/// one, and a tab becomes a space.
-fn plain_line(s: &str) -> String {
-    plain(s).replace('\n', "\u{fffd}").replace('\t', " ")
-}
-
-/// Resolves a prepared suggestion into a dialog `Start`. A prepare response
-/// without a project (none mapped, or several) leaves the path for the user.
-fn start_for(snapshot: Option<&Snapshot>, key: &ItemKey, prepared: Prepared) -> Start {
-    let item = snapshot
-        .iter()
-        .flat_map(|s| &s.items)
-        .find(|i| i.provider_id == key.0 && i.id == key.1);
 /// The empty pane's setup advice for the providers' `enabled` flags.
 /// `offered` says whether the dashboard shows Set up suggestions, which it
 /// does only while a featured plugin offers them.
@@ -445,6 +445,37 @@ fn setup_lines(
     }
 }
 
+/// Provider text is untrusted: drop control characters (escape sequences) and
+/// bidi overrides, keeping newlines and tabs. A carriage return is dropped, so
+/// CRLF text keeps its line breaks.
+fn plain(s: &str) -> String {
+    s.chars()
+        .filter(|&c| c != '\r')
+        .map(|c| {
+            let hostile = (c.is_control() && c != '\n' && c != '\t')
+                || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+            if hostile {
+                '\u{fffd}'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// `plain` for text shown on a single line: line breaks cannot start a second
+/// one, and a tab becomes a space.
+fn plain_line(s: &str) -> String {
+    plain(s).replace('\n', "\u{fffd}").replace('\t', " ")
+}
+
+/// Resolves a prepared suggestion into a dialog `Start`. A prepare response
+/// without a project (none mapped, or several) leaves the path for the user.
+fn start_for(snapshot: Option<&Snapshot>, key: &ItemKey, prepared: Prepared) -> Start {
+    let item = snapshot
+        .iter()
+        .flat_map(|s| &s.items)
+        .find(|i| i.provider_id == key.0 && i.id == key.1);
     let provider = snapshot
         .iter()
         .flat_map(|s| &s.providers)
@@ -1833,21 +1864,11 @@ impl SuggestionsFeed {
         !self.provider_failures().is_empty()
     }
 
-    fn source_preset(&self, item: &Item) -> Option<&WirePreset> {
-        self.provider(&item.provider_id)?
-            .sources
-            .iter()
-            .find(|s| s.criterion == item.criterion)?
-            .preset
-            .as_ref()
-    }
-
-    /// The prompt Enter sends: the source's template expanded with the item's
-    /// variables, or the plugin's draft when the preset has no template.
+    /// The prompt Enter sends, as the daemon resolved it, or the plugin's draft.
     fn effective_prompt(&self, item: &Item) -> String {
-        self.source_preset(item)
-            .and_then(|p| p.prompt.as_deref())
-            .and_then(|t| crate::plugin::suggestions::expand(t, &item.variables).ok())
+        item.start
+            .as_ref()
+            .and_then(|s| s.prompt.clone())
             .unwrap_or_else(|| item.draft.prompt.clone())
     }
 
@@ -1865,11 +1886,10 @@ impl SuggestionsFeed {
             }
             .to_owned(),
         ];
-        let yolo = self.source_preset(item).is_some_and(|p| p.yolo);
         for (on, label) in [
             (start.worktree, "worktree"),
             (start.sandbox, "sandbox"),
-            (yolo, "yolo"),
+            (start.yolo, "yolo"),
         ] {
             if on {
                 parts.push(label.to_owned());
@@ -1998,7 +2018,7 @@ impl SuggestionsFeed {
                     let _ = sink.send(format!("start {provider_id}/{id}{approved}"));
                     Res::Started(Ok(started.clone()))
                 }
-                Req::Refresh => Res::Refreshed(Ok(())),
+                Req::Refresh { .. } => Res::Refreshed(Ok(())),
                 Req::PreTrust { .. } => {
                     let _ = sink.send("pre-trust".into());
                     Res::PreTrusted(Ok(()))
@@ -2024,7 +2044,9 @@ impl SuggestionsFeed {
     }
 
     pub(super) fn refresh(&mut self) {
-        self.submit(Req::Refresh);
+        self.submit(Req::Refresh {
+            origin: self.origin(),
+        });
     }
 
     pub(super) fn dismiss(&mut self, key: &ItemKey, dismissed: bool) {
@@ -2312,8 +2334,6 @@ mod tests {
             started_session: None,
             resolved_project: None,
             mapping_key: None,
-            criterion: String::new(),
-            variables: Default::default(),
             start: None,
             stale: false,
         }
@@ -2353,7 +2373,6 @@ mod tests {
                 enabled: true,
                 updated_at: Some(crate::time::Timestamp::now().as_unix_secs() - 120),
                 refreshing: false,
-                sources: vec![],
                 checks: vec![],
             }],
             items,
@@ -2473,7 +2492,6 @@ mod tests {
                 enabled: true,
                 updated_at: None,
                 refreshing: false,
-                sources: vec![],
                 checks: vec![],
             }],
             items: vec![it],
@@ -2955,6 +2973,11 @@ mod tests {
                 StartAnswer::Failed("Docker isn't running Start it.".into()),
             ),
             (
+                409,
+                json!({ "error": "profile_mismatch", "message": "This Daemon serves profile" }),
+                StartAnswer::Failed(ORIGIN_CHANGED.into()),
+            ),
+            (
                 400,
                 json!({ "error": "stale" }),
                 StartAnswer::Failed("That suggestion is no longer open. Reload with r.".into()),
@@ -2963,6 +2986,50 @@ mod tests {
         for (status, body, expected) in cases {
             assert_eq!(start_answer(status, &body), expected, "{body}");
         }
+    }
+
+    #[test]
+    fn a_refused_profile_reads_as_a_changed_list() {
+        let refused = |code| crate::daemon::DaemonClientError::Status {
+            status: reqwest::StatusCode::CONFLICT,
+            code,
+            body: "This Daemon serves profile \"a\"".into(),
+            truncated: false,
+        };
+        assert_eq!(
+            refusal(refused(Some(crate::daemon::ApiErrorCode::ProfileMismatch))),
+            ORIGIN_CHANGED
+        );
+        assert_ne!(refusal(refused(None)), ORIGIN_CHANGED);
+    }
+
+    #[test]
+    fn the_pane_shows_the_prompt_and_yolo_the_daemon_resolved() {
+        let mut resolved = item("a", Some("repo"), false);
+        resolved.start = Some(crate::daemon::suggestions::ItemStart {
+            agent: "claude".into(),
+            view: "terminal".into(),
+            worktree: false,
+            sandbox: false,
+            yolo: true,
+            prompt: Some("review PR 42".into()),
+        });
+        let mut unresolved = item("b", Some("repo"), false);
+        unresolved.start =
+            resolved
+                .start
+                .clone()
+                .map(|start| crate::daemon::suggestions::ItemStart {
+                    yolo: false,
+                    prompt: None,
+                    ..start
+                });
+        let rig = view_with(vec![resolved, unresolved], idle_worker());
+        let item = |id: &str| rig.store.item(&("p".into(), id.into())).unwrap();
+        assert_eq!(rig.store.effective_prompt(item("a")), "review PR 42");
+        assert!(rig.store.preset_line(item("a")).unwrap().ends_with("yolo"));
+        assert_eq!(rig.store.effective_prompt(item("b")), "do the thing");
+        assert!(!rig.store.preset_line(item("b")).unwrap().contains("yolo"));
     }
 
     #[test]
@@ -3597,7 +3664,7 @@ mod tests {
                 let _ = sink.send("load");
                 Res::Snapshot(Err("boom".into()))
             }
-            Req::Refresh => {
+            Req::Refresh { .. } => {
                 let _ = sink.send("refresh");
                 Res::Refreshed(Ok(()))
             }
@@ -3737,7 +3804,15 @@ mod tests {
             text.contains("aoe plugin install gh:agent-of-empires/plugin-github"),
             "{text}"
         );
+        assert!(text.contains("then turn it on"), "{text}");
         assert!(!text.contains("Nothing to suggest"), "{text}");
+
+        for offered in [true, false] {
+            let lines = setup_lines(&[], || offered).unwrap().join("\n");
+            assert_eq!(lines.contains("Set up suggestions"), offered, "{lines}");
+            assert!(lines.contains("Settings › Suggestions"), "{lines}");
+        }
+        assert!(setup_lines(&[false, true], || true).is_none());
     }
 
     #[test]
@@ -3783,11 +3858,3 @@ mod tests {
         assert!(!rig.store.busy);
     }
 }
-        assert!(text.contains("then turn it on"), "{text}");
-
-        for offered in [true, false] {
-            let lines = setup_lines(&[], || offered).unwrap().join("\n");
-            assert_eq!(lines.contains("Set up suggestions"), offered, "{lines}");
-            assert!(lines.contains("Settings › Suggestions"), "{lines}");
-        }
-        assert!(setup_lines(&[false, true], || true).is_none());

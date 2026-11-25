@@ -64,8 +64,6 @@ pub struct Provider {
     #[serde(default)]
     pub(crate) refreshing: bool,
     #[serde(default)]
-    pub(crate) sources: Vec<Source>,
-    #[serde(default)]
     pub(crate) checks: Vec<Check>,
 }
 
@@ -77,23 +75,6 @@ pub struct Check {
     pub(crate) fix: String,
 }
 
-/// A source's effective preset, as `GET /api/suggestions` resolves it.
-#[derive(Debug, Clone, Deserialize)]
-pub struct Source {
-    pub(crate) criterion: String,
-    #[serde(default)]
-    pub(crate) preset: Option<WirePreset>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct WirePreset {
-    #[serde(default)]
-    pub(crate) yolo: bool,
-    /// A template; `None` sends the plugin's own draft prompt.
-    #[serde(default)]
-    pub(crate) prompt: Option<String>,
-}
-
 /// What Start creates an item with, resolved against its Project.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ItemStart {
@@ -103,6 +84,11 @@ pub struct ItemStart {
     pub(crate) worktree: bool,
     #[serde(default)]
     pub(crate) sandbox: bool,
+    #[serde(default)]
+    pub(crate) yolo: bool,
+    /// The first prompt Start sends; absent when the expanded template is too long.
+    #[serde(default)]
+    pub(crate) prompt: Option<String>,
 }
 
 fn enabled_by_default() -> bool {
@@ -137,10 +123,6 @@ pub struct Item {
     /// The repo the provider links to a Project, as `owner/repo` for GitHub.
     #[serde(default)]
     pub(crate) mapping_key: Option<String>,
-    #[serde(default)]
-    pub(crate) criterion: String,
-    #[serde(default)]
-    pub(crate) variables: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub(crate) start: Option<ItemStart>,
     /// The source closed or changed; the item cannot start.
@@ -275,14 +257,21 @@ impl DaemonClient {
 
     /// `POST /api/suggestions/refresh`. Asks every provider to discover again;
     /// the new items arrive in a later [`suggestions`](Self::suggestions) read.
-    pub async fn refresh_suggestions(&self) -> Result<(), DaemonClientError> {
-        self.suggestion_post("suggestions/refresh", serde_json::json!({}))
-            .await
+    pub async fn refresh_suggestions(
+        &self,
+        expected_profile: Option<&str>,
+    ) -> Result<(), DaemonClientError> {
+        self.suggestion_post(
+            "suggestions/refresh",
+            serde_json::json!({ "expected_profile": expected_profile }),
+        )
+        .await
     }
 
     /// `POST /api/suggestions/{dismiss,undismiss}`.
     pub async fn set_suggestion_dismissed(
         &self,
+        expected_profile: Option<&str>,
         provider_id: &str,
         id: &str,
         dismissed: bool,
@@ -290,7 +279,11 @@ impl DaemonClient {
         let verb = if dismissed { "dismiss" } else { "undismiss" };
         self.suggestion_post(
             &format!("suggestions/{verb}"),
-            serde_json::json!({ "provider_id": provider_id, "id": id }),
+            serde_json::json!({
+                "expected_profile": expected_profile,
+                "provider_id": provider_id,
+                "id": id,
+            }),
         )
         .await
     }
@@ -314,11 +307,16 @@ impl DaemonClient {
     /// `POST /api/suggestions/prepare`. The New Session prefill for one item.
     pub async fn prepare_suggestion(
         &self,
+        expected_profile: Option<&str>,
         provider_id: &str,
         id: &str,
     ) -> Result<Prepared, DaemonClientError> {
         let url = self.suggestions_url("suggestions/prepare")?;
-        let body = serde_json::json!({ "provider_id": provider_id, "id": id });
+        let body = serde_json::json!({
+            "expected_profile": expected_profile,
+            "provider_id": provider_id,
+            "id": id,
+        });
         let response = self
             .send_suggestion_request(self.http.post(url).json(&body))
             .await?;
@@ -420,6 +418,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn item_changes_name_the_profile_they_were_chosen_under() {
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let record = |sent: tokio::sync::mpsc::UnboundedSender<serde_json::Value>| {
+            post(move |Json(body): Json<serde_json::Value>| async move {
+                sent.send(body).unwrap();
+                Json(serde_json::json!({ "title": "T", "initial_prompt": "", "tool": "claude" }))
+            })
+        };
+        let app = Router::new()
+            .route("/api/suggestions/refresh", record(sent.clone()))
+            .route("/api/suggestions/dismiss", record(sent.clone()))
+            .route("/api/suggestions/prepare", record(sent));
+        let (client, server) = serve(app).await;
+        client.refresh_suggestions(Some("work")).await.unwrap();
+        client
+            .set_suggestion_dismissed(Some("work"), "gh", "1", true)
+            .await
+            .unwrap();
+        client
+            .prepare_suggestion(Some("work"), "gh", "1")
+            .await
+            .unwrap();
+        server.abort();
+        for _ in 0..3 {
+            assert_eq!(received.recv().await.unwrap()["expected_profile"], "work");
+        }
+    }
+
+    #[tokio::test]
     async fn a_start_returns_the_typed_outcome_of_a_409_and_posts_the_approval() {
         let app = Router::new().route(
             "/api/suggestions/start",
@@ -483,7 +510,10 @@ mod tests {
             (plain, StatusCode::BAD_GATEWAY, None, ""),
         ] {
             let (client, server) = serve(app).await;
-            let error = client.prepare_suggestion("gh", "1").await.unwrap_err();
+            let error = client
+                .prepare_suggestion(None, "gh", "1")
+                .await
+                .unwrap_err();
             server.abort();
             assert!(
                 matches!(&error, DaemonClientError::Status { status: s, code: c, body, .. }
