@@ -153,9 +153,15 @@ impl RateLimitInfo {
     /// The limit an agent-initiated turn reports only as message text, such as
     /// `You've hit your 5-hour limit · resets 10pm (America/New_York)` (#5990).
     /// The text is kept verbatim as the status; no reset time is read from it.
+    /// Longer text is never a limit sentence.
+    pub const AGENT_TEXT_MAX_CHARS: usize = 200;
+
     pub fn from_agent_text(text: &str) -> Option<Self> {
         let text = text.trim();
-        if text.is_empty() || text.contains('\n') || text.chars().count() > 200 {
+        if text.is_empty()
+            || text.contains('\n')
+            || text.chars().count() > Self::AGENT_TEXT_MAX_CHARS
+        {
             return None;
         }
         let lower = text.to_lowercase().replace('\u{2019}', "'");

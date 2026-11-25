@@ -222,6 +222,9 @@ impl AgentTurnText {
             Event::AgentMessageChunk { text, .. } => {
                 if let Some(turn) = &mut self.0 {
                     turn.push_str(text);
+                    if turn.trim().chars().count() > RateLimitInfo::AGENT_TEXT_MAX_CHARS {
+                        self.disqualify();
+                    }
                 }
             }
             Event::UserPromptSent { .. }
@@ -308,6 +311,11 @@ mod tests {
                 false,
             ),
             ("ordinary text", vec![chunk("Build passed.")], false),
+            (
+                "long text stops collecting",
+                vec![chunk(&"x".repeat(201)), chunk("You've hit your limit")],
+                false,
+            ),
         ];
         for (name, events, parks) in cases {
             let mut turn = AgentTurnText::default();
@@ -315,6 +323,9 @@ mod tests {
             assert_eq!(turn.take_rate_limit().is_some(), parks, "{name}");
             assert!(turn.take_rate_limit().is_none(), "{name}: taking resets");
         }
+        let mut long = AgentTurnText::default();
+        long.observe(&chunk(&"x".repeat(RateLimitInfo::AGENT_TEXT_MAX_CHARS + 1)));
+        assert!(long.0.is_none(), "long text releases its buffer");
         let mut prompted = AgentTurnText::default();
         prompted.disqualify();
         prompted.observe(&chunk("You've hit your limit"));
