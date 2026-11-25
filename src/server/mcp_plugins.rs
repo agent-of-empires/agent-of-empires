@@ -1448,6 +1448,64 @@ mod tests {
             (app, seen)
         }
 
+        /// A burst of requests never has more than the forwarder's in-flight limit in the
+        /// endpoint at once, and every one is still answered once the endpoint lets go.
+        #[tokio::test]
+        async fn forwarder_bounds_the_calls_it_has_in_flight() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            if !node() {
+                return;
+            }
+            const LIMIT: usize = 16;
+            const BURST: usize = 40;
+            let temp = tempfile::tempdir().unwrap();
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let full = Arc::new(tokio::sync::Notify::new());
+            let (active, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+            let app = {
+                let (gate, full, active, peak) =
+                    (gate.clone(), full.clone(), active.clone(), peak.clone());
+                axum::Router::new().route(
+                    "/mcp/plugins/{plugin}/{server}",
+                    any(move |req: axum::extract::Request| {
+                        let (gate, full, active, peak) =
+                            (gate.clone(), full.clone(), active.clone(), peak.clone());
+                        async move {
+                            let body = axum::body::to_bytes(req.into_body(), 1 << 20)
+                                .await
+                                .unwrap();
+                            let id = serde_json::from_slice::<Value>(&body).unwrap()["id"].clone();
+                            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            if now == LIMIT {
+                                full.notify_one();
+                            }
+                            gate.acquire().await.unwrap().forget();
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            axum::Json(json!({"jsonrpc": "2.0", "id": id, "result": {}}))
+                        }
+                    }),
+                )
+            };
+            let (socket, _server) = serve_unix(temp.path(), app);
+            let lines: Vec<String> = (0..BURST)
+                .map(|i| json!({"jsonrpc": "2.0", "id": i, "method": "ping"}).to_string())
+                .collect();
+            let release = async {
+                tokio::time::timeout(DEADLINE, full.notified())
+                    .await
+                    .expect("the endpoint reaches the in-flight limit");
+                gate.add_permits(BURST);
+            };
+            let (replies, ()) = tokio::join!(run(temp.path(), &socket, &lines), release);
+            assert_eq!(replies.len(), BURST, "every request is answered");
+            assert!(
+                peak.load(Ordering::SeqCst) <= LIMIT,
+                "peak {} in flight",
+                peak.load(Ordering::SeqCst)
+            );
+        }
+
         /// A reply far larger than the stdout pipe buffer is still written whole when stdin
         /// closes right after the request: `process.exit` would drop what is still buffered.
         #[tokio::test]

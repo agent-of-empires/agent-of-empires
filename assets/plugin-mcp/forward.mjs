@@ -14,6 +14,9 @@ const HOST = "aoe-plugin-mcp.invalid";
 // Above the daemon's 600 s ceiling for one forwarded call.
 const TIMEOUT_MS = 610_000;
 const EXIT_GRACE_MS = 2_000;
+// Calls forwarded at once. A slot is held until the reply is flushed to stdout, so a slow
+// reader holds back new requests instead of buffering replies without limit.
+const MAX_IN_FLIGHT = 16;
 const META_VERSION = "io.modelcontextprotocol/protocolVersion";
 const VERSION_SHAPE = /^\d{4}-\d{2}-\d{2}$/;
 const METHOD_SHAPE = /^[A-Za-z0-9_./-]+$/;
@@ -33,12 +36,13 @@ const NAME_PARAM = {
 let negotiated;
 let stdinClosed = false;
 const inFlight = new Map();
+const queue = [];
 let pending = 0;
 
 process.stdout.on("error", () => process.exit(0));
 
-function write(message) {
-  process.stdout.write(`${JSON.stringify(message)}\n`);
+function write(message, flushed) {
+  process.stdout.write(`${JSON.stringify(message)}\n`, flushed);
 }
 
 // `process.exit` can drop stdout bytes still buffered in a pipe; the empty write's callback
@@ -51,9 +55,11 @@ function isRequest(message) {
   return typeof message?.method === "string" && message.id !== undefined && message.id !== null;
 }
 
-function fail(message, code, text) {
+function fail(message, code, text, flushed) {
   if (isRequest(message)) {
-    write({ jsonrpc: "2.0", id: message.id, error: { code, message: text } });
+    write({ jsonrpc: "2.0", id: message.id, error: { code, message: text } }, flushed);
+  } else {
+    flushed?.();
   }
 }
 
@@ -120,10 +126,27 @@ function replies(contentType, body) {
   return Array.isArray(value) ? value : [value];
 }
 
+function idle() {
+  return pending === 0 && queue.length === 0;
+}
+
 function settle() {
   pending -= 1;
-  if (stdinClosed && pending === 0) {
+  pump();
+  if (stdinClosed && idle()) {
     exitAfterFlush();
+  }
+}
+
+function pump() {
+  while (queue.length > 0 && pending < MAX_IN_FLIGHT) {
+    const { message, line } = queue.shift();
+    forward(message, line);
+  }
+  if (queue.length < MAX_IN_FLIGHT) {
+    input.resume();
+  } else {
+    input.pause();
   }
 }
 
@@ -137,6 +160,7 @@ function forward(message, body) {
   }
   pending += 1;
   let settled = false;
+  let answered = false;
   const finish = () => {
     if (!settled) {
       settled = true;
@@ -153,12 +177,14 @@ function forward(message, body) {
       response.on("data", (chunk) => chunks.push(chunk));
       response.on("error", () => {});
       response.on("close", () => {
-        if (!settled && !request.cancelledByClient) {
-          fail(message, -32603, "The AoE plugin MCP endpoint closed the reply early.");
+        if (!settled && !answered && !request.cancelledByClient) {
+          fail(message, -32603, "The AoE plugin MCP endpoint closed the reply early.", finish);
+        } else {
+          finish();
         }
-        finish();
       });
       response.on("end", () => {
+        answered = true;
         const text = Buffer.concat(chunks).toString("utf8");
         let messages = [];
         try {
@@ -167,16 +193,20 @@ function forward(message, body) {
           messages = [];
         }
         const rpc = messages.filter(isJsonRpc);
-        for (const reply of rpc) {
+        for (const [i, reply] of rpc.entries()) {
           if (message.method === "initialize" && typeof reply.result?.protocolVersion === "string") {
             negotiated = reply.result.protocolVersion;
           }
-          write(reply);
+          write(reply, i === rpc.length - 1 ? finish : undefined);
         }
         if (rpc.length === 0) {
-          fail(message, -32603, `The AoE plugin MCP endpoint answered HTTP ${response.statusCode} without a JSON-RPC reply.`);
+          fail(
+            message,
+            -32603,
+            `The AoE plugin MCP endpoint answered HTTP ${response.statusCode} without a JSON-RPC reply.`,
+            finish,
+          );
         }
-        finish();
       });
     },
   );
@@ -185,11 +215,12 @@ function forward(message, body) {
   }
   request.on("timeout", () => request.destroy(new Error("timeout")));
   request.on("error", (error) => {
-    if (!settled && !request.cancelledByClient) {
+    if (!settled && !answered && !request.cancelledByClient) {
       const cause = error.message === "timeout" ? "timed out" : `is unreachable (${error.code ?? "error"})`;
-      fail(message, -32603, `The AoE plugin MCP socket ${cause}.`);
+      fail(message, -32603, `The AoE plugin MCP socket ${cause}.`, finish);
+    } else {
+      finish();
     }
-    finish();
   });
   request.end(body);
 }
@@ -199,7 +230,13 @@ function cancel(message) {
   if (message?.method !== "notifications/cancelled") {
     return;
   }
-  const request = inFlight.get(message.params?.requestId);
+  const id = message.params?.requestId;
+  const queued = queue.findIndex((item) => item.message.id === id);
+  if (queued !== -1) {
+    queue.splice(queued, 1);
+    return;
+  }
+  const request = inFlight.get(id);
   if (request) {
     request.cancelledByClient = true;
     request.destroy();
@@ -224,11 +261,12 @@ input.on("line", (line) => {
     return;
   }
   cancel(message);
-  forward(message, line);
+  queue.push({ message, line });
+  pump();
 });
 input.on("close", () => {
   stdinClosed = true;
-  if (pending === 0) {
+  if (idle()) {
     exitAfterFlush();
     return;
   }
