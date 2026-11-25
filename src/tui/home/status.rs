@@ -1158,13 +1158,20 @@ impl HomeView {
         let row_outcomes = self.session_feed.drain_session_outcomes();
         let namespace = self.session_feed.drain_namespace_result();
         let mut changed = !row_outcomes.is_empty() || namespace.is_some();
-        if let Some(Err(error)) = self.session_feed.drain_sidebar_view_result() {
-            self.flash_status(format!("Grouping and sort not saved: {error}"));
+        if let Some(result) = self.session_feed.drain_sidebar_view_result() {
+            if let Err(error) = result {
+                self.flash_status(format!("Grouping and sort not saved: {error}"));
+                changed = true;
+            }
+            // Snapshots applied while the write was pending were not shown, so converge on
+            // the Daemon's value, which may carry another Client's change.
             if let Some(snapshot) = self.session_feed.applied_snapshot() {
                 let view = snapshot.contents.sidebar_view;
-                self.show_sidebar_view(view.group_by, view.sort);
+                if (view.group_by, view.sort) != (self.group_by, self.sort_order) {
+                    self.show_sidebar_view(view.group_by, view.sort);
+                    changed = true;
+                }
             }
-            changed = true;
         }
         let mut purge_notes: Vec<(String, String)> = Vec::new();
         for (id, outcome) in row_outcomes {

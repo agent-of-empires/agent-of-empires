@@ -744,8 +744,8 @@ pub async fn update_workspace_ordering(
     )
 }
 
-/// Change the shared grouping or sort every Client shows. The change reaches every open
-/// Client in the runtime snapshot that this write publishes.
+/// Change the shared grouping or sort. Clients receive it in the runtime snapshot this
+/// write publishes.
 pub async fn update_sidebar_view(
     State(state): State<Arc<AppState>>,
     body: Result<Json<crate::daemon::SidebarViewPatch>, axum::extract::rejection::JsonRejection>,

@@ -1183,8 +1183,9 @@ impl SessionFeed {
         self.pending_sidebar_view.is_some()
     }
 
-    /// The outcome of the last sidebar view write once its snapshot is applied, or its
-    /// failure. `None` while it is in flight or when none was sent.
+    /// The outcome of the last sidebar view write once its snapshot, or one from a
+    /// replacement Daemon, is applied, or its failure. `None` while it is in flight or when
+    /// none was sent.
     pub(crate) fn drain_sidebar_view_result(&mut self) -> Option<Result<(), String>> {
         let failure = match self.pending_sidebar_view.as_mut()? {
             PendingSidebarView::Sent(receiver) => match receiver.try_recv() {
@@ -1205,7 +1206,12 @@ impl SessionFeed {
             },
             PendingSidebarView::Committed(cursor) => {
                 let cursor = cursor.clone();
-                if !self.receipt_applied(&cursor) {
+                // A replacement Daemon's snapshot can never confirm the old epoch's receipt.
+                let replaced = self
+                    .applied
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.cursor.epoch != cursor.epoch);
+                if !replaced && !self.receipt_applied(&cursor) {
                     return None;
                 }
                 self.pending_sidebar_view = None;
@@ -2408,6 +2414,26 @@ impl SessionFeed {
                 )
                 .is_ok());
             Some(request)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sidebar_view_driver_for_test(
+        &mut self,
+    ) -> impl FnMut(RuntimeCursor) -> Option<crate::daemon::SidebarViewPatch> {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<SessionCommand>(COMMAND_CAPACITY);
+        self.commands = Some(sender);
+        set_grant(&self.grant, true);
+        move |cursor| {
+            let command = receiver.try_recv().ok()?;
+            let CommandRequest::SidebarView(patch) = command.request else {
+                panic!("expected a sidebar view command");
+            };
+            assert!(command
+                .result
+                .send(Ok(CommandReply::Mutation(cursor)))
+                .is_ok());
+            Some(patch)
         }
     }
 

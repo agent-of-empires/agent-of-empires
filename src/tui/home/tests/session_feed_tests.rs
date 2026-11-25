@@ -4071,3 +4071,63 @@ fn the_view_follows_a_daemon_sidebar_change_but_not_a_stale_snapshot() {
     publish(&mut env, changed);
     assert_eq!(env.view.group_by, GroupByMode::Project);
 }
+
+/// Snapshots are not shown while a local pick is in flight, so once the write settles the
+/// view takes the Daemon's value, including a peer's change or a replacement Daemon's.
+#[test]
+#[serial]
+fn a_settled_sidebar_write_converges_on_the_daemon_value() {
+    use crate::daemon::RuntimeCursor;
+    use crate::session::config::{GroupByMode, SidebarView, SortOrder};
+    for same_epoch in [true, false] {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Idle);
+        let mut reply = env.view.session_feed.sidebar_view_driver_for_test();
+        let publish = |env: &mut TestEnv, view: SidebarView| {
+            let SessionFeedResult::Snapshot(mut snapshot) = daemon_snapshot(&env.view, &id, "Idle")
+            else {
+                unreachable!()
+            };
+            Arc::make_mut(&mut snapshot).contents.sidebar_view = view;
+            let cursor = snapshot.cursor.clone();
+            env.view
+                .session_feed
+                .publish_for_test(SessionFeedResult::Snapshot(snapshot));
+            env.view.apply_session_feed();
+            cursor
+        };
+        publish(
+            &mut env,
+            SidebarView {
+                group_by: GroupByMode::Project,
+                sort: SortOrder::Custom,
+            },
+        );
+        env.view.apply_group_by(GroupByMode::Group);
+        let merged = SidebarView {
+            group_by: GroupByMode::Group,
+            sort: SortOrder::Name,
+        };
+        let committed = publish(&mut env, merged);
+        assert_eq!(env.view.sort_order, SortOrder::Custom, "case {same_epoch}");
+        let receipt = if same_epoch {
+            committed
+        } else {
+            RuntimeCursor {
+                epoch: "replaced".into(),
+                revision: committed.revision + 1,
+            }
+        };
+        assert!(reply(receipt).is_some_and(|patch| patch.group_by == Some(GroupByMode::Group)));
+        env.view.apply_session_feed();
+        assert!(
+            !env.view.session_feed.sidebar_view_pending(),
+            "case {same_epoch}"
+        );
+        assert_eq!(
+            (env.view.group_by, env.view.sort_order),
+            (merged.group_by, merged.sort),
+            "case {same_epoch}"
+        );
+    }
+}

@@ -868,8 +868,8 @@ where
     Ok(value.and_then(|value| value.try_into().ok()))
 }
 
-/// The one grouping and sort every Client shows. The Daemon owns it: Clients read it
-/// from the runtime snapshot and change it through `PATCH /api/sidebar-view`.
+/// The one grouping and sort the Daemon owns. Clients read it from the runtime snapshot
+/// and change it through `PATCH /api/sidebar-view`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SidebarView {
     pub group_by: GroupByMode,

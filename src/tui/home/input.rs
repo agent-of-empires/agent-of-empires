@@ -5183,8 +5183,10 @@ impl HomeView {
     /// Follow the Daemon's grouping and sort when a snapshot changes it, unless this view's
     /// own change is still on its way there.
     pub(super) fn adopt_sidebar_view(&mut self, view: crate::session::config::SidebarView) {
-        if self.observed_sidebar_view.replace(view) == Some(view)
-            || self.session_feed.sidebar_view_pending()
+        // Pending first: a value seen while this view's write is in flight stays unrecorded,
+        // so the next snapshot still counts as a change.
+        if self.session_feed.sidebar_view_pending()
+            || self.observed_sidebar_view.replace(view) == Some(view)
             || (view.group_by == self.group_by && view.sort == self.sort_order)
         {
             return;
