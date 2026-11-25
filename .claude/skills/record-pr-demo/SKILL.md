@@ -65,13 +65,15 @@ Run with `AOE_DEMO_TOKEN_FILE` (or `AOE_DEMO_TOKEN`) and `AOE_DEMO_RAW=<scratch>
 
 ## TUI clips
 
-Run the native `aoe` TUI inside ttyd and drive it like a web page: Playwright types real keystrokes and `caption`, `convert.sh` work unchanged. Use the step 2 environment, `cd` into a scene repo, then:
+Run the dev `aoe` in ttyd and drive it with Playwright, as `web/scripts/record-tui-demo.mjs` does (read it for the ttyd and `aoe` setup). Here the script uses `demo-lib.mjs` (`launch`, `caption`) and `convert.sh`, so the clip matches the web ones. Use the step 2 environment and `cd` into a scene repo. ttyd runs a writable shell with your env, so it takes a password:
 
 ```sh
-nohup ttyd --port 7683 --interface 127.0.0.1 -t rendererType=dom -t fontSize=15 --writable aoe > $DEMO/ttyd.log 2>&1 &
+export TTYD_PW=$(openssl rand -hex 12)
+nohup ttyd --port 7683 --interface 127.0.0.1 -c demo:$TTYD_PW -t rendererType=dom -t fontSize=15 --writable aoe > $DEMO/ttyd.log 2>&1 &
+echo $! > $DEMO/ttyd.pid
 ```
 
-In the clip script, `launch()`, `page.goto("http://127.0.0.1:7683")`, click `.xterm`, then `page.keyboard.press`. Set `AOE_DEMO_TOKEN=-` since no dashboard token is needed. Assert on `document.body.innerText` before each key. Setup traps (modals that replay, keys reaching the agent, macOS install) are in [`TECHNIQUES.md`](TECHNIQUES.md#tui-clips-ttyd). For scripted e2e tests, `RECORD_E2E=1` records asciinema casts that `agg` converts (`tests/e2e/harness.rs`).
+In the clip script: `launch()`, `await context.setHTTPCredentials({ username: "demo", password: process.env.TTYD_PW })`, `page.goto("http://127.0.0.1:7683")`, click `.xterm`, then `page.keyboard.press`. Set `AOE_DEMO_TOKEN=-` (no dashboard token). Assert on `document.body.innerText` before each key. Traps are in [`TECHNIQUES.md`](TECHNIQUES.md#tui-clips-ttyd). For scripted e2e tests, `RECORD_E2E=1` records asciinema casts that `agg` converts; both must be on `PATH` (`tests/e2e/harness.rs`).
 
 Done when the contact sheet shows each key's effect at the moment its caption claims.
 
@@ -105,4 +107,4 @@ gh pr comment <N> --body-file <out-dir>/body.md --attach <out-dir>/<clip>.mp4
 
 ## 7. Clean up
 
-`aoe serve --stop`, `tmux -S $AOE_TMUX_SOCKET kill-server`, and remove `$DEMO` once the user is happy with the clips.
+`aoe serve --stop`, `kill $(cat $DEMO/ttyd.pid)` for a TUI clip, `tmux -S $AOE_TMUX_SOCKET kill-server`, and remove `$DEMO` once the user is happy with the clips.

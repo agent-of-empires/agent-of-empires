@@ -105,11 +105,9 @@ await prep(async () => {
 
 Each browser connection to ttyd starts a fresh `aoe`, so everything the TUI replays on start shows in the clip.
 
-- Install ttyd with `brew install ttyd` (`/opt/homebrew/bin/ttyd` on macOS). Start it from the same shell that exported the isolated env (`XDG_CONFIG_HOME`, `AOE_TMUX_SOCKET`, `CLAUDE_CONFIG_DIR`), because it passes its environment to `aoe`. On macOS use `LANG=en_US.UTF-8` so glyphs render. `-t rendererType=dom` makes the screen readable text, so scripts can assert on it. The default 1280x800 viewport with `fontSize=15` fits Home with its preview.
-- Drain replayed notices before recording. The first-run walkthrough needs one Escape in a throwaway connection. "Prompt not delivered" modals replay once per old session that missed its prompt: purge old sessions (`aoe rm --purge <id>`), connect once unrecorded, press Enter until none show, and let the clip script dismiss any that still appear before its first caption.
-- Keys go where the selection is. Enter on a session row attaches it, and keys then reach the agent. Park the selection on the target row first (`End` selects the last row, such as Suggested) and check `innerText` after each key instead of sleeping.
-- Claude Code's own terminal dialogs (folder trust, project MCP approval) can block a typed prompt. For a clean start in the TUI, use a Structured-view preset.
-- Captions cover the key-hint footer; pass `{ top: true }` when a step needs it visible.
-- A 37 s clip with 3 s captions gave a 4 MB GIF at the default 900 px width.
-- Stop scratch processes by PID, taken from `$DEMO`'s own tmux socket or ttyd log. `pkill -f` on an agent name also kills your real sessions.
-
+- Install with `brew install ttyd` (`/opt/homebrew/bin/ttyd` on macOS). Start it from the shell that exported the isolated env (`XDG_CONFIG_HOME`, `AOE_TMUX_SOCKET`, `CLAUDE_CONFIG_DIR`): it passes its environment to `aoe`. On macOS set `LANG=en_US.UTF-8` so glyphs render. `-t rendererType=dom` makes the screen text, so scripts can assert on it. `launch()` uses a 1280x800 viewport; `fontSize=15` shows Home with its preview at that size.
+- Replayed notices show in the clip. If the Welcome walkthrough shows, press Escape once in an unrecorded connection. "Prompt not delivered" modals replay once per old session that missed its prompt: connect unrecorded and press Enter until none show, and have the clip script dismiss any left before its first caption. To remove the old sessions, first check `echo $XDG_CONFIG_HOME` and that `aoe list` shows only scene sessions, then `aoe rm --purge <id>`; it also deletes the session's worktree directory.
+- Keys go where the selection is. Enter on a session row attaches it, and keys then reach the agent. Move the selection first (`End` selects the last row in your scene, such as Suggested) and check `innerText` after each key instead of sleeping.
+- Claude Code's own terminal dialogs (folder trust, project MCP approval) can block a typed prompt. Use a Structured view for the start: the kind's preset View row, or `aoe add --structured-view`.
+- Captions cover the key-hint footer; pass `{ top: true }` when a step needs it.
+- Stop scratch processes by the PID you saved (`$DEMO/ttyd.pid`) or `aoe serve --stop`. Never `pkill -f` by name: it also kills your real sessions.
