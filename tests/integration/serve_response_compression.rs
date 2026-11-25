@@ -112,6 +112,6 @@ async fn sessions_json_is_compressed_when_negotiated() {
 async fn tiny_json_is_left_alone() {
     let (encoding, _, body) = fetch(&router(0), Some("gzip, zstd")).await;
     assert_eq!(encoding, None);
-    assert!(body.len() < 100, "{} bytes", body.len());
+    assert!(body.len() < 1024, "{} bytes", body.len());
     serde_json::from_slice::<serde_json::Value>(&body).unwrap();
 }

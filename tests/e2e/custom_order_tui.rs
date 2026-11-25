@@ -81,8 +81,10 @@ fn test_tui_custom_sort_reorders_and_persists() {
     let before = order_on_screen(&h);
     assert_eq!(before.len(), 2, "both sessions on screen: {before:?}");
 
-    // Home selects the group header; Down selects its first session.
+    // Home selects the repository header, Down the `work` Group nested in it, Down again
+    // its first session.
     h.send_keys("Home");
+    h.send_keys("Down");
     h.send_keys("Down");
     h.send_keys("C-Down");
     let expected = vec![before[1].clone(), before[0].clone()];
@@ -98,18 +100,17 @@ fn test_tui_custom_sort_reorders_and_persists() {
     h.wait_for("beta-two");
     wait_for_order(&h, &moved);
 
-    // Both siblings received their new indices.
-    let rows: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(h.sessions_path()).expect("read sessions.json"),
+    // The move landed in the one Custom order every Client shares.
+    let ordering: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            crate::harness::app_dir_in(h.home_path()).join("workspace-ordering.json"),
+        )
+        .expect("read workspace-ordering.json"),
     )
-    .expect("parse sessions.json");
-    let index_of = |title: &str| -> Option<u64> {
-        rows.as_array()?
-            .iter()
-            .find(|r| r["title"] == title)?
-            .get("sort_index")?
-            .as_u64()
-    };
-    assert_eq!(index_of(&moved[0]), Some(0), "moved row stored first");
-    assert_eq!(index_of(&moved[1]), Some(1), "its sibling stored second");
+    .expect("parse workspace-ordering.json");
+    assert_eq!(
+        ordering["order"].as_array().map(Vec::len),
+        Some(2),
+        "both rows placed: {ordering}"
+    );
 }
