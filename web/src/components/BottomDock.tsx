@@ -76,7 +76,12 @@ export function BottomDock({ groups, descriptorFor, renderBody, onActivate, onCl
   }, []);
 
   return (
-    <div ref={ref} className="hidden md:flex flex-col shrink-0 border-t border-surface-700/60" style={{ height }}>
+    <div
+      ref={ref}
+      data-region="dock-bottom"
+      className="hidden md:flex flex-col shrink-0 border-t border-surface-700/60"
+      style={{ height }}
+    >
       <div
         data-testid="bottom-dock-resize"
         onMouseDown={handleMouseDown}

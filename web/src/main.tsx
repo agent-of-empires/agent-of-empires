@@ -1,3 +1,4 @@
+import { PrototypeVariantBar } from "./prototype/PrototypeVariantBar";
 // Import order matters: logging, then token capture, then legacy URL redirect.
 import "./logging-init";
 import { StrictMode } from "react";
@@ -20,6 +21,10 @@ if ("serviceWorker" in navigator) {
 installFetchErrorToasts();
 installEditingFocus();
 installFileEditGuards();
+
+// PROTOTYPE: the variant switcher mounts outside #root so variant styles never touch it.
+const protoHost = document.body.appendChild(document.createElement("div"));
+createRoot(protoHost).render(<PrototypeVariantBar />);
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

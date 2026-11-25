@@ -1,0 +1,144 @@
+/* PROTOTYPE (throwaway): surface treatments keyed on html[data-proto-variant]. A is today's styling. */
+
+.proto-variant-bar {
+  position: fixed;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  z-index: 2147483000;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: #fafafa;
+  color: #111;
+  font:
+    600 12px system-ui,
+    sans-serif;
+  box-shadow: 0 6px 24px rgb(0 0 0 / 0.45);
+}
+.proto-variant-bar button {
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+.proto-variant-bar button:hover {
+  background: #e4e4e7;
+}
+
+/* ---- B: cards on a dark canvas (Claude Code desktop) ---- */
+html[data-proto-variant="B"] #root > div {
+  background: var(--color-surface-950);
+}
+html[data-proto-variant="B"] header[data-tour="topbar"],
+html[data-proto-variant="B"] header[data-tour="topbar"] > div {
+  background: transparent;
+  border-color: transparent;
+}
+html[data-proto-variant="B"] [data-tour="sidebar"],
+html[data-proto-variant="B"] [data-tour="sidebar"] * {
+  border-color: transparent !important;
+}
+html[data-proto-variant="B"] [data-tour="sidebar"] {
+  background: transparent !important;
+}
+html[data-proto-variant="B"] [data-region="main"] {
+  background: var(--color-surface-900);
+  border: 1px solid color-mix(in srgb, var(--color-surface-700) 45%, transparent);
+  border-radius: 12px;
+  margin: 0 4px 8px 4px;
+  overflow: hidden;
+}
+html[data-proto-variant="B"] [data-testid="content-split-resize-handle"] {
+  background: transparent;
+}
+html[data-proto-variant="B"] [data-region="dock-right"] {
+  background: transparent !important;
+  border: 0 !important;
+  gap: 8px;
+  margin: 0 8px 8px 4px;
+}
+html[data-proto-variant="B"] [data-region="dock-right"] > div > div {
+  gap: 8px;
+}
+html[data-proto-variant="B"] [data-region="dock-right"] > div > div > div {
+  border: 0 !important;
+}
+html[data-proto-variant="B"] [data-pane-dock] {
+  background: var(--color-surface-900);
+  border: 1px solid color-mix(in srgb, var(--color-surface-700) 45%, transparent);
+  border-radius: 12px;
+}
+html[data-proto-variant="B"] [data-pane-dock] [role="tablist"] {
+  background: transparent;
+  height: 34px;
+  padding: 0 4px;
+  border-bottom-color: color-mix(in srgb, var(--color-surface-700) 35%, transparent);
+}
+html[data-proto-variant="B"] [data-pane-dock] [data-tab-active] {
+  background: transparent;
+  color: var(--color-text-primary);
+}
+html[data-proto-variant="B"] [data-pane-dock] [role="tablist"] > div > div {
+  border-right: 0;
+}
+
+/* ---- C: flat neutral, pill tabs (Conductor) ---- */
+html[data-proto-variant="C"] #root > div {
+  background: var(--color-surface-950);
+}
+html[data-proto-variant="C"] header[data-tour="topbar"] {
+  background: var(--color-surface-950);
+}
+html[data-proto-variant="C"] header[data-tour="topbar"] > div {
+  border-color: color-mix(in srgb, var(--color-surface-700) 40%, transparent);
+}
+html[data-proto-variant="C"] [data-tour="sidebar"] {
+  background: var(--color-surface-900) !important;
+}
+html[data-proto-variant="C"] [data-region="main"] {
+  background: var(--color-surface-950);
+}
+html[data-proto-variant="C"] [data-region="dock-right"],
+html[data-proto-variant="C"] [data-pane-dock] {
+  background: var(--color-surface-900);
+}
+html[data-proto-variant="C"] [data-pane-dock] [role="tablist"] {
+  background: transparent;
+  height: 36px;
+  padding: 0 6px;
+  gap: 2px;
+  border-bottom-color: transparent;
+}
+html[data-proto-variant="C"] [data-pane-dock] [role="tablist"] > div:first-child {
+  align-items: center;
+  gap: 2px;
+}
+html[data-proto-variant="C"] [data-pane-dock] [role="tablist"] > div > div {
+  border-right: 0;
+  height: 26px;
+  border-radius: 6px;
+}
+html[data-proto-variant="C"] [data-pane-dock] [data-tab-active] {
+  background: var(--color-surface-700);
+  color: var(--color-text-primary);
+}
+html[data-proto-variant="C"] [data-pane-dock] [data-tab-active] span {
+  color: var(--color-text-primary);
+}
+
+/* B and C: the sidebar resize handle is a hit area, not a visible divider. */
+html[data-proto-variant="B"] [data-testid="sidebar-resize-handle"],
+html[data-proto-variant="C"] [data-testid="sidebar-resize-handle"] {
+  background: transparent;
+}
+html[data-proto-variant="C"] [data-testid="sidebar-resize-handle"] {
+  border-left: 1px solid color-mix(in srgb, var(--color-surface-700) 40%, transparent);
+}
+/* C: the sidebar's header cell matches the sidebar column, as Conductor's title bar does. */
+html[data-proto-variant="C"] header[data-tour="topbar"] > div:first-child {
+  background: var(--color-surface-900);
+  border-color: color-mix(in srgb, var(--color-surface-700) 40%, transparent);
+}

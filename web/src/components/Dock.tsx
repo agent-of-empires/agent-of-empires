@@ -81,6 +81,7 @@ function SortableTab({ id, location, groupIndex, isActive, desc, onActivate, onC
     <div
       ref={setNodeRef}
       style={style}
+      data-tab-active={isActive || undefined}
       className={`group flex items-center border-r border-surface-700/20 transition-colors ${
         isDragging ? "opacity-40" : ""
       } ${

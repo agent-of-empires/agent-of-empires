@@ -102,6 +102,7 @@ export function ContentSplit({ left, right, collapsed, onToggleCollapse, sheet =
     <div ref={containerRef} className="flex-1 flex min-h-0 overflow-hidden relative">
       {/* Terminal pane */}
       <div
+        data-region="main"
         className={`${inlineMaximized && !collapsed ? "hidden" : "flex"} flex-1 flex-col min-w-0 min-h-0`}
         inert={sheetOpen}
       >
@@ -131,6 +132,7 @@ export function ContentSplit({ left, right, collapsed, onToggleCollapse, sheet =
           {/* Right pane: one element in every mode, so its panes never remount on a mode change. */}
           <div
             ref={sheetRef}
+            data-region="dock-right"
             {...(sheet
               ? {
                   role: "dialog",
