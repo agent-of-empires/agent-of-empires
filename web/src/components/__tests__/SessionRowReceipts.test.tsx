@@ -12,22 +12,12 @@ import { makeSession, makeWorkspace } from "./fixtures";
 import { SessionActionProvider } from "../sidebar/SessionActionProvider";
 
 let canonical: ReturnType<typeof useSessions>;
-function Harness({
-  batch = false,
-  showRows = true,
-  readOnly = false,
-}: {
-  batch?: boolean;
-  showRows?: boolean;
-  readOnly?: boolean;
-}) {
+function Harness({ showRows = true, readOnly = false }: { showRows?: boolean; readOnly?: boolean }) {
   const current = useSessions();
   useEffect(() => {
     canonical = current;
   });
-  const workspaces = batch
-    ? [makeWorkspace("batch", current.sessions)]
-    : current.sessions.map((session) => makeWorkspace(session.id, [session]));
+  const workspaces = current.sessions.map((session) => makeWorkspace(session.id, [session]));
   return (
     <SessionActionProvider
       sessions={current.sessions}
@@ -54,6 +44,8 @@ function Harness({
             onArchiveToggle={() => {}}
             onSnooze={() => {}}
             onUnreadToggle={() => {}}
+            onIgnoreToggle={() => {}}
+            onReclaimOwnership={() => {}}
             bulkApi={{ prepareScope: () => ({ kind: "single" }), pin: () => {}, archive: () => {}, snooze: () => {} }}
           />
         ))}
@@ -95,47 +87,37 @@ afterEach(() => {
   toastBus.handler = null;
 });
 
-const SETTING_CASES = [
-  {
-    kind: "color",
-    pick: "sidebar-context-menu-color-red",
-    reset: "sidebar-context-menu-color-clear",
-    later: "sidebar-context-menu-color-amber",
-    selected: (session: ReturnType<typeof makeSession>) => ({ ...session, color: "red" }),
-    newer: (session: ReturnType<typeof makeSession>) => ({ ...session, color: "amber" }),
-  },
-  {
-    kind: "notifications",
-    pick: "sidebar-context-menu-notify-all",
-    reset: "sidebar-context-menu-notify-default",
-    later: "sidebar-context-menu-notify-off",
-    selected: (session: ReturnType<typeof makeSession>) => ({
-      ...session,
-      notify_on_waiting: true,
-      notify_on_idle: true,
-      notify_on_error: true,
-    }),
-    newer: (session: ReturnType<typeof makeSession>) => ({
-      ...session,
-      notify_on_waiting: false,
-      notify_on_idle: false,
-      notify_on_error: false,
-    }),
-  },
-] as const;
+type Row = ReturnType<typeof makeSession>;
+const notify = (session: Row, on: boolean) => ({
+  ...session,
+  notify_on_waiting: on,
+  notify_on_idle: on,
+  notify_on_error: on,
+});
+const ALL = "sidebar-context-menu-notify-all";
+const DEFAULT = "sidebar-context-menu-notify-default";
+const OFF = "sidebar-context-menu-notify-off";
+const setting = {
+  kind: "notifications",
+  pick: ALL,
+  reset: DEFAULT,
+  later: OFF,
+  selected: (session: Row) => notify(session, true),
+  newer: (session: Row) => notify(session, false),
+} as const;
 
 function SettingsCommandsConsumer({ open }: { open: boolean }) {
   useSettingsCommands({ open, readOnly: false, onOpenSettingsTab: () => {} });
   return null;
 }
 
-describe.each(SETTING_CASES)("accepted $kind settings across authority availability changes", (setting) => {
+describe("accepted notifications settings across authority availability changes", () => {
   it.each(["committed", "uncertain"] as const)(
     "retains the accepted result after list and settings reads fail (%s)",
     async (outcome) => {
-      const A = makeSession({ id: "A", color: null });
-      const B = makeSession({ id: "B", color: null });
-      const greenB = { ...B, color: "green" };
+      const A = makeSession({ id: "A" });
+      const B = makeSession({ id: "B" });
+      const offB = notify(B, false);
       const save = Promise.withResolvers<Response>();
       const entered = Promise.withResolvers<void>();
       const failedSettingsEntered = Promise.withResolvers<void>();
@@ -156,9 +138,9 @@ describe.each(SETTING_CASES)("accepted $kind settings across authority availabil
               [
                 {
                   section: "session",
-                  field: "show_session_colors",
+                  field: "unread_indicator",
                   category: "session",
-                  label: "Session colors",
+                  label: "Unread marker",
                   description: "",
                   widget: { kind: "toggle" },
                   web_write: { policy: "allow" },
@@ -175,9 +157,9 @@ describe.each(SETTING_CASES)("accepted $kind settings across authority availabil
               failedSettingsEntered.resolve();
               return new Response("", { status: 503 });
             }
-            return reply({ session: { show_session_colors: true } }, revision);
+            return reply({ session: { unread_indicator: true } }, revision);
           }
-          if (url === "/api/sessions/B/color") return reply(greenB, 12n);
+          if (url === "/api/sessions/B/notifications") return reply(offB, 12n);
           if (url === `/api/sessions/A/${setting.kind}`) {
             writes.push(init!);
             entered.resolve();
@@ -199,7 +181,7 @@ describe.each(SETTING_CASES)("accepted $kind settings across authority availabil
       await entered.promise;
       expect(picked(setting.pick)).toBe("true");
       menu(1);
-      await choose("sidebar-context-menu-color-green");
+      await choose(OFF);
       expect(canonical.observedById.B?.revision).toBe(12n);
       expect(canonical.observedById.A?.revision).toBe(10n);
       expect(canonical.sessions[0]).toEqual(A);
@@ -230,7 +212,7 @@ describe.each(SETTING_CASES)("accepted $kind settings across authority availabil
       }
       failPoll = false;
       revision = 13n;
-      snapshot = { sessions: [setting.newer(A), greenB], workspace_ordering: ["A", "B"] };
+      snapshot = { sessions: [setting.newer(A), offB], workspace_ordering: ["A", "B"] };
       await tick(3000);
       expect(canonical.error).toBe(false);
       expect(canonical.sessions[0]).toEqual(setting.newer(A));
@@ -241,7 +223,7 @@ describe.each(SETTING_CASES)("accepted $kind settings across authority availabil
   );
 
   it("dispatches an accepted queued reset during a poll outage", async () => {
-    const A = makeSession({ id: "A", color: null });
+    const A = makeSession({ id: "A" });
     const first = Promise.withResolvers<Response>();
     const second = Promise.withResolvers<Response>();
     const entered = Promise.withResolvers<void>();
@@ -292,7 +274,7 @@ describe.each(SETTING_CASES)("accepted $kind settings across authority availabil
   it.each([false, true])(
     "adopts a dispatched receipt but refuses any queued write after read-only admission changes (queued=%s)",
     async (queued) => {
-      const A = makeSession({ id: "A", color: null });
+      const A = makeSession({ id: "A" });
       const held = Promise.withResolvers<Response>();
       const entered = Promise.withResolvers<void>();
       const writes: RequestInit[] = [];
@@ -334,7 +316,7 @@ describe.each(SETTING_CASES)("accepted $kind settings across authority availabil
   it.each(["unavailable", "readOnly"] as const)(
     "rejects a new pick without replacing the accepted selection when %s",
     async (admission) => {
-      const A = makeSession({ id: "A", color: null });
+      const A = makeSession({ id: "A" });
       const held = Promise.withResolvers<Response>();
       const entered = Promise.withResolvers<void>();
       let failPoll = false;
@@ -386,62 +368,53 @@ describe.each(SETTING_CASES)("accepted $kind settings across authority availabil
 });
 
 describe("SessionRow canonical settings receipts", () => {
-  it.each(["color", "notifications"] as const)(
-    "finishes the accepted %s reset after rows visually unmount",
-    async (setting) => {
-      const A = makeSession({ id: "A", color: null });
-      const first = Promise.withResolvers<Response>();
-      const second = Promise.withResolvers<Response>();
-      const firstEntered = Promise.withResolvers<void>();
-      const secondEntered = Promise.withResolvers<RequestInit>();
-      let calls = 0;
-      const selected =
-        setting === "color"
-          ? { ...A, color: "red" }
-          : { ...A, notify_on_waiting: true, notify_on_idle: true, notify_on_error: true };
-      vi.stubGlobal(
-        "fetch",
-        vi.fn(async (url: string, init?: RequestInit) => {
-          if (url === "/api/sessions?state=untrashed") return reply({ sessions: [A], workspace_ordering: [] }, 10n);
-          if (++calls === 1) {
-            firstEntered.resolve();
-            return first.promise;
-          }
-          secondEntered.resolve(init!);
-          return second.promise;
-        }),
-      );
-      const view = render(<Harness />);
-      await tick();
-      menu();
-      await choose(setting === "color" ? "sidebar-context-menu-color-red" : "sidebar-context-menu-notify-all");
-      await firstEntered.promise;
-      await choose(setting === "color" ? "sidebar-context-menu-color-clear" : "sidebar-context-menu-notify-default");
-      view.rerender(<Harness showRows={false} />);
-      expect(screen.queryByTestId("sidebar-session-row")).toBeNull();
-      await act(async () => first.resolve(reply(selected, 11n)));
-      const request = await secondEntered.promise;
-      expect(JSON.parse(request.body as string)).toEqual(
-        setting === "color"
-          ? { color: null }
-          : { notify_on_waiting: null, notify_on_idle: null, notify_on_error: null },
-      );
-      expect(new Headers(request.headers).get("aoe-runtime-epoch")).toBe("boot");
-      await act(async () => second.resolve(reply(A, 12n)));
-      view.rerender(<Harness />);
-      menu();
-      expect(
-        picked(setting === "color" ? "sidebar-context-menu-color-clear" : "sidebar-context-menu-notify-default"),
-      ).toBe("true");
-      expect(canonical.sessions).toEqual([A]);
-      expect(canonical.observedById.A?.revision).toBe(12n);
-    },
-  );
+  it("finishes the accepted reset after rows visually unmount", async () => {
+    const A = makeSession({ id: "A" });
+    const first = Promise.withResolvers<Response>();
+    const second = Promise.withResolvers<Response>();
+    const firstEntered = Promise.withResolvers<void>();
+    const secondEntered = Promise.withResolvers<RequestInit>();
+    let calls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (url === "/api/sessions?state=untrashed") return reply({ sessions: [A], workspace_ordering: [] }, 10n);
+        if (++calls === 1) {
+          firstEntered.resolve();
+          return first.promise;
+        }
+        secondEntered.resolve(init!);
+        return second.promise;
+      }),
+    );
+    const view = render(<Harness />);
+    await tick();
+    menu();
+    await choose(ALL);
+    await firstEntered.promise;
+    await choose(DEFAULT);
+    view.rerender(<Harness showRows={false} />);
+    expect(screen.queryByTestId("sidebar-session-row")).toBeNull();
+    await act(async () => first.resolve(reply(notify(A, true), 11n)));
+    const request = await secondEntered.promise;
+    expect(JSON.parse(request.body as string)).toEqual({
+      notify_on_waiting: null,
+      notify_on_idle: null,
+      notify_on_error: null,
+    });
+    expect(new Headers(request.headers).get("aoe-runtime-epoch")).toBe("boot");
+    await act(async () => second.resolve(reply(A, 12n)));
+    view.rerender(<Harness />);
+    menu();
+    expect(picked(DEFAULT)).toBe("true");
+    expect(canonical.sessions).toEqual([A]);
+    expect(canonical.observedById.A?.revision).toBe(12n);
+  });
 
   it.each(["epoch", "removed", "birth", "profile", "removed-and-restored"] as const)(
     "does not replay an accepted old setting after actual %s invalidation",
     async (change) => {
-      const A = makeSession({ id: "A", color: null });
+      const A = makeSession({ id: "A" });
       const held = Promise.withResolvers<Response>();
       let snapshot = { sessions: [A], workspace_ordering: [] };
       let epoch = "boot";
@@ -459,9 +432,9 @@ describe("SessionRow canonical settings receipts", () => {
       render(<Harness />);
       await tick();
       menu();
-      await choose("sidebar-context-menu-color-red");
+      await choose(ALL);
       expect(calls).toBe(1);
-      await choose("sidebar-context-menu-color-clear");
+      await choose(DEFAULT);
       if (change === "epoch") epoch = "replacement";
       if (change === "removed" || change === "removed-and-restored")
         snapshot = { sessions: [], workspace_ordering: [] };
@@ -474,7 +447,7 @@ describe("SessionRow canonical settings receipts", () => {
         snapshot = { sessions: [A], workspace_ordering: [] };
         await tick(3000);
       }
-      await act(async () => held.resolve(reply({ ...A, color: "red" }, 21n)));
+      await act(async () => held.resolve(reply(notify(A, true), 21n)));
       expect(calls).toBe(1);
       expect(canonical.sessions).toEqual(snapshot.sessions);
       expect(error).toHaveBeenCalledWith(expect.stringContaining("unconfirmed"));
@@ -482,7 +455,7 @@ describe("SessionRow canonical settings receipts", () => {
   );
 
   it("keeps the newer accepted pick when an older save fails after visual unmount", async () => {
-    const A = makeSession({ id: "A", color: null });
+    const A = makeSession({ id: "A" });
     const held = Promise.withResolvers<Response>();
     let calls = 0;
     const error = vi.fn();
@@ -491,128 +464,116 @@ describe("SessionRow canonical settings receipts", () => {
       "fetch",
       vi.fn(async (url: string) => {
         if (url === "/api/sessions?state=untrashed") return reply({ sessions: [A], workspace_ordering: [] }, 10n);
-        return ++calls === 1 ? held.promise : reply({ ...A, color: "amber" }, 12n);
+        return ++calls === 1 ? held.promise : reply(notify(A, false), 12n);
       }),
     );
     const view = render(<Harness />);
     await tick();
     menu();
-    await choose("sidebar-context-menu-color-red");
-    await choose("sidebar-context-menu-color-amber");
+    await choose(ALL);
+    await choose(OFF);
     view.rerender(<Harness showRows={false} />);
     await act(async () => held.resolve(new Response("", { status: 503 })));
-    expect(canonical.sessions[0]?.color).toBe("amber");
+    expect(canonical.sessions[0]?.notify_on_idle).toBe(false);
     expect(error).not.toHaveBeenCalled();
     view.rerender(<Harness />);
     menu();
-    expect(picked("sidebar-context-menu-color-amber")).toBe("true");
+    expect(picked(OFF)).toBe("true");
   });
 
-  it.each(["color", "notifications"])(
-    "keeps cancelled %s through an unrelated B12 ACK and stale GET11, then accepts writer13",
-    async (setting) => {
-      const first = Promise.withResolvers<Response>();
-      const cancel = Promise.withResolvers<Response>();
-      let callsA = 0;
-      const initialA = makeSession({ id: "A", color: null });
-      const B = makeSession({ id: "B", color: null });
-      const selectedA =
-        setting === "color"
-          ? { ...initialA, color: "red" }
-          : { ...initialA, notify_on_waiting: true, notify_on_idle: true, notify_on_error: true };
-      let snapshot = { sessions: [initialA, B], workspace_ordering: ["A", "B"] };
-      let revision = 9n;
-      vi.stubGlobal(
-        "fetch",
-        vi.fn(async (url: string) => {
-          if (url === "/api/sessions?state=untrashed") return reply(snapshot, revision);
-          if (url === "/api/sessions/A/" + setting) return ++callsA === 1 ? first.promise : cancel.promise;
-          if (url === "/api/sessions/B/color") return reply({ ...B, color: "green" }, 12n);
-          throw new Error("Unexpected request " + url);
-        }),
-      );
-      render(<Harness />);
-      await tick();
-      menu();
-      const earlier = setting === "color" ? "sidebar-context-menu-color-red" : "sidebar-context-menu-notify-all";
-      const latest = setting === "color" ? "sidebar-context-menu-color-clear" : "sidebar-context-menu-notify-default";
-      await choose(earlier);
-      await choose(latest);
-      expect(callsA).toBe(1);
-      snapshot = { sessions: [selectedA, B], workspace_ordering: ["A", "B"] };
-      revision = 10n;
-      await tick(3000);
-      expect(picked(latest)).toBe("true");
-      menu(1);
-      await choose("sidebar-context-menu-color-green");
-      expect(canonical.observedById.B?.revision).toBe(12n);
-      expect(canonical.observedById.A?.revision).toBe(10n);
-      menu();
-      expect(picked(latest)).toBe("true");
-      await act(async () => first.resolve(reply(selectedA, 10n)));
-      expect(callsA).toBe(2);
-      expect(picked(latest)).toBe("true");
-      await act(async () => cancel.resolve(reply(initialA, 11n)));
-      expect(picked(latest)).toBe("true");
-      expect(canonical.observedById.A?.revision).toBe(11n);
-      expect(canonical.sessions[0]).toEqual(initialA);
-      if (setting === "color")
-        expect(
-          screen.queryAllByTestId("sidebar-session-color-dot").map((dot) => dot.getAttribute("data-color")),
-        ).toEqual(["green"]);
-      revision = 11n;
-      await tick(3000);
-      expect(picked(latest)).toBe("true");
-      expect(canonical.observedById.A?.revision).toBe(11n);
-      revision = 13n;
-      await tick(3000);
-      expect(picked(earlier)).toBe("true");
-      expect(picked(latest)).toBe("false");
-    },
-  );
+  it("keeps a cancelled pick through an unrelated B12 ACK and stale GET11, then accepts writer13", async () => {
+    const first = Promise.withResolvers<Response>();
+    const cancel = Promise.withResolvers<Response>();
+    let callsA = 0;
+    const initialA = makeSession({ id: "A" });
+    const B = makeSession({ id: "B" });
+    const selectedA = notify(initialA, true);
+    let snapshot = { sessions: [initialA, B], workspace_ordering: ["A", "B"] };
+    let revision = 9n;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        if (url === "/api/sessions?state=untrashed") return reply(snapshot, revision);
+        if (url === "/api/sessions/A/notifications") return ++callsA === 1 ? first.promise : cancel.promise;
+        if (url === "/api/sessions/B/notifications") return reply(notify(B, false), 12n);
+        throw new Error("Unexpected request " + url);
+      }),
+    );
+    render(<Harness />);
+    await tick();
+    menu();
+    await choose(ALL);
+    await choose(DEFAULT);
+    expect(callsA).toBe(1);
+    snapshot = { sessions: [selectedA, B], workspace_ordering: ["A", "B"] };
+    revision = 10n;
+    await tick(3000);
+    expect(picked(DEFAULT)).toBe("true");
+    menu(1);
+    await choose(OFF);
+    expect(canonical.observedById.B?.revision).toBe(12n);
+    expect(canonical.observedById.A?.revision).toBe(10n);
+    menu();
+    expect(picked(DEFAULT)).toBe("true");
+    await act(async () => first.resolve(reply(selectedA, 10n)));
+    expect(callsA).toBe(2);
+    expect(picked(DEFAULT)).toBe("true");
+    await act(async () => cancel.resolve(reply(initialA, 11n)));
+    expect(picked(DEFAULT)).toBe("true");
+    expect(canonical.observedById.A?.revision).toBe(11n);
+    expect(canonical.sessions[0]).toEqual(initialA);
+    revision = 11n;
+    await tick(3000);
+    expect(picked(DEFAULT)).toBe("true");
+    expect(canonical.observedById.A?.revision).toBe(11n);
+    revision = 13n;
+    await tick(3000);
+    expect(picked(ALL)).toBe("true");
+    expect(picked(DEFAULT)).toBe("false");
+  });
 
   it.each([false, true])(
-    "does not resurrect a surrendered overlay when canonical color returns (repick %s)",
+    "does not resurrect a surrendered overlay when the canonical setting returns (repick %s)",
     async (repick) => {
-      const A = makeSession({ id: "A", color: null });
+      const A = makeSession({ id: "A" });
       const held = Promise.withResolvers<Response>();
       let calls = 0;
       vi.stubGlobal(
         "fetch",
         vi.fn(async (url: string) => {
           if (url === "/api/sessions?state=untrashed") return reply({ sessions: [A], workspace_ordering: [] }, 9n);
-          return ++calls === 1 ? held.promise : reply({ ...A, color: "red" }, 13n);
+          return ++calls === 1 ? held.promise : reply(notify(A, true), 13n);
         }),
       );
       render(<Harness />);
       await tick();
       menu();
-      await choose("sidebar-context-menu-color-red");
+      await choose(ALL);
       act(() =>
         canonical.applySessionMutation({
-          session: { ...A, color: "green" },
+          session: notify(A, false),
           cursor: { epoch: "boot", revision: 11n },
         }),
       );
-      expect(picked("sidebar-context-menu-color-green")).toBe("true");
+      expect(picked(OFF)).toBe("true");
       act(() =>
         canonical.applySessionMutation({
           session: A,
           cursor: { epoch: "boot", revision: 12n },
         }),
       );
-      expect(picked("sidebar-context-menu-color-clear")).toBe("true");
-      if (repick) await choose("sidebar-context-menu-color-red");
-      await act(async () => held.resolve(reply({ ...A, color: "red" }, 10n)));
+      expect(picked(DEFAULT)).toBe("true");
+      if (repick) await choose(ALL);
+      await act(async () => held.resolve(reply(notify(A, true), 10n)));
       expect(calls).toBe(repick ? 2 : 1);
-      expect(picked(repick ? "sidebar-context-menu-color-red" : "sidebar-context-menu-color-clear")).toBe("true");
+      expect(picked(repick ? ALL : DEFAULT)).toBe("true");
     },
   );
 
   it("releases an unchanged cancellation without another GET and respects a newer same-id row before its ACK", async () => {
     const first = Promise.withResolvers<Response>();
     const cancel = Promise.withResolvers<Response>();
-    const A = makeSession({ id: "A", color: null });
+    const A = makeSession({ id: "A" });
     let calls = 0;
     vi.stubGlobal(
       "fetch",
@@ -627,77 +588,20 @@ describe("SessionRow canonical settings receipts", () => {
     render(<Harness />);
     await tick();
     menu();
-    await choose("sidebar-context-menu-color-red");
-    await choose("sidebar-context-menu-color-clear");
-    await act(async () => first.resolve(reply({ ...A, color: "red" }, 11n)));
+    await choose(ALL);
+    await choose(DEFAULT);
+    await act(async () => first.resolve(reply(notify(A, true), 11n)));
     await act(async () => cancel.resolve(reply(A, 12n)));
-    expect(picked("sidebar-context-menu-color-clear")).toBe("true");
-    act(() =>
-      canonical.applySessionMutation({ session: { ...A, color: "red" }, cursor: { epoch: "boot", revision: 13n } }),
-    );
-    expect(picked("sidebar-context-menu-color-red")).toBe("true");
+    expect(picked(DEFAULT)).toBe("true");
+    act(() => canonical.applySessionMutation({ session: notify(A, true), cursor: { epoch: "boot", revision: 13n } }));
+    expect(picked(ALL)).toBe("true");
     const older = Promise.withResolvers<Response>();
     vi.mocked(fetch).mockImplementationOnce(() => older.promise);
-    await choose("sidebar-context-menu-color-clear");
-    act(() =>
-      canonical.applySessionMutation({ session: { ...A, color: "amber" }, cursor: { epoch: "boot", revision: 15n } }),
-    );
+    await choose(DEFAULT);
+    act(() => canonical.applySessionMutation({ session: notify(A, false), cursor: { epoch: "boot", revision: 15n } }));
     await act(async () => older.resolve(reply(A, 14n)));
-    expect(picked("sidebar-context-menu-color-amber")).toBe("true");
-    expect(canonical.sessions[0]!.color).toBe("amber");
+    expect(picked(OFF)).toBe("true");
+    expect(canonical.sessions[0]!.notify_on_idle).toBe(false);
     expect(canonical.observedById.A?.revision).toBe(15n);
-  });
-
-  it("applies every successful multi-session color response and reports partial failure without inventing an ACK", async () => {
-    const A = makeSession({ id: "A", color: "red" });
-    const B = makeSession({ id: "B", color: "red" });
-    const error = vi.fn();
-    toastBus.handler = { error, info: vi.fn(), push: vi.fn(), openLink: vi.fn() };
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string) => {
-        if (url === "/api/sessions?state=untrashed") return reply({ sessions: [A, B], workspace_ordering: [] }, 10n);
-        if (url === "/api/sessions/A/color") return reply({ ...A, color: null }, 11n);
-        return new Response("", { status: 503 });
-      }),
-    );
-    render(<Harness batch />);
-    await tick();
-    menu();
-    await choose("sidebar-context-menu-color-clear");
-    expect(error).toHaveBeenCalledOnce();
-    expect(canonical.sessions.map((row) => row.color)).toEqual([null, "red"]);
-    expect(canonical.observedById.A?.revision).toBe(11n);
-    expect(canonical.observedById.B?.revision).toBe(10n);
-    expect(picked("sidebar-context-menu-color-red")).toBe("true");
-  });
-
-  it("holds a captured two-id batch until both receipts are installed, even when B ACK arrives first", async () => {
-    const A = makeSession({ id: "A", color: "red" });
-    const B = makeSession({ id: "B", color: "red" });
-    const ackA = Promise.withResolvers<Response>();
-    const ackB = Promise.withResolvers<Response>();
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string) => {
-        if (url === "/api/sessions?state=untrashed") return reply({ sessions: [A, B], workspace_ordering: [] }, 10n);
-        return url.includes("/A/") ? ackA.promise : ackB.promise;
-      }),
-    );
-    render(<Harness batch />);
-    await tick();
-    menu();
-    await choose("sidebar-context-menu-color-clear");
-    await act(async () => ackB.resolve(reply({ ...B, color: null }, 12n)));
-    expect(canonical.observedById.A?.revision).toBe(10n);
-    expect(canonical.observedById.B?.revision).toBe(12n);
-    expect(picked("sidebar-context-menu-color-clear")).toBe("true");
-    await act(async () => ackA.resolve(reply({ ...A, color: null }, 11n)));
-    expect(canonical.observedById.A?.revision).toBe(11n);
-    act(() => {
-      canonical.applySessionMutation({ session: { ...A, color: "green" }, cursor: { epoch: "boot", revision: 13n } });
-      canonical.applySessionMutation({ session: { ...B, color: "green" }, cursor: { epoch: "boot", revision: 14n } });
-    });
-    expect(picked("sidebar-context-menu-color-green")).toBe("true");
   });
 });

@@ -891,6 +891,37 @@ last_seen_version = "{}"
         self.tmux_new_detached(name, &format!("env {} {binary}", self.pane_env_policy()));
     }
 
+    /// Run `aoe <args>` in its own tmux session until it exits, for a launch that must
+    /// refuse to open. Returns the exit code and stderr.
+    pub fn run_tui_to_exit(&self, args: &[&str]) -> (i32, String) {
+        let dir = self.home_dir.path();
+        let (stderr, code) = (dir.join("tui-exit.stderr"), dir.join("tui-exit.code"));
+        let quote = |path: &Path| shell_words::quote(path.to_str().expect("path")).into_owned();
+        let binary = self.binary_path.to_str().expect("binary path");
+        let args = shell_words::join(args);
+        self.tmux_new_detached(
+            "tui-exit",
+            &format!(
+                "env {} {binary} {args} 2> {}; echo $? > {}",
+                self.pane_env_policy(),
+                quote(&stderr),
+                quote(&code)
+            ),
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = std::fs::read_to_string(&code)
+                .ok()
+                .filter(|text| text.ends_with('\n'))
+            {
+                let status = status.trim().parse().expect("exit code");
+                return (status, std::fs::read_to_string(&stderr).unwrap_or_default());
+            }
+            assert!(Instant::now() < deadline, "aoe {args} did not exit");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Spawn `aoe` in a detached tmux session at the requested dimensions.
     pub fn spawn_tui_sized(&mut self, cols: u16, rows: u16) {
         self.spawn_sized(&[], cols, rows);

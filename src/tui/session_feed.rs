@@ -61,6 +61,22 @@ pub(crate) enum SidebarSource {
 
 const COMMAND_CAPACITY: usize = 32;
 
+pub(crate) type Prepared = (RuntimeConnection, crate::daemon::DaemonClient);
+
+/// Opens the runtime feed and command client on a reached Daemon. `profile` is empty in
+/// all-profiles mode.
+pub(crate) async fn prepare(
+    endpoint: crate::daemon::DaemonEndpoint,
+    profile: &str,
+) -> anyhow::Result<Prepared> {
+    let connection =
+        RuntimeConnection::connect(&endpoint, (!profile.is_empty()).then_some(profile)).await?;
+    let client = crate::acp::client::HttpClient::new(endpoint)?
+        .daemon_client()
+        .await?;
+    Ok((connection, client))
+}
+
 pub(crate) enum SessionRequest {
     Mutation(SessionMutation),
     Trash {
@@ -431,6 +447,20 @@ impl NativeLease {
         }) {
             return false;
         }
+        if auxiliary.is_none() {
+            let allows = |snapshot: &RuntimeSnapshot| {
+                snapshot
+                    .contents
+                    .sessions
+                    .iter()
+                    .any(|row| row.id == id && status_allows_attachment(row.status.as_str()))
+            };
+            if !allows(snapshot)
+                || !matches!(latest, Some(SessionFeedResult::Snapshot(latest)) if allows(latest))
+            {
+                return false;
+            }
+        }
         if let Some(scope) = self.scope.get() {
             return scope.id == id
                 && scope.auxiliary == auxiliary
@@ -489,9 +519,8 @@ impl NativeLease {
             })
             .transpose()?;
         let capture = || {
-            let created = chrono::DateTime::parse_from_rfc3339(&scope.created_at)
-                .map_err(|_| NativeInputError::Ownership)?
-                .with_timezone(&chrono::Utc);
+            let created = crate::time::Timestamp::parse_rfc3339(&scope.created_at)
+                .map_err(|_| NativeInputError::Ownership)?;
             crate::session::NativeInputFence::capture(
                 &scope.target.profile,
                 &scope.id,
@@ -750,6 +779,22 @@ struct PendingCreation {
     receipt: Option<Box<MutationReceipt<crate::daemon::SessionResponse>>>,
 }
 
+/// Whether a snapshot status may accompany a confirmed agent-pane receipt.
+///
+/// Readiness comes from the receipt's identity (generation, profile, tmux
+/// name) and the snapshot's pane observation, so status only has to rule out a
+/// row that is stopped, failed, or mid-teardown. `Unknown` is the live state of
+/// a pane that is alive but whose screen the detector cannot classify (see
+/// `crate::session::instance::pane_status`), which is exactly what an agent
+/// whose status adapter has not reported yet looks like; it is not evidence the
+/// pane is gone.
+fn status_allows_attachment(status: &str) -> bool {
+    matches!(
+        status,
+        "Running" | "Waiting" | "Idle" | "Starting" | "Unknown"
+    )
+}
+
 fn set_grant(grant: &AtomicU64, allowed: bool) {
     // Renamed to try_update in the standard library; the MSRV this builds against
     // does not have it yet. Upstream carries the same allowance.
@@ -846,7 +891,7 @@ async fn run_command_writer(
             let epoch = epoch.clone();
             creations.spawn(async move {
                 let outcome = client
-                    .create_session(&body, &epoch)
+                    .create_session(&body, &epoch, crate::daemon::PromptOrigin::Tui)
                     .await
                     .map(|receipt| CommandReply::Created(Box::new(receipt)))
                     .map_err(CommandFailure::creation);
@@ -1123,10 +1168,6 @@ impl SessionFeed {
         }
     }
 
-    pub fn connect(&mut self, profile: String) {
-        self.connect_prepared(profile, None);
-    }
-
     pub(crate) fn suspend_for_dashboard(&mut self) {
         set_grant(&self.grant, false);
         set_grant(&self.native_grant, false);
@@ -1137,11 +1178,7 @@ impl SessionFeed {
         self.commands = None;
     }
 
-    pub(crate) fn connect_prepared(
-        &mut self,
-        profile: String,
-        prepared: Option<(RuntimeConnection, crate::daemon::DaemonClient)>,
-    ) {
+    pub(crate) fn connect_prepared(&mut self, profile: String, prepared: Option<Prepared>) {
         set_grant(&self.grant, false);
         set_grant(&self.native_grant, false);
         self.quit_control.send_replace(None);
@@ -1176,15 +1213,7 @@ impl SessionFeed {
                         let endpoint =
                             crate::acp::client::daemon_manager::ensure_native_daemon(&profile)
                                 .await?;
-                        let connection = RuntimeConnection::connect(
-                            &endpoint,
-                            (!profile.is_empty()).then_some(profile.as_str()),
-                        )
-                        .await?;
-                        let client = crate::acp::client::HttpClient::new(endpoint)?
-                            .daemon_client()
-                            .await?;
-                        (connection, client)
+                        prepare(endpoint, &profile).await?
                     }
                 };
                 let epoch = connection.info().epoch.clone();
@@ -1862,7 +1891,7 @@ impl SessionFeed {
             .ok_or_else(|| {
                 anyhow::anyhow!("Native preparation requires the original session snapshot")
             })?;
-        let created_at: chrono::DateTime<chrono::Utc> = row.created_at.parse()?;
+        let created_at = crate::time::Timestamp::parse_rfc3339(&row.created_at)?;
         let profile_binding = crate::session::Storage::open_reference(&row.profile)
             .ok()
             .map(Arc::new);
@@ -2926,7 +2955,7 @@ mod tests {
         assert!(!errors[0].outcome_unknown);
         assert!(feed.can_submit("refused"));
 
-        feed.connect("test".into());
+        feed.connect_prepared("test".into(), None);
         feed.task.take().unwrap().abort();
         set_grant(&feed.grant, true);
         assert!(!feed.can_submit("unknown"));
@@ -4680,7 +4709,7 @@ mod tests {
         feed.create_session("pending".into(), body).unwrap();
         let pending = requests.try_recv().unwrap();
 
-        feed.connect("test".into());
+        feed.connect_prepared("test".into(), None);
         feed.task.take().unwrap().abort();
         old_sender.send_replace(Some(SessionFeedResult::Snapshot(snapshot("old", 99))));
         assert!(matches!(feed.try_recv(), Err(TryRecvError::Empty)));
@@ -4916,6 +4945,91 @@ mod tests {
         assert!(feed.drain_command_errors().is_empty());
         let accepted = prepared.result.try_recv().unwrap().unwrap();
         assert!(Arc::ptr_eq(&accepted, &original));
+    }
+    /// An agent whose screen the detector cannot classify keeps its pane alive
+    /// and alive-pane identity is what the receipt confirms, so the row must
+    /// attach instead of failing as a stale target. A stopped or failed row is
+    /// still refused.
+    #[test]
+    fn ensure_agent_accepts_an_unclassified_status_only_with_the_same_live_pane() {
+        use crate::session::PanePresence;
+        for (status, pane, tmux_session, generation, attach) in [
+            ("Unknown", PanePresence::Alive, Some("agent-4"), 4, true),
+            ("Idle", PanePresence::Alive, Some("agent-4"), 4, true),
+            ("Stopped", PanePresence::Alive, Some("agent-4"), 4, false),
+            ("Error", PanePresence::Alive, Some("agent-4"), 4, false),
+            ("Deleting", PanePresence::Alive, Some("agent-4"), 4, false),
+            (
+                "Unknown",
+                PanePresence::Alive,
+                Some("another-agent"),
+                4,
+                false,
+            ),
+            ("Unknown", PanePresence::Alive, Some("agent-4"), 5, false),
+            ("Unknown", PanePresence::Dead, Some("agent-4"), 4, false),
+            ("Unknown", PanePresence::Absent, Some("agent-4"), 4, false),
+        ] {
+            let row: crate::daemon::SessionResponse = serde_json::from_value(serde_json::json!({
+                "id": "session",
+                "profile": "test",
+                "lifecycle_generation": 4,
+                "status": "Running",
+                "created_at": "2026-01-01T00:00:00Z",
+                "agent_pane": {"state": "alive", "tmux_session": "agent-4"},
+            }))
+            .unwrap();
+            let mut row = row;
+            row.agent_pane.physical = Some(native_physical_fixture());
+            let mut initial = snapshot("test", 1);
+            Arc::make_mut(&mut initial).contents.sessions.push(row);
+            let mut feed =
+                SessionFeed::seeded_for_test(SessionFeedResult::Snapshot(initial.clone()));
+            feed.mark_snapshot_applied(initial.clone());
+            let (commands, mut requests) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
+            feed.commands = Some(commands);
+            set_grant(&feed.native_grant, true);
+            let mut prepared = feed.ensure_agent("session".into(), None).unwrap();
+            let command = requests.try_recv().unwrap();
+            command
+                .result
+                .send(Ok(CommandReply::Terminal(MutationReceipt {
+                    cursor: RuntimeCursor {
+                        epoch: "test".into(),
+                        revision: 2,
+                    },
+                    outcome: TerminalTarget {
+                        tmux_session: "agent-4".into(),
+                        status: crate::daemon::TerminalTargetStatus::Alive,
+                        lifecycle_generation: 4,
+                        profile: "test".into(),
+                        physical: Some(native_physical_fixture()),
+                    },
+                })))
+                .unwrap();
+            let mut next = initial;
+            let committed = Arc::make_mut(&mut next);
+            committed.cursor.revision = 2;
+            let row = &mut committed.contents.sessions[0];
+            row.lifecycle_generation = generation;
+            row.status = status.into();
+            row.agent_pane.state = pane;
+            row.agent_pane.tmux_session = tmux_session.map(str::to_owned);
+            if tmux_session == Some("another-agent") {
+                Arc::make_mut(row.agent_pane.physical.as_mut().unwrap())
+                    .identity
+                    .pane_id = "%99".into();
+            }
+            feed.publish_for_test(SessionFeedResult::Snapshot(next.clone()));
+            assert!(feed.drain_command_errors().is_empty());
+            feed.mark_snapshot_applied(next);
+            assert!(feed.drain_command_errors().is_empty());
+            assert_eq!(
+                prepared.result.try_recv().unwrap().is_ok(),
+                attach,
+                "{status} {pane:?} {tmux_session:?} generation={generation}"
+            );
+        }
     }
 
     #[test]

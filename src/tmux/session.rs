@@ -527,9 +527,64 @@ fn chrome_rows(window_height: u16, pane_height: u16) -> u16 {
     }
 }
 
+/// One live-view capture of a session's window.
+#[derive(Debug, Default)]
+pub(crate) struct WindowCapture {
+    pub(crate) content: String,
+    pub(crate) cursor: Option<PaneCursor>,
+    /// Rows of `content` that soft-wrap onto the next row, ascending.
+    pub(crate) wrapped: Vec<u32>,
+}
+
 /// A `capture-pane` result: its output, or `None` when tmux reported failure.
 fn capture_output(success: bool, stdout: &[u8]) -> Option<String> {
     success.then(|| String::from_utf8_lossy(stdout).into_owned())
+}
+
+/// Capture `pane_id` only while `session_name` still lists it. Membership comes from the
+/// session's own pane list, not the bare id, which resolves through whichever session sharing a
+/// linked window was active last. One tmux call frames its markers with a per-call nonce that
+/// pane output cannot contain, so screen text never reads as a membership result.
+fn capture_pane_in_session(
+    pane_id: &str,
+    session_name: &str,
+    lines: usize,
+) -> std::io::Result<Option<String>> {
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let output = crate::tmux::tmux_command()
+        .args([
+            "list-panes",
+            "-s",
+            "-t",
+            &format!("={session_name}:"),
+            "-F",
+            &format!("{nonce}:#{{pane_id}}"),
+            ";",
+            "display-message",
+            "-p",
+            &format!("{nonce}:capture"),
+            ";",
+            "capture-pane",
+            "-t",
+            pane_id,
+            "-p",
+            "-e",
+            "-S",
+            &format!("-{lines}"),
+        ])
+        .output()?;
+    let Some(text) = capture_output(output.status.success(), &output.stdout) else {
+        return Ok(None);
+    };
+    // One line per pane per window link. Matched here, not with `list-panes -f`, which needs
+    // tmux 3.2.
+    let (listing, capture) = text
+        .split_once(&format!("{nonce}:capture\n"))
+        .unwrap_or_default();
+    let owned = listing
+        .lines()
+        .any(|line| line.strip_prefix(&nonce).and_then(|l| l.strip_prefix(':')) == Some(pane_id));
+    Ok(owned.then(|| capture.to_owned()))
 }
 
 impl Session {
@@ -1017,6 +1072,22 @@ impl Session {
         let target = format!("={}:", self.name);
         append_session_setup_args(&mut args, &target, &config, None);
         crate::tmux::append_session_kind_args(&mut args, &target, crate::tmux::SessionKind::Agent);
+        if let Some(source) = extra_env.iter().find_map(|mutation| match mutation {
+            PaneEnvMutation::Set { key, value } if key == crate::hooks::SESSION_SOURCE_ENV => {
+                uuid::Uuid::parse_str(value).ok().map(|_| value)
+            }
+            _ => None,
+        }) {
+            args.extend([
+                ";".into(),
+                "set-option".into(),
+                "-pF".into(),
+                "-t".into(),
+                target,
+                "@aoe-hook-launch".into(),
+                format!("#{{pane_pid}}:{source}"),
+            ]);
+        }
 
         let output = crate::tmux::tmux_command().args(&args).output()?;
 
@@ -1294,6 +1365,12 @@ impl Session {
             .ok_or_else(|| anyhow::anyhow!("could not capture tmux session '{}'", self.name))
     }
 
+    /// [`Self::try_capture_pane`] of exactly `pane`, a `#{pane_id}`, never a re-resolved one.
+    pub fn try_capture_pane_in(&self, pane: &str, lines: usize) -> Result<String> {
+        self.capture_target(pane, lines)?
+            .ok_or_else(|| anyhow::anyhow!("could not capture tmux pane '{pane}'"))
+    }
+
     /// `None` when the session is gone or `capture-pane` failed; `Err` when tmux could not run.
     fn capture(&self, lines: usize) -> Result<Option<String>> {
         if self.physical.is_none() && !self.exists() {
@@ -1301,12 +1378,16 @@ impl Session {
         }
         let target =
             self.live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
+        self.capture_target(&target, lines)
+    }
+
+    fn capture_target(&self, target: &str, lines: usize) -> Result<Option<String>> {
         let output = self
             .input_command()?
             .args([
                 "capture-pane",
                 "-t",
-                &target,
+                target,
                 "-p",
                 "-e",
                 "-S",
@@ -1316,33 +1397,71 @@ impl Session {
         Ok(capture_output(output.status.success(), &output.stdout))
     }
 
-    /// Wait for a known marker, or for two stable captures when no marker exists.
+    /// Capture a pane the caller already resolved, skipping the existence and pane-id probes.
+    /// `None` when the capture failed or the pane no longer belongs to this session, so a stale
+    /// or moved id never reads as a blank pane.
+    pub(crate) fn capture_pane_at(&self, pane_id: &str, lines: usize) -> Option<String> {
+        capture_pane_in_session(pane_id, &self.name, lines)
+            .ok()
+            .flatten()
+    }
+
+    /// Capture this session's first agent pane, ignoring any VT channel. For callers whose channel
+    /// pane was just rejected, so the same pane is never re-selected.
+    pub(crate) fn capture_first_pane(&self, lines: usize) -> Option<String> {
+        let pane_id = super::utils::first_pane_id_with_deadline(
+            &self.name,
+            &crate::tmux::TmuxCommandDeadline::new(),
+        )?;
+        self.capture_pane_at(&pane_id, lines)
+    }
+
+    /// Wait for any known marker, or for two stable captures when no marker exists.
     /// The polling budget bounds readiness checks, not each native subprocess.
-    pub fn wait_until_ready(&self, max_wait: std::time::Duration, ready_marker: Option<&str>) {
+    /// Returns false when the budget ran out first.
+    pub fn wait_until_ready(&self, max_wait: std::time::Duration, ready_markers: &[&str]) -> bool {
+        self.wait_until_ready_unless(max_wait, ready_markers, |_| None::<()>)
+            .unwrap_or(false)
+    }
+
+    /// [`Self::wait_until_ready`] that also stops at once with `Err` when
+    /// `blocked` recognizes the plain-text screen as a dialog.
+    pub fn wait_until_ready_unless<B>(
+        &self,
+        max_wait: std::time::Duration,
+        ready_markers: &[&str],
+        blocked: impl Fn(&str) -> Option<B>,
+    ) -> Result<bool, B> {
         let poll_interval = std::time::Duration::from_millis(200);
         let deadline = std::time::Instant::now() + max_wait;
-        let ready_marker = ready_marker.map(str::to_lowercase);
+        let ready_markers: Vec<String> = ready_markers.iter().map(|m| m.to_lowercase()).collect();
         let mut last: Option<String> = None;
         while std::time::Instant::now() < deadline {
             std::thread::sleep(poll_interval);
-            let Ok(now) = self.capture_pane(5) else {
+            let Ok(now) = self.capture_pane(0) else {
                 continue;
             };
             #[cfg(test)]
             tests::observe_ready_capture(&now);
-            if let Some(marker) = ready_marker.as_deref() {
-                if now.to_lowercase().contains(marker) {
-                    return;
+            let screen = crate::tmux::utils::strip_ansi(&now);
+            if let Some(blocker) = blocked(&screen) {
+                return Err(blocker);
+            }
+            if !ready_markers.is_empty() {
+                let screen = screen.to_lowercase();
+                if ready_markers.iter().any(|m| screen.contains(m)) {
+                    return Ok(true);
                 }
                 continue;
             }
             if now.trim().len() > 20 {
                 if last.as_deref() == Some(now.as_str()) {
-                    return;
+                    return Ok(true);
                 }
                 last = Some(now);
             }
         }
+        Ok(false)
     }
 
     /// Capture the whole first window, panes composited, for the passive
@@ -1390,6 +1509,23 @@ impl Session {
         lines: usize,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> Result<(String, Option<PaneCursor>)> {
+        self.capture_window(lines, false, deadline)
+            .map(|capture| (capture.content, capture.cursor))
+    }
+
+    /// [`Self::capture_window_composited_with_cursor`] plus which rows
+    /// soft-wrap, for the Web dashboard. A composited window reports none.
+    pub(crate) fn capture_window_with_wraps(&self, lines: usize) -> Result<WindowCapture> {
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.capture_window(lines, true, &deadline)
+    }
+
+    fn capture_window(
+        &self,
+        lines: usize,
+        with_wraps: bool,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> Result<WindowCapture> {
         /// Gates the window-dimensions line. A chained `display-message` can
         /// silently produce nothing while the invocation still exits 0 (the
         /// same hazard `is_probe_line` guards in the vt seed path), and without
@@ -1405,6 +1541,8 @@ impl Session {
         let pane0 = super::utils::first_pane_id_with_deadline(&self.name, deadline)
             .ok_or_else(|| anyhow::anyhow!("No agent pane in session {}", self.name))?;
         let window = &pane0;
+        let start = format!("-{}", lines);
+        let joined_mark = with_wraps.then(crate::tmux::wraps::sentinel);
         let mut command = crate::tmux::tmux_command();
         command.args([
             "display-message",
@@ -1431,8 +1569,29 @@ impl Session {
             // Keep trailing bg fills, matching the VT path.
             "-N",
             "-S",
-            &format!("-{}", lines),
+            &start,
             ";",
+        ]);
+        // The same window with wrapped rows joined, for the wrap flags.
+        if let Some(mark) = &joined_mark {
+            command.args([
+                "display-message",
+                "-p",
+                "-t",
+                &pane0,
+                mark,
+                ";",
+                "capture-pane",
+                "-t",
+                &pane0,
+                "-p",
+                "-J",
+                "-S",
+                &start,
+                ";",
+            ]);
+        }
+        command.args([
             "display-message",
             "-p",
             "-t",
@@ -1443,7 +1602,7 @@ impl Session {
         let output = deadline.run(&mut command)?;
 
         if !output.status.success() {
-            return Ok((String::new(), None));
+            return Ok(WindowCapture::default());
         }
 
         // The first line carrying neither sentinel starts the capture.
@@ -1493,26 +1652,60 @@ impl Session {
         } else {
             unreliable_position(cursor_before)
         };
+        let (pane0_content, wrapped) = match &joined_mark {
+            Some(mark) => {
+                match crate::tmux::wraps::split_at_sentinel(pane0_content.as_bytes(), mark) {
+                    Some((rows, joined)) => {
+                        let wrapped = crate::tmux::wraps::soft_wraps(
+                            &String::from_utf8_lossy(rows),
+                            &String::from_utf8_lossy(joined),
+                        );
+                        let mut rows = rows.to_vec();
+                        if let Some(cursor) = &cursor {
+                            crate::tmux::wraps::relink_continuations(
+                                &pane0,
+                                &mut rows,
+                                &wrapped,
+                                cursor.pane_height,
+                                deadline,
+                            );
+                        }
+                        (String::from_utf8_lossy(&rows).into_owned(), wrapped)
+                    }
+                    // The joined half went missing; its bytes must not render.
+                    None => return Ok(WindowCapture::default()),
+                }
+            }
+            None => (pane0_content, Vec::new()),
+        };
+        let single = |content: String, cursor: Option<PaneCursor>| WindowCapture {
+            content,
+            cursor,
+            wrapped,
+        };
 
         let Some((count, window_width, window_height)) = dims else {
-            return Ok((pane0_content, cursor));
+            return Ok(single(pane0_content, cursor));
         };
         if count <= 1 || window_width == 0 || window_height == 0 {
-            return Ok((pane0_content, cursor));
+            return Ok(single(pane0_content, cursor));
         }
         // Zoom changes geometry, not the agent pane's capture or input identity.
         if zoomed {
-            return Ok((pane0_content, cursor));
+            return Ok(single(pane0_content, cursor));
         }
 
         // Any failure in the split path (fork error, unparseable layout) falls
         // back to the pane-0 bytes already in hand, so a composite that cannot
         // be built is never worse than the old single-pane preview.
         let Some(layout) = self.capture_window_layout_with_deadline(count, deadline) else {
-            return Ok((pane0_content, cursor));
+            return Ok(single(pane0_content, cursor));
         };
         if layout.first_pane_id() != Some(pane0.as_str()) {
-            return Ok((layout.composite(), None));
+            return Ok(WindowCapture {
+                content: layout.composite(),
+                ..WindowCapture::default()
+            });
         }
         // Reuse the pane-0 bytes bracketed by the cursor probes above. The
         // layout capture happens in a second tmux invocation, so using its
@@ -1539,7 +1732,11 @@ impl Session {
             || layout.composite(),
             |rows| layout.composite_with_first_pane_rows(&pane0, rows),
         );
-        Ok((content, cursor))
+        Ok(WindowCapture {
+            content,
+            cursor,
+            wrapped: Vec::new(),
+        })
     }
 
     /// Second fork of capture_window_composited_with_cursor: window dimensions
@@ -1737,6 +1934,20 @@ impl Session {
         self.capture_pane_with_cursor_with_deadline(lines, &deadline)
     }
 
+    /// The pane a held VT channel owns, which input and capture must keep targeting.
+    pub(crate) fn live_channel_pane(
+        &self,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> Option<String> {
+        #[cfg(unix)]
+        return crate::tmux::vt::channel_pane_id(&self.name, deadline);
+        #[cfg(not(unix))]
+        {
+            let _ = deadline;
+            None
+        }
+    }
+
     pub(crate) fn live_pane_target_with_deadline(
         &self,
         deadline: &crate::tmux::TmuxCommandDeadline,
@@ -1744,8 +1955,7 @@ impl Session {
         if let Some(physical) = &self.physical {
             return Ok(physical.identity.pane_id.clone());
         }
-        #[cfg(unix)]
-        if let Some(id) = crate::tmux::vt::channel_pane_id(&self.name, deadline) {
+        if let Some(id) = self.live_channel_pane(deadline) {
             return Ok(id);
         }
         super::utils::first_pane_id_with_deadline(&self.name, deadline)
@@ -1760,6 +1970,7 @@ impl Session {
         let target = self.live_pane_target_with_deadline(deadline)?;
         let start = format!("-{}", lines);
         const HEADER_FMT: &str = CURSOR_FMT;
+        let joined_mark = crate::tmux::wraps::sentinel();
         let mut command = self.input_command()?;
         command.args([
             "display-message",
@@ -1776,6 +1987,21 @@ impl Session {
             "-e",
             // Keep trailing bg fills, matching the VT path.
             "-N",
+            "-S",
+            &start,
+            ";",
+            // The same rows joined, for which ones soft-wrap.
+            "display-message",
+            "-p",
+            "-t",
+            &target,
+            &joined_mark,
+            ";",
+            "capture-pane",
+            "-t",
+            &target,
+            "-p",
+            "-J",
             "-S",
             &start,
             ";",
@@ -1815,7 +2041,24 @@ impl Session {
         };
         let before = PaneCursor::parse(cursor_line);
         let after = PaneCursor::parse(after_line);
-        Ok((content.to_string(), merge_cursor_probes(before, after)))
+        // The joined half went missing; its bytes must not render.
+        let Some((rows, joined)) =
+            crate::tmux::wraps::split_at_sentinel(content.as_bytes(), &joined_mark)
+        else {
+            return Ok((String::new(), None));
+        };
+        let mut rows = rows.to_vec();
+        if let Some(height) = after.or(before).map(|c| c.pane_height) {
+            let wraps = crate::tmux::wraps::soft_wraps(
+                &String::from_utf8_lossy(&rows),
+                &String::from_utf8_lossy(joined),
+            );
+            crate::tmux::wraps::relink_continuations(&target, &mut rows, &wraps, height, deadline);
+        }
+        Ok((
+            String::from_utf8_lossy(&rows).into_owned(),
+            merge_cursor_probes(before, after),
+        ))
     }
 
     /// Deliver raw bytes to the session's agent pane via `tmux send-keys
@@ -1830,10 +2073,14 @@ impl Session {
     pub fn send_raw_bytes(&self, bytes: &[u8]) -> Result<()> {
         let target =
             self.live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
+        self.send_raw_bytes_to(&target, bytes)
+    }
+
+    fn send_raw_bytes_to(&self, target: &str, bytes: &[u8]) -> Result<()> {
         for batch in raw_byte_batches(bytes) {
             self.tmux_input(
                 "send-keys",
-                &target,
+                target,
                 std::iter::once("-H").chain(batch.iter().map(String::as_str)),
             )?;
         }
@@ -1894,6 +2141,19 @@ impl Session {
 
         let target =
             self.live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
+        self.send_keys_to(&target, text, enter_delay_ms)
+    }
+
+    /// [`Self::send_keys_with_delay`] to exactly `pane`, a `#{pane_id}`: text and Enter
+    /// reach the pane that was checked, or fail if it is gone.
+    pub fn send_keys_to_pane(&self, pane: &str, text: &str, enter_delay_ms: u64) -> Result<()> {
+        if !self.exists() {
+            bail!("Session does not exist: {}", self.name);
+        }
+        self.send_keys_to(pane, text, enter_delay_ms)
+    }
+
+    fn send_keys_to(&self, target: &str, text: &str, enter_delay_ms: u64) -> Result<()> {
         let delivery = submit_text(text);
         tracing::debug!(target: "tmux.command",
             "send_keys_with_delay: bytes={} lines={} paste={} target={}",
@@ -1904,15 +2164,15 @@ impl Session {
         );
 
         match delivery {
-            SubmitText::Paste(text) => self.send_via_paste_buffer(&target, text)?,
+            SubmitText::Paste(text) => self.send_via_paste_buffer(target, text)?,
             SubmitText::Literal(payload) => {
                 let (head, semis) = peel_trailing_semicolons(&payload);
                 if !head.is_empty() {
                     // `--` so lines starting with `-` are not read as tmux flags.
-                    self.tmux_input("send-keys", &target, ["-l", "--", head])?;
+                    self.tmux_input("send-keys", target, ["-l", "--", head])?;
                 }
                 if semis > 0 {
-                    self.send_raw_bytes(&vec![b';'; semis])?;
+                    self.send_raw_bytes_to(target, &vec![b';'; semis])?;
                 }
             }
         }
@@ -1922,7 +2182,7 @@ impl Session {
         }
 
         // Enter to submit
-        self.tmux_input("send-keys", &target, ["Enter"])?;
+        self.tmux_input("send-keys", target, ["Enter"])?;
 
         Ok(())
     }
@@ -3710,7 +3970,7 @@ mod tests {
                         resume: resume_rx,
                     });
                     Session::from_name(name)
-                        .wait_until_ready(std::time::Duration::from_secs(60), Some("ask anything"));
+                        .wait_until_ready(std::time::Duration::from_secs(60), &["ask anything"]);
                 });
                 let _release_on_unwind = ReleaseOnDrop(&release);
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

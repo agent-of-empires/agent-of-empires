@@ -114,6 +114,7 @@ async function openSessionAndFile(page: Page) {
   await page.goto("/");
   await expect(page.locator("header")).toBeVisible();
   await clickSidebarSession(page, "diff-comments-test");
+  await page.getByTestId("pane-toggle-diff").click();
   await expect(page.getByText("example.ts").first()).toBeVisible({
     timeout: 10000,
   });

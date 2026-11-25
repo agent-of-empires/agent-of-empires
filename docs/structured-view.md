@@ -1,4 +1,4 @@
-# Structured View (Web Dashboard)
+# Structured View
 
 The **structured view** renders agent state as plans, tool-call cards, diffs and approvals instead of terminal output. It is the web dashboard's default view and is also available in the native TUI, with mobile and multi-pane desktop layouts.
 
@@ -33,7 +33,7 @@ Gemini CLI is deprecated upstream for individual accounts since 2026-06-18. Ente
 
 The global npm installs above are optional. `aoe acp doctor --fix` can install Claude, Codex, Pi and `aoe-agent` adapters into the data directory; use `--adapter <name>` or `--all-adapters` to choose. See [Requirements](#requirements).
 
-Tools outside the registry (aider, cursor, copilot, droid, hermes and kiro) use terminal view. Custom agents opt in with `agent_acp_cmd`, or inherit a supported base adapter through `agent_detect_as`. The inherited adapter does not execute the wrapper; pass account overrides explicitly. See [Configuration](guides/configuration.md#running-a-custom-agent-in-the-structured-view).
+Tools outside the registry (cursor, copilot, droid, hermes, kiro, qwen, antigravity and settl) use terminal view. Custom agents opt in with `agent_acp_cmd`, or inherit a supported base adapter through `agent_detect_as`. The inherited adapter does not execute the wrapper; pass account overrides explicitly. See [Configuration](guides/configuration.md#running-a-custom-agent-in-the-structured-view).
 
 ### Provider credentials
 
@@ -64,7 +64,7 @@ Container images must provide Bash and GNU grep for scoped process inspection, p
 
 On Apple Container, worker descriptor snapshots are streamed as a tar archive by the guest Python helper. Symlinks and non-regular descriptors are refused; no host copy destination is used.
 
-CLI stop and kill persist a stop intent before signalling. Reattachment, automatic respawn, queued turns, and runner publication respect that fence. Only an explicit resume after settled retirement can clear the stop intent it observed; a newer stop remains authoritative. A stopped session with queued prompts shows a startup banner saying the prompts wait until the session is started again. For a tracked runtime that cannot prove settlement, externally stop only that execution on its original host or pinned container and retry `aoe acp stop <id>`.
+CLI stop and kill persist a stop intent before signalling. Reattachment, automatic respawn, queued turns, and runner publication respect that fence. Only an explicit resume after settled retirement can clear the stop intent it observed; a newer stop remains authoritative. A message typed into a stopped session from the dashboard, TUI or CLI starts it as an explicit resume; already-queued prompts and MCP, plugin or automated prompts keep waiting behind the fence and a stopped session with queued prompts shows a startup banner saying so, while `no_revive` senders are refused. For a tracked runtime that cannot prove settlement, externally stop only that execution on its original host or pinned container and retry `aoe acp stop <id>`.
 
 ACP session-ID and store assignments do not consume a committed Stop or dormancy marker, even when the originating worker epoch is still current. An assignment does not resolve a failed operation or clear its diagnostic. Native lifecycle and queue-wake producers own wake decisions before launch admission. Uncorrelated assignments preserve explicit conversation choices and outstanding import/fork markers; matching opaque IDs do not attest a store. Completion effects use the existing native launch admission or matched retained handoff scope. Attach retains its captured admission on the original lease. Display-only renames do not revoke this conversation-completion scope; pre-birth title checks remain in launch admission.
 
@@ -112,7 +112,7 @@ Capabilities depend on channels the adapter advertises; unavailable mode, slash-
 
 ## Quickstart
 
-In the web dashboard or TUI, create a session and choose an ACP-capable agent; **Structured** defaults on. Set `acp.structured_view` to `terminal` to preselect terminal view, or `off` to hide the option. The CLI defaults to terminal view; opt in with:
+In the web dashboard, create a session and choose an ACP-capable agent; **Structured** defaults on. In the TUI dialog the default is terminal view; tick Structured there. Set `acp.structured_view` to `terminal` to preselect terminal view, or `off` to hide the option. The CLI defaults to terminal view; opt in with:
 
 ```bash
 aoe acp doctor
@@ -283,7 +283,7 @@ Every structured-view operation has a matching `aoe acp <verb>` against the same
 
 | Verb | What it does |
 |------|--------------|
-| `aoe acp history <id>` | Dump the persisted transcript |
+| `aoe acp history <id>` | Print the transcript: whole agent messages, user prompts, one line per tool call. `--last N` and `--role user,agent,tool,notice` select entries; `--json` emits raw frames |
 | `aoe acp status <id>` | Print highest/lowest seq and the daemon source |
 | `aoe acp prompt <id> <text>` | Send a prompt (`-` reads stdin) |
 | `aoe acp approve <id> <nonce> [--always\|--deny\|--option <id>]` | Resolve a pending approval |

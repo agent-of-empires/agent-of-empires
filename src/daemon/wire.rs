@@ -187,6 +187,9 @@ pub struct CreateSessionBody {
     pub command_override: String,
     #[serde(default)]
     pub custom_instruction: Option<String>,
+    /// Typed into the agent as its first turn, only once it is ready.
+    #[serde(default)]
+    pub initial_prompt: Option<String>,
     pub profile: Option<String>,
     /// Structured view requires an ACP-capable agent.
     #[serde(default)]
@@ -479,10 +482,7 @@ impl NativePreparationIdentity {
     }
 
     pub(crate) fn matches(&self, instance: &Instance) -> bool {
-        self.created_at
-            .parse::<chrono::DateTime<chrono::Utc>>()
-            .ok()
-            == Some(instance.created_at)
+        crate::time::Timestamp::parse_rfc3339(&self.created_at).ok() == Some(instance.created_at)
             && self.lifecycle_generation == instance.lifecycle_generation
             && self.profile == instance.source_profile
     }
@@ -586,6 +586,55 @@ pub struct EnsureToolBody {
 }
 
 #[cfg(test)]
+mod prompt_origin_tests {
+    use super::*;
+    use crate::acp::state::Event;
+
+    #[test]
+    fn data_without_a_known_origin_decodes_as_unknown() {
+        let event = |extra: &str| -> Event {
+            serde_json::from_str(&format!(r#"{{"UserPromptSent":{{"text":"hi"{extra}}}}}"#))
+                .unwrap()
+        };
+        let row = |extra: &str| -> QueuedPromptEntry {
+            serde_json::from_str(&format!(
+                r#"{{"id":"q","seq":0,"text":"hi","created_at":"t"{extra}}}"#
+            ))
+            .unwrap()
+        };
+        for extra in ["", r#","origin":"from_a_newer_daemon""#] {
+            assert!(matches!(
+                event(extra),
+                Event::UserPromptSent {
+                    origin: PromptOrigin::Unknown,
+                    ..
+                }
+            ));
+            assert_eq!(row(extra).origin, PromptOrigin::Unknown);
+        }
+        assert_eq!(row(r#","origin":"cli""#).origin, PromptOrigin::Cli);
+        assert!(!serde_json::to_string(&row("")).unwrap().contains("origin"));
+    }
+
+    #[test]
+    fn http_accepts_only_the_three_client_origins() {
+        let cases = [
+            (Some("dashboard"), PromptOrigin::Dashboard),
+            (Some("tui"), PromptOrigin::Tui),
+            (Some("cli"), PromptOrigin::Cli),
+            (Some("mcp"), PromptOrigin::Unknown),
+            (Some("plugin"), PromptOrigin::Unknown),
+            (Some("aoe"), PromptOrigin::Unknown),
+            (Some("Dashboard"), PromptOrigin::Unknown),
+            (None, PromptOrigin::Unknown),
+        ];
+        for (header, want) in cases {
+            assert_eq!(PromptOrigin::from_header_value(header), want, "{header:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod legacy_tool_body_tests {
     use super::*;
 
@@ -656,7 +705,7 @@ pub struct TerminalTarget {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputRecencyBody {
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: crate::time::Timestamp,
     pub lifecycle_generation: u64,
     pub profile: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -744,7 +793,7 @@ pub struct DeleteSessionBody {
     pub cleanup_intent: Option<crate::session::deletion::CleanupIntent>,
     /// Consent is bound to the trash lifecycle selected by the client.
     #[serde(default)]
-    pub expected_trashed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub expected_trashed_at: Option<crate::time::Timestamp>,
     #[serde(default)]
     pub expected_trash_lifecycle_id: Option<String>,
     #[serde(default)]
@@ -786,17 +835,24 @@ pub struct UpdateFavoriteBody {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct UpdateColorBody {
-    /// A palette color, or null to clear the label.
-    #[serde(default)]
-    pub color: Option<String>,
-}
-
-#[derive(Serialize, Deserialize)]
 pub struct UpdateSnoozeBody {
     /// Positive minutes within the shared snooze bounds, or null to unsnooze.
     #[serde(default)]
     pub minutes: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct UpdateIgnoredBody {
+    pub ignored: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ReclaimOwnershipBody {
+    /// True takes ownership back by clearing the manager link and the ignore
+    /// marker together. Reserved so a future reclaim variant can reuse the
+    /// route without silently changing meaning.
+    #[serde(default)]
+    pub reclaim: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -901,6 +957,52 @@ impl PromptAttachmentKind {
     }
 }
 
+/// Where a prompt entered AoE. Self-identified HTTP provenance or a daemon-assigned
+/// source, never proof that a human was present. Treat `Unknown` as untrusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptOrigin {
+    Dashboard,
+    Tui,
+    Cli,
+    Mcp,
+    Plugin,
+    /// AoE itself: a wake-up, continuation or other daemon-generated turn.
+    Aoe,
+    /// Missing, forged or pre-origin data. Also catches values a newer daemon wrote.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl PromptOrigin {
+    pub fn is_unknown(&self) -> bool {
+        *self == Self::Unknown
+    }
+
+    /// Request header the dashboard, TUI and CLI identify themselves with.
+    pub const HEADER: &'static str = "x-aoe-prompt-origin";
+
+    /// The origin a client may claim over HTTP. Anything else is `Unknown`.
+    pub fn from_header_value(value: Option<&str>) -> Self {
+        match value {
+            Some("dashboard") => Self::Dashboard,
+            Some("tui") => Self::Tui,
+            Some("cli") => Self::Cli,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn as_header_value(self) -> Option<&'static str> {
+        match self {
+            Self::Dashboard => Some("dashboard"),
+            Self::Tui => Some("tui"),
+            Self::Cli => Some("cli"),
+            _ => None,
+        }
+    }
+}
+
 /// Metadata only: the blob is fetched lazily from `GET /acp/attachments/{id}` so the event
 /// log stays small.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -937,6 +1039,9 @@ pub struct QueuedPromptEntry {
     /// Plugin that queued this through `sessions.message.send`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_plugin: Option<String>,
+    /// Where it was queued from, assigned by the daemon.
+    #[serde(default, skip_serializing_if = "PromptOrigin::is_unknown")]
+    pub origin: PromptOrigin,
 }
 
 /// Ephemeral worker lifecycle; never persisted to the event log.
@@ -1097,6 +1202,13 @@ pub struct SessionResponse {
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error_evidence: Option<crate::session::OperationErrorEvidence>,
+    /// Why the initial prompt was not typed into a terminal session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_prompt_error: Option<String>,
+    /// Machine-readable `initial_prompt_error` cause when one applies:
+    /// `agent_folder_not_trusted` or `agent_bypass_not_accepted`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_prompt_error_code: Option<String>,
     pub branch: Option<String>,
     pub main_repo_path: Option<String>,
     /// Base branch the worktree was created from when AoE managed the
@@ -1133,11 +1245,6 @@ pub struct SessionResponse {
     pub favorited: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub favorited_at: Option<String>,
-    /// Per-session color label (`red` / `amber` / `green`), or omitted when
-    /// unset. Rendered as a colored status dot in the web sidebar; set via the
-    /// sidebar context menu or `aoe session color`. See #2383.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub color: Option<String>,
     /// True when the agent has flagged this session as urgent via the
     /// `attention-urgent` hook (read from `/tmp/aoe-hooks-<euid>/{id}/attention.json`
     /// by `Instance::is_urgent()`). The web sidebar's Attention sort floats
@@ -1170,6 +1277,15 @@ pub struct SessionResponse {
     /// and the response simply omits the field. See #1581.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snoozed_until: Option<String>,
+    /// RFC3339 timestamp at which a managed session was ignored, or omitted
+    /// when it is not ignored. Ignore is distinct from archive, snooze, and
+    /// trash: the row stays present, live, and restorable, and its
+    /// `parent_session_id` names the session that manages it. Opening,
+    /// attaching, or sending from a direct user action clears it; MCP routine
+    /// reads leave it intact and sends refuse instead of clearing it. See
+    /// #5833.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignored_at: Option<String>,
     /// RFC3339 timestamp at which the session was moved to trash, or
     /// omitted when not trashed. Trashed rows are excluded from the
     /// default session list; the web client requests them with
@@ -1377,7 +1493,7 @@ pub struct SessionResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_cleanup_on_delete: Option<bool>,
     /// Non-fatal warnings surfaced by a mutation response. On create these are
-    /// worktree-creation warnings (e.g. post-checkout hook failures where the
+    /// worktree-creation warnings (e.g. a stale fetch where the
     /// worktree was still created successfully). On rename these carry the
     /// tmux rekey warning emitted when the title was persisted durably but the
     /// live tmux session could not be renamed afterwards. Both live on the

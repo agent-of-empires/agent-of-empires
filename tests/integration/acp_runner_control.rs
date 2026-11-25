@@ -2274,6 +2274,7 @@ fn supervisor_with_prompt_in_flight(
             prompt_id: None,
             synthesized: false,
             origin_plugin: None,
+            origin: agent_of_empires::daemon::PromptOrigin::Unknown,
         },
     );
     let supervisor = Arc::new(Supervisor::new(sink));

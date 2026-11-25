@@ -287,6 +287,7 @@ export async function seedSettings(
     mobileToolbarKeys?: string[];
     showArrowJoystick?: boolean;
     showForwardScrollbar?: boolean;
+    terminalFontFamily?: string;
   },
 ) {
   await page.evaluate((settings) => {

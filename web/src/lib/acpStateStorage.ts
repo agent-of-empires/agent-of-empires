@@ -4,6 +4,8 @@
 import type { AcpState } from "./acpTypes";
 
 export const STORAGE_KEY_PREFIX = "aoe:acp-state:v1:";
+export const PENDING_KEY_PREFIX = "aoe:acp-pending:v1:";
+export const PENDING_DONE_KEY_PREFIX = "aoe:acp-pending-done:v1:";
 export const STATE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface PersistedEntry {

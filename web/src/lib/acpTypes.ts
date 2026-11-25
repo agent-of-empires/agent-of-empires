@@ -458,6 +458,8 @@ export type AcpEvent =
         prompt_id?: string | null;
         /** Other queued rows folded into this turn (queue drain or send-now); each one's optimistic row is retired too. */
         merged_prompt_ids?: string[];
+        /** Where the prompt entered AoE; absent or "unknown" must be treated as untrusted. */
+        origin?: PromptOrigin;
       };
     }
   | {
@@ -900,6 +902,8 @@ export interface ActivityRow {
   messageStart?: boolean;
   at: string; // ISO-8601
 }
+
+export type PromptOrigin = "dashboard" | "tui" | "cli" | "mcp" | "plugin" | "aoe" | "unknown";
 
 /** Wire mirror of the Rust `TranscriptRow` (src/acp/transcript.rs). */
 export interface TranscriptRow {

@@ -6,7 +6,7 @@ Settings resolve in layers, each overriding the one before it, field by field:
 2. **Profile**: `~/.agent-of-empires/profiles/<name>/config.toml`
 3. **Repo**: `.agent-of-empires/config.toml` in the project root
 
-Unset fields inherit from the layer above. List fields replace rather than extend. Everything below is also editable from the TUI settings screen (`s`) and, unless noted, from the web dashboard.
+Unset fields inherit from the layer above. List fields replace rather than extend. Most settings below are also editable from the TUI settings screen (`s`) and, unless noted, from the web dashboard. `[tools.*]` is file-only.
 
 Over the web API, `GET /api/settings` returns the settings as they apply to the profile the server serves (or `?profile=<name>`): the profile's overrides over the global config. `PATCH /api/settings` saves each field to the layer it belongs in, that profile for fields it can override and the global config for the rest, so a save always lands where the read looks. Add `?layer=machine` to either to read or write the global config alone.
 
@@ -58,14 +58,15 @@ Updates use a locked read-modify-write operation, preserving concurrent changes.
 
 ```toml
 [theme]
-name = "default"          # see the picker or `aoe theme list`
+name = "zinc"             # see the picker or `aoe theme list`
 color_mode = "truecolor"  # truecolor | palette (TUI only)
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `name` | `"default"` | Theme for the TUI and web dashboard. Builtins: `default`, `empire`, `phosphor`, `tokyo-night-storm`, `catppuccin-latte`, `dracula`, `rose-pine`, `deep-ocean`. Custom TOML themes appear in the picker. Empty means `default`. |
+| `name` | `""` | Theme for the TUI and web dashboard. Builtins: `zinc`, `empire`, `phosphor`, `tokyo-night-storm`, `catppuccin-latte`, `dracula`, `rose-pine`, `deep-ocean`. Custom TOML themes appear in the picker. Empty means `zinc`. |
 | `color_mode` | `"truecolor"` | TUI only. `palette` downsamples to xterm-256 for transports that mangle 24-bit RGB (e.g. some `mosh` setups). The web dashboard always renders truecolor. |
+| `idle_decay_minutes` | `0` | TUI only. Minutes a freshly idle session keeps its highlight and breathing icon, and counts for the `w` jump. 0 turns it off. |
 
 Custom themes are TOML files in `<app_dir>/themes/`, listed in the picker under their filename stem. Run `aoe theme dir` for the active directory; see [File Locations](#file-locations) for Linux and macOS resolution.
 
@@ -90,6 +91,7 @@ auto_stop_idle_secs = 0   # 0 disables; e.g. 7200 = stop after 2h idle
 row_tag = "branch"        # none | auto | profile | sandbox | branch
 sidebar_position = "left" # left | right; TUI session list
 narrow_layout = "stacked" # stacked | one_pane | big_preview; see below
+narrow_breakpoint = 80    # columns; narrower terminals use narrow_layout
 ```
 
 After your 31st session creation, a one-time tip explains how to hide the shortcut bar.
@@ -105,19 +107,21 @@ You can browse tips from **Ctrl+K > Show tips** even with the bar hidden.
 | `prevent_sleep_when_active` | `false` | Have the Daemon inhibit user-idle system sleep while sessions are active; the display can sleep. Global only. Uses `caffeinate -i` or `systemd-inhibit --what=idle:sleep`; missing tools or logind warn once and skip inhibition. |
 | `prevent_sleep_idle_grace_minutes` | `15` | Minutes a session must stay idle before the sleep-inhibit assertion may be released. Only consulted when `prevent_sleep_when_active` is on. Range `0` to `240`; `0` releases as soon as every session leaves an active status. The grace period only begins once a session goes `Idle`, so a session that never reaches `Idle` keeps holding the assertion: `Waiting` on an unanswered prompt, or `Creating` on a container, worktree, or submodule setup that never returns, can hold sleep indefinitely. A `Starting` session is bounded by a short (~3s) launch guard and then re-resolves. |
 | `session_id_poller_max_threads` | `50` | Ceiling on concurrent native-session-ID pollers per process. Overflow IDs stop refreshing until a poller is available, with a 5 s to 60 s retry backoff. `0` keeps the default. Global only; applied when the Daemon starts. |
+| `plugin_staging_sandbox` | `false` | Strict plugin staging. Global only; profiles and repositories cannot override it. Disabled by default. Enabling requires native OS sandbox support and tools and fails closed when unavailable. Default streamed byte, archive-entry, and source snapshot accounting cannot hard-limit Git/helper filesystem writes. |
 | `row_tag` | `"branch"` | Controls the compact metadata shown next to each TUI session title: `none` shows nothing; `auto` shows the profile code only in all-profiles view; `profile` always shows the profile code; `sandbox` shows `sb` on sandboxed sessions; `branch` shows a compact worktree or workspace branch tag. |
 | `show_activity_age` | `true` | Show the age column at the right edge of each TUI session row: time since the agent stopped on `Idle` rows, time since last access on `Unknown` rows, and remaining snooze time under the Attention sort. |
 | `show_structured_badge` | `true` | Show the `[structured]` badge on Structured view rows in the TUI session list. Hiding it returns the width to the title and plugin row badges; the row still opens the Structured view. TUI only; the web session list never shows the badge. |
-| `sidebar_position` | `"left"` | Places the TUI session list on the left or right. Below 80 columns the layout follows `narrow_layout` instead. Global only. |
-| `narrow_layout` | `"stacked"` | How the TUI lays out the session list and preview once the terminal is too narrow for them side by side (below 80 columns). `stacked` puts the list above the preview; `one_pane` shows only one pane at a time, the list normally and the preview while it is the pane being worked in (live mode relaying keys, an interactive structured transcript, a retained trashed transcript, or System Health), then Esc or Ctrl+Q returns to the list; `big_preview` keeps the stack but squeezes the list to its minimum while the preview is that active pane, giving the preview most of the height. Global only, under Settings > Global > Session. |
+| `sidebar_position` | `"left"` | Places the TUI session list on the left or right. Narrower than `narrow_breakpoint` columns the layout follows `narrow_layout` instead. Global only. |
+| `narrow_layout` | `"stacked"` | How the TUI lays out the session list and preview once the terminal is too narrow for them side by side (narrower than `narrow_breakpoint`). `stacked` puts the list above the preview; `one_pane` shows only one pane at a time, the list normally and the preview while it is the pane being worked in (live mode relaying keys, an interactive structured transcript, a retained trashed transcript, or System Health), then Esc or Ctrl+Q returns to the list; `big_preview` keeps the stack but squeezes the list to its minimum while the preview is that active pane, giving the preview most of the height. Global only, under Settings > Global > Session. |
+| `narrow_breakpoint` | `80` | TUI window width in columns below which the list and preview stop sitting side by side and the layout follows `narrow_layout`. The preview compares its own pane width against the same value, not the window width, to choose its compact title over its info header, so a narrow preview beside the list shows the compact title while the layout is still side by side. Range `0` to `1000`; values under `50` act as `50`, the narrowest side-by-side split that still leaves the preview's 40-column floor beside a 10-column list, so a hand-edited value below it still saves. A value greater than your terminal width always uses the narrow layout, which still splits the height by `narrow_layout`. Global only, under Settings > Global > Session. |
 | `split_terminal_height_percent` | `50` | Paired-terminal share of split preview height. Range `1` to `99`. Global only; see [Live mode](live-mode.md). |
 | `split_terminal_min_width` | `100` | Minimum whole-window width in columns for the paired-terminal split. Range `0` to `1000`. Global only. |
 | `split_terminal_min_height` | `30` | Minimum whole-window height in rows for the paired-terminal split. Range `0` to `1000`. Global only. |
 | `show_shortcut_bar` | `true` | Show the TUI's bottom shortcut row, including the LIVE banner. Global only, under Settings > Global > Interaction. Hiding it gives that row to the main view and suppresses the repeated Ctrl+C reminder in Live mode without changing interrupt forwarding. Shortcuts, `?` help, dialog controls, the leader menu, and other temporary notifications still work. |
 | `preview_link_prefixes` | `[]` | Link targets beyond http and https that a click in the preview may open, as case-insensitive `scheme://authority/` prefixes, for example `["vscode://file/"]` to open file links in VS Code. Entries not in that form, including a missing `/` after the authority, are ignored, and `file:`, `javascript:`, `data:` and `vbscript:` never open. Unlisted targets are neither opened nor passed to the terminal; a new entry applies to links printed after it. Global only and not editable from the web dashboard; under Settings > Global > Interaction (advanced). |
 | `tie_workdir_to_name` | `true` | Keep a managed worktree session's directory named after its title. See [Worktrees](worktrees.md#naming). |
-| `yolo_mode_default` | `false` | Enable YOLO mode by default for new sessions (skip permission prompts). Works with or without sandbox. In tmux mode this passes `--dangerously-skip-permissions` to the agent CLI; in structured view it maps to ACP `bypassPermissions` (see [Structured view: Permission modes and YOLO](../structured-view/controls.md#permission-modes-and-yolo) for the adapter caveat). |
-| `pre_trust_agent_folders` | `false` | Pre-trust host worktrees in Claude Code, Codex and Gemini config. Config-dir overrides are honored; `agent_config_dir` wins. The record outlives the session. Trust activates the repo's `.claude/settings.json`, including hooks and permission rules, so enable it only for directories you would trust by hand. MCP servers still ask separately and permission mode is unchanged. Sandboxed sessions pre-trust their staged config. |
+| `yolo_mode_default` | `false` | Enable YOLO mode by default for new sessions (skip permission prompts). Works with or without sandbox. In terminal view this passes the agent's own flag (for example `--dangerously-skip-permissions` for Claude Code, `--yolo` for Cursor) to the agent CLI; in structured view it maps to ACP `bypassPermissions` (see [Structured view: Permission modes and YOLO](../structured-view/controls.md#permission-modes-and-yolo) for the adapter caveat). |
+| `pre_trust_agent_folders` | `false` | Pre-trust host worktrees in Claude Code, Codex and Gemini config. Config-dir overrides are honored; `agent_config_dir` wins. The record outlives the session. Trust activates the repo's `.claude/settings.json`, including hooks and permission rules, so enable it only for directories you would trust by hand. MCP servers still ask separately and permission mode is unchanged. Sandboxed sessions pre-trust their staged config. Without it, a new folder opens Claude Code's trust dialog and a session's initial prompt is not typed: the session records `initial_prompt_error_code` `agent_folder_not_trusted` (see [API](../api.md)). Claude's one-time Bypass Permissions screen on the first yolo start is never pre-accepted; it records `agent_bypass_not_accepted`. |
 | `agent_status_hooks` | `true` | Install status-detection hooks into the agent's config file; see [Agent hook approval](#agent-hook-approval) for the approval that gates the write and [Adding a New Agent](../development/adding-agents.md#hook-format-reference) for the per-agent file and payload. Config-dir overrides are honored. When disabled, status detection reads the pane alone, but any authoritative identity hooks declared for native resume remain installed. A hook write is evidence rather than the last word: pane state and terminal title are weighed against it by declared priority. |
 | `opencode_preassign_session_id` | `false` | Pre-assign OpenCode's native session id before a new host launch. AoE starts a short-lived `opencode serve`, creates the session through `POST /api/session`, then launches `opencode --session <id>`. This avoids guessing from OpenCode's shared SQLite store, at the cost of about two seconds per new session. When disabled or unavailable, automatic capture stays off; an explicitly pinned exact id still resumes. Sandboxed OpenCode automatic capture is unsupported. |
 | `smart_rename` | `true` | Auto-rename a default-named session after its first completed turn. Structured sessions use their first-turn transcript; terminal sessions use the pane after a Running-to-Idle transition. A manually named session is never overwritten. Only the title changes, not the worktree directory. Sandboxed sessions run the one-shot inside their own running container; unsupported agents, command overrides, or a different sandbox rename agent prevent naming. A failed or timed-out call leaves the generated name. Daemon-owned naming jobs finish before daemon shutdown releases ownership. |
@@ -313,6 +317,8 @@ Give the agent an ACP launch command; it must speak the [Agent Client Protocol](
 
 The value is split into argv and executed with no shell, so wrap explicitly for shell features (`sh -lc '...'`). A matching `custom_agents` entry is needed only for the agent picker, not for an explicit ACP switch target. Built-in names take precedence.
 
+A structured session of such an agent can be forked when the agent also declares `agent_execution_as` and `agent_config_dir` for a built-in whose adapter forks (currently `claude`). The fork runs `session/fork` through the agent's own command and stays in the parent's profile, since another profile can give the same name another command and store. It fails, rather than starting an empty session, when that command's adapter does not advertise `session/fork`. `agent_detect_as` alone does not enable it.
+
 A wrapper around a supported agent needs no `agent_acp_cmd` at all: map it with `agent_detect_as` and it inherits the base agent's ACP adapter, which also lights up **Switch to structured view** on an existing terminal session. **The wrapper binary is never executed** in that case, so anything it does outside the CLI (selecting an account, gateway, or profile by setting env) does not apply. Inheritance works only for bases with a built-in adapter (`claude`, `codex`, `opencode`, `gemini`, `vibe`, `pi`, `omp`, `kimi`, `prime-agent`).
 
 To pass those overrides to a host structured session anyway, use the session's `extra_env` or [`environment`](#host-environment). A Docker-sandboxed session reads only `sandbox.environment` and pins its own config dir at a container path, so set the container-side value there, or give the wrapper a real `agent_acp_cmd`. An explicit `agent_acp_cmd` wins if you set both.
@@ -414,14 +420,16 @@ auto_cleanup = true                                   # prompt to remove the wor
 
 See [Git Worktrees](worktrees.md) for the remaining keys and path templates.
 
-## Sandbox (Docker)
+<a id="sandbox-docker"></a>
+
+## Sandbox
 
 `[sandbox]` configures container sandboxing:
 
 ```toml
 [sandbox]
 enabled_by_default = false                                    # auto-enable sandbox for new sessions
-default_image = "ghcr.io/agent-of-empires/aoe-sandbox:latest" # container image
+# default_image unset: the aoe-sandbox image tagged with your AoE version
 environment = ["GH_TOKEN=$AOE_GH_TOKEN"]                      # env vars forwarded into the container
 ```
 
@@ -514,7 +522,7 @@ systemd-cgls --user
 
 A session that changes profile keeps its old slice until its next start, and a sandbox container keeps the slice it was created in. A config written by an earlier aoe may carry the old default as an explicit `slice = "background-aoe-{profile}.slice"` under `[systemd]` (saving an unrelated setting could write it); that keeps one slice per profile. Delete the line, or set the new template, and restart aoe to get one slice per session. To cap one session, a whole profile or all of aoe, put limits on the slice itself with `systemctl --user set-property background-aoe-<profile>-<id>.slice MemoryMax=8G`, `background-aoe-<profile>.slice` or `background-aoe.slice`, or a drop-in. There `<profile>` is the escaped profile name, for example `my_2dprofile` for `my-profile`. The `memory_max` and `tasks_max` settings apply to each session scope on its own. Set `slice` to group sessions elsewhere, for example `aoe.slice`, or to `background-aoe-{profile}.slice` for one slice per profile.
 
-aoe checks once per process that `systemd-run` works with the configured limits, with `--expand-environment=no` so `$` in session commands stays literal. The check is one attempt of at most 5 seconds. Sessions start unscoped, with one line in the log, when `systemd-run` or `env` is not on `PATH`, when `systemd-run` cannot reach the user manager or times out, when it rejects the configured `memory_max`/`tasks_max` (a warning naming them), or when `enabled` is `false` (`systemd.enabled=false`). If `systemd-run` fails after that check passed, the session start fails visibly: the tmux pane dies, and an ACP session reports an attach error after the dial deadline, with the `systemd-run` error in the runner log.
+aoe checks once per process that `systemd-run` works with the configured limits, with `--expand-environment=no` so `$` in session commands stays literal. The check runs in the configured slice when that slice is the same for every session, otherwise (including an invalid `slice`) in `app.slice`. A check that times out after 5 seconds is retried, up to three attempts (about 15 seconds). Sessions start unscoped, with one line in the log, when `systemd-run` or `env` is not on `PATH`, when `systemd-run` cannot reach the user manager or times out on every attempt, when it rejects the configured `memory_max`/`tasks_max` (a warning naming them), or when `enabled` is `false` (`systemd.enabled=false`). If `systemd-run` fails after that check passed, the session start fails visibly: the tmux pane dies, and an ACP session reports an attach error after the dial deadline, with the `systemd-run` error in the runner log.
 
 Sessions already running are not moved into a scope. Stopping, deleting or trashing a session waits for only its captured exact scope units to stop and have empty cgroups, also when `enabled` is `false`. Scoped structured workers use the same captured PID, worker-generation and producer-lease guards as other ACP retirement; the CLI removal path does not bypass that proof. A failed manager command, a live cgroup or unresolved legacy scope ownership refuses resource cleanup and retains retry ownership instead of guessing from a SID glob. Restarting an old terminal row can record a new scope but does not erase unresolved prior scope evidence.
 

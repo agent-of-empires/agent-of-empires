@@ -1,4 +1,5 @@
 import { sourceFromCommand, type PluginMarketplaceState } from "./pluginFlows";
+import { isImeComposing } from "../../lib/ime";
 
 interface Props {
   market: PluginMarketplaceState;
@@ -17,7 +18,7 @@ export function PluginMarketplace({ market, installedSources, onOpenDetail }: Pr
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter") void discover();
+            if (e.key === "Enter" && !isImeComposing(e)) void discover();
           }}
           placeholder="Search GitHub (aoe-plugin topic)…"
           className="min-w-0 flex-1 rounded border border-surface-700 bg-surface-850 px-2 py-1 text-xs"

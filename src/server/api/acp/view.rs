@@ -248,7 +248,7 @@ async fn commit_structured_view(
             slot.status = Status::Idle;
             slot.idle_dormant_since = None;
             slot.idle_entered_at = None;
-            slot.last_error = None;
+            slot.last_error.clear();
             slot.last_error_evidence = None;
             slot.lifecycle_generation = generation;
             slot.acp_load_session_capable = None;
@@ -589,17 +589,11 @@ fn switch_unavailable(error: &anyhow::Error, message: &'static str) -> Response 
 const CHECK_UNAVAILABLE: &str = "Couldn't check the switch to Terminal view; retry shortly";
 const SWITCH_UNAVAILABLE: &str = "Couldn't start the switch to Terminal view; retry shortly";
 const COMMAND_SELECTOR_CONFLICT: &str = "This Session's command picks a conversation with its own session flag, and AoE holds one for it too; remove the session flag from its command or arguments to switch";
-/// Ends a handoff owed from before the refusal above: its launch can never start. Clearing AoE's
-/// id is a way out only here, in Terminal view; Structured view refuses that clear.
-fn command_selector_ended(session_id: &str) -> String {
-    format!(
-        "Terminal view couldn't start this Session: its command picks a conversation with its own session flag, and AoE holds one for it too. Restart the Session with the session flag removed from its command or arguments, or run `aoe session set-session-id {session_id} \"\"` and restart it to run its command as written."
-    )
-}
-
-/// A handoff whose launch the command's own session selector refused; it ended in Terminal view.
+/// A handoff owed from before the refusal above, whose launch the command's own session selector
+/// refused; it ended in Terminal view. Clearing AoE's id is a way out only there; Structured view
+/// refuses that clear.
 #[derive(Debug, thiserror::Error)]
-#[error("{}", command_selector_ended(.0))]
+#[error("{}", Instance::handoff_refused(.0))]
 struct CommandSelectorEnded(String);
 
 /// A coded refusal, so a client can show the matching dialog state. The body
@@ -704,19 +698,18 @@ fn recorded_outcome(
     }
 }
 
-/// What a persisted handoff does with the conversation. A `Discard` continues only when its
-/// target resumes: reservation records one for an earlier conversation and `Cleared` for `fresh`.
-fn handoff_outcome(
-    context: &HandoffContext,
-    terminal: Option<&crate::session::ConversationState>,
-) -> TerminalConversation {
-    match (context, terminal) {
-        (HandoffContext::Keep { .. }, _) => TerminalConversation::Continue,
-        (HandoffContext::Discard, Some(target)) if target.resumes() => {
-            TerminalConversation::Continue
+impl From<crate::session::TerminalHandoffOutcome> for TerminalConversation {
+    fn from(outcome: crate::session::TerminalHandoffOutcome) -> Self {
+        match outcome {
+            crate::session::TerminalHandoffOutcome::Continue => Self::Continue,
+            crate::session::TerminalHandoffOutcome::Fresh => Self::Fresh,
         }
-        (HandoffContext::Discard, _) => TerminalConversation::Fresh,
     }
+}
+
+/// What a persisted handoff does with the conversation, as it recorded.
+fn handoff_outcome(intent: &HandoffIntent) -> TerminalConversation {
+    intent.outcome.into()
 }
 
 /// Whether driving a persisted handoff gives the caller what it asked for. No choice drives any.
@@ -761,7 +754,11 @@ async fn terminal_plan(
 /// Whether the launch refuses `row`'s command selector beside AoE's own conversation. A switch
 /// that `keeps_target` commits one; otherwise the row's own state decides.
 fn command_selector_conflicts(row: &Instance, keeps_target: bool) -> bool {
-    row.command_session_selector().is_some() && (keeps_target || row.conversation_state().resumes())
+    if keeps_target {
+        row.command_session_selector().is_some()
+    } else {
+        row.command_selector_refuses_launch()
+    }
 }
 
 async fn agent_terminal_plan(
@@ -988,7 +985,7 @@ fn claim_handoff_in(
         row.lifecycle_reservation = Some(LifecycleReservation {
             op: LifecycleOperation::Launch,
             generation,
-            at: chrono::Utc::now(),
+            at: crate::time::Timestamp::now(),
         });
         row.terminal_handoff
             .as_mut()
@@ -1083,7 +1080,7 @@ fn reserve_handoff_in(
         let generation = row.try_acquire_lifecycle_reservation(
             LifecycleOperation::Launch,
             Instance::LIFECYCLE_RESERVATION_TTL,
-            chrono::Utc::now(),
+            crate::time::Timestamp::now(),
         )?;
         let unborn_fence = unborn_producer.map(|(producer_epoch, producer_id)| {
             crate::session::TerminalHandoffUnbornFence {
@@ -1093,6 +1090,11 @@ fn reserve_handoff_in(
                 fence_generation: generation,
             }
         });
+        let terminal = recorded.map(|outcome| match outcome {
+            TerminalConversation::Fresh => fresh_terminal_target(row.conversation_state()),
+            TerminalConversation::Continue => row.conversation_state(),
+        });
+        let outcome = crate::session::TerminalHandoffOutcome::of(&context, terminal.as_ref());
         row.terminal_handoff = Some(Box::new(HandoffIntent {
             id: intent_id,
             profile,
@@ -1107,10 +1109,8 @@ fn reserve_handoff_in(
             source_conversation: row.conversation_state(),
             runner,
             unborn_fence,
-            terminal: recorded.map(|outcome| match outcome {
-                TerminalConversation::Fresh => fresh_terminal_target(row.conversation_state()),
-                TerminalConversation::Continue => row.conversation_state(),
-            }),
+            terminal,
+            outcome,
             launch_required: row.ensure_startable().is_ok(),
             launch_started: false,
             selector_ended: false,
@@ -1238,7 +1238,7 @@ fn record_retired_handoff_in(
         intent.source_conversation = source;
         intent.source_acp_session_id = source_acp_session_id;
         intent.runner = completed_runner;
-        intent.terminal = terminal;
+        intent.set_terminal(terminal);
         intent.final_event_seq = Some(final_event_seq);
         intent.stage = TerminalHandoffStage::TerminalCommitOwed;
         Ok(())
@@ -1474,7 +1474,7 @@ async fn terminal_handoff_request(
         if conversation.is_some() && durable.command_session_selector().is_some() {
             return terminal_refusal(TerminalSwitchReason::CommandSelectsConversation, "");
         }
-        let outcome = handoff_outcome(&pending.context, pending.terminal.as_ref());
+        let outcome = handoff_outcome(pending);
         if !pending_handoff_honours(outcome, conversation) {
             let in_flight = match outcome {
                 TerminalConversation::Continue => "keeps the conversation",
@@ -1631,7 +1631,7 @@ fn drive_terminal_handoff(
                     intent.ensure_retirement_target(&id, &mut target)?;
                     let deadline = std::time::Duration::from_secs(5);
                     // A continuing worker may hold the conversation's id, so only a fresh one deletes it.
-                    match handoff_outcome(&intent.context, intent.terminal.as_ref()) {
+                    match handoff_outcome(&intent) {
                         TerminalConversation::Continue => {
                             state
                                 .acp_supervisor
@@ -1880,7 +1880,7 @@ fn drive_terminal_handoff(
                             // replaced, never on disk.
                             current.terminal_handoff = None;
                             current.status = Status::Error;
-                            current.last_error = Some(command_selector_ended(&cleanup_id));
+                            current.last_error.set(Instance::handoff_refused(&cleanup_id));
                             if let Err(error) = native.adopt_runtime_fields(&current) {
                                 tracing::warn!(target: "acp.switch", session = %cleanup_id, %error, "ended handoff's remedy not published");
                             }
@@ -3252,11 +3252,13 @@ mod tests {
         Ok(())
     }
 
+    /// Drives a no-choice `Discard` through retirement and commit, answering the stored outcome
+    /// as reserved and as retired.
     #[cfg(unix)]
     async fn retired_native_handoff_with_event_store(
         row: &Instance,
         event_store: Arc<crate::acp::event_store::EventStore>,
-    ) -> anyhow::Result<Arc<AppState>> {
+    ) -> anyhow::Result<(Arc<AppState>, [TerminalConversation; 2])> {
         use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
         use std::sync::atomic::Ordering;
         use std::time::Duration;
@@ -3319,6 +3321,7 @@ mod tests {
             .unwrap()
             .terminal_handoff
             .unwrap();
+        let reserved = handoff_outcome(&intent);
         let mut target = state.acp_supervisor.capture_retirement(&row.id)?;
         intent.ensure_retirement_target(&row.id, &mut target)?;
         let stop_state = state.clone();
@@ -3385,7 +3388,14 @@ mod tests {
             .capture_retirement(&row.id)?
             .lease
             .is_none());
-        Ok(state)
+        let retired = crate::session::Storage::open_unwatched(&row.source_profile)?
+            .load()?
+            .into_iter()
+            .find(|r| r.id == row.id)
+            .and_then(|r| r.terminal_handoff)
+            .expect("the committed handoff is still owed");
+        assert_eq!(retired.stage, HandoffStage::TerminalLaunchOwed);
+        Ok((state, [reserved, handoff_outcome(&retired)]))
     }
 
     #[tokio::test]
@@ -3481,7 +3491,7 @@ mod tests {
             &root.path().join("events.db"),
             100,
         )?);
-        let state = retired_native_handoff_with_event_store(&source, events.clone()).await?;
+        let (state, _) = retired_native_handoff_with_event_store(&source, events.clone()).await?;
         let sentinel = events.highest_seq_checked(&source.id)? + 1;
         events.record(
             &source.id,
@@ -3776,6 +3786,37 @@ mod tests {
         Ok(())
     }
 
+    /// A no-choice fresh switch reserves Fresh, so retirement deletes the ACP conversation; the
+    /// retired target is the row's own, which resumes its stored id, so the outcome then follows it.
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    async fn a_fresh_switch_over_a_stored_id_follows_the_retired_target() -> anyhow::Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir()?;
+        let events = Arc::new(crate::acp::event_store::EventStore::open(
+            &project.path().join("original-events.db"),
+            100,
+        )?);
+        let mut source = Instance::new("stored id", project.path().to_str().unwrap());
+        source.tool = "shell".into();
+        source.command = "sleep 60".into();
+        source.source_profile = "default".into();
+        source.view = View::Structured;
+        source.agent_session_id = Some("native-preserved".into());
+        let (_state, [reserved, retired]) =
+            retired_native_handoff_with_event_store(&source, events).await?;
+        assert_eq!(reserved, TerminalConversation::Fresh, "retirement deletes");
+        assert_eq!(retired, TerminalConversation::Continue);
+        let stored = crate::session::Storage::open_unwatched("default")?
+            .load()?
+            .into_iter()
+            .find(|r| r.id == source.id)
+            .unwrap();
+        assert_eq!(stored.agent_session_id.as_deref(), Some("native-preserved"));
+        Ok(())
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     #[cfg(unix)]
@@ -3845,7 +3886,8 @@ mod tests {
             );
             let pane_name = crate::tmux::Session::generate_name(&source.id, &source.title);
             let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&pane_name);
-            let state = retired_native_handoff_with_event_store(&source, events.clone()).await?;
+            let (state, _) =
+                retired_native_handoff_with_event_store(&source, events.clone()).await?;
             let storage = crate::session::Storage::open_unwatched("default")?;
             let mut stopped = Instance::new(
                 "deliberately stopped control",
@@ -3924,9 +3966,10 @@ mod tests {
                 storage.update(|rows, _| {
                     let current = rows.iter_mut().find(|row| row.id == source.id).unwrap();
                     assert_eq!(handoff_key(current)?, live_key);
-                    current.lifecycle_reservation.as_mut().unwrap().at = chrono::Utc::now()
-                        - Instance::LIFECYCLE_RESERVATION_TTL
-                        - chrono::Duration::seconds(1);
+                    current.lifecycle_reservation.as_mut().unwrap().at =
+                        crate::time::Timestamp::now()
+                            - Instance::LIFECYCLE_RESERVATION_TTL
+                            - crate::time::Duration::seconds(1);
                     Ok(())
                 })?;
                 // The blocked real host hook proves the live driver, not the marker age.
@@ -5247,7 +5290,8 @@ mod tests {
                 [true, false, true],
             ),
         ] {
-            let outcome = handoff_outcome(context, terminal);
+            let outcome: TerminalConversation =
+                crate::session::TerminalHandoffOutcome::of(context, terminal).into();
             for (conversation, honoured) in [None, Some(Continue), Some(Fresh)]
                 .into_iter()
                 .zip(honoured)
@@ -5278,6 +5322,7 @@ mod tests {
                 .execution
                 .expect("asserted binding has an execution"),
         };
+        kept.outcome = crate::session::TerminalHandoffOutcome::Continue;
         keeping.terminal_handoff = Some(Box::new(kept));
         let rows = vec![discarding, keeping];
         crate::server::test_support::seed_instances_on_disk_for_test("default", rows.clone());
@@ -5372,7 +5417,7 @@ mod tests {
         // An archived row starts no pane, so its selector never reaches a launch.
         let mut archived = selecting("own selector, archived", None);
         archived.agent_session_id = Some("sid-archived".into());
-        archived.archived_at = Some(chrono::Utc::now());
+        archived.archived_at = Some(crate::time::Timestamp::now());
         let rows = vec![
             archived.clone(),
             unbound.clone(),
@@ -5805,6 +5850,29 @@ mod tests {
             Ok(rows.into_iter().find(|r| r.id == id).unwrap())
         };
 
+        // A poll of an ended row without its remedy, past the wait for a missing tmux server
+        // (none is left once the last pane ends), gives the remedy back after the pane's fate
+        // (#5829).
+        let poll = |row: &mut Instance| {
+            crate::tmux::refresh_session_cache();
+            row.unknown_since =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+            row.update_status_with_metadata(None, None);
+            let remedy = format!(
+                " Terminal view can't start this Session again: {}",
+                Instance::command_selector_remedy(&row.id)
+            );
+            assert_eq!(row.status, Status::Error, "{}", row.title);
+            assert!(
+                row.last_error
+                    .as_deref()
+                    .is_some_and(|error| error.ends_with(&remedy)),
+                "{}: {:?}",
+                row.title,
+                row.last_error
+            );
+        };
+
         let mut kept_pane = None;
         for (held, tried, resume) in &cases {
             // Reserve as a daemon without the refusal did; the switch then drives it.
@@ -6034,7 +6102,7 @@ mod tests {
                 );
                 assert_eq!(
                     std::str::from_utf8(&body)?,
-                    command_selector_ended(&held.id)
+                    Instance::handoff_refused(&held.id)
                 );
             } else {
                 // So does the daemon's own recovery, which has no request to answer.
@@ -6047,9 +6115,8 @@ mod tests {
             let cached = find_instance(&state, &held.id).await.unwrap();
             assert_eq!(cached.status, Status::Error);
             if *resume == Resume::SwitchAdoptionFails {
-                // The 409 above is the only place the remedy reaches: the degraded store keeps
-                // the stale published row, and `last_error` is runtime only, so reconciliation
-                // rebuilds the row from disk without it, as after a daemon restart.
+                // The degraded store keeps the stale published row, so only the 409 above carried
+                // the remedy, and reconciliation rebuilds the row from disk, where it isn't kept.
                 assert!(cached.last_error.is_none());
                 assert_ne!(
                     *state.canonical_health.read().await,
@@ -6066,14 +6133,49 @@ mod tests {
                 assert_eq!(reconciled.view, View::Terminal);
                 assert_eq!(reconciled.status, Status::Error);
                 assert!(reconciled.last_error.is_none());
+                // The next poll explains the Error with the remedy again.
+                poll(&mut reconciled.clone());
                 // The ended switch is in Terminal view, so a retry just reports that.
                 assert_eq!(switch().await.into_response().status(), StatusCode::OK);
             } else {
-                assert_eq!(
-                    cached.last_error.as_deref(),
-                    Some(command_selector_ended(&held.id).as_str())
-                );
+                let ended = Instance::handoff_refused(&held.id);
+                assert_eq!(cached.last_error.as_deref(), Some(ended.as_str()));
+                // Either way out drops the ended text's remedy on the next poll; until then the
+                // poll keeps it as written, without naming the remedy twice.
+                let remedies: [(&str, fn(&mut Instance)); 3] = [
+                    ("still refused", |_| {}),
+                    ("flag removed", |row| row.command = "claude".into()),
+                    ("AoE's id cleared", |row| {
+                        row.resume_intent = ResumeIntent::Cleared
+                    }),
+                ];
+                for (fix, apply) in remedies {
+                    let mut row = cached.clone();
+                    apply(&mut row);
+                    crate::tmux::refresh_session_cache();
+                    row.unknown_since =
+                        Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+                    row.update_status_with_metadata(None, None);
+                    let want = if fix == "still refused" {
+                        ended.clone()
+                    } else {
+                        "Terminal view couldn't start this Session.".to_owned()
+                    };
+                    assert_eq!(
+                        (row.status, row.last_error.as_deref()),
+                        (Status::Error, Some(want.as_str())),
+                        "{fix}"
+                    );
+                }
             }
+            // A daemon restart loads the row without the remedy too, and its first poll puts it
+            // back.
+            let mut restarted = stored(&held.id)?;
+            assert_eq!(
+                (restarted.status, restarted.last_error.as_deref()),
+                (Status::Error, None)
+            );
+            poll(&mut restarted);
             assert!(!argv.exists(), "the refused launch ran nothing");
         }
 
@@ -6135,6 +6237,12 @@ mod tests {
             let restarted = stored(&row.id)?;
             assert_eq!(restarted.command, command, "{}", row.title);
             assert!(restarted.terminal_handoff.is_none());
+            // Either remedy leaves nothing for a later poll to explain with it.
+            assert!(
+                !restarted.command_selector_refuses_launch(),
+                "{}",
+                row.title
+            );
         }
         let cleared = stored(&id_cleared.id)?;
         assert_eq!(cleared.agent_session_id, None, "the clear dropped AoE's id");

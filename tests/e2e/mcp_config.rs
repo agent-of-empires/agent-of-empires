@@ -440,13 +440,13 @@ fn configured_autostart_reports_tcp_bind_failure_without_private_fallback() {
     h.run_cli_err(&["serve", "--daemon"]);
     h.run_cli_err(&["profile", "list"]);
     h.run_cli_err(&["--no-autostart", "profile", "list"]);
-    h.spawn_tui();
-    h.wait_for("Not responding");
+    let (status, _) = h.run_tui_to_exit(&[]);
+    assert_ne!(status, 0, "the TUI opened without a Daemon");
     h.run_cli_err(&["--no-autostart", "profile", "list"]);
 
     h.run_cli_ok(&["serve", "--core-only", "--daemon"]);
     h.run_cli_ok(&["--no-autostart", "profile", "list"]);
-    h.send_keys("r");
+    h.spawn_tui();
     h.wait_for_runtime_ready();
     h.run_cli_err(&["mcp", "config"]);
     h.kill_tui();
@@ -516,12 +516,13 @@ fn configured_autostart_respects_selected_endpoint_and_opt_out() {
             let mut read_args = vec!["list", "--json"];
             read_args.extend_from_slice(&args);
             h.run_cli_err(&read_args);
-            h.spawn(&args);
-            h.wait_for(if remote {
-                "Could not reach daemon"
+            if remote {
+                h.spawn(&args);
+                h.wait_for("Could not reach daemon");
             } else {
-                "Not responding"
-            });
+                let (status, _) = h.run_tui_to_exit(&args);
+                assert_ne!(status, 0, "the TUI opened without a Daemon");
+            }
             let app = app_dir_in(h.home_path());
             for name in ["serve.pid", "serve.launch", "daemon/api.sock"] {
                 assert!(!app.join(name).exists(), "unexpected {name}");

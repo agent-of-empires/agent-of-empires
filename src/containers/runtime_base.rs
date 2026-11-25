@@ -2,11 +2,87 @@ use super::container_interface::{
     docker_env_args, ContainerConfig, RunFlag, TargetEnvFile, CGROUP_PARENT_LABEL,
 };
 use super::error::{sanitize_stderr, DockerError, Result};
-use super::image_pull::PullFailureReason;
+use super::image_pull::{PullContext, PullFailureReason};
+use super::pull_progress::{LayerUpdate, LineBuffer};
 use std::collections::HashSet;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+
+/// Format printing what decides PID 1 on stop: the image ENTRYPOINT, `--init`,
+/// `--stop-timeout` and the host PID of PID 1, as `|`-separated JSON.
+const STOP_SETTINGS_FORMAT: &str = "{{json .Config.Entrypoint}}|{{json .HostConfig.Init}}|{{json .Config.StopTimeout}}|{{json .State.Pid}}";
+
+/// The host PID of PID 1 when `settings` show no ENTRYPOINT, init or explicit
+/// timeout, so it can only be the appended `sleep`, or whatever the daemon
+/// defaulted init to. `None` for any other setup or an unreadable answer.
+fn bare_pid1(settings: Option<&str>) -> Option<&str> {
+    let mut fields = settings?.split('|');
+    match (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) {
+        (Some("null" | "[]" | "\"\""), Some("null" | "false"), Some("null"), Some(pid), None)
+            if pid != "0" && pid.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            Some(pid)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `top -eo pid,comm` output lists host process `pid` as `sleep`.
+fn pid_is_sleep(top_stdout: &str, pid: &str) -> bool {
+    top_stdout.lines().skip(1).any(|row| {
+        let mut columns = row.split_whitespace();
+        (columns.next(), columns.next(), columns.next()) == (Some(pid), Some("sleep"), None)
+    })
+}
+
+/// Time the optional stop probes may use in total, so a stalled runtime delays
+/// the stop itself by at most this much.
+const STOP_PROBE_BUDGET: Duration = Duration::from_secs(3);
+
+/// Full `stop` arguments for container `name`. `run` runs the given runtime
+/// arguments within the given time and returns the output, or `None` when it
+/// cannot run or times out. `sleep` as
+/// PID 1 ignores SIGTERM, so waiting out the grace only delays SIGKILL: `-t 0`
+/// needs the settings gate and `top` showing PID 1 is `sleep`. Anything else,
+/// including a failed probe, keeps the runtime's grace.
+pub(crate) fn stop_args_for(
+    name: &str,
+    mut run: impl FnMut(&[String], Duration) -> Option<std::process::Output>,
+) -> Vec<String> {
+    let deadline = Instant::now() + STOP_PROBE_BUDGET;
+    let mut stdout = |args: &[&str]| {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        run(
+            &args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(),
+            remaining,
+        )
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    let settings = stdout(&["inspect", "--format", STOP_SETTINGS_FORMAT, name]);
+    let immediate = bare_pid1(settings.as_deref()).is_some_and(|pid| {
+        stdout(&["top", name, "-eo", "pid,comm"]).is_some_and(|top| pid_is_sleep(&top, pid))
+    });
+    let stop: &[&str] = if immediate {
+        &["stop", "-t", "0"]
+    } else {
+        &["stop"]
+    };
+    stop.iter()
+        .map(|arg| (*arg).to_owned())
+        .chain([name.to_owned()])
+        .collect()
+}
 
 /// `docker pull` has no timeout of its own; this only fires on a wedged pull.
 const PULL_TIMEOUT: Duration = Duration::from_secs(600);
@@ -67,6 +143,9 @@ pub(crate) struct RuntimeBase {
     pub name: &'static str,
     pub daemon_check_args: &'static [&'static str],
     pub pull_prefix: &'static [&'static str],
+    /// Reads a pull's layer lines. `None` until the runtime's non-TTY output is captured, so
+    /// its pulls show a spinner.
+    pub pull_progress: Option<fn(&str) -> Option<LayerUpdate>>,
     pub remove_subcommand: &'static str,
     pub supports_read_only_volumes: bool,
     pub supports_remove_volumes: bool,
@@ -99,6 +178,7 @@ impl RuntimeBase {
         name: "Docker",
         daemon_check_args: &["info"],
         pull_prefix: &["pull"],
+        pull_progress: Some(super::pull_progress::docker_layer),
         remove_subcommand: "rm",
         supports_read_only_volumes: true,
         supports_remove_volumes: true,
@@ -109,10 +189,16 @@ impl RuntimeBase {
         cgroup_probe: Some(("{{.CgroupDriver}} {{.SecurityOptions}}", "name=rootless")),
         supported_run_flags: ALL_RUN_FLAGS,
         not_found_markers: &["no such container"],
-        daemon_down_markers: &["Cannot connect to the Docker daemon"],
-        // Scoped to "docker daemon socket" so unrelated permission errors are not misclassified.
+        // Older CLIs say "daemon", current ones "API".
+        daemon_down_markers: &[
+            "Cannot connect to the Docker daemon",
+            "failed to connect to the docker API",
+        ],
+        // Scoped to the daemon connection (older CLIs say "daemon socket", current ones "API")
+        // so unrelated permission errors are not misclassified.
         permission_denied_markers: &[
             "permission denied while trying to connect to the docker daemon socket",
+            "permission denied while trying to connect to the docker api",
         ],
     };
 
@@ -121,6 +207,8 @@ impl RuntimeBase {
         name: "Apple Container",
         daemon_check_args: &["system", "status"],
         pull_prefix: &["image", "pull"],
+        // `auto` already picks plain without a TTY; this keeps it from depending on that.
+        pull_progress: None,
         remove_subcommand: "delete",
         supports_read_only_volumes: false,
         supports_remove_volumes: false,
@@ -141,6 +229,7 @@ impl RuntimeBase {
         name: "Podman",
         daemon_check_args: &["info"],
         pull_prefix: &["pull"],
+        pull_progress: None,
         remove_subcommand: "rm",
         supports_read_only_volumes: true,
         supports_remove_volumes: true,
@@ -168,6 +257,26 @@ impl RuntimeBase {
         self.permission_denied_markers
             .iter()
             .any(|m| lower.contains(m))
+    }
+
+    /// A failed pull's socket problem. Only a daemon-down marker or a permission error that
+    /// names the socket qualifies: the broad permission markers alone could match a registry
+    /// refusal, which must stay a failed pull. Podman's socket-permission stderr also carries
+    /// its daemon-down marker, so permission wins there.
+    pub fn pull_socket_error(&self, stderr: &str) -> Option<DockerError> {
+        let lower = stderr.to_lowercase();
+        let names_socket = self.is_permission_denied(stderr)
+            && ["socket", ".sock", "connect to the docker api"]
+                .iter()
+                .any(|name| lower.contains(name));
+        if !self.is_daemon_down(stderr) && !names_socket {
+            return None;
+        }
+        Some(if self.is_permission_denied(stderr) {
+            DockerError::PermissionDenied
+        } else {
+            DockerError::DaemonNotRunning
+        })
     }
 
     pub fn is_not_found(&self, stderr: &str) -> bool {
@@ -242,7 +351,7 @@ impl RuntimeBase {
         self.probe_output_with_timeout(cmd, RUNTIME_CMD_TIMEOUT)
     }
 
-    fn probe_output_with_timeout(
+    pub(crate) fn probe_output_with_timeout(
         &self,
         cmd: &mut Command,
         timeout: Duration,
@@ -305,25 +414,44 @@ impl RuntimeBase {
         self.probe_succeeds(&["image", "inspect", image])
     }
 
-    pub fn pull_until_cancelled(&self, image: &str, cancel: &CancellationToken) -> Result<()> {
-        self.pull_with_timeout(image, cancel, PULL_TIMEOUT)
+    pub(crate) fn pull_until_cancelled(&self, image: &str, pull: &PullContext) -> Result<()> {
+        self.pull_with_timeout(image, pull, PULL_TIMEOUT)
     }
 
-    fn pull_with_timeout(
-        &self,
-        image: &str,
-        cancel: &CancellationToken,
-        timeout: Duration,
-    ) -> Result<()> {
+    fn pull_with_timeout(&self, image: &str, pull: &PullContext, timeout: Duration) -> Result<()> {
+        let cancel = pull.kill;
         let mut cmd = self.command();
         cmd.args(self.pull_prefix);
         cmd.arg(image);
         cmd.stdin(Stdio::null());
         let start = Instant::now();
         tracing::info!(target: "containers.image", runtime = %self.name, %image, "pulling image");
-        let output = match crate::process::run_until_cancelled_process_group(
-            &mut cmd, timeout, cancel,
-        )? {
+        let ran = match self.pull_progress {
+            // A runtime with no parser is not observed, so its output isn't split into lines.
+            None => crate::process::run_until_cancelled_process_group(&mut cmd, timeout, cancel),
+            Some(parse) => {
+                let (mut stdout_lines, mut stderr_lines) =
+                    (LineBuffer::default(), LineBuffer::default());
+                let mut on_output = |stream: crate::process::OutputStream, bytes: &[u8]| {
+                    let lines = match stream {
+                        crate::process::OutputStream::Stdout => &mut stdout_lines,
+                        crate::process::OutputStream::Stderr => &mut stderr_lines,
+                    };
+                    lines.push(bytes, |line| {
+                        if let Some(update) = parse(line) {
+                            pull.report(update);
+                        }
+                    });
+                };
+                crate::process::run_until_cancelled_process_group_observed(
+                    &mut cmd,
+                    timeout,
+                    cancel,
+                    &mut on_output,
+                )
+            }
+        };
+        let output = match ran? {
             Some(output) => output,
             None if cancel.is_cancelled() => {
                 tracing::info!(target: "containers.image", runtime = %self.name, %image, "image pull cancelled");
@@ -359,6 +487,9 @@ impl RuntimeBase {
                 stderr_summary = %stderr.trim().chars().take(200).collect::<String>(),
                 "image pull failed"
             );
+            if let Some(error) = self.pull_socket_error(&stderr) {
+                return Err(error);
+            }
             return Err(DockerError::ImagePullFailed {
                 runtime: self.name,
                 image: image.to_string(),
@@ -375,17 +506,6 @@ impl RuntimeBase {
             "image pull completed"
         );
         Ok(())
-    }
-
-    pub fn default_sandbox_image(&self) -> &'static str {
-        "ghcr.io/agent-of-empires/aoe-sandbox:latest"
-    }
-
-    pub fn effective_default_image(&self) -> String {
-        crate::session::Config::load()
-            .ok()
-            .map(|c| c.sandbox.default_image)
-            .unwrap_or_else(|| self.default_sandbox_image().to_string())
     }
 
     pub fn build_create_args(
@@ -750,8 +870,13 @@ impl RuntimeBase {
 
     pub fn stop_container(&self, name: &str) -> Result<()> {
         tracing::info!(target: "containers.runtime", runtime = %self.name, %name, "stopping container");
+        let args = stop_args_for(name, |args, timeout| {
+            let mut probe = self.command();
+            probe.args(args);
+            self.probe_output_with_timeout(&mut probe, timeout).ok()
+        });
         let mut cmd = self.command();
-        cmd.args(["stop", name]);
+        cmd.args(args);
         let output = self.probe_output(&mut cmd)?;
 
         if !output.status.success() {
@@ -933,6 +1058,109 @@ mod tests {
     }
 
     #[test]
+    fn bare_pid1_needs_no_entrypoint_init_or_timeout() {
+        for (settings, expected) in [
+            (Some("null|null|null|123"), Some("123")),
+            (Some("[]|false|null|123"), Some("123")),
+            (Some("\"\"|null|null|123"), Some("123")),
+            (Some("[\"/entry.sh\"]|null|null|123"), None),
+            (Some("null|true|null|123"), None),
+            (Some("null|null|30|123"), None),
+            (Some("null|null|null|0"), None),
+            (Some("null|null|null|abc"), None),
+            (Some("null|null|null"), None),
+            (Some(""), None),
+            (None, None),
+        ] {
+            assert_eq!(bare_pid1(settings), expected, "{settings:?}");
+        }
+    }
+
+    #[test]
+    fn pid_is_sleep_matches_the_exact_row() {
+        const INIT: &str = "PID COMMAND\n91570 docker-init\n91584 sleep";
+        for (top, pid, expected) in [
+            ("PID COMMAND\n91483 sleep", "91483", true),
+            ("PID COMMAND\n91483 sleep\n91500 sh", "91483", true),
+            (INIT, "91570", false),
+            (INIT, "91584", true),
+            (
+                "PID COMMAND\n91584 sleep\n91570 docker-init",
+                "91570",
+                false,
+            ),
+            ("PID COMMAND\n914830 sleep", "91483", false),
+            ("PID COMMAND", "91483", false),
+            ("", "91483", false),
+        ] {
+            assert_eq!(pid_is_sleep(top, pid), expected, "{top:?} {pid}");
+        }
+    }
+
+    #[test]
+    fn stop_probes_share_one_short_deadline() {
+        let mut timeouts = Vec::new();
+        let args = stop_args_for("c1", |args, timeout| {
+            timeouts.push(timeout);
+            let mut output = std::process::Command::new("true").output().unwrap();
+            if args[0] == "inspect" {
+                output.stdout = b"null|null|null|91483".to_vec();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            Some(output)
+        });
+        assert_eq!(args, ["stop", "c1"]);
+        assert_eq!(timeouts.len(), 2);
+        assert!(timeouts[0] <= STOP_PROBE_BUDGET);
+        assert!(timeouts[1] < timeouts[0]);
+        let mut calls = 0;
+        stop_args_for("c1", |_, _| {
+            calls += 1;
+            std::thread::sleep(STOP_PROBE_BUDGET + Duration::from_millis(50));
+            None
+        });
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn stop_args_for_needs_both_the_settings_and_a_sleep_pid1() {
+        let answer = |stdout: &str, ok: bool| {
+            let mut output = std::process::Command::new(if ok { "true" } else { "false" })
+                .output()
+                .unwrap();
+            output.stdout = stdout.as_bytes().to_vec();
+            Some(output)
+        };
+        let stop = |inspect: Option<&str>, top: Option<&str>| {
+            stop_args_for("c1", |args, _| match args[0].as_str() {
+                "inspect" => answer(inspect.unwrap_or(""), inspect.is_some()),
+                _ => answer(top.unwrap_or(""), top.is_some()),
+            })
+        };
+        let now = ["stop", "-t", "0", "c1"];
+        let grace = ["stop", "c1"];
+        let bare = Some("null|null|null|91483");
+        assert_eq!(stop(bare, Some("PID COMMAND\n91483 sleep")), now);
+        assert_eq!(
+            stop(bare, Some("PID COMMAND\n91483 docker-init\n91484 sleep")),
+            grace
+        );
+        assert_eq!(
+            stop(bare, Some("PID COMMAND\n91484 sleep\n91483 docker-init")),
+            grace
+        );
+        assert_eq!(stop(bare, None), grace);
+        assert_eq!(
+            stop(
+                Some("null|true|null|91483"),
+                Some("PID COMMAND\n91483 sleep")
+            ),
+            grace
+        );
+        assert_eq!(stop(None, Some("PID COMMAND\n91483 sleep")), grace);
+    }
+
+    #[test]
     fn classify_probe_failure_per_runtime() {
         let cases = [
             (&DOCKER, DOCKER_MISSING, "ok:false"),
@@ -1002,6 +1230,86 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_pull_tells_a_socket_permission_error_from_a_stopped_daemon() {
+        let kind = |error: Option<DockerError>| match error {
+            None => "pull_failed".to_string(),
+            Some(DockerError::DaemonNotRunning) => "daemon_down".to_string(),
+            Some(DockerError::PermissionDenied) => "permission_denied".to_string(),
+            Some(other) => format!("other:{other}"),
+        };
+        for (base, stderr, expected) in [
+            (
+                &PODMAN,
+                "Error: unable to connect to Podman socket: Connection refused",
+                "daemon_down",
+            ),
+            (
+                &PODMAN,
+                "Error: unable to connect to Podman socket: dial unix \
+                 /run/user/1000/podman/podman.sock: connect: permission denied",
+                "permission_denied",
+            ),
+            (
+                &DOCKER,
+                "Cannot connect to the Docker daemon at unix:///var/run/docker.sock.",
+                "daemon_down",
+            ),
+            (
+                &DOCKER,
+                "failed to connect to the docker API at unix:///var/run/docker.sock; check if \
+                 the path is correct and if the daemon is running: dial unix \
+                 /var/run/docker.sock: connect: no such file or directory",
+                "daemon_down",
+            ),
+            // Docker's own wording has no daemon-down marker.
+            (
+                &DOCKER,
+                "permission denied while trying to connect to the Docker daemon socket at \
+                 unix:///var/run/docker.sock: Post \"http://%2Fvar%2Frun%2Fdocker.sock/v1.47/images/create\"",
+                "permission_denied",
+            ),
+            // The current CLI names the API endpoint, with `.sock` but not "socket".
+            (
+                &DOCKER,
+                "permission denied while trying to connect to the docker API at \
+                 unix:///var/run/docker.sock",
+                "permission_denied",
+            ),
+            (
+                &APPLE,
+                "Error: permission denied accessing container socket",
+                "permission_denied",
+            ),
+            (
+                &DOCKER,
+                "Error response from daemon: pull access denied for example/img, repository does \
+                 not exist or may require 'docker login': denied: requested access to the \
+                 resource is denied",
+                "pull_failed",
+            ),
+            (
+                &DOCKER,
+                "Error response from daemon: Get \"https://registry.example/v2/\": permission \
+                 denied by registry policy",
+                "pull_failed",
+            ),
+            // A registry refusal is a failed pull, never a socket problem.
+            (
+                &PODMAN,
+                "Error: initializing source docker://example/img:1: permission denied by registry",
+                "pull_failed",
+            ),
+        ] {
+            assert_eq!(
+                kind(base.pull_socket_error(stderr)),
+                expected,
+                "{}: {stderr}",
+                base.name
+            );
+        }
+    }
+
+    #[test]
     fn stderr_markers_do_not_bleed_across_runtimes() {
         let runtimes = [&DOCKER, &PODMAN, &APPLE];
         let daemon_down = [
@@ -1025,6 +1333,9 @@ mod tests {
         assert!(runtimes
             .iter()
             .all(|base| base.is_permission_denied(docker_pd)));
+        assert!(DOCKER.is_permission_denied(
+            "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock"
+        ));
         let podman_only = "Error: unable to connect to Podman socket: connect: permission denied";
         assert!(!DOCKER.is_permission_denied(podman_only));
         assert!(PODMAN.is_permission_denied(podman_only));
@@ -1057,6 +1368,68 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::parallel]
+    fn a_running_pull_reports_the_layers_its_runtime_prints() {
+        use super::super::pull_progress::{Progress, PullPhase};
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Arc, Mutex};
+        const DEADLINE: Duration = Duration::from_secs(10);
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let (binary, gate) = (dir.path().join("docker"), dir.path().join("gate"));
+        nix::unistd::mkfifo(&gate, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\n\
+                 echo '6458fc480f83: Pulling fs layer'\n\
+                 read _ < '{gate}'\n\
+                 echo '6458fc480f83: Pull complete'\n",
+                gate = gate.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = RuntimeBase {
+            binary: Box::leak(binary.to_string_lossy().into_owned().into_boxed_str()),
+            ..RuntimeBase::DOCKER
+        };
+        let progress = Arc::new(Mutex::new(Progress::default()));
+        let pulling = {
+            let progress = progress.clone();
+            std::thread::spawn(move || {
+                let pull = PullContext {
+                    kill: &CancellationToken::new(),
+                    progress: &progress,
+                };
+                runtime.pull_with_timeout("img", &pull, DEADLINE)
+            })
+        };
+        let snapshot = || progress.lock().unwrap().snapshot();
+        let deadline = Instant::now() + DEADLINE;
+        while snapshot().layers_known != Some(1) {
+            assert!(
+                Instant::now() < deadline,
+                "the first line never reached the progress"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(snapshot().phase, Some(PullPhase::Downloading));
+
+        crate::process::test_support::open_fifo_writer(&gate, deadline)
+            .write_all(b"go\n")
+            .unwrap();
+        pulling.join().unwrap().unwrap();
+        let end = snapshot();
+        assert_eq!(
+            (end.phase, end.layers_done),
+            (Some(PullPhase::Unpacking), Some(1))
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     #[serial_test::parallel]
@@ -1081,8 +1454,12 @@ mod tests {
             ..RuntimeBase::DOCKER
         };
 
-        let result =
-            runtime.pull_with_timeout("img", &CancellationToken::new(), Duration::from_secs(1));
+        let progress = std::sync::Mutex::default();
+        let pull = PullContext {
+            kill: &CancellationToken::new(),
+            progress: &progress,
+        };
+        let result = runtime.pull_with_timeout("img", &pull, Duration::from_secs(1));
         assert!(matches!(
             result,
             Err(DockerError::ImagePullFailed {

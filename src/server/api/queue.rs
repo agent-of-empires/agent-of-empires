@@ -22,7 +22,7 @@ use crate::acp::protocol::PromptAttachmentUpload;
 use crate::daemon::PromptAttachmentRef;
 use crate::server::api::sessions::cityhall_block_non_structured;
 use crate::server::session_service::{
-    EditQueuedOutcome, QueuePersistFailed, QueueRoom, MAX_QUEUED_PROMPTS_PER_SESSION,
+    EditQueuedOutcome, QueuePersistFailed, QueueRoom, QueueSender, MAX_QUEUED_PROMPTS_PER_SESSION,
     MAX_QUEUED_TEXT_BYTES,
 };
 use crate::server::AppState;
@@ -59,6 +59,7 @@ async fn session_exists(state: &AppState, id: &str) -> bool {
 pub async fn queue_enqueue(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
     req: Result<Json<EnqueueRequest>, JsonRejection>,
 ) -> impl IntoResponse {
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
@@ -82,6 +83,22 @@ pub async fn queue_enqueue(
     // Serialize replacements with a concurrent drain (#3621). The prompt
     // endpoint already holds this guard before calling buffer_and_enqueue.
     let _submission = state.session_service.prompt_submission(&id).await;
+    // A client that lost the response to an earlier POST re-posts the same id; once the
+    // drain has delivered it, queueing it again would send it twice.
+    if state.session_service.was_prompt_delivered(&id, &req.id)
+        && !state
+            .session_service
+            .queued_prompts_snapshot(&id)
+            .await
+            .iter()
+            .any(|q| q.id == req.id)
+    {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "id": req.id, "delivered": true })),
+        )
+            .into_response();
+    }
     if let Some((status, msg)) = queue_refusal(
         state
             .session_service
@@ -106,6 +123,7 @@ pub async fn queue_enqueue(
             blobs: &blobs,
             origin_device: req.origin_device,
             origin_plugin: None,
+            origin: super::prompt_origin(&headers),
             supersede_pending_turn: false,
         },
     )
@@ -142,6 +160,7 @@ pub(super) struct QueuedPrompt<'a> {
     pub blobs: &'a [crate::acp::event_store::AttachmentBlob],
     pub origin_device: Option<String>,
     pub origin_plugin: Option<String>,
+    pub origin: crate::daemon::PromptOrigin,
     /// Drops a queued rate-limit continuation in the same durable write (#3028).
     pub supersede_pending_turn: bool,
 }
@@ -163,6 +182,7 @@ pub(super) async fn buffer_and_enqueue(
         blobs,
         origin_device,
         origin_plugin,
+        origin,
         supersede_pending_turn,
     } = prompt;
     // Before any blob is buffered. The caller holds the session's prompt-submission guard, so
@@ -243,7 +263,10 @@ pub(super) async fn buffer_and_enqueue(
                 text,
                 refs,
                 origin_device,
-                origin_plugin,
+                QueueSender {
+                    plugin: origin_plugin,
+                    origin,
+                },
             )
             .await
     } else {
@@ -254,7 +277,10 @@ pub(super) async fn buffer_and_enqueue(
                 text,
                 refs,
                 origin_device,
-                origin_plugin,
+                QueueSender {
+                    plugin: origin_plugin,
+                    origin,
+                },
             )
             .await)
     };
@@ -408,6 +434,7 @@ mod tests {
                 queue_enqueue(
                     State(state),
                     Path(id),
+                    axum::http::HeaderMap::new(),
                     Ok(Json(EnqueueRequest {
                         id: "q1".to_string(),
                         text: "rewritten".to_string(),
@@ -437,6 +464,102 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    /// The row's origin comes from the header alone, and only the client values count.
+    #[tokio::test]
+    async fn a_queued_row_takes_its_origin_from_the_header_only() {
+        use crate::daemon::PromptOrigin;
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let cases = [
+            (Some("tui"), PromptOrigin::Tui),
+            (Some("mcp"), PromptOrigin::Unknown),
+            (None, PromptOrigin::Unknown),
+        ];
+        for (n, (header, want)) in cases.into_iter().enumerate() {
+            let mut inst = Instance::new("queue-origin", "/tmp/aoe-queue-origin");
+            inst.id = format!("sess-queue-origin-{n}");
+            inst.view = crate::session::View::Structured;
+            let id = inst.id.clone();
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            let mut headers = axum::http::HeaderMap::new();
+            if let Some(value) = header {
+                headers.insert(PromptOrigin::HEADER, value.parse().unwrap());
+            }
+            let response = queue_enqueue(
+                State(Arc::clone(&state)),
+                Path(id.clone()),
+                headers,
+                Ok(Json(
+                    serde_json::from_value(serde_json::json!({
+                        "id": "q1",
+                        "text": "hello",
+                        "origin": "dashboard",
+                    }))
+                    .unwrap(),
+                )),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::OK, "{header:?}");
+            let rows = state.session_service.queued_prompts_snapshot(&id).await;
+            assert_eq!(rows[0].origin, want, "{header:?}");
+        }
+    }
+
+    /// A client that lost the response to its POST re-posts the id after the
+    /// drain delivered and retired the row; that must not queue it again.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_re_post_of_a_delivered_id_queues_nothing() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = Instance::new("queue-redeliver", "/tmp/aoe-5730-redeliver");
+        inst.id = "sess-5730".to_string();
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Idle;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let service = state.session_service.clone();
+        let commands = service
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(&id)
+            .await;
+        let _live = crate::acp::supervisor::test_support::save_agent_record(&id, "claude", true);
+        service.acp_supervisor.test_publish_worker_attached(&id);
+        let post = || async {
+            queue_enqueue(
+                State(Arc::clone(&state)),
+                Path(id.clone()),
+                axum::http::HeaderMap::new(),
+                Ok(Json(EnqueueRequest {
+                    id: "q1".to_string(),
+                    text: "follow-up".to_string(),
+                    origin_device: None,
+                    attachments: Vec::new(),
+                })),
+            )
+            .await
+            .into_response()
+        };
+
+        assert_eq!(post().await.status(), StatusCode::OK);
+        service.drain_queued_prompts_once(&id).await;
+        assert!(service.queued_prompts_snapshot(&id).await.is_empty());
+        service.acp_supervisor.test_flush_worker_commands(&id).await;
+        let delivered = commands.lock().unwrap().len();
+        assert_eq!(delivered, 1, "the drain delivered the prompt once");
+
+        let response = post().await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["delivered"], true);
+        assert!(service.queued_prompts_snapshot(&id).await.is_empty());
+        service.drain_queued_prompts_once(&id).await;
+        service.acp_supervisor.test_flush_worker_commands(&id).await;
+        assert_eq!(commands.lock().unwrap().len(), delivered);
+    }
+
     /// #4092: the resume admission orders queue rows against the rate-limit
     /// park, so the enqueue time is the server's. A client clock, however far
     /// ahead, must not reach the row.
@@ -452,6 +575,7 @@ mod tests {
         let response = queue_enqueue(
             State(Arc::clone(&state)),
             Path(id.clone()),
+            axum::http::HeaderMap::new(),
             Ok(Json(
                 serde_json::from_value(serde_json::json!({
                     "id": "q1",
@@ -476,10 +600,11 @@ mod tests {
             .into_iter()
             .next()
             .expect("the row must land");
-        let stamped = chrono::DateTime::parse_from_rfc3339(&row.created_at)
-            .expect("the server stamps a readable instant")
-            .with_timezone(&chrono::Utc);
-        let skew = (stamped - chrono::Utc::now()).num_seconds().abs();
+        let stamped = crate::time::Timestamp::parse_rfc3339(&row.created_at)
+            .expect("the server stamps a readable instant");
+        let skew = (stamped - crate::time::Timestamp::now())
+            .whole_seconds()
+            .abs();
         assert!(
             skew < 60,
             "the row carries the client's 2999 clock, {skew}s from now"

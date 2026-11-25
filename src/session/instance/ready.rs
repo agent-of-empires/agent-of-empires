@@ -87,7 +87,7 @@ pub(crate) enum NativeInputError {
 pub(crate) struct NativeInputFence {
     store: NativeInputStore,
     instance_id: String,
-    created_at: DateTime<Utc>,
+    created_at: crate::time::Timestamp,
     lifecycle_generation: u64,
     agent: bool,
     cache: std::sync::Mutex<NativeInputCache>,
@@ -120,7 +120,7 @@ impl NativeInputFence {
     pub(crate) fn capture(
         profile: &str,
         instance_id: &str,
-        created_at: DateTime<Utc>,
+        created_at: crate::time::Timestamp,
         lifecycle_generation: u64,
         agent: bool,
         expected_profile: Option<(u64, u64)>,
@@ -141,7 +141,7 @@ impl NativeInputFence {
     pub(crate) fn capture_route(
         profile: &str,
         instance_id: &str,
-        created_at: DateTime<Utc>,
+        created_at: crate::time::Timestamp,
         lifecycle_generation: u64,
         agent: bool,
         expected_profile: Option<(u64, u64)>,
@@ -200,11 +200,15 @@ impl NativeInputFence {
                 row.created_at == self.created_at
                     && row.lifecycle_generation == self.lifecycle_generation
                     && row.source_profile == self.store.profile()
-                    && !row.has_fresh_lifecycle_reservation(Utc::now()),
+                    && !row.has_fresh_lifecycle_reservation(crate::time::Timestamp::now()),
                 LifecycleReservationError::Superseded
             );
             if self.agent {
                 row.ensure_startable()?;
+                anyhow::ensure!(
+                    row.unproven_native_birth_generation.is_none(),
+                    LaunchIndeterminateCause::OwnershipUnproven
+                );
                 anyhow::ensure!(!row.is_structured(), NativeInputError::AgentNotReady);
             }
             Ok(lock)
@@ -263,8 +267,8 @@ impl Instance {
                 Ok(false) => EnsureReadyOutcome::Indeterminate {
                     cause: LaunchIndeterminateCause::StabilizationExpired,
                 },
-                Err(_) => EnsureReadyOutcome::Indeterminate {
-                    cause: LaunchIndeterminateCause::ObservationFailed,
+                Err(error) => EnsureReadyOutcome::Indeterminate {
+                    cause: self.probe_failure_cause(error),
                 },
             });
         }
@@ -310,30 +314,46 @@ impl Instance {
         else {
             return Ok(false);
         };
-        self.pane_is_ready(pane)
+        self.pane_is_ready(pane, true)
     }
 
-    pub(crate) fn pane_is_ready(&self, pane: &crate::tmux::PaneMetadata) -> Result<bool> {
+    pub(crate) fn pane_is_ready(
+        &self,
+        pane: &crate::tmux::PaneMetadata,
+        trust_hook_status: bool,
+    ) -> Result<bool> {
         if pane.pane_dead {
             return Ok(false);
         }
-        if self.expects_shell()
-            || self.has_command_override()
-            || self.current_launch_hook_status().is_some()
-        {
+        anyhow::ensure!(
+            self.unproven_native_birth_generation.is_none(),
+            LaunchIndeterminateCause::OwnershipUnproven
+        );
+        if self.expects_shell() || self.has_command_override() {
             return Ok(true);
         }
-        let command = pane
-            .pane_current_command
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("Agent pane command is unknown"))?;
-        Ok(!crate::tmux::utils::is_pane_running_shell_command(
-            command,
-            pane.pane_start_command_is_protected,
-        ))
+        if pane.pane_current_command.as_deref().is_some_and(|command| {
+            !crate::tmux::utils::is_pane_running_shell_command(
+                command,
+                pane.pane_start_command_is_protected,
+            )
+        }) {
+            return Ok(true);
+        }
+        if trust_hook_status && self.current_launch_hook_status(pane).is_some() {
+            return Ok(true);
+        }
+        anyhow::ensure!(
+            pane.pane_current_command.is_some(),
+            "Agent pane command is unknown"
+        );
+        Ok(false)
     }
 
-    fn current_launch_hook_status(&self) -> Option<crate::session::Status> {
+    fn current_launch_hook_status(
+        &self,
+        pane: &crate::tmux::PaneMetadata,
+    ) -> Option<crate::session::Status> {
         let active = self.active_execution.as_ref()?;
         let binding = self.agent_session_binding.as_ref()?;
         let session_id = self.agent_session_id.as_deref()?;
@@ -343,7 +363,24 @@ impl Instance {
         {
             return None;
         }
-        crate::hooks::read_hook_status_for_launch(&self.id, &active.launch_id, session_id)
+        let status =
+            crate::hooks::read_hook_status_for_launch(&self.id, &active.launch_id, session_id)?;
+        let pid = pane.pane_pid?;
+        let output = crate::tmux::TmuxCommandDeadline::new()
+            .run(crate::tmux::tmux_query_command().args([
+                "display-message",
+                "-t",
+                &pane.pane_id,
+                "-p",
+                "#{session_id}|#{pane_id}|#{pane_pid}|#{@aoe-hook-launch}",
+            ]))
+            .ok()?;
+        let expected = format!(
+            "{}|{}|{pid}|{pid}:{}",
+            pane.session_id, pane.pane_id, active.launch_id
+        );
+        (output.status.success() && str::from_utf8(&output.stdout).ok()?.trim_end() == expected)
+            .then_some(status)
     }
 
     /// Wait up to three seconds for a newly born live pane to leave its boot shell.
@@ -363,7 +400,7 @@ impl Instance {
                 return Err(LaunchIndeterminateCause::OwnershipUnproven);
             }
             if self
-                .pane_is_ready(pane)
+                .pane_is_ready(pane, true)
                 .map_err(|error| self.probe_failure_cause(error))?
             {
                 return Ok(());
@@ -446,7 +483,7 @@ impl Instance {
         if wait {
             session.wait_until_ready(
                 std::time::Duration::from_secs(5),
-                crate::agents::ready_marker(&self.tool),
+                crate::agents::ready_markers(&self.tool),
             );
         }
         session.admit_agent_input(self.expects_shell())?;
@@ -556,7 +593,7 @@ mod tests {
         row.source_profile = storage.profile().into();
         row.lifecycle_generation = 7;
         row.status = Status::Error;
-        row.started_at = Some(Utc::now());
+        row.started_at = Some(crate::time::Timestamp::now());
         storage.update(|rows, _| {
             rows.push(row.clone());
             Ok(())
@@ -589,7 +626,7 @@ mod tests {
         let (storage, mut row) = input_fixture("input-display-refresh")?;
         row.view = View::Structured;
         row.status = Status::Stopped;
-        row.archived_at = Some(Utc::now());
+        row.archived_at = Some(crate::time::Timestamp::now());
         row.terminal_info = Some(TerminalInfo { created: true });
         storage.update(|rows, _| {
             rows[0] = row.clone();
@@ -652,10 +689,10 @@ mod tests {
                     rows[0].lifecycle_reservation = Some(LifecycleReservation {
                         op: LifecycleOperation::Capture,
                         generation: row.lifecycle_generation,
-                        at: Utc::now(),
+                        at: crate::time::Timestamp::now(),
                     });
                 } else {
-                    rows[0].created_at += chrono::Duration::seconds(1);
+                    rows[0].created_at += crate::time::Duration::seconds(1);
                 }
                 Ok(())
             })?;

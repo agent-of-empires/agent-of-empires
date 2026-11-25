@@ -506,7 +506,10 @@ mod tests {
             (
                 "snoozed",
                 |i| i.snooze(30),
-                |i| i.snoozed_until = Some(chrono::Utc::now() - chrono::Duration::minutes(1)),
+                |i| {
+                    i.snoozed_until =
+                        Some(crate::time::Timestamp::now() - crate::time::Duration::minutes(1))
+                },
             ),
             (
                 "probe-failed",

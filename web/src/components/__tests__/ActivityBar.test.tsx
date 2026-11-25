@@ -27,4 +27,23 @@ describe("ActivityBar", () => {
     fireEvent.click(getByTestId("pane-toggle-terminal"));
     expect(onToggle).toHaveBeenCalledWith("terminal");
   });
+
+  it("shows a count only on a closed pane that has one", () => {
+    const render_ = (open: boolean) =>
+      render(
+        <ActivityBar
+          paneIds={["diff", "terminal"]}
+          descriptorFor={descriptorFor}
+          isOpen={() => open}
+          onToggle={vi.fn()}
+          closedBadge={(id) => (id === "diff" ? 3 : 0)}
+        />,
+      );
+    const closed = render_(false);
+    expect(closed.getByTestId("pane-badge-diff").textContent).toBe("3");
+    expect(closed.getByTestId("pane-toggle-diff").getAttribute("aria-label")).toBe("Toggle diff pane, 3 changed");
+    expect(closed.queryByTestId("pane-badge-terminal")).toBeNull();
+    closed.unmount();
+    expect(render_(true).queryByTestId("pane-badge-diff")).toBeNull();
+  });
 });

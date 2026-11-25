@@ -56,8 +56,8 @@ without a token. To connect an agent, see
 | Tool | Arguments | Returns |
 | --- | --- | --- |
 | `list_sessions` | `state` (`live`, default, or `all`), `group` (exact path and descendants), `children_of` (direct parent id) | The `{sessions, workspace_ordering}` envelope from the published canonical snapshot. |
-| `whoami` | none | The calling session (same row shape as `GET /api/sessions`) when the request carries its own session credential, `null` otherwise. |
-| `create_session` | `path`, `tool`, and optionally `title`, `view` (`terminal`, default, or `structured`), `agent_name`, `agent_model`, `agent_effort`, `group`, `worktree_enabled`, `worktree_branch`, `create_new_branch`, `base_branch`, `sandbox`, `sandbox_image`, `yolo_mode`, `profile`, `prompt`, `parent_session_id`, `idempotency_key` | `{session, fresh, prompt_sent, prompt_delivery, prompt_error?}`. `fresh` is false when `idempotency_key` matched an earlier create, whose session it returns. `prompt_delivery` is one of: `none` (no `prompt`); `pending_initial_turn` (a structured session stored it as its first turn); `sent` (typed into a terminal session once its agent's status rules show an empty or live input box); `blocked_waiting` (the terminal agent is waiting on a dialog, such as Claude's folder-trust question, so nothing was typed: a person answers it in the terminal, then `send` the prompt); `not_ready` (the terminal agent did not reach its input prompt within 30 s, so nothing was typed; an agent without a status manifest has no input-prompt rule to read, so it gets `not_ready` at once. `send` can deliver the prompt, but it has no dialog check for such an agent either, so check the pane first (`read_output`)); `not_running` (the terminal session did not start); `replayed` (a retry of an earlier create with the same key; the prompt is not delivered again, and the first create's outcome is not reported, so read it with `read_output`); `failed` (typing it failed). `prompt_error` explains `failed`, `blocked_waiting` and `not_ready`. A `prompt` that strips to nothing is refused with `invalid_request`. An omitted `parent_session_id` defaults to the calling session when that session is top-level, in the profile being created in, and no `group` is given; otherwise the new session is top-level. |
+| `whoami` | none | `{session}`: the calling session (same row shape as `GET /api/sessions`) when the request carries its own session credential, `null` otherwise. |
+| `create_session` | `path`, `tool`, and optionally `title`, `view` (`terminal`, default, or `structured`), `agent_name`, `agent_model`, `agent_effort`, `group`, `worktree_enabled`, `worktree_branch`, `create_new_branch`, `base_branch`, `sandbox`, `sandbox_image`, `yolo_mode`, `profile`, `prompt`, `parent_session_id`, `idempotency_key` | `{session, fresh, prompt_sent, prompt_delivery, prompt_error?}`. `fresh` is false when `idempotency_key` matched an earlier create, whose session it returns. `prompt_delivery` is one of: `none` (no `prompt`); `pending_initial_turn` (a structured session stored it as its first turn); `sent` (typed into a terminal session once its agent's status rules show an empty or live input box); `blocked_waiting` (the terminal agent is waiting on a dialog, such as Claude's folder-trust question, so nothing was typed: a person answers it in the terminal, then `send` the prompt); `not_ready` (the terminal agent did not reach its input prompt within 30 s, so nothing was typed; an agent without a status manifest has no input-prompt rule to read, so it gets `not_ready` at once. `send` can deliver the prompt, but it has no dialog check for such an agent either, so check the pane first (`read_output`)); `ignored` (the session was ignored, because another session manages it, before the prompt could be typed, so nothing was typed: take ownership back, then `send` the prompt); `not_running` (the terminal session did not start); `replayed` (a retry of an earlier create with the same key; the prompt is not delivered again, and the first create's outcome is not reported, so read it with `read_output`); `failed` (typing it failed). `prompt_error` explains `failed`, `blocked_waiting`, `not_ready` and `ignored`. A `prompt` that strips to nothing is refused with `invalid_request`. An omitted `parent_session_id` defaults to the calling session when that session is top-level, in the profile being created in, and no `group` is given; otherwise the new session is top-level. |
 | `send` | `session_id`, `message` | `{disposition, reason?, queued_id?, seq?}`. A structured session reports `sent`, `steered` or `queued` and the prompt's event `seq`; a terminal session reports `sent` with no seq. A message that strips to nothing is refused with `invalid_request` in either view. A terminal session is refused with `waiting`, and nothing is typed, when its agent's status rules detect a dialog or question waiting on a person (such as Claude's folder-trust question), or, for an agent with a status manifest, when its pane can't be captured. This check is only as good as those rules: a dialog they don't recognise, or any pane of an agent without a status manifest, is typed into, so `send` is not a way to keep an agent's questions or approvals for a person. HTTP `POST /send` still types into such a pane. A stopped terminal session is refused with `not_running`; `send` doesn't start it. A structured prompt that was recorded before its agent stopped is refused with `send_failed`; `read_output` shows it, so don't resend it. A structured prompt held for the sandbox login, or because the session's `before_start` hook failed, stays in the queue and is refused with `send_failed` naming its `queued_id`; it goes out after the login, so don't resend it. |
 | `send_to_parent` | `message` | What `send` returns, for a prompt sent to the calling session's parent. Listed in `tools/list` only when the caller has a parent in its own profile that is neither archived nor trashed; otherwise refused with `no_parent`. |
 | `read_output` | `session_id`, `since` and `raw` (structured), `lines` (terminal, 1 to 2000, default 200) | A structured session's transcript after `since` as text, or its raw events, with `next_since` and `has_more`; a terminal session's pane capture. A text page holds whole events up to 48 KB, so following `next_since` reads every event once; one event that alone renders past 48 KB comes back whole as the only event on its page. |
@@ -410,7 +410,7 @@ read `sessions`; the array is never returned unwrapped.
 `aoe-runtime-epoch` and `aoe-runtime-revision` identify the exact returned
 snapshot. Revisions are decimal unsigned 64-bit integers; clients must preserve
 their precision. A stale list must not replace newer canonical rows or ordering.
-Color and notification mutation receipts identify one session: another session
+Notification mutation receipts identify one session: another session
 at a higher revision cannot satisfy that receipt.
 
 **Query parameters**
@@ -445,7 +445,7 @@ A daemon older than this field omits it entirely. Treat an absent
 ```bash
 curl -sS \
   -H "Authorization: Bearer $AOE_TOKEN" \
-  "http://localhost:7777/api/sessions?state=live"
+  "http://localhost:8080/api/sessions?state=live"
 ```
 
 ### Status values
@@ -551,16 +551,17 @@ retains its existing readiness checks.
 
 `pull_latest_image: true` force-pulls the session's Sandbox image before its
 container starts and its `on_create` hooks run, so it requires a running engine.
-It applies the dashboard's pull gate. An unsandboxed request is refused with
-`400 validation_failed`. A request that can't pull (`sandbox.allow_image_pull`
-off) gets `403 pull_disabled`, and one in read-only or CityHall mode gets that
-mode's refusal. Only a configured image may be pulled: the global or a
-profile's `sandbox.default_image`. Any other `sandbox_image` is refused with
-`400 unknown_image`, and an omitted one pulls the profile's default.
+It applies the dashboard's [pull gate](#sandbox-image), with the same refusals,
+and only a configured image may be pulled; an omitted `sandbox_image` pulls the
+profile's default. The pull is shared with the dashboard's, so
+[`image-pull/cancel`](#post-apisandboximage-pullcancel) also fails a create
+waiting on it. An unsandboxed request is refused with `400 validation_failed`.
 These refusals come before anything is provisioned. While the pull runs, the
 create-progress `stage` is `pulling_image`. A failed pull ends the creation with
 `400 sandbox_image_update_failed`, and the session and its resources are rolled
-back. Only the local owner sees the runtime's output in its message; a replay
+back. Its message says why the pull failed, as the dashboard's sandbox image
+banner does.
+Only the local owner sees the runtime's output in its message; a replay
 of the cached failure does not include it. CityHall creations ignore the field.
 
 With CLI intent, `extra_args` uses shell-style word grouping and each decoded
@@ -597,6 +598,11 @@ granting trust or provisioning a session. It returns merged and repository-only
 hooks, MCP summaries with environment/header names but not their values,
 `hooks_need_trust`, `mcp_need_trust`, and a `fingerprint`. Unknown profiles are
 rejected without creating them; read-only and CityHall modes refuse this route.
+
+A project path that is not a directory on the Daemon host returns `400` with
+`aoe-error-code: working_dir_missing`, from this review and from creation.
+Checking out a worktree branch that exists neither locally nor on a remote fails
+creation with `400` and `aoe-error-code: branch_not_found`.
 
 For an interactive generated worktree title, the review may also receive
 `generated_worktree_branch` and `create_new_branch`. It returns `suggested_title`
@@ -669,6 +675,26 @@ an AoE session”. Frozen cleanup ownership covers all tools' current and parked
 ACP IDs, even after an ordinary purge removes the visible row. Unrelated failures
 remain sanitized rather than exposing their internal causes.
 
+**Initial prompt**
+
+`initial_prompt` is sent to the agent as its first turn, never before the
+agent is ready. Structured sessions deliver it once the worker is live and
+retry until it lands. A terminal session running an agent with a ready marker
+waits up to 60 seconds for that marker, then types it. A shell, a
+command-override session or an agent without a ready marker is refused
+immediately and surfaces `initial_prompt_error`. On timeout nothing is typed;
+a send error can leave partial input in the pane. Either way the session row
+carries `initial_prompt_error`. Claude Code's first-run folder-trust dialog and
+its one-time Bypass Permissions screen stop the wait within about a second;
+nothing is typed and neither screen is ever accepted for the user. The row
+then also carries `initial_prompt_error_code`: `agent_folder_not_trusted`
+(turn on `session.pre_trust_agent_folders`, or trust the folder once) or
+`agent_bypass_not_accepted` (open the session once and accept it). The code is
+absent for every other failure, which has only the message. A failed terminal prompt is not retried, unless
+persisting the error fails: the error then lives only in memory and a daemon
+restart retries the prompt. A consumed turn whose clear cannot be persisted is suppressed until a daemon restart, which can retype it. A crash between delivery and bookkeeping can
+deliver it twice. A blank or over-64 KiB (65536 bytes) value returns `400`.
+
 **Worktree fields**
 
 | Field | Notes |
@@ -713,6 +739,134 @@ When `profile` is omitted, creation uses the server's selected profile or the co
   "create_new_branch": true
 }
 ```
+
+## Sandbox image
+
+These endpoints back the dashboard's sandbox image banner (see
+[Available images](guides/sandbox.md#available-images)). They act only on a
+configured image: the global or a profile's `sandbox.default_image`. Any other
+image is refused with `400 unknown_image`, and an omitted one means the global
+`sandbox.default_image`. Images are checked and pulled with the configured
+`container_runtime`. When the configuration can't be read, every endpoint except
+`image-dismiss` answers `500 config_unreadable` rather than fall back to defaults.
+
+**The pull gate.** `image-pull` and `image-pull/cancel` are refused in read-only
+mode (`403 read_only`), in CityHall mode (`403 cityhall_mode`), and with
+`403 pull_disabled` when `sandbox.allow_image_pull` is off (see
+[Configuration](guides/sandbox.md#configuration)). The gate is checked before the
+body. `POST /api/sessions` applies the same gate to
+[`pull_latest_image`](#post-apisessions).
+
+Both take an optional body: none for the global default image, or JSON
+`{"image": "<configured image>"}` sent as `application/json`. Any other body,
+including `{}`, gets `400 invalid_body`. A JSON body naming an image that isn't
+configured gets `400 unknown_image`.
+
+### GET /api/sandbox/image-status
+
+`?image=<ref>&fresh=true`, both optional. Reports whether the registry has a
+newer image, and the state of the image's pull. Registry answers are cached for
+15 minutes per image and runtime; `fresh=true` waits for a check that starts
+after the request. The cached answer is dropped when a pull started by
+`image-pull` ends, or when a create's `pull_latest_image` pull succeeds. Other
+pulls, such as a missing image pulled when a session starts, leave it until it
+expires.
+
+```json
+{
+  "image": "ghcr.io/acme/sandbox:latest",
+  "state": "available",
+  "remote_digest": "sha256:9f2c4e6a8b0d1f3e5a7c9b1d3f5e7a9c1b3d5f7e9a1c3b5d7f9e1a3c5b7d9f1e",
+  "dismissed": false,
+  "checks_enabled": true,
+  "sandbox_in_use": true,
+  "pull": { "state": "running", "phase": "downloading", "layers_done": 2, "layers_known": 5 },
+  "pull_blocked": null,
+  "pull_command": "docker pull ghcr.io/acme/sandbox:latest",
+  "runtime": "Docker"
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `state` | `available` (with `remote_digest`, the registry's newer digest), `current`, `unknown` (with `reason`) or `check_failed` (with `error`: `registry_unreachable`, `registry_auth` or `registry_bad_response`) |
+| `reason` | `unparseable`, `pinned` (the reference names a digest), `not_pulled`, `no_local_digest`, `runtime_unavailable` or `checks_off` |
+| `dismissed` | `true` when `state` is `available` and `remote_digest` is the dismissed digest |
+| `checks_enabled` | `false` when `[updates] update_check_mode` is `off`. `state` is then `unknown` with `checks_off`, and no registry is asked |
+| `sandbox_in_use` | `sandbox.enabled_by_default` is on, or a sandboxed session exists |
+| `pull` | The image's pull, below |
+| `pull_blocked` | `read_only`, `cityhall` or `disabled` when the pull gate refuses, otherwise `null` |
+| `pull_command` | Always present: the runtime's pull command for the image, to run on the host when `pull_blocked` is set |
+| `runtime` | `Docker`, `Podman` or `Apple Container` |
+
+`pull.state` is one of:
+
+- `idle`: no pull of the image has run since the Daemon started, or the last one
+  ended because its last waiter left.
+- `running`: once the runtime prints a layer line, it also carries `phase`
+  (`downloading`, then `unpacking`), `layers_done` and `layers_known`. Only
+  Docker reports them; Podman and Apple Container report a bare
+  `{"state": "running"}`.
+- `done`.
+- `cancelled`: ended by `image-pull/cancel`.
+- `failed`, with `reason` (`timeout`, `network`, `disk_space`, `auth` or
+  `other`), `message` (the wording both clients show) and `error` (the
+  runtime's output). Every runtime's failure is classified: `timeout` when the
+  10-minute limit kills the pull, otherwise a match on the runtime's output. The
+  phrases matched come from Docker's output, so another runtime's failure can
+  read `other` where Docker's would be named.
+
+A finished state stays until the image's next pull starts.
+
+### POST /api/sandbox/image-pull
+
+Starts a pull of the image, or joins the one already running, so at most one
+pull runs per image. It answers `202` straight away, and progress is read from
+`image-status`:
+
+```json
+{ "image": "ghcr.io/acme/sandbox:latest", "pull": { "state": "running" } }
+```
+
+A pull started here keeps running when the page closes or a create waiting on it
+leaves. It ends when it finishes, is cancelled, or reaches the runtime's
+10-minute timeout (`failed` with `reason: timeout`).
+
+### POST /api/sandbox/image-pull/cancel
+
+Same body and gate as `image-pull`. Cancels the image's running pull for every
+waiter, waits up to 5 s for it to end, then answers `200`:
+
+```json
+{ "image": "ghcr.io/acme/sandbox:latest", "pull": { "state": "cancelled" } }
+```
+
+`pull` is normally `cancelled`; it is `done` or `failed`
+if the pull ended another way first, and `running` if it hasn't ended within
+5 s. With no pull running it answers the current state, so a repeat is
+harmless.
+
+A create waiting on the cancelled pull fails with `400`:
+`sandbox_image_update_failed` for a `pull_latest_image` pull, or
+`sandbox_image_pull_failed` for a missing image's pull. The failure isn't kept
+under its `idempotency_key`, so a retry with the same key runs again. A create
+that was itself cancelled gets its own cancellation's `409 creation_cancelled`
+instead.
+
+### POST /api/sandbox/image-dismiss
+
+Body `{"digest": "sha256:<64 lowercase hex>"}`; anything else gets
+`400 invalid_digest`. Saves the digest as `app_state.dismissed_image_digest`,
+which the TUI shares, and answers:
+
+```json
+{ "dismissed_image_digest": "sha256:9f2c4e6a8b0d1f3e5a7c9b1d3f5e7a9c1b3d5f7e9a1c3b5d7f9e1a3c5b7d9f1e" }
+```
+
+The dismissal holds only while the registry still serves that digest: a newer
+one shows again.
+It is refused in read-only mode (`403 read_only`) and CityHall mode
+(`403 cityhall_mode`), but not by `sandbox.allow_image_pull`. A failed save answers `500 save_failed`.
 
 ## POST /api/sessions/{id}/restart
 
@@ -811,7 +965,7 @@ curl -sS -X POST \
   -H "Authorization: Bearer $AOE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"message":"summarize the failing test"}' \
-  "http://localhost:7777/api/sessions/abc123/send"
+  "http://localhost:8080/api/sessions/abc123/send"
 ```
 
 ## GET /api/sessions/{id}/output
@@ -844,7 +998,7 @@ what the agent printed back, or as a polling read-only view.
 ```bash
 curl -sS \
   -H "Authorization: Bearer $AOE_TOKEN" \
-  "http://localhost:7777/api/sessions/abc123/output?lines=80&format=text"
+  "http://localhost:8080/api/sessions/abc123/output?lines=80&format=text"
 ```
 
 ## GET /api/sessions/{id}/acp/replay?view=retained
@@ -1021,6 +1175,8 @@ replacement state requires fresh consent.
 
 Admitted stop work survives HTTP cancellation; its committed native fence survives daemon reconstruction. Automatic reconciliation does not resume a committed stop. A later explicit spawn, start, restart, backend/provider switch or accepted prompt proves original retirement before consuming only its observed stop generation and token; a newer stop wins. A `no_revive` prompt cannot clear the stop.
 
+A new prompt sent from the dashboard, TUI or CLI to a stopped session (`POST /api/sessions/{id}/acp/prompt` without `no_revive` or a queued prompt id) starts it. If a newer stop wins that start, the answer is `409` with header `aoe-error-code: resume_failed` and a `stop_fenced: ...` body. The prompt is not queued, so do not retry it automatically. Prompts from other origins stay queued behind the stop until an explicit start.
+
 If a write commits but canonical publication fails, the stop remains durable and the response reports an unconfirmed outcome. Unproven retirement remains pending rather than reporting success. Daemon detach, idle shutdown and internal provider teardown do not independently create user-stop intent. Reversible stop preserves native transcript history.
 
 ## POST /api/sessions/{id}/acp/subagents/{child_id}/cancel
@@ -1069,7 +1225,11 @@ an aoe session as a controlled subagent. A typical loop:
    session list shows the session's `status` back at `Idle`.
 3. Capture the trailing region of `content` as the agent's reply.
 
-For long-running prompts, prefer polling status via
+This loop works for terminal-view sessions only. A structured-view
+session answers `send` with `400 acp_mode_unsupported`; drive it with
+`POST /api/sessions/{id}/acp/prompt`.
+
+For long-running prompts in a terminal-view session, prefer polling status via
 `GET /api/sessions` over polling `output`, then read `output` once
 when status returns to `Idle`. Status transitions are also broadcast
 to push subscribers if the dashboard's push notifications are

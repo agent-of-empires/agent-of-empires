@@ -5,7 +5,6 @@ import { renameSession, type RuntimeCursor, type SessionMutation } from "../../l
 import { isFreshIdle, isSessionActive } from "../../lib/session";
 import { useIdleDecayWindowMs } from "../../lib/idleDecay";
 import { sessionRowChromeClass } from "../../lib/sessionRowChrome";
-import { useSessionColorsEnabled } from "../../lib/sessionColors";
 import { useSidebarCompact } from "../../lib/sidebarCompact";
 import { EMPTY_OPTIMISTIC, type OptimisticTriage, type RowOptimistic } from "../../lib/sidebarOptimistic";
 import { sessionWorkspace } from "../../lib/sessionWorkspace";
@@ -21,6 +20,7 @@ import { SessionActionsMenu, type SessionActionHandlers, type SessionMenuState }
 import { useSessionRowModel } from "./useSessionRowModel";
 import type { ClickModifiers, RowActivate, RowBulkApi, RowContextScope } from "./types";
 import { useLongPress } from "./useLongPress";
+import { isImeComposing } from "../../lib/ime";
 
 // A sibling row always navigates and never consults the group's selection.
 const NAVIGATE_ONLY: ClickModifiers = { metaKey: false, ctrlKey: false, shiftKey: false };
@@ -49,9 +49,8 @@ export interface SessionRowProps extends SessionActionHandlers {
 export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
   const { rowKey, workspace, isActive, isSelected, onActivate, readOnly, indented, bulkApi } = props;
   const idleDecayWindowMs = useIdleDecayWindowMs();
-  const sessionColorsEnabled = useSessionColorsEnabled();
   const compact = useSidebarCompact();
-  const { model, setNotify, setColor } = useSessionRowModel(workspace, props.optimistic, isActive, props);
+  const { model, setNotify } = useSessionRowModel(workspace, props.optimistic, isActive, props);
   const { label, sessionId, isDeleting, navigationSession } = model;
   const [expanded, setExpanded] = useState(false);
   const siblingBulkApi = useMemo<RowBulkApi>(() => ({ ...bulkApi, prepareScope: () => SINGLE_SCOPE }), [bulkApi]);
@@ -111,7 +110,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
           onChange={(e) => setRenameValue(e.target.value)}
           onBlur={commitRename}
           onKeyDown={(e) => {
-            if (e.key === "Enter") commitRename();
+            if (e.key === "Enter" && !isImeComposing(e)) commitRename();
             if (e.key === "Escape") setRenaming(false);
           }}
           data-testid="sidebar-rename-input"
@@ -238,15 +237,6 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
             <span
               className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${labelTone} ${model.effectivePinned ? "font-semibold" : ""} ${model.effectiveArchived || model.effectiveSnoozed ? "italic" : ""}`}
             >
-              {sessionColorsEnabled && model.sessionColorDot && (
-                <span
-                  title={`Color: ${model.sessionColor}`}
-                  aria-label={`Color: ${model.sessionColor}`}
-                  data-testid="sidebar-session-color-dot"
-                  data-color={model.sessionColor ?? undefined}
-                  className={`shrink-0 inline-block h-2 w-2 rounded-full ${model.sessionColorDot}`}
-                />
-              )}
               {!compact && model.effectivePinned && (
                 <Tooltip text={meaningText(MARK_MEANING.pinned)}>
                   <span
@@ -289,7 +279,6 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         workspace={workspace}
         model={model}
         setNotify={setNotify}
-        setColor={setColor}
         readOnly={readOnly}
         handlers={props}
         onRename={startRename}

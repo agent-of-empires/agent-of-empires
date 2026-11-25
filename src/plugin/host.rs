@@ -3,14 +3,17 @@
 //! Workers are daemon-owned child process groups that speak newline-delimited
 //! JSON-RPC over stdio. They do not persist or reattach across daemon restarts.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use aoe_plugin_api::UiSlot;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, Mutex};
@@ -21,6 +24,7 @@ use crate::plugin::protocol::{self, codes, RpcResponse};
 use crate::plugin::registry::PluginRegistry;
 use crate::plugin::sandbox::{NoSandbox, SandboxBackend};
 use crate::plugin::worker_logs;
+use crate::plugin::worker_requests::{PendingRequests, WorkerRef, WorkerRequestError};
 use crate::process::worker;
 use crate::server::push::StatusChange;
 use crate::session::lifecycle::LifecycleChange;
@@ -28,6 +32,37 @@ use crate::session::lifecycle::LifecycleChange;
 const EVENT_RETENTION_PER_TOPIC: usize = 10_000;
 const MAX_WORKERS: usize = 32;
 const MAX_RESPAWNS: usize = 3;
+/// A worker request that stays pending until [`TEST_HOLD`] gets permits, standing in for a
+/// session RPC that waits on a worker launch.
+#[cfg(test)]
+const TEST_HOLD_METHOD: &str = "test.hold";
+#[cfg(test)]
+static TEST_HOLD: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+/// Counts the ordered-lane calls running at once, to show they never overlap.
+#[cfg(test)]
+static LANE_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static LANE_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+struct LaneProbe;
+#[cfg(test)]
+impl LaneProbe {
+    fn enter() -> Self {
+        use std::sync::atomic::Ordering::SeqCst;
+        let now = LANE_ACTIVE.fetch_add(1, SeqCst) + 1;
+        LANE_MAX.fetch_max(now, SeqCst);
+        Self
+    }
+}
+#[cfg(test)]
+impl Drop for LaneProbe {
+    fn drop(&mut self) {
+        LANE_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+/// Worker requests served at once per worker; the rest queue without pausing reads.
+const MAX_INFLIGHT_WORKER_RPCS: usize = 32;
+type WorkerCall<'a> = Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
 const RESPAWN_WINDOW: Duration = Duration::from_secs(60);
 // Unit tests reap `sleep` workers that ignore SIGTERM; don't wait out the grace.
 const REAP_GRACE: Duration = if cfg!(test) {
@@ -51,6 +86,9 @@ struct RunningWorker {
     task: tokio::task::JoinHandle<()>,
     /// Sender for host notifications, present only while a generation runs.
     inbound: Option<mpsc::UnboundedSender<String>>,
+    /// The manifest this generation was launched from; requests chosen under another are
+    /// not delivered to it. Empty until it is launched.
+    manifest_hash: String,
     /// Lets teardown retire UI state from this worker generation only.
     ui_generation: Option<u64>,
     /// Bounded and separate from `inbound`, so a worker that stops reading stdin cannot grow
@@ -125,6 +163,7 @@ pub struct PluginHost {
     /// Missing when the automation ledger could not open or in reduced tests.
     session_rpc: Option<Arc<crate::plugin::session_api::SessionRpcDeps>>,
     work: Arc<crate::server::runtime::RuntimeWork>,
+    pending: Arc<PendingRequests>,
 }
 
 impl PluginHost {
@@ -158,6 +197,7 @@ impl PluginHost {
             max_workers: MAX_WORKERS,
             session_rpc,
             work,
+            pending: Arc::new(PendingRequests::new()),
         }))
     }
 
@@ -205,6 +245,68 @@ impl PluginHost {
         {
             Some(tx) => tx.send(line).is_ok(),
             None => false,
+        }
+    }
+
+    /// Sends a JSON-RPC request to a running worker and awaits its reply. A worker that is
+    /// still starting is waited for until the timeout elapses. A running worker launched from
+    /// another manifest than `worker.manifest_hash` gets nothing: the request fails closed,
+    /// because it was chosen under a grant that worker does not hold.
+    pub async fn request_worker(
+        &self,
+        worker: WorkerRef<'_>,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, WorkerRequestError> {
+        let plugin_id = worker.plugin_id;
+        let deadline = Instant::now() + timeout;
+        let (generation, inbound) = loop {
+            let found = {
+                let table = self.state.lock().await;
+                table.running.get(plugin_id).and_then(|w| {
+                    w.inbound
+                        .clone()
+                        .map(|tx| (w.manifest_hash == worker.manifest_hash, w.supervisor_id, tx))
+                })
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match found {
+                Some((false, ..)) => return Err(WorkerRequestError::Superseded),
+                Some((true, generation, inbound)) => break (generation, inbound),
+                None if remaining.is_zero() => return Err(WorkerRequestError::NoWorker),
+                None => tokio::time::sleep(remaining.min(Duration::from_millis(50))).await,
+            }
+        };
+        let (id, rx) = self.pending.register(plugin_id, generation);
+        // A dropped caller must not leave its entry behind.
+        let _forget = self.pending.forget_on_drop(&id);
+        let line =
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+                .to_string()
+                + "\n";
+        // The frame is queued only while the channel is this worker's and the registration is
+        // live. EOF retires the registration before the channel is cleared, so a request that
+        // lost that race is never handed to the dead worker.
+        let queued = {
+            let table = self.state.lock().await;
+            table.running.get(plugin_id).is_some_and(|w| {
+                w.inbound.as_ref().is_some_and(|tx| {
+                    tx.same_channel(&inbound)
+                        && self
+                            .pending
+                            .send_while_registered(&id, || tx.send(line).is_ok())
+                })
+            })
+        };
+        if !queued {
+            return Err(WorkerRequestError::WorkerGone);
+        }
+        match tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), rx).await {
+            Ok(Ok(Ok(result))) => Ok(result),
+            Ok(Ok(Err(_))) => Err(WorkerRequestError::Rejected),
+            Ok(Err(_)) => Err(WorkerRequestError::WorkerGone),
+            Err(_) => Err(WorkerRequestError::Timeout),
         }
     }
 
@@ -447,6 +549,7 @@ impl PluginHost {
                         pid: 0,
                         task: tokio::spawn(async {}),
                         inbound: None,
+                        manifest_hash: String::new(),
                         ui_generation: None,
                         events_inbound: None,
                         lifecycle_events: false,
@@ -499,6 +602,7 @@ impl PluginHost {
                 pid: 0,
                 task,
                 inbound: None,
+                manifest_hash: String::new(),
                 ui_generation: None,
                 events_inbound: None,
                 lifecycle_events: false,
@@ -522,6 +626,7 @@ impl PluginHost {
             async move {
                 w.task.abort();
                 let _ = w.task.await;
+                self.pending.fail_worker(&plugin_id, w.supervisor_id);
                 if let Some(generation) = w.ui_generation {
                     self.api.clear_ui(&plugin_id, generation);
                 }
@@ -657,6 +762,7 @@ impl PluginHost {
             .map(|c| c.as_str().to_string())
             .collect();
         let session_status = wants_session_status(plugin.manifest.api_version, &granted);
+        let manifest_hash = plugin.manifest_hash.clone();
         let session_lifecycle = wants_session_lifecycle(plugin.manifest.api_version, &granted);
         let ui_contributions: HashSet<(UiSlot, String)> = plugin
             .manifest
@@ -780,8 +886,12 @@ impl PluginHost {
             let mut table = self.state.lock().await;
             match table.running.get_mut(plugin_id) {
                 Some(w) if w.supervisor_id == supervisor_id => {
+                    // Before the channel is visible, so no request reaches this worker while
+                    // its generation still reads as ended.
+                    self.pending.reopen(plugin_id, supervisor_id);
                     w.pid = pid;
                     w.inbound = Some(inbound_tx.clone());
+                    w.manifest_hash = manifest_hash.clone();
                     w.ui_generation = Some(ui_generation);
                     w.events_inbound = status_tx;
                     w.lifecycle_events = session_lifecycle;
@@ -821,6 +931,10 @@ impl PluginHost {
             inbound_tx,
             self.session_rpc.as_ref(),
             &self.work,
+            HostRequests {
+                pending: &self.pending,
+                generation: supervisor_id,
+            },
         )
         .await;
         // Serving ended; stop accepting host-initiated pushes and tear down the
@@ -837,6 +951,7 @@ impl PluginHost {
                 }
             }
         }
+        self.pending.fail_worker(plugin_id, supervisor_id);
         writer.abort();
 
         // The loop returned: the worker closed its stdout (exited or crashed).
@@ -902,6 +1017,19 @@ fn plan_reconcile(
     (to_launch, to_teardown, truncated)
 }
 
+/// The host requests waiting on one worker instance, by its supervisor generation.
+struct HostRequests<'a> {
+    pending: &'a Arc<PendingRequests>,
+    generation: u64,
+}
+
+impl HostRequests<'_> {
+    /// No reply can arrive any more: wake the waiters now instead of at their timeout.
+    fn fail(&self, plugin_id: &str) {
+        self.pending.fail_worker(plugin_id, self.generation);
+    }
+}
+
 /// Read JSON-RPC requests from a worker's stdout, dispatch each through the
 /// capability-gated host API, and write the response to its stdin. Returns when
 /// the worker closes stdout or sends an unparseable line (fatal).
@@ -912,20 +1040,88 @@ async fn serve_connection(
     stdin: mpsc::UnboundedSender<String>,
     session_rpc: Option<&Arc<crate::plugin::session_api::SessionRpcDeps>>,
     work: &crate::server::runtime::RuntimeWork,
+    requests: HostRequests<'_>,
 ) {
     let mut lines = BufReader::new(stdout).lines();
     // Unbounded line read: per the honest model (D8) the worker is cooperative,
     // not adversarial, so a malicious oversized line is out of scope here; an
     // OS-level sandbox backend is where that ceiling belongs.
+    // Session RPCs run concurrently so a slow one (waiting on a worker launch) never keeps the
+    // loop from reading the worker's replies to host-initiated requests, which that same launch
+    // may be waiting on. Every other method runs one at a time in the order the worker sent it,
+    // so pipelined writes such as `plugin.storage.set` for one key keep their order. Each
+    // response carries its request id, so completion order is free.
+    // Session RPCs past the concurrency cap wait in `backlog`; reading never stops for them.
+    // After EOF or a fatal line nothing more is read and everything already accepted still
+    // runs, even once the worker's stdin is gone.
+    let mut inflight: FuturesUnordered<WorkerCall<'_>> = FuturesUnordered::new();
+    let mut backlog: VecDeque<WorkerCall<'_>> = VecDeque::new();
+    let mut lane: Option<WorkerCall<'_>> = None;
+    let mut lane_queue: VecDeque<WorkerCall<'_>> = VecDeque::new();
+    let mut reading = true;
+    let mut can_write = true;
+    let respond = |can_write: &mut bool, line: String| {
+        if *can_write && stdin.send(line).is_err() {
+            *can_write = false;
+        }
+    };
     loop {
-        let line = match lines.next_line().await {
-            Ok(Some(line)) => line,
-            Ok(None) => return, // EOF: worker exited.
-            Err(e) => {
-                tracing::warn!(target: "plugin.host", plugin = %ctx.plugin_id, "worker read error: {e}");
-                return;
+        while inflight.len() < MAX_INFLIGHT_WORKER_RPCS {
+            match backlog.pop_front() {
+                Some(call) => inflight.push(call),
+                None => break,
             }
+        }
+        if lane.is_none() {
+            lane = lane_queue.pop_front();
+        }
+        if !reading && inflight.is_empty() && lane.is_none() {
+            return;
+        }
+        let line = tokio::select! {
+            Some(response) = inflight.next(), if !inflight.is_empty() => {
+                if let Some(response) = response {
+                    respond(&mut can_write, response);
+                }
+                continue;
+            }
+            response = async { lane.as_mut().expect("guarded").await }, if lane.is_some() => {
+                lane = None;
+                if let Some(response) = response {
+                    respond(&mut can_write, response);
+                }
+                continue;
+            }
+            line = lines.next_line(), if reading => match line {
+                Ok(Some(line)) => line,
+                Ok(None) => {
+                    // EOF: no reply can arrive any more, so waiters on this worker fail now
+                    // instead of at their timeout while accepted calls finish.
+                    reading = false;
+                    requests.fail(&ctx.plugin_id);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(target: "plugin.host", plugin = %ctx.plugin_id, "worker read error: {e}");
+                    reading = false;
+                    requests.fail(&ctx.plugin_id);
+                    continue;
+                }
+            },
         };
+        if let Some(reply) = protocol::parse_worker_reply(&line) {
+            if !requests
+                .pending
+                .resolve(&ctx.plugin_id, requests.generation, reply)
+            {
+                tracing::debug!(
+                    target: "plugin.host",
+                    plugin = %ctx.plugin_id,
+                    "dropped a worker reply that matches no pending host request"
+                );
+            }
+            continue;
+        }
         let request = match protocol::parse_request(&line) {
             Ok(Some(req)) => req,
             Ok(None) => continue, // blank line
@@ -934,8 +1130,10 @@ async fn serve_connection(
                 // error (best effort) and stop reading from this worker.
                 let resp =
                     RpcResponse::error(Value::Null, codes::PARSE_ERROR, e.to_string()).to_line();
-                let _ = stdin.send(resp);
-                return;
+                respond(&mut can_write, resp);
+                reading = false;
+                requests.fail(&ctx.plugin_id);
+                continue;
             }
         };
 
@@ -948,9 +1146,7 @@ async fn serve_connection(
             Err(msg) => {
                 let id = request.id.clone().unwrap_or(Value::Null);
                 let resp = RpcResponse::error(id, codes::INVALID_REQUEST, msg).to_line();
-                if stdin.send(resp).is_err() {
-                    return;
-                }
+                respond(&mut can_write, resp);
                 continue;
             }
         };
@@ -960,33 +1156,61 @@ async fn serve_connection(
         let invocation_deps = session_rpc.cloned();
         let params = request.params;
         let method_log = method.clone();
-        let outcome = work
-            .run("plugin.rpc", async move {
-                if crate::plugin::session_api::handles(&method) {
-                    match invocation_deps {
-                        Some(deps) => {
-                            crate::plugin::session_api::dispatch(
-                                &deps,
-                                &invocation_ctx,
-                                &method,
-                                &params,
-                            )
-                            .await
-                        }
-                        None => {
-                            let unavailable = crate::plugin::host_api::DispatchError::with_kind(
-                                codes::SERVICE_UNAVAILABLE,
-                                "service_unavailable",
-                                "session service is not available in this host",
-                            );
-                            match crate::plugin::session_api::required_capability(&method) {
-                                Some(cap) => invocation_ctx.require(cap).and(Err(unavailable)),
-                                None => Err(unavailable),
+        let request_id = request.id;
+        let concurrent = crate::plugin::session_api::handles(&method) || {
+            #[cfg(test)]
+            {
+                method == TEST_HOLD_METHOD
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        };
+        let queue = if concurrent {
+            &mut backlog
+        } else {
+            &mut lane_queue
+        };
+        queue.push_back(Box::pin(async move {
+            let outcome = work
+                .run("plugin.rpc", async move {
+                    #[cfg(test)]
+                    if method == TEST_HOLD_METHOD {
+                        TEST_HOLD.acquire().await.unwrap().forget();
+                        return Ok(serde_json::json!({ "held": true }));
+                    }
+                    if crate::plugin::session_api::handles(&method) {
+                        match invocation_deps {
+                            Some(deps) => {
+                                crate::plugin::session_api::dispatch(
+                                    &deps,
+                                    &invocation_ctx,
+                                    &method,
+                                    &params,
+                                )
+                                .await
+                            }
+                            None => {
+                                let unavailable = crate::plugin::host_api::DispatchError::with_kind(
+                                    codes::SERVICE_UNAVAILABLE,
+                                    "service_unavailable",
+                                    "session service is not available in this host",
+                                );
+                                match crate::plugin::session_api::required_capability(&method) {
+                                    Some(cap) => invocation_ctx.require(cap).and(Err(unavailable)),
+                                    None => Err(unavailable),
+                                }
                             }
                         }
-                    }
-                } else {
-                    tokio::task::spawn_blocking(move || {
+                    } else {
+                        #[cfg(test)]
+                        let _lane = {
+                            let probe = LaneProbe::enter();
+                            tokio::task::yield_now().await;
+                            probe
+                        };
+                        tokio::task::spawn_blocking(move || {
                         dispatch(&invocation_api, &invocation_ctx, &method, &params)
                     })
                     .await
@@ -996,42 +1220,41 @@ async fn serve_connection(
                             "host dispatch task failed",
                         ))
                     })
+                    }
+                })
+                .await;
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(crate::server::runtime::RuntimeWorkError::ShuttingDown) => {
+                    Err(crate::plugin::host_api::DispatchError::with_kind(
+                        codes::SERVICE_UNAVAILABLE,
+                        "service_unavailable",
+                        "daemon is shutting down",
+                    ))
                 }
-            })
-            .await;
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(crate::server::runtime::RuntimeWorkError::ShuttingDown) => {
-                Err(crate::plugin::host_api::DispatchError::with_kind(
-                    codes::SERVICE_UNAVAILABLE,
-                    "service_unavailable",
-                    "daemon is shutting down",
-                ))
+                Err(crate::server::runtime::RuntimeWorkError::Interrupted) => Err(
+                    crate::plugin::host_api::DispatchError::internal("host dispatch task failed"),
+                ),
+            };
+            match &outcome {
+                Ok(_) => tracing::trace!(
+                    target: "plugin.host", plugin = %ctx.plugin_id, method = %method_log,
+                    "worker rpc ok"
+                ),
+                Err(error) => tracing::warn!(
+                    target: "plugin.host", plugin = %ctx.plugin_id, method = %method_log,
+                    code = error.code, "worker rpc rejected: {}", error.message
+                ),
             }
-            Err(crate::server::runtime::RuntimeWorkError::Interrupted) => Err(
-                crate::plugin::host_api::DispatchError::internal("host dispatch task failed"),
-            ),
-        };
-        match &outcome {
-            Ok(_) => tracing::trace!(
-                target: "plugin.host", plugin = %ctx.plugin_id, method = %method_log,
-                "worker rpc ok"
-            ),
-            Err(error) => tracing::warn!(
-                target: "plugin.host", plugin = %ctx.plugin_id, method = %method_log,
-                code = error.code, "worker rpc rejected: {}", error.message
-            ),
-        }
-        let Some(id) = request.id else {
-            continue;
-        };
-        let response = match outcome {
-            Ok(result) => RpcResponse::success(id, result),
-            Err(error) => RpcResponse::error_with_data(id, error.code, error.message, error.data),
-        };
-        if stdin.send(response.to_line()).is_err() {
-            return;
-        }
+            let id = request_id?;
+            let response = match outcome {
+                Ok(result) => RpcResponse::success(id, result),
+                Err(error) => {
+                    RpcResponse::error_with_data(id, error.code, error.message, error.data)
+                }
+            };
+            Some(response.to_line())
+        }));
     }
 }
 
@@ -1075,9 +1298,38 @@ impl PluginHost {
                 pid: 0,
                 task: tokio::spawn(async {}),
                 inbound: None,
+                manifest_hash: String::new(),
                 ui_generation: None,
                 events_inbound: event_capacity.map(|_| tx),
                 lifecycle_events,
+                dropped_events: 0,
+            },
+        );
+        rx
+    }
+
+    /// Registers a fake worker launched from `manifest_hash` and returns what the host writes
+    /// to its stdin.
+    pub(crate) async fn register_test_inbound(
+        &self,
+        plugin_id: &str,
+        manifest_hash: &str,
+    ) -> mpsc::UnboundedReceiver<String> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut table = self.state.lock().await;
+        let supervisor_id = table.next_supervisor_id;
+        table.next_supervisor_id += 1;
+        table.running.insert(
+            plugin_id.to_string(),
+            RunningWorker {
+                supervisor_id,
+                pid: 0,
+                task: tokio::spawn(async {}),
+                inbound: Some(tx),
+                manifest_hash: manifest_hash.to_string(),
+                ui_generation: None,
+                events_inbound: None,
+                lifecycle_events: false,
                 dropped_events: 0,
             },
         );
@@ -1116,9 +1368,7 @@ mod tests {
             effective_profile: "default".to_string(),
             old,
             new,
-            at: chrono::DateTime::parse_from_rfc3339("2026-10-03T12:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc),
+            at: crate::time::Timestamp::parse_rfc3339("2026-10-03T12:00:00Z").unwrap(),
         }
     }
 
@@ -1143,9 +1393,7 @@ mod tests {
             session_id: "sess-1".to_string(),
             effective_profile: profile.to_string(),
             kind,
-            at: chrono::DateTime::parse_from_rfc3339("2026-10-05T12:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc),
+            at: crate::time::Timestamp::parse_rfc3339("2026-10-05T12:00:00Z").unwrap(),
             summary: (kind != LifecycleKind::Deleted).then_some(summary),
         }
     }
@@ -1503,7 +1751,19 @@ process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"session.meta.set
         let stdout = child.stdout.take().unwrap();
 
         let work = crate::server::runtime::RuntimeWork::default();
-        serve_connection(&api, &ctx, stdout, stdin_writer(stdin), None, &work).await;
+        serve_connection(
+            &api,
+            &ctx,
+            stdout,
+            stdin_writer(stdin),
+            None,
+            &work,
+            HostRequests {
+                pending: &Arc::new(PendingRequests::new()),
+                generation: 1,
+            },
+        )
+        .await;
         let _ = child.wait().await;
 
         // Read the event the worker published: it carries the FORBIDDEN code the
@@ -1574,7 +1834,19 @@ rl.on('line', (line) => {
         .unwrap();
 
         let work = crate::server::runtime::RuntimeWork::default();
-        serve_connection(&api, &ctx, stdout, tx, None, &work).await;
+        serve_connection(
+            &api,
+            &ctx,
+            stdout,
+            tx,
+            None,
+            &work,
+            HostRequests {
+                pending: &Arc::new(PendingRequests::new()),
+                generation: 1,
+            },
+        )
+        .await;
         let _ = child.wait().await;
 
         let published = dispatch(
@@ -1589,6 +1861,536 @@ rl.on('line', (line) => {
         assert_eq!(events.len(), 1, "worker should react to the host push");
         assert_eq!(events[0]["payload"]["ok"], json!(true));
     }
+
+    #[tokio::test]
+    #[serial_test::parallel]
+    async fn host_request_gets_the_workers_reply() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        if which::which("node").is_err() {
+            eprintln!("skipping: node not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let api = Arc::new(
+            HostApiState::open(&tmp.path().join("plugin_events.db"), "default", 100).unwrap(),
+        );
+        let ctx = Arc::new(PluginRpcContext {
+            plugin_id: "acme.worker".into(),
+            granted_capabilities: vec!["runtime.worker".into()],
+            ui_contributions: std::collections::HashSet::new(),
+            ui_generation: 0,
+            deep_link_pages: Default::default(),
+        });
+        let pending = Arc::new(PendingRequests::new());
+
+        const WORKER: &str = r#"
+const rl = require('readline').createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const m = JSON.parse(line);
+  if (m.method === 'mcp.rewrite') {
+    process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{drop:"*",echo:m.params.n}}) + "\n");
+    process.exit(0);
+  }
+});
+"#;
+        let mut child = tokio::process::Command::new("node")
+            .arg("-e")
+            .arg(WORKER)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let tx = stdin_writer(stdin);
+
+        let (id, rx) = pending.register(&ctx.plugin_id, 1);
+        tx.send(
+            json!({"jsonrpc":"2.0","id":id,"method":"mcp.rewrite","params":{"n":42}}).to_string()
+                + "\n",
+        )
+        .unwrap();
+        let work = crate::server::runtime::RuntimeWork::default();
+        serve_connection(
+            &api,
+            &ctx,
+            stdout,
+            tx,
+            None,
+            &work,
+            HostRequests {
+                pending: &pending,
+                generation: 1,
+            },
+        )
+        .await;
+        let _ = child.wait().await;
+
+        let result = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["drop"], "*");
+        assert_eq!(result["echo"], 42);
+    }
+
+    /// A notification written right before the worker exits must still be handled: EOF may
+    /// not discard requests already read. Repeated because the race is the select order.
+    #[tokio::test]
+    #[serial_test::parallel]
+    async fn a_notification_written_just_before_the_worker_exits_is_still_handled() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        if which::which("node").is_err() {
+            eprintln!("skipping: node not found on PATH");
+            return;
+        }
+        const WORKER: &str = r#"
+process.stdout.write(JSON.stringify({jsonrpc:"2.0",method:"events.publish",params:{topic:"last",payload:{ok:true}}}) + "\n", () => process.exit(0));
+"#;
+        for round in 0..20 {
+            let tmp = tempfile::tempdir().unwrap();
+            let api = Arc::new(
+                HostApiState::open(&tmp.path().join("plugin_events.db"), "default", 100).unwrap(),
+            );
+            let ctx = Arc::new(PluginRpcContext {
+                plugin_id: "acme.worker".into(),
+                granted_capabilities: vec!["runtime.worker".into()],
+                ui_contributions: std::collections::HashSet::new(),
+                deep_link_pages: Default::default(),
+                ui_generation: 0,
+            });
+            let mut child = tokio::process::Command::new("node")
+                .arg("-e")
+                .arg(WORKER)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let stdin = child.stdin.take().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            // The line and EOF are both in the pipe before the host reads, so the loop sees them together.
+            let _ = child.wait().await;
+            let work = crate::server::runtime::RuntimeWork::default();
+            serve_connection(
+                &api,
+                &ctx,
+                stdout,
+                stdin_writer(stdin),
+                None,
+                &work,
+                HostRequests {
+                    pending: &Arc::new(PendingRequests::new()),
+                    generation: 1,
+                },
+            )
+            .await;
+
+            let published = dispatch(
+                &api,
+                &ctx,
+                "events.subscribe",
+                &json!({ "topics": ["last"], "after_seq": 0 }),
+            )
+            .unwrap();
+            assert_eq!(
+                published["events"].as_array().unwrap().len(),
+                1,
+                "round {round}: the notification was dropped at EOF"
+            );
+        }
+    }
+
+    async fn run_worker_script(
+        script: &str,
+        tmp: &std::path::Path,
+        wait_for_exit_first: bool,
+    ) -> (Arc<HostApiState>, Arc<PluginRpcContext>) {
+        let api =
+            Arc::new(HostApiState::open(&tmp.join("plugin_events.db"), "default", 100).unwrap());
+        let ctx = Arc::new(PluginRpcContext {
+            plugin_id: "acme.worker".into(),
+            granted_capabilities: vec!["runtime.worker".into()],
+            ui_contributions: std::collections::HashSet::new(),
+            deep_link_pages: Default::default(),
+            ui_generation: 0,
+        });
+        let mut child = tokio::process::Command::new("node")
+            .arg("-e")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        if wait_for_exit_first {
+            let _ = child.wait().await;
+        }
+        let work = crate::server::runtime::RuntimeWork::default();
+        serve_connection(
+            &api,
+            &ctx,
+            stdout,
+            stdin_writer(stdin),
+            None,
+            &work,
+            HostRequests {
+                pending: &Arc::new(PendingRequests::new()),
+                generation: 1,
+            },
+        )
+        .await;
+        let _ = child.wait().await;
+        (api, ctx)
+    }
+
+    /// The worker's stdin is gone before its requests are answered: the failed response
+    /// writes must not cancel the accepted notification queued behind them.
+    #[tokio::test]
+    #[serial_test::parallel]
+    async fn a_closed_worker_stdin_does_not_cancel_accepted_calls() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        if which::which("node").is_err() {
+            eprintln!("skipping: node not found on PATH");
+            return;
+        }
+        const WORKER: &str = r#"
+process.stdin.destroy();
+const send = (m) => process.stdout.write(JSON.stringify({jsonrpc:"2.0",...m}) + "\n");
+for (let id = 1; id <= 3; id++) send({id, method:"events.publish", params:{topic:"filler",payload:{id}}});
+send({method:"events.publish", params:{topic:"last",payload:{ok:true}}});
+"#;
+        for round in 0..10 {
+            let tmp = tempfile::tempdir().unwrap();
+            let (api, ctx) = run_worker_script(WORKER, tmp.path(), true).await;
+            let published = dispatch(
+                &api,
+                &ctx,
+                "events.subscribe",
+                &json!({ "topics": ["last"], "after_seq": 0 }),
+            )
+            .unwrap();
+            assert_eq!(
+                published["events"].as_array().unwrap().len(),
+                1,
+                "round {round}: the notification was cancelled"
+            );
+        }
+    }
+
+    /// A host request waiting on a worker that has exited fails at EOF, while an accepted call
+    /// of that worker is still running, instead of waiting out its timeout.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_pending_host_request_fails_at_eof_while_accepted_calls_finish() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        if which::which("node").is_err() {
+            eprintln!("skipping: node not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let api = Arc::new(
+            HostApiState::open(&tmp.path().join("plugin_events.db"), "default", 100).unwrap(),
+        );
+        let ctx = Arc::new(PluginRpcContext {
+            plugin_id: "acme.worker".into(),
+            granted_capabilities: vec!["runtime.worker".into()],
+            ui_contributions: std::collections::HashSet::new(),
+            deep_link_pages: Default::default(),
+            ui_generation: 0,
+        });
+        let pending = Arc::new(PendingRequests::new());
+        const WORKER: &str = r#"
+process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"test.hold",params:{}}) + "\n", () => process.exit(0));
+"#;
+        let mut child = tokio::process::Command::new("node")
+            .arg("-e")
+            .arg(WORKER)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (_id, rx) = pending.register(&ctx.plugin_id, 1);
+        let work = crate::server::runtime::RuntimeWork::default();
+        let serve = serve_connection(
+            &api,
+            &ctx,
+            stdout,
+            stdin_writer(stdin),
+            None,
+            &work,
+            HostRequests {
+                pending: &pending,
+                generation: 1,
+            },
+        );
+        let checked = async {
+            let outcome = tokio::time::timeout(Duration::from_secs(10), rx).await;
+            // The held call is still running here, so this registers during the drain.
+            let (_late, late_rx) = pending.register(&ctx.plugin_id, 1);
+            let late = tokio::time::timeout(Duration::from_secs(10), late_rx).await;
+            // Release the one held call whatever happened, so the loop ends.
+            TEST_HOLD.add_permits(1);
+            (outcome, late)
+        };
+        let ((), (outcome, late)) = tokio::join!(serve, checked);
+        let _ = child.wait().await;
+        assert!(
+            outcome
+                .expect("the waiter is woken at EOF, not at its timeout")
+                .is_err(),
+            "the waiter sees its worker gone"
+        );
+        assert!(
+            late.expect("a request registered during the drain must not wait")
+                .is_err(),
+            "a request registered after the sweep sees its worker gone"
+        );
+    }
+
+    /// Writes pipelined without waiting for replies commit in the order the worker sent them,
+    /// because calls other than session RPCs never overlap.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pipelined_storage_writes_keep_the_workers_order() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        if which::which("node").is_err() {
+            eprintln!("skipping: node not found on PATH");
+            return;
+        }
+        const WORKER: &str = r#"
+const send = (m) => process.stdout.write(JSON.stringify({jsonrpc:"2.0",...m}) + "\n");
+for (let id = 1; id <= 40; id++) send({id, method:"plugin.storage.set", params:{key:"k",value:id}});
+let answered = 0;
+require('readline').createInterface({ input: process.stdin }).on('line', () => {
+  if (++answered === 40) process.exit(0);
+});
+"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let (api, ctx) = run_worker_script(WORKER, tmp.path(), false).await;
+        let stored = dispatch(&api, &ctx, "plugin.storage.get", &json!({ "key": "k" })).unwrap();
+        assert_eq!(stored["value"], json!(40), "the last write sent wins");
+        assert_eq!(
+            LANE_MAX.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "ordered calls never overlap"
+        );
+    }
+
+    /// A worker request still pending must not stop the host reading the worker's reply to a
+    /// host-initiated one: a session RPC that waits on a launch needs the `mcp.rewrite`
+    /// reply that same launch asks this worker for.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_pending_worker_request_does_not_block_reading_a_host_request_reply() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        if which::which("node").is_err() {
+            eprintln!("skipping: node not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let api = Arc::new(
+            HostApiState::open(&tmp.path().join("plugin_events.db"), "default", 100).unwrap(),
+        );
+        let ctx = Arc::new(PluginRpcContext {
+            plugin_id: "acme.worker".into(),
+            granted_capabilities: vec!["runtime.worker".into()],
+            ui_contributions: std::collections::HashSet::new(),
+            ui_generation: 0,
+            deep_link_pages: Default::default(),
+        });
+        let pending = Arc::new(PendingRequests::new());
+
+        // One more held request than the dispatch cap is written first; the `mcp.rewrite` reply
+        // follows on the same pipe, so a reader stalled by pending requests never sees it. The
+        // worker ends once every held request is answered.
+        const WORKER: &str = r#"
+const rl = require('readline').createInterface({ input: process.stdin });
+let answered = 0;
+for (let id = 1; id <= HOLDS; id++) {
+  process.stdout.write(JSON.stringify({jsonrpc:"2.0",id,method:"test.hold",params:{}}) + "\n");
+}
+rl.on('line', (line) => {
+  const m = JSON.parse(line);
+  if (m.method === 'mcp.rewrite') {
+    process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{drop:"*"}}) + "\n");
+  } else if (++answered === HOLDS) {
+    process.exit(0);
+  }
+});
+"#;
+        let worker = WORKER.replace("HOLDS", &(MAX_INFLIGHT_WORKER_RPCS + 1).to_string());
+        let mut child = tokio::process::Command::new("node")
+            .arg("-e")
+            .arg(worker)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let tx = stdin_writer(stdin);
+
+        let (id, rx) = pending.register(&ctx.plugin_id, 1);
+        tx.send(
+            json!({"jsonrpc":"2.0","id":id,"method":"mcp.rewrite","params":{}}).to_string() + "\n",
+        )
+        .unwrap();
+        let work = crate::server::runtime::RuntimeWork::default();
+        let serve = serve_connection(
+            &api,
+            &ctx,
+            stdout,
+            tx,
+            None,
+            &work,
+            HostRequests {
+                pending: &pending,
+                generation: 1,
+            },
+        );
+        let checked = async {
+            let reply = tokio::time::timeout(Duration::from_secs(10), rx).await;
+            // Release the held request whatever happened, so the worker and the loop end.
+            TEST_HOLD.add_permits(MAX_INFLIGHT_WORKER_RPCS + 1);
+            reply
+        };
+        let ((), reply) = tokio::join!(serve, checked);
+        let _ = child.wait().await;
+        let result = reply
+            .expect("the reply is read while a worker request is still pending")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["drop"], "*");
+    }
+    fn worker_ref<'a>(plugin_id: &'a str, manifest_hash: &'a str) -> WorkerRef<'a> {
+        WorkerRef {
+            plugin_id,
+            manifest_hash,
+        }
+    }
+
+    /// At EOF the generation is retired while its stdin channel is still published. A request
+    /// arriving then must fail without a frame ever being queued for the dead worker.
+    #[tokio::test]
+    async fn a_request_after_retirement_queues_no_frame() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(
+            tmp.path(),
+            "default",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        let mut stdin = host.register_test_inbound("acme.hook", "sha256:v1").await;
+        let generation = host.state.lock().await.running["acme.hook"].supervisor_id;
+        host.pending.fail_worker("acme.hook", generation);
+
+        let err = host
+            .request_worker(
+                worker_ref("acme.hook", "sha256:v1"),
+                "mcp.rewrite",
+                json!({}),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WorkerRequestError::WorkerGone), "{err}");
+        assert!(
+            stdin.try_recv().is_err(),
+            "a frame was queued for a retired worker"
+        );
+    }
+
+    /// A request chosen under one manifest is not delivered to a worker launched from
+    /// another; the same manifest gets it.
+    #[tokio::test]
+    async fn a_request_reaches_only_a_worker_launched_from_the_chosen_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(
+            tmp.path(),
+            "default",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        let mut stdin = host.register_test_inbound("acme.hook", "sha256:v1").await;
+
+        let err = host
+            .request_worker(
+                worker_ref("acme.hook", "sha256:v2"),
+                "mcp.rewrite",
+                json!({ "secret": "credential-bearing" }),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WorkerRequestError::Superseded), "{err}");
+        assert!(
+            stdin.try_recv().is_err(),
+            "the superseded worker must receive nothing"
+        );
+
+        let matching = host.request_worker(
+            worker_ref("acme.hook", "sha256:v1"),
+            "mcp.rewrite",
+            json!({}),
+            Duration::from_millis(200),
+        );
+        let received = tokio::time::timeout(Duration::from_secs(10), stdin.recv());
+        let (reply, line) = tokio::join!(matching, received);
+        assert!(matches!(reply.unwrap_err(), WorkerRequestError::Timeout));
+        assert!(
+            line.expect("the matching worker is asked before the deadline")
+                .expect("the host keeps the channel open")
+                .contains("mcp.rewrite"),
+            "the matching worker receives the request"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_worker_without_a_worker_waits_then_reports_no_worker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(
+            tmp.path(),
+            "default",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let err = host
+            .request_worker(
+                WorkerRef {
+                    plugin_id: "acme.absent",
+                    manifest_hash: "sha256:none",
+                },
+                "mcp.rewrite",
+                json!({}),
+                Duration::from_millis(300),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WorkerRequestError::NoWorker), "{err}");
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "must wait for a booting worker"
+        );
+    }
+
     async fn worker_pid(host: &PluginHost, plugin_id: &str) -> Option<u32> {
         let table = host.state.lock().await;
         table
@@ -1612,6 +2414,10 @@ rl.on('line', (line) => {
 
     /// Install and grant a plugin whose worker just sleeps.
     fn install_sleeper(plugin_id: &str) {
+        install_worker(plugin_id, r#"["sleep", "600"]"#);
+    }
+
+    fn install_worker(plugin_id: &str, command: &str) {
         use crate::session::{update_config, CapabilityGrant, PluginConfig};
 
         let manifest = format!(
@@ -1625,7 +2431,7 @@ capabilities = ["runtime.worker"]
 [runtime]
 kind = "command"
 system = true
-command = ["sleep", "600"]
+command = {command}
 "#
         );
         let dir = crate::plugin::plugins_dir().unwrap().join(plugin_id);
@@ -1640,7 +2446,7 @@ command = ["sleep", "600"]
                             manifest.as_bytes(),
                         ),
                         capabilities: vec!["runtime.worker".to_string()],
-                        granted_at: chrono::Utc::now(),
+                        granted_at: crate::time::Timestamp::now(),
                     }),
                     ..PluginConfig::default()
                 },
@@ -1791,6 +2597,195 @@ command = ["sleep", "600"]
         })
         .await;
 
+        host.shutdown().await;
+    }
+
+    /// A reply that names the request but lacks the JSON-RPC 2.0 envelope must fail the call,
+    /// so a caller's failure path runs instead of applying its result.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_reply_without_the_jsonrpc_version_fails_the_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("XDG_CONFIG_HOME", temp.path().to_path_buf()),
+            ("HOME", temp.path().to_path_buf()),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let plugin_id = "acme.sloppy";
+        install_worker(
+            plugin_id,
+            r#"["sh", "-c", "read line; echo '{\"id\":\"h-1\",\"result\":{\"drop\":\"*\"}}'; sleep 30"]"#,
+        );
+        let registry = crate::plugin::reload_registry();
+        let host = PluginHost::new(
+            &temp.path().join("host"),
+            "default",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        host.start(&registry).await;
+        let hash = registry.get(plugin_id).unwrap().manifest_hash.clone();
+
+        let started = Instant::now();
+        let err = host
+            .request_worker(
+                worker_ref(plugin_id, &hash),
+                "mcp.rewrite",
+                json!({}),
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WorkerRequestError::Rejected), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        host.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn request_worker_fails_promptly_when_the_worker_exits_mid_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("XDG_CONFIG_HOME", temp.path().to_path_buf()),
+            ("HOME", temp.path().to_path_buf()),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let plugin_id = "acme.quitter";
+        install_worker(plugin_id, r#"["sh", "-c", "read line; exit 0"]"#);
+        let registry = crate::plugin::reload_registry();
+        let host = PluginHost::new(
+            &temp.path().join("host"),
+            "default",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        host.start(&registry).await;
+        let hash = registry.get(plugin_id).unwrap().manifest_hash.clone();
+
+        let started = Instant::now();
+        let err = host
+            .request_worker(
+                worker_ref(plugin_id, &hash),
+                "mcp.rewrite",
+                json!({}),
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WorkerRequestError::WorkerGone), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "must not wait for the timeout"
+        );
+        host.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn request_worker_fails_promptly_when_the_worker_is_torn_down() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("XDG_CONFIG_HOME", temp.path().to_path_buf()),
+            ("HOME", temp.path().to_path_buf()),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let plugin_id = "acme.sleeper";
+        install_sleeper(plugin_id);
+        let registry = crate::plugin::reload_registry();
+        let host = PluginHost::new(
+            &temp.path().join("host"),
+            "default",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        host.start(&registry).await;
+        let hash = registry.get(plugin_id).unwrap().manifest_hash.clone();
+
+        let waiter = tokio::spawn({
+            let host = host.clone();
+            async move {
+                let started = Instant::now();
+                let result = host
+                    .request_worker(
+                        worker_ref(plugin_id, &hash),
+                        "mcp.rewrite",
+                        json!({}),
+                        Duration::from_secs(20),
+                    )
+                    .await;
+                (result, started.elapsed())
+            }
+        });
+        wait_until("the request to be pending", || async {
+            host.pending.waiting(plugin_id) == 1
+        })
+        .await;
+
+        host.restart_worker(plugin_id, &registry).await;
+        let (result, elapsed) = waiter.await.unwrap();
+        assert!(
+            matches!(result, Err(WorkerRequestError::WorkerGone)),
+            "{result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "must not wait for the timeout"
+        );
+        host.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dropping_a_pending_request_forgets_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("XDG_CONFIG_HOME", temp.path().to_path_buf()),
+            ("HOME", temp.path().to_path_buf()),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let plugin_id = "acme.sleeper";
+        install_sleeper(plugin_id);
+        let registry = crate::plugin::reload_registry();
+        let host = PluginHost::new(
+            &temp.path().join("host"),
+            "default",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        host.start(&registry).await;
+        let hash = registry.get(plugin_id).unwrap().manifest_hash.clone();
+
+        let waiter = tokio::spawn({
+            let host = host.clone();
+            async move {
+                host.request_worker(
+                    worker_ref(plugin_id, &hash),
+                    "mcp.rewrite",
+                    json!({}),
+                    Duration::from_secs(60),
+                )
+                .await
+            }
+        });
+        wait_until("the request to be pending", || async {
+            host.pending.waiting(plugin_id) == 1
+        })
+        .await;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert_eq!(host.pending.waiting(plugin_id), 0);
         host.shutdown().await;
     }
 

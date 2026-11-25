@@ -198,6 +198,15 @@ fn requires_elevation(method: &axum::http::Method, path: &str) -> bool {
         {
             return false;
         }
+        // Sets one `acp_defaults` model, which `PATCH .../settings` writes without elevation.
+        if method == Method::PUT
+            && matches!(
+                rest.split('/').collect::<Vec<_>>().as_slice(),
+                [_, "acp-defaults", _, "model"]
+            )
+        {
+            return false;
+        }
         return true;
     }
 
@@ -1297,6 +1306,12 @@ mod tests {
             (Method::POST, "/api/profiles"),
             (Method::PATCH, "/api/profiles/work/rename"),
             (Method::DELETE, "/api/profiles/work"),
+            // Only the one-model PUT is exempt, not other writes under acp-defaults.
+            (Method::PUT, "/api/profiles/work/acp-defaults/claude"),
+            (
+                Method::DELETE,
+                "/api/profiles/work/acp-defaults/claude/model",
+            ),
             (Method::POST, "/api/login/logout-all"),
             (Method::DELETE, "/api/login/sessions/abc123"),
             (Method::POST, "/api/passkeys/register/start"),
@@ -1311,6 +1326,7 @@ mod tests {
             (Method::PATCH, "/api/settings"),
             (Method::PATCH, "/api/profiles/work/settings"),
             (Method::PATCH, "/api/profiles/work/settings/"),
+            (Method::PUT, "/api/profiles/work/acp-defaults/claude/model"),
             // Session traffic: attach, prompt, approve, spawn, delete.
             (Method::GET, "/api/sessions/abc/ws"),
             (Method::GET, "/api/sessions/abc/ws-readonly"),

@@ -22,6 +22,21 @@ export async function clickSidebarSession(page: Page, title: string) {
   await sessionLink.click();
 }
 
+/**
+ * Press the desktop sidebar's resize handle and move through each `x` (pixels from the viewport's left edge,
+ * where the desktop sidebar starts) in one gesture, releasing at the last.
+ */
+export async function dragSidebarHandle(page: Page, ...xs: number[]) {
+  const handle = page.getByTestId("sidebar-resize-handle");
+  await handle.waitFor({ state: "visible", timeout: 10_000 });
+  const box = (await handle.boundingBox())!;
+  const y = box.y + box.height / 2;
+  await page.mouse.move(box.x + box.width / 2, y);
+  await page.mouse.down();
+  for (const x of xs) await page.mouse.move(x, y, { steps: 6 });
+  await page.mouse.up();
+}
+
 /** Open the mobile sidebar only if it is closed, then wait for the slide-in to settle. */
 export async function openMobileSidebar(page: Page) {
   const toggle = page.getByRole("button", { name: "Toggle sidebar" });

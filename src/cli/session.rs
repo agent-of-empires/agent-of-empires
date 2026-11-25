@@ -91,13 +91,6 @@ pub enum SessionCommands {
     /// Clear the favorite flag on a session.
     Unfavorite(SessionIdArgs),
 
-    /// Set (or clear) a per-session color label, rendered as a colored dot in
-    /// the web sidebar for at-a-glance status signaling. Intended for a
-    /// running agent to flag its own state, e.g.
-    /// `aoe session color $(aoe session current -q) red`. Colors: `red`
-    /// (needs attention), `amber` (working), `green` (done); `none` clears it.
-    Color(SetColorArgs),
-
     /// Archive a session: sink it in the Attention sort and tear down its
     /// tmux sessions. Worktree, branch, container preserved. `--no-kill`
     /// skips tmux teardown. See #1868.
@@ -396,15 +389,6 @@ pub struct SetBaseArgs {
     pub repo: Option<String>,
 }
 
-#[derive(Args)]
-pub struct SetColorArgs {
-    /// Session ID or title
-    pub identifier: String,
-    /// Color label: `red` (needs attention), `amber` (working), `green`
-    /// (done), or `none`/`clear` to remove the label.
-    pub color: String,
-}
-
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
     match command {
@@ -430,7 +414,6 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Unfavorite(args) => {
             mark_session(profile, args, "Unfavorited", Instance::unfavorite).await
         }
-        SessionCommands::Color(args) => set_color_session(profile, args).await,
         SessionCommands::Archive(args) => archive_session(profile, args).await,
         SessionCommands::Unarchive(args) => {
             mark_session(profile, args, "Unarchived", Instance::unarchive).await
@@ -459,29 +442,6 @@ async fn mark_session(
         })
     })?;
     println!("{verb}: {title}");
-    Ok(())
-}
-
-async fn set_color_session(profile: &str, args: SetColorArgs) -> Result<()> {
-    let normalized = args.color.trim().to_lowercase();
-    let new_color = match normalized.as_str() {
-        "none" | "clear" | "" => None,
-        other => Some(other.to_string()),
-    };
-
-    let storage = Storage::open_unwatched(profile)?;
-    let (title, color) = storage.update(|instances, _groups| {
-        super::patch_instance(instances, &args.identifier, |inst| {
-            inst.set_color(new_color.clone())
-                .map_err(|e| anyhow::anyhow!(e))?;
-            Ok((inst.title.clone(), inst.color.clone()))
-        })
-    })?;
-
-    match color {
-        Some(c) => println!("✓ Set color for '{}': {}", title, c),
-        None => println!("✓ Cleared color for '{}'", title),
-    }
     Ok(())
 }
 
@@ -570,7 +530,7 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         let decision = crate::session::claim::decide_restore_claim(
             instances,
             &restore_id,
-            chrono::Utc::now(),
+            crate::time::Timestamp::now(),
         )?;
         let fresh = if matches!(
             decision,
@@ -1533,7 +1493,7 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
                     && stored.lifecycle_generation == working.lifecycle_generation,
                 crate::session::LifecycleReservationError::Superseded
             );
-            stored.last_accessed_at = Some(chrono::Utc::now());
+            stored.last_accessed_at = Some(crate::time::Timestamp::now());
             Ok(())
         }) {
             Ok(()) => true,
@@ -1642,18 +1602,20 @@ fn wait_decision(
     }
 }
 
-/// Confirmed absence only. An unreachable tmux server leaves a plain `Error`, and a launch that
-/// holds the reservation has not created its pane yet.
-fn is_terminated(
+/// Confirmed absence only: a gone pane's latch, unless tmux now reports the session present. An
+/// unreachable tmux server leaves a plain `Error`, and a launch that holds the reservation has not
+/// created its pane yet.
+pub(crate) fn is_terminated(
     status: Status,
-    last_error: Option<&str>,
+    last_error: &crate::session::LastError,
     launching: bool,
     existence: crate::tmux::SessionExistence,
 ) -> bool {
     !launching
         && (status == Status::Stopped
             || (status == Status::Error
-                && last_error == Some(crate::session::TMUX_SESSION_GONE_ERROR))
+                && existence != crate::tmux::SessionExistence::Present
+                && crate::session::reports_tmux_session_gone(last_error))
             // A capture that loses a vanishing pane reads as Idle, so recheck the pane itself.
             || existence == crate::tmux::SessionExistence::Absent)
 }
@@ -1664,8 +1626,8 @@ fn confirmed_terminated(inst: &Instance) -> bool {
         .map_or(crate::tmux::SessionExistence::Unknown, |s| s.existence());
     is_terminated(
         inst.status,
-        inst.last_error.as_deref(),
-        inst.has_fresh_launch_reservation(chrono::Utc::now()),
+        &inst.last_error,
+        inst.has_fresh_launch_reservation(crate::time::Timestamp::now()),
         existence,
     )
 }
@@ -1762,6 +1724,13 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
     };
 
     crate::session::config::profile_config::resolve_config_or_warn(profile);
+
+    if inst.is_structured() {
+        eprintln!(
+            "Structured session: there is no terminal pane to capture. Read the transcript with `aoe acp history {}`.",
+            inst.id
+        );
+    }
 
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
 
@@ -2197,7 +2166,7 @@ mod rename_tests {
             branch: "agent-old".into(),
             main_repo_path: repo.to_str().unwrap().into(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: Some("main".into()),
         });
         let id = target.id.clone();
@@ -2451,7 +2420,7 @@ mod rename_tests {
             branch: "drifted".to_string(),
             main_repo_path: "/tmp/repo".to_string(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: None,
         });
         let tied_id = tied.id.clone();
@@ -2486,7 +2455,7 @@ mod rename_tests {
             branch: "main-branch".to_string(),
             main_repo_path: "/tmp/repo".to_string(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: None,
         });
         let active_id = active.id.clone();
@@ -2549,7 +2518,7 @@ mod rename_tests {
             branch: "agent-old".into(),
             main_repo_path: dir.path().join("repo").to_str().unwrap().into(),
             managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             base_branch: None,
         });
         let id = target.id.clone();
@@ -2848,8 +2817,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                     anyhow::ensure!(crate::process::systemd::scope_stopped(&inst.id, scope)?,
                         "terminal target scope remains live; complete its explicit shutdown before selecting a target");
                 }
-                let launch = pending.launch.as_ref().context(
-                    "terminal handoff has no pre-birth checkpoint; cannot prove an unknown birth absent")?;
+                if let Some(launch) = pending.launch.as_ref() {
                 let socket = launch.receipt.as_ref().map(|receipt| receipt.server.socket.as_str())
                     .or_else(|| launch.birth_inventory.as_ref().map(|inventory| inventory.socket()))
                     .context("terminal handoff has no captured physical socket; restore its original ownership evidence")?;
@@ -2868,6 +2836,13 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                     complete.ensure_only_preexisting_panes(
                         launch.birth_inventory.as_ref().context("missing pre-birth physical inventory")?,
                     )?;
+                }
+                } else {
+                    anyhow::ensure!(
+                        stage == crate::session::TerminalHandoffStage::TerminalCommitOwed
+                            && !pending.launch_started,
+                        "terminal handoff has no pre-birth checkpoint; cannot prove an unknown birth absent"
+                    );
                 }
             }
             inst.source_profile = storage.profile().to_string();
@@ -2908,7 +2883,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                 pending.context = context;
                 pending.source_conversation = target.clone();
                 pending.source_acp_session_id = source_acp_session_id;
-                pending.terminal = Some(target);
+                pending.set_terminal(Some(target));
                 pending.launch_started = false;
                 if stage == crate::session::TerminalHandoffStage::ProjectionCleanupOwed {
                     pending.stage = crate::session::TerminalHandoffStage::TerminalLaunchOwed;
@@ -3279,7 +3254,7 @@ mod set_base_target_tests {
                     base_branch_override: None,
                 })
                 .collect(),
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             cleanup_on_delete: true,
         });
         inst
@@ -3667,7 +3642,7 @@ mod start_blocked_tests {
             let profile = "archive-trashed";
             let project = temp.path().join("project");
             let mut inst = Instance::new("trashed", project.to_str().unwrap());
-            inst.pinned_at = Some(chrono::Utc::now());
+            inst.pinned_at = Some(crate::time::Timestamp::now());
             inst.trash();
             let id = inst.id.clone();
             let storage = Storage::new_unwatched(profile).unwrap();
@@ -3702,7 +3677,7 @@ mod start_blocked_tests {
 
 #[cfg(test)]
 mod session_mutation_tests {
-    use super::{set_color_session, set_session_id, SetColorArgs, SetSessionIdArgs};
+    use super::{set_session_id, SetSessionIdArgs};
     use crate::session::{Instance, ResumeIntent, Storage};
     use serial_test::serial;
     use tempfile::tempdir;
@@ -3742,7 +3717,9 @@ mod session_mutation_tests {
         row.try_acquire_lifecycle_reservation(
             crate::session::LifecycleOperation::Trash,
             Instance::LIFECYCLE_RESERVATION_TTL,
-            chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+            crate::time::Timestamp::now()
+                - Instance::LIFECYCLE_RESERVATION_TTL
+                - crate::time::Duration::seconds(1),
         )
         .unwrap();
         row.trash();
@@ -3798,6 +3775,78 @@ mod session_mutation_tests {
         let row = stored(&storage, &id);
         assert_eq!(row.resume_intent, ResumeIntent::Use(SID_B.to_string()));
         assert_eq!(row.resume_probe_failed_sid, None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn set_session_id_repairs_a_retired_handoff_before_birth() {
+        use crate::session::{
+            TerminalHandoffContext, TerminalHandoffIntent, TerminalHandoffOutcome,
+            TerminalHandoffStage,
+        };
+
+        let temp = tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "repair-unborn-handoff";
+        let mut row = Instance::new("handoff", temp.path().to_str().unwrap());
+        row.view = crate::session::View::Structured;
+        row.source_profile = profile.into();
+        row.lifecycle_generation = 1;
+        row.terminal_scopes = Some(Vec::new());
+        let (_, id) = seed(profile, row.clone());
+        let storage = Storage::open_unwatched(profile).unwrap();
+        let intent_id = uuid::Uuid::new_v4();
+        row.terminal_handoff = Some(Box::new(TerminalHandoffIntent {
+            id: intent_id,
+            profile: profile.into(),
+            profile_identity: storage.bound_profile_identity().unwrap(),
+            generation: 1,
+            target_generation: 1,
+            stage: TerminalHandoffStage::TerminalCommitOwed,
+            context: TerminalHandoffContext::Discard,
+            source_acp_session_id: None,
+            source_event_seq: 0,
+            final_event_seq: Some(0),
+            source_conversation: row.conversation_state(),
+            runner: crate::session::purge_owners::RunnerCapture::Uncaptured {
+                scopes: Vec::new(),
+                producer_epoch: None,
+                producer_id: None,
+                prime: crate::acp::runner_lifecycle::PrimeOwnership::NotPrime,
+            },
+            unborn_fence: None,
+            terminal: None,
+            outcome: TerminalHandoffOutcome::Fresh,
+            launch_required: true,
+            launch_started: false,
+            launch: None,
+            selector_ended: false,
+        }));
+        storage
+            .update(|rows, _| {
+                rows[0].terminal_handoff = row.terminal_handoff.take();
+                Ok(())
+            })
+            .unwrap();
+        let args = || SetSessionIdArgs {
+            identifier: id.clone(),
+            session_id: String::new(),
+            store: None,
+        };
+        set_session_id(profile, args()).await.unwrap();
+        let repaired = stored(&storage, &id);
+        let handoff = repaired.terminal_handoff.unwrap();
+        assert_eq!(handoff.id, intent_id);
+        assert_eq!(handoff.generation, 2);
+        assert_eq!(handoff.terminal.unwrap().intent, ResumeIntent::Cleared);
+        storage
+            .update(|rows, _| {
+                rows[0].terminal_handoff.as_mut().unwrap().launch_started = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(set_session_id(profile, args()).await.is_err());
+        assert_eq!(stored(&storage, &id).lifecycle_generation, 2);
     }
 
     #[tokio::test]
@@ -3883,64 +3932,6 @@ mod session_mutation_tests {
         assert_eq!(
             row.agent_session_id, None,
             "rejected call must not mutate sid"
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn set_color_normalizes_clears_and_rejects_unknown_values() {
-        let temp = tempdir().unwrap();
-        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
-
-        let (storage, id) = seed("set-color", Instance::new("color_session", "/tmp/x"));
-        let set = |color: &str| {
-            set_color_session(
-                "set-color",
-                SetColorArgs {
-                    identifier: id.clone(),
-                    color: color.to_string(),
-                },
-            )
-        };
-
-        set("Red")
-            .await
-            .expect("palette names are case-insensitive");
-        assert_eq!(stored(&storage, &id).color.as_deref(), Some("red"));
-
-        set("chartreuse")
-            .await
-            .expect_err("unknown color must error");
-        assert_eq!(stored(&storage, &id).color.as_deref(), Some("red"));
-
-        set("none").await.unwrap();
-        assert_eq!(stored(&storage, &id).color, None);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn set_color_refuses_unknown_profile_without_vivifying_it() {
-        let _guard = crate::session::test_support::isolate_app_dir();
-        let profiles = crate::session::get_app_dir().unwrap().join("profiles");
-        std::fs::create_dir_all(profiles.join("real")).unwrap();
-
-        let msg = set_color_session(
-            "ghost-profile",
-            SetColorArgs {
-                identifier: "whatever".to_string(),
-                color: "red".to_string(),
-            },
-        )
-        .await
-        .expect_err("unknown profile must error")
-        .to_string();
-        assert!(
-            msg.contains("does not exist"),
-            "expected the unknown-profile error, got: {msg}"
-        );
-        assert!(
-            !profiles.join("ghost-profile").exists(),
-            "set-color must not mint profiles/ghost-profile"
         );
     }
 }
@@ -4102,8 +4093,8 @@ mod import_tests {
 mod wait_decision_tests {
     use super::{adopt_stored, is_terminated, wait_decision, WaitDecision};
     use crate::session::{
-        Instance, LifecycleOperation, Status, TMUX_SERVER_UNREACHABLE_ERROR,
-        TMUX_SESSION_GONE_ERROR,
+        Instance, LastError, LifecycleOperation, Status, TmuxAbsence,
+        TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR, TMUX_SESSION_GONE_LEAD,
     };
     use std::time::Duration;
 
@@ -4160,35 +4151,41 @@ mod wait_decision_tests {
     #[test]
     fn only_confirmed_absence_is_termination() {
         use crate::tmux::SessionExistence::{Absent, Present, Unknown};
+        let latched = |absence, message: &str| {
+            let mut error = LastError::default();
+            error.latch_tmux(absence, message);
+            error
+        };
+        let gone = latched(TmuxAbsence::Gone, TMUX_SESSION_GONE_ERROR);
+        // What a live pane printed, however it begins, is no latch.
+        let printed = {
+            let mut error = LastError::default();
+            error.set(format!("{TMUX_SESSION_GONE_LEAD} Exiting."));
+            error
+        };
+        let none = LastError::default();
         let cases = [
-            (Status::Stopped, None, false, Present, true),
+            (Status::Stopped, &none, false, Present, true),
+            // tmux reports the session again, so its pane is no longer gone
+            (Status::Error, &gone, false, Present, false),
+            // the tmux server exits with its last session, so a later poll can't reach it
+            (Status::Error, &gone, false, Unknown, true),
             (
                 Status::Error,
-                Some(TMUX_SESSION_GONE_ERROR),
-                false,
-                Present,
-                true,
-            ),
-            (
-                Status::Error,
-                Some(TMUX_SERVER_UNREACHABLE_ERROR),
+                &latched(TmuxAbsence::Unreachable, TMUX_SERVER_UNREACHABLE_ERROR),
                 false,
                 Unknown,
                 false,
             ),
-            (Status::Error, None, false, Unknown, false),
-            (
-                Status::Idle,
-                Some(TMUX_SESSION_GONE_ERROR),
-                false,
-                Present,
-                false,
-            ),
+            (Status::Error, &printed, false, Present, false),
+            (Status::Error, &printed, false, Unknown, false),
+            (Status::Error, &none, false, Unknown, false),
+            (Status::Idle, &gone, false, Unknown, false),
             // a capture that lost the pane reads Idle; the pane check still catches it
-            (Status::Idle, None, false, Absent, true),
+            (Status::Idle, &none, false, Absent, true),
             // a launch holding its reservation has no pane yet
-            (Status::Starting, None, true, Absent, false),
-            (Status::Stopped, None, true, Absent, false),
+            (Status::Starting, &none, true, Absent, false),
+            (Status::Stopped, &none, true, Absent, false),
         ];
         for (status, last_error, launching, existence, want) in cases {
             assert_eq!(
@@ -4201,7 +4198,7 @@ mod wait_decision_tests {
 
     #[test]
     fn adopt_stored_sees_a_launch_commit_and_keeps_detection_state() {
-        let now = chrono::Utc::now();
+        let now = crate::time::Timestamp::now();
         let mut live = Instance::new("t", "/p");
         live.try_acquire_lifecycle_reservation(
             LifecycleOperation::Launch,

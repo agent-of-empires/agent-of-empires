@@ -102,7 +102,7 @@ pub fn trust_repo(
                 path: normalized,
                 hooks_hash: hooks_final,
                 mcp_hash: mcp_final,
-                trusted_at: chrono::Utc::now().to_rfc3339(),
+                trusted_at: crate::time::Timestamp::now().to_rfc3339(),
             });
             Ok::<_, anyhow::Error>(())
         },

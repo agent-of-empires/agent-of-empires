@@ -489,6 +489,8 @@ const requestCases: RequestCase[] = [
     { respond: json(session), result: { ok: true, session } },
   ],
   ["PATCH /api/sessions/s1/snooze", () => api.setSessionSnooze("s1", 60), { body: { minutes: 60 } }],
+  ["PATCH /api/sessions/s1/ignored", () => api.setSessionIgnored("s1", true), { body: { ignored: true } }],
+  ["POST /api/sessions/s1/reclaim-ownership", () => api.reclaimSessionOwnership("s1"), { body: { reclaim: true } }],
   ["PATCH /api/sessions/s1/unread", () => api.setSessionUnread("s1", true), { body: { unread: true } }],
   [
     "POST /api/sessions/s1/projects",
@@ -761,6 +763,52 @@ describe("settings saves", () => {
       async () => ({ ok: false, status: 409, json: async () => ({ error: "stale_write" }) }) as unknown as Response,
     );
     expect(await api.updateSettings({ a: 1 })).toBe("rejected");
+  });
+
+  it("reads a Session's default model from the Daemon, and gives null when it can't", async () => {
+    const reply = { profile: "my work", agent_key: "cursor", model: "opus", pinned: false };
+    fetchSpy.mockResolvedValueOnce(json(reply)).mockResolvedValueOnce(json({ error: "not_found" }, 404));
+    expect(await api.fetchSessionModelDefault("s/1")).toEqual(reply);
+    expect(fetchSpy.mock.calls[0][0]).toBe("/api/sessions/s%2F1/acp-default-model");
+    expect(await api.fetchSessionModelDefault("s/1")).toBeNull();
+  });
+
+  it.each([
+    ["a saved model", () => json({ agent_key: "claude", model: "opus", pinned: false }), "committed", true],
+    ["a pin", () => json({ error: "model_pinned", message: "" }, 409), "pinned", false],
+    ["another conflict", () => json({ error: "read_only", message: "" }, 409), "rejected", false],
+    ["an unknown Agent", () => json({ error: "unknown_agent", message: "" }, 400), "rejected", false],
+    ["a server error", () => json({ error: "internal", message: "" }, 500), "uncertain", true],
+    ["no reply", () => Promise.reject(new Error("offline")), "uncertain", true],
+  ])("PUTs only the model, and maps %s", async (_name, reply, outcome, announced) => {
+    const listener = vi.fn();
+    const off = onSettingsChanged(listener);
+    try {
+      fetchSpy.mockImplementationOnce(async () => reply());
+      expect(await api.putAgentModelDefault("work", "claude", "opus")).toBe(outcome);
+      const [url, init] = fetchSpy.mock.calls[0];
+      expect(url).toBe("/api/profiles/work/acp-defaults/claude/model");
+      expect(init?.method).toBe("PUT");
+      expect(JSON.parse(String(init?.body))).toEqual({ model: "opus" });
+      expect(listener).toHaveBeenCalledTimes(announced ? 1 : 0);
+    } finally {
+      off();
+    }
+  });
+
+  it("sends a default model PUT only after the one before it has answered", async () => {
+    let answerFirst: (r: Response) => void = () => {};
+    fetchSpy
+      .mockImplementationOnce(() => new Promise<Response>((r) => (answerFirst = r)))
+      .mockResolvedValueOnce(json({}));
+    const first = api.putAgentModelDefault("work", "claude", "opus");
+    const second = api.putAgentModelDefault("work", "claude", "sonnet");
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(1));
+    await Promise.resolve();
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    answerFirst(json({}));
+    expect([await first, await second]).toEqual(["committed", "committed"]);
+    expect(fetchSpy.mock.calls.map(([, init]) => JSON.parse(String(init?.body)).model)).toEqual(["opus", "sonnet"]);
   });
 
   it("setDefaultProfile announces a landed save and stays quiet on a rejected one", async () => {
@@ -1209,6 +1257,12 @@ describe("fetchSandboxImageStatus", () => {
       "ghcr.io/x/sb:1",
       { fresh: true },
       "/api/sandbox/image-status?image=ghcr.io%2Fx%2Fsb%3A1&fresh=true",
+    ],
+    [
+      "the launching profile's automatic image",
+      undefined,
+      { profile: "work" },
+      "/api/sandbox/image-status?profile=work",
     ],
   ] as const)("asks for %s", async (_name, image, opts, url) => {
     fetchSpy.mockResolvedValueOnce(json({ state: "current" }));
@@ -1779,41 +1833,33 @@ describe("runtime snapshots and cancellation", () => {
     ["zero revision", { "aoe-runtime-epoch": "boot", "aoe-runtime-revision": "0" }],
     ["another epoch", { "aoe-runtime-epoch": "successor", "aoe-runtime-revision": "1" }],
   ])("does not claim a setting committed without its original runtime receipt (%s)", async (_name, headers) => {
-    for (const call of [
-      () => api.setSessionColor("s1", null, "boot"),
-      () => api.setSessionNotifications("s1", "default", "boot"),
-    ]) {
-      fetchSpy.mockResolvedValueOnce(
-        new Response(JSON.stringify(session), { headers: headers as Record<string, string> }),
-      );
-      expect(await call()).toEqual({ outcome: "uncertain" });
-    }
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify(session), { headers: headers as Record<string, string> }),
+    );
+    expect(await api.setSessionNotifications("s1", "default", "boot")).toEqual({ outcome: "uncertain" });
   });
 
   it.each([400, 401, 403, 409, 500, 503])(
     "distinguishes setting rejection from unconfirmed writes (%s)",
     async (status) => {
-      for (const call of [
-        () => api.setSessionColor("s1", null, "boot"),
-        () => api.setSessionNotifications("s1", "all", "boot"),
-      ]) {
-        fetchSpy.mockResolvedValueOnce(empty(status));
-        expect(await call()).toEqual({ outcome: status >= 500 ? "uncertain" : "rejected" });
-      }
+      fetchSpy.mockResolvedValueOnce(empty(status));
+      expect(await api.setSessionNotifications("s1", "all", "boot")).toEqual({
+        outcome: status >= 500 ? "uncertain" : "rejected",
+      });
     },
   );
 
   it("does not attest another session or a missing canonical row", async () => {
     for (const body of [null, {}, { ...session, id: "replacement" }]) {
       fetchSpy.mockResolvedValueOnce(runtimeJson(body));
-      expect(await api.setSessionColor("s1", null, "boot")).toEqual({ outcome: "uncertain" });
+      expect(await api.setSessionNotifications("s1", "off", "boot")).toEqual({ outcome: "uncertain" });
     }
   });
 
   it("preserves u64 revision precision and the canonical returned fields, including optional outcome", async () => {
-    const canonical = { ...session, color: "green", outcome: { acknowledged: true } };
+    const canonical = { ...session, notify_on_idle: true, outcome: { acknowledged: true } };
     fetchSpy.mockResolvedValueOnce(runtimeJson(canonical));
-    expect(await api.setSessionColor("s1", null, "boot")).toEqual({
+    expect(await api.setSessionNotifications("s1", "all", "boot")).toEqual({
       outcome: "committed",
       mutation: { session: canonical, cursor },
     });

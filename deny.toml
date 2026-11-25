@@ -9,7 +9,7 @@ no-default-features = false
 # Deny any crate with a known security vulnerability
 version = 2
 ignore = [
-    # chrono is unmaintained with no safe upgrade; replace it in a separate change.
+    # Only rmcp still pulls in chrono; see #5914.
     "RUSTSEC-2026-0543",
 ]
 

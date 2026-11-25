@@ -26,6 +26,7 @@ import { SchemaSection } from "./settings/SchemaSection";
 import { SelectField } from "./settings/FormFields";
 import { DiffSettings } from "./settings/DiffSettings";
 import { PanelsSettings } from "./settings/PanelsSettings";
+import { PANEL_SETTING_FIELDS } from "../lib/panelDefaults";
 import { TelemetrySettings } from "./settings/TelemetrySettings";
 import { CityHallSettings } from "./settings/CityHallSettings";
 import { PluginsSettings } from "./settings/PluginsSettings";
@@ -46,7 +47,7 @@ import { StructuredViewDisplaySettings } from "./settings/StructuredViewDisplayS
 import { ProfilesSection } from "./profiles/ProfilesSection";
 import { ProfileSelector } from "./settings/ProfileSelector";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
-import { SECTION_TO_TAB, type SettingsSearchHit } from "./settings/settingsSearchIndex";
+import { tabOf, type SettingsSearchHit } from "./settings/settingsSearchIndex";
 
 export type TabId =
   | "profiles"
@@ -158,7 +159,7 @@ const CITYHALL_THEME_HIDDEN = ["color_mode", "idle_decay_minutes"];
 // and jumping to a hit lands on Theme because `activeTab` silently clamps. #7.
 function curateCityhallSchema(schema: SettingsFieldDescriptor[]): SettingsFieldDescriptor[] {
   return schema.filter((d) => {
-    const tab = SECTION_TO_TAB[d.section];
+    const tab = tabOf(d);
     if (!tab || !CITYHALL_TAB_IDS.has(tab)) return false;
     if (d.section === "theme") return !CITYHALL_THEME_HIDDEN.includes(d.field);
     if (d.section === "session") return CITYHALL_SESSION_FIELDS.includes(d.field);
@@ -333,7 +334,7 @@ export function SettingsView({
       new Set(
         schema
           .filter((d) => d.profile_overridable && d.web_write.policy !== "local_only")
-          .map((d) => SECTION_TO_TAB[d.section])
+          .map((d) => tabOf(d))
           .filter(Boolean),
       ),
     [schema],
@@ -358,10 +359,7 @@ export function SettingsView({
   if (field && field !== deepLinked && !schemaLoading && !schemaError) {
     setDeepLinked(field);
     const d = searchSchema.find(
-      (x) =>
-        `${x.section}.${x.field}` === field &&
-        x.web_write.policy !== "local_only" &&
-        SECTION_TO_TAB[x.section] === activeTab,
+      (x) => `${x.section}.${x.field}` === field && x.web_write.policy !== "local_only" && tabOf(x) === activeTab,
     );
     if (d) setFocusRequest((prev) => ({ section: d.section, field: d.field, nonce: (prev?.nonce ?? 0) + 1 }));
   }
@@ -658,7 +656,22 @@ export function SettingsView({
       case "diff":
         return <DiffSettings />;
       case "panels":
-        return <PanelsSettings />;
+        return (
+          <div className="space-y-4">
+            {schemaGuard() ??
+              (settings && (
+                <SchemaSection
+                  section="web"
+                  schema={schema}
+                  focusRequest={focusRequest}
+                  values={web}
+                  onSaveField={sendSave}
+                  onlyFields={PANEL_SETTING_FIELDS}
+                />
+              ))}
+            <PanelsSettings />
+          </div>
+        );
       case "sound":
         return (
           <SchemaSection
@@ -757,6 +770,7 @@ export function SettingsView({
                     focusRequest={focusRequest}
                     values={web}
                     onSaveField={sendSave}
+                    hideFields={PANEL_SETTING_FIELDS}
                   />
                 ))}
             </div>

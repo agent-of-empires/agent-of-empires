@@ -12,6 +12,8 @@ Where it can, the server renders from the [VT live transport](../live-mode.md#th
 
 Scrolling up into history widens the window the server sends and surfaces a **Back to live** button; scrolling back to the bottom (or clicking it) returns to the live tail. The agent keeps running while you read.
 
+**Settings > Terminal > Font family** picks the terminal font. Geist Mono (the default) and JetBrains Mono (Ghostty's default) ship with the dashboard; common monospace fonts such as Menlo, Fira Code, or a Nerd Font are listed when the device has them installed. The choice follows you to other browsers, and a device without that font renders Geist Mono and says so in the picker.
+
 ## Copy and scroll
 
 The terminal uses tmux for scrollback and selection, so copy and scroll work with no modifier keys:
