@@ -93,6 +93,81 @@ fn h_in_the_pane_turns_the_home_row_on() {
 }
 
 /// The dashboard's "Show in the sidebar" pref also hides the Home row.
+/// The row opens the pinned bottom shelf, directly above the Archived section
+/// (expanded or collapsed), or above Trash when nothing is archived.
+#[test]
+#[serial]
+fn the_row_sits_directly_above_archived_and_trash() {
+    use crate::session::config::GroupByMode;
+    use crate::session::{is_within_archived_section, is_within_trash_section};
+    // (archived, archived section collapsed, trashed)
+    let cases = [
+        (false, false, false),
+        (false, false, true),
+        (true, false, false),
+        (true, true, false),
+        (true, false, true),
+        (true, true, true),
+    ];
+    for group_by in [
+        GroupByMode::Manual,
+        GroupByMode::Project,
+        GroupByMode::Status,
+    ] {
+        for (archived, collapsed, trashed) in cases {
+            let case =
+                format!("{group_by:?} archived={archived} collapsed={collapsed} trashed={trashed}");
+            let mut env = create_test_env_with_sessions(3);
+            env.view
+                .suggestions_feed
+                .set_snapshot_for_test(snapshot(2, &[]));
+            env.view.group_by = group_by;
+            let ids: Vec<String> = env.view.instances().map(|i| i.id.clone()).collect();
+            if archived {
+                env.view.mutate_instance(&ids[0], |inst| inst.archive());
+            }
+            if trashed {
+                env.view.mutate_instance(&ids[1], |inst| {
+                    inst.trashed_at = Some(crate::time::Timestamp::now())
+                });
+            }
+            env.view.archived_section_collapsed = collapsed;
+            env.view.trashed_section_collapsed = false;
+            env.view.rebuild_flat_items();
+
+            let row = env.view.suggested_row().expect(&case);
+            assert_eq!(env.view.shelf_start(), Some(row), "{case}");
+            assert!(
+                env.view.flat_items[..row]
+                    .iter()
+                    .any(|item| matches!(item, Item::Session { .. })),
+                "{case}: live sessions come first"
+            );
+            let next = env.view.flat_items.get(row + 1);
+            let next_path = match next {
+                Some(Item::Group { path, .. }) => Some(path.as_str()),
+                _ => None,
+            };
+            match (archived, trashed) {
+                (true, _) => assert!(next_path.is_some_and(is_within_archived_section), "{case}"),
+                (false, true) => assert!(next_path.is_some_and(is_within_trash_section), "{case}"),
+                (false, false) => assert!(next.is_none(), "{case}: the row is last"),
+            }
+            if archived && trashed {
+                let trash = env
+                    .view
+                    .flat_items
+                    .iter()
+                    .position(|item| {
+                        matches!(item, Item::Group { path, .. } if is_within_trash_section(path))
+                    })
+                    .expect(&case);
+                assert!(trash > row + 1, "{case}: Trash stays below Archived");
+            }
+        }
+    }
+}
+
 #[test]
 #[serial]
 fn the_row_follows_the_sidebar_pref() {

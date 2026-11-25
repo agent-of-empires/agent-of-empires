@@ -1563,10 +1563,10 @@ impl HomeView {
             }
         };
         let borders = layout.list_borders();
-        // The Trash / Archived sections render in a pinned bottom shelf instead of
-        // scrolling with the list. They are a contiguous suffix of `flat_items` starting at
-        // `list_len`, with a divider between; when that divider shows it carries the sort
-        // indicator, so the bottom-border copy is suppressed.
+        // The Suggested row and the Archived / Trash sections render in a pinned bottom
+        // shelf instead of scrolling with the list. They are a contiguous suffix of
+        // `flat_items` starting at `list_len`, with a divider between; when that divider
+        // shows it carries the sort indicator, so the bottom-border copy is suppressed.
         let shelf_start = self.shelf_start();
         let list_len = shelf_start.unwrap_or(self.flat_items.len());
         let show_divider = shelf_start.is_some() && list_len > 0;
