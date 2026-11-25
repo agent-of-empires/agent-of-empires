@@ -3,7 +3,8 @@
 //! Every relocatable action (one that binds to a different chord in strict vs
 //! non-strict mode) is declared exactly once in [`BINDINGS`]. The dispatcher
 //! ([`resolve`]), the command palette, and the help overlay all derive from
-//! this table, so a binding can no longer drift between those surfaces.
+//! this table, with the user's `[keybinds]` overrides (`keybinds.rs`) layered
+//! on top, so a binding can no longer drift between those surfaces.
 //!
 //! Pure navigation keys (arrows, `j`/`k`/`h`/`l`, Home/End, PageUp/Down,
 //! `{`/`}`, `<`/`>`, Enter, Tab) are NOT here: they never relocate between
@@ -23,6 +24,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use super::keybinds::{self, Keymap};
 use super::ViewMode;
 use crate::session::config::SortOrder;
 use crate::tui::dialogs::PaletteGroup;
@@ -354,17 +356,30 @@ fn context_holds(context: Context, ctx: &Ctx) -> bool {
     }
 }
 
-/// Resolve a key event to an action, honoring strict mode and context guards.
-/// Returns the first matching binding in table order; context-guarded entries
-/// are listed before the unguarded entries that share their chord.
-pub fn resolve(key: &KeyEvent, strict: bool, ctx: &Ctx) -> Option<ActionId> {
-    for b in BINDINGS {
-        let chords = if strict { b.strict } else { b.non_strict };
-        if context_holds(b.context, ctx) && chords.iter().any(|c| chord_matches(c, key)) {
-            return Some(b.id);
-        }
+/// The shipped chords for a binding in the given mode, ignoring `[keybinds]` overrides.
+pub(super) fn default_chords(b: &Binding, strict: bool) -> &'static [Chord] {
+    if strict {
+        b.strict
+    } else {
+        b.non_strict
     }
-    None
+}
+
+/// Resolve a key event to an action, honoring strict mode, context guards and the active
+/// `[keybinds]` overrides. Returns the first matching binding in table order;
+/// context-guarded entries are listed before the unguarded entries that share their chord.
+pub fn resolve(key: &KeyEvent, strict: bool, ctx: &Ctx) -> Option<ActionId> {
+    keybinds::with_active(|km| resolve_in(km, key, strict, ctx))
+}
+
+pub(super) fn resolve_in(km: &Keymap, key: &KeyEvent, strict: bool, ctx: &Ctx) -> Option<ActionId> {
+    BINDINGS
+        .iter()
+        .find(|b| {
+            context_holds(b.context, ctx)
+                && km.chords(b, strict).iter().any(|c| chord_matches(c, key))
+        })
+        .map(|b| b.id)
 }
 
 /// A plugin-contributed action a key resolved to: a plugin id plus the command
@@ -452,35 +467,46 @@ fn plugin_bindings() -> Vec<(Chord, PluginAction)> {
 /// Returns `None` for anything the live-send grammar rejects.
 pub fn parse_chord(s: &str) -> Option<Chord> {
     let (code, mods) = super::live_send::parse_chord(s)?;
+    Some(chord_from_parts(code, mods))
+}
+
+/// The [`Chord`] for a live-send `(code, modifiers)` pair, normalized as [`parse_chord`] does.
+pub(super) fn chord_from_parts(code: KeyCode, mods: KeyModifiers) -> Chord {
     let shift = mods.contains(KeyModifiers::SHIFT);
     let code = match code {
         KeyCode::Char(c) if shift => KeyCode::Char(c.to_ascii_uppercase()),
         KeyCode::Char(c) => KeyCode::Char(c.to_ascii_lowercase()),
         other => other,
     };
-    Some(Chord {
+    Chord {
         code,
         ctrl: mods.contains(KeyModifiers::CONTROL),
         alt: mods.contains(KeyModifiers::ALT),
         shift: shift && !matches!(code, KeyCode::Char(_)),
-    })
+    }
 }
 
 /// Whether a core binding already claims `chord` in either mode. Used by
 /// `aoe plugin info` to flag a plugin keybind that core shadows.
 pub fn core_shadows(chord: &Chord) -> bool {
-    BINDINGS.iter().any(|b| {
-        // App-only chords run before the home view and only while a banner shows, so they
-        // do not statically shadow a plugin chord.
-        if b.context == Context::AppOnly {
-            return false;
-        }
-        b.non_strict.iter().chain(b.strict).any(|c| {
-            // Same rule as `chord_matches`: an unset core `shift` also matches shifted events.
-            c.code == chord.code
-                && c.ctrl == chord.ctrl
-                && c.alt == chord.alt
-                && (!c.shift || chord.shift)
+    keybinds::with_active(|km| {
+        BINDINGS.iter().any(|b| {
+            // App-only chords run before the home view and only while a banner shows, so
+            // they do not statically shadow a plugin chord.
+            if b.context == Context::AppOnly {
+                return false;
+            }
+            km.chords(b, false)
+                .iter()
+                .chain(km.chords(b, true))
+                .any(|c| {
+                    // Same rule as `chord_matches`: an unset core `shift` also matches shifted
+                    // events.
+                    c.code == chord.code
+                        && c.ctrl == chord.ctrl
+                        && c.alt == chord.alt
+                        && (!c.shift || chord.shift)
+                })
         })
     })
 }
@@ -489,26 +515,27 @@ pub fn core_shadows(chord: &Chord) -> bool {
 /// `"D"`, `"Ctrl+D"`, `"F5"`. Returns `""` if the action has no binding in the
 /// requested mode (e.g. `NextWaiting` in strict).
 pub fn label(id: ActionId, strict: bool) -> String {
-    let Some(b) = BINDINGS.iter().find(|b| b.id == id) else {
-        return String::new();
-    };
-    let chords = if strict { b.strict } else { b.non_strict };
-    chords.first().map(format_chord).unwrap_or_default()
+    keybinds::with_active(|km| label_in(km, id, strict))
+}
+
+pub(super) fn label_in(km: &Keymap, id: ActionId, strict: bool) -> String {
+    binding(id)
+        .and_then(|b| km.chords(b, strict).first())
+        .map(format_chord)
+        .unwrap_or_default()
 }
 
 /// Whether `key` is one of the action's chords in the given mode, ignoring context
 /// guards. For handlers that run outside the home dispatcher.
 pub fn is_bound(id: ActionId, strict: bool, key: &KeyEvent) -> bool {
-    BINDINGS.iter().any(|b| {
-        let chords = if strict { b.strict } else { b.non_strict };
-        b.id == id && chords.iter().any(|c| chord_matches(c, key))
+    keybinds::with_active(|km| {
+        binding(id).is_some_and(|b| km.chords(b, strict).iter().any(|c| chord_matches(c, key)))
     })
 }
 
 /// The key event a click on the action's footer button synthesizes: its primary chord.
 pub fn key_event(id: ActionId, strict: bool) -> Option<KeyEvent> {
-    let b = BINDINGS.iter().find(|b| b.id == id)?;
-    let c = if strict { b.strict } else { b.non_strict }.first()?;
+    let c = keybinds::with_active(|km| km.chords(binding(id)?, strict).first().copied())?;
     let mut modifiers = KeyModifiers::NONE;
     if c.ctrl {
         modifiers |= KeyModifiers::CONTROL;
@@ -522,8 +549,21 @@ pub fn key_event(id: ActionId, strict: bool) -> Option<KeyEvent> {
     Some(KeyEvent::new(c.code, modifiers))
 }
 
-fn format_chord(c: &Chord) -> String {
+fn binding(id: ActionId) -> Option<&'static Binding> {
+    BINDINGS.iter().find(|b| b.id == id)
+}
+
+/// The action whose stable name (its [`palette_id`]) is `name`.
+pub(super) fn action_by_name(name: &str) -> Option<ActionId> {
+    BINDINGS
+        .iter()
+        .map(|b| b.id)
+        .find(|id| palette_id(*id) == name)
+}
+
+pub(super) fn format_chord(c: &Chord) -> String {
     let key = match c.code {
+        KeyCode::Char(' ') => "Space".to_string(),
         KeyCode::Char(ch) => ch.to_ascii_uppercase().to_string(),
         KeyCode::F(n) => format!("F{n}"),
         KeyCode::Up => "Up".to_string(),
@@ -532,6 +572,15 @@ fn format_chord(c: &Chord) -> String {
         KeyCode::Right => "Right".to_string(),
         KeyCode::PageUp => "PgUp".to_string(),
         KeyCode::PageDown => "PgDn".to_string(),
+        KeyCode::Home => "Home".to_string(),
+        KeyCode::End => "End".to_string(),
+        KeyCode::Enter => "Enter".to_string(),
+        KeyCode::Tab => "Tab".to_string(),
+        KeyCode::BackTab => "BackTab".to_string(),
+        KeyCode::Esc => "Esc".to_string(),
+        KeyCode::Backspace => "Backspace".to_string(),
+        KeyCode::Delete => "Del".to_string(),
+        KeyCode::Insert => "Ins".to_string(),
         _ => return String::new(),
     };
     // A bare letter keeps its lone-character form; every modified chord is spelled out, or
@@ -540,7 +589,7 @@ fn format_chord(c: &Chord) -> String {
         return format!("Shift+{key}");
     }
     match (c.ctrl, c.alt, c.code) {
-        (false, false, KeyCode::Char(ch)) => ch.to_string(),
+        (false, false, KeyCode::Char(ch)) if ch != ' ' => ch.to_string(),
         (true, true, _) => format!("Ctrl+Alt+{key}"),
         (true, false, _) => format!("Ctrl+{key}"),
         (false, true, _) => format!("Alt+{key}"),

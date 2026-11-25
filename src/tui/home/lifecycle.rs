@@ -38,6 +38,7 @@ impl HomeView {
         crate::session::set_unread_enabled(resolved.session.unread_indicator);
         crate::session::set_favorites_first(resolved.session.favorites_first);
         crate::session::set_preview_link_prefixes(&resolved.session.preview_link_prefixes);
+        let keybind_warnings = super::config_refresh::install_keybinds(&resolved);
         let sort_order = user_config
             .as_ref()
             .and_then(|c| c.app_state.sort_order)
@@ -407,13 +408,7 @@ impl HomeView {
         };
 
         view.tool_hotkey_cache = input::build_tool_hotkey_cache(&view.tool_configs);
-        let hotkey_warnings = input::validate_tool_hotkeys(&view.tool_configs);
-        if !hotkey_warnings.is_empty() && view.info_dialog.is_none() {
-            view.info_dialog = Some(InfoDialog::new(
-                "Tool hotkey config errors",
-                &hotkey_warnings.join("\n"),
-            ));
-        }
+        view.show_key_config_errors(keybind_warnings);
 
         view.refresh_registered_projects();
         view.refresh_flat_items();

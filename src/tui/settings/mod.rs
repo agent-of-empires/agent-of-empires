@@ -349,6 +349,10 @@ impl SettingsView {
         push_tab(&mut rows, SettingsCategory::Session);
         push_tab(&mut rows, SettingsCategory::Agents);
         push_tab(&mut rows, SettingsCategory::Interaction);
+        // `[keybinds]` is global-only.
+        if scope == SettingsScope::Global {
+            push_tab(&mut rows, SettingsCategory::Keybinds);
+        }
         push_tab(&mut rows, SettingsCategory::Diff);
         push_tab(&mut rows, SettingsCategory::Acp);
 
@@ -1319,9 +1323,11 @@ mod categories_for_scope_tests {
             "repo-overridable"
         );
         let profile = SettingsView::categories_for_scope(SettingsScope::Profile);
-        assert!(has_tab(&global, SettingsCategory::Systemd));
-        assert!(!has_tab(&profile, SettingsCategory::Systemd), "global-only");
-        assert!(!has_tab(&repo, SettingsCategory::Systemd), "global-only");
+        for cat in [SettingsCategory::Systemd, SettingsCategory::Keybinds] {
+            assert!(has_tab(&global, cat), "{cat:?}");
+            assert!(!has_tab(&profile, cat), "{cat:?} is global-only");
+            assert!(!has_tab(&repo, cat), "{cat:?} is global-only");
+        }
     }
 }
 

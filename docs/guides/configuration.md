@@ -578,6 +578,19 @@ hotkey = "Alt+g"
 
 See [Tool Sessions](tool-sessions.md) for the full reference.
 
+## Keybinds
+
+`[keybinds]` changes the TUI's home-view and live-mode shortcuts. Each key is an action name and each value a list of keys in the `live_send_leader` grammar (`C-n`, `M-Up`, `S-PageUp`, `F7`, `x`); a bare letter is lowercase, so write `S-d` for `D`. The list replaces the action's keys in both hotkey modes, and `[]` unbinds it.
+
+```toml
+[keybinds]
+previous-finished = ["M-k"]
+next-finished = ["M-j"]
+move-row-up = []
+```
+
+**Settings > Global > Keybinds** lists every action name with its current keys, read-only. An entry is ignored, with a warning on that page and when the TUI loads config, if it names an unknown action, has a key that does not parse, or takes a key already in use: another action's key in the current hotkey mode, a tool hotkey, `Ctrl+C`, or the navigation keys (arrows, `j` `k` `h` `l`, `G`, `{` `}`, `<` `>`, Home, End, Page Up/Down, Enter, Tab, Esc). The actions live mode keeps from the Agent (`previous-finished`, `next-finished`, `preview-scroll-up`, `preview-scroll-down`) also cannot use the live-send leader or exit chord, or a character key without Ctrl or Alt; `quit` cannot use Ctrl or Alt. An ignored entry leaves its action on the default keys. Dialog keys, Enter and Tab are not configurable. Global only.
+
 ## Profiles
 
 Profiles have separate sessions, groups, and overrides of profile-overridable settings. Press `P` in the TUI to choose from the last applied Daemon profile list. Reopen it to see later changes. A removed profile stays selected until you choose another filter; choose `all` to see remaining profiles.

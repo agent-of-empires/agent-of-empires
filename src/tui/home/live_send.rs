@@ -192,6 +192,23 @@ pub(super) fn parse_chord_list(spec: &str) -> Vec<(KeyCode, KeyModifiers)> {
     out
 }
 
+/// The configured leader chord. An empty value disables it, so every key passes through;
+/// an unparseable value is treated as a typo and falls back to the default rather than
+/// silently dropping the feature, like the exit chord.
+pub(super) fn resolve_leader(spec: &str) -> Option<(KeyCode, KeyModifiers)> {
+    if spec.trim().is_empty() {
+        return None;
+    }
+    parse_chord(spec).or_else(|| {
+        tracing::warn!(
+            "live-send: unparseable leader chord '{}'; falling back to default '{}'",
+            spec,
+            DEFAULT_LEADER
+        );
+        parse_chord(DEFAULT_LEADER)
+    })
+}
+
 /// True when `event` matches any chord in the configured list.
 pub(super) fn chord_list_matches(chords: &[(KeyCode, KeyModifiers)], event: KeyEvent) -> bool {
     chords.iter().any(|c| chord_matches(*c, event))

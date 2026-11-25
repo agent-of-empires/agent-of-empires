@@ -130,17 +130,11 @@ impl HomeView {
         crate::session::set_favorites_first(config.session.favorites_first);
         self.tips_unseen = self.tips_unseen_count(&config);
         self.queue_shortcut_bar_tip(&config);
+        let keybind_warnings = install_keybinds(&config);
         self.tool_configs = config.tools;
         self.tool_hotkey_cache = input::build_tool_hotkey_cache(&self.tool_configs);
-        let hotkey_warnings = input::validate_tool_hotkeys(&self.tool_configs);
-        if matches!(origin, ConfigRefreshOrigin::Interactive)
-            && !hotkey_warnings.is_empty()
-            && self.info_dialog.is_none()
-        {
-            self.info_dialog = Some(InfoDialog::new(
-                "Tool hotkey config errors",
-                &hotkey_warnings.join("\n"),
-            ));
+        if matches!(origin, ConfigRefreshOrigin::Interactive) {
+            self.show_key_config_errors(keybind_warnings);
         }
         // Interactive saves already dispatch `Action::SetTheme`; the theme is global-only.
         if matches!(origin, ConfigRefreshOrigin::Watcher) {
@@ -149,6 +143,15 @@ impl HomeView {
         if hide_snoozed_changed && self.hide_stopped_in_groups {
             self.rebuild_flat_items_keeping_cursor();
             self.update_selected();
+        }
+    }
+
+    /// Report tool hotkey and `[keybinds]` warnings unless another dialog is up.
+    pub(super) fn show_key_config_errors(&mut self, keybind_warnings: Vec<String>) {
+        let mut warnings = input::validate_tool_hotkeys(&self.tool_configs);
+        warnings.extend(keybind_warnings);
+        if !warnings.is_empty() && self.info_dialog.is_none() {
+            self.info_dialog = Some(InfoDialog::new("Key config errors", &warnings.join("\n")));
         }
     }
 
@@ -195,6 +198,13 @@ impl HomeView {
             );
         }
     }
+}
+
+/// Make the config's `[keybinds]` the active keymap, returning its warnings.
+pub(super) fn install_keybinds(config: &crate::session::Config) -> Vec<String> {
+    let (keymap, warnings) = super::keybinds::from_config(config);
+    super::keybinds::install(keymap);
+    warnings.iter().map(ToString::to_string).collect()
 }
 
 #[cfg(test)]
@@ -252,5 +262,36 @@ mod tests {
         std::fs::write(crate::session::config::config_path().unwrap(), "[session\n").unwrap();
         assert!(view.try_refresh_from_config_watcher().is_err());
         assert_eq!(view.sidebar_position, SidebarPosition::Right);
+    }
+
+    /// A bad `[keybinds]` entry is reported at startup and on interactive reloads, not
+    /// from the watcher. Only an invalid entry is used, so the installed keymap stays empty.
+    #[test]
+    #[serial]
+    fn bad_keybind_entries_surface_in_the_key_config_dialog() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        update_config(|config| {
+            config
+                .keybinds
+                .insert("bogus".to_string(), vec!["F2".to_string()]);
+        })
+        .unwrap();
+        save_profile_config("test", &Default::default()).unwrap();
+        let mut view = HomeView::new_for_test(
+            Some("test".to_string()),
+            AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        let message = |view: &HomeView| view.info_dialog.as_ref().map(|d| d.message().to_string());
+        let want = "[keybinds] bogus: unknown action; keeping the default keys";
+        assert_eq!(message(&view).as_deref(), Some(want));
+
+        view.info_dialog = None;
+        view.try_refresh_from_config_watcher().unwrap();
+        assert_eq!(message(&view), None);
+        view.refresh_from_config(ConfigRefreshOrigin::Interactive);
+        assert_eq!(message(&view).as_deref(), Some(want));
     }
 }

@@ -9,6 +9,7 @@ mod file_watch_tests;
 pub(crate) use icons::get_indent;
 mod icons;
 mod input;
+pub(crate) mod keybinds;
 mod last_prompt;
 mod layout;
 mod lifecycle;
