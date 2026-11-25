@@ -888,12 +888,14 @@ mod tests {
     }
 
     /// #5921: replacing the worker publishes cancellations and detaches for the retired one,
-    /// past the Retry's watermark. Neither the listener nor lag recovery lets them settle
-    /// `Starting`; the new worker's own frames, a background one included, still do.
+    /// past the Retry's watermark. Neither the listener, even while the install is still
+    /// publishing, nor lag recovery lets them settle `Starting`; the new worker's own frames, a
+    /// background one included, still do.
     #[tokio::test]
     #[serial_test::serial]
     async fn a_retry_starting_ignores_what_its_install_publishes_for_the_retired_worker() {
         use crate::acp::Event;
+        use crate::server::acp_events::retry_test_gate::RevertGate;
         use crate::session::Status::{Error, Starting};
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let project = tempfile::tempdir().unwrap();
@@ -936,6 +938,11 @@ mod tests {
             ),
             (
                 "orphaned-approval",
+                Some(approval.clone()),
+                Some(Event::startup_error("adapter exited")),
+            ),
+            (
+                "orphaned-approval-mid-install",
                 Some(approval),
                 Some(Event::startup_error("adapter exited")),
             ),
@@ -965,15 +972,64 @@ mod tests {
             .await
             .expect("listener subscribes");
             let mut changes = state.status_tx.subscribe();
-            let response = spawn_acp(State(state.clone()), Path(id.clone()), retry_request())
-                .await
-                .into_response();
+            let gate = (case == "orphaned-approval-mid-install")
+                .then(|| RevertGate::arm(&format!("{id}#retire")));
+            let mut launch = Box::pin(spawn_acp(
+                State(state.clone()),
+                Path(id.clone()),
+                retry_request(),
+            ));
+            let mid_install = gate.is_some();
+            if let Some((gate, parked)) = gate {
+                tokio::select! {
+                    response = &mut launch => panic!("{case}: launch ended before the gate: {}", response.into_response().status()),
+                    parked = tokio::time::timeout(std::time::Duration::from_secs(10), parked) => {
+                        parked.expect("the install reaches the gate").expect("gate open");
+                    }
+                }
+                assert_eq!(next_change(&mut changes).await, (Error, Starting), "{case}");
+                // Queued behind the cleanup frames, so its change proves the listener has
+                // handled them while the install had not yet recorded their cutoff.
+                let mut sentinel =
+                    crate::session::Instance::new("sentinel", project.path().to_str().unwrap());
+                sentinel.id = format!("{id}-sentinel");
+                sentinel.view = crate::session::View::Structured;
+                sentinel.source_profile = "default".into();
+                sentinel.status = crate::session::Status::Idle;
+                state.instances.write().await.push(sentinel.clone());
+                state
+                    .acp_events_tx
+                    .send(crate::acp::protocol::AcpBroadcastFrame {
+                        session_id: sentinel.id.clone(),
+                        seq: 1,
+                        event: Arc::new(Event::startup_error("sentinel")),
+                        worker_generation: None,
+                        sidebar_status: None,
+                    })
+                    .unwrap();
+                let change =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), changes.recv())
+                        .await
+                        .expect("a status change")
+                        .expect("status channel open");
+                assert_eq!(
+                    (change.instance_id.as_str(), change.new),
+                    (sentinel.id.as_str(), Error),
+                    "{case}: the retired worker's frames moved the row first"
+                );
+                assert_eq!(state.instances.read().await[0].status, Starting, "{case}");
+                assert_eq!(rolled_back(&state, &id), Some(false), "{case}");
+                gate.release();
+            }
+            let response = launch.await.into_response();
             assert!(
                 response.status().is_success(),
                 "{case}: {}",
                 response.status()
             );
-            assert_eq!(next_change(&mut changes).await, (Error, Starting), "{case}");
+            if !mid_install {
+                assert_eq!(next_change(&mut changes).await, (Error, Starting), "{case}");
+            }
             assert_eq!(
                 state.acp_supervisor.latest_seq(&id) > seq,
                 orphan.is_some(),

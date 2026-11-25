@@ -551,7 +551,13 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             let retired = state.acp_supervisor.retired_through(&inst.id);
             let rolled_back_failure = live_worker
                 && status_update.is_some_and(|(_, projected)| {
-                    take_rolled_back_retry(&state.retry_starting, &inst.id, frame.seq, projected)
+                    take_rolled_back_retry(
+                        &state.retry_starting,
+                        &inst.id,
+                        frame.seq,
+                        projected,
+                        retired,
+                    )
                 });
             if rolled_back_failure {
                 report_failure_after_rollback(inst, &state.status_tx);
@@ -789,7 +795,7 @@ pub(crate) struct RetryAttempt {
     /// The launch's epoch: once its worker is installed, the attempt can no longer roll back.
     epoch: u64,
     /// The attempt's launch failed and its rollback restored the Error. Kept until the new worker
-    /// reports past `watermark`, since its startup error can arrive after the rollback.
+    /// reports past its cutoff, since its startup error can arrive after the rollback.
     rolled_back: bool,
 }
 
@@ -883,10 +889,11 @@ fn take_rolled_back_retry(
     id: &str,
     seq: u64,
     projected: Status,
+    retired: Option<(u64, u64)>,
 ) -> bool {
     let mut owners = retry_starting.lock().unwrap_or_else(|e| e.into_inner());
     match owners.get(id) {
-        Some(owner) if owner.rolled_back && seq > owner.watermark => {
+        Some(owner) if owner.rolled_back && seq > owner.retired_through(retired) => {
             owners.remove(id);
             projected == Status::Error
         }
@@ -1279,7 +1286,13 @@ pub(super) async fn recover_structured_unread_after_lag(
             }
             let old_status = inst.status;
             let retired = service.acp_supervisor.retired_through(&id);
-            if take_rolled_back_retry(retry_starting, &inst.id, newest_status_seq, projected) {
+            if take_rolled_back_retry(
+                retry_starting,
+                &inst.id,
+                newest_status_seq,
+                projected,
+                retired,
+            ) {
                 report_failure_after_rollback(inst, status_tx);
             } else if !retired_before_retry(retry_starting, inst, newest_status_seq, retired) {
                 apply_status_intent(inst, StatusPolicy::Authoritative, projected, status_tx);
@@ -1481,8 +1494,8 @@ pub(crate) mod retry_test_gate {
 
     /// Test-only: parks a Retry for `id` until released: its rollback, before it takes
     /// `instances`; with `id#mode`, a spawn applying its mode to an installed worker; or with
-    /// `id#launched`, a spawn past both. Dropping the
-    /// gate releases a parked Retry.
+    /// `id#launched`, a spawn past both; with `id#retire`, an install between publishing for the
+    /// retired worker and its final cutoff. Dropping the gate releases a parked Retry.
     pub(crate) struct RevertGate {
         id: String,
         release: Option<oneshot::Sender<()>>,

@@ -673,6 +673,11 @@ impl<S: BroadcastSink> Supervisor<S> {
         // alive and whatever still has a transcript resumes instead (#4001).
         // Only the queries and their publishes belong before the drain; the
         // resume send is a real await, so it runs after `workers` is dropped.
+        // Fence the frames published below until their final cutoff is known.
+        // Nothing between the two inserts awaits outside tests; an await there
+        // would need a guard that writes the final cutoff on drop.
+        lock_recover(&self.retired_through)
+            .insert(session_id.to_string(), (lease.epoch(), u64::MAX));
         self.cancel_orphaned_requests(session_id);
         // Tasks follow the same split: an attached worker's tasks may still be
         // running, so their tailers resume; a replaced worker's are finished
@@ -690,6 +695,11 @@ impl<S: BroadcastSink> Supervisor<S> {
             self.detach_orphaned_background_agents(session_id);
             (Vec::new(), Vec::new())
         };
+        #[cfg(test)]
+        crate::server::acp_events::retry_test_gate::RevertGate::wait(&format!(
+            "{session_id}#retire"
+        ))
+        .await;
         lock_recover(&self.retired_through).insert(
             session_id.to_string(),
             (lease.epoch(), self.latest_seq(session_id)),
