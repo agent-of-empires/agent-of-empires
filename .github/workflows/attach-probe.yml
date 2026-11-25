@@ -1,0 +1,16 @@
+name: Attach probe (temporary)
+on: pull_request
+jobs:
+  probe:
+    if: github.head_ref == 'docs/record-pr-demo-attach'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh --version
+          echo 'R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==' | base64 -d > probe.gif
+          gh pr comment "${{ github.event.pull_request.number }}" -R "$GITHUB_REPOSITORY" --body "GITHUB_TOKEN attach probe, deleted before merge." --attach ./probe.gif

@@ -70,88 +70,48 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: e2e-recordings
+          name: e2e-media
           path: |
-            target/e2e-recordings/*.gif
-            target/e2e-recordings/*.cast
+            target/e2e-media/*.gif
+            target/e2e-media/*.cast
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Publish GIFs and comment on PR
+      - name: Attach GIFs to PR comments
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           shopt -s nullglob
-          gifs=(target/e2e-recordings/*.gif)
-
+          cd target/e2e-media
+          gifs=(*.gif)
           if [ ${#gifs[@]} -eq 0 ]; then
             echo "No GIF recordings found, skipping PR comment."
             exit 0
           fi
 
-          # Push GIFs to the e2e-recordings orphan branch so they are
-          # accessible via raw.githubusercontent.com and render inline.
-          RUN_DIR="run-${{ github.run_id }}"
-          REPO="${{ github.repository }}"
-          BRANCH="e2e-recordings"
+          # Replace this workflow's comments from earlier runs.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("## E2E Test Recordings"))) | .id' \
+            | while read -r id; do gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/comments/$id"; done
 
-          # Set up a temporary worktree for the orphan branch.
-          tmp=$(mktemp -d)
-          git clone --depth 1 --branch "$BRANCH" \
-            "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$tmp" 2>/dev/null \
-          || {
-            # Branch doesn't exist yet -- create an orphan.
-            git clone --depth 1 \
-              "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$tmp"
-            cd "$tmp"
-            git checkout --orphan "$BRANCH"
-            git rm -rf . > /dev/null 2>&1 || true
-            echo "# E2E Test Recordings" > README.md
-            echo "" >> README.md
-            echo "GIFs published by the E2E Recordings workflow. Each run-* directory" >> README.md
-            echo "corresponds to a GitHub Actions run." >> README.md
-            git add README.md
-            git commit -m "init: e2e-recordings branch"
-            cd -
-          }
-
-          # Copy GIFs into the run directory.
-          mkdir -p "$tmp/$RUN_DIR"
-          cp "${gifs[@]}" "$tmp/$RUN_DIR/"
-
-          cd "$tmp"
-          git add "$RUN_DIR"
-          git commit -m "recordings: PR #${{ github.event.pull_request.number }} (run ${{ github.run_id }})"
-          git push origin "$BRANCH"
-          cd -
-
-          # Build PR comment with inline GIF images.
-          RAW_BASE="https://raw.githubusercontent.com/${REPO}/${BRANCH}/${RUN_DIR}"
-          body="## E2E Test Recordings"$'\n\n'
-
-          for gif in "${gifs[@]}"; do
-            name=$(basename "$gif" .gif)
-            body+="### ${name}"$'\n\n'
-            body+="![${name}](${RAW_BASE}/${name}.gif)"$'\n\n'
+          # gh uploads at most 50 attachments per command.
+          for ((i = 0; i < ${#gifs[@]}; i += 50)); do
+            batch=("${gifs[@]:i:50}")
+            {
+              echo "## E2E Test Recordings ($((i / 50 + 1)))"
+              echo
+              for gif in "${batch[@]}"; do
+                echo "### ${gif%.gif}"
+                echo
+                echo "![${gif%.gif}](./$gif)"
+                echo
+              done
+              echo "*Raw recordings (.cast) are in the [e2e-media artifact]($RUN_URL).*"
+            } > body.md
+            args=()
+            for gif in "${batch[@]}"; do args+=(--attach "./$gif"); done
+            gh pr comment "$PR" -R "$GITHUB_REPOSITORY" --body-file body.md "${args[@]}"
           done
-
-          body+="---"$'\n'
-          body+="*Raw recordings (.cast) available in the [e2e-recordings artifact](${{ github.server_url }}/${REPO}/actions/runs/${{ github.run_id }}).*"
-
-          # Post or update the comment to avoid duplicates on re-runs.
-          existing=$(gh api \
-            "repos/${REPO}/issues/${{ github.event.pull_request.number }}/comments" \
-            --jq '.[] | select(.body | startswith("## E2E Test Recordings")) | .id' \
-            | head -1)
-
-          if [ -n "$existing" ]; then
-            gh api \
-              "repos/${REPO}/issues/comments/${existing}" \
-              -X PATCH \
-              -f body="$body"
-            echo "Updated existing PR comment ${existing}"
-          else
-            gh pr comment "${{ github.event.pull_request.number }}" --body "$body"
-            echo "Posted new PR comment"
-          fi
