@@ -158,6 +158,7 @@ pub(crate) fn fake_sandbox_pin(
             local_mounts: true,
             routing: Vec::new(),
             global_arguments: Vec::new(),
+            shared_root: None,
         },
         container_id: container_id.into(),
     };

@@ -1979,6 +1979,7 @@ else:
                 local_mounts: true,
                 routing: Vec::new(),
                 global_arguments: Vec::new(),
+                shared_root: None,
             },
             name: "aoe-attested-route".into(),
             id: "0123456789ab".into(),

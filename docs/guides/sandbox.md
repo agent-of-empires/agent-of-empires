@@ -79,7 +79,7 @@ Docker and Podman honor every run-policy option. Apple Container honors `cap_add
 | `~/.claude/sandbox-v2/.credentials.json` | `/root/.claude/.credentials.json` | RW |
 | `<app dir>/sandbox-hooks/<instance-id>/` | `/tmp/aoe-hooks/<instance-id>/` | RW |
 
-The hook directory is under the app directory, which is under your home directory, so a VM-backed runtime that shares only your home directory (Colima's default) can still deliver status and the conversation ID to AoE. A container created before AoE moved it keeps binding `/tmp/aoe-hooks-<euid>/<instance-id>/` until it is recreated; delete the sandbox, or rebuild it, to move it.
+The hook directory is under the app directory, which is under your home directory. Colima's default profile shares your home directory with its VM at the same path, so AoE reads the sandbox's store and hook directory there as host paths, and gets status and the conversation ID. AoE assumes that share only for a Colima socket at `~/.colima/<profile>/docker.sock` (or under `$COLIMA_HOME`) whose `colima.yaml` has no `mounts:` list; with a list of its own, Colima is treated as a remote runtime. A container created before AoE moved it keeps binding `/tmp/aoe-hooks-<euid>/<instance-id>/` until it is recreated; delete the sandbox, or rebuild it, to move it.
 
 ### Git config and hooks
 

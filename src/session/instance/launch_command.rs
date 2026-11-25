@@ -3514,98 +3514,108 @@ sandbox = "unsupported"
             eprintln!("skipping: jq not on PATH");
             return;
         }
-        let temp = tempfile::tempdir().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
-        let project = temp.path().join("project");
-        std::fs::create_dir_all(&project).unwrap();
-        let profile = "sandbox-sidecar-leaf";
-        super::super::test_helpers::declare_execution_aliases(
-            profile,
-            &[("claude", "claude")],
-            temp.path(),
-        );
-        let mut inst = Instance::new("claude-sidecar", project.to_str().unwrap());
-        inst.tool = "claude".into();
-        inst.command = "claude".into();
-        inst.source_profile = profile.into();
-        inst.sandbox_info = Some(crate::session::SandboxInfo {
-            provider: None,
-            enabled: true,
-            container_id: None,
-            image: "fixture".into(),
-            container_name: "claude-sidecar".into(),
-            extra_env: None,
-            custom_instruction: None,
-            container_workdir: Some("/workspace/project".into()),
-            before_start_env: Vec::new(),
-            before_start_hook_env: Vec::new(),
-        });
-        let config = inst.build_container_config_for_test().unwrap();
-        let _transport = super::super::test_helpers::install_container_transport(
-            temp.path(),
-            "claude-sidecar",
-            &config.volumes,
-        );
-        std::fs::copy(
-            temp.path().join("native-bin/prime-agent"),
-            temp.path().join("native-bin/claude"),
-        )
-        .unwrap();
-        let execution = inst.resolve_native_execution(None).unwrap();
-        let source = execution
-            .routing
-            .iter()
-            .find(|(key, _)| key == crate::hooks::SESSION_SOURCE_ENV)
-            .and_then(|(_, value)| value.clone())
-            .expect("a sandboxed launch exports its source");
-        let active = super::super::execution::ActiveExecution {
-            launch_id: execution.inputs.launch_id.clone(),
-            binding: execution.binding.clone(),
-            capture: execution.capture.clone(),
-            container: execution.inputs.container.clone(),
-        };
-        let mounted = config
-            .volumes
-            .iter()
-            .find(|mount| {
-                mount
-                    .container_path
-                    .starts_with(crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER)
-            })
-            .expect("hook dir is bind-mounted");
-        let host_base = std::path::Path::new(&mounted.host_path).parent().unwrap();
-        let writer = crate::hooks::hook_command_session_id(
-            crate::hooks::HookInstallTarget::Sandbox,
-            crate::agents::HookIdentityField::SessionId,
-            None,
-        )
-        .replace(
-            crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER,
-            host_base.to_str().unwrap(),
-        );
-        let minted = "22222222-2222-4222-8222-222222222222";
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", &writer])
-            .env("AOE_INSTANCE_ID", &inst.id)
-            .env(crate::hooks::SESSION_SOURCE_ENV, &source)
-            .env_remove("AOE_AGENT_BIN")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
+        for runtime in ["colima", "local"] {
+            let temp = tempfile::tempdir().unwrap();
+            // Test hook bases sit in /tmp; a real one is under the app dir, inside HOME.
+            let _hooks = (runtime == "colima").then(|| {
+                crate::hooks::test_support::BaseGuard::with_base(temp.path().join("aoe-hooks"))
+            });
+            let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+            let project = temp.path().join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            let profile = "sandbox-sidecar-leaf";
+            super::super::test_helpers::declare_execution_aliases(
+                profile,
+                &[("claude", "claude")],
+                temp.path(),
+            );
+            let mut inst = Instance::new("claude-sidecar", project.to_str().unwrap());
+            inst.tool = "claude".into();
+            inst.command = "claude".into();
+            inst.source_profile = profile.into();
+            inst.sandbox_info = Some(crate::session::SandboxInfo {
+                provider: None,
+                enabled: true,
+                container_id: None,
+                image: "fixture".into(),
+                container_name: "claude-sidecar".into(),
+                extra_env: None,
+                custom_instruction: None,
+                container_workdir: Some("/workspace/project".into()),
+                before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
+            });
+            let config = inst.build_container_config_for_test().unwrap();
+            let _transport = super::super::test_helpers::install_container_transport(
+                temp.path(),
+                "claude-sidecar",
+                &config.volumes,
+            );
+            // Under Colima the hook dir reaches AoE only through the home share.
+            let _colima = (runtime == "colima")
+                .then(|| super::super::test_helpers::route_through_colima(temp.path()));
+            std::fs::copy(
+                temp.path().join("native-bin/prime-agent"),
+                temp.path().join("native-bin/claude"),
+            )
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(format!(r#"{{"session_id":"{minted}"}}"#).as_bytes())
-            .unwrap();
-        assert!(child.wait().unwrap().success());
-        let observed =
-            super::super::execution::hook_session_observation(&inst.id, Some(&active), None);
-        assert_eq!(
-            observed.map(|observation| observation.sid).as_deref(),
-            Some(minted)
-        );
-        crate::hooks::cleanup_hook_status_dir(&inst.id);
+            let execution = inst.resolve_native_execution(None).unwrap();
+            let source = execution
+                .routing
+                .iter()
+                .find(|(key, _)| key == crate::hooks::SESSION_SOURCE_ENV)
+                .and_then(|(_, value)| value.clone())
+                .expect("a sandboxed launch exports its source");
+            let active = super::super::execution::ActiveExecution {
+                launch_id: execution.inputs.launch_id.clone(),
+                binding: execution.binding.clone(),
+                capture: execution.capture.clone(),
+                container: execution.inputs.container.clone(),
+            };
+            let mounted = config
+                .volumes
+                .iter()
+                .find(|mount| {
+                    mount
+                        .container_path
+                        .starts_with(crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER)
+                })
+                .expect("hook dir is bind-mounted");
+            let host_base = std::path::Path::new(&mounted.host_path).parent().unwrap();
+            let writer = crate::hooks::hook_command_session_id(
+                crate::hooks::HookInstallTarget::Sandbox,
+                crate::agents::HookIdentityField::SessionId,
+                None,
+            )
+            .replace(
+                crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER,
+                host_base.to_str().unwrap(),
+            );
+            let minted = "22222222-2222-4222-8222-222222222222";
+            let mut child = std::process::Command::new("sh")
+                .args(["-c", &writer])
+                .env("AOE_INSTANCE_ID", &inst.id)
+                .env(crate::hooks::SESSION_SOURCE_ENV, &source)
+                .env_remove("AOE_AGENT_BIN")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(format!(r#"{{"session_id":"{minted}"}}"#).as_bytes())
+                .unwrap();
+            assert!(child.wait().unwrap().success());
+            let observed =
+                super::super::execution::hook_session_observation(&inst.id, Some(&active), None);
+            assert_eq!(
+                observed.map(|observation| observation.sid).as_deref(),
+                Some(minted),
+                "{runtime}"
+            );
+            crate::hooks::cleanup_hook_status_dir(&inst.id);
+        }
     }
 
     #[test]
@@ -3682,7 +3692,14 @@ sandbox = "unsupported"
                 "/workspace/project",
             ))
             .join(format!("{sid}.jsonl"));
-        for (written, want) in [(false, "--session-id"), (true, "--resume")] {
+        // (runtime, transcript written, flag). Colima's home share makes its store a host path.
+        for (runtime, written, want) in [
+            ("colima", false, "--session-id"),
+            ("local", false, "--session-id"),
+            ("local", true, "--resume"),
+        ] {
+            let _colima = (runtime == "colima")
+                .then(|| super::super::test_helpers::route_through_colima(temp.path()));
             if written {
                 std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
                 std::fs::write(&transcript, "").unwrap();
@@ -3700,9 +3717,13 @@ sandbox = "unsupported"
             let command = carried.command.unwrap();
             assert!(
                 command.contains(&format!("{want} {sid}")),
-                "{written}: {command}"
+                "{runtime} {written}: {command}"
             );
-            assert_eq!(inst.agent_session_id.as_deref(), Some(sid), "{written}");
+            assert_eq!(
+                inst.agent_session_id.as_deref(),
+                Some(sid),
+                "{runtime} {written}"
+            );
         }
     }
 

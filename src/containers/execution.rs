@@ -16,6 +16,10 @@ pub(crate) struct RuntimeExecutionSnapshot {
     /// Frozen transport flags for the inspected Docker endpoint.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) global_arguments: Vec<String>,
+    /// The one host directory a VM runtime shares at the same path, when `local_mounts` is
+    /// false. Mapped paths that stay under it are host paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) shared_root: Option<std::path::PathBuf>,
 }
 
 const RUNTIME_ROUTING_KEYS: &[&str] = &[
@@ -38,6 +42,7 @@ const RUNTIME_ROUTING_KEYS: &[&str] = &[
     "CONTAINERS_CONF_MODULES",
     "CONTAINERS_STORAGE_CONF",
     "SSH_AUTH_SOCK",
+    "COLIMA_HOME",
 ];
 
 impl RuntimeExecutionSnapshot {
@@ -190,6 +195,7 @@ impl RuntimeExecutionSnapshot {
             local_mounts: false,
             routing,
             global_arguments: Vec::new(),
+            shared_root: None,
         };
         match snapshot.kind {
             Name::Docker => {
@@ -281,6 +287,20 @@ impl RuntimeExecutionSnapshot {
                                         })
                                 })
                         });
+                if !snapshot.local_mounts {
+                    let shared = snapshot
+                        .endpoint
+                        .strip_prefix("unix://")
+                        .zip(snapshot.value("HOME"))
+                        .and_then(|(socket, home)| {
+                            colima_shared_root(
+                                std::path::Path::new(socket),
+                                std::path::Path::new(home),
+                                snapshot.value("COLIMA_HOME").map(std::path::Path::new),
+                            )
+                        });
+                    snapshot.shared_root = shared;
+                }
             }
             Name::Podman => {
                 let remote = snapshot
@@ -577,20 +597,35 @@ impl ContainerExecutionSnapshot {
         )
     }
 
+    /// Whether a mapped path is one the host sees: any path on a local runtime, and under a
+    /// shared root only a path that stays inside it once symlinks resolve, since the VM
+    /// resolves a link that leaves the share in its own filesystem.
+    fn on_host(&self, mapped: &std::path::Path) -> bool {
+        if self.runtime.local_mounts {
+            return true;
+        }
+        let Some(root) = self.runtime.shared_root.as_deref() else {
+            return false;
+        };
+        let lexical = crate::git::template::lexical_normalize(mapped);
+        lexical.starts_with(root)
+            && canonical_prefix(&lexical)
+                .zip(std::fs::canonicalize(root).ok())
+                .is_some_and(|(path, root)| path.starts_with(root))
+    }
+
     pub(crate) fn host_path(
         &self,
         path: &std::path::Path,
         writable: bool,
     ) -> Option<std::path::PathBuf> {
-        if !self.runtime.local_mounts {
-            return None;
-        }
         self.mapped_path(path, writable)
+            .filter(|mapped| self.on_host(mapped))
     }
 
     pub(crate) fn physical_path(&self, path: &std::path::Path) -> (String, std::path::PathBuf) {
         if let Some(mapped) = self.mapped_path(path, true) {
-            if self.runtime.local_mounts {
+            if self.on_host(&mapped) {
                 let canonical = std::fs::canonicalize(&mapped)
                     .unwrap_or_else(|_| crate::git::template::lexical_normalize(&mapped));
                 return ("host".into(), canonical);
@@ -610,6 +645,58 @@ impl ContainerExecutionSnapshot {
     }
 }
 
+/// `path` with its deepest existing ancestor canonicalized, so a path not created yet still
+/// resolves the links above it.
+fn canonical_prefix(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    path.ancestors().find_map(|ancestor| {
+        let canonical = std::fs::canonicalize(ancestor).ok()?;
+        Some(canonical.join(path.strip_prefix(ancestor).ok()?))
+    })
+}
+
+/// The home directory a Colima VM shares at the same path, when `socket` is a profile's
+/// `<colima home>/<profile>/docker.sock` and that profile keeps Colima's default mounts. A
+/// missing config proves nothing, so it gives `None`.
+fn colima_shared_root(
+    socket: &std::path::Path,
+    home: &std::path::Path,
+    colima_home: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    let base = colima_home.map_or_else(|| home.join(".colima"), std::path::Path::to_path_buf);
+    let mut parts = socket.strip_prefix(&base).ok()?.components();
+    let (Some(Component::Normal(profile)), Some(Component::Normal(file)), None) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    if file != "docker.sock" {
+        return None;
+    }
+    let config = std::fs::read_to_string(base.join(profile).join("colima.yaml")).ok()?;
+    colima_default_mounts(&config).then(|| home.to_path_buf())
+}
+
+/// Whether a `colima.yaml` keeps the default mounts (no `mounts:` key, or an empty one). Any
+/// list replaces the home share. A line scan, as there is no YAML parser here.
+fn colima_default_mounts(config: &str) -> bool {
+    let mut lines = config.lines();
+    while let Some(line) = lines.next() {
+        let Some(value) = line.strip_prefix("mounts:") else {
+            continue;
+        };
+        let value = value.split('#').next().unwrap_or_default().trim();
+        if !value.is_empty() {
+            return value == "[]";
+        }
+        return !lines
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .is_some_and(|line| line.starts_with('-'));
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,6 +713,7 @@ mod tests {
                 local_mounts,
                 routing: Vec::new(),
                 global_arguments: Vec::new(),
+                shared_root: None,
             },
             name: "aoe-test".into(),
             id: "container-id".into(),
@@ -661,6 +749,119 @@ mod tests {
             snapshot(true).physical_path(std::path::Path::new("/unmapped/file.txt"));
         assert!(domain.starts_with("container:"));
         assert_eq!(path, std::path::PathBuf::from("/unmapped/file.txt"));
+    }
+
+    /// Colima's profile socket is trusted only with the default mounts, which share `$HOME` at
+    /// the same path; any other socket or config proves nothing.
+    #[test]
+    fn colima_shared_root_trusts_only_the_default_home_share() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let elsewhere = temp.path().join("ch");
+        let profile = |base: &std::path::Path, name: &str, yaml: Option<&str>| {
+            let dir = base.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            if let Some(yaml) = yaml {
+                std::fs::write(dir.join("colima.yaml"), yaml).unwrap();
+            }
+            dir.join("docker.sock")
+        };
+        let colima = home.join(".colima");
+        let shared = Some(home.clone());
+        // (case, socket, COLIMA_HOME, expected)
+        for (case, socket, colima_home, want) in [
+            (
+                "default-empty-mounts",
+                profile(&colima, "default", Some("cpu: 2\nmounts: [] # none\n")),
+                None,
+                shared.clone(),
+            ),
+            (
+                "default-no-mounts-key",
+                profile(&colima, "nokey", Some("cpu: 2\nvmType: vz\n")),
+                None,
+                shared.clone(),
+            ),
+            (
+                "custom-mounts-list",
+                profile(
+                    &colima,
+                    "listed",
+                    Some("mounts:\n  # mine\n  - location: ~/work\n    writable: true\n"),
+                ),
+                None,
+                None,
+            ),
+            (
+                "custom-mounts-inline",
+                profile(
+                    &colima,
+                    "inline",
+                    Some("mounts: [{location: /Volumes/x}]\n"),
+                ),
+                None,
+                None,
+            ),
+            ("no-yaml", profile(&colima, "bare", None), None, None),
+            (
+                "named-profile",
+                profile(&colima, "work", Some("mounts: []\n")),
+                None,
+                shared.clone(),
+            ),
+            (
+                "colima-home",
+                profile(&elsewhere, "default", Some("mounts: []\n")),
+                Some(elsewhere.as_path()),
+                shared.clone(),
+            ),
+            (
+                "colima-home-elsewhere",
+                profile(&colima, "default", Some("mounts: []\n")),
+                Some(elsewhere.as_path()),
+                None,
+            ),
+            (
+                "nested",
+                profile(&colima.join("default"), "x", Some("mounts: []\n")),
+                None,
+                None,
+            ),
+            ("other-socket", temp.path().join("docker.sock"), None, None),
+        ] {
+            assert_eq!(
+                colima_shared_root(&socket, &home, colima_home),
+                want,
+                "{case}"
+            );
+        }
+    }
+
+    /// Under a shared root, a mapped path is a host path only while it stays inside the root,
+    /// both as written and once its links resolve.
+    #[test]
+    fn a_colima_share_maps_only_paths_under_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(home.join("store")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, home.join("link")).unwrap();
+        // (case, bind source, shared root, is a host path)
+        for (case, source, shared, host) in [
+            ("under-home", home.join("store"), Some(home.clone()), true),
+            ("outside-home", outside.clone(), Some(home.clone()), false),
+            ("symlink-out", home.join("link"), Some(home.clone()), false),
+            ("no-share", home.join("store"), None, false),
+        ] {
+            let mut snapshot = snapshot(false);
+            snapshot.runtime.shared_root = shared;
+            snapshot.mounts[0].host_path = source.to_string_lossy().into_owned();
+            let target = std::path::Path::new("/workspace/project/file");
+            let (domain, _) = snapshot.physical_path(target);
+            assert_eq!(domain == "host", host, "{case}: {domain}");
+            assert_eq!(snapshot.host_path(target, true).is_some(), host, "{case}");
+        }
     }
 
     /// A fake `docker` binary plus a hermetic environment let `capture`

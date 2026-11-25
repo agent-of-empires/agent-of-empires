@@ -210,6 +210,24 @@ if (args[0] === "container" && args[1] === "inspect" && args.at(-1) === fixture.
     ])
 }
 
+/// Routes [`install_container_transport`] through a Colima default-profile socket with `root`
+/// as `$HOME`, so the runtime isn't local and only paths under `root` are host paths.
+pub(super) fn route_through_colima(
+    root: &std::path::Path,
+) -> crate::session::test_support::EnvGuard {
+    let colima = root.join("colima");
+    std::fs::create_dir_all(colima.join("default")).unwrap();
+    std::fs::write(colima.join("default/colima.yaml"), "mounts: []\n").unwrap();
+    crate::session::test_support::EnvGuard::set(&[
+        (
+            "DOCKER_HOST",
+            std::path::PathBuf::from(format!("unix://{}/default/docker.sock", colima.display())),
+        ),
+        ("COLIMA_HOME", colima),
+    ])
+    .and_set("HOME", root)
+}
+
 pub(super) fn write_sidecar(instance_id: &str, sid: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let base = crate::hooks::hook_base_path();
