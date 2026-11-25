@@ -4685,17 +4685,20 @@ impl HomeView {
 
             // New session: while a committed search claims a New chord for cycling, advertise
             // one it leaves free, else new-from-selection (Shift+N by default), which still
-            // creates (#3038).
+            // creates (#3038) but only from a selected session or group.
             let new_key = |id| {
                 let shadow = committed_search.then_some(ActionId::SearchNext);
                 super::bindings::key_event_unshadowed(id, shadow, strict)
             };
-            let (click, key) = new_key(ActionId::NewSession)
-                .or_else(|| new_key(ActionId::NewFromSelection))
-                .map_or((None, String::new()), |(event, label)| {
-                    (Some(event), label.replace("Ctrl+", "^"))
-                });
-            groups.push((1, click, mk(&key, "New")));
+            let has_selection = self.selected_session.is_some() || self.selected_group.is_some();
+            let new = new_key(ActionId::NewSession).or_else(|| {
+                has_selection
+                    .then(|| new_key(ActionId::NewFromSelection))
+                    .flatten()
+            });
+            if let Some((event, label)) = new {
+                groups.push((1, Some(event), mk(&label.replace("Ctrl+", "^"), "New")));
+            }
 
             // Priority 1 is the core daily workflow (new, message, the web dashboard), which
             // survives the greedy pack at ~80 cols; del stays at p3 and can drop first.

@@ -784,7 +784,7 @@ fn send_message_keeps_buffered_paste_per_session() {
 }
 
 /// `[keybinds]` moves activation off Enter and Tab: the override attaches, the footer
-/// button sends it, the preview hint names it, and the freed keys do nothing.
+/// button sends it, and the freed keys do nothing.
 #[test]
 #[serial]
 fn activation_follows_keybind_overrides() {
@@ -808,23 +808,11 @@ fn activation_follows_keybind_overrides() {
     env.view.update_selected();
 
     let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
-    env.view
-        .mutate_instance(&id, |inst| inst.status = Status::Stopped);
     let theme = crate::tui::styles::load_theme("empire");
     let mut terminal = Terminal::new(TestBackend::new(200, 12)).unwrap();
     terminal
         .draw(|f| env.view.render(f, f.area(), &theme, None))
         .unwrap();
-    let screen: String = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(|c| c.symbol())
-        .collect();
-    assert!(screen.contains("Press Ctrl+Enter"), "{screen}");
-    env.view
-        .mutate_instance(&id, |inst| inst.status = Status::Idle);
     let buttons: Vec<KeyEvent> = env.view.footer_buttons.iter().map(|(k, _)| *k).collect();
     assert!(buttons.contains(&ctrl_enter), "{buttons:?}");
     assert!(
@@ -838,4 +826,72 @@ fn activation_follows_keybind_overrides() {
         env.view.handle_key(ctrl_enter, None),
         Some(Action::AttachSession(id))
     );
+}
+
+/// The stopped and structured previews name the effective activation key, and drop the
+/// prompt when activation is unbound.
+#[test]
+#[serial]
+fn preview_hints_name_the_activation_key() {
+    use crate::tui::home::keybinds;
+    use ratatui::{backend::TestBackend, Terminal};
+    let cases: [(&[&str], Option<&str>); 3] = [
+        (&["Enter"], Some("Press Enter")),
+        (&["C-Enter"], Some("Press Ctrl+Enter")),
+        (&[], None),
+    ];
+    for (keys, want) in cases {
+        for structured in [false, true] {
+            let mut env = create_test_env_empty();
+            let config = crate::session::Config {
+                keybinds: [(
+                    "activate".to_string(),
+                    keys.iter().map(|k| k.to_string()).collect(),
+                )]
+                .into(),
+                ..Default::default()
+            };
+            let (keymap, warnings) = keybinds::from_config(&config);
+            assert!(warnings.is_empty(), "{warnings:?}");
+            keybinds::install(keymap);
+            let id = add_session(&mut env.view, "session-one");
+            env.view.mutate_instance(&id, |inst| {
+                if structured {
+                    inst.view = crate::session::View::Structured;
+                } else {
+                    inst.status = Status::Stopped;
+                }
+            });
+            env.view.flat_items = env.view.build_flat_items();
+            env.view.cursor = 0;
+            env.view.update_selected();
+            let theme = crate::tui::styles::load_theme("empire");
+            let mut terminal = Terminal::new(TestBackend::new(200, 12)).unwrap();
+            terminal
+                .draw(|f| env.view.render(f, f.area(), &theme, None))
+                .unwrap();
+            let screen: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            let tail = if structured {
+                " to open the transcript."
+            } else {
+                " to start it."
+            };
+            match want {
+                Some(press) => assert!(
+                    screen.contains(&format!("{press}{tail}")),
+                    "{keys:?} structured={structured}\n{screen}"
+                ),
+                None => assert!(
+                    !screen.contains(tail),
+                    "{keys:?} structured={structured}\n{screen}"
+                ),
+            }
+        }
+    }
 }

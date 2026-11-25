@@ -371,3 +371,33 @@ fn committed_search_footer_follows_keybind_overrides() {
         assert!(env.view.new_dialog.is_some(), "{next:?}: New opened");
     }
 }
+
+/// With new-session unbound, New falls back to new-from-selection only while a session or
+/// group is selected, since that action creates nothing without one.
+#[test]
+#[serial]
+fn new_button_falls_back_only_with_a_selection() {
+    use crate::tui::home::keybinds;
+    for sessions in [0, 3] {
+        let mut env = if sessions == 0 {
+            create_test_env_empty()
+        } else {
+            create_test_env_with_sessions(sessions)
+        };
+        let config = crate::session::Config {
+            keybinds: [("new-session".to_string(), vec![])].into(),
+            ..Default::default()
+        };
+        let (keymap, warnings) = keybinds::from_config(&config);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        keybinds::install(keymap);
+        render_at(&mut env, 200, 12);
+        let selected = env.view.selected_session.is_some() || env.view.selected_group.is_some();
+        assert_eq!(selected, sessions > 0, "fixture selection");
+        assert_eq!(
+            button_key(&env, KeyCode::Char('N')).is_some(),
+            selected,
+            "{sessions} sessions"
+        );
+    }
+}
