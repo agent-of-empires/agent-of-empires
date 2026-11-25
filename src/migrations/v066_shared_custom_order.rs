@@ -59,7 +59,7 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
     if pass == Pass::Recovery && pending.is_none() {
         return Ok(());
     }
-    let mut placed: Vec<(u64, String, String)> = Vec::new();
+    let mut placed: Vec<(u64, Option<Timestamp>, String)> = Vec::new();
     let mut live: Vec<LiveRow> = Vec::new();
     let mut to_strip: Vec<(std::path::PathBuf, String)> = Vec::new();
     let mut skipped = false;
@@ -85,12 +85,7 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
             };
             let workspace = workspace_id(row);
             if let Some(index) = row.get("sort_index").and_then(Value::as_u64) {
-                let created = row
-                    .get("created_at")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                placed.push((index, created, workspace.clone()));
+                placed.push((index, time("created_at"), workspace.clone()));
             }
             live.push(LiveRow {
                 workspace,
@@ -368,6 +363,9 @@ mod tests {
                  "worktree_info": {"main_repo_path": "/r/two/", "branch": "feat"}},
                 {"id": "c", "project_path": "/r/three", "created_at": "2026-01-03T00:00:00Z"},
                 {"id": "d", "project_path": "/r/four", "sort_index": 0, "archived_at": "2026-01-04T00:00:00Z"},
+                // Tied, so the later instant leads, though its text sorts first.
+                {"id": "e", "project_path": "/r/five", "sort_index": 2, "created_at": "2026-01-01T05:00:00+05:00"},
+                {"id": "f", "project_path": "/r/six", "sort_index": 2, "created_at": "2026-01-01T01:00:00Z"},
             ]),
         );
         fs::write(
@@ -379,7 +377,15 @@ mod tests {
         run_in(dir.path(), Pass::Upgrade).unwrap();
 
         let ordering = ordering(dir.path());
-        assert_eq!(ordering.order, ["/r/two::feat", "/r/one::__session__::a"]);
+        assert_eq!(
+            ordering.order,
+            [
+                "/r/two::feat",
+                "/r/one::__session__::a",
+                "/r/six::__session__::f",
+                "/r/five::__session__::e",
+            ]
+        );
         assert_eq!(ordering.repositories, ["/r/two", "/r/one"]);
         let rows = fs::read_to_string(dir.path().join("profiles/main/sessions.json")).unwrap();
         assert!(!rows.contains("sort_index"));
