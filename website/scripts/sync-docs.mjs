@@ -414,9 +414,13 @@ for (const page of PAGES) {
   mkdirSync(dirname(destPath), { recursive: true });
   writeFileSync(destPath, frontmatter + content);
 
-  const mdContent = content.replace(/\]\((\/[^)#\s]*)/g, (m, url) =>
-    MD_URL_MAP[url] ? `](${MD_URL_MAP[url]}` : m,
-  );
+  const mdContent = content
+    .replace(/\]\((\/[^)#\s]*)/g, (m, url) =>
+      MD_URL_MAP[url] ? `](${MD_URL_MAP[url]}` : m,
+    )
+    .replace(/href="(\/[^"#]*)/g, (m, url) =>
+      MD_URL_MAP[url] ? `href="${MD_URL_MAP[url]}` : m,
+    );
   const markdown = `# ${page.title}\n\n${mdContent.trim()}\n`;
   const publicPath = join(PUBLIC_DIR, page.dest);
   mkdirSync(dirname(publicPath), { recursive: true });
