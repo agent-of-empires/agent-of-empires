@@ -67,6 +67,7 @@ jobs:
         run: cargo test --features e2e-tests --test e2e -- --nocapture
 
       - name: Upload recordings as artifact
+        id: upload
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -83,17 +84,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
         run: |
           shopt -s nullglob
           gifs=(target/e2e-media/*.gif)
-          if [ ${#gifs[@]} -eq 0 ]; then
-            echo "No GIF recordings found, skipping PR comment."
+          if [ ${#gifs[@]} -eq 0 ] || [ -z "$ARTIFACT_URL" ]; then
+            echo "No uploaded GIF recordings, skipping PR comment."
             exit 0
           fi
 
           body="## E2E Test Recordings"$'\n\n'
-          body+="${#gifs[@]} GIFs and their .cast files are in the [e2e-media artifact]($RUN_URL) for 30 days."
+          body+="GIFs and .cast files for ${#gifs[@]} tests: [e2e-media artifact]($ARTIFACT_URL), kept 30 days."
 
           existing=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
             --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("## E2E Test Recordings"))) | .id' \

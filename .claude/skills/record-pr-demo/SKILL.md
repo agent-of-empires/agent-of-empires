@@ -75,7 +75,7 @@ Read every contact sheet it prints. Done when each clip visibly shows its behavi
 
 Posting is outward-facing: confirm with the user before this step.
 
-Write the comment to `<out-dir>/body.md`, referencing each clip by relative path, and post it with one `--attach` per clip (gh 2.99 or later):
+Write the comment to `<out-dir>/body.md`, referencing each clip by relative path, and post it with one `--attach` per clip (gh 2.103 or later):
 
 ```md
 **Demo** (real Chromium, debug `aoe serve` at <sha>, real tmux sessions)
