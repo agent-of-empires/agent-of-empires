@@ -2620,6 +2620,7 @@ impl HomeView {
                 theme,
                 compact,
                 false,
+                &super::bindings::label(ActionId::Activate, self.strict_hotkeys),
             );
         }
         frame.buffer_mut().set_style(
@@ -3784,6 +3785,7 @@ impl HomeView {
                             theme,
                             compact,
                             show_info,
+                            &super::bindings::label(ActionId::Activate, self.strict_hotkeys),
                         );
                     }
                 } else {
@@ -3842,6 +3844,7 @@ impl HomeView {
                             theme,
                             compact,
                             show_info,
+                            &super::bindings::label(ActionId::Activate, self.strict_hotkeys),
                         );
                     }
                 } else {
