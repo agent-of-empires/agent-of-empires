@@ -48,9 +48,9 @@ test.describe("Side panel defaults", () => {
   test("Sessions start closed, a closed Diff shows its count, and viewing saves nothing", async ({ page }) => {
     await boot(page);
     await clickSidebarSession(page, "alpha");
-    const diffToggle = page.getByTestId("pane-toggle-diff");
-    await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
-    await expect(page.getByTestId("pane-badge-diff")).toHaveText("2");
+    const panelToggle = page.getByTestId("right-dock-toggle");
+    await expect(panelToggle).toHaveAttribute("aria-pressed", "false");
+    await expect(page.getByTestId("right-dock-badge")).toHaveText("2");
     await expect(dockTabs(page)).toHaveCount(0);
     await clickSidebarSession(page, "beta");
     await expect(page).toHaveURL(/\/session\/beta$/);
@@ -59,23 +59,24 @@ test.describe("Side panel defaults", () => {
 
   test("turning a default on reaches Sessions already viewed", async ({ page }) => {
     const defaults = await boot(page);
-    const diffToggle = page.getByTestId("pane-toggle-diff");
+    const panelToggle = page.getByTestId("right-dock-toggle");
     await clickSidebarSession(page, "alpha");
-    await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
+    await expect(panelToggle).toHaveAttribute("aria-pressed", "false");
 
     defaults.auto_open_diff_pane = true;
     await page.reload();
-    await expect(diffToggle).toHaveAttribute("aria-pressed", "true");
-    await expect(page.getByTestId("pane-badge-diff")).toHaveCount(0);
+    await expect(panelToggle).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("pane-tab-diff")).toBeVisible();
+    await expect(page.getByTestId("right-dock-badge")).toHaveCount(0);
     await clickSidebarSession(page, "beta");
     await expect(page).toHaveURL(/\/session\/beta$/);
-    await expect(diffToggle).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("pane-tab-diff")).toBeVisible();
   });
 
   test("a layout the user changed survives reload while the others follow the default", async ({ page }) => {
     await boot(page);
     await clickSidebarSession(page, "alpha");
-    await page.getByTestId("pane-toggle-diff").click();
+    await page.getByTestId("right-dock-toggle").click();
     await page.getByTestId("pane-toggle-terminal").click();
     await expect(page.getByTestId("pane-tab-terminal:alpha:0")).toBeVisible();
     await page.reload();

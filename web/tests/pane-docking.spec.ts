@@ -48,25 +48,34 @@ async function tabCenter(page: Page, id: string): Promise<{ x: number; y: number
 }
 
 test.describe("Dockable pane system", () => {
-  test("the activity bar toggles the built-in panes and the new-terminal button adds a closable tab", async ({
+  test("the header toggles the review panel and terminal, the pane menu toggles panes, and the new-terminal button adds a closable tab", async ({
     page,
   }) => {
     await openSession(page);
     await page.goto(`/session/${SESSION}`);
 
-    const diffToggle = page.locator('[data-testid="pane-toggle-diff"]');
-    const termToggle = page.locator('[data-testid="pane-toggle-terminal"]');
-    await expect(diffToggle).toHaveAttribute("aria-pressed", "true");
+    const panelToggle = page.getByTestId("right-dock-toggle");
+    const termToggle = page.getByTestId("pane-toggle-terminal");
+    await expect(panelToggle).toHaveAttribute("aria-pressed", "true");
     await expect(termToggle).toHaveAttribute("aria-pressed", "true");
 
-    // Panes toggle independently.
-    await diffToggle.click();
-    await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
+    // The pane menu checks open panes and toggles them independently of the terminal.
+    await page.getByTestId("pane-menu-toggle").click();
+    await expect(page.getByTestId("pane-toggle-diff")).toHaveAttribute("aria-checked", "true");
+    await expect(page.getByTestId("pane-toggle-files")).toHaveAttribute("aria-checked", "false");
+    await page.getByTestId("pane-toggle-files").click();
+    await expect(page.getByTestId("pane-tab-files")).toBeVisible();
+    await page.getByTestId("pane-menu-toggle").click();
+    await page.getByTestId("pane-toggle-diff").click();
+    await expect(page.getByTestId("pane-tab-diff")).toHaveCount(0);
     await expect(termToggle).toHaveAttribute("aria-pressed", "true");
-    await expect(page.getByLabel("Move diff to bottom dock")).toHaveCount(0);
 
-    await diffToggle.click();
-    await expect(diffToggle).toHaveAttribute("aria-pressed", "true");
+    // The header toggle hides and restores the whole review panel, keeping its panes.
+    await panelToggle.click();
+    await expect(panelToggle).toHaveAttribute("aria-pressed", "false");
+    await expect(page.getByTestId("pane-tab-files")).toHaveCount(0);
+    await panelToggle.click();
+    await expect(page.getByTestId("pane-tab-files")).toBeVisible();
 
     // The new-terminal button opens a second terminal tab that can be closed.
     await expect(page.getByTestId("pane-tab-terminal:pinch-test:1")).toHaveCount(0);
@@ -128,8 +137,9 @@ test.describe("Dockable pane system", () => {
 
     await page.goto(`/session/${SESSION}`);
 
-    // Plugin panes get a toggle but open only on demand (`autoOpenPluginPanes` defaults off).
+    // Plugin panes get a pane-menu entry but open only on demand (`autoOpenPluginPanes` defaults off).
     const paneId = "plugin:acme.demo:demo_pane";
+    await page.getByTestId("pane-menu-toggle").click();
     await expect(page.locator(`[data-testid="pane-toggle-${paneId}"]`)).toBeVisible();
     await expect(page.getByTestId(`pane-tab-${paneId}`)).toHaveCount(0);
     await page.locator(`[data-testid="pane-toggle-${paneId}"]`).click();

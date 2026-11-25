@@ -20,9 +20,9 @@ async function openSession(page: Page, serve: ServeHandle, title: string) {
   const row = page.getByRole("link").filter({ hasText: title }).first();
   await expect(row).toBeVisible({ timeout: 10_000 });
   await row.click();
-  const diffToggle = page.getByTestId("pane-toggle-diff").first();
-  await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
-  await diffToggle.click();
+  const panelToggle = page.getByTestId("right-dock-toggle").first();
+  await expect(panelToggle).toHaveAttribute("aria-pressed", "false");
+  await panelToggle.click();
 }
 
 // The dashboard mounts a desktop and a hidden mobile right panel, so visible-anywhere checks use first().
@@ -84,7 +84,7 @@ test("diff pane in a non-git session stays closed until opened, then shows one n
     await route.continue();
   });
   const diffFilesRequested = page.waitForRequest((r) => r.url().includes(`/sessions/${session!.id}/diff/files`));
-  const diffToggle = page.getByTestId("pane-toggle-diff").first();
+  const panelToggle = page.getByTestId("right-dock-toggle").first();
   try {
     await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(session!.id)}`);
     // The diff-files effect establishes the unknown-session layout window.
@@ -92,15 +92,15 @@ test("diff pane in a non-git session stays closed until opened, then shows one n
     expect(heldGets).toBeGreaterThan(0);
     expect(await storedTabs()).toBeNull();
     // The toggle renders only once the Session is known, so it must not be awaited before release.
-    await expect(diffToggle).toHaveCount(0);
+    await expect(panelToggle).toHaveCount(0);
   } finally {
     release();
   }
-  await expect(diffToggle).toBeVisible({ timeout: 10_000 });
-  await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
+  await expect(panelToggle).toBeVisible({ timeout: 10_000 });
+  await expect(panelToggle).toHaveAttribute("aria-pressed", "false");
   expect(await storedTabs()).toBeNull();
 
-  await diffToggle.click();
+  await panelToggle.click();
   await expect.poll(storedTabs).toEqual(["diff"]);
   const neutral = `The working directory (${String(session!.project_path)}) isn't a git repository, so there's nothing to compare.`;
   await expect(page.getByText(neutral, { exact: true }).first()).toBeVisible({ timeout: 10_000 });

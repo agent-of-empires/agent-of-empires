@@ -99,18 +99,17 @@ test("Cmd/Ctrl+Alt+B toggles the right panel and Shift+D the diff pane on a sess
   await expect(handle).toBeVisible();
   await expect.poll(() => rightDockState(page)).toEqual({ tabs: ["diff"], collapsed: false });
 
-  // Shift+D toggles the diff pane specifically (not the whole dock); the
-  // activity-bar toggle's pressed state reflects whether diff is open.
-  const diffToggle = page.locator('[data-testid="pane-toggle-diff"]');
-  await expect(diffToggle).toHaveAttribute("aria-pressed", "true");
+  // Shift+D toggles the diff pane specifically (not the whole dock).
+  const diffTab = page.getByTestId("pane-tab-diff");
+  await expect(diffTab).toBeVisible();
 
   await blurToBody(page);
   await page.keyboard.press("Shift+D");
-  await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
+  await expect(diffTab).toHaveCount(0);
 
   // Re-blur: collapsing re-layouts the split, which can hand focus back to
   // the terminal via xterm's ResizeObserver focus-restore.
   await blurToBody(page);
   await page.keyboard.press("Shift+D");
-  await expect(diffToggle).toHaveAttribute("aria-pressed", "true");
+  await expect(diffTab).toBeVisible();
 });

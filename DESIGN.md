@@ -104,6 +104,9 @@ content. It is denser and quieter than the marketing site.
   (Diff, Files, Background, plugins); the terminal sits in the bottom dock.
   Below 1100px the right dock overlays the main area as a sheet rather than
   squeezing a third column.
+- The header toggles regions, not individual panes: one button shows or hides
+  the review panel, one the terminal. Panes inside the review panel open from
+  its own Panes menu, so plugin panes never widen the header.
 
 If a visual change requires an exception, update this document with the new
 rule as part of the change.

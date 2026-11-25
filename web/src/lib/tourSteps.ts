@@ -130,8 +130,8 @@ export const TOUR_STEPS: readonly TourStep[] = [
     id: "right-panel",
     anchor: TOUR_ANCHORS.diffToggle,
     scopes: ["session", "structured-view"],
-    title: "Diff and review",
-    body: "Open the diff here to review the agent's file changes and send comments back without leaving the session.",
+    title: "Review panel",
+    body: "Open the review panel here to see the agent's file changes and send comments back without leaving the session. Its pane menu adds Files and other panes.",
     shortcutHints: [
       { id: "diff", verb: "toggles the diff" },
       { id: "rightPanel", verb: "toggles the panel" },

@@ -61,6 +61,6 @@ test("the scope picker switches the file list and the viewer between Branch, Unc
 
   // Remembered for the Session in this browser.
   await page.reload();
-  await page.getByTestId("pane-toggle-diff").waitFor();
+  await page.getByTestId("right-dock-toggle").waitFor();
   await expect(page.getByRole("radio", { name: "Last turn" })).toHaveAttribute("aria-checked", "true");
 });

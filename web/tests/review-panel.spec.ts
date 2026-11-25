@@ -69,15 +69,15 @@ test("between md and 1100px the dock is a sheet that Escape and the backdrop clo
 
   await page.keyboard.press("Escape");
   await expect(sheet).toHaveCount(0);
-  await expect(page.getByTestId("pane-toggle-diff")).toBeFocused();
+  await expect(page.getByTestId("right-dock-toggle")).toBeFocused();
 
-  await page.getByTestId("pane-toggle-diff").click();
+  await page.getByTestId("right-dock-toggle").click();
   await expect(sheet).toBeVisible();
   await page.getByTestId("right-dock-sheet-backdrop").click({ position: { x: 20, y: 200 } });
   await expect(sheet).toHaveCount(0);
 
   // Picking a file from the sheet closes it and shows the file in the main area.
-  await page.getByTestId("pane-toggle-diff").click();
+  await page.getByTestId("right-dock-toggle").click();
   await openDiffFile(page, "example.ts");
   await expect(sheet).toHaveCount(0);
   await expect(page.getByTestId("main-view-tab-file")).toHaveAttribute("aria-selected", "true");

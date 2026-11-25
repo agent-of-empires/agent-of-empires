@@ -208,6 +208,7 @@ import { DiffPane } from "./components/DiffPane";
 import { FilesPane } from "./components/FilesPane";
 import { FileContentViewer } from "./components/diff/FileContentViewer";
 import { MainViewTabs } from "./components/MainViewTabs";
+import type { PaneMenuControl } from "./components/PaneMenu";
 import { MAIN_VIEW_IDS } from "./lib/mainViewIds";
 import { DiffScopeContext, loadDiffScope, saveDiffScope, type DiffScope, type DiffScopeState } from "./lib/diffScope";
 import { PairedShellPane, ShellModeToggle } from "./components/PairedTerminal";
@@ -992,24 +993,35 @@ function AppContent({
   }, [workspaces, activeSessionId]);
   const activeSession = activeWorkspace?.sessions.find((s) => s.id === activeSessionId);
   const focusSession = useFocusSession(focusSessionId, activeSession, openedSessionSettled);
-  const allPaneIds: string[] = [
-    // CityHall client mode hides the code-inspection panes (diff, files) and
-    // the terminal (plus plugin panes below) so only the composer + structured
-    // view remain. See #7.
-    // The right dock's review panes first, in its tab order, then the bottom terminal.
-    ...(caps.canUseDiff ? ["diff", "files"] : []),
-    // The background-agents panel only applies to structured-view (ACP)
-    // sessions; a plain terminal session never launches sub-agents.
-    ...(activeSession?.view === "structured" ? ["agents"] : []),
-    ...(caps.cityhall ? [] : pluginPanes.map((p) => p.id)),
-    ...(caps.canUseTerminal ? ["terminal"] : []),
-  ];
-  // The mobile picker/single-pane view reuses this exact list (minus
-  // "terminal", desktop's multi-instance extra-terminal dock, which has no
-  // single-pane mobile equivalent) so its available views can't drift from
-  // desktop's capability/session gating the way the sub-agents and Files
-  // panes previously did.
-  const mobilePaneIds = allPaneIds.filter((id) => id !== "terminal");
+  const view = activeSession?.view;
+  // The panes beside the agent: the right dock's review panes in its tab order, then plugin panes. The mobile
+  // picker lists the same ones, so its views can't drift from desktop's capability and session gating.
+  const dockPaneIds = useMemo(
+    () => [
+      // CityHall client mode hides the code-inspection panes (diff, files), the terminal and plugin panes, so
+      // only the composer and structured view remain. See #7.
+      ...(caps.canUseDiff ? ["diff", "files"] : []),
+      // Only structured-view (ACP) sessions launch sub-agents.
+      ...(view === "structured" ? ["agents"] : []),
+      ...(caps.cityhall ? [] : pluginPanes.map((p) => p.id)),
+    ],
+    [caps.canUseDiff, caps.cityhall, view, pluginPanes],
+  );
+  // On desktop the header toggles the terminal and the whole right dock; the other panes open from the dock's
+  // pane menu, so plugin panes add a menu entry rather than header width.
+  const headerPaneIds = useMemo(() => (caps.canUseTerminal ? ["terminal"] : []), [caps.canUseTerminal]);
+  const paneMenu = useMemo<PaneMenuControl>(
+    () => ({
+      paneIds: dockPaneIds,
+      descriptorFor: paneDescriptor,
+      openIds: dockPaneIds.filter((id) => {
+        const dock = dockOf(paneLayout, id);
+        return dock !== null && !isDockCollapsed(paneLayout, dock);
+      }),
+      onToggle: togglePaneAny,
+    }),
+    [dockPaneIds, paneDescriptor, paneLayout, togglePaneAny],
+  );
 
   // Fetch the diff when the panel is actually showing: on desktop when the
   // split is expanded, on mobile when the diff view is the active pane.
@@ -1042,7 +1054,6 @@ function AppContent({
     [diffScope, requestedDiffScope, lastTurnAt, pickDiffScope],
   );
   // Fetched once per Session even while Diff is closed, so the count is as of opening it.
-  const diffBadge = useCallback((id: string) => (id === "diff" ? diffFiles.length : 0), [diffFiles]);
 
   // Diff-viewer comments (#928). Session-scoped. The
   // banner lives in the diff pane while the inline UI lives inside
@@ -1128,7 +1139,7 @@ function AppContent({
   // Mirrors the paired guard above; render-phase derivation per the block at
   // the top.
   const isGatedBuiltinView = rightPanelView === "diff" || rightPanelView === "files" || rightPanelView === "agents";
-  if ((isGatedBuiltinView || isPluginPaneId(rightPanelView)) && !mobilePaneIds.includes(rightPanelView)) {
+  if ((isGatedBuiltinView || isPluginPaneId(rightPanelView)) && !dockPaneIds.includes(rightPanelView)) {
     setRightPanelView("agent");
   }
 
@@ -2480,6 +2491,7 @@ function AppContent({
                   onMove={movePaneAny}
                   onClose={closePaneAny}
                   {...dockControls("right")}
+                  paneMenu={paneMenu}
                   maximize={
                     rightDockSheet
                       ? undefined
@@ -2948,11 +2960,19 @@ function AppContent({
                 onToggleSidebar={handleToggleSidebar}
                 onOpenPalette={() => setShowPalette(true)}
                 onToggleDiff={toggleDiff}
-                paneIds={allPaneIds}
+                paneIds={headerPaneIds}
                 paneDescriptor={paneDescriptor}
                 isPaneOpen={isPaneOpen}
                 onTogglePane={togglePaneAny}
-                closedPaneBadge={diffBadge}
+                rightDock={
+                  dockPaneIds.length > 0
+                    ? {
+                        open: !rightDockCollapsed,
+                        onToggle: toggleRightDock,
+                        badge: caps.canUseDiff ? diffFiles.length : 0,
+                      }
+                    : undefined
+                }
                 onOpenHelp={handleOpenHelp}
                 onOpenAbout={handleOpenAbout}
                 onStartTutorial={tour.startTour}
@@ -3215,7 +3235,7 @@ function AppContent({
                 open={pickerOpen}
                 active={rightPanelView}
                 sessionTitle={activeSession.title}
-                availablePanes={mobilePaneIds}
+                availablePanes={dockPaneIds}
                 describePane={paneDescriptor}
                 shellGroups={caps.canUseTerminal ? shellGroups : []}
                 onPickShell={(shell) => {

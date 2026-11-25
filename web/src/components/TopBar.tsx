@@ -5,7 +5,7 @@ import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { PluginHeaderStartSegments, PluginStatusBarSegments } from "./plugin/PluginSlots";
 import { PluginPageButtons } from "./plugin/PluginPageButtons";
-import { ActivityBar } from "./ActivityBar";
+import { ActivityBar, RightDockToggle } from "./ActivityBar";
 import type { PaneDisplay } from "./Dock";
 import { useWebSettings } from "../hooks/useWebSettings";
 import type { AttentionBadgeColors } from "../lib/attentionBadgeColors";
@@ -21,12 +21,14 @@ interface Props {
   /** Mobile (below md): opens the view picker. The desktop activity bar uses
    *  `onTogglePane` instead. */
   onToggleDiff: () => void;
-  /** All dockable pane ids (built-in + plugin) for the active session. */
+  /** The panes with their own header toggle: the terminal, whose bottom dock has no other control. The rest
+   *  open from the right dock's pane menu. */
   paneIds: string[];
   paneDescriptor: (id: string) => PaneDisplay;
   isPaneOpen: (id: string) => boolean;
   onTogglePane: (id: string) => void;
-  closedPaneBadge?: (id: string) => number;
+  /** The right dock's show/hide toggle; omitted where the Session has no review panel. */
+  rightDock?: { open: boolean; onToggle: () => void; badge: number };
   onOpenHelp: () => void;
   onOpenAbout: () => void;
   onStartTutorial: () => void;
@@ -70,7 +72,7 @@ export function TopBar({
   paneDescriptor,
   isPaneOpen,
   onTogglePane,
-  closedPaneBadge,
+  rightDock,
   onOpenHelp,
   onOpenAbout,
   onStartTutorial,
@@ -242,13 +244,8 @@ export function TopBar({
         {activeWorkspace && activeSession && (
           <>
             {/* Desktop: per-pane toggles. */}
-            <ActivityBar
-              paneIds={paneIds}
-              descriptorFor={paneDescriptor}
-              isOpen={isPaneOpen}
-              onToggle={onTogglePane}
-              closedBadge={closedPaneBadge}
-            />
+            <ActivityBar paneIds={paneIds} descriptorFor={paneDescriptor} isOpen={isPaneOpen} onToggle={onTogglePane} />
+            {rightDock && <RightDockToggle {...rightDock} />}
             <button
               onClick={onToggleDiff}
               className="md:hidden w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors text-text-secondary hover:text-text-primary hover:bg-surface-700/50"
