@@ -101,14 +101,14 @@ Features depend on the ACP adapter and its profile:
 | Usage / context-window display | ✓ | depends | ✓ | ✓ | depends |
 | `/clear` boundary divider | `/clear` | `/new` | `/new` | none | none |
 | TodoWrite / Skill / ExitPlanMode / ScheduleWakeup cards | ✓ | — | — | — | — |
-| Subagent indentation | ✓ | — | unverified | — | — |
-| Per-subagent state and Stop | ✓ | — | — | — | — |
+| Subagent indentation | ✓ | codex-acp 2.7.0+ | unverified | — | — |
+| Per-subagent state and Stop | ✓ | unverified | — | — | — |
 | Workflow agents in the Background pane | ✓ | — | — | — | — |
 | Session resume across `aoe serve` restart | ✓ | depends | ✓ | depends | depends |
 
 In a sandboxed session a Claude `Workflow` run is not tracked, like a backgrounded command: the session can show idle while its agents still work.
 
-Capabilities depend on channels the adapter advertises; unavailable mode, slash-command or usage controls stay empty rather than stale. Codex currently advertises no Plan-mode channel. OpenCode 1.16.0 or newer improves edit/think classification, read output and permission context; older versions use generic cards and prompts. Report unexpected `tool.kind` and `tool.name` values. See [agent profiles](development/internals/structured-view.md#agent-profiles).
+Capabilities depend on channels the adapter advertises; unavailable mode, slash-command or usage controls stay empty rather than stale. Codex currently advertises no Plan-mode channel. With the bundled codex-acp 2.6.0, each Codex subagent gets a Sub agents row with its state, but its tool calls stay unnested in the parent thread; nesting needs codex-acp 2.7.0 or newer. Codex subagent support has not been checked against a live session. OpenCode 1.16.0 or newer improves edit/think classification, read output and permission context; older versions use generic cards and prompts. Report unexpected `tool.kind` and `tool.name` values. See [agent profiles](development/internals/structured-view.md#agent-profiles).
 
 ## Quickstart
 
