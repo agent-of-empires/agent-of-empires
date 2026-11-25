@@ -18,7 +18,7 @@ export const BUILTIN_PANES: PaneDescriptor[] = [
   { id: "diff", title: "Diff", icon: FileDiff, defaultDock: "right" },
   { id: "files", title: "Files", icon: FolderTree, defaultDock: "right" },
   { id: "agents", title: "Background", icon: Bot, defaultDock: "right" },
-  { id: "terminal", title: "Terminal", icon: SquareTerminal, defaultDock: "bottom" },
+  { id: "terminal", title: "Terminal", icon: SquareTerminal, defaultDock: "right" },
 ];
 
 /** Where a newly opened tab sits among a group's tabs: Diff, Files, Background, plugin panes, then terminals. */
@@ -32,8 +32,9 @@ export function paneRank(id: string): number {
 // Session's paired shell at tmux index n, whichever Session is selected.
 export const TERMINAL_KIND = "terminal";
 
-/** Where a terminal tab opens when no other terminal tab is open: below the main view, as in an editor. */
-export const TERMINAL_DOCK: DockLocation = "bottom";
+/** Where a terminal tab opens when no other terminal tab is open: the right dock, below the review panes, as
+ *  in Conductor and Claude Code desktop. */
+export const TERMINAL_DOCK: DockLocation = "right";
 
 // Strict, so a malformed id cannot alias a real tmux index.
 const TERMINAL_TAB_ID_RE = /^terminal:([A-Za-z0-9_-]+):(\d+)$/;

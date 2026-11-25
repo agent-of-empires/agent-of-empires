@@ -117,9 +117,8 @@ test("Open Terminal reveals a collapsed dock whose active tab is the terminal", 
   });
   await recordTerminals(page);
   await openStructuredSession(page, mock);
+  // It opens in the right dock, so collapsing that dock hides it.
   await page.getByTestId("pane-toggle-terminal").click();
-  // It opens at the bottom; on the right, collapsing that dock hides it.
-  await page.getByLabel("Move story-sign-in · 1 to right dock").click();
   const handle = page.getByTestId("content-split-resize-handle");
   await expect(handle).toBeVisible();
   await page.keyboard.press("ControlOrMeta+Alt+b");

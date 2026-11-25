@@ -84,8 +84,8 @@ test.describe("Side panel defaults", () => {
     await expect(page.getByTestId("pane-tab-terminal:alpha:0")).toBeVisible();
     // Beta keeps its default panels; only alpha's terminal tab, bound to alpha's shell, follows.
     await clickSidebarSession(page, "beta");
-    await expect(dockTabs(page)).toHaveCount(0);
-    await expect(page.locator('[data-pane-dock="bottom"] [data-testid^="pane-tab-"]')).toHaveCount(1);
+    await expect(dockTabs(page)).toHaveCount(1);
+    await expect(page.locator('[data-pane-dock="bottom"] [data-testid^="pane-tab-"]')).toHaveCount(0);
     await expect(page.getByTestId("pane-tab-terminal:alpha:0")).toBeVisible();
     await expect(page.getByTestId("pane-toggle-terminal")).toHaveAttribute("aria-pressed", "false");
   });

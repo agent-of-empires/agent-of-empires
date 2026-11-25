@@ -101,7 +101,8 @@ content. It is denser and quieter than the marketing site.
 - Mobile prioritizes monitoring and conversation controls; overlays replace
   persistent side panels.
 - Sessions stay on the left. The right dock is the Session's review panel
-  (Diff, Files, Background, plugins); the terminal sits in the bottom dock.
+  (Diff, Files, Background, plugins), with the terminal tabs stacked below
+  them in the same dock, as in Conductor.
   Below 1100px the right dock overlays the main area as a sheet rather than
   squeezing a third column.
 - Follow the conventions of Claude Code desktop, VS Code and Conductor rather

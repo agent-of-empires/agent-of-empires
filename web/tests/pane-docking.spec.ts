@@ -13,10 +13,17 @@ async function openSession(page: Page) {
   await page.setViewportSize({ width: 1280, height: 720 });
 }
 
-/** The terminal opens in the bottom dock; these drags start from it beside Diff on the right. */
-async function terminalToRight(page: Page) {
-  await page.getByLabel("Move pinch-test · 1 to right dock").click();
+/** The terminal opens in the right dock, in its own group below Diff, and the bottom dock stays empty. */
+async function terminalBelowDiff(page: Page) {
+  await expect(page.getByTestId("pane-tab-terminal:pinch-test:0")).toBeVisible();
+  await expect.poll(() => dockGroupCount(page, "right")).toBe(2);
   await expect(page.getByTestId("bottom-dock-resize")).toHaveCount(0);
+}
+
+async function openFromPaneMenu(page: Page, id: string) {
+  await page.getByTestId("pane-menu-toggle").click();
+  await page.getByTestId(`pane-toggle-${id}`).click();
+  await expect(page.getByTestId(`pane-tab-${id}`)).toBeVisible();
 }
 
 async function dockTabOrder(page: Page, dock: "right" | "bottom"): Promise<string[]> {
@@ -89,8 +96,7 @@ test.describe("Dockable pane system", () => {
   test("a pane moves from the right dock to the bottom dock", async ({ page }) => {
     await openSession(page);
     await page.goto(`/session/${SESSION}`);
-    // The default terminal fills the bottom dock; move it out so Diff is what opens it.
-    await terminalToRight(page);
+    await terminalBelowDiff(page);
 
     await page.getByTestId("pane-tab-diff").click();
     await page.getByLabel("Move diff to bottom dock").click();
@@ -162,16 +168,14 @@ test.describe("Dockable pane system", () => {
   test("dragging a tab reorders it within a dock and the order persists across reload", async ({ page }) => {
     await openSession(page);
     await page.goto(`/session/${SESSION}`);
-    await terminalToRight(page);
-
-    await expect(page.getByTestId("pane-tab-diff")).toBeVisible();
-    await expect(page.getByTestId("pane-tab-terminal:pinch-test:0")).toBeVisible();
-    expect(await dockTabOrder(page, "right")).toEqual(["diff", "terminal:pinch-test:0"]);
+    await terminalBelowDiff(page);
+    await openFromPaneMenu(page, "files");
+    expect(await dockTabOrder(page, "right")).toEqual(["diff", "files", "terminal:pinch-test:0"]);
 
     const diff = await page.getByTestId("pane-tab-diff").boundingBox();
     if (!diff) throw new Error("missing diff tab");
-    await dragTab(page, "terminal:pinch-test:0", { x: diff.x + 4, y: diff.y + diff.height / 2 });
-    await expect.poll(() => dockTabOrder(page, "right")).toEqual(["terminal:pinch-test:0", "diff"]);
+    await dragTab(page, "files", { x: diff.x + 4, y: diff.y + diff.height / 2 });
+    await expect.poll(() => dockTabOrder(page, "right")).toEqual(["files", "diff", "terminal:pinch-test:0"]);
     await expect
       .poll(() =>
         page.evaluate((session) => {
@@ -181,17 +185,17 @@ test.describe("Dockable pane system", () => {
           return saved?.sessions?.[session]?.right.flatMap((group) => group.tabs);
         }, SESSION),
       )
-      .toEqual(["terminal:pinch-test:0", "diff"]);
+      .toEqual(["files", "diff", "terminal:pinch-test:0"]);
 
     await page.reload();
     await expect(page.getByTestId("pane-tab-diff")).toBeVisible();
-    await expect.poll(() => dockTabOrder(page, "right")).toEqual(["terminal:pinch-test:0", "diff"]);
+    await expect.poll(() => dockTabOrder(page, "right")).toEqual(["files", "diff", "terminal:pinch-test:0"]);
   });
 
   test("dragging a tab onto the empty bottom dock opens it there", async ({ page }) => {
     await openSession(page);
     await page.goto(`/session/${SESSION}`);
-    await terminalToRight(page);
+    await terminalBelowDiff(page);
     await expect(page.getByTestId("bottom-dock-resize")).toHaveCount(0);
 
     await dragTab(page, "diff", { x: 640, y: 715 }, async () => {
@@ -209,7 +213,7 @@ test.describe("Dockable pane system", () => {
   test("a cross-dock drag shows an insertion marker and moves the pane", async ({ page }) => {
     await openSession(page);
     await page.goto(`/session/${SESSION}`);
-    await terminalToRight(page);
+    await terminalBelowDiff(page);
 
     await page.getByTestId("pane-tab-diff").click();
     await page.getByLabel("Move diff to bottom dock").click();
@@ -231,30 +235,30 @@ test.describe("Dockable pane system", () => {
     await openSession(page);
     await page.goto(`/session/${SESSION}`);
 
-    await expect(page.getByTestId("pane-tab-diff")).toBeVisible();
-    expect(await dockGroupCount(page, "right")).toBe(1);
+    await terminalBelowDiff(page);
+    await openFromPaneMenu(page, "files");
 
-    // Dropping on the trailing split half creates a second group instead of reordering.
-    await dragTab(page, "terminal:pinch-test:0", { x: 1000, y: 400 }, async () => {
+    // Dropping on the trailing split half creates another group instead of reordering.
+    await dragTab(page, "files", { x: 1000, y: 200 }, async () => {
       const zone = page.getByTestId("pane-split-right-0-after");
       await expect(zone).toBeVisible();
       const box = await zone.boundingBox();
       if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 6 });
     });
 
-    await expect.poll(() => dockGroupCount(page, "right")).toBe(2);
+    await expect.poll(() => dockGroupCount(page, "right")).toBe(3);
     await expect(page.getByTestId("pane-tab-diff")).toBeVisible();
-    await expect(page.getByTestId("pane-tab-terminal:pinch-test:0")).toBeVisible();
+    await expect(page.getByTestId("pane-tab-files")).toBeVisible();
 
     // The split layout round-trips through localStorage.
     await page.reload();
     await expect(page.getByTestId("pane-tab-diff")).toBeVisible();
-    await expect.poll(() => dockGroupCount(page, "right")).toBe(2);
+    await expect.poll(() => dockGroupCount(page, "right")).toBe(3);
 
-    // Closing one group's pane prunes only that group; the other stays valid.
-    await page.getByLabel("Close pinch-test · 1").click();
-    await expect(page.getByTestId("pane-tab-terminal:pinch-test:0")).toHaveCount(0);
-    await expect.poll(() => dockGroupCount(page, "right")).toBe(1);
+    // Closing one group's pane prunes only that group; the others stay valid.
+    await page.getByLabel("Close Files").click();
+    await expect(page.getByTestId("pane-tab-files")).toHaveCount(0);
+    await expect.poll(() => dockGroupCount(page, "right")).toBe(2);
     await expect(page.getByTestId("pane-tab-diff")).toBeVisible();
   });
 });

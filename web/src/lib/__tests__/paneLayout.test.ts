@@ -39,12 +39,8 @@ function emptyLayout(): DockLayout {
 
 /** Right-dock tabs `right`, bottom-dock tabs `bottom`, each dock's first tab active. */
 function layout(right: string[], bottom: string[] = []): DockLayout {
-  let l = emptyLayout();
-  for (const id of right) l = addTab(l, "right", id);
-  for (const id of bottom) l = addTab(l, "bottom", id);
-  if (right[0]) l = setActive(l, "right", right[0]);
-  if (bottom[0]) l = setActive(l, "bottom", bottom[0]);
-  return l;
+  const group = (tabs: string[]) => (tabs.length ? [{ tabs: [...tabs], active: tabs[0]! }] : []);
+  return { ...emptyLayout(), right: group(right), bottom: group(bottom) };
 }
 
 /** Right dock split into groups [a] and [b]. */
@@ -201,7 +197,11 @@ describe("usePaneLayout persistence", () => {
     });
     expect(dockTabs(result.current.layout, "right")).toEqual(["plugin:p:a"]);
     rerender({ prefs: OPEN });
-    expect(docks(result.current.layout)).toEqual([["diff", "plugin:p:a"], ["terminal:s1:0"]]);
+    // The terminal stacks in its own group under the review panes.
+    expect(groups(result.current.layout)).toEqual([
+      [["diff", "plugin:p:a"], "diff"],
+      [["terminal:s1:0"], "terminal:s1:0"],
+    ]);
     expect(savedSessions()).toEqual([]);
 
     act(() => result.current.setDockCollapsed("right", true));
@@ -292,7 +292,7 @@ describe("usePaneLayout persistence", () => {
     act(() => sweepOrphanPaneLayouts(new Set(["s1"])));
     expect(savedSessions()).toEqual(["s1"]);
     act(() => sweepOrphanPaneLayouts(new Set()));
-    expect(docks(result.current.layout)).toEqual([["diff"], ["terminal:s1:0"]]);
+    expect(docks(result.current.layout)).toEqual([["diff", "terminal:s1:0"], []]);
   });
 });
 
@@ -405,7 +405,7 @@ describe("terminal tabs across Sessions", () => {
       { id: "terminal:s1:2", dock: "right" },
     ]);
     expect([groups(l), dockTabs(l, "bottom")]).toEqual([
-      [[["diff", "terminal:s1:1", "terminal:s1:0", "terminal:s1:2"], "terminal:s1:0"]],
+      [[["terminal:s1:1", "diff", "terminal:s1:0", "terminal:s1:2"], "terminal:s1:0"]],
       [],
     ]);
     const same = layout(["diff", "terminal:s1:0"]);
@@ -432,10 +432,10 @@ describe("terminal tabs across Sessions", () => {
 describe("usePaneLayout outside a repository (#4574)", () => {
   it.each([
     // [outside, terminal default, seeded right and bottom tabs]
-    [false, true, [["diff"], ["terminal:s1:0"]]],
+    [false, true, [["diff", "terminal:s1:0"], []]],
     // Not yet known: Diff waits for the Session row.
-    [null, true, [[], ["terminal:s1:0"]]],
-    [true, true, [[], ["terminal:s1:0"]]],
+    [null, true, [["terminal:s1:0"], []]],
+    [true, true, [["terminal:s1:0"], []]],
     [true, false, [[], []]],
   ])("outside=%s terminal=%s seeds %o with the Diff default on", (outside, terminal, expected) => {
     const { result } = renderHook(() => usePaneLayout("s1", outside, { diff: true, terminal }, NO_PLUGINS));
@@ -450,7 +450,7 @@ describe("usePaneLayout outside a repository (#4574)", () => {
     act(() => result.current.setDockCollapsed("right", true));
     act(() => result.current.setDockCollapsed("right", false));
     rerender({ outside: false });
-    expect(docks(result.current.layout)).toEqual([["plugin:p:a"], ["terminal:s1:0"]]);
+    expect(docks(result.current.layout)).toEqual([["plugin:p:a", "terminal:s1:0"], []]);
     expect(isDockCollapsed(result.current.layout, "right")).toBe(false);
   });
 
@@ -469,23 +469,39 @@ describe("usePaneLayout outside a repository (#4574)", () => {
   });
 });
 
+describe("right dock stacking", () => {
+  it("keeps terminals in a group below the review panes, whichever opens first", () => {
+    let l = addTab(emptyLayout(), "right", "terminal:s1:0");
+    l = addTab(l, "right", "diff");
+    l = addTab(l, "right", "terminal:s1:1", false);
+    l = addTab(l, "right", "files", false);
+    expect(groups(l)).toEqual([
+      [["diff", "files"], "diff"],
+      [["terminal:s1:0", "terminal:s1:1"], "terminal:s1:0"],
+    ]);
+    // The bottom dock keeps one group.
+    const bottom = addTab(addTab(emptyLayout(), "bottom", "terminal:s1:0"), "bottom", "diff");
+    expect(bottom.bottom.map((g) => g.tabs)).toEqual([["diff", "terminal:s1:0"]]);
+  });
+});
+
 describe("seedLayout", () => {
   it.each([
-    [true, true, ["diff"], ["terminal:s1:0"]],
-    [false, true, [], ["terminal:s1:0"]],
-    [true, false, ["diff"], []],
-    [false, false, [], []],
-  ])(
-    "diff=%s terminal=%s opens %o on the right and %o at the bottom, each first active",
-    (diff, terminal, right, bottom) => {
-      const seeded = seedLayout({ diff, terminal }, "s1");
-      expect(docks(seeded)).toEqual([right, bottom]);
-      expect([seeded.right[0]?.active ?? null, seeded.bottom[0]?.active ?? null]).toEqual([
-        right[0] ?? null,
-        bottom[0] ?? null,
-      ]);
-    },
-  );
+    [
+      true,
+      true,
+      [
+        [["diff"], "diff"],
+        [["terminal:s1:0"], "terminal:s1:0"],
+      ],
+    ],
+    [false, true, [[["terminal:s1:0"], "terminal:s1:0"]]],
+    [true, false, [[["diff"], "diff"]]],
+    [false, false, []],
+  ])("diff=%s terminal=%s opens the right dock's groups %o, the terminal below Diff", (diff, terminal, expected) => {
+    const seeded = seedLayout({ diff, terminal }, "s1");
+    expect([groups(seeded), dockTabs(seeded, "bottom")]).toEqual([expected, []]);
+  });
 });
 
 describe("usePaneLayout file edit guard", () => {
@@ -524,7 +540,7 @@ describe("usePaneLayout file edit guard", () => {
 
   it("asks before hiding or moving the edited tab and keeps the layout when declined", () => {
     const { result, discard, release, confirm } = editing();
-    act(() => result.current.openTab("terminal:s1:1", "right"));
+    act(() => result.current.openTab("diff", "right"));
     act(() => result.current.moveTab("files", "bottom"));
     act(() => result.current.setDockCollapsed("right", true));
     expect([dockTabs(result.current.layout, "right"), isDockCollapsed(result.current.layout, "right")]).toEqual([
@@ -551,8 +567,8 @@ describe("usePaneLayout file edit guard", () => {
   it("asks when the edited tab is shown in place of an unloaded plugin tab", () => {
     const start = setActive(layout(["plugin:x:pane", "files"]), "right", "plugin:x:pane");
     const { result, release, confirm } = editing(start, (id) => !id.startsWith("plugin:"));
-    act(() => result.current.addTerminal("right"));
-    expect(dockTabs(result.current.layout, "right")).toEqual(["files", "plugin:x:pane"]);
+    act(() => result.current.openTab("diff", "right"));
+    expect(dockTabs(result.current.layout, "right")).toEqual(["plugin:x:pane", "files"]);
     expect(confirm).toHaveBeenCalledOnce();
     release();
   });

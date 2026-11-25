@@ -143,9 +143,23 @@ export function setDockCollapsed(layout: DockLayout, dock: DockLocation, collaps
   return next;
 }
 
-function ensureGroup(layout: DockLayout, dock: DockLocation): PaneGroup {
-  if (!layout[dock][0]) layout[dock] = [{ tabs: [], active: null }];
-  return layout[dock][0]!;
+/** The group `tabId` joins in `dock`. The right dock stacks terminals in a group below the review panes: a
+ *  terminal joins the group already holding one, other panes the first group holding a non-terminal, and a
+ *  new group opens below or above for the first of each. */
+function ensureGroup(layout: DockLayout, dock: DockLocation, tabId: TabId): PaneGroup {
+  const groups = layout[dock];
+  if (groups.length === 0) {
+    layout[dock] = [{ tabs: [], active: null }];
+    return layout[dock][0]!;
+  }
+  if (dock !== "right") return groups[0]!;
+  const terminal = isTerminalTabId(tabId);
+  const home = groups.find((g) => g.tabs.some((t) => isTerminalTabId(t) === terminal));
+  if (home) return home;
+  const fresh: PaneGroup = { tabs: [], active: null };
+  if (terminal) groups.push(fresh);
+  else groups.unshift(fresh);
+  return fresh;
 }
 
 /** Prunes on real tab count, so a group holding only an unloaded plugin tab survives. */
@@ -156,7 +170,7 @@ function pruneEmpty(layout: DockLayout, dock: DockLocation): void {
 export function addTab(layout: DockLayout, dock: DockLocation, tabId: TabId, activate = true): DockLayout {
   if (dockOf(layout, tabId)) return layout; // already open somewhere
   const next = clone(layout);
-  const group = ensureGroup(next, dock);
+  const group = ensureGroup(next, dock, tabId);
   const rank = paneRank(tabId);
   const at = group.tabs.findIndex((t) => paneRank(t) > rank);
   group.tabs.splice(at < 0 ? group.tabs.length : at, 0, tabId);

@@ -99,12 +99,12 @@ describe("usePairedTerminalReveal", () => {
       activated: ["right", "terminal:active:1"],
     },
     {
-      label: "no terminal tab opens the first at the bottom",
+      label: "no terminal tab opens the first in the right dock, under the review panes",
       singlePane: false,
       layout: layout([group(["diff"])]),
       shows: 0,
       focusedNow: false,
-      opened: ["terminal:active:0", "bottom"],
+      opened: ["terminal:active:0", "right"],
     },
   ])("$label", ({ singlePane, layout, remounts, shows, focusedNow, focusedNextFrame, activated, opened }) => {
     const raf = vi.spyOn(window, "requestAnimationFrame").mockImplementation((cb) => {
