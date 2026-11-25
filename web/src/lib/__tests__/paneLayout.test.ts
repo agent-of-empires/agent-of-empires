@@ -12,18 +12,22 @@ import {
   isDockCollapsed,
   isActiveTab,
   moveTab,
+  deriveLayout,
   placeTab,
-  removeAllTerminals,
+  removeSessionTerminals,
   removeTab,
   seedLayout,
   setActive,
   setDockCollapsed,
   sweepOrphanPaneLayouts,
   syncPluginTabs,
+  terminalPlacements,
   usePaneLayout,
+  withTerminals,
   type AutoPane,
   type DockLayout,
   type PlaceTarget,
+  type TerminalPlacement,
 } from "../paneLayout";
 
 beforeEach(() => localStorage.clear());
@@ -49,19 +53,26 @@ const groups = (l: DockLayout) => l.right.map((g) => [g.tabs, g.active]);
 
 describe("pane layout pure ops", () => {
   it("addTab appends and is idempotent per tab id", () => {
-    const l = layout(["diff", "terminal:0"]);
-    expect(dockTabs(l, "right")).toEqual(["diff", "terminal:0"]);
+    const l = layout(["diff", "terminal:s1:0"]);
+    expect(dockTabs(l, "right")).toEqual(["diff", "terminal:s1:0"]);
     expect(addTab(l, "right", "diff")).toBe(l);
   });
 
   it("addTerminal allocates a monotonic index", () => {
-    const a = addTerminal(emptyLayout(), "right");
-    const b = addTerminal(a.layout, "right");
-    expect([a.tabId, b.tabId, b.layout.nextTerminalIndex]).toEqual(["terminal:1", "terminal:2", 3]);
+    const a = addTerminal(emptyLayout(), "right", "s1");
+    const b = addTerminal(a.layout, "right", "s1");
+    // A shell the Daemon already sees alive is skipped.
+    const c = addTerminal(b.layout, "right", "s1", 6);
+    expect([a.tabId, b.tabId, c.tabId, c.layout.nextTerminalIndex]).toEqual([
+      "terminal:s1:1",
+      "terminal:s1:2",
+      "terminal:s1:6",
+      7,
+    ]);
   });
 
   it("removeTab fixes the active tab and prunes the empty dock", () => {
-    let l = removeTab(setActive(layout(["diff", "terminal:0"]), "right", "terminal:0"), "terminal:0");
+    let l = removeTab(setActive(layout(["diff", "terminal:s1:0"]), "right", "terminal:s1:0"), "terminal:s1:0");
     expect(groups(l)).toEqual([[["diff"], "diff"]]);
     l = removeTab(l, "diff");
     expect(l.right).toEqual([]);
@@ -111,11 +122,12 @@ describe("pane layout pure ops", () => {
     expect(groups(placeTab(l, "a", { dock: "right", group: 1, index: 1 }))).toEqual([[["b", "a"], "a"]]);
   });
 
-  it("removeAllTerminals keeps other tabs", () => {
+  it("removeSessionTerminals keeps other tabs and other Sessions' terminals", () => {
     let l = addTab(emptyLayout(), "right", "diff");
-    l = addTerminal(addTerminal(l, "right").layout, "bottom").layout;
-    l = removeAllTerminals(l);
-    expect([dockTabs(l, "right"), dockTabs(l, "bottom")]).toEqual([["diff"], []]);
+    l = addTerminal(addTerminal(l, "right", "s1").layout, "bottom", "s1").layout;
+    l = addTab(l, "bottom", "terminal:s2:0");
+    l = removeSessionTerminals(l, "s1");
+    expect([dockTabs(l, "right"), dockTabs(l, "bottom")]).toEqual([["diff"], ["terminal:s2:0"]]);
   });
 
   it("a closed plugin is not re-added by syncPluginTabs; a new one is", () => {
@@ -142,9 +154,11 @@ describe("pane layout pure ops", () => {
 const CLOSED = { diff: false, terminal: false };
 const OPEN = { diff: true, terminal: true };
 const V3_KEY = "aoe-pane-layout-v3";
+const V4_KEY = "aoe-pane-layout-v4";
 const persistV3 = (sessions: Record<string, unknown>) =>
   localStorage.setItem(V3_KEY, JSON.stringify({ version: 3, sessions }));
-const savedSessions = () => Object.keys(JSON.parse(localStorage.getItem(V3_KEY) ?? "{}").sessions ?? {});
+const saved = () => JSON.parse(localStorage.getItem(V4_KEY) ?? "{}");
+const savedSessions = () => Object.keys(saved().sessions ?? {});
 const NO_PLUGINS: AutoPane[] = [];
 const PLUGIN: AutoPane[] = [{ id: "plugin:p:a", defaultDock: "right" }];
 
@@ -156,14 +170,17 @@ describe("usePaneLayout persistence", () => {
     bottom: { tabs: string[]; active: string }[] = [],
   ) => persistV3({ s1: { right, bottom, nextTerminalIndex: 1, closedPlugins: [] } });
 
-  it("keeps terminals and collapse state per session and persists them", () => {
+  it("shares terminal tabs across Sessions, keeps collapse state per Session, and persists both", () => {
     const result = hook();
     act(() => result.current.addTerminal("right"));
     act(() => result.current.setDockCollapsed("right", true));
     const other = hook("s2").current.layout;
-    expect([dockTabs(other, "right").includes("terminal:1"), isDockCollapsed(other, "right")]).toEqual([false, false]);
+    expect([dockTabs(other, "right").includes("terminal:s1:1"), isDockCollapsed(other, "right")]).toEqual([
+      true,
+      false,
+    ]);
     const reloaded = hook().current.layout;
-    expect([dockTabs(reloaded, "right").includes("terminal:1"), isDockCollapsed(reloaded, "right")]).toEqual([
+    expect([dockTabs(reloaded, "right").includes("terminal:s1:1"), isDockCollapsed(reloaded, "right")]).toEqual([
       true,
       true,
     ]);
@@ -175,15 +192,11 @@ describe("usePaneLayout persistence", () => {
     });
     expect(dockTabs(result.current.layout, "right")).toEqual(["plugin:p:a"]);
     rerender({ prefs: OPEN });
-    expect(dockTabs(result.current.layout, "right")).toEqual(["diff", "terminal:0", "plugin:p:a"]);
+    expect(dockTabs(result.current.layout, "right")).toEqual(["diff", "terminal:s1:0", "plugin:p:a"]);
     expect(savedSessions()).toEqual([]);
 
     act(() => result.current.setDockCollapsed("right", true));
-    expect(JSON.parse(localStorage.getItem(V3_KEY)!).sessions.s1.right[0].tabs).toEqual([
-      "diff",
-      "terminal:0",
-      "plugin:p:a",
-    ]);
+    expect(saved().sessions.s1.right[0].tabs).toEqual(["diff", "terminal:s1:0", "plugin:p:a"]);
     expect(isDockCollapsed(result.current.layout, "right")).toBe(true);
   });
 
@@ -193,10 +206,10 @@ describe("usePaneLayout persistence", () => {
       { initialProps: { session: "s1", outside: false } },
     );
     let finish!: (ok: boolean) => void;
-    act(() => result.current.closeTab("terminal:0", () => new Promise((r) => (finish = r))));
+    act(() => result.current.closeTab("terminal:s1:0", () => new Promise((r) => (finish = r))));
     rerender({ session: "s2", outside: true });
     await act(async () => finish(true));
-    expect(JSON.parse(localStorage.getItem(V3_KEY)!).sessions.s1.right[0].tabs).toEqual(["diff"]);
+    expect(saved().sessions.s1.right[0].tabs).toEqual(["diff"]);
   });
 
   it("adds a newly loaded plugin to a saved layout unless the user closed it", () => {
@@ -205,9 +218,9 @@ describe("usePaneLayout persistence", () => {
     });
     act(() => result.current.toggleKind("terminal", "right"));
     rerender({ plugins: PLUGIN });
-    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:0", "plugin:p:a"]);
+    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:s1:0", "plugin:p:a"]);
     act(() => result.current.closeTab("plugin:p:a"));
-    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:0"]);
+    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:s1:0"]);
   });
 
   it.each([
@@ -224,26 +237,26 @@ describe("usePaneLayout persistence", () => {
   });
 
   it("drops tab ids duplicated across docks or within a group on load", () => {
-    persistGroups([{ tabs: ["diff", "diff", "terminal:0"], active: "diff" }], [{ tabs: ["diff"], active: "diff" }]);
+    persistGroups([{ tabs: ["diff", "diff", "terminal:s1:0"], active: "diff" }], [{ tabs: ["diff"], active: "diff" }]);
     const { layout: l } = hook().current;
-    expect([dockTabs(l, "right"), dockTabs(l, "bottom")]).toEqual([["diff", "terminal:0"], []]);
+    expect([dockTabs(l, "right"), dockTabs(l, "bottom")]).toEqual([["diff", "terminal:s1:0"], []]);
   });
 
   it("loads multiple persisted groups per dock without merging them", () => {
     persistGroups([
       { tabs: ["diff"], active: "diff" },
-      { tabs: ["terminal:0"], active: "terminal:0" },
+      { tabs: ["terminal:s1:0"], active: "terminal:s1:0" },
     ]);
     expect(groups(hook().current.layout)).toEqual([
       [["diff"], "diff"],
-      [["terminal:0"], "terminal:0"],
+      [["terminal:s1:0"], "terminal:s1:0"],
     ]);
   });
 
   it("toggleKind adds then removes the terminal tabs", () => {
     const result = hook();
     act(() => result.current.toggleKind("terminal", "right"));
-    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:0"]);
+    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:s1:0"]);
     act(() => result.current.toggleKind("terminal", "right"));
     expect(dockTabs(result.current.layout, "right")).toEqual([]);
   });
@@ -258,19 +271,19 @@ describe("usePaneLayout persistence", () => {
 
     act(() => result.current.toggleKind("terminal", "right"));
     rerender({ prefs: OPEN });
-    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:0"]);
+    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:s1:0"]);
     expect(savedSessions()).toEqual(["s1"]);
   });
 
   it("sweeps saved layouts of sessions that are gone, keeping the live ones in view", () => {
-    persistGroups([{ tabs: ["terminal:0"], active: "terminal:0" }]);
+    persistGroups([{ tabs: ["terminal:s1:0"], active: "terminal:s1:0" }]);
     const result = hook("s1", OPEN);
     const other = hook("s2");
     act(() => other.current.toggleKind("diff", "right"));
     act(() => sweepOrphanPaneLayouts(new Set(["s1"])));
     expect(savedSessions()).toEqual(["s1"]);
     act(() => sweepOrphanPaneLayouts(new Set()));
-    expect(dockTabs(result.current.layout, "right")).toEqual(["diff", "terminal:0"]);
+    expect(dockTabs(result.current.layout, "right")).toEqual(["diff", "terminal:s1:0"]);
   });
 });
 
@@ -278,32 +291,103 @@ describe("usePaneLayout upgrade from v2", () => {
   const V2_KEY = "aoe-pane-layout-v2";
   const shells = (l: DockLayout) => [dockTabs(l, "right"), dockTabs(l, "bottom"), l.nextTerminalIndex];
 
-  it("keeps the terminals of a v2 Session so a new tab never reuses a live shell, and writes v3 before deleting v2", () => {
-    let terminals = layout(["diff", "terminal:0"]);
-    terminals = addTerminal(terminals, "right").layout;
-    terminals = addTerminal(terminals, "bottom").layout;
+  it("keeps and binds the terminals of a v2 Session so a new tab never reuses a live shell, then writes v4", () => {
+    // v2 stored unbound `terminal:<n>` ids.
+    const v2 = (right: string[], bottom: string[], next: number) => ({
+      ...layout(right, bottom),
+      nextTerminalIndex: next,
+    });
     localStorage.setItem(
       V2_KEY,
-      JSON.stringify({ version: 2, template: emptyLayout(), sessions: { s1: terminals, s2: layout(["diff"]) } }),
+      JSON.stringify({
+        version: 2,
+        template: emptyLayout(),
+        sessions: { s1: v2(["diff", "terminal:0", "terminal:1"], ["terminal:2"], 3), s2: layout(["diff"]) },
+      }),
     );
     const { result } = renderHook(() => usePaneLayout("s1", false, CLOSED, NO_PLUGINS));
-    expect(shells(result.current.layout)).toEqual([["diff", "terminal:0", "terminal:1"], ["terminal:2"], 3]);
+    expect(shells(result.current.layout)).toEqual([["diff", "terminal:s1:0", "terminal:s1:1"], ["terminal:s1:2"], 3]);
 
     act(() => sweepOrphanPaneLayouts(new Set(["s1", "s2"])));
     expect(savedSessions()).toEqual(["s1"]);
     expect(localStorage.getItem(V2_KEY)).toBeNull();
     act(() => result.current.addTerminal("right"));
-    expect(dockTabs(result.current.layout, "right")).toContain("terminal:3");
+    expect(dockTabs(result.current.layout, "right")).toContain("terminal:s1:3");
+  });
+});
+
+describe("usePaneLayout upgrade from v3", () => {
+  it("binds each Session's terminals to its own shells and keeps them per Session until a change", () => {
+    persistV3({
+      s1: { right: [{ tabs: ["terminal:0", "terminal:1"], active: "terminal:1" }], bottom: [], nextTerminalIndex: 2 },
+      s2: { right: [{ tabs: ["diff", "terminal:0"], active: "terminal:0" }], bottom: [], nextTerminalIndex: 1 },
+    });
+    const s1 = renderHook(() => usePaneLayout("s1", false, CLOSED, NO_PLUGINS)).result;
+    const s2 = renderHook(() => usePaneLayout("s2", false, CLOSED, NO_PLUGINS)).result;
+    expect(groups(s1.current.layout)).toEqual([[["terminal:s1:0", "terminal:s1:1"], "terminal:s1:1"]]);
+    expect(groups(s2.current.layout)).toEqual([[["diff", "terminal:s2:0"], "terminal:s2:0"]]);
+
+    // The first change makes the changed layout's terminals the shared set.
+    act(() => s1.current.setDockCollapsed("bottom", true));
+    expect(dockTabs(s2.current.layout, "right")).toEqual(["diff", "terminal:s1:0", "terminal:s1:1"]);
+    expect(saved().terminals).toEqual([
+      { id: "terminal:s1:0", dock: "right" },
+      { id: "terminal:s1:1", dock: "right" },
+    ]);
+    act(() => sweepOrphanPaneLayouts(new Set(["s1", "s2"])));
+    expect(localStorage.getItem(V3_KEY)).toBeNull();
+  });
+});
+
+describe("terminal tabs across Sessions", () => {
+  const hook = (session: string, prefs = CLOSED) =>
+    renderHook(() => usePaneLayout(session, false, prefs, NO_PLUGINS)).result;
+
+  it("keeps another Session's tab when its own terminals toggle, and closes tabs of a gone Session", () => {
+    const s1 = hook("s1");
+    act(() => s1.current.toggleKind("terminal", "right"));
+    const s2 = hook("s2");
+    act(() => s2.current.toggleKind("terminal", "bottom"));
+    expect([dockTabs(s1.current.layout, "right"), dockTabs(s1.current.layout, "bottom")]).toEqual([
+      ["terminal:s1:0"],
+      ["terminal:s2:0"],
+    ]);
+    act(() => s2.current.toggleKind("terminal", "bottom"));
+    expect(terminalPlacements(s1.current.layout)).toEqual([{ id: "terminal:s1:0", dock: "right" }]);
+
+    act(() => s2.current.openTab("terminal:s2:3", "right"));
+    act(() => sweepOrphanPaneLayouts(new Set(["s1"])));
+    expect(dockTabs(s1.current.layout, "right")).toEqual(["terminal:s1:0"]);
+    expect(saved().terminals).toEqual([{ id: "terminal:s1:0", dock: "right" }]);
+  });
+
+  it.each<[string, TerminalPlacement[] | null, string[]]>([
+    ["seeds its own terminal before any is shared", null, ["terminal:s2:0"]],
+    ["seeds its own terminal once every terminal is closed", [], ["terminal:s2:0"]],
+    [
+      "shows the shared terminals instead of seeding another",
+      [{ id: "terminal:s1:4", dock: "right" }],
+      ["terminal:s1:4"],
+    ],
+  ])("an unchanged Session %s", (_name, terminals, expected) => {
+    expect(dockTabs(deriveLayout("s2", undefined, terminals, { diff: false, terminal: true }), "right")).toEqual(
+      expected,
+    );
+  });
+
+  it("withTerminals closes unshared terminal tabs and adds shared ones without taking focus", () => {
+    const l = withTerminals(layout(["diff", "terminal:s1:0"]), [{ id: "terminal:s2:1", dock: "bottom" }]);
+    expect([groups(l), dockTabs(l, "bottom")]).toEqual([[[["diff"], "diff"]], ["terminal:s2:1"]]);
   });
 });
 
 describe("usePaneLayout outside a repository (#4574)", () => {
   it.each([
     // [outside, terminal default, seeded tabs]
-    [false, true, ["diff", "terminal:0"]],
+    [false, true, ["diff", "terminal:s1:0"]],
     // Not yet known: Diff waits for the Session row.
-    [null, true, ["terminal:0"]],
-    [true, true, ["terminal:0"]],
+    [null, true, ["terminal:s1:0"]],
+    [true, true, ["terminal:s1:0"]],
     [true, false, []],
   ])("outside=%s terminal=%s seeds %o with the Diff default on", (outside, terminal, expected) => {
     const { result } = renderHook(() => usePaneLayout("s1", outside, { diff: true, terminal }, NO_PLUGINS));
@@ -318,7 +402,7 @@ describe("usePaneLayout outside a repository (#4574)", () => {
     act(() => result.current.setDockCollapsed("right", true));
     act(() => result.current.setDockCollapsed("right", false));
     rerender({ outside: false });
-    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:0", "plugin:p:a"]);
+    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:s1:0", "plugin:p:a"]);
     expect(isDockCollapsed(result.current.layout, "right")).toBe(false);
   });
 
@@ -339,12 +423,12 @@ describe("usePaneLayout outside a repository (#4574)", () => {
 
 describe("seedLayout", () => {
   it.each([
-    [true, true, ["diff", "terminal:0"]],
-    [false, true, ["terminal:0"]],
+    [true, true, ["diff", "terminal:s1:0"]],
+    [false, true, ["terminal:s1:0"]],
     [true, false, ["diff"]],
     [false, false, []],
   ])("diff=%s terminal=%s opens %o with the first active", (diff, terminal, expected) => {
-    const seeded = seedLayout({ diff, terminal });
+    const seeded = seedLayout({ diff, terminal }, "s1");
     expect([dockTabs(seeded, "right"), seeded.right[0]?.active ?? null]).toEqual([expected, expected[0] ?? null]);
     expect(dockTabs(seeded, "bottom")).toEqual([]);
   });
@@ -359,7 +443,7 @@ describe("usePaneLayout file edit guard", () => {
   });
 
   /** A dirty Files editor in the right dock beside a terminal in the bottom dock. */
-  function editing(start = layout(["files"], ["terminal:0"]), tabAvailable?: (id: string) => boolean) {
+  function editing(start = layout(["files"], ["terminal:s1:0"]), tabAvailable?: (id: string) => boolean) {
     persistV3({ s1: start });
     const discard = vi.fn();
     setFileDraft(key, { original, text: "draft", pendingSave: null });
@@ -376,9 +460,9 @@ describe("usePaneLayout file edit guard", () => {
   it("changes the other dock without asking or discarding the visible draft", () => {
     const { result, discard, release, confirm } = editing();
     act(() => result.current.addTerminal("bottom"));
-    act(() => result.current.closeTab("terminal:0"));
+    act(() => result.current.closeTab("terminal:s1:0"));
     act(() => result.current.setDockCollapsed("bottom", true));
-    expect(dockTabs(result.current.layout, "bottom")).toEqual(["terminal:1"]);
+    expect(dockTabs(result.current.layout, "bottom")).toEqual(["terminal:s1:1"]);
     expect(isDockCollapsed(result.current.layout, "bottom")).toBe(true);
     expect([confirm.mock.calls.length, discard.mock.calls.length]).toEqual([0, 0]);
     release();
@@ -386,7 +470,7 @@ describe("usePaneLayout file edit guard", () => {
 
   it("asks before hiding or moving the edited tab and keeps the layout when declined", () => {
     const { result, discard, release, confirm } = editing();
-    act(() => result.current.openTab("terminal:1", "right"));
+    act(() => result.current.openTab("terminal:s1:1", "right"));
     act(() => result.current.moveTab("files", "bottom"));
     act(() => result.current.setDockCollapsed("right", true));
     expect([dockTabs(result.current.layout, "right"), isDockCollapsed(result.current.layout, "right")]).toEqual([
@@ -402,10 +486,10 @@ describe("usePaneLayout file edit guard", () => {
   });
 
   it("asks when closing an earlier split group renumbers the edited one", () => {
-    const start = placeTab(layout(["terminal:1", "files"]), "files", { dock: "right", group: 1, newGroup: true });
+    const start = placeTab(layout(["terminal:s1:1", "files"]), "files", { dock: "right", group: 1, newGroup: true });
     const { result, discard, release, confirm } = editing(start);
-    act(() => result.current.closeTab("terminal:1"));
-    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:1", "files"]);
+    act(() => result.current.closeTab("terminal:s1:1"));
+    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:s1:1", "files"]);
     expect([confirm.mock.calls.length, discard.mock.calls.length]).toEqual([1, 0]);
     release();
   });
@@ -420,26 +504,26 @@ describe("usePaneLayout file edit guard", () => {
   });
 
   it("asks before a close's side effect and skips it when declined or a save is pending", async () => {
-    const start = placeTab(layout(["terminal:1", "files"]), "files", { dock: "right", group: 1, newGroup: true });
+    const start = placeTab(layout(["terminal:s1:1", "files"]), "files", { dock: "right", group: 1, newGroup: true });
     const { result, release, confirm } = editing(start);
     const kill = vi.fn(async () => true);
-    act(() => result.current.closeTab("terminal:1", kill));
+    act(() => result.current.closeTab("terminal:s1:1", kill));
     expect([confirm.mock.calls.length, kill.mock.calls.length]).toEqual([1, 0]);
     setFileDraft(key, { original, text: "draft", pendingSave: { promise: new Promise(() => {}) } });
-    act(() => result.current.closeTab("terminal:1", kill));
+    act(() => result.current.closeTab("terminal:s1:1", kill));
     expect([confirm.mock.calls.length, kill.mock.calls.length]).toEqual([1, 0]);
     setFileDraft(key, { original, text: "draft", pendingSave: null });
     confirm.mockReturnValue(true);
-    await act(async () => result.current.closeTab("terminal:1", kill));
+    await act(async () => result.current.closeTab("terminal:s1:1", kill));
     expect(kill).toHaveBeenCalledOnce();
     expect(dockTabs(result.current.layout, "right")).toEqual(["files"]);
     release();
   });
 
   it("keeps the tab when its close side effect fails", async () => {
-    const { result, release, confirm } = editing(layout(["files"], ["terminal:1"]));
-    await act(async () => result.current.closeTab("terminal:1", async () => false));
-    expect(dockTabs(result.current.layout, "bottom")).toEqual(["terminal:1"]);
+    const { result, release, confirm } = editing(layout(["files"], ["terminal:s1:1"]));
+    await act(async () => result.current.closeTab("terminal:s1:1", async () => false));
+    expect(dockTabs(result.current.layout, "bottom")).toEqual(["terminal:s1:1"]);
     expect(confirm).not.toHaveBeenCalled();
     release();
   });

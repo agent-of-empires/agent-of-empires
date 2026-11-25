@@ -1,5 +1,6 @@
 import { useEffect, type ReactNode } from "react";
 import { Sparkles, SquareTerminal, type LucideIcon } from "lucide-react";
+import type { PairedShell, PairedShellGroup } from "../lib/pairedShells";
 import type { RightPanelView } from "../lib/rightPanelView";
 import { sessionRowChromeClass } from "../lib/sessionRowChrome";
 import type { PaneDisplay } from "./Dock";
@@ -19,6 +20,9 @@ interface Props {
   // follows the desktop dock's capability and session gating.
   availablePanes: string[];
   describePane: (id: string) => PaneDisplay;
+  /** Every live paired shell, so the paired view can show another Session's. */
+  shellGroups: PairedShellGroup[];
+  onPickShell: (shell: PairedShell) => void;
   onSelect: (view: RightPanelView) => void;
   onClose: () => void;
 }
@@ -73,6 +77,8 @@ export function MobileRightPanelPicker({
   sessionTitle,
   availablePanes,
   describePane,
+  shellGroups,
+  onPickShell,
   onSelect,
   onClose,
 }: Props) {
@@ -117,6 +123,32 @@ export function MobileRightPanelPicker({
               <Row key={view} display={{ title, icon }} view={view} active={view === active} onSelect={onSelect} />
             ))}
           </Section>
+          {shellGroups.length > 0 && (
+            <Section label="Paired terminals">
+              {shellGroups.flatMap(({ session, shells }) =>
+                shells.map((shell) => (
+                  <li key={`${shell.sessionId}:${shell.index}:${shell.mode}`}>
+                    <button
+                      onClick={() => onPickShell(shell)}
+                      aria-current={shell.open && active === "paired" ? "true" : undefined}
+                      data-testid={`mobile-shell-pick-${shell.sessionId}-${shell.index}-${shell.mode}`}
+                      className={`w-full h-11 flex items-center gap-3 px-3 text-left text-[14px] cursor-pointer transition-colors duration-75 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-600 text-text-secondary ${sessionRowChromeClass(shell.open && active === "paired", false)}`}
+                    >
+                      <SquareTerminal className="h-4 w-4 shrink-0 text-text-dim" />
+                      <span className="truncate">
+                        {session.title} · {shell.index + 1}
+                      </span>
+                      {session.is_sandboxed && (
+                        <span className="ml-auto shrink-0 font-mono text-[11px] text-text-dim">
+                          {shell.mode === "container" ? "Container" : "Host"}
+                        </span>
+                      )}
+                    </button>
+                  </li>
+                )),
+              )}
+            </Section>
+          )}
           {availablePanes.length > 0 && (
             <Section label="Panes">
               {availablePanes.map((id) => (

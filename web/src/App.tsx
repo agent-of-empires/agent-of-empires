@@ -205,9 +205,15 @@ import { hasStartedBefore } from "./components/acp/startupWait";
 import { DiffPane } from "./components/DiffPane";
 import { FilesPane } from "./components/FilesPane";
 import { FileContentViewer } from "./components/diff/FileContentViewer";
-import { PairedShellPane, ShellModeToggle, effectiveShellMode } from "./components/PairedTerminal";
-import { TerminalSwitcherButton, TerminalSwitcherOverlay, shellLabel } from "./components/TerminalSwitcher";
-import { liveShellIndices, pairedShellGroups, type PairedShell } from "./lib/pairedShells";
+import { PairedShellPane, ShellModeToggle } from "./components/PairedTerminal";
+import { TerminalSwitcherButton, TerminalSwitcherOverlay } from "./components/TerminalSwitcher";
+import {
+  effectiveShellMode,
+  liveShellIndices,
+  pairedShellGroups,
+  shellLabel,
+  type PairedShell,
+} from "./lib/pairedShells";
 import { usePairedShellModes } from "./hooks/usePairedShellModes";
 import { useOpenPairedTerminal, usePairedTerminalReveal } from "./hooks/usePairedTerminalReveal";
 import { BUILTIN_PANES, parseTerminalTabId, terminalTabId, type DockLocation, type TerminalRef } from "./lib/panes";

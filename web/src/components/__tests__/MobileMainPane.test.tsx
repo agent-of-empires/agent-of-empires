@@ -10,7 +10,8 @@ import type { useDiffComments } from "../../hooks/useDiffComments";
 vi.mock("../TerminalSessionStack", () => ({
   TerminalSessionStack: () => <div data-testid="agent-terminal" />,
 }));
-vi.mock("../PairedTerminal", () => ({
+vi.mock("../PairedTerminal", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../PairedTerminal")>()),
   PairedShellPane: () => <div data-testid="paired-shell" />,
 }));
 vi.mock("../diff/DiffFileList", () => ({
@@ -75,6 +76,9 @@ function setup(overrides: Partial<Parameters<typeof MobileMainPane>[0]> = {}) {
     onBackToAgent,
     onOpenAgentsPane: vi.fn(),
     pairedMounted: false,
+    pairedShell: { session: session(), index: 0 },
+    shellMode: "host",
+    onShellModeChange: vi.fn(),
     activeSession: session(),
     activeSessionId: "s1",
     sessions: [session()],
@@ -122,6 +126,18 @@ describe("MobileMainPane", () => {
     const { onBackToAgent } = setup({ view: "paired", pairedMounted: true });
     fireEvent.click(screen.getByTestId("mobile-back-to-agent"));
     expect(onBackToAgent).toHaveBeenCalled();
+  });
+
+  it("names the shown shell, another Session's included, and offers its mode only when sandboxed", () => {
+    const onShellModeChange = vi.fn();
+    const other = session({ id: "s2", title: "Other", is_sandboxed: true });
+    setup({ view: "paired", pairedMounted: true, pairedShell: { session: other, index: 2 }, onShellModeChange });
+    expect(screen.getByText("Other · 3")).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "Container" }));
+    expect(onShellModeChange).toHaveBeenCalledWith("container");
+    cleanup();
+    setup({ view: "paired", pairedMounted: true });
+    expect(screen.queryByRole("button", { name: "Container" })).toBeNull();
   });
 
   it("mounts the paired shell only once activated", () => {

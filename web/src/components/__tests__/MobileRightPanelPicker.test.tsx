@@ -5,6 +5,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 
 import { MobileRightPanelPicker } from "../MobileRightPanelPicker";
 import { FileDiff, Puzzle } from "lucide-react";
+import { makeSession } from "./fixtures";
 
 const PLUGIN_ID = "plugin:acme.kit:gh";
 const describePane = (id: string) =>
@@ -13,6 +14,7 @@ const describePane = (id: string) =>
 function setup(overrides: Partial<Parameters<typeof MobileRightPanelPicker>[0]> = {}) {
   const onSelect = vi.fn();
   const onClose = vi.fn();
+  const onPickShell = vi.fn();
   render(
     <MobileRightPanelPicker
       open
@@ -20,15 +22,28 @@ function setup(overrides: Partial<Parameters<typeof MobileRightPanelPicker>[0]> 
       sessionTitle="s1"
       availablePanes={["diff"]}
       describePane={describePane}
+      shellGroups={[]}
+      onPickShell={onPickShell}
       onSelect={onSelect}
       onClose={onClose}
       {...overrides}
     />,
   );
-  return { onSelect, onClose };
+  return { onSelect, onClose, onPickShell };
 }
 
 describe("MobileRightPanelPicker", () => {
+  it("lists every live paired shell and picks one", () => {
+    const other = makeSession({ id: "s2", title: "Other", is_sandboxed: true });
+    const shell = { sessionId: "s2", index: 1, mode: "container" as const, open: false };
+    const { onPickShell } = setup({ shellGroups: [{ session: other, shells: [shell] }] });
+    const row = screen.getByTestId("mobile-shell-pick-s2-1-container");
+    expect(row.textContent).toContain("Other · 2");
+    expect(row.textContent).toContain("Container");
+    fireEvent.click(row);
+    expect(onPickShell).toHaveBeenCalledWith(shell);
+  });
+
   it("hides gated entries not in availablePanes and marks the active one", () => {
     setup({ availablePanes: [], active: "paired" });
     expect(screen.queryByTestId("mobile-right-panel-pick-agents")).toBeNull();

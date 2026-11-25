@@ -1,7 +1,7 @@
 import { StructuredSessionStack } from "./StructuredSessionStack";
 import { TerminalSessionStack } from "./TerminalSessionStack";
 import { PairedShellPane, ShellModeToggle, type ShellMode } from "./PairedTerminal";
-import { shellLabel } from "./TerminalSwitcher";
+import { shellLabel } from "../lib/pairedShells";
 import type { AgentFocus } from "./acp/BackgroundAgentsPanel";
 import { hasStartedBefore } from "./acp/startupWait";
 import { recreateContainerBlock, recreateContainerTitle } from "./sidebar/sessionActionTargets";

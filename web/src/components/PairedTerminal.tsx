@@ -1,12 +1,8 @@
 import { LiveTerminalView } from "./LiveTerminalView";
+import { effectiveShellMode } from "../lib/pairedShells";
 import type { SessionResponse } from "../lib/types";
 
 export type ShellMode = "host" | "container";
-
-/** Container mode is only valid while the session is sandboxed; one that loses its container falls back to host. */
-export function effectiveShellMode(session: SessionResponse | null | undefined, mode: ShellMode): ShellMode {
-  return session?.is_sandboxed ? mode : "host";
-}
 
 /** Host or Container for a sandboxed Session's shell; the caller renders it only for sandboxed Sessions. */
 export function ShellModeToggle({

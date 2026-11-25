@@ -9,6 +9,15 @@ export interface PairedShell extends TerminalRef {
   open: boolean;
 }
 
+export function shellLabel(index: number): string {
+  return `Terminal ${index + 1}`;
+}
+
+/** Container mode is only valid while the session is sandboxed; one that loses its container falls back to host. */
+export function effectiveShellMode(session: SessionResponse | null | undefined, mode: ShellMode): ShellMode {
+  return session?.is_sandboxed ? mode : "host";
+}
+
 export interface PairedShellGroup {
   session: SessionResponse;
   shells: PairedShell[];

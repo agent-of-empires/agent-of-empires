@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { ChevronDown, Plus, SquareTerminal } from "lucide-react";
 
-import type { PairedShell, PairedShellGroup } from "../lib/pairedShells";
+import { shellLabel, type PairedShell, type PairedShellGroup } from "../lib/pairedShells";
 import { useOutsideDismiss } from "./useOutsideDismiss";
 
 export interface TerminalSwitcherProps {
@@ -10,10 +10,6 @@ export interface TerminalSwitcherProps {
   newTerminalFor?: string;
   onPick: (shell: PairedShell) => void;
   onNew?: () => void;
-}
-
-export function shellLabel(index: number): string {
-  return `Terminal ${index + 1}`;
 }
 
 function moveFocus(e: KeyboardEvent<HTMLElement>) {
