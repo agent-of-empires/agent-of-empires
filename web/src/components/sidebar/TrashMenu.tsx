@@ -101,6 +101,7 @@ export function TrashMenu({
   // Sessions, the unit the daemon reports before the rows load, so the badge does not change meaning when Trash opens.
   const loadedCount = trashedWorkspaces.reduce((sum, ws) => sum + ws.sessions.length, 0);
   const count = loaded ? loadedCount : loadedCount || trashedCount;
+  const label = `Trash, ${count} ${count === 1 ? "session" : "sessions"}`;
   const pendingMenu = menu?.ws.sessions.some(hasPendingTrash) ?? false;
   const menuTargets = menu
     ? menu.ws.sessions
@@ -109,7 +110,7 @@ export function TrashMenu({
     : [];
 
   return (
-    <div ref={ref} className="relative min-w-0 flex-1">
+    <div ref={ref} className="relative shrink-0">
       <button
         onClick={() => {
           if (!open) {
@@ -121,18 +122,22 @@ export function TrashMenu({
         aria-expanded={open}
         aria-controls={open ? "sidebar-trash-panel" : undefined}
         data-testid="sidebar-trash-toggle"
-        className="h-8 w-full min-w-0 flex items-center gap-2 rounded-md px-2.5 text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer transition-colors"
-        title={`Trash (${count})`}
-        aria-label={`Trash (${count})`}
+        className="relative w-8 h-8 flex items-center justify-center rounded-md text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer transition-colors"
+        title={label}
+        aria-label={label}
       >
-        <Trash2 className="h-4 w-4 shrink-0" />
-        <span
-          data-testid="sidebar-trash-count"
-          className="shrink-0 rounded-full bg-surface-900 px-1.5 py-0.5 text-[10px] font-mono tabular-nums text-text-dim leading-none"
-        >
-          {count}
+        <span className="relative">
+          <Trash2 className="h-4 w-4" />
+          {count > 0 && (
+            <span
+              data-testid="sidebar-trash-count"
+              aria-hidden="true"
+              className="pointer-events-none absolute -top-1.5 -right-2.5 min-w-[1rem] rounded-full border border-surface-600 bg-surface-800 px-1 text-[10px] font-semibold leading-[0.875rem] tabular-nums text-text-secondary text-center"
+            >
+              {count > 99 ? "99+" : count}
+            </span>
+          )}
         </span>
-        <span className="min-w-0 flex-1 truncate text-left text-[13px] font-medium">Trash</span>
       </button>
       {open &&
         panelPosition &&

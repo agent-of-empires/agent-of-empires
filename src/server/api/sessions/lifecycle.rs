@@ -5098,7 +5098,11 @@ mod durable_stop_tests {
             let log = std::fs::read_to_string(&calls).unwrap_or_default();
             assert_eq!(
                 log.trim(),
-                if superseded { "" } else { "stop c1" },
+                if superseded {
+                    ""
+                } else {
+                    "inspect --format {{json .Config.Entrypoint}}|{{json .HostConfig.Init}}|{{json .Config.StopTimeout}}|{{json .State.Pid}} c1\nstop c1"
+                },
                 "superseded={superseded}"
             );
         }

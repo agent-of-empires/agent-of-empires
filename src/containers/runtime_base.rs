@@ -9,6 +9,81 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
+/// Format printing what decides PID 1 on stop: the image ENTRYPOINT, `--init`,
+/// `--stop-timeout` and the host PID of PID 1, as `|`-separated JSON.
+const STOP_SETTINGS_FORMAT: &str = "{{json .Config.Entrypoint}}|{{json .HostConfig.Init}}|{{json .Config.StopTimeout}}|{{json .State.Pid}}";
+
+/// The host PID of PID 1 when `settings` show no ENTRYPOINT, init or explicit
+/// timeout, so it can only be the appended `sleep`, or whatever the daemon
+/// defaulted init to. `None` for any other setup or an unreadable answer.
+fn bare_pid1(settings: Option<&str>) -> Option<&str> {
+    let mut fields = settings?.split('|');
+    match (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) {
+        (Some("null" | "[]" | "\"\""), Some("null" | "false"), Some("null"), Some(pid), None)
+            if pid != "0" && pid.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            Some(pid)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `top -eo pid,comm` output lists host process `pid` as `sleep`.
+fn pid_is_sleep(top_stdout: &str, pid: &str) -> bool {
+    top_stdout.lines().skip(1).any(|row| {
+        let mut columns = row.split_whitespace();
+        (columns.next(), columns.next(), columns.next()) == (Some(pid), Some("sleep"), None)
+    })
+}
+
+/// Time the optional stop probes may use in total, so a stalled runtime delays
+/// the stop itself by at most this much.
+const STOP_PROBE_BUDGET: Duration = Duration::from_secs(3);
+
+/// Full `stop` arguments for container `name`. `run` runs the given runtime
+/// arguments within the given time and returns the output, or `None` when it
+/// cannot run or times out. `sleep` as
+/// PID 1 ignores SIGTERM, so waiting out the grace only delays SIGKILL: `-t 0`
+/// needs the settings gate and `top` showing PID 1 is `sleep`. Anything else,
+/// including a failed probe, keeps the runtime's grace.
+pub(crate) fn stop_args_for(
+    name: &str,
+    mut run: impl FnMut(&[String], Duration) -> Option<std::process::Output>,
+) -> Vec<String> {
+    let deadline = Instant::now() + STOP_PROBE_BUDGET;
+    let mut stdout = |args: &[&str]| {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        run(
+            &args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(),
+            remaining,
+        )
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    let settings = stdout(&["inspect", "--format", STOP_SETTINGS_FORMAT, name]);
+    let immediate = bare_pid1(settings.as_deref()).is_some_and(|pid| {
+        stdout(&["top", name, "-eo", "pid,comm"]).is_some_and(|top| pid_is_sleep(&top, pid))
+    });
+    let stop: &[&str] = if immediate {
+        &["stop", "-t", "0"]
+    } else {
+        &["stop"]
+    };
+    stop.iter()
+        .map(|arg| (*arg).to_owned())
+        .chain([name.to_owned()])
+        .collect()
+}
+
 /// `docker pull` has no timeout of its own; this only fires on a wedged pull.
 const PULL_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -276,7 +351,7 @@ impl RuntimeBase {
         self.probe_output_with_timeout(cmd, RUNTIME_CMD_TIMEOUT)
     }
 
-    fn probe_output_with_timeout(
+    pub(crate) fn probe_output_with_timeout(
         &self,
         cmd: &mut Command,
         timeout: Duration,
@@ -795,8 +870,13 @@ impl RuntimeBase {
 
     pub fn stop_container(&self, name: &str) -> Result<()> {
         tracing::info!(target: "containers.runtime", runtime = %self.name, %name, "stopping container");
+        let args = stop_args_for(name, |args, timeout| {
+            let mut probe = self.command();
+            probe.args(args);
+            self.probe_output_with_timeout(&mut probe, timeout).ok()
+        });
         let mut cmd = self.command();
-        cmd.args(["stop", name]);
+        cmd.args(args);
         let output = self.probe_output(&mut cmd)?;
 
         if !output.status.success() {
@@ -975,6 +1055,109 @@ mod tests {
             Err(DockerError::InspectFailed(stderr)) => format!("inspect_failed:{stderr}"),
             Err(other) => format!("other:{other}"),
         }
+    }
+
+    #[test]
+    fn bare_pid1_needs_no_entrypoint_init_or_timeout() {
+        for (settings, expected) in [
+            (Some("null|null|null|123"), Some("123")),
+            (Some("[]|false|null|123"), Some("123")),
+            (Some("\"\"|null|null|123"), Some("123")),
+            (Some("[\"/entry.sh\"]|null|null|123"), None),
+            (Some("null|true|null|123"), None),
+            (Some("null|null|30|123"), None),
+            (Some("null|null|null|0"), None),
+            (Some("null|null|null|abc"), None),
+            (Some("null|null|null"), None),
+            (Some(""), None),
+            (None, None),
+        ] {
+            assert_eq!(bare_pid1(settings), expected, "{settings:?}");
+        }
+    }
+
+    #[test]
+    fn pid_is_sleep_matches_the_exact_row() {
+        const INIT: &str = "PID COMMAND\n91570 docker-init\n91584 sleep";
+        for (top, pid, expected) in [
+            ("PID COMMAND\n91483 sleep", "91483", true),
+            ("PID COMMAND\n91483 sleep\n91500 sh", "91483", true),
+            (INIT, "91570", false),
+            (INIT, "91584", true),
+            (
+                "PID COMMAND\n91584 sleep\n91570 docker-init",
+                "91570",
+                false,
+            ),
+            ("PID COMMAND\n914830 sleep", "91483", false),
+            ("PID COMMAND", "91483", false),
+            ("", "91483", false),
+        ] {
+            assert_eq!(pid_is_sleep(top, pid), expected, "{top:?} {pid}");
+        }
+    }
+
+    #[test]
+    fn stop_probes_share_one_short_deadline() {
+        let mut timeouts = Vec::new();
+        let args = stop_args_for("c1", |args, timeout| {
+            timeouts.push(timeout);
+            let mut output = std::process::Command::new("true").output().unwrap();
+            if args[0] == "inspect" {
+                output.stdout = b"null|null|null|91483".to_vec();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            Some(output)
+        });
+        assert_eq!(args, ["stop", "c1"]);
+        assert_eq!(timeouts.len(), 2);
+        assert!(timeouts[0] <= STOP_PROBE_BUDGET);
+        assert!(timeouts[1] < timeouts[0]);
+        let mut calls = 0;
+        stop_args_for("c1", |_, _| {
+            calls += 1;
+            std::thread::sleep(STOP_PROBE_BUDGET + Duration::from_millis(50));
+            None
+        });
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn stop_args_for_needs_both_the_settings_and_a_sleep_pid1() {
+        let answer = |stdout: &str, ok: bool| {
+            let mut output = std::process::Command::new(if ok { "true" } else { "false" })
+                .output()
+                .unwrap();
+            output.stdout = stdout.as_bytes().to_vec();
+            Some(output)
+        };
+        let stop = |inspect: Option<&str>, top: Option<&str>| {
+            stop_args_for("c1", |args, _| match args[0].as_str() {
+                "inspect" => answer(inspect.unwrap_or(""), inspect.is_some()),
+                _ => answer(top.unwrap_or(""), top.is_some()),
+            })
+        };
+        let now = ["stop", "-t", "0", "c1"];
+        let grace = ["stop", "c1"];
+        let bare = Some("null|null|null|91483");
+        assert_eq!(stop(bare, Some("PID COMMAND\n91483 sleep")), now);
+        assert_eq!(
+            stop(bare, Some("PID COMMAND\n91483 docker-init\n91484 sleep")),
+            grace
+        );
+        assert_eq!(
+            stop(bare, Some("PID COMMAND\n91484 sleep\n91483 docker-init")),
+            grace
+        );
+        assert_eq!(stop(bare, None), grace);
+        assert_eq!(
+            stop(
+                Some("null|true|null|91483"),
+                Some("PID COMMAND\n91483 sleep")
+            ),
+            grace
+        );
+        assert_eq!(stop(None, Some("PID COMMAND\n91483 sleep")), grace);
     }
 
     #[test]

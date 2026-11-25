@@ -166,7 +166,7 @@ test.describe("delete and trash (#1220, #2489)", () => {
     await expect(row).toHaveCount(0, { timeout: 10_000 });
 
     const trashToggle = page.locator("[data-testid='sidebar-trash-toggle']");
-    await expect(trashToggle).toHaveAttribute("aria-label", "Trash (1)");
+    await expect(trashToggle).toHaveAttribute("aria-label", "Trash, 1 session");
     await trashToggle.click();
     const restorePromise = page.waitForResponse(
       (res) => res.url().endsWith(`/api/sessions/${sessionId}/restore`) && res.request().method() === "POST",

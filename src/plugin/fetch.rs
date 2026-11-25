@@ -2000,7 +2000,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let fixture = tempfile::tempdir().unwrap();
-        let directory = fixture.path().join("staging");
+        let directory = fixture.path().join("plugins/.staging-read-only");
         let mount = directory.join("volume");
         let nested = mount.join("tree/read-only");
         std::fs::create_dir_all(&nested).unwrap();

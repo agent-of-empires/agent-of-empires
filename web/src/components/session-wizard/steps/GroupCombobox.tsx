@@ -1,8 +1,9 @@
-import { useCallback, useId, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 
 import type { GroupInfo } from "../../../lib/types";
 import { ROW_INPUT } from "../WizardRows";
 import { groupOptions, optionLabel, type GroupOption } from "./groupOptions";
+import { isImeComposing } from "../../../lib/ime";
 
 const LIST_MAX = 288;
 
@@ -14,11 +15,27 @@ export function GroupCombobox({
   value,
   onChange,
   groups,
+  autoFocus,
+  testId,
+  disabled,
+  openOnFocus = true,
+  inline,
+  showAllUntilEdited = false,
 }: {
   id: string;
   value: string;
   onChange: (value: string) => void;
   groups: GroupInfo[];
+  /** Focus the input on mount and return focus to the previous element on unmount. */
+  autoFocus?: boolean;
+  testId?: string;
+  disabled?: boolean;
+  /** False keeps the list closed on focus, e.g. for a programmatic refocus. */
+  openOnFocus?: boolean;
+  /** Render the list in the page flow, pushing what is below instead of floating over it. */
+  inline?: boolean;
+  /** List every group, with the current value highlighted, until the user types. */
+  showAllUntilEdited?: boolean;
 }) {
   const listId = useId();
   const inputRef = useRef<HTMLInputElement>(null);
@@ -26,7 +43,14 @@ export function GroupCombobox({
   // By option identity, so groups arriving after typing don't move it onto another row.
   const [highlight, setHighlight] = useState<string | null>(null);
   const [placement, setPlacement] = useState<{ up: boolean; maxHeight: number }>({ up: true, maxHeight: LIST_MAX });
-  const { options, highlight: defaultHighlight } = groupOptions(groups, value);
+  const [edited, setEdited] = useState(!showAllUntilEdited);
+  const listFor = (text: string, isEdited: boolean) => {
+    const result = groupOptions(groups, isEdited ? text : "");
+    if (isEdited) return result;
+    const current = result.options.findIndex((o) => o.kind === "group" && o.group.path === text);
+    return { options: result.options, highlight: current };
+  };
+  const { options, highlight: defaultHighlight } = listFor(value, edited);
 
   // Opens upward unless there is room below inside the wizard's scroll area, and never
   // taller than the room it opens into, so the sheet can't clip it.
@@ -48,7 +72,7 @@ export function GroupCombobox({
 
   // Before paint, so the list never shows a frame at its default size.
   useLayoutEffect(() => {
-    if (!open) return;
+    if (!open || inline) return;
     place();
     const scroller = inputRef.current?.closest<HTMLElement>("[data-wizard-scroll]");
     const viewport = window.visualViewport;
@@ -63,11 +87,11 @@ export function GroupCombobox({
       viewport?.removeEventListener("scroll", place);
       window.removeEventListener("resize", place);
     };
-  }, [open, place]);
+  }, [open, inline, place]);
 
-  const show = (next: string) => {
+  const show = (next: string, isEdited = edited) => {
     setOpen(true);
-    const { options: nextOptions, highlight: i } = groupOptions(groups, next);
+    const { options: nextOptions, highlight: i } = listFor(next, isEdited);
     setHighlight(i >= 0 ? keyOf(nextOptions[i]!) : null);
   };
   const pick = (option: GroupOption) => {
@@ -75,7 +99,15 @@ export function GroupCombobox({
     setOpen(false);
   };
   const kept = highlight === null ? -1 : options.findIndex((o) => keyOf(o) === highlight);
-  const active = !open ? -1 : highlight === null ? -1 : kept >= 0 ? kept : defaultHighlight;
+  const active = !open
+    ? -1
+    : highlight === null
+      ? edited
+        ? -1
+        : defaultHighlight
+      : kept >= 0
+        ? kept
+        : defaultHighlight;
   const optionId = (i: number) => `${listId}-option-${i}`;
   // Also when rows arrive above the highlighted one or the popup resizes around it.
   useLayoutEffect(() => {
@@ -83,12 +115,30 @@ export function GroupCombobox({
       document.getElementById(`${listId}-option-${active}`)?.scrollIntoView?.({ block: "nearest" });
   }, [open, active, listId, options.length, placement.maxHeight]);
   const noGroups = groups.length === 0;
+  // Disabling a focused input does not reliably fire blur, so close the list here.
+  const [wasDisabled, setWasDisabled] = useState(disabled);
+  if (disabled !== wasDisabled) {
+    setWasDisabled(disabled);
+    if (disabled) setOpen(false);
+  }
+
+  useEffect(() => {
+    if (!autoFocus) return;
+    const previous = document.activeElement as HTMLElement | null;
+    inputRef.current?.focus();
+    inputRef.current?.select();
+    return () => previous?.focus?.();
+    // Mount-only, like useDialogFocus.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <div className="relative">
       <input
         ref={inputRef}
         id={id}
+        data-testid={testId}
+        disabled={disabled}
         type="text"
         role="combobox"
         data-owns-escape
@@ -101,9 +151,10 @@ export function GroupCombobox({
         placeholder="Optional"
         onChange={(e) => {
           onChange(e.target.value);
-          show(e.target.value);
+          setEdited(true);
+          show(e.target.value, true);
         }}
-        onFocus={() => show(value)}
+        onFocus={() => openOnFocus && show(value)}
         onBlur={() => setOpen(false)}
         onKeyDown={(e) => {
           if (e.key === "ArrowDown" || e.key === "ArrowUp") {
@@ -116,7 +167,7 @@ export function GroupCombobox({
               options.length - 1,
             );
             setHighlight(keyOf(options[next]!));
-          } else if (e.key === "Enter" && open) {
+          } else if (e.key === "Enter" && !isImeComposing(e) && open) {
             e.preventDefault();
             if (active >= 0) pick(options[active]!);
             else setOpen(false);
@@ -128,16 +179,23 @@ export function GroupCombobox({
         }}
         className={ROW_INPUT}
       />
-      {open && (
+      {open && !disabled && (
         <div
           data-testid="group-combobox-popup"
-          style={{ maxHeight: placement.maxHeight }}
-          className={`absolute left-0 right-0 z-20 flex flex-col overflow-hidden rounded-lg border border-surface-700/60 bg-surface-900 shadow-lg ${
-            placement.up ? "bottom-full mb-1" : "top-full mt-1"
+          style={inline ? undefined : { maxHeight: placement.maxHeight }}
+          className={`flex flex-col overflow-hidden rounded-lg border border-surface-700/60 bg-surface-900 ${
+            inline
+              ? "relative mt-1"
+              : `absolute left-0 right-0 z-20 shadow-lg ${placement.up ? "bottom-full mb-1" : "top-full mt-1"}`
           }`}
         >
           {/* In a cramped popup the help yields first, so at least one row stays usable. */}
-          <ul id={listId} role="listbox" aria-label="Groups" className="min-h-11 flex-1 overflow-y-auto">
+          <ul
+            id={listId}
+            role="listbox"
+            aria-label="Groups"
+            className={`min-h-11 flex-1 overflow-y-auto ${inline ? "max-h-40" : ""}`}
+          >
             {options.map((option, i) => (
               <li
                 key={keyOf(option)}
