@@ -16,6 +16,7 @@ const {
   fetchPresets,
   trashSession,
   updateSettings,
+  updateSuggestionPrefs,
 } = vi.hoisted(() => ({
   fetchSuggestions: vi.fn(),
   prepareSuggestion: vi.fn(),
@@ -26,6 +27,7 @@ const {
   fetchPresets: vi.fn(),
   trashSession: vi.fn(),
   updateSettings: vi.fn(),
+  updateSuggestionPrefs: vi.fn(),
 }));
 
 vi.mock("../../lib/api", () => ({
@@ -39,6 +41,7 @@ vi.mock("../../lib/api", () => ({
   fetchSuggestionPresets: fetchPresets,
   trashSession,
   updateSettings,
+  updateSuggestionPrefs,
 }));
 
 const item: SuggestionItem = {
@@ -756,6 +759,29 @@ describe("SuggestionsView", () => {
       ).toBeTruthy();
       fireEvent.click(screen.getByRole("button", { name: "Turn it on" }));
       expect(onOpenSettings).toHaveBeenCalled();
+    });
+
+    it("with every provider off, one note turns them all on instead of the per-provider notes", async () => {
+      const base = snapshot();
+      const off = { ...base.providers[0]!, enabled: false };
+      fetchSuggestions
+        .mockResolvedValueOnce({
+          ...base,
+          items: [],
+          providers: [off, { id: "linear", name: "Linear", status: "ok", enabled: false, sources: [] }],
+        })
+        .mockResolvedValue(base);
+      updateSuggestionPrefs.mockResolvedValue({ ok: true, data: undefined });
+      render(<SuggestionsView onPrepare={vi.fn()} onOpenSession={vi.fn()} onOpenSettings={vi.fn()} />);
+      expect((await screen.findByTestId("suggestions-off")).textContent).toBe(
+        "Suggestions are off: GitHub, Linear are installed but turned off. Turn them on",
+      );
+      expect(screen.queryByText(/hidden because|Nothing to suggest/)).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Turn them on" }));
+      await waitFor(() =>
+        expect(updateSuggestionPrefs).toHaveBeenCalledWith({ provider_enabled: { github: true, linear: true } }),
+      );
+      expect(await screen.findByText("Fix lifecycle")).toBeTruthy();
     });
   });
 

@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
-import { fetchSuggestions, refreshSuggestions, runSuggestionChecks, type PluginDiscoveryResult } from "../lib/api";
+import {
+  fetchSuggestions,
+  refreshSuggestions,
+  runSuggestionChecks,
+  updateSuggestionPrefs,
+  type PluginDiscoveryResult,
+} from "../lib/api";
 import { sourceLabel } from "../lib/featuredSuggestionSources";
 import type { SuggestionSetupCheck, SuggestionsSnapshot } from "../lib/types";
 import { PluginInstallConsentModal } from "./settings/PluginInstallConsentModal";
@@ -252,11 +258,13 @@ function ChecksStep({ onDone, onFinishLater }: { onDone: () => void; onFinishLat
   const [rechecking, setRechecking] = useState(false);
   const [loadFailed, setLoadFailed] = useState(false);
   const [recheckError, setRecheckError] = useState<string | null>(null);
+  const [enableError, setEnableError] = useState<string | null>(null);
 
   // Polls until the first suggestions land or a check fails; Check again restarts it.
   useEffect(() => {
     if (!polling) return;
     let alive = true;
+    let switchedOn = false;
     const tick = async () => {
       const next = await fetchSuggestions();
       if (!alive) return;
@@ -266,6 +274,18 @@ function ChecksStep({ onDone, onFinishLater }: { onDone: () => void; onFinishLat
         return;
       }
       setSnapshot(next);
+      // Providers start off and are not checked until on. The sheet is only offered with none installed, so every one is one it installed.
+      const off = next.providers.filter((p) => !p.enabled);
+      if (off.length > 0 && !switchedOn) {
+        const res = await updateSuggestionPrefs({ provider_enabled: Object.fromEntries(off.map((p) => [p.id, true])) });
+        if (!alive) return;
+        if (!res.ok) {
+          setEnableError(`Couldn't turn on ${off.map((p) => p.name).join(", ")}: ${res.error}`);
+          setPolling(false);
+          return;
+        }
+        switchedOn = true;
+      }
       if (isReady(next)) onDone();
       else if (checkRows(next).some((c) => c.status === "fail")) setPolling(false);
       else timer = setTimeout(() => void tick(), POLL_MS);
@@ -334,7 +354,16 @@ function ChecksStep({ onDone, onFinishLater }: { onDone: () => void; onFinishLat
             Could not load suggestions.
           </li>
         )}
-        {!failed && !loadFailed && (
+        {enableError && (
+          <li
+            className="px-4 py-3 text-sm text-status-error-text"
+            role="alert"
+            data-testid="suggestions-setup-enable-error"
+          >
+            {enableError}
+          </li>
+        )}
+        {!failed && !loadFailed && !enableError && (
           <li className="flex gap-3 px-4 py-3" data-testid="suggestions-setup-waiting">
             <span aria-hidden="true" className="w-[18px] shrink-0 text-center font-mono text-brand-500">
               ⠙
@@ -352,12 +381,13 @@ function ChecksStep({ onDone, onFinishLater }: { onDone: () => void; onFinishLat
         <button type="button" className={GHOST} onClick={onFinishLater} data-testid="suggestions-setup-later">
           Finish later
         </button>
-        {loadFailed && (
+        {(loadFailed || enableError) && (
           <button
             type="button"
             className={PRIMARY}
             onClick={() => {
               setLoadFailed(false);
+              setEnableError(null);
               setPolling(true);
             }}
             data-testid="suggestions-setup-retry"
@@ -403,7 +433,7 @@ function checkRows(s: SuggestionsSnapshot): SuggestionSetupCheck[] {
 function isReady(s: SuggestionsSnapshot): boolean {
   return (
     s.providers.length > 0 &&
-    s.providers.every((p) => p.status === "ok") &&
+    s.providers.every((p) => p.enabled && p.status === "ok") &&
     !checkRows(s).some((c) => c.status === "fail")
   );
 }

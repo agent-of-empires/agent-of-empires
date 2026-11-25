@@ -7,7 +7,13 @@ import { SuggestionItemActions } from "./SuggestionItemActions";
 import { SuggestionHooksReview } from "./SuggestionHooksReview";
 import { suggestionKey, useDismissUndo, useSuggestions } from "../hooks/useSuggestions";
 import { useIsWideViewport } from "../hooks/useIsWideViewport";
-import { SUGGESTION_NOTE_CLASS, SuggestionRow, SuggestionStatusNotes, UndoBar } from "./SuggestionRow";
+import {
+  SUGGESTION_NOTE_CLASS,
+  SuggestionRow,
+  SuggestionStatusNotes,
+  SuggestionsOffNote,
+  UndoBar,
+} from "./SuggestionRow";
 import type { WizardPrefill } from "./session-wizard/SessionWizard";
 
 interface Props {
@@ -60,8 +66,10 @@ export function DashboardSuggestions({
 
   const active = snapshot.items.filter((item) => !item.dismissed);
   const rows = active.slice(0, wide ? 3 : 2);
-  const pending = snapshot.providers.filter((p) => p.status === "pending");
-  const errored = snapshot.providers.filter((p) => p.status === "error");
+  // A provider that is off is never asked, so it stays "pending" forever.
+  const on = snapshot.providers.filter((p) => p.enabled);
+  const pending = on.filter((p) => p.status === "pending");
+  const errored = on.filter((p) => p.status === "error");
   const kindOf = (item: { provider_id: string; criterion: string }) =>
     snapshot.providers
       .find((p) => p.id === item.provider_id)
@@ -138,7 +146,15 @@ export function DashboardSuggestions({
             {p.name} · couldn&apos;t refresh, {p.error ?? "provider error"}
           </li>
         ))}
-        {rows.length === 0 && pending.length === 0 && (
+        {on.length === 0 && (
+          <SuggestionsOffNote
+            providers={snapshot.providers}
+            readOnly={readOnly}
+            disabled={busy !== null || offline}
+            act={act}
+          />
+        )}
+        {rows.length === 0 && pending.length === 0 && on.length > 0 && (
           <li className={SUGGESTION_NOTE_CLASS}>
             {errored.length === 0 && "Nothing to suggest right now. "}
             {!readOnly && !offline && (

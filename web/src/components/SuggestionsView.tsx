@@ -12,7 +12,14 @@ import { SuggestionItemActions } from "./SuggestionItemActions";
 import { SuggestionHooksReview } from "./SuggestionHooksReview";
 import { SuggestionsSetupHint } from "./SuggestionsSetupHint";
 import { StartedPromptNote } from "./PromptBlockedNote";
-import { SUGGESTION_NOTE_CLASS, SuggestionRow, TAP, SuggestionStatusNotes, UndoBar } from "./SuggestionRow";
+import {
+  SUGGESTION_NOTE_CLASS,
+  SuggestionRow,
+  TAP,
+  SuggestionStatusNotes,
+  SuggestionsOffNote,
+  UndoBar,
+} from "./SuggestionRow";
 import type { WizardPrefill } from "./session-wizard/SessionWizard";
 
 interface Props {
@@ -124,6 +131,7 @@ export function SuggestionsView({
     );
   const chipSelected = (chip: KeyChip) => keyChips.some((c) => chipId(c) === chipId(chip));
   const providers = snapshot?.providers.filter((p) => p.enabled) ?? [];
+  const allOff = !!snapshot && snapshot.providers.length > 0 && providers.length === 0;
   const anyRefreshing = refreshing || providers.some((p) => p.refreshing);
   const groups = groupByRepo(visible);
   const kindOptions = providers.flatMap((p) =>
@@ -440,7 +448,15 @@ export function SuggestionsView({
               );
             })}
             <ul className="mt-4 rounded-lg border border-surface-700/40 bg-surface-900 empty:hidden">
-              {visible.length === 0 && (
+              {allOff && (
+                <SuggestionsOffNote
+                  providers={snapshot.providers}
+                  readOnly={readOnly}
+                  disabled={busy !== null || disabled}
+                  act={act}
+                />
+              )}
+              {visible.length === 0 && !allOff && (
                 <li className={SUGGESTION_NOTE_CLASS}>
                   {narrowed && listed.length > 0
                     ? "No suggestions match the filters."
@@ -451,22 +467,23 @@ export function SuggestionsView({
                         : "Nothing to suggest right now."}
                 </li>
               )}
-              {snapshot.providers
-                .filter((p) => !p.enabled)
-                .map((p) => (
-                  <li key={p.id} className={SUGGESTION_NOTE_CLASS}>
-                    {p.name} suggestions are hidden because {p.name} is off in Settings › Suggestions.{" "}
-                    {onOpenSettings && (
-                      <button
-                        type="button"
-                        onClick={onOpenSettings}
-                        className="cursor-pointer text-brand-500 hover:underline"
-                      >
-                        Turn it on
-                      </button>
-                    )}
-                  </li>
-                ))}
+              {!allOff &&
+                snapshot.providers
+                  .filter((p) => !p.enabled)
+                  .map((p) => (
+                    <li key={p.id} className={SUGGESTION_NOTE_CLASS}>
+                      {p.name} suggestions are hidden because {p.name} is off in Settings › Suggestions.{" "}
+                      {onOpenSettings && (
+                        <button
+                          type="button"
+                          onClick={onOpenSettings}
+                          className="cursor-pointer text-brand-500 hover:underline"
+                        >
+                          Turn it on
+                        </button>
+                      )}
+                    </li>
+                  ))}
               <SuggestionStatusNotes readOnly={readOnly} offline={offline} cityhall={cityhall} />
             </ul>
             {undo && (

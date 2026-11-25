@@ -1,7 +1,8 @@
 import { useState, type ReactNode } from "react";
 import { MoreHorizontal, X } from "lucide-react";
 import { failureText, lockTitle, STALE_REASON } from "../lib/suggestionPlan";
-import type { StartedSession } from "../lib/types";
+import { updateSuggestionPrefs, type SuggestionResult } from "../lib/api";
+import type { StartedSession, SuggestionProvider } from "../lib/types";
 import { agoLabel } from "../lib/suggestionTime";
 import { MENU_ITEM, MenuPopover, StartInMenu, StartMenu, type StartMenuProps } from "./SuggestionStartMenu";
 
@@ -330,6 +331,43 @@ export function SuggestionActions({
         </button>
       )}
     </>
+  );
+}
+
+/** Every installed provider is off. Read-only says where to turn one on instead of offering it. */
+export function SuggestionsOffNote({
+  providers,
+  readOnly,
+  disabled,
+  act,
+}: {
+  providers: SuggestionProvider[];
+  readOnly: boolean;
+  disabled: boolean;
+  /** The `act` of {@link useSuggestions}, so the snapshot reloads once they are on. */
+  act: (key: string, run: () => Promise<SuggestionResult<unknown>>) => Promise<boolean>;
+}) {
+  const one = providers.length === 1;
+  const turnOn = () =>
+    act("turn-on", () =>
+      updateSuggestionPrefs({ provider_enabled: Object.fromEntries(providers.map((p) => [p.id, true])) }),
+    );
+  return (
+    <li className={SUGGESTION_NOTE_CLASS} data-testid="suggestions-off">
+      Suggestions are off: {providers.map((p) => p.name).join(", ")} {one ? "is" : "are"} installed but turned off.{" "}
+      {readOnly ? (
+        "Turn one on in Settings › Suggestions."
+      ) : (
+        <button
+          type="button"
+          onClick={() => void turnOn()}
+          disabled={disabled}
+          className="cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
+        >
+          {one ? "Turn it on" : "Turn them on"}
+        </button>
+      )}
+    </li>
   );
 }
 

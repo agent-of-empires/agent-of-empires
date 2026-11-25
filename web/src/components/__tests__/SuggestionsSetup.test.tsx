@@ -14,6 +14,7 @@ const api = vi.hoisted(() => ({
   startPluginInstall: vi.fn(),
   runSuggestionChecks: vi.fn(),
   refreshSuggestions: vi.fn(),
+  updateSuggestionPrefs: vi.fn(),
 }));
 const hydration = vi.hoisted(() => ({ done: true, listeners: [] as Array<() => void> }));
 
@@ -78,6 +79,7 @@ const provider = (over: Partial<SuggestionProvider> = {}): SuggestionProvider =>
   id: "github",
   name: "GitHub",
   status: "ok",
+  enabled: true,
   sources: [],
   checks: [],
   ...over,
@@ -348,6 +350,38 @@ describe("setup sheet", () => {
 
     fireEvent.click(await screen.findByTestId("suggestions-setup-show"));
     expect(onFinished).toHaveBeenCalled();
+  });
+
+  it("turns on the providers it installed, then finishes once they report", async () => {
+    await openSheet();
+    await approveInstall();
+    api.updateSuggestionPrefs.mockImplementation(async () => {
+      api.fetchSuggestions.mockResolvedValue(snapshot([provider({ checks: [check("cli", "ok")] })]));
+      return { ok: true, data: undefined };
+    });
+    api.fetchSuggestions.mockResolvedValue(snapshot([provider({ status: "pending", enabled: false })]));
+    fireEvent.click(await screen.findByText("close-job"));
+
+    expect(await screen.findByTestId("suggestions-setup-show", {}, { timeout: 4000 })).toBeTruthy();
+    expect(api.updateSuggestionPrefs).toHaveBeenCalledTimes(1);
+    expect(api.updateSuggestionPrefs).toHaveBeenCalledWith({ provider_enabled: { github: true } });
+  });
+
+  it("says when turning the installed provider on fails, and Retry tries again", async () => {
+    await openSheet();
+    await approveInstall();
+    api.updateSuggestionPrefs.mockResolvedValue({ ok: false, error: "read-only", stale: false });
+    api.fetchSuggestions.mockResolvedValue(snapshot([provider({ status: "pending", enabled: false })]));
+    fireEvent.click(await screen.findByText("close-job"));
+
+    expect((await screen.findByTestId("suggestions-setup-enable-error")).textContent).toBe(
+      "Couldn't turn on GitHub: read-only",
+    );
+    expect(screen.queryByTestId("suggestions-setup-waiting")).toBeNull();
+    api.updateSuggestionPrefs.mockResolvedValue({ ok: true, data: undefined });
+    fireEvent.click(screen.getByTestId("suggestions-setup-retry"));
+    await waitFor(() => expect(screen.queryByTestId("suggestions-setup-enable-error")).toBeNull());
+    expect(api.updateSuggestionPrefs).toHaveBeenCalledTimes(2);
   });
 
   it("treats closing after the install as finishing, so the hint stops offering it", async () => {

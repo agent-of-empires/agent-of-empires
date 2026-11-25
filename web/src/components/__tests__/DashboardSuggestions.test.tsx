@@ -15,7 +15,10 @@ const { fetchSuggestions, prepareSuggestion, refreshSuggestions, dismissSuggesti
     wide: { value: true },
   }));
 
-const { updateSuggestionSource } = vi.hoisted(() => ({ updateSuggestionSource: vi.fn() }));
+const { updateSuggestionSource, updateSuggestionPrefs } = vi.hoisted(() => ({
+  updateSuggestionSource: vi.fn(),
+  updateSuggestionPrefs: vi.fn(),
+}));
 
 vi.mock("../../lib/api", () => ({
   startSuggestion,
@@ -26,6 +29,7 @@ vi.mock("../../lib/api", () => ({
   refreshSuggestions,
   dismissSuggestion,
   updateSuggestionSource,
+  updateSuggestionPrefs,
 }));
 vi.mock("../../hooks/useIsWideViewport", () => ({ useIsWideViewport: () => wide.value }));
 
@@ -52,7 +56,7 @@ const PREFS: SuggestionsSnapshot["prefs"] = {
 };
 const snap = (items: SuggestionItem[], status: "ok" | "pending" = "ok"): SuggestionsSnapshot => ({
   items,
-  providers: [{ id: "github", name: "GitHub", status, sources: [] }],
+  providers: [{ id: "github", name: "GitHub", status, enabled: true, sources: [] }],
   prefs: PREFS,
 });
 const ok = { ok: true, data: undefined };
@@ -69,10 +73,45 @@ const renderIt = (props: Partial<Parameters<typeof DashboardSuggestions>[0]> = {
   render(<DashboardSuggestions onPrepare={vi.fn()} onViewAll={vi.fn()} onOpenSession={vi.fn()} {...props} />);
 
 describe("DashboardSuggestions", () => {
+  it("says when every installed provider is off, and turns them on in one click", async () => {
+    const off: SuggestionsSnapshot = {
+      ...snap([]),
+      providers: [{ id: "github", name: "GitHub", status: "pending", enabled: false, sources: [] }],
+    };
+    fetchSuggestions.mockResolvedValueOnce(off).mockResolvedValue(snap([mk(1)]));
+    updateSuggestionPrefs.mockResolvedValue(ok);
+    renderIt();
+    expect((await screen.findByTestId("suggestions-off")).textContent).toBe(
+      "Suggestions are off: GitHub is installed but turned off. Turn it on",
+    );
+    expect(screen.queryByText(/Getting your first suggestions|Nothing to suggest/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Turn it on" }));
+    await waitFor(() => expect(updateSuggestionPrefs).toHaveBeenCalledWith({ provider_enabled: { github: true } }));
+    expect(await screen.findByText("Item 1")).toBeTruthy();
+    expect(screen.queryByTestId("suggestions-off")).toBeNull();
+  });
+
+  it("read-only, the off note says where to turn a provider on instead of offering it", async () => {
+    fetchSuggestions.mockResolvedValue({
+      ...snap([]),
+      providers: [
+        { id: "github", name: "GitHub", status: "pending", enabled: false, sources: [] },
+        { id: "linear", name: "Linear", status: "pending", enabled: false, sources: [] },
+      ],
+    });
+    renderIt({ readOnly: true });
+    expect((await screen.findByTestId("suggestions-off")).textContent).toBe(
+      "Suggestions are off: GitHub, Linear are installed but turned off. Turn one on in Settings › Suggestions.",
+    );
+    expect(screen.queryByRole("button", { name: /Turn/ })).toBeNull();
+  });
+
   it("shows a provider error instead of claiming there is nothing to suggest", async () => {
     fetchSuggestions.mockResolvedValue({
       ...snap([]),
-      providers: [{ id: "github", name: "GitHub", status: "error", error: "gh is not signed in", sources: [] }],
+      providers: [
+        { id: "github", name: "GitHub", status: "error", error: "gh is not signed in", enabled: true, sources: [] },
+      ],
     });
     renderIt();
     expect(await screen.findByText(/GitHub · couldn't refresh, gh is not signed in/)).toBeTruthy();
@@ -326,7 +365,9 @@ describe("DashboardSuggestions", () => {
   it("a failed refresh keeps Try again, which refreshes again", async () => {
     fetchSuggestions.mockResolvedValue({
       ...snap([]),
-      providers: [{ id: "github", name: "GitHub", status: "error", error: "gh is not signed in", sources: [] }],
+      providers: [
+        { id: "github", name: "GitHub", status: "error", error: "gh is not signed in", enabled: true, sources: [] },
+      ],
     });
     refreshSuggestions.mockResolvedValue({ ok: false, error: "Refresh failed." });
     renderIt();
