@@ -5,6 +5,7 @@ import { test, expect, type ServeHandle } from "../helpers/liveTest";
 import { enableStructuredViewAndWait, composer } from "../helpers/acp";
 import { listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 import { openDeleteDialogFromRow } from "../helpers/trashMocks";
+import { openReviewPane } from "../helpers/panes";
 
 async function openFile(page: Page, serve: ServeHandle, title?: string) {
   const sessions = await listSessions(serve.baseUrl);
@@ -22,9 +23,7 @@ async function showNotes(page: Page) {
     await page.getByRole("button", { name: "Toggle panels" }).click();
     await page.getByTestId("mobile-right-panel-picker").getByRole("button", { name: "Files", exact: true }).click();
   } else {
-    const toggle = page.getByRole("button", { name: "Toggle Files pane" }).first();
-    await expect(toggle).toBeVisible();
-    if ((await toggle.getAttribute("aria-pressed")) !== "true") await toggle.click();
+    await openReviewPane(page, "files");
   }
   await page.getByRole("button", { name: "notes.txt", exact: true }).first().click();
 }
@@ -92,11 +91,9 @@ test("file editing is opt-in, persists exact bytes and mode, and guards dirty pa
   page.off("dialog", recordDialog);
   expect(unexpectedDialogs).toEqual([]);
   await expect(editor).toHaveValue("changed\nsecond\n");
+  // Opening Diff in the edited pane's group would hide it; declining keeps the draft.
   page.once("dialog", (dialog) => dialog.dismiss());
-  await page
-    .getByRole("button", { name: /^New terminal for / })
-    .first()
-    .click();
+  await openReviewPane(page, "diff");
   await expect(editor).toHaveValue("changed\nsecond\n");
   const currentUrl = page.url();
   const leaving = page.waitForEvent("dialog");
@@ -299,7 +296,7 @@ test("changing the other dock keeps a visible draft without asking", async ({ pa
   expect(dialogs).toEqual([]);
   await expect(editor).toHaveValue("draft");
   // Hiding the edited tab still asks; declining keeps it.
-  await newTerminal.first().click();
+  await openReviewPane(page, "diff");
   await expect.poll(() => dialogs.length).toBe(1);
   await expect(editor).toHaveValue("draft");
 });

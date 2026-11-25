@@ -8,6 +8,7 @@ import { test, expect, type ServeHandle } from "../helpers/liveTest";
 import { appDirFor, listSessions, resolveAoeBinary, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 import { commitAll, generateLargeFileContent, pngStubBytes, writeBinaryFile } from "../helpers/gitFixture";
 import { enableStructuredViewAndWait } from "../helpers/acp";
+import { openReviewPane } from "../helpers/panes";
 
 const decodablePng = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEklEQVR4AWLSSN30H4SZGKAAAAAA//977exuAAAABklEQVQDADoABIHXJwUZAAAAAElFTkSuQmCC",
@@ -39,7 +40,7 @@ test("files pane renders a Markdown file in a scratch session", async ({ page, s
     }),
   });
   await openSession(page, serve, "rp-files-md");
-  await page.getByRole("button", { name: "Toggle Files pane" }).first().click();
+  await openReviewPane(page, "files");
   const planRow = page.getByRole("button", { name: "plan.md" }).first();
   await expect(planRow).toBeVisible({ timeout: 10_000 });
   await planRow.click();
@@ -118,7 +119,7 @@ test("files pane numbers the lines of a source file", async ({ page, spawnServe 
     }),
   });
   await openSession(page, serve, "rp-files-gutter");
-  await page.getByRole("button", { name: "Toggle Files pane" }).first().click();
+  await openReviewPane(page, "files");
   const notesRow = page.getByRole("button", { name: "notes.ts" }).first();
   await expect(notesRow).toBeVisible({ timeout: 10_000 });
   await notesRow.click();
@@ -219,7 +220,7 @@ test("files pane: Open file shows an unchanged file in a new tab", async ({ page
     }),
   });
   await openSession(page, serve, "rp-files-open");
-  await page.getByRole("button", { name: "Toggle Files pane" }).first().click();
+  await openReviewPane(page, "files");
 
   const openFileFor = async (name: string) => {
     await page.getByRole("button", { name }).first().click({ button: "right" });
@@ -252,7 +253,7 @@ test("files pane: a binary file renders an image inline and downloads anything e
     }),
   });
   await openSession(page, serve, "rp-files-binary");
-  await page.getByRole("button", { name: "Toggle Files pane" }).first().click();
+  await openReviewPane(page, "files");
 
   await page.getByRole("button", { name: "logo.png" }).first().click();
   const image = page.getByRole("img", { name: "logo.png" });
