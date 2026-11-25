@@ -641,6 +641,9 @@ pub struct HomeView {
     pub(super) hide_snoozed_with_stopped: bool,
     /// Show only the sessions that need you, in their usual places.
     pub(super) needs_you_only: bool,
+    /// The selected session the needs-you filter keeps listed after it stops needing you,
+    /// until the selection leaves it.
+    pub(super) needs_you_kept: Option<String>,
     /// While stopped sessions are hidden, each group header's full count, keyed by path and
     /// profile, so the header can show `visible/total`.
     pub(super) group_totals: HashMap<(String, Option<String>), usize>,

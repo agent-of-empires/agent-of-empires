@@ -230,7 +230,37 @@ impl HomeView {
 
     /// Whether the `y` filter or the needs-you filter is keeping `inst` out of the list.
     pub(super) fn hidden_by_filter(&self, inst: &Instance) -> bool {
-        (self.needs_you_only && !inst.needs_you()) || self.hidden_as_stopped(inst)
+        (self.needs_you_only && !self.listed_by_needs_you(inst)) || self.hidden_as_stopped(inst)
+    }
+
+    /// Whether the needs-you filter lists `inst`: it needs you, or it is the selection kept.
+    pub(super) fn listed_by_needs_you(&self, inst: &Instance) -> bool {
+        inst.needs_you()
+            || (self.needs_you_kept.as_deref() == Some(inst.id.as_str()) && !inst.is_dismissed())
+    }
+
+    /// Keep the selected session listed under the needs-you filter until the selection leaves
+    /// it, as a mail client keeps a message just read; the row left behind drops out at once.
+    pub(super) fn sync_needs_you_kept(&mut self) {
+        let kept = self
+            .selected_session
+            .clone()
+            .filter(|_| self.needs_you_only)
+            .filter(|id| {
+                self.get_instance(id)
+                    .is_some_and(|inst| self.listed_by_needs_you(inst))
+            });
+        let released = std::mem::replace(&mut self.needs_you_kept, kept);
+        if released.is_some()
+            && released != self.needs_you_kept
+            && self.needs_you_only
+            && released
+                .as_deref()
+                .and_then(|id| self.get_instance(id))
+                .is_some_and(|inst| !inst.needs_you())
+        {
+            self.rebuild_flat_items_keeping_cursor();
+        }
     }
 
     pub(super) fn hidden_as_stopped(&self, inst: &Instance) -> bool {
@@ -251,7 +281,8 @@ impl HomeView {
     /// The row of the group header session `id` sits under while a filter hides it, so a
     /// selection that drops out moves to its own group rather than to whichever row now has its
     /// index. Read from the unfiltered rows of the current grouping, where a session follows its
-    /// own group's header.
+    /// own group's header. When the filter drops that header too, the nearest listed header
+    /// before the session, or else after it.
     pub(super) fn header_row_for_hidden_session(&self, id: &str) -> Option<usize> {
         if !self
             .get_instance(id)
@@ -263,12 +294,14 @@ impl HomeView {
         let at = unfiltered
             .iter()
             .position(|item| matches!(item, Item::Session { id: sid, .. } if sid == id))?;
-        let (path, profile) = unfiltered[..at].iter().rev().find_map(|item| match item {
-            Item::Group { path, profile, .. } => Some((path, profile)),
-            Item::Session { .. } | Item::Suggested { .. } => None,
-        })?;
-        self.flat_items.iter().position(|item| {
-            matches!(item, Item::Group { path: p, profile: pr, .. } if p == path && pr == profile)
+        let (before, after) = unfiltered.split_at(at);
+        before.iter().rev().chain(after).find_map(|item| {
+            let Item::Group { path, profile, .. } = item else {
+                return None;
+            };
+            self.flat_items.iter().position(|row| {
+                matches!(row, Item::Group { path: p, profile: pr, .. } if p == path && pr == profile)
+            })
         })
     }
 
@@ -297,7 +330,7 @@ impl HomeView {
 
         let mut pool = self.shown_in_groups(self.cloned_instances_in_active_view(), hide_stopped);
         if needs_you_only {
-            pool.retain(Instance::needs_you);
+            pool.retain(|inst| self.listed_by_needs_you(inst));
         }
         let mut items = if let Some(profile) = &self.active_profile {
             self.group_trees
@@ -323,7 +356,7 @@ impl HomeView {
         let mut grouped: Vec<Instance> = self
             .cloned_instances_in_active_view()
             .into_iter()
-            .filter(|inst| !needs_you_only || inst.needs_you())
+            .filter(|inst| !needs_you_only || self.listed_by_needs_you(inst))
             .map(|mut inst| {
                 inst.group_path = if inst.is_archived() || inst.is_trashed() {
                     project_group_key(&inst)

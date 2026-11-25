@@ -365,6 +365,7 @@ impl HomeView {
             suggestions_feed: crate::tui::suggestions::SuggestionsFeed::new(),
             hide_stopped_in_groups: false,
             needs_you_only: false,
+            needs_you_kept: None,
             group_totals: HashMap::new(),
             opener_exits: Vec::new(),
             restart_cooldown_at: std::collections::HashMap::new(),

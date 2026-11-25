@@ -487,8 +487,8 @@ impl Instance {
     }
 
     /// Waiting on a person, in Error, flagged urgent, or finished and not yet seen (with the
-    /// unread indicator on), and not put away. The web dashboard's `sessionNeedsAttention`
-    /// reads the same states.
+    /// unread indicator on), and not put away. Differs from the web's `sessionNeedsAttention`:
+    /// unread counts here, plugin attention does not.
     pub fn needs_you(&self) -> bool {
         !self.is_dismissed()
             && (matches!(

@@ -695,24 +695,107 @@ fn needs_you_counts_on_headers_and_filters_the_list() {
     assert_eq!(session_titles(&env.view).len(), 6);
 }
 
-/// Under the needs-you filter, a session that stops needing you leaves the list at once: live-send
-/// on it ends and the selection moves to its own header.
+/// Under the needs-you filter, the selected session stays listed after it stops needing you, and
+/// live-send to it keeps working. Once the cursor leaves it, it drops out like a row the `y`
+/// filter hides: live-send on it ends and the selection stays on its header.
 #[test]
 #[serial]
-fn a_session_that_stops_needing_you_ends_live_send_and_selects_its_header() {
+fn a_session_that_stops_needing_you_stays_until_the_cursor_leaves_it() {
     let mut env = env_with_stopped(true);
     let id = select_session(&mut env, "util-stopped-a");
     publish_statuses(&mut env.view, &[(&id, Status::Waiting)]);
     env.view.toggle_needs_you_only();
     select_session(&mut env, "util-stopped-a");
-    live_send_to_terminal(&mut env, &id);
 
     publish_statuses(&mut env.view, &[(&id, Status::Running)]);
+    live_send_to_terminal(&mut env, &id);
+    env.view.rebuild_flat_items();
+
+    assert_eq!(session_titles(&env.view), ["util-stopped-a"]);
+    assert_eq!(env.view.selected_session.as_deref(), Some(id.as_str()));
+    assert!(env.view.live_send.is_some(), "the kept row is still shown");
+    assert!(!header_text(&env.view, "util").contains('\u{25cf}'));
+
+    env.view.cursor = env.view.cursor.checked_sub(1).unwrap();
+    env.view.update_selected();
 
     assert!(session_titles(&env.view).is_empty());
     assert!(env.view.live_send.is_none(), "live-send ends with its row");
     assert_eq!(env.view.selected_session, None);
     assert_eq!(env.view.selected_group.as_deref(), Some("util"));
+}
+
+/// The dwell that marks the selected unread session read does not pull it out from under the
+/// cursor; moving to another row does.
+#[test]
+#[serial]
+fn a_session_read_by_dwelling_on_it_stays_until_the_cursor_leaves_it() {
+    let unread_before = crate::session::unread_enabled();
+    crate::session::set_unread_enabled(true);
+    let mut env = env_with_stopped(true);
+    let error = select_session(&mut env, "ops-stopped-b");
+    publish_statuses(&mut env.view, &[(&error, Status::Error)]);
+    let unread = select_session(&mut env, "util-live");
+    env.view.mutate_instance(&unread, |inst| inst.mark_unread());
+    env.view.toggle_needs_you_only();
+    select_session(&mut env, "util-live");
+    let _commands = env.view.session_feed.request_driver_for_test();
+
+    let now = std::time::Instant::now();
+    assert!(!env.view.tick_unread_dwell(now));
+    assert!(env
+        .view
+        .tick_unread_dwell(now + crate::tui::home::UNREAD_DWELL));
+    // The canonical row comes back read.
+    publish_statuses(&mut env.view, &[]);
+    assert!(!env.view.get_instance(&unread).unwrap().is_unread());
+
+    let mut shown = session_titles(&env.view);
+    shown.sort();
+    assert_eq!(shown, ["ops-stopped-b", "util-live"]);
+    assert_eq!(env.view.selected_session.as_deref(), Some(unread.as_str()));
+
+    select_session(&mut env, "ops-stopped-b");
+
+    assert_eq!(session_titles(&env.view), ["ops-stopped-b"]);
+    assert_eq!(env.view.selected_session.as_deref(), Some(error.as_str()));
+    crate::session::set_unread_enabled(unread_before);
+}
+
+/// Under Repository, a selected session the needs-you filter drops along with its repository's
+/// header moves the selection to another header, not to whichever session now has its index.
+#[test]
+#[serial]
+fn a_selection_whose_header_drops_out_lands_on_a_header() {
+    let mut env = env_with_stopped(false);
+    env.view.apply_group_by(GroupByMode::Project);
+    let util = select_session(&mut env, "util-stopped-a");
+    let ops = select_session(&mut env, "ops-stopped-b");
+    publish_statuses(
+        &mut env.view,
+        &[(&util, Status::Waiting), (&ops, Status::Waiting)],
+    );
+    env.view.toggle_needs_you_only();
+
+    for (title, gone, other) in [
+        ("util-stopped-a", &util, "ops"),
+        ("ops-stopped-b", &ops, "util"),
+    ] {
+        select_session(&mut env, title);
+        env.view.mutate_instance(gone, |inst| {
+            inst.ignored_at = Some(crate::time::Timestamp::now())
+        });
+        env.view.rebuild_flat_items_keeping_cursor();
+
+        assert_eq!(env.view.selected_session, None, "{title}");
+        assert!(
+            matches!(&env.view.flat_items[env.view.cursor], Item::Group { path, .. } if path.starts_with(other)),
+            "{title}"
+        );
+        env.view
+            .mutate_instance(gone, |inst| inst.ignored_at = None);
+        env.view.rebuild_flat_items_keeping_cursor();
+    }
 }
 
 /// Under Repository, a needs-you filter that matches nothing leaves no rows, and no session or

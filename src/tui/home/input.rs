@@ -4838,9 +4838,9 @@ impl HomeView {
             .collect();
         let current_session = self.selected_session.clone();
 
-        // Pass 1: forward-walk from cursor+1, wrapping, for the next Waiting session or a
-        // freshly-stopped Idle one (within `idle_decay_window`). Both need attention, so
-        // they cycle together and repeated `w` taps walk the actionable backlog.
+        // Pass 1: forward-walk from cursor+1, wrapping, for the next session that needs you
+        // or a freshly-stopped Idle one (within `idle_decay_window`), so repeated `w` taps
+        // walk the actionable backlog.
         let window = self.idle_decay_window;
         let start = (self.cursor + 1) % len;
         for i in 0..len - 1 {
@@ -4850,14 +4850,9 @@ impl HomeView {
                 _ => continue,
             };
             if let Some(inst) = self.get_instance(&id) {
-                // Trashed rows are stopped and only surface under the collapsed Trash
-                // section, so they never need attention even if a stale unread flag
-                // survived (#2489). Snoozed and archived rows are the same explicit
-                // "don't bother me" sink states.
+                // Dismissed rows never need attention, even with a stale unread flag (#2489).
                 let is_actionable = !inst.is_dismissed()
-                    && (inst.needs_you()
-                        || matches!(inst.idle_age(), Some(age) if age < window)
-                        || (crate::session::unread_enabled() && inst.is_unread()));
+                    && (inst.needs_you() || matches!(inst.idle_age(), Some(age) if age < window));
                 if is_actionable {
                     self.jump_to_session_id(&id);
                     return;
@@ -4876,9 +4871,7 @@ impl HomeView {
                 {
                     return false;
                 }
-                inst.needs_you()
-                    || matches!(inst.idle_age(), Some(age) if age < window)
-                    || (crate::session::unread_enabled() && inst.is_unread())
+                inst.needs_you() || matches!(inst.idle_age(), Some(age) if age < window)
             })
             .map(|inst| inst.id.clone());
         if let Some(id) = hidden_actionable {
@@ -5132,6 +5125,7 @@ impl HomeView {
                 self.unread_dwell = None;
             }
         }
+        self.sync_needs_you_kept();
         if self.selected_is_trashed() {
             self.exit_live_send_if_active();
         }

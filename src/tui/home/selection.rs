@@ -30,6 +30,7 @@ impl HomeView {
             self.selected_session = None;
             self.selected_group = None;
             self.selected_group_profile = None;
+            self.needs_you_kept = None;
             return;
         }
         let restored = match (&self.selected_session, &self.selected_group) {
@@ -180,7 +181,11 @@ impl HomeView {
             }
         }
         // A session asked for by name must show, so the needs-you filter steps aside.
-        if self.needs_you_only && self.get_instance(id).is_some_and(|inst| !inst.needs_you()) {
+        if self.needs_you_only
+            && self
+                .get_instance(id)
+                .is_some_and(|inst| !self.listed_by_needs_you(inst))
+        {
             self.needs_you_only = false;
             self.flash_status("Showing every session");
         }
