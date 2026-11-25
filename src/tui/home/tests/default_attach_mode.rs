@@ -784,7 +784,7 @@ fn send_message_keeps_buffered_paste_per_session() {
 }
 
 /// `[keybinds]` moves activation off Enter and Tab: the override attaches, the footer
-/// button sends it, and the freed keys do nothing.
+/// button sends it, the preview hint names it, and the freed keys do nothing.
 #[test]
 #[serial]
 fn activation_follows_keybind_overrides() {
@@ -808,11 +808,23 @@ fn activation_follows_keybind_overrides() {
     env.view.update_selected();
 
     let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+    env.view
+        .mutate_instance(&id, |inst| inst.status = Status::Stopped);
     let theme = crate::tui::styles::load_theme("empire");
     let mut terminal = Terminal::new(TestBackend::new(200, 12)).unwrap();
     terminal
         .draw(|f| env.view.render(f, f.area(), &theme, None))
         .unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(screen.contains("Press Ctrl+Enter"), "{screen}");
+    env.view
+        .mutate_instance(&id, |inst| inst.status = Status::Idle);
     let buttons: Vec<KeyEvent> = env.view.footer_buttons.iter().map(|(k, _)| *k).collect();
     assert!(buttons.contains(&ctrl_enter), "{buttons:?}");
     assert!(

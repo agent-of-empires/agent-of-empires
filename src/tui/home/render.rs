@@ -614,10 +614,10 @@ fn render_placeholder(frame: &mut Frame, area: Rect, theme: &Theme, placeholder:
     frame.render_widget(para, area);
 }
 
-fn press_hint(theme: &Theme, key: &'static str, tail: &'static str) -> Line<'static> {
+fn press_hint(theme: &Theme, key: impl Into<String>, tail: &'static str) -> Line<'static> {
     Line::from(vec![
         Span::styled("Press ", Style::default().fg(theme.dimmed)),
-        Span::styled(key, Style::default().fg(theme.hint).bold()),
+        Span::styled(key.into(), Style::default().fg(theme.hint).bold()),
         Span::styled(tail, Style::default().fg(theme.dimmed)),
     ])
 }
@@ -4243,6 +4243,12 @@ impl HomeView {
         }
     }
 
+    /// "Press <activate key> {tail}", or nothing when activation is unbound.
+    fn activate_hint(&self, theme: &Theme, tail: &'static str) -> Option<Line<'static>> {
+        let key = super::bindings::label(ActionId::Activate, self.strict_hotkeys);
+        (!key.is_empty()).then(|| press_hint(theme, key, tail))
+    }
+
     /// Calm placeholder for a pane that is simply gone (the generic gone-error), in
     /// place of the red crash error; the row's status icon still signals the state.
     fn render_stopped_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -4254,7 +4260,7 @@ impl HomeView {
                 heading: "Stopped",
                 body: "This session isn't running.".into(),
                 inst: None,
-                hint: Some(press_hint(theme, "Enter", " to start it.")),
+                hint: self.activate_hint(theme, " to start it."),
                 wrap: false,
             },
         );
@@ -4291,7 +4297,7 @@ impl HomeView {
                 heading: "Structured view",
                 body: body.into(),
                 inst: None,
-                hint: Some(press_hint(theme, "Enter", " to open the transcript.")),
+                hint: self.activate_hint(theme, " to open the transcript."),
                 wrap: false,
             },
         );

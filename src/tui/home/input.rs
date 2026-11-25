@@ -7504,10 +7504,16 @@ impl HomeView {
     pub(super) fn note_live_takeover(&mut self, taken: live_send::TakenLive) {
         if !self.show_shortcut_bar {
             let label = taken.taker.label();
-            self.flash_status(match self.live_key(&taken.session_id) {
-                Some(LiveKey::Tab) => format!("{label}: Tab to take it back"),
-                Some(LiveKey::Enter) => format!("{label}: Enter to take it back"),
-                None => label.to_string(),
+            let id = match self.live_key(&taken.session_id) {
+                Some(LiveKey::Tab) => Some(ActionId::ActivateAlt),
+                Some(LiveKey::Enter) => Some(ActionId::Activate),
+                None => None,
+            };
+            let key = id.map_or_else(String::new, |id| bindings::label(id, self.strict_hotkeys));
+            self.flash_status(if key.is_empty() {
+                label.to_string()
+            } else {
+                format!("{label}: {key} to take it back")
             });
         }
         self.live_takeover = Some(taken);
