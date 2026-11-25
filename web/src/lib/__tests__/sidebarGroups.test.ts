@@ -101,13 +101,13 @@ describe("buildSessionGroups", () => {
     expect(wsIds(build(workspaces, () => false, compareWorkspacesByName)[0]!)).toEqual(["w-a", "w-b"]);
   });
 
-  it("buckets by group_path, A to Z ignoring case, with Ungrouped last", () => {
+  it("buckets by group_path, A to Z ignoring case, with Ungrouped first as in the TUI", () => {
     const groups = build([ws("w1", "refactor"), ws("w0", ""), ws("w2", "Feature"), ws("w3", "   ")]);
-    expect(groups.map((g) => g.id)).toEqual(["Feature", "refactor", UNGROUPED_GROUP_ID]);
+    expect(groups.map((g) => g.id)).toEqual([UNGROUPED_GROUP_ID, "Feature", "refactor"]);
     expect(groups.every((g) => g.kind === "sessionGroup")).toBe(true);
-    expect(groups[0]!.groupPath).toBe("Feature");
-    expect(groups[2]).toMatchObject({ displayName: "Ungrouped", groupPath: "" });
-    expect(wsIds(groups[2]!)).toEqual(["w0", "w3"]);
+    expect(groups[1]!.groupPath).toBe("Feature");
+    expect(groups[0]).toMatchObject({ displayName: "Ungrouped", groupPath: "" });
+    expect(wsIds(groups[0]!)).toEqual(["w0", "w3"]);
   });
 
   it("splits a workspace whose sessions span groups, keeping its real id", () => {

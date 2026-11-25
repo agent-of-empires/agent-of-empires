@@ -148,8 +148,9 @@ export function buildSessionGroups(
   }
 
   groups.sort((a, b) => {
-    if (a.id === UNGROUPED_GROUP_ID) return 1;
-    if (b.id === UNGROUPED_GROUP_ID) return -1;
+    // Ungrouped rows lead, as the TUI's tree puts them first.
+    if (a.id === UNGROUPED_GROUP_ID) return -1;
+    if (b.id === UNGROUPED_GROUP_ID) return 1;
     return opts.comparePaths
       ? opts.comparePaths(a.groupPath!, b.groupPath!)
       : compareNames(a.displayName, b.displayName);
@@ -177,8 +178,8 @@ export function archivableWorkspaces(group: SidebarGroup): Workspace[] {
     });
 }
 
-// A Repository header with its workspaces split into the user's Groups. Ungrouped rows come first and render
-// straight under the header, as in the TUI, which also keeps Scratch sessions out of Groups.
+// A Repository header with its workspaces split into the user's Groups. Ungrouped rows render straight under the
+// header, as in the TUI, which also keeps Scratch sessions out of Groups.
 export interface NestedSidebarGroup {
   repo: SidebarGroup;
   subgroups: SidebarGroup[];
@@ -202,8 +203,7 @@ export function buildNestedSidebarGroups(
       comparePaths: opts.comparePaths,
       isCollapsed: (_groupId, groupPath) => opts.isSubgroupCollapsed(repo.id, groupPath),
     });
-    const ungrouped = subgroups.filter((g) => g.id === UNGROUPED_GROUP_ID);
-    return { repo, subgroups: [...ungrouped, ...subgroups.filter((g) => g.id !== UNGROUPED_GROUP_ID)] };
+    return { repo, subgroups };
   });
 }
 

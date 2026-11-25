@@ -3400,6 +3400,101 @@ fn test_row_moves_never_regroup_under_repository_grouping() {
     );
 }
 
+/// Under Repository + Custom, nested Group headers follow the Group order and move through it
+/// like My groups headers; under Name they stay A to Z.
+#[test]
+#[serial]
+fn repository_mode_orders_and_moves_nested_groups_by_the_group_order() {
+    use crate::daemon::{MoveDirection, NamespaceMutation, ReorderBody};
+    use crate::session::config::{GroupByMode, SortOrder};
+
+    let mut env = seeded_env(
+        test_home(),
+        &[
+            instance_in("z1", "/tmp/alpha", "zeta"),
+            instance_in("b1", "/tmp/alpha", "beta/child"),
+            instance_in("m1", "/tmp/alpha", "mid"),
+        ],
+        false,
+    );
+    let view = &mut env.view;
+    view.group_by = GroupByMode::Project;
+    let order =
+        ["zeta", "beta", "beta/child"].map(|p| Group::new(p.rsplit('/').next().unwrap(), p));
+    view.group_trees.insert(
+        "test".into(),
+        GroupTree::new_with_group_paths(std::iter::empty(), &order),
+    );
+    for (sort, expected) in [
+        (
+            SortOrder::Custom,
+            [
+                "alpha",
+                "alpha/zeta",
+                "alpha/beta",
+                "alpha/beta/child",
+                "alpha/mid",
+            ],
+        ),
+        (
+            SortOrder::Name,
+            [
+                "alpha",
+                "alpha/beta",
+                "alpha/beta/child",
+                "alpha/mid",
+                "alpha/zeta",
+            ],
+        ),
+    ] {
+        view.sort_order = sort;
+        let headers: Vec<String> = view
+            .build_flat_items()
+            .into_iter()
+            .filter_map(|item| match item {
+                Item::Group { path, .. } => Some(path),
+                Item::Session { .. } => None,
+            })
+            .collect();
+        assert_eq!(headers, expected, "{sort:?}");
+    }
+
+    let mut respond = view.session_feed.namespace_driver_for_test();
+    view.sort_order = SortOrder::Custom;
+    view.selected_group = Some("alpha/beta".into());
+    view.move_row_at_cursor(-1).unwrap();
+    assert!(
+        matches!(
+            respond(Err("refused".into())),
+            Some(NamespaceMutation::Reorder(ReorderBody::Group { group, direction: MoveDirection::Up, siblings: None }))
+                if group.profile == "test" && group.path == "beta"
+        ),
+        "a nested header moves its profile's Group"
+    );
+    view.pending_namespace_intent = None;
+
+    let mut shared = instance_in("o1", "/tmp/alpha", "beta");
+    shared.source_profile = "other".into();
+    view.add_instance(shared);
+    view.active_profile = None;
+    for (sort, flash) in [
+        (
+            SortOrder::Name,
+            "Pick the Custom sort (o) to arrange groups by hand",
+        ),
+        (SortOrder::Custom, "Groups move only within one profile"),
+    ] {
+        view.sort_order = sort;
+        view.move_row_at_cursor(1).unwrap();
+        assert!(respond(Err("refused".into())).is_none(), "{sort:?}");
+        assert_eq!(
+            view.status_flash.as_ref().map(|f| f.text.as_str()),
+            Some(flash),
+            "{sort:?}"
+        );
+    }
+}
+
 /// A group that exists only because a session names it has no `groups.json` row yet. Moving
 /// it must still persist the new order, or the next load rebuilds the original one.
 #[tokio::test]

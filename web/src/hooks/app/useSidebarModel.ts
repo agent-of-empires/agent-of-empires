@@ -4,7 +4,14 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import type { RuntimeCursor, SidebarView, WorkspaceOrderingPatch } from "../../lib/api";
 import { reportFeatureUse } from "../../lib/featureUse";
-import { groupMove, groupPathComparator, mergeGroupOrder, type GroupMove, type GroupOrder } from "../../lib/groupOrder";
+import {
+  groupMove,
+  groupPathComparator,
+  mergeGroupOrder,
+  parentPath,
+  type GroupMove,
+  type GroupOrder,
+} from "../../lib/groupOrder";
 import { buildSortValueMap, pluginSortSpecs } from "../../lib/pluginUi";
 import { usePluginUiEntries } from "../../lib/pluginUiContext";
 import { reportInfo, toastBus } from "../../lib/toastBus";
@@ -220,20 +227,34 @@ export function useSidebarModel({
         reportInfo("Pick Custom to arrange groups");
         return;
       }
-      if (refuseWhileSaving()) return;
-      const profiles = new Set(
-        displayGroups
-          .filter((g) => g.groupPath === activePath)
-          .flatMap((g) => g.workspaces.flatMap((v) => v.workspace.sessions.map((s) => s.profile))),
-      );
+      if (refuseWhileSaving() || activePath === overPath) return;
+      const profilesOf = (g: (typeof displayGroups)[number]) =>
+        g.workspaces.flatMap((v) => v.workspace.sessions.map((s) => s.profile));
+      const profiles = new Set(displayGroups.filter((g) => g.groupPath === activePath).flatMap(profilesOf));
       // The Daemon orders each profile's Groups apart, so a header merging two has no one place to go.
       const [profile] = profiles;
-      if (profiles.size !== 1 || profile === undefined) return;
-      const shown = displayGroups.map((g) => g.groupPath ?? "").filter((p) => p !== "");
-      const move = groupMove(groupOrder[profile] ?? [], shown, activePath, overPath, after);
+      if (profiles.size !== 1 || profile === undefined) {
+        reportInfo("Groups move only within one profile");
+        return;
+      }
+      if (parentPath(overPath) !== parentPath(activePath)) {
+        reportInfo("Couldn't move the group there");
+        return;
+      }
+      const order = groupOrder[profile] ?? [];
+      const shown = displayGroups
+        .filter((g) => g.groupPath && profilesOf(g).includes(profile))
+        .map((g) => g.groupPath!);
+      if (!order.includes(overPath) && !shown.includes(overPath)) {
+        reportInfo("Groups move only within one profile");
+        return;
+      }
+      const move = groupMove(order, shown, activePath, overPath, after);
       if (!move) return;
       dropUndo();
-      void moveGroup(profile, activePath, move);
+      void moveGroup(profile, activePath, move).then((receipt) => {
+        if (!receipt) reportInfo("Couldn't move the group there");
+      });
     },
     [sort, refuseWhileSaving, displayGroups, groupOrder, dropUndo, moveGroup],
   );

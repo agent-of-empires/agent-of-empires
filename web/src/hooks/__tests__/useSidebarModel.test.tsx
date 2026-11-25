@@ -554,7 +554,48 @@ describe("Group headers", () => {
     act(() => result.current.model.selectSort("custom"));
     await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
     act(() => result.current.model.moveGroupHeader("alpha/inner", "zeta", false));
+    expect(toasts.info).toHaveBeenLastCalledWith("Couldn't move the group there");
     expect(writes.filter((w) => w.method === "POST")).toEqual([]);
+  });
+
+  it("say why a drop the Daemon can't carry out snaps back", async () => {
+    daemon.sessions.push(
+      { ...grouped("other-mid", "mid"), profile: "other" },
+      { ...grouped("other-only", "theirs"), profile: "other" },
+    );
+    daemon.group_order.other = ["theirs", "mid"];
+    const { result } = mount();
+    await waitFor(() => expect(groupHeaders(result)).toContain("theirs"));
+    for (const [active, over, notice] of [
+      ["mid", "zeta", "Groups move only within one profile"],
+      ["zeta", "theirs", "Groups move only within one profile"],
+    ] as const) {
+      act(() => result.current.model.moveGroupHeader(active, over, false));
+      expect(toasts.info).toHaveBeenLastCalledWith(notice);
+    }
+    expect(writes.filter((w) => w.method === "POST")).toEqual([]);
+
+    server.use(http.post("*/api/reorder", () => HttpResponse.json({ status: "at_edge" })));
+    act(() => result.current.model.moveGroupHeader("alpha", "zeta", false));
+    await waitFor(() => expect(toasts.info).toHaveBeenLastCalledWith("Couldn't move the group there"));
+  });
+
+  it("count only the dragged profile's Groups as siblings", async () => {
+    daemon.sessions.push({ ...grouped("other-only", "aaa"), profile: "other" });
+    daemon.group_order.other = ["aaa"];
+    server.use(
+      http.post("*/api/reorder", async ({ request }) => {
+        writes.push({ method: "POST", body: await request.json() });
+        daemon.revision += 1;
+        return HttpResponse.json({ status: "moved", destination: null }, { headers: runtime(daemon.revision) });
+      }),
+    );
+    const { result } = mount();
+    await waitFor(() => expect(groupHeaders(result)).toContain("aaa"));
+    act(() => result.current.model.moveGroupHeader("zeta", "loose", true));
+    await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
+    // Past alpha, mid and the unlisted loose; the other profile's aaa is not a sibling to pass.
+    expect(writes.filter((w) => w.method === "POST")).toHaveLength(3);
   });
 });
 

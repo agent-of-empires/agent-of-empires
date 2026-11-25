@@ -730,11 +730,16 @@ impl HomeView {
     }
 
     fn move_header_row(&mut self, path: &str, delta: isize) -> anyhow::Result<()> {
-        if self.group_by == GroupByMode::Group {
+        let nested = super::rows::split_project_view_path(path).1.is_some();
+        if self.group_by == GroupByMode::Group || nested {
+            if nested && self.sort_order != SortOrder::Custom {
+                self.flash_status("Pick the Custom sort (o) to arrange groups by hand");
+                return Ok(());
+            }
             return self.move_group_row(path, delta);
         }
         let Some(repo) = self.repository_path_for_header(path) else {
-            self.flash_status("Only repository headers move under the Repository grouping");
+            self.flash_status("This header does not move");
             return Ok(());
         };
         let mut order = self.displayed_repository_order();
@@ -913,9 +918,16 @@ impl HomeView {
 
     /// Move a group among its siblings. Under Name the move starts from the order on
     /// screen, which the stored group order and the shared row order then keep.
-    fn move_group_row(&mut self, group_path: &str, delta: isize) -> anyhow::Result<()> {
+    fn move_group_row(&mut self, header_path: &str, delta: isize) -> anyhow::Result<()> {
         anyhow::ensure!(delta == -1 || delta == 1, "Invalid row direction");
-        let group = self.canonical_group_location(group_path)?;
+        let group = if self.group_by == GroupByMode::Group {
+            self.canonical_group_location(header_path)?
+        } else {
+            let Some(group) = self.nested_group_location(header_path) else {
+                return Ok(());
+            };
+            group
+        };
         let freeze = self.sort_order != SortOrder::Custom;
         let siblings = freeze.then(|| self.displayed_sibling_groups(&group));
         let (freeze, switch) = freeze
@@ -930,6 +942,54 @@ impl HomeView {
             }),
             NamespaceIntent::ReorderGroup { switch },
         )
+    }
+
+    /// The profile Group behind a `repo/group` header under Repository: the one profile whose
+    /// sessions sit under it. Flashes why when there is none.
+    fn nested_group_location(&mut self, header_path: &str) -> Option<crate::daemon::GroupLocation> {
+        let (_, Some(path)) = super::rows::split_project_view_path(header_path) else {
+            return None;
+        };
+        let prefix = format!("{header_path}/");
+        let mut owners: Vec<String> = self
+            .instances
+            .values()
+            .filter(|inst| !inst.is_archived() && !inst.is_trashed())
+            .filter(|inst| {
+                self.active_profile
+                    .as_ref()
+                    .is_none_or(|p| inst.source_profile == *p)
+            })
+            .filter(|inst| {
+                let at = project_view_path(inst);
+                at == header_path || at.starts_with(&prefix)
+            })
+            .map(|inst| inst.source_profile.clone())
+            .collect();
+        owners.sort_unstable();
+        owners.dedup();
+        let location = match &owners[..] {
+            [profile]
+                if self
+                    .group_trees
+                    .get(profile)
+                    .is_some_and(|t| t.group_exists(path)) =>
+            {
+                crate::daemon::GroupLocation {
+                    profile: profile.clone(),
+                    path: path.to_owned(),
+                }
+            }
+            [_] | [] => {
+                self.flash_status("The group changed elsewhere; no change submitted");
+                return None;
+            }
+            _ => {
+                self.flash_status("Groups move only within one profile");
+                return None;
+            }
+        };
+        Some(location)
     }
 
     /// The headers sharing `group`'s parent and profile, in the order the list shows them.
