@@ -368,7 +368,7 @@ impl HomeView {
                 .and_then(|c| c.app_state.archived_section_collapsed)
                 .unwrap_or(true),
             trashed_section_collapsed: true,
-            suggested_section_collapsed: true,
+            suggestions_focused: false,
             prompt_failures_announced: std::collections::HashSet::new(),
             start_after_trash: None,
             suggestions_feed: crate::tui::suggestions::SuggestionsFeed::new(),

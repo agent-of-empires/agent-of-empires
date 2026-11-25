@@ -37,7 +37,7 @@ pub struct Snapshot {
 #[serde(default)]
 pub struct Prefs {
     pub(crate) show_source_ref: bool,
-    /// "Show in the sidebar": the web sidebar group and the TUI Home group.
+    /// "Show in the sidebar": the web sidebar group and the TUI Home row.
     pub(crate) sidebar: bool,
 }
 

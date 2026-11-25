@@ -13,8 +13,8 @@ use super::update_bar::UpdateBar;
 use super::{
     get_indent, live_send, DragKind, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION,
     ICON_COLLAPSED, ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_FAVORITE,
-    ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_TERMINAL, ICON_TRASH_SECTION, ICON_UNKNOWN,
-    ICON_UNREAD,
+    ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_SUGGESTED, ICON_TERMINAL, ICON_TRASH_SECTION,
+    ICON_UNKNOWN, ICON_UNREAD,
 };
 use crate::session::config::{GroupByMode, NarrowLayout, RowTagMode, SidebarPosition, SortOrder};
 use crate::session::{Item, Status};
@@ -1089,24 +1089,6 @@ impl HomeView {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
 
-        if let Some(view) = &self.suggestions_view {
-            self.divider_col = None;
-            self.main_area_width = 0;
-            view.render(
-                frame,
-                area,
-                theme,
-                &self.suggestions_feed,
-                self.session_feed.mutation_block(),
-            );
-            if let Some(palette) = &mut self.command_palette {
-                palette.render(frame, area, theme);
-            }
-            if let Some(dialog) = &mut self.confirm_dialog {
-                dialog.render(frame, area, theme);
-            }
-            return;
-        }
         if let Some(ref serve) = self.serve_view {
             self.divider_col = None;
             self.main_area_width = 0;
@@ -2038,22 +2020,17 @@ impl HomeView {
                 }
                 (icon, text, style)
             }
-            Item::Suggestion {
-                provider_id, id, ..
-            } => {
-                let (title, suffix) = self
-                    .suggestion_row_text(provider_id, id)
-                    .unwrap_or_else(|| ("(no longer available)".to_string(), String::new()));
-                (
-                    " ",
-                    Cow::Owned(format!("{title}{suffix}")),
-                    Style::default().fg(theme.text),
-                )
-            }
-            Item::SuggestionsViewAll { total, .. } => (
-                " ",
-                Cow::Owned(format!("… View all ({total})")),
-                Style::default().fg(theme.dimmed),
+            // A provider that failed to refresh marks the row; its pane says why.
+            Item::Suggested { total, failed } => (
+                ICON_SUGGESTED,
+                Cow::Owned(if *failed {
+                    format!("Suggested ({total}) !")
+                } else {
+                    format!("Suggested ({total})")
+                }),
+                Style::default()
+                    .fg(if *failed { theme.error } else { theme.group })
+                    .bold(),
             ),
             Item::Session { id, .. } => {
                 if let Some(inst) = self.get_instance(id) {
@@ -2213,24 +2190,6 @@ impl HomeView {
             _ => None,
         };
         let Some((id, inst)) = inst else {
-            if let Item::Suggestion {
-                provider_id, id, ..
-            } = item
-            {
-                if let Some((title, _)) = self.suggestion_row_text(provider_id, id) {
-                    let shown = truncate_to_width(&text, room);
-                    let (title, muted) =
-                        shown.split_at(prefix_within_width(&shown, rendered_width(&title)).len());
-                    let muted_style = if is_selected {
-                        text_style
-                    } else {
-                        Style::default().fg(theme.dimmed)
-                    };
-                    line_spans.push(Span::styled(title.to_string(), text_style));
-                    line_spans.push(Span::styled(muted.to_string(), muted_style));
-                    return Line::from(line_spans);
-                }
-            }
             line_spans.push(Span::styled(truncate_to_width(&text, room), text_style));
             return Line::from(line_spans);
         };
@@ -3331,7 +3290,7 @@ impl HomeView {
             );
             return;
         }
-        if self.render_suggestion_preview(frame, area, theme) {
+        if self.render_suggestions_pane(frame, area, theme) {
             return;
         }
         let compact = responsive::is_narrow(area.width, self.narrow_breakpoint);
@@ -4625,7 +4584,10 @@ impl HomeView {
             // Enter to live-send or tmux attach and Tab does the other, so both labels resolve
             // here and can never advertise the same action. Acp rows ignore the setting and
             // keep the plain "Attach" label. Mirrors `HelpOverlay`'s wording.
+            // The focused suggestions pane draws its own keys.
+            let on_suggested = self.suggestions_focused || self.on_suggested_row();
             let (enter_action_text, tab_action_text) = match self.flat_items.get(self.cursor) {
+                _ if self.suggestions_focused => (None, None),
                 Some(Item::Group {
                     collapsed: true, ..
                 }) => (Some("Expand"), None),
@@ -4647,9 +4609,7 @@ impl HomeView {
                         (Some("Attach"), Some("Live"))
                     }
                 }
-                // A started suggestion leaves the group, so a row always starts.
-                Some(Item::Suggestion { .. }) => (Some("Start"), None),
-                Some(Item::SuggestionsViewAll { .. }) => (Some("View all"), None),
+                Some(Item::Suggested { .. }) => (Some("Browse"), None),
                 None => (None, None),
             };
             // After another window took live control: its status, then the key that takes
@@ -4688,20 +4648,8 @@ impl HomeView {
                 }
             }
 
-            // A suggestion row is not a session: only start, dismiss and another apply.
-            let on_suggestion = matches!(
-                self.flat_items.get(self.cursor),
-                Some(Item::Suggestion { .. })
-            );
-            if on_suggestion {
-                let (click, key) = bound(ActionId::ToggleArchive);
-                let restorable = self
-                    .cursor_suggestion()
-                    .and_then(|key| self.suggestions_feed.entry(&key))
-                    .is_some_and(|e| e.dismissed);
-                let label = if restorable { "Restore" } else { "Dismiss" };
-                groups.push((1, click, mk(&key, label)));
-            } else {
+            // The Suggested row is not a session: view, tool and group keys do not apply.
+            if !on_suggested {
                 let (click, key) = bound(ActionId::ToggleView);
                 groups.push((2, click, mk(&key, "View")));
                 if matches!(self.view_mode, ViewMode::Tool(_)) {
@@ -4731,16 +4679,12 @@ impl HomeView {
             // `n` for cycling, advertise Shift+N (which still creates, #3038). Strict mode
             // already uses `N`.
             let new_uses_shift = committed_search && !strict;
-            let (click, key, label) = if on_suggestion {
-                let (click, key) = bound(ActionId::NewFromSelection);
-                (click, key, "New")
-            } else if new_uses_shift {
-                (kc('N'), "N".to_string(), "New")
+            let (click, key) = if new_uses_shift {
+                (kc('N'), "N".to_string())
             } else {
-                let (click, key) = bound(ActionId::NewSession);
-                (click, key, "New")
+                bound(ActionId::NewSession)
             };
-            groups.push((1, click, mk(&key, label)));
+            groups.push((1, click, mk(&key, "New")));
 
             // Priority 1 is the core daily workflow (new, message, the web dashboard), which
             // survives the greedy pack at ~80 cols; del stays at p3 and can drop first.
@@ -4748,14 +4692,14 @@ impl HomeView {
                 let (click, key) = bound(ActionId::SendMessage);
                 groups.push((1, click, mk(&key, "Msg")));
             }
-            if !self.flat_items.is_empty() && !on_suggestion {
+            if !self.flat_items.is_empty() && !on_suggested {
                 let (click, key) = bound(ActionId::Delete);
                 groups.push((3, click, mk(&key, "Del")));
             }
             // Archive / Snooze render only in Attention sort: they shape the Attention queue
             // and do nothing visible elsewhere, so they would just take footer space.
             let in_attention = self.sort_order == SortOrder::Attention;
-            if in_attention && !on_suggestion {
+            if in_attention && !on_suggested {
                 if !self.flat_items.is_empty() {
                     let (click, key) = bound(ActionId::ToggleArchive);
                     groups.push((1, click, mk(&key, "Archive")));
@@ -4789,7 +4733,7 @@ impl HomeView {
 
             let (click, key) = bound(ActionId::SearchStart);
             groups.push((4, click, mk_key(&key)));
-            if !on_suggestion {
+            if !on_suggested {
                 let (click, key) = bound(ActionId::Diff);
                 groups.push((4, click, mk(&key, "Diff")));
             }

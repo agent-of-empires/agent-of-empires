@@ -129,11 +129,10 @@ impl HomeView {
                     }
                     _ => continue,
                 },
-                Item::Suggestion { .. } | Item::SuggestionsViewAll { .. } => continue,
+                Item::Suggested { .. } => continue,
             };
             if crate::session::is_within_archived_section(path)
                 || crate::session::is_within_trash_section(path)
-                || crate::session::is_suggested_section_path(path)
             {
                 continue;
             }

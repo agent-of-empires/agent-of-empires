@@ -1546,20 +1546,21 @@ fn restore_on_a_live_row_explains_itself() {
 
 #[test]
 #[serial]
-fn s_opens_the_suggestions_view_which_owns_keys_until_esc() {
+fn s_focuses_the_suggestions_pane_which_owns_keys_until_esc() {
     let mut env = create_test_env_empty();
     env.view.handle_key(key(KeyCode::Char('S')), None);
-    assert!(env.view.suggestions_view.is_some());
-    assert!(env.view.has_non_live_send_overlay());
+    assert!(env.view.suggestions_focused);
+    assert!(env.view.suggestions_pane_shown());
 
     env.view.handle_key(key(KeyCode::Char('n')), None);
     assert!(
         env.view.new_dialog.is_none(),
-        "keys go to the view, not the list behind it"
+        "keys go to the pane, not the list beside it"
     );
 
     env.view.handle_key(key(KeyCode::Esc), None);
-    assert!(env.view.suggestions_view.is_none());
+    assert!(!env.view.suggestions_focused);
+    assert!(!env.view.suggestions_pane_shown());
 }
 
 fn start_for_test(path: &str) -> crate::tui::suggestions::Start {
@@ -1579,7 +1580,7 @@ fn start_for_test(path: &str) -> crate::tui::suggestions::Start {
 
 #[test]
 #[serial]
-fn a_started_suggestion_opens_the_prefilled_dialog_and_closes_the_view() {
+fn a_started_suggestion_opens_the_prefilled_dialog_and_leaves_the_pane() {
     let mut env = create_test_env_empty();
     // A structured default would make Enter check for the ACP adapter on the host.
     crate::session::config::update_config(|config| {
@@ -1587,8 +1588,9 @@ fn a_started_suggestion_opens_the_prefilled_dialog_and_closes_the_view() {
     })
     .unwrap();
     env.view.suggestions_view = Some(crate::tui::suggestions::SuggestionsView::idle_for_test());
+    env.view.suggestions_focused = true;
     env.view.start_suggestion(start_for_test("/tmp"));
-    assert!(env.view.suggestions_view.is_none());
+    assert!(!env.view.suggestions_focused);
     let data = match env
         .view
         .new_dialog

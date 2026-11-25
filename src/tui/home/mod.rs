@@ -42,8 +42,7 @@ use ratatui::prelude::Rect;
 use tui_input::Input;
 
 use crate::session::{
-    append_archived_section, append_archived_section_by_project, append_suggested_section,
-    append_trash_section,
+    append_archived_section, append_archived_section_by_project, append_trash_section,
     config::{load_config, update_app_state, update_config, GroupByMode, SortOrder},
     flatten_sessions_by_attention, flatten_tree, flatten_tree_all_profiles, resolve_config_or_warn,
     DefaultTerminalMode, Group, GroupTree, Instance, Item, Storage,
@@ -64,8 +63,8 @@ use super::settings::SettingsView;
 
 use self::icons::{
     ICON_ARCHIVED_SECTION, ICON_COLLAPSED, ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED,
-    ICON_FAVORITE, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_TERMINAL, ICON_TRASH_SECTION,
-    ICON_UNKNOWN, ICON_UNREAD, UNREAD_DWELL,
+    ICON_FAVORITE, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_SUGGESTED, ICON_TERMINAL,
+    ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD, UNREAD_DWELL,
 };
 use self::preview::{PreviewCache, PreviewSelection, PreviewTextView, PreviewTimings};
 use self::rows::project_group_key;
@@ -622,7 +621,8 @@ pub struct HomeView {
     pub(super) group_totals: HashMap<(String, Option<String>), usize>,
 
     pub(super) trashed_section_collapsed: bool,
-    pub(super) suggested_section_collapsed: bool,
+    /// The keys go to the suggestions list in the preview pane.
+    pub(super) suggestions_focused: bool,
     /// Sessions whose undelivered first prompt was already announced.
     pub(super) prompt_failures_announced: std::collections::HashSet<String>,
     /// A suggestion to start again once its blocked Session, by id, is in Trash.

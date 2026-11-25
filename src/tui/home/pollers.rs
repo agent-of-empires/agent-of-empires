@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::tui::dialogs::PromptOrigin;
-use crate::tui::suggestions::{PrepareTarget, Start, StartAnswer, SuggestionsView};
+use crate::tui::suggestions::{Start, StartAnswer, SuggestionsView};
 
 impl HomeView {
     pub(super) const CANONICAL_RELOAD_RETRY_INTERVAL: std::time::Duration =
@@ -126,28 +126,6 @@ impl HomeView {
             self.update_selected();
             changed = true;
         }
-        // A view prepare answered after the view closed has no one to start it.
-        if let Some((key, mut start, target @ (PrepareTarget::Home | PrepareTarget::HomeAnother))) =
-            polled.start
-        {
-            if let Some(view) = &mut self.suggestions_view {
-                // The full view owns suggestion starts now, so say why nothing opened.
-                let key = match (target, self.strict_hotkeys) {
-                    (PrepareTarget::Home, _) => "Enter",
-                    (_, false) => "N",
-                    (_, true) => "Ctrl+N",
-                };
-                view.set_error(format!("Suggestion ready. Press {key} on it again here."));
-            } else if self.cursor_suggestion().as_ref() == Some(&key) && self.new_dialog.is_none() {
-                if target == PrepareTarget::HomeAnother {
-                    start.suggestion = None;
-                }
-                self.start_suggestion(start);
-            } else {
-                self.flash_status("Selection changed, suggestion not started");
-            }
-            changed = true;
-        }
         if let Some((key, answer)) = polled.started {
             self.apply_start_answer(key, answer);
             changed = true;
@@ -166,32 +144,22 @@ impl HomeView {
             Some(view) => view.set_notice(message),
             None => this.flash_status(message),
         };
-        // Home lists a started suggestion as its Session, not as a row Enter could open.
-        let opens = if self.suggestions_view.is_some() {
-            " · Enter opens it"
-        } else {
-            ""
-        };
         match answer {
             StartAnswer::Started { session_id, title } => {
                 self.suggestions_feed.link_started(&key, &session_id);
                 self.rebuild_flat_items_keeping_cursor();
                 self.update_selected();
-                say(self, format!("Started {title}{opens}"), false);
+                say(self, format!("Started {title} · Enter opens it"), false);
             }
             StartAnswer::AlreadyStarted(Some(session_id)) => {
                 self.suggestions_feed.link_started(&key, &session_id);
                 self.rebuild_flat_items_keeping_cursor();
                 self.update_selected();
-                say(self, format!("Already started{opens}"), false);
+                say(self, "Already started · Enter opens it".to_string(), false);
             }
             StartAnswer::AlreadyStarted(None) => {
-                let message = if self.suggestions_view.is_some() {
-                    let reload = if self.strict_hotkeys { "R" } else { "r" };
-                    format!("Already starting. Press {reload} in a moment to reload.")
-                } else {
-                    "Already starting. It shows under its Project in a moment.".to_string()
-                };
+                let reload = if self.strict_hotkeys { "R" } else { "r" };
+                let message = format!("Already starting. Press {reload} in a moment to reload.");
                 say(self, message, false);
             }
             StartAnswer::TrustChanged => self.suggestions_feed.restart_after_trust_change(key),
@@ -224,36 +192,24 @@ impl HomeView {
                 );
                 self.suggestions_feed.hold_trust(key, fingerprint);
             }
-            StartAnswer::NoProject => match &mut self.suggestions_view {
-                Some(view) => view.prepare(key, false, &mut self.suggestions_feed),
-                None => self.suggestions_feed.prepare(key),
-            },
+            StartAnswer::NoProject => {
+                if let Some(view) = &mut self.suggestions_view {
+                    view.prepare(key, false, &mut self.suggestions_feed);
+                }
+            }
             StartAnswer::Failed(reason) => match &mut self.suggestions_view {
                 Some(view) => view.set_failed(&mut self.suggestions_feed, key, reason),
-                None => {
-                    self.flash_status(format!("{reason} Enter tries again."));
-                    self.suggestions_feed.failed = Some((key, reason));
-                }
+                None => self.flash_status(reason),
             },
         }
     }
 
-    pub(super) fn open_suggestions_view(&mut self) {
-        let mut view = SuggestionsView::new(&mut self.suggestions_feed);
-        view.strict = self.strict_hotkeys;
-        // The local config stands in until a load reads the daemon's setting.
-        view.pretrusted = self.suggestions_feed.daemon_pre_trust().unwrap_or_else(|| {
-            crate::session::config::Config::load().is_ok_and(|c| c.session.pre_trust_agent_folders)
-        });
-        self.suggestions_view = Some(view);
-    }
-
-    /// Replaces the view with the regular new-session dialog, prefilled; when
-    /// the dialog cannot open the view stays and shows why.
+    /// Opens the regular new-session dialog, prefilled, over Home; when the
+    /// dialog cannot open the list shows why.
     pub(super) fn start_suggestion(&mut self, start: Start) {
         match self.suggestion_dialog(start) {
             Ok(dialog) => {
-                self.suggestions_view = None;
+                self.suggestions_focused = false;
                 self.new_dialog = Some(dialog);
             }
             Err(message) => {

@@ -1,119 +1,79 @@
-//! Home-list behavior of the Suggested group and its rows.
+//! Home's Suggested row and the suggestions list it shows in the preview pane.
 
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::*;
 use crate::tui::dialogs::{PaletteAction, PaletteCommand, PaletteGroup};
 use crate::tui::styles::Theme;
-
-/// Prompt lines shown in the preview before it is ellipsised.
-const PREVIEW_PROMPT_LINES: usize = 4;
-
-/// Terminal width from which the key line names the ^K action.
-const WIDE_KEY_LINE_COLS: u16 = 120;
-
-/// "A", "A and B", "A, B and C".
-fn join_names(names: &[String]) -> String {
-    match names {
-        [] => String::new(),
-        [one] => one.clone(),
-        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
-    }
-}
-
-/// A row of the Suggested group, identified independently of its index.
-pub(super) enum SuggestedRow {
-    Header,
-    Item((String, String)),
-    ViewAll,
-}
+use crate::tui::suggestions::SuggestionsView;
 
 impl HomeView {
-    /// Appends the Suggested group when the daemon's "Show in the sidebar" pref is on.
+    /// Appends the Suggested row when the daemon's "Show in the sidebar" pref
+    /// is on. Absent with nothing to list, unless a provider failed, so its
+    /// error is not hidden with the row.
     pub(super) fn append_suggested(&self, items: &mut Vec<Item>) {
         let feed = &self.suggestions_feed;
-        if feed.shown_on_home() {
-            append_suggested_section(
-                items,
-                &feed.keys(),
-                self.suggested_section_collapsed,
-                feed.has_provider_failure(),
-            );
+        let total = feed.keys().len();
+        let failed = feed.has_provider_failure();
+        if feed.shown_on_home() && (total > 0 || failed) {
+            items.push(Item::Suggested { total, failed });
         }
     }
 
-    pub fn toggle_suggested_section(&mut self) {
-        self.suggested_section_collapsed = !self.suggested_section_collapsed;
-        self.rebuild_flat_items();
-        if !self.flat_items.is_empty() && self.cursor >= self.flat_items.len() {
-            self.cursor = self.flat_items.len() - 1;
-        }
-        self.update_selected();
-    }
-
-    /// The suggestion under the cursor, when the cursor is on one.
-    pub(super) fn cursor_suggestion(&self) -> Option<(String, String)> {
-        match self.flat_items.get(self.cursor) {
-            Some(Item::Suggestion {
-                provider_id, id, ..
-            }) => Some((provider_id.clone(), id.clone())),
-            _ => None,
-        }
-    }
-
-    /// What the cursor is on within the Suggested group, to find it again after a rebuild.
-    pub(super) fn suggested_row_at_cursor(&self) -> Option<SuggestedRow> {
-        match self.flat_items.get(self.cursor)? {
-            Item::Group { path, .. } if crate::session::is_suggested_section_path(path) => {
-                Some(SuggestedRow::Header)
-            }
-            Item::Suggestion {
-                provider_id, id, ..
-            } => Some(SuggestedRow::Item((provider_id.clone(), id.clone()))),
-            Item::SuggestionsViewAll { .. } => Some(SuggestedRow::ViewAll),
-            _ => None,
-        }
-    }
-
-    pub(super) fn suggested_row_position(&self, row: Option<&SuggestedRow>) -> Option<usize> {
-        let row = row?;
-        self.flat_items.iter().position(|item| match (row, item) {
-            (SuggestedRow::Header, Item::Group { path, .. }) => {
-                crate::session::is_suggested_section_path(path)
-            }
-            (
-                SuggestedRow::Item((p, i)),
-                Item::Suggestion {
-                    provider_id, id, ..
-                },
-            ) => p == provider_id && i == id,
-            (SuggestedRow::ViewAll, Item::SuggestionsViewAll { .. }) => true,
-            _ => false,
-        })
-    }
-
-    /// Enter on a suggestion row starts it with its preset; on "View all" it
-    /// opens the full view. False when the cursor is on neither. A started
-    /// suggestion is listed as its Session, not as a row.
-    pub(super) fn activate_suggestion_row(&mut self) -> bool {
-        if let Some(key) = self.cursor_suggestion() {
-            if !self.mutations_blocked() {
-                self.suggestions_feed.start(key);
-            }
-            return true;
-        }
-        if matches!(
+    pub(super) fn on_suggested_row(&self) -> bool {
+        matches!(
             self.flat_items.get(self.cursor),
-            Some(Item::SuggestionsViewAll { .. })
-        ) {
-            self.open_suggestions_view();
-            return true;
+            Some(Item::Suggested { .. })
+        )
+    }
+
+    pub(super) fn suggested_row(&self) -> Option<usize> {
+        self.flat_items
+            .iter()
+            .position(|item| matches!(item, Item::Suggested { .. }))
+    }
+
+    /// Creates the list the preview pane shows, keeping one that exists so its
+    /// selection survives the cursor leaving the row.
+    pub(super) fn ensure_suggestions_view(&mut self) {
+        if self.suggestions_view.is_none() {
+            let mut view = SuggestionsView::new(&self.suggestions_feed);
+            // The local config stands in until a load reads the daemon's setting.
+            view.pretrusted = self.suggestions_feed.daemon_pre_trust().unwrap_or_else(|| {
+                crate::session::config::Config::load()
+                    .is_ok_and(|c| c.session.pre_trust_agent_folders)
+            });
+            self.suggestions_view = Some(view);
         }
-        false
+        if let Some(view) = &mut self.suggestions_view {
+            view.strict = self.strict_hotkeys;
+        }
+    }
+
+    /// Enter or Right on the Suggested row moves the keys into its pane.
+    /// False when the cursor is elsewhere.
+    pub(super) fn focus_suggestions_pane(&mut self) -> bool {
+        if !self.on_suggested_row() {
+            return false;
+        }
+        self.focus_suggestions();
+        true
+    }
+
+    /// Shows the suggestions list in the preview pane with the keys in it.
+    pub(super) fn focus_suggestions(&mut self) {
+        if let Some(state) = self.live_send.clone() {
+            self.exit_live_send_and_restore_sizing(&state);
+        }
+        self.ensure_suggestions_view();
+        self.system_health_open = false;
+        self.suggestions_focused = true;
+    }
+
+    /// The preview pane shows the suggestions list.
+    pub(super) fn suggestions_pane_shown(&self) -> bool {
+        self.suggestions_view.is_some() && (self.suggestions_focused || self.on_suggested_row())
     }
 
     /// Selects the Session a suggestion was started as, expanding the Archived
@@ -180,225 +140,46 @@ impl HomeView {
         }
     }
 
-    /// Flashes why the daemon refuses mutations; true when it does.
-    fn mutations_blocked(&mut self) -> bool {
-        let Some(block) = self.session_feed.mutation_block() else {
-            return false;
-        };
-        self.flash_status(crate::tui::suggestions::block_note(block));
-        true
-    }
-
-    /// `z` on a suggestion row dismisses it, or restores one still in its undo
-    /// window. False when the cursor is elsewhere.
-    pub(super) fn dismiss_suggestion_row(&mut self) -> bool {
-        let Some(key) = self.cursor_suggestion() else {
-            return false;
-        };
-        if !self.mutations_blocked() {
-            let dismissed = self
-                .suggestions_feed
-                .entry(&key)
-                .is_some_and(|e| e.dismissed);
-            self.suggestions_feed.dismiss(&key, !dismissed);
-        }
-        true
-    }
-
-    /// `N` (Ctrl+N in strict mode) on a suggestion row prepares a second session for the same item;
-    /// the new session does not claim the suggestion's link.
-    pub(super) fn start_another_from_suggestion(&mut self) {
-        if let Some(key) = self.cursor_suggestion() {
-            if !self.mutations_blocked() {
-                self.suggestions_feed.prepare_another(key);
-            }
-        }
-    }
     /// "Open in <provider>" for a suggestion, when its `source_url` is openable.
     pub(super) fn open_source_command(&self, key: &(String, String)) -> Option<PaletteCommand> {
-        let entry = self.suggestions_feed.entry(key)?;
+        let (provider, url) = self.suggestions_feed.source_link(key)?;
         Some(PaletteCommand {
             id: "open-suggestion-source",
-            title: format!("Open in {}", entry.provider),
+            title: format!("Open in {provider}"),
             group: PaletteGroup::Actions,
             keywords: vec!["open", "link", "source", "browser"],
             hotkey: String::new(),
-            payload: PaletteAction::OpenLink(entry.source_url?),
+            payload: PaletteAction::OpenLink(url?),
         })
     }
 
-    /// Paints the preview for the Suggested group or a suggestion row. False
-    /// when the cursor is on neither, so the regular preview runs.
-    pub(super) fn render_suggestion_preview(
+    /// Paints the suggestions list into the preview pane. False when the pane
+    /// shows something else.
+    pub(super) fn render_suggestions_pane(
         &mut self,
         frame: &mut Frame,
         area: Rect,
         theme: &Theme,
     ) -> bool {
-        let dim = Style::default().fg(theme.dimmed);
-        let bold = Style::default().add_modifier(Modifier::BOLD);
-        let (title, lines): (String, Vec<Line>) = match self.flat_items.get(self.cursor) {
-            Some(Item::Group { path, .. }) if crate::session::is_suggested_section_path(path) => {
-                let total = self.suggestions_feed.keys().len();
-                let failures = self.suggestions_feed.provider_failures();
-                let mut lines = Vec::new();
-                for (name, error, fix) in &failures {
-                    lines.push(Line::from(Span::styled(
-                        format!("{name} couldn't refresh: {error}"),
-                        Style::default().fg(theme.error),
-                    )));
-                    if let Some(fix) = fix {
-                        lines.push(Line::from(format!("  {fix}")));
-                    }
-                }
-                if !failures.is_empty() {
-                    if total > 0 {
-                        lines.push(Line::from(Span::styled(
-                            "These are from the last refresh.",
-                            Style::default().fg(theme.waiting),
-                        )));
-                    }
-                    let open = super::bindings::label(
-                        super::bindings::ActionId::Suggestions,
-                        self.strict_hotkeys,
-                    );
-                    let retry = if self.strict_hotkeys { "R" } else { "r" };
-                    lines.push(Line::from(Span::styled(
-                        format!("{open} opens the full view; {retry} there retries."),
-                        dim,
-                    )));
-                    lines.push(Line::from(""));
-                }
-                lines.push(Line::from(format!(
-                    "Suggestions from {}.",
-                    join_names(&self.suggestions_feed.provider_names())
-                )));
-                if total > 0 {
-                    let hint = if self.suggested_section_collapsed {
-                        "Enter to expand, then Enter on one to start a session."
-                    } else {
-                        "Enter on one starts a session. Enter or ← collapses the group."
-                    };
-                    lines.push(Line::from(""));
-                    lines.push(Line::from(Span::styled(hint, dim)));
-                }
-                (format!("Suggested ({total})"), lines)
-            }
-            Some(Item::SuggestionsViewAll { total, .. }) => (
-                format!("Suggested ({total})"),
-                vec![Line::from(Span::styled(
-                    "Enter to open all suggestions.",
-                    dim,
-                ))],
-            ),
-            Some(Item::Suggestion {
-                provider_id, id, ..
-            }) => {
-                let Some(entry) = self
-                    .suggestions_feed
-                    .entry(&(provider_id.clone(), id.clone()))
-                else {
-                    return false;
-                };
-                let mut source = vec![entry.provider.clone()];
-                if !entry.source_ref.is_empty() {
-                    source.push(entry.source_ref.clone());
-                }
-                source.extend(entry.project.clone());
-                source.push(entry.reason.clone());
-                let mut lines = vec![
-                    Line::from(Span::styled(entry.title.clone(), bold)),
-                    Line::from(source.join(" · ")),
-                ];
-                if let Some(reason) = &entry.failed {
-                    lines.push(Line::from(Span::styled(
-                        format!("Couldn't start: {reason} · Enter tries again"),
-                        Style::default().fg(theme.error),
-                    )));
-                }
-                if entry.provider_error.is_some() {
-                    lines.push(Line::from(Span::styled(
-                        format!(
-                            "{} couldn't refresh. Shown from the last fetch.",
-                            entry.provider
-                        ),
-                        Style::default().fg(theme.waiting),
-                    )));
-                }
-                lines.push(Line::from(""));
-                if let Some(preset) = &entry.preset {
-                    lines.push(Line::from(Span::styled(preset.clone(), dim)));
-                }
-                lines.push(Line::from(Span::styled("Prompt", bold)));
-                let prompt: Vec<&str> = entry.prompt.lines().collect();
-                lines.extend(
-                    prompt
-                        .iter()
-                        .take(PREVIEW_PROMPT_LINES)
-                        .map(|l| Line::from(format!("  {l}"))),
-                );
-                if prompt.len() > PREVIEW_PROMPT_LINES {
-                    lines.push(Line::from("  …"));
-                }
-                lines.push(Line::from(""));
-                let dismiss = super::bindings::label(
-                    super::bindings::ActionId::ToggleArchive,
-                    self.strict_hotkeys,
-                );
-                let dismiss_verb = if entry.dismissed {
-                    "restore"
-                } else {
-                    "dismiss"
-                };
-                let keys = if frame.area().width >= WIDE_KEY_LINE_COLS && entry.source_url.is_some()
-                {
-                    format!(
-                        "↵ start  {dismiss} {dismiss_verb}  ^K open in {}",
-                        entry.provider
-                    )
-                } else {
-                    format!("↵ start  {dismiss} {dismiss_verb}  ^K more")
-                };
-                lines.push(Line::from(Span::styled(keys, dim)));
-                ("Suggestion".to_string(), lines)
-            }
-            _ => return false,
+        if !self.suggestions_pane_shown() {
+            return false;
+        }
+        let Some(view) = &self.suggestions_view else {
+            return false;
         };
+        view.render(
+            frame,
+            area,
+            theme,
+            &self.suggestions_feed,
+            self.session_feed.mutation_block(),
+            self.suggestions_focused,
+        );
         self.preview_outer_area = area;
         self.preview_area = area;
         self.preview_pane_area = area;
         self.preview_visible_rows = area.height as usize;
         self.sync_preview_capture_worker(None);
-        let block = Block::default()
-            .title(format!(" {title} "))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.border))
-            .title_style(Style::default().fg(theme.title))
-            .padding(Padding::horizontal(1));
-        frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .block(block),
-            area,
-        );
         true
-    }
-
-    /// The title of a suggestion row and the muted ` source ref` after it.
-    pub(super) fn suggestion_row_text(
-        &self,
-        provider_id: &str,
-        id: &str,
-    ) -> Option<(String, String)> {
-        let entry = self
-            .suggestions_feed
-            .entry(&(provider_id.to_owned(), id.to_owned()))?;
-        let suffix = if entry.source_ref.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", entry.source_ref)
-        };
-        Some((entry.title, suffix))
     }
 }

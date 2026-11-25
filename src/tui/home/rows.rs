@@ -145,12 +145,9 @@ impl HomeView {
         self.flat_items.iter().position(|it| match it {
             Item::Group { path, .. } => {
                 crate::session::is_within_archived_section(path)
-                    || crate::session::is_suggested_section_path(path)
                     || crate::session::is_within_trash_section(path)
             }
-            Item::Session { .. } | Item::Suggestion { .. } | Item::SuggestionsViewAll { .. } => {
-                false
-            }
+            Item::Session { .. } | Item::Suggested { .. } => false,
         })
     }
 
@@ -171,9 +168,7 @@ impl HomeView {
                         session_count,
                         ..
                     } => Some(((path, profile), session_count)),
-                    Item::Session { .. }
-                    | Item::Suggestion { .. }
-                    | Item::SuggestionsViewAll { .. } => None,
+                    Item::Session { .. } | Item::Suggested { .. } => None,
                 })
                 .collect()
         } else {
@@ -231,9 +226,7 @@ impl HomeView {
             .position(|item| matches!(item, Item::Session { id: sid, .. } if sid == id))?;
         let (path, profile) = unfiltered[..at].iter().rev().find_map(|item| match item {
             Item::Group { path, profile, .. } => Some((path, profile)),
-            Item::Session { .. } | Item::Suggestion { .. } | Item::SuggestionsViewAll { .. } => {
-                None
-            }
+            Item::Session { .. } | Item::Suggested { .. } => None,
         })?;
         self.flat_items.iter().position(|item| {
             matches!(item, Item::Group { path: p, profile: pr, .. } if p == path && pr == profile)

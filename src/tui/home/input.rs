@@ -2278,7 +2278,12 @@ impl HomeView {
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('k' | 'K'))
         {
-            if let Some(selected) = self.suggestions_view.as_ref().map(|v| v.selected_key()) {
+            if let Some(selected) = self
+                .suggestions_view
+                .as_ref()
+                .filter(|_| self.suggestions_focused)
+                .map(|v| v.selected_key())
+            {
                 // Nothing selected (empty or loading list): nothing to open, no error.
                 if let Some(key) = selected {
                     match self.open_source_command(&key) {
@@ -2295,15 +2300,16 @@ impl HomeView {
                 return None;
             }
         }
-        if let (Some(view), None, None) = (
+        if let (Some(view), true, None, None) = (
             &mut self.suggestions_view,
+            self.suggestions_focused,
             &self.command_palette,
             &self.confirm_dialog,
         ) {
             let block = self.session_feed.mutation_block();
             match view.handle_key(key, block, &mut self.suggestions_feed) {
                 SuggestionsAction::Continue => {}
-                SuggestionsAction::Close => self.suggestions_view = None,
+                SuggestionsAction::Unfocus => self.suggestions_focused = false,
                 SuggestionsAction::TurnOnPreTrust if !self.suggestions_feed.hold_pre_trust() => {
                     if let Some(view) = &mut self.suggestions_view {
                         view.set_error(
@@ -2348,7 +2354,7 @@ impl HomeView {
                     }
                 }
                 SuggestionsAction::OpenSession(id) => match self.try_open_linked_session(&id) {
-                    Ok(()) => self.suggestions_view = None,
+                    Ok(()) => self.suggestions_focused = false,
                     Err(reason) => {
                         if let Some(view) = &mut self.suggestions_view {
                             view.set_error(reason);
@@ -3319,7 +3325,7 @@ impl HomeView {
                 SidebarPosition::Right => self.shrink_list(),
             },
             KeyCode::Enter => {
-                if self.activate_suggestion_row() {
+                if self.focus_suggestions_pane() {
                     return None;
                 }
                 if self.selected_session.is_some() {
@@ -3363,6 +3369,9 @@ impl HomeView {
                 }
             }
             KeyCode::Right | KeyCode::Char('l') => {
+                if self.focus_suggestions_pane() {
+                    return None;
+                }
                 if let Some(Item::Group {
                     path, collapsed, ..
                 }) = self.flat_items.get(self.cursor)
@@ -3554,13 +3563,7 @@ impl HomeView {
                 self.update_selected();
             }
             ActionId::NewSession => self.open_new_session_dialog(),
-            ActionId::NewFromSelection => {
-                if self.cursor_suggestion().is_some() {
-                    self.start_another_from_suggestion();
-                } else {
-                    self.open_new_from_selection();
-                }
-            }
+            ActionId::NewFromSelection => self.open_new_from_selection(),
             ActionId::NewFromProject => self.open_project_session_picker(),
             ActionId::AttachTerminal => return self.attach_terminal_for_selected(),
             ActionId::ToggleView => {
@@ -3604,7 +3607,7 @@ impl HomeView {
             ActionId::Diff => self.open_diff_for_selected(),
             ActionId::Serve => self.open_connections(),
             ActionId::Settings => self.open_settings(),
-            ActionId::Suggestions => self.open_suggestions_view(),
+            ActionId::Suggestions => self.focus_suggestions(),
             ActionId::Profiles => self.show_profile_picker(),
             ActionId::Projects => {
                 let profile = self.config_profile();
@@ -3619,9 +3622,6 @@ impl HomeView {
             ActionId::Restart => self.open_restart_dialog(),
             ActionId::Update => return self.run_update(update_info),
             ActionId::ToggleArchive => {
-                if self.dismiss_suggestion_row() {
-                    return None;
-                }
                 if self.selected_group.is_some() {
                     self.prompt_archive_selected_group();
                 } else if let Err(e) = self.toggle_archive_at_cursor() {
@@ -4541,13 +4541,6 @@ impl HomeView {
             payload: PaletteAction::Invoke(ActionId::Quit),
         });
 
-        if let Some(command) = self
-            .cursor_suggestion()
-            .and_then(|key| self.open_source_command(&key))
-        {
-            entries.push(command);
-        }
-
         // Dynamic session/group entries, one per flat_items row, so the user can
         // fuzzy-search and jump to it. In-flight sessions are tagged in the title so it is
         // clear that Stop/Delete will be a no-op for them.
@@ -4591,7 +4584,6 @@ impl HomeView {
                     // codebase disarms.
                     if crate::session::is_within_archived_section(path)
                         || crate::session::is_within_trash_section(path)
-                        || crate::session::is_suggested_section_path(path)
                     {
                         continue;
                     }
@@ -4613,7 +4605,7 @@ impl HomeView {
                         payload: PaletteAction::JumpToCursor(idx),
                     });
                 }
-                Item::Suggestion { .. } | Item::SuggestionsViewAll { .. } => {}
+                Item::Suggested { .. } => {}
             }
         }
 
@@ -4752,9 +4744,7 @@ impl HomeView {
             .iter()
             .filter_map(|item| match item {
                 Item::Session { id, .. } => Some(id.clone()),
-                Item::Group { .. } | Item::Suggestion { .. } | Item::SuggestionsViewAll { .. } => {
-                    None
-                }
+                Item::Group { .. } | Item::Suggested { .. } => None,
             })
             .collect();
         let current_session = self.selected_session.clone();
@@ -5004,7 +4994,6 @@ impl HomeView {
                     self.selected_session = None;
                     if crate::session::is_within_archived_section(path)
                         || crate::session::is_within_trash_section(path)
-                        || crate::session::is_suggested_section_path(path)
                     {
                         // The synthetic Archived section (and its Project-mode
                         // sub-folders) is not a real group and cannot be renamed, deleted,
@@ -5018,10 +5007,12 @@ impl HomeView {
                         self.selected_group_profile = self.profile_for_cursor(self.cursor);
                     }
                 }
-                Item::Suggestion { .. } | Item::SuggestionsViewAll { .. } => {
+                Item::Suggested { .. } => {
                     self.selected_session = None;
                     self.selected_group = None;
                     self.selected_group_profile = None;
+                    self.system_health_open = false;
+                    self.ensure_suggestions_view();
                 }
             }
             if self.selected_session != prev_session {
@@ -5150,10 +5141,6 @@ impl HomeView {
         }
         if crate::session::is_trash_section_path(path) {
             self.toggle_trashed_section();
-            return;
-        }
-        if crate::session::is_suggested_section_path(path) {
-            self.toggle_suggested_section();
             return;
         }
         if self.group_by == GroupByMode::Project {
@@ -5667,13 +5654,8 @@ impl HomeView {
                     return true;
                 }
             }
-            // Suggested rows have no session or group actions to offer.
-            let suggested_row = match &self.flat_items[idx] {
-                super::Item::Suggestion { .. } | super::Item::SuggestionsViewAll { .. } => true,
-                super::Item::Group { path, .. } => crate::session::is_suggested_section_path(path),
-                super::Item::Session { .. } => false,
-            };
-            if suggested_row {
+            // The Suggested row has no session or group actions to offer.
+            if matches!(self.flat_items[idx], super::Item::Suggested { .. }) {
                 return true;
             }
             let is_group = matches!(self.flat_items[idx], super::Item::Group { .. });
@@ -6506,13 +6488,13 @@ impl HomeView {
                     self.activate_selected_session()
                 }
                 Item::Group { .. } => None,
-                Item::Suggestion { .. } | Item::SuggestionsViewAll { .. } => {
+                Item::Suggested { .. } => {
                     if let Some(state) = self.live_send.clone() {
                         self.exit_live_send_and_restore_sizing(&state);
                     }
                     self.cursor = abs_idx;
                     self.update_selected();
-                    self.activate_suggestion_row();
+                    self.focus_suggestions_pane();
                     None
                 }
             };
@@ -6523,7 +6505,7 @@ impl HomeView {
                 self.toggle_group_collapsed(&path);
                 None
             }
-            Item::Suggestion { .. } | Item::SuggestionsViewAll { .. } => {
+            Item::Suggested { .. } => {
                 if let Some(state) = self.live_send.clone() {
                     self.exit_live_send_and_restore_sizing(&state);
                 }
@@ -7311,7 +7293,7 @@ impl HomeView {
     /// live-send's resize loop forces manual sizing, which would leave the next attach
     /// from a full-size terminal cramped at the preview dimensions. Re-setting
     /// `window-size latest` is best-effort, so a stuck pane never blocks the exit.
-    fn exit_live_send_and_restore_sizing(&mut self, state: &live_send::LiveSendState) {
+    pub(super) fn exit_live_send_and_restore_sizing(&mut self, state: &live_send::LiveSendState) {
         let session = crate::tmux::Session::from_name(&state.tmux_name);
         session.reset_size_to_latest_client();
         self.teardown_live_send();
@@ -7836,20 +7818,7 @@ impl HomeView {
                 Item::Group { name, path, .. } => {
                     format!("{} {}", name, path)
                 }
-                Item::Suggestion {
-                    provider_id, id, ..
-                } => {
-                    match self
-                        .suggestions_feed
-                        .entry(&(provider_id.clone(), id.clone()))
-                    {
-                        Some(entry) => {
-                            format!("{} {} {}", entry.provider, entry.source_ref, entry.title)
-                        }
-                        None => continue,
-                    }
-                }
-                Item::SuggestionsViewAll { .. } => continue,
+                Item::Suggested { .. } => "Suggested".to_string(),
             };
 
             let haystack_utf32 = Utf32Str::new(&haystack, &mut buf);
@@ -7904,20 +7873,7 @@ impl HomeView {
                 Item::Group { name, path, .. } => {
                     format!("{} {}", name, path)
                 }
-                Item::Suggestion {
-                    provider_id, id, ..
-                } => {
-                    match self
-                        .suggestions_feed
-                        .entry(&(provider_id.clone(), id.clone()))
-                    {
-                        Some(entry) => {
-                            format!("{} {} {}", entry.provider, entry.source_ref, entry.title)
-                        }
-                        None => continue,
-                    }
-                }
-                Item::SuggestionsViewAll { .. } => continue,
+                Item::Suggested { .. } => "Suggested".to_string(),
             };
 
             let haystack_utf32 = Utf32Str::new(&haystack, &mut buf);

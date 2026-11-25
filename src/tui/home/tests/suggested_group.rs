@@ -1,4 +1,4 @@
-//! The collapsed Suggested group in the Home list.
+//! The Suggested row in the Home list and the suggestions pane it opens.
 
 use super::*;
 use crate::session::Item;
@@ -28,26 +28,26 @@ fn suggested_rows(env: &TestEnv) -> Vec<&Item> {
     env.view
         .flat_items
         .iter()
-        .filter(|item| match item {
-            Item::Group { path, .. } => crate::session::is_suggested_section_path(path),
-            other => !matches!(other, Item::Session { .. }),
-        })
+        .filter(|item| matches!(item, Item::Suggested { .. }))
         .collect()
 }
 
-fn select_suggested_header(env: &mut TestEnv) {
-    env.view.cursor = env
-        .view
-        .flat_items
-        .iter()
-        .position(|item| matches!(item, Item::Group { path, .. } if crate::session::is_suggested_section_path(path)))
-        .expect("Suggested header");
+fn select_suggested_row(env: &mut TestEnv) {
+    env.view.cursor = env.view.suggested_row().expect("Suggested row");
     env.view.update_selected();
+}
+
+fn pane_notice(env: &TestEnv) -> Option<String> {
+    env.view.suggestions_view.as_ref()?.notice.clone()
+}
+
+fn pane_error(env: &TestEnv) -> Option<String> {
+    env.view.suggestions_view.as_ref()?.error.clone()
 }
 
 #[test]
 #[serial]
-fn group_is_absent_without_providers_and_collapsed_by_default() {
+fn the_row_is_absent_without_suggestions_and_counts_the_listed_ones() {
     let mut env = create_test_env_with_sessions(1);
     assert!(suggested_rows(&env).is_empty());
 
@@ -59,10 +59,9 @@ fn group_is_absent_without_providers_and_collapsed_by_default() {
     assert_eq!(rows.len(), 1);
     assert!(matches!(
         rows[0],
-        Item::Group {
-            collapsed: true,
-            session_count: 4,
-            ..
+        Item::Suggested {
+            total: 4,
+            failed: false
         }
     ));
 
@@ -73,18 +72,18 @@ fn group_is_absent_without_providers_and_collapsed_by_default() {
     assert!(suggested_rows(&env).is_empty());
 }
 
-/// With the Home group off, the full view says so and `h` turns it on.
+/// With the Home row off, the pane says so and `h` turns it on.
 #[test]
 #[serial]
-fn h_in_the_full_view_turns_the_home_group_on() {
+fn h_in_the_pane_turns_the_home_row_on() {
     let (mut env, requests) = expanded_env(2);
     let mut hidden = snapshot(2, &[]);
     hidden["prefs"]["sidebar"] = false.into();
     env.view.suggestions_feed.set_snapshot_for_test(hidden);
-    env.view.open_suggestions_view();
+    env.view.focus_suggestions();
     let text = render_home_to_string(&mut env.view, 120, 40);
     assert!(
-        text.contains("Not shown on Home. h shows the Suggested group there."),
+        text.contains("Not shown on Home. h shows the Suggested row there."),
         "{text}"
     );
     with_authenticated_local_project_registry(&mut env.view, |view| {
@@ -93,10 +92,10 @@ fn h_in_the_full_view_turns_the_home_group_on() {
     assert_eq!(next_request(&requests), "show on home true");
 }
 
-/// The dashboard's "Show in the sidebar" pref also hides the Home group.
+/// The dashboard's "Show in the sidebar" pref also hides the Home row.
 #[test]
 #[serial]
-fn the_group_follows_the_sidebar_pref() {
+fn the_row_follows_the_sidebar_pref() {
     let mut env = create_test_env_with_sessions(1);
     let mut snap = snapshot(2, &[]);
     snap["prefs"]["sidebar"] = false.into();
@@ -105,51 +104,71 @@ fn the_group_follows_the_sidebar_pref() {
     assert!(suggested_rows(&env).is_empty());
 }
 
+/// Selecting the row shows the list in the preview pane without taking the keys.
 #[test]
 #[serial]
-fn enter_expands_to_three_items_and_a_view_all_row() {
-    let mut env = create_test_env_with_sessions(1);
-    env.view
-        .suggestions_feed
-        .set_snapshot_for_test(snapshot(5, &[]));
-    env.view.rebuild_flat_items();
-    select_suggested_header(&mut env);
-    env.view.handle_key(key(KeyCode::Enter), None);
-
-    let rows = suggested_rows(&env);
-    assert_eq!(rows.len(), 5);
-    assert!(matches!(rows[1], Item::Suggestion { id, .. } if id == "i0"));
-    assert!(matches!(rows[3], Item::Suggestion { id, .. } if id == "i2"));
-    assert!(matches!(rows[4], Item::SuggestionsViewAll { total: 5, .. }));
-
-    env.view.cursor += 4;
-    env.view.update_selected();
-    env.view.handle_key(key(KeyCode::Enter), None);
-    assert!(
-        env.view.suggestions_view.is_some(),
-        "View all opens the full view"
-    );
-}
-
-#[test]
-#[serial]
-fn suggestion_rows_have_no_session_or_group_selection() {
+fn selecting_the_row_shows_the_list_in_the_preview_pane() {
     let mut env = create_test_env_with_sessions(1);
     env.view
         .suggestions_feed
         .set_snapshot_for_test(snapshot(2, &[]));
     env.view.rebuild_flat_items();
-    select_suggested_header(&mut env);
-    env.view.handle_key(key(KeyCode::Enter), None);
-    env.view.cursor += 1;
-    env.view.update_selected();
+    select_suggested_row(&mut env);
 
-    assert_eq!(
-        env.view.cursor_suggestion(),
-        Some(("gh".to_string(), "i0".to_string()))
-    );
     assert!(env.view.selected_session.is_none());
     assert!(env.view.selected_group.is_none());
+    assert!(!env.view.suggestions_focused);
+    let text = render_home_to_string(&mut env.view, 140, 40);
+    for expected in [
+        "Suggested sessions",
+        "Item 0",
+        "Item 1",
+        "do it",
+        "↵ browse",
+        "↵ Browse",
+    ] {
+        assert!(text.contains(expected), "{expected:?}: {text}");
+    }
+    let row = env.view.cursor;
+    env.view.handle_key(key(KeyCode::Char('k')), None);
+    assert_ne!(env.view.cursor, row, "Home's list keeps the keys");
+    assert!(!env.view.suggestions_pane_shown());
+}
+
+/// Enter or Right on the row moves the keys into the pane; Esc gives them back.
+#[test]
+#[serial]
+fn enter_or_right_focuses_the_pane_and_esc_returns_to_the_row() {
+    for focus in [KeyCode::Enter, KeyCode::Right] {
+        let mut env = create_test_env_with_sessions(1);
+        env.view
+            .suggestions_feed
+            .set_snapshot_for_test(snapshot(3, &[]));
+        env.view.rebuild_flat_items();
+        select_suggested_row(&mut env);
+        let row = env.view.cursor;
+
+        env.view.handle_key(key(focus), None);
+        assert!(env.view.suggestions_focused, "{focus:?}");
+        env.view.handle_key(key(KeyCode::Char('j')), None);
+        env.view.handle_key(key(KeyCode::Char('j')), None);
+        let view = env.view.suggestions_view.as_ref().unwrap();
+        assert_eq!(view.selected_key(), Some(("gh".into(), "i2".into())));
+        assert_eq!(env.view.cursor, row, "the list's cursor stays on the row");
+
+        env.view.handle_key(key(KeyCode::Esc), None);
+        assert!(!env.view.suggestions_focused);
+        assert_eq!(env.view.cursor, row);
+        assert!(env.view.suggestions_pane_shown());
+        let view = env.view.suggestions_view.as_ref().unwrap();
+        assert_eq!(
+            view.selected_key(),
+            Some(("gh".into(), "i2".into())),
+            "the pane keeps its selection"
+        );
+        env.view.handle_key(key(KeyCode::Char('k')), None);
+        assert_ne!(env.view.cursor, row, "Home's list has the keys again");
+    }
 }
 
 fn expanded_env(count: usize) -> (TestEnv, mpsc::Receiver<String>) {
@@ -160,6 +179,8 @@ fn expanded_env(count: usize) -> (TestEnv, mpsc::Receiver<String>) {
     expanded_env_answering(count, started)
 }
 
+/// Home with the cursor on the Suggested row and its pane focused; the
+/// suggestions worker records its requests and answers a start with `started`.
 fn expanded_env_answering(count: usize, started: StartAnswer) -> (TestEnv, mpsc::Receiver<String>) {
     let mut env = create_test_env_with_sessions(1);
     let (sink, requests) = mpsc::channel();
@@ -169,8 +190,9 @@ fn expanded_env_answering(count: usize, started: StartAnswer) -> (TestEnv, mpsc:
         .suggestions_feed
         .set_snapshot_for_test(snapshot(count, &[]));
     env.view.rebuild_flat_items();
-    select_suggested_header(&mut env);
+    select_suggested_row(&mut env);
     env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(env.view.suggestions_focused);
     (env, requests)
 }
 
@@ -202,8 +224,6 @@ fn terminal_view_config() {
 fn enter_on_a_suggestion_with_no_linked_project_opens_the_prefilled_dialog() {
     let (mut env, requests) = expanded_env_answering(2, StartAnswer::NoProject);
     terminal_view_config();
-    env.view.cursor += 1;
-    env.view.update_selected();
     with_authenticated_local_project_registry(&mut env.view, |view| {
         view.handle_key(key(KeyCode::Enter), None);
     });
@@ -230,18 +250,14 @@ fn enter_on_a_suggestion_with_no_linked_project_opens_the_prefilled_dialog() {
 
 #[test]
 #[serial]
-fn enter_starts_a_suggestion_and_its_row_leaves_the_group() {
+fn enter_starts_a_suggestion_and_the_row_stops_counting_it() {
     let (mut env, requests) = expanded_env(2);
-    env.view.cursor += 1;
-    env.view.update_selected();
     with_authenticated_local_project_registry(&mut env.view, |view| {
         view.handle_key(key(KeyCode::Enter), None);
     });
     assert_eq!(next_request(&requests), "start gh/i0");
     poll_until(&mut env, |env| {
-        env.view
-            .status_flash_text()
-            .is_some_and(|text| text == "Started Prepared title")
+        pane_notice(env).is_some_and(|text| text == "Started Prepared title · Enter opens it")
     });
     assert_eq!(next_request(&requests), "load");
     assert!(env.view.new_dialog.is_none(), "no wizard for a plain start");
@@ -251,9 +267,7 @@ fn enter_starts_a_suggestion_and_its_row_leaves_the_group() {
         .started_session_for_test(&("gh".into(), "i0".into()));
     assert_eq!(linked.as_deref(), Some("s-new"));
     assert!(
-        !suggested_rows(&env)
-            .iter()
-            .any(|row| matches!(row, Item::Suggestion { id, .. } if id == "i0")),
+        matches!(suggested_rows(&env)[..], [Item::Suggested { total: 1, .. }]),
         "the Session is listed under its Project instead"
     );
 }
@@ -262,17 +276,13 @@ fn enter_starts_a_suggestion_and_its_row_leaves_the_group() {
 #[serial]
 fn a_second_enter_does_not_start_twice() {
     let (mut env, requests) = expanded_env(2);
-    env.view.cursor += 1;
-    env.view.update_selected();
     with_authenticated_local_project_registry(&mut env.view, |view| {
         view.handle_key(key(KeyCode::Enter), None);
         view.handle_key(key(KeyCode::Enter), None);
     });
     assert_eq!(next_request(&requests), "start gh/i0");
     poll_until(&mut env, |env| {
-        env.view
-            .status_flash_text()
-            .is_some_and(|text| text.contains("Started"))
+        pane_notice(env).is_some_and(|text| text.contains("Started"))
     });
     // The reload after a start follows the first start; a duplicate would come before it.
     assert_eq!(next_request(&requests), "load", "no duplicate start");
@@ -283,16 +293,12 @@ fn a_second_enter_does_not_start_twice() {
 fn a_start_the_daemon_says_is_already_started_becomes_open() {
     let answer = StartAnswer::AlreadyStarted(Some("s-other".into()));
     let (mut env, requests) = expanded_env_answering(2, answer);
-    env.view.cursor += 1;
-    env.view.update_selected();
     with_authenticated_local_project_registry(&mut env.view, |view| {
         view.handle_key(key(KeyCode::Enter), None);
     });
     assert_eq!(next_request(&requests), "start gh/i0");
     poll_until(&mut env, |env| {
-        env.view
-            .status_flash_text()
-            .is_some_and(|text| text.contains("Already started"))
+        pane_notice(env).is_some_and(|text| text.contains("Already started"))
     });
     let linked = env
         .view
@@ -310,8 +316,6 @@ fn hooks_that_need_trust_show_a_review_and_approving_starts_with_its_fingerprint
         fingerprint: serde_json::json!({ "project_path": "/repo", "hooks": "abc" }),
     };
     let (mut env, requests) = expanded_env_answering(2, answer);
-    env.view.cursor += 1;
-    env.view.update_selected();
     with_authenticated_local_project_registry(&mut env.view, |view| {
         view.handle_key(key(KeyCode::Enter), None);
     });
@@ -338,7 +342,6 @@ fn the_hooks_review_lists_the_mcp_servers_the_daemon_summarised() {
     };
     let (mut env, requests) = expanded_env_answering(2, answer);
     with_authenticated_local_project_registry(&mut env.view, |view| {
-        view.open_suggestions_view();
         view.handle_key(key(KeyCode::Enter), None);
     });
     assert_eq!(next_request(&requests), "start gh/i0");
@@ -352,7 +355,6 @@ fn the_hooks_review_lists_the_mcp_servers_the_daemon_summarised() {
 fn a_changed_trust_asks_the_daemon_for_a_fresh_review_without_approval() {
     let (mut env, requests) = expanded_env_answering(2, StartAnswer::TrustChanged);
     with_authenticated_local_project_registry(&mut env.view, |view| {
-        view.open_suggestions_view();
         view.handle_key(key(KeyCode::Enter), None);
     });
     assert_eq!(next_request(&requests), "start gh/i0");
@@ -370,11 +372,10 @@ fn a_changed_trust_asks_the_daemon_for_a_fresh_review_without_approval() {
 
 #[test]
 #[serial]
-fn a_failed_start_in_the_full_view_shows_its_whole_reason() {
+fn a_failed_start_in_the_pane_shows_its_whole_reason() {
     let reason = format!("Docker isn't running{}. Start it.", ", really".repeat(20));
     let (mut env, requests) = expanded_env_answering(2, StartAnswer::Failed(reason));
     with_authenticated_local_project_registry(&mut env.view, |view| {
-        view.open_suggestions_view();
         view.handle_key(key(KeyCode::Enter), None);
     });
     assert_eq!(next_request(&requests), "start gh/i0");
@@ -391,7 +392,7 @@ fn a_failed_start_in_the_full_view_shows_its_whole_reason() {
 
 #[test]
 #[serial]
-fn the_hooks_review_opened_from_the_full_view_is_drawn_and_takes_the_keys() {
+fn the_hooks_review_opened_from_the_pane_is_drawn_and_takes_the_keys() {
     let answer = StartAnswer::NeedsTrust {
         mcp_summaries: vec![],
         commands: vec!["on create: make setup".into()],
@@ -399,7 +400,6 @@ fn the_hooks_review_opened_from_the_full_view_is_drawn_and_takes_the_keys() {
     };
     let (mut env, requests) = expanded_env_answering(2, answer);
     with_authenticated_local_project_registry(&mut env.view, |view| {
-        view.open_suggestions_view();
         view.handle_key(key(KeyCode::Enter), None);
     });
     assert_eq!(next_request(&requests), "start gh/i0");
@@ -415,7 +415,7 @@ fn the_hooks_review_opened_from_the_full_view_is_drawn_and_takes_the_keys() {
 
 #[test]
 #[serial]
-fn cancelling_the_hooks_review_in_the_full_view_says_nothing_started() {
+fn cancelling_the_hooks_review_in_the_pane_says_nothing_started() {
     let answer = StartAnswer::NeedsTrust {
         mcp_summaries: vec![],
         commands: vec!["on create: make setup".into()],
@@ -423,7 +423,6 @@ fn cancelling_the_hooks_review_in_the_full_view_says_nothing_started() {
     };
     let (mut env, requests) = expanded_env_answering(2, answer);
     with_authenticated_local_project_registry(&mut env.view, |view| {
-        view.open_suggestions_view();
         view.handle_key(key(KeyCode::Enter), None);
     });
     assert_eq!(next_request(&requests), "start gh/i0");
@@ -446,8 +445,6 @@ fn a_profile_switch_closes_the_hooks_review_and_nothing_is_approved() {
         fingerprint: serde_json::json!({ "project_path": "/repo" }),
     };
     let (mut env, requests) = expanded_env_answering(2, answer);
-    env.view.cursor += 1;
-    env.view.update_selected();
     env.view.active_profile = Some("A".into());
     env.view.apply_suggestions_results();
     with_authenticated_local_project_registry(&mut env.view, |view| {
@@ -467,28 +464,26 @@ fn a_profile_switch_closes_the_hooks_review_and_nothing_is_approved() {
 
 #[test]
 #[serial]
-fn e_in_the_full_view_opens_the_prefilled_dialog_in_one_press() {
+fn e_in_the_pane_opens_the_prefilled_dialog_in_one_press() {
     let (mut env, requests) = expanded_env(2);
     terminal_view_config();
     with_authenticated_local_project_registry(&mut env.view, |view| {
-        view.open_suggestions_view();
         view.handle_key(key(KeyCode::Char('e')), None);
     });
     assert_eq!(next_request(&requests), "prepare gh/i0");
     poll_until(&mut env, |env| env.view.new_dialog.is_some());
     assert!(
-        env.view.suggestions_view.is_none(),
-        "the dialog replaces the view"
+        !env.view.suggestions_focused,
+        "the dialog takes the keys from the pane"
     );
 }
 
 #[test]
 #[serial]
-fn enter_in_the_full_view_on_an_unlinked_item_opens_the_dialog_to_pick_a_project() {
+fn enter_in_the_pane_on_an_unlinked_item_opens_the_dialog_to_pick_a_project() {
     let (mut env, requests) = expanded_env_answering(2, StartAnswer::NoProject);
     terminal_view_config();
     with_authenticated_local_project_registry(&mut env.view, |view| {
-        view.open_suggestions_view();
         view.handle_key(key(KeyCode::Enter), None);
     });
     poll_until(&mut env, |env| env.view.new_dialog.is_some());
@@ -498,12 +493,12 @@ fn enter_in_the_full_view_on_an_unlinked_item_opens_the_dialog_to_pick_a_project
 
 #[test]
 #[serial]
-fn the_full_view_dismisses_with_z_and_in_strict_mode_only_with_capital_z() {
+fn the_pane_dismisses_with_z_and_in_strict_mode_only_with_capital_z() {
     for (strict, dismiss, ignored) in [(false, 'z', 'Z'), (true, 'Z', 'z')] {
         let (mut env, requests) = expanded_env(2);
         env.view.strict_hotkeys = strict;
         with_authenticated_local_project_registry(&mut env.view, |view| {
-            view.open_suggestions_view();
+            view.focus_suggestions();
             view.handle_key(key(KeyCode::Char(ignored)), None);
             view.suggestions_feed.reload();
         });
@@ -520,106 +515,30 @@ fn the_full_view_dismisses_with_z_and_in_strict_mode_only_with_capital_z() {
 
 #[test]
 #[serial]
-fn a_failed_start_says_why_and_enter_tries_again() {
-    let answer = StartAnswer::Failed("Docker isn't running. Start it, then try again.".into());
-    let (mut env, requests) = expanded_env_answering(2, answer);
-    env.view.cursor += 1;
-    env.view.update_selected();
-    with_authenticated_local_project_registry(&mut env.view, |view| {
-        view.handle_key(key(KeyCode::Enter), None);
-    });
-    assert_eq!(next_request(&requests), "start gh/i0");
-    poll_until(&mut env, |env| {
-        env.view.status_flash_text().is_some_and(|text| {
-            text.contains("Docker isn't running") && text.contains("Enter tries again")
-        })
-    });
-    // The flash fades; the preview keeps the reason until the next try.
-    let preview = preview_text(&mut env, 100);
-    assert!(
-        preview.contains("Couldn't start: Docker isn't running"),
-        "{preview}"
-    );
-    with_authenticated_local_project_registry(&mut env.view, |view| {
-        view.handle_key(key(KeyCode::Enter), None);
-    });
-    assert_eq!(next_request(&requests), "start gh/i0");
-    assert!(!preview_text(&mut env, 100).contains("Couldn't start"));
-}
-
-#[test]
-#[serial]
-fn a_started_suggestion_is_not_listed_in_the_group() {
+fn the_row_does_not_count_a_started_suggestion() {
     let mut env = create_test_env_with_sessions(1);
     let mut snap = snapshot(2, &[]);
     snap["items"][0]["started_session"] = serde_json::json!({ "id": "s1", "status": "Idle" });
     env.view.suggestions_feed.set_snapshot_for_test(snap);
     env.view.rebuild_flat_items();
-    select_suggested_header(&mut env);
-    env.view.handle_key(key(KeyCode::Enter), None);
-
-    let rows = suggested_rows(&env);
     assert!(matches!(
-        rows[0],
-        Item::Group {
-            session_count: 1,
-            ..
-        }
+        suggested_rows(&env)[..],
+        [Item::Suggested { total: 1, .. }]
     ));
-    assert!(matches!(rows[1], Item::Suggestion { id, .. } if id == "i1"));
-    assert!(matches!(rows[2], Item::SuggestionsViewAll { total: 1, .. }));
-}
-
-#[test]
-#[serial]
-fn the_footer_offers_n_new_on_a_suggestion() {
-    let (mut env, _requests) = expanded_env(1);
-    env.view.cursor += 1;
-    env.view.update_selected();
-    let text = render_home_to_string(&mut env.view, 160, 40);
-    assert!(text.contains("N New"), "{text}");
-    assert!(!text.contains("Another"), "{text}");
-}
-
-#[test]
-#[serial]
-fn a_prepare_answered_after_the_cursor_moved_is_dropped() {
-    let (mut env, requests) = expanded_env(2);
-    env.view.cursor += 1;
-    env.view.update_selected();
-    with_authenticated_local_project_registry(&mut env.view, |view| {
-        view.handle_key(key(KeyCode::Char('N')), None);
-    });
-    env.view.cursor -= 1;
-    env.view.update_selected();
-    assert_eq!(next_request(&requests), "prepare gh/i0");
-    poll_until(&mut env, |env| env.view.status_flash_text().is_some());
-    assert!(env.view.new_dialog.is_none());
 }
 
 #[test]
 #[serial]
 fn z_dismisses_when_the_daemon_accepts_mutations_and_is_refused_otherwise() {
     let (mut env, requests) = expanded_env(2);
-    env.view.cursor += 1;
-    env.view.update_selected();
 
     env.view.handle_key(key(KeyCode::Char('z')), None);
-    assert!(env
-        .view
-        .status_flash_text()
-        .unwrap()
-        .contains("Disconnected"));
+    assert!(pane_error(&env).unwrap().contains("Disconnected"));
     // Requests are FIFO: a refused dismiss never reached the worker ahead of this one.
-    env.view
-        .suggestions_feed
-        .prepare(("gh".into(), "i1".into()));
-    assert_eq!(next_request(&requests), "prepare gh/i1");
-    // Drain the prepare so the dismiss is not queued behind it.
+    env.view.suggestions_feed.reload();
+    assert_eq!(next_request(&requests), "load");
     poll_until(&mut env, |env| {
-        env.view
-            .status_flash_text()
-            .is_some_and(|text| text.contains("Selection changed"))
+        !env.view.suggestions_feed.is_busy_for_test()
     });
 
     with_authenticated_local_project_registry(&mut env.view, |view| {
@@ -633,8 +552,6 @@ fn z_dismisses_when_the_daemon_accepts_mutations_and_is_refused_otherwise() {
 fn n_on_a_suggestion_prepares_another_session_that_does_not_claim_the_link() {
     let (mut env, requests) = expanded_env(2);
     terminal_view_config();
-    env.view.cursor += 1;
-    env.view.update_selected();
     with_authenticated_local_project_registry(&mut env.view, |view| {
         view.handle_key(key(KeyCode::Char('N')), None);
     });
@@ -657,23 +574,15 @@ fn n_on_a_suggestion_prepares_another_session_that_does_not_claim_the_link() {
 #[serial]
 fn enter_on_an_unstarted_suggestion_is_refused_while_mutations_are_unavailable() {
     let (mut env, requests) = expanded_env(2);
-    env.view.cursor += 1;
-    env.view.update_selected();
     env.view.handle_key(key(KeyCode::Enter), None);
-    assert!(env
-        .view
-        .status_flash_text()
-        .unwrap()
-        .contains("Disconnected"));
-    assert!(requests.try_recv().is_err(), "no prepare was sent");
+    assert!(pane_error(&env).unwrap().contains("Disconnected"));
+    assert!(requests.try_recv().is_err(), "no start was sent");
 }
 
 #[test]
 #[serial]
 fn a_second_n_does_not_queue_a_second_prepare() {
     let (mut env, requests) = expanded_env(2);
-    env.view.cursor += 1;
-    env.view.update_selected();
     with_authenticated_local_project_registry(&mut env.view, |view| {
         view.handle_key(key(KeyCode::Char('N')), None);
         view.handle_key(key(KeyCode::Char('N')), None);
@@ -693,31 +602,7 @@ fn a_second_n_does_not_queue_a_second_prepare() {
 
 #[test]
 #[serial]
-fn a_home_prepare_answered_after_the_full_view_opened_is_dropped() {
-    let (mut env, requests) = expanded_env(2);
-    env.view.cursor += 1;
-    env.view.update_selected();
-    with_authenticated_local_project_registry(&mut env.view, |view| {
-        view.handle_key(key(KeyCode::Char('N')), None);
-        view.open_suggestions_view();
-    });
-    assert_eq!(next_request(&requests), "prepare gh/i0");
-    // Not busy means the answer was taken off the worker and applied.
-    poll_until(&mut env, |env| {
-        !env.view.suggestions_feed.is_busy_for_test()
-    });
-    assert!(env.view.new_dialog.is_none());
-    let view = env.view.suggestions_view.as_ref().expect("view stays open");
-    assert!(view
-        .error
-        .as_deref()
-        .unwrap()
-        .contains("Press N on it again here."));
-}
-
-#[test]
-#[serial]
-fn z_on_home_dismisses_then_restores_within_the_undo_window() {
+fn z_in_the_pane_dismisses_then_restores_within_the_undo_window() {
     let mut env = create_test_env_with_sessions(1);
     let (sink, requests) = mpsc::channel();
     // The worker answers every request with i0 dismissed, as the daemon would after a dismiss.
@@ -726,10 +611,8 @@ fn z_on_home_dismisses_then_restores_within_the_undo_window() {
         .suggestions_feed
         .set_snapshot_for_test(snapshot(2, &[]));
     env.view.rebuild_flat_items();
-    select_suggested_header(&mut env);
+    select_suggested_row(&mut env);
     env.view.handle_key(key(KeyCode::Enter), None);
-    env.view.cursor += 1;
-    env.view.update_selected();
 
     with_authenticated_local_project_registry(&mut env.view, |view| {
         view.handle_key(key(KeyCode::Char('z')), None);
@@ -738,9 +621,9 @@ fn z_on_home_dismisses_then_restores_within_the_undo_window() {
     let key_i0 = ("gh".to_string(), "i0".to_string());
     poll_until(&mut env, |env| env.view.suggestions_feed.is_recent(&key_i0));
     assert_eq!(
-        env.view.cursor_suggestion(),
+        env.view.suggestions_view.as_ref().unwrap().selected_key(),
         Some(key_i0),
-        "the dismissed row stays under the cursor for the undo window"
+        "the dismissed item stays selected for the undo window"
     );
 
     with_authenticated_local_project_registry(&mut env.view, |view| {
@@ -751,7 +634,7 @@ fn z_on_home_dismisses_then_restores_within_the_undo_window() {
 
 #[test]
 #[serial]
-fn status_grouping_keeps_the_suggested_section() {
+fn status_grouping_keeps_the_suggested_row() {
     use crate::session::config::GroupByMode;
     let mut env = create_test_env_with_sessions(1);
     env.view
@@ -780,32 +663,21 @@ fn a_failed_background_load_keeps_the_snapshot_and_stays_quiet() {
 
 #[test]
 #[serial]
-fn the_cursor_stays_on_its_suggestion_when_the_list_reorders() {
+fn the_cursor_stays_on_the_row_when_the_list_rebuilds() {
     let (mut env, _requests) = expanded_env(5);
-    env.view.cursor += 2;
-    env.view.update_selected();
-    assert_eq!(
-        env.view.cursor_suggestion(),
-        Some(("gh".to_string(), "i1".to_string()))
-    );
     env.view
         .suggestions_feed
         .set_snapshot_for_test(snapshot(5, &[0]));
     env.view.rebuild_flat_items_keeping_cursor();
-    assert_eq!(
-        env.view.cursor_suggestion(),
-        Some(("gh".to_string(), "i1".to_string()))
-    );
+    assert!(env.view.on_suggested_row());
+    assert!(matches!(
+        suggested_rows(&env)[..],
+        [Item::Suggested { total: 4, .. }]
+    ));
 }
 
 fn ctrl_k() -> KeyEvent {
     KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)
-}
-
-fn type_text(env: &mut TestEnv, text: &str) {
-    for c in text.chars() {
-        env.view.handle_key(key(KeyCode::Char(c)), None);
-    }
 }
 
 /// Runs `body` with `AOE_OPEN_URL_TO` pointing at a fresh file and returns the
@@ -843,24 +715,9 @@ fn open_in_source_is_offered_for_an_http_source_only() {
 
 #[test]
 #[serial]
-fn the_palette_opens_the_source_of_the_suggestion_under_the_cursor() {
-    let (mut env, _requests) = expanded_env(2);
-    env.view.cursor += 1;
-    env.view.update_selected();
-    let opened = recorded_opens(|| {
-        env.view.handle_key(ctrl_k(), None);
-        type_text(&mut env, "Open in GitHub");
-        env.view.handle_key(key(KeyCode::Enter), None);
-    });
-    assert_eq!(opened, ["https://example.test"]);
-    assert!(env.view.command_palette.is_none());
-}
-
-#[test]
-#[serial]
 fn the_full_view_palette_opens_the_selected_source_and_esc_returns_to_the_view() {
     let (mut env, _requests) = expanded_env(2);
-    env.view.open_suggestions_view();
+    env.view.focus_suggestions();
 
     env.view.handle_key(ctrl_k(), None);
     assert!(env.view.command_palette.is_some());
@@ -876,90 +733,6 @@ fn the_full_view_palette_opens_the_selected_source_and_esc_returns_to_the_view()
     assert!(env.view.suggestions_view.is_some());
 }
 
-fn preview_text(env: &mut TestEnv, width: u16) -> String {
-    let mut terminal =
-        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
-    terminal
-        .draw(|frame| {
-            let area = frame.area();
-            assert!(env.view.render_suggestion_preview(
-                frame,
-                area,
-                &crate::tui::styles::Theme::default()
-            ));
-        })
-        .unwrap();
-    terminal
-        .backend()
-        .buffer()
-        .content
-        .iter()
-        .map(|c| c.symbol())
-        .collect()
-}
-
-#[test]
-#[serial]
-fn the_preview_key_line_names_the_source_from_120_columns() {
-    let (mut env, _requests) = expanded_env(1);
-    env.view.cursor += 1;
-    env.view.update_selected();
-    for (width, strict, expected) in [
-        (119, false, "z dismiss  ^K more"),
-        (120, false, "z dismiss  ^K open in GitHub"),
-        (120, true, "Z dismiss  ^K open in GitHub"),
-    ] {
-        env.view.strict_hotkeys = strict;
-        let text = preview_text(&mut env, width);
-        assert!(
-            text.contains(expected),
-            "{width} cols, strict {strict}: {expected:?}"
-        );
-    }
-}
-
-#[test]
-#[serial]
-fn the_preview_shows_the_preset_and_the_prompt_enter_sends() {
-    let mut snap = snapshot(1, &[]);
-    snap["providers"][0]["sources"] = serde_json::json!([{
-        "criterion": "review",
-        "preset": { "agent": "claude", "view": "structured", "worktree": true,
-                    "sandbox": false, "yolo": true, "prompt": "Review PR {pr_number} now" }
-    }]);
-    snap["items"][0]["criterion"] = "review".into();
-    snap["items"][0]["variables"] = serde_json::json!({ "pr_number": "42" });
-    snap["items"][0]["start"] = serde_json::json!({
-        "agent": "claude", "view": "structured", "worktree": true, "sandbox": false
-    });
-    let (mut env, _requests) = expanded_env(1);
-    env.view.suggestions_feed.set_snapshot_for_test(snap);
-    env.view.rebuild_flat_items();
-    env.view.cursor += 1;
-    env.view.update_selected();
-    let text = preview_text(&mut env, 120);
-    assert!(
-        text.contains("Starts with Claude Code · Structured · worktree · yolo"),
-        "{text}"
-    );
-    assert!(text.contains("Review PR 42 now"), "{text}");
-    assert!(!text.contains("do it"), "{text}");
-}
-
-#[test]
-#[serial]
-fn the_wide_key_line_only_offers_open_when_the_suggestion_has_a_link() {
-    let (mut env, _requests) = expanded_env(1);
-    env.view.cursor += 1;
-    env.view.update_selected();
-    let mut linkless = snapshot(1, &[]);
-    linkless["items"][0]["source_url"] = "javascript:alert(1)".into();
-    env.view.suggestions_feed.set_snapshot_for_test(linkless);
-    let text = preview_text(&mut env, 120);
-    assert!(text.contains("^K more"), "{text}");
-    assert!(!text.contains("open in"), "{text}");
-}
-
 #[test]
 #[serial]
 fn the_full_view_says_so_when_the_selected_suggestion_has_no_link() {
@@ -967,7 +740,7 @@ fn the_full_view_says_so_when_the_selected_suggestion_has_no_link() {
     let mut hostile = snapshot(1, &[]);
     hostile["items"][0]["source_url"] = "javascript:alert(1)".into();
     env.view.suggestions_feed.set_snapshot_for_test(hostile);
-    env.view.open_suggestions_view();
+    env.view.focus_suggestions();
 
     env.view.handle_key(ctrl_k(), None);
     assert!(env.view.command_palette.is_none());
@@ -977,42 +750,26 @@ fn the_full_view_says_so_when_the_selected_suggestion_has_no_link() {
 
 #[test]
 #[serial]
-fn the_group_counts_only_the_rows_it_lists_not_stale_items() {
+fn the_row_counts_only_the_items_it_lists_not_stale_ones() {
     let (mut env, _requests) = expanded_env(2);
     let mut snap = snapshot(2, &[]);
     snap["items"][1]["stale"] = true.into();
     env.view.suggestions_feed.set_snapshot_for_test(snap);
     env.view.rebuild_flat_items();
-
-    let rows = suggested_rows(&env);
     assert!(matches!(
-        rows[0],
-        Item::Group {
-            session_count: 1,
-            ..
-        }
+        suggested_rows(&env)[..],
+        [Item::Suggested { total: 1, .. }]
     ));
-    assert!(matches!(
-        rows.last().unwrap(),
-        Item::SuggestionsViewAll { total: 1, .. }
-    ));
-    assert_eq!(
-        rows.iter()
-            .filter(|row| matches!(row, Item::Suggestion { .. }))
-            .count(),
-        1,
-        "Home previews only the startable one"
-    );
 }
 
 #[test]
 #[serial]
 fn ctrl_k_on_an_empty_suggestions_list_does_nothing() {
-    let (mut env, _requests) = expanded_env(1);
+    let mut env = create_test_env_with_sessions(1);
     env.view
         .suggestions_feed
         .set_snapshot_for_test(snapshot(0, &[]));
-    env.view.open_suggestions_view();
+    env.view.focus_suggestions();
 
     env.view.handle_key(ctrl_k(), None);
     assert!(env.view.command_palette.is_none());
@@ -1021,7 +778,7 @@ fn ctrl_k_on_an_empty_suggestions_list_does_nothing() {
 
 #[test]
 #[serial]
-fn clicking_a_suggestion_row_leaves_live_send() {
+fn clicking_the_suggested_row_leaves_live_send() {
     use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
     let (mut env, _requests) = expanded_env(1);
     env.view.list_inner_area = ratatui::layout::Rect::new(1, 1, 28, 5);
@@ -1029,9 +786,9 @@ fn clicking_a_suggestion_row_leaves_live_send() {
     let (click_row, idx) = (1..12)
         .find_map(|r| {
             let idx = env.view.resolve_row_to_index(5, r)?;
-            matches!(env.view.flat_items[idx], Item::Suggestion { .. }).then_some((r, idx))
+            matches!(env.view.flat_items[idx], Item::Suggested { .. }).then_some((r, idx))
         })
-        .expect("a suggestion row on screen");
+        .expect("the Suggested row on screen");
     env.view.live_send = Some(LiveSendState {
         session_id: "live".to_string(),
         title: "live".to_string(),
@@ -1048,7 +805,7 @@ fn clicking_a_suggestion_row_leaves_live_send() {
 
 #[test]
 #[serial]
-fn the_group_shows_without_any_session() {
+fn the_row_shows_without_any_session() {
     let mut env = create_test_env_with_sessions(0);
     env.view
         .suggestions_feed
@@ -1068,32 +825,6 @@ fn the_group_shows_without_any_session() {
         .collect();
     assert!(text.contains("Suggested"), "{text}");
     assert!(!text.contains("No sessions yet"));
-}
-
-#[test]
-#[serial]
-fn the_source_reference_shows_on_the_row_and_preview_unless_hidden() {
-    let (mut env, _requests) = expanded_env(1);
-    env.view.cursor += 1;
-    env.view.update_selected();
-    for (prefs, suffix, meta) in [
-        (None, " #0", "GitHub · #0 · review requested"),
-        (
-            Some(serde_json::json!({ "show_source_ref": false, "sidebar": true })),
-            "",
-            "GitHub · review requested",
-        ),
-    ] {
-        let mut snap = snapshot(1, &[]);
-        if let Some(prefs) = prefs {
-            snap["prefs"] = prefs;
-        }
-        env.view.suggestions_feed.set_snapshot_for_test(snap);
-        let row = env.view.suggestion_row_text("gh", "i0").unwrap();
-        assert_eq!(row, ("Item 0".to_string(), suffix.to_string()));
-        let text = preview_text(&mut env, 100);
-        assert!(text.contains(meta), "{meta:?}: {text}");
-    }
 }
 
 #[test]
@@ -1124,7 +855,7 @@ fn an_undelivered_first_prompt_is_announced_once_per_failure() {
 #[serial]
 fn open_on_an_unknown_session_says_so_and_keeps_the_full_view() {
     let mut env = create_test_env_with_sessions(1);
-    env.view.open_suggestions_view();
+    env.view.focus_suggestions();
     let reason = env.view.try_open_linked_session("gone").unwrap_err();
     assert!(reason.contains("no longer exists"), "{reason}");
     assert!(env.view.suggestions_view.is_some());
@@ -1157,7 +888,7 @@ fn a_failed_open_in_the_full_view_is_shown_there() {
     let mut snap = snapshot(1, &[]);
     snap["items"][0]["started_session"] = serde_json::json!({ "id": "gone", "status": "Idle" });
     env.view.suggestions_feed.set_snapshot_for_test(snap);
-    env.view.open_suggestions_view();
+    env.view.focus_suggestions();
     env.view.handle_key(key(KeyCode::Enter), None);
 
     let shown = env.view.suggestions_view.as_ref().expect("view stays open");
@@ -1167,13 +898,13 @@ fn a_failed_open_in_the_full_view_is_shown_there() {
         .is_some_and(|e| e.contains("no longer exists")));
 }
 
-/// A failed refresh leads with the error, the plugin's fix and the retry key;
-/// the start hint shows only when there are rows to start.
+/// A failed refresh marks the row, and the pane leads with the error, the
+/// plugin's fix and the retry key, with or without items to list.
 #[test]
 #[serial]
 fn a_failed_refresh_leads_with_the_error_and_how_to_retry() {
-    let mut env = create_test_env_with_sessions(1);
     for count in [0, 2] {
+        let mut env = create_test_env_with_sessions(1);
         let mut snap = snapshot(count, &[]);
         snap["providers"][0]["error"] = "token expired".into();
         snap["providers"][0]["checks"] = serde_json::json!([
@@ -1182,36 +913,32 @@ fn a_failed_refresh_leads_with_the_error_and_how_to_retry() {
         ]);
         env.view.suggestions_feed.set_snapshot_for_test(snap);
         env.view.rebuild_flat_items();
-        select_suggested_header(&mut env);
+        assert!(matches!(
+            suggested_rows(&env)[..],
+            [Item::Suggested { failed: true, .. }]
+        ));
+        select_suggested_row(&mut env);
 
-        let text = render_home_to_string(&mut env.view, 120, 40);
+        let text = render_home_to_string(&mut env.view, 160, 40);
+        assert!(text.contains(&format!("Suggested ({count}) !")), "{text}");
         let error = text.find("GitHub couldn't refresh: token expired");
-        let retry = text.find("S opens the full view; r there retries.");
+        let retry = text.find("r retries.");
         assert!(error.is_some() && error < retry, "{text}");
         assert!(text.contains("Run gh auth login") && !text.contains("not this"));
         assert_eq!(
-            text.contains("These are from the last refresh."),
+            text.contains("Shown from the last refresh."),
             count > 0,
             "{count}: {text}"
         );
         assert_eq!(
-            text.contains("Enter to expand"),
-            count > 0,
+            text.contains("Nothing to suggest right now."),
+            count == 0,
             "{count}: {text}"
         );
     }
 }
 
-#[test]
-#[serial]
-fn a_home_row_leads_with_the_title_not_the_source() {
-    let (mut env, _requests) = expanded_env(1);
-    let text = render_home_to_string(&mut env.view, 120, 40);
-    assert!(text.contains("Item 0 #0"), "{text}");
-    assert!(!text.contains("GitHub #0"), "{text}");
-}
-
-/// Home with the full view open on a one-click started item whose Session is
+/// Home with the pane focused on a one-click started item whose Session is
 /// blocked on folder trust; the suggestions worker records its requests.
 fn blocked_on_folder_trust() -> (TestEnv, String, mpsc::Receiver<String>) {
     use crate::tui::session_feed::SessionFeedResult;
@@ -1233,7 +960,7 @@ fn blocked_on_folder_trust() -> (TestEnv, String, mpsc::Receiver<String>) {
     env.view.suggestions_feed = SuggestionsFeed::recording_for_test(snap.clone(), sink);
     env.view.suggestions_feed.set_snapshot_for_test(snap);
     env.view.apply_suggestions_results();
-    env.view.open_suggestions_view();
+    env.view.focus_suggestions();
     (env, instance.id, requests)
 }
 
@@ -1328,8 +1055,7 @@ fn pre_trust_is_refused_when_the_list_changes_under_its_confirmation() {
 #[serial]
 fn a_second_try_again_is_refused_while_one_is_in_flight() {
     let (mut env, _id, _requests) = blocked_on_folder_trust();
-    crate::session::config::update_config(|c| c.session.pre_trust_agent_folders = true).unwrap();
-    env.view.open_suggestions_view();
+    env.view.suggestions_view.as_mut().unwrap().pretrusted = true;
     let mut commands = env.view.session_feed.request_driver_for_test();
     let pending = crate::tui::home::RetryAfterTrash {
         session_id: "other".into(),
@@ -1353,8 +1079,7 @@ fn a_second_try_again_is_refused_while_one_is_in_flight() {
 #[serial]
 fn a_failed_try_again_trash_disarms_so_a_later_trash_starts_nothing() {
     let (mut env, id, requests) = blocked_on_folder_trust();
-    crate::session::config::update_config(|c| c.session.pre_trust_agent_folders = true).unwrap();
-    env.view.open_suggestions_view();
+    env.view.suggestions_view.as_mut().unwrap().pretrusted = true;
     let mut commands = env.view.session_feed.request_driver_for_test();
     env.view.handle_key(key(KeyCode::Enter), None);
     assert!(commands(Err("refused".into())).is_some(), "Trash was sent");
@@ -1385,7 +1110,6 @@ fn a_prepare_answer_is_applied_when_a_prompt_error_changes_in_the_same_poll() {
     let (mut env, requests) = expanded_env(2);
     terminal_view_config();
     with_authenticated_local_project_registry(&mut env.view, |view| {
-        view.open_suggestions_view();
         view.handle_key(key(KeyCode::Char('e')), None);
     });
     assert_eq!(next_request(&requests), "prepare gh/i0");

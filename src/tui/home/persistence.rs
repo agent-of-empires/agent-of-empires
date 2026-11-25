@@ -128,8 +128,7 @@ impl HomeView {
                     let (owner, _) = owners.next()?;
                     return owners.next().is_none().then(|| owner.clone());
                 }
-                crate::session::Item::Suggestion { .. }
-                | crate::session::Item::SuggestionsViewAll { .. } => {}
+                crate::session::Item::Suggested { .. } => {}
             }
         }
         None

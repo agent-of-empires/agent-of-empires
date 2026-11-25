@@ -16,13 +16,6 @@ pub const ARCHIVED_SECTION_NAME: &str = "Archived";
 pub const TRASH_SECTION_PATH: &str = "__aoe_trash_section__";
 pub const TRASH_SECTION_NAME: &str = "Trash";
 
-/// Synthetic group path for the built-in Suggested group, just above Trash.
-pub const SUGGESTED_SECTION_PATH: &str = "__aoe_suggested_section__";
-pub const SUGGESTED_SECTION_NAME: &str = "Suggested";
-
-/// Rows listed under an expanded Suggested group before "View all".
-pub const SUGGESTED_PREVIEW_ROWS: usize = 3;
-
 /// Synthetic group identity for the scratch bucket in project mode.
 pub const SCRATCH_GROUP_PATH: &str = "__aoe_scratch_group__";
 /// Capitalized so the bucket reads as a system group rather than a repo basename, matching the web
@@ -37,11 +30,6 @@ pub fn is_archived_section_path(path: &str) -> bool {
 #[inline]
 pub fn is_trash_section_path(path: &str) -> bool {
     path == TRASH_SECTION_PATH
-}
-
-#[inline]
-pub fn is_suggested_section_path(path: &str) -> bool {
-    path == SUGGESTED_SECTION_PATH
 }
 
 /// Exact match for the synthetic scratch bucket's sentinel identity path.
@@ -434,16 +422,11 @@ pub enum Item {
         id: String,
         depth: usize,
     },
-    /// One suggestion under the Suggested group, keyed by provider and item id.
-    Suggestion {
-        provider_id: String,
-        id: String,
-        depth: usize,
-    },
-    /// The "View all (N)" row that opens the full Suggestions view.
-    SuggestionsViewAll {
+    /// The Suggested row, just above Trash: `total` listed suggestions, and
+    /// whether a provider failed to refresh. Its list shows in the preview pane.
+    Suggested {
         total: usize,
-        depth: usize,
+        failed: bool,
     },
 }
 
@@ -451,9 +434,8 @@ impl Item {
     pub fn depth(&self) -> usize {
         match self {
             Item::Group { depth, .. } => *depth,
-            Item::Session { depth, .. }
-            | Item::Suggestion { depth, .. }
-            | Item::SuggestionsViewAll { depth, .. } => *depth,
+            Item::Session { depth, .. } => *depth,
+            Item::Suggested { .. } => 0,
         }
     }
 }
@@ -1049,45 +1031,6 @@ pub fn append_trash_section(items: &mut Vec<Item>, instances: &[Instance], colla
         collapsed,
         |i| i.trashed_at,
     );
-}
-
-/// Append the Suggested group: a header counting `suggestions`, then the
-/// first [`SUGGESTED_PREVIEW_ROWS`] `(provider_id, id)` pairs and a "View all"
-/// row unless collapsed. Absent when `suggestions` is empty, unless a provider
-/// `failed`, so its error is not hidden with the group.
-pub fn append_suggested_section(
-    items: &mut Vec<Item>,
-    suggestions: &[(String, String)],
-    collapsed: bool,
-    failed: bool,
-) {
-    if suggestions.is_empty() && !failed {
-        return;
-    }
-    let total = suggestions.len();
-    items.push(Item::Group {
-        path: SUGGESTED_SECTION_PATH.to_string(),
-        name: SUGGESTED_SECTION_NAME.to_string(),
-        depth: 0,
-        collapsed,
-        session_count: total,
-        profile: None,
-        archived_at: None,
-    });
-    if collapsed {
-        return;
-    }
-    items.extend(
-        suggestions
-            .iter()
-            .take(SUGGESTED_PREVIEW_ROWS)
-            .map(|(provider_id, id)| Item::Suggestion {
-                provider_id: provider_id.clone(),
-                id: id.clone(),
-                depth: 1,
-            }),
-    );
-    items.push(Item::SuggestionsViewAll { total, depth: 1 });
 }
 
 pub fn append_archived_section_by_project(

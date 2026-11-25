@@ -29,7 +29,7 @@ use crate::tui::styles::Theme;
 use crate::tui::worker::Worker;
 
 impl Item {
-    /// `(key, name)` of the full view's group: the repo, named by its last
+    /// `(key, name)` of the pane's group: the repo, named by its last
     /// segment, else the resolved Project.
     fn group(&self) -> Option<(&str, &str)> {
         if let Some(repo) = self.mapping_key.as_deref() {
@@ -164,7 +164,6 @@ enum Req {
     Prepare {
         provider_id: String,
         id: String,
-        target: PrepareTarget,
         origin: Option<Origin>,
     },
     /// Starts the item with its preset; `review_fingerprint` approves the repo hooks it names.
@@ -178,7 +177,7 @@ enum Req {
     PreTrust {
         origin: Option<Origin>,
     },
-    /// Sets the "Show in the sidebar" pref, which also shows the Home group.
+    /// Sets the "Show in the sidebar" pref, which also shows the Home row.
     ShowOnHome {
         shown: bool,
         origin: Option<Origin>,
@@ -209,16 +208,6 @@ fn origin_error(origin: &Origin, daemon: &str, published: Option<&str>) -> Optio
     (moved || switched).then(|| {
         "The daemon or profile changed since this list loaded. Reload and try again.".to_string()
     })
-}
-
-/// Which surface asked for a prepare, so its answer goes back to that surface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PrepareTarget {
-    Home,
-    /// Home's "start another": the new Session does not claim the suggestion's link.
-    HomeAnother,
-    /// The view with this epoch; a closed view's answer matches no later view.
-    View(u64),
 }
 
 enum Res {
@@ -326,7 +315,7 @@ async fn run(req: &Req) -> Res {
                 .await
             {
                 Ok(()) => Res::Snapshot(load(&client, &daemon).await),
-                Err(e) => Res::Snapshot(Err(format!("Couldn't change the Home group: {e}"))),
+                Err(e) => Res::Snapshot(Err(format!("Couldn't change the Home row: {e}"))),
             }
         }
         Req::Dismiss {
@@ -534,7 +523,8 @@ const UNDO_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(super) enum SuggestionsAction {
     Continue,
-    Close,
+    /// Esc: the keys go back to Home's list.
+    Unfocus,
     /// Jump to the Session an item was started as.
     OpenSession(String),
     /// Ask before turning on `pre_trust_agent_folders`.
@@ -550,10 +540,9 @@ pub(super) struct SuggestionsView {
     /// when the store's snapshot or the dismissed filter changes.
     order: Vec<ItemKey>,
     pub(super) error: Option<String>,
-    notice: Option<String>,
+    pub(super) notice: Option<String>,
     /// The resolved prefill, for the caller to open the dialog with.
     prepared: Option<Start>,
-    epoch: u64,
     selected: usize,
     detail_scroll: u16,
     show_dismissed: bool,
@@ -572,10 +561,8 @@ pub(super) struct SuggestionsView {
 }
 
 impl SuggestionsView {
-    pub(super) fn new(store: &mut SuggestionsFeed) -> Self {
-        store.view_epoch += 1;
+    pub(super) fn new(store: &SuggestionsFeed) -> Self {
         let mut view = Self::empty();
-        view.epoch = store.view_epoch;
         view.reorder(store, None);
         view
     }
@@ -586,7 +573,6 @@ impl SuggestionsView {
             error: None,
             notice: None,
             prepared: None,
-            epoch: 0,
             selected: 0,
             detail_scroll: 0,
             show_dismissed: false,
@@ -708,7 +694,7 @@ impl SuggestionsView {
         };
         match code {
             KeyCode::Char('?') => self.help = true,
-            KeyCode::Esc | KeyCode::Char('q') => return SuggestionsAction::Close,
+            KeyCode::Esc | KeyCode::Char('q') => return SuggestionsAction::Unfocus,
             KeyCode::Up | KeyCode::Char('k') => self.select(self.selected.saturating_sub(1)),
             KeyCode::Down | KeyCode::Char('j') => self.select(self.selected + 1),
             KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(8),
@@ -732,9 +718,9 @@ impl SuggestionsView {
                     self.begin();
                     self.notice = Some(
                         if shown {
-                            "Showing the group on Home…"
+                            "Showing the Suggested row on Home…"
                         } else {
-                            "Hiding the group from Home…"
+                            "Hiding the Suggested row from Home…"
                         }
                         .into(),
                     );
@@ -836,7 +822,7 @@ impl SuggestionsView {
         store.failed = None;
         self.preparing = Some(key.clone());
         self.prepare_another = another;
-        store.prepare_in_view(key, self.epoch);
+        store.prepare(key);
     }
 
     /// The prefill a prepare resolved, for the caller to open the dialog with.
@@ -879,10 +865,8 @@ impl SuggestionsView {
             changed = true;
         }
         // Only the row still preparing opens, in the mode its own key asked for.
-        if matches!(&polled.start, Some((key, _, PrepareTarget::View(e)))
-            if *e == self.epoch && self.preparing.as_ref() == Some(key))
-        {
-            if let Some((_, mut start, _)) = polled.start.take() {
+        if matches!(&polled.start, Some((key, _)) if self.preparing.as_ref() == Some(key)) {
+            if let Some((_, mut start)) = polled.start.take() {
                 self.preparing = None;
                 if self.prepare_another {
                     start.suggestion = None;
@@ -971,14 +955,14 @@ impl SuggestionsView {
             (
                 self.key_label('h'),
                 if store.shown_on_home() {
-                    "hide the Suggested group from Home"
+                    "hide the Suggested row from Home"
                 } else {
-                    "show the Suggested group on Home"
+                    "show the Suggested row on Home"
                 },
             ),
             ("PgUp/PgDn".to_string(), "scroll the detail"),
             ("Ctrl+K".to_string(), "open in the provider"),
-            ("Esc".to_string(), "back"),
+            ("Esc".to_string(), "back to the list on the left"),
         ]
     }
 
@@ -1028,7 +1012,7 @@ impl SuggestionsView {
         if store.snapshot.is_some() && !store.shown_on_home() {
             notes.push((
                 format!(
-                    "Not shown on Home. {} shows the Suggested group there.",
+                    "Not shown on Home. {} shows the Suggested row there.",
                     self.key_label('h')
                 ),
                 Style::default().fg(theme.dimmed),
@@ -1086,14 +1070,16 @@ impl SuggestionsView {
         theme: &Theme,
         store: &SuggestionsFeed,
         mutation_block: Option<MutationBlock>,
+        focused: bool,
     ) {
         frame.render_widget(Clear, area);
+        let border = if focused { theme.accent } else { theme.border };
         let block = Block::default()
             .title(" Suggested sessions ")
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .style(Style::default().bg(theme.background).fg(theme.text))
-            .border_style(Style::default().fg(theme.border));
+            .border_style(Style::default().fg(border));
         let bordered = block.inner(area);
         frame.render_widget(block, area);
         // A one-cell margin inside the border.
@@ -1109,8 +1095,10 @@ impl SuggestionsView {
         let detail = self.detail_lines(store, theme, width as usize);
         let mut units = if self.help {
             vec!["any key closes".to_string()]
-        } else {
+        } else if focused {
             self.row_keys(store, mutation_block)
+        } else {
+            vec!["↵ browse".to_string()]
         };
         let mut footer: Vec<Line> = Vec::new();
         if let Some(error) = &self.error {
@@ -1141,10 +1129,10 @@ impl SuggestionsView {
         };
         let detail_rows: usize = detail.iter().map(|l| wrapped_line_count(l, width)).sum();
         let visible = split(&units).3.height.saturating_sub(1) as usize;
-        if !self.help && self.detail_scroll > 0 {
+        if focused && !self.help && self.detail_scroll > 0 {
             units.insert(units.len() - 2, "PgUp back".to_string());
         }
-        if !self.help && detail_rows > visible + self.detail_scroll as usize {
+        if focused && !self.help && detail_rows > visible + self.detail_scroll as usize {
             units.insert(units.len() - 2, "PgDn more".to_string());
         }
         // `?` lists Esc too, so it goes first when the key line would wrap.
@@ -1187,7 +1175,7 @@ impl SuggestionsView {
                 )
             };
             let rule = (area.width as usize).saturating_sub(3 + rendered_width(&status));
-            let border = Style::default().fg(theme.border);
+            let border = Style::default().fg(border);
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled("├─", border),
@@ -1484,32 +1472,12 @@ const FEED_RELOAD: std::time::Duration = std::time::Duration::from_secs(60);
 /// How often the feed reloads while a provider shows "refreshing…".
 const REFRESHING_RELOAD: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// What the Home list shows for one suggestion; provider text is untrusted and
-/// already stripped of control characters.
-pub(super) struct Entry {
-    pub source_ref: String,
-    pub title: String,
-    pub reason: String,
-    pub provider: String,
-    pub project: Option<String>,
-    pub prompt: String,
-    /// "Starts with Claude Code · Structured · worktree"; `None` before the daemon reports it.
-    pub preset: Option<String>,
-    pub provider_error: Option<String>,
-    /// The item's `source_url` when it is an http(s) address; core validates
-    /// it, this is a second check before anything is opened.
-    pub source_url: Option<String>,
-    pub dismissed: bool,
-    /// Why the last start failed, until the next try.
-    pub failed: Option<String>,
-}
-
 pub(super) struct FeedPoll {
     pub changed: bool,
     /// The daemon accepted a refresh request.
     pub refreshed: bool,
-    /// A prepared suggestion, with the key and the surface it was requested for.
-    pub start: Option<(ItemKey, Start, PrepareTarget)>,
+    /// A prepared suggestion, with its key.
+    pub start: Option<(ItemKey, Start)>,
     /// What the daemon answered to a start, with the item it was for.
     pub started: Option<(ItemKey, StartAnswer)>,
     /// Failure of a user-initiated request; background reloads only log.
@@ -1521,7 +1489,7 @@ pub(super) struct FeedPoll {
 }
 
 /// The one suggestions store, owned by `HomeView`: snapshot, worker and
-/// in-flight state behind both the Suggested group and the full view, which
+/// in-flight state behind both the Suggested row and its pane, which
 /// keeps only its own UI state.
 pub(super) struct SuggestionsFeed {
     snapshot: Option<Snapshot>,
@@ -1533,21 +1501,18 @@ pub(super) struct SuggestionsFeed {
     start_key: Option<ItemKey>,
     /// The hooks review on screen: its item, the fingerprint it shows and the origin it was issued for.
     held_trust: Option<(ItemKey, serde_json::Value, Option<Origin>)>,
-    /// The Home group setting the `ShowOnHome` in flight asks for.
+    /// The Home row setting the `ShowOnHome` in flight asks for.
     home_in_flight: Option<bool>,
     /// The origin the pre-trust confirmation on screen was opened for.
     held_pre_trust: Option<Origin>,
-    /// The last start or prepare that failed, shown on its row on Home and in
-    /// the full view until the next try.
+    /// The last start or prepare that failed, shown on its row in the pane
+    /// until the next try.
     pub(super) failed: Option<(ItemKey, String)>,
     /// Why a Session's first prompt was not typed, by Session id: the
     /// daemon's plain message and its `initial_prompt_error_code`, if any.
     pub(super) blocked_prompts: std::collections::HashMap<String, (String, Option<String>)>,
     /// The next hooks review follows a `trust_changed` answer.
     hooks_changed: bool,
-    prepare_target: PrepareTarget,
-    /// Epoch of the most recently opened full view.
-    view_epoch: u64,
     /// The in-flight request came from the user (prepare or dismiss), so its
     /// failure is worth showing.
     in_flight_user: bool,
@@ -1592,8 +1557,6 @@ impl SuggestionsFeed {
             failed: None,
             blocked_prompts: std::collections::HashMap::new(),
             hooks_changed: false,
-            prepare_target: PrepareTarget::Home,
-            view_epoch: 0,
             in_flight_user: false,
             busy: false,
             queued: std::collections::VecDeque::new(),
@@ -1614,14 +1577,8 @@ impl SuggestionsFeed {
             Req::Load => self.load_attempt_at = Some(std::time::Instant::now()),
             Req::ShowOnHome { shown, .. } => self.home_in_flight = Some(*shown),
             Req::Prepare {
-                provider_id,
-                id,
-                target,
-                ..
-            } => {
-                self.prepare_key = Some((provider_id.clone(), id.clone()));
-                self.prepare_target = *target;
-            }
+                provider_id, id, ..
+            } => self.prepare_key = Some((provider_id.clone(), id.clone())),
             Req::Start {
                 provider_id, id, ..
             } => self.start_key = Some((provider_id.clone(), id.clone())),
@@ -1759,7 +1716,7 @@ impl SuggestionsFeed {
         self.recent.len() != before
     }
 
-    /// Whether the full view lists `item`: undismissed, dismissed within the
+    /// Whether the pane lists `item`: undismissed, dismissed within the
     /// undo window, or any when dismissed ones are shown. Stale items are listed.
     fn is_listed(&self, item: &Item, show_dismissed: bool) -> bool {
         show_dismissed
@@ -1767,7 +1724,7 @@ impl SuggestionsFeed {
             || self.is_recent(&(item.provider_id.clone(), item.id.clone()))
     }
 
-    /// Whether Home shows the Suggested group: the last `h` still on its way
+    /// Whether Home shows the Suggested row: the last `h` still on its way
     /// to the daemon, else its "Show in the sidebar" pref.
     pub(super) fn shown_on_home(&self) -> bool {
         self.queued
@@ -1826,16 +1783,6 @@ impl SuggestionsFeed {
         !self.provider_failures().is_empty()
     }
 
-    /// Enabled provider names in snapshot order, for the group preview.
-    pub(super) fn provider_names(&self) -> Vec<String> {
-        self.snapshot
-            .iter()
-            .flat_map(|s| &s.providers)
-            .filter(|p| p.enabled)
-            .map(|p| plain(&p.name))
-            .collect()
-    }
-
     fn source_preset(&self, item: &Item) -> Option<&WirePreset> {
         self.provider(&item.provider_id)?
             .sources
@@ -1881,26 +1828,14 @@ impl SuggestionsFeed {
         Some(format!("Starts with {}", parts.join(" · ")))
     }
 
-    pub(super) fn entry(&self, key: &ItemKey) -> Option<Entry> {
+    /// The provider's name and the item's `source_url` when it is an
+    /// http(s) address; core validates it, this is a second check before
+    /// anything is opened.
+    pub(super) fn source_link(&self, key: &ItemKey) -> Option<(String, Option<String>)> {
         let item = self.item(key)?;
         let provider = self.provider(&key.0)?;
-        Some(Entry {
-            source_ref: self.source_ref(item).map(plain).unwrap_or_default(),
-            title: plain(&item.title),
-            reason: plain(&item.reason),
-            provider: plain(&provider.name),
-            project: item.project.as_deref().map(plain),
-            prompt: plain(&self.effective_prompt(item)),
-            preset: self.preset_line(item),
-            provider_error: provider.error.as_deref().map(plain),
-            source_url: crate::util::is_http_url(&item.source_url).then(|| item.source_url.clone()),
-            dismissed: item.dismissed,
-            failed: self
-                .failed
-                .as_ref()
-                .filter(|(k, _)| k == key)
-                .map(|(_, m)| plain(m)),
-        })
+        let url = crate::util::is_http_url(&item.source_url).then(|| item.source_url.clone());
+        Some((plain(&provider.name), url))
     }
 
     /// Reloads when the snapshot is stale and nothing is in flight, sooner
@@ -2145,39 +2080,21 @@ impl SuggestionsFeed {
         });
     }
 
-    pub(super) fn prepare(&mut self, key: ItemKey) {
-        self.submit_prepare(key, PrepareTarget::Home);
-    }
-
-    pub(super) fn prepare_another(&mut self, key: ItemKey) {
-        self.submit_prepare(key, PrepareTarget::HomeAnother);
-    }
-
-    fn prepare_in_view(&mut self, key: ItemKey, epoch: u64) {
-        self.submit_prepare(key, PrepareTarget::View(epoch));
-    }
-
-    /// Whether a prepare for this item and surface is in flight or queued.
-    fn prepare_pending(&self, key: &ItemKey, target: PrepareTarget) -> bool {
-        let in_flight =
-            self.busy && self.prepare_key.as_ref() == Some(key) && self.prepare_target == target;
-        in_flight
+    /// Asks for `key`'s prefill. A second press while the first answer is
+    /// pending must not queue a second dialog.
+    fn prepare(&mut self, key: ItemKey) {
+        let pending = (self.busy && self.prepare_key.as_ref() == Some(&key))
             || self.queued.iter().any(|req| {
-                matches!(req, Req::Prepare { provider_id, id, target: t, .. }
-                    if (provider_id, id) == (&key.0, &key.1) && *t == target)
-            })
-    }
-
-    fn submit_prepare(&mut self, key: ItemKey, target: PrepareTarget) {
-        // A second Enter while the first answer is pending must not queue a second dialog.
-        if self.prepare_pending(&key, target) {
+                matches!(req, Req::Prepare { provider_id, id, .. }
+                    if (provider_id, id) == (&key.0, &key.1))
+            });
+        if pending {
             return;
         }
         let origin = self.origin();
         self.submit(Req::Prepare {
             provider_id: key.0,
             id: key.1,
-            target,
             origin,
         });
     }
@@ -2248,7 +2165,7 @@ impl SuggestionsFeed {
             Res::Prepared(Ok(prepared)) => {
                 if let Some(key) = self.prepare_key.take() {
                     let start = start_for(self.snapshot.as_ref(), &key, prepared);
-                    out.start = Some((key, start, self.prepare_target));
+                    out.start = Some((key, start));
                 } else {
                     // A profile switch dropped the request this answers.
                     out.error = Some("Profile changed, suggestion not started".into());
@@ -2357,7 +2274,7 @@ mod tests {
         store: SuggestionsFeed,
     }
 
-    /// Prefs with the Home group shown, so renders carry no notice about it.
+    /// Prefs with the Home row shown, so renders carry no notice about it.
     fn shown_prefs() -> Prefs {
         Prefs {
             sidebar: true,
@@ -2384,7 +2301,7 @@ mod tests {
             items,
             prefs: shown_prefs(),
         });
-        let view = SuggestionsView::new(&mut store);
+        let view = SuggestionsView::new(&store);
         Rig { view, store }
     }
 
@@ -2421,8 +2338,14 @@ mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| {
-                rig.view
-                    .render(frame, frame.area(), &Theme::default(), &rig.store, block)
+                rig.view.render(
+                    frame,
+                    frame.area(),
+                    &Theme::default(),
+                    &rig.store,
+                    block,
+                    true,
+                )
             })
             .unwrap();
         terminal
@@ -3156,20 +3079,6 @@ mod tests {
     }
 
     #[test]
-    fn the_group_preview_names_only_enabled_providers() {
-        let mut rig = view_with(vec![], idle_worker());
-        let snapshot = rig.store.snapshot.as_mut().unwrap();
-        let mut off = snapshot.providers[0].clone();
-        off.id = "q".into();
-        off.name = "Linear".into();
-        off.enabled = false;
-        snapshot.providers.push(off);
-        assert_eq!(rig.store.provider_names(), ["GitHub"]);
-        rig.store.snapshot.as_mut().unwrap().providers[0].enabled = false;
-        assert!(rig.store.provider_names().is_empty());
-    }
-
-    #[test]
     fn each_provider_gets_a_status_on_the_divider_and_a_failure_leads_the_list() {
         let mut rig = view_with(vec![item("a", None, false)], idle_worker());
         let text = render_text(&rig);
@@ -3402,7 +3311,7 @@ mod tests {
                 "preview": "", "draft": { "prompt": "x" }
             }],
         }));
-        let mut view = SuggestionsView::new(&mut store);
+        let mut view = SuggestionsView::new(&store);
         assert_eq!(store.keys().len(), 1);
         view.handle_key(
             KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
@@ -3437,44 +3346,6 @@ mod tests {
     }
 
     #[test]
-    fn a_view_prepare_answered_after_the_view_closed_is_left_for_the_caller_to_drop() {
-        let worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(Some("/repo")))));
-        let mut rig = view_with(vec![item("a", Some("repo"), false)], worker);
-        press(&mut rig, KeyCode::Char('e'), true);
-        let mut view_closed = rig.store.poll();
-        for _ in 0..200 {
-            if view_closed.start.is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            view_closed = rig.store.poll();
-        }
-        assert!(matches!(
-            view_closed.start,
-            Some((_, _, PrepareTarget::View(_)))
-        ));
-    }
-
-    #[test]
-    fn a_view_prepare_does_not_land_in_a_reopened_view() {
-        let worker = Worker::seeded_for_test("t", Res::Prepared(Ok(prepared(Some("/repo")))));
-        let mut rig = view_with(vec![item("a", Some("repo"), false)], worker);
-        press(&mut rig, KeyCode::Char('e'), true);
-        rig.view = SuggestionsView::new(&mut rig.store);
-        let mut polled = rig.store.poll();
-        for _ in 0..200 {
-            if polled.start.is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            polled = rig.store.poll();
-        }
-        assert!(polled.start.is_some());
-        rig.view.apply(&mut rig.store, &mut polled);
-        assert!(rig.view.prepared.is_none());
-    }
-
-    #[test]
     fn keys_are_not_swallowed_while_a_background_load_is_in_flight() {
         let mut rig = view_with(vec![item("a", Some("repo"), false)], idle_worker());
         rig.store.busy = true;
@@ -3506,14 +3377,12 @@ mod tests {
 
     #[test]
     fn the_source_reference_follows_the_pref() {
-        for (shown, entry_ref) in [(true, "ref-a"), (false, "")] {
+        for shown in [true, false] {
             let mut rig = view_with(vec![item("a", None, false)], idle_worker());
             rig.store.snapshot.as_mut().unwrap().prefs.show_source_ref = shown;
             let text = render_text(&rig);
             assert_eq!(row(&text, "› a").ends_with(" ref-a"), shown, "{text}");
             assert_eq!(text.contains("ref-a"), shown, "{text}");
-            let key = ("p".to_string(), "a".to_string());
-            assert_eq!(rig.store.entry(&key).unwrap().source_ref, entry_ref);
         }
     }
 
