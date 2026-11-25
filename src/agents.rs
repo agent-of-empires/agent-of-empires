@@ -2757,6 +2757,9 @@ if [ "$PROBE_MODE" = legacy ]; then printf '%s\n' 'FLAGS --fork fork session'; e
     #[test]
     #[serial_test::serial]
     fn cursor_resolves_fallback_binary_when_only_cursor_agent_is_on_path() {
+        if crate::tmux::tests::run_probe_test_in_subprocess() {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let bin = temp.path().join("bin");

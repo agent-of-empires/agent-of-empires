@@ -3723,7 +3723,7 @@ fn load_session(config: crate::session::config::Config) -> crate::session::confi
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     /// Invalidation must clear after an in-flight probe publishes, not before.
     #[test]
     #[serial_test::serial]
@@ -3763,7 +3763,7 @@ mod tests {
 
     // Isolate process-wide probe and socket state from unrelated tests.
     #[cfg(unix)]
-    pub(super) fn run_probe_test_in_subprocess() -> bool {
+    pub(crate) fn run_probe_test_in_subprocess() -> bool {
         const CHILD_ENV: &str = "AOE_AGENT_PROBE_TEST_CHILD";
         let thread = std::thread::current();
         let test = thread.name().expect("named test thread");

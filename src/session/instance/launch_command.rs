@@ -1728,6 +1728,14 @@ impl Instance {
             fallback_profile = self.effective_profile();
             &fallback_profile
         };
+        // A cold daemon has not yet run a login-shell probe for fallback binaries;
+        // probe before resolving the launch binary so unmanaged host launches
+        // (e.g., `cursor-agent` only on login-shell PATH) pick the right executable.
+        if self.command.is_empty() && execution.is_none() {
+            if let Some(agent) = agent.filter(|a| !a.fallback_binaries.is_empty()) {
+                let _ = crate::tmux::is_agent_available(agent);
+            }
+        }
         let program = parse_launch_command(&self.get_tool_command()).and_then(|parsed| {
             parsed.words.first().and_then(|word| {
                 Path::new(word)
@@ -5164,5 +5172,69 @@ sandbox = "unsupported"
             "the session flags were applied, so the launch line was really built: {command}"
         );
         assert!(!command.contains("--name"), "{command}");
+    }
+
+    /// After a daemon restart, `DISCOVERED_AGENT_BINARIES` is cold. Launching a
+    /// host Cursor session when `cursor-agent` exists only on the login-shell
+    /// PATH must probe before building the launch command so it runs
+    /// `cursor-agent` rather than falling back to `agent`.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn cold_cache_cursor_launch_probes_login_shell_fallback_binary() {
+        if crate::tmux::tests::run_probe_test_in_subprocess() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let login_bin = temp.path().join("login-bin");
+        std::fs::create_dir_all(&login_bin).unwrap();
+        let cursor_agent = login_bin.join("cursor-agent");
+        std::fs::write(&cursor_agent, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&cursor_agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let shell_bin = temp.path().join("shell-bin");
+        std::fs::create_dir_all(&shell_bin).unwrap();
+        let login_shell = shell_bin.join("login-shell");
+        std::fs::write(
+            &login_shell,
+            format!(
+                "#!/bin/sh\nexport PATH={}:$PATH\nexec /bin/sh -c \"$2\"\n",
+                shell_escape(login_bin.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&login_shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Daemon PATH has neither `agent` nor `cursor-agent`; only the login shell has `cursor-agent`.
+        let _env = EnvGuard::set(&[
+            ("PATH", "/usr/bin:/bin"),
+            ("SHELL", login_shell.to_str().unwrap()),
+        ]);
+        let memo = crate::tmux::AgentAvailabilityGuard::capture();
+        memo.clear();
+
+        let mut inst = tool_instance("cursor", project.to_str().unwrap());
+        let prepared = inst
+            .prepare_launch_command(inst.conversation_state())
+            .expect("cold-cache cursor launch should succeed");
+        assert!(
+            prepared.execution.is_none(),
+            "login-shell-only cursor-agent should take the unmanaged host branch"
+        );
+        let command = prepared.command.expect("host launch command");
+        assert!(
+            command.contains("cursor-agent"),
+            "expected cold-cache launch to resolve cursor-agent: {command}"
+        );
+        assert!(
+            !command.contains("exec env agent\n") && !command.ends_with(" agent"),
+            "launch must not fall back to bare `agent`: {command}"
+        );
     }
 }
