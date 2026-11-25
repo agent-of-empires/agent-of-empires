@@ -8332,16 +8332,17 @@ mod open_file {
     }
 }
 
-pub(super) mod terminal_custody {
+pub(in crate::server) mod terminal_custody {
     use super::*;
     use std::sync::{LazyLock, Mutex};
     use std::time::Duration;
     use tokio::sync::oneshot;
 
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-    pub(in crate::server::api::sessions) enum Boundary {
+    pub(in crate::server) enum Boundary {
         SendAdmitted,
         SendInitialSnapshot,
+        SendAcknowledged,
         LaunchFinished,
         EnsureReceipt,
     }
@@ -8355,14 +8356,14 @@ pub(super) mod terminal_custody {
     static GATES: LazyLock<Mutex<HashMap<Key, Rendezvous>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
 
-    struct Gate {
+    pub(in crate::server) struct Gate {
         key: Key,
         entered: Option<oneshot::Receiver<()>>,
         release: Option<oneshot::Sender<()>>,
     }
 
     impl Gate {
-        fn install(id: &str, boundary: Boundary) -> Self {
+        pub(in crate::server) fn install(id: &str, boundary: Boundary) -> Self {
             let (entered_tx, entered) = oneshot::channel();
             let (release, release_rx) = oneshot::channel();
             let key = (id.to_owned(), boundary);
@@ -8384,14 +8385,14 @@ pub(super) mod terminal_custody {
             }
         }
 
-        async fn entered(&mut self) {
+        pub(in crate::server) async fn entered(&mut self) {
             tokio::time::timeout(Duration::from_secs(10), self.entered.take().unwrap())
                 .await
                 .expect("handler did not reach the custody boundary")
                 .expect("handler dropped the custody acknowledgement");
         }
 
-        fn release(&mut self) {
+        pub(in crate::server) fn release(&mut self) {
             self.release.take().unwrap().send(()).ok();
         }
     }
