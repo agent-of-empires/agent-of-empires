@@ -15,9 +15,35 @@ use super::{api_error, AppState};
 use crate::plugin::suggestions::{self, PrepareRefusal, Preset, Provider};
 use axum::http::StatusCode;
 
+/// Optional body of the routes that take none: the profile the caller selected
+/// its target under.
+#[derive(Deserialize)]
+pub struct ProfileGuard {
+    expected_profile: Option<String>,
+}
+
+/// 409 `profile_mismatch` when the caller chose its target under a profile this
+/// Daemon does not serve, so a switch between selecting and sending cannot land
+/// the action on the new profile.
+fn wrong_profile(
+    host: &crate::plugin::host::PluginHost,
+    expected: Option<&str>,
+) -> Option<axum::response::Response> {
+    let served = host.suggestions_profile();
+    expected.filter(|expected| *expected != served).map(|_| {
+        super::api_error_with_code_header(
+            crate::daemon::ApiErrorCode::ProfileMismatch,
+            format!(
+                "This Daemon serves profile {served:?}, not the one you selected; nothing changed"
+            ),
+        )
+    })
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ItemRef {
+    expected_profile: Option<String>,
     provider_id: String,
     id: String,
 }
@@ -25,6 +51,7 @@ pub struct ItemRef {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceBody {
+    expected_profile: Option<String>,
     provider_id: String,
     criterion: String,
     enabled: bool,
@@ -33,6 +60,7 @@ pub struct SourceBody {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PresetKey {
+    expected_profile: Option<String>,
     provider_id: String,
     criterion: String,
 }
@@ -40,6 +68,7 @@ pub struct PresetKey {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PresetBody {
+    expected_profile: Option<String>,
     provider_id: String,
     criterion: String,
     preset: Preset,
@@ -48,6 +77,7 @@ pub struct PresetBody {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MappingBody {
+    expected_profile: Option<String>,
     provider_id: String,
     mapping_key: String,
     projects: Vec<String>,
@@ -56,6 +86,7 @@ pub struct MappingBody {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MappingRef {
+    expected_profile: Option<String>,
     provider_id: String,
     mapping_key: String,
 }
@@ -147,24 +178,36 @@ pub async fn get_suggestions(State(state): State<Arc<AppState>>) -> impl IntoRes
     }
 }
 
-pub async fn refresh_suggestions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn refresh_suggestions(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<ProfileGuard>>,
+) -> impl IntoResponse {
     if state.read_only {
         return super::read_only_response();
     }
     let Some(host) = &state.plugin_host else {
         return Json(json!({ "ok": true, "notified": 0 })).into_response();
     };
+    if let Some(refused) = wrong_profile(host, body.and_then(|b| b.0.expected_profile).as_deref()) {
+        return refused;
+    }
     let notified = host.refresh_suggestions(None).await;
     Json(json!({ "ok": true, "notified": notified })).into_response()
 }
 
-pub async fn run_suggestion_checks(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn run_suggestion_checks(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<ProfileGuard>>,
+) -> impl IntoResponse {
     if state.read_only {
         return super::read_only_response();
     }
     let Some(host) = &state.plugin_host else {
         return Json(json!({ "ok": true, "notified": 0 })).into_response();
     };
+    if let Some(refused) = wrong_profile(host, body.and_then(|b| b.0.expected_profile).as_deref()) {
+        return refused;
+    }
     let notified = host.run_suggestion_checks().await;
     Json(json!({ "ok": true, "notified": notified })).into_response()
 }
@@ -172,6 +215,7 @@ pub async fn run_suggestion_checks(State(state): State<Arc<AppState>>) -> impl I
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderRef {
+    expected_profile: Option<String>,
     provider_id: String,
 }
 
@@ -189,6 +233,9 @@ pub async fn run_suggestion_fix(
     let Some(host) = &state.plugin_host else {
         return unavailable();
     };
+    if let Some(refused) = wrong_profile(host, body.expected_profile.as_deref()) {
+        return refused;
+    }
     if find_provider(&body.provider_id).is_none() {
         return unknown_provider();
     }
@@ -213,6 +260,9 @@ async fn set_dismissed(
     let Some(host) = state.plugin_host.clone() else {
         return unavailable();
     };
+    if let Some(refused) = wrong_profile(&host, item.expected_profile.as_deref()) {
+        return refused;
+    }
     let Some(provider) = find_provider(&item.provider_id) else {
         return unknown_provider();
     };
@@ -272,6 +322,9 @@ pub async fn update_suggestion_source(
     let Some(host) = state.plugin_host.clone() else {
         return unavailable();
     };
+    if let Some(refused) = wrong_profile(&host, body.expected_profile.as_deref()) {
+        return refused;
+    }
     let Some(provider) = find_provider(&body.provider_id) else {
         return unknown_provider();
     };
@@ -328,6 +381,9 @@ pub async fn patch_suggestion_prefs(
     let Some(host) = state.plugin_host.clone() else {
         return unavailable();
     };
+    if let Some(refused) = wrong_profile(&host, patch.expected_profile.as_deref()) {
+        return refused;
+    }
     let result = tokio::task::spawn_blocking({
         let host = host.clone();
         move || {
@@ -395,6 +451,7 @@ pub struct StartProject {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartBody {
+    expected_profile: Option<String>,
     provider_id: String,
     id: String,
     /// Link the item's repo to this Project first, then start.
@@ -587,6 +644,9 @@ pub async fn start_suggestion(
     let Some(host) = state.plugin_host.clone() else {
         return unavailable();
     };
+    if let Some(refused) = wrong_profile(&host, body.expected_profile.as_deref()) {
+        return refused;
+    }
     let Some(provider) = find_provider(&body.provider_id) else {
         return unknown_provider();
     };
@@ -596,6 +656,7 @@ pub async fn start_suggestion(
         project,
         approve_hooks,
         review_fingerprint,
+        expected_profile: _,
     } = body;
 
     let prefill = {
@@ -709,6 +770,9 @@ pub async fn prepare_suggestion(
     let Some(host) = state.plugin_host.clone() else {
         return unavailable();
     };
+    if let Some(refused) = wrong_profile(&host, item.expected_profile.as_deref()) {
+        return refused;
+    }
     let Some(provider) = find_provider(&item.provider_id) else {
         return unknown_provider();
     };
@@ -851,6 +915,9 @@ pub async fn put_suggestion_preset(
     let Some(host) = state.plugin_host.clone() else {
         return unavailable();
     };
+    if let Some(refused) = wrong_profile(&host, body.expected_profile.as_deref()) {
+        return refused;
+    }
     let provider = find_provider(&body.provider_id);
     let result = tokio::task::spawn_blocking(move || {
         // The profile config is a disk read: keep it off the executor.
@@ -906,6 +973,9 @@ pub async fn delete_suggestion_preset(
     let Some(host) = state.plugin_host.clone() else {
         return unavailable();
     };
+    if let Some(refused) = wrong_profile(&host, key.expected_profile.as_deref()) {
+        return refused;
+    }
     // No provider or criterion check: a stored preset must stay resettable
     // after its plugin is disabled or drops the criterion.
     let result = tokio::task::spawn_blocking(move || {
@@ -974,6 +1044,9 @@ pub async fn put_suggestion_mapping(
     let Some(host) = state.plugin_host.clone() else {
         return unavailable();
     };
+    if let Some(refused) = wrong_profile(&host, body.expected_profile.as_deref()) {
+        return refused;
+    }
     if find_provider(&body.provider_id).is_none() {
         return unknown_provider();
     }
@@ -1023,6 +1096,9 @@ pub async fn delete_suggestion_mapping(
     let Some(host) = state.plugin_host.clone() else {
         return unavailable();
     };
+    if let Some(refused) = wrong_profile(&host, target.expected_profile.as_deref()) {
+        return refused;
+    }
     let result = tokio::task::spawn_blocking(move || {
         host.with_suggestions_db(|conn, profile| {
             suggestions::delete_mapping(conn, profile, &target.provider_id, &target.mapping_key)

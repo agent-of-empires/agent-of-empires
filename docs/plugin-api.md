@@ -550,6 +550,8 @@ Suggestions are stored per profile. The routes below list and act on them; only 
 | `GET /api/suggestions/mappings` | none | `{ mappings: [{ provider_id, mapping_key, projects }] }` |
 | `PUT /api/suggestions/mappings` | `{ provider_id, mapping_key, projects }` | `{ provider_id, mapping_key, projects }` |
 | `DELETE /api/suggestions/mappings?provider_id=&mapping_key=` | none | `{ ok, deleted }` |
+
+Every route above except the `GET`s takes an optional `expected_profile`: a body field, or a query parameter on the two `DELETE` routes (`refresh` and `checks/run` accept a JSON body for it). It names the profile the caller selected its target under. When it is not the profile this Daemon serves, the route answers 409 `profile_mismatch` (also in the `AoE-Error-Code` header) and changes nothing, so a profile switch between selecting and sending cannot land the action on the new profile. Omitted, nothing is checked.
 | `GET /api/suggestions/projects` | none | `{ projects: [{ name, path, origin }] }` |
 
 Providers are listed in the user's `provider_order`; a provider never ordered follows, sorted by id. `prefs` defaults to `{ homepage: true, sidebar: false, refresh_minutes: 15, show_source_ref: true, provider_order: [] }` and is per profile. `show_source_ref` makes the web and TUI suggestion rows show each item's `source_ref`. `PATCH /api/suggestions/prefs` is partial: `refresh_minutes` is one of 5, 15, 30, 60 or 120, `provider_order` must list every provider exactly once, and `provider_enabled` maps provider ids to booleans. Other values fail with 400 `validation_failed`, and nothing is stored. `refresh_minutes` is a hint for plugins; core does not schedule refreshes yet. The route is denied in read-only (403 `read_only`) and CityHall mode.

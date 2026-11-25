@@ -9,6 +9,8 @@ pub(crate) const REFRESH_MINUTES: [u32; 5] = [5, 15, 30, 60, 120];
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrefsPatch {
+    /// The profile the caller selected the preferences under; checked by the route.
+    pub expected_profile: Option<String>,
     pub homepage: Option<bool>,
     pub sidebar: Option<bool>,
     pub refresh_minutes: Option<u32>,

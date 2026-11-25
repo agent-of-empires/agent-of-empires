@@ -542,6 +542,127 @@ async fn the_snapshot_prompt_agrees_with_prepare_for_blank_and_oversize() {
     }
 }
 
+/// A request that names another profile than the one this Daemon serves is
+/// refused before it changes anything; the served profile or no field is
+/// handled as before.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_suggestion_request_for_another_profile_is_refused_untouched() {
+    let f = fixture();
+    f.seed_item("a", Some("acme/web"), "42");
+    let item = |extra: Value| {
+        let mut body = json!({ "provider_id": PROVIDER, "id": "a" });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        body
+    };
+    let other = json!({ "expected_profile": "other" });
+    let repo = f.repo.to_string_lossy().into_owned();
+    let key = "provider_id=acme.gh";
+    for (method, uri, body) in [
+        (
+            Method::POST,
+            "/api/suggestions/dismiss".to_string(),
+            item(other.clone()),
+        ),
+        (
+            Method::POST,
+            "/api/suggestions/undismiss".to_string(),
+            item(other.clone()),
+        ),
+        (
+            Method::POST,
+            "/api/suggestions/prepare".to_string(),
+            item(other.clone()),
+        ),
+        (
+            Method::POST,
+            "/api/suggestions/start".to_string(),
+            item(other.clone()),
+        ),
+        (
+            Method::POST,
+            "/api/suggestions/refresh".to_string(),
+            other.clone(),
+        ),
+        (
+            Method::POST,
+            "/api/suggestions/checks/run".to_string(),
+            other.clone(),
+        ),
+        (
+            Method::POST,
+            "/api/suggestions/fix".to_string(),
+            json!({ "provider_id": PROVIDER, "expected_profile": "other" }),
+        ),
+        (
+            Method::PATCH,
+            "/api/suggestions/sources".to_string(),
+            json!({ "provider_id": PROVIDER, "criterion": "assigned", "enabled": false, "expected_profile": "other" }),
+        ),
+        (
+            Method::PATCH,
+            "/api/suggestions/prefs".to_string(),
+            json!({ "refresh_minutes": 30, "expected_profile": "other" }),
+        ),
+        (Method::PUT, "/api/suggestions/presets".to_string(), {
+            let mut body = preset_body("assigned", "codex", Value::Null);
+            body["expected_profile"] = json!("other");
+            body
+        }),
+        (
+            Method::DELETE,
+            format!("/api/suggestions/presets?{key}&criterion=assigned&expected_profile=other"),
+            Value::Null,
+        ),
+        (
+            Method::PUT,
+            "/api/suggestions/mappings".to_string(),
+            json!({ "provider_id": PROVIDER, "mapping_key": "acme/web", "projects": [repo], "expected_profile": "other" }),
+        ),
+        (
+            Method::DELETE,
+            format!("/api/suggestions/mappings?{key}&mapping_key=acme/web&expected_profile=other"),
+            Value::Null,
+        ),
+    ] {
+        let (status, code, _) = f.call(method, &uri, body).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (StatusCode::CONFLICT, "profile_mismatch"),
+            "{uri}"
+        );
+    }
+    let (_, _, snapshot) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
+    assert_eq!(snapshot["items"][0]["dismissed"], false, "{snapshot}");
+    assert_eq!(snapshot["prefs"]["refresh_minutes"], 15);
+    assert_eq!(snapshot["providers"][0]["sources"][0]["enabled"], true);
+    assert_eq!(snapshot["providers"][0]["sources"][0]["customized"], false);
+    assert!(snapshot["items"][0]["start"].get("project").is_none());
+
+    // The served profile, or none, is accepted.
+    for body in [
+        item(json!({ "expected_profile": "default" })),
+        item(json!({})),
+    ] {
+        let (status, _, _) = f.call(Method::POST, "/api/suggestions/dismiss", body).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, _) = f
+            .call(Method::POST, "/api/suggestions/undismiss", item(json!({})))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, _, _) = f
+        .call(
+            Method::POST,
+            "/api/suggestions/refresh",
+            json!({ "expected_profile": "default" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn presets_default_round_trip_reset_and_validate() {
