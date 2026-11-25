@@ -55,6 +55,10 @@ impl FeaturedIndex {
             .any(|e| e.source.eq_ignore_ascii_case(slug))
     }
 
+    pub fn offers_suggestions(&self) -> bool {
+        self.plugins.values().any(|e| e.suggestions)
+    }
+
     pub fn declares_suggestions(&self, slug: &str) -> bool {
         self.plugins
             .values()

@@ -9,6 +9,8 @@ pub struct TipSignals {
     pub used_system_health: bool,
     pub sessions_created: u64,
     pub shortcut_bar_hidden: bool,
+    /// A featured plugin offers suggestions and no installed plugin provides them.
+    pub suggestions_setup_available: bool,
 }
 
 impl From<&crate::session::Config> for TipSignals {
@@ -20,8 +22,19 @@ impl From<&crate::session::Config> for TipSignals {
             used_system_health: config.app_state.used_system_health,
             sessions_created: config.app_state.sessions_created,
             shortcut_bar_hidden: !config.session.show_shortcut_bar,
+            suggestions_setup_available: suggestions_setup_available(),
         }
     }
+}
+
+fn suggestions_setup_available() -> bool {
+    let featured = crate::plugin::featured::FeaturedIndex::load()
+        .is_ok_and(|index| index.offers_suggestions());
+    featured
+        && !crate::plugin::registry()
+            .all()
+            .iter()
+            .any(|plugin| plugin.manifest.suggestions.is_some())
 }
 
 /// Called only after a creation is committed, never for a restart or a placeholder.
@@ -40,6 +53,7 @@ pub const NEW_FROM_SELECTION_TIP_THRESHOLD: u32 = 3;
 pub const SYSTEM_HEALTH_AGENT_THRESHOLD: usize = 6;
 pub const SYSTEM_HEALTH_SAMPLE_THRESHOLD: u8 = 3;
 pub const SHORTCUT_BAR_TIP_ID: &str = "hide-shortcut-bar";
+pub const SUGGESTED_SESSIONS_TIP_ID: &str = "suggested-sessions";
 
 /// A tip shows only on the surfaces it lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +99,10 @@ fn earned_system_health(signals: &TipSignals) -> bool {
     signals.system_health_tip_earned && !signals.used_system_health
 }
 
+fn earned_suggested_sessions(signals: &TipSignals) -> bool {
+    signals.suggestions_setup_available
+}
+
 fn earned_shortcut_bar(signals: &TipSignals) -> bool {
     signals.sessions_created > 30 && !signals.shortcut_bar_hidden
 }
@@ -123,6 +141,17 @@ static CATALOG: &[Tip] = &[
                memory, load, swap, and per-agent usage.",
         trigger: TipTrigger::Earned(earned_system_health),
         surfaces: &[TipSurface::Tui],
+    },
+    // First of the web tips, so the dashboard's auto-pop opens it before the rotation.
+    Tip {
+        id: SUGGESTED_SESSIONS_TIP_ID,
+        title: "New: suggested sessions",
+        body: "Plugins can propose sessions worth starting, like pull requests waiting for \
+               your review. Nothing runs until you press Start.\n\n\
+               In the dashboard, use Set up suggestions on the homepage. In the TUI, press S \
+               to open the list, and h there to show its row on Home.",
+        trigger: TipTrigger::Earned(earned_suggested_sessions),
+        surfaces: &[TipSurface::Tui, TipSurface::Web],
     },
     Tip {
         id: "install-dashboard-pwa",
@@ -457,6 +486,37 @@ mod tests {
         let seen = vec!["install-dashboard-pwa".to_string()];
         assert_eq!(web_unseen_ids(&seen, &signals(0)).len(), all.len() - 1);
         assert!(next_earned_pop(TipSurface::Web, &[], &signals(0)).is_none());
+    }
+
+    #[test]
+    fn suggested_sessions_tip_shows_once_while_setup_is_available() {
+        for (available, seen, expected) in [
+            (false, false, false),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            let signals = TipSignals {
+                suggestions_setup_available: available,
+                ..TipSignals::default()
+            };
+            let seen: Vec<String> = if seen {
+                vec![SUGGESTED_SESSIONS_TIP_ID.into()]
+            } else {
+                vec![]
+            };
+            let case = format!("available={available}, seen={seen:?}");
+            assert_eq!(
+                next_earned_pop(TipSurface::Tui, &seen, &signals).map(|tip| tip.id),
+                expected.then_some(SUGGESTED_SESSIONS_TIP_ID),
+                "{case}"
+            );
+            // The dashboard auto-pops its first unseen tip.
+            assert_eq!(
+                web_unseen_ids(&seen, &signals).first() == Some(&SUGGESTED_SESSIONS_TIP_ID),
+                expected,
+                "{case}"
+            );
+        }
     }
 
     #[test]

@@ -6085,6 +6085,16 @@ impl HomeView {
         );
     }
 
+    /// Queue the suggested-sessions tip at launch; the drain re-checks that it is
+    /// earned, unseen and that tips are on.
+    pub(in crate::tui) fn queue_suggested_sessions_tip(&mut self) {
+        if self.pending_tip_pop.is_none() {
+            self.pending_tip_pop = crate::tips::catalog()
+                .iter()
+                .find(|tip| tip.id == crate::tips::SUGGESTED_SESSIONS_TIP_ID);
+        }
+    }
+
     /// Open the queued earned tip as a one-tip overlay, if any. Called when the home view
     /// is idle so the pop never interrupts an action. True when one opened, so the caller
     /// can treat the triggering keystroke as consumed.

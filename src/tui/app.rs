@@ -367,6 +367,7 @@ impl App {
         if self.suppress_first_run_dialogs {
             return false;
         }
+        self.home.queue_suggested_sessions_tip();
         let app_state = match AppStateConfig::load() {
             Ok(state) => state,
             Err(error) => {
