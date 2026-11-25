@@ -6091,8 +6091,9 @@ impl HomeView {
         self.suggested_sessions_tip_armed = true;
     }
 
-    /// Queue the armed suggested-sessions tip; the drain re-checks that it is
-    /// earned, unseen and that tips are on.
+    /// Queue the armed suggested-sessions tip when it is eligible and unseen.
+    /// An ineligible one would hold the single pop slot until a key drains it,
+    /// blocking the shortcut bar tip the heartbeat queues.
     pub(super) fn queue_suggested_sessions_tip(&mut self) {
         if self.suggestions_feed.providers_enabled().is_none() {
             return;
@@ -6100,10 +6101,14 @@ impl HomeView {
         self.suggested_sessions_tip_armed = false;
         let config = load_config().ok().flatten().unwrap_or_default();
         self.tips_unseen = self.tips_unseen_count(&config);
-        if self.pending_tip_pop.is_none() {
-            self.pending_tip_pop = crate::tips::catalog()
-                .iter()
-                .find(|tip| tip.id == crate::tips::SUGGESTED_SESSIONS_TIP_ID);
+        if self.pending_tip_pop.is_none() && config.session.show_tips {
+            self.pending_tip_pop = crate::tips::eligible_unseen(
+                crate::tips::TipSurface::Tui,
+                &config.app_state.tips_seen,
+                &self.tip_signals(&config),
+            )
+            .into_iter()
+            .find(|tip| tip.id == crate::tips::SUGGESTED_SESSIONS_TIP_ID);
         }
     }
 

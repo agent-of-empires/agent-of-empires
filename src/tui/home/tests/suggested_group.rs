@@ -1257,6 +1257,14 @@ fn the_suggestions_tip_signal_follows_the_daemon_snapshot() {
             expected,
             "enabled={enabled}"
         );
+        // Only an eligible tip takes the pop slot, so it never blocks another one.
+        env.view.pending_tip_pop = None;
+        env.view.queue_suggested_sessions_tip();
+        assert_eq!(
+            env.view.pending_tip_pop.map(|tip| tip.id),
+            expected.then_some(crate::tips::SUGGESTED_SESSIONS_TIP_ID),
+            "enabled={enabled}"
+        );
     }
 }
 
