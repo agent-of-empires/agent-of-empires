@@ -63,14 +63,14 @@ Write one script per clip in a scratch dir, importing `demo-lib.mjs`. Each clip 
 
 Run with `AOE_DEMO_TOKEN_FILE` (or `AOE_DEMO_TOKEN`) and `AOE_DEMO_RAW=<scratch>/raw` set. On arm64 Linux add `PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-arm64 PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1`.
 
-## TUI clips
+### TUI clips
 
 Run the dev `aoe` in ttyd and drive it with Playwright, as `web/scripts/record-tui-demo.mjs` does (read it for the ttyd and `aoe` setup). Here the script uses `demo-lib.mjs` (`launch`, `caption`) and `convert.sh`, so the clip matches the web ones. Use the step 2 environment and start ttyd with `--cwd` set to a scene repo (no `cd`, so later steps keep their repo-root paths). ttyd runs a writable shell with your env, so it takes a password:
 
 ```sh
 export TTYD_PW=$(openssl rand -hex 12)
-nohup ttyd --port 7683 --interface 127.0.0.1 --cwd $DEMO/projects/<scene> -c demo:$TTYD_PW -t rendererType=dom -t fontSize=15 --writable aoe > $DEMO/ttyd.log 2>&1 &
-echo $! > $DEMO/ttyd.pid
+nohup ttyd --port 7683 --interface 127.0.0.1 --cwd "$DEMO/projects/<scene>" -c demo:$TTYD_PW -t rendererType=dom -t fontSize=15 --writable aoe > "$DEMO/ttyd.log" 2>&1 &
+echo $! > "$DEMO/ttyd.pid"
 ```
 
 In the clip script: `launch()`, `await context.setHTTPCredentials({ username: "demo", password: process.env.TTYD_PW })`, `page.goto("http://127.0.0.1:7683")`, click `.xterm`, then `page.keyboard.press`. Set `AOE_DEMO_TOKEN=-` (no dashboard token). Assert on `document.body.innerText` before each key. Traps are in [`TECHNIQUES.md`](TECHNIQUES.md#tui-clips-ttyd). For scripted e2e tests, `RECORD_E2E=1` records asciinema casts that `agg` converts; both must be on `PATH` (`tests/e2e/harness.rs`).
