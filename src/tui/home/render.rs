@@ -4523,8 +4523,7 @@ impl HomeView {
         let mk_key =
             |key: &str| -> Vec<Span<'static>> { vec![Span::styled(key.to_string(), key_style)] };
 
-        // Key a footer button synthesizes on click, for the few entries outside the registry.
-        let kc = |c: char| Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        // Keys a footer button synthesizes on click, for the few entries outside the registry.
         let kenter = Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let ktab = Some(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         // Click key and compact label (`^G`) for an action's chord in the active mode.
@@ -4666,15 +4665,18 @@ impl HomeView {
                 }
             }
 
-            // New session: bare `n` is the usual chord, but while a committed search borrows
-            // `n` for cycling, advertise Shift+N (which still creates, #3038). Strict mode
-            // already uses `N`.
-            let new_uses_shift = committed_search && !strict;
-            let (click, key) = if new_uses_shift {
-                (kc('N'), "N".to_string())
-            } else {
-                bound(ActionId::NewSession)
+            // New session: while a committed search claims a New chord for cycling, advertise
+            // one it leaves free, else new-from-selection (Shift+N by default), which still
+            // creates (#3038).
+            let new_key = |id| {
+                let shadow = committed_search.then_some(ActionId::SearchNext);
+                super::bindings::key_event_unshadowed(id, shadow, strict)
             };
+            let (click, key) = new_key(ActionId::NewSession)
+                .or_else(|| new_key(ActionId::NewFromSelection))
+                .map_or((None, String::new()), |(event, label)| {
+                    (Some(event), label.replace("Ctrl+", "^"))
+                });
             groups.push((1, click, mk(&key, "New")));
 
             // Priority 1 is the core daily workflow (new, message, the web dashboard), which
@@ -4707,17 +4709,21 @@ impl HomeView {
                 groups.push((2, click, mk(&key, "Fav")));
             }
 
-            // Committed-search cue: `n` cycles matches and `Esc` clears (#3038). The `[i/N]`
-            // counter lives on the search bar, so it isn't duplicated here. Priority 0 so it
-            // survives the pack; clicking it cycles to the next match.
+            // Committed-search cue: search-next cycles matches and `Esc` clears (#3038). The
+            // `[i/N]` counter lives on the search bar, so it isn't duplicated here. Priority 0
+            // so it survives the pack; clicking it cycles to the next match, or clears the
+            // search when search-next is unbound.
             if committed_search {
-                let hint = vec![
-                    Span::styled("n", key_style),
-                    Span::styled(" next ", desc_style),
-                    Span::styled("Esc", key_style),
-                    Span::styled(" clear", desc_style),
-                ];
-                groups.push((0, kc('n'), hint));
+                let (click, key) = bound(ActionId::SearchNext);
+                let mut hint = Vec::new();
+                if click.is_some() {
+                    hint.push(Span::styled(key, key_style));
+                    hint.push(Span::styled(" next ", desc_style));
+                }
+                hint.push(Span::styled("Esc", key_style));
+                hint.push(Span::styled(" clear", desc_style));
+                let esc = Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                groups.push((0, click.or(esc), hint));
             }
 
             let (click, key) = bound(ActionId::SearchStart);

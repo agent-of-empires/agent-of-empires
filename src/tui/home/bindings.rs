@@ -535,7 +535,25 @@ pub fn is_bound(id: ActionId, strict: bool, key: &KeyEvent) -> bool {
 
 /// The key event a click on the action's footer button synthesizes: its primary chord.
 pub fn key_event(id: ActionId, strict: bool) -> Option<KeyEvent> {
-    let c = keybinds::with_active(|km| km.chords(binding(id)?, strict).first().copied())?;
+    key_event_unshadowed(id, None, strict).map(|(event, _)| event)
+}
+
+/// The action's first chord that `shadow` does not also claim, as the key event a footer
+/// click synthesizes plus its label.
+pub fn key_event_unshadowed(
+    id: ActionId,
+    shadow: Option<ActionId>,
+    strict: bool,
+) -> Option<(KeyEvent, String)> {
+    let c = keybinds::with_active(|km| {
+        let shadowed: &[Chord] = shadow
+            .and_then(binding)
+            .map_or(&[], |s| km.chords(s, strict));
+        km.chords(binding(id)?, strict)
+            .iter()
+            .find(|c| !shadowed.contains(c))
+            .copied()
+    })?;
     let mut modifiers = KeyModifiers::NONE;
     if c.ctrl {
         modifiers |= KeyModifiers::CONTROL;
@@ -546,7 +564,7 @@ pub fn key_event(id: ActionId, strict: bool) -> Option<KeyEvent> {
     if c.shift {
         modifiers |= KeyModifiers::SHIFT;
     }
-    Some(KeyEvent::new(c.code, modifiers))
+    Some((KeyEvent::new(c.code, modifiers), format_chord(&c)))
 }
 
 fn binding(id: ActionId) -> Option<&'static Binding> {
@@ -589,8 +607,11 @@ pub(super) fn format_chord(c: &Chord) -> String {
         KeyCode::Char(ch) if ch != ' ' && !c.ctrl && !c.alt => return ch.to_string(),
         _ => {}
     }
+    // Shift on a letter lives in its uppercase code; spell it out once Ctrl or Alt joins it,
+    // or `C-S-e` would read as `Ctrl+E`.
+    let shifted = c.shift || matches!(c.code, KeyCode::Char(ch) if ch.is_ascii_uppercase());
     let mut out = String::new();
-    for (on, prefix) in [(c.ctrl, "Ctrl+"), (c.alt, "Alt+"), (c.shift, "Shift+")] {
+    for (on, prefix) in [(c.ctrl, "Ctrl+"), (c.alt, "Alt+"), (shifted, "Shift+")] {
         if on {
             out.push_str(prefix);
         }

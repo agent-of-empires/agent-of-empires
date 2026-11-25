@@ -331,3 +331,43 @@ fn an_offline_daemon_takes_over_the_home_screen_as_connections() {
     }
     assert!(!screen.contains("Runtime unavailable"), "{screen}");
 }
+
+/// The committed-search cue and New follow the effective keys. An overridden search-next is
+/// what "next" sends and New keeps the bare `n` it no longer shares; an unbound search-next
+/// leaves an Esc button that clears the search.
+#[test]
+#[serial]
+fn committed_search_footer_follows_keybind_overrides() {
+    use crate::tui::home::keybinds;
+    for next in [vec!["F8".to_string()], vec![]] {
+        let mut env = create_test_env_with_sessions(3);
+        let config = crate::session::Config {
+            keybinds: [("search-next".to_string(), next.clone())].into(),
+            ..Default::default()
+        };
+        let (keymap, warnings) = keybinds::from_config(&config);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        keybinds::install(keymap);
+        for c in ['/', 's', 'e', 's', 's'] {
+            env.view.handle_key(key(KeyCode::Char(c)), None);
+        }
+        env.view.handle_key(key(KeyCode::Enter), None);
+        assert!(env.view.search_matches.len() > 1, "{next:?}");
+        render_at(&mut env, 200, 12);
+
+        if next.is_empty() {
+            let esc = button_key(&env, KeyCode::Esc).expect("Esc clears the search");
+            env.view.handle_key(esc, None);
+            assert!(env.view.search_query.value().is_empty(), "Esc cleared");
+        } else {
+            assert!(button_key(&env, KeyCode::Char('n')).is_some());
+            let next = button_key(&env, KeyCode::F(8)).expect("next sends F8");
+            env.view.handle_key(next, None);
+            assert_eq!(env.view.search_match_index, 1, "F8 cycled");
+            render_at(&mut env, 200, 12);
+        }
+        let new = button_key(&env, KeyCode::Char('n')).expect("New keeps bare n");
+        env.view.handle_key(new, None);
+        assert!(env.view.new_dialog.is_some(), "{next:?}: New opened");
+    }
+}

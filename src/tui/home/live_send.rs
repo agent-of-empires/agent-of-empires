@@ -192,6 +192,24 @@ pub(super) fn parse_chord_list(spec: &str) -> Vec<(KeyCode, KeyModifiers)> {
     out
 }
 
+/// The exit chords and leader one config gives live mode. The home view keeps the snapshot
+/// it applied with its keymap, so a live-send target switch never pairs stale action keys
+/// with a newer exit or leader read from disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LiveSendChords {
+    pub exit: Vec<(KeyCode, KeyModifiers)>,
+    pub leader: Option<(KeyCode, KeyModifiers)>,
+}
+
+impl LiveSendChords {
+    pub(super) fn from_config(config: &crate::session::Config) -> Self {
+        Self {
+            exit: parse_chord_list(&config.session.live_send_exit_chord),
+            leader: resolve_leader(&config.session.live_send_leader),
+        }
+    }
+}
+
 /// The configured leader chord. An empty value disables it, so every key passes through;
 /// an unparseable value is treated as a typo and falls back to the default rather than
 /// silently dropping the feature, like the exit chord.

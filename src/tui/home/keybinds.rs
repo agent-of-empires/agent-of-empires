@@ -7,7 +7,7 @@
 //! result, so moving two actions onto each other's keys is accepted.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use crossterm::event::KeyCode;
 
@@ -106,13 +106,10 @@ pub struct Reserved {
 impl Reserved {
     pub fn from_config(config: &crate::session::Config) -> Self {
         let to_chord = |(code, mods)| chord_from_parts(code, mods);
+        let live = super::live_send::LiveSendChords::from_config(config);
         Self {
-            leader: super::live_send::resolve_leader(&config.session.live_send_leader)
-                .map(to_chord),
-            exit: super::live_send::parse_chord_list(&config.session.live_send_exit_chord)
-                .into_iter()
-                .map(to_chord)
-                .collect(),
+            leader: live.leader.map(to_chord),
+            exit: live.exit.into_iter().map(to_chord).collect(),
             tools: super::input::build_tool_hotkey_cache(&config.tools)
                 .into_iter()
                 .map(|(name, code, mods)| (name, to_chord((code, mods))))
@@ -176,6 +173,16 @@ pub(super) fn is_live_action(id: ActionId) -> bool {
 /// event (see `chord_matches`), so Shift never separates two chords.
 fn overlaps(a: &Chord, b: &Chord) -> bool {
     a.code == b.code && a.ctrl == b.ctrl && a.alt == b.alt
+}
+
+/// [`overlaps`] for two actions' chords. `App` matches Quit's key with any modifiers held,
+/// swallowing Ctrl and quitting on Alt, so the key code alone decides a clash with Quit.
+fn clashes(a_id: ActionId, a: &Chord, b_id: ActionId, b: &Chord) -> bool {
+    if a_id == ActionId::Quit || b_id == ActionId::Quit {
+        a.code == b.code
+    } else {
+        overlaps(a, b)
+    }
 }
 
 /// Why `c` cannot be bound to `id`, from rules that do not depend on other overrides.
@@ -266,14 +273,22 @@ pub fn build(
                     BINDINGS
                         .iter()
                         .filter(|other| other.id != *id)
-                        .find(|other| merged.chords(other, strict).iter().any(|o| overlaps(o, c)))
+                        .find(|other| {
+                            merged
+                                .chords(other, strict)
+                                .iter()
+                                .any(|o| clashes(*id, c, other.id, o))
+                        })
                         .map(|other| (c, other.id))
                 });
             if let Some((c, other)) = clash {
-                dropped.push((
-                    name.clone(),
-                    format!("{} is bound to {}", format_chord(c), palette_id(other)),
-                ));
+                let key = format_chord(c);
+                let reason = if other == ActionId::Quit {
+                    format!("{key} is taken by quit, which matches its key with any modifier")
+                } else {
+                    format!("{key} is bound to {}", palette_id(other))
+                };
+                dropped.push((name.clone(), reason));
             }
         }
         if dropped.is_empty() {
@@ -291,7 +306,7 @@ fn warn(warnings: &mut Vec<EntryWarning>, name: &str, reason: String) {
         name: name.to_string(),
         reason,
     };
-    tracing::warn!("{warning}");
+    tracing::warn!(target: "tui.input", "{warning}");
     warnings.push(warning);
 }
 
@@ -304,14 +319,30 @@ fn binding(id: ActionId) -> &'static Binding {
 
 /// Process-wide keymap the dispatcher, help, palette and footer read, replaced whenever the
 /// home view applies config. Empty until then, so other processes see the shipped table.
-static ACTIVE: RwLock<Option<Arc<Keymap>>> = RwLock::new(None);
+#[cfg(not(test))]
+static ACTIVE: std::sync::RwLock<Option<Arc<Keymap>>> = std::sync::RwLock::new(None);
+
+// Per thread under test, so parallel tests installing overrides cannot see each other's.
+#[cfg(test)]
+thread_local! {
+    static ACTIVE: std::cell::RefCell<Option<Arc<Keymap>>> = const { std::cell::RefCell::new(None) };
+}
 
 pub fn install(keymap: Keymap) {
-    *ACTIVE.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(keymap));
+    let keymap = Some(Arc::new(keymap));
+    #[cfg(not(test))]
+    {
+        *ACTIVE.write().unwrap_or_else(|e| e.into_inner()) = keymap;
+    }
+    #[cfg(test)]
+    ACTIVE.with(|active| *active.borrow_mut() = keymap);
 }
 
 pub(super) fn with_active<R>(f: impl FnOnce(&Keymap) -> R) -> R {
+    #[cfg(not(test))]
     let active = ACTIVE.read().unwrap_or_else(|e| e.into_inner()).clone();
+    #[cfg(test)]
+    let active = ACTIVE.with(|active| active.borrow().clone());
     match active {
         Some(km) => f(&km),
         None => f(&Keymap::default()),
@@ -403,6 +434,8 @@ mod tests {
                 &["S-F10"],
                 "quit takes a key without Ctrl, Alt or Shift",
             ),
+            ("delete", &["M-q"], "Alt+Q is taken by quit"),
+            ("delete", &["C-q"], "Ctrl+Q is taken by quit"),
             ("next-finished", &["S-x"], "live mode relays typing"),
             (
                 "preview-scroll-up",
@@ -436,6 +469,17 @@ mod tests {
         );
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(chords(&km, ActionId::Stop, false), ["d"]);
+
+        // A remapped quit claims its key under every modifier: strict stop is `X`, but App
+        // would read dismiss-update-banner's Ctrl+X as quit.
+        let (_, warnings) = build(&entries(&[("quit", &["x"])]), true, &reserved());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0]
+                .reason
+                .contains("bound to dismiss-update-banner"),
+            "{warnings:?}"
+        );
 
         // `d` is free in strict mode, where delete is Shift+D, and taken otherwise.
         let one = entries(&[("stop", &["d"])]);

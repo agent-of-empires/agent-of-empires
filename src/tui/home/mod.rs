@@ -663,6 +663,8 @@ pub struct HomeView {
     pub(super) restart_cooldown_at: std::collections::HashMap<String, std::time::Instant>,
 
     pub(super) tool_configs: HashMap<String, crate::session::config::ToolSessionConfig>,
+    /// Live mode's exit and leader, applied alongside the keymap.
+    live_send_chords: live_send::LiveSendChords,
     pub(super) tool_hotkey_cache: Vec<(
         String,
         crossterm::event::KeyCode,

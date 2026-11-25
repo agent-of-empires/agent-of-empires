@@ -131,6 +131,7 @@ impl HomeView {
         self.tips_unseen = self.tips_unseen_count(&config);
         self.queue_shortcut_bar_tip(&config);
         let keybind_warnings = install_keybinds(&config);
+        self.live_send_chords = live_send::LiveSendChords::from_config(&config);
         self.tool_configs = config.tools;
         self.tool_hotkey_cache = input::build_tool_hotkey_cache(&self.tool_configs);
         if matches!(origin, ConfigRefreshOrigin::Interactive) {
@@ -262,6 +263,33 @@ mod tests {
         std::fs::write(crate::session::config::config_path().unwrap(), "[session\n").unwrap();
         assert!(view.try_refresh_from_config_watcher().is_err());
         assert_eq!(view.sidebar_position, SidebarPosition::Right);
+    }
+
+    /// Live mode reads the exit and leader applied with the keymap, so an external edit
+    /// reaches a later live-send entry or target switch only once a reload applies both.
+    #[test]
+    #[serial]
+    fn live_send_chords_change_only_with_the_applied_keymap() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let set_exit = |spec: &str| {
+            update_config(|config| config.session.live_send_exit_chord = spec.to_string()).unwrap()
+        };
+        set_exit("C-e");
+        save_profile_config("test", &Default::default()).unwrap();
+        let mut view = HomeView::new_for_test(
+            Some("test".to_string()),
+            AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        let exit = |spec| live_send::parse_chord_list(spec);
+        assert_eq!(view.live_send_chords.exit, exit("C-e"));
+
+        set_exit("C-r");
+        assert_eq!(view.live_send_chords.exit, exit("C-e"), "not yet applied");
+        view.try_refresh_from_config_watcher().unwrap();
+        assert_eq!(view.live_send_chords.exit, exit("C-r"));
     }
 
     /// A bad `[keybinds]` entry is reported at startup and on interactive reloads, not

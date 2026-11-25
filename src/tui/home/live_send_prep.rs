@@ -158,13 +158,12 @@ impl HomeView {
                 crate::tmux::Session::from_name(name).reset_size_to_latest_client();
             }
         }
-        // Parse the configured exit-chord list now so the per-keystroke path doesn't
-        // re-parse on every event. Config cannot be edited during live mode (settings_view
-        // participates in has_dialog), so an entry-time snapshot is sufficient.
-        let resolved_config = resolve_config_or_warn(&self.config_profile());
-        let exit_chord_spec = resolved_config.session.live_send_exit_chord;
-        let exit_chords = live_send::parse_chord_list(&exit_chord_spec);
-        let leader = live_send::resolve_leader(&resolved_config.session.live_send_leader);
+        // The exit and leader applied with the keymap, not a fresh read: the watcher defers
+        // reloads during live mode, and a target switch must not mix the two snapshots.
+        let live_send::LiveSendChords {
+            exit: exit_chords,
+            leader,
+        } = self.live_send_chords.clone();
         // Show the pane the keys now reach. A no-op on entry, where the target was picked
         // from the view; it flips the view on a leader `t` swap.
         let view_mode = target.view_mode();

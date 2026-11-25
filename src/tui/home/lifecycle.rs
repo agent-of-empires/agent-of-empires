@@ -39,6 +39,7 @@ impl HomeView {
         crate::session::set_favorites_first(resolved.session.favorites_first);
         crate::session::set_preview_link_prefixes(&resolved.session.preview_link_prefixes);
         let keybind_warnings = super::config_refresh::install_keybinds(&resolved);
+        let live_send_chords = live_send::LiveSendChords::from_config(&resolved);
         let sort_order = user_config
             .as_ref()
             .and_then(|c| c.app_state.sort_order)
@@ -396,6 +397,7 @@ impl HomeView {
                 .as_ref()
                 .map(|c| c.tools.clone())
                 .unwrap_or_default(),
+            live_send_chords,
             tool_hotkey_cache: Vec::new(),
             tool_picker_dialog: None,
             file_watch,
