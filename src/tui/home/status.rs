@@ -1164,8 +1164,10 @@ impl HomeView {
                 changed = true;
             }
             // Snapshots applied while the write was pending were not shown or recorded, so
-            // converge on the Daemon's value, which may carry another Client's change.
-            if let Some(snapshot) = self.session_feed.applied_snapshot() {
+            // converge on the Daemon's value, which may carry another Client's change, once
+            // no queued pick is still on its way.
+            let queued = self.session_feed.sidebar_view_pending();
+            if let Some(snapshot) = self.session_feed.applied_snapshot().filter(|_| !queued) {
                 let view = snapshot.contents.sidebar_view;
                 self.observed_sidebar_view = Some(view);
                 if (view.group_by, view.sort) != (self.group_by, self.sort_order) {

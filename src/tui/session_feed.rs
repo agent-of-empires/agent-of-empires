@@ -793,6 +793,9 @@ pub struct SessionFeed {
     pending_creations: HashMap<String, PendingCreation>,
     pending_namespace: Option<PendingNamespace>,
     pending_sidebar_view: Option<PendingSidebarView>,
+    /// Picks made while a sidebar view write is in flight, sent once it settles so its
+    /// outcome is still reported.
+    queued_sidebar_view: Option<crate::daemon::SidebarViewPatch>,
     namespace_quarantined: bool,
     row_outcomes: Vec<(String, SessionCommandOutcome)>,
     bulk_queue: VecDeque<(String, SessionRequest)>,
@@ -830,6 +833,7 @@ impl SessionFeed {
             pending_creations: HashMap::new(),
             pending_namespace: None,
             pending_sidebar_view: None,
+            queued_sidebar_view: None,
             namespace_quarantined: false,
             row_outcomes: Vec::new(),
             applied: None,
@@ -1156,12 +1160,19 @@ impl SessionFeed {
         Ok(())
     }
 
-    /// Send a sidebar grouping or sort change. Until it resolves, snapshots keep the local
-    /// choice rather than reverting it to the value from before the write.
+    /// Send a sidebar grouping or sort change, or queue it behind the one in flight. Until
+    /// they resolve, snapshots keep the local choice rather than reverting it to the value
+    /// from before the write.
     pub(crate) fn submit_sidebar_view(
         &mut self,
         patch: crate::daemon::SidebarViewPatch,
     ) -> anyhow::Result<()> {
+        if self.pending_sidebar_view.is_some() {
+            let queued = self.queued_sidebar_view.get_or_insert_default();
+            queued.group_by = patch.group_by.or(queued.group_by);
+            queued.sort = patch.sort.or(queued.sort);
+            return Ok(());
+        }
         let commands = self
             .commands
             .as_ref()
@@ -1185,17 +1196,29 @@ impl SessionFeed {
         self.pending_sidebar_view.is_some()
     }
 
-    /// The outcome of the last sidebar view write once its snapshot, or one from a
+    /// The outcome of the oldest sidebar view write once its snapshot, or one from a
     /// replacement Daemon, is applied, or its failure. `None` while it is in flight or when
-    /// none was sent.
+    /// none was sent. A settled write sends the queued picks, if any.
     pub(crate) fn drain_sidebar_view_result(&mut self) -> Option<Result<(), String>> {
+        let result = self.settle_sidebar_view()?;
+        let Some(queued) = self.queued_sidebar_view.take() else {
+            return Some(result);
+        };
+        match (result, self.submit_sidebar_view(queued)) {
+            (result, Ok(())) => Some(result),
+            (Ok(()), Err(error)) => Some(Err(error.to_string())),
+            (Err(failure), Err(error)) => Some(Err(format!("{failure}; {error}"))),
+        }
+    }
+
+    fn settle_sidebar_view(&mut self) -> Option<Result<(), String>> {
         let failure = match self.pending_sidebar_view.as_mut()? {
             PendingSidebarView::Sent(receiver) => match receiver.try_recv() {
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return None,
                 Ok(Ok(reply)) => {
                     let cursor = reply.cursor().clone();
                     self.pending_sidebar_view = Some(PendingSidebarView::Committed(cursor));
-                    return self.drain_sidebar_view_result();
+                    return self.settle_sidebar_view();
                 }
                 Ok(Err(
                     CommandFailure::Rejected(message)
@@ -2422,19 +2445,19 @@ impl SessionFeed {
     #[cfg(test)]
     pub(crate) fn sidebar_view_driver_for_test(
         &mut self,
-    ) -> impl FnMut(RuntimeCursor) -> Option<crate::daemon::SidebarViewPatch> {
+    ) -> impl FnMut(Result<RuntimeCursor, String>) -> Option<crate::daemon::SidebarViewPatch> {
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<SessionCommand>(COMMAND_CAPACITY);
         self.commands = Some(sender);
         set_grant(&self.grant, true);
-        move |cursor| {
+        move |reply| {
             let command = receiver.try_recv().ok()?;
             let CommandRequest::SidebarView(patch) = command.request else {
                 panic!("expected a sidebar view command");
             };
-            assert!(command
-                .result
-                .send(Ok(CommandReply::Mutation(cursor)))
-                .is_ok());
+            let reply = reply
+                .map(CommandReply::Mutation)
+                .map_err(CommandFailure::Rejected);
+            assert!(command.result.send(reply).is_ok());
             Some(patch)
         }
     }

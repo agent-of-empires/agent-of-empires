@@ -759,7 +759,7 @@ pub async fn update_sidebar_view(
     };
 
     // Same lock order as the ordering handler: namespace, then this write's lane.
-    let _namespace = state.profile_namespace.read().await;
+    let namespace = state.profile_namespace.read().await;
     let lane = state.sidebar_view_lane.lock().await;
     if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -808,6 +808,7 @@ pub async fn update_sidebar_view(
     state.runtime.request_publish();
     drop(publication);
     drop(lane);
+    drop(namespace);
     let snapshot = match state.runtime.publish(&state).await {
         Ok(snapshot) => snapshot,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
