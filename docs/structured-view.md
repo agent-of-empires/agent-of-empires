@@ -99,8 +99,8 @@ Features depend on the ACP adapter and its profile:
 | Usage / context-window display | ✓ | depends | ✓ | ✓ | depends |
 | `/clear` boundary divider | `/clear` | `/new` | `/new` | none | none |
 | TodoWrite / Skill / ExitPlanMode / ScheduleWakeup cards | ✓ | — | — | — | — |
-| Subagent indentation | ✓ | — | unverified | — | — |
-| Per-subagent state and Stop | ✓ | — | — | — | — |
+| Subagent indentation | ✓ | unverified | unverified | — | — |
+| Per-subagent state and Stop | ✓ | unverified | — | — | — |
 | Workflow agents in the Background pane | ✓ | — | — | — | — |
 | Session resume across `aoe serve` restart | ✓ | depends | ✓ | depends | depends |
 
