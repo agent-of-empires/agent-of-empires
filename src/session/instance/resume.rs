@@ -334,6 +334,8 @@ impl Instance {
                 tests::container_probe_past_host_grace(&session);
             }
             if self.screen_reads_idle(&session)? {
+                #[cfg(test)]
+                tests::container_probe_read_idle();
                 return Some(Ok(ProbeResult::Alive));
             }
             if std::time::Instant::now() >= deadline {
@@ -1398,12 +1400,14 @@ mod tests {
         let _app = crate::session::test_support::isolate_app_dir();
         const LIVES: &str = "exec cat";
         const PROMPT: &str = "printf '%s\\n%s\\n%s\\n' ──────── '❯ ' ────────; exec cat";
-        // (script, sandboxed, end the agent once the probe is past the host grace, want)
-        for (script, sandboxed, end_past_grace, want) in [
-            (LIVES, true, true, ProbeResult::Dead),
-            (LIVES, false, false, ProbeResult::Alive),
-            (PROMPT, true, false, ProbeResult::Alive),
+        // (script, sandboxed, end the agent once the probe is past the host grace, want, whether the
+        // probe accepted an idle screen rather than waiting out its deadline)
+        for (script, sandboxed, end_past_grace, want, read_idle) in [
+            (LIVES, true, true, ProbeResult::Dead, false),
+            (LIVES, false, false, ProbeResult::Alive, false),
+            (PROMPT, true, false, ProbeResult::Alive, true),
         ] {
+            READ_IDLE.with(|seen| seen.set(false));
             let mut inst = Instance::new("probe-idle", "/tmp");
             inst.tool = "claude".to_string();
             let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
@@ -1444,6 +1448,11 @@ mod tests {
                 end_past_grace,
                 "{script} sandboxed={sandboxed}"
             );
+            assert_eq!(
+                READ_IDLE.with(std::cell::Cell::get),
+                read_idle,
+                "{script} sandboxed={sandboxed}: idle accepted"
+            );
             PAST_GRACE_OBSERVER.with(|slot| slot.borrow_mut().take());
         }
     }
@@ -1452,6 +1461,11 @@ mod tests {
     thread_local! {
         static POST_SHELL_OBSERVER: std::cell::RefCell<Option<PostShellCallback>> = const { std::cell::RefCell::new(None) };
         static PAST_GRACE_OBSERVER: std::cell::RefCell<Option<PostShellCallback>> = const { std::cell::RefCell::new(None) };
+        static READ_IDLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) fn container_probe_read_idle() {
+        READ_IDLE.with(|seen| seen.set(true));
     }
 
     pub(super) fn container_probe_past_host_grace(session: &crate::tmux::Session) {
