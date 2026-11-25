@@ -784,6 +784,23 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
                 outcome = apply_canonical_reorder(rows, groups, &body, worker_state.cityhall_mode)?;
                 Ok(())
             })?;
+            // CityHall may regroup a row but not rewrite the shared order, which it
+            // denies through `PUT /api/workspace-ordering`.
+            if let (
+                false,
+                ReorderBody::Session {
+                    id,
+                    profile,
+                    destination,
+                    direction,
+                    ..
+                },
+                ReorderOutcome::Moved { .. },
+            ) = (worker_state.cityhall_mode, &body, &outcome)
+            {
+                place_carried_workspace(&worker_state, id, profile, destination, *direction)
+                    .map_err(|error| error.context(crate::session::SessionCommitApplied))?;
+            }
             Ok(outcome)
         })
         .await
@@ -807,6 +824,90 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
         }
         Err(error) => failure(&state, error).await,
     }
+}
+
+/// Put a carried session's workspace at the edge of `destination` it entered from, so the
+/// shared Custom order ranks it there. Sessions sharing the workspace move with it.
+fn place_carried_workspace(
+    state: &AppState,
+    id: &str,
+    profile: &str,
+    destination: &str,
+    direction: crate::daemon::MoveDirection,
+) -> Result<()> {
+    let _publication = state.publication.blocking_write();
+    let instances = state.instances.blocking_read();
+    let Some(moved) = instances
+        .iter()
+        .find(|row| row.id == id)
+        .map(|row| row.workspace_id())
+    else {
+        return Ok(());
+    };
+    let peers: Vec<String> = instances
+        .iter()
+        .filter(|row| {
+            row.source_profile == profile
+                && row.group_path == destination
+                && !row.is_archived()
+                && !row.is_trashed()
+        })
+        .map(|row| row.workspace_id())
+        .filter(|workspace| *workspace != moved)
+        .collect();
+    if peers.is_empty() {
+        return Ok(());
+    }
+    let created: Vec<_> = instances
+        .iter()
+        .map(|row| (row.workspace_id(), Some(row.created_at)))
+        .collect();
+    drop(instances);
+    let committed = crate::session::update_workspace_ordering(|ordering| {
+        let merged = super::sessions::merge_workspace_ordering(created, &ordering.order);
+        if let Some(placed) = place_at_entering_edge(merged, &moved, &peers, direction) {
+            ordering.order = placed;
+        }
+        Ok(())
+    });
+    let (_, ordering) = match committed {
+        Ok(committed) => committed,
+        Err(error) => {
+            *state.canonical_health.blocking_write() = RuntimeHealth::Degraded {
+                code: crate::daemon::ReloadFailureCode::Metadata,
+                profiles: Vec::new(),
+            };
+            state.runtime.request_publish();
+            return Err(error);
+        }
+    };
+    state.canonical_metadata.blocking_write().workspace_ordering = ordering.order;
+    state
+        .mutation_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
+/// `order` with `moved` at the edge of the `peers` workspaces a carry enters from: before
+/// the first moving down, after the last moving up.
+fn place_at_entering_edge(
+    mut order: Vec<String>,
+    moved: &str,
+    peers: &[String],
+    direction: crate::daemon::MoveDirection,
+) -> Option<Vec<String>> {
+    order.retain(|workspace| workspace != moved);
+    let mut ranks = order
+        .iter()
+        .enumerate()
+        .filter(|(_, workspace)| peers.contains(workspace))
+        .map(|(at, _)| at);
+    let at = match direction {
+        crate::daemon::MoveDirection::Down => ranks.next()?,
+        crate::daemon::MoveDirection::Up => ranks.next_back()? + 1,
+    };
+    order.insert(at, moved.to_owned());
+    Some(order)
 }
 
 fn apply_canonical_reorder(
@@ -846,6 +947,7 @@ fn apply_canonical_reorder(
             profile,
             source_group,
             destination,
+            ..
         } => {
             let Some(anchor) = rows.iter().position(|row| {
                 &row.id == id
@@ -883,6 +985,41 @@ fn apply_canonical_reorder(
                     path: destination.clone(),
                 }),
             })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::place_at_entering_edge;
+    use crate::daemon::MoveDirection::{Down, Up};
+
+    #[test]
+    fn carried_workspace_lands_at_the_entering_edge() {
+        let list = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (order, peers, direction, expected) in [
+            (
+                &["m", "a", "p", "b", "q"][..],
+                &["p", "q"][..],
+                Down,
+                Some(&["a", "m", "p", "b", "q"][..]),
+            ),
+            (
+                &["m", "a", "p", "b", "q", "c"],
+                &["p", "q"],
+                Up,
+                Some(&["a", "p", "b", "q", "m", "c"]),
+            ),
+            (&["p", "m", "q"], &["q", "p"], Down, Some(&["m", "p", "q"])),
+            (&["p", "m", "q"], &["p", "q"], Up, Some(&["p", "q", "m"])),
+            (&["a", "m"], &["m"], Down, None),
+            (&["a", "m"], &[], Up, None),
+        ] {
+            assert_eq!(
+                place_at_entering_edge(list(order), "m", &list(peers), direction),
+                expected.map(list),
+                "{order:?} into {peers:?} moving {direction:?}"
+            );
         }
     }
 }

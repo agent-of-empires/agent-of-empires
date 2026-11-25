@@ -635,20 +635,34 @@ fn workspace_id_for_session(s: &SessionResponse) -> String {
     }
 }
 
-// Unknown workspaces precede the manual order, newest session first; ties keep the later row first.
 pub(crate) fn compute_merged_ordering(
     sessions: &[SessionResponse],
+    current_order: &[String],
+) -> Vec<String> {
+    merge_workspace_ordering(
+        sessions.iter().map(|session| {
+            (
+                workspace_id_for_session(session),
+                crate::time::Timestamp::parse_rfc3339(&session.created_at).ok(),
+            )
+        }),
+        current_order,
+    )
+}
+
+/// Unknown workspaces precede the manual order, newest session first; ties keep the later
+/// row first. `rows` yields each session's workspace and creation time.
+pub(crate) fn merge_workspace_ordering(
+    rows: impl IntoIterator<Item = (String, Option<crate::time::Timestamp>)>,
     current_order: &[String],
 ) -> Vec<String> {
     let known: std::collections::HashSet<&str> = current_order.iter().map(String::as_str).collect();
     let mut new_ids: indexmap::IndexMap<String, Option<crate::time::Timestamp>> =
         indexmap::IndexMap::new();
-    for session in sessions {
-        let id = workspace_id_for_session(session);
+    for (id, created) in rows {
         if known.contains(id.as_str()) {
             continue;
         }
-        let created = crate::time::Timestamp::parse_rfc3339(&session.created_at).ok();
         let newest = new_ids.entry(id).or_default();
         *newest = (*newest).max(created);
     }

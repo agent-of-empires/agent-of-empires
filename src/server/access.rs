@@ -1220,11 +1220,15 @@ mod tests {
             let _home = crate::session::test_support::isolate_app_dir();
             let mut a = crate::session::Instance::new("first", "/tmp/first");
             let mut b = crate::session::Instance::new("second", "/tmp/second");
-            for row in [&mut a, &mut b] {
+            // A structured peer at the destination would rank the carry in the shared order.
+            let mut c = crate::session::Instance::new("third", "/tmp/third");
+            for row in [&mut a, &mut b, &mut c] {
                 row.source_profile = "default".into();
                 row.group_path = "work".into();
                 row.status = crate::session::Status::Stopped;
             }
+            c.group_path = String::new();
+            c.view = crate::session::View::Structured;
             if !native_peer {
                 a.view = crate::session::View::Structured;
             }
@@ -1234,13 +1238,13 @@ mod tests {
             let storage = crate::session::Storage::new_unwatched("default").unwrap();
             storage
                 .update(|rows, _| {
-                    *rows = vec![a.clone(), b.clone()];
+                    *rows = vec![a.clone(), b.clone(), c.clone()];
                     Ok(())
                 })
                 .unwrap();
             let before = std::fs::read(storage.sessions_path()).unwrap();
             let state = test_support::build_test_app_state_with_policy_configured(
-                vec![a.clone(), b.clone()],
+                vec![a.clone(), b.clone(), c.clone()],
                 vec!["localhost".into()],
                 Vec::new(),
                 None,
@@ -1250,7 +1254,7 @@ mod tests {
             let body = if group_request {
                 serde_json::json!({"target":"group","group":{"profile":"default","path":"work"},"direction":"up"})
             } else {
-                serde_json::json!({"target":"session","id":b.id,"profile":"default","source_group":"work","destination":""})
+                serde_json::json!({"target":"session","id":b.id,"profile":"default","source_group":"work","destination":"","direction":"up"})
             };
             let response = test_support::build_router_for_test(state)
                 .oneshot(
@@ -1286,6 +1290,13 @@ mod tests {
                 };
                 assert_eq!(group_of(&b.id).as_deref(), Some(""), "the carry landed");
                 assert_eq!(group_of(&a.id).as_deref(), Some("work"));
+                assert!(
+                    !crate::session::get_app_dir()
+                        .unwrap()
+                        .join("workspace-ordering.json")
+                        .exists(),
+                    "CityHall cannot write the shared order"
+                );
             } else {
                 assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
             }

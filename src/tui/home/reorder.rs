@@ -74,10 +74,9 @@ impl HomeView {
             order.iter().position(|w| *w == b).unwrap(),
         );
         order.swap(i, j);
-        self.submit_custom_order(
-            Some(order),
-            freeze.then(|| self.displayed_repository_order()),
-        )
+        let repositories = (freeze && self.group_by == GroupByMode::Project)
+            .then(|| keep_unshown(self.displayed_repository_order(), &self.repository_order));
+        self.submit_custom_order(Some(order), repositories)
     }
 
     /// Write a Custom order. One taken from the screen switches the sort to Custom once it
@@ -98,6 +97,11 @@ impl HomeView {
 
     /// Clear the shared Custom order, so rows and headers sit newest first again.
     pub(super) fn reset_custom_order(&mut self) -> anyhow::Result<()> {
+        // A pending move may switch the sort to Custom once its own write commits.
+        if self.session_feed.ordering_pending() {
+            self.flash_status("The last move is still saving");
+            return Ok(());
+        }
         self.session_feed
             .submit_workspace_ordering(crate::daemon::WorkspaceOrderingPatch {
                 order: Some(Vec::new()),
@@ -188,6 +192,7 @@ impl HomeView {
         };
         order.swap(at, to);
         let rows = (self.sort_order != SortOrder::Custom).then(|| self.displayed_workspace_order());
+        let order = keep_unshown(order, &self.repository_order);
         self.submit_custom_order(rows, Some(order))
     }
 
@@ -215,6 +220,7 @@ impl HomeView {
                 profile,
                 source_group,
                 destination,
+                direction: move_direction(delta),
             }),
             NamespaceIntent::ReorderSession { id: id.to_owned() },
         )
@@ -303,15 +309,37 @@ impl HomeView {
         self.submit_namespace_intent(
             crate::daemon::NamespaceMutation::Reorder(crate::daemon::ReorderBody::Group {
                 group,
-                direction: if delta < 0 {
-                    crate::daemon::MoveDirection::Up
-                } else {
-                    crate::daemon::MoveDirection::Down
-                },
+                direction: move_direction(delta),
             }),
             NamespaceIntent::ReorderGroup,
         )
     }
+}
+
+fn move_direction(delta: isize) -> crate::daemon::MoveDirection {
+    if delta < 0 {
+        crate::daemon::MoveDirection::Up
+    } else {
+        crate::daemon::MoveDirection::Down
+    }
+}
+
+/// `shown` in its own order, with each `persisted` entry this view does not show (another
+/// profile's repository, say) kept after the entry it followed, so other Clients keep its place.
+fn keep_unshown(mut shown: Vec<String>, persisted: &[String]) -> Vec<String> {
+    let mut previous: Option<&String> = None;
+    for entry in persisted {
+        if !shown.contains(entry) {
+            let at = match previous {
+                Some(previous) => shown.iter().position(|e| e == previous).map(|at| at + 1),
+                None => shown.iter().position(|e| persisted.contains(e)),
+            }
+            .unwrap_or(shown.len());
+            shown.insert(at, entry.clone());
+        }
+        previous = Some(entry);
+    }
+    shown
 }
 
 #[cfg(test)]
@@ -320,6 +348,28 @@ mod tests {
     use crate::tui::home::tests::{
         apply_published, native_state, payload_bytes, published_snapshot, request_with_headers,
     };
+
+    #[test]
+    fn keep_unshown_holds_hidden_entries_in_place() {
+        let list = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (shown, persisted, expected) in [
+            (&["b", "a"][..], &["x", "a", "b"][..], &["x", "b", "a"][..]),
+            (&["b", "a"], &["a", "x", "b"], &["b", "a", "x"]),
+            (
+                &["new", "b", "a"],
+                &["a", "b", "x"],
+                &["new", "b", "x", "a"],
+            ),
+            (&["a", "new"], &["x", "a"], &["x", "a", "new"]),
+            (&["a"], &[], &["a"]),
+        ] {
+            assert_eq!(
+                keep_unshown(list(shown), &list(persisted)),
+                list(expected),
+                "{shown:?} over {persisted:?}"
+            );
+        }
+    }
 
     async fn native_move(group: bool, snapshot_first: bool) {
         let _home = crate::session::test_support::isolate_app_dir();
@@ -375,7 +425,7 @@ mod tests {
         let body = if group {
             serde_json::json!({"target":"group","group":{"profile":"reorder","path":"aaa"},"direction":"down"})
         } else {
-            serde_json::json!({"target":"session","id":id,"profile":"reorder","source_group":"aaa","destination":"bbb"})
+            serde_json::json!({"target":"session","id":id,"profile":"reorder","source_group":"aaa","destination":"bbb","direction":"down"})
         };
         let (status, headers, value) =
             request_with_headers(&state, "POST", "/api/reorder", body).await;

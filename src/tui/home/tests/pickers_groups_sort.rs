@@ -365,7 +365,7 @@ pub(super) async fn cross_then_peer_collapse(
     let row = view.get_instance(id).unwrap();
     let profile = row.source_profile.clone();
     let body = serde_json::json!({ "target": "session", "id": id, "profile": profile,
-        "source_group": row.group_path, "destination": destination });
+        "source_group": row.group_path, "destination": destination, "direction": "down" });
     view.selected_session = Some(id.into());
     view.selected_group = None;
     let mut respond = view.session_feed.namespace_driver_for_test();
@@ -405,15 +405,16 @@ pub(in crate::tui::home) async fn settle_reorder(
     delta: isize,
 ) -> anyhow::Result<()> {
     use crate::daemon::{GroupLocation, MoveDirection, NamespaceMutation, ReorderBody};
+    let direction = if delta < 0 {
+        MoveDirection::Up
+    } else {
+        MoveDirection::Down
+    };
     let request = if let Some(path) = view.selected_group.clone() {
         let profile = view.canonical_group_location(&path)?.profile;
         ReorderBody::Group {
             group: GroupLocation { profile, path },
-            direction: if delta < 0 {
-                MoveDirection::Up
-            } else {
-                MoveDirection::Down
-            },
+            direction,
         }
     } else {
         let id = view.selected_session.clone().expect("selected session");
@@ -459,6 +460,7 @@ pub(in crate::tui::home) async fn settle_reorder(
             profile: row.source_profile.clone(),
             source_group: row.group_path.clone(),
             destination,
+            direction,
         }
     };
     settle_namespace(state, view, NamespaceMutation::Reorder(request), |view| {
@@ -2742,13 +2744,23 @@ async fn test_ctrl_arrows_under_name_start_custom_from_the_screen_order() {
     assert!(capture().is_none(), "no sort write follows a refused order");
     assert_eq!(env.view.sort_order, SortOrder::Name);
 
+    // Reset waits for the move, whose commit alone switches the sort.
     let writes = settle_view_writes(&state, &mut env.view, |view| {
         view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+        view.reset_custom_order().unwrap();
+        assert_eq!(
+            view.status_flash.as_ref().map(|flash| flash.text.as_str()),
+            Some("The last move is still saving")
+        );
     })
     .await;
     match writes.as_slice() {
         [ViewWrite::Ordering(patch), ViewWrite::SidebarView(view)] => {
             assert_eq!(patch.order.as_ref(), Some(&expected));
+            assert_eq!(
+                patch.repositories, None,
+                "no Repository header is on screen under My groups"
+            );
             assert_eq!(view.sort, Some(SortOrder::Custom));
             assert_eq!(view.group_by, None);
         }
@@ -2859,6 +2871,30 @@ async fn test_ctrl_arrows_carry_a_session_into_the_next_group() {
         env.view.get_instance(&top).map(|i| i.group_path.clone()),
         Some(String::new()),
         "the session left its group"
+    );
+    let shown_in = |view: &HomeView, group: &str| -> Vec<String> {
+        view.flat_items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .filter(|id| view.get_instance(id).is_some_and(|s| s.group_path == group))
+            .collect()
+    };
+    let ungrouped = shown_in(&env.view, "");
+    assert!(ungrouped.len() >= 2, "the fixture has ungrouped sessions");
+    assert_eq!(
+        ungrouped.last(),
+        Some(&top),
+        "moving up enters at the bottom"
+    );
+
+    settle_reorder(&state, &mut env.view, 1).await.unwrap();
+    assert_eq!(
+        shown_in(&env.view, "work").first(),
+        Some(&top),
+        "moving down enters at the top"
     );
 }
 
@@ -3533,7 +3569,7 @@ async fn test_failed_native_reorder_keeps_source_rows_and_explains_uncertainty()
         "/api/reorder",
         serde_json::json!({
             "target": "session", "id": a, "profile": "test", "source_group": "aaa",
-            "destination": "bbb",
+            "destination": "bbb", "direction": "down",
         }),
     )
     .await;

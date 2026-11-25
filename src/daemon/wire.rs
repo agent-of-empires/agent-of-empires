@@ -412,13 +412,15 @@ pub enum MoveDirection {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "target", rename_all = "snake_case")]
 pub enum ReorderBody {
-    /// Carry a session into a neighbouring group, at the edge it enters from. A move
-    /// within one group rewrites the shared order instead (`PUT /api/workspace-ordering`).
+    /// Carry a session into a neighbouring group, at the edge it enters from: moving
+    /// `Down` it lands before the group's first row, `Up` after its last. A move within one
+    /// group rewrites the shared order instead (`PUT /api/workspace-ordering`).
     Session {
         id: String,
         profile: String,
         source_group: String,
         destination: String,
+        direction: MoveDirection,
     },
     Group {
         group: GroupLocation,

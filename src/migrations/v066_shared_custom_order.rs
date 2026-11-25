@@ -25,11 +25,15 @@ fn run_in(app_dir: &Path) -> Result<()> {
     let mut placed: Vec<(u64, String, String)> = Vec::new();
     let mut to_strip: Vec<(std::path::PathBuf, String)> = Vec::new();
     for path in sessions_file::session_files(app_dir)? {
-        let Ok(content) = fs::read_to_string(&path) else {
+        // Only a missing file is skipped: finishing without a profile's rows would lose
+        // its order for good, so an unreadable one fails the run to retry next start.
+        let Some(content) = read_if_present(&path)? else {
             continue;
         };
-        let Ok(Value::Array(rows)) = serde_json::from_str::<Value>(&content) else {
-            continue;
+        let Value::Array(rows) = serde_json::from_str::<Value>(&content)
+            .with_context(|| format!("Failed to parse {} during v064 migration", path.display()))?
+        else {
+            anyhow::bail!("{} is not a session list", path.display());
         };
         if !rows.iter().any(|row| row.get("sort_index").is_some()) {
             continue;
@@ -61,9 +65,7 @@ fn run_in(app_dir: &Path) -> Result<()> {
     let web_repositories = web_repository_order(app_dir)?;
 
     let ordering_path = app_dir.join("workspace-ordering.json");
-    let mut ordering: crate::session::WorkspaceOrdering = fs::read_to_string(&ordering_path)
-        .ok()
-        .filter(|content| !content.trim().is_empty())
+    let mut ordering: crate::session::WorkspaceOrdering = read_if_present(&ordering_path)?
         .map(|content| serde_json::from_str(&content))
         .transpose()?
         .unwrap_or_default();
@@ -93,6 +95,16 @@ fn run_in(app_dir: &Path) -> Result<()> {
         sessions_file::heal_rows(&path, &content, |row| row.remove("sort_index").is_some())?;
     }
     Ok(())
+}
+
+/// The file's content, or `None` when it is missing or blank. Any other read error fails.
+fn read_if_present(path: &Path) -> Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(content) if content.trim().is_empty() => Ok(None),
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("Failed to read {}", path.display())),
+    }
 }
 
 /// `repoPath::branch`, or `repoPath::__session__::id` without a worktree, as
@@ -202,6 +214,38 @@ mod tests {
             let rows = fs::read_to_string(dir.path().join("profiles/main/sessions.json")).unwrap();
             assert!(rows.contains("sort_index"), "{file}");
             assert_eq!(fs::read_to_string(dir.path().join(file)).unwrap(), broken);
+        }
+    }
+
+    /// Only a missing file counts as absent; one that exists but cannot be read or parsed
+    /// fails the run so the next start retries, without seeding or stripping anything.
+    #[test]
+    fn an_unreadable_input_fails_the_run_untouched() {
+        for broken in [
+            "profiles/other/sessions.json",
+            "profiles/other/sessions.json:not json",
+            "profiles/other/sessions.json:{}",
+            "workspace-ordering.json",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            seed(
+                dir.path(),
+                serde_json::json!([{"id": "a", "project_path": "/r/one", "sort_index": 0}]),
+            );
+            let (file, content) = broken.split_once(':').unwrap_or((broken, ""));
+            let path = dir.path().join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            if content.is_empty() {
+                // A directory in the file's place cannot be read but is not missing.
+                fs::create_dir(&path).unwrap();
+            } else {
+                fs::write(&path, content).unwrap();
+            }
+            assert!(run_in(dir.path()).is_err(), "{broken}");
+            let rows = fs::read_to_string(dir.path().join("profiles/main/sessions.json")).unwrap();
+            assert!(rows.contains("sort_index"), "{broken}");
+            let ordering = dir.path().join("workspace-ordering.json");
+            assert!(!ordering.is_file(), "{broken}");
         }
     }
 
