@@ -7,7 +7,6 @@
   <p align="center">
     <a href="https://github.com/agent-of-empires/agent-of-empires/actions/workflows/ci.yml"><img src="https://github.com/agent-of-empires/agent-of-empires/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
     <a href="https://runs-on.com"><img src="https://img.shields.io/badge/CI%20runners-RunsOn-2ea44f" alt="CI runners: RunsOn"></a>
-    <a href="https://getmac.io"><img src="https://getmac.io/badge.svg" alt="Builds Powered by GetMac"></a>
     <a href="https://formulae.brew.sh/formula/aoe"><img src="https://img.shields.io/homebrew/v/aoe" alt="Homebrew"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
     <a href="https://clawhub.ai/njbrake/aoe"><img src="https://img.shields.io/badge/ClawHub-aoe-blue" alt="ClawHub"></a>
@@ -15,8 +14,6 @@
     <a href="https://www.youtube.com/@agent-of-empires"><img src="https://img.shields.io/badge/YouTube-channel-red?logo=youtube" alt="YouTube"></a>
     <a href="https://x.com/agentofempires"><img src="https://img.shields.io/badge/follow-%40agentofempires-black?logo=x&logoColor=white" alt="Follow @agentofempires"></a>
     <a href="https://discord.gg/5N3QKX3f6s"><img src="https://img.shields.io/badge/Discord-Mozilla.ai-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
-    <br>
-    <sub>Thanks to <a href="https://getmac.io">GetMac</a> for sponsoring the macOS runners for our release builds.</sub>
   </p>
 </p>
 
