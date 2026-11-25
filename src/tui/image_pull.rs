@@ -338,6 +338,7 @@ impl PullWatch {
                 PullRequest::Poll => {}
                 PullRequest::Start => {
                     self.start_unanswered = true;
+                    self.cancel_armed = None;
                     return Applied::Recheck;
                 }
                 PullRequest::Cancel => {
@@ -419,7 +420,8 @@ impl PullWatch {
     }
 
     /// The pull id the answer to the last request carried. A running pull with a new id is
-    /// another pull than the one shown, so a cancel prompt for it ends. Returns whether it did.
+    /// another pull than the one shown: a cancel prompt for it ends, and a hide doesn't carry
+    /// over. Returns whether the bar changed.
     pub(crate) fn note_flight(&mut self, flight: Option<u64>) -> bool {
         let Some(flight) = flight else {
             return false;
@@ -433,7 +435,11 @@ impl PullWatch {
         }
         let replaced = self.flight.is_some_and(|shown| shown != flight);
         self.flight = Some(flight);
-        replaced && self.cancel_armed.take().is_some()
+        if !replaced {
+            return false;
+        }
+        let unhid = std::mem::take(&mut self.hidden);
+        self.cancel_armed.take().is_some() || unhid
     }
 
     /// The id of the running pull shown, for the cancel to name.
@@ -831,6 +837,16 @@ mod tests {
         assert!(watch.dismiss(&outcome));
         assert_eq!(watch.line(), None);
         assert!(!watch.holds_line());
+
+        // A hide is of one pull: another id that replaces it shows.
+        watch.apply(PullRequest::Poll, running(1));
+        watch.note_flight(Some(1));
+        let drawn = watch.line().cloned().unwrap();
+        assert!(watch.dismiss(&drawn));
+        assert!(!watch.note_flight(Some(1)), "the same pull changed the bar");
+        assert_eq!(watch.line(), None, "the same pull unhid");
+        assert!(watch.note_flight(Some(2)), "another pull didn't repaint");
+        assert!(watch.line().is_some(), "another pull started hidden");
     }
 
     /// Ctrl+E only opens the prompt, so repeating it never cancels; the confirming key cancels
@@ -873,6 +889,15 @@ mod tests {
         );
         assert!(watch.other_key(true));
         assert_eq!(watch.line(), None);
+
+        // A Start with no reply ends the prompt, so a poll then showing a pull running, which
+        // may be another client's, doesn't bring it back.
+        watch.start();
+        assert!(watch.arm_cancel(at));
+        watch.apply(PullRequest::Start, PullReport::Unavailable);
+        watch.apply(PullRequest::Poll, running(1));
+        assert!(watch.cancellable());
+        assert!(!watch.cancel_prompt(at), "the prompt came back on a poll");
     }
 
     #[test]

@@ -205,10 +205,11 @@ fn counts(snapshot: &ProgressSnapshot) -> Option<(u32, u32)> {
     }
 }
 
-/// Six cells, rounded to the nearest.
+/// Six cells, rounded to the nearest. In `u64`, so the Daemon's counts can't overflow it.
 fn meter(done: u32, known: u32) -> String {
-    const CELLS: u32 = 6;
-    let filled = ((done.min(known) * CELLS * 2 + known) / (known * 2)) as usize;
+    const CELLS: u64 = 6;
+    let (done, known) = (u64::from(done.min(known)), u64::from(known));
+    let filled = ((done * CELLS * 2 + known) / (known * 2)) as usize;
     "▰".repeat(filled) + &"▱".repeat(CELLS as usize - filled)
 }
 
@@ -473,5 +474,7 @@ mod tests {
         );
         assert_eq!(meter(0, 7), "▱▱▱▱▱▱");
         assert_eq!(meter(1, 2), "▰▰▰▱▱▱");
+        assert_eq!(meter(u32::MAX, u32::MAX), "▰▰▰▰▰▰");
+        assert_eq!(meter(u32::MAX / 2, u32::MAX), "▰▰▰▱▱▱");
     }
 }

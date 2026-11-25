@@ -149,6 +149,9 @@ pub struct App {
     pull_image: String,
     /// The update the watched pull installs, recorded when it starts.
     pull_digest: Option<String>,
+    /// The watched pull is one this TUI started, so only the offer at its start names its
+    /// digest: a later one may be of a tag that moved since.
+    pull_started_here: bool,
     /// A Cancel asked for while the Start is in flight; sent once the Start's answer shows the pull.
     cancel_after_start: bool,
     /// The update a pull this TUI watched just installed, so a stale offer of it stays away. It
@@ -304,11 +307,16 @@ impl App {
 
     fn expire_status(&mut self) {
         if self.update_status.as_ref().is_some_and(|s| s.is_expired()) {
-            self.update_status = self
-                .update_status
-                .take()
-                .and_then(|s| s.beneath.map(|b| *b));
+            self.uncover_status();
         }
+    }
+
+    /// Ends the status shown, and shows the persistent one it covers, if any.
+    fn uncover_status(&mut self) {
+        self.update_status = self
+            .update_status
+            .take()
+            .and_then(|s| s.beneath.map(|b| *b));
     }
     /// Printable ASCII or Enter with no modifier other than Shift. Enter is
     /// included so newlines inside a Mosh-stripped paste stay in the burst.
@@ -413,6 +421,7 @@ impl App {
             dismissed_update_version,
             image_update: None,
             pull_image: String::new(),
+            pull_started_here: false,
             pull_digest: None,
             cancel_after_start: false,
             pull: PullWatch::default(),
@@ -1754,7 +1763,7 @@ impl App {
             }
             DrawnBar::Status(text) => {
                 if self.update_status.as_ref().is_some_and(|s| &s.text == text) {
-                    self.update_status = None;
+                    self.uncover_status();
                 }
             }
             DrawnBar::AppUpdate { version } => {
@@ -1821,6 +1830,7 @@ impl App {
 
     fn start_pull(&mut self, image: String) {
         self.pull_digest = self.offered_digest(&image);
+        self.pull_started_here = true;
         self.pull_image = image.clone();
         self.cancel_after_start = false;
         self.pull.start();
@@ -1915,7 +1925,11 @@ impl App {
                 let installed = self
                     .pull_digest
                     .take()
-                    .or_else(|| self.offered_digest(&self.pull_image))
+                    .or_else(|| {
+                        (!self.pull_started_here)
+                            .then(|| self.offered_digest(&self.pull_image))
+                            .flatten()
+                    })
                     .map(|remote_digest| ImageUpdate {
                         image: self.pull_image.clone(),
                         remote_digest,
@@ -1943,12 +1957,15 @@ impl App {
             if self.pull_image.is_empty() {
                 self.pull_image = image.unwrap_or_default();
             }
-            if self.pull_digest.is_none() {
+            if self.pull_digest.is_none() && !self.pull_started_here {
                 self.pull_digest = self.offered_digest(&self.pull_image);
             }
-        } else if !self.pull.holds_line() {
-            self.pull_image.clear();
-            self.pull_digest = None;
+        } else {
+            self.pull_started_here = false;
+            if !self.pull.holds_line() {
+                self.pull_image.clear();
+                self.pull_digest = None;
+            }
         }
         if request == PullRequest::Start
             && std::mem::take(&mut self.cancel_after_start)
@@ -5475,7 +5492,8 @@ mod tests {
 
     /// A pull is tied to an offer's digest only when the offer is for the pulled image, so
     /// pulling A never takes off or suppresses B's offer: at the confirm, at Done, and for a
-    /// pull first seen running elsewhere.
+    /// pull first seen running elsewhere. A pull this TUI started takes no digest from an offer
+    /// made after its start.
     #[tokio::test]
     #[serial_test::serial]
     async fn a_pull_records_only_its_own_images_digest() {
@@ -5583,6 +5601,57 @@ mod tests {
             app.image_update,
             Some(b_at_a),
             "a poll's offer of B was suppressed"
+        );
+
+        // Nothing on offer for A at the start, and then A's tag moves.
+        let (mut app, _terminal) = key_app();
+        let sent = hold_pull_requests(&mut app);
+        app.start_pull(a.image.clone());
+        answer_sent(&mut app, &sent, 0, running());
+        let moved = ImageUpdate {
+            image: a.image.clone(),
+            remote_digest: "sha256:moved".into(),
+        };
+        answer_pull(
+            &mut app,
+            PullRequest::Poll,
+            PullAnswer {
+                report: running(),
+                offer: Some(ImageOffer::Update(moved.clone())),
+                image: Some(a.image.clone()),
+                flight: None,
+            },
+        );
+        answer_pull(&mut app, PullRequest::Poll, done());
+        assert_eq!(
+            app.image_update,
+            Some(moved.clone()),
+            "A's pull took an offer made after it started"
+        );
+
+        // Another client's pull of A, waiting behind this TUI's Done, is seen running elsewhere.
+        let (mut app, _terminal) = key_app();
+        let sent = hold_pull_requests(&mut app);
+        app.image_update = Some(a.clone());
+        app.start_pull(a.image.clone());
+        answer_sent(&mut app, &sent, 0, running());
+        answer_pull(&mut app, PullRequest::Poll, done());
+        answer_pull(
+            &mut app,
+            PullRequest::Poll,
+            PullAnswer {
+                report: running(),
+                offer: Some(ImageOffer::Update(moved.clone())),
+                image: Some(a.image.clone()),
+                flight: None,
+            },
+        );
+        assert!(app.pull.dismiss(&PullLine::Done));
+        answer_pull(&mut app, PullRequest::Poll, running());
+        answer_pull(&mut app, PullRequest::Poll, done());
+        assert_eq!(
+            app.image_update, None,
+            "the pull behind Done didn't take its offer off"
         );
     }
 
@@ -5695,6 +5764,7 @@ mod tests {
         for case in [
             "cancel unconfirmed",
             "image no longer configured",
+            "dismissed",
             "another status",
         ] {
             let (mut app, mut terminal) = key_app();
@@ -5711,13 +5781,21 @@ mod tests {
                     app.pull.start();
                     answer_pull(&mut app, PullRequest::Poll, PullReport::UnknownImage);
                 }
+                "dismissed" => app.set_pull_status(DISMISS_UNSAVED),
                 _ => app.set_status("auto-naming \"x\"…"),
             }
             let shown = app.update_status.as_ref().map(|s| s.text.clone());
             assert_ne!(shown.as_deref(), Some(NOTICE), "{case}: no message shown");
-            app.update_status.as_mut().unwrap().expires_at =
-                Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
-            app.expire_status();
+            if case == "dismissed" {
+                draw(&mut app);
+                let ctrl_x =
+                    bindings::key_event(bindings::ActionId::DismissUpdateBanner, false).unwrap();
+                app.handle_key(ctrl_x, &mut terminal).await.unwrap();
+            } else {
+                app.update_status.as_mut().unwrap().expires_at =
+                    Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+                app.expire_status();
+            }
             let after = app.update_status.as_ref().map(|s| s.text.as_str());
             let kept = case != "another status";
             assert_eq!(after, kept.then_some(NOTICE), "{case}");
