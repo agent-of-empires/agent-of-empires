@@ -33,20 +33,6 @@ pub use utils::{attach_return_hint, first_pane_id, tmux_prefix_display};
 
 pub(crate) use session_kind::{append_session_kind_args, SessionKind};
 
-#[doc(hidden)]
-#[cfg(feature = "e2e-tests")]
-pub fn tmux_pipe_input_version_supported(version: &str) -> bool {
-    #[cfg(unix)]
-    {
-        vt::parse_tmux_pipe_input_support(version) == Some(true)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = version;
-        false
-    }
-}
-
 /// OSC 8 hyperlinks the live VT channel for `session` has seen, oldest first.
 /// Always empty off unix, where there is no channel and the capture fallback
 /// carries the sequences in the frame text.
@@ -74,6 +60,20 @@ pub(crate) fn pane_links(session: &str) -> Vec<osc8::PaneLink> {
     {
         let _ = session;
         Vec::new()
+    }
+}
+
+#[doc(hidden)]
+#[cfg(feature = "e2e-tests")]
+pub fn tmux_pipe_input_version_supported(version: &str) -> bool {
+    #[cfg(unix)]
+    {
+        vt::parse_tmux_pipe_input_support(version) == Some(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = version;
+        false
     }
 }
 
