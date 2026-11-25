@@ -29,7 +29,7 @@ pub(crate) use rate_limit::{
 };
 pub(crate) use rate_limit::{resume_rate_limited, QuotaDelivery, QuotaResume};
 pub(crate) use resume::ensure_rate_limit_worker;
-pub(crate) use resume::{trigger_resume_background, ResumeTrigger};
+pub(crate) use resume::{trigger_resume_background, trigger_resume_observing, ResumeTrigger};
 
 use resume::{resume_one, ResumeTarget};
 
@@ -158,16 +158,6 @@ type ResumeDispatchGate = (
 #[cfg(test)]
 static RESUME_DISPATCH_GATE: std::sync::Mutex<Option<ResumeDispatchGate>> =
     std::sync::Mutex::new(None);
-
-fn refund_tick_budget(respawn_history: &mut HashMap<String, Vec<Instant>>, id: &str) {
-    if let Some(entries) = respawn_history.get_mut(id) {
-        entries.pop();
-        if entries.is_empty() {
-            respawn_history.remove(id);
-        }
-    }
-}
-
 async fn defer_control_refusal(
     state: &Arc<AppState>,
     id: &str,
@@ -718,7 +708,7 @@ pub async fn reconcile_acp_workers(
     while let Some(result) = set.join_next().await {
         match result {
             Ok((id, ResumeOutcome::RegistryBusy)) => {
-                refund_tick_budget(respawn_history, &id);
+                refund_respawn_attempt(respawn_history, &id);
                 attempted.remove(&id);
             }
             Ok((id, ResumeOutcome::Retry)) => {
@@ -738,7 +728,7 @@ pub async fn reconcile_acp_workers(
                     lifecycle_generation,
                 },
             )) => {
-                refund_tick_budget(respawn_history, &id);
+                refund_respawn_attempt(respawn_history, &id);
                 // Never pin: `attempted` would skip the session forever.
                 attempted.remove(&id);
                 // `publish_startup_error` does not dedup, so publish once per transition.
@@ -765,7 +755,7 @@ pub async fn reconcile_acp_workers(
                     originating_epoch,
                 },
             )) => {
-                refund_tick_budget(respawn_history, &id);
+                refund_respawn_attempt(respawn_history, &id);
                 attempted.remove(&id);
                 if let Some(scope) = scope {
                     defer_control_refusal(

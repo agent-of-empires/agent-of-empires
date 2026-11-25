@@ -60,9 +60,20 @@ export function visibleOrgRepos(groups: OrgNestedGroup[], expandAll: boolean): S
   return groups.flatMap((og) => (expandAll || !og.org.collapsed ? og.repos : []));
 }
 
+function sinkTimeMs(ws: Workspace): number {
+  let best = Number.NEGATIVE_INFINITY;
+  for (const s of ws.sessions) {
+    const ts = s.archived_at ?? s.snoozed_until ?? s.last_accessed_at;
+    const ms = ts ? Date.parse(ts) : Number.NaN;
+    if (ms > best) best = ms;
+  }
+  return best;
+}
+
 // Deduped by workspace: the status axis slices one workspace into a bucket per status, so the
 // footer lists it once with every archived session from those buckets. First bucket wins for
-// the row identity, matching the group order.
+// the row identity. Rows sort newest sunk first across groups, whatever the sidebar sort, matching
+// the TUI's Archived section.
 export const sunkViews = (groups: SidebarGroup[]) => {
   const byId = new Map<string, SidebarWorkspaceView>();
   for (const g of groups) {
@@ -83,7 +94,7 @@ export const sunkViews = (groups: SidebarGroup[]) => {
       }
     }
   }
-  return [...byId.values()];
+  return [...byId.values()].sort((a, b) => sinkTimeMs(b.workspace) - sinkTimeMs(a.workspace) || 0);
 };
 
 /** Rendered row keys in render order, so Shift+click ranges only span visible rows. `allGroups`

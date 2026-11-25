@@ -1,4 +1,3 @@
-import type { RepoColor } from "./repoAppearance";
 import type { ProjectInfo, RepoGroup, SessionResponse, SessionStatus, Workspace, WorkspaceStatus } from "./types";
 import { isSessionActive } from "./session";
 import {
@@ -19,7 +18,6 @@ export const NO_ORG_GROUP_ID = "__no_org__";
 
 // Header affordances per axis, gated here instead of by `kind` checks while rendering.
 export interface SidebarGroupCapabilities {
-  appearance: boolean;
   reorder: boolean;
   create: "repo" | "generic";
 }
@@ -34,9 +32,6 @@ export interface SidebarGroup {
   id: string;
   kind: "repo" | "sessionGroup" | "org" | "status";
   displayName: string;
-  defaultDisplayName: string;
-  alias: string | null;
-  color: RepoColor | null;
   /** `owner@host` of the Repository's remote; repo and org groups only. */
   remoteOwnerKey: string | null;
   workspaces: SidebarWorkspaceView[];
@@ -66,9 +61,6 @@ export function repoGroupToSidebarGroup(group: RepoGroup): SidebarGroup {
     id: group.id,
     kind: "repo",
     displayName: group.displayName,
-    defaultDisplayName: group.defaultDisplayName,
-    alias: group.alias,
-    color: group.color,
     remoteOwnerKey: group.remoteOwnerKey,
     workspaces: group.workspaces.map((workspace) => ({
       key: workspace.id,
@@ -77,7 +69,6 @@ export function repoGroupToSidebarGroup(group: RepoGroup): SidebarGroup {
     status: group.status,
     collapsed: group.collapsed,
     capabilities: {
-      appearance: true,
       reorder: true,
       create: synthetic ? "generic" : "repo",
     },
@@ -167,14 +158,11 @@ export function buildSessionGroups(
       id,
       kind: "sessionGroup",
       displayName: groupDisplayName(gp),
-      defaultDisplayName: groupDisplayName(gp),
-      alias: null,
-      color: null,
       remoteOwnerKey: null,
       workspaces: views,
       status: hasActive ? "active" : "idle",
       collapsed: opts.isCollapsed(id, gp),
-      capabilities: { appearance: false, reorder: false, create: "generic" },
+      capabilities: { reorder: false, create: "generic" },
       groupPath: gp,
       registeredProjects: [],
       pinned: false,
@@ -241,14 +229,11 @@ export function buildStatusGroups(
       id,
       kind: "status",
       displayName: status,
-      defaultDisplayName: status,
-      alias: null,
-      color: null,
       remoteOwnerKey: null,
       workspaces: views,
       status: views.some((v) => v.workspace.status === "active") ? "active" : "idle",
       collapsed: opts.isCollapsed(id),
-      capabilities: { appearance: false, reorder: false, create: "generic" },
+      capabilities: { reorder: false, create: "generic" },
       registeredProjects: [],
       pinned: false,
       pinnedEmpty: false,
@@ -281,7 +266,7 @@ export interface NestedSidebarGroup {
   subgroups: SidebarGroup[];
 }
 
-// Repo order, appearance and collapse come from the repo axis; subgroups split each repo's workspaces.
+// Repo order and collapse come from the repo axis; subgroups split each repo's workspaces.
 export function buildNestedSidebarGroups(
   repoGroups: RepoGroup[],
   opts: {
@@ -365,14 +350,11 @@ export function buildOrgGroups(
       id: orgId,
       kind: "org",
       displayName,
-      defaultDisplayName: displayName,
-      alias: null,
-      color: null,
       remoteOwnerKey: orgId === NO_ORG_GROUP_ID ? null : orgId,
       workspaces,
       status: hasActive ? "active" : "idle",
       collapsed: opts.isOrgCollapsed(orgId),
-      capabilities: { appearance: false, reorder: false, create: "generic" },
+      capabilities: { reorder: false, create: "generic" },
       registeredProjects: [],
       pinned: false,
       pinnedEmpty: false,

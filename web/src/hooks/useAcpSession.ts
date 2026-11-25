@@ -31,6 +31,7 @@ import { ACP_MAX_RETRIES, useAcpConnection } from "./acpSession/useAcpConnection
 import {
   cacheGet,
   cacheSet,
+  flushPersist,
   sweepExpiredStorage,
   registerLiveAcpActions,
   ownsLiveAcpActions,
@@ -151,6 +152,16 @@ const queueMigrations = new Map<string, Promise<ReadonlySet<string>>>();
 const attemptedMigrations = new Map<string, Set<string>>();
 const queueEdits = new Map<string, Promise<unknown>>();
 
+export function pendingRowIds(state: AcpState): ReadonlySet<string> {
+  return new Set(state.queuedPrompts.filter((q) => q.pending).map((q) => q.id));
+}
+
+/** True when a row became pending (enqueued) or stopped being pending (confirmed, removed, delivered). */
+export function pendingRowsChanged(before: ReadonlySet<string>, state: AcpState): boolean {
+  const now = pendingRowIds(state);
+  return now.size !== before.size || [...now].some((id) => !before.has(id));
+}
+
 function acknowledgeQueued(sessionId: string, action: Action): void {
   const targets = queueAckTargets.get(sessionId);
   if (targets?.size) {
@@ -158,7 +169,9 @@ function acknowledgeQueued(sessionId: string, action: Action): void {
     return;
   }
   const stored = cacheGet(sessionId);
-  if (stored) cacheSet(sessionId, reducer(stored, action));
+  if (!stored) return;
+  cacheSet(sessionId, reducer(stored, action));
+  flushPersist(sessionId);
 }
 
 function postQueuedInOrder(sessionId: string, task: (entry: QueuePosts) => Promise<void>): Promise<void> {
@@ -264,9 +277,23 @@ export function useAcpSession(
   const archivedAtRef = useLatestRef(archivedAt);
   const snoozedUntilRef = useLatestRef(snoozedUntil);
   const sessionIdRef = useLatestRef(sessionId);
+  const unconfirmedRef = useRef<ReadonlySet<string>>(new Set());
   useEffect(() => {
-    if (sessionIdRef.current) cacheSet(sessionIdRef.current, state);
+    if (!sessionIdRef.current) return;
+    cacheSet(sessionIdRef.current, state);
+    // An unconfirmed row is the only retry copy, and a confirmed one must not be re-sent by another window, so persist both now.
+    if (pendingRowsChanged(unconfirmedRef.current, state)) flushPersist(sessionIdRef.current);
+    unconfirmedRef.current = pendingRowIds(state);
   }, [state, sessionIdRef]);
+  // Separate from the `[state]` effect: its cleanup runs on every state change and would defeat the throttle.
+  useEffect(
+    () => () => {
+      // Cleanup on session switch or unmount.
+      // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
+      if (sessionId) flushPersist(sessionId);
+    },
+    [sessionId],
+  );
   const queuedPromptsRef = useLatestRef(state.queuedPrompts);
   const connection = useAcpConnection(sessionId, sessionIdRef, state, dispatch);
   const { status, lastActivityRef } = connection;

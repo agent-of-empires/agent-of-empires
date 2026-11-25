@@ -818,10 +818,9 @@ commit before ACK and replacement admission; physical absence alone does not
 settle metadata debt. A stopped resume carries its existing reservation directly
 into launch rather than admitting twice. Journal or handoff ownership refuses
 checkpoint takeover, and failed foreground commits retain custody.
-A concurrent restart returns `409 restart_in_progress`. A permanent deletion
-fence before the restart claim or replacement admission returns
-`409 purge_in_progress`. If the old
-worker cannot settle before the bounded shutdown wait, the endpoint returns a
+A concurrent restart returns `409 restart_in_progress`. Permanent deletion
+fencing the claim or replacement admission returns `409 purge_in_progress`.
+If the old worker cannot settle before the bounded shutdown wait, the endpoint returns a
 `503` settlement error and leaves the replacement admission to a retry. A
 separate `409 worker_not_stopped` response is used when the worker is still
 present after a successful shutdown wait. The restart request is runtime-owned,

@@ -1100,6 +1100,7 @@ export type PluginUiSlot =
   | "pane"
   | "composer-action"
   | "detail-badge"
+  | "composer-status"
   | "home-pane"
   | "page"
   | "notification";
@@ -1249,6 +1250,44 @@ export async function invokePluginCommand(fqid: string, sessionId: string): Prom
 export function updateSettings(updates: Record<string, unknown>, profile?: string): Promise<SaveOutcome> {
   const params = profile ? `?profile=${encodeURIComponent(profile)}` : "";
   return announceOutcome(sendSave(`/api/settings${params}`, jsonInit("PATCH", updates)));
+}
+
+/** An Agent's default model for new Structured view Sessions in a profile, as the Daemon resolves it. */
+export interface AgentModelDefault {
+  profile: string;
+  /** The `acp_defaults` key it reads from: `claude` for a legacy `claude-code` Session. */
+  agent_key: string;
+  /** Null when the Agent picks its own. */
+  model: string | null;
+  pinned: boolean;
+}
+
+const agentModelUrl = (profile: string, agent: string) =>
+  `/api/profiles/${encodeURIComponent(profile)}/acp-defaults/${encodeURIComponent(agent)}/model`;
+
+/** The default a Session's next Structured view spawn reads, under the profile and Agent key the Daemon resolves for it. */
+export function fetchSessionModelDefault(sessionId: string): Promise<AgentModelDefault | null> {
+  return fetchJson<AgentModelDefault>(`/api/sessions/${encodeURIComponent(sessionId)}/acp-default-model`);
+}
+
+/** Chains the PUTs so an earlier save still in flight can't land after, and overwrite, a later one. */
+let agentModelSaves: Promise<unknown> = Promise.resolve();
+
+/** Sets only `agent`'s default model in `profile`. `pinned`: the profile's resolved settings pin it, so nothing changed. */
+export async function putAgentModelDefault(
+  profile: string,
+  agent: string,
+  model: string,
+): Promise<SaveOutcome | "pinned"> {
+  const request = agentModelSaves.then(() =>
+    send(agentModelUrl(profile, agent), jsonInit("PUT", { model })).catch(() => null),
+  );
+  agentModelSaves = request;
+  const reply = await request;
+  if (reply?.status === 409 && stringField(reply.payload, "error") === "model_pinned") return "pinned";
+  const outcome = reply ? saveOutcome(reply) : "uncertain";
+  if (outcome !== "rejected") notifySettingsChanged();
+  return outcome;
 }
 
 /** Set the machine-wide value of every field in `updates`, for editors that
@@ -3025,25 +3064,6 @@ export async function setSessionPin(id: string, pinned: boolean): Promise<Sessio
     return await sessionUpdate(id, "pin", jsonInit("PATCH", { pinned }));
   } catch {
     return null;
-  }
-}
-
-/** Set (or clear, with `null`) a session's color label. Rendered as a colored
- *  status dot in the sidebar; the palette is `red` / `amber` / `green`. Also
- *  settable from the CLI via `aoe session color`. See #2383. */
-export async function setSessionColor(
-  id: string,
-  color: string | null,
-  expectedEpoch: string,
-): Promise<SessionSettingOutcome> {
-  try {
-    const res = await fetch(
-      `/api/sessions/${id}/color`,
-      jsonInit("PATCH", { color }, { "aoe-runtime-epoch": expectedEpoch }),
-    );
-    return await sessionSettingOutcome(res, id, expectedEpoch);
-  } catch {
-    return { outcome: "uncertain" };
   }
 }
 

@@ -1,6 +1,6 @@
 //! `TranscriptModel`: the server-side render model for the structured-view transcript.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::time::Timestamp;
 use indexmap::IndexMap;
@@ -124,6 +124,10 @@ fn session_notice_text(severity: &str, title: &str, description: &Option<String>
 #[derive(Debug, Default)]
 pub(crate) struct RetainedTranscript {
     pub rows: Vec<TranscriptRow>,
+    /// Row id to the seq that appended it.
+    pub row_seq: HashMap<String, u64>,
+    /// Tool call id to the seq of its latest start.
+    pub tool_start_seq: HashMap<String, u64>,
     pub unfinished_outputs: Vec<UnfinishedToolOutput>,
 }
 
@@ -188,6 +192,10 @@ pub(crate) fn closes_tool_lifecycle(
 pub struct TranscriptModel {
     rows: Vec<TranscriptRow>,
     row_ids: HashSet<String>,
+    /// Seq at which each row was appended, for clients that order by event order.
+    row_seq: HashMap<String, u64>,
+    /// Seq of each tool id's latest start; a reused id keeps its first row but restarts here.
+    tool_start_seq: HashMap<String, u64>,
     /// Tool lifecycle and buffered output, in opening order, including skipped starts.
     tools: IndexMap<String, ToolLifecycle>,
     /// Orphan snapshots remain readable but never feed subsequent tool invocations.
@@ -245,6 +253,8 @@ impl TranscriptModel {
         unfinished_outputs.sort_unstable_by_key(|output| output.first_seq);
         RetainedTranscript {
             rows: self.rows,
+            row_seq: self.row_seq,
+            tool_start_seq: self.tool_start_seq,
             unfinished_outputs,
         }
     }
@@ -793,6 +803,8 @@ impl TranscriptModel {
             return Vec::new();
         }
         self.track_tool_start(&tool_call.id, true);
+        self.tool_start_seq
+            .insert(tool_call.id.clone(), self.last_seq);
         self.turn_has_output = true;
         let Some(idx) = self.find_tool_start(&tool_call.id) else {
             return vec![self.append(tool_start_row(tool_call.clone()))];
@@ -947,6 +959,7 @@ impl TranscriptModel {
     fn append(&mut self, mut row: TranscriptRow) -> TranscriptDelta {
         row.seq = self.last_seq;
         self.row_ids.insert(row.id.clone());
+        self.row_seq.insert(row.id.clone(), self.last_seq);
         self.rows.push(row.clone());
         TranscriptDelta::Append(row)
     }

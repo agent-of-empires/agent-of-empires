@@ -239,6 +239,13 @@ pub(super) async fn resolve_canonical_fork_seed(
         )
         .map_err(|_| StatusCode::BAD_REQUEST.into_response());
     }
+    // Judged for the request's agent, which the checks below hold to the source's.
+    let profile = body
+        .profile
+        .clone()
+        .unwrap_or_else(|| state.served_profile().clone());
+    let structured_fork_capable = body.view == crate::session::View::Structured
+        && request_structured_fork_capable(&profile, body).await;
     let instances = state.instances.read().await;
     let source = instances
         .iter()
@@ -260,11 +267,16 @@ pub(super) async fn resolve_canonical_fork_seed(
         return Err(StatusCode::BAD_REQUEST.into_response());
     }
     let parent_id = if source.is_structured() {
-        if !crate::session::fork::structured_fork_capable(
+        if !structured_fork_capable {
+            return Err(StatusCode::BAD_REQUEST.into_response());
+        }
+        if !crate::session::fork::structured_fork_profile_compatible(
             &source.tool,
             source.agent_name.as_deref(),
+            &source.source_profile,
+            &profile,
         ) {
-            return Err(StatusCode::BAD_REQUEST.into_response());
+            return Err(StatusCode::CONFLICT.into_response());
         }
         source.acp_session_id.as_deref()
     } else {
@@ -286,6 +298,61 @@ pub(super) async fn resolve_canonical_fork_seed(
 fn acp_agent_key<'a>(tool: &'a str, agent_name: Option<&'a str>) -> &'a str {
     agent_name.filter(|s| !s.is_empty()).unwrap_or(tool)
 }
+
+/// The `agent_name` a structured fork of `parent_id` runs, held to the agent of
+/// the rows that recorded that conversation as `fork_session_id` holds it. A
+/// request naming no agent under the parent's tool inherits the parent's
+/// `agent_name`; a parent no row records leaves the request as it is. The error
+/// is the refusal's message.
+pub(super) fn structured_fork_agent_name(
+    rows: &[crate::session::Instance],
+    parent_id: &str,
+    profile: &str,
+    tool: &str,
+    agent_name: Option<&str>,
+) -> Result<Option<String>, &'static str> {
+    let parents: Vec<_> = rows
+        .iter()
+        .filter(|row| row.acp_session_id.as_deref() == Some(parent_id))
+        .collect();
+    let agent_name = agent_name.filter(|s| !s.is_empty());
+    let Some(parent) = parents.first() else {
+        return Ok(agent_name.map(str::to_string));
+    };
+    let parent_key = acp_agent_key(&parent.tool, parent.agent_name.as_deref());
+    if parents
+        .iter()
+        .any(|row| acp_agent_key(&row.tool, row.agent_name.as_deref()) != parent_key)
+    {
+        return Err(FORK_AGENT_MISMATCH);
+    }
+    // The rows agree on the agent, so any row under the requested tool names it.
+    let agent_name = match agent_name {
+        None => parents
+            .iter()
+            .find(|row| row.tool == tool)
+            .and_then(|row| row.agent_name.clone()),
+        named => named.map(str::to_string),
+    };
+    if acp_agent_key(tool, agent_name.as_deref()) != parent_key {
+        return Err(FORK_AGENT_MISMATCH);
+    }
+    if !parents.iter().all(|row| {
+        crate::session::fork::structured_fork_profile_compatible(
+            &row.tool,
+            row.agent_name.as_deref(),
+            &row.source_profile,
+            profile,
+        )
+    }) {
+        return Err(FORK_PROFILE_MISMATCH);
+    }
+    Ok(agent_name)
+}
+
+const FORK_AGENT_MISMATCH: &str = "A structured fork must run the agent of the session it forks";
+const FORK_PROFILE_MISMATCH: &str =
+    "A structured fork of a custom agent must stay in the profile of the session it forks";
 
 /// True iff the agent can run a structured (ACP) session in this project: a
 /// built-in ACP agent in the registry, or a custom tool with a valid
@@ -320,6 +387,25 @@ pub(crate) fn agent_is_acp_capable(
         // A custom agent inheriting a registry-backed base spawns through that
         // base adapter, so report it capable up front.
         || crate::acp::inherited_acp_base(resolved, &session.agent_detect_as).is_some()
+}
+
+/// [`crate::session::fork::structured_fork_capable_in`] for a create request's
+/// agent, off the async runtime because a custom agent reads config.
+async fn request_structured_fork_capable(profile: &str, body: &CreateSessionBody) -> bool {
+    let profile = profile.to_string();
+    let project_path = std::path::PathBuf::from(&body.path);
+    let tool = body.tool.clone();
+    let agent_name = body.agent_name.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::session::fork::structured_fork_capable_in(
+            &profile,
+            &project_path,
+            &tool,
+            agent_name.as_deref(),
+        )
+    })
+    .await
+    .unwrap_or(false)
 }
 
 pub(super) fn validate_session_tool_identity(
@@ -1209,6 +1295,31 @@ pub(crate) async fn create_session_with(
         );
     }
 
+    // A structured fork runs the agent that recorded the conversation, so the
+    // policy and capability checks below judge that agent.
+    if body.view == crate::session::View::Structured {
+        if let Some(parent_id) = body
+            .fork_from
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let instances = state.instances.read().await;
+            match structured_fork_agent_name(
+                &instances,
+                parent_id,
+                validation_profile,
+                &body.tool,
+                body.agent_name.as_deref(),
+            ) {
+                Ok(agent_name) => body.agent_name = agent_name,
+                Err(message) => {
+                    return api_error(StatusCode::BAD_REQUEST, "fork_unsupported", message);
+                }
+            }
+        }
+    }
+
     // Operator agent allowlist (#3241), answered here rather than failing at
     // spawn. Applies outside CityHall too, whose create path only proves the
     // agent is ACP-capable, not that the operator permits it. Placed after the
@@ -1413,12 +1524,7 @@ pub(crate) async fn create_session_with(
             // A structured fork needs a live ACP connection. Reject it here, or
             // the post-build capability check silently downgrades it to a
             // non-forked terminal session, dropping the fork.
-            if structured
-                && !crate::session::fork::structured_fork_capable(
-                    &body.tool,
-                    body.agent_name.as_deref(),
-                )
-            {
+            if structured && !request_structured_fork_capable(validation_profile, &body).await {
                 return api_error(
                     StatusCode::BAD_REQUEST,
                     "fork_unsupported",

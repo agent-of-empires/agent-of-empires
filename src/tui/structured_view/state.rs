@@ -154,6 +154,8 @@ pub struct StructuredViewState {
     /// held as a real `Sent` response would until the turn-start echo clears it.
     #[cfg(test)]
     pub accept_submits_for_test: usize,
+    #[cfg(test)]
+    pub prompt_intent_available_for_test: bool,
     /// Every prompt the composer submitted, in order. Test-only, so the paste
     /// handoff can assert what each Enter actually sent.
     #[cfg(test)]
@@ -466,6 +468,8 @@ impl StructuredViewState {
             #[cfg(test)]
             accept_submits_for_test: 0,
             #[cfg(test)]
+            prompt_intent_available_for_test: false,
+            #[cfg(test)]
             submitted_prompts: Vec::new(),
             show_full_thinking: false,
             transcript_cache: RefCell::new(None),
@@ -559,6 +563,10 @@ impl StructuredViewState {
     }
 
     pub fn can_submit_prompt_intent(&self) -> bool {
+        #[cfg(test)]
+        if self.prompt_intent_available_for_test {
+            return true;
+        }
         self.ws.is_some()
             && self.transcript.native_snapshot_seq.is_some()
             && self.transcript.connection_unavailable.is_none()

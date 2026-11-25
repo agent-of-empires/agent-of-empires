@@ -1793,12 +1793,18 @@ impl<S: BroadcastSink> Drain<S> {
             .as_ref()
             .filter(|sandbox| sandbox.enabled)
             .map(|sandbox| sandbox.container_name.clone());
-        let (_, container) = tokio::join!(tokio::time::sleep(RESPAWN_BACKOFF), async {
-            match container {
-                Some(name) => probe_sandbox_container(name).await,
-                None => ContainerState::Present,
-            }
-        });
+        let container = tokio::select! {
+            biased;
+            _ = lease.cancellation().cancelled() => return None,
+            (_, state) = async {
+                tokio::join!(tokio::time::sleep(RESPAWN_BACKOFF), async {
+                    match container {
+                        Some(name) => probe_sandbox_container(name).await,
+                        None => ContainerState::Present,
+                    }
+                })
+            } => state,
+        };
         // Retag the existing handle while both admission gates are held.
         // This is still the same drain/client; launch_epoch remains unchanged.
         let mut retry = false;

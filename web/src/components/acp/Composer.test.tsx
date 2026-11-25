@@ -165,6 +165,30 @@ describe("toolbar and send", () => {
     expect(tip.includes(spend)).toBe(cost !== null);
   });
 
+  it("renders plugin composer-status beside the usage hint for this session only", () => {
+    const status = (id: string, session_id: string): PluginUiEntry => ({
+      plugin_id: "acme.kit",
+      slot: "composer-status",
+      id,
+      session_id,
+      payload: { text: `status ${id}` },
+    });
+    entriesRef.current = [status("mine", "sess"), status("theirs", "other")];
+    mount({ sessionUsage: { used: 50_000, size: 200_000, cost: null } });
+    const slot = screen.getByTestId("plugin-composer-status");
+    expect(slot.textContent).toBe("status mine");
+    const trailing = screen.getByTestId("composer-trailing");
+    expect(trailing.contains(slot)).toBe(true);
+    expect(trailing.contains(screen.getByTestId("composer-usage"))).toBe(true);
+  });
+
+  it("leaves the trailing cluster empty, so it hides, with no status and no usage", () => {
+    mount();
+    const trailing = screen.getByTestId("composer-trailing");
+    expect(trailing.childNodes.length).toBe(0);
+    expect(trailing.className).toContain("empty:hidden");
+  });
+
   it("stages pasted image files and leaves text paste alone", async () => {
     const setPendingAttachments = vi.fn();
     const { textarea } = mount({

@@ -309,11 +309,13 @@ impl Instance {
                 stored.resume_probe_failed_sid = self.resume_probe_failed_sid.clone();
             }
             stored.first_launch_names_agent = false;
+            stored.unproven_native_birth_generation = None;
             stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
             Ok(true)
         })?;
         anyhow::ensure!(committed, LifecycleReservationError::Superseded);
         self.lifecycle_reservation = None;
+        self.unproven_native_birth_generation = None;
         self.first_launch_names_agent = false;
         Ok(())
     }
@@ -325,7 +327,7 @@ impl Instance {
         probe: &resume::LaunchProbe,
         sandbox_prior: Option<&resume::LaunchSandboxSnapshot>,
     ) -> Result<()> {
-        let status = storage.update(|rows, _| {
+        let (status, unproven_birth) = storage.update(|rows, _| {
             let row = rows
                 .iter_mut()
                 .find(|row| row.id == self.id)
@@ -335,6 +337,10 @@ impl Instance {
                 LifecycleReservationError::Superseded
             );
             if probe.expected.matches_launch_observation(row) {
+                if probe.pane.is_some() && row.unproven_native_birth_generation == Some(generation)
+                {
+                    row.unproven_native_birth_generation = None;
+                }
                 row.capture_started_at = self.capture_started_at;
                 row.started_at = self.started_at;
                 row.launch_executable.clone_from(&self.launch_executable);
@@ -364,9 +370,10 @@ impl Instance {
                 row.status = Status::Starting;
             }
             row.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
-            Ok(row.status)
+            Ok((row.status, row.unproven_native_birth_generation))
         })?;
         self.lifecycle_reservation = None;
+        self.unproven_native_birth_generation = unproven_birth;
         self.status = status;
         Ok(())
     }

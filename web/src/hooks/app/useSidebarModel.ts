@@ -99,7 +99,6 @@ export function useSidebarModel({
     toggleOrgCollapsed: org.toggleOrgCollapsed,
     toggleOrgRepoCollapsed: org.toggleRepoCollapsed,
     savedProjects: repo.savedProjects,
-    updateRepoAppearance: repo.updateRepoAppearance,
     reorderRepoGroups: repo.reorderRepoGroups,
     reorderWorkspaces,
     attentionJump,

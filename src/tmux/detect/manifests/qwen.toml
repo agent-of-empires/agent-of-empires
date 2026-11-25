@@ -16,6 +16,11 @@ id = "approval_prompt"
 priority = 950
 contains_any = ["execute?", "run command?", "enter to select", "esc to cancel"]
 
+[[rules]]
+extends = "approval_choice"
+id = "approval_choice"
+priority = 950
+
 # Qwen renders its menu cursor as `›` by default and `❯` in some themes.
 [[rules]]
 id = "numbered_choice"

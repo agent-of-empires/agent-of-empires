@@ -1,4 +1,4 @@
-//! Pin, color, archive, trash/restore, rename/summarize triggers, and
+//! Pin, archive, trash/restore, rename/summarize triggers, and
 //! stop/start/snooze/unread endpoints.
 
 use super::*;
@@ -273,73 +273,6 @@ pub async fn reclaim_session_ownership(
     }
     tracing::info!(target: "session.sync", session = %id, field = "ownership", value = "reclaimed", "session updated");
     drop(guard);
-    drop(namespace);
-    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
-}
-
-pub async fn update_session_color(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    body: Result<Json<UpdateColorBody>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    if state.read_only {
-        return crate::server::api::read_only_response();
-    }
-    let Json(body) = match body {
-        Ok(b) => b,
-        Err(rej) => return rej.into_response(),
-    };
-
-    // Validate up front so an unknown color never reaches disk; `None` clears
-    // the label. Mirrors the CLI's palette check.
-    let new_color = body.color.map(|c| c.trim().to_lowercase());
-    if let Some(c) = &new_color {
-        if !crate::session::is_valid_session_color(c) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!("invalid color {c:?}; expected one of: red, amber, green, or null"),
-                })),
-            )
-                .into_response();
-        }
-    }
-
-    let namespace = state.profile_namespace.read().await;
-    let lock = state.instance_lock(&id).await;
-    let _guard = lock.lock().await;
-    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
-        return response;
-    }
-
-    let profile = {
-        let instances = state.instances.read().await;
-        let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return crate::server::api::session_not_found();
-        };
-        inst.source_profile.clone()
-    };
-
-    let color = new_color.clone();
-    let persist_id = id.clone();
-    let committed = commit_profile_update(
-        &state,
-        profile,
-        "color update",
-        move |instances| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                // Pre-validated above, so this cannot fail.
-                let _ = inst.set_color(new_color);
-            }
-        },
-        None,
-    )
-    .await;
-    if let Err(response) = committed {
-        return response;
-    }
-    tracing::info!(target: "session.sync", session = %id, field = "color", value = ?color, "session updated");
-    drop(_guard);
     drop(namespace);
     crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
 }
@@ -1702,6 +1635,9 @@ pub(crate) fn lifecycle_rejection(
     if let Some(cause) = error.downcast_ref::<crate::session::LaunchIndeterminateCause>() {
         return Some(super::ensure::indeterminate_launch_response(*cause));
     }
+    if error.is::<super::send::IgnoredSession>() {
+        return Some(super::send::ignored_response());
+    }
     match error.downcast_ref::<LifecycleTargetError>() {
         Some(LifecycleTargetError::Missing) => {
             return Some(if state.cityhall_mode {
@@ -1837,6 +1773,15 @@ async fn adopt_lifecycle_commit<R>(
 }
 
 fn structured_lifecycle_error(state: &AppState, error: anyhow::Error) -> axum::response::Response {
+    if error.is::<crate::process::worker_registry::StopSuperseded>() {
+        let mut response = api_error(
+            StatusCode::CONFLICT,
+            "stop_fenced",
+            "The session was stopped again; start it to send this message",
+        );
+        super::super::insert_code_header(&mut response, crate::daemon::ApiErrorCode::ResumeFailed);
+        return response;
+    }
     if error.is::<crate::session::SessionCommitApplied>() {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2100,7 +2045,7 @@ pub(crate) async fn resume_structured_stop(
     kind: Option<crate::acp::supervisor::ResumeKind>,
 ) -> Result<(Instance, Option<crate::acp::supervisor::ResumeReservation>), axum::response::Response>
 {
-    resume_structured_stop_with_restart(state, expected, kind, None, None).await
+    resume_structured_stop_with_restart(state, expected, kind, None, None, true).await
 }
 
 pub(crate) async fn resume_structured_stop_with_restart(
@@ -2109,9 +2054,19 @@ pub(crate) async fn resume_structured_stop_with_restart(
     kind: Option<crate::acp::supervisor::ResumeKind>,
     restart: Option<&crate::acp::supervisor::RestartRequestGuard>,
     establishment: Option<Arc<crate::acp::establishment::EstablishmentAttempt>>,
+    allow_explicit_stop: bool,
 ) -> Result<(Instance, Option<crate::acp::supervisor::ResumeReservation>), axum::response::Response>
 {
-    resume_structured_stop_inner(state, expected, kind, restart, establishment, true).await
+    resume_structured_stop_inner(
+        state,
+        expected,
+        kind,
+        restart,
+        establishment,
+        true,
+        allow_explicit_stop,
+    )
+    .await
 }
 
 /// Retire the exact source before a route-changing launch selects its destination.
@@ -2121,7 +2076,7 @@ pub(crate) async fn resume_structured_stop_deferred(
     kind: Option<crate::acp::supervisor::ResumeKind>,
 ) -> Result<(Instance, Option<crate::acp::supervisor::ResumeReservation>), axum::response::Response>
 {
-    resume_structured_stop_inner(state, expected, kind, None, None, false).await
+    resume_structured_stop_inner(state, expected, kind, None, None, false, true).await
 }
 
 async fn resume_structured_stop_inner(
@@ -2131,6 +2086,7 @@ async fn resume_structured_stop_inner(
     restart: Option<&crate::acp::supervisor::RestartRequestGuard>,
     establishment: Option<Arc<crate::acp::establishment::EstablishmentAttempt>>,
     arm_selection: bool,
+    allow_explicit_stop: bool,
 ) -> Result<(Instance, Option<crate::acp::supervisor::ResumeReservation>), axum::response::Response>
 {
     use crate::process::worker_registry::{self, ResumeAuthority};
@@ -2195,7 +2151,9 @@ async fn resume_structured_stop_inner(
             );
             let registry = worker_registry::try_registry_lock(&probe_id)?
                 .ok_or(worker_registry::RegistryBusy)?;
-            let observed_stop = registry.stop()?;
+            let observed_stop = registry
+                .stop()
+                .map_err(|error| error.context(worker_registry::StopSuperseded))?;
             let stopped_record = registry.record()?;
             let context = crate::acp::state::NativeEventContext::capture(&row, native.storage())?;
             drop(registry);
@@ -2221,6 +2179,9 @@ async fn resume_structured_stop_inner(
         .map_err(anyhow::Error::from)
         .and_then(|result| result)
         .map_err(|error| structured_lifecycle_error(state, error))?;
+    if !allow_explicit_stop && observed_stop.is_some() {
+        return Ok((expected, None));
+    }
     let target = state
         .acp_supervisor
         .capture_retirement(&expected.id)
@@ -2289,7 +2250,13 @@ async fn resume_structured_stop_inner(
     });
     let mut reservation = state
         .acp_supervisor
-        .reserve_spawn_with_restart(&expected.id, kind, ResumeAuthority::Explicit, restart)
+        .reserve_spawn_with_restart(
+            &expected.id,
+            kind,
+            ResumeAuthority::Explicit,
+            restart,
+            Some(observed_stop.clone()),
+        )
         .await
         .map_err(|error| {
             if restart.is_some()
@@ -2303,12 +2270,6 @@ async fn resume_structured_stop_inner(
                 crate::server::api::acp::supervisor_error_response("resume failed", &error)
             }
         })?;
-    if reservation.observed_stop() != Some(&observed_stop) {
-        return Err(structured_lifecycle_error(
-            state,
-            crate::session::LifecycleReservationError::Superseded.into(),
-        ));
-    }
     let supervisor = state.acp_supervisor.clone();
     tokio::task::spawn_blocking(move || {
         let _title = crate::session::acquire_session_title_lock(&expected.id)?;
@@ -3964,6 +3925,7 @@ struct AgentPreparationInput {
     >,
     captured: Option<Instance>,
     physical: Option<Arc<crate::session::LegacyToolObservation>>,
+    refuse_if_ignored: bool,
 }
 
 pub(super) async fn prepare_agent_session(
@@ -3983,6 +3945,7 @@ pub(super) async fn prepare_agent_session(
             body,
             captured: None,
             physical: None,
+            refuse_if_ignored: false,
         },
         preparation,
         restart,
@@ -3999,6 +3962,7 @@ pub(super) async fn prepare_captured_terminal_session(
     instance: Instance,
     expected: crate::daemon::NativePreparationIdentity,
     physical: Option<Arc<crate::session::LegacyToolObservation>>,
+    refuse_if_ignored: bool,
 ) -> axum::response::Response {
     Box::pin(prepare_agent_session_inner(
         state,
@@ -4010,6 +3974,7 @@ pub(super) async fn prepare_captured_terminal_session(
             }))),
             captured: Some(instance),
             physical,
+            refuse_if_ignored,
         },
         AgentPreparation::Ensure,
         None,
@@ -4104,6 +4069,7 @@ pub(super) async fn failover_account_swap_with(
             body: Ok(None),
             captured: None,
             physical: None,
+            refuse_if_ignored: false,
         },
         AgentPreparation::Restart,
         Some(Arc::new(crate::daemon::RestartSessionBody {
@@ -4307,6 +4273,7 @@ pub(crate) async fn recovery_restart(
             body: Ok(None),
             captured: None,
             physical: None,
+            refuse_if_ignored: false,
         },
         AgentPreparation::Restart,
         Some(Arc::new(crate::daemon::RestartSessionBody {
@@ -4340,6 +4307,7 @@ async fn prepare_agent_session_inner(
         body,
         captured,
         physical: mut captured_physical,
+        refuse_if_ignored,
     } = input;
     if preparation == AgentPreparation::Ensure && state.cityhall_mode {
         return crate::server::api::cityhall_response();
@@ -4860,6 +4828,10 @@ async fn prepare_agent_session_inner(
                         .as_ref()
                         .is_none_or(|expected| expected.matches(row)),
                     crate::session::LifecycleReservationError::Superseded
+                );
+                anyhow::ensure!(
+                    !refuse_if_ignored || !row.is_ignored(),
+                    super::send::IgnoredSession
                 );
                 if worker_state.cityhall_mode && !row.is_structured() {
                     return Err(LifecycleTargetError::CityHall.into());
@@ -6503,7 +6475,11 @@ mod durable_stop_tests {
             let log = std::fs::read_to_string(&calls).unwrap_or_default();
             assert_eq!(
                 log.trim(),
-                if superseded { "" } else { "stop c1" },
+                if superseded {
+                    ""
+                } else {
+                    "inspect --format {{json .Config.Entrypoint}}|{{json .HostConfig.Init}}|{{json .Config.StopTimeout}}|{{json .State.Pid}} c1\nstop c1"
+                },
                 "superseded={superseded}"
             );
         }

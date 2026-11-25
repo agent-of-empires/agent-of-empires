@@ -4935,24 +4935,82 @@ mod tests {
     #[test]
     fn ensure_agent_accepts_an_unclassified_status_only_with_the_same_live_pane() {
         use crate::session::PanePresence;
-        for (status, pane, tmux_session, generation, attach) in [
-            ("Unknown", PanePresence::Alive, Some("agent-4"), 4, true),
-            ("Idle", PanePresence::Alive, Some("agent-4"), 4, true),
-            ("Stopped", PanePresence::Alive, Some("agent-4"), 4, false),
-            ("Error", PanePresence::Alive, Some("agent-4"), 4, false),
-            ("Deleting", PanePresence::Alive, Some("agent-4"), 4, false),
+        for (status, pane, tmux_session, generation, changed_physical, attach) in [
+            (
+                "Unknown",
+                PanePresence::Alive,
+                Some("agent-4"),
+                4,
+                false,
+                true,
+            ),
+            ("Idle", PanePresence::Alive, Some("agent-4"), 4, false, true),
+            (
+                "Stopped",
+                PanePresence::Alive,
+                Some("agent-4"),
+                4,
+                false,
+                false,
+            ),
+            (
+                "Error",
+                PanePresence::Alive,
+                Some("agent-4"),
+                4,
+                false,
+                false,
+            ),
+            (
+                "Deleting",
+                PanePresence::Alive,
+                Some("agent-4"),
+                4,
+                false,
+                false,
+            ),
             (
                 "Unknown",
                 PanePresence::Alive,
                 Some("renamed-agent"),
                 4,
+                false,
                 true,
             ),
-            ("Unknown", PanePresence::Alive, Some("agent-4"), 5, false),
-            ("Unknown", PanePresence::Dead, Some("agent-4"), 4, false),
-            ("Unknown", PanePresence::Absent, Some("agent-4"), 4, false),
+            (
+                "Unknown",
+                PanePresence::Alive,
+                Some("agent-4"),
+                4,
+                true,
+                false,
+            ),
+            (
+                "Unknown",
+                PanePresence::Alive,
+                Some("agent-4"),
+                5,
+                false,
+                false,
+            ),
+            (
+                "Unknown",
+                PanePresence::Dead,
+                Some("agent-4"),
+                4,
+                false,
+                false,
+            ),
+            (
+                "Unknown",
+                PanePresence::Absent,
+                Some("agent-4"),
+                4,
+                false,
+                false,
+            ),
         ] {
-            let mut row: crate::daemon::SessionResponse =
+            let row: crate::daemon::SessionResponse =
                 serde_json::from_value(serde_json::json!({
                     "id": "session",
                     "profile": "test",
@@ -4962,8 +5020,6 @@ mod tests {
                     "agent_pane": {"physical": native_physical_fixture(), "state": "alive", "tmux_session": "agent-4"},
                 }))
                 .unwrap();
-            row.agent_pane.state = pane;
-            row.agent_pane.tmux_session = tmux_session.map(str::to_owned);
             let mut initial = snapshot("test", 1);
             Arc::make_mut(&mut initial).contents.sessions.push(row);
             let mut feed =
@@ -4991,9 +5047,18 @@ mod tests {
                 })))
                 .unwrap();
             let mut next = initial;
-            Arc::make_mut(&mut next).cursor.revision = 2;
-            Arc::make_mut(&mut next).contents.sessions[0].lifecycle_generation = generation;
-            Arc::make_mut(&mut next).contents.sessions[0].status = status.into();
+            let committed = Arc::make_mut(&mut next);
+            committed.cursor.revision = 2;
+            let row = &mut committed.contents.sessions[0];
+            row.lifecycle_generation = generation;
+            row.status = status.into();
+            row.agent_pane.state = pane;
+            row.agent_pane.tmux_session = tmux_session.map(str::to_owned);
+            if changed_physical {
+                Arc::make_mut(row.agent_pane.physical.as_mut().unwrap())
+                    .identity
+                    .pane_id = "%99".into();
+            }
             feed.publish_for_test(SessionFeedResult::Snapshot(next.clone()));
             assert!(feed.drain_command_errors().is_empty());
             feed.mark_snapshot_applied(next);
@@ -5001,7 +5066,7 @@ mod tests {
             assert_eq!(
                 prepared.result.try_recv().unwrap().is_ok(),
                 attach,
-                "{status} {pane:?} {tmux_session:?} generation={generation}"
+                "{status} {pane:?} {tmux_session:?} generation={generation} changed_physical={changed_physical}"
             );
         }
     }

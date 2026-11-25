@@ -12,7 +12,7 @@ const GAP = 3000;
 const DEADLINE = 15000;
 const cursor = (revision: bigint, epoch = "boot"): RuntimeCursor => ({ epoch, revision });
 const envelope = (ids: string[], revision = 10n, epoch = "boot"): SessionsEnvelope => ({
-  sessions: ids.map((id) => ({ id, color: null })) as SessionsEnvelope["sessions"],
+  sessions: ids.map((id) => ({ id, branch: null })) as SessionsEnvelope["sessions"],
   workspace_ordering: ids,
   cursor: cursor(revision, epoch),
 });
@@ -145,7 +145,7 @@ describe("connectivity independently of canonical admission", () => {
       await settle(GAP);
       act(() =>
         result.current.applySessionMutation({
-          session: { ...result.current.sessions[1]!, color: "green" },
+          session: { ...result.current.sessions[1]!, branch: "green" },
           cursor: cursor(12n),
         }),
       );
@@ -163,7 +163,7 @@ describe("connectivity independently of canonical admission", () => {
       expect(ids(result)).toEqual(["A", "B"]);
       expect(result.current.workspaceOrdering).toEqual(["A", "B"]);
       expect(result.current.observedById).toEqual({ A: cursor(10n), B: cursor(12n) });
-      expect(result.current.sessions[1]!.color).toBe("green");
+      expect(result.current.sessions[1]!.branch).toBe("green");
     },
   );
 });
@@ -171,35 +171,35 @@ describe("connectivity independently of canonical admission", () => {
 describe("canonical session receipts", () => {
   it("installs A11 after B12, fences stale GET/order, and publishes per-id rows and observations atomically", async () => {
     vi.mocked(fetchSessions).mockResolvedValue(envelope(["A", "B"]));
-    const trace: { color: string | null | undefined; revision: bigint | undefined }[] = [];
+    const trace: { branch: string | null | undefined; revision: bigint | undefined }[] = [];
     const { result } = renderHook(() => {
       const state = useSessions();
       trace.push({
-        color: state.sessions.find((row) => row.id === "A")?.color,
+        branch: state.sessions.find((row) => row.id === "A")?.branch,
         revision: state.observedById.A?.revision,
       });
       return state;
     });
     await settle();
-    const mutation = (id: string, revision: bigint, color: string | null) => ({
-      session: { ...result.current.sessions.find((row) => row.id === id)!, color },
+    const mutation = (id: string, revision: bigint, branch: string | null) => ({
+      session: { ...result.current.sessions.find((row) => row.id === id)!, branch },
       cursor: cursor(revision),
     });
     act(() => result.current.applySessionMutation(mutation("B", 12n, "green")));
     expect(result.current.observedById.A).toEqual(cursor(10n));
     act(() => result.current.applySessionMutation(mutation("A", 11n, "red")));
-    expect(result.current.sessions.map((row) => row.color)).toEqual(["red", "green"]);
+    expect(result.current.sessions.map((row) => row.branch)).toEqual(["red", "green"]);
     expect(result.current.observedById).toEqual({ A: cursor(11n), B: cursor(12n) });
     vi.mocked(fetchSessions).mockResolvedValueOnce(envelope(["B", "A"], 11n));
     await settle(GAP);
     expect(ids(result)).toEqual(["A", "B"]);
     expect(result.current.workspaceOrdering).toEqual(["A", "B"]);
-    expect(result.current.sessions.map((row) => row.color)).toEqual(["red", "green"]);
+    expect(result.current.sessions.map((row) => row.branch)).toEqual(["red", "green"]);
     vi.mocked(fetchSessions).mockResolvedValueOnce(envelope(["B", "A"], 12n));
     await settle(GAP);
     expect(ids(result)).toEqual(["B", "A"]);
     expect(result.current.observedById).toEqual({ A: cursor(12n), B: cursor(12n) });
-    expect(trace.some((row) => row.revision === 11n && row.color !== "red")).toBe(false);
+    expect(trace.some((row) => row.revision === 11n && row.branch !== "red")).toBe(false);
   });
 
   it("synchronously fences same-batch GETs but compares mutation ACKs only to their own row", async () => {
@@ -212,29 +212,29 @@ describe("canonical session receipts", () => {
     await settle(GAP);
     await act(async () => {
       result.current.applySessionMutation({
-        session: { ...result.current.sessions[1]!, color: "green" },
+        session: { ...result.current.sessions[1]!, branch: "green" },
         cursor: cursor(12n),
       });
       result.current.applySessionMutation({
-        session: { ...result.current.sessions[0]!, color: "red" },
+        session: { ...result.current.sessions[0]!, branch: "red" },
         cursor: cursor(11n),
       });
       poll.resolve(envelope(["B", "A"], 11n));
     });
     expect(ids(result)).toEqual(["A", "B"]);
-    expect(result.current.sessions.map((row) => row.color)).toEqual(["red", "green"]);
+    expect(result.current.sessions.map((row) => row.branch)).toEqual(["red", "green"]);
     expect(result.current.observedById).toEqual({ A: cursor(11n), B: cursor(12n) });
     act(() => {
       result.current.applySessionMutation({
-        session: { ...result.current.sessions[0]!, color: "amber" },
+        session: { ...result.current.sessions[0]!, branch: "amber" },
         cursor: cursor(13n),
       });
       result.current.applySessionMutation({
-        session: { ...result.current.sessions[0]!, color: null },
+        session: { ...result.current.sessions[0]!, branch: null },
         cursor: cursor(11n),
       });
     });
-    expect(result.current.sessions[0]!.color).toBe("amber");
+    expect(result.current.sessions[0]!.branch).toBe("amber");
     expect(result.current.observedById.A).toEqual(cursor(13n));
   });
 
@@ -246,9 +246,9 @@ describe("canonical session receipts", () => {
     await settle();
     const row = result.current.sessions[0]!;
     const { queue_reason: _, ...bare } = row;
-    act(() => result.current.applySession({ ...bare, color: "green" }));
-    act(() => result.current.applySessionMutation({ session: { ...bare, color: "red" }, cursor: cursor(11n) }));
-    expect(result.current.sessions[0]).toMatchObject({ color: "red", queue_reason: "compacting" });
+    act(() => result.current.applySession({ ...bare, branch: "green" }));
+    act(() => result.current.applySessionMutation({ session: { ...bare, branch: "red" }, cursor: cursor(11n) }));
+    expect(result.current.sessions[0]).toMatchObject({ branch: "red", queue_reason: "compacting" });
     vi.mocked(fetchSessions).mockResolvedValueOnce(envelope(["A"], 12n));
     await settle(GAP);
     expect(result.current.sessions[0]!.queue_reason).toBeUndefined();
@@ -261,7 +261,9 @@ describe("canonical session receipts", () => {
     const oldA = result.current.sessions[0]!;
     vi.mocked(fetchSessions).mockResolvedValueOnce(envelope(["A"], 1n, "new"));
     await settle(GAP);
-    act(() => result.current.applySessionMutation({ session: { ...oldA, color: "red" }, cursor: cursor(999n, "old") }));
+    act(() =>
+      result.current.applySessionMutation({ session: { ...oldA, branch: "red" }, cursor: cursor(999n, "old") }),
+    );
     vi.mocked(fetchSessions).mockResolvedValueOnce(envelope(["B"], 1000n, "old"));
     await settle(GAP);
     expect(ids(result)).toEqual(["A"]);
@@ -270,7 +272,7 @@ describe("canonical session receipts", () => {
     vi.mocked(fetchSessions).mockResolvedValueOnce(envelope(["A"], 2n, "new"));
     await settle(GAP);
     expect(result.current.observedById.A).toEqual(cursor(2n, "new"));
-    act(() => result.current.applySession({ ...result.current.sessions[0]!, color: "green" }));
+    act(() => result.current.applySession({ ...result.current.sessions[0]!, branch: "green" }));
     expect(result.current.observedById.A).toBeUndefined();
   });
 });

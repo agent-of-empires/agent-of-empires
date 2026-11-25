@@ -64,7 +64,7 @@ Container images must provide Bash and GNU grep for scoped process inspection, p
 
 On Apple Container, worker descriptor snapshots are streamed as a tar archive by the guest Python helper. Symlinks and non-regular descriptors are refused; no host copy destination is used.
 
-CLI stop and kill persist a stop intent before signalling. Reattachment, automatic respawn, queued turns, and runner publication respect that fence. Only an explicit resume after settled retirement can clear the stop intent it observed; a newer stop remains authoritative. A stopped session with queued prompts shows a startup banner saying the prompts wait until the session is started again. For a tracked runtime that cannot prove settlement, externally stop only that execution on its original host or pinned container and retry `aoe acp stop <id>`.
+CLI stop and kill persist a stop intent before signalling. Reattachment, automatic respawn, queued turns, and runner publication respect that fence. Only an explicit resume after settled retirement can clear the stop intent it observed; a newer stop remains authoritative. A message typed into a stopped session from the dashboard, TUI or CLI starts it as an explicit resume; already-queued prompts and MCP, plugin or automated prompts keep waiting behind the fence and a stopped session with queued prompts shows a startup banner saying so, while `no_revive` senders are refused. For a tracked runtime that cannot prove settlement, externally stop only that execution on its original host or pinned container and retry `aoe acp stop <id>`.
 
 ACP session-ID and store assignments do not consume a committed Stop or dormancy marker, even when the originating worker epoch is still current. An assignment does not resolve a failed operation or clear its diagnostic. Native lifecycle and queue-wake producers own wake decisions before launch admission. Uncorrelated assignments preserve explicit conversation choices and outstanding import/fork markers; matching opaque IDs do not attest a store. Completion effects use the existing native launch admission or matched retained handoff scope. Attach retains its captured admission on the original lease. Display-only renames do not revoke this conversation-completion scope; pre-birth title checks remain in launch admission.
 
@@ -287,7 +287,7 @@ Every structured-view operation has a matching `aoe acp <verb>` against the same
 
 | Verb | What it does |
 |------|--------------|
-| `aoe acp history <id>` | Dump the persisted transcript |
+| `aoe acp history <id>` | Print the transcript: whole agent messages, user prompts, one line per tool call. `--last N` and `--role user,agent,tool,notice` select entries; `--json` emits raw frames |
 | `aoe acp status <id>` | Print highest/lowest seq and the daemon source |
 | `aoe acp prompt <id> <text>` | Send a prompt (`-` reads stdin) |
 | `aoe acp approve <id> <nonce> [--always\|--deny\|--option <id>]` | Resolve a pending approval |

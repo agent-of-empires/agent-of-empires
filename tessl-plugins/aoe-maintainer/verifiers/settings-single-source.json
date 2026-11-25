@@ -1,0 +1,18 @@
+{
+  "name": "Settings are declared once with #[setting(...)]",
+  "instruction": "A new or changed user-facing setting is declared only on its SettingsSection struct field with a #[setting(...)] attribute, with no parallel per-field registry.",
+  "relevant_when": "A patch adds or renames a field on a struct deriving SettingsSection, or adds a per-setting list, enum, match arm, label table, override struct or hard-coded settings key in src/tui/settings/, src/session/config/, src/server/ or web/src/ that names individual settings.",
+  "context": "docs/development/adding-settings.md: the TUI, web dashboard, server validation, profile and repo overrides and config.toml all derive from the #[setting(...)] declaration, and AGENTS.md forbids parallel field registries or override structs. Documented exceptions that are not parallel registries: #[setting(skip)] for non-user-facing fields, registering a custom:<id> widget in src/tui/settings/fields.rs and web/src/components/settings/customWidgets.tsx, registering a new section in settings_schema/registry.rs plus its SettingsCategory and SECTION_TO_TAB entries, the generated web/src/lib/generated/settingsKeys.ts, the flows listed under \"What stays out of the schema\" (the web telemetry toggle with its consent endpoint, the client-local web Diff tab, app_state through update_app_state, hooks, Config.environment), an onAfterSave side effect on SchemaSection, and plugin settings in aoe-plugin.toml.",
+  "scope": "diff",
+  "scope_reason": "A missing annotation or a parallel registry shows up as added lines; the existing schema code legitimately enumerates sections and custom widgets.",
+  "checklist": [
+    {
+      "name": "added-field-has-setting-attribute",
+      "rule": "Every field the patch adds to a struct deriving SettingsSection carries a #[setting(...)] attribute, either with a label and widget or as #[setting(skip)]. Not applicable when the patch adds no such field."
+    },
+    {
+      "name": "no-parallel-settings-registry",
+      "rule": "The patch adds no hand-maintained per-setting entry outside the #[setting(...)] declaration, such as a field-key enum variant, a match arm or lookup keyed on one setting's name to build, apply, clear or validate it, a per-section *Override struct, or a hard-coded label or description for a schema-backed setting. Not applicable when the added code is one of the documented exceptions in context."
+    }
+  ]
+}

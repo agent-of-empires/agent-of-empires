@@ -162,14 +162,14 @@ fn render_choice_picker(
     // Padded to the reserved height so the option rows keep their position.
     detail.resize(detail_rows, Line::default());
     lines.extend(detail);
-    let ready = state.can_accept_choice();
-    let title = if ready {
+    let accepts_choice = state.can_accept_choice();
+    let title = if accepts_choice {
         picker.title.clone()
     } else {
         " Native input not ready · Esc dismiss ".into()
     };
     let drawn = render_popup_above(frame, composer_area, theme, title, lines);
-    if ready {
+    if accepts_choice {
         record_picker(state, PickerKind::Choice, drawn, first, rows, context_rows);
     }
 }

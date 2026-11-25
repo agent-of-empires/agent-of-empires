@@ -19,7 +19,10 @@ vi.mock("../../../lib/clipboard", () => ({ writeClipboard: vi.fn().mockResolvedV
 vi.mock("../../../hooks/useShikiTheme", () => ({
   useShikiTheme: () => ({ theme: "vitesse-dark", appearance: "dark" }),
 }));
-vi.mock("../../../lib/snippetHighlighter", () => ({ highlightSnippet: vi.fn().mockResolvedValue(null) }));
+vi.mock("../../../lib/snippetHighlighter", () => ({
+  highlightSnippet: vi.fn().mockResolvedValue(null),
+  peekHighlight: () => undefined,
+}));
 vi.mock("../../../hooks/useHighlightedLines", () => ({ useHighlightedLines: () => ({ tokens: null }) }));
 
 beforeEach(() => {

@@ -512,9 +512,6 @@ impl Instance {
         if pre.base_branch_override != post.base_branch_override {
             self.base_branch_override = post.base_branch_override.clone();
         }
-        if pre.color != post.color {
-            self.color = post.color.clone();
-        }
         if pre.sort_index != post.sort_index {
             self.sort_index = post.sort_index;
         }
@@ -1975,9 +1972,7 @@ mod tests {
     fn terminal_error_metadata_is_transient_and_does_not_cross_generations() {
         let mut observed = Instance::new("error-evidence", "/tmp");
         observed.lifecycle_generation = 3;
-        observed
-            .last_error
-            .set("provider request failed".to_owned());
+        observed.last_error.set("provider request failed");
         let mut evidence = OperationErrorEvidence::new(
             ErrorEvidenceSource::TerminalText,
             ErrorOperation::TerminalObservation,

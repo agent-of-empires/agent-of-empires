@@ -1,6 +1,5 @@
 import { memo, useRef } from "react";
 import type { ProjectInfo, RepoGroup } from "../lib/types";
-import { repoColorStyle } from "../lib/repoAppearance";
 import { MARK_MEANING, meaningText } from "../lib/sidebarMarks";
 import { useSidebarCompact } from "../lib/sidebarCompact";
 import { ContextMenu, MenuItem, MenuSeparator } from "./ContextMenu";
@@ -156,7 +155,6 @@ const ProjectRow = memo(function ProjectRow({
             : undefined
         }
         className="group flex items-center gap-2 px-3 py-1.5 text-text-secondary hover:bg-surface-800/50 transition-colors focus:outline-none focus:ring-2 focus:ring-brand-600 select-none [-webkit-touch-callout:none]"
-        style={repoColorStyle(project.color)}
       >
         {/* Listed here when the axis draws no pinned header (#5065), so the row carries the pin itself. */}
         <Tooltip text={meaningText(pinned ? MARK_MEANING.pinnedProject : MARK_MEANING.project)}>

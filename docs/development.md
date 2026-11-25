@@ -113,4 +113,4 @@ Maintainer keys can only read and write `maint/`, so CI never consumes artifacts
 
 ## Demo recordings
 
-`web/scripts/record-tui-demo.mjs` produces `docs/assets/demo.gif`, and `web/scripts/record-web-demo.mjs` the desktop and mobile dashboard GIFs. Each documents its dependencies and setup in its file header.
+`web/scripts/record-tui-demo.mjs` produces `docs/assets/demo.gif`, and `web/scripts/record-web-demo.mjs` the desktop and mobile dashboard GIFs. Each documents its dependencies and setup in its file header. To record a PR's change for review, use the `record-pr-demo` agent skill in `.claude/skills/record-pr-demo/`.

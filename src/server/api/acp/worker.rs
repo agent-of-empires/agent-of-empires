@@ -751,6 +751,7 @@ async fn restart_acp_inner(
             None,
             Some(&restart),
             establishment.clone(),
+            true,
         )
         .await
         {
@@ -784,6 +785,7 @@ async fn restart_acp_inner(
                 },
                 crate::process::worker_registry::ResumeAuthority::Explicit,
                 Some(&restart),
+                None,
             )
             .await
         {
@@ -2677,7 +2679,7 @@ mod tests {
                 assert!(snapshot().starts_with(&history));
                 let reservation = state.acp_supervisor.reserve_spawn_with_restart(
                     &id, crate::acp::supervisor::ResumeKind::Spawn,
-                    crate::process::worker_registry::ResumeAuthority::Explicit, Some(&restart),
+                    crate::process::worker_registry::ResumeAuthority::Explicit, Some(&restart), None,
                 ).await.expect("the foreground checkpoint ACK releases actual replacement admission");
                 assert!(state.acp_supervisor.current_lease(&id) == Some(reservation.lease().clone()));
                 assert!(reservation.lease() != &original.lease);
@@ -2732,6 +2734,7 @@ mod tests {
                 None,
                 Some(&restart),
                 None,
+                true,
             )
             .await
             .unwrap_or_else(|response| panic!("resume failed: {}", response.status()));
@@ -2932,10 +2935,15 @@ mod tests {
             .unwrap()
             .remove(0);
         let response = if prompt {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                crate::daemon::PromptOrigin::HEADER,
+                axum::http::HeaderValue::from_static("dashboard"),
+            );
             crate::server::api::acp_prompt(
                 State(state.clone()),
                 Path(row.id.clone()),
-                axum::http::HeaderMap::new(),
+                headers,
                 Ok(Json(
                     serde_json::from_value(serde_json::json!({
                         "text":"explicit wake at capacity", "prompt_id":"capacity-prompt",

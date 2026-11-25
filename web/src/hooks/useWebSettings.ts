@@ -9,6 +9,7 @@ import {
 import { DEFAULT_PERSISTENT_TERMINALS, normalizePersistentTerminalLimit } from "../lib/persistentTerminals";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import { normalizeStructuredHistoryWindow } from "../lib/structuredHistoryWindow";
+import { DEFAULT_TERMINAL_FONT, normalizeTerminalFontFamily } from "../lib/terminalFonts";
 import { DEFAULT_TOOLBAR_KEYS, normalizeToolbarKeys, type ToolbarKeyId } from "../lib/terminalToolbarKeys";
 
 const STORAGE_KEY = "aoe-web-settings";
@@ -20,6 +21,7 @@ export interface WebSettings {
   structuredDesktopFontSize: number;
   /** Rows a structured view shows when a session opens. */
   structuredHistoryWindow: number;
+  /** A listed font name, or "" for the bundled default. */
   terminalFontFamily: string;
   autoOpenKeyboard: boolean;
   persistentTerminals: boolean;
@@ -47,7 +49,7 @@ function getDefaults(): WebSettings {
     structuredMobileFontSize: DEFAULT_CONVERSATION_FONT_SIZE,
     structuredDesktopFontSize: DEFAULT_CONVERSATION_FONT_SIZE,
     structuredHistoryWindow: DEFAULT_HISTORY_WINDOW,
-    terminalFontFamily: "",
+    terminalFontFamily: DEFAULT_TERMINAL_FONT,
     autoOpenKeyboard: true,
     persistentTerminals: false,
     maxPersistentTerminals: DEFAULT_PERSISTENT_TERMINALS,
@@ -81,6 +83,7 @@ function normalizeSnapshot(settings: WebSettings): WebSettings {
     structuredMobileFontSize: normalizeConversationFontSize(settings.structuredMobileFontSize),
     structuredDesktopFontSize: normalizeConversationFontSize(settings.structuredDesktopFontSize),
     structuredHistoryWindow: normalizeStructuredHistoryWindow(settings.structuredHistoryWindow),
+    terminalFontFamily: normalizeTerminalFontFamily(settings.terminalFontFamily),
     fileEditing: normalizeBool(settings.fileEditing, defaults.fileEditing),
     sidebarCompact: normalizeBool(settings.sidebarCompact, defaults.sidebarCompact),
     mobileToolbarKeys: normalizeToolbarKeys(settings.mobileToolbarKeys),

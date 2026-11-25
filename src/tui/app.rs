@@ -2531,8 +2531,17 @@ impl App {
     /// Deliver paste buffered for the row whose in-flight mount just took the
     /// screen for Enter; `poll_structured_mount` names that row.
     async fn drain_structured_paste(&mut self) {
-        if let Some(sid) = self.structured_paste_drain.take() {
-            self.drain_pending_paste_for_structured_view(&sid).await;
+        let Some(sid) = self.structured_paste_drain.as_deref() else {
+            return;
+        };
+        match self.home.structured_preview.as_ref() {
+            Some(view) if view.session_id() == sid && !view.can_submit_prompt_intent() => {}
+            Some(view) if view.session_id() == sid => {
+                if let Some(sid) = self.structured_paste_drain.take() {
+                    self.drain_pending_paste_for_structured_view(&sid).await;
+                }
+            }
+            _ => self.structured_paste_drain = None,
         }
     }
 

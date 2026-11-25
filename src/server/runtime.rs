@@ -1090,10 +1090,10 @@ mod tests {
         )?;
         transition_probe.try_lock_exclusive()?;
         fs2::FileExt::unlock(&transition_probe)?;
-        let request = |color: &str| {
+        let request = |pinned: bool| {
             axum::http::Request::builder()
                 .method(axum::http::Method::PATCH)
-                .uri(format!("/api/sessions/{id}/color"))
+                .uri(format!("/api/sessions/{id}/pin"))
                 .header(axum::http::header::HOST, "localhost")
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
                 .extension(axum::extract::ConnectInfo(
@@ -1102,12 +1102,12 @@ mod tests {
                     },
                 ))
                 .body(axum::body::Body::from(
-                    serde_json::json!({ "color": color }).to_string(),
+                    serde_json::json!({ "pinned": pinned }).to_string(),
                 ))
                 .unwrap()
         };
         let publication = state.publication.write().await;
-        let mut requester = tokio::spawn(router.clone().oneshot(request("red")));
+        let mut requester = tokio::spawn(router.clone().oneshot(request(true)));
         // The native writer takes the shared migration transition before
         // publication, but the profile flock only afterwards. Observe that
         // physical transition rather than inferring admission from a read.
@@ -1116,11 +1116,11 @@ mod tests {
                 if requester.is_finished() {
                     let response = (&mut requester)
                         .await
-                        .context("color PATCH requester failed before native admission")??;
+                        .context("pin PATCH requester failed before native admission")??;
                     let status = response.status();
                     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
                     anyhow::bail!(
-                        "color PATCH completed before native transition admission: status {status}, body {}",
+                        "pin PATCH completed before native transition admission: status {status}, body {}",
                         String::from_utf8_lossy(&body)
                     );
                 }
@@ -1140,7 +1140,7 @@ mod tests {
             }
         })
         .await
-        .context("native color writer did not acquire its shared storage transition")??;
+        .context("native pin writer did not acquire its shared storage transition")??;
         requester.abort();
         let cancelled = tokio::time::timeout(Duration::from_secs(3), requester)
             .await
@@ -1152,10 +1152,9 @@ mod tests {
             futures_util::poll!(&mut drain).is_pending(),
             "shutdown must retain the admitted writer while publication is held"
         );
-        let refused =
-            tokio::time::timeout(Duration::from_secs(3), router.oneshot(request("green")))
-                .await
-                .context("shutdown admission fence did not answer the second color PATCH")??;
+        let refused = tokio::time::timeout(Duration::from_secs(3), router.oneshot(request(false)))
+            .await
+            .context("shutdown admission fence did not answer the second pin PATCH")??;
         assert_eq!(
             refused.status(),
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -1164,29 +1163,21 @@ mod tests {
         drop(publication);
         tokio::time::timeout(Duration::from_secs(3), drain)
             .await
-            .context("admitted native color writer did not drain after publication was released")?;
-        assert_eq!(
-            storage
-                .load()?
-                .iter()
-                .find(|row| row.id == id)
-                .unwrap()
-                .color
-                .as_deref(),
-            Some("red")
-        );
-        assert_eq!(
-            state
-                .instances
-                .read()
-                .await
-                .iter()
-                .find(|row| row.id == id)
-                .unwrap()
-                .color
-                .as_deref(),
-            Some("red")
-        );
+            .context("admitted native pin writer did not drain after publication was released")?;
+        assert!(storage
+            .load()?
+            .iter()
+            .find(|row| row.id == id)
+            .unwrap()
+            .is_pinned());
+        assert!(state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id)
+            .unwrap()
+            .is_pinned());
         Ok(())
     }
 

@@ -967,7 +967,7 @@ impl SessionService {
     /// (#4081 review: a client-side liveness check before this call would
     /// race a concurrent archive, snooze, or wake).
     pub(crate) async fn touch_and_wake_on_prompt(&self, id: &str, no_revive: bool) -> PromptTouch {
-        self.touch_and_wake_on_prompt_with(id, no_revive, false)
+        self.touch_and_wake_on_prompt_with(id, no_revive, false, true)
             .await
     }
 
@@ -979,15 +979,16 @@ impl SessionService {
         id: &str,
         no_revive: bool,
     ) -> PromptTouch {
-        self.touch_and_wake_on_prompt_with(id, no_revive, true)
+        self.touch_and_wake_on_prompt_with(id, no_revive, true, false)
             .await
     }
 
-    async fn touch_and_wake_on_prompt_with(
+    pub(crate) async fn touch_and_wake_on_prompt_with(
         &self,
         id: &str,
         no_revive: bool,
         refuse_if_ignored: bool,
+        allow_explicit_stop: bool,
     ) -> PromptTouch {
         let Ok(state) = self.native_state() else {
             return PromptTouch::WorkerNotReady;
@@ -999,7 +1000,12 @@ impl SessionService {
             "server.prompt_touch",
             Box::pin(async move {
                 service
-                    .touch_and_wake_on_prompt_inner(&id, no_revive, refuse_if_ignored)
+                    .touch_and_wake_on_prompt_inner(
+                        &id,
+                        no_revive,
+                        refuse_if_ignored,
+                        allow_explicit_stop,
+                    )
                     .await
             }),
         )
@@ -1027,6 +1033,7 @@ impl SessionService {
         id: &str,
         no_revive: bool,
         refuse_if_ignored: bool,
+        allow_explicit_stop: bool,
     ) -> PromptTouch {
         let Ok(state) = self.native_state() else {
             return PromptTouch::WorkerNotReady;
@@ -1036,7 +1043,7 @@ impl SessionService {
             self.acp_supervisor.worker_state(id).await == crate::daemon::AcpWorkerState::Running;
         let namespace = state.profile_namespace.clone().read_owned().await;
         let guard = self.instance_lock(id).await.lock_owned().await;
-        let (worker_id, profile, title, generation, provider, view, needs_resume, was_idle_dormant) = {
+        let (worker_id, profile, title, generation, provider, view, was_idle_dormant) = {
             let instances = self.instances.read().await;
             let Some(row) = instances.iter().find(|row| row.id == id) else {
                 return PromptTouch::WorkerNotReady;
@@ -1048,8 +1055,6 @@ impl SessionService {
                 row.lifecycle_generation,
                 row.agent_provider.clone(),
                 row.view,
-                row.is_structured()
-                    && (row.status == crate::session::Status::Stopped || row.is_idle_dormant()),
                 row.is_idle_dormant(),
             )
         };
@@ -1114,6 +1119,9 @@ impl SessionService {
                     return PromptTouch::WorkerNotReady;
                 }
             };
+            let needs_resume = expected.is_structured()
+                && (expected.status == crate::session::Status::Stopped
+                    || expected.is_idle_dormant());
             match self.prompt_native_unavailability(id).await {
                 Ok(Some(unavailable)) => return PromptTouch::Unavailable(unavailable),
                 Ok(None) => {}
@@ -1136,8 +1144,15 @@ impl SessionService {
             };
             // No lifecycle/title flock crosses late-construction retirement.
             let (expected, reservation) = if needs_resume {
-                match crate::server::api::sessions::resume_structured_stop(&state, expected, None)
-                    .await
+                match crate::server::api::sessions::resume_structured_stop_with_restart(
+                    &state,
+                    expected,
+                    None,
+                    None,
+                    None,
+                    allow_explicit_stop,
+                )
+                .await
                 {
                     Ok(prepared) => prepared,
                     Err(response) => return PromptTouch::AdmissionRefused(response),
@@ -1145,6 +1160,12 @@ impl SessionService {
             } else {
                 (expected, None)
             };
+            if needs_resume && reservation.is_none() && !allow_explicit_stop {
+                return PromptTouch::Touched {
+                    idle_dormant: false,
+                    resume_reservation: None,
+                };
+            }
             if reservation.is_some() {
                 current_native = None;
             }
@@ -1173,6 +1194,10 @@ impl SessionService {
             let committed = store.update(|rows, _| {
                 let row = rows.iter_mut().find(|row| row.id == worker_id)
                     .ok_or(crate::session::SessionGone)?;
+                if refuse_if_ignored && row.is_ignored() {
+                    refused = Some(PromptTouch::Ignored);
+                    anyhow::bail!(crate::session::LifecycleReservationError::Superseded);
+                }
                 if let Some(outcome) = prompt_touch_rejection(
                     row, generation, &title, provider.as_deref(), view, no_revive,
                 ) {
@@ -1224,16 +1249,6 @@ impl SessionService {
                     refused = Some(PromptTouch::Unavailable(unavailable));
                     anyhow::bail!(crate::session::LifecycleReservationError::Superseded);
                 }
-                if refuse_if_ignored && row.is_ignored() {
-                    refused = Some(PromptTouch::Ignored);
-                    anyhow::bail!(crate::session::LifecycleReservationError::Superseded);
-                }
-                if let Some(outcome) = prompt_touch_rejection(
-                row, generation, &title, provider.as_deref(), view, no_revive,
-            ) {
-                refused = Some(outcome);
-                anyhow::bail!(crate::session::LifecycleReservationError::Superseded);
-            }
                 let idle_dormant = was_idle_dormant || row.is_idle_dormant();
                 let wake = row.is_snoozed() || idle_dormant;
                 apply_prompt_persist_to_disk(row, wake);
@@ -1297,42 +1312,39 @@ impl SessionService {
     /// stay hidden under the operator's own keystrokes. Only the marker and recency change,
     /// and only while the canonical row is still ignored and startable, so the write happens
     /// once rather than per keystroke.
-    pub(crate) async fn touch_after_direct_input(&self, id: &str) -> anyhow::Result<()> {
-        // The snapshot lags a peer's commit, so an already-ignored row is the only case
-        // that needs no store read here; anything else asks the canonical store.
-        if !self
-            .instances
-            .read()
-            .await
-            .iter()
-            .any(|row| row.id == id && row.is_ignored())
-            && !self.is_ignored_on_disk(id).await?
-        {
-            return Ok(());
-        }
+    pub(crate) async fn touch_after_direct_input(
+        &self,
+        id: String,
+        expected: crate::daemon::NativePreparationIdentity,
+    ) -> anyhow::Result<()> {
         let state = self.native_state()?;
-        let profile = self
-            .instances
-            .read()
-            .await
-            .iter()
-            .find(|row| row.id == id)
-            .map(|row| row.source_profile.clone())
-            .ok_or(crate::session::SessionGone)?;
-        let id = id.to_owned();
+        let _namespace = state.profile_namespace.read().await;
+        let state = state.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             use crate::session::SessionStore;
-            let native = super::session_store::NativeSessionStore::open(state, &profile, None)?;
+            let native =
+                super::session_store::NativeSessionStore::open(state, &expected.profile, None)?;
+            if !expected.matches_source(native.storage()) {
+                return Ok(());
+            }
+            let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&id)?;
             let store: &dyn SessionStore = &native;
+            if !store
+                .load()?
+                .iter()
+                .any(|row| row.id == id && expected.matches(row) && row.is_ignored())
+            {
+                return Ok(());
+            }
             store.update(|rows, _| {
-                if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
-                    if row.is_ignored() {
-                        row.touch_after_input();
-                    }
+                if let Some(row) = rows
+                    .iter_mut()
+                    .find(|row| row.id == id && expected.matches(row) && row.is_ignored())
+                {
+                    row.touch_after_input();
                 }
                 Ok(())
-            })?;
-            Ok(())
+            })
         })
         .await?
     }
@@ -1356,6 +1368,19 @@ impl SessionService {
         self.send_classified_turn(caller, id, turn, None).await
     }
 
+    /// [`Self::send_turn`] admitting its resume against `observed_stop` (`Some`: the stop
+    /// intent the caller decided on), so a newer stop is refused instead of cleared.
+    pub(crate) async fn send_turn_observing(
+        self: &Arc<Self>,
+        caller: &SessionCaller,
+        id: &str,
+        turn: SendTurnRequest<'_>,
+        observed_stop: Option<Option<crate::process::worker_registry::StopIntent>>,
+    ) -> Result<Option<u64>, SendTurnError> {
+        self.send_turn_inner(caller, id, turn, None, observed_stop)
+            .await
+    }
+
     /// [`Self::send_turn`], publishing with `classified_as` when the caller already cut the
     /// turn for an agent, else with [`Self::agent_profile`] once the worker is ready.
     async fn send_classified_turn(
@@ -1364,6 +1389,18 @@ impl SessionService {
         id: &str,
         turn: SendTurnRequest<'_>,
         classified_as: Option<crate::acp::supervisor::Classified>,
+    ) -> Result<Option<u64>, SendTurnError> {
+        self.send_turn_inner(caller, id, turn, classified_as, None)
+            .await
+    }
+
+    async fn send_turn_inner(
+        self: &Arc<Self>,
+        caller: &SessionCaller,
+        id: &str,
+        turn: SendTurnRequest<'_>,
+        classified_as: Option<crate::acp::supervisor::Classified>,
+        observed_stop: Option<Option<crate::process::worker_registry::StopIntent>>,
     ) -> Result<Option<u64>, SendTurnError> {
         let SendTurnRequest {
             resume_authority,
@@ -1445,6 +1482,7 @@ impl SessionService {
         if no_revive && needs_resume {
             return Err(SendTurnError::RevivalRefused);
         }
+        let mut stop_refusal = None;
         if needs_resume {
             let origin = match caller {
                 SessionCaller::User => crate::server::sandbox_login::LaunchOrigin::Interactive,
@@ -1505,10 +1543,11 @@ impl SessionService {
                             Some(reservation) => Some(reservation),
                             None => self
                                 .acp_supervisor
-                                .begin_resume(
+                                .begin_resume_observing(
                                     id,
                                     crate::acp::supervisor::ResumeKind::Attach,
                                     resume_authority,
+                                    observed_stop,
                                 )
                                 .await
                                 .map_err(SendTurnError::ResumeFailed)?,
@@ -1530,12 +1569,21 @@ impl SessionService {
                     return Err(SendTurnError::LoginRequired(blocked));
                 }
             }
-            match crate::server::acp_reconciler::trigger_resume_background(
+            let stop_refused = if observed_stop.is_some() || resume_reservation.is_some() {
+                let (reply, result) = tokio::sync::oneshot::channel();
+                stop_refusal = Some(result);
+                Some(reply)
+            } else {
+                None
+            };
+            match crate::server::acp_reconciler::trigger_resume_observing(
                 self,
                 id,
                 resume_authority,
                 origin,
                 resume_reservation,
+                observed_stop,
+                stop_refused,
             )
             .await
             {
@@ -1548,8 +1596,14 @@ impl SessionService {
             }
         }
         // Gate the publish below on the worker actually being there.
+        let deadline = tokio::time::Instant::now() + crate::acp::supervisor::WORKER_READY_TIMEOUT;
         if initial.is_none() {
             if let Err(e) = self.acp_supervisor.wait_until_ready(id).await {
+                if let Some(result) = stop_refusal {
+                    if let Ok(Ok(error)) = tokio::time::timeout_at(deadline, result).await {
+                        return Err(SendTurnError::ResumeFailed(error));
+                    }
+                }
                 if let Some(unavailable) = self
                     .prompt_native_unavailability(id)
                     .await
@@ -1858,11 +1912,11 @@ impl SessionService {
                     return Ok(false);
                 }
             }
-            let pane = crate::server::api::sessions::ready_agent_pane_for_automatic_input(&target)?
-                .ok_or_else(|| anyhow::anyhow!("the agent is no longer running"))?;
-            // The waits ran before these guards; what is on screen now decides.
-            // Check, capture and type address the pane the process check saw.
-            let tmux = target.tmux_session()?;
+            let (name, physical) =
+                crate::server::api::sessions::ready_agent_target_for_automatic_input(&target)?
+                    .ok_or_else(|| anyhow::anyhow!("the agent is no longer running"))?;
+            let pane = physical.identity.pane_id.clone();
+            let tmux = crate::tmux::Session::from_observation(&name, physical);
             if !pane_accepts_automatic_input(&target, &tmux, &pane)? {
                 return Ok(false);
             }
@@ -2890,21 +2944,24 @@ impl SessionService {
         .await
         .map_err(anyhow::Error::from)
         .and_then(|result| result);
-        let reduced = match reduced {
-            Ok(reduced) => reduced,
-            Err(error) => {
-                tracing::error!(target: "acp.control_state", session = id, %error, "cannot read session control state");
-                return Err(error);
-            }
-        };
-        Ok(reduced)
+        reduced.inspect_err(|error| {
+            tracing::error!(target: "acp.control_state", session = id, %error, "cannot read session control state");
+        })
     }
 
     pub(crate) async fn fold_control_state(
         &self,
         id: &str,
     ) -> anyhow::Result<crate::acp::state::AcpState> {
-        let mut reduced = self.fold_control_history(id).await?;
+        let reduced = self.fold_control_history(id).await?;
+        self.project_control_state(id, reduced).await
+    }
+
+    async fn project_control_state(
+        &self,
+        id: &str,
+        mut reduced: crate::acp::state::AcpState,
+    ) -> anyhow::Result<crate::acp::state::AcpState> {
         let projection = self
             .native_control_projection(id, reduced.native_availability, reduced.native_control_seq)
             .await;
@@ -3162,7 +3219,7 @@ impl SessionService {
         seq: u64,
     ) -> Option<crate::session::Status> {
         use crate::acp::state::{AcpSessionId, AcpState, AgentName};
-        let fold = self.fold_control_state(id).await.ok()?;
+        let fold = self.fold_control_history(id).await.ok()?;
         if fold.last_seq == seq {
             tracing::debug!(
                 target: "acp.sidebar_projection",
@@ -3172,7 +3229,12 @@ impl SessionService {
                 folded = 0,
                 "projected sidebar status from the cached fold"
             );
-            return Some(fold.sidebar_status());
+            return Some(
+                self.project_control_state(id, fold)
+                    .await
+                    .ok()?
+                    .sidebar_status(),
+            );
         }
         let store = Arc::clone(&self.acp_event_store);
         let sid = id.to_string();
@@ -3209,12 +3271,12 @@ impl SessionService {
         .ok()
         .and_then(Result::ok)
         .flatten()?;
-        let projection = self
-            .native_control_projection(id, state.native_availability, state.native_control_seq)
-            .await;
-        let mut state = state;
-        state.apply_native_availability(projection);
-        Some(state.sidebar_status())
+        Some(
+            self.project_control_state(id, state)
+                .await
+                .ok()?
+                .sidebar_status(),
+        )
     }
 
     /// Drain the leading batch of a session's server-owned queue into the live
@@ -6423,10 +6485,12 @@ mod tests {
         let pane = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
         let target = crate::tmux::test_helpers::only_pane_id(pane.name());
         crate::tmux::test_helpers::wait_for_pane_command(&target, "cat");
-        let tmux = crate::tmux::Session::from_name(pane.name());
-        let pane_id = crate::server::api::sessions::ready_agent_pane_for_automatic_input(&inst)
-            .unwrap()
-            .expect("agent pane");
+        let (name, physical) =
+            crate::server::api::sessions::ready_agent_target_for_automatic_input(&inst)
+                .unwrap()
+                .expect("agent pane");
+        let pane_id = physical.identity.pane_id.clone();
+        let tmux = crate::tmux::Session::from_observation(&name, physical);
         let tmux_ok = |args: &[&str]| {
             let out = crate::tmux::tmux_command().args(args).output().unwrap();
             assert!(out.status.success(), "{args:?}");
@@ -7928,6 +7992,11 @@ mod tests {
         let state = crate::server::test_support::build_test_app_state(vec![managed.clone()]);
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let service = state.session_service.clone();
+        let bound = crate::session::Storage::open_reference("default").unwrap();
+        let expected = crate::daemon::NativePreparationIdentity::from_instance(
+            &managed,
+            bound.bound_profile_identity().unwrap(),
+        );
 
         // A peer commits the ignore; this daemon's snapshot still shows the row live.
         let mut ignored = managed;
@@ -7936,7 +8005,7 @@ mod tests {
         assert!(!state.instances.read().await[0].is_ignored());
 
         service
-            .touch_after_direct_input("peer-typed")
+            .touch_after_direct_input("peer-typed".into(), expected)
             .await
             .unwrap();
 
@@ -7970,11 +8039,16 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
+            let bound = crate::session::Storage::open_reference("default").unwrap();
+            let expected = crate::daemon::NativePreparationIdentity::from_instance(
+                &row,
+                bound.bound_profile_identity().unwrap(),
+            );
             let state = crate::server::test_support::build_test_app_state(vec![row]);
             crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
             state
                 .session_service
-                .touch_after_direct_input(id)
+                .touch_after_direct_input(id.into(), expected)
                 .await
                 .unwrap();
 

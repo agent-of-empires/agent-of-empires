@@ -2027,7 +2027,7 @@ async fn native_loss_and_legacy_refusal_precede_prompt_touch_queue_or_launch() {
             let mut rows = state.instances.write().await;
             rows[0].mark_idle_dormant();
             rows[0].snoozed_until =
-                Some(crate::time::Timestamp::now() + crate::time::Duration::days(3));
+                Some(crate::time::Timestamp::now() + crate::time::Duration::seconds(259_200));
             rows[0].pending_initial_turn = Some(crate::session::PendingInitialTurn {
                 text: "existing continuation".into(),
                 attachments: Vec::new(),
@@ -2053,7 +2053,7 @@ async fn native_loss_and_legacy_refusal_precede_prompt_touch_queue_or_launch() {
             .unwrap();
         state.instances.write().await[0]
             .last_error
-            .set("retained operation diagnostic".to_owned());
+            .set("retained operation diagnostic");
         let socket = worker_registry::socket_path_for(id).unwrap();
         let mut record = WorkerRecord::new(
             id.into(),
@@ -2924,4 +2924,314 @@ async fn send_now_publishes_the_request_id_then_the_queued_row_id() {
         })
     })
     .await;
+}
+
+/// Settles a durable stop fence for `id`, as `aoe acp stop` leaves it.
+fn settle_stop_fence(id: &str) {
+    use crate::process::worker_registry::{self, WorkerRecord};
+    let record = WorkerRecord::new(
+        id.into(),
+        std::process::id(),
+        worker_registry::socket_path_for(id).unwrap(),
+        "aoe-agent".into(),
+        "aoe-agent".into(),
+        std::path::PathBuf::from("/tmp"),
+        None,
+        vec![],
+        vec![],
+        None,
+        None,
+    );
+    worker_registry::save(&record).unwrap();
+    worker_registry::request_stop(&record).unwrap();
+    worker_registry::retire_selected(&record).unwrap();
+    assert!(worker_registry::stop_requested(id));
+}
+
+fn dashboard_headers() -> axum::http::HeaderMap {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        crate::daemon::PromptOrigin::HEADER,
+        axum::http::HeaderValue::from_static("dashboard"),
+    );
+    headers
+}
+
+/// A prompt typed into a stop-fenced session starts it (explicit resume) instead of
+/// parking behind the fence; a `no_revive` sender still parks.
+#[tokio::test]
+#[serial_test::serial]
+async fn user_prompt_to_a_stop_fenced_session_wakes_it() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-stop-fence-wake".to_string();
+    let (state, launches) = failing_start_state(&id, false).await;
+    settle_stop_fence(&id);
+    // The detached start holds a `SessionService` clone until it ends.
+    let refs_at_rest = Arc::strong_count(&state.session_service);
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        dashboard_headers(),
+        prompt_req("wake up"),
+    )
+    .await
+    .into_response();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while Arc::strong_count(&state.session_service) > refs_at_rest {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the detached start never finished");
+
+    assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!crate::process::worker_registry::stop_requested(&id));
+    assert!(state
+        .session_service
+        .queued_prompts_snapshot(&id)
+        .await
+        .is_empty());
+}
+
+/// A stop written after the prompt's promotion decision is newer than the intent that
+/// decision observed: the resume is refused and the newer stop stays in force.
+#[tokio::test]
+#[serial_test::serial]
+async fn stop_newer_than_the_observed_one_refuses_the_prompt_start() {
+    use crate::process::worker_registry::{self, ResumeAuthority};
+
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-stop-fence-newer-stop".to_string();
+    let (state, launches) = failing_start_state(&id, false).await;
+    settle_stop_fence(&id);
+    let observed = worker_registry::stop_intent(&id).unwrap();
+    worker_registry::admit_resume(&id, ResumeAuthority::Explicit, &observed).unwrap();
+    settle_stop_fence(&id);
+    let newer = worker_registry::stop_intent(&id).unwrap();
+    assert_ne!(observed, newer);
+
+    let result = state
+        .session_service
+        .send_turn_observing(
+            &SessionCaller::User,
+            &id,
+            SendTurnRequest {
+                resume_authority: ResumeAuthority::Explicit,
+                text: "wake up",
+                attachments: &[],
+                woke_idle_dormant: false,
+                prompt_ids: Vec::new(),
+                synthesized: false,
+                origin: crate::daemon::PromptOrigin::Unknown,
+                no_revive: false,
+                resume_reservation: None,
+            },
+            Some(observed),
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(SendTurnError::ResumeFailed(
+            crate::acp::supervisor::SupervisorError::StopSuperseded(_)
+        ))
+    ));
+    assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(worker_registry::stop_intent(&id).unwrap(), newer);
+    assert!(state
+        .session_service
+        .queued_prompts_snapshot(&id)
+        .await
+        .is_empty());
+}
+
+/// An unreadable stop intent keeps fencing: the resume is refused with a non-retryable
+/// 409 (the same path as a newer stop winning), nothing launches or queues, and the file
+/// is left for the operator.
+#[tokio::test]
+#[serial_test::serial]
+async fn stop_fence_unreadable_intent_refuses_the_prompt_start() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-stop-fence-unreadable".to_string();
+    let (state, launches) = failing_start_state(&id, false).await;
+    settle_stop_fence(&id);
+    let stop_file = crate::process::worker_registry::workers_dir()
+        .unwrap()
+        .join(format!("{id}.stop"));
+    std::fs::write(&stop_file, b"\xff not json").unwrap();
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        dashboard_headers(),
+        prompt_req("wake up"),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        crate::daemon::ApiErrorCode::from_headers(response.status(), response.headers(), false),
+        Some(crate::daemon::ApiErrorCode::ResumeFailed)
+    );
+    assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(stop_file.exists());
+    assert!(state
+        .session_service
+        .queued_prompts_snapshot(&id)
+        .await
+        .is_empty());
+}
+
+/// A prompt without a foreground origin (MCP, plugin, automated) parks behind the fence.
+#[tokio::test]
+#[serial_test::serial]
+async fn non_foreground_prompt_to_a_stop_fenced_session_stays_queued() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-stop-fence-unknown-origin".to_string();
+    let (state, launches) = failing_start_state(&id, false).await;
+    settle_stop_fence(&id);
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        axum::http::HeaderMap::new(),
+        prompt_req("automated"),
+    )
+    .await
+    .into_response();
+
+    assert!(response.status().is_success(), "{}", response.status());
+    assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(crate::process::worker_registry::stop_requested(&id));
+    let queued = state.session_service.queued_prompts_snapshot(&id).await;
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].text, "automated");
+}
+
+/// A named "Send now" row never starts a stop-fenced session: it keeps its stored sender
+/// and a stale click after a Stop must not clear the fence.
+#[tokio::test]
+#[serial_test::serial]
+async fn send_now_on_a_stop_fenced_session_stays_behind_the_fence() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-stop-fence-send-now".to_string();
+    let (state, launches) = failing_start_state(&id, false).await;
+    state
+        .session_service
+        .enqueue_prompt(
+            &id,
+            "q1".into(),
+            "PR #7 was merged".into(),
+            vec![],
+            None,
+            crate::server::session_service::QueueSender {
+                plugin: Some("cron".into()),
+                origin: crate::daemon::PromptOrigin::Unknown,
+            },
+        )
+        .await
+        .expect("session exists");
+    settle_stop_fence(&id);
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        dashboard_headers(),
+        send_now_req("PR #7 was merged", "q1"),
+    )
+    .await
+    .into_response();
+
+    assert!(response.status().is_success(), "{}", response.status());
+    assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(crate::process::worker_registry::stop_requested(&id));
+    let queued = state.session_service.queued_prompts_snapshot(&id).await;
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].id, "q1");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn no_revive_prompt_to_a_stop_fenced_session_stays_fenced() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-stop-fence-no-revive".to_string();
+    let (state, launches) = failing_start_state(&id, false).await;
+    settle_stop_fence(&id);
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        axum::http::HeaderMap::new(),
+        no_revive_prompt_req("automated"),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(crate::process::worker_registry::stop_requested(&id));
+    assert!(state
+        .session_service
+        .queued_prompts_snapshot(&id)
+        .await
+        .is_empty());
+}
+
+/// A stop that lands while the `before_start` hook runs is newer than the one the prompt
+/// observed: the failed start refuses the prompt (409) instead of queueing it.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn hook_failure_after_a_newer_stop_refuses_the_promoted_prompt() {
+    let app_dir = crate::session::test_support::isolate_app_dir();
+    let (_runtime, _calls) =
+        crate::session::test_support::failing_container_runtime(app_dir.path());
+    let _unset = crate::session::test_support::EnvGuard::unset(&[
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+    ]);
+    let project = app_dir.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let id = "sess-hook-newer-stop".to_string();
+    settle_stop_fence(&id);
+    let stop_file = crate::process::worker_registry::workers_dir()
+        .unwrap()
+        .join(format!("{id}.stop"));
+    crate::session::config::update_config(|c| {
+        c.host_hooks.before_start = vec![format!(
+            "printf '{{\"pid\":1,\"generation\":9,\"token\":\"newer\"}}' > '{}'; exit 3",
+            stop_file.display()
+        )]
+    })
+    .unwrap();
+    let mut inst = structured_instance(&id, true);
+    inst.project_path = project.to_string_lossy().into_owned();
+    crate::session::test_support::sandbox_needing_login(app_dir.path(), &mut inst);
+    crate::server::test_support::seed_instances_on_disk_for_test(
+        &inst.source_profile,
+        vec![inst.clone()],
+    );
+    let state = crate::server::test_support::build_native_test_app_state(vec![inst]).await;
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        dashboard_headers(),
+        prompt_req("hello"),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(state
+        .session_service
+        .queued_prompts_snapshot(&id)
+        .await
+        .is_empty());
+    assert!(crate::process::worker_registry::stop_requested(&id));
 }

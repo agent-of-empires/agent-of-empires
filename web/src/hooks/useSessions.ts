@@ -7,7 +7,7 @@ import {
   type SessionMutation,
   type SessionsEnvelope,
 } from "../lib/api";
-import { setServerDown } from "../lib/connectionState";
+import { noteDaemonChanged, setServerDown } from "../lib/connectionState";
 
 const POLL_INTERVAL = 3000;
 const POLL_DEADLINE_MS = 15000;
@@ -100,8 +100,10 @@ export function useSessions() {
         const floor = floorGet.current;
         if (abandonedEpochs.current.has(cursor.epoch)) return;
         if (floor?.epoch === cursor.epoch && cursor.revision < floor.revision) return;
-        if (floor && floor.epoch !== cursor.epoch) abandonedEpochs.current.add(floor.epoch);
+        const newEpoch = !!floor && floor.epoch !== cursor.epoch;
+        if (newEpoch) abandonedEpochs.current.add(floor.epoch);
         floorGet.current = cursor;
+        if (newEpoch) noteDaemonChanged();
         const present = new Set(data.sessions.map((s) => s.id));
         const absent = absentRef.current;
         const gone = (id: string) => {
@@ -181,11 +183,9 @@ export function useSessions() {
   const syncTrash = useCallback((): Promise<void> => {
     if (!trashWantedRef.current) return Promise.resolve();
     if (trashInFlightRef.current) return trashInFlightRef.current;
-    const request = new AbortController();
-    const deadline = setTimeout(() => request.abort(), POLL_DEADLINE_MS);
     const run = (async () => {
       try {
-        const data = await fetchTrashedSessions(request.signal);
+        const data = await fetchTrashedSessions(AbortSignal.timeout(POLL_DEADLINE_MS));
         if (!data) {
           setTrashError(true);
           return;
@@ -248,12 +248,15 @@ export function useSessions() {
         });
         setTrashEpoch(cursor.epoch);
         setTrashError(false);
-      } finally {
-        clearTimeout(deadline);
-        trashInFlightRef.current = null;
+      } catch {
+        setTrashError(true);
       }
     })();
     trashInFlightRef.current = run;
+    // After the assignment: a failure before the first await settles `run` synchronously.
+    void run.then(() => {
+      trashInFlightRef.current = null;
+    });
     return run;
   }, [noteSeen]);
 

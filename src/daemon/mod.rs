@@ -47,7 +47,7 @@ pub use wire::{
     RestartSessionBody, RestoreOutcome, SessionResponse, SessionsEnvelope, SetWorktreeNameBody,
     StartSessionBody, StopAuxiliaryBody, TerminalSize, TerminalTarget, TerminalTargetStatus,
     TrashOutcome, TrashRelocationOutcome, TrashSessionBody, Tristate, UpdateArchiveBody,
-    UpdateColorBody, UpdateDiffBaseBody, UpdateFavoriteBody, UpdateGroupBody, UpdateIgnoredBody,
+    UpdateDiffBaseBody, UpdateFavoriteBody, UpdateGroupBody, UpdateIgnoredBody,
     UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
     WorkspaceRepoSummary, WorktreeEditOutcome,
 };

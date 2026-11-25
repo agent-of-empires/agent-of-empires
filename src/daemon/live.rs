@@ -33,7 +33,7 @@ pub struct LivePane0 {
 }
 
 /// The pane state every content message carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct LivePaneMeta {
@@ -49,6 +49,11 @@ pub struct LivePaneMeta {
     /// SGR (1006) mouse encoding rather than legacy X10.
     pub mouse_sgr: bool,
     pub pane0: Option<LivePane0>,
+    /// Rows of the window, after this message applies, whose line continues on
+    /// the next row (a soft wrap), ascending. Absent when none do, or when the
+    /// transport cannot tell (a composited split window).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wrapped: Vec<u32>,
 }
 
 /// Why a connection is on the capture fallback, when the daemon can say.
@@ -219,6 +224,7 @@ mod tests {
                 left: 41,
                 top: 0,
             }),
+            wrapped: vec![0, 5],
         }
     }
 
@@ -238,6 +244,7 @@ mod tests {
                     "rows": 24, "history": 40, "cursor": {"x": 3, "y": 1},
                     "altScreen": true, "mouse": true, "mouseSgr": true,
                     "pane0": {"cols": 40, "rows": 10, "left": 41, "top": 0},
+                    "wrapped": [0, 5],
                 }),
             ),
             (

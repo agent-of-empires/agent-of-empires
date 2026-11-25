@@ -12,6 +12,7 @@ import {
   normalizeStructuredHistoryWindow,
 } from "../../lib/structuredHistoryWindow";
 import { FontSizeControl } from "./FontSizeControl";
+import { isImeComposing } from "../../lib/ime";
 
 /** Structured view display preferences, stored in `aoe-web-settings` (already clamped). */
 export function StructuredViewDisplaySettings() {
@@ -62,7 +63,7 @@ export function StructuredViewDisplaySettings() {
           onChange={(e) => setHistoryDraft(e.target.value)}
           onBlur={commitHistory}
           onKeyDown={(e) => {
-            if (e.key === "Enter") commitHistory();
+            if (e.key === "Enter" && !isImeComposing(e)) commitHistory();
           }}
           className="bg-surface-800 border border-surface-700 rounded-md px-2 py-1 text-sm text-text-primary font-mono w-20 text-center"
         />
