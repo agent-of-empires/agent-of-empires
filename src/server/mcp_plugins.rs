@@ -1653,6 +1653,75 @@ mod tests {
                 .success());
         }
 
+        /// While nothing reads the forwarder's stdout, replies stay buffered and their
+        /// slots stay taken: the endpoint never sees more than the in-flight limit, and
+        /// every reply still arrives once stdout is drained.
+        #[tokio::test]
+        async fn forwarder_holds_slots_until_replies_are_read() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            if !node() {
+                return;
+            }
+            const BURST: u64 = 60;
+            const SIZE: usize = 512 << 10;
+            let temp = tempfile::tempdir().unwrap();
+            let seen = Arc::new(AtomicUsize::new(0));
+            let over = Arc::new(tokio::sync::Notify::new());
+            let full = Arc::new(tokio::sync::Notify::new());
+            let (count, past, reached) = (seen.clone(), over.clone(), full.clone());
+            let app = axum::Router::new().route(
+                "/mcp/plugins/{plugin}/{server}",
+                any(move |req: axum::extract::Request| {
+                    let (count, past, reached) = (count.clone(), past.clone(), reached.clone());
+                    async move {
+                        let body = axum::body::to_bytes(req.into_body(), 1 << 20)
+                            .await
+                            .unwrap();
+                        let msg: Value = serde_json::from_slice(&body).unwrap();
+                        let n = count.fetch_add(1, Ordering::SeqCst) + 1;
+                        if n == LIMIT {
+                            reached.notify_one();
+                        } else if n > LIMIT {
+                            past.notify_one();
+                        }
+                        axum::Json(json!({"jsonrpc": "2.0", "id": msg["id"], "result": {
+                            "content": [{"type": "text", "text": "x".repeat(SIZE)}]}}))
+                    }
+                }),
+            );
+            let (socket, _server) = serve_unix(temp.path(), app);
+            let mut child = spawn(temp.path(), &socket);
+            let mut stdin = child.stdin.take().unwrap();
+            let burst: String = (0..BURST).map(|i| call(i) + "\n").collect();
+            stdin.write_all(burst.as_bytes()).await.unwrap();
+            tokio::time::timeout(DEADLINE, full.notified())
+                .await
+                .expect("the endpoint reaches the in-flight limit");
+            // Nothing drains stdout, so no slot may free: wait out a window in which a
+            // premature release would let the next call through.
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(1500), over.notified())
+                    .await
+                    .is_err(),
+                "a call beyond the limit reached the endpoint while replies sat unread"
+            );
+            assert_eq!(seen.load(Ordering::SeqCst), LIMIT);
+
+            drop(stdin);
+            let mut stdout = BufReader::new(child.stdout.take().unwrap()).lines();
+            let mut answered = 0;
+            while tokio::time::timeout(DEADLINE, stdout.next_line())
+                .await
+                .expect("the forwarder finishes once stdout is read")
+                .unwrap()
+                .is_some()
+            {
+                answered += 1;
+            }
+            assert_eq!(answered, BURST);
+        }
+
         /// A reply far larger than the stdout pipe buffer is still written whole when stdin
         /// closes right after the request: `process.exit` would drop what is still buffered.
         #[tokio::test]

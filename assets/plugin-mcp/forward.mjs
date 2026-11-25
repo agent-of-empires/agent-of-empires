@@ -186,7 +186,11 @@ function forward(message, body, counted) {
       response.on("data", (chunk) => chunks.push(chunk));
       response.on("error", () => {});
       response.on("close", () => {
-        if (!settled && !answered && !request.cancelledByClient) {
+        // After `end` the reply's flush callback releases the slot, not the close.
+        if (answered) {
+          return;
+        }
+        if (!settled && !request.cancelledByClient) {
           fail(message, -32603, "The AoE plugin MCP endpoint closed the reply early.", finish);
         } else {
           finish();
@@ -224,7 +228,10 @@ function forward(message, body, counted) {
   }
   request.on("timeout", () => request.destroy(new Error("timeout")));
   request.on("error", (error) => {
-    if (!settled && !answered && !request.cancelledByClient) {
+    if (answered) {
+      return;
+    }
+    if (!settled && !request.cancelledByClient) {
       const cause = error.message === "timeout" ? "timed out" : `is unreachable (${error.code ?? "error"})`;
       fail(message, -32603, `The AoE plugin MCP socket ${cause}.`, finish);
     } else {

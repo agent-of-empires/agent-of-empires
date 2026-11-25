@@ -124,8 +124,15 @@ fn resolve_served(
     let mut unreachable: BTreeSet<String> = BTreeSet::new();
     let mut omitted: BTreeSet<String> = BTreeSet::new();
     let mut per_plugin: HashMap<String, usize> = HashMap::new();
+    // Retained discovery entries arrive as plain servers; they count first and are never dropped.
+    for entry in &entries {
+        if let McpEntry::Server(server) = entry {
+            if let Some(p) = ctx.plugin_served.iter().find(|p| p.server == *server) {
+                *per_plugin.entry(p.plugin_id.clone()).or_default() += 1;
+            }
+        }
+    }
     for entry in entries {
-        // The cap covers retained discovery entries and hook-added ones together, in chain order.
         if let McpEntry::Serve { served } = &entry {
             let count = per_plugin.entry(served.plugin_id.clone()).or_default();
             if *count >= MCP_SERVE_MAX_PER_PLUGIN {
@@ -1055,6 +1062,48 @@ mod tests {
         );
         assert!(out.servers.iter().any(|s| s.name == "acme_a__s000"));
         assert!(!out.servers.iter().any(|s| s.name == "acme_a__s064"));
+    }
+
+    /// Discovered serve entries count toward the cap too: a hook adds only what is left.
+    #[tokio::test]
+    async fn hook_added_serve_entries_count_with_the_discovered_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let ep = endpoint(dir.path(), None);
+        const DISCOVERED: usize = MCP_SERVE_MAX_PER_PLUGIN - 4;
+        let discovered: Vec<ServedServer> = (0..DISCOVERED)
+            .map(|i| ServedServer::new("acme.a", format!("d{i:03}"), true))
+            .collect();
+        let mut c = host_ctx();
+        c.plugin_served = plugin_entries(
+            &ep.secret,
+            crate::server::daemon_endpoint::PluginRoute::Http("http://127.0.0.1:4321"),
+            "s",
+            &discovered,
+        );
+        let servers: Vec<_> = c.plugin_served.iter().map(|p| p.server.clone()).collect();
+        let adds: Vec<_> = (0..10)
+            .map(|i| json!({"name": format!("n{i}"), "serve": {}}))
+            .collect();
+        let caller = FakeCaller::new(vec![Ok(json!({ "add": adds }))]);
+        let out = run_hooks(
+            Some(&caller),
+            &[serving_hook("acme.a")],
+            &c,
+            servers,
+            Some(&ep),
+        )
+        .await
+        .unwrap();
+        let ours = out
+            .servers
+            .iter()
+            .filter(|s| s.name.starts_with("acme_a__"))
+            .count();
+        assert_eq!(ours, MCP_SERVE_MAX_PER_PLUGIN, "discovered plus added");
+        assert_eq!(out.served_by.len(), 4, "only the remaining budget is added");
+        assert!(out.servers.iter().any(|s| s.name == "acme_a__d000"));
+        assert!(out.servers.iter().any(|s| s.name == "acme_a__n3"));
+        assert!(!out.servers.iter().any(|s| s.name == "acme_a__n4"));
     }
 
     /// A hook-served entry replaces a same-key entry like any add, silently.
