@@ -5,7 +5,8 @@
 //! into `group_by` and `sort_order`, a value picked on the web winning, and the removed
 //! choices map to the nearest kept one. A TUI user who never picked a grouping keeps My
 //! groups, the TUI's old default; everyone else gets the new Repository default. The
-//! org and status collapse lists go with their groupings.
+//! org and status collapse lists go with their groupings. The web keys stay, since the
+//! dashboard still reads them.
 
 use anyhow::Result;
 use std::path::Path;
@@ -29,26 +30,15 @@ fn run_in(app_dir: &Path) -> Result<()> {
 
 fn migrate(state: &mut toml::Table) -> bool {
     let before = state.clone();
-    let web = state
-        .get_mut("web_ui_state")
-        .and_then(toml::Value::as_table_mut);
+    let web = state.get("web_ui_state").and_then(toml::Value::as_table);
     let web_axis = web
-        .as_ref()
         .and_then(|t| t.get(WEB_AXIS_KEY))
         .and_then(toml::Value::as_str)
         .map(str::to_owned);
     let web_sort = web
-        .as_ref()
         .and_then(|t| t.get(WEB_SORT_KEY))
         .and_then(toml::Value::as_str)
         .map(str::to_owned);
-    if let Some(web) = web {
-        web.remove(WEB_AXIS_KEY);
-        web.remove(WEB_SORT_KEY);
-        if web.is_empty() {
-            state.remove("web_ui_state");
-        }
-    }
 
     let tui_group = state.get("group_by").and_then(toml::Value::as_str);
     let group = web_axis
@@ -163,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn drops_web_keys_and_removed_collapse_lists_but_keeps_the_rest() {
+    fn drops_removed_collapse_lists_but_keeps_the_rest() {
         let out = run_on(
             "org_group_collapsed = [\"acme\"]\nstatus_group_collapsed = [\"Idle\"]\nproject_group_collapsed = [\"api\"]\n[web_ui_state]\n\"aoe-sidebar-axis\" = \"org\"\n\"aoe-repo-collapsed-x\" = \"1\"\n",
         );
@@ -173,7 +163,7 @@ mod tests {
         assert!(table.get("project_group_collapsed").is_some());
         let (_, _, web) = view(&out);
         let web = web.unwrap();
-        assert!(web.get(WEB_AXIS_KEY).is_none());
+        assert_eq!(web.get(WEB_AXIS_KEY).and_then(|v| v.as_str()), Some("org"));
         assert_eq!(
             web.get("aoe-repo-collapsed-x").and_then(|v| v.as_str()),
             Some("1")

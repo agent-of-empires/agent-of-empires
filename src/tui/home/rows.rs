@@ -302,18 +302,21 @@ impl HomeView {
             &[],
         );
         // Pinned registered projects with no live session render as empty headers.
-        for project in crate::session::projects::unpopulated_projects(
+        let pinned = crate::session::projects::unpopulated_projects(
             &populated_labels,
             &self.registered_projects,
-        ) {
-            tree.append_group(Group::new(&project.label, &project.label));
-        }
-        if populated_labels.contains(crate::session::SCRATCH_GROUP_PATH) {
-            tree.append_group(Group::new(
-                crate::session::SCRATCH_GROUP_NAME,
-                crate::session::SCRATCH_GROUP_PATH,
-            ));
-        }
+        )
+        .into_iter()
+        .map(|project| Group::new(&project.label, &project.label));
+        let scratch = populated_labels
+            .contains(crate::session::SCRATCH_GROUP_PATH)
+            .then(|| {
+                Group::new(
+                    crate::session::SCRATCH_GROUP_NAME,
+                    crate::session::SCRATCH_GROUP_PATH,
+                )
+            });
+        tree.append_groups(pinned.chain(scratch));
         for (path, _) in self.project_group_collapsed.iter().filter(|(_, &c)| c) {
             tree.set_collapsed(path, true);
         }

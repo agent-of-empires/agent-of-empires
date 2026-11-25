@@ -6,7 +6,7 @@ pub fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::session::config::{update_app_state, AppStateConfig, SortOrder};
+    use crate::session::config::{AppStateConfig, GroupByMode, SortOrder};
 
     #[test]
     #[serial_test::serial]
@@ -23,12 +23,13 @@ mod tests {
                 profile.join("sessions.json"),
                 r#"[{"id":"retained"},{"id":"trashed","trashed_at":"2026-01-01"}]"#,
             )?;
-            update_app_state(|state| {
-                state.sort_order = Some(SortOrder::Name);
-                state.sessions_created_seeded = seeded;
-                state.sessions_created = count;
-                state.tips_seen.push("retained-tip".into());
-            })?;
+            // Values this build no longer decodes must survive until v063 rewrites them.
+            std::fs::write(
+                app.join("state.toml"),
+                format!(
+                    "sort_order = \"a_z\"\ngroup_by = \"manual\"\nsessions_created_seeded = {seeded}\nsessions_created = {count}\ntips_seen = [\"retained-tip\"]\n"
+                ),
+            )?;
             let journal_path = app.join(crate::session::purge_owners::FILE_NAME);
             let existing_journal = if version == 40 {
                 use crate::session::purge_owners::{PurgeCapture, PurgeOwner};
@@ -51,6 +52,7 @@ mod tests {
             assert_eq!(state.sessions_created, expected_count, "schema {version}");
             assert!(state.sessions_created_seeded);
             assert_eq!(state.sort_order, Some(SortOrder::Name));
+            assert_eq!(state.group_by, Some(GroupByMode::Group));
             assert_eq!(state.tips_seen, ["retained-tip"]);
             let journal = std::fs::read(&journal_path)?;
             match existing_journal {

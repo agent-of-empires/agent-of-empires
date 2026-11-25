@@ -224,13 +224,15 @@ impl GroupTree {
         parent.children = children;
     }
 
-    /// Add `group` after every existing one, keeping its display name. No-op if it exists.
-    pub fn append_group(&mut self, group: Group) {
-        if self.groups_by_path.contains_key(&group.path) {
-            return;
+    /// Add `groups` after every existing one, keeping their display names; existing paths are skipped.
+    pub fn append_groups(&mut self, groups: impl IntoIterator<Item = Group>) {
+        for group in groups {
+            if self.groups_by_path.contains_key(&group.path) {
+                continue;
+            }
+            self.insertion_order.push(group.path.clone());
+            self.groups_by_path.insert(group.path.clone(), group);
         }
-        self.insertion_order.push(group.path.clone());
-        self.groups_by_path.insert(group.path.clone(), group);
         self.rebuild_tree();
     }
 
@@ -456,7 +458,7 @@ fn sort_sessions_inner(sessions: &mut [&Instance], sort_order: SortOrder, favori
         SortOrder::Custom => {
             // The user placed these rows by hand; nothing else may reorder them, not even the
             // favorites pass. Rows never moved sit on top, newest first.
-            sessions.sort_by_key(|i| (i.sort_index.is_some(), i.sort_index, Reverse(i.created_at)));
+            sessions.sort_by_key(|i| i.custom_order_key());
             return;
         }
         SortOrder::Name => sessions.sort_by_key(|i| i.title.to_lowercase()),

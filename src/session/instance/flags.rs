@@ -243,6 +243,16 @@ impl Instance {
         self.archived_at.is_some()
     }
 
+    /// Rank among siblings under `SortOrder::Custom`: rows never moved first, newest first,
+    /// then by `sort_index`. The display and the Daemon's reorder must share it.
+    pub fn custom_order_key(&self) -> (bool, Option<u32>, std::cmp::Reverse<Timestamp>) {
+        (
+            self.sort_index.is_some(),
+            self.sort_index,
+            std::cmp::Reverse(self.created_at),
+        )
+    }
+
     /// Soft-delete the session into the trash bucket. Stops the live
     /// session (handled by the caller: ACP `shutdown`, optional tmux kill)
     /// but keeps every durable artifact so `untrash` can bring it back
