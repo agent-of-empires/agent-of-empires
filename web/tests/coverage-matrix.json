@@ -149,6 +149,7 @@
         "web/src/components/MainViewTabs.tsx",
         "web/src/components/ContentSplit.tsx",
         "web/src/components/Dock.tsx",
+        "web/src/components/PaneMenu.tsx",
         "web/src/lib/rightDockMode.ts",
         "web/src/lib/panes.ts"
       ],
@@ -171,6 +172,7 @@
         "web/src/components/TerminalSwitcher.tsx",
         "web/src/components/PairedTerminal.tsx",
         "web/src/components/Dock.tsx",
+        "web/src/components/PaneMenu.tsx",
         "web/src/components/MobileRightPanelPicker.tsx",
         "web/src/components/MobileMainPane.tsx",
         "web/src/lib/pairedShells.ts",
@@ -201,6 +203,7 @@
       "components": [
         "web/src/components/ActivityBar.tsx",
         "web/src/components/Dock.tsx",
+        "web/src/components/PaneMenu.tsx",
         "web/src/components/DockGroups.tsx",
         "web/src/components/BottomDock.tsx",
         "web/src/components/PaneDndController.tsx",
@@ -6064,6 +6067,7 @@
         "web/src/components/Dashboard.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/Dock.tsx",
+        "web/src/components/PaneMenu.tsx",
         "web/src/components/acp/Composer.tsx",
         "web/src/components/SettingsView.tsx",
         "web/src/components/settings/SettingsIntro.tsx"
