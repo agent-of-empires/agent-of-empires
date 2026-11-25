@@ -6500,6 +6500,8 @@ mod tests {
                         break;
                     }
                 }
+                // A capture after the timeout must neither block on `resume` nor hang the join.
+                drop((captured_rx, resume_tx));
                 waiter.join().unwrap()
             });
             if kill {
