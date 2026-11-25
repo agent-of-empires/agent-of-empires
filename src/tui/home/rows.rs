@@ -295,17 +295,17 @@ impl HomeView {
             })
             .collect();
         // Headers never moved by hand sit newest first, then the shared repository order.
+        let rank = |repo: &str| {
+            let repo = repo.trim_end_matches('/');
+            (self.sort_order == SortOrder::Custom)
+                .then(|| self.repository_order.iter().position(|r| r == repo))
+                .flatten()
+        };
         grouped.sort_by_key(|inst| std::cmp::Reverse(inst.created_at));
-        if self.sort_order == SortOrder::Custom {
-            let rank = |inst: &Instance| {
-                let repo = inst.repo_path().trim_end_matches('/');
-                self.repository_order.iter().position(|r| r == repo)
-            };
-            grouped.sort_by_key(|inst| {
-                let rank = rank(inst);
-                (rank.is_some(), rank)
-            });
-        }
+        grouped.sort_by_key(|inst| {
+            let rank = rank(inst.repo_path());
+            (rank.is_some(), rank)
+        });
         let live: Vec<&Instance> = grouped
             .iter()
             .filter(|i| !i.is_archived() && !i.is_trashed())
@@ -316,19 +316,33 @@ impl HomeView {
             .collect();
         // An archived-only repository must not seed a header: it would render as an empty,
         // undeletable phantom in the main flow.
-        let mut tree = GroupTree::new_with_group_paths(
-            live.iter()
-                .filter(|i| i.group_path != crate::session::SCRATCH_GROUP_PATH)
-                .map(|i| i.group_path.as_str()),
-            &[],
-        );
-        // Pinned registered projects with no live session render as empty headers.
-        let pinned = crate::session::projects::unpopulated_projects(
+        let seeded: Vec<&Instance> = live
+            .iter()
+            .copied()
+            .filter(|i| i.group_path != crate::session::SCRATCH_GROUP_PATH)
+            .collect();
+        // Pinned registered projects with no live session render as empty headers, placed
+        // among the others by the shared repository order.
+        let mut headers: Vec<(Option<usize>, Group)> = Vec::new();
+        for inst in &seeded {
+            let label = split_project_view_path(&inst.group_path).0;
+            if !headers.iter().any(|(_, group)| group.path == label) {
+                headers.push((rank(inst.repo_path()), Group::new(label, label)));
+            }
+        }
+        for project in crate::session::projects::unpopulated_projects(
             &populated_labels,
             &self.registered_projects,
-        )
-        .into_iter()
-        .map(|project| Group::new(&project.label, &project.label));
+        ) {
+            headers.push((
+                rank(&project.path),
+                Group::new(&project.label, &project.label),
+            ));
+        }
+        headers.sort_by_key(|(rank, _)| (rank.is_some(), *rank));
+        let headers: Vec<Group> = headers.into_iter().map(|(_, group)| group).collect();
+        let mut tree =
+            GroupTree::new_with_group_paths(seeded.iter().map(|i| i.group_path.as_str()), &headers);
         let scratch = populated_labels
             .contains(crate::session::SCRATCH_GROUP_PATH)
             .then(|| {
@@ -337,7 +351,7 @@ impl HomeView {
                     crate::session::SCRATCH_GROUP_PATH,
                 )
             });
-        tree.append_groups(pinned.chain(scratch));
+        tree.append_groups(scratch);
         for (path, _) in self.project_group_collapsed.iter().filter(|(_, &c)| c) {
             tree.set_collapsed(path, true);
         }

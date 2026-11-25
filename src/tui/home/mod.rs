@@ -298,6 +298,8 @@ pub struct HomeView {
     /// The Daemon's grouping and sort as of the last applied snapshot. Cleared on reconnect,
     /// so the new connection's first value is adopted.
     pub(in crate::tui) observed_sidebar_view: Option<crate::session::config::SidebarView>,
+    /// A move under Name wrote the order on screen; the sort becomes Custom once it commits.
+    custom_after_ordering: bool,
     session_feed_reload_retry_at: Option<std::time::Instant>,
     session_feed_failed_cursor: Option<crate::daemon::RuntimeCursor>,
     canonical_metadata_lag: Option<CanonicalMetadataLagState>,

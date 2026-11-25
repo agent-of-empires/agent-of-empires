@@ -98,16 +98,33 @@ pub(super) async fn settle_namespace(
 }
 
 /// Run `action`, carry each shared-order or sidebar-view write it submits to the Daemon, then
-/// apply the snapshot they publish. Returns the writes in the order they were sent.
+/// apply the snapshot they publish, until no write follows. Returns the writes in the order
+/// they were sent.
 pub(super) async fn settle_view_writes(
     state: &std::sync::Arc<crate::server::AppState>,
     view: &mut HomeView,
     action: impl FnOnce(&mut HomeView),
 ) -> Vec<crate::tui::session_feed::ViewWrite> {
-    use crate::tui::session_feed::ViewWrite;
     let mut capture = view.session_feed.view_write_driver_for_test();
     action(view);
     let mut writes = Vec::new();
+    loop {
+        let sent = writes.len();
+        carry_view_writes(state, &mut capture, &mut writes).await;
+        view.apply_session_feed();
+        apply_published(view, state).await;
+        if writes.len() == sent {
+            return writes;
+        }
+    }
+}
+
+async fn carry_view_writes(
+    state: &std::sync::Arc<crate::server::AppState>,
+    capture: &mut impl FnMut() -> Option<crate::tui::session_feed::CapturedViewWrite>,
+    writes: &mut Vec<crate::tui::session_feed::ViewWrite>,
+) {
+    use crate::tui::session_feed::ViewWrite;
     while let Some(captured) = capture() {
         let (method, path, body) = match &captured.write {
             ViewWrite::Ordering(patch) => (
@@ -125,9 +142,6 @@ pub(super) async fn settle_view_writes(
         assert!(status.is_success(), "{status}: {value}");
         writes.push(captured.finish(Ok(receipt_cursor(&headers))));
     }
-    view.apply_session_feed();
-    apply_published(view, state).await;
-    writes
 }
 
 pub(super) async fn settle_row_command(
@@ -2627,7 +2641,9 @@ async fn test_ctrl_arrows_move_a_session_under_custom_sort() {
     env.view.update_selected();
 
     let ctrl = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
+    // A second press before the first write shows would be built from the stale order.
     let writes = settle_view_writes(&state, &mut env.view, |view| {
+        view.handle_key(ctrl(KeyCode::Down), None);
         view.handle_key(ctrl(KeyCode::Down), None);
     })
     .await;
@@ -2640,7 +2656,7 @@ async fn test_ctrl_arrows_move_a_session_under_custom_sort() {
             );
             assert!(patch.repositories.is_none());
         }
-        other => panic!("expected one shared-order write, got {other:?}"),
+        other => panic!("expected one shared-order write, the repeat deferred, got {other:?}"),
     }
     assert_eq!(
         work_group_titles(&env.view),
@@ -2714,6 +2730,17 @@ async fn test_ctrl_arrows_under_name_start_custom_from_the_screen_order() {
         .position(|i| matches!(i, Item::Session { id: row, .. } if *row == id))
         .unwrap();
     env.view.update_selected();
+
+    // A refused order leaves the sort alone.
+    let mut capture = env.view.session_feed.view_write_driver_for_test();
+    env.view
+        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+    let refused = capture().expect("the order write");
+    assert!(matches!(refused.write, ViewWrite::Ordering(_)));
+    refused.finish(Err("refused".into()));
+    env.view.apply_session_feed();
+    assert!(capture().is_none(), "no sort write follows a refused order");
+    assert_eq!(env.view.sort_order, SortOrder::Name);
 
     let writes = settle_view_writes(&state, &mut env.view, |view| {
         view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);

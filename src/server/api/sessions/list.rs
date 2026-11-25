@@ -635,22 +635,28 @@ fn workspace_id_for_session(s: &SessionResponse) -> String {
     }
 }
 
-// Unknown workspaces precede the manual order, newest first.
+// Unknown workspaces precede the manual order, newest session first; ties keep the later row first.
 pub(crate) fn compute_merged_ordering(
     sessions: &[SessionResponse],
     current_order: &[String],
 ) -> Vec<String> {
     let known: std::collections::HashSet<&str> = current_order.iter().map(String::as_str).collect();
-    let mut new_ids = indexmap::IndexSet::new();
+    let mut new_ids: indexmap::IndexMap<String, Option<crate::time::Timestamp>> =
+        indexmap::IndexMap::new();
     for session in sessions {
         let id = workspace_id_for_session(session);
-        if !known.contains(id.as_str()) {
-            new_ids.insert(id);
+        if known.contains(id.as_str()) {
+            continue;
         }
+        let created = crate::time::Timestamp::parse_rfc3339(&session.created_at).ok();
+        let newest = new_ids.entry(id).or_default();
+        *newest = (*newest).max(created);
     }
+    let mut new_ids: Vec<_> = new_ids.into_iter().rev().collect();
+    new_ids.sort_by_key(|(_, created)| std::cmp::Reverse(*created));
     new_ids
         .into_iter()
-        .rev()
+        .map(|(id, _)| id)
         .chain(current_order.iter().cloned())
         .collect()
 }
@@ -1522,6 +1528,21 @@ mod workspace_ordering_tests {
                 vec!["/repo/x::main", "/repo/y::dev"],
             ),
         ];
+        let created = |id: &str, path: &str, at: &str| SessionResponse {
+            created_at: at.to_string(),
+            ..mock_response(id, path, Some("main"))
+        };
+        // Storage order is not creation order, e.g. an older row in a later-loaded profile;
+        // second precision and sub-second precision compare as times, not strings.
+        let cases = cases.into_iter().chain([(
+            vec![
+                created("s1", "/repo/new", "2026-01-03T00:00:00.5+00:00"),
+                created("s2", "/repo/old", "2026-01-01T00:00:00+00:00"),
+                created("s3", "/repo/mid", "2026-01-03T00:00:00+00:00"),
+            ],
+            vec![],
+            vec!["/repo/new::main", "/repo/mid::main", "/repo/old::main"],
+        )]);
         for (sessions, existing, expected) in cases {
             assert_eq!(compute_merged_ordering(&sessions, &existing), expected);
         }

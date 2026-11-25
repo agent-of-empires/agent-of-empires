@@ -4,10 +4,12 @@
 //! dashboard kept its own in `workspace-ordering.json` (rows) and in `state.toml`'s
 //! `web_ui_state` (`aoe-repo-group-order-v1`, Repository headers). `workspace-ordering.json`
 //! is now the one store. A TUI order seeds it only where the dashboard has none, so the
-//! dashboard's wins; `sort_index` is then dropped from the rows.
+//! dashboard's wins. The dashboard's header order is copied, not removed, because the
+//! dashboard still reads it. `sort_index` is dropped only after the shared order is
+//! written, so an interrupted run retries from the original rows.
 
 use super::sessions_file;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
@@ -21,6 +23,7 @@ pub fn run() -> Result<()> {
 
 fn run_in(app_dir: &Path) -> Result<()> {
     let mut placed: Vec<(u64, String, String)> = Vec::new();
+    let mut to_strip: Vec<(std::path::PathBuf, String)> = Vec::new();
     for path in sessions_file::session_files(app_dir)? {
         let Ok(content) = fs::read_to_string(&path) else {
             continue;
@@ -43,8 +46,7 @@ fn run_in(app_dir: &Path) -> Result<()> {
                 placed.push((index, created, workspace_id(row)));
             }
         }
-        crate::session::backup_before_migration(&path)?;
-        sessions_file::heal_rows(&path, &content, |row| row.remove("sort_index").is_some())?;
+        to_strip.push((path, content));
     }
     // Each group numbered its own rows from 0, so interleaving by index keeps every
     // group's order; newer rows break ties as they did on screen.
@@ -56,7 +58,7 @@ fn run_in(app_dir: &Path) -> Result<()> {
         }
     }
 
-    let web_repositories = take_web_repository_order(app_dir)?;
+    let web_repositories = web_repository_order(app_dir)?;
 
     let ordering_path = app_dir.join("workspace-ordering.json");
     let mut ordering: crate::session::WorkspaceOrdering = fs::read_to_string(&ordering_path)
@@ -86,6 +88,10 @@ fn run_in(app_dir: &Path) -> Result<()> {
             "seeded the shared Custom order"
         );
     }
+    for (path, content) in to_strip {
+        crate::session::backup_before_migration(&path)?;
+        sessions_file::heal_rows(&path, &content, |row| row.remove("sort_index").is_some())?;
+    }
     Ok(())
 }
 
@@ -107,29 +113,24 @@ fn workspace_id(row: &serde_json::Map<String, Value>) -> String {
     }
 }
 
-/// Remove the dashboard's Repository header order from `state.toml`, returning it.
-fn take_web_repository_order(app_dir: &Path) -> Result<Vec<String>> {
-    let mut taken = Vec::new();
-    super::config_file::rewrite_strict(&app_dir.join("state.toml"), "v066", |state| {
-        let Some(web) = state
-            .get_mut("web_ui_state")
-            .and_then(toml::Value::as_table_mut)
-        else {
-            return false;
-        };
-        let Some(raw) = web.remove(WEB_REPO_ORDER_KEY) else {
-            return false;
-        };
-        taken = raw
-            .as_str()
-            .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
-            .unwrap_or_default();
-        if web.is_empty() {
-            state.remove("web_ui_state");
-        }
-        true
-    })?;
-    Ok(taken)
+/// The dashboard's Repository header order from `state.toml`. A file that does not parse
+/// fails the run rather than seeding without it.
+fn web_repository_order(app_dir: &Path) -> Result<Vec<String>> {
+    let path = app_dir.join("state.toml");
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let state: toml::Table = content
+        .parse()
+        .with_context(|| format!("Failed to parse {} during v066 migration", path.display()))?;
+    Ok(state
+        .get("web_ui_state")
+        .and_then(|web| web.get(WEB_REPO_ORDER_KEY))
+        .and_then(toml::Value::as_str)
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -174,11 +175,34 @@ mod tests {
         let rows = fs::read_to_string(dir.path().join("profiles/main/sessions.json")).unwrap();
         assert!(!rows.contains("sort_index"));
         let state = fs::read_to_string(dir.path().join("state.toml")).unwrap();
-        assert!(!state.contains(WEB_REPO_ORDER_KEY));
+        assert!(
+            state.contains(WEB_REPO_ORDER_KEY),
+            "the dashboard still reads it"
+        );
 
         // A second run over migrated state changes nothing.
         run_in(dir.path()).unwrap();
         assert_eq!(ordering.order, self::ordering(dir.path()).order);
+    }
+
+    /// A run that cannot commit the shared order leaves every legacy source as it was.
+    #[test]
+    fn a_failed_run_keeps_the_legacy_order() {
+        for (file, broken) in [
+            ("workspace-ordering.json", "{not json"),
+            ("state.toml", "not = [toml"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            seed(
+                dir.path(),
+                serde_json::json!([{"id": "a", "project_path": "/r/one", "sort_index": 0}]),
+            );
+            fs::write(dir.path().join(file), broken).unwrap();
+            assert!(run_in(dir.path()).is_err(), "{file}");
+            let rows = fs::read_to_string(dir.path().join("profiles/main/sessions.json")).unwrap();
+            assert!(rows.contains("sort_index"), "{file}");
+            assert_eq!(fs::read_to_string(dir.path().join(file)).unwrap(), broken);
+        }
     }
 
     #[test]

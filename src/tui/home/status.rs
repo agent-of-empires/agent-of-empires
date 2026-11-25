@@ -1160,9 +1160,18 @@ impl HomeView {
         let row_outcomes = self.session_feed.drain_session_outcomes();
         let namespace = self.session_feed.drain_namespace_result();
         let mut changed = !row_outcomes.is_empty() || namespace.is_some();
-        if let Some(Err(error)) = self.session_feed.drain_workspace_ordering_result() {
-            self.flash_status(format!("Order not saved: {error}"));
-            changed = true;
+        match self.session_feed.drain_workspace_ordering_result() {
+            Some(Err(error)) => {
+                self.custom_after_ordering = false;
+                self.flash_status(format!("Order not saved: {error}"));
+                changed = true;
+            }
+            Some(Ok(())) if std::mem::take(&mut self.custom_after_ordering) => {
+                self.apply_sort_order(crate::session::config::SortOrder::Custom);
+                self.flash_status("Sort is now Custom, starting from the order on screen");
+                changed = true;
+            }
+            _ => {}
         }
         if let Some(result) = self.session_feed.drain_sidebar_view_result() {
             if let Err(error) = result {

@@ -643,6 +643,35 @@ fn pinned_project_without_sessions_shows_empty_header() {
         "pinned empty project gamma must show as a header, got {group_names:?}"
     );
     assert!(env.view.is_project_label_pinned("gamma"));
+
+    // Under Custom the shared repository order places the empty header among the others.
+    let alpha = env
+        .view
+        .instances()
+        .find(|inst| crate::tui::home::project_group_key(inst) == "alpha")
+        .map(|inst| inst.repo_path().to_string())
+        .unwrap();
+    env.view.sort_order = crate::session::config::SortOrder::Custom;
+    env.view.repository_order = vec!["/repos/gamma".into(), alpha];
+    env.view.flat_items = env.view.build_flat_items();
+    let headers: Vec<&str> = env
+        .view
+        .flat_items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Group { name, depth: 0, .. }
+                if matches!(name.as_str(), "alpha" | "beta" | "gamma") =>
+            {
+                Some(name.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        headers,
+        ["beta", "gamma", "alpha"],
+        "never-moved beta first"
+    );
 }
 
 /// Pressing `p` on a project header pins it (registers the repo) instead of

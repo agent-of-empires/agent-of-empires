@@ -10,6 +10,11 @@ impl HomeView {
     /// list switches to Custom, starting from the order on screen.
     pub(super) fn move_row_at_cursor(&mut self, delta: isize) -> anyhow::Result<()> {
         anyhow::ensure!(delta == -1 || delta == 1, "Invalid row direction");
+        // Each move is built from the applied order, so wait until the last one shows.
+        if self.session_feed.ordering_pending() {
+            self.flash_status("The last move is still saving");
+            return Ok(());
+        }
         if let Some(path) = self.selected_group.clone() {
             return self.move_header_row(&path, delta);
         }
@@ -75,26 +80,19 @@ impl HomeView {
         )
     }
 
-    /// Write a Custom order, switching the sort to Custom when it came from the screen.
+    /// Write a Custom order. One taken from the screen switches the sort to Custom once it
+    /// commits, so a refused write leaves the sort alone.
     fn submit_custom_order(
         &mut self,
         order: Option<Vec<String>>,
         repositories: Option<Vec<String>>,
     ) -> anyhow::Result<()> {
-        let freeze = self.sort_order != SortOrder::Custom;
         self.session_feed
             .submit_workspace_ordering(crate::daemon::WorkspaceOrderingPatch {
                 order,
                 repositories,
             })?;
-        if freeze {
-            self.session_feed
-                .submit_sidebar_view(crate::daemon::SidebarViewPatch {
-                    sort: Some(SortOrder::Custom),
-                    ..Default::default()
-                })?;
-            self.flash_status("Sort is now Custom, starting from the order on screen");
-        }
+        self.custom_after_ordering = self.sort_order != SortOrder::Custom;
         Ok(())
     }
 

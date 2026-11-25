@@ -81,10 +81,12 @@ fn test_tui_custom_sort_reorders_and_persists() {
     let before = order_on_screen(&h);
     assert_eq!(before.len(), 2, "both sessions on screen: {before:?}");
 
-    // Home selects the repository header, Down the `work` Group nested in it, Down again
-    // its first session.
+    // Under My groups, Home selects the `work` header and Down its first session.
+    h.send_keys("g");
+    h.wait_for(" Group By ");
+    h.send_keys("m");
+    h.wait_for_absent(" Group By ", Duration::from_secs(10));
     h.send_keys("Home");
-    h.send_keys("Down");
     h.send_keys("Down");
     h.send_keys("C-Down");
     let expected = vec![before[1].clone(), before[0].clone()];
