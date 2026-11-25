@@ -7,6 +7,7 @@ import {
   BUILTIN_PANES,
   bindUnboundTerminalTabId,
   isTerminalTabId,
+  paneRank,
   parseTerminalTabId,
   terminalTabId,
   TERMINAL_DOCK,
@@ -156,7 +157,9 @@ export function addTab(layout: DockLayout, dock: DockLocation, tabId: TabId, act
   if (dockOf(layout, tabId)) return layout; // already open somewhere
   const next = clone(layout);
   const group = ensureGroup(next, dock);
-  group.tabs.push(tabId);
+  const rank = paneRank(tabId);
+  const at = group.tabs.findIndex((t) => paneRank(t) > rank);
+  group.tabs.splice(at < 0 ? group.tabs.length : at, 0, tabId);
   if (activate || group.active === null) group.active = tabId;
   next.closedPlugins = next.closedPlugins.filter((id) => id !== tabId);
   return next;

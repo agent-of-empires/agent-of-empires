@@ -13,12 +13,20 @@ export interface PaneDescriptor {
   defaultDock: DockLocation;
 }
 
+/** The right dock is the Session's review panel, in this order; the terminal lives at the bottom. */
 export const BUILTIN_PANES: PaneDescriptor[] = [
   { id: "diff", title: "Diff", icon: FileDiff, defaultDock: "right" },
   { id: "files", title: "Files", icon: FolderTree, defaultDock: "right" },
-  { id: "terminal", title: "Terminal", icon: SquareTerminal, defaultDock: "bottom" },
   { id: "agents", title: "Background", icon: Bot, defaultDock: "right" },
+  { id: "terminal", title: "Terminal", icon: SquareTerminal, defaultDock: "bottom" },
 ];
+
+/** Where a newly opened tab sits among a group's tabs: Diff, Files, Background, plugin panes, then terminals. */
+export function paneRank(id: string): number {
+  const builtin = BUILTIN_PANES.findIndex((p) => p.id === id);
+  if (builtin >= 0) return builtin;
+  return id.startsWith("plugin:") ? BUILTIN_PANES.length : BUILTIN_PANES.length + 1;
+}
 
 // Terminals are the only multi-instance pane. Tab `terminal:<sessionId>:<n>` is bound at creation to that
 // Session's paired shell at tmux index n, whichever Session is selected.

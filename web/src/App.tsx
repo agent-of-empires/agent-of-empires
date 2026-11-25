@@ -990,12 +990,13 @@ function AppContent({
     // CityHall client mode hides the code-inspection panes (diff, files) and
     // the terminal (plus plugin panes below) so only the composer + structured
     // view remain. See #7.
+    // The right dock's review panes first, in its tab order, then the bottom terminal.
     ...(caps.canUseDiff ? ["diff", "files"] : []),
-    ...(caps.canUseTerminal ? ["terminal"] : []),
     // The background-agents panel only applies to structured-view (ACP)
     // sessions; a plain terminal session never launches sub-agents.
     ...(activeSession?.view === "structured" ? ["agents"] : []),
     ...(caps.cityhall ? [] : pluginPanes.map((p) => p.id)),
+    ...(caps.canUseTerminal ? ["terminal"] : []),
   ];
   // The mobile picker/single-pane view reuses this exact list (minus
   // "terminal", desktop's multi-instance extra-terminal dock, which has no

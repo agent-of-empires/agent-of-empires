@@ -54,6 +54,13 @@ const docks = (l: DockLayout) => [dockTabs(l, "right"), dockTabs(l, "bottom")];
 const allTabs = (l: DockLayout) => docks(l).flat();
 
 describe("pane layout pure ops", () => {
+  it("addTab keeps the review order Diff, Files, Background, plugins, then terminals", () => {
+    let l = emptyLayout();
+    for (const id of ["terminal:s1:0", "plugin:p:a", "agents", "files", "diff", "plugin:p:b"])
+      l = addTab(l, "right", id);
+    expect(dockTabs(l, "right")).toEqual(["diff", "files", "agents", "plugin:p:a", "plugin:p:b", "terminal:s1:0"]);
+  });
+
   it("addTab appends and is idempotent per tab id", () => {
     const l = layout(["diff", "terminal:s1:0"]);
     expect(dockTabs(l, "right")).toEqual(["diff", "terminal:s1:0"]);
@@ -220,7 +227,7 @@ describe("usePaneLayout persistence", () => {
     });
     act(() => result.current.toggleKind("terminal", "right"));
     rerender({ plugins: PLUGIN });
-    expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:s1:0", "plugin:p:a"]);
+    expect(dockTabs(result.current.layout, "right")).toEqual(["plugin:p:a", "terminal:s1:0"]);
     act(() => result.current.closeTab("plugin:p:a"));
     expect(dockTabs(result.current.layout, "right")).toEqual(["terminal:s1:0"]);
   });
@@ -517,7 +524,7 @@ describe("usePaneLayout file edit guard", () => {
     const start = setActive(layout(["plugin:x:pane", "files"]), "right", "plugin:x:pane");
     const { result, release, confirm } = editing(start, (id) => !id.startsWith("plugin:"));
     act(() => result.current.addTerminal("right"));
-    expect(dockTabs(result.current.layout, "right")).toEqual(["plugin:x:pane", "files"]);
+    expect(dockTabs(result.current.layout, "right")).toEqual(["files", "plugin:x:pane"]);
     expect(confirm).toHaveBeenCalledOnce();
     release();
   });
