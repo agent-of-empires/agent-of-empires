@@ -1374,30 +1374,34 @@ impl Session {
                         let admission = if let Err(message) = &clear_after_seq {
                             Err(message.clone())
                         } else if projected && ready && pending.proposal.current().await {
-                            match tokio::time::timeout_at(
-                                pending.deadline,
-                                current_effect_wait(
-                                    scope.as_ref(),
-                                    native,
-                                    &shared.connection_state,
-                                    || {
-                                        self.acp_session_id = response.session_id.clone();
-                                        self.channels = SessionChannels::new(
-                                            response.modes.as_ref(),
-                                            response.config_options.as_deref(),
-                                        );
-                                        shared.terminal_claim.clear_failed_outcome();
-                                        shared.connection_state.record_usable();
-                                    },
-                                ),
+                            // The receipt settles independently of the caller's deadline.
+                            current_effect_wait(
+                                scope.as_ref(),
+                                native,
+                                &shared.connection_state,
+                                || {
+                                    if (native
+                                        && !self
+                                            .control
+                                            .as_ref()
+                                            .is_some_and(|control| control.native_session_ready()))
+                                        || shared.connection_state.is_stopping()
+                                    {
+                                        return Err("native reset channel is unavailable".into());
+                                    }
+                                    self.acp_session_id = response.session_id.clone();
+                                    self.channels = SessionChannels::new(
+                                        response.modes.as_ref(),
+                                        response.config_options.as_deref(),
+                                    );
+                                    shared.terminal_claim.clear_failed_outcome();
+                                    shared.connection_state.record_usable();
+                                    Ok(())
+                                },
                             )
                             .await
-                            {
-                                Ok(result) => result.map_err(|error| public_error_message(&error)),
-                                Err(_) => {
-                                    Err("reset deadline expired before channel admission".into())
-                                }
-                            }
+                            .map_err(|error| public_error_message(&error))
+                            .and_then(|result| result)
                         } else {
                             Err("native reset was superseded or its channel is unavailable".into())
                         };

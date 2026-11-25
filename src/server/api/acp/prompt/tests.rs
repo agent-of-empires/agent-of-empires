@@ -313,7 +313,11 @@ async fn initial_host_intent_obeys_applied_and_stop_before_native_issue() {
                 live.native.send(serde_json::json!({
                     "jsonrpc": "2.0", "id": request["id"], "result": {"sessionId": replacement}
                 })).await;
-                reset.await.unwrap();
+                let outcome = reset.await.unwrap();
+                assert!(
+                    matches!(&outcome, crate::acp::acp_client::ResetSessionOutcome::Reset { new_acp_session_id } if new_acp_session_id == replacement),
+                    "reset must publish its replacement before submitting fresh input: {outcome:?}"
+                );
                 live.sid = replacement.into();
             }
             assert_eq!(live.client.initial_prompt_identity(), None);
