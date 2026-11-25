@@ -60,8 +60,6 @@ pub(crate) fn providers() -> Vec<Provider> {
         .collect()
 }
 
-const SCHEMA_VERSION: i64 = 4;
-
 /// Identifies the manifest spec a publication was validated against. Reads show
 /// only items stamped with the provider's current spec, so a worker that
 /// publishes late under an older manifest never surfaces under a newer one.
@@ -73,48 +71,7 @@ pub(crate) fn spec_hash(spec: &SuggestionsSpec) -> String {
         .fold(String::new(), |acc, b| acc + &format!("{b:02x}"))
 }
 
-/// Every suggestion table, including the legacy `suggestion_policy` and
-/// `suggestion_templates`, dropped when the recorded schema version differs.
-const TABLES: [&str; 14] = [
-    "suggestion_providers",
-    "suggestion_items",
-    "suggestion_sources",
-    "suggestion_dismissals",
-    "suggestion_presets",
-    "suggestion_mappings",
-    "suggestion_fixes",
-    "suggestion_stale",
-    "suggestion_checks",
-    "suggestion_preferences",
-    "suggestion_provider_prefs",
-    "suggestion_policy",
-    "suggestion_templates",
-    "suggestion_links",
-];
-
 pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS suggestion_schema (
-             id      INTEGER PRIMARY KEY CHECK (id = 1),
-             version INTEGER NOT NULL
-         );",
-    )?;
-    let version: Option<i64> = conn
-        .query_row(
-            "SELECT version FROM suggestion_schema WHERE id = 1",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if version != Some(SCHEMA_VERSION) {
-        for table in TABLES {
-            conn.execute_batch(&format!("DROP TABLE IF EXISTS {table};"))?;
-        }
-        conn.execute(
-            "INSERT OR REPLACE INTO suggestion_schema (id, version) VALUES (1, ?1)",
-            params![SCHEMA_VERSION],
-        )?;
-    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS suggestion_providers (
              profile     TEXT NOT NULL,
@@ -204,26 +161,6 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
              PRIMARY KEY (profile, provider_id)
          );",
     )?;
-    // A link written before `started_via` existed is a wizard start, the safe
-    // reading: a client never discards a Session it cannot tell the origin of.
-    let has_via: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('suggestion_links') WHERE name = 'started_via'",
-        [],
-        |r| r.get(0),
-    )?;
-    if has_via == 0 {
-        conn.execute_batch(
-            "ALTER TABLE suggestion_links ADD COLUMN started_via TEXT NOT NULL DEFAULT 'wizard'",
-        )?;
-    }
-    let has_prompt: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('suggestion_links') WHERE name = 'started_prompt'",
-        [],
-        |r| r.get(0),
-    )?;
-    if has_prompt == 0 {
-        conn.execute_batch("ALTER TABLE suggestion_links ADD COLUMN started_prompt TEXT")?;
-    }
     Ok(())
 }
 
@@ -369,37 +306,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_store_from_another_schema_version_is_rebuilt() {
+    fn init_and_forgetting_a_publication_keep_the_rows_only_the_user_can_recreate() {
         let conn = Connection::open_in_memory().unwrap();
+        init(&conn).unwrap();
+        assert_eq!(publish(&conn, "p", &[item("a", "assigned")])["accepted"], 1);
         conn.execute_batch(
-            "CREATE TABLE suggestion_items (
-                 profile TEXT NOT NULL, provider_id TEXT NOT NULL, item_id TEXT NOT NULL,
-                 item_json TEXT NOT NULL, revision INTEGER NOT NULL,
-                 PRIMARY KEY (profile, provider_id, item_id)
-             );
-             CREATE TABLE suggestion_policy (profile TEXT PRIMARY KEY);
-             CREATE TABLE suggestion_templates (profile TEXT PRIMARY KEY);
-             CREATE TABLE suggestion_schema (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);
-             INSERT INTO suggestion_schema VALUES (1, 0);",
+            "INSERT INTO suggestion_dismissals VALUES ('p', 'acme.github', 'a');
+             INSERT INTO suggestion_presets VALUES ('p', 'acme.github', 'assigned', '{}');
+             INSERT INTO suggestion_mappings VALUES ('p', 'acme.github', 'k', '[]');
+             INSERT INTO suggestion_links VALUES ('p', 'acme.github', 'a', 'h', 0, 'wizard', NULL);",
         )
         .unwrap();
         init(&conn).unwrap();
-        assert_eq!(publish(&conn, "p", &[item("a", "assigned")])["accepted"], 1);
-        let version: i64 = conn
-            .query_row("SELECT version FROM suggestion_schema", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        let legacy: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE name IN ('suggestion_policy', 'suggestion_templates')",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(legacy, 0);
-        // A matching version keeps the data.
-        init(&conn).unwrap();
         assert_eq!(ids(&snap(&conn, "p")), ["a"]);
+        forget_publication(&conn, "acme.github").unwrap();
+        for table in [
+            "suggestion_dismissals",
+            "suggestion_presets",
+            "suggestion_mappings",
+            "suggestion_links",
+        ] {
+            let rows: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 1, "{table}");
+        }
     }
 }

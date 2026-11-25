@@ -361,24 +361,4 @@ mod tests {
         assert_eq!(via(), StartedVia::Wizard);
         assert_eq!(via().prompt(), None, "the takeover drops the old prompt");
     }
-
-    #[test]
-    fn a_link_from_before_started_via_reads_as_a_wizard_start() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(&format!(
-            "CREATE TABLE suggestion_schema (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL);
-             INSERT INTO suggestion_schema VALUES (1, {SCHEMA_VERSION});
-             CREATE TABLE suggestion_links (
-                 profile TEXT NOT NULL, provider_id TEXT NOT NULL, item_id TEXT NOT NULL,
-                 holder TEXT NOT NULL, pending INTEGER NOT NULL,
-                 PRIMARY KEY (profile, provider_id, item_id));
-             INSERT INTO suggestion_links VALUES ('p', 'acme.github', 'a', 'old', 0);"
-        ))
-        .unwrap();
-        init(&conn).unwrap();
-        let rows = links(&conn, "p").unwrap();
-        assert_eq!(rows.len(), 1, "the link survives");
-        assert_eq!(rows[0].started_via, StartedVia::Wizard);
-        assert_eq!(rows[0].started_via.prompt(), None);
-    }
 }
