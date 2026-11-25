@@ -1,10 +1,12 @@
 //! Plugin-backed `McpRewriter`: asks each hooked worker to edit the forwarded MCP set.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aoe_plugin_api::{McpRewriteScope, PluginManifest, MCP_SERVE_CAPABILITY};
+use aoe_plugin_api::{
+    McpRewriteScope, PluginManifest, MCP_SERVE_CAPABILITY, MCP_SERVE_MAX_PER_PLUGIN,
+};
 use futures_util::future::BoxFuture;
 
 use crate::acp::mcp_rewrite::{
@@ -121,7 +123,16 @@ fn resolve_served(
     let mut out = Rewritten::default();
     let mut unreachable: BTreeSet<String> = BTreeSet::new();
     let mut omitted: BTreeSet<String> = BTreeSet::new();
+    let mut per_plugin: HashMap<String, usize> = HashMap::new();
     for entry in entries {
+        // The cap covers retained discovery entries and hook-added ones together, in chain order.
+        if let McpEntry::Serve { served } = &entry {
+            let count = per_plugin.entry(served.plugin_id.clone()).or_default();
+            if *count >= MCP_SERVE_MAX_PER_PLUGIN {
+                continue;
+            }
+            *count += 1;
+        }
         match (entry, target) {
             (McpEntry::Server(server), _) => out.servers.push(server),
             (McpEntry::Serve { served }, Ok((secret, route))) => {
@@ -1015,6 +1026,35 @@ mod tests {
             ]),
             "replacing makes the later hook the contributor"
         );
+    }
+
+    /// The per-plugin cap holds for the whole chain, not only for discovery.
+    #[tokio::test]
+    async fn hook_added_serve_entries_count_toward_the_per_plugin_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let ep = endpoint(dir.path(), None);
+        let adds: Vec<_> = (0..MCP_SERVE_MAX_PER_PLUGIN + 10)
+            .map(|i| json!({"name": format!("s{i:03}"), "serve": {}}))
+            .collect();
+        let caller = FakeCaller::new(vec![Ok(json!({ "add": adds }))]);
+        let out = run_hooks(
+            Some(&caller),
+            &[serving_hook("acme.a")],
+            &host_ctx(),
+            vec![stdio("keep")],
+            Some(&ep),
+        )
+        .await
+        .unwrap();
+        let served = out.served_by.len();
+        assert_eq!(served, MCP_SERVE_MAX_PER_PLUGIN, "served entries kept");
+        assert_eq!(out.credentials.len(), MCP_SERVE_MAX_PER_PLUGIN);
+        assert!(
+            out.servers.iter().any(|s| s.name == "keep"),
+            "ordinary entries are not counted"
+        );
+        assert!(out.servers.iter().any(|s| s.name == "acme_a__s000"));
+        assert!(!out.servers.iter().any(|s| s.name == "acme_a__s064"));
     }
 
     /// A hook-served entry replaces a same-key entry like any add, silently.
