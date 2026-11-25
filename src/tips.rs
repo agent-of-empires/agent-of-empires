@@ -9,7 +9,8 @@ pub struct TipSignals {
     pub used_system_health: bool,
     pub sessions_created: u64,
     pub shortcut_bar_hidden: bool,
-    /// A featured plugin offers suggestions and no installed plugin provides them.
+    /// A featured plugin offers suggestions and the daemon has no provider.
+    /// Each surface sets it from what its daemon reports.
     pub suggestions_setup_available: bool,
 }
 
@@ -22,19 +23,17 @@ impl From<&crate::session::Config> for TipSignals {
             used_system_health: config.app_state.used_system_health,
             sessions_created: config.app_state.sessions_created,
             shortcut_bar_hidden: !config.session.show_shortcut_bar,
-            suggestions_setup_available: suggestions_setup_available(),
+            suggestions_setup_available: false,
         }
     }
 }
 
-fn suggestions_setup_available() -> bool {
-    let featured = crate::plugin::featured::FeaturedIndex::load()
-        .is_ok_and(|index| index.offers_suggestions());
-    featured
-        && !crate::plugin::registry()
-            .all()
-            .iter()
-            .any(|plugin| plugin.manifest.suggestions.is_some())
+/// True when a featured plugin offers suggestions and the daemon reports no
+/// installed provider.
+pub fn suggestions_setup_available(provider_installed: bool) -> bool {
+    !provider_installed
+        && crate::plugin::featured::FeaturedIndex::load()
+            .is_ok_and(|index| index.offers_suggestions())
 }
 
 /// Called only after a creation is committed, never for a restart or a placeholder.

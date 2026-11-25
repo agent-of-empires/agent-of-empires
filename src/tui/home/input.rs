@@ -5949,7 +5949,7 @@ impl HomeView {
     pub(super) fn open_tips_dialog(&mut self) {
         crate::tui::telemetry::report_feature_use(crate::telemetry::feature_use::FeatureUse::Tips);
         let config = load_config().ok().flatten().unwrap_or_default();
-        let signals = crate::tips::TipSignals::from(&config);
+        let signals = self.tip_signals(&config);
         let eligible = crate::tips::eligible(crate::tips::TipSurface::Tui, &signals);
         self.tips_dialog = Some(TipsDialog::new(
             eligible,
@@ -5984,7 +5984,7 @@ impl HomeView {
             }
         }
         if let Ok(config) = load_config().map(|c| c.unwrap_or_default()) {
-            self.tips_unseen = super::tips_unseen_count(&config);
+            self.tips_unseen = self.tips_unseen_count(&config);
         }
     }
 
@@ -5999,7 +5999,7 @@ impl HomeView {
             return;
         }
         if let Ok(config) = load_config().map(|c| c.unwrap_or_default()) {
-            self.tips_unseen = super::tips_unseen_count(&config);
+            self.tips_unseen = self.tips_unseen_count(&config);
         }
     }
 
@@ -6024,14 +6024,14 @@ impl HomeView {
             return;
         }
         if let Ok(config) = load_config().map(|c| c.unwrap_or_default()) {
-            self.tips_unseen = super::tips_unseen_count(&config);
+            self.tips_unseen = self.tips_unseen_count(&config);
         }
     }
 
     /// Refresh on startup and the storage heartbeat, including creates in other profiles.
     pub(super) fn refresh_shortcut_bar_tip(&mut self) {
         if let Ok(Some(config)) = load_config() {
-            self.tips_unseen = super::tips_unseen_count(&config);
+            self.tips_unseen = self.tips_unseen_count(&config);
             self.queue_shortcut_bar_tip(&config);
         }
     }
@@ -6043,7 +6043,7 @@ impl HomeView {
         self.pending_tip_pop = crate::tips::eligible_unseen(
             crate::tips::TipSurface::Tui,
             &config.app_state.tips_seen,
-            &crate::tips::TipSignals::from(config),
+            &self.tip_signals(config),
         )
         .into_iter()
         .find(|tip| tip.id == crate::tips::SHORTCUT_BAR_TIP_ID);
@@ -6077,7 +6077,7 @@ impl HomeView {
         if !config.session.show_tips {
             return;
         }
-        let signals = crate::tips::TipSignals::from(&config);
+        let signals = self.tip_signals(&config);
         self.pending_tip_pop = crate::tips::next_earned_pop(
             crate::tips::TipSurface::Tui,
             &config.app_state.tips_seen,
@@ -6085,9 +6085,21 @@ impl HomeView {
         );
     }
 
-    /// Queue the suggested-sessions tip at launch; the drain re-checks that it is
+    /// Arm the suggested-sessions tip at launch. Its signal comes from the
+    /// daemon's suggestions snapshot, so it queues once the first one loads.
+    pub(in crate::tui) fn arm_suggested_sessions_tip(&mut self) {
+        self.suggested_sessions_tip_armed = true;
+    }
+
+    /// Queue the armed suggested-sessions tip; the drain re-checks that it is
     /// earned, unseen and that tips are on.
-    pub(in crate::tui) fn queue_suggested_sessions_tip(&mut self) {
+    pub(super) fn queue_suggested_sessions_tip(&mut self) {
+        if self.suggestions_feed.provider_installed().is_none() {
+            return;
+        }
+        self.suggested_sessions_tip_armed = false;
+        let config = load_config().ok().flatten().unwrap_or_default();
+        self.tips_unseen = self.tips_unseen_count(&config);
         if self.pending_tip_pop.is_none() {
             self.pending_tip_pop = crate::tips::catalog()
                 .iter()
@@ -6107,7 +6119,7 @@ impl HomeView {
             || !crate::tips::eligible_unseen(
                 crate::tips::TipSurface::Tui,
                 &config.app_state.tips_seen,
-                &crate::tips::TipSignals::from(&config),
+                &self.tip_signals(&config),
             )
             .iter()
             .any(|eligible| eligible.id == tip.id)

@@ -613,7 +613,7 @@ fn earn_tip(env: &mut TestEnv) {
     let config = crate::session::config::load_config()
         .unwrap()
         .unwrap_or_default();
-    env.view.tips_unseen = crate::tui::home::tips_unseen_count(&config);
+    env.view.tips_unseen = env.view.tips_unseen_count(&config);
 }
 
 // Group deletion tests

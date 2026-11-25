@@ -1446,7 +1446,14 @@ pub struct TipsResponse {
 pub async fn get_tips(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
     let result = tokio::task::spawn_blocking(|| {
         let config = crate::session::Config::load()?;
-        let signals = crate::tips::TipSignals::from(&config);
+        let mut signals = crate::tips::TipSignals::from(&config);
+        // This runs in the daemon, so its registry is the daemon's.
+        signals.suggestions_setup_available = crate::tips::suggestions_setup_available(
+            crate::plugin::registry()
+                .all()
+                .iter()
+                .any(|plugin| plugin.manifest.suggestions.is_some()),
+        );
         let seen = &config.app_state.tips_seen;
         let tips = crate::tips::eligible(crate::tips::TipSurface::Web, &signals)
             .into_iter()

@@ -56,6 +56,9 @@ impl HomeView {
         self.suggestions_feed
             .tick(self.session_feed.latest_snapshot().is_some());
         let mut polled = self.suggestions_feed.poll();
+        if self.suggested_sessions_tip_armed {
+            self.queue_suggested_sessions_tip();
+        }
         if self
             .start_after_trash
             .as_ref()

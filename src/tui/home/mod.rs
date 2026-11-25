@@ -69,8 +69,8 @@ use self::icons::{
 use self::preview::{PreviewCache, PreviewSelection, PreviewTextView, PreviewTimings};
 use self::rows::project_group_key;
 pub(super) use self::watchers::{
-    log_legacy_duplicates_once, tips_unseen_count, ConfigRefreshOrigin, ConfigWatchState,
-    DiskWatchState, ReloadFailureState,
+    log_legacy_duplicates_once, ConfigRefreshOrigin, ConfigWatchState, DiskWatchState,
+    ReloadFailureState,
 };
 use self::watchers::{RELOAD_FAILED_TITLE, WATCHER_WARNING_TITLE};
 
@@ -629,6 +629,8 @@ pub struct HomeView {
     pub(super) prompt_failures_seeded: bool,
     /// Announced failures waiting for the tick path: session id and message.
     pub(super) prompt_failure_queue: Vec<(String, String)>,
+    /// The suggested-sessions tip queues once the first suggestions snapshot loads.
+    pub(super) suggested_sessions_tip_armed: bool,
     /// The prompt the "Prompt not delivered" dialog's Copy button puts on the clipboard.
     pub(super) undelivered_prompt: Option<String>,
     /// A suggestion to start again once its blocked Session, by id, is in Trash.

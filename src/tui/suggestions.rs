@@ -1310,7 +1310,16 @@ impl SuggestionsView {
             };
             lines.push(Line::from(""));
         }
-        if self.order.is_empty() {
+        if self.order.is_empty() && store.provider_installed() == Some(false) {
+            for line in [
+                "No suggestion source is installed. To set one up, use",
+                "Set up suggestions on the web dashboard's homepage, or run:",
+                "",
+                "  aoe plugin install gh:agent-of-empires/plugin-github",
+            ] {
+                lines.push(Line::from(Span::styled(line, dim)));
+            }
+        } else if self.order.is_empty() {
             let message = match (&store.snapshot, store.busy) {
                 (None, true) => "Loading suggestions…".to_string(),
                 (None, false) => {
@@ -1856,6 +1865,11 @@ impl SuggestionsFeed {
         if connected && !self.busy && due(self.loaded_at) && due(self.load_attempt_at) {
             self.send(Req::Load, false);
         }
+    }
+
+    /// Whether the daemon reports a suggestions provider; None until a snapshot loads.
+    pub(super) fn provider_installed(&self) -> Option<bool> {
+        self.snapshot.as_ref().map(|s| !s.providers.is_empty())
     }
 
     /// True while a request is in flight: its answer is not yet processed.
@@ -3665,6 +3679,22 @@ mod tests {
             lines[3].contains("GitHub · nothing new · r checks again."),
             "{text}"
         );
+    }
+
+    #[test]
+    fn an_empty_list_without_a_provider_says_how_to_set_one_up() {
+        let mut rig = view_with(vec![item("a", None, false)], idle_worker());
+        let snapshot = rig.store.snapshot.as_mut().unwrap();
+        snapshot.items.clear();
+        snapshot.providers.clear();
+        rig.view.sync(&rig.store);
+        let text = render_sized(&rig, None, 80, 24);
+        assert!(text.contains("Set up suggestions"), "{text}");
+        assert!(
+            text.contains("aoe plugin install gh:agent-of-empires/plugin-github"),
+            "{text}"
+        );
+        assert!(!text.contains("Nothing to suggest"), "{text}");
     }
 
     #[test]
