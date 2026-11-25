@@ -1380,6 +1380,7 @@ mod tests {
         let frame = move |seq: u64| {
             serde_json::json!({
                 "session_id": "s", "seq": seq,
+                "scope": "history_only",
                 "event": {"AgentMessageChunk": {"text": format!("m{seq}"), "message_id": format!("id{seq}")}},
             })
         };

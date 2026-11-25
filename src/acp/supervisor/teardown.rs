@@ -3398,7 +3398,7 @@ mod tests {
     #[serial_test::serial]
     async fn shutdown_detaches_outstanding_background_agents_before_stopped() {
         super::super::test_support::managed::with_managed(|scope| Box::pin(async move {
-            let native = crate::acp::task_transcript::resource_test_support::NativeBootstrap::new(scope, "codex").await;
+            let native = crate::acp::task_transcript::resource_test_support::NativeBootstrap::new(scope, "gemini").await;
             let id = native.managed.id.clone();
             for agent in ["bg-1", "bg-2"] {
                 let path = native.home.join(format!("{agent}.jsonl"));

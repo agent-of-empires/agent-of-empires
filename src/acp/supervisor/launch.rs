@@ -5447,7 +5447,7 @@ time.sleep(60)
         let agent_key = if open_task.is_some() {
             "claude"
         } else {
-            "codex"
+            "gemini"
         };
         let (config, peer) = scope.native_peer(
             workdir.path().to_path_buf(),

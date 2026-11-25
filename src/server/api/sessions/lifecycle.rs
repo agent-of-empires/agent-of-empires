@@ -3645,9 +3645,7 @@ async fn finish_structured_restart(
         drop(guard);
         drop(submission);
         drop(namespace);
-        let spawned = state
-            .acp_supervisor
-            .spawn_inner(request, reservation)
+        let spawned = Box::pin(state.acp_supervisor.spawn_inner(request, reservation))
             .await
             .map_err(anyhow::Error::new);
         crate::server::session_spawn::finish_structured_launch(

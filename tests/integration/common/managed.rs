@@ -855,7 +855,7 @@ async fn with_managed_configured<F>(
         quote(&node),
         quote(&shim_path()),
     );
-    for name in ["claude-agent-acp", "codex-acp", "pi-acp"] {
+    for name in ["claude-agent-acp", "codex-acp", "opencode", "pi-acp"] {
         let path = bin.join(name);
         std::fs::write(&path, &wrapper).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -910,7 +910,11 @@ async fn with_managed_configured<F>(
                     actual.tool, template.tool,
                     "tool must be fixed before admission"
                 );
-                assert_eq!(actual.cwd, template.cwd, "factory must retain the case cwd");
+                assert_eq!(
+                    actual.cwd,
+                    template.cwd.canonicalize().expect("canonical case cwd"),
+                    "factory must retain the canonical case cwd"
+                );
                 // Only case inputs are overlaid. Attempt, producer, native store,
                 // selected identity, generation and admission remain factory-owned.
                 actual.spec = template.spec;

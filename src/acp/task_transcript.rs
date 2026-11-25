@@ -2165,7 +2165,8 @@ pub(crate) mod resource_test_support {
 
     impl AgentFixture {
         pub(crate) async fn new(scope: &mut ManagedScope) -> Self {
-            let mut native = NativeBootstrap::new(scope, "codex").await;
+            // Gemini uses legacy Agent transcript tailing; Codex uses typed subagents.
+            let mut native = NativeBootstrap::new(scope, "gemini").await;
             let path = native.home.join("agent.jsonl");
             std::fs::write(&path, "").unwrap();
             native
