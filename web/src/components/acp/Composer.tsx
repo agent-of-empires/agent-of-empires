@@ -63,6 +63,7 @@ import {
 } from "./useComposerHooks";
 import { useDictationBurstGuard } from "./useDictationBurstGuard";
 import { useProviderSwitch } from "./useProviderSwitch";
+import { TRANSCRIPT_COLUMN } from "./transcriptColumn";
 
 interface Props {
   /** False for a hidden or covered retained view: it takes no focus requests. */
@@ -231,7 +232,7 @@ export function Composer(props: Props) {
       <div
         data-session-composer
         {...tourAnchor(TOUR_ANCHORS.composer)}
-        className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl"
+        className={TRANSCRIPT_COLUMN}
         onDragOver={(e) => {
           if (Array.from(e.dataTransfer?.types ?? []).includes("Files")) e.preventDefault();
         }}

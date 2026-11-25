@@ -9,7 +9,7 @@
 //!
 //! Set `RECORD_E2E=1` to record each TUI test as an asciinema `.cast` file and
 //! convert it to a GIF via `agg`. Recordings are saved to
-//! `target/e2e-recordings/`. Both `asciinema` and `agg` must be on `$PATH`.
+//! `target/e2e-media/`. Both `asciinema` and `agg` must be on `$PATH`.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::net::{TcpListener, TcpStream};
@@ -337,8 +337,8 @@ fn agg_available() -> bool {
         .unwrap_or(false)
 }
 
-fn recordings_dir() -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/e2e-recordings");
+pub fn recordings_dir() -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/e2e-media");
     std::fs::create_dir_all(&dir).expect("create recordings dir");
     dir
 }

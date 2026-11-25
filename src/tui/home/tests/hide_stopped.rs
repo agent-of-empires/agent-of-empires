@@ -148,6 +148,134 @@ fn status_grouping_hides_stopped_sessions_and_keeps_the_header() {
     assert!(header_text(&env.view, "Stopped").contains("Stopped (5)"));
 }
 
+/// `session.hide_snoozed_with_stopped` folds snoozed sessions into the rows `y` hides; a session
+/// in no manual group stays visible either way.
+#[test]
+#[serial]
+fn the_setting_hides_snoozed_sessions_with_stopped_ones() {
+    let mut snoozed = with_status(
+        instance_in("util-snoozed", "/tmp/util", "util"),
+        Status::Waiting,
+    );
+    snoozed.snooze(30);
+    let mut loose = with_status(
+        Instance::new("loose-snoozed", "/tmp/loose"),
+        Status::Waiting,
+    );
+    loose.snooze(30);
+    let mut env = seeded_env(
+        test_home(),
+        &[
+            with_status(instance_in("util-live", "/tmp/util", "util"), Status::Idle),
+            with_status(
+                instance_in("util-stopped", "/tmp/util", "util"),
+                Status::Stopped,
+            ),
+            snoozed,
+            loose,
+        ],
+        true,
+    );
+
+    press_y(&mut env);
+    let shown = session_titles(&env.view);
+    assert!(shown.contains(&"util-snoozed".to_string()), "{shown:?}");
+    assert!(!shown.contains(&"util-stopped".to_string()), "{shown:?}");
+    assert!(header_text(&env.view, "util").contains("util (2/3)"));
+
+    env.view.hide_snoozed_with_stopped = true;
+    env.view.rebuild_flat_items();
+    let shown = session_titles(&env.view);
+    assert!(!shown.contains(&"util-snoozed".to_string()), "{shown:?}");
+    assert!(
+        shown.contains(&"loose-snoozed".to_string()),
+        "a session in no group is never hidden: {shown:?}"
+    );
+    assert!(header_text(&env.view, "util").contains("util (1/3)"));
+}
+
+/// Status grouping keeps a header whose sessions were all hidden, snoozed ones included.
+#[test]
+#[serial]
+fn status_grouping_hides_snoozed_sessions_only_with_the_setting() {
+    let mut snoozed = with_status(
+        instance_in("util-snoozed", "/tmp/util", "util"),
+        Status::Waiting,
+    );
+    snoozed.snooze(30);
+    let mut env = seeded_env(
+        test_home(),
+        &[
+            with_status(instance_in("util-live", "/tmp/util", "util"), Status::Idle),
+            with_status(
+                instance_in("util-stopped", "/tmp/util", "util"),
+                Status::Stopped,
+            ),
+            snoozed,
+        ],
+        false,
+    );
+    env.view.apply_group_by(GroupByMode::Status);
+    press_y(&mut env);
+    assert!(
+        session_titles(&env.view).contains(&"util-snoozed".to_string()),
+        "the setting is off"
+    );
+
+    env.view.hide_snoozed_with_stopped = true;
+    env.view.rebuild_flat_items();
+    assert_eq!(session_titles(&env.view), vec!["util-live".to_string()]);
+    assert!(header_text(&env.view, "Waiting").contains("Waiting (0/1)"));
+    assert!(header_text(&env.view, "Stopped").contains("Stopped (0/1)"));
+}
+
+/// Editing `session.hide_snoozed_with_stopped` while `y` is on re-filters the list on the next
+/// config refresh, in both directions.
+#[test]
+#[serial]
+fn a_config_refresh_applies_the_setting_while_stopped_sessions_are_hidden() {
+    let mut snoozed = with_status(
+        instance_in("util-snoozed", "/tmp/util", "util"),
+        Status::Waiting,
+    );
+    snoozed.snooze(30);
+    let mut env = seeded_env(
+        test_home(),
+        &[
+            with_status(instance_in("util-live", "/tmp/util", "util"), Status::Idle),
+            with_status(
+                instance_in("util-stopped", "/tmp/util", "util"),
+                Status::Stopped,
+            ),
+            snoozed,
+        ],
+        true,
+    );
+
+    press_y(&mut env);
+    assert!(
+        session_titles(&env.view).contains(&"util-snoozed".to_string()),
+        "the setting is still off"
+    );
+
+    fn set(view: &mut HomeView, on: bool) {
+        crate::session::update_config(|config| {
+            config.session.hide_snoozed_with_stopped = on;
+        })
+        .unwrap();
+        view.refresh_from_config(ConfigRefreshOrigin::Interactive);
+    }
+
+    set(&mut env.view, true);
+    assert!(env.view.hide_snoozed_with_stopped);
+    assert_eq!(session_titles(&env.view), vec!["util-live".to_string()]);
+    assert!(header_text(&env.view, "util").contains("util (1/3)"));
+
+    set(&mut env.view, false);
+    assert!(session_titles(&env.view).contains(&"util-snoozed".to_string()));
+    assert!(header_text(&env.view, "util").contains("util (2/3)"));
+}
+
 /// Attention sort lists sessions without groups, and archived sessions keep their own section,
 /// so neither loses a row.
 #[test]
