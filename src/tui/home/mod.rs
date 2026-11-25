@@ -612,6 +612,8 @@ pub struct HomeView {
 
     /// Stopped sessions inside groups are left out of the sidebar, for this run only.
     pub(super) hide_stopped_in_groups: bool,
+    /// `session.hide_snoozed_with_stopped`: count snoozed Sessions as hidden too.
+    pub(super) hide_snoozed_with_stopped: bool,
     /// While stopped sessions are hidden, each group header's full count, keyed by path and
     /// profile, so the header can show `visible/total`.
     pub(super) group_totals: HashMap<(String, Option<String>), usize>,
