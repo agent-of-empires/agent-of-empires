@@ -34,6 +34,35 @@ impl AgentSpec {
     }
 }
 
+/// True for selectors npm resolves from the registry: a dist-tag, version or range.
+/// Paths, archives, URLs and aliases do not prove the package identity.
+fn is_registry_selector(selector: &str) -> bool {
+    let lower = selector.to_ascii_lowercase();
+    if [".tgz", ".tar", ".tar.gz", ".zip"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+    {
+        return false;
+    }
+    let is_tag = selector.starts_with(|c: char| c.is_ascii_alphabetic())
+        && selector
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+    let is_comparator = |token: &str| {
+        let core = token.trim_start_matches(['^', '~', '<', '>', '=']);
+        let core = core.strip_prefix(['v', 'V']).unwrap_or(core);
+        core.starts_with(|c: char| c.is_ascii_digit() || "xX*".contains(c))
+            && core
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || ".-+*".contains(c))
+    };
+    let is_range = selector.split("||").all(|part| {
+        let mut tokens = part.split_whitespace().peekable();
+        tokens.peek().is_some() && tokens.all(|t| t == "-" || is_comparator(t))
+    });
+    is_tag || is_range
+}
+
 /// Whether a custom `agent_acp_cmd` runs the Claude ACP adapter, the only adapter known to
 /// load Claude session ids. Matches the adapter binary, or an `npx`/`bunx` launch that
 /// passes only `-y`/`--yes` before one of the adapter's known packages.
@@ -71,16 +100,6 @@ pub fn runs_claude_adapter(cmd: &str) -> bool {
             .and_then(|rest| rest.find('@'))
             .map_or(package.len(), |at| at + 1);
         let (name, version) = package.split_at(name_end);
-        // Only a plain registry selector proves identity; aliases and archive refs do not.
-        let is_registry_selector = |selector: &str| {
-            !selector.is_empty()
-                && selector
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || " ._+-^~<>=|*".contains(c))
-                && ![".tgz", ".tar", ".tar.gz"]
-                    .iter()
-                    .any(|ext| selector.ends_with(ext))
-        };
         PACKAGES.contains(&name) && (version.is_empty() || is_registry_selector(&version[1..]))
     })
 }
@@ -483,6 +502,33 @@ mod tests {
             ),
             ("npx @agentclientprotocol/claude-agent-acp@u/r", false),
             ("npx @agentclientprotocol/claude-agent-acp@x.tgz", false),
+            ("npx @agentclientprotocol/claude-agent-acp@1", true),
+            ("npx @agentclientprotocol/claude-agent-acp@1.2.3", true),
+            ("npx @agentclientprotocol/claude-agent-acp@v1.2.3", true),
+            (
+                "npx @agentclientprotocol/claude-agent-acp@1.2.3-beta.1",
+                true,
+            ),
+            ("npx @agentclientprotocol/claude-agent-acp@^1.2", true),
+            ("npx @agentclientprotocol/claude-agent-acp@~1.2", true),
+            ("npx @agentclientprotocol/claude-agent-acp@1.x", true),
+            ("npx @agentclientprotocol/claude-agent-acp@*", true),
+            ("npx @agentclientprotocol/claude-agent-acp@latest", true),
+            ("npx @agentclientprotocol/claude-agent-acp@next", true),
+            ("npx @agentclientprotocol/claude-agent-acp@./x", false),
+            ("npx @agentclientprotocol/claude-agent-acp@../x", false),
+            ("npx @agentclientprotocol/claude-agent-acp@/abs", false),
+            ("npx @agentclientprotocol/claude-agent-acp@~/x", false),
+            ("npx @agentclientprotocol/claude-agent-acp@.", false),
+            ("npx @agentclientprotocol/claude-agent-acp@..", false),
+            ("npx @agentclientprotocol/claude-agent-acp@x.TGZ", false),
+            ("npx @agentclientprotocol/claude-agent-acp@x.TAR.GZ", false),
+            ("npx @agentclientprotocol/claude-agent-acp@x.zip", false),
+            ("npx \"@agentclientprotocol/claude-agent-acp@1 || 2\"", true),
+            (
+                "npx \"@agentclientprotocol/claude-agent-acp@1.2 - 1.4\"",
+                true,
+            ),
             ("npx claude-agent-acp@npm:other", false),
             ("npx claude-agent-acp@", false),
         ] {
