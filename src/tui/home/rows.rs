@@ -4,20 +4,10 @@
 use super::*;
 use std::collections::HashSet;
 
-/// `pool` without the stopped sessions that sit in a group, when `hide_stopped` is on. Archived
-/// and trashed sessions keep their own sections.
-fn shown_in_groups(pool: Vec<Instance>, hide_stopped: bool) -> Vec<Instance> {
-    if !hide_stopped {
-        return pool;
-    }
-    pool.into_iter()
-        .filter(|i| {
-            i.status != crate::session::Status::Stopped
-                || i.group_path.is_empty()
-                || i.is_archived()
-                || i.is_trashed()
-        })
-        .collect()
+/// Whether the `y` filter counts `inst` among the stopped rows to hide. Snoozed Sessions join
+/// them when `hide_snoozed` is on; archived and trashed rows keep their own sections.
+fn stopped_row_hidden_in_groups(inst: &Instance, hide_snoozed: bool) -> bool {
+    inst.status == crate::session::Status::Stopped || (hide_snoozed && inst.is_snoozed())
 }
 
 /// Project-mode group key, including the distinct scratch sentinel.
@@ -191,17 +181,19 @@ impl HomeView {
         self.hide_stopped_in_groups = !self.hide_stopped_in_groups;
         self.rebuild_flat_items_keeping_cursor();
         self.update_selected();
-        self.flash_status(if self.hide_stopped_in_groups {
-            "Stopped sessions in groups hidden (y to show)"
-        } else {
+        self.flash_status(if !self.hide_stopped_in_groups {
             "Showing stopped sessions"
+        } else if self.hide_snoozed_with_stopped {
+            "Stopped and snoozed sessions in groups hidden (y to show)"
+        } else {
+            "Stopped sessions in groups hidden (y to show)"
         });
     }
 
     /// Whether the `y` filter is keeping `inst` out of the list.
     pub(super) fn hidden_by_filter(&self, inst: &Instance) -> bool {
         self.hide_stopped_in_groups
-            && inst.status == crate::session::Status::Stopped
+            && stopped_row_hidden_in_groups(inst, self.hide_snoozed_with_stopped)
             && self.could_hide(inst)
     }
 
@@ -240,6 +232,24 @@ impl HomeView {
         })
     }
 
+    /// `pool` without the sessions the `y` filter hides, when `hide_stopped` is on: stopped rows
+    /// in a group, plus snoozed ones under `session.hide_snoozed_with_stopped`. Archived and
+    /// trashed sessions keep their own sections, and a session in no manual group stays visible.
+    fn shown_in_groups(&self, pool: Vec<Instance>, hide_stopped: bool) -> Vec<Instance> {
+        if !hide_stopped {
+            return pool;
+        }
+        let hide_snoozed = self.hide_snoozed_with_stopped;
+        pool.into_iter()
+            .filter(|i| {
+                !stopped_row_hidden_in_groups(i, hide_snoozed)
+                    || i.group_path.is_empty()
+                    || i.is_archived()
+                    || i.is_trashed()
+            })
+            .collect()
+    }
+
     fn build_flat_items_hiding(&self, hide_stopped: bool) -> Vec<Item> {
         // Project/org grouping keeps headers under every sort order, Attention included.
         match self.group_by {
@@ -254,7 +264,7 @@ impl HomeView {
         let pool = if self.sort_order == SortOrder::Attention {
             pool
         } else {
-            shown_in_groups(pool, hide_stopped)
+            self.shown_in_groups(pool, hide_stopped)
         };
         // Manual grouping + Attention sort is a flat priority view so tiers
         // interleave across groups.
@@ -299,7 +309,7 @@ impl HomeView {
             .cloned()
             .collect();
         // Seeded before hiding, so a group whose sessions are all hidden keeps its header.
-        (shown_in_groups(grouped, hide_stopped), tree_seed)
+        (self.shown_in_groups(grouped, hide_stopped), tree_seed)
     }
 
     /// Flatten a derived (project or org) grouping with its collapse state,
@@ -423,8 +433,9 @@ impl HomeView {
             // Seed from the unfiltered members, so a status whose sessions are all hidden
             // keeps its header like the other derived groupings.
             let present = !members.is_empty();
-            if hide_stopped && status == crate::session::Status::Stopped {
-                members.clear();
+            if hide_stopped {
+                members
+                    .retain(|i| !stopped_row_hidden_in_groups(i, self.hide_snoozed_with_stopped));
             }
             if !present {
                 continue;

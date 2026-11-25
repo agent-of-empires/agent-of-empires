@@ -25,7 +25,11 @@ impl HomeView {
         } else if let Some(id) = self.selected_session.clone() {
             if self.hide_stopped_in_groups {
                 // A session move renumbers every sibling in the store, the hidden ones too.
-                self.flash_status("Show stopped sessions (y) to move sessions by hand");
+                self.flash_status(if self.hide_snoozed_with_stopped {
+                    "Show stopped and snoozed sessions (y) to move sessions by hand"
+                } else {
+                    "Show stopped sessions (y) to move sessions by hand"
+                });
                 return Ok(());
             }
             self.move_session_row(&id, delta)?;
