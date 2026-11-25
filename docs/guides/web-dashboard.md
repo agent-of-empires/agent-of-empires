@@ -38,8 +38,8 @@ The Daemon prints a URL carrying an auth token. Open it in a browser; the token 
 When a poll expires, the dashboard aborts its request and shows the server as
 unreachable while retaining the last session list and workspace order. A later
 successful poll restores the online state. A save acknowledgement alone does not
-clear a cancelled color or notification choice; it is reconciled against the
-affected sessions' canonical mutation results.
+clear a cancelled notification choice; it is reconciled against the
+affected session's canonical mutation result.
 
 `--open` is suppressed with `--daemon`, `--remote`, SSH without a forwarded `DISPLAY`, or a Linux/BSD host without a display server. `BROWSER` overrides that visibility check where the platform launcher supports it, not on macOS. Preview links use the same rules.
 

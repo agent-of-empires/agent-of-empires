@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, RefObject } from "react";
 import type { AnsiSegment } from "../lib/ansi";
-import { LineParseCache, linkifyLine, lineText, textWidth, wrapLine } from "../lib/liveTermLines";
+import {
+  LineParseCache,
+  linkifyLine,
+  linkifyWrappedRuns,
+  lineText,
+  textWidth,
+  wrapLine,
+  type WrappedRunCache,
+} from "../lib/liveTermLines";
 import { cursorLineIndex, pointerPaneCell, unwrapPointer } from "../lib/liveMouse";
 import type { LiveFrame, LiveStats } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
@@ -169,7 +177,8 @@ export function MobileLiveTerminal({
       const older = held.history - heldLines.length - (next.history - nextLines.length);
       // A frame too short for the whole prefix (scrollback cleared mid-selection) would refold forever.
       if (older <= 0 || older > nextLines.length) return null;
-      return { ...held, lines: nextLines.slice(0, older).concat(heldLines) };
+      const wrapped = (next.wrapped ?? []).filter((i) => i < older).concat((held.wrapped ?? []).map((i) => i + older));
+      return { ...held, lines: nextLines.slice(0, older).concat(heldLines), wrapped };
     },
     [reading],
   );
@@ -220,19 +229,24 @@ export function MobileLiveTerminal({
   const [wrapCache] = useState(
     () => new WeakMap<AnsiSegment[], { cols: number; rows: AnsiSegment[][]; key: string }>(),
   );
+  const [runCache] = useState((): WrappedRunCache => new WeakMap());
   const visual = useMemo(() => {
     const cols = renderCols > 0 ? renderCols : Number.POSITIVE_INFINITY;
     const rows: AnsiSegment[][] = [];
     const lineStartRow: number[] = new Array(lines.length);
     const keys: string[] = new Array(lines.length);
     const source: Array<{ line: number; wrap: number }> = [];
+    // Soft-wrapped runs link as one line; a run's rows keep their identity while its lines do.
+    const runs = linkifyWrappedRuns(lines, frame?.wrapped, runCache);
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i]!;
-      let wrapped = wrapCache.get(line);
+      const run = runs.get(i);
+      const unwrapped = run ?? line;
+      let wrapped = wrapCache.get(unwrapped);
       if (!wrapped || wrapped.cols !== cols) {
         // Plain text, so the anchor matches a line whichever producer encoded its style.
-        wrapped = { cols, rows: wrapLine(linkifyLine(line), cols), key: lineText(line).trimEnd() };
-        wrapCache.set(line, wrapped);
+        wrapped = { cols, rows: wrapLine(run ?? linkifyLine(line), cols), key: lineText(line).trimEnd() };
+        wrapCache.set(unwrapped, wrapped);
       }
       lineStartRow[i] = rows.length;
       keys[i] = wrapped.key;
@@ -243,7 +257,7 @@ export function MobileLiveTerminal({
     }
     const screenStart = Math.max(0, lines.length - (frame?.rows ?? 0));
     return { keys, rows, lineStartRow, source, screenStart };
-  }, [lines, frame?.rows, renderCols, wrapCache]);
+  }, [lines, frame?.rows, frame?.wrapped, renderCols, wrapCache, runCache]);
   const screenRows = frame?.rows ?? 0;
   const spacerLines = Math.max(0, (frame?.history ?? 0) - Math.max(0, lines.length - screenRows));
   // A full-screen mouse app's scrollback is not capturable: no spacer, no native scroll, wheels go to the app.
@@ -278,8 +292,10 @@ export function MobileLiveTerminal({
   // blanks for bottom alignment does not bounce with a spinner on the last row.
   const [renderRowCount, setRenderRowCount] = useState(0);
   const shrinkTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const rowTargetRef = useRef(0);
   useEffect(() => {
     const target = Math.max(0, lastNonBlankRow + 1);
+    rowTargetRef.current = target;
     setRenderRowCount((current) => {
       if (target >= current) {
         if (shrinkTimerRef.current) clearTimeout(shrinkTimerRef.current);
@@ -288,7 +304,8 @@ export function MobileLiveTerminal({
       }
       shrinkTimerRef.current ??= setTimeout(() => {
         shrinkTimerRef.current = null;
-        setRenderRowCount(Math.max(0, lastNonBlankRow + 1));
+        // Rows may have arrived since this was scheduled; trim to the rows there now.
+        setRenderRowCount(rowTargetRef.current);
       }, SHRINK_DELAY_MS);
       return current;
     });

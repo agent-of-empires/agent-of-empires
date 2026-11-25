@@ -1498,6 +1498,11 @@ impl LiveCaptureWorker {
                         Option<String>,
                         Option<crate::tmux::PaneCursor>,
                     )> = None;
+                    // Whether the frame is pane 0's VT grid, for the link trace.
+                    #[cfg(unix)]
+                    let mut from_grid = false;
+                    #[cfg(not(unix))]
+                    let from_grid = false;
                     #[cfg(unix)]
                     let (capture, cursor_now) = if let Some(capture) = capture_override {
                         capture
@@ -1567,6 +1572,7 @@ impl LiveCaptureWorker {
                                         &command_deadline,
                                     )
                                 } else {
+                                    from_grid = true;
                                     let sample = v.sample_with_deadline(lines, &command_deadline);
                                     // A half-drawn synchronized-output frame is not
                                     // published: the bracket closing brings a whole one and
@@ -1664,6 +1670,18 @@ impl LiveCaptureWorker {
                                     None => 0,
                                 };
                                 if floor == 0 && debounce == 0 {
+                                    if tracing::enabled!(
+                                        target: "tui.preview_links",
+                                        tracing::Level::DEBUG
+                                    ) && crate::tmux::osc8::has_hyperlink(content.as_bytes())
+                                    {
+                                        tracing::debug!(
+                                            target: "tui.preview_links",
+                                            pane = %name,
+                                            from_grid,
+                                            "preview: published a frame carrying OSC 8"
+                                        );
+                                    }
                                     if let Ok(mut guard) = slot.lock() {
                                         *guard = Some(CaptureFrame {
                                             generation: generation_now,

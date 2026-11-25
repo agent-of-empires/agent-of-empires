@@ -134,6 +134,7 @@ pub const CODEX: AgentProfile = AgentProfile {
     clear_requires_driven_reset: true,
     yolo_mode_id: Some("agent-full-access"),
     native_config_agent: Some("codex"),
+    supports_subagents: true,
     ..DEFAULT
 };
 

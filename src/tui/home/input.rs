@@ -6455,10 +6455,8 @@ impl HomeView {
         self.preview_link_at(col, row)
     }
 
-    /// The link under `(col, row)`, if one is painted there this frame. The preview's
-    /// transport strips OSC 8 before ratatui sees it, so the target is recovered by
-    /// matching the pane's advertised link text against the row, or by finding a plain URL
-    /// in the row (`crate::tui::links`).
+    /// The link under `(col, row)`, if one is painted there this frame: an OSC 8 run the
+    /// frame placed on that row, or a plain URL in the row (`crate::tui::links`).
     pub fn preview_link_at(&self, col: u16, row: u16) -> Option<String> {
         if self.has_non_live_send_overlay() {
             return None;
@@ -6474,16 +6472,13 @@ impl HomeView {
             return None;
         }
         let cache = self.active_preview_cache();
-        let line = cache
-            .parsed_text
-            .as_ref()?
-            .lines
-            .get(view.abs_line_at_row(row))?;
+        let index = view.abs_line_at_row(row);
+        let line = cache.parsed_text.as_ref()?.lines.get(index)?;
         let offset = col - view.pane.x;
         crate::tui::links::link_spans_for_line(
             line,
             view.pane.width,
-            &cache.links,
+            cache.links_on(index),
             &self.preview_link_prefixes,
         )
         .into_iter()

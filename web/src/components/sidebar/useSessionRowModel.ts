@@ -4,7 +4,7 @@ import { useIdleDecayWindowMs } from "../../lib/idleDecay";
 import { useUnreadIndicatorEnabled } from "../../lib/unreadIndicator";
 import { usePluginAttention } from "../../lib/pluginUiContext";
 import type { OptimisticTriage } from "../../lib/sidebarOptimistic";
-import { deriveRowModel, SESSION_COLOR_OPTIONS, type RowModel } from "./rowModel";
+import { deriveRowModel, type RowModel } from "./rowModel";
 import { sessionActionTarget, usePendingSetting } from "./usePendingSetting";
 
 export interface RowObservation {
@@ -13,7 +13,7 @@ export interface RowObservation {
   onSessionMutation: (mutation: SessionMutation) => void;
 }
 
-/** The row model with its notify and color picks applied optimistically. */
+/** The row model with its notify pick applied optimistically. */
 export function useSessionRowModel(
   workspace: Workspace,
   optimistic: OptimisticTriage,
@@ -29,14 +29,10 @@ export function useSessionRowModel(
     unreadIndicatorEnabled,
     pluginAttention,
   });
-  const targets = workspace.sessions.map((session) => sessionActionTarget(session, observation.runtimeEpoch));
-  const [notifyPreset, setNotify] = usePendingSetting("notifications", targets.slice(0, 1), derived.notifyPreset);
-  const [sessionColor, setColor] = usePendingSetting("color", targets, derived.sessionColor);
-  const model: RowModel = {
-    ...derived,
-    notifyPreset,
-    sessionColor,
-    sessionColorDot: SESSION_COLOR_OPTIONS.find((o) => o.key === sessionColor)?.dotClass ?? null,
-  };
-  return { model, setNotify, setColor };
+  const targets = workspace.sessions
+    .slice(0, 1)
+    .map((session) => sessionActionTarget(session, observation.runtimeEpoch));
+  const [notifyPreset, setNotify] = usePendingSetting("notifications", targets, derived.notifyPreset);
+  const model: RowModel = { ...derived, notifyPreset };
+  return { model, setNotify };
 }

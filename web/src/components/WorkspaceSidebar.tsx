@@ -13,7 +13,6 @@ import {
   type SidebarGroup,
   type SidebarWorkspaceView,
 } from "../lib/sidebarGroups";
-import type { RepoAppearanceUpdate } from "../lib/repoAppearance";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { SidebarCompactContext } from "../lib/sidebarCompact";
 import { useMediaQuery } from "../hooks/useMediaQuery";
@@ -77,7 +76,6 @@ interface Props {
   onOpenChange: (open: boolean) => void;
   onSelect: (workspaceId: string, sessionId: string | null) => void;
   onToggleGroup: (groupId: string) => void;
-  onUpdateRepoAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
   onNew: (prefill?: { group?: string }) => void;
   onCreateSession: (repoPath: string) => void;
   onPinProject?: (repoPath: string) => void;
@@ -245,7 +243,6 @@ export function WorkspaceSidebar(props: Props) {
     displayedActiveSessionId: selection.displayedActiveSessionId,
     onNew: props.onNew,
     onCreateSession: props.onCreateSession,
-    onUpdateAppearance: props.onUpdateRepoAppearance,
     onPinProject: props.onPinProject,
     onUnpinProject: props.onUnpinProject,
     onEditProjectSettings: props.onEditProjectSettings,

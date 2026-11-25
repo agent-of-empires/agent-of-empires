@@ -1,0 +1,6 @@
+{
+  "name": "agent-of-empires/aoe-maintainer",
+  "version": "0.1.0",
+  "description": "Agent of Empires maintainer automation: issue triage, red-main and CodeQL classification, ready-for-agent grooming, and conventions for factory pull requests.",
+  "private": true
+}

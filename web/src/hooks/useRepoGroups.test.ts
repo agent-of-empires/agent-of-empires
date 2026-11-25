@@ -203,7 +203,7 @@ describe("useRepoGroups manual group order (#1644)", () => {
 });
 
 describe("useRepoGroups stateful API", () => {
-  it("toggleRepoCollapsed, updateRepoAppearance, and reorderRepoGroups persist", () => {
+  it("toggleRepoCollapsed and reorderRepoGroups persist", () => {
     const { result } = groupsOf([ws("a1", "/repo-a"), ws("b1", "/repo-b")], "manual");
     const first = () => result.current.groups[0]!;
 
@@ -213,9 +213,6 @@ describe("useRepoGroups stateful API", () => {
     act(() => result.current.toggleRepoCollapsed("/repo-a"));
     expect(first().collapsed).toBe(false);
     expect(localStorage.getItem("aoe-repo-collapsed-/repo-a")).toBeNull();
-
-    act(() => result.current.updateRepoAppearance("/repo-a", { alias: "pretty-name" }));
-    expect(first()).toMatchObject({ displayName: "pretty-name", alias: "pretty-name" });
 
     act(() => result.current.reorderRepoGroups(["/repo-b", "/repo-a"]));
     expect(result.current.groups.map((g) => g.id)).toEqual(["/repo-b", "/repo-a"]);

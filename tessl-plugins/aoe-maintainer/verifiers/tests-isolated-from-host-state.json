@@ -1,0 +1,22 @@
+{
+  "name": "Tests do not inherit the developer's git, tmux or shell state",
+  "instruction": "Added test code that starts git, tmux or an aoe process, or that depends on an ambient environment variable, isolates that input instead of inheriting it from the developer's machine.",
+  "relevant_when": "A patch adds Rust test code (a #[test] or #[tokio::test] function, a #[cfg(test)] module or test helper, or a file under tests/) that starts a git, tmux or aoe process (including std::env::current_exe() or the aoe binary as a Daemon or CLI child), creates a tmux session or pane fixture, or names an environment variable a developer's shell may set (HOME, XDG_CONFIG_HOME, XDG_DATA_HOME, SHELL, TMUX, SSH_CONNECTION, SSH_CLIENT, SSH_TTY, an AOE_* variable, ANTHROPIC_API_KEY or another agent credential).",
+  "context": "AGENTS.md: tests must be deterministic and isolated from user state, and fixtures targeting ^.0 must use managed session creation or append_pane_base_index_args from src/tmux/utils.rs. A test that inherits a global git config (core.hooksPath, commit.gpgSign), the default tmux server, AOE_TMUX_SOCKET, an SSH session or exported credentials passes in CI and fails on a developer machine. Accepted isolation: crate::git::test_support::run_git, or a git Command that sets GIT_CONFIG_GLOBAL and GIT_CONFIG_NOSYSTEM; tmux through tmux_command() or with an explicit -S or -L private socket; EnvGuard::set or EnvGuard::unset, isolate_app_dir, isolate_app_dir_at, isolate_home, unset_claude_auth_routes and the other guards in src/session/test_support.rs; a child process whose environment the test builds explicitly (env_clear, env_remove, or env of the variable). isolate_app_dir and isolate_app_dir_at also point HOME at their temporary directory, so dirs::home_dir() after them is isolated. EnvGuard changes the whole process environment, so it does not isolate a variable from parallel tests that read it; a child process environment does. Processes started by the code under test, not by the test itself, are out of scope, and so is a marker variable a test sets on a child it re-executes, to tell the parent and child runs apart.",
+  "scope": "diff",
+  "scope_reason": "Many existing tests predate the rule; the judge needs the added test code and its surrounding hunk to see which helper or guard it uses.",
+  "checklist": [
+    {
+      "name": "git-and-tmux-isolated",
+      "rule": "Every git or tmux process that added test code starts directly uses an accepted isolation from context, and a fixture that addresses pane ^.0 or :0.0 uses managed session creation or append_pane_base_index_args instead of setting pane-base-index by hand. Not applicable when added test code starts no git or tmux process itself."
+    },
+    {
+      "name": "aoe-child-environment-isolated",
+      "rule": "Every aoe Daemon or CLI child process that added test code starts gets an isolated HOME or app directory and an explicit tmux socket (AOE_TMUX_SOCKET or an equivalent flag), set on the child or through an accepted guard, rather than inheriting them. Not applicable when added test code starts no aoe child process."
+    },
+    {
+      "name": "ambient-variable-controlled",
+      "rule": "When an added test exercises behavior that the patch shows reads one of the environment variables named in relevant_when, and sibling tests in the same hunk or file guard that variable, the added test guards it the same way. Fail only when the patch shows the variable dependency and no guard or explicit child environment for it. Not applicable when no such dependency is visible in the patch."
+    }
+  ]
+}
