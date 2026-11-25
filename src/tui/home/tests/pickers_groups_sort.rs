@@ -3466,7 +3466,7 @@ fn repository_mode_orders_and_moves_nested_groups_by_the_group_order() {
     assert!(
         matches!(
             respond(Err("refused".into())),
-            Some(NamespaceMutation::Reorder(ReorderBody::Group { group, direction: MoveDirection::Up, siblings: None }))
+            Some(NamespaceMutation::Reorder(ReorderBody::Group { group, direction: MoveDirection::Up, siblings: None, freeze: None }))
                 if group.profile == "test" && group.path == "beta"
         ),
         "a nested header moves its profile's Group"
