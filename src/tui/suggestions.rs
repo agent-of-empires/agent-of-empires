@@ -411,6 +411,40 @@ fn start_for(snapshot: Option<&Snapshot>, key: &ItemKey, prepared: Prepared) -> 
         .iter()
         .flat_map(|s| &s.items)
         .find(|i| i.provider_id == key.0 && i.id == key.1);
+/// The empty pane's setup advice for the providers' `enabled` flags.
+/// `offered` says whether the dashboard shows Set up suggestions, which it
+/// does only while a featured plugin offers them.
+fn setup_lines(
+    enabled: &[bool],
+    offered: impl FnOnce() -> bool,
+) -> Option<&'static [&'static str]> {
+    if enabled.contains(&true) {
+        None
+    } else if !enabled.is_empty() {
+        Some(&[
+            "Your suggestion sources are off. Turn one on in the web",
+            "dashboard under Settings › Suggestions.",
+        ])
+    } else if offered() {
+        Some(&[
+            "No suggestion source is installed. To set one up, use",
+            "Set up suggestions on the web dashboard's homepage, or run:",
+            "",
+            "  aoe plugin install gh:agent-of-empires/plugin-github",
+            "",
+            "then turn it on in the web dashboard under Settings › Suggestions.",
+        ])
+    } else {
+        Some(&[
+            "No suggestion source is installed. To set one up, run:",
+            "",
+            "  aoe plugin install gh:agent-of-empires/plugin-github",
+            "",
+            "then turn it on in the web dashboard under Settings › Suggestions.",
+        ])
+    }
+}
+
     let provider = snapshot
         .iter()
         .flat_map(|s| &s.providers)
@@ -1310,20 +1344,19 @@ impl SuggestionsView {
             };
             lines.push(Line::from(""));
         }
-        let setup: Option<&[&str]> = match store.providers_enabled() {
-            Some(enabled) if enabled.is_empty() => Some(&[
-                "No suggestion source is installed. To set one up, use",
-                "Set up suggestions on the web dashboard's homepage, or run:",
-                "",
-                "  aoe plugin install gh:agent-of-empires/plugin-github",
-            ]),
-            Some(enabled) if !enabled.contains(&true) => Some(&[
-                "Your suggestion sources are off. Turn one on in the web",
-                "dashboard under Settings › Suggestions.",
-            ]),
-            _ => None,
-        };
-        if let Some(setup) = setup.filter(|_| self.order.is_empty()) {
+        let setup = store
+            .providers_enabled()
+            .filter(|_| self.order.is_empty())
+            .and_then(|enabled| {
+                setup_lines(&enabled, || {
+                    static OFFERED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                        crate::plugin::featured::FeaturedIndex::load()
+                            .is_ok_and(|index| index.offers_suggestions())
+                    });
+                    *OFFERED
+                })
+            });
+        if let Some(setup) = setup {
             for line in setup {
                 lines.push(Line::from(Span::styled(*line, dim)));
             }
@@ -3700,7 +3733,6 @@ mod tests {
         snapshot.providers.clear();
         rig.view.sync(&rig.store);
         let text = render_sized(&rig, None, 80, 24);
-        assert!(text.contains("Set up suggestions"), "{text}");
         assert!(
             text.contains("aoe plugin install gh:agent-of-empires/plugin-github"),
             "{text}"
@@ -3751,3 +3783,11 @@ mod tests {
         assert!(!rig.store.busy);
     }
 }
+        assert!(text.contains("then turn it on"), "{text}");
+
+        for offered in [true, false] {
+            let lines = setup_lines(&[], || offered).unwrap().join("\n");
+            assert_eq!(lines.contains("Set up suggestions"), offered, "{lines}");
+            assert!(lines.contains("Settings › Suggestions"), "{lines}");
+        }
+        assert!(setup_lines(&[false, true], || true).is_none());
