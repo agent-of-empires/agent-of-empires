@@ -150,6 +150,13 @@ fn enter_or_right_focuses_the_pane_and_esc_returns_to_the_row() {
 
         env.view.handle_key(key(focus), None);
         assert!(env.view.suggestions_focused, "{focus:?}");
+        let text = render_home_to_string(&mut env.view, 140, 40);
+        let footer = text.lines().last().unwrap_or_default();
+        assert!(footer.contains("Esc Sessions"), "{footer}");
+        assert!(
+            !footer.contains("New"),
+            "Home keys stay off the footer: {footer}"
+        );
         env.view.handle_key(key(KeyCode::Char('j')), None);
         env.view.handle_key(key(KeyCode::Char('j')), None);
         let view = env.view.suggestions_view.as_ref().unwrap();

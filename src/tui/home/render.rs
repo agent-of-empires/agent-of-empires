@@ -4552,7 +4552,14 @@ impl HomeView {
         // Shortcut groups carry a priority, optional key action, and display spans.
         let mut groups: Vec<(u8, Option<KeyEvent>, Vec<Span<'static>>)> = Vec::new();
         let mut serving_status = None;
-        if !self.selected_is_trashed() {
+        // The focused suggestions pane lists its own keys.
+        if self.suggestions_focused {
+            groups.push((
+                0,
+                Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                mk("Esc", "Sessions"),
+            ));
+        } else if !self.selected_is_trashed() {
             // Other-TUI indicator, shown when more than one `aoe` TUI is alive: two TUIs
             // watching the same sessions clash over pane sizes (tmux reflows to the smallest
             // client). Recomputed on a throttle in the app loop, not per frame.
@@ -4584,10 +4591,8 @@ impl HomeView {
             // Enter to live-send or tmux attach and Tab does the other, so both labels resolve
             // here and can never advertise the same action. Acp rows ignore the setting and
             // keep the plain "Attach" label. Mirrors `HelpOverlay`'s wording.
-            // The focused suggestions pane draws its own keys.
-            let on_suggested = self.suggestions_focused || self.on_suggested_row();
+            let on_suggested = self.on_suggested_row();
             let (enter_action_text, tab_action_text) = match self.flat_items.get(self.cursor) {
-                _ if self.suggestions_focused => (None, None),
                 Some(Item::Group {
                     collapsed: true, ..
                 }) => (Some("Expand"), None),
