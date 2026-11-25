@@ -3,8 +3,8 @@
 // memory, skills, workflows, and Claude's scheduling and harness tools.
 
 import { useMemo } from "react";
-import DOMPurify from "dompurify";
-import { marked } from "marked";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   Activity,
   Brain,
@@ -338,9 +338,6 @@ export function MemoryRecallCard({ tool, result }: ToolCardProps) {
   const paths = recall.paths ?? [];
   const synthesized = cleanRecalledMemory(recall.synthesized_text ?? "");
   const isSynthesize = recall.mode === "synthesize";
-  // `marked`, not <Markdown>, which needs the assistant-ui runtime. The text is
-  // agent-surfaced and marked does not sanitize, so DOMPurify is mandatory.
-  const synthesizedHtml = isSynthesize ? DOMPurify.sanitize(marked.parse(synthesized, { async: false }) as string) : "";
   const hasBody = isSynthesize ? synthesized.length > 0 : paths.length > 0;
 
   return (
@@ -372,8 +369,11 @@ export function MemoryRecallCard({ tool, result }: ToolCardProps) {
                 <div
                   data-testid="memory-recall-synthesized"
                   className="acp-markdown break-words text-[11px] text-text-secondary"
-                  dangerouslySetInnerHTML={{ __html: synthesizedHtml }}
-                />
+                >
+                  <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml>
+                    {synthesized}
+                  </ReactMarkdown>
+                </div>
               ) : (
                 <ul data-testid="memory-recall-paths" className="space-y-0.5 text-[11px] text-text-secondary">
                   {paths.map((p) => (

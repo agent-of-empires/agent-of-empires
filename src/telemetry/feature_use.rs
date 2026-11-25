@@ -68,7 +68,6 @@ const WEB_ONLY: &[&str] = &[
     "axis_repo_group",
     "axis_status",
     "pin_toggle",
-    "session_color",
     "focus_mode",
     "summarize",
     "files_pane",

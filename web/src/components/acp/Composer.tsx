@@ -12,6 +12,7 @@ import { useSkillIndex } from "../../hooks/useSkillIndex";
 import { consumeComposerPrefill, subscribeComposerPrefill } from "../../lib/composerPrefill";
 import { clearDraft } from "../../lib/acpDrafts";
 import type { AcpState, PromptAttachmentInput, PromptCapabilities, QueuedPrompt } from "../../lib/acpTypes";
+import { isImeComposing } from "../../lib/ime";
 import { isIOS, isStandalone } from "../../lib/platform";
 import { sessionEntries } from "../../lib/pluginUi";
 import { usePluginUiEntries } from "../../lib/pluginUiContext";
@@ -21,7 +22,7 @@ import {
   subscribePendingSwitchAgent,
 } from "../../lib/switchAgentTrigger";
 import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
-import { PluginComposerActions } from "../plugin/PluginSlots";
+import { PluginComposerActions, PluginComposerStatus } from "../plugin/PluginSlots";
 import { composerDraftOperation, type ComposerDraftOperation } from "../plugin/composerDraftOperation";
 import {
   AttachmentChips,
@@ -41,14 +42,14 @@ import {
   decideArrowRecall,
   decideBeforeInputAction,
   decideEnterAction,
-  fitTextarea,
+  fitTextareaFallback,
   insertAtCaret,
   insertNewlineAtCaret,
   insertRawTextAtCaret,
   insertSlashCommand,
   IOS_ACCESSORY_BAR_PX,
 } from "./composerInput";
-import { SessionConfigControls } from "./SessionConfigControls";
+import { SessionConfigControls, type ModelDefaultTarget } from "./SessionConfigControls";
 import { SwitchAgentModal } from "./SwitchAgentModal";
 import {
   useAttachments,
@@ -77,6 +78,8 @@ interface Props {
   configOptions: AcpState["configOptions"];
   pendingConfigOption: AcpState["pendingConfigOption"];
   setConfigOption: (configId: string, value: string) => void | Promise<void>;
+  /** Offers the picked model as the Agent's default; absent where Settings can't be written. */
+  modelDefault?: ModelDefaultTarget | null;
   sessionUsage: AcpState["sessionUsage"];
   authStatus: AcpState["authStatus"];
   /** Feeds the Not logged in label's sign-in steps and actions. */
@@ -184,7 +187,7 @@ export function Composer(props: Props) {
       ctrlKey: e.ctrlKey,
       metaKey: e.metaKey,
       altKey: e.altKey,
-      isComposing: e.nativeEvent.isComposing,
+      isComposing: isImeComposing(e),
     };
     const recallAction = decideArrowRecall(keys, {
       caretAtStart: !!el && el.selectionStart === 0 && el.selectionEnd === 0,
@@ -252,7 +255,9 @@ export function Composer(props: Props) {
               <PopoverItems trigger="/" skillIndex={skillIndex} />
             </ComposerPrimitive.Unstable_TriggerPopover>
 
+            {/* asChild: the default TextareaAutosize writes inline heights that override field-sizing. */}
             <ComposerPrimitive.Input
+              asChild
               ref={taRef}
               rows={2}
               // Touch-primary Enter inserts a newline; sending is the Send button's job.
@@ -268,7 +273,7 @@ export function Composer(props: Props) {
                     : "Queue a follow-up… (sent when current turn ends)"
                   : "Send a message…  Type @ for files, / for commands")
               }
-              onInput={(e) => fitTextarea(e.currentTarget)}
+              onInput={(e) => fitTextareaFallback(e.currentTarget)}
               onFocus={() => {
                 // Belt and braces for UAs that lag the keyboard's layout-viewport update.
                 if (!isMobile) return;
@@ -306,11 +311,13 @@ export function Composer(props: Props) {
               }}
               autoFocus={!isMobile}
               className={[
-                "min-h-[56px] max-h-[200px] resize-none bg-transparent",
+                "field-sizing-content min-h-[56px] max-h-[200px] resize-none bg-transparent",
                 "px-4 pt-3 pb-1 text-sm leading-6 text-text-primary",
                 "placeholder:text-text-dim focus:outline-none",
               ].join(" ")}
-            />
+            >
+              <textarea />
+            </ComposerPrimitive.Input>
 
             <AttachmentChips attachments={attachments.supported} onRemove={attachments.remove} />
 
@@ -375,9 +382,17 @@ export function Composer(props: Props) {
                   providerPending={provider.pending}
                   onSetProvider={provider.set}
                   providerLockedReason={turnActive ? "Switch providers once the turn finishes" : null}
+                  modelDefault={props.modelDefault}
                 />
                 <AuthStatusHint authStatus={props.authStatus} signIn={props.signIn} />
-                <UsageHint usage={props.sessionUsage} />
+                {/* Last in the wrapping cluster: on a narrow footer it takes its own row instead of pushing Stop and Send off screen. */}
+                <div
+                  data-testid="composer-trailing"
+                  className="ml-auto flex min-w-0 max-w-full items-center gap-2 pl-2 empty:hidden"
+                >
+                  <PluginComposerStatus sessionId={sessionId} />
+                  <UsageHint usage={props.sessionUsage} />
+                </div>
               </div>
 
               <div data-testid="composer-actions" className="flex shrink-0 items-center gap-2">
@@ -447,7 +462,7 @@ function usePluginDraftOperations(
           if (!el) return;
           el.focus();
           el.setSelectionRange(operation.text.length, operation.text.length);
-          fitTextarea(el);
+          fitTextareaFallback(el);
         });
       } else if (!ta) {
         client.setText(`${client.getState().text}${operation.text}`);

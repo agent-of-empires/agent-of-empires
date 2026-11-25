@@ -24,6 +24,7 @@ import {
   highlightSnippet,
   langHintForPath,
   langIdForHint,
+  peekHighlight,
   resolveSnippetTheme,
 } from "./snippetHighlighter";
 
@@ -135,5 +136,35 @@ describe("highlightSnippet", () => {
   it("returns null for an unresolvable hint", async () => {
     const html = await highlightSnippet("const x = 1;", { langHint: "notalang", theme: "github-dark" });
     expect(html).toBeNull();
+  });
+});
+
+describe("highlight cache", () => {
+  const opts = { langHint: "ts", theme: "github-dark" };
+
+  it("peeks undefined before a highlight and the html after, without calling the highlighter", async () => {
+    expect(peekHighlight("peek();", opts)).toBeUndefined();
+    const html = await highlightSnippet("peek();", opts);
+    getSharedHighlighterMock.mockClear();
+    expect(peekHighlight("peek();", opts)).toBe(html);
+    expect(peekHighlight("peek();", { langHint: "notalang", theme: "github-dark" })).toBeUndefined();
+    expect(await highlightSnippet("peek();", opts)).toBe(html);
+    expect(getSharedHighlighterMock).not.toHaveBeenCalled();
+  });
+
+  it("keys on the resolved theme, so fallbacks share an entry", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    await highlightSnippet("fb();", { langHint: "ts", theme: "not-a-real-theme" });
+    expect(peekHighlight("fb();", { langHint: "ts", theme: "github-dark" })).toBeDefined();
+  });
+
+  it("evicts the oldest entry at the cap, and a hit refreshes recency", async () => {
+    await highlightSnippet("first", opts);
+    for (let i = 0; i < 63; i++) await highlightSnippet(`fill${i}`, opts);
+    expect(peekHighlight("first", opts)).toBeDefined();
+    await highlightSnippet("overflow", opts);
+    expect(peekHighlight("first", opts)).toBeDefined();
+    expect(peekHighlight("fill0", opts)).toBeUndefined();
+    expect(peekHighlight("overflow", opts)).toBeDefined();
   });
 });

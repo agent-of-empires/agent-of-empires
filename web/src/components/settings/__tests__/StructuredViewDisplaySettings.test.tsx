@@ -120,3 +120,18 @@ describe("StructuredViewDisplaySettings localStorage contract", () => {
     expect(getWebSettingsSnapshot().structuredHistoryWindow).toBe(150);
   });
 });
+
+describe("StructuredViewDisplaySettings IME composition", () => {
+  it.each([
+    ["keyCode 229", { key: "Enter", keyCode: 229 }],
+    ["isComposing", { key: "Enter", isComposing: true }],
+  ])("does not commit the history window on Enter while composing (%s)", (_n, init) => {
+    const { getByLabelText } = render(<StructuredViewDisplaySettings />);
+    const input = getByLabelText("Initial visible history (rows)") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "200" } });
+    fireEvent.keyDown(input, init);
+    expect(readStored().structuredHistoryWindow).toBeUndefined();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(readStored().structuredHistoryWindow).toBe(200);
+  });
+});

@@ -10,6 +10,7 @@ import {
   trashRows,
   trashToggle,
 } from "./helpers/trashMocks";
+import { dragSidebarHandle } from "./helpers/sidebar";
 
 test.use({ viewport: { width: 1280, height: 720 } });
 
@@ -65,6 +66,40 @@ test.describe("Session trash flow", () => {
     await confirmDelete(dialog);
     await expect.poll(() => handle.deletedIds.length, { timeout: 10_000 }).toBe(1);
   });
+
+  // A 24px root font is browser text scaled to 150%.
+  for (const rootFontPx of [16, 24]) {
+    test(`the footer Trash and Settings controls stay inside the compact rail at a ${rootFontPx}px root font`, async ({
+      page,
+    }) => {
+      await installTrashMocks(page, [{ ...SESSION, trashed: true }]);
+      await page.addInitScript((px) => {
+        document.addEventListener("DOMContentLoaded", () => {
+          document.documentElement.style.fontSize = `${px}px`;
+        });
+      }, rootFontPx);
+      await page.goto("/");
+      await expect(trashToggle(page)).toHaveAccessibleName("Trash, 1 session");
+      await dragSidebarHandle(page, 100);
+      const panel = page.locator('[data-tour="sidebar"]');
+      await expect(panel).toHaveAttribute("data-compact", "true");
+
+      const panelBox = (await panel.boundingBox())!;
+      const toggle = (await trashToggle(page).boundingBox())!;
+      const badge = (await page.getByTestId("sidebar-trash-count").boundingBox())!;
+      const settings = (await page.getByRole("button", { name: "Settings" }).boundingBox())!;
+      for (const box of [toggle, badge, settings]) {
+        expect(box.x).toBeGreaterThanOrEqual(panelBox.x);
+        expect(box.x + box.width).toBeLessThanOrEqual(panelBox.x + panelBox.width);
+      }
+      const overlaps =
+        badge.x < settings.x + settings.width &&
+        settings.x < badge.x + badge.width &&
+        badge.y < settings.y + settings.height &&
+        settings.y < badge.y + badge.height;
+      expect(overlaps).toBe(false);
+    });
+  }
 });
 
 // #2530, #2533: sessions on one `repoPath::branch` form one workspace even when

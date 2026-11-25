@@ -46,9 +46,9 @@ pub use wire::{
     ReorderOutcome, RepoBaseInput, RestartOutcome, RestartSessionBody, RestoreOutcome,
     SessionResponse, SessionsEnvelope, SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody,
     TerminalSize, TerminalTarget, TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome,
-    TrashSessionBody, Tristate, UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody,
-    UpdateFavoriteBody, UpdateGroupBody, UpdateIgnoredBody, UpdateNotificationsBody, UpdatePinBody,
-    UpdateSnoozeBody, UpdateUnreadBody, WorkspaceRepoSummary, WorktreeEditOutcome,
+    TrashSessionBody, Tristate, UpdateArchiveBody, UpdateDiffBaseBody, UpdateFavoriteBody,
+    UpdateGroupBody, UpdateIgnoredBody, UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody,
+    UpdateUnreadBody, WorkspaceRepoSummary, WorktreeEditOutcome,
 };
 pub use wire::{
     ApplyUpdateBody, InstallPreviewBody, PluginJob, PluginJobAccepted, PluginJobKind, PluginJobLog,

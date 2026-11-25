@@ -2,8 +2,10 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 
 import type { ServerAbout, UpdateStatus } from "../../lib/api";
+import type { InstallHint } from "../../lib/platform";
 import type { PushHealth } from "../../lib/pushHealth";
 import { setServerDown } from "../../lib/connectionState";
 import type { ConnectionBannerState } from "../../hooks/useConnectionBanner";
@@ -62,6 +64,12 @@ vi.mock("../../hooks/useSandboxImageBanner", async (importOriginal) => {
   };
 });
 
+let hint: InstallHint | null = null;
+vi.mock("../../lib/platform", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../lib/platform")>()),
+  installHint: () => hint,
+}));
+
 import { BannerStack } from "../BannerStack";
 
 function status(overrides?: Partial<UpdateStatus>): UpdateStatus {
@@ -89,11 +97,14 @@ const NAMES: [RegExp, string][] = [
   [/Sandbox image/, "sandbox image"],
   [/Update available/, "update available"],
   [/Notifications stopped/, "push"],
+  [/Get notifications on this device/, "install"],
 ];
 
 function shown(container: HTMLElement): string[] {
   // Top-level banners only; a banner's own copy feedback is a status region inside it.
-  return Array.from(container.querySelectorAll(':scope > [role="alert"], :scope > [role="status"]')).map((el) => {
+  return Array.from(
+    container.querySelectorAll(':scope > [role="alert"], :scope > [role="status"], :scope > [role="region"]'),
+  ).map((el) => {
     const text = `${el.getAttribute("aria-label") ?? ""} ${el.textContent ?? ""}`;
     return NAMES.find(([re]) => re.test(text))?.[1] ?? text;
   });
@@ -108,6 +119,7 @@ beforeEach(() => {
   fetchAbout.mockReset();
   pushHealth = "healthy";
   forced = null;
+  hint = null;
   setServerDown(false);
 });
 
@@ -118,6 +130,24 @@ afterEach(() => {
 });
 
 describe("BannerStack", () => {
+  it("puts the install banner last, and hides it while Disconnected or during the tour", () => {
+    // (connection, tour running, banners top to bottom)
+    const cases: [ConnectionBannerState | null, boolean, string[]][] = [
+      [null, false, ["push", "install"]],
+      ["reconnected", false, ["reconnected", "push", "install"]],
+      [null, true, ["push"]],
+      ["down", false, ["disconnected"]],
+    ];
+    hint = "push";
+    pushHealth = "revoked";
+    for (const [connection, tourActive, want] of cases) {
+      forced = { connection, dashboard: false, update: false, sandbox: false };
+      const { container, unmount } = render(<BannerStack tourActive={tourActive} />, { wrapper: MemoryRouter });
+      expect(shown(container), JSON.stringify({ connection, tourActive })).toEqual(want);
+      unmount();
+    }
+  });
+
   it("shows one connection or update banner, most urgent first, and push only while connected", () => {
     // (connection, dashboard updated, update available, sandbox image, push unhealthy, banners top to bottom)
     const cases: [ConnectionBannerState | null, boolean, boolean, boolean, boolean, string[]][] = [

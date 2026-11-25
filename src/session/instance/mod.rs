@@ -84,10 +84,7 @@ mod tmux_session;
 mod types;
 
 pub(crate) use accessors::{resolved_agent_for, UNBOUND_STORE_HINT};
-pub use flags::{
-    is_valid_session_color, SandboxLoginRequired, SandboxLoginUnsupported, SessionBucket,
-    StartBlocked, SESSION_COLORS,
-};
+pub use flags::{SandboxLoginRequired, SandboxLoginUnsupported, SessionBucket, StartBlocked};
 pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
 
 #[cfg(test)]
@@ -926,17 +923,6 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_branch_override: Option<String>,
 
-    /// Per-session color label for at-a-glance status signaling in the web
-    /// sidebar (a colored dot next to the title). Purely a decoration: it does
-    /// not re-rank the session. Settable from the web context menu and from the
-    /// CLI (`aoe session color <id> <color>`) so a running agent can flag its
-    /// own state (red = needs attention, amber = working, green = done) without
-    /// the user opening the session. `None` clears the dot. Constrained to the
-    /// [`SESSION_COLORS`] palette by [`is_valid_session_color`]. Additive:
-    /// absent in older `sessions.json` rows, so no migration is needed. See
-    /// #2383.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub color: Option<String>,
     /// Position within its group under `SortOrder::Custom`. `None` sorts last.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort_index: Option<u32>,
@@ -1090,6 +1076,10 @@ pub struct Instance {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) capture_started_at: Option<std::time::SystemTime>,
+
+    /// A pane launch was dispatched but its birth has not been proved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) unproven_native_birth_generation: Option<u64>,
 
     /// Set when this pane's launch line carried the Pi session-id extension.
     /// After reload, the recorded Pi capture context admits its scoped publisher.

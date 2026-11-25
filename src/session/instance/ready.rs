@@ -184,8 +184,8 @@ impl Instance {
             Ok(false) => EnsureReadyOutcome::Indeterminate {
                 cause: LaunchIndeterminateCause::StabilizationExpired,
             },
-            Err(_) => EnsureReadyOutcome::Indeterminate {
-                cause: LaunchIndeterminateCause::ObservationFailed,
+            Err(error) => EnsureReadyOutcome::Indeterminate {
+                cause: self.probe_failure_cause(error),
             },
         })
     }
@@ -207,6 +207,10 @@ impl Instance {
         if pane.pane_dead {
             return Ok(false);
         }
+        anyhow::ensure!(
+            self.unproven_native_birth_generation.is_none(),
+            LaunchIndeterminateCause::OwnershipUnproven
+        );
         if self.expects_shell() || self.has_command_override() {
             return Ok(true);
         }
@@ -275,6 +279,10 @@ impl Instance {
             return Err(SessionGone.into());
         };
         row.ensure_startable()?;
+        anyhow::ensure!(
+            row.unproven_native_birth_generation.is_none(),
+            LaunchIndeterminateCause::OwnershipUnproven
+        );
         Ok(lock)
     }
 

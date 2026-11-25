@@ -4,10 +4,10 @@ import { vi } from "vitest";
 import { MobileLiveTerminal, type MobileLiveTerminalProps } from "../MobileLiveTerminal";
 import type { LiveFrame } from "../../hooks/useLiveTerminal";
 
-// Grid math in jsdom: charW falls back to fontSize * 0.6 (no layout), lineH is fontSize * 1.2.
+// Grid math in jsdom: charW falls back to fontSize * 0.6 (no layout); lineH is fontSize * 1.2 rounded to whole pixels.
 export const FONT_SIZE = 14;
 export const CHAR_W = FONT_SIZE * 0.6;
-export const LINE_H = FONT_SIZE * 1.2;
+export const LINE_H = Math.round(FONT_SIZE * 1.2);
 export const RESIZE_DEBOUNCE_MS = 150;
 
 export function liveFrame(over: Partial<LiveFrame> = {}): LiveFrame {

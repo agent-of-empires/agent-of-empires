@@ -1,22 +1,7 @@
 import { Fragment, memo, type CSSProperties, type ReactNode } from "react";
-import type { AnsiSegment, AnsiStyle } from "../../lib/ansi";
+import type { AnsiSegment } from "../../lib/ansi";
+import { segStyle } from "./segStyle";
 import { clusterSpanAt, findCursorCharIndex, isHttpUrl, splitCellRuns, textWidth } from "../../lib/liveTermLines";
-
-function segStyle(style: AnsiStyle): CSSProperties | undefined {
-  const css: CSSProperties = {};
-  let fg = style.fg;
-  let bg = style.bg;
-  if (style.inverse) {
-    [fg, bg] = [bg ?? "var(--term-bg, #1c1c1f)", fg ?? "var(--term-fg, #e4e4e7)"];
-  }
-  if (fg) css.color = fg;
-  if (bg) css.backgroundColor = bg;
-  if (style.bold) css.fontWeight = 700;
-  if (style.dim) css.opacity = 0.6;
-  if (style.italic) css.fontStyle = "italic";
-  if (style.underline) css.textDecoration = "underline";
-  return Object.keys(css).length ? css : undefined;
-}
 
 /** An inline box exactly `cells` wide, so a fallback font's advance error cannot shift later glyphs. */
 function fixedBoxStyle(cells: number, base: CSSProperties | undefined): CSSProperties {
