@@ -100,6 +100,10 @@ content. It is denser and quieter than the marketing site.
   brand mark.
 - Mobile prioritizes monitoring and conversation controls; overlays replace
   persistent side panels.
+- Sessions stay on the left. The right dock is the Session's review panel
+  (Diff, Files, Background, plugins); the terminal sits in the bottom dock.
+  Below 1100px the right dock overlays the main area as a sheet rather than
+  squeezing a third column.
 
 If a visual change requires an exception, update this document with the new
 rule as part of the change.

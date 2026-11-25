@@ -116,6 +116,25 @@
       "notes": "The shell's Host/Container mode is per Session and terminal tab. Revealing it focuses at once only when it is shown and stays mounted; otherwise focus is latched and activateTab reveals the tab, opening a collapsed dock. The focus and the latch name that terminal, so with one shown in each dock, Cmd+` and Open Terminal never land in the other."
     },
     {
+      "id": "dock.review-panel",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/review-panel.spec.ts",
+        "src/components/__tests__/MainViewTabs.test.tsx",
+        "src/lib/__tests__/rightDockMode.test.ts",
+        "src/lib/__tests__/paneLayout.test.ts"
+      ],
+      "components": [
+        "web/src/components/MainViewTabs.tsx",
+        "web/src/components/ContentSplit.tsx",
+        "web/src/components/Dock.tsx",
+        "web/src/lib/rightDockMode.ts",
+        "web/src/lib/panes.ts"
+      ],
+      "notes": "The right dock keeps Diff, Files, Background, plugins, then terminals in that order. A file picked in Diff or Files opens behind an Agent | file tab strip in the main area; Agent keeps the file open, the file tab returns to it, and its close button closes it. The right dock maximizes over the main area and restores. Between 768px and 1100px it is a modal sheet that takes focus, closes on Escape or a backdrop click, returns focus to its opener, and closes when a file is picked."
+    },
+    {
       "id": "terminal.paired-shell-switcher",
       "kind": "mocked-playwright",
       "risk": "medium",

@@ -15,6 +15,8 @@ The dashboard is the home screen of the web app: a workspace sidebar on the left
 
 The diff and terminal panels start closed. Open one from its top-bar icon; a closed diff icon shows how many files had changed when you opened the Session. A Session keeps the panels you open or close in it, in that browser. Terminal tabs open in the bottom dock and are the exception: each shows one Session's shell and stays open as you switch Sessions (see [Paired terminal](terminal.md#paired-terminal)). **Settings > Panels** sets the defaults; they apply to every Session whose panels you haven't changed.
 
+The right dock is the Session's review panel: **Diff**, **Files**, **Background** (structured-view sessions) and plugin panes, in that order. Picking a file in Diff or Files opens it in the main area with an **Agent | <file>** tab strip above it: **Agent** returns to the session without closing the file, the file tab brings it back, and **×** closes it. Picking another file replaces it. The **maximize** button on the right dock's tab strip lets the dock take the whole main area until you restore it; a reload restores it too. Between 768px and 1100px of window width the right dock opens as a sheet over the main area instead of a third column; **Escape** or a click outside closes it, and picking a file closes it to show the file.
+
 ### Status glyphs
 
 Each sidebar row carries an animated braille glyph encoding the session's state: a spinner of dots while **Running**, an orbiting dot while **Waiting** or **Creating**, a slow breathe while **Starting** or freshly idle. Errors render in the error color. The frame is offset by each session's creation time so rows don't pulse in lockstep.
