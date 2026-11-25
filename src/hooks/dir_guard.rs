@@ -48,6 +48,9 @@ thread_local! {
     /// `reset_for_test` and serialize via `serial_test::serial(hook_base)`.
     static HOOK_BASE_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
+    /// Test-only sandbox base, for a fixture whose two bases must not share a parent.
+    static SANDBOX_HOOK_BASE_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Per-user host base path. The suffix is `geteuid()`, not `getuid()`: the
@@ -91,10 +94,14 @@ impl HookBase {
     }
 }
 
-/// Bind source base for sandboxed rows. Tests keep it beside the (overridden) host base.
+/// Bind source base for sandboxed rows. Tests keep it beside the (overridden) host base, unless
+/// they set it apart.
 pub(crate) fn sandbox_hook_base_path() -> Result<PathBuf> {
     #[cfg(test)]
     {
+        if let Some(p) = SANDBOX_HOOK_BASE_OVERRIDE.with(|c| c.borrow().clone()) {
+            return Ok(p);
+        }
         let host = hook_base_path();
         let name = host
             .file_name()
@@ -114,8 +121,14 @@ pub(crate) fn override_base_for_test(path: PathBuf) {
 }
 
 #[cfg(test)]
+pub(crate) fn override_sandbox_base_for_test(path: PathBuf) {
+    SANDBOX_HOOK_BASE_OVERRIDE.with(|c| *c.borrow_mut() = Some(path));
+}
+
+#[cfg(test)]
 pub(crate) fn clear_base_override_for_test() {
     HOOK_BASE_OVERRIDE.with(|c| *c.borrow_mut() = None);
+    SANDBOX_HOOK_BASE_OVERRIDE.with(|c| *c.borrow_mut() = None);
 }
 
 // Singleton cell.
@@ -1125,11 +1138,22 @@ mod tests {
                 let _ = done.send(());
                 result
             });
-            // Either it is blocked on the lock, or (lock reverted) it already finished.
+            // Either it is blocked on the lock, or (lock reverted) it already finished or
+            // panicked, which the join below reports.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
-                if waiting.try_recv().is_ok() || finished.try_recv().is_ok() {
+                if waiting.try_recv().is_ok()
+                    || !matches!(
+                        finished.try_recv(),
+                        Err(std::sync::mpsc::TryRecvError::Empty)
+                    )
+                {
                     break;
                 }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the writer neither waited on the switch lock nor finished"
+                );
                 std::thread::yield_now();
             }
             *handle.lock().unwrap() = Some(joined);

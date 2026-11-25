@@ -3640,19 +3640,30 @@ sandbox = "unsupported"
             return;
         }
         for runtime in ["colima", "local"] {
-            let temp = tempfile::tempdir().unwrap();
-            // Test hook bases sit in /tmp; a real one is under the app dir, inside HOME.
+            let temp_dir = tempfile::tempdir().unwrap();
+            // Resolved, as a real HOME is: under a symlinked TMPDIR the hook source resolves out of
+            // a HOME written through the link, which Colima wouldn't share.
+            let root = std::fs::canonicalize(temp_dir.path()).unwrap();
+            let temp = root.as_path();
+            // As on a Mac: the host base outside the shared HOME (`temp`), the sandbox base under
+            // the app dir inside it.
+            let host_hooks = tempfile::tempdir().unwrap();
+            let sandbox_base = temp.join("app").join("sandbox-hooks");
             let _hooks = (runtime == "colima").then(|| {
-                crate::hooks::test_support::BaseGuard::with_base(temp.path().join("aoe-hooks"))
+                std::fs::create_dir_all(temp.join("app")).unwrap();
+                crate::hooks::test_support::BaseGuard::with_bases(
+                    host_hooks.path().join("aoe-hooks"),
+                    sandbox_base.clone(),
+                )
             });
-            let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
-            let project = temp.path().join("project");
+            let _app = crate::session::test_support::isolate_app_dir_at(&temp.join("app"));
+            let project = temp.join("project");
             std::fs::create_dir_all(&project).unwrap();
             let profile = "sandbox-sidecar-leaf";
             super::super::test_helpers::declare_execution_aliases(
                 profile,
                 &[("claude", "claude")],
-                temp.path(),
+                temp,
             );
             let mut inst = Instance::new("claude-sidecar", project.to_str().unwrap());
             inst.tool = "claude".into();
@@ -3670,18 +3681,26 @@ sandbox = "unsupported"
                 before_start_env: Vec::new(),
                 before_start_hook_env: Vec::new(),
             });
+            // A new container: the runtime has none by this name yet, so mount preparation picks
+            // the base, as a first launch does.
+            let absent = super::super::test_helpers::install_container_transport(
+                temp,
+                "not-created-yet",
+                &[],
+            );
             let config = inst.build_container_config_for_test().unwrap();
+            drop(absent);
             let _transport = super::super::test_helpers::install_container_transport(
-                temp.path(),
+                temp,
                 "claude-sidecar",
                 &config.volumes,
             );
             // Under Colima the hook dir reaches AoE only through the home share.
             let _colima = (runtime == "colima")
-                .then(|| super::super::test_helpers::route_through_colima(temp.path()));
+                .then(|| super::super::test_helpers::route_through_colima(temp));
             std::fs::copy(
-                temp.path().join("native-bin/prime-agent"),
-                temp.path().join("native-bin/claude"),
+                temp.join("native-bin/prime-agent"),
+                temp.join("native-bin/claude"),
             )
             .unwrap();
             let execution = inst.resolve_native_execution(None).unwrap();
@@ -3706,6 +3725,14 @@ sandbox = "unsupported"
                         .starts_with(crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER)
                 })
                 .expect("hook dir is bind-mounted");
+            if runtime == "colima" {
+                assert!(
+                    std::path::Path::new(&mounted.host_path)
+                        .starts_with(std::fs::canonicalize(&sandbox_base).unwrap()),
+                    "colima: the hook bind comes from the sandbox base: {}",
+                    mounted.host_path
+                );
+            }
             let host_base = std::path::Path::new(&mounted.host_path).parent().unwrap();
             let writer = crate::hooks::hook_command_session_id(
                 crate::hooks::HookInstallTarget::Sandbox,
