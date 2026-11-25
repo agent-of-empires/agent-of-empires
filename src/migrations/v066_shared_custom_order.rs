@@ -4,13 +4,17 @@
 //! dashboard kept its own in `workspace-ordering.json` (rows) and in `state.toml`'s
 //! `web_ui_state` (`aoe-repo-group-order-v1`, Repository headers). `workspace-ordering.json`
 //! is now the one store. A TUI order seeds it only where the dashboard has none, so the
-//! dashboard's wins. The dashboard's header order is copied, not removed, because the
-//! dashboard still reads it. `sort_index` is dropped only after the shared order is
-//! written, so an interrupted run retries from the original rows.
+//! dashboard's wins. With neither, the removed sort v063 left in `legacy_sort_order` seeds
+//! it, so the list keeps the order it had. The dashboard's header order is copied, not
+//! removed, because the dashboard still reads it. `sort_index` and `legacy_sort_order` are
+//! dropped only after the shared order is written, so an interrupted run retries from them.
 
 use super::sessions_file;
+use super::v063_shared_sidebar_view::LEGACY_SORT_KEY;
+use crate::time::Timestamp;
 use anyhow::{Context, Result};
 use serde_json::Value;
+use std::cmp::Reverse;
 use std::fs;
 use std::path::Path;
 use tracing::info;
@@ -21,8 +25,16 @@ pub fn run() -> Result<()> {
     run_in(&crate::session::get_app_dir()?)
 }
 
+/// A live row's place in each order v064 can seed.
+struct LiveRow {
+    workspace: String,
+    created: Option<Timestamp>,
+    accessed: Option<Timestamp>,
+}
+
 fn run_in(app_dir: &Path) -> Result<()> {
     let mut placed: Vec<(u64, String, String)> = Vec::new();
+    let mut live: Vec<LiveRow> = Vec::new();
     let mut to_strip: Vec<(std::path::PathBuf, String)> = Vec::new();
     for path in sessions_file::session_files(app_dir)? {
         // Only a missing file is skipped: finishing without a profile's rows would lose
@@ -35,34 +47,48 @@ fn run_in(app_dir: &Path) -> Result<()> {
         else {
             anyhow::bail!("{} is not a session list", path.display());
         };
-        if !rows.iter().any(|row| row.get("sort_index").is_some()) {
-            continue;
-        }
         for row in rows.iter().filter_map(Value::as_object) {
-            let live = !sessions_file::is_archived(row)
-                && row.get("trashed_at").is_none_or(Value::is_null);
-            if let (true, Some(index)) = (live, row.get("sort_index").and_then(Value::as_u64)) {
+            if sessions_file::is_archived(row)
+                || row.get("trashed_at").is_some_and(|v| !v.is_null())
+            {
+                continue;
+            }
+            let time = |key: &str| {
+                row.get(key)
+                    .and_then(Value::as_str)
+                    .and_then(|raw| Timestamp::parse_rfc3339(raw).ok())
+            };
+            let workspace = workspace_id(row);
+            if let Some(index) = row.get("sort_index").and_then(Value::as_u64) {
                 let created = row
                     .get("created_at")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                placed.push((index, created, workspace_id(row)));
+                placed.push((index, created, workspace.clone()));
             }
+            live.push(LiveRow {
+                workspace,
+                created: time("created_at"),
+                accessed: time("last_accessed_at"),
+            });
         }
-        to_strip.push((path, content));
+        if rows.iter().any(|row| row.get("sort_index").is_some()) {
+            to_strip.push((path, content));
+        }
     }
     // Each group numbered its own rows from 0, so interleaving by index keeps every
     // group's order; newer rows break ties as they did on screen.
     placed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
-    let mut tui_order: Vec<String> = Vec::new();
-    for (_, _, id) in placed {
-        if !tui_order.contains(&id) {
-            tui_order.push(id);
-        }
-    }
+    let tui_order = dedup(placed.into_iter().map(|(_, _, id)| id));
 
-    let web_repositories = web_repository_order(app_dir)?;
+    let state = read_state(app_dir)?;
+    let web_repositories = web_repository_order(state.as_ref());
+    let legacy_sort = state
+        .as_ref()
+        .and_then(|state| state.get(LEGACY_SORT_KEY))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned);
 
     let ordering_path = app_dir.join("workspace-ordering.json");
     let mut ordering: crate::session::WorkspaceOrdering = read_if_present(&ordering_path)?
@@ -70,9 +96,19 @@ fn run_in(app_dir: &Path) -> Result<()> {
         .transpose()?
         .unwrap_or_default();
     let mut changed = false;
-    if ordering.order.is_empty() && !tui_order.is_empty() {
-        ordering.order = tui_order;
-        changed = true;
+    if ordering.order.is_empty() {
+        let seeded = if tui_order.is_empty() {
+            legacy_sort
+                .as_deref()
+                .map(|sort| legacy_order(live, sort))
+                .unwrap_or_default()
+        } else {
+            tui_order
+        };
+        if !seeded.is_empty() {
+            ordering.order = seeded;
+            changed = true;
+        }
     }
     if ordering.repositories.is_empty() && !web_repositories.is_empty() {
         ordering.repositories = web_repositories;
@@ -94,7 +130,40 @@ fn run_in(app_dir: &Path) -> Result<()> {
         crate::session::backup_before_migration(&path)?;
         sessions_file::heal_rows(&path, &content, |row| row.remove("sort_index").is_some())?;
     }
+    if legacy_sort.is_some() {
+        super::config_file::rewrite_strict(&app_dir.join("state.toml"), "v064", |state| {
+            state.remove(LEGACY_SORT_KEY).is_some()
+        })?;
+    }
     Ok(())
+}
+
+/// Workspaces in the order the removed sort `sort` showed them; see v063's `legacy_seed`.
+/// A workspace ranks by its newest session for last activity, by its oldest for oldest.
+fn legacy_order(mut live: Vec<LiveRow>, sort: &str) -> Vec<String> {
+    match sort {
+        "oldest" => live.sort_by_key(|row| (row.created.is_none(), row.created)),
+        "last_activity" => live.sort_by_key(|row| {
+            (
+                row.accessed.is_none(),
+                Reverse(row.accessed),
+                Reverse(row.created),
+            )
+        }),
+        _ => return Vec::new(),
+    }
+    dedup(live.into_iter().map(|row| row.workspace))
+}
+
+/// `ids` with each one kept at its first position.
+fn dedup(ids: impl Iterator<Item = String>) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    for id in ids {
+        if !order.contains(&id) {
+            order.push(id);
+        }
+    }
+    order
 }
 
 /// The file's content, or `None` when it is missing or blank. Any other read error fails.
@@ -125,24 +194,29 @@ fn workspace_id(row: &serde_json::Map<String, Value>) -> String {
     }
 }
 
-/// The dashboard's Repository header order from `state.toml`. A file that does not parse
-/// fails the run rather than seeding without it.
-fn web_repository_order(app_dir: &Path) -> Result<Vec<String>> {
+/// `state.toml`, or `None` when it is missing. A file that does not parse fails the run
+/// rather than seeding without it.
+fn read_state(app_dir: &Path) -> Result<Option<toml::Table>> {
     let path = app_dir.join("state.toml");
     let content = match fs::read_to_string(&path) {
         Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let state: toml::Table = content
+    content
         .parse()
-        .with_context(|| format!("Failed to parse {} during v066 migration", path.display()))?;
-    Ok(state
-        .get("web_ui_state")
+        .map(Some)
+        .with_context(|| format!("Failed to parse {} during v066 migration", path.display()))
+}
+
+/// The dashboard's Repository header order.
+fn web_repository_order(state: Option<&toml::Table>) -> Vec<String> {
+    state
+        .and_then(|state| state.get("web_ui_state"))
         .and_then(|web| web.get(WEB_REPO_ORDER_KEY))
         .and_then(toml::Value::as_str)
         .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
-        .unwrap_or_default())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -263,5 +337,103 @@ mod tests {
         .unwrap();
         run_in(dir.path()).unwrap();
         assert_eq!(ordering(dir.path()).order, ["/r/web::main"]);
+    }
+
+    /// With no TUI or dashboard order, the removed sort v063 kept seeds one that shows the
+    /// rows as that sort did, and is then dropped.
+    #[test]
+    fn seeds_the_order_the_removed_sort_showed() {
+        let rows = serde_json::json!([
+            {"id": "a", "project_path": "/r/a", "created_at": "2026-01-01T00:00:00Z",
+             "last_accessed_at": "2026-03-01T00:00:00Z"},
+            {"id": "b", "project_path": "/r/b", "created_at": "2026-01-03T00:00:00Z"},
+            {"id": "c", "project_path": "/r/c", "created_at": "2026-01-02T00:00:00Z",
+             "last_accessed_at": "2026-03-02T00:00:00.5Z"},
+            // Two sessions on one branch rank by the newest and the oldest of them.
+            {"id": "d1", "project_path": "/r/d", "created_at": "2026-01-04T00:00:00Z",
+             "worktree_info": {"main_repo_path": "/r/d", "branch": "x"}},
+            {"id": "d2", "project_path": "/r/d", "created_at": "2025-12-31T00:00:00Z",
+             "last_accessed_at": "2026-03-03T00:00:00Z",
+             "worktree_info": {"main_repo_path": "/r/d", "branch": "x"}},
+            {"id": "e", "project_path": "/r/e", "created_at": "2025-01-01T00:00:00Z",
+             "last_accessed_at": "2027-01-01T00:00:00Z", "archived_at": "2026-01-05T00:00:00Z"},
+            {"id": "f", "project_path": "/r/f", "created_at": "2025-01-01T00:00:00Z",
+             "trashed_at": "2026-01-05T00:00:00Z"},
+        ]);
+        let (a, b, c, d) = (
+            "/r/a::__session__::a",
+            "/r/b::__session__::b",
+            "/r/c::__session__::c",
+            "/r/d::x",
+        );
+        for (legacy, ordering, expected) in [
+            (Some("oldest"), None, vec![d, a, c, b]),
+            (Some("last_activity"), None, vec![d, c, a, b]),
+            // Newest, Name and the dashboard's Manual leave Custom's default.
+            (None, None, vec![]),
+            // A dashboard order is never overwritten.
+            (
+                Some("oldest"),
+                Some(r#"{"order": ["/r/web::main"]}"#),
+                vec!["/r/web::main"],
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            seed(dir.path(), rows.clone());
+            let state = match legacy {
+                Some(sort) => format!("{LEGACY_SORT_KEY} = \"{sort}\"\nsort_order = \"custom\"\n"),
+                None => "sort_order = \"custom\"\n".to_string(),
+            };
+            fs::write(dir.path().join("state.toml"), state).unwrap();
+            if let Some(ordering) = ordering {
+                fs::write(dir.path().join("workspace-ordering.json"), ordering).unwrap();
+            }
+
+            run_in(dir.path()).unwrap();
+
+            let seeded = if expected.is_empty() {
+                assert!(
+                    !dir.path().join("workspace-ordering.json").exists(),
+                    "{legacy:?}"
+                );
+                Vec::new()
+            } else {
+                self::ordering(dir.path()).order
+            };
+            assert_eq!(seeded, expected, "{legacy:?} {ordering:?}");
+            let state = fs::read_to_string(dir.path().join("state.toml")).unwrap();
+            assert!(!state.contains(LEGACY_SORT_KEY), "{legacy:?}");
+            assert!(state.contains("sort_order"), "{legacy:?}");
+
+            // A second run over migrated state changes nothing.
+            run_in(dir.path()).unwrap();
+            assert_eq!(
+                fs::read_to_string(dir.path().join("state.toml")).unwrap(),
+                state
+            );
+            if !expected.is_empty() {
+                assert_eq!(self::ordering(dir.path()).order, expected);
+            }
+        }
+    }
+
+    /// A TUI Custom order is what the user arranged by hand, so it is kept over a removed sort.
+    #[test]
+    fn a_tui_order_wins_over_the_removed_sort() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            serde_json::json!([
+                {"id": "a", "project_path": "/r/a", "sort_index": 0, "created_at": "2026-01-02T00:00:00Z"},
+                {"id": "b", "project_path": "/r/b", "created_at": "2026-01-01T00:00:00Z"},
+            ]),
+        );
+        fs::write(
+            dir.path().join("state.toml"),
+            format!("{LEGACY_SORT_KEY} = \"oldest\"\n"),
+        )
+        .unwrap();
+        run_in(dir.path()).unwrap();
+        assert_eq!(ordering(dir.path()).order, ["/r/a::__session__::a"]);
     }
 }

@@ -3726,6 +3726,11 @@ impl HomeView {
                     self.info_dialog = Some(InfoDialog::new("Order not reset", &e.to_string()));
                 }
             }
+            ActionId::UndoOrderChange => {
+                if let Err(e) = self.undo_order_change() {
+                    self.info_dialog = Some(InfoDialog::new("Order not restored", &e.to_string()));
+                }
+            }
             ActionId::RestoreTrash => self.restore_selected_from_trash(),
             ActionId::RetryTrash => self.retry_selected_trash(),
             ActionId::AutoName => return self.auto_name_selected(),

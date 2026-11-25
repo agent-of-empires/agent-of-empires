@@ -1,9 +1,26 @@
 //! Moving rows by hand. A row moves within its header by rewriting the shared Custom
 //! order (`PUT /api/workspace-ordering`), the order the web dashboard's drag writes too.
-//! Under My groups a row at the edge of its group crosses into the next one.
+//! Under My groups a row at the edge of its group crosses into the next one. A switch to
+//! Custom and a reset can be undone once, from the command palette.
 
 use super::*;
 use crate::session::config::{GroupByMode, SortOrder};
+
+/// The shared order and sort from before an order change, which Undo writes back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct OrderUndo {
+    order: Vec<String>,
+    repositories: Vec<String>,
+    sort: SortOrder,
+}
+
+/// An order write that offers Undo once it commits.
+#[derive(Debug)]
+pub(super) enum OrderChange {
+    /// A move under Name; the sort becomes Custom.
+    SwitchToCustom(OrderUndo),
+    Reset(OrderUndo),
+}
 
 impl HomeView {
     /// Move the cursor's row one slot in `delta` (-1 up, 1 down). Under the Name sort the
@@ -86,13 +103,9 @@ impl HomeView {
         order: Option<Vec<String>>,
         repositories: Option<Vec<String>>,
     ) -> anyhow::Result<()> {
-        self.session_feed
-            .submit_workspace_ordering(crate::daemon::WorkspaceOrderingPatch {
-                order,
-                repositories,
-            })?;
-        self.custom_after_ordering = self.sort_order != SortOrder::Custom;
-        Ok(())
+        let change = (self.sort_order != SortOrder::Custom)
+            .then(|| OrderChange::SwitchToCustom(self.order_undo_point()));
+        self.write_order(order, repositories, change)
     }
 
     /// Clear the shared Custom order, so rows and headers sit newest first again.
@@ -102,13 +115,73 @@ impl HomeView {
             self.flash_status("The last move is still saving");
             return Ok(());
         }
+        let change = OrderChange::Reset(self.order_undo_point());
+        self.write_order(Some(Vec::new()), Some(Vec::new()), Some(change))
+    }
+
+    /// Write back the order, and the sort, from before the last switch to Custom or reset.
+    pub(super) fn undo_order_change(&mut self) -> anyhow::Result<()> {
+        if self.session_feed.ordering_pending() {
+            self.flash_status("The last move is still saving");
+            return Ok(());
+        }
+        let Some(undo) = self.order_undo.clone() else {
+            self.flash_status("No order change to undo");
+            return Ok(());
+        };
+        self.write_order(Some(undo.order), Some(undo.repositories), None)?;
+        if undo.sort != self.sort_order {
+            self.apply_sort_order(undo.sort);
+        }
+        self.flash_status("Order change undone");
+        Ok(())
+    }
+
+    /// Send an order write. Any other order change makes the remembered Undo stale.
+    fn write_order(
+        &mut self,
+        order: Option<Vec<String>>,
+        repositories: Option<Vec<String>>,
+        change: Option<OrderChange>,
+    ) -> anyhow::Result<()> {
         self.session_feed
             .submit_workspace_ordering(crate::daemon::WorkspaceOrderingPatch {
-                order: Some(Vec::new()),
-                repositories: Some(Vec::new()),
+                order,
+                repositories,
             })?;
-        self.flash_status("Custom order reset to newest first");
+        self.order_undo = None;
+        self.pending_order_change = change;
         Ok(())
+    }
+
+    /// The order and sort Undo restores, as the Daemon last published them.
+    fn order_undo_point(&self) -> OrderUndo {
+        let snapshot = self.session_feed.applied_snapshot();
+        let contents = snapshot.as_ref().map(|snapshot| &snapshot.contents);
+        OrderUndo {
+            order: contents
+                .map(|c| c.workspace_ordering.clone())
+                .unwrap_or_default(),
+            repositories: contents
+                .map(|c| c.repository_order.clone())
+                .unwrap_or_default(),
+            sort: self.sort_order,
+        }
+    }
+
+    pub(super) fn order_change_committed(&mut self, change: OrderChange) {
+        let undo = match change {
+            OrderChange::SwitchToCustom(undo) => {
+                self.apply_sort_order(SortOrder::Custom);
+                self.flash_status("Sort is now Custom (Undo in Ctrl+K)");
+                undo
+            }
+            OrderChange::Reset(undo) => {
+                self.flash_status("Custom order reset (Undo in Ctrl+K)");
+                undo
+            }
+        };
+        self.order_undo = Some(undo);
     }
 
     /// The Daemon's merged order: every workspace, unmoved ones first.

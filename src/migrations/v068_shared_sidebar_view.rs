@@ -6,7 +6,8 @@
 //! choices map to the nearest kept one. A TUI user who never picked a grouping keeps
 //! Groups, the TUI's old default; everyone else gets the new Repository default. The
 //! org and status collapse lists go with their groupings. The web keys stay, since the
-//! dashboard still reads them.
+//! dashboard still reads them. A removed sort that v064 can seed as a Custom order is kept
+//! in `legacy_sort_order` for v064, which removes it.
 
 use anyhow::Result;
 use std::path::Path;
@@ -14,6 +15,7 @@ use tracing::info;
 
 const WEB_AXIS_KEY: &str = "aoe-sidebar-axis";
 const WEB_SORT_KEY: &str = "aoe-sidebar-sort-mode";
+pub(super) const LEGACY_SORT_KEY: &str = "legacy_sort_order";
 
 pub fn run() -> Result<()> {
     run_in(&crate::session::get_app_dir()?)
@@ -35,9 +37,11 @@ fn migrate(state: &mut toml::Table) -> bool {
         .and_then(|t| t.get(WEB_AXIS_KEY))
         .and_then(toml::Value::as_str)
         .map(str::to_owned);
+    // A sort the web never wrote is not a pick, so it leaves the TUI's sort in place.
     let web_sort = web
         .and_then(|t| t.get(WEB_SORT_KEY))
         .and_then(toml::Value::as_str)
+        .filter(|mode| matches!(*mode, "manual" | "lastActivity" | "attention"))
         .map(str::to_owned);
 
     let tui_group = state.get("group_by").and_then(toml::Value::as_str);
@@ -55,9 +59,10 @@ fn migrate(state: &mut toml::Table) -> bool {
     let tui_sort = state.get("sort_order").and_then(toml::Value::as_str);
     // The web offered Manual, Last activity and Attention; none of them orders by name.
     let sort = web_sort
-        .filter(|mode| matches!(mode.as_str(), "manual" | "lastActivity" | "attention"))
+        .as_ref()
         .map(|_| "custom")
         .or_else(|| tui_sort.map(tui_sort_order));
+    let legacy = web_sort.as_deref().or(tui_sort).and_then(legacy_seed);
 
     match group {
         Some(group) => state.insert("group_by".into(), group.into()),
@@ -67,6 +72,11 @@ fn migrate(state: &mut toml::Table) -> bool {
         Some(sort) => state.insert("sort_order".into(), sort.into()),
         None => state.remove("sort_order"),
     };
+    if let Some(legacy) = legacy {
+        state
+            .entry(LEGACY_SORT_KEY)
+            .or_insert_with(|| legacy.into());
+    }
     state.remove("org_group_collapsed");
     state.remove("status_group_collapsed");
 
@@ -90,6 +100,17 @@ fn tui_group_by(mode: &str) -> &'static str {
     match mode {
         "manual" | "group" => "group",
         _ => "project",
+    }
+}
+
+/// The order v064 seeds for a removed sort, in place of Custom's newest-first default.
+/// Attention ranked rows by live status, which no stored order can follow, so it seeds
+/// last activity, the stable order closest to it.
+fn legacy_seed(sort: &str) -> Option<&'static str> {
+    match sort {
+        "oldest" => Some("oldest"),
+        "last_activity" | "lastActivity" | "attention" => Some("last_activity"),
+        _ => None,
     }
 }
 
@@ -160,6 +181,34 @@ mod tests {
         for (input, group, sort) in cases {
             let (g, s, _) = view(&run_on(input));
             assert_eq!((g, s), (group, sort), "{input}");
+        }
+    }
+
+    #[test]
+    fn keeps_a_seedable_legacy_sort_for_v064() {
+        let web = |sort: &str| format!("[web_ui_state]\n\"aoe-sidebar-sort-mode\" = \"{sort}\"\n");
+        for (input, legacy) in [
+            ("sort_order = \"oldest\"\n".to_string(), Some("oldest")),
+            (
+                "sort_order = \"last_activity\"\n".into(),
+                Some("last_activity"),
+            ),
+            ("sort_order = \"attention\"\n".into(), Some("last_activity")),
+            ("sort_order = \"newest\"\n".into(), None),
+            ("sort_order = \"a_z\"\n".into(), None),
+            (web("lastActivity"), Some("last_activity")),
+            (web("attention"), Some("last_activity")),
+            // The web's pick wins, and its drag order is already in the shared store.
+            (format!("sort_order = \"oldest\"\n{}", web("manual")), None),
+        ] {
+            let out = run_on(&input);
+            let table: toml::Table = out.parse().unwrap();
+            assert_eq!(
+                table.get(LEGACY_SORT_KEY).and_then(toml::Value::as_str),
+                legacy,
+                "{input}"
+            );
+            assert_eq!(run_on(&out), out, "a second run changes nothing: {input}");
         }
     }
 

@@ -2745,6 +2745,7 @@ async fn test_ctrl_arrows_under_name_start_custom_from_the_screen_order() {
     assert_eq!(env.view.sort_order, SortOrder::Name);
 
     // Reset waits for the move, whose commit alone switches the sort.
+    let before = env.view.session_feed.applied_snapshot().unwrap();
     let writes = settle_view_writes(&state, &mut env.view, |view| {
         view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
         view.reset_custom_order().unwrap();
@@ -2768,6 +2769,128 @@ async fn test_ctrl_arrows_under_name_start_custom_from_the_screen_order() {
     }
     assert_eq!(env.view.sort_order, SortOrder::Custom);
     assert_eq!(work_group_titles(&env.view), ["Mango", "Apple", "Zebra"]);
+    assert_eq!(
+        flash_text(&env.view),
+        Some("Sort is now Custom (Undo in Ctrl+K)")
+    );
+
+    // Undo restores the order and the Name sort from before the move.
+    let writes = settle_view_writes(&state, &mut env.view, |view| {
+        view.undo_order_change().unwrap();
+    })
+    .await;
+    match writes.as_slice() {
+        [ViewWrite::Ordering(patch), ViewWrite::SidebarView(view)] => {
+            assert_eq!(
+                patch.order.as_ref(),
+                Some(&before.contents.workspace_ordering)
+            );
+            assert_eq!(
+                patch.repositories.as_ref(),
+                Some(&before.contents.repository_order)
+            );
+            assert_eq!(view.sort, Some(SortOrder::Name));
+        }
+        other => panic!("expected an order and a sort write, got {other:?}"),
+    }
+    assert_eq!(env.view.sort_order, SortOrder::Name);
+    assert_eq!(work_group_titles(&env.view), ["Apple", "Mango", "Zebra"]);
+}
+
+fn flash_text(view: &HomeView) -> Option<&str> {
+    view.status_flash.as_ref().map(|flash| flash.text.as_str())
+}
+
+/// Reset offers Undo, which writes back the order from before it. Undo waits for a pending
+/// order write, and restores one change only.
+#[tokio::test]
+#[serial]
+async fn test_undo_restores_the_order_from_before_a_reset() {
+    use crate::tui::session_feed::ViewWrite;
+
+    let mut env = create_test_env_with_mixed_sessions();
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut env.view, &state).await;
+    let mut arranged = env
+        .view
+        .session_feed
+        .applied_snapshot()
+        .unwrap()
+        .contents
+        .workspace_ordering
+        .clone();
+    arranged.reverse();
+    let (status, _, _) = request_with_headers(
+        &state,
+        "PUT",
+        "/api/workspace-ordering",
+        serde_json::json!({ "order": arranged }),
+    )
+    .await;
+    assert!(status.is_success());
+    apply_published(&mut env.view, &state).await;
+    let before = env.view.session_feed.applied_snapshot().unwrap();
+    let sort = env.view.sort_order;
+
+    env.view.undo_order_change().unwrap();
+    assert_eq!(flash_text(&env.view), Some("No order change to undo"));
+
+    let writes = settle_view_writes(&state, &mut env.view, |view| {
+        view.reset_custom_order().unwrap();
+    })
+    .await;
+    assert!(
+        matches!(writes.as_slice(), [ViewWrite::Ordering(_)]),
+        "{writes:?}"
+    );
+    assert_eq!(
+        flash_text(&env.view),
+        Some("Custom order reset (Undo in Ctrl+K)")
+    );
+    assert!(crate::session::load_workspace_ordering()
+        .unwrap()
+        .order
+        .is_empty());
+
+    // Undo is refused while another order write is pending, and stays on offer.
+    let mut capture = env.view.session_feed.view_write_driver_for_test();
+    env.view
+        .session_feed
+        .submit_workspace_ordering(crate::daemon::WorkspaceOrderingPatch::default())
+        .unwrap();
+    env.view.undo_order_change().unwrap();
+    assert_eq!(flash_text(&env.view), Some("The last move is still saving"));
+    let pending = capture().expect("the pending write");
+    assert!(capture().is_none(), "Undo sent nothing");
+    pending.finish(Err("refused".into()));
+    env.view.apply_session_feed();
+
+    let writes = settle_view_writes(&state, &mut env.view, |view| {
+        view.undo_order_change().unwrap();
+    })
+    .await;
+    match writes.as_slice() {
+        [ViewWrite::Ordering(patch)] => {
+            assert_eq!(
+                patch.order.as_ref(),
+                Some(&before.contents.workspace_ordering)
+            );
+            assert_eq!(
+                patch.repositories.as_ref(),
+                Some(&before.contents.repository_order)
+            );
+        }
+        other => panic!("expected one order write and no sort write, got {other:?}"),
+    }
+    assert_eq!(
+        crate::session::load_workspace_ordering().unwrap().order,
+        before.contents.workspace_ordering
+    );
+    assert_eq!(env.view.sort_order, sort);
+
+    env.view.undo_order_change().unwrap();
+    assert_eq!(flash_text(&env.view), Some("No order change to undo"));
 }
 
 /// Alt+Down and Alt+Up walk the sessions the theme paints as attention-worthy: `Running`
