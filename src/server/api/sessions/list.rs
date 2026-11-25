@@ -844,11 +844,11 @@ mod sidebar_view_tests {
             (
                 SidebarViewPatch {
                     group_by: None,
-                    sort: Some(SortOrder::Name),
+                    sort: Some(SortOrder::Newest),
                 },
                 SidebarView {
                     group_by: GroupByMode::Group,
-                    sort: SortOrder::Name,
+                    sort: SortOrder::Newest,
                 },
             ),
         ];
