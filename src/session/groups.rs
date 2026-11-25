@@ -422,7 +422,7 @@ pub enum Item {
         id: String,
         depth: usize,
     },
-    /// The Suggested row, just above Trash: `total` listed suggestions, and
+    /// The Suggested row, just above Archived and Trash: `total` listed suggestions, and
     /// whether a provider failed to refresh. Its list shows in the preview pane.
     Suggested {
         total: usize,
