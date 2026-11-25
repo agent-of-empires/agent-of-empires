@@ -1643,9 +1643,10 @@ function mergeSubagents(
     ...held.map((r) => {
       const fresh = snapshotIsNewer ? fromSnapshot.get(r.session_id) : undefined;
       if (!fresh) return r;
-      // Stamps come from event times, which the snapshot lacks; keep them only while the state agrees.
-      // A snapshot that skipped a running round trip looks unchanged, so resultSuperseded's call-based rule still applies.
-      return fresh.state === r.state ? { ...fresh, idle_since: r.idle_since, running_since: r.running_since } : fresh;
+      // Stamps come from event times, which the snapshot lacks. A seen resume (running_since) stays evidence
+      // whatever state the snapshot reports; the idle stamp holds only while the state agrees.
+      const idle_since = fresh.state === r.state ? r.idle_since : undefined;
+      return { ...fresh, idle_since, running_since: r.running_since };
     }),
     ...snapshot.filter((r) => !heldIds.has(r.session_id)),
   ];

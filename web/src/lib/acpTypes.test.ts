@@ -496,15 +496,16 @@ describe("applyEvent control state", () => {
       record("b", "running", true),
     ]);
 
-    // Event stamps survive a snapshot that agrees on the state, and drop when it does not.
+    // The idle stamp survives a snapshot that agrees on the state; the resume stamp survives any snapshot.
     const stamps = { idle_since: "t2", running_since: "t1" };
     const stamped = { ...held, lastSeq: 7, subagents: [{ ...record("a", "running", true), ...stamps }] };
     expect(applyReducedState(stamped, snapshot([record("a", "running", true)]), [], 7).subagents[0]).toMatchObject(
       stamps,
     );
-    expect(applyReducedState(stamped, snapshot([record("a", "idle", true)]), [], 7).subagents[0]).toEqual(
-      record("a", "idle", true),
-    );
+    expect(applyReducedState(stamped, snapshot([record("a", "idle", true)]), [], 7).subagents[0]).toEqual({
+      ...record("a", "idle", true),
+      running_since: "t1",
+    });
   });
 
   it("codex /new drops usage to the post-reset baseline (#2979)", () => {

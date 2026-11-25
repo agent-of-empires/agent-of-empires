@@ -430,6 +430,22 @@ describe("applyEvent / subagent roster", () => {
     expect(once.earlierReport).toBeUndefined();
   });
 
+  it("keeps a seen text-only resume across a reconnect that adopts a newer idle snapshot", () => {
+    const launch: ToolCall = { id: "task-1", name: "Explore", kind: "think", args_preview: "{}", started_at: "t0" };
+    const first: ActivityRow = { id: "r", kind: "tool_complete", text: "first report", at: "2026-01-01T00:02:00Z" };
+    const t = (m: number) => `2026-01-01T00:0${m}:00Z`;
+    const held = run(
+      update("running", t(1), { background: true }),
+      update("idle", t(2), { stop_reason: "end_turn", background: true }),
+      update("running", t(4), { background: true }),
+    );
+    const { running_since: _r, idle_since: _i, updated_at: _u, ...bare } = held.subagents[0] as Record<string, unknown>;
+    const reduced = reducedState({ subagents: [{ ...bare, state: "idle", stop_reason: "end_turn" }] as never });
+    const merged = applyReducedState(held, reduced, [], held.lastSeq).subagents[0]!;
+    const card = fromInline(launch, first, [], merged);
+    expect(card).toMatchObject({ status: "done", report: "", earlierReport: "first report" });
+  });
+
   it("maps the state onto the matching background agent, including idle then running again", () => {
     const agentAfter = (...events: AcpEvent[]) => run(launched, ...events).backgroundAgents[0];
     expect(agentAfter(update("requires_action", "t1"))).toMatchObject({ status: "requires_action", endedAt: null });
