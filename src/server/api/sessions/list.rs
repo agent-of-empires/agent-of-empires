@@ -758,7 +758,12 @@ pub async fn update_sidebar_view(
         Err(rej) => return rej.into_response(),
     };
 
+    // Same lock order as the ordering handler: namespace, then this write's lane.
+    let _namespace = state.profile_namespace.read().await;
     let lane = state.sidebar_view_lane.lock().await;
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     let result = tokio::task::spawn_blocking(move || {
         crate::session::update_app_state(|app| {
             if let Some(group_by) = patch.group_by {
@@ -777,6 +782,11 @@ pub async fn update_sidebar_view(
         Ok(view) => view,
         Err(error) => {
             tracing::error!(target: "http.api.sessions", %error, "sidebar view commit failed");
+            *state.canonical_health.write().await = crate::daemon::RuntimeHealth::Degraded {
+                code: crate::daemon::ReloadFailureCode::Metadata,
+                profiles: Vec::new(),
+            };
+            state.runtime.request_publish();
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "message": "Failed to save the sidebar view" })),
@@ -786,6 +796,11 @@ pub async fn update_sidebar_view(
     };
     // The epoch bump makes a reload that read state.toml before this write discard itself.
     let publication = state.publication.write().await;
+    // Health lost during the commit keeps the last complete metadata; the healing reload
+    // reads this value from state.toml.
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     state.canonical_metadata.write().await.sidebar_view = view;
     state
         .mutation_epoch
@@ -849,6 +864,69 @@ mod sidebar_view_tests {
                     .app_state
                     .sidebar_view(),
                 expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_refused_patch_leaves_the_stored_view_unchanged() {
+        use crate::server::test_support;
+        use tower::ServiceExt;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let read_only = test_support::build_test_app_state_with_policy_configured(
+            Vec::new(),
+            vec!["localhost".into()],
+            Vec::new(),
+            None,
+            |state| state.read_only = true,
+        );
+        let cityhall = test_support::build_test_app_state_with_policy_configured(
+            Vec::new(),
+            vec!["localhost".into()],
+            Vec::new(),
+            None,
+            |state| state.cityhall_mode = true,
+        );
+        let degraded = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vec!["localhost".into()],
+            Vec::new(),
+            None,
+        );
+        *degraded.canonical_health.write().await = crate::daemon::RuntimeHealth::Degraded {
+            code: crate::daemon::ReloadFailureCode::Metadata,
+            profiles: Vec::new(),
+        };
+        for (name, state, status) in [
+            ("read-only", read_only, StatusCode::FORBIDDEN),
+            ("CityHall", cityhall, StatusCode::FORBIDDEN),
+            ("degraded", degraded, StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let response = test_support::build_router_for_test(state)
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("PATCH")
+                        .uri("/api/sidebar-view")
+                        .header("host", "localhost")
+                        .header("content-type", "application/json")
+                        .extension(axum::extract::ConnectInfo(
+                            "127.0.0.1:5555".parse::<std::net::SocketAddr>().unwrap(),
+                        ))
+                        .body(axum::body::Body::from(r#"{"sort":"name"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{name}");
+            assert_eq!(
+                crate::session::Config::load()
+                    .unwrap()
+                    .app_state
+                    .sidebar_view()
+                    .sort,
+                SortOrder::Custom,
+                "{name}"
             );
         }
     }
