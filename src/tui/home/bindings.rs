@@ -1325,11 +1325,11 @@ pub static BINDINGS: &[Binding] = &[
         context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Attention,
-            desc: "Jump to next waiting/idle",
+            desc: "Jump to next waiting/error/idle",
         }),
         palette: Some(PaletteMeta {
-            title: "Jump to next waiting / idle session",
-            keywords: &["jump", "next", "waiting", "idle"],
+            title: "Jump to next session that needs you or just finished",
+            keywords: &["jump", "next", "waiting", "idle", "error", "needs"],
             group: PaletteGroup::Views,
         }),
     },

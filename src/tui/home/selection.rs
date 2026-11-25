@@ -25,6 +25,13 @@ impl HomeView {
     pub(super) fn rebuild_flat_items_keeping_cursor(&mut self) {
         let on_suggested = self.on_suggested_row();
         self.rebuild_flat_items();
+        if self.flat_items.is_empty() {
+            self.cursor = 0;
+            self.selected_session = None;
+            self.selected_group = None;
+            self.selected_group_profile = None;
+            return;
+        }
         let restored = match (&self.selected_session, &self.selected_group) {
             // The Suggested row carries neither selection; once it is gone the cursor
             // stays on the index, which now holds its neighbour.
@@ -171,6 +178,11 @@ impl HomeView {
                     return Ok(false);
                 }
             }
+        }
+        // A session asked for by name must show, so the needs-you filter steps aside.
+        if self.needs_you_only && self.get_instance(id).is_some_and(|inst| !inst.needs_you()) {
+            self.needs_you_only = false;
+            self.flash_status("Showing every session");
         }
         self.rebuild_flat_items();
         let position = self

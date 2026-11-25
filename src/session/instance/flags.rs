@@ -486,11 +486,6 @@ impl Instance {
         self.snoozed_until.filter(|t| *t > Timestamp::now())
     }
 
-    /// Combined "don't bother me" sink-state check: trashed, snoozed,
-    /// archived, or ignored. Callers that walk sessions looking for something
-    /// to land on (e.g. the `w`/jump-to-next-attention passes) use this
-    /// instead of the per-flag calls so a row in any sink state is uniformly
-    /// excluded.
     /// Waiting on a person, in Error, or flagged urgent, and not put away. The web
     /// dashboard's `sessionNeedsAttention` reads the same states.
     pub fn needs_you(&self) -> bool {
@@ -501,6 +496,11 @@ impl Instance {
             ) || self.is_urgent())
     }
 
+    /// Combined "don't bother me" sink-state check: trashed, snoozed,
+    /// archived, or ignored. Callers that walk sessions looking for something
+    /// to land on (e.g. the `w`/jump-to-next-attention passes) use this
+    /// instead of the per-flag calls so a row in any sink state is uniformly
+    /// excluded.
     pub fn is_dismissed(&self) -> bool {
         self.is_trashed() || self.is_snoozed() || self.is_archived() || self.is_ignored()
     }

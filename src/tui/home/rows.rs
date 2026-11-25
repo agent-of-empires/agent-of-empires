@@ -158,14 +158,14 @@ impl HomeView {
     }
 
     pub(in crate::tui) fn build_flat_items(&self) -> Vec<Item> {
-        self.build_flat_items_hiding(self.hide_stopped_in_groups)
+        self.build_flat_items_hiding(self.hide_stopped_in_groups, self.needs_you_only)
     }
 
     /// Rebuild the rows and, while stopped sessions are hidden, every group header's full count.
     pub(super) fn refresh_flat_items(&mut self) {
         self.flat_items = self.build_flat_items();
         self.group_totals = if self.hide_stopped_in_groups {
-            self.build_flat_items_hiding(false)
+            self.build_flat_items_hiding(false, self.needs_you_only)
                 .into_iter()
                 .filter_map(|item| match item {
                     Item::Group {
@@ -200,9 +200,11 @@ impl HomeView {
     pub(super) fn needs_you_under(&self, path: &str, profile: Option<&str>) -> usize {
         let prefix = format!("{path}/");
         let within = |p: &str| p == path || p.starts_with(&prefix);
-        self.cloned_instances_in_active_view()
-            .iter()
+        let active = self.active_profile.as_deref();
+        self.instances
+            .values()
             .filter(|inst| inst.needs_you())
+            .filter(|inst| active.is_none_or(|p| inst.source_profile == p))
             .filter(|inst| match self.group_by {
                 GroupByMode::Project => within(&project_view_path(inst)),
                 GroupByMode::Group => {
@@ -226,8 +228,12 @@ impl HomeView {
         });
     }
 
-    /// Whether the `y` filter is keeping `inst` out of the list.
+    /// Whether the `y` filter or the needs-you filter is keeping `inst` out of the list.
     pub(super) fn hidden_by_filter(&self, inst: &Instance) -> bool {
+        (self.needs_you_only && !inst.needs_you()) || self.hidden_as_stopped(inst)
+    }
+
+    pub(super) fn hidden_as_stopped(&self, inst: &Instance) -> bool {
         self.hide_stopped_in_groups
             && stopped_row_hidden_in_groups(inst, self.hide_snoozed_with_stopped)
             && self.could_hide(inst)
@@ -242,7 +248,7 @@ impl HomeView {
         grouped && !inst.is_archived() && !inst.is_trashed()
     }
 
-    /// The row of the group header session `id` sits under while the `y` filter hides it, so a
+    /// The row of the group header session `id` sits under while a filter hides it, so a
     /// selection that drops out moves to its own group rather than to whichever row now has its
     /// index. Read from the unfiltered rows of the current grouping, where a session follows its
     /// own group's header.
@@ -253,7 +259,7 @@ impl HomeView {
         {
             return None;
         }
-        let unfiltered = self.build_flat_items_hiding(false);
+        let unfiltered = self.build_flat_items_hiding(false, false);
         let at = unfiltered
             .iter()
             .position(|item| matches!(item, Item::Session { id: sid, .. } if sid == id))?;
@@ -284,13 +290,13 @@ impl HomeView {
             .collect()
     }
 
-    fn build_flat_items_hiding(&self, hide_stopped: bool) -> Vec<Item> {
+    fn build_flat_items_hiding(&self, hide_stopped: bool, needs_you_only: bool) -> Vec<Item> {
         if self.group_by == GroupByMode::Project {
-            return self.build_flat_items_by_project(hide_stopped);
+            return self.build_flat_items_by_project(hide_stopped, needs_you_only);
         }
 
         let mut pool = self.shown_in_groups(self.cloned_instances_in_active_view(), hide_stopped);
-        if self.needs_you_only {
+        if needs_you_only {
             pool.retain(Instance::needs_you);
         }
         let mut items = if let Some(profile) = &self.active_profile {
@@ -313,11 +319,11 @@ impl HomeView {
 
     /// Repository mode: one header per repository with the session's Groups nested inside.
     /// Archived rows keep only their repository, which buckets the Archived section.
-    fn build_flat_items_by_project(&self, hide_stopped: bool) -> Vec<Item> {
+    fn build_flat_items_by_project(&self, hide_stopped: bool, needs_you_only: bool) -> Vec<Item> {
         let mut grouped: Vec<Instance> = self
             .cloned_instances_in_active_view()
             .into_iter()
-            .filter(|inst| !self.needs_you_only || inst.needs_you())
+            .filter(|inst| !needs_you_only || inst.needs_you())
             .map(|mut inst| {
                 inst.group_path = if inst.is_archived() || inst.is_trashed() {
                     project_group_key(&inst)
@@ -367,7 +373,7 @@ impl HomeView {
                 headers.push((rank(inst.repo_path()), Group::new(label, label)));
             }
         }
-        let unpopulated = if self.needs_you_only {
+        let unpopulated = if needs_you_only {
             Vec::new()
         } else {
             crate::session::projects::unpopulated_projects(

@@ -689,3 +689,98 @@ fn needs_you_counts_on_headers_and_filters_the_list() {
     env.view.toggle_needs_you_only();
     assert_eq!(session_titles(&env.view).len(), 6);
 }
+
+/// Under the needs-you filter, a session that stops needing you leaves the list at once: live-send
+/// on it ends and the selection moves to its own header.
+#[test]
+#[serial]
+fn a_session_that_stops_needing_you_ends_live_send_and_selects_its_header() {
+    let mut env = env_with_stopped(true);
+    let id = select_session(&mut env, "util-stopped-a");
+    publish_statuses(&mut env.view, &[(&id, Status::Waiting)]);
+    env.view.toggle_needs_you_only();
+    select_session(&mut env, "util-stopped-a");
+    live_send_to_terminal(&mut env, &id);
+
+    publish_statuses(&mut env.view, &[(&id, Status::Running)]);
+
+    assert!(session_titles(&env.view).is_empty());
+    assert!(env.view.live_send.is_none(), "live-send ends with its row");
+    assert_eq!(env.view.selected_session, None);
+    assert_eq!(env.view.selected_group.as_deref(), Some("util"));
+}
+
+/// Under Repository, a needs-you filter that matches nothing leaves no rows, and no session or
+/// group stays selected for the preview or the next action.
+#[test]
+#[serial]
+fn a_needs_you_filter_with_no_matches_clears_the_selection() {
+    let mut env = env_with_stopped(false);
+    env.view.apply_group_by(GroupByMode::Project);
+    select_session(&mut env, "util-live");
+
+    env.view.toggle_needs_you_only();
+
+    assert!(env.view.flat_items.is_empty());
+    assert_eq!(env.view.selected_session, None);
+    assert_eq!(env.view.selected_group, None);
+}
+
+/// `w` reaches a session in Error inside a collapsed group, as the header's count promises.
+#[test]
+#[serial]
+fn w_reaches_an_error_session_in_a_collapsed_group() {
+    let mut env = env_with_stopped(false);
+    env.view.apply_group_by(GroupByMode::Project);
+    let live = select_session(&mut env, "util-live");
+    let error = select_session(&mut env, "ops-stopped-b");
+    publish_statuses(
+        &mut env.view,
+        &[(&live, Status::Stopped), (&error, Status::Error)],
+    );
+    env.view
+        .project_group_collapsed
+        .insert("ops".to_string(), true);
+    env.view.rebuild_flat_items();
+    select_session(&mut env, "util-stopped-a");
+
+    env.view.handle_key(key(KeyCode::Char('w')), None);
+
+    assert_eq!(env.view.selected_session.as_deref(), Some(error.as_str()));
+}
+
+/// Under the needs-you filter, `w` with nothing else needing you stops at "No Available
+/// Sessions" instead of trying to reveal an idle row the filter hides.
+#[test]
+#[serial]
+fn w_under_the_needs_you_filter_skips_idle_rows_it_hides() {
+    let mut env = env_with_stopped(true);
+    let waiting = select_session(&mut env, "util-stopped-a");
+    publish_statuses(&mut env.view, &[(&waiting, Status::Waiting)]);
+    env.view.toggle_needs_you_only();
+    select_session(&mut env, "util-stopped-a");
+
+    env.view.handle_key(key(KeyCode::Char('w')), None);
+
+    assert_eq!(env.view.selected_session.as_deref(), Some(waiting.as_str()));
+    assert_eq!(
+        env.view.info_dialog.as_ref().map(|d| d.title()),
+        Some("No Available Sessions")
+    );
+}
+
+/// Revealing a session the needs-you filter hides, as creating one does, turns the filter off
+/// so the new session shows and can be attached.
+#[test]
+#[serial]
+fn revealing_a_session_the_needs_you_filter_hides_turns_the_filter_off() {
+    let mut env = env_with_stopped(true);
+    let live = select_session(&mut env, "util-live");
+    publish_statuses(&mut env.view, &[(&live, Status::Running)]);
+    env.view.toggle_needs_you_only();
+
+    assert!(env.view.reveal_session(&live, true).unwrap());
+
+    assert!(!env.view.needs_you_only);
+    assert_eq!(env.view.selected_session.as_deref(), Some(live.as_str()));
+}

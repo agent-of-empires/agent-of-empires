@@ -4856,7 +4856,6 @@ impl HomeView {
                 // "don't bother me" sink states.
                 let is_actionable = !inst.is_dismissed()
                     && (inst.needs_you()
-                        || inst.status == Status::Waiting
                         || matches!(inst.idle_age(), Some(age) if age < window)
                         || (crate::session::unread_enabled() && inst.is_unread()));
                 if is_actionable {
@@ -4877,7 +4876,7 @@ impl HomeView {
                 {
                     return false;
                 }
-                inst.status == Status::Waiting
+                inst.needs_you()
                     || matches!(inst.idle_age(), Some(age) if age < window)
                     || (crate::session::unread_enabled() && inst.is_unread())
             })
@@ -4913,6 +4912,7 @@ impl HomeView {
                 || current_session.as_deref() == Some(inst.id.as_str())
                 || inst.is_dismissed()
                 || inst.status != Status::Idle
+                || self.hidden_by_filter(inst)
             {
                 continue;
             }
@@ -7430,7 +7430,7 @@ impl HomeView {
         }
     }
 
-    /// End live-send when a rebuild has left its target hidden by the `y` filter, whatever
+    /// End live-send when a rebuild has left its target hidden by a filter, whatever
     /// changed (its status, the sort, the grouping, its group): a stopped session's terminal
     /// can outlive its agent, and keys must not reach a pane the list no longer shows. The
     /// selection is left for the caller's rebuild to settle.
@@ -7438,13 +7438,17 @@ impl HomeView {
         let Some(state) = self.live_send.clone() else {
             return;
         };
-        let Some(by_filter) = self.get_instance(&state.session_id).and_then(|inst| {
+        let Some(message) = self.get_instance(&state.session_id).and_then(|inst| {
             if self.hidden_by_filter(inst) {
-                Some(true)
+                Some(if self.hidden_as_stopped(inst) {
+                    "Live mode ended: its session is hidden (y to show)"
+                } else {
+                    "Live mode ended: its session is hidden"
+                })
             } else {
                 self.session_row(&state.session_id)
                     .is_none()
-                    .then_some(false)
+                    .then_some("Live mode ended: its session is under a collapsed header")
             }
         }) else {
             return;
@@ -7462,11 +7466,7 @@ impl HomeView {
             self.selected_group,
             self.selected_group_profile,
         ) = selection;
-        self.flash_status(if by_filter {
-            "Live mode ended: its session is hidden (y to show)"
-        } else {
-            "Live mode ended: its session is under a collapsed header"
-        });
+        self.flash_status(message);
     }
 
     /// Tear down live-send state and restore the tmux window's automatic sizing:
