@@ -12,7 +12,7 @@ import remarkGfm from "remark-gfm";
 
 import { writeClipboard } from "../../lib/clipboard";
 import { tableSource } from "../../lib/tableMarkdown";
-import { highlightSnippet } from "../../lib/snippetHighlighter";
+import { highlightSnippet, peekHighlight } from "../../lib/snippetHighlighter";
 import { useShikiTheme } from "../../hooks/useShikiTheme";
 import { parseFileRef, resolveArtifactUrl, resolveToRepoRelative } from "../../lib/fileRef";
 import { useAcpFileRef } from "./AcpFileRefContext";
@@ -170,13 +170,25 @@ function ShikiSyntaxHighlighter({ language, code }: SyntaxHighlighterProps) {
   // NUL-delimited (as the escape sequence: a raw NUL byte in source makes
   // git treat the file as binary) so field concatenations cannot collide.
   const inputKey = `${language ?? ""}\u0000${code}`;
-  const [result, setResult] = useState<{ key: string; html: string } | null>(null);
   const shiki = useShikiTheme();
+  // A cache hit renders highlighted on first paint, so a remounted block never flashes plain text.
+  const cached = useMemo(
+    () =>
+      language
+        ? peekHighlight(code, { langHint: language, theme: shiki.theme, appearance: shiki.appearance })
+        : undefined,
+    [language, code, shiki.theme, shiki.appearance],
+  );
+  // Seeded from a mount-time cache hit so a later theme switch keeps that palette.
+  const [result, setResult] = useState<{ key: string; html: string } | null>(() =>
+    cached !== undefined ? { key: inputKey, html: cached } : null,
+  );
   const [wrapped, toggleWrap] = useWrapState();
 
   useEffect(() => {
     let cancelled = false;
     if (!language) return;
+    if (cached !== undefined) return;
     (async () => {
       try {
         const out = await highlightSnippet(code, {
@@ -193,9 +205,9 @@ function ShikiSyntaxHighlighter({ language, code }: SyntaxHighlighterProps) {
     return () => {
       cancelled = true;
     };
-  }, [language, code, inputKey, shiki.theme, shiki.appearance]);
+  }, [language, code, inputKey, shiki.theme, shiki.appearance, cached]);
 
-  const html = result && result.key === inputKey ? result.html : null;
+  const html = cached ?? (result && result.key === inputKey ? result.html : null);
 
   // The em-based size carries no line-height, so set it or code inherits the looser body leading.
   return (

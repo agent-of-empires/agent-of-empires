@@ -70,3 +70,11 @@ export async function mockSettingsApis(
     (r) => r.fulfill({ json: opts.settings?.() ?? {} }),
   );
 }
+
+/** Serves `web.auto_open_*` on, so Sessions open with Diff and a terminal. Register after other `/api/settings` stubs. */
+export async function openPanelsByDefault(page: Page) {
+  await page.route(
+    (url) => url.pathname === "/api/settings",
+    (r) => r.fulfill({ json: { web: { auto_open_diff_pane: true, auto_open_terminal_pane: true } } }),
+  );
+}

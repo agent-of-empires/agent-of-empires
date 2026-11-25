@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 
 use crate::git::GitWorktree;
 use crate::session::worktree_edit::{
@@ -752,7 +752,7 @@ fn reconcile_trashed_batch(
     batch: &[Instance],
 ) -> anyhow::Result<Vec<Instance>> {
     let _identity = crate::session::acquire_session_identity_lock()?;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let reserved = storage.update_complete(|instances, _groups| {
         let mut reserved: Vec<(u64, Instance)> = Vec::new();
         for snapshot in batch {
@@ -896,7 +896,7 @@ pub(crate) fn reconcile_trashed_transition(
         let generation = stored.try_acquire_lifecycle_reservation(
             crate::session::LifecycleOperation::Trash,
             Instance::LIFECYCLE_RESERVATION_TTL,
-            Utc::now(),
+            Timestamp::now(),
         )?;
         Ok((generation, stored.clone()))
     })?;
@@ -934,14 +934,15 @@ pub(crate) fn reconcile_trashed_transition(
 /// True when a trashed session is past its retention window and should be
 /// auto-purged. `retention_days == 0` means "keep forever" (manual purge
 /// only), so it never expires. A non-trashed session never expires.
-pub fn is_expired(instance: &Instance, retention_minutes: u32, now: DateTime<Utc>) -> bool {
+pub fn is_expired(instance: &Instance, retention_minutes: u32, now: Timestamp) -> bool {
     if retention_minutes == 0 {
         return false;
     }
     match instance.trashed_at {
-        Some(trashed_at) => {
-            now >= trashed_at + chrono::Duration::minutes(i64::from(retention_minutes))
-        }
+        // An expiry past the representable range never arrives.
+        Some(trashed_at) => trashed_at
+            .checked_add(crate::time::Duration::minutes(i64::from(retention_minutes)))
+            .is_some_and(|expiry| now >= expiry),
         None => false,
     }
 }
@@ -966,7 +967,7 @@ pub fn sweep_interval(retention_minutes: impl IntoIterator<Item = u32>) -> std::
 pub fn expired_trashed_ids(
     instances: &[Instance],
     retention_minutes: u32,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Vec<String> {
     instances
         .iter()
@@ -981,13 +982,13 @@ mod tests {
 
     fn trashed_days_ago(days: i64) -> Instance {
         let mut inst = Instance::new("s", "/tmp/x");
-        inst.trashed_at = Some(Utc::now() - chrono::Duration::days(days));
+        inst.trashed_at = Some(Timestamp::now() - crate::time::Duration::days(days));
         inst
     }
 
     #[test]
     fn is_expired_cases() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         const DAY: u32 = 24 * 60;
         // (case, trashed minutes ago, retention minutes, expected)
         let cases = [
@@ -1007,7 +1008,7 @@ mod tests {
         for (case, trashed_minutes, retention, expected) in cases {
             let mut inst = Instance::new("s", "/tmp/x");
             inst.trashed_at =
-                trashed_minutes.map(|minutes| now - chrono::Duration::minutes(minutes));
+                trashed_minutes.map(|minutes| now - crate::time::Duration::minutes(minutes));
             assert_eq!(is_expired(&inst, retention, now), expected, "{case}");
         }
         let fresh = trashed_days_ago(1);
@@ -1070,7 +1071,7 @@ mod tests {
             branch: "feature/relocate-me".to_string(),
             main_repo_path: main_repo.to_string_lossy().to_string(),
             managed_by_aoe: true,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             base_branch: None,
         });
         (tmp, inst)
@@ -1114,7 +1115,7 @@ mod tests {
             branch: "main".to_string(),
             main_repo_path: bare.to_string_lossy().to_string(),
             managed_by_aoe: true,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             base_branch: None,
         });
         (tmp, inst)

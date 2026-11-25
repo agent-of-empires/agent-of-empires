@@ -1,10 +1,12 @@
 // @vitest-environment jsdom
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render } from "@testing-library/react";
 
 import type { PushState } from "../../hooks/usePushSubscription";
+import type { InstallHint } from "../../lib/platform";
 import type { PushHealth } from "../../lib/pushHealth";
+import { INSTALL_STEPS } from "../../lib/tourSteps";
 
 const enable = vi.fn();
 const disable = vi.fn();
@@ -24,7 +26,17 @@ vi.mock("../../hooks/usePushSubscription", () => ({
   }),
 }));
 
+const platform = vi.hoisted(() => ({ hint: null as InstallHint | null }));
+vi.mock("../../lib/platform", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../lib/platform")>()),
+  installHint: () => platform.hint,
+}));
+
 import { NotificationSettings } from "../NotificationSettings";
+
+afterEach(() => {
+  platform.hint = null;
+});
 
 function setState(s: PushState, health: PushHealth = "unknown") {
   currentState = s;
@@ -85,12 +97,6 @@ describe("NotificationSettings", () => {
     ["'denied' keeps the Enable button", { kind: "denied" }, null, true],
     ["'error' renders its message", { kind: "error", message: "boom" }, "boom", true],
     [
-      "'unsupported / ios-not-standalone' renders the install help",
-      { kind: "unsupported", reason: "ios-not-standalone" },
-      "How to install on iPhone",
-      false,
-    ],
-    [
       "'unsupported / insecure-origin' surfaces the HTTPS hint",
       { kind: "unsupported", reason: "insecure-origin" },
       "require HTTPS",
@@ -107,5 +113,46 @@ describe("NotificationSettings", () => {
     const container = renderFor(state);
     if (text) expect(container.textContent).toContain(text);
     expect(buttonByText(container, "Enable notifications") !== null).toBe(enableShown);
+  });
+
+  // The install banner's × says the steps stay here, so each platform's own step must show.
+  it.each<{ name: string; hint: InstallHint | null; state: PushState; steps: readonly string[]; enable: boolean }>([
+    {
+      name: "an iPhone tab lists the Home Screen steps",
+      hint: "ios",
+      state: { kind: "unsupported", reason: "ios-not-standalone" },
+      steps: INSTALL_STEPS.ios.settings,
+      enable: false,
+    },
+    {
+      name: "an iPhone tab that exposes push lists the Home Screen steps and offers Enable",
+      hint: "ios",
+      state: { kind: "off" },
+      steps: INSTALL_STEPS.ios.settings,
+      enable: true,
+    },
+    { name: "a tab that can push offers Enable", hint: "push", state: { kind: "off" }, steps: [], enable: true },
+    {
+      name: "a touch browser without push lists the install steps",
+      hint: "other",
+      state: { kind: "unsupported", reason: "no-api" },
+      steps: INSTALL_STEPS.other.settings,
+      enable: false,
+    },
+    {
+      name: "a desktop without push shows no steps",
+      hint: null,
+      state: { kind: "unsupported", reason: "no-api" },
+      steps: [],
+      enable: false,
+    },
+  ])("$name", ({ hint, state, steps, enable: enableShown }) => {
+    platform.hint = hint;
+    const container = renderFor(state);
+    const listed = [...container.querySelectorAll("ol li")].map((li) => li.textContent);
+    expect(listed).toEqual([...steps]);
+    expect(buttonByText(container, "Enable notifications") !== null).toBe(enableShown);
+    if (hint === null) expect(container.textContent).toContain("does not support Web Push");
+    if (hint === "other") expect(container.textContent).not.toContain("does not support Web Push");
   });
 });

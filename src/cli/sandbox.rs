@@ -143,11 +143,11 @@ fn check_report(
         SandboxLoginStatus::Ok { refresh_expires_at } => {
             let expiry = refresh_expires_at
                 .and_then(|ms| i64::try_from(ms).ok())
-                .and_then(chrono::DateTime::from_timestamp_millis)
+                .and_then(crate::time::Timestamp::from_millis)
                 .map(|at| {
                     format!(
                         " (refresh token expires {})",
-                        at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                        at.to_rfc3339_opts(crate::time::SecondsFormat::Secs, true)
                     )
                 })
                 .unwrap_or_default();

@@ -81,9 +81,12 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> Response {
         SupervisorError::RestartInProgress(_) => {
             (StatusCode::CONFLICT, format!("restart_in_progress: {err}"))
         }
-        SupervisorError::Superseded(_) => (StatusCode::CONFLICT, err.to_string()),
+        SupervisorError::Superseded(_) | SupervisorError::StopSuperseded(_) => {
+            (StatusCode::CONFLICT, err.to_string())
+        }
         SupervisorError::CapacityFull { .. }
         | SupervisorError::TeardownPending(_)
+        | SupervisorError::PurgeInProgress(_)
         | SupervisorError::EventStoreUnavailable(_)
         | SupervisorError::NativeStoreUnavailable => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string())
@@ -201,6 +204,7 @@ pub(crate) fn spawn_request_for(
         fork_from: instance.fork_pending.clone(),
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
         sandbox_info,
+        workspace_info: instance.workspace_info.clone(),
         // Passed even without sandboxing so agent_acp_cmd and worker env
         // resolve from the session's profile.
         source_profile: Some(instance.source_profile.clone()),
@@ -335,6 +339,21 @@ mod tests {
             state.acp_supervisor.worker_state("sess").await,
             crate::daemon::AcpWorkerState::Absent
         );
+    }
+
+    #[test]
+    fn spawn_request_for_carries_the_workspace_layout() {
+        let instance = crate::server::test_support::workspace_instance(
+            "ws-spawn-request",
+            std::path::Path::new("/tmp/aoe-ws-spawn-request"),
+        );
+        let req = spawn_request_for(&instance, "claude".into(), None);
+        crate::server::test_support::assert_carries_workspace(
+            req.workspace_info.as_ref(),
+            &instance,
+            "spawn_request_for",
+        );
+        assert_eq!(req.cwd, PathBuf::from(&instance.project_path));
     }
 
     #[tokio::test]

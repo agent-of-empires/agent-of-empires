@@ -25,6 +25,7 @@ pub(crate) enum SendKeysError {
     NotRunning,
     Transient(Status),
     StructuredView,
+    Ignored,
     Blocked(crate::session::StartBlocked),
     Gone,
     Tmux(anyhow::Error),
@@ -46,14 +47,22 @@ pub(crate) async fn send_terminal_message(
     id: &str,
     message: String,
     revive: bool,
+    refuse_if_ignored: bool,
 ) -> Result<bool, TerminalSendError> {
     let mut committed_cursor = None;
-    send_terminal_message_inner(service, id, message, revive, &mut committed_cursor)
-        .await
-        .map_err(|error| TerminalSendError {
-            error,
-            committed_cursor: committed_cursor.map(Box::new),
-        })
+    send_terminal_message_inner(
+        service,
+        id,
+        message,
+        revive,
+        refuse_if_ignored,
+        &mut committed_cursor,
+    )
+    .await
+    .map_err(|error| TerminalSendError {
+        error,
+        committed_cursor: committed_cursor.map(Box::new),
+    })
 }
 
 async fn send_terminal_message_inner(
@@ -61,6 +70,7 @@ async fn send_terminal_message_inner(
     id: &str,
     message: String,
     revive: bool,
+    refuse_if_ignored: bool,
     committed_cursor: &mut Option<(axum::http::HeaderValue, axum::http::HeaderValue)>,
 ) -> Result<bool, SendKeysError> {
     let state = service.native_state().map_err(SendKeysError::Tmux)?;
@@ -103,6 +113,9 @@ async fn send_terminal_message_inner(
                 .find(|row| row.id == initial_id)
                 .ok_or(SendKeysError::NotFound)?;
             before.ensure_startable().map_err(SendKeysError::Blocked)?;
+            if refuse_if_ignored && before.is_ignored() {
+                return Err(SendKeysError::Ignored);
+            }
             if before.is_structured() {
                 return Err(SendKeysError::StructuredView);
             }
@@ -149,6 +162,7 @@ async fn send_terminal_message_inner(
                 crate::session::LifecycleReservationError::Superseded
             );
             let _ownership = before.acquire_auxiliary_locks_in(&native)?;
+            anyhow::ensure!(!refuse_if_ignored || !before.is_ignored(), IgnoredSession);
             anyhow::ensure!(
                 !before.is_structured(),
                 crate::session::NativeInputError::Ownership
@@ -174,6 +188,7 @@ async fn send_terminal_message_inner(
             existing_target
                 .as_ref()
                 .and_then(|target| target.physical.clone()),
+            refuse_if_ignored,
         )
         .await;
         let (parts, body) = response.into_parts();
@@ -182,6 +197,9 @@ async fn send_terminal_message_inner(
             .map_err(|_| SendKeysError::Internal)?;
         if !parts.status.is_success() {
             let detail = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            if detail["error"] == "ignored" {
+                return Err(SendKeysError::Ignored);
+            }
             return Err(SendKeysError::Preparation {
                 response: Box::new(axum::response::Response::from_parts(
                     parts,
@@ -238,7 +256,7 @@ async fn send_terminal_message_inner(
             crate::session::NativeStoreUnavailable.into(),
         ));
     }
-    let _submission = service
+    let submission = service
         .prompt_submission_for_session(id)
         .await
         .ok_or(SendKeysError::NotFound)?;
@@ -269,6 +287,7 @@ async fn send_terminal_message_inner(
             expected.matches(&instance),
             crate::session::LifecycleReservationError::Superseded
         );
+        anyhow::ensure!(!refuse_if_ignored || !instance.is_ignored(), IgnoredSession);
         instance.ensure_startable()?;
         anyhow::ensure!(
             !instance.is_structured(),
@@ -296,7 +315,7 @@ async fn send_terminal_message_inner(
     // Captured native/physical scope now owns admission. User after-send hooks
     // must be able to re-enter lifecycle operations through this daemon too.
     drop(guard);
-    drop(_submission);
+    drop(submission);
     drop(namespace);
     let result = match prepared {
         Ok((native, instance, session)) => {
@@ -306,6 +325,25 @@ async fn send_terminal_message_inner(
                 let _lifecycle = native
                     .storage()
                     .acquire_instance_lifecycle_lock(&instance.id)?;
+                if let Some(pending) = &instance.pending_initial_turn {
+                    let key = pending.key();
+                    (&native as &dyn SessionStore).update(|rows, _| {
+                        if let Some(row) = rows.iter_mut().find(|row| {
+                            row.id == instance.id
+                                && row.created_at == instance.created_at
+                                && row.lifecycle_generation == instance.lifecycle_generation
+                        }) {
+                            if row
+                                .pending_initial_turn
+                                .as_ref()
+                                .is_some_and(|turn| turn.key() == key)
+                            {
+                                row.pending_initial_turn = None;
+                            }
+                        }
+                        Ok(())
+                    })?;
+                }
                 let recency = (&native as &dyn SessionStore).update(|rows, _| {
                     let row = rows
                         .iter_mut()
@@ -316,7 +354,13 @@ async fn send_terminal_message_inner(
                             && row.lifecycle_generation == instance.lifecycle_generation,
                         crate::session::LifecycleReservationError::Superseded
                     );
-                    row.last_accessed_at = Some(chrono::Utc::now());
+                    row.last_accessed_at = Some(crate::time::Timestamp::now());
+                    if !refuse_if_ignored
+                        && row.ignored_at == instance.ignored_at
+                        && row.ensure_startable().is_ok()
+                    {
+                        row.unignore();
+                    }
                     Ok(())
                 });
                 if let Err(error) = recency {
@@ -342,6 +386,8 @@ async fn send_terminal_message_inner(
 fn terminal_send_failure(state: &crate::server::AppState, error: anyhow::Error) -> SendKeysError {
     if let Some(blocked) = error.downcast_ref::<crate::session::StartBlocked>() {
         SendKeysError::Blocked(*blocked)
+    } else if error.is::<IgnoredSession>() {
+        SendKeysError::Ignored
     } else if error.is::<crate::session::SessionGone>() {
         SendKeysError::Gone
     } else if error.is::<TerminalNotRunning>() {
@@ -368,6 +414,18 @@ fn terminal_send_failure(state: &crate::server::AppState, error: anyhow::Error) 
 #[error("Terminal session is not running")]
 struct TerminalNotRunning;
 
+#[derive(Debug, thiserror::Error)]
+#[error("Session is ignored")]
+pub(super) struct IgnoredSession;
+
+pub(super) fn ignored_response() -> axum::response::Response {
+    crate::server::api::api_error(
+        StatusCode::CONFLICT,
+        "ignored",
+        "The session is ignored because another session manages it",
+    )
+}
+
 impl IntoResponse for TerminalSendError {
     fn into_response(self) -> axum::response::Response {
         let mut response = match self.error {
@@ -389,6 +447,7 @@ impl IntoResponse for TerminalSendError {
                 Json(serde_json::json!({"error": "acp_mode_unsupported"})),
             )
                 .into_response(),
+            SendKeysError::Ignored => ignored_response(),
             SendKeysError::Blocked(blocked) => crate::server::api::start_blocked_response(blocked),
             SendKeysError::Tmux(error) => {
                 tracing::warn!(target: "http.api.sessions", %error, "terminal send failed");
@@ -451,7 +510,7 @@ pub async fn send_message(
     }
 
     let revive = req.revive;
-    match send_terminal_message(&state.session_service, &id, req.message, revive).await {
+    match send_terminal_message(&state.session_service, &id, req.message, revive, false).await {
         Ok(_) => {
             tracing::info!(target: "session.lifecycle", session = %id, len, revive, "terminal message sent");
             match state.runtime.publish(&state).await {

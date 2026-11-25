@@ -4,6 +4,7 @@ import { ProjectSearchList } from "../session-wizard/steps/ProjectSearchList";
 import { useProjectPicker } from "../session-wizard/steps/projectPicker";
 import { SidebarModal } from "./SidebarModal";
 import { MODAL_CANCEL, MODAL_INPUT, MODAL_PRIMARY } from "./styles";
+import { isImeComposing } from "../../lib/ime";
 
 function workerSummary(res: AttachProjectResult): string {
   switch (res.worker) {
@@ -115,7 +116,7 @@ export function AddProjectModal({
               setError(null);
             }}
             onKeyDown={(e) => {
-              if (e.key === "Enter") {
+              if (e.key === "Enter" && !isImeComposing(e)) {
                 e.preventDefault();
                 void submit();
               }

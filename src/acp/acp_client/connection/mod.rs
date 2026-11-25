@@ -975,7 +975,8 @@ async fn report_connection_error(
         shared.publish_connection_unavailable().await;
         return;
     }
-    let resets_at = captured_rate_limit_reset(&shared.rate_limit_rejections, chrono::Utc::now());
+    let resets_at =
+        captured_rate_limit_reset(&shared.rate_limit_rejections, crate::time::Timestamp::now());
     let rate_limit =
         super::rate_limit::classify_rate_limit_error(e, resets_at.as_ref()).or_else(|| {
             super::rate_limit::classify_rate_limit_from_message(&e.message, resets_at.as_ref()).map(

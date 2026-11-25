@@ -314,7 +314,7 @@ fn finish_stop_completion<S: BroadcastSink>(sink: &S, seqs: &super::SeqMap, leas
                 id,
                 &Event::BackgroundTaskFinished {
                     task_id,
-                    ended_at: Some(chrono::Utc::now()),
+                    ended_at: Some(crate::time::Timestamp::now()),
                 },
             )
             .1
@@ -334,7 +334,7 @@ fn finish_stop_completion<S: BroadcastSink>(sink: &S, seqs: &super::SeqMap, leas
                 tools: Vec::new(),
                 result: None,
                 warning: None,
-                ended_at: chrono::Utc::now(),
+                ended_at: crate::time::Timestamp::now(),
             };
             if !super::publish_next_persisted(sink, seqs, id, &event).1 {
                 return false;
@@ -482,7 +482,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 session_id,
                 &Event::BackgroundTaskFinished {
                     task_id,
-                    ended_at: Some(chrono::Utc::now()),
+                    ended_at: Some(crate::time::Timestamp::now()),
                 },
             )
             .1
@@ -513,7 +513,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                     tools: Vec::new(),
                     result: None,
                     warning: None,
-                    ended_at: chrono::Utc::now(),
+                    ended_at: crate::time::Timestamp::now(),
                 },
             )
             .1
@@ -1768,7 +1768,7 @@ mod tests {
             sup.publish_next(
                 id,
                 &Event::CancelRequested {
-                    escalates_at: chrono::Utc::now(),
+                    escalates_at: crate::time::Timestamp::now(),
                 },
             );
             sup.publish_next(
@@ -1790,7 +1790,7 @@ mod tests {
                     prompt: "work".into(),
                     model: "test-model".into(),
                     output_file: String::new(),
-                    started_at: chrono::Utc::now(),
+                    started_at: crate::time::Timestamp::now(),
                     workflow: None,
                 },
             );
@@ -1918,7 +1918,7 @@ mod tests {
         p.sup.publish_next(
             id,
             &Event::CancelRequested {
-                escalates_at: chrono::Utc::now(),
+                escalates_at: crate::time::Timestamp::now(),
             },
         );
         p.sup.publish_next(
@@ -1930,7 +1930,7 @@ mod tests {
                 prompt: "work".into(),
                 model: "test-model".into(),
                 output_file: String::new(),
-                started_at: chrono::Utc::now(),
+                started_at: crate::time::Timestamp::now(),
                 workflow: None,
             },
         );
@@ -2503,7 +2503,7 @@ mod tests {
                     prompt: "do it".into(),
                     model: "claude-opus-4-8".into(),
                     output_file: "/tmp/bg-real.output".into(),
-                    started_at: chrono::Utc::now(),
+                    started_at: crate::time::Timestamp::now(),
                     workflow: None,
                 },
             )
@@ -2584,7 +2584,7 @@ mod tests {
                     prompt: "do it".into(),
                     model: "claude-opus-4-8".into(),
                     output_file: String::new(),
-                    started_at: chrono::Utc::now(),
+                    started_at: crate::time::Timestamp::now(),
                     workflow: None,
                 },
             )
@@ -2607,7 +2607,7 @@ mod tests {
                         model: None,
                         background: true,
                     },
-                    at: chrono::Utc::now(),
+                    at: crate::time::Timestamp::now(),
                 },
             )
             .unwrap();

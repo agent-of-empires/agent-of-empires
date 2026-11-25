@@ -65,6 +65,15 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeSpec>,
 
+    /// Read-only work suggestions and the criteria they come in; grants no
+    /// session execution authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestions: Option<crate::suggestions::SuggestionsSpec>,
+
+    /// Host hooks the worker serves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<HooksSpec>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aoe_version: Option<String>,
 }
@@ -577,6 +586,8 @@ pub enum UiSlot {
     ComposerAction,
     /// A badge in a session's detail view (per session).
     DetailBadge,
+    /// A read-only status chip beside a session's composer (per session, API v25).
+    ComposerStatus,
     HomePane,
     Notification,
     /// A full dashboard view rendered from a plugin HTML bundle (global, API v16).
@@ -592,6 +603,7 @@ impl UiSlot {
                 | UiSlot::Pane
                 | UiSlot::ComposerAction
                 | UiSlot::DetailBadge
+                | UiSlot::ComposerStatus
         )
     }
 
@@ -607,6 +619,7 @@ impl UiSlot {
             UiSlot::Pane => "pane",
             UiSlot::ComposerAction => "composer-action",
             UiSlot::DetailBadge => "detail-badge",
+            UiSlot::ComposerStatus => "composer-status",
             UiSlot::HomePane => "home-pane",
             UiSlot::Notification => "notification",
             UiSlot::Page => "page",
@@ -638,6 +651,41 @@ pub fn deep_link_value_ok(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~'))
+}
+
+pub const MCP_REWRITE_DEFAULT_TIMEOUT_MS: u64 = 5_000;
+pub const MCP_REWRITE_MAX_TIMEOUT_MS: u64 = 30_000;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HooksSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_rewrite: Option<McpRewriteHook>,
+}
+
+/// Rewrites the MCP servers AoE forwards to a session's agent (`api_version >= 24`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpRewriteHook {
+    #[serde(default)]
+    pub applies_to: McpRewriteScope,
+    #[serde(default = "default_mcp_rewrite_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Lower runs first; ties break by plugin id.
+    #[serde(default)]
+    pub order: i32,
+}
+
+fn default_mcp_rewrite_timeout_ms() -> u64 {
+    MCP_REWRITE_DEFAULT_TIMEOUT_MS
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpRewriteScope {
+    #[default]
+    Sandbox,
+    All,
 }
 
 /// How the plugin's worker is launched.
@@ -1452,6 +1500,12 @@ impl PluginManifest {
                 "composer-action UI slots require api_version >= 8".into(),
             );
         }
+        if self.api_version < 25 {
+            check(
+                self.ui.iter().all(|u| u.slot != UiSlot::ComposerStatus),
+                "composer-status UI slots require api_version >= 25".into(),
+            );
+        }
         if self.api_version < 9 {
             check(
                 self.settings.iter().all(|s| {
@@ -1534,6 +1588,81 @@ impl PluginManifest {
             check(
                 self.ui.iter().all(|u| !u.deep_link),
                 "deep_link requires api_version >= 20".into(),
+            );
+        }
+        if let Some(suggestions) = &self.suggestions {
+            check(
+                self.api_version >= 23,
+                "suggestions require api_version >= 23".into(),
+            );
+            check(
+                !suggestions.sources.is_empty(),
+                "suggestions must declare at least one source".into(),
+            );
+            let mut criteria = std::collections::HashSet::new();
+            for source in &suggestions.sources {
+                let criterion = source.criterion.as_str();
+                check(
+                    !criterion.trim().is_empty()
+                        && criterion.len() <= crate::suggestions::MAX_KEY_BYTES,
+                    "suggestion source criterion must be non-empty and at most 256 bytes".into(),
+                );
+                check(
+                    criteria.insert(criterion),
+                    format!("duplicate suggestion source criterion {criterion:?}"),
+                );
+                check(
+                    !source.label.trim().is_empty(),
+                    format!("suggestion source {criterion:?} needs a label"),
+                );
+                check(
+                    source
+                        .variables
+                        .iter()
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        == source.variables.len(),
+                    format!("suggestion source {criterion:?} has duplicate variables"),
+                );
+                check(
+                    source.variables.iter().all(|name| {
+                        !name.is_empty()
+                            && name
+                                .bytes()
+                                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                    }),
+                    format!("suggestion source {criterion:?} variables must match [a-z0-9_]+"),
+                );
+            }
+            check(
+                self.runtime.is_some(),
+                "suggestions require a runtime worker".into(),
+            );
+            check(
+                self.capabilities
+                    .iter()
+                    .any(|cap| cap.as_str() == "runtime.worker"),
+                "suggestions require the runtime.worker capability".into(),
+            );
+        }
+        if let Some(hook) = self.hooks.as_ref().and_then(|h| h.mcp_rewrite.as_ref()) {
+            check(
+                self.api_version >= 24,
+                "hooks.mcp_rewrite requires api_version >= 24".into(),
+            );
+            check(
+                self.capabilities
+                    .iter()
+                    .any(|c| c.as_str() == "mcp.rewrite"),
+                "hooks.mcp_rewrite requires the mcp.rewrite capability".into(),
+            );
+            check(
+                self.runtime.is_some(),
+                "hooks.mcp_rewrite requires a runtime worker".into(),
+            );
+            check(
+                (1..=MCP_REWRITE_MAX_TIMEOUT_MS).contains(&hook.timeout_ms),
+                format!("hooks.mcp_rewrite.timeout_ms must be 1..={MCP_REWRITE_MAX_TIMEOUT_MS}"),
             );
         }
         for key in self.setting_defaults.keys() {
@@ -1648,6 +1777,85 @@ mod tests {
              [[settings.fields]]\nkey = \"match\"\nlabel = \"URL patterns\"\ntype = \"string_list\"\nrequired = true\n\n\
              [[settings.fields]]\nkey = \"gate\"\nlabel = \"Gate check command\"\ntype = \"string\"\nrequired = true\n"
         )
+    }
+
+    fn mcp_rewrite_toml(api_version: u32, caps: &str, hook_body: &str) -> String {
+        format!(
+            "id = \"acme.gate\"\nname = \"Gate\"\nversion = \"1.0.0\"\napi_version = {api_version}\n\
+             capabilities = [{caps}]\n\n\
+             [runtime]\nkind = \"command\"\ncommand = [\"bin/worker\"]\n\n\
+             [hooks.mcp_rewrite]\n{hook_body}"
+        )
+    }
+
+    #[test]
+    fn mcp_rewrite_hook_parses_with_defaults() {
+        let m = PluginManifest::from_toml_str(&mcp_rewrite_toml(
+            24,
+            "\"runtime.worker\", \"mcp.rewrite\"",
+            "",
+        ))
+        .expect("v23 hook parses");
+        let hook = m.hooks.unwrap().mcp_rewrite.unwrap();
+        assert_eq!(hook.applies_to, McpRewriteScope::Sandbox);
+        assert_eq!(hook.timeout_ms, MCP_REWRITE_DEFAULT_TIMEOUT_MS);
+        assert_eq!(hook.order, 0);
+    }
+
+    #[test]
+    fn mcp_rewrite_hook_parses_explicit_values() {
+        let m = PluginManifest::from_toml_str(&mcp_rewrite_toml(
+            24,
+            "\"runtime.worker\", \"mcp.rewrite\"",
+            "applies_to = \"all\"\ntimeout_ms = 1200\norder = -5\n",
+        ))
+        .unwrap();
+        let hook = m.hooks.unwrap().mcp_rewrite.unwrap();
+        assert_eq!(hook.applies_to, McpRewriteScope::All);
+        assert_eq!(hook.timeout_ms, 1200);
+        assert_eq!(hook.order, -5);
+    }
+
+    #[test]
+    fn mcp_rewrite_hook_is_validated() {
+        let ok_caps = "\"runtime.worker\", \"mcp.rewrite\"";
+        let no_runtime =
+            "id = \"acme.gate\"\nname = \"Gate\"\nversion = \"1.0.0\"\napi_version = 24\n\
+             capabilities = [\"mcp.rewrite\"]\n\n[hooks.mcp_rewrite]\n"
+                .to_string();
+        rejects(&[
+            (
+                "below v23",
+                mcp_rewrite_toml(23, ok_caps, ""),
+                "api_version >= 24",
+            ),
+            (
+                "missing capability",
+                mcp_rewrite_toml(24, "\"runtime.worker\"", ""),
+                "mcp.rewrite capability",
+            ),
+            ("missing runtime", no_runtime, "runtime worker"),
+            (
+                "zero timeout",
+                mcp_rewrite_toml(24, ok_caps, "timeout_ms = 0\n"),
+                "timeout_ms",
+            ),
+            (
+                "huge timeout",
+                mcp_rewrite_toml(24, ok_caps, "timeout_ms = 30001\n"),
+                "timeout_ms",
+            ),
+            (
+                "bad scope",
+                mcp_rewrite_toml(24, ok_caps, "applies_to = \"never\"\n"),
+                "applies_to",
+            ),
+            (
+                "unknown hook key",
+                mcp_rewrite_toml(24, ok_caps, "bogus = 1\n"),
+                "bogus",
+            ),
+        ]);
     }
 
     fn rejects(cases: &[(&str, String, &str)]) {

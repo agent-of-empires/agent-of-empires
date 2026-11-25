@@ -98,7 +98,7 @@ pub fn vapid_auth_header(state: &PushState, endpoint: &str) -> Result<String> {
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 
     let aud = endpoint_origin(endpoint)?;
-    let exp = chrono::Utc::now().timestamp() as u64 + VAPID_EXP_SECS;
+    let exp = crate::time::Timestamp::now().as_unix_secs() as u64 + VAPID_EXP_SECS;
     let claims = VapidClaims {
         aud,
         exp,
@@ -344,7 +344,7 @@ mod tests {
             auth: b64url(&[9u8; 16]),
             owner_token_hash: [0u8; 32],
             user_agent: String::new(),
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
             generation: 0,
             origin: "http://localhost:8080".to_string(),
         };

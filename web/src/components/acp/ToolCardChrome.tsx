@@ -17,7 +17,7 @@ import { parseJsonObject } from "../../lib/acpArgs";
 import { useAcpPrefs } from "../../lib/acpPrefs";
 import type { ActivityRow, ToolCall } from "../../lib/acpTypes";
 import { hasAnsi, parseAnsi, type AnsiSegment, type AnsiStyle } from "../../lib/ansi";
-import { highlightSnippet } from "../../lib/snippetHighlighter";
+import { highlightSnippet, peekHighlight } from "../../lib/snippetHighlighter";
 import { useAcpFileRef } from "./AcpFileRefContext";
 import { useToolExpansionStore, useToolId, type ExpansionOverride } from "./ToolExpansion";
 import { useToolDisplayMode } from "./ToolDisplayMode";
@@ -326,7 +326,6 @@ export function HighlightedBlock({
   // a theme switch keeps the old palette until the re-highlight lands.
   // NUL-delimited (as the escape sequence: a raw NUL byte in source makes git
   // treat the file as binary) so field concatenations cannot collide.
-  const [result, setResult] = useState<{ key: string; html: string } | null>(null);
   const [showAll, setShowAll] = useState(false);
   const [wrapped, toggleWrap] = useWrapState();
   const shiki = useShikiTheme();
@@ -339,11 +338,24 @@ export function HighlightedBlock({
   const inputKey = `${effectiveLang ?? ""}\u0000${shown}`;
   // Shiki cannot highlight SGR escapes, so ANSI output renders styled spans instead.
   const ansi = hasAnsi(shown);
+  // A cache hit renders highlighted on first paint, so a remounted block never flashes plain text.
+  const cached = useMemo(
+    () =>
+      !ansi && effectiveLang
+        ? peekHighlight(shown, { langHint: effectiveLang, theme: shiki.theme, appearance: shiki.appearance })
+        : undefined,
+    [ansi, effectiveLang, shown, shiki.theme, shiki.appearance],
+  );
+  // Seeded from a mount-time cache hit so a later theme switch keeps that palette.
+  const [result, setResult] = useState<{ key: string; html: string } | null>(() =>
+    cached !== undefined ? { key: inputKey, html: cached } : null,
+  );
 
   useEffect(() => {
     if (ansi) return;
     let cancelled = false;
     if (!effectiveLang) return;
+    if (cached !== undefined) return;
     (async () => {
       try {
         const out = await highlightSnippet(shown, {
@@ -360,9 +372,9 @@ export function HighlightedBlock({
     return () => {
       cancelled = true;
     };
-  }, [effectiveLang, shown, inputKey, shiki.theme, shiki.appearance, ansi]);
+  }, [effectiveLang, shown, inputKey, shiki.theme, shiki.appearance, ansi, cached]);
 
-  const html = result && result.key === inputKey ? result.html : null;
+  const html = cached ?? (result && result.key === inputKey ? result.html : null);
 
   return (
     <div className="border-t border-surface-800 bg-surface-950">

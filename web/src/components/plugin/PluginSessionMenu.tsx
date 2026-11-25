@@ -30,7 +30,13 @@ export interface SessionMenuRequest {
   onClose: (picked: string | null) => void;
 }
 
-type TriageHandlers = "onPinToggle" | "onArchiveToggle" | "onSnooze" | "onUnreadToggle";
+type TriageHandlers =
+  | "onPinToggle"
+  | "onArchiveToggle"
+  | "onSnooze"
+  | "onUnreadToggle"
+  | "onIgnoreToggle"
+  | "onReclaimOwnership";
 
 interface Props extends Omit<RowObservation, "onSessionMutation"> {
   request: SessionMenuRequest;
@@ -74,6 +80,8 @@ function ScopedMenu({ request, workspaces, readOnly, handlers, observedById, run
         onArchiveToggle: triage.archiveToggle,
         onSnooze: triage.snooze,
         onUnreadToggle: triage.unreadToggle,
+        onIgnoreToggle: triage.ignoreToggle,
+        onReclaimOwnership: triage.reclaimOwnership,
       }}
     />
   );
@@ -102,7 +110,7 @@ function HostMenu({
   observedById: RowObservation["observedById"];
   runtimeEpoch: RowObservation["runtimeEpoch"];
 }) {
-  const { model, setNotify, setColor } = useSessionRowModel(workspace, optimistic, false, {
+  const { model, setNotify } = useSessionRowModel(workspace, optimistic, false, {
     observedById,
     runtimeEpoch,
     onSessionMutation: handlers.onSessionMutation,
@@ -159,7 +167,6 @@ function HostMenu({
         workspace={workspace}
         model={model}
         setNotify={setNotify}
-        setColor={setColor}
         readOnly={readOnly}
         handlers={handlers}
         onRename={() => {

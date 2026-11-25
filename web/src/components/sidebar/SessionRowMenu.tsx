@@ -7,6 +7,7 @@ import {
   CircleDot,
   CircleStop,
   Container,
+  EyeOff,
   FolderPen,
   FolderPlus,
   Focus,
@@ -27,9 +28,9 @@ import {
 import type { SessionResponse } from "../../lib/types";
 import { triageMenuShape, triageStateOf } from "../../lib/sidebarSort";
 import type { BulkTriageBuckets } from "../../lib/sidebarBulk";
-import { MenuChoiceRow, MenuHeading, MenuItem, MenuSeparator, MenuSwatches } from "../ContextMenu";
+import { MenuChoiceRow, MenuHeading, MenuItem, MenuSeparator } from "../ContextMenu";
 import { SNOOZE_PRESETS } from "./format";
-import { SESSION_COLOR_OPTIONS, type NotifyPreset, type RowModel } from "./rowModel";
+import type { NotifyPreset, RowModel } from "./rowModel";
 import type { SessionAction } from "./sessionActionTargets";
 import type { RowBulkApi } from "./types";
 
@@ -108,11 +109,12 @@ export interface SingleRowActions {
   restartUpdate: (sessionId: string) => void;
   recreateContainer: (sessionId: string) => void;
   notify: (preset: NotifyPreset) => void;
-  color: (color: string | null) => void;
   pin: () => void;
   archive: () => void;
   openSnooze: () => void;
   unsnooze: () => void;
+  ignore: (sessionId: string) => void;
+  reclaimOwnership: (sessionId: string) => void;
   unread: () => void;
   remove: () => void;
 }
@@ -176,14 +178,12 @@ function Tiers({ tiers }: { tiers: React.ReactNode[][] }) {
 export function SingleRowMenuItems({
   model,
   readOnly,
-  colorsEnabled,
   unreadEnabled,
   actions: a,
   extraItems,
 }: {
   model: RowModel;
   readOnly?: boolean;
-  colorsEnabled: boolean;
   unreadEnabled: boolean;
   actions: SingleRowActions;
   /** Plugin-contributed items, placed above Move to Trash…. */
@@ -306,6 +306,23 @@ export function SingleRowMenuItems({
         indent: true,
       }),
     ],
+    [
+      item("ignore", {
+        label: "Ignore managed session",
+        singleLabel: (s) => (s.ignored_at != null ? "Unignore session" : "Ignore managed session"),
+        targetDetail: (s) => (s.ignored_at != null ? "ignored" : "not ignored"),
+        detail: "Keeps it live without archive or trash",
+        testId: "sidebar-context-menu-ignore",
+        glyph: icon(EyeOff),
+      }),
+      item("reclaimOwnership", {
+        label: "Take ownership",
+        singleLabel: (s) => (s.parent_session_id ? "Take ownership back" : "Take ownership"),
+        detail: "Removes the manager link and clears Ignore",
+        testId: "sidebar-context-menu-reclaim-ownership",
+        glyph: icon(UserRoundCog),
+      }),
+    ],
   ];
   return (
     <Tiers
@@ -391,16 +408,6 @@ export function SingleRowMenuItems({
               ))}
             </div>
           </MenuChoiceRow>,
-          write && colorsEnabled && (
-            <MenuChoiceRow key="color" label="Color">
-              <MenuSwatches
-                options={SESSION_COLOR_OPTIONS.map((o) => ({ key: o.key, label: o.label, className: o.dotClass }))}
-                value={model.sessionColor}
-                onPick={a.color}
-                testIdPrefix="sidebar-context-menu-color"
-              />
-            </MenuChoiceRow>
-          ),
         ],
         [extraItems && <Fragment key="plugin">{extraItems}</Fragment>],
         [

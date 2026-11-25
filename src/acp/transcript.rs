@@ -1,8 +1,8 @@
 //! `TranscriptModel`: the server-side render model for the structured-view transcript.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
@@ -22,7 +22,7 @@ pub struct TranscriptRow {
     pub id: String,
     pub group_id: String,
     pub kind: TranscriptRowKind,
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
     pub text: String,
     /// Set on tool-lifecycle rows so a client pairs a completion with its start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -119,6 +119,10 @@ fn session_notice_text(severity: &str, title: &str, description: &Option<String>
 #[derive(Debug, Default)]
 pub(crate) struct RetainedTranscript {
     pub rows: Vec<TranscriptRow>,
+    /// Row id to the seq that appended it.
+    pub row_seq: HashMap<String, u64>,
+    /// Tool call id to the seq of its latest start.
+    pub tool_start_seq: HashMap<String, u64>,
     pub unfinished_outputs: Vec<UnfinishedToolOutput>,
 }
 
@@ -169,6 +173,10 @@ impl ToolLifecycle {
 pub struct TranscriptModel {
     rows: Vec<TranscriptRow>,
     row_ids: HashSet<String>,
+    /// Seq at which each row was appended, for clients that order by event order.
+    row_seq: HashMap<String, u64>,
+    /// Seq of each tool id's latest start; a reused id keeps its first row but restarts here.
+    tool_start_seq: HashMap<String, u64>,
     /// Tool lifecycle and buffered output, in opening order, including skipped starts.
     tools: IndexMap<String, ToolLifecycle>,
     /// Orphan snapshots remain readable but never feed subsequent tool invocations.
@@ -225,6 +233,8 @@ impl TranscriptModel {
         unfinished_outputs.sort_unstable_by_key(|output| output.first_seq);
         RetainedTranscript {
             rows: self.rows,
+            row_seq: self.row_seq,
+            tool_start_seq: self.tool_start_seq,
             unfinished_outputs,
         }
     }
@@ -373,6 +383,7 @@ impl TranscriptModel {
                 merged_prompt_ids,
                 synthesized,
                 origin_plugin,
+                ..
             } => {
                 self.begin_turn();
                 // A rate-limit resume continuation replays a prompt the user
@@ -716,6 +727,8 @@ impl TranscriptModel {
             return Vec::new();
         }
         self.track_tool_start(&tool_call.id, true);
+        self.tool_start_seq
+            .insert(tool_call.id.clone(), self.last_seq);
         self.turn_has_output = true;
         let Some(idx) = self.find_tool_start(&tool_call.id) else {
             return vec![self.append(tool_start_row(tool_call.clone()))];
@@ -734,7 +747,7 @@ impl TranscriptModel {
         title: Option<&str>,
         args_preview: Option<&str>,
         prompt: Option<&str>,
-        started_at: Option<DateTime<Utc>>,
+        started_at: Option<Timestamp>,
         diffs: Option<&[DiffPreview]>,
     ) -> Vec<TranscriptDelta> {
         if self.elicitation_tool_ids.contains(tool_call_id)
@@ -752,7 +765,7 @@ impl TranscriptModel {
             title,
             args_preview,
             prompt,
-            started_at.unwrap_or_else(Utc::now),
+            started_at.unwrap_or_else(Timestamp::now),
             diffs,
         );
         if !synthesized.is_empty() {
@@ -792,7 +805,7 @@ impl TranscriptModel {
         name: Option<&str>,
         args_preview: Option<&str>,
         prompt: Option<&str>,
-        started_at: DateTime<Utc>,
+        started_at: Timestamp,
         diffs: Option<&[DiffPreview]>,
     ) -> Vec<TranscriptDelta> {
         if self.find_tool_start(tool_call_id).is_some() {
@@ -855,7 +868,7 @@ impl TranscriptModel {
     /// Close every `tool_start` without a terminal row with a `tool_stopped`
     /// carrying any buffered output.
     fn sweep_open_tools(&mut self, seq: u64) -> Vec<TranscriptDelta> {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut deltas = Vec::new();
         for index in 0..self.tools.len() {
             let (id, tool) = self.tools.get_index_mut(index).expect("tool index");
@@ -899,6 +912,7 @@ impl TranscriptModel {
 
     fn append(&mut self, row: TranscriptRow) -> TranscriptDelta {
         self.row_ids.insert(row.id.clone());
+        self.row_seq.insert(row.id.clone(), self.last_seq);
         self.rows.push(row.clone());
         TranscriptDelta::Append(row)
     }
@@ -957,7 +971,7 @@ impl TranscriptRow {
             id,
             group_id,
             kind,
-            at: Utc::now(),
+            at: Timestamp::now(),
             text,
             tool_call_id: None,
             tool: None,
@@ -1071,10 +1085,9 @@ mod tests {
     use crate::acp::state::test_support::{chunk, prompt, stopped};
     use crate::acp::state::MemoryRecall;
     use crate::daemon::PromptAttachmentKind;
-    use chrono::TimeZone;
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(secs, 0).single().expect("valid ts")
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_unix_secs(secs).expect("valid ts")
     }
 
     fn tool(id: &str, name: &str) -> ToolCall {
@@ -1595,6 +1608,7 @@ mod tests {
             prompt_id: None,
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let mut m = TranscriptModel::new();
         let deltas = m.apply_event(3, &with_attachment);
@@ -1618,6 +1632,7 @@ mod tests {
                     prompt_id: prompt_id.map(Into::into),
                     synthesized: false,
                     origin_plugin: None,
+                    origin: crate::daemon::PromptOrigin::Unknown,
                 },
             );
             assert_eq!(m.rows()[0].id, want, "prompt_id={prompt_id:?}");
@@ -1633,6 +1648,7 @@ mod tests {
                 prompt_id: Some("q1".into()),
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
         );
         assert_eq!(m.rows()[0].id, "q1");
@@ -1646,6 +1662,7 @@ mod tests {
             prompt_id: Some("q1".into()),
             synthesized: false,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let deltas = m.apply_event(9, &retry);
         assert!(matches!(deltas.as_slice(), [TranscriptDelta::Patch { id, .. }] if id == "q1"));
@@ -1692,6 +1709,7 @@ mod tests {
             prompt_id: None,
             synthesized: true,
             origin_plugin: None,
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let mut m = TranscriptModel::new();
         let deltas = m.apply_event(1, &ev);
@@ -1708,6 +1726,7 @@ mod tests {
             prompt_id: None,
             synthesized: false,
             origin_plugin: Some("cron".into()),
+            origin: crate::daemon::PromptOrigin::Unknown,
         };
         let mut m = TranscriptModel::new();
         m.apply_event(1, &ev);

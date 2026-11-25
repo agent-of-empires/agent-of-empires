@@ -1,0 +1,14 @@
+{
+  "name": "No dead_code allowance added",
+  "instruction": "A change does not add an attribute that silences the dead_code lint.",
+  "relevant_when": "A patch adds a Rust line containing 'dead_code' inside an attribute: #[allow(...)], #![allow(...)], #[expect(...)], #![expect(...)] or #[cfg_attr(..., allow(...))].",
+  "context": "AGENTS.md forbids dead code and #[allow(dead_code)]. CI runs clippy with -D warnings, so silencing the lint is the only way unused code survives; remove the unused item instead. A dead_code allowance that already existed and is only moved or reindented by the change is not new.",
+  "scope": "diff",
+  "scope_reason": "The violation is an added attribute line; existing allowances in unchanged lines are out of scope.",
+  "checklist": [
+    {
+      "name": "no-added-dead-code-allowance",
+      "rule": "No added line introduces allow(dead_code) or expect(dead_code) in any attribute form, including inside cfg_attr. Not applicable when an identical attribute is removed elsewhere in the same patch, meaning it was only moved."
+    }
+  ]
+}

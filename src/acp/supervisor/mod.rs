@@ -6,6 +6,7 @@ mod drain;
 mod fork_rejection;
 mod launch;
 mod publish;
+pub use publish::UserPrompt;
 mod requests;
 mod sink;
 mod teardown;
@@ -85,10 +86,29 @@ struct SpawnRequestState {
     /// Requests that have not reached lifecycle admission yet. A stop cancels
     /// these before it waits on any durable launch work.
     pending: HashMap<String, HashMap<u64, CancellationToken>>,
-    /// A stop fence remains held while the request owns its submission and
-    /// instance guards, preventing a replacement from slipping through.
-    stop_fences: HashMap<String, (u64, usize)>,
+    /// Admission fences distinguish a temporary purge from an explicit stop.
+    stop_fences: HashMap<String, SpawnFence>,
     switches: HashMap<String, usize>,
+}
+
+struct SpawnFence {
+    request_id: u64,
+    owners: usize,
+    stop_owners: usize,
+}
+
+impl SpawnRequestState {
+    fn admission_error(&self, session_id: &str, restarting: bool) -> Option<SupervisorError> {
+        let fence = self.stop_fences.get(session_id)?;
+        if restarting && fence.owners == fence.stop_owners {
+            return None;
+        }
+        Some(if restarting || fence.stop_owners == 0 {
+            SupervisorError::PurgeInProgress(session_id.to_string())
+        } else {
+            SupervisorError::SpawnCancelled(session_id.to_string())
+        })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -115,7 +135,10 @@ pub enum SupervisorError {
     /// A concurrent shutdown cancelled the resume; callers treat it as a soft success.
     #[error("resume of session {0:?} was cancelled by a concurrent shutdown")]
     SpawnCancelled(String),
-    /// The previous runner is not proven dead yet.
+    /// A temporary purge fence prevents admission.
+    #[error("session {0:?} has a purge in progress")]
+    PurgeInProgress(String),
+    /// Retirement of the previous worker has not completed.
     #[error("session {0:?} is still stopping its previous structured view worker")]
     TeardownPending(String),
     /// The worker a caller observed is no longer the running one.
@@ -123,6 +146,9 @@ pub enum SupervisorError {
     Superseded(String),
     #[error(transparent)]
     Blocked(crate::session::StartBlocked),
+    /// A newer stop fence refused an explicit resume.
+    #[error("session {0:?} was stopped again; resume refused")]
+    StopSuperseded(String),
     #[error("session {0:?} no longer exists")]
     SessionGone(String),
     #[error("native session authority unavailable")]
@@ -301,6 +327,7 @@ pub(crate) struct RestartRequestGuard {
 pub(crate) enum RestartClaimConflict {
     Switch,
     Restart,
+    Purge,
 }
 
 /// Cancellation for a request that is still acquiring launch guards or
@@ -329,11 +356,12 @@ impl Drop for SwitchRequestGuard {
     }
 }
 
-/// A stop fence that outlives the HTTP request and cancels pending spawns.
+/// Retains admission exclusion across purge preparation and committed stop requests.
 pub(crate) struct StopRequestGuard {
     session_id: String,
     request_id: u64,
     requests: SpawnRequests,
+    is_stop: bool,
     cancelled_pending: usize,
     cancelled_launch: bool,
 }
@@ -359,10 +387,13 @@ impl PendingSpawnGuard {
 impl Drop for StopRequestGuard {
     fn drop(&mut self) {
         let mut requests = lock_recover(&self.requests);
-        if let Some((request_id, owners)) = requests.stop_fences.get_mut(&self.session_id) {
-            if *request_id == self.request_id {
-                *owners -= 1;
-                if *owners == 0 {
+        if let Some(fence) = requests.stop_fences.get_mut(&self.session_id) {
+            if fence.request_id == self.request_id {
+                fence.owners -= 1;
+                if self.is_stop {
+                    fence.stop_owners -= 1;
+                }
+                if fence.owners == 0 {
                     requests.stop_fences.remove(&self.session_id);
                 }
             }
@@ -494,6 +525,8 @@ pub struct SpawnRequest {
     pub fork_from: Option<String>,
     pub sandbox_continuation: SandboxContinuation,
     pub sandbox_info: Option<SandboxInfo>,
+    /// `Instance.workspace_info`; a sandboxed workspace container mounts its main repos too.
+    pub workspace_info: Option<crate::session::WorkspaceInfo>,
     /// The stored row's profile. Every production launch sets it, and the launch rechecks that
     /// row before and after the handshake (#4116).
     pub source_profile: Option<String>,
@@ -538,7 +571,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             workers: Arc::default(),
             next_seqs: Arc::default(),
             lifecycle: Arc::new(std::sync::Mutex::new(LifecycleTable::new(
-                chrono::Utc::now().timestamp_millis().max(1) as u64,
+                crate::time::Timestamp::now().as_millis().max(1) as u64,
             ))),
             restart_requests: Arc::default(),
             next_restart_request_id: AtomicU64::new(1),
@@ -778,8 +811,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
     ) -> Result<PendingSpawnGuard, SupervisorError> {
         let mut requests = lock_recover(&self.spawn_requests);
-        if requests.stop_fences.contains_key(session_id) {
-            return Err(SupervisorError::SpawnCancelled(session_id.to_string()));
+        if let Some(error) = requests.admission_error(session_id, false) {
+            return Err(error);
         }
         if lock_recover(&self.restart_requests).contains_key(session_id) {
             return Err(SupervisorError::RestartInProgress(session_id.to_string()));
@@ -851,6 +884,39 @@ impl<S: BroadcastSink> Supervisor<S> {
         .await
     }
 
+    /// Fence new admission without cancelling pending requests or the current constructor.
+    pub(crate) fn fence_spawn_admission(&self, session_id: &str) -> StopRequestGuard {
+        self.acquire_spawn_fence(session_id, false)
+    }
+
+    fn acquire_spawn_fence(&self, session_id: &str, is_stop: bool) -> StopRequestGuard {
+        let mut requests = lock_recover(&self.spawn_requests);
+        let request_id = if let Some(fence) = requests.stop_fences.get_mut(session_id) {
+            fence.owners += 1;
+            fence.stop_owners += usize::from(is_stop);
+            fence.request_id
+        } else {
+            let request_id = self.next_stop_request_id.fetch_add(1, Ordering::Relaxed);
+            requests.stop_fences.insert(
+                session_id.to_string(),
+                SpawnFence {
+                    request_id,
+                    owners: 1,
+                    stop_owners: usize::from(is_stop),
+                },
+            );
+            request_id
+        };
+        StopRequestGuard {
+            session_id: session_id.to_string(),
+            request_id,
+            requests: Arc::clone(&self.spawn_requests),
+            is_stop,
+            cancelled_pending: 0,
+            cancelled_launch: false,
+        }
+    }
+
     async fn begin_stop_request_with_pending_cancellation(
         &self,
         session_id: &str,
@@ -859,43 +925,19 @@ impl<S: BroadcastSink> Supervisor<S> {
         captured: bool,
         cancel_pending: bool,
     ) -> StopRequestGuard {
-        let (request_id, cancelled_pending) = {
-            let mut requests = lock_recover(&self.spawn_requests);
-            let request_id =
-                if let Some((request_id, owners)) = requests.stop_fences.get_mut(session_id) {
-                    *owners += 1;
-                    *request_id
-                } else {
-                    let request_id = self.next_stop_request_id.fetch_add(1, Ordering::Relaxed);
-                    requests
-                        .stop_fences
-                        .insert(session_id.to_string(), (request_id, 1));
-                    request_id
-                };
-            let pending = requests
-                .pending
-                .get(session_id)
-                .filter(|_| cancel_pending)
-                .map(|pending| pending.values().cloned().collect::<Vec<_>>())
-                .unwrap_or_default();
-            let cancelled_pending = pending
-                .iter()
-                .filter(|cancellation| !cancellation.is_cancelled())
-                .count();
-            for cancellation in pending {
-                cancellation.cancel();
+        let mut stop_request = self.acquire_spawn_fence(session_id, true);
+        stop_request.cancelled_pending = {
+            let requests = lock_recover(&self.spawn_requests);
+            let mut cancelled = 0;
+            if let Some(pending) = requests.pending.get(session_id).filter(|_| cancel_pending) {
+                for cancellation in pending.values() {
+                    if !cancellation.is_cancelled() {
+                        cancelled += 1;
+                    }
+                    cancellation.cancel();
+                }
             }
-            (request_id, cancelled_pending)
-        };
-        // Install the guard before the first await. If acquiring the worker
-        // gate is cancelled, Drop must release the fence owner that was just
-        // registered above.
-        let mut stop_request = StopRequestGuard {
-            session_id: session_id.to_string(),
-            request_id,
-            requests: Arc::clone(&self.spawn_requests),
-            cancelled_pending,
-            cancelled_launch: false,
+            cancelled
         };
         let workers = self.workers.lock().await;
         let cancelled_launch = {
@@ -928,6 +970,13 @@ impl<S: BroadcastSink> Supervisor<S> {
     ) -> Result<RestartRequestGuard, RestartClaimConflict> {
         let _workers = self.workers.lock().await;
         let spawn_requests = lock_recover(&self.spawn_requests);
+        if spawn_requests
+            .stop_fences
+            .get(session_id)
+            .is_some_and(|fence| fence.owners > fence.stop_owners)
+        {
+            return Err(RestartClaimConflict::Purge);
+        }
         if spawn_requests.switches.contains_key(session_id) {
             return Err(RestartClaimConflict::Switch);
         }
@@ -1029,7 +1078,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_and_switch_claims_exclude_each_other() {
+    async fn restart_claims_exclude_switches_and_purge_fences() {
         let sup = Supervisor::new(VecSink::new());
         let switching = sup.begin_switch_request("s").unwrap();
         assert!(sup.try_begin_restart_with_reason("s").await.is_err());
@@ -1047,6 +1096,13 @@ mod tests {
         drop(restart);
         assert!(sup.begin_switch_request("s").is_ok());
         assert!(sup.begin_spawn_request("s").is_ok());
+        let purge = sup.fence_spawn_admission("s");
+        assert!(matches!(
+            sup.try_begin_restart_with_reason("s").await,
+            Err(RestartClaimConflict::Purge)
+        ));
+        drop(purge);
+        assert!(sup.try_begin_restart_with_reason("s").await.is_ok());
     }
 
     #[tokio::test]
@@ -1126,6 +1182,47 @@ mod tests {
             .begin_spawn_request("s-fence-cancel")
             .expect("cancelled stop must not strand admission");
         drop(fresh);
+    }
+
+    #[tokio::test]
+    async fn stop_fence_refuses_an_observing_explicit_resume_as_superseded() {
+        use crate::process::worker_registry::ResumeAuthority::{Automatic, Explicit};
+        let fence = |stop_owners| SpawnFence {
+            request_id: 1,
+            owners: 1,
+            stop_owners,
+        };
+        let sup = Supervisor::new(VecSink::new());
+        let id = "s-fence-observing";
+        let resume = |authority, observed| {
+            sup.begin_resume_observing(id, ResumeKind::Spawn, authority, observed)
+        };
+
+        lock_recover(&sup.spawn_requests)
+            .stop_fences
+            .insert(id.into(), fence(1));
+        assert!(matches!(
+            resume(Explicit, Some(None)).await,
+            Err(SupervisorError::StopSuperseded(_))
+        ));
+        // A caller that observed nothing, or an automatic one, keeps the old refusal.
+        assert!(matches!(
+            resume(Explicit, None).await,
+            Err(SupervisorError::SpawnCancelled(_))
+        ));
+        assert!(matches!(
+            resume(Automatic, Some(None)).await,
+            Err(SupervisorError::SpawnCancelled(_))
+        ));
+
+        // A purge fence is not a stop: it stays retryable.
+        lock_recover(&sup.spawn_requests)
+            .stop_fences
+            .insert(id.into(), fence(0));
+        assert!(matches!(
+            resume(Explicit, Some(None)).await,
+            Err(SupervisorError::PurgeInProgress(_))
+        ));
     }
 
     #[tokio::test]

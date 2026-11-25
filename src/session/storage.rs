@@ -2293,6 +2293,14 @@ impl Storage {
         // Writes sharing a stamp fall in one filesystem timestamp tick, which closes
         // within a tick of first seeing it whatever the filesystem clock's offset.
         let settled = read_started >= first_seen + SessionsFileCache::TIMESTAMP_TICK;
+        tracing::debug!(
+            target: "session.inventory",
+            profile = %self.profile,
+            has_stamp = stamp.is_some(),
+            settled,
+            rows = rows.len(),
+            "parsed the sessions inventory instead of reusing the cache"
+        );
         if let Some(stamp) = stamp.filter(|_| settled) {
             if stamp_file()?.as_ref() == Some(&stamp) {
                 cache.entry = Some((stamp, complete, rows.clone()));
@@ -6412,7 +6420,7 @@ mod tests {
         source.update(|_instances, groups| {
             let mut group = Group::new("empty", "empty");
             group.collapsed = true;
-            group.archived_at = Some(chrono::Utc::now());
+            group.archived_at = Some(crate::time::Timestamp::now());
             groups.push(group);
             Ok(())
         })?;
@@ -6785,7 +6793,7 @@ mod tests {
         let source_instances = vec![stayer];
         let mut work_group = Group::new("work", "work");
         work_group.collapsed = true;
-        work_group.archived_at = Some(chrono::Utc::now());
+        work_group.archived_at = Some(crate::time::Timestamp::now());
         let mut source_groups = vec![work_group];
         let target_instances = vec![mover];
         let mut target_groups = Vec::new();
@@ -6906,7 +6914,7 @@ mod tests {
     #[test]
     fn recent_entry_prefers_last_accessed_over_created() {
         let mut inst = Instance::new("s", "/repo");
-        let accessed = inst.created_at + chrono::Duration::hours(5);
+        let accessed = inst.created_at + crate::time::Duration::hours(5);
         inst.last_accessed_at = Some(accessed);
         let e = recent_project_entry_for(&inst).unwrap();
         assert_eq!(e.last_used_at, accessed.to_rfc3339());
@@ -7654,7 +7662,7 @@ mod tests {
     #[test]
     fn group_repair_preserves_indirect_metadata_and_other_side_name() -> Result<()> {
         let (_temp, _guard, source, target, before, _after) = setup_recovery_env("gparity")?;
-        let archived_at = chrono::Utc::now();
+        let archived_at = crate::time::Timestamp::now();
         source.update(|_instances, groups| {
             let work = groups
                 .iter_mut()

@@ -44,12 +44,14 @@ import {
   retryBody,
   type PendingCreate,
 } from "../../lib/pendingCreates";
+import { useFocusTrap } from "../../hooks/useFocusTrap";
 import { hasFinePointer } from "../../lib/platform";
 import { useServerDown } from "../../lib/connectionState";
 import { ProjectStep } from "./steps/ProjectStep";
 import { ExtraReposPicker } from "./steps/ExtraReposPicker";
 import { AgentPanel } from "./steps/AgentPanel";
 import { WorktreePanel } from "./steps/WorktreePanel";
+import { WorktreeInfo } from "./WorktreeInfo";
 import { SandboxPanel } from "./steps/SandboxPanel";
 import { ProfilePresetPicker } from "./steps/ProfilePresetPicker";
 import { GroupCombobox } from "./steps/GroupCombobox";
@@ -226,6 +228,8 @@ export interface WizardRestore {
 
 interface Props {
   onClose: () => void;
+  /** Opens a Settings tab in the app; the wizard closes first. */
+  onOpenSettingsTab: (tab: string) => void;
   onCreated: (session?: SessionResponse) => void;
   /** A create the user sent to the background finished; the wizard is already closed. */
   onCreatedInBackground?: (session?: SessionResponse) => void;
@@ -245,6 +249,7 @@ const NO_GROUPS: GroupInfo[] = [];
 
 export function SessionWizard({
   onClose,
+  onOpenSettingsTab,
   onCreated,
   onCreatedInBackground,
   onReopenFailure,
@@ -279,6 +284,13 @@ export function SessionWizard({
   const [runtimeDown, setRuntimeDown] = useState(false);
   const [rechecking, setRechecking] = useState(false);
   const viewGroupRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
+  useFocusTrap(() => panelRef.current, { restoreFocus: true });
+  // A fine pointer's fields focus themselves; a coarse one starts on Close, which opens no keyboard.
+  useEffect(() => {
+    if (!hasFinePointer() && !panelRef.current?.contains(document.activeElement)) closeRef.current?.focus();
+  }, []);
   const pullLatestRef = useRef<HTMLDivElement>(null);
   // The failure box grows the footer and shrinks the form above it; keep the pull box it blames in view.
   useEffect(() => {
@@ -987,7 +999,11 @@ export function SessionWizard({
     : !state.dockerAvailable
       ? `${state.dockerRuntimeName ?? "Container runtime"} is not running`
       : null;
-  const imageStatus = useSandboxImageRowStatus(d.sandboxImage, defaultsReady && d.sandboxEnabled && !sandboxBlocked);
+  const imageStatus = useSandboxImageRowStatus(
+    d.sandboxImage,
+    defaultsReady && d.sandboxEnabled && !sandboxBlocked,
+    d.profile || servedProfile,
+  );
   const pullOffer = pullLatestOffer(imageStatus?.reply, {
     sandbox: d.sandboxEnabled && !sandboxBlocked,
     structured: structuredOn,
@@ -1182,6 +1198,14 @@ export function SessionWizard({
           disabled={!!worktreeBlocked && !d.useWorktree}
           summary={worktreeBlocked ?? (d.useWorktree ? worktreeSummary(d) : "run in the repo folder")}
           onConfigure={!worktreeBlocked && d.useWorktree ? openPanel("worktree") : undefined}
+          info={
+            <WorktreeInfo
+              onOpenSettings={() => {
+                onClose();
+                onOpenSettingsTab("worktree");
+              }}
+            />
+          }
         />
         <SwitchRow
           label="Sandbox"
@@ -1250,15 +1274,22 @@ export function SessionWizard({
     <div className="fixed inset-0 z-[60] flex items-end md:items-center md:justify-center">
       <div className="absolute inset-0 bg-black/60" onClick={creating ? undefined : onClose} />
       <div
+        ref={panelRef}
         data-testid="session-wizard"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="session-wizard-title"
         style={{ paddingBottom: keyboardHeight || undefined }}
         // Phones get a bottom sheet sized to its content, so Launch sits under the last row
         // within thumb reach; a long panel grows it to just below the notch and scrolls.
         className="relative w-full max-h-[calc(100dvh-env(safe-area-inset-top))] md:max-w-lg bg-surface-800 border-t border-surface-700/30 rounded-t-lg md:border md:rounded-lg flex flex-col md:max-h-[min(720px,90vh)]"
       >
         <div className="flex items-center justify-between px-4 md:px-5 py-3 border-b border-surface-700/20">
-          <h1 className="text-sm font-medium text-text-secondary">{creating ? "Creating session" : "New session"}</h1>
+          <h1 id="session-wizard-title" className="text-sm font-medium text-text-secondary">
+            {creating ? "Creating session" : "New session"}
+          </h1>
           <button
+            ref={closeRef}
             onClick={creating ? handleBackground : onClose}
             className="w-8 h-8 flex items-center justify-center text-text-dim hover:text-text-secondary cursor-pointer rounded-md hover:bg-surface-700/50 transition-colors"
             aria-label="Close"

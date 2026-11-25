@@ -54,6 +54,7 @@ const RECENTS = {
 function renderWizard(prefill?: WizardPrefill, nameOnly = false) {
   return render(
     <SessionWizard
+      onOpenSettingsTab={vi.fn()}
       servedProfile="default"
       onClose={() => {}}
       onCreated={() => {}}

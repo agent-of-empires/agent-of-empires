@@ -8,7 +8,7 @@ import type { Unstable_TriggerAdapter, Unstable_TriggerItem } from "@assistant-u
 import { getDraft, setDraft } from "../../lib/acpDrafts";
 import type { AcpState, PromptAttachmentInput, PromptCapabilities, QueuedPrompt } from "../../lib/acpTypes";
 import { useClearAliases } from "../../lib/agentProfileContext";
-import { fitTextarea, fileToBase64, kindSupported, MAX_ATTACHMENTS, mimeToKind } from "./composerInput";
+import { fileToBase64, fitTextareaFallback, kindSupported, MAX_ATTACHMENTS, mimeToKind } from "./composerInput";
 import { nextRecallTarget, recallBannerInfo, type RecallCursor, type RecallNav } from "./recallNav";
 import { fuzzyFilter, useFilesIndex } from "./useFilesIndex";
 
@@ -60,7 +60,7 @@ export function useLoadText(client: ComposerClient, taRef: TextareaRef) {
         } catch {
           // Detached nodes can throw.
         }
-        fitTextarea(el);
+        fitTextareaFallback(el);
       });
     },
     [client, taRef],
@@ -81,7 +81,7 @@ export function useDraftPersistence(
     if (saved && client.getState().text === "") {
       client.setText(saved);
       requestAnimationFrame(() => {
-        if (taRef.current) fitTextarea(taRef.current);
+        if (taRef.current) fitTextareaFallback(taRef.current);
       });
     }
     const flush = () => setDraft(sessionId, draftTextRef.current);

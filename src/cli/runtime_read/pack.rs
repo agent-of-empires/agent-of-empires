@@ -1,4 +1,4 @@
-//! Recorded wire fixtures and the published v4 data schemas, for tests only.
+//! Recorded wire fixtures and the published v5 data schemas, for tests only.
 
 use std::fs;
 use std::io::{self, Cursor};

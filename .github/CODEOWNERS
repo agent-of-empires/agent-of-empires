@@ -83,6 +83,12 @@ Cargo.lock                              @agent-of-empires/protected
 /CLAUDE.md                              @agent-of-empires/protected
 /DESIGN.md                              @agent-of-empires/protected
 /MAINTAINERS.md                         @agent-of-empires/protected
+/tessl.json                             @agent-of-empires/protected
+/.tessl/                                @agent-of-empires/protected
+/.tessl-code-review.yml                 @agent-of-empires/protected
+/tessl-plugins/                         @agent-of-empires/protected
+/.mcp.json                              @agent-of-empires/protected
+/.codex/config.toml                     @agent-of-empires/protected
 
 # Releases
 /.github/workflows/release.yml          @agent-of-empires/release

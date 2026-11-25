@@ -519,7 +519,7 @@ pub fn rollback_worktree_branch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use crate::time::Timestamp;
 
     #[test]
     fn pinned_stop_targets_only_the_recorded_container() {
@@ -574,7 +574,15 @@ mod tests {
             let label = format!("{sandboxed} {pinned:?} {recorded:?} {code} {stderr}");
             assert_eq!(result.is_ok(), ok, "{label}");
             let log = std::fs::read_to_string(&calls).unwrap_or_default();
-            assert_eq!(log.trim(), if called { "stop c1" } else { "" }, "{label}");
+            assert_eq!(
+                log.trim(),
+                if called {
+                    "inspect --format {{json .Config.Entrypoint}}|{{json .HostConfig.Init}}|{{json .Config.StopTimeout}}|{{json .State.Pid}} c1\nstop c1"
+                } else {
+                    ""
+                },
+                "{label}"
+            );
         }
     }
 
@@ -583,7 +591,7 @@ mod tests {
             branch: branch.to_string(),
             main_repo_path: main_repo.to_string(),
             managed_by_aoe: managed,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             base_branch: None,
         }
     }

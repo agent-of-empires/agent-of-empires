@@ -3,8 +3,10 @@ pub mod error;
 mod execution;
 pub mod image_pull;
 pub mod image_update;
+pub mod pull_progress;
 mod runtime;
 pub(crate) mod runtime_base;
+pub mod sandbox_image;
 pub mod stats;
 
 use std::collections::{HashMap, HashSet};
@@ -518,7 +520,7 @@ mod tests {
         pin.runtime.stop_container(&pin.container_id).unwrap();
         assert_eq!(
             std::fs::read_to_string(&calls).unwrap().trim(),
-            "tcp://created:2375 stop c1"
+            "tcp://created:2375 inspect --format {{json .Config.Entrypoint}}|{{json .HostConfig.Init}}|{{json .Config.StopTimeout}}|{{json .State.Pid}} c1\ntcp://created:2375 stop c1"
         );
     }
 

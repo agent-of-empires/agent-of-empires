@@ -183,8 +183,8 @@ pub(crate) async fn project_sessions(
         )
         .await;
 
-    // Overlay custom-agent ACP capability; built-ins were resolved in the
-    // constructor. Distinct `(profile, project_path)` pairs resolve once via
+    // Overlay custom-agent ACP and fork capability; built-ins were resolved in
+    // the constructor. Distinct `(profile, project_path)` pairs resolve once via
     // the shared cache.
     for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
         if !resp.acp_capable {
@@ -199,6 +199,8 @@ pub(crate) async fn project_sessions(
                 .filter(|name| !name.is_empty())
                 .unwrap_or(&inst.tool);
             resp.acp_capable = custom_agent_acp_capable(cfg, agent_key);
+            resp.acp_can_fork =
+                crate::session::fork::custom_structured_fork_capable(agent_key, None, cfg);
         }
         // The solo commands of the agent that classifies this session's prompts, resolved as the
         // queue and publication resolve it, so a custom agent's declared reset is advertised.
@@ -873,6 +875,8 @@ mod workspace_ordering_tests {
             lifecycle_generation: 0,
             dormant: false,
             idle_dormant_since: None,
+            initial_prompt_error: None,
+            initial_prompt_error_code: None,
             pane_dead_observed: false,
             yolo_mode: false,
             sort_index: None,
@@ -948,10 +952,10 @@ mod workspace_ordering_tests {
             monitor_description: None,
             favorited: false,
             favorited_at: None,
-            color: None,
             urgent: false,
             pinned_at: None,
             archived_at: None,
+            ignored_at: None,
             snoozed_until: None,
             unread: false,
         }
@@ -1025,7 +1029,7 @@ mod workspace_ordering_tests {
             if present {
                 state.acp_supervisor.test_insert_worker(&row.id).await;
             }
-            let reset = chrono::Utc::now() + chrono::Duration::hours(1);
+            let reset = crate::time::Timestamp::now() + crate::time::Duration::seconds(3600);
             let mut events = vec![prompt("interrupted main")];
             if !undated {
                 events.push(Event::RateLimit {
@@ -1052,7 +1056,7 @@ mod workspace_ordering_tests {
                     model: "test".into(),
                     output_file: String::new(),
                     workflow: None,
-                    started_at: chrono::Utc::now(),
+                    started_at: crate::time::Timestamp::now(),
                 });
             }
             for (seq, event) in events.iter().enumerate() {

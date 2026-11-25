@@ -18,7 +18,10 @@ use super::input::{Focus, Intent};
 use super::reducer::{
     AcpTranscript, NoteKind, PendingApproval, ToolCallRow, ToolCompletion, ToolOutcome,
 };
-use super::state::{FileIndex, PickerKind, PickerTarget, StructuredViewState, ViewLayout};
+use super::state::{
+    FileIndex, PickerKind, PickerTarget, ScrollAnchor, StructuredViewState, TranscriptTextCache,
+    ViewLayout,
+};
 use crate::acp::approvals::{tool_target, ToolTarget, CMD_KEYS, PATH_KEYS};
 use crate::acp::session_paths::{relative_display_path, SessionPathRoots};
 use crate::acp::state::{
@@ -92,43 +95,138 @@ fn render_choice_picker(
     let Some(picker) = &state.choice else {
         return;
     };
-    let (first, lines) = window_rows(
+    // Body width inside the popup: its border and horizontal padding.
+    let body_width = composer_area.width.saturating_sub(4);
+    // Rows the popup can paint above the composer, less its two borders.
+    let budget = (composer_area.y as usize).saturating_sub(2);
+    // The detail block is reserved at its fullest across the open options, so
+    // moving to another option cannot resize the popup and slide the rows out
+    // from under the pointer.
+    let detail_rows = picker
+        .details
+        .iter()
+        .flatten()
+        .map(|detail| detail_row_count(detail, body_width))
+        .max()
+        .unwrap_or(0)
+        .min(CHOICE_DETAIL_MAX_ROWS)
+        .min(budget.saturating_sub(1));
+    // The answers come first: context is what gets dropped on a short terminal,
+    // never the option the user is about to accept.
+    let (first, mut lines) = window_rows(
         composer_area,
-        8,
+        budget.saturating_sub(detail_rows).min(8),
         picker.selected,
         prev_first,
         &picker.options,
         |(_, label)| vec![label.clone()],
     );
     let rows = lines.len();
-    let title = if state.can_accept_choice() {
+    let context_cap = CHOICE_CONTEXT_MAX_ROWS.min(budget.saturating_sub(rows + detail_rows));
+    let context_rows = picker.context.as_deref().map_or(0, |context| {
+        let style = Style::default().fg(theme.hint);
+        let mut wrapped = Vec::new();
+        for text in context.lines() {
+            wrap_line_into(
+                Line::styled(text.to_string(), style),
+                body_width,
+                &mut wrapped,
+            );
+        }
+        cap_rows(&mut wrapped, context_cap, style);
+        let count = wrapped.len() as u16;
+        lines.splice(0..0, wrapped);
+        count
+    });
+    // The highlighted option carries its own detail, so the answer being
+    // considered reads in full without opening the web form.
+    let detail_style = Style::default()
+        .fg(theme.dimmed)
+        .add_modifier(Modifier::ITALIC);
+    let mut detail = Vec::new();
+    if let Some(Some(text)) = picker.details.get(picker.selected) {
+        push_detail_rows(text, body_width, detail_style, &mut detail);
+    }
+    // Capped at the reserved height rather than the constant, so a short
+    // terminal ends on the marker instead of dropping rows silently.
+    cap_rows(&mut detail, detail_rows, detail_style);
+    // Padded to the reserved height so the option rows keep their position.
+    detail.resize(detail_rows, Line::default());
+    lines.extend(detail);
+    let accepts_choice = state.can_accept_choice();
+    let title = if accepts_choice {
         picker.title.clone()
     } else {
         " Native input not ready · Esc dismiss ".into()
     };
     let drawn = render_popup_above(frame, composer_area, theme, title, lines);
-    if state.can_accept_choice() {
-        record_picker(state, PickerKind::Choice, drawn, first, rows);
+    if accepts_choice {
+        record_picker(state, PickerKind::Choice, drawn, first, rows, context_rows);
     }
 }
 
+/// Rows `detail` takes at `width`, counted the way it is painted.
+fn detail_row_count(detail: &str, width: u16) -> usize {
+    let style = Style::default().add_modifier(Modifier::ITALIC);
+    let mut wrapped = Vec::new();
+    push_detail_rows(detail, width, style, &mut wrapped);
+    wrapped.len()
+}
+
+/// Wrap one option's detail into `rows`: the bullet opens the first source line
+/// and later lines align under the text.
+fn push_detail_rows(detail: &str, width: u16, style: Style, rows: &mut Vec<Line<'static>>) {
+    for (index, line) in detail.lines().enumerate() {
+        let prefix = if index == 0 { "· " } else { "  " };
+        wrap_line_into(Line::styled(format!("{prefix}{line}"), style), width, rows);
+    }
+}
+
+/// Context rows a choice picker shows above its options, and detail rows it
+/// shows under them, so a long question never hides the answers themselves.
+const CHOICE_CONTEXT_MAX_ROWS: usize = 4;
+const CHOICE_DETAIL_MAX_ROWS: usize = 3;
+
+/// Cap `rows` at `max`, ending on a marker row when text was dropped so a cut
+/// sentence never reads as the whole of it.
+fn cap_rows(rows: &mut Vec<Line<'static>>, max: usize, style: Style) {
+    if rows.len() <= max {
+        return;
+    }
+    if max == 0 {
+        rows.clear();
+        return;
+    }
+    rows.truncate(max - 1);
+    rows.push(Line::styled("…", style));
+}
+
 /// Store a drawn picker as the frame's click / hover target. `rows` counts the
-/// item rows at the top of the popup body, excluding any trailing note.
+/// item rows, and `top_rows` the context rows painted above them; a trailing
+/// note under the items is in neither.
 fn record_picker(
     state: &StructuredViewState,
     kind: PickerKind,
     drawn: Option<(Rect, Rect)>,
     first: usize,
     rows: usize,
+    top_rows: u16,
 ) {
     let Some((area, inner)) = drawn else {
         return;
     };
-    let height = u16::try_from(rows).unwrap_or(u16::MAX).min(inner.height);
+    let top_rows = top_rows.min(inner.height);
+    let height = u16::try_from(rows)
+        .unwrap_or(u16::MAX)
+        .min(inner.height - top_rows);
     state.mouse_targets.borrow_mut().picker = Some(PickerTarget {
         kind,
         area,
-        rows: Rect { height, ..inner },
+        rows: Rect {
+            y: inner.y + top_rows,
+            height,
+            ..inner
+        },
         first,
     });
 }
@@ -221,7 +319,8 @@ fn render_popup_above(
 /// Pure so the redraw path can stash it on `state.layout` for hit-testing.
 pub(super) fn compute_layout(area: Rect, state: &StructuredViewState) -> ViewLayout {
     let queue_height = queued_strip_height(state);
-    let approval_height = u16::from(!state.transcript.pending_approvals.is_empty()) * 3;
+    // A tall shelf on a short terminal would crowd out the transcript behind it.
+    let approval_height = approval_shelf_height(state, area.width).min(area.height / 2);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -241,6 +340,21 @@ pub(super) fn compute_layout(area: Rect, state: &StructuredViewState) -> ViewLay
         composer: chunks[4],
         status: chunks[5],
     }
+}
+
+/// The approval shelf's height: borders, its request detail, and its actions
+/// row, all from the rows the shelf will paint.
+fn approval_shelf_height(state: &StructuredViewState, width: u16) -> u16 {
+    let Some(row) = selected_pending_approval(state) else {
+        return 0;
+    };
+    let body = approval_body_rows(
+        row,
+        state.path_roots.as_ref(),
+        width.saturating_sub(4),
+        APPROVAL_BODY_MAX_ROWS,
+    );
+    2 + body.len() as u16 + 1
 }
 
 /// Plugin pane overlay: right half when wide, full width when narrow.
@@ -411,6 +525,18 @@ fn render_queue(frame: &mut Frame, area: Rect, theme: &Theme, state: &Structured
     frame.render_widget(Paragraph::new(line), area);
 }
 
+/// The approval the shelf is showing: the selected nonce, if it is still
+/// pending. The layout and the render both ask, so the reserved rows and the
+/// painted card always agree.
+fn selected_pending_approval(state: &StructuredViewState) -> Option<&PendingApproval> {
+    let selected = state.selected_approval.as_deref()?;
+    state
+        .transcript
+        .pending_approvals
+        .iter()
+        .find(|pending| pending.nonce == selected)
+}
+
 fn render_approval_shelf(
     frame: &mut Frame,
     area: Rect,
@@ -418,22 +544,14 @@ fn render_approval_shelf(
     state: &StructuredViewState,
     active: bool,
 ) {
-    let Some(selected) = state.selected_approval.as_deref() else {
-        return;
-    };
-    let Some(row) = state
-        .transcript
-        .pending_approvals
-        .iter()
-        .find(|pending| pending.nonce == selected)
-    else {
+    let Some(row) = selected_pending_approval(state) else {
         return;
     };
     let position = state
         .transcript
         .pending_approvals
         .iter()
-        .position(|pending| pending.nonce == selected)
+        .position(|pending| pending.nonce == row.nonce)
         .unwrap_or_default()
         + 1;
     let total = state.transcript.pending_approvals.len();
@@ -459,13 +577,34 @@ fn render_approval_shelf(
         .border_style(Style::default().fg(accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    // The request itself, so the user reads what they are approving rather
+    // than only the tool name: the actions sit on the bottom row.
+    if inner.height > 1 {
+        let body_area = Rect {
+            height: inner.height - 1,
+            ..inner
+        };
+        let body = approval_body_lines(
+            row,
+            state.path_roots.as_ref(),
+            theme,
+            body_area.width,
+            body_area.height as usize,
+        );
+        frame.render_widget(Paragraph::new(body), body_area);
+    }
+    let actions_area = Rect {
+        y: inner.y + inner.height.saturating_sub(1),
+        height: 1.min(inner.height),
+        ..inner
+    };
     let (actions, spans) = approval_actions_line(
         theme,
         active,
         row.choice && !row.options.is_empty(),
         state.native_input_available(),
     );
-    frame.render_widget(Paragraph::new(actions), inner);
+    frame.render_widget(Paragraph::new(actions), actions_area);
     // An open choice picker owns the keyboard, so the decision buttons go
     // inert with their keys.
     if state.choice.is_some() {
@@ -477,7 +616,7 @@ fn render_approval_shelf(
         .map(|(offset, width, intent)| {
             let rect = Rect {
                 x: inner.x + offset,
-                y: inner.y,
+                y: actions_area.y,
                 width: width.min(inner.width - offset),
                 height: 1,
             };
@@ -486,6 +625,165 @@ fn render_approval_shelf(
         .collect();
     paint_hovered_button(frame, theme, state, &buttons);
     state.mouse_targets.borrow_mut().buttons = buttons;
+}
+
+/// Request detail rows the shelf shows above its actions. Capped so a modal
+/// prompt leaves the transcript readable behind it.
+const APPROVAL_BODY_MAX_ROWS: usize = 5;
+
+/// How one body row of the shelf reads.
+#[derive(Clone, Copy)]
+enum ApprovalRowKind {
+    /// The command or path the call is about, which leads the body.
+    Primary,
+    /// Any other argument, as `key: value`.
+    Detail,
+    /// The count of rows that did not fit.
+    Hidden,
+}
+
+/// One line of the approval's request payload. `primary` marks the command or
+/// path the call is about, which leads the body.
+fn approval_body_entries(
+    row: &PendingApproval,
+    target: Option<&ToolTarget>,
+) -> Vec<(String, bool)> {
+    let Some(args) = parse_args_object(&row.args) else {
+        let raw = row.args.trim();
+        return if raw.is_empty() {
+            Vec::new()
+        } else {
+            vec![(raw.to_string(), true)]
+        };
+    };
+    // The kind decides which argument leads: a path-based call that also carries a
+    // command string must not promote it over the path the call is about.
+    let keys: Vec<&str> = match target {
+        Some(ToolTarget::Path(_)) => PATH_KEYS.to_vec(),
+        Some(ToolTarget::Command(_)) => CMD_KEYS.to_vec(),
+        None => CMD_KEYS.iter().chain(PATH_KEYS).copied().collect(),
+    };
+    let primary_key = keys
+        .iter()
+        .find(|key| args.get(**key).is_some_and(|value| value.is_string()));
+    let mut entries = Vec::new();
+    if let Some(key) = primary_key {
+        // The title elides this to its first line, so show it whole here.
+        if let Some(value) = args.get(*key).and_then(|value| value.as_str()) {
+            entries.push((value.to_string(), true));
+        }
+    }
+    for (key, value) in &args {
+        if key.starts_with("_aoe_") || Some(key.as_str()) == primary_key.copied() {
+            continue;
+        }
+        let text = match value {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        if !text.trim().is_empty() {
+            entries.push((format!("{key}: {text}"), false));
+        }
+    }
+    entries
+}
+
+/// Render control characters as the control pictures that occupy one cell each,
+/// so a tab or an escape byte is visible instead of vanishing into its neighbors.
+fn visible_controls(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\t' => '\u{2409}',
+            // DEL sits past the C0 pictures, whose offset would land on a digit.
+            '\x7f' => '\u{2421}',
+            c if c.is_ascii_control() => char::from_u32(0x2400 + c as u32).unwrap_or('\u{fffd}'),
+            // C1 controls have no control picture; a replacement keeps them from
+            // vanishing out of the command being approved.
+            c if c.is_control() => '\u{fffd}',
+            c => c,
+        })
+        .collect()
+}
+
+/// The request detail, wrapped to `width` and capped at
+/// [`APPROVAL_BODY_MAX_ROWS`], unstyled. The shelf's height and the rows it
+/// paints both come from here, so the reserved space cannot disagree with the
+/// text, which matters when the text is a command the user is approving.
+fn approval_body_rows(
+    row: &PendingApproval,
+    path_roots: Option<&SessionPathRoots>,
+    width: u16,
+    max_rows: usize,
+) -> Vec<(Line<'static>, ApprovalRowKind)> {
+    let mut rows: Vec<(Line<'static>, ApprovalRowKind)> = Vec::new();
+    let args = parse_args_object(&row.args);
+    let target = args.as_ref().and_then(|args| tool_target(&row.kind, args));
+    for (text, primary) in approval_body_entries(row, target.as_ref()) {
+        let is_command = primary && matches!(target, Some(ToolTarget::Command(_)));
+        let text = match (target.as_ref(), primary) {
+            (Some(ToolTarget::Path(_)), true) => {
+                relative_display_path(&text, path_roots).to_string()
+            }
+            _ => text,
+        };
+        let kind = if primary {
+            ApprovalRowKind::Primary
+        } else {
+            ApprovalRowKind::Detail
+        };
+        let mut wrapped = Vec::new();
+        // A command may run over several lines, and wrapping it as one would run
+        // those lines together: the shelf must show what would actually run.
+        for (index, logical) in text.split('\n').enumerate() {
+            let prefix = if is_command && index == 0 { "$ " } else { "" };
+            // Ratatui drops control characters, so a tab would silently join words:
+            // show them instead, wrapped as they will read on screen.
+            wrap_line_into(
+                Line::raw(format!("{prefix}{}", visible_controls(logical))),
+                width,
+                &mut wrapped,
+            );
+        }
+        rows.extend(wrapped.into_iter().map(|line| (line, kind)));
+    }
+    // The shelf's real height wins: a capped body would otherwise be clipped by
+    // the paragraph, hiding rows without saying so.
+    let cap = max_rows.clamp(1, APPROVAL_BODY_MAX_ROWS);
+    if rows.len() > cap {
+        let hidden = rows.len() - (cap - 1);
+        rows.truncate(cap - 1);
+        rows.push((
+            Line::raw(format!("… +{hidden} more")),
+            ApprovalRowKind::Hidden,
+        ));
+    }
+    rows
+}
+
+/// Style the shared body rows for painting.
+fn approval_body_lines(
+    row: &PendingApproval,
+    path_roots: Option<&SessionPathRoots>,
+    theme: &Theme,
+    width: u16,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    approval_body_rows(row, path_roots, width, max_rows)
+        .into_iter()
+        .map(|(mut line, kind)| {
+            let style = match kind {
+                ApprovalRowKind::Primary => Style::default().fg(theme.text),
+                ApprovalRowKind::Detail => Style::default().fg(theme.hint),
+                ApprovalRowKind::Hidden => {
+                    Style::default().fg(theme.hint).add_modifier(Modifier::DIM)
+                }
+            };
+            for span in &mut line.spans {
+                span.style = style;
+            }
+            line
+        })
+        .collect()
 }
 
 /// Highlight whichever of this frame's `buttons` the pointer is over.
@@ -617,7 +915,7 @@ fn render_slash_picker(
         " Commands (↑/↓ or Ctrl+n/p · Enter/Tab select · Esc dismiss) ".into(),
         lines,
     );
-    record_picker(state, PickerKind::Slash, drawn, first, rows);
+    record_picker(state, PickerKind::Slash, drawn, first, rows, 0);
 }
 
 /// `@` mention picker, with placeholders while the file index loads or fails.
@@ -671,7 +969,7 @@ fn render_mention_picker(
         " Files (↑/↓ or Ctrl+n/p · Enter/Tab insert · Esc close) ".into(),
         lines,
     );
-    record_picker(state, PickerKind::Mention, drawn, first, rows);
+    record_picker(state, PickerKind::Mention, drawn, first, rows, 0);
 }
 
 /// One separator row above the terminal-native prompt rail.
@@ -748,13 +1046,45 @@ fn render_transcript(
         );
     }
 
-    let text = wrapped_transcript(state, theme, text_area.width, ToolOutputMode::Compact);
+    let (text, groups) =
+        wrapped_transcript_rows(state, theme, text_area.width, ToolOutputMode::Compact);
     // Pre-wrapped at the render width, so visual rows are logical rows.
     let total = text.lines.len().min(u16::MAX as usize) as u16;
     let max = total.saturating_sub(text_area.height);
     // Lets a scroll step resolve the stick-to-bottom sentinel first.
     state.last_scroll_max.set(max);
-    let first = state.scroll_offset.min(max);
+    let mut first = state.scroll_offset.get().min(max);
+    // A projection that grew above the reader moved their row; put the row they
+    // were reading back where they had it.
+    if let Some(anchor) = state.take_scroll_anchor() {
+        if let Some(index) = anchored_offset(&text.lines, &groups, &anchor, first) {
+            first = index.saturating_sub(anchor.pane_row).min(max);
+            state.scroll_offset.set(first);
+        }
+    }
+    // The topmost row with content is the one to find again: a blank separator
+    // says nothing about which row the reader is on.
+    let top_row = text
+        .lines
+        .iter()
+        .enumerate()
+        .skip(first as usize)
+        .take(text_area.height as usize)
+        .find_map(|(index, line)| {
+            let content = line_text(line);
+            if content.trim().is_empty() {
+                return None;
+            }
+            let group = groups.get(index)?.as_ref()?;
+            let (start, _) = group_bounds(&groups, group)?;
+            Some(ScrollAnchor {
+                group: group.clone(),
+                row: (index - start).min(u16::MAX as usize) as u16,
+                pane_row: (index - first as usize).min(u16::MAX as usize) as u16,
+                text: content,
+            })
+        });
+    state.note_top_row(top_row);
     let para = Paragraph::new(text).scroll((first, 0));
     frame.render_widget(para, text_area);
     TranscriptGeometry {
@@ -762,6 +1092,87 @@ fn render_transcript(
         first_line: first as usize,
         total_lines: total as usize,
     }
+}
+
+/// The plain content of one rendered row.
+fn line_text(line: &Line<'static>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+/// The rows of `groups` belonging to one transcript identity: `[start, end)`.
+fn group_bounds(groups: &[Option<String>], group: &str) -> Option<(usize, usize)> {
+    let start = groups
+        .iter()
+        .position(|row| row.as_deref() == Some(group))?;
+    let len = groups[start..]
+        .iter()
+        .position(|row| row.as_deref() != Some(group))
+        .unwrap_or(groups.len() - start);
+    Some((start, start + len))
+}
+
+/// Last row of `[start, end)` with text, since an identity can end on the blank
+/// separator that follows it. Anchoring on that blank pushes the identity's own
+/// content off the top when the rows below it fill the pane.
+fn last_content_row(lines: &[Line<'static>], start: usize, end: usize) -> usize {
+    (start..end)
+        .rev()
+        .find(|&row| !line_text(&lines[row]).trim().is_empty())
+        .unwrap_or(end.saturating_sub(1))
+}
+
+/// Row index of the identity the reader anchored on, found by identity rather
+/// than by text, since identical replies either side of the row they were
+/// reading are the same text. `first` hints the fallback search.
+fn anchored_offset(
+    lines: &[Line<'static>],
+    groups: &[Option<String>],
+    anchor: &ScrollAnchor,
+    first: u16,
+) -> Option<u16> {
+    if let Some((start, end)) = group_bounds(groups, &anchor.group) {
+        let expected = start + anchor.row as usize;
+        // Inside the identity, its own text says which row grew: a projection
+        // that expanded the row the reader was in still has that line.
+        let row = lines[start..end]
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line_text(line) == anchor.text)
+            .map(|(offset, _)| start + offset)
+            .min_by_key(|index| index.abs_diff(expected))
+            .unwrap_or(expected)
+            .min(last_content_row(lines, start, end));
+        return u16::try_from(row).ok();
+    }
+    // The projection no longer holds that identity (a windowed row, say): fall
+    // back to the nearest copy of its text.
+    anchor_offset(lines, &anchor.text, first.saturating_add(anchor.pane_row))
+}
+
+/// Row index of `anchor` closest to `hint`, so a blank or repeated row keeps
+/// the reader near where they were instead of jumping to the first match.
+fn anchor_offset(lines: &[Line<'static>], anchor: &str, hint: u16) -> Option<u16> {
+    // An empty anchor names no row: any match would be a different blank.
+    if anchor.trim().is_empty() {
+        return None;
+    }
+    let mut best: Option<(u16, usize)> = None;
+    for (index, line) in lines.iter().enumerate() {
+        if index > u16::MAX as usize {
+            break;
+        }
+        if line_text(line) != anchor {
+            continue;
+        }
+        let distance = (index as u16).abs_diff(hint);
+        if best.is_none_or(|(closest, _)| distance < closest) {
+            best = Some((distance, index));
+        }
+    }
+    best.map(|(_, index)| index as u16)
 }
 
 const METADATA_CARD_MAX_WIDTH: u16 = 72;
@@ -903,24 +1314,126 @@ pub(super) enum ToolOutputMode<'a> {
 }
 
 /// The transcript pre-wrapped at `width`: the single source of transcript
-/// geometry for painting, scroll clamping, and selection.
+/// geometry for painting, scroll clamping, and selection. The live projection
+/// is cached, so an unchanged transcript costs a clone rather than a re-wrap.
 pub(super) fn wrapped_transcript(
     state: &StructuredViewState,
     theme: &Theme,
     width: u16,
     tool_output: ToolOutputMode,
 ) -> Text<'static> {
-    let lines = transcript_lines(
+    wrapped_transcript_rows(state, theme, width, tool_output).0
+}
+
+/// [`wrapped_transcript`] plus, per visual row, the transcript row identity it
+/// came from, so a scroll anchor can find its own row again after the
+/// projection moves it.
+pub(super) fn wrapped_transcript_rows(
+    state: &StructuredViewState,
+    theme: &Theme,
+    width: u16,
+    tool_output: ToolOutputMode,
+) -> (Text<'static>, Vec<Option<String>>) {
+    let revision = state.transcript.projection_revision();
+    if let ToolOutputMode::Compact = tool_output {
+        let cached = state.transcript_cache.borrow();
+        if let Some(hit) = cached.as_ref().filter(|hit| {
+            hit.matches(
+                revision,
+                width,
+                theme,
+                state.path_roots.as_ref(),
+                state.show_full_thinking,
+            )
+        }) {
+            return (hit.text.clone(), hit.groups.clone());
+        }
+    }
+    let projected = project_transcript_rows(state, theme, width, tool_output);
+    // The retained reader builds its own cache over outputs the state does not
+    // hold, so only the compact projection is stored here.
+    if let ToolOutputMode::Compact = tool_output {
+        *state.transcript_cache.borrow_mut() = Some(TranscriptTextCache {
+            revision,
+            width,
+            theme: theme.clone(),
+            roots: state.path_roots.clone(),
+            full_thinking: state.show_full_thinking,
+            text: projected.0.clone(),
+            groups: projected.1.clone(),
+        });
+    }
+    projected
+}
+
+/// Project and wrap without touching the cache. Selection extraction passes a
+/// placeholder theme, so it reads this rather than evicting the painted text.
+pub(super) fn project_transcript(
+    state: &StructuredViewState,
+    theme: &Theme,
+    width: u16,
+    tool_output: ToolOutputMode,
+) -> Text<'static> {
+    project_transcript_rows(state, theme, width, tool_output).0
+}
+
+fn project_transcript_rows(
+    state: &StructuredViewState,
+    theme: &Theme,
+    width: u16,
+    tool_output: ToolOutputMode,
+) -> (Text<'static>, Vec<Option<String>>) {
+    let text = transcript_lines(
         &state.transcript,
         theme,
         state.path_roots.as_ref(),
+        state.show_full_thinking,
         tool_output,
     );
-    let mut wrapped: Vec<Line<'static>> = Vec::with_capacity(lines.len());
-    for line in lines {
+    let mut wrapped: Vec<Line<'static>> = Vec::with_capacity(text.lines.len());
+    let mut groups: Vec<Option<String>> = Vec::with_capacity(text.lines.len());
+    for (line, group) in text.lines.into_iter().zip(text.groups) {
         wrap_line_into(own_line(line), width, &mut wrapped);
+        groups.resize(wrapped.len(), group);
     }
-    Text::from(wrapped)
+    (Text::from(wrapped), groups)
+}
+
+/// Transcript rows paired with the identity each row's lines came from.
+struct TranscriptText {
+    lines: Vec<Line<'static>>,
+    groups: Vec<Option<String>>,
+    current: Option<String>,
+}
+
+impl TranscriptText {
+    fn new() -> Self {
+        Self {
+            lines: Vec::new(),
+            groups: Vec::new(),
+            current: None,
+        }
+    }
+
+    /// Lines pushed from here belong to the transcript row `key` names.
+    fn row_of(&mut self, key: String) {
+        self.current = Some(key);
+    }
+
+    fn push(&mut self, line: Line<'static>) {
+        self.lines.push(line);
+        self.groups.push(self.current.clone());
+    }
+
+    fn extend(&mut self, lines: impl IntoIterator<Item = Line<'static>>) {
+        for line in lines {
+            self.push(line);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
 }
 
 fn plan_summary_line(plan: &[super::reducer::PlanLine], theme: &Theme) -> Line<'static> {
@@ -1098,16 +1611,36 @@ fn join_split_graphemes(line: &mut Line<'static>) {
     line.spans.retain(|span| !span.content.is_empty());
 }
 
+/// Text whose graphemes all sit inside one span and paint one cell each. Most
+/// transcript text is this, and it needs no grapheme walk to measure or split.
+fn is_plain_ascii(text: &str) -> bool {
+    text.is_ascii() && !text.bytes().any(|byte| byte.is_ascii_control())
+}
+
+fn painted_cells(text: &str) -> usize {
+    if is_plain_ascii(text) {
+        return text.len();
+    }
+    crate::tui::components::text::rendered_width(text)
+}
+
 pub(super) fn wrap_line_into(mut line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>) {
     use ratatui::buffer::CellWidth;
     use unicode_segmentation::UnicodeSegmentation;
 
-    join_split_graphemes(&mut line);
+    // A grapheme can only span a span boundary when a span ends inside one, so
+    // plain ASCII (which has no combining or joined clusters) skips the join.
+    let plain = line.spans.iter().all(|span| is_plain_ascii(&span.content));
+    if plain {
+        line.spans.retain(|span| !span.content.is_empty());
+    } else {
+        join_split_graphemes(&mut line);
+    }
     let width = width.max(1) as usize;
     let painted_width: usize = line
         .spans
         .iter()
-        .map(|span| crate::tui::components::text::rendered_width(&span.content))
+        .map(|span| painted_cells(&span.content))
         .sum();
     if painted_width <= width {
         out.push(line);
@@ -1140,39 +1673,59 @@ pub(super) fn wrap_line_into(mut line: Line<'static>, width: u16, out: &mut Vec<
     let mut row: Vec<(usize, std::ops::Range<usize>, usize)> = Vec::new();
     let mut row_width = 0;
     let mut last_space = None;
+    let mut push = |span_index: usize,
+                    range: std::ops::Range<usize>,
+                    cells: usize,
+                    is_space: bool,
+                    out: &mut Vec<Line<'static>>| {
+        while row_width + cells > width && row_width > 0 {
+            if let Some(cut) = last_space {
+                emit(&row[..cut], out);
+                row.drain(..=cut);
+            } else {
+                emit(&row, out);
+                row.clear();
+            }
+            row_width = row.iter().map(|glyph| glyph.2).sum();
+            last_space = row
+                .iter()
+                .rposition(|(index, range, _)| &line.spans[*index].content[range.clone()] == " ");
+        }
+        if is_space {
+            last_space = Some(row.len());
+        }
+        row.push((span_index, range, cells));
+        row_width += cells;
+        if cells > width {
+            emit(&row, out);
+            row.clear();
+            row_width = 0;
+            last_space = None;
+        }
+    };
     for (span_index, span) in line.spans.iter().enumerate() {
+        if plain {
+            for (byte, glyph) in span.content.bytes().enumerate() {
+                push(span_index, byte..byte + 1, 1, glyph == b' ', out);
+            }
+            continue;
+        }
         for (byte, grapheme) in span.content.grapheme_indices(true) {
             let cells = if grapheme.contains(char::is_control) {
                 0
             } else {
                 grapheme.cell_width() as usize
             };
-            while row_width + cells > width && row_width > 0 {
-                if let Some(cut) = last_space {
-                    emit(&row[..cut], out);
-                    row.drain(..=cut);
-                } else {
-                    emit(&row, out);
-                    row.clear();
-                }
-                row_width = row.iter().map(|glyph| glyph.2).sum();
-                last_space = row.iter().rposition(|(index, range, _)| {
-                    &line.spans[*index].content[range.clone()] == " "
-                });
-            }
-            if grapheme == " " {
-                last_space = Some(row.len());
-            }
-            row.push((span_index, byte..byte + grapheme.len(), cells));
-            row_width += cells;
-            if cells > width {
-                emit(&row, out);
-                row.clear();
-                row_width = 0;
-                last_space = None;
-            }
+            push(
+                span_index,
+                byte..byte + grapheme.len(),
+                cells,
+                grapheme == " ",
+                out,
+            );
         }
     }
+    drop(push);
     emit(&row, out);
 }
 
@@ -1284,7 +1837,7 @@ fn render_status(
             Style::default().fg(theme.error),
         ));
     }
-    if state.scroll_offset != u16::MAX {
+    if state.scroll_offset.get() != u16::MAX {
         spans.push(Span::styled(
             " · G latest ",
             Style::default().fg(theme.hint),
@@ -1565,9 +2118,10 @@ fn transcript_lines(
     transcript: &AcpTranscript,
     theme: &Theme,
     path_roots: Option<&SessionPathRoots>,
+    full_thinking: bool,
     tool_output: ToolOutputMode,
-) -> Vec<Line<'static>> {
-    let rows = &transcript.server_rows;
+) -> TranscriptText {
+    let rows = transcript.rows();
     // One card per tool call at its start row; the last terminal row wins.
     let mut completions: HashMap<&str, &TranscriptRow> = HashMap::new();
     for row in rows {
@@ -1597,16 +2151,17 @@ fn transcript_lines(
     let blocks = ToolBlocks {
         completions: &completions,
         children: &children,
-        subagents: &transcript.subagents,
+        subagents: transcript.subagents(),
         theme,
         path_roots,
         tool_output,
     };
 
-    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut out = TranscriptText::new();
     let mut i = 0;
     while i < rows.len() {
         let row = &rows[i];
+        out.row_of(group_key(row));
         match row.kind {
             TranscriptRowKind::Message => {
                 // Consecutive chunks of one group form one bubble.
@@ -1633,7 +2188,11 @@ fn transcript_lines(
                     text.push_str(&rows[i].text);
                     i += 1;
                 }
-                out.push(thinking_preview_line(&text));
+                if full_thinking {
+                    out.extend(thinking_lines(&text, theme));
+                } else {
+                    out.push(thinking_preview_line(&text));
+                }
                 out.push(Line::default());
                 continue;
             }
@@ -1729,6 +2288,15 @@ fn transcript_lines(
     out
 }
 
+/// The identity a transcript row's lines belong to: the group its chunks share,
+/// so one bubble stays one anchor, or the row's own id.
+fn group_key(row: &TranscriptRow) -> String {
+    match row.kind {
+        TranscriptRowKind::Message | TranscriptRowKind::Thinking => row.group_id.clone(),
+        _ => row.id.clone(),
+    }
+}
+
 /// The spawning tool call of `row`, when its card is in the window.
 fn in_window_parent<'a>(row: &'a TranscriptRow, starts: &HashSet<&str>) -> Option<&'a str> {
     let parent = row.tool.as_ref()?.parent_tool_call_id.as_deref()?;
@@ -1819,7 +2387,39 @@ fn subagent_badge(state: SubagentState, theme: &Theme) -> Span<'static> {
     Span::styled(format!(" · {text}"), Style::default().fg(color))
 }
 
-/// One dim preview per thought: the TUI has no expansion state to show it all.
+/// A thought in full, dimmed so it never competes with the agent's answer.
+fn thinking_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
+    // A thought is quoted, not formatted: markup the parser would swallow as
+    // HTML still reads as the model wrote it.
+    let body = crate::tui::markdown::render_keeping_html(text);
+    if text.trim().is_empty() || body.is_empty() {
+        return vec![Line::from(Span::styled(
+            "· Thinking: …",
+            Style::default()
+                .fg(theme.hint)
+                .add_modifier(Modifier::DIM | Modifier::ITALIC),
+        ))];
+    }
+    body.into_iter()
+        .enumerate()
+        .map(|(index, mut line)| {
+            line.spans.insert(
+                0,
+                Span::styled(
+                    if index == 0 { "· " } else { "  " },
+                    Style::default().fg(theme.hint),
+                ),
+            );
+            line.style = line.style.add_modifier(Modifier::DIM);
+            for span in &mut line.spans {
+                span.style = span.style.add_modifier(Modifier::DIM);
+            }
+            line
+        })
+        .collect()
+}
+
+/// One dim preview per thought, for when the transcript is collapsed.
 fn thinking_preview_line(text: &str) -> Line<'static> {
     const MAX_CHARS: usize = 120;
     let first = text
@@ -2489,6 +3089,20 @@ mod tests {
         render_rows(state, w, h, true).concat()
     }
 
+    /// Render once and report where the transcript landed, so a test can check
+    /// the row the pane starts on.
+    fn render_geometry(state: &StructuredViewState, w: u16, h: u16) -> TranscriptGeometry {
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        let mut geometry = None;
+        terminal
+            .draw(|f| {
+                geometry = Some(render(f, f.area(), &theme, state, true));
+            })
+            .expect("draw");
+        geometry.expect("geometry")
+    }
+
     /// Server transcript rows folded from events, as the daemon ships them.
     fn server_rows(events: &[Event]) -> Vec<TranscriptRow> {
         let mut m = crate::acp::transcript::TranscriptModel::new();
@@ -2753,6 +3367,78 @@ mod tests {
         }
     }
 
+    /// The wrapped transcript is cached across frames, so it must never serve
+    /// text older than its rows or narrower than the frame it paints into.
+    #[test]
+    fn transcript_cache_follows_rows_and_width() {
+        let chunk = |text: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: Some("m-1".into()),
+        };
+        let mut state = test_state();
+        state.transcript.set_rows(server_rows(&[chunk("alpha")]));
+        assert!(render_dump(&state, 60, 12).contains("alpha"));
+
+        state.transcript.set_rows(server_rows(&[chunk("beta")]));
+        let dump = render_dump(&state, 60, 12);
+        assert!(
+            dump.contains("beta") && !dump.contains("alpha"),
+            "a replaced transcript must not reuse the cached text: {dump}"
+        );
+
+        state
+            .transcript
+            .set_rows(server_rows(&[chunk(&"wide ".repeat(20))]));
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let rows = |width| {
+            wrapped_transcript(&state, &theme, width, ToolOutputMode::Compact)
+                .lines
+                .len()
+        };
+        let wide = rows(60);
+        assert!(rows(30) > wide, "a narrower frame must re-wrap");
+    }
+
+    /// A child's state turns its parent's card on and off with no row delta, so
+    /// the roster alone has to invalidate the cached transcript.
+    #[test]
+    fn transcript_cache_follows_the_subagent_roster() {
+        use crate::acp::state::{SubagentRecord, SubagentState};
+        let record = |state| SubagentRecord {
+            session_id: "child".into(),
+            parent_session_id: "s-1".into(),
+            parent_tool_call_id: Some("msg-1".into()),
+            title: Some("Explore repo".into()),
+            description: None,
+            state,
+            stop_reason: None,
+            error: None,
+            cancel_capable: true,
+            model: None,
+            background: false,
+        };
+        let mut state = test_state();
+        state
+            .transcript
+            .set_rows(server_rows(&[tool_event("msg-1", "Explore repo", None)]));
+        state
+            .transcript
+            .set_subagents(vec![record(SubagentState::Running)]);
+        assert!(
+            render_dump(&state, 80, 20).contains("Explore repo · running"),
+            "the roster badges the card"
+        );
+
+        state
+            .transcript
+            .set_subagents(vec![record(SubagentState::Idle)]);
+        let dump = render_dump(&state, 80, 20);
+        assert!(
+            dump.contains("Explore repo · idle") && !dump.contains("running"),
+            "a roster change must not reuse the cached badges: {dump}"
+        );
+    }
+
     #[test]
     fn wrap_line_rows_and_styles() {
         let rows = |line: Line<'static>, width| {
@@ -2965,6 +3651,340 @@ mod tests {
         assert!(dump.contains("src/main.rs") && !dump.contains("zzz/other.md"));
     }
 
+    /// A pending question has to say what it is asking: the option labels alone
+    /// leave the lead-in and the chosen answer's detail unsaid.
+    #[test]
+    fn question_picker_shows_the_question_context_and_highlighted_detail() {
+        use super::super::state::{ChoicePicker, ChoicePurpose};
+
+        let mut state = test_state();
+        state.choice = Some(ChoicePicker {
+            title: " Which store? (Enter=pick · Esc=dismiss) ".into(),
+            context: Some(
+                "Picking the store for the new service; the one we can migrate cheaply".into(),
+            ),
+            options: vec![
+                ("a".into(), "Postgres".into()),
+                ("b".into(), "SQLite".into()),
+            ],
+            details: vec![Some("Managed, boring, already there".into()), None],
+            selected: 0,
+            purpose: ChoicePurpose::Mode,
+        });
+        let dump = render_dump(&state, 80, 24);
+        assert!(dump.contains("Picking the store for"), "{dump}");
+        assert!(
+            dump.contains("Postgres") && dump.contains("SQLite"),
+            "{dump}"
+        );
+        assert!(dump.contains("Managed, boring"), "{dump}");
+
+        // The context rows sit above the items, so clicking the first item row
+        // must still resolve to the first option rather than to the context.
+        let targets = state.mouse_targets.borrow();
+        let picker = targets.picker.expect("choice picker target");
+        let first_row = Rect {
+            y: picker.rows.y,
+            height: 1,
+            ..picker.rows
+        };
+        assert_eq!(
+            super::super::input::picker_row_at(
+                &targets,
+                ratatui::layout::Position::new(first_row.x, first_row.y)
+            ),
+            Some((PickerKind::Choice, 0))
+        );
+    }
+
+    /// The approval shelf has to show the request itself: the tool name and an
+    /// elided target in the title are not enough to decide on a command.
+    #[test]
+    fn approval_shelf_shows_the_request_payload() {
+        let mut state = test_state();
+        state.transcript.pending_approvals = vec![PendingApproval {
+            nonce: "n-1".into(),
+            title: "Bash".into(),
+            kind: "execute".into(),
+            args: r#"{"command":"rm -rf build && make","description":"clean the tree"}"#.into(),
+            destructive: true,
+            options: Vec::new(),
+            choice: false,
+        }];
+        state.selected_approval = Some("n-1".into());
+        state.focus = Focus::Approval;
+        let dump = render_dump(&state, 80, 24);
+        for want in [
+            "$ rm -rf build && make",
+            "description: clean the tree",
+            "destructive",
+            "allow once",
+        ] {
+            assert!(dump.contains(want), "missing {want:?}:\n{dump}");
+        }
+
+        // A payload longer than the shelf keeps the head and counts the rest.
+        state.transcript.pending_approvals[0].args = serde_json::json!({
+            "command": (0..40)
+                .map(|i| format!("step-{i}"))
+                .collect::<Vec<_>>()
+                .join(" && "),
+        })
+        .to_string();
+        let dump = render_dump(&state, 40, 24);
+        assert!(dump.contains("step-0"), "{dump}");
+        assert!(dump.contains(" more"), "the rest is counted: {dump}");
+
+        // A shelf clamped by a short terminal clips the paragraph, so the count
+        // has to come from the height it really has.
+        let dump = render_dump(&state, 40, 12);
+        assert!(
+            dump.contains(" more"),
+            "a clipped body still counts what it dropped: {dump}"
+        );
+    }
+
+    /// A command that runs over several lines is shown as it will run, not run
+    /// together the way a single wrapped line would show it.
+    #[test]
+    fn approval_shelf_keeps_the_lines_of_a_multiline_command() {
+        let mut state = test_state();
+        state.transcript.pending_approvals = vec![PendingApproval {
+            nonce: "n-1".into(),
+            title: "Bash".into(),
+            kind: "execute".into(),
+            args: serde_json::json!({ "command": "echo ok\nrm -rf build" }).to_string(),
+            destructive: false,
+            options: Vec::new(),
+            choice: false,
+        }];
+        state.selected_approval = Some("n-1".into());
+        state.focus = Focus::Approval;
+        let lines = render_rows(&state, 80, 24, true);
+        let dump = lines.join("\n");
+        assert!(
+            lines.iter().any(|line| line.contains("$ echo ok")),
+            "the command's pilot line is missing:\n{dump}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("rm -rf build")),
+            "the command's second line is missing:\n{dump}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("echo ok") && line.contains("rm -rf build")),
+            "the command's lines ran together:\n{dump}"
+        );
+    }
+
+    /// A command's control characters are shown, not dropped: a tab would
+    /// otherwise join the words either side of it, and DEL would reach the
+    /// terminal as a digit-like glyph.
+    #[test]
+    fn approval_shelf_shows_control_characters_in_the_command() {
+        let cases = [
+            ("\t", "echo\u{2409}ok", "the tab is shown as one cell"),
+            ("\u{7f}", "echo\u{2421}ok", "DEL is the delete symbol"),
+            ("\u{9b}", "echo\u{fffd}ok", "a C1 control is replaced"),
+        ];
+        for (byte, expected, why) in cases {
+            let mut state = test_state();
+            state.transcript.pending_approvals = vec![PendingApproval {
+                nonce: "n-1".into(),
+                title: "Bash".into(),
+                kind: "execute".into(),
+                args: serde_json::json!({ "command": format!("echo{byte}ok") }).to_string(),
+                destructive: false,
+                options: Vec::new(),
+                choice: false,
+            }];
+            state.selected_approval = Some("n-1".into());
+            state.focus = Focus::Approval;
+            let lines = render_rows(&state, 80, 24, true);
+            let dump = lines.join("\n");
+            assert!(
+                lines.iter().any(|line| line.contains(expected)),
+                "{why} ({expected:?} missing):\n{dump}"
+            );
+        }
+    }
+
+    /// The kind decides the leading argument: a path-based call that also
+    /// carries a command string must not promote that string over the path.
+    #[test]
+    fn approval_body_entries_lead_with_the_kinds_own_target() {
+        let row = PendingApproval {
+            nonce: "n-1".into(),
+            title: "Edit".into(),
+            kind: "edit".into(),
+            args: serde_json::json!({ "command": "touch /tmp/x", "path": "src/a.rs" }).to_string(),
+            destructive: false,
+            options: Vec::new(),
+            choice: false,
+        };
+        let target = ToolTarget::Path("src/a.rs");
+        let entries = approval_body_entries(&row, Some(&target));
+        assert_eq!(
+            entries
+                .first()
+                .map(|(text, primary)| (text.as_str(), *primary)),
+            Some(("src/a.rs", true)),
+            "the edited path leads: {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(text, primary)| !*primary && text.contains("touch /tmp/x")),
+            "the command stays a detail: {entries:?}"
+        );
+    }
+
+    /// A question whose lead-in is longer than the room above the composer must
+    /// still show its answers: they are what the keys act on.
+    #[test]
+    fn question_picker_keeps_its_options_visible_on_a_short_terminal() {
+        use super::super::state::{ChoicePicker, ChoicePurpose};
+        let mut state = test_state();
+        state.choice = Some(ChoicePicker {
+            title: " Which store? ".into(),
+            context: Some(
+                (0..6)
+                    .map(|i| format!("line {i} of the lead-in"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            options: vec![
+                ("a".into(), "Postgres".into()),
+                ("b".into(), "SQLite".into()),
+            ],
+            details: vec![Some("Managed, boring, already there".into()), None],
+            selected: 0,
+            purpose: ChoicePurpose::Mode,
+        });
+        let dump = render_dump(&state, 60, 12);
+        assert!(
+            dump.contains("Postgres") && dump.contains("SQLite"),
+            "the answers must stay on screen:\n{dump}"
+        );
+    }
+
+    /// Moving between options must not resize the popup: it is bottom-anchored,
+    /// so a shorter detail would slide the options out from under the pointer.
+    #[test]
+    fn question_picker_option_rows_hold_still_while_the_detail_changes() {
+        use super::super::state::{ChoicePicker, ChoicePurpose};
+        let mut state = test_state();
+        state.choice = Some(ChoicePicker {
+            title: " Which store? ".into(),
+            context: None,
+            options: vec![
+                ("a".into(), "Postgres".into()),
+                ("b".into(), "SQLite".into()),
+            ],
+            details: vec![
+                Some("Managed, boring, already there and worth its own rows".into()),
+                None,
+            ],
+            selected: 0,
+            purpose: ChoicePurpose::Mode,
+        });
+        let _ = render_dump(&state, 80, 24);
+        let with_detail = state.mouse_targets.borrow().picker.expect("picker").rows;
+
+        state.choice.as_mut().unwrap().selected = 1;
+        let _ = render_dump(&state, 80, 24);
+        let without_detail = state.mouse_targets.borrow().picker.expect("picker").rows;
+        assert_eq!(
+            with_detail.y, without_detail.y,
+            "the option rows must keep their place when the detail shrinks"
+        );
+    }
+
+    /// An option detail written over several lines has to read as those lines:
+    /// the popup has no other way to show a break, so losing it runs two
+    /// sentences together.
+    #[test]
+    fn question_picker_keeps_the_lines_of_a_multiline_detail() {
+        use super::super::state::{ChoicePicker, ChoicePurpose};
+        let mut state = test_state();
+        state.choice = Some(ChoicePicker {
+            title: " Which store? ".into(),
+            context: None,
+            options: vec![
+                ("a".into(), "Postgres".into()),
+                ("b".into(), "SQLite".into()),
+            ],
+            details: vec![
+                Some("Use the managed one\nOnly for the new service".into()),
+                None,
+            ],
+            selected: 0,
+            purpose: ChoicePurpose::Mode,
+        });
+        let rows = render_rows(&state, 80, 24, true);
+        let dump = rows.join("\n");
+        assert!(
+            rows.iter().any(|row| row.contains("· Use the managed one")),
+            "the detail's first line is missing:\n{dump}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Only for the new service")),
+            "the detail's second line is missing:\n{dump}"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.contains("managed one") && row.contains("Only for the new service")),
+            "the detail's lines ran together:\n{dump}"
+        );
+    }
+
+    /// A detail clipped by a short terminal ends on the marker, so a cut
+    /// sentence never reads as the whole of it.
+    #[test]
+    fn question_picker_marks_a_detail_clipped_to_the_reserved_height() {
+        use super::super::state::{ChoicePicker, ChoicePurpose};
+        let tail = "and the tail of this answer must not survive the clip";
+        let mut state = test_state();
+        state.choice = Some(ChoicePicker {
+            title: " Which store? ".into(),
+            context: None,
+            options: vec![
+                ("a".into(), "Postgres".into()),
+                ("b".into(), "SQLite".into()),
+            ],
+            details: vec![
+                Some(format!(
+                    "This answer needs more rows than the popup can spare here, {tail}"
+                )),
+                None,
+            ],
+            selected: 0,
+            purpose: ChoicePurpose::Mode,
+        });
+        let rows = render_rows(&state, 40, 8, true);
+        let dump = rows.join("\n");
+        assert!(
+            rows.iter().any(|row| row.contains("· This answer needs")),
+            "the detail has to start on screen:\n{dump}"
+        );
+        let marker_rows: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.trim_matches(['│', ' ']) == "…")
+            .collect();
+        assert_eq!(
+            marker_rows.len(),
+            1,
+            "a clipped detail must end on a marker row of its own:\n{dump}"
+        );
+        assert!(
+            !dump.contains("must not survive"),
+            "the clip must still drop the tail:\n{dump}"
+        );
+    }
+
     /// Two agent messages render as two bubbles; one streamed message
     /// stays whole.
     #[test]
@@ -2974,20 +3994,17 @@ mod tests {
             message_id: Some(id.into()),
         };
         let mut t = AcpTranscript::new("s-1");
-        t.server_rows = server_rows(&[
+        t.set_rows(server_rows(&[
             chunk("for #4656.", "m-a"),
             chunk("", "m-b"),
             chunk("The waiter has the lock.", "m-b"),
             Event::ThinkingStarted,
             chunk("Build", "m-c"),
             chunk("ing now", "m-c"),
-        ]);
-        let out = joined(&transcript_lines(
-            &t,
-            &Theme::default(),
-            None,
-            ToolOutputMode::Compact,
-        ));
+        ]));
+        let out = joined(
+            &transcript_lines(&t, &Theme::default(), None, false, ToolOutputMode::Compact).lines,
+        );
         assert!(!out.contains("#4656.The waiter"), "{out:?}");
         assert!(
             out.contains("for #4656.") && out.contains("The waiter has the lock."),
@@ -3005,13 +4022,14 @@ mod tests {
         };
         let long = "é".repeat(130);
         let mut t = AcpTranscript::new("s-1");
-        t.server_rows = server_rows(&[
+        t.set_rows(server_rows(&[
             thought("Weighing ", "t-a"),
             thought("options\nsecond line", "t-a"),
             thought(&long, "t-b"),
-        ]);
+        ]));
         let lines: Vec<String> =
-            transcript_lines(&t, &Theme::default(), None, ToolOutputMode::Compact)
+            transcript_lines(&t, &Theme::default(), None, false, ToolOutputMode::Compact)
+                .lines
                 .iter()
                 .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
                 .filter(|line: &String| !line.is_empty())
@@ -3022,6 +4040,307 @@ mod tests {
                 "· Thinking: Weighing options…".to_string(),
                 format!("· Thinking: {}…", "é".repeat(120)),
             ]
+        );
+
+        // Expanded, the same thoughts render whole: every line, no elision.
+        let expanded: Vec<String> =
+            transcript_lines(&t, &Theme::default(), None, true, ToolOutputMode::Compact)
+                .lines
+                .iter()
+                .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+                .filter(|line: &String| !line.trim().is_empty())
+                .collect();
+        let body = expanded.join("\n");
+        assert!(body.contains("Weighing options"), "{body:?}");
+        assert!(body.contains("second line"), "{body:?}");
+        assert!(
+            body.contains(&long),
+            "the full thought, not a preview: {body:?}"
+        );
+    }
+
+    /// A thought is a quote, not formatted output: markup inside it must not be
+    /// swallowed by the parser and leave the thought looking empty.
+    #[test]
+    fn an_expanded_thought_keeps_markup_it_quotes() {
+        let thought = |text: &str, id: &str| Event::AgentThoughtChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let mut t = AcpTranscript::new("s-1");
+        t.set_rows(server_rows(&[thought(
+            "<div>\nCompare both alternatives.\n</div>",
+            "t-a",
+        )]));
+        let body = joined(
+            &transcript_lines(&t, &Theme::default(), None, true, ToolOutputMode::Compact).lines,
+        );
+        assert!(body.contains("Compare both alternatives."), "{body:?}");
+    }
+
+    /// Expanding a thought above the reader grows the transcript under them, so
+    /// the row they were reading has to stay at the top of the pane.
+    #[test]
+    fn expanding_a_thought_keeps_the_reader_on_their_row() {
+        let chunk = |text: &str, id: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let thought = |text: &str, id: &str| Event::AgentThoughtChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let mut state = test_state();
+        let mut events = vec![thought(
+            "first thought\nweighing the options\nchecking the second one\nsettling on one",
+            "t-a",
+        )];
+        for index in 0..12 {
+            events.push(chunk(
+                &format!("reply number {index}"),
+                &format!("m-{index}"),
+            ));
+        }
+        state.transcript.set_rows(server_rows(&events));
+
+        // Scroll back into the replies, then expand the thought above them. The
+        // projection separates rows with blanks, so land on a reply rather than
+        // one of them.
+        state.scroll_offset.set(2);
+        let before = render_geometry(&state, 60, 20);
+        let top_before = render_rows(&state, 60, 20, true)[before.text_area.y as usize]
+            .trim()
+            .to_string();
+        assert!(!top_before.is_empty(), "the pane must start on a row");
+
+        state.anchor_scroll_to_top_line();
+        state.show_full_thinking = true;
+        let after = render_geometry(&state, 60, 20);
+        let top_after = render_rows(&state, 60, 20, true)[after.text_area.y as usize]
+            .trim()
+            .to_string();
+        assert_eq!(
+            top_after, top_before,
+            "the reader keeps the row they were on"
+        );
+    }
+
+    /// A separator at the top of the pane names no row, so anchoring on it used
+    /// to pick whichever blank sat nearest the old offset and move the reader.
+    #[test]
+    fn a_blank_top_row_keeps_the_reader_on_their_content() {
+        let chunk = |text: &str, id: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let thought = |text: &str, id: &str| Event::AgentThoughtChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let mut state = test_state();
+        let mut events = vec![thought(
+            "first thought\nweighing the options\nchecking the second one\nsettling on one",
+            "t-a",
+        )];
+        for index in 0..12 {
+            events.push(chunk(
+                &format!("reply number {index}"),
+                &format!("m-{index}"),
+            ));
+        }
+        state.transcript.set_rows(server_rows(&events));
+
+        // Find an offset that puts a blank separator at the top of the pane, so
+        // the reader's own row is the first line of content below it.
+        let offset = (1..20u16)
+            .find(|offset| {
+                state.scroll_offset.set(*offset);
+                let rows = render_rows(&state, 60, 20, true);
+                let top = render_geometry(&state, 60, 20).text_area.y as usize;
+                rows[top].trim().is_empty() && !rows[top + 1].trim().is_empty()
+            })
+            .expect("fixture has a blank separator above a reply");
+        state.scroll_offset.set(offset);
+        let before = render_geometry(&state, 60, 20);
+        let rows_before = render_rows(&state, 60, 20, true);
+        let content_before = rows_before[(before.text_area.y + 1) as usize]
+            .trim()
+            .to_string();
+
+        state.anchor_scroll_to_top_line();
+        state.show_full_thinking = true;
+        let after = render_geometry(&state, 60, 20);
+        let rows_after = render_rows(&state, 60, 20, true);
+        assert_eq!(
+            rows_after[(after.text_area.y + 1) as usize].trim(),
+            content_before,
+            "the content under the separator stays where the reader had it"
+        );
+    }
+
+    /// Identical replies either side of the reader must not hijack the anchor:
+    /// the stored row says which copy they were reading, so an unchanged
+    /// projection leaves the pane where it was.
+    #[test]
+    fn a_repeated_reply_keeps_the_reader_on_their_row() {
+        let chunk = |text: &str, id: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let mut state = test_state();
+        let events: Vec<Event> = (0..12)
+            .map(|index| chunk("same reply", &format!("m-{index}")))
+            .collect();
+        state.transcript.set_rows(server_rows(&events));
+
+        // A separator at the top puts the anchor one row down, where the copy
+        // above the reader sits as near as the copy they are on.
+        let offset = (2..18u16)
+            .find(|offset| {
+                state.scroll_offset.set(*offset);
+                let rows = render_rows(&state, 60, 20, true);
+                let top = render_geometry(&state, 60, 20).text_area.y as usize;
+                if !rows[top].trim().is_empty() {
+                    return false;
+                }
+                let below = rows[top + 1].trim().to_string();
+                if below.is_empty() {
+                    return false;
+                }
+                // The same reply also sits directly above that separator.
+                state.scroll_offset.set(offset - 1);
+                let above = render_rows(&state, 60, 20, true);
+                above[top].trim() == below
+            })
+            .expect("fixture repeats a reply above the reader");
+        state.scroll_offset.set(offset);
+        let before = render_geometry(&state, 60, 20);
+        let rows_before = render_rows(&state, 60, 20, true);
+        let reply_before = rows_before[before.text_area.y as usize + 1].clone();
+
+        state.anchor_scroll_to_top_line();
+        let after = render_geometry(&state, 60, 20);
+        let rows_after = render_rows(&state, 60, 20, true);
+        assert_eq!(
+            after.first_line, before.first_line,
+            "an unchanged projection keeps the offset"
+        );
+        assert_eq!(
+            rows_after[after.text_area.y as usize + 1],
+            reply_before,
+            "the reader stays on the copy they were reading"
+        );
+    }
+
+    /// The same reply either side of a thought the reader expands: the copy they
+    /// were on has to stay under them even though the other copy is nearer the
+    /// text match once the thought grows.
+    #[test]
+    fn an_expanded_thought_keeps_the_reader_on_a_repeated_reply() {
+        let chunk = |text: &str, id: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let thought = |text: &str, id: &str| Event::AgentThoughtChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let mut state = test_state();
+        let mut events = vec![
+            chunk("same reply", "m-a"),
+            thought(
+                &(0..10)
+                    .map(|line| format!("thought line {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                "t-a",
+            ),
+            chunk("same reply", "m-b"),
+        ];
+        for index in 0..12 {
+            events.push(chunk(
+                &format!("reply number {index}"),
+                &format!("m-{index}"),
+            ));
+        }
+        state.transcript.set_rows(server_rows(&events));
+
+        // Land the pane on the second copy, with the thought's preview just above
+        // it, so the first copy sits only a few rows further up.
+        let row_at = |state: &StructuredViewState, offset: u16| {
+            state.scroll_offset.set(offset);
+            let geometry = render_geometry(state, 60, 20);
+            let rows = render_rows(state, 60, 20, true);
+            rows[geometry.text_area.y as usize].trim().to_string()
+        };
+        let offset = (3..20u16)
+            .find(|offset| {
+                if !row_at(&state, *offset).ends_with("same reply") {
+                    return false;
+                }
+                (1..=3).any(|above| row_at(&state, offset - above).contains("Thinking"))
+            })
+            .expect("fixture puts the second copy of the reply below the thought");
+        state.scroll_offset.set(offset);
+        let before = render_geometry(&state, 60, 20);
+        let rows_before = render_rows(&state, 60, 20, true);
+        let visible_before = rows_before[before.text_area.y as usize..].to_vec();
+
+        state.anchor_scroll_to_top_line();
+        state.show_full_thinking = true;
+        let after = render_geometry(&state, 60, 20);
+        let rows_after = render_rows(&state, 60, 20, true);
+        assert_eq!(
+            rows_after[after.text_area.y as usize..].to_vec(),
+            visible_before,
+            "expanding the thought leaves the reader's pane as it was"
+        );
+    }
+
+    /// Collapsing a thought the reader was inside has to keep its preview on
+    /// screen. Its group ends on a blank separator, so anchoring there with
+    /// later replies filling the pane drops the preview above the viewport.
+    #[test]
+    fn collapsing_a_thought_keeps_its_preview_visible() {
+        let thought = |text: &str, id: &str| Event::AgentThoughtChunk {
+            text: text.into(),
+            message_id: Some(id.into()),
+        };
+        let mut state = test_state();
+        let body = (0..10)
+            .map(|line| format!("thought line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut events = vec![thought(&body, "t-a")];
+        for index in 0..20 {
+            events.push(Event::AgentMessageChunk {
+                text: format!("reply number {index}"),
+                message_id: Some(format!("m-{index}")),
+            });
+        }
+        state.transcript.set_rows(server_rows(&events));
+        state.show_full_thinking = true;
+
+        let row_at = |state: &StructuredViewState, offset: u16| {
+            state.scroll_offset.set(offset);
+            let geometry = render_geometry(state, 60, 20);
+            let rows = render_rows(state, 60, 20, true);
+            rows[geometry.text_area.y as usize].trim().to_string()
+        };
+        let offset = (1..20u16)
+            .find(|offset| row_at(&state, *offset).starts_with("thought line"))
+            .expect("fixture puts the pane inside the expanded thought");
+        state.scroll_offset.set(offset);
+        state.anchor_scroll_to_top_line();
+
+        state.show_full_thinking = false;
+        let geometry = render_geometry(&state, 60, 20);
+        let rows = render_rows(&state, 60, 20, true);
+        assert!(
+            rows[geometry.text_area.y as usize..]
+                .iter()
+                .any(|row| row.contains("Thinking")),
+            "the collapsed preview stays visible: {rows:?}"
         );
     }
 
@@ -3045,7 +4364,7 @@ mod tests {
             options: Vec::new(),
             choice: false,
         });
-        t.server_rows = server_rows(&[
+        t.set_rows(server_rows(&[
             Event::AgentMessageChunk {
                 text: "working on it".into(),
                 message_id: None,
@@ -3063,13 +4382,10 @@ mod tests {
                 compaction_id: "c-2".into(),
                 text: String::new(),
             },
-        ]);
-        let out = joined(&transcript_lines(
-            &t,
-            &Theme::default(),
-            None,
-            ToolOutputMode::Compact,
-        ));
+        ]));
+        let out = joined(
+            &transcript_lines(&t, &Theme::default(), None, false, ToolOutputMode::Compact).lines,
+        );
         assert_eq!(out.matches("Compaction summary").count(), 1, "{out:?}");
         for want in [
             "working on it",
@@ -3115,7 +4431,7 @@ mod tests {
                 kind: "other".into(),
                 args_preview: String::new(),
                 prompt: None,
-                started_at: chrono::Utc::now(),
+                started_at: crate::time::Timestamp::now(),
                 parent_tool_call_id: parent.map(Into::into),
                 memory_recall: None,
                 diffs: Vec::new(),
@@ -3124,7 +4440,8 @@ mod tests {
     }
 
     fn tool_lines(t: &AcpTranscript) -> Vec<String> {
-        transcript_lines(t, &Theme::default(), None, ToolOutputMode::Compact)
+        transcript_lines(t, &Theme::default(), None, false, ToolOutputMode::Compact)
+            .lines
             .iter()
             .map(line_text)
             .filter(|line| !line.is_empty())
@@ -3136,13 +4453,13 @@ mod tests {
     #[test]
     fn child_tool_calls_nest_under_their_parent_with_orphan_fallback() {
         let mut t = AcpTranscript::new("s-1");
-        t.server_rows = server_rows(&[
+        t.set_rows(server_rows(&[
             tool_event("p1", "Agent", None),
             tool_event("c1", "Read", Some("p1")),
             tool_event("c2", "Grep", Some("p1")),
             tool_event("o1", "Orphan", Some("gone")),
             tool_event("n1", "Plain", None),
-        ]);
+        ]));
         assert_eq!(
             tool_lines(&t),
             [
@@ -3189,11 +4506,11 @@ mod tests {
         ];
         for (state, stop_reason, head) in cases {
             let mut t = AcpTranscript::new("s-1");
-            t.server_rows = server_rows(&[
+            t.set_rows(server_rows(&[
                 tool_event("msg-1", "Explore repo", None),
                 tool_event("c1", "Read", Some("msg-1")),
-            ]);
-            t.subagents = vec![SubagentRecord {
+            ]));
+            t.set_subagents(vec![SubagentRecord {
                 session_id: "child".into(),
                 parent_session_id: "s-1".into(),
                 parent_tool_call_id: Some("msg-1".into()),
@@ -3205,7 +4522,7 @@ mod tests {
                 cancel_capable: true,
                 model: None,
                 background: false,
-            }];
+            }]);
             let mut want: Vec<String> = head.into_iter().map(Into::into).collect();
             want.push("  tool ▶ · Read".into());
             assert_eq!(tool_lines(&t), want);
@@ -3232,8 +4549,8 @@ mod tests {
             events.push(Event::Stopped {
                 reason: "end_turn".into(),
             });
-            t.server_rows = server_rows(&events);
-            t.subagents = vec![SubagentRecord {
+            t.set_rows(server_rows(&events));
+            t.set_subagents(vec![SubagentRecord {
                 session_id: "child".into(),
                 parent_session_id: "s-1".into(),
                 parent_tool_call_id: Some("msg-1".into()),
@@ -3245,7 +4562,7 @@ mod tests {
                 cancel_capable: true,
                 model: None,
                 background: false,
-            }];
+            }]);
             let lines = tool_lines(&t);
             assert_eq!(lines[0], head);
             assert!(
@@ -3267,7 +4584,7 @@ mod tests {
             path: path.into(),
             old_text: old.map(Into::into),
             new_text: Some(new.into()),
-            created_at: chrono::Utc::now(),
+            created_at: crate::time::Timestamp::now(),
         };
         row.diffs = vec![
             diff("src/one.rs", Some("let a = 1;"), "let a = 2;"),
@@ -3574,7 +4891,7 @@ mod tests {
             main_repo_path: None,
             workspace_repos: Vec::new(),
         });
-        state.transcript.server_rows = server_rows(&[
+        state.transcript.set_rows(server_rows(&[
             Event::UserPromptSent {
                 merged_prompt_ids: Vec::new(),
                 prompt_id: None,
@@ -3582,12 +4899,13 @@ mod tests {
                 attachments: Vec::new(),
                 synthesized: false,
                 origin_plugin: None,
+                origin: crate::daemon::PromptOrigin::Unknown,
             },
             Event::AgentMessageChunk {
                 text: "What should we build?".into(),
                 message_id: None,
             },
-        ]);
+        ]));
 
         let rows = render_rows(&state, 80, 20, true);
         let card_right = rows[0].chars().position(|ch| ch == '╮').expect("card edge");
@@ -3614,14 +4932,17 @@ mod tests {
         );
 
         // A plugin-sent message names its sender; a typed one does not.
-        state.transcript.server_rows = server_rows(&[Event::UserPromptSent {
-            merged_prompt_ids: Vec::new(),
-            prompt_id: None,
-            text: "PR merged".into(),
-            attachments: Vec::new(),
-            synthesized: false,
-            origin_plugin: Some("cron".into()),
-        }]);
+        state
+            .transcript
+            .set_rows(server_rows(&[Event::UserPromptSent {
+                merged_prompt_ids: Vec::new(),
+                prompt_id: None,
+                text: "PR merged".into(),
+                attachments: Vec::new(),
+                synthesized: false,
+                origin_plugin: Some("cron".into()),
+                origin: crate::daemon::PromptOrigin::Unknown,
+            }]));
         let rows = render_rows(&state, 80, 20, true);
         assert!(
             rows.iter()

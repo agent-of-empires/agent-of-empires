@@ -69,6 +69,18 @@ describe("ProfileSelector create", () => {
     await waitFor(() => expect(createProfile).toHaveBeenCalledWith("work-2"));
   });
 
+  it.each([
+    ["keyCode 229", { key: "Enter", keyCode: 229 }],
+    ["isComposing", { key: "Enter", isComposing: true }],
+  ] as const)("ignores Enter while an IME composes (%s)", async (_n, init) => {
+    const { input, submit } = await openPanel("+ New");
+    fireEvent.change(input, { target: { value: "work-2" } });
+    fireEvent.keyDown(input, init);
+    expect(createProfile).not.toHaveBeenCalled();
+    submit();
+    await waitFor(() => expect(createProfile).toHaveBeenCalledWith("work-2"));
+  });
+
   it("surfaces a create failure", async () => {
     vi.mocked(createProfile).mockResolvedValueOnce(false);
     const { container, submit } = await openPanel("+ New");

@@ -1,12 +1,12 @@
-//! A hyperlink in the preview keeps its OSC 8 target. Neither the vt100 grid nor a ratatui
-//! cell can carry one, so targets ride alongside the text and are re-anchored to the row
-//! that shows them; a plain click on that row opens the target (#3735).
+//! A hyperlink in the preview keeps its OSC 8 target. A ratatui cell cannot carry one, so
+//! each row's runs ride alongside the text at the place the frame put them; a plain click
+//! there opens the target (#3735).
 
 use super::*;
-use crate::tmux::osc8::PaneLink;
 use crate::tui::home::PreviewTextView;
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Text};
+
+const AOE: &str = "https://example.com/aoe";
 
 const PANE: Rect = Rect {
     x: 2,
@@ -15,20 +15,30 @@ const PANE: Rect = Rect {
     height: 4,
 };
 
-fn link(text: &str, uri: &str) -> PaneLink {
-    PaneLink {
-        text: text.to_string(),
-        uri: uri.to_string(),
-    }
+/// `text` as an OSC 8 run pointing at `uri`.
+fn osc8(text: &str, uri: &str) -> String {
+    format!("\x1b]8;;{uri}\x1b\\{text}\x1b]8;;\x1b\\")
 }
 
-/// Stage the preview text view and cache the render path would have set, so
-/// the click handler maps a screen cell onto a content line the same way.
-fn stage(env: &mut TestEnv, lines: &[&str], links: Vec<PaneLink>) {
-    let text: Text<'static> = lines.iter().map(|l| Line::from(l.to_string())).collect();
-    let total_lines = text.lines.len();
-    env.view.preview_cache.parsed_text = Some(text);
-    env.view.preview_cache.links = links;
+/// Store `rows` as a capture and stage the preview text view the render path would have
+/// set, so the click handler maps a screen cell onto a content line the same way.
+fn stage(env: &mut TestEnv, rows: &[String]) {
+    let content: String = rows.iter().map(|r| format!("{r}\n")).collect();
+    env.view.preview_cache.store_capture(
+        content,
+        "s1".to_string(),
+        "aoe_s1".to_string(),
+        1,
+        (PANE.width, PANE.height),
+        None,
+    );
+    env.view.preview_cache.ensure_parsed();
+    let total_lines = env
+        .view
+        .preview_cache
+        .parsed_text
+        .as_ref()
+        .map_or(0, |t| t.lines.len());
     env.view.preview_area = PANE;
     env.view.preview_text_view = PreviewTextView {
         pane: PANE,
@@ -43,17 +53,14 @@ fn trash_reader_never_opens_links_from_previous_pane() {
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
     env.view.select_session_by_id(&id);
-    stage(
-        &mut env,
-        &["old link"],
-        vec![link("old link", "https://example.com/old")],
-    );
+    stage(&mut env, &[osc8("old link", "https://example.com/old")]);
     assert_eq!(
         env.view.preview_link_at(PANE.x, PANE.y),
         Some("https://example.com/old".into())
     );
-    env.view
-        .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+    env.view.mutate_instance(&id, |inst| {
+        inst.trashed_at = Some(crate::time::Timestamp::now())
+    });
     assert_eq!(env.view.preview_link_at(PANE.x, PANE.y), None);
 }
 
@@ -63,15 +70,14 @@ fn click_on_a_link_whose_text_hides_the_target_resolves_it() {
     let mut env = create_test_env_empty();
     stage(
         &mut env,
-        &["see the AoE repo now"],
-        vec![link("the AoE repo", "https://example.com/aoe")],
+        &[format!("see {} now", osc8("the AoE repo", AOE))],
     );
 
     // Columns 4..16 of the row carry the link; `see ` and ` now` do not.
     for col in 4..16 {
         assert_eq!(
             env.view.preview_link_at(PANE.x + col, PANE.y),
-            Some("https://example.com/aoe".to_string()),
+            Some(AOE.to_string()),
             "column {col} is inside the link"
         );
     }
@@ -86,36 +92,44 @@ fn click_on_a_link_whose_text_hides_the_target_resolves_it() {
 
 #[test]
 #[serial]
-fn a_link_resolves_on_whichever_row_shows_it() {
+fn a_link_resolves_only_on_the_row_and_columns_it_was_printed_at() {
+    // Two wrapped labels whose continuations read alike, and a one-character tail: each
+    // row resolves its own run, and the same text elsewhere stays plain.
     let mut env = create_test_env_empty();
+    const A: &str = "https://example.com/a";
+    const B: &str = "https://example.com/b";
     stage(
         &mut env,
-        &["first", "the AoE repo", "third"],
-        vec![link("the AoE repo", "https://example.com/aoe")],
+        &[
+            format!("see {}", osc8("the do", A)),
+            format!("{} and {}", osc8("cs", A), osc8("the do", B)),
+            format!("{} then the docs", osc8("cs", B)),
+            osc8("x", A),
+        ],
     );
-
+    let at =
+        |env: &TestEnv, col: u16, row: u16| env.view.preview_link_at(PANE.x + col, PANE.y + row);
+    assert_eq!(at(&env, 4, 0).as_deref(), Some(A));
+    assert_eq!(at(&env, 0, 1).as_deref(), Some(A));
+    assert_eq!(at(&env, 7, 1).as_deref(), Some(B));
+    assert_eq!(at(&env, 1, 2).as_deref(), Some(B));
+    assert_eq!(at(&env, 0, 3).as_deref(), Some(A), "a one-character tail");
     assert_eq!(
-        env.view.preview_link_at(PANE.x, PANE.y + 1),
-        Some("https://example.com/aoe".to_string())
+        at(&env, 12, 2),
+        None,
+        "the same text outside a run is plain"
     );
-    // Rows whose text no longer holds the link are inert, even though the
-    // pane still remembers the target.
-    assert_eq!(env.view.preview_link_at(PANE.x, PANE.y), None);
-    assert_eq!(env.view.preview_link_at(PANE.x, PANE.y + 2), None);
+    assert_eq!(at(&env, 3, 1), None, "between the runs");
 }
 
 #[test]
 #[serial]
 fn clicks_off_the_text_or_with_no_links_resolve_nothing() {
     let mut env = create_test_env_empty();
-    stage(&mut env, &["the AoE repo"], vec![]);
+    stage(&mut env, &["the AoE repo".to_string()]);
     assert_eq!(env.view.preview_link_at(PANE.x, PANE.y), None);
 
-    stage(
-        &mut env,
-        &["the AoE repo"],
-        vec![link("the AoE repo", "https://example.com/aoe")],
-    );
+    stage(&mut env, &[osc8("the AoE repo", AOE)]);
     // Outside the pane rect, and on a row past the painted content.
     assert_eq!(env.view.preview_link_at(PANE.x - 1, PANE.y), None);
     assert_eq!(env.view.preview_link_at(PANE.x, PANE.y + 1), None);
@@ -129,8 +143,7 @@ fn link_columns_are_underlined_so_the_text_reads_as_a_link() {
     let mut env = create_test_env_empty();
     stage(
         &mut env,
-        &["see the AoE repo now"],
-        vec![link("the AoE repo", "https://example.com/aoe")],
+        &[format!("see {} now", osc8("the AoE repo", AOE))],
     );
     let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 60, 10));
     env.view.paint_preview_links(&mut buf);
@@ -194,8 +207,7 @@ fn hovering_a_link_reveals_its_target_before_the_click() {
     let mut env = create_test_env_empty();
     stage(
         &mut env,
-        &["see the AoE repo now"],
-        vec![link("the AoE repo", "https://example.com/aoe")],
+        &[format!("see {} now", osc8("the AoE repo", AOE))],
     );
 
     assert_eq!(env.view.hovered_link(), None);
@@ -216,11 +228,9 @@ fn hovering_a_link_reveals_its_target_before_the_click() {
 
 #[test]
 #[serial]
-fn a_generation_change_re_collects_targets_for_an_unchanged_grid() {
-    // vt100 strips both sequences, so a pane that reprints the same label against a new
-    // target leaves the grid byte-identical: keying on the rendered text would keep serving
-    // the old target. Driven through `ensure_parsed` and `collect_links` so the branch under
-    // test is the production one.
+fn a_repointed_label_re_collects_targets_for_unchanged_cells() {
+    // The frame text carries each target, so a label repointed with no visible change still
+    // changes the frame and re-collects its targets.
     let mut env = create_test_env_empty();
     let advertised = "see \x1b]8;;https://example.com/a\x1b\\the docs\x1b]8;;\x1b\\ now\n";
     env.view.preview_cache.store_capture(
@@ -246,12 +256,21 @@ fn a_generation_change_re_collects_targets_for_an_unchanged_grid() {
         Some("https://example.com/a")
     );
 
-    // The pane repoints the label. The visible cells do not move, so `parsed_text` stays
-    // valid and only the advertised target changed, which the generation reports.
-    env.view.preview_cache.content =
-        "see \x1b]8;;https://example.com/b\x1b\\the docs\x1b]8;;\x1b\\ now\n".to_string();
-    env.view.preview_cache.links_generation = 99;
-    env.view.preview_cache.ensure_parsed();
+    let restore = |env: &mut TestEnv, content: &str| {
+        env.view.preview_cache.store_capture(
+            content.to_string(),
+            "s1".to_string(),
+            "aoe_s1".to_string(),
+            1,
+            (40, 4),
+            None,
+        );
+        env.view.preview_cache.ensure_parsed();
+    };
+    restore(
+        &mut env,
+        "see \x1b]8;;https://example.com/b\x1b\\the docs\x1b]8;;\x1b\\ now\n",
+    );
     assert_eq!(
         env.view.preview_cache.parsed_text.as_ref().unwrap().lines[0].to_string(),
         "see the docs now",
@@ -265,9 +284,7 @@ fn a_generation_change_re_collects_targets_for_an_unchanged_grid() {
 
     // The pane reprints the label as plain text. Nothing is advertised any
     // more, so the label must stop being actionable.
-    env.view.preview_cache.content = "see the docs now\n".to_string();
-    env.view.preview_cache.links_generation = 100;
-    env.view.preview_cache.ensure_parsed();
+    restore(&mut env, "see the docs now\n");
     assert_eq!(
         env.view.preview_link_at(PANE.x + 4, PANE.y),
         None,
@@ -293,7 +310,12 @@ fn capture_frames_carry_their_own_targets_through_the_parse() {
 
     assert_eq!(
         env.view.preview_cache.links,
-        vec![link("the AoE repo", "https://example.com/aoe")]
+        vec![crate::tmux::osc8::RowLink {
+            row: 0,
+            start: 4,
+            text: "the AoE repo".to_string(),
+            uri: AOE.to_string(),
+        }]
     );
     let text = env.view.preview_cache.parsed_text.as_ref().unwrap();
     assert_eq!(text.lines[0].to_string(), "see the AoE repo now");
