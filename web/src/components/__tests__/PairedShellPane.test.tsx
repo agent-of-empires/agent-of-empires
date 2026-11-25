@@ -43,7 +43,7 @@ vi.mock("../../hooks/useMobileKeyboard", () => ({
   }),
 }));
 
-import { PairedShellPane } from "../PairedTerminal";
+import { PairedShellPane, ShellModeToggle } from "../PairedTerminal";
 import { usePairedShellModes } from "../../hooks/usePairedShellModes";
 
 const makeSession = () =>
@@ -55,14 +55,14 @@ afterEach(() => {
 });
 
 describe("PairedShellPane", () => {
-  it("shows the pending placeholder with Host preselected, or a prompt with no session", () => {
+  it("shows the pending placeholder without a mode strip, or a prompt with no session", () => {
     // Never-resolving promise pins ensureState at "pending".
     ensureTerminal.mockReturnValue(new Promise(() => {}));
-    render(<PairedShellPane readOnly={false} session={makeSession()} sessionId="sess-rp-1" />);
+    render(<PairedShellPane readOnly={false} session={makeSession()} />);
     expect(screen.getByText(/Starting session/i)).toBeDefined();
-    expect(screen.getAllByRole("button", { name: /^Host$/ }).length).toBeGreaterThan(0);
+    expect(screen.queryByRole("button", { name: /^Host$/ })).toBeNull();
     cleanup();
-    render(<PairedShellPane readOnly={false} session={null} sessionId={null} />);
+    render(<PairedShellPane readOnly={false} session={null} />);
     expect(screen.getByText(/Select a session/i)).toBeDefined();
   });
 
@@ -74,27 +74,27 @@ describe("PairedShellPane", () => {
     "opens the shell its owner picked: Container, sandboxed %s, opens a container shell: %s",
     (sandboxed, container) => {
       ensureTerminal.mockReturnValue(new Promise(() => {}));
-      const onModeChange = vi.fn();
       render(
         <PairedShellPane
           readOnly={false}
           session={{ ...makeSession(), is_sandboxed: sandboxed }}
-          sessionId="sess-rp-1"
+          terminalIndex={2}
           mode="container"
-          onModeChange={onModeChange}
         />,
       );
-      expect(ensureTerminal).toHaveBeenLastCalledWith("sess-rp-1", 0, container, expect.any(AbortSignal));
-      expect(screen.getByRole("button", { name: /^Host$/ }).getAttribute("aria-pressed")).toBe(String(!container));
-      fireEvent.click(screen.getByRole("button", { name: /^Host$/ }));
-      expect(onModeChange).toHaveBeenCalledWith("host");
+      expect(ensureTerminal).toHaveBeenLastCalledWith("sess-rp-1", 2, container, expect.any(AbortSignal));
     },
   );
+});
 
-  it("takes the mode and its setter together or not at all", () => {
-    // @ts-expect-error A mode the pane can't change would leave its buttons inert.
-    const halfControlled = <PairedShellPane readOnly session={null} sessionId={null} mode="host" />;
-    expect(halfControlled).toBeTruthy();
+describe("ShellModeToggle", () => {
+  it("marks the shown mode and reports a pick", () => {
+    const onModeChange = vi.fn();
+    render(<ShellModeToggle mode="container" onModeChange={onModeChange} label="rp-test terminal 1" />);
+    expect(screen.getByRole("group", { name: "rp-test terminal 1 shell" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Container" }).getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(screen.getByRole("button", { name: "Host" }));
+    expect(onModeChange).toHaveBeenCalledWith("host");
   });
 });
 

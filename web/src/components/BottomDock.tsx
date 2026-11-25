@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import { DockGroups, type DockGroupView } from "./DockGroups";
-import type { PaneDisplay } from "./Dock";
+import type { DockControls, PaneDisplay } from "./Dock";
 import type { DockLocation } from "../lib/panes";
 
 const HEIGHT_KEY = "aoe-bottom-dock-height";
@@ -20,18 +20,17 @@ function loadHeight(): number {
   return DEFAULT_HEIGHT;
 }
 
-interface Props {
+interface Props extends DockControls {
   groups: DockGroupView[];
   descriptorFor: (id: string) => PaneDisplay;
   renderBody: (id: string) => ReactNode;
   onActivate: (id: string) => void;
   onClose: (id: string) => void;
   onMove: (id: string, dock: DockLocation) => void;
-  onNewTerminal?: () => void;
 }
 
 /** Full-width bottom dock: a height-resizable strip below the main+right-dock row. */
-export function BottomDock({ groups, descriptorFor, renderBody, onActivate, onClose, onMove, onNewTerminal }: Props) {
+export function BottomDock({ groups, descriptorFor, renderBody, onActivate, onClose, onMove, ...controls }: Props) {
   const [height, setHeight] = useState(loadHeight);
   const ref = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
@@ -90,7 +89,7 @@ export function BottomDock({ groups, descriptorFor, renderBody, onActivate, onCl
         onActivate={onActivate}
         onClose={onClose}
         onMove={onMove}
-        onNewTerminal={onNewTerminal}
+        {...controls}
       />
     </div>
   );

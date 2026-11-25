@@ -1,7 +1,7 @@
 import { Fragment, type ReactNode } from "react";
 
 import type { DockLocation } from "../lib/panes";
-import { Dock, type PaneDisplay } from "./Dock";
+import { Dock, type DockControls, type PaneDisplay } from "./Dock";
 
 /** One rendered group: its persisted index, its visible tabs, and the active one. */
 export interface DockGroupView {
@@ -10,7 +10,7 @@ export interface DockGroupView {
   active: string | null;
 }
 
-interface Props {
+interface Props extends DockControls {
   location: DockLocation;
   groups: DockGroupView[];
   descriptorFor: (id: string) => PaneDisplay;
@@ -18,7 +18,6 @@ interface Props {
   onActivate: (id: string) => void;
   onClose: (id: string) => void;
   onMove: (id: string, dock: DockLocation) => void;
-  onNewTerminal?: () => void;
 }
 
 /** Lays a dock's groups out along its split axis: the tall right column stacks groups top to bottom (flex column),
@@ -31,7 +30,7 @@ export function DockGroups({
   onActivate,
   onClose,
   onMove,
-  onNewTerminal,
+  ...controls
 }: Props) {
   if (groups.length === 0) return null;
   const axis = location === "right" ? "flex-col" : "flex-row";
@@ -53,7 +52,7 @@ export function DockGroups({
               onActivate={onActivate}
               onClose={onClose}
               onMove={onMove}
-              onNewTerminal={onNewTerminal}
+              {...controls}
             />
           </div>
         </Fragment>

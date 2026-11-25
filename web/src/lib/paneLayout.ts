@@ -3,14 +3,22 @@ import { useCallback, useMemo, useSyncExternalStore } from "react";
 import { confirmFileEditPanes } from "./fileEditGuard";
 import { useLatestRef } from "../hooks/useLatestRef";
 import { safeGetItem, safeRemoveItem, safeSetItem } from "./safeStorage";
-import { BUILTIN_PANES, isTerminalTabId, terminalTabId, type DockLocation } from "./panes";
+import {
+  BUILTIN_PANES,
+  bindUnboundTerminalTabId,
+  isTerminalTabId,
+  parseTerminalTabId,
+  terminalTabId,
+  type DockLocation,
+} from "./panes";
 
-const LAYOUT_KEY = "aoe-pane-layout-v3";
+const LAYOUT_KEY = "aoe-pane-layout-v4";
+const V3_KEY = "aoe-pane-layout-v3";
 const V2_KEY = "aoe-pane-layout-v2";
-// Earlier layout stores, deleted once v3 is written to free quota.
-const REPLACED_KEYS = [V2_KEY, "aoe-pane-layout", "aoe-right-collapsed"];
+// Earlier layout stores, deleted once v4 is written to free quota.
+const REPLACED_KEYS = [V3_KEY, V2_KEY, "aoe-pane-layout", "aoe-right-collapsed"];
 
-/** `"diff"`, `"terminal:<n>"`, or `"plugin:<plugin>:<entry>"`. */
+/** `"diff"`, `"terminal:<sessionId>:<n>"`, or `"plugin:<plugin>:<entry>"`. */
 export type TabId = string;
 
 export interface PaneGroup {
@@ -18,11 +26,11 @@ export interface PaneGroup {
   active: TabId | null;
 }
 
-/** One session's tab layout. Only one group per dock renders today; the array leaves room for split groups without a storage migration. */
+/** One session's tab layout. Its terminal tabs follow {@link LayoutStore.terminals}. Only one group per dock renders today; the array leaves room for split groups without a storage migration. */
 export interface DockLayout {
   right: PaneGroup[];
   bottom: PaneGroup[];
-  // Never reused, so a new tab can't alias a just-closed terminal's tmux session.
+  // This Session's next shell index, never reused, so a new tab can't alias a just-closed terminal's tmux session.
   nextTerminalIndex: number;
   // Plugin tabs the user closed, so auto-add does not reopen them.
   closedPlugins: TabId[];
@@ -30,10 +38,18 @@ export interface DockLayout {
   collapsed: Record<DockLocation, boolean>;
 }
 
+export interface TerminalPlacement {
+  id: TabId;
+  dock: DockLocation;
+}
+
 /** Only Sessions whose layout the user changed; the rest follow {@link seedLayout}. */
 interface LayoutStore {
-  version: 3;
+  version: 4;
   sessions: Record<string, DockLayout>;
+  /** Terminal tabs every Session shows, as the last changed layout placed them; null until a change after an
+   *  upgrade, so each Session keeps the terminals it had. */
+  terminals: TerminalPlacement[] | null;
 }
 
 const DOCKS: DockLocation[] = ["right", "bottom"];
@@ -223,21 +239,49 @@ export function moveTab(layout: DockLayout, tabId: TabId, toDock: DockLocation):
   return placeTab(layout, tabId, { dock: toDock, group: last, index: groups[last]!.tabs.length });
 }
 
-export function addTerminal(layout: DockLayout, dock: DockLocation): { layout: DockLayout; tabId: TabId } {
-  const tabId = terminalTabId(layout.nextTerminalIndex);
+/** Opens a new shell of `sessionId`, the layout's own Session, above `minIndex` (shells already live). */
+export function addTerminal(
+  layout: DockLayout,
+  dock: DockLocation,
+  sessionId: string,
+  minIndex = 1,
+): { layout: DockLayout; tabId: TabId } {
+  const index = Math.max(layout.nextTerminalIndex, minIndex);
+  const tabId = terminalTabId(sessionId, index);
   const next = addTab(layout, dock, tabId);
-  next.nextTerminalIndex = layout.nextTerminalIndex + 1;
+  if (next === layout) return { layout, tabId };
+  next.nextTerminalIndex = index + 1;
   return { layout: next, tabId };
 }
 
-export function removeAllTerminals(layout: DockLayout): DockLayout {
+export function terminalPlacements(layout: DockLayout): TerminalPlacement[] {
+  return DOCKS.flatMap((dock) =>
+    dockTabs(layout, dock)
+      .filter(isTerminalTabId)
+      .map((id) => ({ id, dock })),
+  );
+}
+
+/** `layout` showing the open terminal tabs: others close, missing ones join their dock without taking focus. */
+export function withTerminals(layout: DockLayout, terminals: readonly TerminalPlacement[]): DockLayout {
+  const open = new Set(terminals.map((t) => t.id));
   let next = layout;
-  for (const dock of DOCKS) {
-    for (const id of [...dockTabs(layout, dock)]) {
-      if (isTerminalTabId(id)) next = removeTab(next, id);
-    }
+  for (const { id } of terminalPlacements(layout)) {
+    if (!open.has(id)) next = removeTab(next, id);
+  }
+  for (const t of terminals) {
+    if (!dockOf(next, t.id)) next = addTab(next, t.dock, t.id, false);
   }
   return next;
+}
+
+/** The terminal tabs bound to `sessionId`'s shells. */
+export function sessionTerminals(layout: DockLayout, sessionId: string): TerminalPlacement[] {
+  return terminalPlacements(layout).filter((t) => parseTerminalTabId(t.id)?.sessionId === sessionId);
+}
+
+export function removeSessionTerminals(layout: DockLayout, sessionId: string): DockLayout {
+  return sessionTerminals(layout, sessionId).reduce((l, t) => removeTab(l, t.id), layout);
 }
 
 /** Add available plugin panes that are neither open nor closed, leaving open ones in place. */
@@ -260,25 +304,45 @@ export interface SeedPrefs {
   terminal: boolean;
 }
 
-/** What a Session shows until the user changes its layout. */
-export function seedLayout(prefs: SeedPrefs): DockLayout {
+/** What `sessionId` shows until the user changes its layout. */
+export function seedLayout(prefs: SeedPrefs, sessionId: string): DockLayout {
   let l = emptyDockLayout();
   for (const p of BUILTIN_PANES) {
     if (p.id === "diff" && prefs.diff) l = addTab(l, p.defaultDock, "diff", false);
-    if (p.id === "terminal" && prefs.terminal) l = addTab(l, p.defaultDock, terminalTabId(0), false);
+    if (p.id === "terminal" && prefs.terminal) l = addTab(l, p.defaultDock, terminalTabId(sessionId, 0), false);
   }
   return l;
 }
 
-function normalizeGroups(v: unknown): PaneGroup[] {
+/** The layout `sessionId` shows: its saved one or seed, with the terminal tabs open across Sessions. The seeded
+ *  terminal shows only while no other terminal is open, so the default never stacks onto a kept tab. */
+export function deriveLayout(
+  sessionId: string,
+  saved: DockLayout | undefined,
+  terminals: readonly TerminalPlacement[] | null,
+  prefs: SeedPrefs,
+): DockLayout {
+  if (saved) return terminals ? withTerminals(saved, terminals) : saved;
+  if (!terminals) return seedLayout(prefs, sessionId);
+  const seeded = withTerminals(seedLayout({ ...prefs, terminal: false }, sessionId), terminals);
+  if (!prefs.terminal || terminals.length > 0) return seeded;
+  return addTab(seeded, "right", terminalTabId(sessionId, 0), false);
+}
+
+function normalizeGroups(v: unknown, sessionId: string): PaneGroup[] {
   if (!Array.isArray(v)) return [];
   const groups: PaneGroup[] = [];
   for (const g of v) {
     if (!g || typeof g !== "object") continue;
     const o = g as Record<string, unknown>;
-    const tabs = Array.isArray(o.tabs) ? o.tabs.filter((t): t is string => typeof t === "string") : [];
+    const tabs = Array.isArray(o.tabs)
+      ? o.tabs.filter((t): t is string => typeof t === "string").map((t) => bindUnboundTerminalTabId(t, sessionId))
+      : [];
     if (tabs.length === 0) continue;
-    const active = typeof o.active === "string" && tabs.includes(o.active) ? o.active : tabs[0]!;
+    const active =
+      typeof o.active === "string" && tabs.includes(bindUnboundTerminalTabId(o.active, sessionId))
+        ? bindUnboundTerminalTabId(o.active, sessionId)
+        : tabs[0]!;
     groups.push({ tabs, active });
   }
   return groups;
@@ -299,13 +363,14 @@ function dropDuplicates(group: PaneGroup[], seen: Set<TabId>): PaneGroup[] {
     .filter((g) => g.tabs.length > 0);
 }
 
-function normalizeDock(v: unknown): DockLayout {
+/** Binds a pre-v4 layout's `terminal:<n>` tabs to `sessionId`, whose shells they showed. */
+function normalizeDock(v: unknown, sessionId: string): DockLayout {
   const o = (v && typeof v === "object" ? v : {}) as Record<string, unknown>;
   const seen = new Set<TabId>();
   const collapsed = (o.collapsed && typeof o.collapsed === "object" ? o.collapsed : {}) as Record<string, unknown>;
   return {
-    right: dropDuplicates(normalizeGroups(o.right), seen),
-    bottom: dropDuplicates(normalizeGroups(o.bottom), seen),
+    right: dropDuplicates(normalizeGroups(o.right, sessionId), seen),
+    bottom: dropDuplicates(normalizeGroups(o.bottom, sessionId), seen),
     nextTerminalIndex:
       typeof o.nextTerminalIndex === "number" && o.nextTerminalIndex >= 1 ? Math.floor(o.nextTerminalIndex) : 1,
     closedPlugins: Array.isArray(o.closedPlugins)
@@ -318,36 +383,61 @@ function normalizeDock(v: unknown): DockLayout {
   };
 }
 
-function parseSessions(raw: string | null, version: 2 | 3): Record<string, DockLayout> {
+function parseJson(raw: string | null, version: 2 | 3 | 4): Record<string, unknown> | null {
   try {
     const parsed = JSON.parse(raw ?? "null") as Record<string, unknown> | null;
-    if (parsed?.version !== version) return {};
-    const sessions: Record<string, DockLayout> = {};
-    for (const [id, layout] of Object.entries((parsed.sessions ?? {}) as Record<string, unknown>)) {
-      sessions[id] = normalizeDock(layout);
-    }
-    return sessions;
+    return parsed?.version === version ? parsed : null;
   } catch {
-    return {};
+    return null;
   }
 }
 
-/** v3 if written, else the v2 layouts whose added terminals may still be live shells: keeping their tab ids and
- *  next index stops a new tab from reusing one. Other v2 layouts were seeds or simple toggles and are dropped. */
+function parseSessions(parsed: Record<string, unknown> | null): Record<string, DockLayout> {
+  const sessions: Record<string, DockLayout> = {};
+  for (const [id, layout] of Object.entries((parsed?.sessions ?? {}) as Record<string, unknown>)) {
+    sessions[id] = normalizeDock(layout, id);
+  }
+  return sessions;
+}
+
+function parseTerminals(v: unknown): TerminalPlacement[] | null {
+  if (!Array.isArray(v)) return null;
+  const seen = new Set<TabId>();
+  return v.flatMap((t) => {
+    const o = (t && typeof t === "object" ? t : {}) as Record<string, unknown>;
+    if (typeof o.id !== "string" || !isTerminalTabId(o.id) || seen.has(o.id)) return [];
+    if (o.dock !== "right" && o.dock !== "bottom") return [];
+    seen.add(o.id);
+    return [{ id: o.id, dock: o.dock }];
+  });
+}
+
+/** v4 if written, else v3, else the v2 layouts whose added terminals may still be live shells: keeping their tab
+ *  ids and next index stops a new tab from reusing one. Other v2 layouts were seeds or simple toggles and are
+ *  dropped. */
 function loadStore(): LayoutStore {
   const raw = safeGetItem(LAYOUT_KEY);
-  if (raw !== null) return { version: 3, sessions: parseSessions(raw, 3) };
-  const v2 = Object.entries(parseSessions(safeGetItem(V2_KEY), 2)).filter(([, l]) => l.nextTerminalIndex > 1);
-  return { version: 3, sessions: Object.fromEntries(v2) };
+  if (raw !== null) {
+    const parsed = parseJson(raw, 4);
+    return { version: 4, sessions: parseSessions(parsed), terminals: parseTerminals(parsed?.terminals) };
+  }
+  const v3 = safeGetItem(V3_KEY);
+  if (v3 !== null) return { version: 4, sessions: parseSessions(parseJson(v3, 3)), terminals: null };
+  const v2 = Object.entries(parseSessions(parseJson(safeGetItem(V2_KEY), 2))).filter(
+    ([, l]) => l.nextTerminalIndex > 1,
+  );
+  return { version: 4, sessions: Object.fromEntries(v2), terminals: null };
 }
 
 const listeners = new Set<() => void>();
 let cachedSource: string | undefined;
-let cachedStore: LayoutStore = { version: 3, sessions: {} };
+let cachedStore: LayoutStore = { version: 4, sessions: {}, terminals: null };
 
 function storedSource(): string {
   const raw = safeGetItem(LAYOUT_KEY);
-  return raw !== null ? `3:${raw}` : `2:${safeGetItem(V2_KEY) ?? ""}`;
+  if (raw !== null) return `4:${raw}`;
+  const v3 = safeGetItem(V3_KEY);
+  return v3 !== null ? `3:${v3}` : `2:${safeGetItem(V2_KEY) ?? ""}`;
 }
 
 function readStore(): LayoutStore {
@@ -375,13 +465,33 @@ function subscribe(listener: () => void): () => void {
   return () => void listeners.delete(listener);
 }
 
-/** Drops saved layouts of Sessions not in `live`, writes v3 if it was read from v2, then deletes the old stores. */
+function ownerLive(live: ReadonlySet<string>) {
+  return (id: TabId) => {
+    const ref = parseTerminalTabId(id);
+    return !ref || live.has(ref.sessionId);
+  };
+}
+
+/** Drops saved layouts of Sessions not in `live` and terminal tabs of their shells, writes v4 if it was read from
+ *  an older store, then deletes the old stores. */
 export function sweepOrphanPaneLayouts(live: ReadonlySet<string>): void {
   const upgrading = safeGetItem(LAYOUT_KEY) === null;
+  const kept = ownerLive(live);
   updateStore((s) => {
-    const kept = Object.entries(s.sessions).filter(([id]) => live.has(id));
-    const unchanged = kept.length === Object.keys(s.sessions).length;
-    return unchanged && !upgrading ? s : { version: 3, sessions: Object.fromEntries(kept) };
+    let changed = upgrading;
+    const sessions: Record<string, DockLayout> = {};
+    for (const [id, layout] of Object.entries(s.sessions)) {
+      if (!live.has(id)) {
+        changed = true;
+        continue;
+      }
+      const orphans = terminalPlacements(layout).filter((t) => !kept(t.id));
+      sessions[id] = orphans.reduce((l, t) => removeTab(l, t.id), layout);
+      changed ||= orphans.length > 0;
+    }
+    const terminals = s.terminals?.filter((t) => kept(t.id)) ?? null;
+    changed ||= (terminals?.length ?? 0) !== (s.terminals?.length ?? 0);
+    return changed ? { version: 4, sessions, terminals } : s;
   });
   if (safeGetItem(LAYOUT_KEY) !== null) for (const key of REPLACED_KEYS) safeRemoveItem(key);
 }
@@ -390,7 +500,8 @@ export interface PaneLayoutApi {
   layout: DockLayout;
   /** No-op if already open anywhere. */
   openTab: (tabId: TabId, dock: DockLocation) => void;
-  addTerminal: (dock: DockLocation) => void;
+  /** A new shell of the layout's Session, above `minIndex`. */
+  addTerminal: (dock: DockLocation, minIndex?: number) => void;
   /** Asks first, so an irreversible `before` (a shell kill) never runs for a declined close; closes once it resolves true. */
   closeTab: (tabId: TabId, before?: () => Promise<boolean>) => void;
   activateTab: (dock: DockLocation, tabId: TabId) => void;
@@ -416,14 +527,6 @@ function activateOrRevealTab(layout: DockLayout, dock: DockLocation, tabId: TabI
   return revealDock(setActive(layout, dock, tabId), dock);
 }
 
-function terminalTabs(layout: DockLayout): { id: TabId; dock: DockLocation }[] {
-  return DOCKS.flatMap((dock) =>
-    dockTabs(layout, dock)
-      .filter(isTerminalTabId)
-      .map((id) => ({ id, dock })),
-  );
-}
-
 export type AutoPane = { id: TabId; defaultDock: DockLocation };
 
 /**
@@ -441,14 +544,16 @@ export function usePaneLayout(
   const store = useSyncExternalStore(subscribe, readStore);
   const seedDiff = prefs.diff && outsideRepository === false;
   const derive = useCallback(
-    (saved: DockLayout | undefined) =>
-      syncPluginTabs(saved ?? seedLayout({ diff: seedDiff, terminal: prefs.terminal }), autoPlugins),
-    [seedDiff, prefs.terminal, autoPlugins],
+    (s: LayoutStore) =>
+      sessionId
+        ? syncPluginTabs(
+            deriveLayout(sessionId, s.sessions[sessionId], s.terminals, { diff: seedDiff, terminal: prefs.terminal }),
+            autoPlugins,
+          )
+        : emptyDockLayout(),
+    [sessionId, seedDiff, prefs.terminal, autoPlugins],
   );
-  const layout = useMemo(
-    () => (sessionId ? derive(store.sessions[sessionId]) : emptyDockLayout()),
-    [store, sessionId, derive],
-  );
+  const layout = useMemo(() => derive(store), [store, derive]);
 
   const shownRef = useLatestRef({ layout, tabAvailable });
   const deriveRef = useLatestRef(derive);
@@ -456,10 +561,14 @@ export function usePaneLayout(
     (fn: (l: DockLayout) => DockLayout, derive = deriveRef.current) => {
       if (!sessionId) return;
       updateStore((s) => {
-        const current = derive(s.sessions[sessionId]);
+        const current = derive(s);
         const updated = fn(current);
         if (updated === current) return s;
-        return { version: 3, sessions: { ...s.sessions, [sessionId]: updated } };
+        return {
+          version: 4,
+          sessions: { ...s.sessions, [sessionId]: updated },
+          terminals: terminalPlacements(updated),
+        };
       });
     },
     [sessionId, deriveRef],
@@ -483,8 +592,10 @@ export function usePaneLayout(
     [guardedMutate],
   );
   const addTerminalCb = useCallback(
-    (dock: DockLocation) => guardedMutate((l) => revealDock(addTerminal(l, dock).layout, dock)),
-    [guardedMutate],
+    (dock: DockLocation, minIndex?: number) => {
+      if (sessionId) guardedMutate((l) => revealDock(addTerminal(l, dock, sessionId, minIndex).layout, dock));
+    },
+    [guardedMutate, sessionId],
   );
   const closeTab = useCallback(
     (tabId: TabId, before?: () => Promise<boolean>) => {
@@ -522,20 +633,20 @@ export function usePaneLayout(
   const toggleKind = useCallback(
     (kind: "diff" | "terminal" | "agents" | "files", defaultDock: DockLocation) =>
       guardedMutate((l) => {
-        // Single-instance panes toggle their tab; terminals toggle the whole group.
+        // Single-instance panes toggle their tab; terminals toggle this Session's, leaving other Sessions' tabs.
         if (kind === "diff" || kind === "agents" || kind === "files") {
           const at = findTab(l, kind);
           if (at) return isDockCollapsed(l, at.dock) ? openOrRevealTab(l, kind, defaultDock) : removeTab(l, kind);
           return openOrRevealTab(l, kind, defaultDock);
         }
-        const terminals = terminalTabs(l);
-        if (terminals.length === 0) return openOrRevealTab(l, terminalTabId(0), defaultDock);
-        const visibleTerminal = terminals.find(({ dock }) => !isDockCollapsed(l, dock));
-        if (visibleTerminal) return removeAllTerminals(l);
+        if (!sessionId) return l;
+        const terminals = sessionTerminals(l, sessionId);
+        if (terminals.length === 0) return openOrRevealTab(l, terminalTabId(sessionId, 0), defaultDock);
+        if (terminals.some(({ dock }) => !isDockCollapsed(l, dock))) return removeSessionTerminals(l, sessionId);
         const first = terminals[0]!;
         return activateOrRevealTab(l, first.dock, first.id);
       }),
-    [guardedMutate],
+    [guardedMutate, sessionId],
   );
   const togglePlugin = useCallback(
     (id: TabId, defaultDock: DockLocation) =>

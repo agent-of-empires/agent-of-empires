@@ -2,6 +2,12 @@ import type { RateLimitInfo } from "./acpTypes";
 import type { AgentLifecycleInfo } from "./agentProfiles";
 import type { SchemaSettings } from "./generated/settingsKeys";
 
+export interface AuxiliaryObservation {
+  target: { kind: "host"; index: number } | { kind: "container"; index: number } | { kind: "tool"; tool_name: string };
+  state: "absent" | "alive" | "dead" | "unknown";
+  tmux_session?: string | null;
+}
+
 export interface SessionResponse {
   id: string;
   idempotency_key?: string | null;
@@ -65,6 +71,8 @@ export interface SessionResponse {
   /** Renaming also moves the worktree directory. */
   tie_workdir_to_name?: boolean;
   has_terminal: boolean;
+  /** The Daemon's latest look at the Session's paired shells and tool panes. */
+  auxiliary?: AuxiliaryObservation[];
   profile: string;
   cleanup_defaults: CleanupDefaults;
   remote_owner: string | null;

@@ -62,6 +62,7 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
   const { focusTarget, dataTerm } = base;
   // Two docks can each show a paired terminal, so paired focus intents name the one they mean.
   const focusIndex = surface === "agent" ? undefined : terminalIndex;
+  const focusSession = surface === "agent" ? undefined : session.id;
   // Paired terminals carry their instance index as a query param so the
   // server attaches the right tmux session; the agent surface ignores it.
   const wsPath = surface === "agent" ? base.wsPath : `${base.wsPath}?index=${terminalIndex}`;
@@ -397,7 +398,7 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     const policy = policyRef.current;
     if (policy.readOnly || policy.errorHeld || startRef.current.awaitingStart) return;
     if (lastEnsuredSessionIdRef.current === policy.sessionId) {
-      if (consumePendingTerminalFocus(focusTarget, focusIndex)) focusSelf();
+      if (consumePendingTerminalFocus(focusTarget, focusIndex, focusSession)) focusSelf();
       return;
     }
     retryEnsure();
@@ -411,6 +412,7 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     focusSelf,
     focusTarget,
     focusIndex,
+    focusSession,
     retryEnsure,
   ]);
 
@@ -418,20 +420,20 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
   useEffect(() => {
     // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
     if (readOnly || ensureState !== "ready") return;
-    if (consumePendingTerminalFocus(focusTarget, focusIndex)) focusSelf();
-  }, [ensureState, readOnly, focusSelf, focusTarget, focusIndex]);
+    if (consumePendingTerminalFocus(focusTarget, focusIndex, focusSession)) focusSelf();
+  }, [ensureState, readOnly, focusSelf, focusTarget, focusIndex, focusSession]);
 
   // Cmd+` shortcut focuses this terminal when it is the dispatched target.
   useEffect(() => {
     const onFocusEvent = (e: Event) => {
       const detail = (e as CustomEvent<FocusTerminalDetail>).detail;
-      if (policyRef.current.readOnly || !focusIntentMatches(detail, focusTarget, focusIndex)) return;
-      // Latch the request's own index, so an indexless one stays open to any paired view.
-      if (!focusSelf()) setPendingTerminalFocus(focusTarget, detail.terminalIndex);
+      if (policyRef.current.readOnly || !focusIntentMatches(detail, focusTarget, focusIndex, focusSession)) return;
+      // Latch the request's own target, so an indexless one stays open to any paired view.
+      if (!focusSelf()) setPendingTerminalFocus(focusTarget, detail.terminalIndex, detail.sessionId);
     };
     window.addEventListener(FOCUS_TERMINAL_EVENT, onFocusEvent);
     return () => window.removeEventListener(FOCUS_TERMINAL_EVENT, onFocusEvent);
-  }, [focusSelf, focusTarget, focusIndex]);
+  }, [focusSelf, focusTarget, focusIndex, focusSession]);
 
   // Stop then Start leaves a dead pane's closed socket behind. Latch the Start edge until the 4001 close
   // arrives (either order), consume it once so a crash-looping agent cannot retrigger it, and drop it

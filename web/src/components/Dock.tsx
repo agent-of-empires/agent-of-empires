@@ -15,9 +15,24 @@ export interface PaneDisplay {
   /** A plugin's manifest `icon_asset`, resolved to a fetchable URL. See
    *  `PaneIcon` for the precedence over `icon`. */
   iconAssetUrl?: string;
+  /** Short mono suffix after the title, e.g. a terminal's Container mode. */
+  badge?: string;
 }
 
-interface Props {
+/** Terminal controls each group of a dock shows. */
+export interface DockControls {
+  /** Omitted on read-only servers, where the terminal ensure route is
+   *  rejected, so the new-terminal control is hidden rather than dead-ended. */
+  onNewTerminal?: () => void;
+  /** Names what the new-terminal control opens. */
+  newTerminalLabel?: string;
+  /** Controls for the active tab, shown before the dock controls. */
+  tabActions?: (id: string) => ReactNode;
+  /** The terminal switcher trigger, shown beside the new-terminal control. */
+  terminalSwitcher?: ReactNode;
+}
+
+interface Props extends DockControls {
   location: DockLocation;
   /** Persisted index of this group within its dock; carried on the drop
    *  payloads so a drop addresses the right group. */
@@ -32,9 +47,6 @@ interface Props {
   onActivate: (id: string) => void;
   onClose: (id: string) => void;
   onMove: (id: string, dock: DockLocation) => void;
-  /** Omitted on read-only servers, where the terminal ensure route is
-   *  rejected, so the new-terminal control is hidden rather than dead-ended. */
-  onNewTerminal?: () => void;
 }
 
 const btn =
@@ -88,6 +100,7 @@ function SortableTab({ id, location, groupIndex, isActive, desc, onActivate, onC
       >
         <PaneIcon icon={desc.icon} iconAssetUrl={desc.iconAssetUrl} className="size-3.5 shrink-0" />
         <span className="text-[11px] font-medium truncate max-w-[10rem]">{desc.title}</span>
+        {desc.badge && <span className="font-mono text-[10px] text-text-dim shrink-0">{desc.badge}</span>}
       </button>
       <button
         type="button"
@@ -146,6 +159,9 @@ export function Dock({
   onClose,
   onMove,
   onNewTerminal,
+  newTerminalLabel = "New terminal",
+  tabActions,
+  terminalSwitcher,
 }: Props) {
   const { activeTab, source, dropTarget } = usePaneDnd();
   const { setNodeRef: setGroupRef } = useDroppable({
@@ -201,6 +217,7 @@ export function Dock({
           </SortableContext>
         </div>
         <div className="flex items-center ml-auto px-1 gap-0.5 shrink-0">
+          {tabActions?.(activeId)}
           <button
             onClick={() => onMove(activeId, target)}
             className={btn}
@@ -209,8 +226,9 @@ export function Dock({
           >
             <MoveIcon className="size-3.5" aria-hidden />
           </button>
+          {terminalSwitcher}
           {onNewTerminal && (
-            <button onClick={onNewTerminal} className={btn} title="New terminal" aria-label="New terminal">
+            <button onClick={onNewTerminal} className={btn} title={newTerminalLabel} aria-label={newTerminalLabel}>
               <Plus className="size-3.5" aria-hidden />
             </button>
           )}

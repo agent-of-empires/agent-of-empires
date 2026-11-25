@@ -74,7 +74,15 @@ import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useMobileViewportLock } from "./hooks/useMobileViewportLock";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
-import { usePaneLayout, dockTabs, dockGroups, dockOf, isDockCollapsed, renderedGroups } from "./lib/paneLayout";
+import {
+  usePaneLayout,
+  dockGroups,
+  dockOf,
+  isDockCollapsed,
+  renderedGroups,
+  sessionTerminals,
+  terminalPlacements,
+} from "./lib/paneLayout";
 import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginPane";
 import { PluginPageView } from "./components/plugin/PluginPageView";
@@ -187,7 +195,7 @@ const LazyCommandPalette = lazyView(() => loadCommandPalette().then((m) => m.Com
 function CommandPalette(props: ComponentProps<typeof LazyCommandPalette>) {
   return props.open ? <LazyCommandPalette {...props} /> : null;
 }
-import { type PaneDisplay } from "./components/Dock";
+import { type DockControls, type PaneDisplay } from "./components/Dock";
 import { DockGroups, type DockGroupView } from "./components/DockGroups";
 import { BottomDock } from "./components/BottomDock";
 import { PaneDndController } from "./components/PaneDndController";
@@ -197,10 +205,12 @@ import { hasStartedBefore } from "./components/acp/startupWait";
 import { DiffPane } from "./components/DiffPane";
 import { FilesPane } from "./components/FilesPane";
 import { FileContentViewer } from "./components/diff/FileContentViewer";
-import { PairedShellPane } from "./components/PairedTerminal";
+import { PairedShellPane, ShellModeToggle, effectiveShellMode } from "./components/PairedTerminal";
+import { TerminalSwitcherButton, TerminalSwitcherOverlay, shellLabel } from "./components/TerminalSwitcher";
+import { liveShellIndices, pairedShellGroups, type PairedShell } from "./lib/pairedShells";
 import { usePairedShellModes } from "./hooks/usePairedShellModes";
 import { useOpenPairedTerminal, usePairedTerminalReveal } from "./hooks/usePairedTerminalReveal";
-import { BUILTIN_PANES, isTerminalTabId, terminalIndexOf, terminalTabId, type DockLocation } from "./lib/panes";
+import { BUILTIN_PANES, parseTerminalTabId, terminalTabId, type DockLocation, type TerminalRef } from "./lib/panes";
 import { MobileRightPanelPicker } from "./components/MobileRightPanelPicker";
 import { MobileMainPane } from "./components/MobileMainPane";
 import { ChromeCollapseHandle, CollapsibleRegion } from "./components/CollapsibleChrome";
@@ -724,10 +734,17 @@ function AppContent({
     [panelDefaults.plugins, pluginPanes],
   );
   // A persisted tab is visible only if its backing pane currently exists: diff
-  // and terminals always do; a plugin tab does only while its plugin is loaded.
+  // always does; a terminal while its Session is listed; a plugin tab while its plugin is loaded.
+  // Host or Container per shell, so choosing one never switches another shell.
+  const { modeFor: shellModeFor, setMode: setShellMode } = usePairedShellModes();
+  const sessionById = useMemo(() => new Map(sessions.map((s) => [s.id, s])), [sessions]);
   const tabAvailable = useCallback(
-    (id: string) => !id.startsWith("plugin:") || pluginPaneById.has(id),
-    [pluginPaneById],
+    (id: string) => {
+      if (id.startsWith("plugin:")) return pluginPaneById.has(id);
+      const shell = parseTerminalTabId(id);
+      return !shell || sessionById.has(shell.sessionId);
+    },
+    [pluginPaneById, sessionById],
   );
   const {
     layout: paneLayout,
@@ -773,15 +790,24 @@ function AppContent({
         // per-pane runtime icon a worker chose before icon_asset existed.
         return { title: plugin.title, icon, iconAssetUrl: identity?.iconAssetUrl };
       }
-      if (isTerminalTabId(id)) {
-        const idx = terminalIndexOf(id);
+      const shell = parseTerminalTabId(id);
+      if (shell) {
         const term = BUILTIN_PANES.find((p) => p.id === "terminal")!;
-        return { title: idx === 0 ? term.title : `${term.title} ${idx + 1}`, icon: term.icon };
+        const session = sessionById.get(shell.sessionId);
+        return {
+          title: `${session?.title ?? term.title} · ${shell.index + 1}`,
+          icon: term.icon,
+          badge: session?.is_sandboxed
+            ? shellModeFor(shell.sessionId, shell.index) === "container"
+              ? "ctr"
+              : "host"
+            : undefined,
+        };
       }
       const d = BUILTIN_PANES.find((p) => p.id === id)!;
       return { title: d.title, icon: d.icon };
     },
-    [pluginPaneById, pluginIdentityById],
+    [pluginPaneById, pluginIdentityById, sessionById, shellModeFor],
   );
 
   const renderGroups = useCallback(
@@ -804,9 +830,9 @@ function AppContent({
     }),
     [rightGroups, bottomGroups],
   );
-  const terminalOpen = (["right", "bottom"] as DockLocation[]).some(
-    (d) => !isDockCollapsed(paneLayout, d) && dockTabs(paneLayout, d).some(isTerminalTabId),
-  );
+  const terminalOpen =
+    !!activeSessionId &&
+    sessionTerminals(paneLayout, activeSessionId).some(({ dock }) => !isDockCollapsed(paneLayout, dock));
 
   // Activity-bar entries are pane KINDS (diff, terminal, each plugin), not
   // individual tabs; the strip's +/x manage terminal instances.
@@ -846,19 +872,17 @@ function AppContent({
       // Closing an extra terminal tab kills its tmux shell so it does not leak;
       // terminal 0 (shared with the native TUI) only hides. Diff/plugin tabs
       // have no backend shell to reap.
-      if (isTerminalTabId(id)) {
-        const idx = terminalIndexOf(id);
-        if (idx >= 1) {
-          // Remove the tab only once the shell is actually killed; if the
-          // DELETE fails, keep the tab so the user can retry instead of
-          // silently leaking the shell with no way to close it.
-          if (activeSessionId) closeTab(id, () => killTerminal(activeSessionId, idx));
-          return;
-        }
+      const shell = parseTerminalTabId(id);
+      if (shell && shell.index >= 1) {
+        // Remove the tab only once the shell is actually killed; if the
+        // DELETE fails, keep the tab so the user can retry instead of
+        // silently leaking the shell with no way to close it.
+        closeTab(id, () => killTerminal(shell.sessionId, shell.index));
+        return;
       }
       closeTab(id);
     },
-    [closeTab, activeSessionId],
+    [closeTab],
   );
   const movePaneAny = useCallback((id: string, dock: DockLocation) => moveTab(id, dock), [moveTab]);
   // The dnd controller works in visible-tab space; map a drop index back to the
@@ -898,7 +922,9 @@ function AppContent({
   // switches. Mounting it eagerly would spawn a shell for every mobile
   // session the user never opens the shell on.
   const [pairedMounted, setPairedMounted] = useState(false);
-  const { modeFor: shellModeFor, setMode: setShellMode } = usePairedShellModes();
+  // The shell the mobile paired view shows; null is the active Session's primary shell.
+  const [mobileShell, setMobileShell] = useState<TerminalRef | null>(null);
+  const [terminalSwitcherOpen, setTerminalSwitcherOpen] = useState(false);
   const [showSessionWizard, setShowSessionWizard] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const tipsAutoPoppedRef = useRef(false);
@@ -1039,6 +1065,7 @@ function AppContent({
     setRightPanelView("agent");
     setPickerOpen(false);
     setPairedMounted(false);
+    setMobileShell(null);
     setSelectedFile(null);
   }
 
@@ -1738,12 +1765,12 @@ function AppContent({
       setDockCollapsed("right", false);
       if (availableRightGroups.length === 0) {
         openTab("diff", "right");
-        openTab(terminalTabId(0), "right");
+        if (activeSessionId) openTab(terminalTabId(activeSessionId, 0), "right");
       }
     } else {
       setDockCollapsed("right", true);
     }
-  }, [isMdUp, rightDockCollapsed, setDockCollapsed, availableRightGroups.length, openTab]);
+  }, [isMdUp, rightDockCollapsed, setDockCollapsed, availableRightGroups.length, openTab, activeSessionId]);
 
   const handlePickView = useCallback(
     (view: RightPanelView) => {
@@ -1893,20 +1920,69 @@ function AppContent({
     setShowSessionWizard(true);
   }, []);
 
-  const showPairedTerminal = usePairedTerminalReveal({
+  const showMobileShell = useCallback((shell: TerminalRef) => {
+    setMobileShell(shell);
+    setRightPanelView("paired");
+  }, []);
+  const { revealActive: showPairedTerminal, revealShell } = usePairedTerminalReveal({
     singlePane,
+    activeSessionId,
     layout: paneLayout,
     openTab,
     activateTab,
-    setRightPanelView,
+    showMobileShell,
   });
 
   // PairedTerminal shows Host whatever the stored mode while the Session isn't sandboxed.
   const shownShellMode = useCallback(
     (sessionId: string, terminalIndex: number) =>
-      activeSession?.is_sandboxed ? shellModeFor(sessionId, terminalIndex) : "host",
-    [activeSession?.is_sandboxed, shellModeFor],
+      effectiveShellMode(sessionById.get(sessionId), shellModeFor(sessionId, terminalIndex)),
+    [sessionById, shellModeFor],
   );
+  const mobileShellShown = useMemo<TerminalRef | null>(
+    () => mobileShell ?? (activeSessionId ? { sessionId: activeSessionId, index: 0 } : null),
+    [mobileShell, activeSessionId],
+  );
+  const shownShells = useMemo(() => {
+    if (singlePane) return rightPanelView === "paired" && mobileShellShown ? [mobileShellShown] : [];
+    return terminalPlacements(paneLayout).flatMap((t) => {
+      const shell = parseTerminalTabId(t.id);
+      return shell && tabAvailable(t.id) ? [shell] : [];
+    });
+  }, [singlePane, rightPanelView, mobileShellShown, paneLayout, tabAvailable]);
+  const shellGroups = useMemo(
+    () =>
+      pairedShellGroups(
+        sessions,
+        shownShells,
+        (session, index) => effectiveShellMode(session, shellModeFor(session.id, index)),
+        activeSessionId,
+      ),
+    [sessions, shownShells, shellModeFor, activeSessionId],
+  );
+  const pickShell = useCallback(
+    (shell: PairedShell) =>
+      revealShell(shell, () => {
+        const remounts = shownShellMode(shell.sessionId, shell.index) !== shell.mode;
+        setShellMode(shell.sessionId, shell.index, shell.mode);
+        return remounts;
+      }),
+    [revealShell, shownShellMode, setShellMode],
+  );
+  // A new shell skips the indices the Daemon sees alive, which another browser may have opened.
+  const newTerminal = useCallback(
+    (dock?: DockLocation) =>
+      addTerminal(
+        dock ?? terminalPlacements(paneLayout)[0]?.dock ?? "right",
+        Math.max(0, ...liveShellIndices(activeSession)) + 1,
+      ),
+    [addTerminal, paneLayout, activeSession],
+  );
+  const canOpenTerminals = caps.canUseTerminal && !!activeSession;
+  const newTerminalFor = caps.readOnly || !activeSession ? undefined : activeSession.title;
+  const toggleTerminalSwitcher = useCallback(() => {
+    if (canOpenTerminals) setTerminalSwitcherOpen((o) => !o);
+  }, [canOpenTerminals]);
   const handleOpenPairedTerminal = useOpenPairedTerminal(
     activeSessionId,
     showPairedTerminal,
@@ -2024,6 +2100,7 @@ function AppContent({
         onToggleSidebar: focusMode ? noop : () => setSidebarOpen((o) => !o),
         onToggleRightPanel: () => toggleRightDock(),
         onToggleTerminalFocus: handleToggleTerminalFocus,
+        onSwitchTerminal: toggleTerminalSwitcher,
       }),
       [
         toggleDiff,
@@ -2035,6 +2112,7 @@ function AppContent({
         handleCloseSettings,
         handleOpenSettings,
         handleToggleTerminalFocus,
+        toggleTerminalSwitcher,
         handleNewSession,
         handleNewScratch,
         handleJumpToAttention,
@@ -2136,6 +2214,19 @@ function AppContent({
     // Render a pane body by id. Passed to the docks as a callback (rather than
     // building an array of {icon, body} objects here) so the per-session JSX is
     // constructed inside the dock, not threaded through a prop object.
+    // A sandboxed Session's shell switches Host or Container from its dock's strip.
+    const shellModeActions = (id: string): ReactNode => {
+      const shell = parseTerminalTabId(id);
+      const session = shell && sessionById.get(shell.sessionId);
+      if (!shell || !session?.is_sandboxed) return null;
+      return (
+        <ShellModeToggle
+          mode={shellModeFor(shell.sessionId, shell.index)}
+          onModeChange={(mode) => setShellMode(shell.sessionId, shell.index, mode)}
+          label={`${session.title} ${shellLabel(shell.index).toLowerCase()}`}
+        />
+      );
+    };
     const renderPaneBody = (id: string): ReactNode => {
       const plugin = pluginPaneById.get(id);
       if (plugin) return <PluginPaneBody entry={plugin.entry} />;
@@ -2182,18 +2273,29 @@ function AppContent({
           />
         );
       }
-      const terminalIndex = isTerminalTabId(id) ? terminalIndexOf(id) : 0;
+      const shell = parseTerminalTabId(id);
       return (
         <PairedShellPane
           readOnly={caps.readOnly}
-          session={activeSession ?? null}
-          sessionId={activeSessionId}
-          terminalIndex={terminalIndex}
-          mode={shellModeFor(activeSessionId, terminalIndex)}
-          onModeChange={(mode) => activeSessionId && setShellMode(activeSessionId, terminalIndex, mode)}
+          session={(shell && sessionById.get(shell.sessionId)) ?? null}
+          terminalIndex={shell?.index ?? 0}
+          mode={shell ? shellModeFor(shell.sessionId, shell.index) : "host"}
         />
       );
     };
+    const dockControls = (dock: DockLocation): DockControls => ({
+      onNewTerminal: newTerminalFor === undefined ? undefined : () => newTerminal(dock),
+      newTerminalLabel: newTerminalFor === undefined ? undefined : `New terminal for ${newTerminalFor}`,
+      tabActions: shellModeActions,
+      terminalSwitcher: canOpenTerminals ? (
+        <TerminalSwitcherButton
+          groups={shellGroups}
+          newTerminalFor={newTerminalFor}
+          onPick={pickShell}
+          onNew={() => newTerminal(dock)}
+        />
+      ) : undefined,
+    });
     return (
       <div className="flex-1 flex flex-col min-h-0">
         <PaneDndController groupsByDock={groupsByDock} descriptorFor={paneDescriptor} onPlaceTab={placeVisibleTab}>
@@ -2299,7 +2401,7 @@ function AppContent({
                   onActivate={(id) => activateTab("right", id)}
                   onMove={movePaneAny}
                   onClose={closePaneAny}
-                  onNewTerminal={caps.readOnly ? undefined : () => addTerminal("right")}
+                  {...dockControls("right")}
                 />
               </div>
             }
@@ -2312,7 +2414,7 @@ function AppContent({
               onActivate={(id) => activateTab("bottom", id)}
               onMove={movePaneAny}
               onClose={closePaneAny}
-              onNewTerminal={caps.readOnly ? undefined : () => addTerminal("bottom")}
+              {...dockControls("bottom")}
             />
           )}
         </PaneDndController>
@@ -2501,8 +2603,14 @@ function AppContent({
           onOpenTerminal={canSwitchToTerminal ? handleOpenPairedTerminal : undefined}
           canRestartAgent={canRestartAgent}
           newSessionLike={newSessionLike}
-          shellMode={shellModeFor(activeSessionId, 0)}
-          onShellModeChange={(mode) => activeSessionId && setShellMode(activeSessionId, 0, mode)}
+          pairedShell={{
+            session: (mobileShellShown && sessionById.get(mobileShellShown.sessionId)) ?? null,
+            index: mobileShellShown?.index ?? 0,
+          }}
+          shellMode={mobileShellShown ? shellModeFor(mobileShellShown.sessionId, mobileShellShown.index) : "host"}
+          onShellModeChange={(mode) =>
+            mobileShellShown && setShellMode(mobileShellShown.sessionId, mobileShellShown.index, mode)
+          }
           pairedMounted={pairedMounted}
           activeSession={activeSession ?? null}
           activeSessionId={activeSessionId}
@@ -2912,6 +3020,15 @@ function AppContent({
           {tour.tourElement}
 
           {showHelp && <HelpOverlay onClose={() => setShowHelp(false)} />}
+          {terminalSwitcherOpen && canOpenTerminals && (
+            <TerminalSwitcherOverlay
+              groups={shellGroups}
+              newTerminalFor={isMdUp ? newTerminalFor : undefined}
+              onPick={pickShell}
+              onNew={() => newTerminal()}
+              onClose={() => setTerminalSwitcherOpen(false)}
+            />
+          )}
 
           {tips.isOpen && (
             <TipsModal
@@ -3007,6 +3124,11 @@ function AppContent({
               sessionTitle={activeSession.title}
               availablePanes={mobilePaneIds}
               describePane={paneDescriptor}
+              shellGroups={caps.canUseTerminal ? shellGroups : []}
+              onPickShell={(shell) => {
+                setPickerOpen(false);
+                pickShell(shell);
+              }}
               onSelect={handlePickView}
               onClose={closePicker}
             />

@@ -1,77 +1,107 @@
 import { useCallback } from "react";
 
 import { confirmFileEditPanes } from "../lib/fileEditGuard";
-import { dockOf, dockTabs, isActiveTab, isDockCollapsed, type DockLayout, type PaneLayoutApi } from "../lib/paneLayout";
-import { isTerminalTabId, terminalIndexOf, terminalTabId, type DockLocation } from "../lib/panes";
+import {
+  dockOf,
+  isActiveTab,
+  isDockCollapsed,
+  sessionTerminals,
+  terminalPlacements,
+  type DockLayout,
+  type PaneLayoutApi,
+} from "../lib/paneLayout";
+import { parseTerminalTabId, terminalTabId, type TerminalRef } from "../lib/panes";
 import type { ShellMode } from "../components/PairedTerminal";
-import type { RightPanelView } from "../lib/rightPanelView";
 import { dispatchFocusTerminal, setPendingTerminalFocus } from "../lib/terminalFocus";
 
 /**
- * Shows and focuses the paired shell, never toggling back to the Agent; returns the terminal it shows,
- * or null when the user keeps an unsaved file edit. `prepare` runs first with that terminal's index and
+ * Shows and focuses the active Session's paired shell, never toggling back to the Agent; returns the terminal it
+ * shows, or null when the user keeps an unsaved file edit. `prepare` runs first with that terminal's index and
  * returns whether it will remount the shell.
  */
 export type RevealPairedTerminal = (prepare?: (terminalIndex: number) => boolean) => number | null;
 
-export function usePairedTerminalReveal({
-  singlePane,
-  layout,
-  openTab,
-  activateTab,
-  setRightPanelView,
-}: {
+/** Shows and focuses one Session's shell, opening a tab for it if none is; `prepare` as for {@link RevealPairedTerminal}. */
+export type RevealShell = (shell: TerminalRef, prepare?: () => boolean) => boolean;
+
+interface Args {
   singlePane: boolean;
+  activeSessionId: string | null;
   layout: DockLayout;
   openTab: PaneLayoutApi["openTab"];
   activateTab: PaneLayoutApi["activateTab"];
-  setRightPanelView: (view: RightPanelView) => void;
-}): RevealPairedTerminal {
-  return useCallback(
-    (prepare) => {
+  /** Promotes the mobile paired view to show `shell`. */
+  showMobileShell: (shell: TerminalRef) => void;
+}
+
+export function usePairedTerminalReveal({
+  singlePane,
+  activeSessionId,
+  layout,
+  openTab,
+  activateTab,
+  showMobileShell,
+}: Args): { revealActive: RevealPairedTerminal; revealShell: RevealShell } {
+  const shown = useCallback(
+    (id: string) => {
+      const dock = dockOf(layout, id);
+      return dock !== null && isActiveTab(layout, id) && !isDockCollapsed(layout, dock);
+    },
+    [layout],
+  );
+
+  const reveal = useCallback(
+    (tabId: string, shell: TerminalRef, remounts: boolean) => {
       if (singlePane) {
-        if (!confirmFileEditPanes([null])) return null;
-        prepare?.(0);
         // Below md there is one full-viewport pane. Promote the paired view, then
         // dispatch focus on the next frame: the inactive layer is inert until React
         // commits the switch. The paired shell mounts lazily, so its PTY may not be
         // ready when the dispatch fires; latch the intent too.
-        setRightPanelView("paired");
-        setPendingTerminalFocus("paired", 0);
-        requestAnimationFrame(() => dispatchFocusTerminal("paired", 0));
-        return 0;
+        showMobileShell(shell);
+        setPendingTerminalFocus("paired", shell.index, shell.sessionId);
+        requestAnimationFrame(() => dispatchFocusTerminal("paired", shell.index, shell.sessionId));
+        return;
       }
-      // The paired shell only mounts while a terminal tab is its group's active tab
-      // in an open dock. Prefer a visible one, then an active one, then the first.
-      const shown = (id: string) => {
-        const dock = dockOf(layout, id);
-        return dock !== null && isActiveTab(layout, id) && !isDockCollapsed(layout, dock);
-      };
-      const terminalTabs = (["right", "bottom"] as DockLocation[])
-        .flatMap((d) => dockTabs(layout, d))
-        .filter(isTerminalTabId);
-      const termTab =
-        terminalTabs.find(shown) ??
-        terminalTabs.find((id) => isActiveTab(layout, id)) ??
-        terminalTabs[0] ??
-        terminalTabId(0);
-      const index = terminalIndexOf(termTab);
-      const remounts = prepare?.(index) ?? false;
-      if (shown(termTab) && !remounts) {
+      if (shown(tabId) && !remounts) {
         // Mounted and staying: focus synchronously so rapid agent/paired toggles stay deterministic.
-        dispatchFocusTerminal("paired", index);
-        return index;
+        dispatchFocusTerminal("paired", shell.index, shell.sessionId);
+        return;
       }
       // Unmounted, hidden or about to remount: latch the intent for the shell to take once
-      // ready, and reveal its tab (activateTab also opens a collapsed dock).
-      setPendingTerminalFocus("paired", index);
-      const termDock = dockOf(layout, termTab);
-      if (termDock) activateTab(termDock, termTab);
-      else openTab(termTab, "right");
-      return index;
+      // ready, and reveal its tab (activateTab also opens a collapsed dock). A new tab joins the other terminals.
+      setPendingTerminalFocus("paired", shell.index, shell.sessionId);
+      const termDock = dockOf(layout, tabId);
+      if (termDock) activateTab(termDock, tabId);
+      else openTab(tabId, terminalPlacements(layout)[0]?.dock ?? "right");
     },
-    [singlePane, layout, openTab, activateTab, setRightPanelView],
+    [singlePane, shown, layout, openTab, activateTab, showMobileShell],
   );
+
+  const revealActive = useCallback<RevealPairedTerminal>(
+    (prepare) => {
+      // The mobile paired view replaces the main view, which may hold an unsaved edit.
+      if (!activeSessionId || (singlePane && !confirmFileEditPanes([null]))) return null;
+      // The mobile view shows the primary shell; a dock prefers a visible tab, then an active one, then the first.
+      const tabs = singlePane ? [] : sessionTerminals(layout, activeSessionId).map((t) => t.id);
+      const tabId =
+        tabs.find(shown) ?? tabs.find((id) => isActiveTab(layout, id)) ?? tabs[0] ?? terminalTabId(activeSessionId, 0);
+      const shell = parseTerminalTabId(tabId)!;
+      reveal(tabId, shell, prepare?.(shell.index) ?? false);
+      return shell.index;
+    },
+    [activeSessionId, singlePane, layout, shown, reveal],
+  );
+
+  const revealShell = useCallback<RevealShell>(
+    (shell, prepare) => {
+      if (singlePane && !confirmFileEditPanes([null])) return false;
+      reveal(terminalTabId(shell.sessionId, shell.index), shell, prepare?.() ?? false);
+      return true;
+    },
+    [singlePane, reveal],
+  );
+
+  return { revealActive, revealShell };
 }
 
 /** Open Terminal for `sessionId`: only the active Session's, so it never switches another Session's shell. */

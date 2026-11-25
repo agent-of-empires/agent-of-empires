@@ -1,6 +1,7 @@
 import { StructuredSessionStack } from "./StructuredSessionStack";
 import { TerminalSessionStack } from "./TerminalSessionStack";
-import { PairedShellPane, type ShellMode } from "./PairedTerminal";
+import { PairedShellPane, ShellModeToggle, type ShellMode } from "./PairedTerminal";
+import { shellLabel } from "./TerminalSwitcher";
 import type { AgentFocus } from "./acp/BackgroundAgentsPanel";
 import { hasStartedBefore } from "./acp/startupWait";
 import { recreateContainerBlock, recreateContainerTitle } from "./sidebar/sessionActionTargets";
@@ -50,7 +51,8 @@ interface Props {
   canRestartAgent: boolean;
   /** Opens the wizard for a Session like that one; undefined on a read-only server. */
   newSessionLike?: (session: SessionResponse) => NewSessionLike | undefined;
-  /** The active Session's mode for its primary paired shell. */
+  /** The shell the paired view shows, which may be another Session's, and its mode. */
+  pairedShell: { session: SessionResponse | null; index: number };
   shellMode: ShellMode;
   onShellModeChange: (mode: ShellMode) => void;
   pairedMounted: boolean;
@@ -108,6 +110,7 @@ export function MobileMainPane({
   onOpenTerminal,
   canRestartAgent,
   newSessionLike,
+  pairedShell,
   shellMode,
   onShellModeChange,
   pairedMounted,
@@ -147,7 +150,9 @@ export function MobileMainPane({
       : view === "files"
         ? "Files"
         : view === "paired"
-          ? "Paired terminal"
+          ? pairedShell.session
+            ? `${pairedShell.session.title} · ${pairedShell.index + 1}`
+            : "Paired terminal"
           : view === "agents"
             ? "Background"
             : (activePluginPane?.title ?? "Plugin");
@@ -163,7 +168,16 @@ export function MobileMainPane({
           >
             <span aria-hidden>&larr;</span> Agent
           </button>
-          <span className="text-xs text-text-dim">{viewLabel}</span>
+          <span className="text-xs text-text-dim truncate">{viewLabel}</span>
+          {view === "paired" && pairedShell.session?.is_sandboxed && (
+            <div className="ml-auto shrink-0">
+              <ShellModeToggle
+                mode={shellMode}
+                onModeChange={onShellModeChange}
+                label={`${pairedShell.session.title} ${shellLabel(pairedShell.index).toLowerCase()}`}
+              />
+            </div>
+          )}
         </div>
       )}
       <div className="relative flex-1 flex flex-col min-h-0 overflow-hidden">
@@ -234,12 +248,11 @@ export function MobileMainPane({
             data-testid="mobile-paired-layer"
           >
             <PairedShellPane
-              session={activeSession}
-              sessionId={activeSessionId}
+              session={pairedShell.session}
+              terminalIndex={pairedShell.index}
               readOnly={readOnly}
               active={view === "paired"}
               mode={shellMode}
-              onModeChange={onShellModeChange}
             />
           </div>
         )}
