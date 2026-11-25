@@ -100,3 +100,16 @@ await prep(async () => {
   })).status;
 });
 ```
+
+## TUI clips (ttyd)
+
+Each browser connection to ttyd starts a fresh `aoe`, so everything the TUI replays on start shows in the clip.
+
+- Install ttyd with `brew install ttyd` (`/opt/homebrew/bin/ttyd` on macOS). Start it from the same shell that exported the isolated env (`XDG_CONFIG_HOME`, `AOE_TMUX_SOCKET`, `CLAUDE_CONFIG_DIR`), because it passes its environment to `aoe`. On macOS use `LANG=en_US.UTF-8` so glyphs render. `-t rendererType=dom` makes the screen readable text, so scripts can assert on it. The default 1280x800 viewport with `fontSize=15` fits Home with its preview.
+- Drain replayed notices before recording. The first-run walkthrough needs one Escape in a throwaway connection. "Prompt not delivered" modals replay once per old session that missed its prompt: purge old sessions (`aoe rm --purge <id>`), connect once unrecorded, press Enter until none show, and let the clip script dismiss any that still appear before its first caption.
+- Keys go where the selection is. Enter on a session row attaches it, and keys then reach the agent. Park the selection on the target row first (`End` selects the last row, such as Suggested) and check `innerText` after each key instead of sleeping.
+- Claude Code's own terminal dialogs (folder trust, project MCP approval) can block a typed prompt. For a clean start in the TUI, use a Structured-view preset.
+- Captions cover the key-hint footer; pass `{ top: true }` when a step needs it visible.
+- A 37 s clip with 3 s captions gave a 4 MB GIF at the default 900 px width.
+- Stop scratch processes by PID, taken from `$DEMO`'s own tmux socket or ttyd log. `pkill -f` on an agent name also kills your real sessions.
+

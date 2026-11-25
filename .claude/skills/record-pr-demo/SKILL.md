@@ -11,7 +11,7 @@ Files beside this one:
 
 - `demo-lib.mjs`: Playwright helpers (`launch`, `finish`, `caption`, `ring`, `glide`, `prep`) with a visible pointer overlay.
 - `convert.sh`: webm to MP4 plus a contact sheet of frames.
-- [`TECHNIQUES.md`](TECHNIQUES.md): read when a clip needs touch input, a native `<select>`, link hover/click proof, a WebSocket counter, or a simulated lost event.
+- [`TECHNIQUES.md`](TECHNIQUES.md): read when a clip needs touch input, a native `<select>`, link hover/click proof, a WebSocket counter, a simulated lost event, or the native TUI.
 
 ## 1. Build
 
@@ -62,6 +62,18 @@ Write one script per clip in a scratch dir, importing `demo-lib.mjs`. Each clip 
 - Show only the final behavior unless the user asks for before/after.
 
 Run with `AOE_DEMO_TOKEN_FILE` (or `AOE_DEMO_TOKEN`) and `AOE_DEMO_RAW=<scratch>/raw` set. On arm64 Linux add `PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-arm64 PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1`.
+
+## TUI clips
+
+Run the native `aoe` TUI inside ttyd and drive it like a web page: Playwright types real keystrokes and `caption`, `convert.sh` work unchanged. Use the step 2 environment, `cd` into a scene repo, then:
+
+```sh
+nohup ttyd --port 7683 --interface 127.0.0.1 -t rendererType=dom -t fontSize=15 --writable aoe > $DEMO/ttyd.log 2>&1 &
+```
+
+In the clip script, `launch()`, `page.goto("http://127.0.0.1:7683")`, click `.xterm`, then `page.keyboard.press`. Set `AOE_DEMO_TOKEN=-` since no dashboard token is needed. Assert on `document.body.innerText` before each key. Setup traps (modals that replay, keys reaching the agent, macOS install) are in [`TECHNIQUES.md`](TECHNIQUES.md#tui-clips-ttyd). For scripted e2e tests, `RECORD_E2E=1` records asciinema casts that `agg` converts (`tests/e2e/harness.rs`).
+
+Done when the contact sheet shows each key's effect at the moment its caption claims.
 
 ## 5. Convert and check
 
