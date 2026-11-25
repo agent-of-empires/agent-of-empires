@@ -492,6 +492,56 @@ async fn the_snapshot_shows_each_kinds_preset_and_what_start_uses() {
     );
 }
 
+/// The snapshot's start.prompt is what prepare reports and start sends: blank
+/// stays empty, and an expansion over the limit is absent where both refuse.
+#[tokio::test]
+#[serial_test::serial]
+async fn the_snapshot_prompt_agrees_with_prepare_for_blank_and_oversize() {
+    let f = fixture();
+    f.seed_item("a", None, "42");
+    f.seed_item("big", None, &"x".repeat(1000));
+    let big_template = "{number}".repeat(100);
+    for template in ["   ", big_template.as_str()] {
+        f.call(
+            Method::PUT,
+            "/api/suggestions/presets",
+            preset_body("assigned", "codex", json!(template)),
+        )
+        .await;
+        let (_, _, snapshot) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
+        for id in ["a", "big"] {
+            let shown = snapshot["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["id"] == id)
+                .unwrap()["start"]
+                .get("prompt")
+                .cloned();
+            let (status, _, prepared) = f
+                .call(
+                    Method::POST,
+                    "/api/suggestions/prepare",
+                    json!({ "provider_id": PROVIDER, "id": id }),
+                )
+                .await;
+            match shown {
+                Some(prompt) => {
+                    assert_eq!(status, StatusCode::OK, "{template:?} {id}");
+                    assert_eq!(prompt, prepared["initial_prompt"], "{template:?} {id}");
+                }
+                None => {
+                    assert_eq!(status, StatusCode::BAD_REQUEST, "{template:?} {id}");
+                    assert_eq!(id, "big");
+                }
+            }
+        }
+        if template == "   " {
+            assert_eq!(snapshot["items"][0]["start"]["prompt"], "");
+        }
+    }
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn presets_default_round_trip_reset_and_validate() {
