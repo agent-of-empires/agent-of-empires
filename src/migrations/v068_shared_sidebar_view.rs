@@ -6,8 +6,8 @@
 //! choices map to the nearest kept one. A TUI user who never picked a grouping keeps
 //! Groups, the TUI's old default; everyone else gets the new Repository default. The
 //! org and status collapse lists go with their groupings. The web keys stay, since the
-//! dashboard still reads them. A removed sort that v064 can seed as a Custom order is kept
-//! in `legacy_sort_order` for v064, which removes it.
+//! dashboard still reads them. A removed sort that v065 can seed as a Custom order is kept
+//! in `legacy_sort_order` for v065, which removes it.
 
 use anyhow::Result;
 use std::path::Path;
@@ -103,7 +103,7 @@ fn tui_group_by(mode: &str) -> &'static str {
     }
 }
 
-/// The order v064 seeds for a removed sort, in place of Custom's newest-first default.
+/// The order v065 seeds for a removed sort, in place of Custom's newest-first default.
 /// Attention ranked rows by live status, which no stored order can follow, so it seeds
 /// last activity, the stable order closest to it.
 fn legacy_seed(sort: &str) -> Option<&'static str> {
@@ -185,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_a_seedable_legacy_sort_for_v064() {
+    fn keeps_a_seedable_legacy_sort_for_v065() {
         let web = |sort: &str| format!("[web_ui_state]\n\"aoe-sidebar-sort-mode\" = \"{sort}\"\n");
         for (input, legacy) in [
             ("sort_order = \"oldest\"\n".to_string(), Some("oldest")),

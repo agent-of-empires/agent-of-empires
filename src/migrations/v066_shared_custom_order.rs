@@ -4,20 +4,22 @@
 //! dashboard kept its own in `workspace-ordering.json` (rows) and in `state.toml`'s
 //! `web_ui_state` (`aoe-repo-group-order-v1`, Repository headers). `workspace-ordering.json`
 //! is now the one store. A TUI order seeds it only where the dashboard has none, so the
-//! dashboard's wins. With neither, the removed sort v063 left in `legacy_sort_order` seeds
+//! dashboard's wins. With neither, the removed sort v064 left in `legacy_sort_order` seeds
 //! it, so the list keeps the order it had. The dashboard's header order is copied, not
 //! removed, because the dashboard still reads it. `sort_index` and `legacy_sort_order` are
 //! dropped only after the shared order is written, so an interrupted run retries from them.
+//! A `sessions.json` that cannot be read is left for its owner's recovery path, and its
+//! rows count as never moved.
 
 use super::sessions_file;
-use super::v063_shared_sidebar_view::LEGACY_SORT_KEY;
+use super::v064_shared_sidebar_view::LEGACY_SORT_KEY;
 use crate::time::Timestamp;
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::cmp::Reverse;
 use std::fs;
 use std::path::Path;
-use tracing::info;
+use tracing::{info, warn};
 
 const WEB_REPO_ORDER_KEY: &str = "aoe-repo-group-order-v1";
 
@@ -25,9 +27,10 @@ pub fn run() -> Result<()> {
     run_in(&crate::session::get_app_dir()?)
 }
 
-/// A live row's place in each order v064 can seed.
+/// A live row's place in each order v065 can seed.
 struct LiveRow {
     workspace: String,
+    repository: String,
     created: Option<Timestamp>,
     accessed: Option<Timestamp>,
 }
@@ -37,15 +40,8 @@ fn run_in(app_dir: &Path) -> Result<()> {
     let mut live: Vec<LiveRow> = Vec::new();
     let mut to_strip: Vec<(std::path::PathBuf, String)> = Vec::new();
     for path in sessions_file::session_files(app_dir)? {
-        // Only a missing file is skipped: finishing without a profile's rows would lose
-        // its order for good, so an unreadable one fails the run to retry next start.
-        let Some(content) = read_if_present(&path)? else {
+        let Some((content, rows)) = read_session_rows(&path) else {
             continue;
-        };
-        let Value::Array(rows) = serde_json::from_str::<Value>(&content)
-            .with_context(|| format!("Failed to parse {} during v064 migration", path.display()))?
-        else {
-            anyhow::bail!("{} is not a session list", path.display());
         };
         for row in rows.iter().filter_map(Value::as_object) {
             if sessions_file::is_archived(row)
@@ -69,6 +65,7 @@ fn run_in(app_dir: &Path) -> Result<()> {
             }
             live.push(LiveRow {
                 workspace,
+                repository: repository_path(row).to_string(),
                 created: time("created_at"),
                 accessed: time("last_accessed_at"),
             });
@@ -96,12 +93,15 @@ fn run_in(app_dir: &Path) -> Result<()> {
         .transpose()?
         .unwrap_or_default();
     let mut changed = false;
+    let legacy = legacy_sort
+        .as_deref()
+        .and_then(|sort| legacy_rank(live, sort))
+        .unwrap_or_default();
+    let legacy_rows = dedup(legacy.iter().map(|row| row.workspace.clone()));
+    let legacy_repositories = dedup(legacy.iter().map(|row| row.repository.clone()));
     if ordering.order.is_empty() {
         let seeded = if tui_order.is_empty() {
-            legacy_sort
-                .as_deref()
-                .map(|sort| legacy_order(live, sort))
-                .unwrap_or_default()
+            legacy_rows
         } else {
             tui_order
         };
@@ -110,9 +110,16 @@ fn run_in(app_dir: &Path) -> Result<()> {
             changed = true;
         }
     }
-    if ordering.repositories.is_empty() && !web_repositories.is_empty() {
-        ordering.repositories = web_repositories;
-        changed = true;
+    if ordering.repositories.is_empty() {
+        let seeded = if web_repositories.is_empty() {
+            legacy_repositories
+        } else {
+            web_repositories
+        };
+        if !seeded.is_empty() {
+            ordering.repositories = seeded;
+            changed = true;
+        }
     }
     if changed {
         crate::session::atomic_write(
@@ -131,16 +138,17 @@ fn run_in(app_dir: &Path) -> Result<()> {
         sessions_file::heal_rows(&path, &content, |row| row.remove("sort_index").is_some())?;
     }
     if legacy_sort.is_some() {
-        super::config_file::rewrite_strict(&app_dir.join("state.toml"), "v064", |state| {
+        super::config_file::rewrite_strict(&app_dir.join("state.toml"), "v065", |state| {
             state.remove(LEGACY_SORT_KEY).is_some()
         })?;
     }
     Ok(())
 }
 
-/// Workspaces in the order the removed sort `sort` showed them; see v063's `legacy_seed`.
-/// A workspace ranks by its newest session for last activity, by its oldest for oldest.
-fn legacy_order(mut live: Vec<LiveRow>, sort: &str) -> Vec<String> {
+/// Live rows in the order the removed sort `sort` showed them, or `None` for a sort with
+/// nothing to seed; see v064's `legacy_seed`. Deduplicated, a workspace or repository then
+/// ranks by its newest session for last activity and by its oldest for oldest.
+fn legacy_rank(mut live: Vec<LiveRow>, sort: &str) -> Option<Vec<LiveRow>> {
     match sort {
         "oldest" => live.sort_by_key(|row| (row.created.is_none(), row.created)),
         "last_activity" => live.sort_by_key(|row| {
@@ -150,9 +158,32 @@ fn legacy_order(mut live: Vec<LiveRow>, sort: &str) -> Vec<String> {
                 Reverse(row.created),
             )
         }),
-        _ => return Vec::new(),
+        _ => return None,
     }
-    dedup(live.into_iter().map(|row| row.workspace))
+    Some(live)
+}
+
+/// A profile's raw content and rows, or `None` when it is missing or cannot be read as a
+/// session list. Such a file is left untouched for the recovery that owns it.
+fn read_session_rows(path: &Path) -> Option<(String, Vec<Value>)> {
+    let content = match read_if_present(path) {
+        Ok(content) => content?,
+        Err(error) => {
+            warn!(target: "migrations.v065", path = %path.display(), %error, "skipping an unreadable session list");
+            return None;
+        }
+    };
+    match serde_json::from_str::<Value>(&content) {
+        Ok(Value::Array(rows)) => Some((content, rows)),
+        Ok(_) => {
+            warn!(target: "migrations.v065", path = %path.display(), "skipping a file that is not a session list");
+            None
+        }
+        Err(error) => {
+            warn!(target: "migrations.v065", path = %path.display(), %error, "skipping a session list that does not parse");
+            None
+        }
+    }
 }
 
 /// `ids` with each one kept at its first position.
@@ -179,19 +210,28 @@ fn read_if_present(path: &Path) -> Result<Option<String>> {
 /// `repoPath::branch`, or `repoPath::__session__::id` without a worktree, as
 /// `Instance::workspace_id` computes it.
 fn workspace_id(row: &serde_json::Map<String, Value>) -> String {
-    let worktree = row.get("worktree_info").filter(|w| !w.is_null());
-    fn text(value: Option<&Value>) -> &str {
-        value.and_then(Value::as_str).unwrap_or_default()
-    }
-    let repo = match worktree {
-        Some(worktree) => text(worktree.get("main_repo_path")),
-        None => text(row.get("project_path")),
-    }
-    .trim_end_matches('/');
-    match worktree {
+    let repo = repository_path(row);
+    match worktree(row) {
         Some(worktree) => format!("{repo}::{}", text(worktree.get("branch"))),
         None => format!("{repo}::__session__::{}", text(row.get("id"))),
     }
+}
+
+/// The repository a row's workspace belongs to: its worktree's main repo, else its project.
+fn repository_path(row: &serde_json::Map<String, Value>) -> &str {
+    match worktree(row) {
+        Some(worktree) => text(worktree.get("main_repo_path")),
+        None => text(row.get("project_path")),
+    }
+    .trim_end_matches('/')
+}
+
+fn worktree(row: &serde_json::Map<String, Value>) -> Option<&Value> {
+    row.get("worktree_info").filter(|w| !w.is_null())
+}
+
+fn text(value: Option<&Value>) -> &str {
+    value.and_then(Value::as_str).unwrap_or_default()
 }
 
 /// `state.toml`, or `None` when it is missing. A file that does not parse fails the run
@@ -291,10 +331,11 @@ mod tests {
         }
     }
 
-    /// Only a missing file counts as absent; one that exists but cannot be read or parsed
-    /// fails the run so the next start retries, without seeding or stripping anything.
+    /// A session list that cannot be read is skipped and left for its recovery, while the
+    /// other profiles migrate. An unreadable `workspace-ordering.json` fails the run
+    /// untouched, since writing over it could lose an order.
     #[test]
-    fn an_unreadable_input_fails_the_run_untouched() {
+    fn an_unreadable_input_is_left_untouched() {
         for broken in [
             "profiles/other/sessions.json",
             "profiles/other/sessions.json:not json",
@@ -315,11 +356,25 @@ mod tests {
             } else {
                 fs::write(&path, content).unwrap();
             }
-            assert!(run_in(dir.path()).is_err(), "{broken}");
-            let rows = fs::read_to_string(dir.path().join("profiles/main/sessions.json")).unwrap();
-            assert!(rows.contains("sort_index"), "{broken}");
-            let ordering = dir.path().join("workspace-ordering.json");
-            assert!(!ordering.is_file(), "{broken}");
+            let read_back = || match content {
+                "" => path.is_dir(),
+                content => fs::read_to_string(&path).unwrap() == content,
+            };
+            let rows =
+                || fs::read_to_string(dir.path().join("profiles/main/sessions.json")).unwrap();
+            if file == "workspace-ordering.json" {
+                assert!(run_in(dir.path()).is_err(), "{broken}");
+                assert!(rows().contains("sort_index"), "{broken}");
+            } else {
+                run_in(dir.path()).unwrap();
+                assert!(!rows().contains("sort_index"), "{broken}");
+                assert_eq!(
+                    ordering(dir.path()).order,
+                    ["/r/one::__session__::a"],
+                    "{broken}"
+                );
+            }
+            assert!(read_back(), "{broken}");
         }
     }
 
@@ -339,7 +394,7 @@ mod tests {
         assert_eq!(ordering(dir.path()).order, ["/r/web::main"]);
     }
 
-    /// With no TUI or dashboard order, the removed sort v063 kept seeds one that shows the
+    /// With no TUI or dashboard order, the removed sort v064 kept seeds one that shows the
     /// rows as that sort did, and is then dropped.
     #[test]
     fn seeds_the_order_the_removed_sort_showed() {
@@ -366,16 +421,34 @@ mod tests {
             "/r/c::__session__::c",
             "/r/d::x",
         );
-        for (legacy, ordering, expected) in [
-            (Some("oldest"), None, vec![d, a, c, b]),
-            (Some("last_activity"), None, vec![d, c, a, b]),
+        let repos = |ids: &[&str]| -> Vec<String> {
+            ids.iter()
+                .map(|id| id.split("::").next().unwrap().to_string())
+                .collect()
+        };
+        for (legacy, ordering, expected, repositories) in [
+            (Some("oldest"), None, vec![d, a, c, b], repos(&[d, a, c, b])),
+            (
+                Some("last_activity"),
+                None,
+                vec![d, c, a, b],
+                repos(&[d, c, a, b]),
+            ),
             // Newest, Name and the dashboard's Manual leave Custom's default.
-            (None, None, vec![]),
-            // A dashboard order is never overwritten.
+            (None, None, vec![], vec![]),
+            // A dashboard order is never overwritten, rows or headers.
             (
                 Some("oldest"),
+                Some(r#"{"order": ["/r/web::main"], "repositories": ["/r/web"]}"#),
+                vec!["/r/web::main"],
+                vec!["/r/web".to_string()],
+            ),
+            // Headers seed on their own when only the rows were arranged.
+            (
+                Some("last_activity"),
                 Some(r#"{"order": ["/r/web::main"]}"#),
                 vec!["/r/web::main"],
+                repos(&[d, c, a, b]),
             ),
         ] {
             let dir = tempfile::tempdir().unwrap();
@@ -396,11 +469,12 @@ mod tests {
                     !dir.path().join("workspace-ordering.json").exists(),
                     "{legacy:?}"
                 );
-                Vec::new()
+                Default::default()
             } else {
-                self::ordering(dir.path()).order
+                self::ordering(dir.path())
             };
-            assert_eq!(seeded, expected, "{legacy:?} {ordering:?}");
+            assert_eq!(seeded.order, expected, "{legacy:?} {ordering:?}");
+            assert_eq!(seeded.repositories, repositories, "{legacy:?} {ordering:?}");
             let state = fs::read_to_string(dir.path().join("state.toml")).unwrap();
             assert!(!state.contains(LEGACY_SORT_KEY), "{legacy:?}");
             assert!(state.contains("sort_order"), "{legacy:?}");
@@ -412,7 +486,9 @@ mod tests {
                 state
             );
             if !expected.is_empty() {
-                assert_eq!(self::ordering(dir.path()).order, expected);
+                let again = self::ordering(dir.path());
+                assert_eq!(again.order, expected);
+                assert_eq!(again.repositories, repositories);
             }
         }
     }
