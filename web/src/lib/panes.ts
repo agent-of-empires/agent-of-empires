@@ -64,3 +64,8 @@ export function bindUnboundTerminalTabId(id: string, sessionId: string): string 
   const m = UNBOUND_TERMINAL_TAB_ID_RE.exec(id);
   return m ? terminalTabId(sessionId, Number.parseInt(m[1]!, 10)) : id;
 }
+
+/** The pane an empty review panel opens: Diff, or the first available pane where Diff is not (CityHall). */
+export function emptyPanelPane(available: readonly string[]): string | undefined {
+  return available.includes("diff") ? "diff" : available[0];
+}

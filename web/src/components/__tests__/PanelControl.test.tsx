@@ -45,7 +45,7 @@ describe("PanelControl", () => {
     expect(open.queryByTestId("right-dock-badge")).toBeNull();
   });
 
-  it("lists panes checked while open, toggles the picked one, and hands focus back on Escape", () => {
+  it("lists panes checked while open, moves with the arrow keys, toggles the picked one, and hands focus back on Escape", () => {
     const { onTogglePane } = setup(true);
     const chevron = screen.getByRole("button", { name: "Panes" });
     fireEvent.click(chevron);
@@ -55,6 +55,12 @@ describe("PanelControl", () => {
       ["Files", "false"],
     ]);
     expect(document.activeElement).toBe(items[0]);
+    fireEvent.keyDown(items[0]!, { key: "ArrowDown" });
+    expect(document.activeElement).toBe(items[1]);
+    fireEvent.keyDown(items[1]!, { key: "ArrowDown" });
+    expect(document.activeElement).toBe(items[0]);
+    fireEvent.keyDown(items[0]!, { key: "End" });
+    expect(document.activeElement).toBe(items[1]);
     fireEvent.click(screen.getByTestId("pane-toggle-files"));
     expect([onTogglePane.mock.calls, screen.queryByRole("menu")]).toEqual([[["files"]], null]);
 

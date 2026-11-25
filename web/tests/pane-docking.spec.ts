@@ -70,6 +70,9 @@ test.describe("Dockable pane system", () => {
     await page.getByTestId("pane-menu-toggle").click();
     await expect(page.getByTestId("pane-toggle-diff")).toHaveAttribute("aria-checked", "true");
     await expect(page.getByTestId("pane-toggle-files")).toHaveAttribute("aria-checked", "false");
+    await expect(page.getByTestId("pane-toggle-diff")).toBeFocused();
+    await page.keyboard.press("ArrowDown");
+    await expect(page.getByTestId("pane-toggle-files")).toBeFocused();
     await page.getByTestId("pane-toggle-files").click();
     await expect(page.getByTestId("pane-tab-files")).toBeVisible();
     await page.getByTestId("pane-menu-toggle").click();

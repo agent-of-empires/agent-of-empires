@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { bindUnboundTerminalTabId, isTerminalTabId, parseTerminalTabId, terminalTabId } from "../panes";
+import { bindUnboundTerminalTabId, emptyPanelPane, isTerminalTabId, parseTerminalTabId, terminalTabId } from "../panes";
 
 describe("terminal tab ids", () => {
   it("round-trips a Session's shell index", () => {
@@ -30,5 +30,15 @@ describe("terminal tab ids", () => {
     for (const kept of ["terminal:s0:1", "diff", "plugin:p:a", "terminal:x"]) {
       expect(bindUnboundTerminalTabId(kept, "s1")).toBe(kept);
     }
+  });
+});
+
+describe("emptyPanelPane", () => {
+  it("opens Diff when available, else the first pane, else nothing", () => {
+    expect([emptyPanelPane(["files", "diff"]), emptyPanelPane(["agents", "plugin:p:a"]), emptyPanelPane([])]).toEqual([
+      "diff",
+      "agents",
+      undefined,
+    ]);
   });
 });

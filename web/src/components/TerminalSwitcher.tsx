@@ -1,8 +1,9 @@
-import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import { ChevronDown, Plus, SquareTerminal } from "lucide-react";
 
 import { shellLabel, type PairedShell, type PairedShellGroup } from "../lib/pairedShells";
+import { moveMenuFocus } from "./menuFocus";
 import { useOutsideDismiss } from "./useOutsideDismiss";
 
 export interface TerminalSwitcherProps {
@@ -11,24 +12,6 @@ export interface TerminalSwitcherProps {
   newTerminalFor?: string;
   onPick: (shell: PairedShell) => void;
   onNew?: () => void;
-}
-
-function moveFocus(e: KeyboardEvent<HTMLElement>) {
-  const items = [...e.currentTarget.querySelectorAll<HTMLElement>('[role="menuitem"]')];
-  const at = items.indexOf(document.activeElement as HTMLElement);
-  const next =
-    e.key === "ArrowDown"
-      ? (at + 1) % items.length
-      : e.key === "ArrowUp"
-        ? (at - 1 + items.length) % items.length
-        : e.key === "Home"
-          ? 0
-          : e.key === "End"
-            ? items.length - 1
-            : null;
-  if (next === null || items.length === 0) return;
-  e.preventDefault();
-  items[next]!.focus();
 }
 
 /** Every live paired shell grouped by Session; picking one shows it in a terminal tab. Focuses its first item. */
@@ -53,7 +36,7 @@ export function TerminalSwitcherMenu({
       aria-label="Paired terminals"
       data-testid="terminal-switcher-menu"
       data-owns-escape="open"
-      onKeyDown={moveFocus}
+      onKeyDown={moveMenuFocus}
       style={maxHeight === undefined ? undefined : { maxHeight }}
       className="w-72 max-h-[60vh] overflow-y-auto bg-surface-800 border border-surface-700/50 rounded-md shadow-xl py-1"
     >

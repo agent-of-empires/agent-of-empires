@@ -221,7 +221,14 @@ import {
 } from "./lib/pairedShells";
 import { usePairedShellModes } from "./hooks/usePairedShellModes";
 import { useOpenPairedTerminal, usePairedTerminalReveal } from "./hooks/usePairedTerminalReveal";
-import { BUILTIN_PANES, parseTerminalTabId, TERMINAL_DOCK, type DockLocation, type TerminalRef } from "./lib/panes";
+import {
+  BUILTIN_PANES,
+  emptyPanelPane,
+  parseTerminalTabId,
+  TERMINAL_DOCK,
+  type DockLocation,
+  type TerminalRef,
+} from "./lib/panes";
 import { MobileRightPanelPicker } from "./components/MobileRightPanelPicker";
 import { MobileMainPane } from "./components/MobileMainPane";
 import { ChromeCollapseHandle, CollapsibleRegion } from "./components/CollapsibleChrome";
@@ -1807,12 +1814,12 @@ function AppContent({
     }
     if (rightDockCollapsed) {
       setDockCollapsed("right", false);
-      // The right dock is the review panel; terminals keep their own dock.
-      if (availableRightGroups.length === 0) openTab("diff", "right");
+      const first = emptyPanelPane(dockPaneIds);
+      if (availableRightGroups.length === 0 && first) openTab(first, "right");
     } else {
       setDockCollapsed("right", true);
     }
-  }, [isMdUp, rightDockCollapsed, setDockCollapsed, availableRightGroups.length, openTab]);
+  }, [isMdUp, rightDockCollapsed, setDockCollapsed, availableRightGroups.length, openTab, dockPaneIds]);
 
   const handlePickView = useCallback(
     (view: RightPanelView) => {

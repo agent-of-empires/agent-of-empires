@@ -4,6 +4,7 @@ import { Check, ChevronDown, PanelRight, SquareTerminal } from "lucide-react";
 import type { PaneDisplay } from "./Dock";
 import { PaneIcon } from "./PaneIcon";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
+import { moveMenuFocus } from "./menuFocus";
 import { useOutsideDismiss } from "./useOutsideDismiss";
 import { formatShortcut, IS_MAC, SHORTCUTS_BY_ID, type ShortcutId } from "../lib/shortcuts";
 
@@ -100,7 +101,8 @@ export function PanelControl({
           aria-label="Panes"
           data-testid="pane-menu"
           data-owns-escape="open"
-          className="absolute right-0 top-full mt-1 z-50 w-52 py-1 bg-surface-800 border border-surface-700/50 rounded-md shadow-xl animate-fade-in"
+          onKeyDown={moveMenuFocus}
+          className="absolute right-0 top-full mt-1 z-50 w-52 max-h-[calc(100vh-4rem)] overflow-y-auto py-1 bg-surface-800 border border-surface-700/50 rounded-md shadow-xl animate-fade-in"
         >
           {paneIds.map((id) => {
             const desc = descriptorFor(id);
