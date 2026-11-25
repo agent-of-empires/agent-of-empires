@@ -5596,6 +5596,19 @@
       "components": ["web/src/components/acp/Composer.tsx", "web/src/hooks/useAcpSession.ts"]
     },
     {
+      "id": "acp.wide-screen-column",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/acp-wide-screen-column.spec.ts"],
+      "components": [
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/PromptStrips.tsx",
+        "web/src/components/acp/transcriptColumn.ts"
+      ],
+      "notes": "The transcript column widens to 72rem at 120rem viewports and 80rem at 150rem, and the composer keeps its left edge and width. #6019."
+    },
+    {
       "id": "acp.mid-turn-steering",
       "kind": "live-playwright",
       "risk": "high",
