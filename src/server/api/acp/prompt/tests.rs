@@ -313,7 +313,11 @@ async fn initial_host_intent_obeys_applied_and_stop_before_native_issue() {
                 live.native.send(serde_json::json!({
                     "jsonrpc": "2.0", "id": request["id"], "result": {"sessionId": replacement}
                 })).await;
-                reset.await.unwrap();
+                let outcome = reset.await.unwrap();
+                assert!(
+                    matches!(&outcome, crate::acp::acp_client::ResetSessionOutcome::Reset { new_acp_session_id } if new_acp_session_id == replacement),
+                    "reset must publish its replacement before submitting fresh input: {outcome:?}"
+                );
                 live.sid = replacement.into();
             }
             assert_eq!(live.client.initial_prompt_identity(), None);
@@ -751,7 +755,16 @@ async fn turn_on_a_park_attaches_the_retained_actor_then_delivers_only_new_expli
                             .await
                             .into_response()
                         };
-                        assert_eq!(response.status(), StatusCode::ACCEPTED);
+                        let status = response.status();
+                        let body = axum::body::to_bytes(response.into_body(), 4096)
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            status,
+                            StatusCode::ACCEPTED,
+                            "{}",
+                            String::from_utf8_lossy(&body)
+                        );
                     })
                     .await;
                 live.client.ready().await;
