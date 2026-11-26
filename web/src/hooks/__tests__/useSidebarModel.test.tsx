@@ -4,7 +4,7 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { SidebarView } from "../../lib/api";
+import type { SidebarView, WorkspaceOrderingPatch } from "../../lib/api";
 import { reportFeatureUse } from "../../lib/featureUse";
 import { toastBus, type ToastApi } from "../../lib/toastBus";
 import type { SessionResponse } from "../../lib/types";
@@ -27,6 +27,7 @@ interface Daemon {
 const row = (id: string, repo: string, title: string, created_at = "2025-01-01T00:00:00Z") =>
   session({ id, title, project_path: repo, branch: id, group_path: "", created_at });
 const wsId = (s: SessionResponse) => `${s.project_path}::${s.branch}`;
+const same = (a: string[], b: string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
 
 let daemon: Daemon;
 const writes: { method: string; body: unknown }[] = [];
@@ -52,8 +53,12 @@ const server = setupServer(
     return HttpResponse.json(daemon.sidebar_view, { headers: runtime(daemon.revision) });
   }),
   http.put("*/api/workspace-ordering", async ({ request }) => {
-    const body = (await request.json()) as { order?: string[]; repositories?: string[] };
+    const body = (await request.json()) as WorkspaceOrderingPatch;
     writes.push({ method: "PUT", body });
+    const { base } = body;
+    if (base && !(same(base.order, daemon.workspace_ordering) && same(base.repositories, daemon.repository_order))) {
+      return HttpResponse.json({ message: "stale" }, { status: 409 });
+    }
     if (body.order) daemon.workspace_ordering = body.order;
     if (body.repositories) daemon.repository_order = body.repositories;
     daemon.revision += 1;
@@ -169,6 +174,7 @@ function mount() {
       orderingSaving: sessions.orderingSaving,
       changeSidebarView: sessions.changeSidebarView,
       onSharedRead: sessions.onSharedRead,
+      refresh: sessions.refresh,
     });
     return { sessions, model };
   });
@@ -377,7 +383,7 @@ describe("the shared Custom order", () => {
     server.use(
       http.patch("*/api/sidebar-view", async ({ request }) => {
         writes.push({ method: "PATCH", body: await request.json() });
-        return new HttpResponse(null, { status: 500 });
+        return new HttpResponse(null, { status: 422 });
       }),
     );
     const { result } = mount();
@@ -540,10 +546,12 @@ describe("Undo", () => {
       expect(result.current.model.sort).toBe("custom");
       expect(rows(result)).not.toEqual(shown);
 
+      const { order, repositories } = writes[0]!.body as WorkspaceOrderingPatch;
+      const left = { order, repositories };
       await act(async () => void toasts.undo[0]!.run());
       await waitFor(() => expect(writes).toHaveLength(4));
       expect(writes.slice(2)).toEqual([
-        { method: "PUT", body: before },
+        { method: "PUT", body: { ...before, base: left } },
         { method: "PATCH", body: { sort } },
       ]);
       expect(result.current.model.sort).toBe(sort);
@@ -579,7 +587,7 @@ describe("Undo", () => {
     await waitFor(() => expect(toasts.undo).toHaveLength(1));
     await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
     await act(async () => result.current.model.moveRepository("/r/beta", "/r/Alpha", false));
-    expect(toasts.undo[0]!.dismissed).toBe(true);
+    await waitFor(() => expect(toasts.undo[0]!.dismissed).toBe(true));
 
     await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
     act(() => result.current.model.selectSort("name"));
@@ -602,7 +610,7 @@ describe("Undo after another Client", () => {
     expect(toasts.undo[0]!.dismissed).toBe(false);
     daemon.repository_order = ["/r/beta", "/r/Alpha"];
     await pollAt(result, daemon.revision + 1);
-    expect(toasts.undo[0]!.dismissed).toBe(true);
+    await waitFor(() => expect(toasts.undo[0]!.dismissed).toBe(true));
   });
 
   it("puts back only the lists its change wrote", async () => {
@@ -613,9 +621,51 @@ describe("Undo after another Client", () => {
     await act(async () => result.current.model.moveWorkspace("/r/beta::b2", "/r/beta::b1", false));
     await waitFor(() => expect(toasts.undo).toHaveLength(1));
     await waitFor(() => expect(writes).toHaveLength(2));
+    const order = (writes[0]!.body as WorkspaceOrderingPatch).order!;
     await act(async () => void toasts.undo[0]!.run());
     await waitFor(() => expect(writes).toHaveLength(4));
-    expect(writes[2]).toEqual({ method: "PUT", body: { order: before } });
+    expect(writes[2]).toEqual({
+      method: "PUT",
+      body: { order: before, base: { order, repositories: daemon.repository_order } },
+    });
+  });
+
+  it("is refused with a notice when another Client changed the order before this one read it", async () => {
+    daemon.sidebar_view = { group_by: "project", sort: "name" };
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    await act(async () => result.current.model.moveWorkspace("/r/beta::b2", "/r/beta::b1", false));
+    await waitFor(() => expect(toasts.undo).toHaveLength(1));
+    await waitFor(() => expect(writes).toHaveLength(2));
+    const theirs = [...daemon.workspace_ordering].reverse();
+    daemon.workspace_ordering = theirs;
+    await act(async () => void toasts.undo[0]!.run());
+    await waitFor(() => expect(toasts.info).toHaveBeenCalledWith("Another Client changed the order, so Undo kept it"));
+    expect(writes.map((w) => w.method)).toEqual(["PUT", "PATCH", "PUT"]);
+    expect(daemon.workspace_ordering).toEqual(theirs);
+    expect(daemon.sidebar_view.sort).toBe("custom");
+  });
+
+  it("says so when its restore fails", async () => {
+    daemon.sidebar_view = { group_by: "project", sort: "name" };
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    await act(async () => result.current.model.moveWorkspace("/r/beta::b2", "/r/beta::b1", false));
+    await waitFor(() => expect(toasts.undo).toHaveLength(1));
+    await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
+    server.use(http.put("*/api/workspace-ordering", () => new HttpResponse(null, { status: 422 })));
+    await act(async () => void toasts.undo[0]!.run());
+    await waitFor(() => expect(toasts.info).toHaveBeenCalledWith("Couldn't undo; part of the change may have saved"));
+  });
+
+  it("is withdrawn when the sidebar model is torn down", async () => {
+    daemon.sidebar_view = { group_by: "project", sort: "name" };
+    const { result, unmount } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    await act(async () => result.current.model.moveWorkspace("/r/beta::b2", "/r/beta::b1", false));
+    await waitFor(() => expect(toasts.undo).toHaveLength(1));
+    unmount();
+    expect(toasts.undo[0]!.dismissed).toBe(true);
   });
 });
 
@@ -707,13 +757,65 @@ describe("Group headers", () => {
     await waitFor(() => expect(toasts.undo).toHaveLength(1));
     daemon.group_order.default = ["zeta", "mid", "alpha", "alpha/inner", "loose"];
     await pollAt(result, daemon.revision + 1);
-    expect(toasts.undo[0]!.dismissed).toBe(true);
+    await waitFor(() => expect(toasts.undo[0]!.dismissed).toBe(true));
+  });
+
+  it("keep a Group another Client placed when Undo puts their order back", async () => {
+    daemon.sidebar_view = { group_by: "group", sort: "name" };
+    const { result } = mount();
+    await waitFor(() => expect(groupHeaders(result)).toHaveLength(5));
+    await act(async () => result.current.model.moveWorkspace("/r/one::zeta", "/r/one::mid", false));
+    await waitFor(() => expect(toasts.undo).toHaveLength(1));
+    await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
+    daemon.sessions.push(grouped("peer", "peer"));
+    daemon.group_order.default = ["peer", ...daemon.group_order.default!];
+    await pollAt(result, daemon.revision + 1);
+    expect(toasts.undo[0]!.dismissed).toBe(false);
+
+    await act(async () => void toasts.undo[0]!.run());
+    await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
+    await waitFor(() => expect(daemon.sidebar_view.sort).toBe("name"));
+    expect(daemon.group_order.default).toEqual(["peer", "zeta", "alpha", "alpha/inner", "mid", "loose"]);
+  });
+
+  it.each([
+    [
+      "a Group move",
+      http.post("*/api/reorder", () => new HttpResponse(null, { status: 500 }), { once: true }),
+      ["PUT"],
+    ],
+    [
+      "the sort",
+      http.patch("*/api/sidebar-view", () => new HttpResponse(null, { status: 500 }), { once: true }),
+      ["PUT", "POST"],
+    ],
+  ])("leave the orders to the Daemon when %s of a switch from Name may have landed", async (_, handler, sent) => {
+    daemon.sidebar_view = { group_by: "group", sort: "name" };
+    server.use(handler);
+    const { result } = mount();
+    await waitFor(() => expect(groupHeaders(result)).toHaveLength(5));
+    await act(async () => result.current.model.moveWorkspace("/r/one::zeta", "/r/one::mid", false));
+    await waitFor(() =>
+      expect(toasts.info).toHaveBeenCalledWith("Couldn't confirm the switch to Custom; the list shows what saved"),
+    );
+    expect(writes.map((w) => w.method)).toEqual(sent);
+    expect(toasts.undo).toEqual([]);
+  });
+
+  it("say nothing moved when every write of a switch from Name was refused", async () => {
+    daemon.sidebar_view = { group_by: "group", sort: "name" };
+    server.use(http.put("*/api/workspace-ordering", () => new HttpResponse(null, { status: 422 }), { once: true }));
+    const { result } = mount();
+    await waitFor(() => expect(groupHeaders(result)).toHaveLength(5));
+    await act(async () => result.current.model.moveWorkspace("/r/one::zeta", "/r/one::mid", false));
+    await waitFor(() => expect(toasts.info).toHaveBeenCalledWith("Couldn't switch to Custom, so nothing moved"));
+    expect(writes).toEqual([]);
   });
 
   it("put the order back when a Group move fails during a switch from Name", async () => {
     daemon.sidebar_view = { group_by: "group", sort: "name" };
     const before = [...daemon.workspace_ordering];
-    server.use(http.post("*/api/reorder", () => new HttpResponse(null, { status: 500 }), { once: true }));
+    server.use(http.post("*/api/reorder", () => new HttpResponse(null, { status: 422 }), { once: true }));
     const { result } = mount();
     await waitFor(() => expect(groupHeaders(result)).toHaveLength(5));
     await act(async () => result.current.model.moveWorkspace("/r/one::zeta", "/r/one::mid", false));

@@ -114,3 +114,20 @@ export function arrangeGroups(
   }
   return moves;
 }
+
+/**
+ * The moves that put the Groups of `previous` and `changed`, a change's own order, back in `previous` order, each
+ * into a slot one of them holds in `current`, so a Group neither lists keeps its place.
+ */
+export function restoreGroups(current: readonly string[], previous: readonly string[], changed: readonly string[]) {
+  const owned = new Set([...previous, ...changed]);
+  const fill = (arranged: readonly string[]) => {
+    let next = 0;
+    return current.map((p) => (owned.has(p) ? arranged[next++]! : p));
+  };
+  return arrangeGroups(
+    current.filter((p) => owned.has(p)),
+    [],
+    groupPathComparator(previous),
+  ).map(({ path, move }) => ({ path, move: { ...move, order: fill(move.order) } }));
+}

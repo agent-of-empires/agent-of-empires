@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { arrangeGroups, groupMove, groupPathComparator, mergeGroupOrder } from "./groupOrder";
+import { arrangeGroups, groupMove, groupPathComparator, mergeGroupOrder, restoreGroups } from "./groupOrder";
 import { compareNames } from "./sidebarSort";
 
 describe("groupPathComparator", () => {
@@ -65,5 +65,12 @@ describe("arrangeGroups", () => {
       },
     ]);
     expect(arrangeGroups(["a", "b"], [], compareNames)).toEqual([]);
+  });
+});
+
+describe("restoreGroups", () => {
+  it("puts back only the Groups a change listed, leaving another Client's in its slot", () => {
+    const moves = restoreGroups(["c", "a", "b"], ["b", "a"], ["a", "b"]);
+    expect(moves).toEqual([{ path: "b", move: { direction: "up", siblings: ["a", "b"], order: ["c", "b", "a"] } }]);
   });
 });

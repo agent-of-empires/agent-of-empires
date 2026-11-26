@@ -203,7 +203,8 @@ static CATALOG: &[Tip] = &[
         id: "sort-sidebar",
         title: "Sort the sidebar your way",
         body: "The view menu sorts by Custom, where you drag rows and repositories into any \
-               order yourself, or by Name. The TUI and every browser share the choice.",
+               order yourself, by Newest first, or by Name. The TUI and every browser share \
+               the choice.",
         trigger: TipTrigger::Rotation,
         surfaces: &[TipSurface::Web],
     },

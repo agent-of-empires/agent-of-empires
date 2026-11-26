@@ -312,46 +312,65 @@ export function fetchRecentProjects(): Promise<RecentProjectsEnvelope | null> {
 export interface WorkspaceOrderingPatch {
   order?: string[];
   repositories?: string[];
+  /** The stored orders this write replaces; the Daemon refuses it with 409 once either changed. */
+  base?: { order: string[]; repositories: string[] };
 }
 
-/** The receipt cursor of a committed write, or null when it failed or carried none. */
+/** How a shared write ended: its receipt once committed, else `conflict` (refused for a stale `base`), `rejected`
+ *  (refused or not sent), or `uncertain` (no answer, a server error or no receipt, so it may have landed). */
+export type WriteResult =
+  | { receipt: RuntimeCursor; failure?: undefined }
+  | { receipt: null; failure: "conflict" | "rejected" | "uncertain" };
+
+export const NOT_SENT: WriteResult = { receipt: null, failure: "rejected" };
+
 // A write that never answers would hold polls off its value forever; past this it counts as failed.
 const WRITE_RECEIPT_DEADLINE_MS = 15_000;
 
-async function writeReceipt(url: string, init: RequestInit): Promise<RuntimeCursor | null> {
+function writeResult(res: Response): WriteResult {
+  if (res.ok) {
+    const receipt = runtimeCursor(res);
+    return receipt ? { receipt } : { receipt: null, failure: "uncertain" };
+  }
+  if (res.status === 409) return { receipt: null, failure: "conflict" };
+  return { receipt: null, failure: res.status >= 500 ? "uncertain" : "rejected" };
+}
+
+async function writeReceipt(url: string, init: RequestInit): Promise<WriteResult> {
   try {
-    const res = await fetch(url, { ...init, signal: AbortSignal.timeout(WRITE_RECEIPT_DEADLINE_MS) });
-    return res.ok ? runtimeCursor(res) : null;
+    return writeResult(await fetch(url, { ...init, signal: AbortSignal.timeout(WRITE_RECEIPT_DEADLINE_MS) }));
   } catch {
-    return null;
+    return { receipt: null, failure: "uncertain" };
   }
 }
 
-export function updateWorkspaceOrdering(patch: WorkspaceOrderingPatch): Promise<RuntimeCursor | null> {
+export function updateWorkspaceOrdering(patch: WorkspaceOrderingPatch): Promise<WriteResult> {
   return writeReceipt("/api/workspace-ordering", jsonInit("PUT", patch));
 }
 
-/** Arranges a Group's siblings as `siblings` lists them, then moves it one slot; resolves with the receipt when it
- *  moved, else null. */
+/** Arranges a Group's siblings as `siblings` lists them, then moves it one slot; a Group that did not move is
+ *  `rejected`. */
 export async function reorderGroup(
   group: { profile: string; path: string },
   direction: "up" | "down",
   siblings: string[],
-): Promise<RuntimeCursor | null> {
+): Promise<WriteResult> {
   try {
     const res = await fetch("/api/reorder", {
       ...jsonInit("POST", { target: "group", group, direction, siblings }),
       signal: AbortSignal.timeout(WRITE_RECEIPT_DEADLINE_MS),
     });
-    if (!res.ok) return null;
+    const result = writeResult(res);
+    if (!res.ok) return result;
     const outcome = (await res.json().catch(() => null)) as { status?: string } | null;
-    return outcome?.status === "moved" ? runtimeCursor(res) : null;
+    if (!outcome) return { receipt: null, failure: "uncertain" };
+    return outcome.status === "moved" ? result : NOT_SENT;
   } catch {
-    return null;
+    return { receipt: null, failure: "uncertain" };
   }
 }
 
-export function updateSidebarView(patch: Partial<SidebarView>): Promise<RuntimeCursor | null> {
+export function updateSidebarView(patch: Partial<SidebarView>): Promise<WriteResult> {
   return writeReceipt("/api/sidebar-view", jsonInit("PATCH", patch));
 }
 

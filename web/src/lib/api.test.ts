@@ -97,12 +97,16 @@ const requestCases: RequestCase[] = [
   [
     "PUT /api/workspace-ordering",
     () => api.updateWorkspaceOrdering({ repositories: ["/r"] }),
-    { body: { repositories: ["/r"] }, respond: runtimeJson({}), result: cursor },
+    { body: { repositories: ["/r"] }, respond: runtimeJson({}), result: { receipt: cursor } },
   ],
   [
     "PATCH /api/sidebar-view",
     () => api.updateSidebarView({ sort: "name" }),
-    { body: { sort: "name" }, respond: runtimeJson({ group_by: "project", sort: "name" }), result: cursor },
+    {
+      body: { sort: "name" },
+      respond: runtimeJson({ group_by: "project", sort: "name" }),
+      result: { receipt: cursor },
+    },
   ],
   ["POST /api/sessions/s1/terminal?index=0", () => api.ensureTerminal("s1"), { result: { ok: true } }],
   ["POST /api/sessions/s1/container-terminal?index=2", () => api.ensureTerminal("s1", 2, true)],
@@ -840,8 +844,12 @@ const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ["fetchSessions", () => api.fetchSessions(), null],
   ["fetchProjects", () => api.fetchProjects({ profile: "work" }), null],
   ["searchConversations", () => api.searchConversations("q"), []],
-  ["updateWorkspaceOrdering", () => api.updateWorkspaceOrdering({ order: [] }), null],
-  ["updateSidebarView", () => api.updateSidebarView({ sort: "custom" }), null],
+  [
+    "updateWorkspaceOrdering",
+    () => api.updateWorkspaceOrdering({ order: [] }),
+    { receipt: null, failure: "uncertain" },
+  ],
+  ["updateSidebarView", () => api.updateSidebarView({ sort: "custom" }), { receipt: null, failure: "uncertain" }],
   ["getSessionFileContents", () => api.getSessionFileContents("s1", "a"), null],
   ["fetchThemes", () => api.fetchThemes(), []],
   ["fetchAcpAgents", () => api.fetchAcpAgents(), []],
@@ -876,6 +884,23 @@ describe("failure fallbacks", () => {
     expect(await call()).toEqual(fallback);
     offline();
     expect(await call()).toEqual(fallback);
+  });
+});
+
+describe("shared sidebar writes", () => {
+  it.each([
+    ["a stale base", () => api.updateWorkspaceOrdering({ order: [] }), json({}, 409), "conflict"],
+    ["a refusal", () => api.updateSidebarView({ sort: "name" }), json({}, 422), "rejected"],
+    ["no receipt", () => api.updateSidebarView({ sort: "name" }), json({}), "uncertain"],
+    [
+      "a Group at its edge",
+      () => api.reorderGroup({ profile: "p", path: "g" }, "up", []),
+      json({ status: "at_edge" }),
+      "rejected",
+    ],
+  ])("report %s", async (_name, call, response, failure) => {
+    fetchSpy.mockResolvedValueOnce(response);
+    expect(await call()).toEqual({ receipt: null, failure });
   });
 });
 

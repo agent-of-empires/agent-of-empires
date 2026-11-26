@@ -3,6 +3,7 @@ import type { SessionResponse } from "../lib/types";
 import {
   fetchSessions,
   fetchTrashedSessions,
+  NOT_SENT,
   reorderGroup,
   updateSidebarView,
   updateWorkspaceOrdering,
@@ -11,6 +12,7 @@ import {
   type SessionsEnvelope,
   type SidebarView,
   type WorkspaceOrderingPatch,
+  type WriteResult,
 } from "../lib/api";
 import type { GroupMove, GroupOrder } from "../lib/groupOrder";
 import { noteDaemonChanged, setServerDown } from "../lib/connectionState";
@@ -140,7 +142,7 @@ export function useSessions() {
     );
   }, []);
 
-  /** Applies an ordering write at once and sends it; resolves with its receipt, or null when it failed. */
+  /** Applies an ordering write at once and sends it; resolves with how it ended. */
   const changeOrdering = useCallback(
     async (patch: WorkspaceOrderingPatch) => {
       const holds = [];
@@ -153,10 +155,10 @@ export function useSessions() {
         holds.push(repositoryHold.current);
       }
       holds.forEach(holdStarted);
-      const receipt = await orderingWrites.current(() => updateWorkspaceOrdering(patch));
-      noteWriteEpoch(receipt);
-      for (const hold of holds) holdSettled(hold, receipt);
-      return receipt;
+      const result = await orderingWrites.current(() => updateWorkspaceOrdering(patch));
+      noteWriteEpoch(result.receipt);
+      for (const hold of holds) holdSettled(hold, result.receipt);
+      return result;
     },
     [noteWriteEpoch],
   );
@@ -164,15 +166,15 @@ export function useSessions() {
   /** Applies a Group move at once and sends it after `after`, dropping it when that fails; the next poll then
    *  restores what the Daemon holds. */
   const moveGroup = useCallback(
-    async (profile: string, path: string, move: GroupMove, after?: Promise<RuntimeCursor | null>) => {
+    async (profile: string, path: string, move: GroupMove, after?: Promise<WriteResult>) => {
       setGroupOrder((prev) => ({ ...prev, [profile]: move.order }));
       holdStarted(groupHold.current);
-      const receipt = await groupWrites.current(async () =>
-        !after || (await after) !== null ? reorderGroup({ profile, path }, move.direction, move.siblings) : null,
+      const result = await groupWrites.current(async () =>
+        !after || (await after).receipt ? reorderGroup({ profile, path }, move.direction, move.siblings) : NOT_SENT,
       );
-      noteWriteEpoch(receipt);
-      holdSettled(groupHold.current, receipt);
-      return receipt;
+      noteWriteEpoch(result.receipt);
+      holdSettled(groupHold.current, result.receipt);
+      return result;
     },
     [noteWriteEpoch],
   );
@@ -186,25 +188,25 @@ export function useSessions() {
   /**
    * Applies a grouping or sort pick at once. The write is sent after the earlier picks' writes, waits for `after`,
    * and is dropped when that fails; a field picked again meanwhile is left to the newer pick. Either way the next
-   * poll restores what the Daemon holds. Resolves with the receipt, or null when nothing was saved.
+   * poll restores what the Daemon holds. Resolves with how the write ended.
    */
   const changeSidebarView = useCallback(
-    async (patch: Partial<SidebarView>, after?: Promise<RuntimeCursor | null>) => {
+    async (patch: Partial<SidebarView>, after?: Promise<WriteResult>) => {
       setSidebarView((prev) => ({ ...prev, ...patch }));
       const picks = viewPicks.current;
       const pick = ++picks.seq;
       const fields = Object.keys(patch) as (keyof SidebarView)[];
       for (const field of fields) picks.latest[field] = pick;
       holdStarted(viewHold.current);
-      const receipt = await viewWrites.current(async () => {
-        const ready = !after || (await after) !== null;
+      const result = await viewWrites.current(async () => {
+        const ready = !after || (await after).receipt !== null;
         const current = fields.filter((field) => picks.latest[field] === pick);
         const send = Object.fromEntries(current.map((field) => [field, patch[field]]));
-        return ready && current.length > 0 ? updateSidebarView(send) : null;
+        return ready && current.length > 0 ? updateSidebarView(send) : NOT_SENT;
       });
-      noteWriteEpoch(receipt);
-      holdSettled(viewHold.current, receipt);
-      return receipt;
+      noteWriteEpoch(result.receipt);
+      holdSettled(viewHold.current, result.receipt);
+      return result;
     },
     [noteWriteEpoch],
   );

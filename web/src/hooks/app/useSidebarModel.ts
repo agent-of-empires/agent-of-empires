@@ -2,7 +2,7 @@
 // order are the Daemon's, shared with every Client; a plugin sort is this browser's alone.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { RuntimeCursor, SidebarView, WorkspaceOrderingPatch } from "../../lib/api";
+import type { RuntimeCursor, SidebarView, WorkspaceOrderingPatch, WriteResult } from "../../lib/api";
 import { reportFeatureUse } from "../../lib/featureUse";
 import {
   arrangeGroups,
@@ -10,6 +10,7 @@ import {
   groupPathComparator,
   mergeGroupOrder,
   parentPath,
+  restoreGroups,
   type GroupMove,
   type GroupOrder,
 } from "../../lib/groupOrder";
@@ -36,20 +37,18 @@ interface Options {
   workspaceOrdering: string[];
   repositoryOrder: string[];
   groupOrder: GroupOrder;
-  moveGroup: (
-    profile: string,
-    path: string,
-    move: GroupMove,
-    after?: Promise<RuntimeCursor | null>,
-  ) => Promise<RuntimeCursor | null>;
-  changeOrdering: (patch: WorkspaceOrderingPatch) => Promise<RuntimeCursor | null>;
+  moveGroup: (profile: string, path: string, move: GroupMove, after?: Promise<WriteResult>) => Promise<WriteResult>;
+  changeOrdering: (patch: WorkspaceOrderingPatch) => Promise<WriteResult>;
   orderingSaving: () => boolean;
-  changeSidebarView: (
-    patch: Partial<SidebarView>,
-    after?: Promise<RuntimeCursor | null>,
-  ) => Promise<RuntimeCursor | null>;
+  changeSidebarView: (patch: Partial<SidebarView>, after?: Promise<WriteResult>) => Promise<WriteResult>;
   onSharedRead: (listener: (read: SharedRead) => void) => () => void;
+  /** Reads the Daemon now. */
+  refresh: () => void;
 }
+
+type OrderingBase = NonNullable<WorkspaceOrderingPatch["base"]>;
+/** The row order on screen, with the Repository header order when the sidebar shows those headers. */
+type ShownOrder = { order: string[]; repositories?: string[] };
 
 /** The shared values an order change wrote, or that its Undo puts back. */
 interface Shared {
@@ -57,6 +56,13 @@ interface Shared {
   repositories?: string[];
   groups?: GroupOrder;
   sort?: SidebarSort;
+}
+
+/** What putting a change back needs: the values it replaced, the stored orders and the Group order it left. */
+interface Undoable {
+  previous: Shared;
+  base: OrderingBase;
+  groups: GroupOrder;
 }
 
 interface UndoOffer {
@@ -112,15 +118,14 @@ function stillLeft(watch: NonNullable<UndoOffer["watch"]>, read: SharedRead): bo
   return true;
 }
 
-/** The newest receipt once every write lands, or null when one fails. */
-async function settleAll(writes: Promise<RuntimeCursor | null>[]): Promise<RuntimeCursor | null> {
-  const receipts = await Promise.all(writes);
-  let newest: RuntimeCursor | null = null;
-  for (const receipt of receipts) {
-    if (!receipt) return null;
-    if (!newest || receipt.revision > newest.revision) newest = receipt;
+/** The newest receipt once every write lands, else the gravest failure: a conflict, then one that may have landed. */
+async function settleAll(writes: Promise<WriteResult>[]): Promise<WriteResult> {
+  const results = await Promise.all(writes);
+  for (const failure of ["conflict", "uncertain", "rejected"] as const) {
+    const failed = results.find((r) => r.failure === failure);
+    if (failed) return failed;
   }
-  return newest;
+  return results.reduce((a, b) => (b.receipt!.revision > a.receipt!.revision ? b : a));
 }
 
 export function useSidebarModel({
@@ -135,6 +140,7 @@ export function useSidebarModel({
   orderingSaving,
   changeSidebarView,
   onSharedRead,
+  refresh,
 }: Options) {
   const pluginUiEntries = usePluginUiEntries();
   // Plugin entries die with the Daemon, so the pick is not persisted. A ref whose entry is gone is inert and the
@@ -199,7 +205,7 @@ export function useSidebarModel({
   }, [orderingSaving]);
 
   // One level of Undo for a drag that switched the sort to Custom, offered once the write lands. The next local
-  // change drops it, and so does a read showing another Client changed what it wrote.
+  // change drops it, and so do a read showing another Client changed what it wrote and this model's teardown.
   const undoOffer = useRef<UndoOffer>({ seq: 0 });
   const dropUndo = useCallback(() => {
     const offer = undoOffer.current;
@@ -208,45 +214,43 @@ export function useSidebarModel({
     offer.dismiss = undefined;
     offer.watch = undefined;
   }, []);
-  useEffect(
-    () =>
-      // eslint-disable-next-line react-you-might-not-need-an-effect/no-pass-data-to-parent -- subscribes to reads
-      onSharedRead((read) => {
-        const watch = undoOffer.current.watch;
-        if (!watch) return;
-        if (read.cursor.epoch !== watch.receipt.epoch) return dropUndo();
-        if (read.cursor.revision >= watch.receipt.revision && !stillLeft(watch, read)) dropUndo();
-      }),
-    [onSharedRead, dropUndo],
-  );
+  useEffect(() => {
+    const unsubscribe = onSharedRead((read) => {
+      const watch = undoOffer.current.watch;
+      if (!watch) return;
+      if (read.cursor.epoch !== watch.receipt.epoch) return dropUndo();
+      if (read.cursor.revision >= watch.receipt.revision && !stillLeft(watch, read)) dropUndo();
+    });
+    return () => {
+      unsubscribe();
+      dropUndo();
+    };
+  }, [onSharedRead, dropUndo]);
 
-  /** Moves each profile's Group order from `current` back to `previous`, after `after`. */
-  const restoreGroups = useCallback(
-    (current: GroupOrder, previous: GroupOrder, after: Promise<RuntimeCursor | null>) =>
-      Object.entries(previous).flatMap(([profile, paths]) =>
-        arrangeGroups(current[profile] ?? [], [], groupPathComparator(paths)).map(({ path, move }) =>
-          moveGroup(profile, path, move, after),
-        ),
-      ),
-    [moveGroup],
-  );
-
-  /** Writes `previous` back over a change that left the Groups as `groups`; resolves null when a write failed. */
+  /**
+   * Writes back what `change` replaced, with the Groups now `groups`. The orders go first, carrying the stored orders
+   * the change left, so the Daemon refuses them once another Client changed them and nothing else is sent.
+   */
   const putBack = useCallback(
-    (previous: Shared, groups: GroupOrder, receipt: RuntimeCursor) => {
-      const { groups: previousGroups, sort: previousSort, ...patch } = previous;
-      const ordered = Object.keys(patch).length > 0 ? changeOrdering(patch) : Promise.resolve(receipt);
-      const undone = settleAll([ordered, ...restoreGroups(groups, previousGroups ?? {}, ordered)]);
-      return previousSort ? changeSidebarView({ sort: previousSort }, undone) : undone;
+    (change: Undoable, groups: GroupOrder) => {
+      const { groups: previousGroups, sort: previousSort, ...lists } = change.previous;
+      const ordered = changeOrdering({ ...lists, base: change.base });
+      const moves = Object.entries(previousGroups ?? {}).flatMap(([profile, paths]) =>
+        restoreGroups(groups[profile] ?? [], paths, change.groups[profile] ?? []).map(({ path, move }) =>
+          moveGroup(profile, path, move, ordered),
+        ),
+      );
+      const undone = settleAll([ordered, ...moves]);
+      return previousSort ? settleAll([undone, changeSidebarView({ sort: previousSort }, undone)]) : undone;
     },
-    [changeOrdering, restoreGroups, changeSidebarView],
+    [changeOrdering, moveGroup, changeSidebarView],
   );
 
   const offerUndo = useCallback(
-    (message: string, write: Promise<RuntimeCursor | null>, wrote: Shared, previous: Shared) => {
+    (message: string, write: Promise<WriteResult>, wrote: Shared, change: Undoable) => {
       const offer = undoOffer.current;
       const seq = offer.seq;
-      void write.then((receipt) => {
+      void write.then(({ receipt }) => {
         if (!receipt || offer.seq !== seq) return;
         const watch = { receipt, left: wrote, seen: new Set<keyof Shared>() };
         offer.watch = watch;
@@ -254,11 +258,19 @@ export function useSidebarModel({
           if (refuseWhileSaving()) return false;
           dropUndo();
           // While the offer stands, the Groups are as the change left them.
-          void putBack(previous, watch.left.groups ?? {}, receipt);
+          void putBack(change, watch.left.groups ?? {}).then(({ failure }) => {
+            if (!failure) return;
+            refresh();
+            reportInfo(
+              failure === "conflict"
+                ? "Another Client changed the order, so Undo kept it"
+                : "Couldn't undo; part of the change may have saved",
+            );
+          });
         });
       });
     },
-    [refuseWhileSaving, dropUndo, putBack],
+    [refuseWhileSaving, dropUndo, putBack, refresh],
   );
 
   const selectGroupBy = useCallback(
@@ -286,7 +298,7 @@ export function useSidebarModel({
   // Under Name or Newest first a drag switches to Custom starting from the order on screen, so nothing else moves.
   const frozen = sort !== "custom" && !pluginSort;
   const onScreenOrder = useCallback(
-    (): WorkspaceOrderingPatch => ({
+    (): ShownOrder => ({
       order: orderStartingWith(
         displayGroups.flatMap((g) => g.workspaces.map((v) => v.workspace.id)),
         workspaceOrdering,
@@ -327,15 +339,18 @@ export function useSidebarModel({
     },
     [groupBy, nested.groups, session.groups],
   );
-  /** Commits `patch`; under Name or Newest first also the Group order on screen and the switch to Custom, with
-   *  `header`, a Group header drag, on top of them. */
+  /** Commits `patch` under Custom. */
   const commit = useCallback(
-    (patch: WorkspaceOrderingPatch, header?: { profile: string; path: string; over: string; after: boolean }) => {
-      if (!frozen) {
-        dropUndo();
-        void changeOrdering(patch);
-        return;
-      }
+    (patch: WorkspaceOrderingPatch) => {
+      dropUndo();
+      void changeOrdering(patch);
+    },
+    [dropUndo, changeOrdering],
+  );
+  /** Under Name or Newest first, commits `patch` with the Group order on screen and the switch to Custom, with
+   *  `header`, a Group header drag, on top of them. */
+  const switchToCustom = useCallback(
+    (patch: ShownOrder, header?: { profile: string; path: string; over: string; after: boolean }) => {
       const shown = onScreenGroupPaths();
       const moves = [...shown].flatMap(([profile, paths]) =>
         arrangeGroups(groupOrder[profile] ?? [], paths, groupPathComparator(paths)).map((m) => ({ profile, ...m })),
@@ -362,7 +377,7 @@ export function useSidebarModel({
       const write = changeOrdering(patch);
       const wrote: Shared = { ...patch, sort: "custom" };
       const previous: Shared = {
-        ...(patch.order && { order: workspaceOrdering }),
+        order: workspaceOrdering,
         ...(patch.repositories && { repositories: repositoryOrder }),
         sort,
       };
@@ -373,24 +388,43 @@ export function useSidebarModel({
       const writes = [write, ...moves.map((m) => moveGroup(m.profile, m.path, m.move, write))];
       switching.current = true;
       const switched = changeSidebarView({ sort: "custom" }, settleAll(writes));
-      offerUndo("Switched to Custom", switched, wrote, previous);
+      // The Daemon stores a list as written, so `base` is what `write` leaves.
+      const change: Undoable = {
+        previous,
+        base: { order: patch.order, repositories: patch.repositories ?? repositoryOrder },
+        groups: groupsAfter,
+      };
+      offerUndo("Switched to Custom", switched, wrote, change);
       // The orders and the sort land together: when the switch fails after a write landed, the orders go back.
-      void Promise.all([switched, ...writes])
-        .then(([receipt, ...receipts]) => {
-          const landed = receipts.find((r) => r !== null);
-          if (receipt || !landed || offer.seq !== seq) return;
-          return putBack({ ...previous, sort: undefined }, wrote.groups ?? {}, landed).then((undone) =>
-            reportInfo(
-              undone
-                ? "Couldn't switch to Custom, so nothing moved"
-                : "Couldn't switch to Custom; part of the move saved",
-            ),
+      void Promise.all([switched, Promise.all(writes)])
+        .then(([result, results]) => {
+          if (result.receipt || offer.seq !== seq) return;
+          // A write that may have landed leaves no known state to put back, so show what the Daemon holds.
+          if ([result, ...results].some((r) => r.failure === "uncertain")) {
+            refresh();
+            reportInfo("Couldn't confirm the switch to Custom; the list shows what saved");
+            return;
+          }
+          if (!results.some((r) => r.receipt)) {
+            reportInfo("Couldn't switch to Custom, so nothing moved");
+            return;
+          }
+          return putBack({ ...change, previous: { ...previous, sort: undefined } }, wrote.groups ?? {}).then(
+            ({ failure }) => {
+              if (failure) refresh();
+              reportInfo(
+                !failure
+                  ? "Couldn't switch to Custom, so nothing moved"
+                  : failure === "conflict"
+                    ? "Couldn't switch to Custom; another Client's newer order stays"
+                    : "Couldn't switch to Custom; part of the move saved",
+              );
+            },
           );
         })
         .finally(() => (switching.current = false));
     },
     [
-      frozen,
       dropUndo,
       changeOrdering,
       onScreenGroupPaths,
@@ -403,6 +437,7 @@ export function useSidebarModel({
       offerUndo,
       putBack,
       changeSidebarView,
+      refresh,
     ],
   );
 
@@ -412,11 +447,15 @@ export function useSidebarModel({
       if (refuseWhileSaving()) return;
       reportFeatureUse("row_reorder");
       // Moving next to a row the order does not list yet needs it listed.
+      if (frozen) {
+        const shown = onScreenOrder();
+        switchToCustom({ ...shown, order: moveId(shown.order, activeId, overId, after) });
+        return;
+      }
       const listed = workspaceOrdering.includes(activeId) && workspaceOrdering.includes(overId);
-      const base = frozen ? onScreenOrder() : { order: listed ? workspaceOrdering : onScreenOrder().order };
-      commit({ ...base, order: moveId(base.order ?? [], activeId, overId, after) });
+      commit({ order: moveId(listed ? workspaceOrdering : onScreenOrder().order, activeId, overId, after) });
     },
-    [refuseWhileSaving, frozen, workspaceOrdering, onScreenOrder, commit],
+    [refuseWhileSaving, frozen, workspaceOrdering, onScreenOrder, switchToCustom, commit],
   );
 
   /** Moves a Repository header next to `overId`, after it when the drag went down. */
@@ -427,9 +466,10 @@ export function useSidebarModel({
       const headers = repo.groups.map((g) => g.id);
       const moved = moveId(headers, activeId, overId, after).filter((id) => !isSyntheticGroup(id));
       const repositories = keepUnshown(moved, repositoryOrder);
-      commit(frozen ? { ...onScreenOrder(), repositories } : { repositories });
+      if (frozen) switchToCustom({ ...onScreenOrder(), repositories });
+      else commit({ repositories });
     },
-    [refuseWhileSaving, repo.groups, repositoryOrder, frozen, onScreenOrder, commit],
+    [refuseWhileSaving, repo.groups, repositoryOrder, frozen, onScreenOrder, switchToCustom, commit],
   );
 
   /** Moves a Group header next to its sibling `overPath`, after it when the drag went down. */
@@ -462,17 +502,27 @@ export function useSidebarModel({
         return;
       }
       if (frozen) {
-        commit(onScreenOrder(), { profile, path: activePath, over: overPath, after });
+        switchToCustom(onScreenOrder(), { profile, path: activePath, over: overPath, after });
         return;
       }
       const move = groupMove(order, shown, activePath, overPath, after);
       if (!move) return;
       dropUndo();
-      void moveGroup(profile, activePath, move).then((receipt) => {
+      void moveGroup(profile, activePath, move).then(({ receipt }) => {
         if (!receipt) reportInfo("Couldn't move the group there");
       });
     },
-    [pluginSort, refuseWhileSaving, displayGroups, groupOrder, frozen, commit, onScreenOrder, dropUndo, moveGroup],
+    [
+      pluginSort,
+      refuseWhileSaving,
+      displayGroups,
+      groupOrder,
+      frozen,
+      switchToCustom,
+      onScreenOrder,
+      dropUndo,
+      moveGroup,
+    ],
   );
 
   return {
