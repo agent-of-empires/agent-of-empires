@@ -30,7 +30,6 @@ impl HomeView {
             DefaultTerminalMode::Host => TerminalMode::Host,
             DefaultTerminalMode::Container => TerminalMode::Container,
         };
-        let sound_config = resolved.sound.clone();
         let strict_hotkeys = resolved.session.strict_hotkeys;
         let confirm_before_quit = resolved.session.confirm_before_quit;
         let host_tab_title = resolved.session.host_tab_title;
@@ -322,7 +321,6 @@ impl HomeView {
             manual_unread_hold: None,
             terminal_modes: HashMap::new(),
             default_terminal_mode,
-            sound_config,
             strict_hotkeys,
             confirm_before_quit,
             host_tab_title,

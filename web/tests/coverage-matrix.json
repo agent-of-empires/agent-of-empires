@@ -1323,9 +1323,16 @@
         "src/lib/statusSounds.test.ts",
         "src/hooks/useStatusSounds.test.ts",
         "src/hooks/useSessionStatusStream.test.ts",
-        "src/hooks/useSessions.test.ts"
+        "src/hooks/useSessions.test.ts",
+        "src/lib/soundPlayer.test.ts"
       ],
-      "components": ["web/src/lib/statusSounds.ts", "web/src/hooks/useStatusSounds.ts", "web/src/lib/soundPlayer.ts"]
+      "components": [
+        "web/src/lib/statusSounds.ts",
+        "web/src/hooks/useStatusSounds.ts",
+        "web/src/lib/soundPlayer.ts",
+        "web/src/App.tsx"
+      ],
+      "notes": "Sounds are built in and fetched per event from `/api/sounds/{event}`. They play through one Web Audio context that each click or key press resumes; a sound that comes while it is suspended stays silent and fires `onSoundBlocked` once. The tests fake the context, so they cover this logic, not a real browser's autoplay policy or App's toast. The Daemon plays the host sounds itself (`server::sound_cues`)."
     },
     {
       "id": "notifications.linked-toasts",

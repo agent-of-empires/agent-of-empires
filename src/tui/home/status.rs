@@ -668,18 +668,7 @@ impl HomeView {
                 GroupTree::new_with_groups(&rows, &profile.groups),
             );
         }
-        // No displayed row, approval, selection, or sound changes before every read and parse succeeds.
-        for (id, instance) in &next {
-            if let Some(previous) = self.instances.get(id) {
-                if previous.status != instance.status {
-                    crate::sound::play_for_transition(
-                        previous.status,
-                        instance.status,
-                        &self.sound_config,
-                    );
-                }
-            }
-        }
+        // No displayed row, approval or selection changes before every read and parse succeeds.
         self.instances = next;
         self.group_trees = trees;
         self.storages.extend(opened_storages);
@@ -964,9 +953,6 @@ impl HomeView {
         let mut changed = instance.status != status
             || instance.last_error.as_deref() != row.last_error.as_deref()
             || instance.pane_dead_observed != row.pane_dead_observed;
-        if instance.status != status {
-            crate::sound::play_for_transition(instance.status, status, &self.sound_config);
-        }
         instance.status = status;
         match row.last_error.as_deref() {
             Some(error) => instance.last_error.set(error),

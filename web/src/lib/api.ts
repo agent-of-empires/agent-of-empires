@@ -1546,20 +1546,12 @@ export function fetchCurrentTheme(): Promise<ResolvedTheme | null> {
   return fetchJson<ResolvedTheme>("/api/theme/current");
 }
 
-export async function fetchSounds(): Promise<string[]> {
-  return (await fetchJson<string[]>("/api/sounds")) ?? [];
-}
-
-/** Fetch a sound file as a Blob so the acp's browser-side approval
- *  player can hand a blob URL to `new Audio(...)`. The fetch path runs
- *  through `fetchInterceptor.ts`, which injects `Authorization: Bearer`
- *  on every request; an `<audio src="...">` element does not, so a
- *  blob round-trip is necessary in PWA mode. See #1038. */
-export async function fetchSoundBlob(name: string): Promise<Blob | null> {
+/** A built-in sound's bytes, fetched (not loaded by a media element) so the auth interceptor covers it. */
+export async function fetchSound(event: string): Promise<ArrayBuffer | null> {
   try {
-    const res = await fetch(`/api/sounds/file/${encodeURIComponent(name)}`);
+    const res = await fetch(`/api/sounds/${encodeURIComponent(event)}`);
     if (!res.ok) return null;
-    return await res.blob();
+    return await res.arrayBuffer();
   } catch {
     return null;
   }
@@ -2776,9 +2768,8 @@ export async function logout(): Promise<void> {
     } catch {
       // ignore
     }
-    // Drop the in-memory approval-sound caches so a future user on the
-    // same tab does not see the previous user's settings snapshot or
-    // hear their cached blob.
+    // Drop the cached sound settings so a future user on the same tab
+    // does not inherit the previous user's.
     try {
       const { clearSoundCache } = await import("./soundPlayer");
       clearSoundCache();

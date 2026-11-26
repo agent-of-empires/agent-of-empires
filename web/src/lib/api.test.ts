@@ -181,7 +181,6 @@ const requestCases: RequestCase[] = [
   ["GET /api/themes", () => api.fetchThemes(), { respond: json(["empire"]), result: ["empire"] }],
   ["GET /api/themes/My%20Theme", () => api.fetchResolvedTheme("My Theme")],
   ["GET /api/theme/current", () => api.fetchCurrentTheme()],
-  ["GET /api/sounds", () => api.fetchSounds(), { respond: json(["chime.wav"]), result: ["chime.wav"] }],
   [
     "GET /api/about",
     () => api.fetchAbout(),
@@ -855,7 +854,7 @@ const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ["resolveMcpConflict", () => api.resolveMcpConflict("n", "a", "aoe", "fp"), "error"],
   ["invokePluginAction", () => api.invokePluginAction("p", "m"), null],
   ["resolvePluginOptions", () => api.resolvePluginOptions("p", "s", []), []],
-  ["fetchSoundBlob", () => api.fetchSoundBlob("x.wav"), null],
+  ["fetchSound", () => api.fetchSound("idle"), null],
   ["fetchProfileAgents", () => api.fetchProfileAgents("work"), null],
   ["pullSandboxImage", () => api.pullSandboxImage(), { ok: false }],
   ["dismissSandboxImage", () => api.dismissSandboxImage("sha256:new"), false],
@@ -1140,10 +1139,10 @@ it("keeps a dispatched image upload result after write policy is revoked", async
   expect(fetchSpy).toHaveBeenCalledTimes(1);
 });
 
-it("fetchSoundBlob returns the file as a Blob", async () => {
+it("fetchSound returns the event's bytes", async () => {
   fetchSpy.mockResolvedValueOnce(new Response("bytes"));
-  expect(await (await api.fetchSoundBlob("my sound.wav"))!.text()).toBe("bytes");
-  expect(lastCall().url).toBe("/api/sounds/file/my%20sound.wav");
+  expect(new TextDecoder().decode((await api.fetchSound("idle"))!)).toBe("bytes");
+  expect(lastCall().url).toBe("/api/sounds/idle");
 });
 
 describe("fetchCityHallBundle", () => {

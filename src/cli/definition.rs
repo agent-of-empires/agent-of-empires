@@ -194,7 +194,7 @@ pub enum Commands {
         command: TmuxCommands,
     },
 
-    /// Manage sound effects for agent state transitions
+    /// Test the built-in sound effects
     Sounds {
         #[command(subcommand)]
         command: SoundsCommands,
