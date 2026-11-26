@@ -58,6 +58,16 @@ fn check_structured(row: &Instance) -> Result<()> {
     Ok(())
 }
 
+/// CityHall reorders the groups under `parent` only when every session in them is
+/// structured.
+fn check_siblings_structured(rows: &[Instance], parent: &str) -> Result<()> {
+    rows.iter()
+        .filter(|row| {
+            row.group_path != parent && (parent.is_empty() || belongs(&row.group_path, parent))
+        })
+        .try_for_each(check_structured)
+}
+
 fn check_row(row: &Instance, cityhall: bool) -> Result<()> {
     if cityhall {
         check_structured(row)?;
@@ -717,6 +727,15 @@ pub async fn reorder(
             return refused;
         }
     }
+    if let crate::daemon::ReorderBody::Session {
+        headers: Some(headers),
+        ..
+    } = &body
+    {
+        if let Some(refused) = super::sessions::oversized_order(headers) {
+            return refused;
+        }
+    }
     match &body {
         crate::daemon::ReorderBody::Group { group, .. } => {
             if let Err(response) = validate_location(group) {
@@ -807,6 +826,7 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
             };
             let mut outcome = ReorderOutcome::Stale;
             let mut replaced_order = None;
+            let mut before = None;
             let committed = (&store as &dyn SessionStore).update(|rows, groups| {
                 let freeze = match &body {
                     ReorderBody::Session { freeze, .. } | ReorderBody::Group { freeze, .. } => {
@@ -824,6 +844,7 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
                 }) {
                     return Ok(());
                 }
+                before = Some(membership(rows, groups, &body));
                 outcome = apply_canonical_reorder(rows, groups, &body, worker_state.cityhall_mode)?;
                 // CityHall may regroup a row but not rewrite the shared order, which it
                 // denies through `PUT /api/workspace-ordering`. The order is written before
@@ -858,8 +879,12 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
                 };
                 Ok(())
             });
-            if let (Err(_), Some(previous)) = (&committed, replaced_order) {
-                commit_workspace_order(&worker_state, |_| previous)?;
+            if let (Err(error), Some(previous), Some(before)) = (&committed, replaced_order, before)
+            {
+                let disk = || store.storage().load_complete_with_groups();
+                if commit_left_unapplied(error, disk, &body, &before) {
+                    commit_workspace_order(&worker_state, |_| previous)?;
+                }
             }
             committed?;
             Ok(outcome)
@@ -885,6 +910,39 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
         }
         Err(error) => failure(&state, error).await,
     }
+}
+
+/// Whether a failed reorder commit left the disk as the move found it. A failure after
+/// sessions.json was replaced may still have applied it, so only a disk that reads and
+/// shows the `before` membership proves it did not.
+fn commit_left_unapplied(
+    error: &anyhow::Error,
+    disk: impl FnOnce() -> Result<(Vec<Instance>, Vec<crate::session::Group>)>,
+    body: &crate::daemon::ReorderBody,
+    before: &(Option<String>, Vec<String>),
+) -> bool {
+    !error.is::<crate::session::SessionCommitApplied>()
+        && disk().is_ok_and(|(rows, groups)| membership(&rows, &groups, body) == *before)
+}
+
+/// What a reorder changes in a profile's sessions: the moved row's group and the group
+/// order.
+fn membership(
+    rows: &[Instance],
+    groups: &[crate::session::Group],
+    body: &crate::daemon::ReorderBody,
+) -> (Option<String>, Vec<String>) {
+    let moved = match body {
+        crate::daemon::ReorderBody::Session { id, .. } => rows
+            .iter()
+            .find(|row| &row.id == id)
+            .map(|row| row.group_path.clone()),
+        crate::daemon::ReorderBody::Group { .. } => None,
+    };
+    (
+        moved,
+        groups.iter().map(|group| group.path.clone()).collect(),
+    )
 }
 
 /// Put a carried session's workspace at the edge of `destination` it entered from, so the
@@ -922,10 +980,17 @@ fn place_carried_workspace(
         .iter()
         .map(|row| (row.workspace_id(), Some(row.created_at)))
         .collect();
+    let live = created
+        .iter()
+        .map(|(workspace, _)| workspace.clone())
+        .collect();
     commit_workspace_order(state, |stored| {
         let order =
             frozen.unwrap_or_else(|| super::sessions::merge_workspace_ordering(created, stored));
-        place_at_entering_edge(order.clone(), &moved, &peers, direction).unwrap_or(order)
+        let order =
+            place_at_entering_edge(order.clone(), &moved, &peers, direction).unwrap_or(order);
+        // Within what a Client's rewrite of the full order keeps, so that one drops nothing.
+        super::sessions::writable_live_order(live, order)
     })
     .map(Some)
 }
@@ -997,13 +1062,10 @@ fn apply_canonical_reorder(
             ..
         } => {
             if cityhall {
-                let parent = group.path.rsplit_once('/').map_or("", |(parent, _)| parent);
-                for row in rows.iter().filter(|row| {
-                    row.group_path != parent
-                        && (parent.is_empty() || belongs(&row.group_path, parent))
-                }) {
-                    check_structured(row)?;
-                }
+                check_siblings_structured(
+                    rows,
+                    group.path.rsplit_once('/').map_or("", |(parent, _)| parent),
+                )?;
             }
             let mut tree = GroupTree::new_with_groups(rows, groups);
             if !tree.group_exists(&group.path) {
@@ -1055,13 +1117,20 @@ fn apply_canonical_reorder(
                 return Ok(ReorderOutcome::Stale);
             }
             if let Some(headers) = headers {
-                let parent = |path: &str| path.rsplit_once('/').map(|(head, _)| head.to_owned());
-                let mut tree = GroupTree::new_with_groups(rows, groups);
-                let mut arranged = std::collections::HashSet::new();
+                let mut sets: std::collections::BTreeMap<Option<&str>, Vec<String>> =
+                    Default::default();
                 for header in headers {
-                    if arranged.insert(parent(header)) {
-                        tree.arrange_siblings(header, headers);
+                    let parent = header.rsplit_once('/').map(|(head, _)| head);
+                    sets.entry(parent).or_default().push(header.clone());
+                }
+                if cityhall {
+                    for parent in sets.keys() {
+                        check_siblings_structured(rows, parent.unwrap_or_default())?;
                     }
+                }
+                let mut tree = GroupTree::new_with_groups(rows, groups);
+                for set in sets.values() {
+                    tree.arrange_siblings(&set[0], set);
                 }
                 *groups = tree.get_all_groups();
             }
@@ -1090,6 +1159,40 @@ fn apply_canonical_reorder(
 mod tests {
     use super::place_at_entering_edge;
     use crate::daemon::MoveDirection::{Down, Up};
+
+    #[test]
+    fn a_failed_carry_restores_its_order_only_when_the_disk_shows_it_unapplied() {
+        let mut row = crate::session::Instance::new("one", "/tmp/one");
+        row.group_path = "aaa".into();
+        let body = crate::daemon::ReorderBody::Session {
+            id: row.id.clone(),
+            profile: "default".into(),
+            source_group: "aaa".into(),
+            destination: Some("bbb".into()),
+            direction: Down,
+            headers: None,
+            freeze: None,
+        };
+        let groups = vec![crate::session::Group::new("aaa", "aaa")];
+        let before = super::membership(std::slice::from_ref(&row), &groups, &body);
+        let mut moved = row.clone();
+        moved.group_path = "bbb".into();
+        let failed = || anyhow::anyhow!("sync failed");
+        let applied = || failed().context(crate::session::SessionCommitApplied);
+        for (name, error, disk, restores) in [
+            ("disk unchanged", failed(), Ok(vec![row.clone()]), true),
+            ("disk moved", failed(), Ok(vec![moved.clone()]), false),
+            ("disk unreadable", failed(), Err(failed()), false),
+            ("commit applied", applied(), Ok(vec![row.clone()]), false),
+        ] {
+            let disk = || disk.map(|rows| (rows, groups.clone()));
+            assert_eq!(
+                super::commit_left_unapplied(&error, disk, &body, &before),
+                restores,
+                "{name}"
+            );
+        }
+    }
 
     #[test]
     fn carried_workspace_lands_at_the_entering_edge() {

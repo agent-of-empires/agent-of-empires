@@ -20,7 +20,8 @@
 //! since, rather than where the removed sort would have ranked them. A run that skips a
 //! profile records that before it writes, so an interrupted one still owes it. A
 //! `workspace-ordering.json` that cannot be read or parsed is left untouched with every
-//! legacy input, and recovery reruns the whole upgrade once it reads.
+//! legacy input, and recovery reruns the whole upgrade once it reads, seeding only a list
+//! the repaired file leaves empty.
 
 use super::sessions_file;
 use super::v068_shared_sidebar_view::{web_effective_sort, LEGACY_SORT_KEY, WEB_SORT_KEY};
@@ -40,6 +41,9 @@ const PENDING_FILE: &str = ".v069_custom_order_pending";
 const UNFINISHED: &str = "+";
 /// Marks a list the upgrade seeded, which recovery may still add to.
 const SEEDED: &str = "=";
+/// Marks a list in a `workspace-ordering.json` the upgrade could not read: recovery seeds
+/// it only when the repaired file leaves it empty, as the upgrade would have.
+const UNCLASSIFIED: &str = "?";
 
 pub fn run() -> Result<()> {
     run_in(&crate::session::get_app_dir()?, Pass::Upgrade)
@@ -82,13 +86,18 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
             .collect();
         (!names.is_empty()).then_some(names)
     });
+    let unclassified: Vec<&str> = lines
+        .iter()
+        .flatten()
+        .filter_map(|line| line.strip_prefix(UNCLASSIFIED))
+        .collect();
     let seeded_lists: Vec<&str> = lines
         .iter()
         .flatten()
         .filter_map(|line| line.strip_prefix(SEEDED))
         .collect();
     // Profiles an earlier run migrated are done; only the skipped ones still seed.
-    let owed = lines.filter(|_| seeding.is_none());
+    let owed = lines.filter(|_| seeding.is_none() && unclassified.is_empty());
     if pass == Pass::Recovery && pending.is_none() {
         return Ok(());
     }
@@ -180,7 +189,7 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
                 let sort = legacy_sort.as_deref().unwrap_or_default();
                 crate::session::atomic_write(
                     &pending_path,
-                    format!("{sort}\n{UNFINISHED}order\n{UNFINISHED}repositories\n").as_bytes(),
+                    format!("{sort}\n{UNCLASSIFIED}order\n{UNCLASSIFIED}repositories\n").as_bytes(),
                 )?;
             }
             return Ok(());
@@ -211,7 +220,10 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
         ),
     ] {
         let next = match (pass, &owed, &seeding) {
-            (Pass::Upgrade, None, None) if current.is_empty() => {
+            (pass, None, None)
+                if (pass == Pass::Upgrade || unclassified.contains(&name))
+                    && current.is_empty() =>
+            {
                 seeds.push(name);
                 seeded
             }
@@ -612,17 +624,21 @@ mod tests {
                 assert!(read_back(), "{broken}");
                 assert_eq!(
                     fs::read_to_string(&pending).unwrap(),
-                    "custom\n+order\n+repositories\n"
+                    "custom\n?order\n?repositories\n"
                 );
                 run_in(dir.path(), Pass::Recovery).unwrap();
                 assert!(read_back() && pending.exists(), "{broken}");
-                if path.is_dir() {
+                // Repaired to a dashboard order, that order stays; repaired away, the
+                // upgrade's seed fills the empty list.
+                let expected = if path.is_dir() {
                     fs::remove_dir(&path).unwrap();
+                    "/r/one::__session__::a"
                 } else {
-                    fs::remove_file(&path).unwrap();
-                }
+                    fs::write(&path, r#"{"order":["/r/b::__session__::b"]}"#).unwrap();
+                    "/r/b::__session__::b"
+                };
                 run_in(dir.path(), Pass::Recovery).unwrap();
-                assert_eq!(ordering(dir.path()).order, ["/r/one::__session__::a"]);
+                assert_eq!(ordering(dir.path()).order, [expected], "{broken}");
                 assert!(!rows().contains("sort_index"), "{broken}");
                 assert!(!pending.exists(), "{broken}");
                 assert!(!fs::read_to_string(dir.path().join("state.toml"))

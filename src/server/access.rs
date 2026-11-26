@@ -1210,12 +1210,14 @@ mod tests {
     #[serial_test::serial]
     async fn cityhall_reorder_preserves_native_rows_and_allows_structured_ordering() {
         use tower::ServiceExt;
-        // A carry touches only its own row, so a native peer left behind does not refuse it.
-        for (structured, native_peer, group_request, expected) in [
-            (true, false, false, axum::http::StatusCode::OK),
-            (false, true, false, axum::http::StatusCode::FORBIDDEN),
-            (true, true, false, axum::http::StatusCode::OK),
-            (false, true, true, axum::http::StatusCode::FORBIDDEN),
+        // A carry touches only its own row, so a native peer left behind does not refuse it;
+        // headers it reorders are refused like a group move over the same sibling set.
+        for (structured, native_peer, request, expected) in [
+            (true, false, "carry", axum::http::StatusCode::OK),
+            (false, true, "carry", axum::http::StatusCode::FORBIDDEN),
+            (true, true, "carry", axum::http::StatusCode::OK),
+            (false, true, "group", axum::http::StatusCode::FORBIDDEN),
+            (true, true, "headers", axum::http::StatusCode::FORBIDDEN),
         ] {
             let _home = crate::session::test_support::isolate_app_dir();
             let mut a = crate::session::Instance::new("first", "/tmp/first");
@@ -1251,10 +1253,16 @@ mod tests {
                 |state| state.cityhall_mode = true,
             );
             test_support::refresh_canonical_metadata_for_test(&state).await;
-            let body = if group_request {
-                serde_json::json!({"target":"group","group":{"profile":"default","path":"work"},"direction":"up"})
-            } else {
-                serde_json::json!({"target":"session","id":b.id,"profile":"default","source_group":"work","destination":"","direction":"up"})
+            let body = match request {
+                "group" => {
+                    serde_json::json!({"target":"group","group":{"profile":"default","path":"work"},"direction":"up"})
+                }
+                "headers" => {
+                    serde_json::json!({"target":"session","id":c.id,"profile":"default","source_group":"","headers":["work"],"direction":"up"})
+                }
+                _ => {
+                    serde_json::json!({"target":"session","id":b.id,"profile":"default","source_group":"work","destination":"","direction":"up"})
+                }
             };
             let response = test_support::build_router_for_test(state)
                 .oneshot(
@@ -1278,7 +1286,7 @@ mod tests {
             assert_eq!(
                 status,
                 expected,
-                "structured={structured}, native_peer={native_peer}, group={group_request}: {}",
+                "structured={structured}, native_peer={native_peer}, {request}: {}",
                 String::from_utf8_lossy(&bytes)
             );
             if expected == axum::http::StatusCode::OK {

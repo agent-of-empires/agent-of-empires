@@ -1225,6 +1225,12 @@ mod tests {
             "source_group":"aaa","direction":"down"});
         let (status, _, value) = request_with_headers(&state, "POST", "/api/reorder", body).await;
         assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{value}");
+        // Headers are bounded like an order, since the move arranges them under its guards.
+        let headers: Vec<String> = (0..=4096).map(|n| format!("g{n}")).collect();
+        let body = serde_json::json!({"target":"session","id":id,"profile":"reorder",
+            "source_group":"aaa","headers":headers,"direction":"down"});
+        let (status, _, value) = request_with_headers(&state, "POST", "/api/reorder", body).await;
+        assert_eq!(status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{value}");
         let ordering = crate::session::get_app_dir()
             .unwrap()
             .join("workspace-ordering.json");
@@ -1236,6 +1242,50 @@ mod tests {
         let (stored, _) = storage.load_with_groups().unwrap();
         let row = stored.iter().find(|row| row.id == id).unwrap();
         assert_eq!(row.group_path, "aaa");
+    }
+
+    /// A carry writes only live workspaces, so a Client rewriting the full order next keeps
+    /// every placement it carried.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_carry_drops_workspaces_no_session_belongs_to() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("reorder").unwrap();
+        let rows: Vec<Instance> = [("one", "aaa"), ("two", "bbb")]
+            .into_iter()
+            .map(|(title, group)| {
+                let mut row = Instance::new(title, &format!("/tmp/{title}"));
+                row.group_path = group.into();
+                row
+            })
+            .collect();
+        let (one, two) = (rows[0].workspace_id(), rows[1].workspace_id());
+        storage
+            .update(|stored, groups| {
+                *stored = rows.clone();
+                *groups = ["aaa", "bbb"]
+                    .map(|path| crate::session::Group::new(path, path))
+                    .into();
+                Ok(())
+            })
+            .unwrap();
+        let state = native_state(&["reorder"]).await;
+        let (status, _, _) = request_with_headers(
+            &state,
+            "PUT",
+            "/api/workspace-ordering",
+            serde_json::json!({ "order": ["gone", &one, &two] }),
+        )
+        .await;
+        assert!(status.is_success());
+        let body = serde_json::json!({"target":"session","id":rows[0].id,"profile":"reorder",
+            "source_group":"aaa","destination":"bbb","direction":"down"});
+        let (status, _, value) = request_with_headers(&state, "POST", "/api/reorder", body).await;
+        assert!(status.is_success(), "{status}: {value}");
+        assert_eq!(
+            crate::session::load_workspace_ordering().unwrap().order,
+            [one, two]
+        );
     }
 
     async fn native_move(group: bool, snapshot_first: bool) {

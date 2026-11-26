@@ -699,10 +699,19 @@ pub(crate) const MAX_ORDER_ENTRY_LEN: usize = 1024;
 /// what `PUT /api/workspace-ordering` accepts, so rewriting the full order never grows it.
 pub(crate) fn writable_workspace_order(
     sessions: &[SessionResponse],
+    order: Vec<String>,
+) -> Vec<String> {
+    writable_live_order(
+        sessions.iter().map(workspace_id_for_session).collect(),
+        order,
+    )
+}
+
+/// `order` without repeats or workspaces outside `live`, within what the endpoint accepts.
+pub(crate) fn writable_live_order(
+    mut live: std::collections::HashSet<String>,
     mut order: Vec<String>,
 ) -> Vec<String> {
-    let mut live: std::collections::HashSet<String> =
-        sessions.iter().map(workspace_id_for_session).collect();
     order.retain(|id| live.remove(id));
     writable_repository_order(order)
 }
