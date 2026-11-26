@@ -161,16 +161,25 @@ derive_title() {
 videos=()
 titles=()
 durations=()
-while IFS= read -r -d '' video; do
+# video.webm first, then Playwright's extra pages (video-1.webm, ...) in order.
+while IFS= read -r video; do
   videos+=("${video}")
   titles+=("$(derive_title "${video}")")
   dur="$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 "${video}" || echo 0)"
   durations+=("${dur}")
-done < <(find "${RESULTS}" -type f -name 'video.webm' -print0 | sort -z)
+done < <(
+  find "${RESULTS}" -type f -name 'video*.webm' | while IFS= read -r f; do
+    n="${f##*/}"
+    n="${n#video}"
+    n="${n#-}"
+    n="${n%.webm}"
+    printf '%s\t%s\t%s\n' "$(dirname "${f}")" "${n:-0}" "${f}"
+  done | sort -t$'\t' -k1,1 -k2,2n | cut -f3
+)
 
 count="${#videos[@]}"
 if [[ "${count}" -eq 0 ]]; then
-  echo "no video.webm files found under ${RESULTS}" >&2
+  echo "no video*.webm files found under ${RESULTS}" >&2
   exit 1
 fi
 
