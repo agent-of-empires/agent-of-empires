@@ -366,7 +366,7 @@ describe("SuggestionsView", () => {
         useStructuredView: false,
         useWorktree: true,
         yoloMode: true,
-        sandboxEnabled: false,
+        useSandbox: false,
         initialPrompt: "Review the issue.",
         suggestion: { provider_id: "github", id: "issue-1" },
       }),
