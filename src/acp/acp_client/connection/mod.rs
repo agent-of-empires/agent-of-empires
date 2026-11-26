@@ -16,7 +16,7 @@ mod tests;
 
 use crate::acp::agent_compat::ExpectedAgent;
 use crate::acp::agent_profiles::AgentProfile;
-use crate::acp::state::Event;
+use crate::acp::state::{Event, IntegrationLostReason};
 use agent_client_protocol::v1::schema::{
     CreateElicitationRequest, CreateElicitationResponse, CreateTerminalRequest,
     CreateTerminalResponse, ElicitationAction, ElicitationScope, KillTerminalRequest,
@@ -204,8 +204,9 @@ pub(super) async fn run_connection_task<W, R>(
         .v1()
         .name("aoe-acp")
         .on_close({
-            let control = control.clone();
+            let (control, shared) = (control.clone(), shared.clone());
             move |_connection| async move {
+                shared.transport_closed.store(true, Ordering::Relaxed);
                 if let Some(control) = control {
                     control.shutdown();
                 }
@@ -539,6 +540,13 @@ async fn report_connection_error(
         let _ = event_tx
             .send(Event::Stopped {
                 reason: "stored_session_rejected".into(),
+            })
+            .await;
+    } else if shared.transport_closed.load(Ordering::Relaxed) && shared.aoe.is_proxied() {
+        // A deliberate close ends the connection cleanly and never reaches here.
+        let _ = event_tx
+            .send(Event::IntegrationLost {
+                reason: IntegrationLostReason::ProxyExited,
             })
             .await;
     } else {

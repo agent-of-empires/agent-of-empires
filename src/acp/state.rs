@@ -407,6 +407,8 @@ pub enum IntegrationLostReason {
     HoldOverflow,
     /// The proxy held more leases than any real agent does.
     LeaseOverflow,
+    /// The proxy, or the agent behind it, exited after its hello.
+    ProxyExited,
 }
 
 /// Lifecycle status of an async background sub-agent.

@@ -29,7 +29,7 @@ use crate::acp::runner_lifecycle::{
 /// Bounds recovery of a live runner whose control channel closed.
 const CONTROL_REATTACH_ATTEMPTS: u32 = 3;
 const CONTROL_REATTACH_DEADLINE: Duration = Duration::from_secs(3);
-use crate::acp::state::{AcpSessionId, Event, StartupCause};
+use crate::acp::state::{AcpSessionId, Event, IntegrationLostReason, StartupCause};
 use crate::process::worker_registry;
 
 impl<S: BroadcastSink> Supervisor<S> {
@@ -527,6 +527,13 @@ impl<S: BroadcastSink> Drain<S> {
             self.publish(Event::Stopped {
                 reason: "runner_control_lost".into(),
             });
+        }
+        // Nothing continues unproxied: the next respawn relaunches the proxy.
+        if loss.proxied && !self.restart_intended() {
+            self.publish(Event::IntegrationLost {
+                reason: IntegrationLostReason::ProxyExited,
+            });
+            return;
         }
         self.publish(Event::startup_error(
             "ACP connection failed: runner control channel closed",
@@ -1762,6 +1769,57 @@ mod tests {
                 .filter(|(_, _, ev)| matches!(ev, Event::AgentStartupError { .. }))
                 .count();
             assert_eq!(published, usize::from(!deliberate), "{name}: published");
+        }
+    }
+
+    /// A runner whose proxied agent is gone loses its integration; a plain
+    /// agent, or a runner the daemon is restarting on purpose, fails as before.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_lost_proxied_runner_reports_the_integration_not_a_startup_error() {
+        // (name, proxied, restart pending, expect proxy_exited)
+        let cases = [
+            ("proxied", true, false, true),
+            ("plain agent", false, false, false),
+            ("deliberate restart", true, true, false),
+        ];
+        for (name, proxied, restarting, proxy_exited) in cases {
+            let (_home, tmp) = isolate_home();
+            let id = "s-proxy-lost";
+            let sink = VecSink::new();
+            let sup = Supervisor::new(sink.clone());
+            worker_registry::save(
+                &worker_record(id, std::process::id(), tmp.path().join("attach.sock"))
+                    .with_generation(4),
+            )
+            .unwrap();
+            if restarting {
+                worker_registry::mark_restart_pending(id, 4);
+            }
+            let (client, _client_tx) = crate::acp::acp_client::AcpClient::fake_for_test(
+                crate::acp::state::AcpSessionId(id.into()),
+            );
+            recovery_test_drain(&sup, id).report_control_loss(
+                &client,
+                ControlLoss {
+                    io_error: None,
+                    turn_in_flight: false,
+                    proxied,
+                },
+            );
+            let frames = sink.frames.lock().unwrap();
+            let lost = frames.iter().any(|(_, _, ev)| {
+                matches!(
+                    ev,
+                    Event::IntegrationLost {
+                        reason: IntegrationLostReason::ProxyExited
+                    }
+                )
+            });
+            let startup = frames
+                .iter()
+                .any(|(_, _, ev)| matches!(ev, Event::AgentStartupError { .. }));
+            assert_eq!((lost, startup), (proxy_exited, !proxy_exited), "{name}");
         }
     }
 
@@ -3597,6 +3655,7 @@ mod tests {
             loss: ControlLoss {
                 io_error: None,
                 turn_in_flight: true,
+                proxied: false,
             },
             attempts: 1,
         });

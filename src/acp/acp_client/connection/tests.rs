@@ -338,6 +338,7 @@ struct FakeConnection {
     agent: tokio::task::JoinHandle<()>,
     /// Values of each `session/set_config_option` the agent received.
     set_options: Arc<Mutex<Vec<String>>>,
+    shutdown: tokio_util::sync::CancellationToken,
     _cwd: tempfile::TempDir,
 }
 
@@ -388,6 +389,7 @@ async fn spawn_fake_connection_raw(
     let cwd = temp.path().to_path_buf();
     let pending_responders: PendingResponders = Arc::new(Mutex::new(HashMap::new()));
     let (response_tx, responses) = mpsc::unbounded_channel();
+    let shutdown = tokio_util::sync::CancellationToken::new();
     let params = ConnectionParams {
         claude_home: None,
         event_tx,
@@ -419,7 +421,7 @@ async fn spawn_fake_connection_raw(
         mcp_servers: Vec::new(),
         runner: None,
         cancellation: tokio_util::sync::CancellationToken::new(),
-        shutdown: tokio_util::sync::CancellationToken::new(),
+        shutdown: shutdown.clone(),
     };
     let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
     let connection = tokio::spawn(run_connection_task(transport, params));
@@ -472,6 +474,7 @@ async fn spawn_fake_connection_raw(
         connection,
         agent,
         set_options,
+        shutdown,
         _cwd: temp,
     };
     (ready, fake)
@@ -1398,4 +1401,68 @@ async fn proxy_hello_and_primitives_shape_the_event_stream() {
     ));
     fake.agent.abort();
     fake.connection.abort();
+}
+
+/// Closes the agent's end and returns every event the ended connection emitted.
+/// The channel closes only when the connection task is done, so none are missed.
+async fn close_agent_and_collect(fake: FakeConnection) -> Vec<Event> {
+    let FakeConnection {
+        mut event_rx,
+        agent,
+        agent_write,
+        connection,
+        ..
+    } = fake;
+    agent.abort();
+    let _ = agent.await;
+    drop(agent_write);
+    let mut events = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = event_rx.recv().await {
+            events.push(event);
+        }
+    })
+    .await
+    .expect("connection ends once the agent closes");
+    connection.await.unwrap();
+    events
+}
+
+/// A proxied agent that closes its transport after the hello loses its
+/// integration; an agent that never proved it was proxied fails as before, and
+/// a close the daemon asked for emits neither.
+#[tokio::test]
+async fn closing_the_transport_after_a_hello_loses_the_integration() {
+    // (name, hello, daemon shut the connection down first, expect proxy_exited, expect startup error)
+    let cases = [
+        ("proxied", GOOD_HELLO, false, true, false),
+        ("no hello", "", false, false, true),
+        ("deliberate close", GOOD_HELLO, true, false, false),
+    ];
+    for (name, hello, deliberate, proxy_exited, startup_error) in cases {
+        let (ready, fake) =
+            spawn_fake_connection_raw("s-x", hello, None, None, None, |_| vec![]).await;
+        ready.expect(name);
+        if deliberate {
+            fake.shutdown.cancel();
+        }
+        let events = close_agent_and_collect(fake).await;
+        assert_eq!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::IntegrationLost {
+                    reason: IntegrationLostReason::ProxyExited
+                }
+            )),
+            proxy_exited,
+            "{name}: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::AgentStartupError { .. })),
+            startup_error,
+            "{name}: {events:?}"
+        );
+    }
 }

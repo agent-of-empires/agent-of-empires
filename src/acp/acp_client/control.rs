@@ -47,6 +47,8 @@ pub(super) struct DaemonControlClient {
     raw_fd: RawFd,
     closed_locally: Arc<AtomicBool>,
     loss: Arc<std::sync::OnceLock<ControlLoss>>,
+    /// The agent sent a valid proxy hello on this connection.
+    proxied: Arc<AtomicBool>,
     pub(super) disconnected: tokio_util::sync::CancellationToken,
 }
 
@@ -57,6 +59,8 @@ pub(crate) struct ControlLoss {
     /// `None` for a clean EOF.
     pub(crate) io_error: Option<std::io::ErrorKind>,
     pub(crate) turn_in_flight: bool,
+    /// A proxied agent was behind the channel, so its loss is the proxy's.
+    pub(crate) proxied: bool,
 }
 
 enum CompletionDelivery {
@@ -148,6 +152,10 @@ impl DaemonControlClient {
         self.closed_locally.store(true, AtomicOrdering::Release);
         // SAFETY: `self` keeps this exact socket alive for the call.
         unsafe { libc::shutdown(self.raw_fd, libc::SHUT_RDWR) };
+    }
+
+    pub(super) fn mark_proxied(&self) {
+        self.proxied.store(true, AtomicOrdering::Relaxed);
     }
 
     pub(super) fn lost(&self) -> bool {
@@ -427,6 +435,8 @@ pub(super) async fn connect_runner_control_v3(
     let closed_locally = Arc::new(AtomicBool::new(false));
     let loss = Arc::new(std::sync::OnceLock::new());
     let (reader_closed_locally, reader_loss) = (closed_locally.clone(), loss.clone());
+    let proxied = Arc::new(AtomicBool::new(false));
+    let reader_proxied = proxied.clone();
     let disconnected = tokio_util::sync::CancellationToken::new();
     let reader_disconnected = disconnected.clone();
     tokio::spawn(async move {
@@ -438,6 +448,7 @@ pub(super) async fn connect_runner_control_v3(
             let loss = ControlLoss {
                 io_error,
                 turn_in_flight: reader_prompt_in_flight.load(AtomicOrdering::Relaxed),
+                proxied: reader_proxied.load(AtomicOrdering::Relaxed),
             };
             warn!(
                 target: "acp.protocol",
@@ -812,6 +823,7 @@ pub(super) async fn connect_runner_control_v3(
             raw_fd,
             closed_locally,
             loss,
+            proxied,
             disconnected,
         }),
         crate_side,

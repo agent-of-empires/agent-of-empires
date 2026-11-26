@@ -41,7 +41,7 @@ A `session/update` with no `_meta.aoe` is an unanchored adapter frame: it is cou
 
 ## Failure
 
-For a proxied agent, a frame that breaks the contract, an overfull hold buffer or an overfull lease table emits `Event::IntegrationLost` and core ignores the agent's later frames. A process that has not announced itself is never held to this.
+For a proxied agent, a frame that breaks the contract, an overfull hold buffer or an overfull lease table emits `Event::IntegrationLost` and core ignores the agent's later frames. The same event with reason `proxy_exited` follows when the proxy, or the agent behind it, exits after its hello, unless the daemon stopped or restarted the session. Nothing then continues unproxied: a prompt queues until a respawn or reattach assigns a session. A process that has not announced itself is never held to this.
 
 ## Conformance
 

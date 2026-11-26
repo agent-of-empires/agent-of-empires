@@ -303,7 +303,8 @@ export type IncompatibleAgentDetail =
 export type IntegrationLostReason =
   | { kind: "contract_violation"; detail: string }
   | { kind: "hold_overflow" }
-  | { kind: "lease_overflow" };
+  | { kind: "lease_overflow" }
+  | { kind: "proxy_exited" };
 
 // One variant per Event::* in src/acp/state.rs, externally tagged.
 export type AcpEvent =

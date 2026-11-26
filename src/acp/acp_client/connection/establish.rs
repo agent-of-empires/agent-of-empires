@@ -204,6 +204,9 @@ pub(super) async fn establish(
         }
     };
     shared.aoe.begin_connection(proxied);
+    if let Some(control) = ctx.control.as_ref().filter(|_| proxied) {
+        control.mark_proxied();
+    }
 
     let load_session_capable = init.agent_capabilities.load_session;
     // Re-derived on every connect (a respawn may land on another adapter
