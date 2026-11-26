@@ -45,6 +45,7 @@ use super::rate_limit::{
     captured_rate_limit_reset, classify_rate_limit_error, classify_rate_limit_from_message,
 };
 use super::session_identity::{RequestPolicy, SessionIngress, SessionIngressNotification};
+use super::spawn::ProxySpec;
 use super::terminal_handlers::{
     handle_create_terminal, handle_kill_terminal, handle_release_terminal, handle_terminal_output,
     handle_wait_for_terminal_exit,
@@ -79,6 +80,7 @@ pub(super) struct ConnectionParams {
     pub(super) ready_tx: oneshot::Sender<Result<(), AcpError>>,
     pub(super) profile: &'static AgentProfile,
     pub(super) expected_agent: ExpectedAgent,
+    pub(super) proxy: Option<ProxySpec>,
     pub(super) source_profile: Option<String>,
     pub(super) default_effort: Option<String>,
     pub(super) default_model_config: std::collections::BTreeMap<String, String>,
@@ -149,6 +151,7 @@ pub(super) async fn run_connection_task<W, R>(
         ready_tx,
         profile,
         expected_agent,
+        proxy,
         source_profile,
         default_effort,
         default_model_config,
@@ -414,6 +417,7 @@ pub(super) async fn run_connection_task<W, R>(
         ready_tx: ready_tx.clone(),
         mode,
         expected_agent,
+        proxy,
         mcp_servers,
         default_effort,
         default_model_config,

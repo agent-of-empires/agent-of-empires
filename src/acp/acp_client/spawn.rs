@@ -1,6 +1,7 @@
 //! `SpawnConfig` and agent subprocess spawning, including the environment
 //! filter that decides which host variables the agent sees.
 
+use crate::acp::agent_compat::ProxyCompat;
 use crate::acp::agent_registry::AgentSpec;
 use crate::session::SandboxInfo;
 use agent_client_protocol::v1::schema::McpServer;
@@ -28,6 +29,7 @@ pub struct ProxySpec {
     pub args: Vec<String>,
     pub failure_policy: ProxyFailurePolicy,
     pub display_name: String,
+    pub compat: ProxyCompat,
 }
 
 #[derive(Debug, Clone)]

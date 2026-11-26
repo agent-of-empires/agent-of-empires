@@ -254,6 +254,8 @@ struct Launch {
     sandbox: Option<(SessionSandbox, SandboxPathMap)>,
     profile: &'static agent_profiles::AgentProfile,
     install_binary: String,
+    /// Set when the runner launches a proxy; the hello is held to it.
+    proxy: Option<ProxySpec>,
     source_profile: Option<String>,
     default_effort: Option<String>,
     default_model_config: std::collections::BTreeMap<String, String>,
@@ -302,6 +304,7 @@ impl Launch {
             ready_tx,
             profile: self.profile,
             expected_agent: ExpectedAgent::from_command(&self.install_binary),
+            proxy: self.proxy,
             source_profile: self.source_profile,
             default_effort: self.default_effort,
             default_model_config: self.default_model_config,
@@ -588,6 +591,7 @@ impl AcpClient {
             sandbox,
             profile: agent_profiles::resolve(&config.agent_key),
             install_binary: config.spec.command.clone(),
+            proxy: config.proxy.clone(),
             source_profile: config.source_profile.clone(),
             default_effort: config.default_effort.clone(),
             default_model_config: config.default_model_config.clone(),
@@ -792,6 +796,7 @@ impl AcpClient {
             sandbox: spec.sandbox.clone(),
             profile: agent_profiles::resolve(&spec.agent_key),
             install_binary,
+            proxy: None,
             source_profile: spec.source_profile.clone(),
             // Resume sends no session/new or load, so defaults and MCP servers
             // were applied on first connect.

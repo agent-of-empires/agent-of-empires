@@ -5,6 +5,8 @@ use super::prompt::{SelectProbe, SELECT_PROBE};
 use super::*;
 use crate::acp::acp_client::commands::PromptInput;
 use crate::acp::acp_client::reset::ResetSessionOutcome;
+use crate::acp::acp_client::{ProxyFailurePolicy, ProxySpec};
+use crate::acp::agent_compat::ProxyCompat;
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::fs_handler::FsPolicy;
 use crate::acp::state::{IntegrationLostReason, StartupErrorDetail, SubagentState};
@@ -129,6 +131,7 @@ async fn cancel_under_flood() {
         ready_tx,
         profile: &crate::acp::agent_profiles::GEMINI,
         expected_agent: ExpectedAgent::Gemini,
+        proxy: None,
         source_profile: None,
         default_effort: None,
         default_model_config: Default::default(),
@@ -266,6 +269,7 @@ async fn auth_events(mode: ConnectMode, reports: bool) -> Vec<bool> {
         ready_tx,
         profile: &crate::acp::agent_profiles::GEMINI,
         expected_agent: ExpectedAgent::Gemini,
+        proxy: None,
         source_profile: None,
         default_effort: None,
         default_model_config: Default::default(),
@@ -351,8 +355,15 @@ async fn spawn_fake_connection_with(
     config_options: Option<&'static str>,
     on_prompt: impl Fn(&serde_json::Value) -> Vec<String> + Send + 'static,
 ) -> FakeConnection {
-    let (ready, fake) =
-        spawn_fake_connection_raw(session_id, "", default_mode, config_options, on_prompt).await;
+    let (ready, fake) = spawn_fake_connection_raw(
+        session_id,
+        "",
+        default_mode,
+        config_options,
+        None,
+        on_prompt,
+    )
+    .await;
     ready.expect("handshake ok");
     fake
 }
@@ -364,6 +375,7 @@ async fn spawn_fake_connection_raw(
     init_extra: &'static str,
     default_mode: Option<&'static str>,
     config_options: Option<&'static str>,
+    proxy: Option<ProxySpec>,
     on_prompt: impl Fn(&serde_json::Value) -> Vec<String> + Send + 'static,
 ) -> (Result<(), AcpError>, FakeConnection) {
     let (daemon_write, agent_read) = tokio::io::duplex(64 * 1024);
@@ -398,6 +410,7 @@ async fn spawn_fake_connection_raw(
         ready_tx,
         profile: &crate::acp::agent_profiles::GEMINI,
         expected_agent: ExpectedAgent::Gemini,
+        proxy,
         source_profile: None,
         default_effort: None,
         default_model_config: Default::default(),
@@ -940,6 +953,7 @@ async fn child_cancel_targets_the_child_and_requires_the_capability() {
         ready_tx,
         profile: &crate::acp::agent_profiles::CLAUDE,
         expected_agent: ExpectedAgent::Gemini,
+        proxy: None,
         source_profile: None,
         default_effort: None,
         default_mode: None,
@@ -1082,6 +1096,7 @@ async fn reset_waits_for_a_running_subagent() {
         ready_tx,
         profile: &crate::acp::agent_profiles::CLAUDE,
         expected_agent: ExpectedAgent::Gemini,
+        proxy: None,
         source_profile: None,
         default_effort: None,
         default_mode: None,
@@ -1238,6 +1253,90 @@ async fn child_approval_wait_does_not_stall_other_sessions() {
 const GOOD_HELLO: &str = r#","_meta":{"aoe":{"proxy":{"plugin_id":"p","protocol_version":1,"primitive_schema_version":1}}}"#;
 const BAD_HELLO: &str = r#","_meta":{"aoe":{"proxy":{"plugin_id":"p","protocol_version":9,"primitive_schema_version":1}}}"#;
 
+const HELLO_WITH_INFO: &str = r#","agentInfo":{"name":"claude-x","version":"1.2.0"},"_meta":{"aoe":{"proxy":{"plugin_id":"p","protocol_version":1,"primitive_schema_version":1}}}"#;
+
+fn proxy_spec(compat: ProxyCompat) -> ProxySpec {
+    ProxySpec {
+        plugin_id: "p".into(),
+        command: "proxy".into(),
+        args: vec![],
+        failure_policy: ProxyFailurePolicy::Refuse,
+        display_name: "P".into(),
+        compat,
+    }
+}
+
+/// A launched proxy must send a hello naming itself, in front of an adapter
+/// its compat accepts; each breach is an `InvalidProxyHello`. Without a launched
+/// proxy a hello is accepted as announced.
+#[tokio::test]
+async fn launched_proxy_hello_is_held_to_its_spec() {
+    let other_plugin = r#","_meta":{"aoe":{"proxy":{"plugin_id":"q","protocol_version":1,"primitive_schema_version":1}}}"#;
+    let compat = |names: &[&str], req: Option<&str>| ProxyCompat {
+        agent_names: names.iter().map(|n| n.to_string()).collect(),
+        version_req: req.map(|r| r.parse().unwrap()),
+    };
+    let cases: [(&str, &str, Option<ProxySpec>, Option<&str>); 8] = [
+        (
+            "no hello",
+            "",
+            Some(proxy_spec(ProxyCompat::default())),
+            Some("sent no hello"),
+        ),
+        (
+            "other plugin",
+            other_plugin,
+            Some(proxy_spec(ProxyCompat::default())),
+            Some("names plugin `q`"),
+        ),
+        (
+            "any adapter",
+            GOOD_HELLO,
+            Some(proxy_spec(ProxyCompat::default())),
+            None,
+        ),
+        (
+            "compat met",
+            HELLO_WITH_INFO,
+            Some(proxy_spec(compat(&["claude-x"], Some(">=1.2")))),
+            None,
+        ),
+        (
+            "wrong name",
+            HELLO_WITH_INFO,
+            Some(proxy_spec(compat(&["other"], None))),
+            Some("`claude-x` is not supported"),
+        ),
+        (
+            "version too old",
+            HELLO_WITH_INFO,
+            Some(proxy_spec(compat(&[], Some(">=2")))),
+            Some("does not satisfy"),
+        ),
+        (
+            "no agent_info",
+            GOOD_HELLO,
+            Some(proxy_spec(compat(&["claude-x"], None))),
+            Some("no agent_info"),
+        ),
+        ("hello without a launched proxy", GOOD_HELLO, None, None),
+    ];
+    for (name, init_extra, proxy, refusal) in cases {
+        let (ready, fake) =
+            spawn_fake_connection_raw("s-v", init_extra, None, None, proxy, |_| vec![]).await;
+        match refusal {
+            None => assert!(ready.is_ok(), "{name}: {ready:?}"),
+            Some(needle) => assert!(
+                matches!(&ready, Err(AcpError::IncompatibleAgent(e))
+                    if matches!(&e.detail, StartupErrorDetail::InvalidProxyHello { reason } if reason.contains(needle))),
+                "{name}: {ready:?}"
+            ),
+        }
+        fake.agent.abort();
+        fake.connection.abort();
+    }
+}
+
 fn tool_call_frame(id: &str, aoe: &str) -> String {
     let meta = if aoe.is_empty() {
         String::new()
@@ -1254,7 +1353,8 @@ fn tool_call_frame(id: &str, aoe: &str) -> String {
 /// broken frame ends the integration.
 #[tokio::test]
 async fn proxy_hello_and_primitives_shape_the_event_stream() {
-    let (ready, fake) = spawn_fake_connection_raw("s-h", BAD_HELLO, None, None, |_| vec![]).await;
+    let (ready, fake) =
+        spawn_fake_connection_raw("s-h", BAD_HELLO, None, None, None, |_| vec![]).await;
     assert!(
         matches!(&ready, Err(AcpError::IncompatibleAgent(e))
             if matches!(e.detail, StartupErrorDetail::InvalidProxyHello { .. })),
@@ -1264,7 +1364,7 @@ async fn proxy_hello_and_primitives_shape_the_event_stream() {
     fake.connection.abort();
 
     let (ready, mut fake) =
-        spawn_fake_connection_raw("s-h", GOOD_HELLO, None, None, |_| vec![]).await;
+        spawn_fake_connection_raw("s-h", GOOD_HELLO, None, None, None, |_| vec![]).await;
     ready.expect("valid hello accepted");
     let frames = [
         tool_call_frame("t1", ""),

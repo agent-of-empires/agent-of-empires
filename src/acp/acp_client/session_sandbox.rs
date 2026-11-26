@@ -414,6 +414,7 @@ mod tests {
             args: vec!["--x".into()],
             failure_policy: crate::acp::acp_client::ProxyFailurePolicy::Refuse,
             display_name: "P".into(),
+            compat: Default::default(),
         };
 
         let argv = super::super::runner::agent_argv(

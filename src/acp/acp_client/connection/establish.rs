@@ -21,6 +21,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use super::super::spawn::ProxySpec;
 use super::command_loop::Session;
 use super::notifications::{now_ms, Shared};
 use super::ReadyTx;
@@ -94,6 +95,7 @@ pub(super) struct EstablishCtx {
     pub(super) ready_tx: Arc<ReadyTx>,
     pub(super) mode: ConnectMode,
     pub(super) expected_agent: ExpectedAgent,
+    pub(super) proxy: Option<ProxySpec>,
     pub(super) mcp_servers: Vec<McpServer>,
     pub(super) default_effort: Option<String>,
     pub(super) default_model_config: BTreeMap<String, String>,
@@ -103,6 +105,31 @@ pub(super) struct EstablishCtx {
     pub(super) agent_cwd: PathBuf,
     pub(super) cmd_rx: mpsc::Receiver<ClientCmd>,
     pub(super) lifecycle_rx: mpsc::Receiver<LifecycleEnvelope>,
+}
+
+/// Whether the agent is proxied, or why its hello is unacceptable. A launched
+/// proxy must send a hello naming its own plugin and fronting a compatible
+/// adapter; with none launched, a hello is accepted as announced.
+fn proxy_verdict(expected: Option<&ProxySpec>, init: &InitializeResponse) -> Result<bool, String> {
+    let hello = init
+        .meta
+        .as_ref()
+        .map(aoe_meta::ProxyHello::from_meta)
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .flatten();
+    let Some(spec) = expected else {
+        return Ok(hello.is_some());
+    };
+    let hello = hello.ok_or("the launched proxy sent no hello")?;
+    if hello.plugin_id != spec.plugin_id {
+        return Err(format!(
+            "hello names plugin `{}` but `{}` was launched",
+            hello.plugin_id, spec.plugin_id
+        ));
+    }
+    spec.compat.check(init.agent_info.as_ref())?;
+    Ok(true)
 }
 
 /// `Ok(None)` when the agent failed the compatibility check; the typed error
@@ -155,25 +182,18 @@ pub(super) async fn establish(
         return Ok(None);
     }
 
-    // A proxy announces itself on the initialize response; any other agent
-    // has no hello and is not held to the `_meta.aoe` contract.
-    let proxied = match init
-        .meta
-        .as_ref()
-        .map(aoe_meta::ProxyHello::from_meta)
-        .transpose()
-    {
-        Ok(hello) => hello.flatten().is_some(),
-        Err(err) => {
+    // One classification point for proxy hello failures, so the failure
+    // policy has a single typed error (`InvalidProxyHello`) to act on.
+    let proxied = match proxy_verdict(ctx.proxy.as_ref(), &init) {
+        Ok(proxied) => proxied,
+        Err(reason) => {
             warn!(
                 target: "acp.protocol",
                 session = %label,
-                error = %err,
+                error = %reason,
                 "proxy hello rejected; refusing to enter session"
             );
-            let detail = StartupErrorDetail::InvalidProxyHello {
-                reason: err.to_string(),
-            };
+            let detail = StartupErrorDetail::InvalidProxyHello { reason };
             let message = detail.user_message();
             if let Some(tx) = ctx.ready_tx.lock().await.take() {
                 let _ = tx.send(Err(AcpError::IncompatibleAgent(Box::new(
