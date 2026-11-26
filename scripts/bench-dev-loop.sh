@@ -4,17 +4,17 @@
 # Benchmarks a copy of the tree it runs from, with a fresh one-commit git repo
 # and its own debug target dir, both under a mktemp dir removed on exit. Needs
 # node, npm, git and jq; installs hyperfine with cargo if missing. Results stay
-# in $TMPDIR/bench-dev-loop-<timestamp>/. Aborts below 10 GiB free disk.
+# in $TMPDIR/bench-dev-loop-<timestamp>-*/. Aborts below 10 GiB free disk.
 set -euo pipefail
 [ "${1:-}" = -h ] && { sed -n 3p "$0" | sed 's/^# //' >&2; exit 2; }
 
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
 SRC=$(cd "$(dirname "$0")/.." && pwd)
 TREE="synced tree"
 [ -e "$SRC/.git" ] && TREE=$(git -C "$SRC" describe --always --dirty)
-OUT=${TMPDIR:-/tmp}/bench-dev-loop-$(date +%Y%m%d-%H%M%S)
+OUT=$(mktemp -d "${TMPDIR:-/tmp}/bench-dev-loop-$(date +%Y%m%d-%H%M%S)-XXXX")
 B=$(mktemp -d)
-mkdir -p "$OUT"
-trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$B"' EXIT
+trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$B"' EXIT
 RUN=" ${*:-1 2 3} "
 command -v hyperfine >/dev/null || cargo install hyperfine --locked -q
 command -v jq >/dev/null || { echo "needs jq" >&2; exit 2; }
