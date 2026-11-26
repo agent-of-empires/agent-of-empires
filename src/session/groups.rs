@@ -483,17 +483,24 @@ impl Item {
     }
 }
 
-/// Sort a slice of session references by `sort_order`, then lift every row of a workspace
-/// holding a pin with a stable pass, as the dashboard's `workspaceTriageTier` lifts its
+/// How the rows under each header are ordered: by `sort`, then with the `pinned`
+/// workspaces lifted. A workspace spans headers, so `pinned` comes from every listed row.
+#[derive(Clone, Copy)]
+struct RowOrder<'a> {
+    sort: SortOrder,
+    pinned: &'a std::collections::HashSet<String>,
+}
+
+/// Sort a slice of session references by `order.sort`, then lift every row of a pinned
+/// workspace with a stable pass, as the dashboard's `workspaceTriageTier` lifts its
 /// workspace rows. Lifted rows keep the sort's order among themselves.
-fn sort_sessions(sessions: &mut [&Instance], sort_order: SortOrder) {
-    match sort_order {
+fn sort_sessions(sessions: &mut [&Instance], RowOrder { sort, pinned }: RowOrder) {
+    match sort {
         // Rows never moved sit on top, newest first.
         SortOrder::Custom => sessions.sort_by_key(|i| i.custom_order_key()),
         SortOrder::Newest => sessions.sort_by_key(|i| Reverse(i.created_at)),
         SortOrder::Name => sessions.sort_by_key(|i| i.title.to_lowercase()),
     }
-    let pinned = pinned_workspaces(sessions.iter().copied());
     if !pinned.is_empty() {
         sessions.sort_by_cached_key(|i| !pinned.contains(&i.workspace_id()));
     }
@@ -564,7 +571,12 @@ pub fn flatten_tree_all_profiles(
         .filter(|i| i.group_path.is_empty() && !i.is_archived() && !i.is_trashed())
         .collect();
 
-    sort_sessions(&mut ungrouped, sort_order);
+    let pinned = pinned_workspaces(instances);
+    let order = RowOrder {
+        sort: sort_order,
+        pinned: &pinned,
+    };
+    sort_sessions(&mut ungrouped, order);
 
     for inst in ungrouped {
         items.push(Item::Session {
@@ -606,7 +618,7 @@ pub fn flatten_tree_all_profiles(
             ranked,
             &mut items,
             0,
-            sort_order,
+            order,
             Some(profile_name),
         );
     }
@@ -630,7 +642,12 @@ pub fn flatten_tree(
         .filter(|i| i.group_path.is_empty() && !i.is_archived() && !i.is_trashed())
         .collect();
 
-    sort_sessions(&mut ungrouped, sort_order);
+    let pinned = pinned_workspaces(instances);
+    let order = RowOrder {
+        sort: sort_order,
+        pinned: &pinned,
+    };
+    sort_sessions(&mut ungrouped, order);
 
     for inst in ungrouped {
         items.push(Item::Session {
@@ -650,7 +667,7 @@ pub fn flatten_tree(
     );
 
     for root in roots_to_iterate {
-        flatten_group(root, instances, ranked, &mut items, 0, sort_order, None);
+        flatten_group(root, instances, ranked, &mut items, 0, order, None);
     }
 
     items
@@ -662,7 +679,7 @@ fn flatten_group(
     ranked: &[Instance],
     items: &mut Vec<Item>,
     depth: usize,
-    sort_order: SortOrder,
+    order: RowOrder,
     profile: Option<&str>,
 ) {
     let session_count = count_sessions_in_group(&group.path, instances);
@@ -687,7 +704,7 @@ fn flatten_group(
         .filter(|i| i.group_path == group.path && !i.is_archived() && !i.is_trashed())
         .collect();
 
-    sort_sessions(&mut group_sessions, sort_order);
+    sort_sessions(&mut group_sessions, order);
 
     for inst in group_sessions {
         items.push(Item::Session {
@@ -700,21 +717,13 @@ fn flatten_group(
     let mut children_to_iterate: Vec<&Group> = group.children.iter().collect();
     sort_groups(
         &mut children_to_iterate,
-        sort_order,
+        order.sort,
         |g| &g.name,
         |g| newest_member(&g.path, ranked),
     );
 
     for child in children_to_iterate {
-        flatten_group(
-            child,
-            instances,
-            ranked,
-            items,
-            depth + 1,
-            sort_order,
-            profile,
-        );
+        flatten_group(child, instances, ranked, items, depth + 1, order, profile);
     }
 }
 
@@ -955,7 +964,13 @@ mod tests {
         let instances = [placed_second, unplaced_old, placed_first, unplaced_new];
 
         let mut refs: Vec<&Instance> = instances.iter().collect();
-        sort_sessions(&mut refs, SortOrder::Custom);
+        sort_sessions(
+            &mut refs,
+            RowOrder {
+                sort: SortOrder::Custom,
+                pinned: &Default::default(),
+            },
+        );
 
         assert_eq!(titles(&refs), ["new", "old", "a", "b"]);
     }
@@ -1178,8 +1193,8 @@ mod tests {
     }
 
     /// Pinned rows sit at the top of their header under every sort and keep that sort's order
-    /// among themselves; a pin lifts its whole workspace, and headers holding a pinned row
-    /// are not lifted.
+    /// among themselves; a pin lifts its whole workspace, under every header it spans, and
+    /// headers holding a pinned row are not lifted.
     #[test]
     fn pinned_rows_lead_their_header_under_every_sort() {
         let now = Timestamp::now();
@@ -1192,10 +1207,10 @@ mod tests {
             }
             i
         };
-        let branch_row = |title: &str, sort_index: Option<u32>, pinned: bool| {
-            let mut i = row(title, "w-group", sort_index, pinned);
+        let branch_row = |title: &str, group: &str, branch: &str, sort_index, pinned| {
+            let mut i = row(title, group, sort_index, pinned);
             i.worktree_info = Some(crate::session::WorktreeInfo {
-                branch: "feat".into(),
+                branch: branch.into(),
                 main_repo_path: "/tmp/repo".into(),
                 managed_by_aoe: true,
                 created_at: now,
@@ -1210,24 +1225,28 @@ mod tests {
             row("alpha", "", Some(3), true),
             row("zulu", "b-group", Some(0), false),
             row("yankee", "b-group", Some(1), true),
+            branch_row("xenon", "b-group", "x", Some(5), true),
             row("plain", "a-group", None, false),
-            branch_row("whiskey", Some(0), false),
+            branch_row("xray", "a-group", "x", Some(0), false),
+            branch_row("whiskey", "w-group", "feat", Some(0), false),
             row("victor", "w-group", Some(1), false),
-            branch_row("uniform", Some(2), true),
+            branch_row("uniform", "w-group", "feat", Some(2), true),
         ];
         let tree = GroupTree::new_with_groups(&instances, &[]);
-        for (order, ungrouped, b_group, w_group, groups) in [
+        for (order, ungrouped, a_group, b_group, w_group, groups) in [
             (
                 SortOrder::Custom,
                 ["charlie", "alpha", "delta", "bravo"],
-                ["yankee", "zulu"],
+                ["xray", "plain"],
+                ["yankee", "xenon", "zulu"],
                 ["whiskey", "uniform", "victor"],
                 ["b-group", "a-group", "w-group"],
             ),
             (
                 SortOrder::Name,
                 ["alpha", "charlie", "bravo", "delta"],
-                ["yankee", "zulu"],
+                ["xray", "plain"],
+                ["xenon", "yankee", "zulu"],
                 ["uniform", "whiskey", "victor"],
                 ["a-group", "b-group", "w-group"],
             ),
@@ -1242,6 +1261,7 @@ mod tests {
                     .filter(|t| group.contains(t))
                     .collect()
             };
+            assert_eq!(only(&a_group), a_group, "{order:?}");
             assert_eq!(only(&b_group), b_group, "{order:?}");
             assert_eq!(only(&w_group), w_group, "{order:?}");
             assert_eq!(group_names(&items), groups, "{order:?}");

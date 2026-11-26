@@ -91,7 +91,7 @@ impl HomeView {
                 let Some(other) = self.get_instance(&neighbour).map(Instance::workspace_id) else {
                     return self.refresh_after_stale_move();
                 };
-                let pinned = self.header_pinned_workspaces(at);
+                let pinned = self.listed_pinned_workspaces();
                 if pinned.contains(&workspace) != pinned.contains(&other) {
                     self.flash_status("Pinned rows stay at the top of their header");
                     return Ok(());
@@ -107,10 +107,14 @@ impl HomeView {
         }
     }
 
-    /// The workspaces lifted under the header of the row at `at`, from the run of rows it
-    /// owns directly.
-    fn header_pinned_workspaces(&self, at: usize) -> std::collections::HashSet<String> {
-        crate::session::pinned_workspaces(self.header_run(at))
+    /// The workspaces the list lifts: a pin anywhere in the view lifts its workspace under
+    /// every header, as `flatten_tree` sorts them.
+    fn listed_pinned_workspaces(&self) -> std::collections::HashSet<String> {
+        crate::session::pinned_workspaces(self.instances.values().filter(|i| {
+            self.active_profile
+                .as_ref()
+                .is_none_or(|profile| &i.source_profile == profile)
+        }))
     }
 
     /// Flash and return true while an order write or a carry or group move is unapplied,
