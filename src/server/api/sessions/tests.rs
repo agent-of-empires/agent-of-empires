@@ -3904,6 +3904,109 @@ async fn abandon_purge_preserves_read_only_and_cityhall_policy() -> anyhow::Resu
 }
 
 #[tokio::test]
+#[serial_test::serial]
+async fn favorite_selector_refuses_busy_namespace_and_hidden_exact_ids() -> anyhow::Result<()> {
+    use crate::daemon::{ERROR_CODE_HEADER, RUNTIME_EPOCH_HEADER};
+    use crate::server::test_support;
+    use tower::ServiceExt;
+
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut hidden = Instance::new("Hidden terminal", "/tmp/hidden-favorite");
+    hidden.view = crate::session::View::Terminal;
+    hidden.source_profile = "main".into();
+    let mut visible = Instance::new(&hidden.id, "/tmp/visible-favorite");
+    visible.view = crate::session::View::Structured;
+    visible.source_profile = "main".into();
+    let rows = vec![hidden.clone(), visible.clone()];
+    test_support::seed_instances_on_disk_for_test("main", rows.clone());
+    let state = test_support::build_test_app_state_with_policy_configured(
+        rows,
+        vec!["localhost".into()],
+        Vec::new(),
+        None,
+        |state| state.cityhall_mode = true,
+    );
+    test_support::refresh_canonical_metadata_for_test(&state).await;
+    let baseline = state.runtime.publish(&state).await?.value.cursor.clone();
+    let app = test_support::build_router_for_test(state.clone());
+    let request = |id: &str, body: serde_json::Value| {
+        axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/api/sessions/{id}/favorite"))
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header(RUNTIME_EPOCH_HEADER, &baseline.epoch)
+            .extension(axum::extract::ConnectInfo(
+                crate::server::peer::ConnectionPeer::UnixOwner {
+                    uid: nix::unistd::geteuid().as_raw(),
+                },
+            ))
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    };
+    let scoped = |selector: &str| {
+        request(
+            "by-selector",
+            serde_json::json!({
+                "profile": "main", "selector": selector, "select_favorited": true
+            }),
+        )
+    };
+
+    let held = state.profile_namespace.read().await;
+    let busy = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        app.clone().oneshot(scoped(&visible.id)),
+    )
+    .await??;
+    let busy = assert_response_status(busy, StatusCode::CONFLICT, "namespace held").await;
+    assert_eq!(busy.headers()[ERROR_CODE_HEADER], "favorite_namespace_busy");
+    drop(held);
+
+    let absent = serde_json::to_vec(&crate::daemon::SessionLookupError::NotFound)?;
+    for selector in [hidden.id.as_str(), "not-found"] {
+        let response = app.clone().oneshot(scoped(selector)).await?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response.headers()[ERROR_CODE_HEADER],
+            "favorite_selection_refused"
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await?
+                .as_ref(),
+            absent
+        );
+    }
+    let storage = Storage::open_unwatched("main")?;
+    assert!(storage.load()?.iter().all(|row| !row.is_favorited()));
+    assert_eq!(state.runtime.publish(&state).await?.value.cursor, baseline);
+    let accepted = app.clone().oneshot(scoped(&visible.id)).await?;
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let is_favorited = || -> anyhow::Result<bool> {
+        Ok(storage
+            .load()?
+            .iter()
+            .find(|row| row.id == visible.id)
+            .unwrap()
+            .is_favorited())
+    };
+    assert!(is_favorited()?);
+
+    let legacy = app
+        .oneshot(request(
+            &visible.id,
+            serde_json::json!({
+                "favorited": false, "client_tag": "batch"
+            }),
+        ))
+        .await?;
+    assert_eq!(legacy.status(), StatusCode::OK);
+    assert!(!is_favorited()?);
+    Ok(())
+}
+
+#[tokio::test]
 async fn abandon_purge_inherits_a_namespace_lease_published_after_it_started() -> anyhow::Result<()>
 {
     let state = crate::server::test_support::build_test_app_state(Vec::new());

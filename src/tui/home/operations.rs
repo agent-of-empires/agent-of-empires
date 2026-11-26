@@ -708,7 +708,7 @@ impl HomeView {
         };
         self.session_feed.submit(
             id,
-            crate::daemon::SessionMutation::Favorite(crate::daemon::UpdateFavoriteBody {
+            crate::daemon::SessionMutation::Favorite(crate::daemon::UpdateFavoriteBody::Unscoped {
                 favorited: !is_fav,
             }),
         )?;
