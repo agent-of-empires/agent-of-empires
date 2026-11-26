@@ -4,7 +4,6 @@ import type { RightPanelView } from "../lib/rightPanelView";
 import type { SessionResponse, Workspace } from "../lib/types";
 import { PaletteTriggerPill } from "./PaletteTriggerPill";
 import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
-import { appMenuItems } from "../lib/appMenu";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { PluginHeaderStartSegments, PluginStatusBarSegments } from "./plugin/PluginSlots";
 import { PluginPageButtons } from "./plugin/PluginPageButtons";
@@ -43,9 +42,6 @@ interface Props {
   };
   /** The review panel toggle and its pane menu; omitted where the Session has no review panel. */
   panels?: PanelControlProps;
-  onOpenHelp: () => void;
-  onOpenAbout: () => void;
-  onStartTutorial: () => void;
   /** Sessions with an unseen finished turn, across every workspace; shown as a badge on the sidebar toggle. */
   unreadCount: number;
   /** Sessions waiting for input, across every workspace; shown as a badge on the sidebar toggle. */
@@ -53,16 +49,13 @@ interface Props {
   /** Colors for the unread/waiting badges, derived from the app's single resolved-theme read (in `App`); computed
    *  here instead, it would call `useResolvedTheme()` a second time and race that one (see the function's doc). */
   attentionBadgeColors: AttentionBadgeColors;
-  onLogout: () => void;
-  loginRequired: boolean;
   isOffline: boolean;
   /** When true, render a "DEV" badge (in the `status-waiting` amber) in the right-hand status zone so debug builds
    *  (port 8081 / `aoe_dev_` tmux / `~/.agent-of-empires-dev/`) are visually distinct from release builds at a
    *  glance, including in PWA installs where the port is not visible in the window chrome. */
   isDevBuild: boolean;
-  /** Opens the tip-of-the-day modal; wired into the overflow menu so tips are
-   *  re-readable any time, like GIMP/DBeaver's Help menu entry. */
-  onOpenTips: () => void;
+  /** The app's own items, ending the ⋯ menu: Help, the symbol legend, the tutorial, Tips, About, Sign out. */
+  appMenu: OverflowItem[];
   onGoDashboard: () => void;
   /** Set in a focus-mode window: an "All Sessions" button replaces the sidebar toggle and the dashboard logo. */
   onExitFocusMode?: () => void;
@@ -88,26 +81,17 @@ export function TopBar({
   panels,
   sessionItems,
   phoneViews,
-  onOpenHelp,
-  onOpenAbout,
-  onStartTutorial,
+  appMenu,
   unreadCount,
   waitingCount,
   attentionBadgeColors,
-  onLogout,
-  loginRequired,
   isOffline,
   isDevBuild,
-  onOpenTips,
   onGoDashboard,
   onExitFocusMode,
   sidebarColumnVisible,
   rightColumnVisible,
 }: Props) {
-  const overflowItems = useMemo<OverflowItem[]>(
-    () => appMenuItems({ onOpenHelp, onStartTutorial, onOpenTips, onOpenAbout, onLogout, loginRequired }),
-    [onOpenHelp, onStartTutorial, onOpenTips, onOpenAbout, onLogout, loginRequired],
-  );
   // A phone's menu: the Session's views, then its actions, then the app's items.
   const menuItems = useMemo<OverflowItem[]>(() => {
     const views: OverflowItem[] = (phoneViews?.choices ?? []).map(({ id, label, icon }) => ({
@@ -125,11 +109,11 @@ export function TopBar({
         onClick: phoneViews.onMore,
       });
     }
-    const groups = [views, sessionItems ?? [], overflowItems].filter((g) => g.length > 0);
+    const groups = [views, sessionItems ?? [], appMenu].filter((g) => g.length > 0);
     return groups.flatMap((group, g) =>
       group.map((item, i) => (g > 0 && i === 0 ? { ...item, separated: true } : item)),
     );
-  }, [phoneViews, sessionItems, overflowItems]);
+  }, [phoneViews, sessionItems, appMenu]);
   const phoneSession = !!activeSession && !onExitFocusMode;
 
   // The left zone only borrows the sidebar's width while that column is visible, so the compact rail only crowds

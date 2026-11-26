@@ -1,4 +1,4 @@
-import { useEffect, useRef, useSyncExternalStore, type ReactNode } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { Pin } from "lucide-react";
 import { ContextMenu } from "../ContextMenu";
 import { StatusGlyph } from "../StatusGlyph";
@@ -6,8 +6,6 @@ import { statusLegend, type StatusLegendRow, type StatusMeaning } from "../../li
 import { useContextMenu } from "../useContextMenu";
 import { MARK_MEANING } from "../../lib/sidebarMarks";
 import { STATUS_DOT_CLASS } from "../../lib/session";
-import { TOOLBAR_BUTTON, TOOLBAR_TINT } from "./styles";
-import { TOUR_ANCHORS, tourSelector } from "../../lib/tourSteps";
 
 const REDUCED_MOTION = "(prefers-reduced-motion: reduce)";
 const INTERACTIVE = 'a[href], button, input, select, textarea, [contenteditable], [tabindex]:not([tabindex="-1"])';
@@ -51,23 +49,43 @@ function Row({ mark, meaning, testId }: { mark: ReactNode; meaning: StatusMeanin
 }
 
 /** The sidebar footer's "?": what the status glyphs and marks mean. A popover, or a sheet on a phone. */
-export function SidebarLegend() {
-  const buttonRef = useRef<HTMLButtonElement>(null);
+/**
+ * What the sidebar's glyphs and marks mean, opened from the app's ⋯ menu: a popover at `anchor` on desktop,
+ * a sheet on a phone.
+ */
+export function SidebarLegend({
+  anchor,
+  onClose,
+  opener,
+}: {
+  anchor: { x: number; y: number };
+  onClose: () => void;
+  /** The control that opened it, where focus goes back. */
+  opener: HTMLElement | null;
+}) {
+  const returnFocusTo = useRef(opener);
   const bodyRef = useRef<HTMLDivElement>(null);
   const { menu, menuRef, openMenu, closeMenu } = useContextMenu<{ x: number; y: number }>();
   const reducedMotion = useSyncExternalStore(subscribeReducedMotion, prefersReducedMotion, () => false);
+  const [initialAnchor] = useState(anchor);
+  useEffect(() => openMenu(initialAnchor), [initialAnchor, openMenu]);
 
   const close = () => {
     closeMenu();
-    buttonRef.current?.focus();
+    returnFocusTo.current?.focus();
   };
-  // An outside click closes the popover without `close`: back to "?" when the click landed on
+  // An outside click closes the popover without `close`: back to the opener when the click landed on
   // nothing focusable, left alone when it was a control. Safari doesn't focus a clicked button, so
   // the pointer's target decides, not only where focus went.
   const wasOpen = useRef(false);
   const pressedControl = useRef(false);
   useEffect(() => {
     if (menu) {
+      // The popover isn't modal, so it takes focus itself once shown; Escape then reaches it. The phone sheet
+      // is modal and has already focused its close button, where its Tab trap starts; leave that be.
+      if (!wasOpen.current && !menuRef.current?.contains(document.activeElement)) {
+        bodyRef.current?.focus({ preventScroll: true });
+      }
       wasOpen.current = true;
       pressedControl.current = false;
       const onPointerDown = (e: PointerEvent) => {
@@ -80,38 +98,13 @@ export function SidebarLegend() {
     wasOpen.current = false;
     const active = document.activeElement;
     if ((!active || active === document.body) && !pressedControl.current) {
-      buttonRef.current?.focus({ preventScroll: true });
+      returnFocusTo.current?.focus({ preventScroll: true });
     }
-  }, [menu]);
-  const toggle = () => {
-    if (menu) return close();
-    const rect = buttonRef.current?.getBoundingClientRect();
-    // Past the sidebar's edge, level with "?": clamped up to fit the window, it covers neither its trigger nor
-    // the sidebar's other controls.
-    const edge =
-      buttonRef.current?.closest(tourSelector(TOUR_ANCHORS.sidebar))?.getBoundingClientRect().right ?? rect?.right ?? 0;
-    openMenu({ x: edge + 8, y: rect?.top ?? 0 });
-    // The popover isn't modal, so it takes focus itself; Escape then reaches it. The phone sheet is
-    // modal and has already focused its close button, where its Tab trap starts; leave that be.
-    requestAnimationFrame(() => {
-      if (!menuRef.current?.contains(document.activeElement)) bodyRef.current?.focus({ preventScroll: true });
-    });
-  };
+    onClose();
+  }, [menu, menuRef, onClose, returnFocusTo]);
 
   return (
     <>
-      <button
-        ref={buttonRef}
-        type="button"
-        onClick={toggle}
-        aria-label="What do these symbols mean?"
-        // A disclosure, not `aria-haspopup="dialog"`: only the phone sheet is a dialog.
-        aria-expanded={!!menu}
-        data-testid="sidebar-legend-toggle"
-        className={`${TOOLBAR_BUTTON} ${TOOLBAR_TINT(!!menu)} text-sm font-semibold`}
-      >
-        ?
-      </button>
       {menu && (
         <ContextMenu
           menu={menu}
@@ -122,7 +115,7 @@ export function SidebarLegend() {
           label="What the sidebar symbols mean"
           heading={<span className="text-xs font-medium uppercase tracking-wide text-text-subtle">Symbols</span>}
           onClose={close}
-          returnFocusTo={buttonRef}
+          returnFocusTo={returnFocusTo}
         >
           <div
             ref={bodyRef}

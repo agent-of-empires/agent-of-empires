@@ -23,7 +23,11 @@ test.describe("edges an iOS 26 installed app can tint", () => {
   test.use(iPhone13);
 
   test("the session list and an open session paint opaque edges", async ({ page }) => {
+    // An installed app draws under the status bar: the header must clear it and the strip must fill it.
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send("Emulation.setSafeAreaInsetsOverride", { insets: { top: 47, bottom: 34 } });
     await openLiveTerminal(page, { mobile: true });
+    expect((await page.getByTestId("topbar-menu").boundingBox())!.y).toBeGreaterThanOrEqual(47);
     for (const screen of ["session", "list"] as const) {
       if (screen === "list") await page.goto("/");
       for (const edge of ["top", "bottom"] as const) {

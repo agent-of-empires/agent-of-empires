@@ -227,6 +227,8 @@ import { MainViewTabs } from "./components/MainViewTabs";
 import type { OverflowItem } from "./components/OverflowMenu";
 import { TopBar, type PhoneViewChoice } from "./components/TopBar";
 import { appMenuItems } from "./lib/appMenu";
+import { TOUR_ANCHORS, findTourAnchor } from "./lib/tourSteps";
+import { SidebarLegend } from "./components/sidebar/SidebarLegend";
 import { MAIN_VIEW_IDS } from "./lib/mainViewIds";
 import { DiffScopeContext, loadDiffScope, saveDiffScope, type DiffScope, type DiffScopeState } from "./lib/diffScope";
 import { PairedShellPane, ShellModeToggle } from "./components/PairedTerminal";
@@ -2925,17 +2927,26 @@ function AppContent({
     seenKnown: tourSeenKnown,
     onSeen: handleTourSeen,
   });
+  // The symbol legend opens from the app's ⋯, beside whichever ⋯ opened it.
+  const [legend, setLegend] = useState<{ anchor: { x: number; y: number }; opener: HTMLElement | null } | null>(null);
+  const openLegend = useCallback(() => {
+    const opener = findTourAnchor(TOUR_ANCHORS.topbarMore);
+    const r = opener?.getBoundingClientRect();
+    setLegend({ anchor: { x: r ? r.right - 340 : 8, y: r ? r.bottom + 6 : 56 }, opener });
+  }, []);
+  const closeLegend = useCallback(() => setLegend(null), []);
   const appMenu = useMemo(
     () =>
       appMenuItems({
         onOpenHelp: handleOpenHelp,
+        onOpenLegend: openLegend,
         onStartTutorial: tour.startTour,
         onOpenTips: tips.open,
         onOpenAbout: handleOpenAbout,
         onLogout,
         loginRequired,
       }),
-    [handleOpenHelp, tour.startTour, tips.open, handleOpenAbout, onLogout, loginRequired],
+    [handleOpenHelp, openLegend, tour.startTour, tips.open, handleOpenAbout, onLogout, loginRequired],
   );
 
   // Auto-pop the tip-of-the-day once per load, after onboarding settles, like
@@ -3047,12 +3058,17 @@ function AppContent({
             // What a phone's floating header covers, for the views that keep their banners and first lines clear of it.
             style={phoneDrawer ? ({ "--phone-overlay-top": "64px" } as CSSProperties) : undefined}
           >
+            {phoneDrawer && (
+              // iOS 26 blurs the top edge unless a fixed, opaque, full-width box sits there. This one fills the status
+              // bar's area, which an installed app draws under, so the clock sits on solid colour, never on content.
+              <div className="md:hidden fixed inset-x-0 top-0 z-30 h-[calc(env(safe-area-inset-top)+12px)] bg-surface-900" />
+            )}
             <div
               // The phone's list is the whole screen with no Session open, and carries the app's menu itself. With a
               // Session open the header floats over it, as Muse's does: only its controls take taps.
               className={`${PUSH_MOTION} ${phoneHome ? "max-md:hidden" : ""} ${
                 phoneDrawer
-                  ? "max-md:fixed max-md:inset-x-0 max-md:top-0 max-md:z-30 max-md:pointer-events-none max-md:[&_button]:pointer-events-auto max-md:[&_[role=menu]]:pointer-events-auto max-md:[&_[data-testid=session-title-pill]]:pointer-events-auto"
+                  ? "max-md:fixed max-md:inset-x-0 max-md:top-[env(safe-area-inset-top)] max-md:z-30 max-md:pointer-events-none max-md:[&_button]:pointer-events-auto max-md:[&_[role=menu]]:pointer-events-auto max-md:[&_[data-testid=session-title-pill]]:pointer-events-auto"
                   : ""
               } ${
                 drawerPushed
@@ -3061,15 +3077,10 @@ function AppContent({
               }`}
             >
               {phoneDrawer && (
-                <>
-                  {/* iOS 26 blurs the top edge unless a fixed, opaque, full-width box sits there; this strip is it. */}
-                  <div className="md:hidden fixed inset-x-0 top-0 h-3 bg-surface-900 pointer-events-auto" />
-                  {/* Keeps the floating controls legible over the text scrolling beneath them. */}
-                  <div
-                    aria-hidden
-                    className="md:hidden absolute inset-x-0 top-0 h-16 -z-10 bg-gradient-to-b from-surface-900/90 to-transparent"
-                  />
-                </>
+                <div
+                  aria-hidden
+                  className="md:hidden absolute inset-x-0 top-0 h-16 -z-10 bg-gradient-to-b from-surface-900/90 to-transparent"
+                />
               )}
               <TopBar
                 activeWorkspace={activeWorkspace}
@@ -3080,6 +3091,7 @@ function AppContent({
                   caps.canUseTerminal ? { open: terminalOpen, onToggle: () => togglePaneAny("terminal") } : undefined
                 }
                 sessionItems={phoneSessionItems}
+                appMenu={appMenu}
                 phoneViews={phoneViews && { ...phoneViews, onPick: handlePickView, onMore: () => setPickerOpen(true) }}
                 panels={
                   dockPaneIds.length > 0
@@ -3091,17 +3103,11 @@ function AppContent({
                       }
                     : undefined
                 }
-                onOpenHelp={handleOpenHelp}
-                onOpenAbout={handleOpenAbout}
-                onStartTutorial={tour.startTour}
                 unreadCount={unreadCount}
                 waitingCount={waitingCount}
                 attentionBadgeColors={attentionBadgeColors}
-                onLogout={onLogout}
-                loginRequired={loginRequired}
                 isOffline={!!error}
                 isDevBuild={isDebugBuild(serverAbout)}
-                onOpenTips={tips.open}
                 onGoDashboard={handleGoDashboard}
                 onExitFocusMode={focusMode ? exitFocusMode : undefined}
                 sidebarColumnVisible={!focusMode && !fullPageView && sidebarOpen}
@@ -3200,6 +3206,8 @@ function AppContent({
                 {renderContent()}
               </div>
             </div>
+
+            {legend && <SidebarLegend anchor={legend.anchor} onClose={closeLegend} opener={legend.opener} />}
 
             {showSessionWizard && (
               <SessionWizard

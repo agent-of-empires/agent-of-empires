@@ -30,7 +30,6 @@ type TopBarOverrides = {
   isOffline?: boolean;
   activeWorkspace?: Workspace;
   activeSession?: SessionResponse | null;
-  onOpenTips?: () => void;
   onToggleSidebar?: () => void;
   unreadCount?: number;
   waitingCount?: number;
@@ -47,17 +46,12 @@ function topBarProps(overrides: TopBarOverrides = {}) {
     paneDescriptor: (id: string) => ({ title: id, icon: (() => null) as never }),
     isPaneOpen: () => true,
     onTogglePane: vi.fn(),
-    onOpenHelp: vi.fn(),
-    onOpenAbout: vi.fn(),
-    onStartTutorial: vi.fn(),
     unreadCount: overrides.unreadCount ?? 0,
     waitingCount: overrides.waitingCount ?? 0,
     attentionBadgeColors: overrides.attentionBadgeColors ?? DEFAULT_ATTENTION_BADGE_COLORS,
-    onLogout: vi.fn(),
-    loginRequired: false,
     isOffline: overrides.isOffline ?? false,
     isDevBuild: overrides.isDevBuild ?? false,
-    onOpenTips: overrides.onOpenTips ?? vi.fn(),
+    appMenu: [],
     onGoDashboard: vi.fn(),
     sidebarColumnVisible: false,
     rightColumnVisible: false,
@@ -133,14 +127,6 @@ describe("TopBar", () => {
     fireEvent.click(exit);
     expect(onExitFocusMode).toHaveBeenCalledTimes(1);
     expect(onToggleSidebar).not.toHaveBeenCalled();
-  });
-
-  it("exposes a Tips entry in the overflow menu that fires onOpenTips", () => {
-    const onOpenTips = vi.fn();
-    const { getByRole } = renderTopBar({ onOpenTips });
-    fireEvent.click(getByRole("button", { name: "More options" }));
-    fireEvent.click(getByRole("menuitem", { name: "Tips" }));
-    expect(onOpenTips).toHaveBeenCalledTimes(1);
   });
 
   it("shows counts on the sidebar toggle's badges and accessible name, and nothing extra at zero", () => {

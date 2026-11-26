@@ -185,6 +185,7 @@ test.describe("Phone session stack", () => {
       "Stop",
       "Move to Trash",
       "Help",
+      "Symbol legend",
       "Show tutorial",
       "Tips",
       "About",
