@@ -135,7 +135,7 @@ export const TOUR_STEPS: readonly TourStep[] = [
     anchor: TOUR_ANCHORS.dashboardSuggestions,
     scopes: ["dashboard"],
     title: "Suggested sessions",
-    body: "Plugins can propose sessions worth starting, like pull requests waiting for your review. Nothing runs until you press Start.",
+    body: "Your agents and plugins can propose sessions worth starting, like a pull request waiting for your review. Nothing runs until you press Start.",
   },
   {
     id: "settings",

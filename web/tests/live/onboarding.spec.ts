@@ -107,7 +107,13 @@ test("first-run tutorial: auto-launch, skip, persist, re-trigger, and the Settin
 
   // #4594: the tour stays on the dashboard.
   const next = page.getByRole("button", { name: /^Next/ });
-  for (const heading of ["Your sessions", "Start a session", "Settings", "Replay this tour any time"]) {
+  for (const heading of [
+    "Your sessions",
+    "Start a session",
+    "Suggested sessions",
+    "Settings",
+    "Replay this tour any time",
+  ]) {
     await next.click();
     await expect(tourStep(heading)).toBeVisible({ timeout: 10_000 });
     expect(new URL(page.url()).pathname).toBe("/");

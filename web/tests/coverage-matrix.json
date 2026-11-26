@@ -1189,7 +1189,12 @@
         "src/components/__tests__/SuggestionsSetup.test.tsx",
         "src/components/__tests__/DashboardSetupHint.test.tsx"
       ],
-      "components": ["web/src/components/SuggestionsSetupHint.tsx", "web/src/components/SuggestionsSetupSheet.tsx"]
+      "components": [
+        "web/src/components/SuggestionsSetupHint.tsx",
+        "web/src/components/SuggestionsSetupSheet.tsx",
+        "web/src/components/SuggestionsAgentGuide.tsx"
+      ],
+      "notes": "With only the built-in Agent provider, the Home section and /suggestions explain that any session can suggest work and offer a prompt to paste (DashboardSuggestions.test.tsx)."
     },
     {
       "id": "suggestions.live-persistence",
