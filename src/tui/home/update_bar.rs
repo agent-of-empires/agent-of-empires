@@ -59,18 +59,29 @@ impl<'a> UpdateBar<'a> {
 pub(crate) enum DrawnBar {
     CancelPrompt,
     Status(String),
-    Pull(PullLine),
+    Pull(DrawnPull),
     Live,
     AppUpdate { version: String },
     ImageUpdate { digest: String },
 }
 
-impl From<UpdateBar<'_>> for DrawnBar {
-    fn from(bar: UpdateBar<'_>) -> Self {
+/// A drawn pull line and its id: two outcomes can draw alike, and a key acts only on the one drawn.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DrawnPull {
+    pub(crate) line: PullLine,
+    pub(crate) id: u64,
+}
+
+impl DrawnBar {
+    /// `pull_id` is the id of the pull line `bar` shows, if it shows one.
+    pub(crate) fn drawn(bar: UpdateBar<'_>, pull_id: u64) -> Self {
         match bar {
             UpdateBar::CancelPrompt => Self::CancelPrompt,
             UpdateBar::Status(s) => Self::Status(s.to_string()),
-            UpdateBar::Pull(line) => Self::Pull(line.clone()),
+            UpdateBar::Pull(line) => Self::Pull(DrawnPull {
+                line: line.clone(),
+                id: pull_id,
+            }),
             UpdateBar::Live(_) => Self::Live,
             UpdateBar::AppUpdate(info) => Self::AppUpdate {
                 version: info.latest_version.clone(),

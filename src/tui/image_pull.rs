@@ -8,7 +8,7 @@ use crate::containers::image_pull::PullState;
 use crate::containers::image_update::ImageUpdate;
 use crate::containers::pull_progress::ProgressSnapshot;
 use crate::daemon::DaemonEndpoint;
-use crate::tui::home::update_bar::PullLine;
+use crate::tui::home::update_bar::{DrawnPull, PullLine};
 
 const START_UNANSWERED: &str =
     "Couldn't start the sandbox image download: the Daemon didn't answer.";
@@ -224,6 +224,9 @@ pub(crate) struct PullWatch {
     /// The Daemon's id for the running pull shown, and for the one behind; a cancel names it.
     flight: Option<u64>,
     behind_flight: Option<u64>,
+    /// Moves on whenever the line becomes another one, but not on a running pull's progress, so
+    /// a key drawn against one outcome can't act on another that looks the same.
+    line_id: u64,
 }
 
 /// What [`PullWatch::apply`] changed, beyond the line.
@@ -245,6 +248,23 @@ impl PullWatch {
         self.line
             .as_ref()
             .filter(|_| !(self.hidden && self.running()))
+    }
+
+    /// The line as a frame draws it, with its id; none while a running pull is hidden.
+    #[cfg(test)]
+    pub(crate) fn drawn(&self) -> Option<DrawnPull> {
+        self.line().map(|line| DrawnPull {
+            line: line.clone(),
+            id: self.line_id,
+        })
+    }
+
+    pub(crate) fn line_id(&self) -> u64 {
+        self.line_id
+    }
+
+    fn is_drawn(&self, drawn: &DrawnPull) -> bool {
+        self.line_id == drawn.id && self.line.as_ref() == Some(&drawn.line)
     }
 
     /// Whether the update bar holds a pull, shown or hidden, running or waiting to be
@@ -356,8 +376,8 @@ impl PullWatch {
 
     /// Ctrl+X on the drawn pull line, if it is still `drawn`: hides a running pull and
     /// acknowledges an outcome. Returns whether it was still current.
-    pub(crate) fn dismiss(&mut self, drawn: &PullLine) -> bool {
-        if self.line.as_ref() != Some(drawn) {
+    pub(crate) fn dismiss(&mut self, drawn: &DrawnPull) -> bool {
+        if !self.is_drawn(drawn) {
             return false;
         }
         if self.running() {
@@ -369,9 +389,8 @@ impl PullWatch {
     }
 
     /// Whether the Update key on the drawn line retries the pull.
-    pub(crate) fn retries(&self, drawn: &PullLine) -> bool {
-        self.line.as_ref() == Some(drawn)
-            && matches!(drawn, PullLine::Failed(_) | PullLine::Cancelled)
+    pub(crate) fn retries(&self, drawn: &DrawnPull) -> bool {
+        self.is_drawn(drawn) && matches!(drawn.line, PullLine::Failed(_) | PullLine::Cancelled)
     }
 
     /// Whether a cancel may go out for this pull. After a Start with no reply, only a poll
@@ -409,10 +428,10 @@ impl PullWatch {
         self.confirms_cancel(self.cancel_armed, now)
     }
 
-    /// A key that isn't the pull's clears a Done line the last frame `done_drawn`, so the key
-    /// acts as usual. Returns whether the line changed.
-    pub(crate) fn other_key(&mut self, done_drawn: bool) -> bool {
-        if done_drawn && self.line == Some(PullLine::Done) {
+    /// A key that isn't the pull's clears the Done line the last frame drew, so the key acts as
+    /// usual. Returns whether the line changed.
+    pub(crate) fn other_key(&mut self, drawn: Option<&DrawnPull>) -> bool {
+        if drawn.is_some_and(|d| d.line == PullLine::Done && self.is_drawn(d)) {
             self.acknowledge();
             return true;
         }
@@ -438,6 +457,7 @@ impl PullWatch {
         if !replaced {
             return false;
         }
+        self.line_id += 1;
         let unhid = std::mem::take(&mut self.hidden);
         self.cancel_armed.take().is_some() || unhid
     }
@@ -496,6 +516,10 @@ impl PullWatch {
     }
 
     fn set_line(&mut self, line: Option<PullLine>) {
+        let progress = self.running() && matches!(line, Some(PullLine::Running(_)));
+        if !progress {
+            self.line_id += 1;
+        }
         if !matches!(line, Some(PullLine::Running(_))) {
             self.hidden = false;
             self.cancel_armed = None;
@@ -780,9 +804,9 @@ mod tests {
                 "{case}: the outcome was replaced"
             );
             if shown == PullLine::Done {
-                assert!(watch.other_key(true), "{case}");
+                assert!(watch.other_key(watch.drawn().as_ref()), "{case}");
             } else {
-                assert!(watch.dismiss(&shown), "{case}");
+                assert!(watch.dismiss(&watch.drawn().unwrap()), "{case}");
             }
             assert_eq!(watch.line(), acknowledged.as_ref(), "{case}: acknowledged");
         }
@@ -807,10 +831,10 @@ mod tests {
     fn dismiss_hides_a_running_pull_and_acknowledges_an_outcome() {
         let mut watch = PullWatch::default();
         watch.apply(PullRequest::Poll, running(3));
-        let drawn = watch.line().cloned().unwrap();
+        let drawn = watch.drawn().unwrap();
         watch.apply(PullRequest::Poll, running(4));
         assert!(!watch.dismiss(&drawn), "a line since redrawn was dismissed");
-        let drawn = watch.line().cloned().unwrap();
+        let drawn = watch.drawn().unwrap();
         assert!(watch.dismiss(&drawn));
         assert_eq!(watch.line(), None);
         assert!(watch.holds_line(), "a hidden pull let the image offer back");
@@ -829,8 +853,7 @@ mod tests {
 
         watch.apply(PullRequest::Poll, failed());
         let outcome = watch
-            .line()
-            .cloned()
+            .drawn()
             .expect("the outcome shows though the pull was hidden");
         assert_eq!(watch.hidden_progress(), None);
         assert!(watch.retries(&outcome));
@@ -841,7 +864,7 @@ mod tests {
         // A hide is of one pull: another id that replaces it shows.
         watch.apply(PullRequest::Poll, running(1));
         watch.note_flight(Some(1));
-        let drawn = watch.line().cloned().unwrap();
+        let drawn = watch.drawn().unwrap();
         assert!(watch.dismiss(&drawn));
         assert!(!watch.note_flight(Some(1)), "the same pull changed the bar");
         assert_eq!(watch.line(), None, "the same pull unhid");
@@ -878,16 +901,16 @@ mod tests {
         }
         watch.arm_cancel(at);
         assert!(
-            !watch.other_key(true),
+            !watch.other_key(watch.drawn().as_ref()),
             "a running pull's line changed on a key"
         );
 
         watch.apply(PullRequest::Poll, PullReport::State(PullState::Done));
         assert!(
-            !watch.other_key(false),
+            !watch.other_key(None),
             "a key cleared a Done that wasn't drawn"
         );
-        assert!(watch.other_key(true));
+        assert!(watch.other_key(watch.drawn().as_ref()));
         assert_eq!(watch.line(), None);
 
         // A Start with no reply ends the prompt, so a poll then showing a pull running, under

@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
-use super::home::update_bar::{DrawnBar, PullLine, UpdateBar};
+use super::home::update_bar::{DrawnBar, UpdateBar};
 use super::home::{bindings, HomeView, PendingStructuredInput, TerminalMode};
 use super::image_pull::{
     self, Applied, ImageOffer, PullAnswer, PullReport, PullRequest, PullSource, PullWatch,
@@ -1650,7 +1650,7 @@ impl App {
         self.home.render(frame, frame.area(), &self.theme, bar);
         self.drawn_bar = bar
             .filter(|_| self.home.update_bar_drawn)
-            .map(DrawnBar::from);
+            .map(|bar| DrawnBar::drawn(bar, self.pull.line_id()));
         // Sampled: only frames over the 16ms budget and live-send frames.
         let elapsed = start.elapsed();
         let in_live = self.home.live_send.is_some();
@@ -1758,8 +1758,8 @@ impl App {
         };
         match drawn {
             DrawnBar::Live | DrawnBar::CancelPrompt => {}
-            DrawnBar::Pull(line) => {
-                self.pull.dismiss(line);
+            DrawnBar::Pull(drawn) => {
+                self.pull.dismiss(drawn);
             }
             DrawnBar::Status(text) => {
                 if self.update_status.as_ref().is_some_and(|s| &s.text == text) {
@@ -1798,8 +1798,8 @@ impl App {
     /// the home Update action.
     fn pull_from_update_bar(&mut self) -> bool {
         match &self.drawn_bar {
-            Some(DrawnBar::Pull(line)) => {
-                if !self.pull.retries(line) {
+            Some(DrawnBar::Pull(drawn)) => {
+                if !self.pull.retries(drawn) {
                     return false;
                 }
                 self.start_pull(self.pull_image.clone());
@@ -2361,8 +2361,12 @@ impl App {
         // Taken before any key is routed, so every key ends the cancel prompt; only the
         // confirming key, reaching the pull below, can still act on it.
         let cancel_armed = self.pull.take_cancel_arm();
-        // A key routed away below still acknowledges a Done line that was on screen.
-        let done_drawn = self.drawn_bar == Some(DrawnBar::Pull(PullLine::Done));
+        // A key routed away below still acknowledges the Done line that was on screen.
+        let drawn_pull = match &self.drawn_bar {
+            Some(DrawnBar::Pull(drawn)) => Some(drawn.clone()),
+            _ => None,
+        };
+        let done_drawn = drawn_pull.as_ref();
         let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL;
         if !ctrl_c && self.home.retained_reader_focused() && !self.home.has_non_live_send_overlay()
         {
@@ -3961,6 +3965,7 @@ pub enum Action {
 mod tests {
     use super::*;
     use crate::containers::image_pull::PullState;
+    use crate::tui::home::update_bar::PullLine;
 
     /// An app whose selected row is a previewable structured session, with the
     /// row's id so a mount can name it.
@@ -5660,7 +5665,7 @@ mod tests {
                 flight: None,
             },
         );
-        assert!(app.pull.dismiss(&PullLine::Done));
+        assert!(app.pull.dismiss(&app.pull.drawn().unwrap()));
         answer_pull(&mut app, PullRequest::Poll, running());
         answer_pull(&mut app, PullRequest::Poll, done());
         assert_eq!(
@@ -5728,14 +5733,55 @@ mod tests {
         );
         for (press, expected) in [(1, Some(&PullLine::Done)), (2, None)] {
             draw(&mut app);
-            assert_eq!(
-                app.drawn_bar,
-                Some(DrawnBar::Pull(PullLine::Done)),
+            assert!(
+                matches!(&app.drawn_bar, Some(DrawnBar::Pull(d)) if d.line == PullLine::Done),
                 "{press}"
             );
             app.handle_key(ctrl_x, &mut terminal).await.unwrap();
             assert_eq!(app.pull.line(), expected, "Ctrl+X #{press}");
         }
+
+        // Keys dispatched before the next draw (a short burst, its deferred Ctrl+X, Live send's
+        // skipped post-key draw) acknowledge only the Done drawn: the one behind it waits for a frame.
+        let char_key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let mut early = Vec::new();
+        for case in ["two keys", "a key, then Ctrl+X", "Live send"] {
+            app.start_pull(image_update().image);
+            for state in [
+                PullState::Running(Default::default()),
+                PullState::Done,
+                PullState::Running(Default::default()),
+                PullState::Done,
+            ] {
+                answer_pull(&mut app, PullRequest::Poll, PullReport::State(state));
+            }
+            draw(&mut app);
+            let second = if case == "a key, then Ctrl+X" {
+                ctrl_x
+            } else {
+                char_key('k')
+            };
+            for key in [char_key('j'), second] {
+                if case == "Live send" {
+                    app.home.enter_live_send_for_test();
+                }
+                app.handle_key(key, &mut terminal).await.unwrap();
+            }
+            if app.pull.line() != Some(&PullLine::Done) {
+                early.push(case);
+            }
+            draw(&mut app);
+            app.handle_key(char_key('j'), &mut terminal).await.unwrap();
+            assert_eq!(
+                app.pull.line(),
+                None,
+                "{case}: the drawn second Done stayed"
+            );
+        }
+        assert!(
+            early.is_empty(),
+            "the Done behind was acknowledged before it was drawn: {early:?}"
+        );
     }
 
     /// The Daemon's state is read with this TUI's update checks off and no sandbox in use: the
@@ -5908,7 +5954,7 @@ mod tests {
                 app.pull
                     .apply(PullRequest::Poll, PullReport::State(PullState::Done));
                 if case == "drawn done" {
-                    app.drawn_bar = Some(DrawnBar::Pull(PullLine::Done));
+                    app.drawn_bar = app.pull.drawn().map(DrawnBar::Pull);
                 }
             }
             match path {
