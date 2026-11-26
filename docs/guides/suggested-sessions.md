@@ -36,7 +36,7 @@ If the repo defines [hooks](repo-config.md) you have not approved, Start pauses 
 
 **▾** next to Start shows what Start will use for this suggestion (Project, agent, view, worktree) and offers:
 
-- **Start with changes**: opens the New session dialog prefilled from the preset, for this one only. A strip above the form names the source and says "issue text not included"; the source's own text is never added to the prompt for you. The dialog also shows "From the <kind> preset" with an **Edit preset** link.
+- **Start with changes**: opens the New session dialog prefilled from the preset, for this one only. A strip above the form names the source and says "issue text not included": AoE does not add the item's preview to the prompt. The prompt itself is the preset's or the provider's draft, which the provider writes and can quote the source, so read it before you launch. The dialog also shows "From the <kind> preset" with an **Edit preset** link.
 - **Copy prompt**, **Open in <provider> ↗**, and **Edit the <kind> preset** (Settings › Suggestions).
 
 If the repo has no Project yet, **Start in… ▾** replaces Start. Picking a Project links the repo to it, then starts, so later suggestions from that repo start in one click. It is off on read-only dashboards and in CityHall mode, which cannot save the link.
