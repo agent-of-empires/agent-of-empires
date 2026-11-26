@@ -108,7 +108,7 @@ pub(crate) use require_tmux;
 static DRAFT_WATCHERS: std::sync::Mutex<Vec<(String, std::sync::mpsc::Sender<()>)>> =
     std::sync::Mutex::new(Vec::new());
 
-/// Signals each time an input-line wait reads a draft in `pane`.
+/// Signals the first time each input-line wait reads a draft in `pane`.
 pub(crate) fn watch_drafts(pane: &str) -> std::sync::mpsc::Receiver<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     DRAFT_WATCHERS.lock().unwrap().push((pane.to_string(), tx));
@@ -121,7 +121,27 @@ pub(crate) fn observe_draft(pane: &str) {
             let _ = tx.send(());
         }
     }
+    for hook in take_hooks(&DRAFT_SEEN_HOOKS, pane) {
+        hook();
+    }
 }
+
+static DRAFT_SEEN_HOOKS: HookRegistry = std::sync::Mutex::new(Vec::new());
+
+/// Runs `hook` once, on the waiting thread, the first time an input-line wait reads a draft in
+/// `pane`, before it sleeps.
+pub(crate) fn on_draft_seen(pane: &str, hook: impl FnOnce() + Send + 'static) {
+    DRAFT_SEEN_HOOKS
+        .lock()
+        .unwrap()
+        .push((pane.to_string(), Box::new(hook)));
+}
+
+/// Claude's input box drawn by hand: `cat` on a cooked tty echoes typed keys after the `❯`,
+/// between two rules, above the footer that holds Claude's ready marker.
+pub(crate) const INPUT_BOX_SCRIPT: &str =
+    "printf '%s\\n\\n%s\\n%s\\n' ──────── ──────── '? for shortcuts'; \
+     printf '\\033[3A❯ '; exec cat";
 
 /// Splits `session`'s first window, running `script` in the new pane, and returns its `#{pane_id}`.
 pub(crate) fn split_pane(session: &str, script: &str) -> String {
@@ -152,8 +172,18 @@ pub(crate) fn split_pane(session: &str, script: &str) -> String {
 }
 
 type InputCheckHook = Box<dyn FnOnce() + Send>;
-static INPUT_CHECK_HOOKS: std::sync::Mutex<Vec<(String, InputCheckHook)>> =
-    std::sync::Mutex::new(Vec::new());
+type HookRegistry = std::sync::Mutex<Vec<(String, InputCheckHook)>>;
+static INPUT_CHECK_HOOKS: HookRegistry = std::sync::Mutex::new(Vec::new());
+
+/// Removes and returns the hooks registered for `pane`.
+fn take_hooks(registry: &HookRegistry, pane: &str) -> Vec<InputCheckHook> {
+    let mut all = registry.lock().unwrap();
+    let (mine, rest) = std::mem::take(&mut *all)
+        .into_iter()
+        .partition::<Vec<_>, _>(|(watched, _)| watched == pane);
+    *all = rest;
+    mine.into_iter().map(|(_, hook)| hook).collect()
+}
 
 /// Runs `hook` once, between a send's input-line check of `pane` and its keys.
 pub(crate) fn on_input_checked(pane: &str, hook: impl FnOnce() + Send + 'static) {
@@ -164,21 +194,12 @@ pub(crate) fn on_input_checked(pane: &str, hook: impl FnOnce() + Send + 'static)
 }
 
 pub(crate) fn after_input_check(pane: &str) {
-    let hooks: Vec<InputCheckHook> = {
-        let mut all = INPUT_CHECK_HOOKS.lock().unwrap();
-        let (mine, rest) = std::mem::take(&mut *all)
-            .into_iter()
-            .partition::<Vec<_>, _>(|(watched, _)| watched == pane);
-        *all = rest;
-        mine.into_iter().map(|(_, hook)| hook).collect()
-    };
-    for hook in hooks {
+    for hook in take_hooks(&INPUT_CHECK_HOOKS, pane) {
         hook();
     }
 }
 
-static TEXT_TYPED_HOOKS: std::sync::Mutex<Vec<(String, InputCheckHook)>> =
-    std::sync::Mutex::new(Vec::new());
+static TEXT_TYPED_HOOKS: HookRegistry = std::sync::Mutex::new(Vec::new());
 
 /// Runs `hook` once, after a checked-pane send has typed its text into `pane` and before its
 /// membership check for Enter.
@@ -190,15 +211,7 @@ pub(crate) fn on_text_typed(pane: &str, hook: impl FnOnce() + Send + 'static) {
 }
 
 pub(crate) fn after_text_typed(pane: &str) {
-    let hooks: Vec<InputCheckHook> = {
-        let mut all = TEXT_TYPED_HOOKS.lock().unwrap();
-        let (mine, rest) = std::mem::take(&mut *all)
-            .into_iter()
-            .partition::<Vec<_>, _>(|(watched, _)| watched == pane);
-        *all = rest;
-        mine.into_iter().map(|(_, hook)| hook).collect()
-    };
-    for hook in hooks {
+    for hook in take_hooks(&TEXT_TYPED_HOOKS, pane) {
         hook();
     }
 }

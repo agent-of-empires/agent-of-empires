@@ -5554,11 +5554,7 @@ mod tests {
         assert!(!accepts().unwrap());
     }
 
-    /// Claude's input box drawn by hand: `cat` on a cooked tty echoes typed keys after the `❯`,
-    /// between two rules, above the footer that holds Claude's ready marker.
-    const INPUT_BOX_SCRIPT: &str =
-        "printf '%s\\n\\n%s\\n%s\\n' ──────── ──────── '? for shortcuts'; \
-                                    printf '\\033[3A❯ '; exec cat";
+    use crate::tmux::test_helpers::INPUT_BOX_SCRIPT;
 
     /// Types `draft` into the box drawn by [`INPUT_BOX_SCRIPT`] and waits until it shows.
     fn type_draft(pane: &crate::tmux::test_helpers::TmuxTestSession, draft: &str) -> String {
@@ -5677,6 +5673,102 @@ mod tests {
                 !screen(&first).contains("hello"),
                 "{case}: {}",
                 screen(&first)
+            );
+        }
+    }
+
+    /// A draft blocks until a read of an empty box taken within the budget. An unreadable pane
+    /// after a draft, or a box cleared once the budget is spent, still refuses. A first read
+    /// that can't tell, or an agent with no input-line rule, passes without waiting.
+    #[test]
+    #[serial_test::serial]
+    fn a_seen_draft_blocks_until_a_clear_read_within_the_budget() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        enum Then {
+            KillFirst,
+            KillOnDraft,
+            ClearOnDraft,
+            Leave,
+        }
+        for (name, tool, budget_ms, then, want) in [
+            (
+                "capture-fails-after-draft",
+                "claude",
+                3_000,
+                Then::KillOnDraft,
+                false,
+            ),
+            (
+                "cleared-after-deadline",
+                "claude",
+                150,
+                Then::ClearOnDraft,
+                false,
+            ),
+            (
+                "cleared-in-budget",
+                "claude",
+                3_000,
+                Then::ClearOnDraft,
+                true,
+            ),
+            ("no-rule", "opencode", 3_000, Then::Leave, true),
+            ("unknown-first", "claude", 3_000, Then::KillFirst, true),
+        ] {
+            let mut inst = terminal_turn_instance(&format!("sess-wait-{name}"), name, "unused");
+            inst.tool = tool.into();
+            let pane = start_terminal_pane(&inst, INPUT_BOX_SCRIPT, false);
+            let pane_id = type_draft(&pane, "half typed");
+            let session = crate::tmux::Session::from_name(pane.name());
+            let drafts = crate::tmux::test_helpers::watch_drafts(&pane_id);
+            let kill = {
+                let pane_id = pane_id.clone();
+                move || {
+                    let status = crate::tmux::tmux_command()
+                        .args(["kill-pane", "-t", &pane_id])
+                        .status()
+                        .unwrap();
+                    assert!(status.success(), "{name}: kill-pane");
+                }
+            };
+            match then {
+                Then::KillFirst => kill(),
+                Then::Leave => {}
+                Then::KillOnDraft => crate::tmux::test_helpers::on_draft_seen(&pane_id, kill),
+                Then::ClearOnDraft => {
+                    let target = pane_id.clone();
+                    let name = pane.name().to_string();
+                    crate::tmux::test_helpers::on_draft_seen(&pane_id, move || {
+                        tmux_keys(&target, &["C-u"]);
+                        let tmux = crate::tmux::Session::from_name(&name);
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(10);
+                        while tmux
+                            .try_capture_pane_in(&target, 0)
+                            .is_ok_and(|screen| screen.contains("half typed"))
+                        {
+                            assert!(std::time::Instant::now() < deadline, "the draft clears");
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                    });
+                }
+            }
+            // A first read loads the detection manifest; the budget measures only the wait.
+            let _ = inst.input_line_in(&session, &pane_id);
+            let got = inst.wait_for_input_line(
+                &session,
+                &pane_id,
+                std::time::Duration::from_millis(budget_ms),
+            );
+            assert_eq!(got, want, "{name}");
+            let waited = drafts.try_recv().is_ok();
+            assert_eq!(
+                waited,
+                tool == "claude" && !matches!(then, Then::KillFirst),
+                "{name}: draft read"
             );
         }
     }

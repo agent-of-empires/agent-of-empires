@@ -661,8 +661,9 @@ impl Instance {
             })
     }
 
-    /// Polls [`Self::input_line_in`] until the box holds no draft. `false` when a draft is
-    /// still there once `budget` runs out.
+    /// Polls [`Self::input_line_in`] until the box reads empty. A first read that is `Unknown`
+    /// passes at once, as for an agent with no input-line rule. Once a draft is seen, only an
+    /// empty read taken before `budget` runs out passes: an unreadable pane proves nothing.
     pub(crate) fn wait_for_input_line(
         &self,
         session: &tmux::Session,
@@ -670,16 +671,28 @@ impl Instance {
         budget: std::time::Duration,
     ) -> bool {
         let deadline = std::time::Instant::now() + budget;
+        let mut drafted = false;
         loop {
-            if self.input_line_in(session, pane) != tmux::InputLine::Draft {
-                return true;
+            match self.input_line_in(session, pane) {
+                tmux::InputLine::Empty => return true,
+                tmux::InputLine::Unknown if !drafted => return true,
+                tmux::InputLine::Unknown => {}
+                tmux::InputLine::Draft => {
+                    #[cfg(test)]
+                    if !drafted {
+                        tmux::test_helpers::observe_draft(pane);
+                    }
+                    drafted = true;
+                }
             }
-            #[cfg(test)]
-            tmux::test_helpers::observe_draft(pane);
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            std::thread::sleep(left.min(std::time::Duration::from_millis(200)));
             if std::time::Instant::now() >= deadline {
                 return false;
             }
-            std::thread::sleep(std::time::Duration::from_millis(200));
         }
     }
 
