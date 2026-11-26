@@ -768,6 +768,7 @@ for line in sys.stdin:
         Some(tokio::time::Instant::now() + Duration::from_millis(500)),
         None,
         None,
+        None,
     )
     .await;
     assert!(
@@ -1465,6 +1466,7 @@ for line in sys.stdin:
         None,
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -1637,6 +1639,7 @@ for line in sys.stdin:
         None,
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -1781,6 +1784,7 @@ for line in sys.stdin:
             AcpSessionId(session.into()),
             None,
             "review-agent".into(),
+            None,
             None,
             None,
             None,

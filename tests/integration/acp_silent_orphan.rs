@@ -139,6 +139,7 @@ async fn cost_bearing_wrap_up_without_response_ends_as_prompt_complete() {
         None,
         None,
         None,
+        None,
     )
     .await
     .expect("attach for silent-orphan positive test");
@@ -203,6 +204,7 @@ async fn silent_orphan_fires_when_the_turn_never_wraps_up() {
         AcpSessionId("silent-orphan-no-cost".into()),
         None,
         "claude".into(),
+        None,
         None,
         None,
         None,
@@ -279,6 +281,7 @@ async fn silent_orphan_disabled_by_zero_grace() {
         None,
         None,
         None,
+        None,
     )
     .await
     .expect("attach for silent-orphan disabled test");
@@ -350,6 +353,7 @@ async fn silent_orphan_suppressed_during_async_agent_wait() {
         None,
         None,
         None,
+        None,
     )
     .await
     .expect("attach for async-agent silent-orphan test");
@@ -413,6 +417,7 @@ async fn silent_orphan_suppressed_during_background_bash() {
         AcpSessionId("silent-orphan-background-bash".into()),
         None,
         "claude".into(),
+        None,
         None,
         None,
         None,
@@ -487,6 +492,7 @@ async fn background_bash_wrap_up_ends_as_prompt_complete() {
         None,
         None,
         None,
+        None,
     )
     .await
     .expect("attach for wrapped-up backgrounded-bash test");
@@ -548,6 +554,7 @@ async fn silent_orphan_suppressed_during_scheduled_wakeup() {
         AcpSessionId("silent-orphan-wakeup".into()),
         None,
         "claude".into(),
+        None,
         None,
         None,
         None,

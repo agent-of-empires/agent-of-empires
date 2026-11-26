@@ -195,6 +195,21 @@ pub async fn spawn_runner_with_shim(
     session_id: &str,
     env: &[(&str, String)],
 ) -> (PathBuf, RunnerGuard) {
+    let shim = [
+        shim_node().expect("shim prerequisite").to_str().unwrap(),
+        shim_path().to_str().unwrap(),
+    ]
+    .map(String::from);
+    spawn_runner(session_id, env, &shim).await
+}
+
+/// As [`spawn_runner_with_shim`], with `agent_argv` as everything after `--`.
+#[cfg(debug_assertions)]
+pub async fn spawn_runner(
+    session_id: &str,
+    env: &[(&str, String)],
+    agent_argv: &[String],
+) -> (PathBuf, RunnerGuard) {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let xdg = temp.path().join("xdg");
@@ -218,9 +233,8 @@ pub async fn spawn_runner_with_shim(
         "--cwd",
         home.to_str().unwrap(),
         "--",
-        shim_node().expect("shim prerequisite").to_str().unwrap(),
-        shim_path().to_str().unwrap(),
     ])
+    .args(agent_argv)
     .env("HOME", &home)
     .env("XDG_CONFIG_HOME", &xdg)
     .kill_on_drop(true);

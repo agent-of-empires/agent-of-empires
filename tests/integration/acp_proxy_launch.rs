@@ -199,3 +199,101 @@ fn proxy_exit_leaves_no_orphan_adapter() {
     }
     assert_no_orphans("proxy-orphan-exit", "ok", |_, proxy| signal("-KILL", proxy));
 }
+
+#[cfg(debug_assertions)]
+mod attach {
+    use agent_of_empires::acp::acp_client::{AcpClient, AcpError, ProxyFailurePolicy, ProxySpec};
+    use agent_of_empires::acp::agent_compat::ProxyCompat;
+    use agent_of_empires::acp::state::{AcpSessionId, Event, StartupErrorDetail};
+
+    use crate::common::{shim_node, shim_path, shim_ready, spawn_runner, RunnerGuard};
+
+    fn proxy_spec() -> ProxySpec {
+        ProxySpec {
+            plugin_id: "fake-proxy".into(),
+            command: String::new(),
+            args: Vec::new(),
+            failure_policy: ProxyFailurePolicy::Refuse,
+            display_name: "Fake".into(),
+            compat: ProxyCompat::default(),
+        }
+    }
+
+    async fn attach(session_id: &str, mode: &str) -> (Result<AcpClient, AcpError>, RunnerGuard) {
+        let node = shim_node().expect("shim prerequisite").to_str().unwrap();
+        let proxy = shim_path().with_file_name("fake-proxy.mjs");
+        let argv = [
+            node,
+            proxy.to_str().unwrap(),
+            "--",
+            node,
+            shim_path().to_str().unwrap(),
+        ]
+        .map(String::from);
+        let env = [("FAKE_PROXY_MODE", mode.to_string())];
+        let (socket, runner) = spawn_runner(session_id, &env, &argv).await;
+        let result = AcpClient::attach(
+            socket,
+            std::env::temp_dir(),
+            vec![],
+            "unused".into(),
+            false,
+            AcpSessionId(session_id.into()),
+            None,
+            "shim".into(),
+            None,
+            None,
+            None,
+            None,
+            Some(proxy_spec()),
+        )
+        .await;
+        (result, runner)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_good_hello_connects() {
+        if let Err(reason) = shim_ready() {
+            eprintln!("skipping: {reason}");
+            return;
+        }
+        let (client, _runner) = attach("proxy-attach-ok", "ok").await;
+        let mut client = client.expect("attach");
+        let assigned = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(event) = client.next_event().await {
+                if matches!(event, Event::AcpSessionAssigned { .. }) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("timed out");
+        assert!(assigned, "a proxied session must reach AcpSessionAssigned");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_bad_or_missing_hello_is_refused() {
+        if let Err(reason) = shim_ready() {
+            eprintln!("skipping: {reason}");
+            return;
+        }
+        for (mode, id) in [
+            ("bad-hello", "proxy-attach-bad"),
+            ("no-hello", "proxy-attach-none"),
+        ] {
+            let (result, _runner) = attach(id, mode).await;
+            match result {
+                Err(AcpError::IncompatibleAgent(error)) => assert!(
+                    matches!(error.detail, StartupErrorDetail::InvalidProxyHello { .. }),
+                    "{mode}: {:?}",
+                    error.detail
+                ),
+                Err(other) => panic!("{mode}: unexpected error {other}"),
+                Ok(_) => panic!("{mode}: a bad hello must not connect"),
+            }
+        }
+    }
+}
