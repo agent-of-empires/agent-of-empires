@@ -670,12 +670,17 @@ impl HomeView {
             return Ok(());
         };
         if instance.is_snoozed() {
-            return self.session_feed.submit(
+            self.session_feed.submit(
                 id,
                 crate::daemon::SessionMutation::Snooze(crate::daemon::UpdateSnoozeBody {
                     minutes: None,
                 }),
-            );
+            )?;
+            // No snooze marker shows outside the Attention sort, so confirm the wake.
+            if self.sort_order != crate::session::config::SortOrder::Attention {
+                self.flash_status("Unsnoozed");
+            }
+            return Ok(());
         }
         self.snooze_duration_dialog = Some(crate::tui::dialogs::SnoozeDurationDialog::new(
             &instance.title,
@@ -693,6 +698,14 @@ impl HomeView {
         )?;
         if self.sort_order == crate::session::config::SortOrder::Attention {
             self.select_top_attention(Some(id));
+        } else {
+            // No snooze marker shows outside the Attention sort, so confirm the park.
+            self.flash_status(format!(
+                "Snoozed for {}",
+                super::render::format_snooze_remaining(crate::time::Duration::minutes(i64::from(
+                    minutes
+                )))
+            ));
         }
         Ok(())
     }
