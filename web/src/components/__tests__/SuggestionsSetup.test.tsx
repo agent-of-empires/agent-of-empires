@@ -170,6 +170,15 @@ describe("first-run hint", () => {
     expect(await screen.findByTestId("suggestions-hint")).toBeTruthy();
   });
 
+  it("draws the dismiss button with the shared X icon, named for assistive tech", async () => {
+    renderHint();
+    const dismiss = await screen.findByTestId("suggestions-hint-dismiss");
+    expect(dismiss.querySelector("svg")).not.toBeNull();
+    expect(dismiss.textContent).toBe("");
+    expect(dismiss.getAttribute("aria-label")).toBe("Don't show again");
+    expect(dismiss.getAttribute("title")).toBe("Don't show again");
+  });
+
   it("looks sources up once per page load, shared across mounts", async () => {
     const first = renderHint();
     await screen.findByTestId("suggestions-hint");

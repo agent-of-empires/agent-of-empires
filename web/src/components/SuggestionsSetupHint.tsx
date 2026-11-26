@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { fetchSuggestions } from "../lib/api";
+import { X } from "lucide-react";
 import {
   discoveryFailureText,
   loadFeaturedSuggestionSources,
@@ -151,11 +152,11 @@ function DismissButton({ onClick }: { onClick: () => void }) {
       type="button"
       title="Don't show again"
       aria-label="Don't show again"
-      className="size-8 cursor-pointer rounded-md text-text-dim hover:bg-surface-800"
+      className="inline-flex size-8 cursor-pointer items-center justify-center rounded-md text-text-dim hover:bg-surface-800"
       onClick={onClick}
       data-testid="suggestions-hint-dismiss"
     >
-      ✕
+      <X className="size-4" aria-hidden />
     </button>
   );
 }
