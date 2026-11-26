@@ -95,6 +95,8 @@ test("first-run tutorial: auto-launch, skip, persist, re-trigger, and the Settin
   await expect(intro).toBeHidden();
 
   await page.goto(serve.baseUrl);
+  // The tour lists the Suggested step only if its section is already on the page.
+  await expect(page.getByRole("region", { name: "Suggested sessions" })).toBeVisible({ timeout: 10_000 });
   await openTopBarMenuItem(page, "Show tutorial");
   await expect(firstStep).toBeVisible({ timeout: 10_000 });
   await expect
