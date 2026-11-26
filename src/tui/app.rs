@@ -2432,16 +2432,12 @@ impl App {
             self.request_pull(PullRequest::Cancel, self.pull_image.clone());
             return Ok(());
         }
-        // Ctrl+X acknowledges a drawn Done through the bar; acknowledging it here too would
-        // dismiss a Done waiting behind it before it is drawn.
+        self.pull.other_key(done_drawn);
         let dismisses_bar = bindings::is_bound(
             bindings::ActionId::DismissUpdateBanner,
             self.home.strict_hotkeys,
             &key,
         ) && !self.home.has_dialog();
-        if !dismisses_bar {
-            self.pull.other_key(done_drawn);
-        }
         match (key.code, key.modifiers) {
             // Ctrl+C belongs to the agent in live-send.
             (KeyCode::Char('c'), KeyModifiers::CONTROL) if !self.home.is_live_send_capturing() => {
@@ -5707,42 +5703,9 @@ mod tests {
         app.handle_key(down, &mut terminal).await.unwrap();
         assert_eq!(app.pull.line(), None, "a drawn Done outlived the next key");
 
-        // Ctrl+X on a drawn Done with another client's Done waiting behind it acknowledges only
-        // the drawn one; the second is acknowledged once it was drawn.
-        let ctrl_x = bindings::key_event(bindings::ActionId::DismissUpdateBanner, false).unwrap();
-        app.start_pull(image_update().image);
-        answer_pull(
-            &mut app,
-            PullRequest::Poll,
-            PullReport::State(PullState::Running(Default::default())),
-        );
-        answer_pull(
-            &mut app,
-            PullRequest::Poll,
-            PullReport::State(PullState::Done),
-        );
-        answer_pull(
-            &mut app,
-            PullRequest::Poll,
-            PullReport::State(PullState::Running(Default::default())),
-        );
-        answer_pull(
-            &mut app,
-            PullRequest::Poll,
-            PullReport::State(PullState::Done),
-        );
-        for (press, expected) in [(1, Some(&PullLine::Done)), (2, None)] {
-            draw(&mut app);
-            assert!(
-                matches!(&app.drawn_bar, Some(DrawnBar::Pull(d)) if d.line == PullLine::Done),
-                "{press}"
-            );
-            app.handle_key(ctrl_x, &mut terminal).await.unwrap();
-            assert_eq!(app.pull.line(), expected, "Ctrl+X #{press}");
-        }
-
         // Keys dispatched before the next draw (a short burst, its deferred Ctrl+X, Live send's
         // skipped post-key draw) acknowledge only the Done drawn: the one behind it waits for a frame.
+        let ctrl_x = bindings::key_event(bindings::ActionId::DismissUpdateBanner, false).unwrap();
         let char_key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
         let mut early = Vec::new();
         for case in ["two keys", "a key, then Ctrl+X", "Live send"] {
@@ -5782,6 +5745,44 @@ mod tests {
             early.is_empty(),
             "the Done behind was acknowledged before it was drawn: {early:?}"
         );
+
+        // Ctrl+X on a drawn outcome with another client's Done waiting behind it acknowledges only
+        // the drawn one; the waiting Done is acknowledged once it was drawn.
+        let failed = PullState::Failed {
+            reason: crate::containers::image_pull::PullFailureReason::Network,
+            message: String::new(),
+            error: String::new(),
+        };
+        for (kind, outcome, line) in [
+            ("done", PullState::Done, PullLine::Done),
+            (
+                "failed",
+                failed,
+                PullLine::Failed(crate::containers::image_pull::PullFailureReason::Network),
+            ),
+            ("cancelled", PullState::Cancelled, PullLine::Cancelled),
+        ] {
+            app.start_pull(image_update().image);
+            for state in [
+                PullState::Running(Default::default()),
+                outcome,
+                PullState::Running(Default::default()),
+                PullState::Done,
+            ] {
+                answer_pull(&mut app, PullRequest::Poll, PullReport::State(state));
+            }
+            for (press, drawn, expected) in
+                [(1, line, Some(&PullLine::Done)), (2, PullLine::Done, None)]
+            {
+                draw(&mut app);
+                assert!(
+                    matches!(&app.drawn_bar, Some(DrawnBar::Pull(d)) if d.line == drawn),
+                    "{kind}: drawn before Ctrl+X #{press}"
+                );
+                app.handle_key(ctrl_x, &mut terminal).await.unwrap();
+                assert_eq!(app.pull.line(), expected, "{kind}: Ctrl+X #{press}");
+            }
+        }
     }
 
     /// The Daemon's state is read with this TUI's update checks off and no sandbox in use: the
