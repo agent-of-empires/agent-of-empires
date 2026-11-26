@@ -1,7 +1,7 @@
 import { useCallback, useRef, useState } from "react";
 import type { DeleteSessionOptions } from "../lib/api";
 import type { CleanupDefaults } from "../lib/types";
-import { CancelButton, ConfirmButton, DANGER_BUTTON, Dialog } from "./Dialog";
+import { CancelButton, ConfirmButton, Dialog } from "./Dialog";
 import { useBusyAction, useConfirmKeys, useDialogFocus } from "./dialogHooks";
 
 interface AffectedSession {
@@ -121,7 +121,7 @@ export function DeleteSessionDialog({
             onClick={handleConfirm}
             busy={deleting}
             testId="delete-session-confirm"
-            className={DANGER_BUTTON}
+            tone="danger"
           >
             {deleting ? "Deleting..." : "Delete"}
           </ConfirmButton>

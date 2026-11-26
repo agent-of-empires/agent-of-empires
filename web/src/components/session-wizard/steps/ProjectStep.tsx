@@ -7,6 +7,7 @@ import { CloneRepoForm } from "./CloneRepoForm";
 import { ProjectSearchList } from "./ProjectSearchList";
 import { useProjectPicker } from "./projectPicker";
 import type { WizardData } from "../wizardReducer";
+import { BUTTON_SECONDARY } from "../../../lib/surfaces";
 
 type Tab = "recent" | "browse" | "clone" | "import" | "scratch";
 
@@ -105,7 +106,7 @@ export function ProjectStep({
       {error && (
         <div
           role="alert"
-          className="mb-4 rounded-md border border-status-warning/40 bg-surface-900 px-3 py-2 text-sm text-text-secondary"
+          className="mb-4 rounded-lg border border-status-warning/40 bg-status-warning/5 px-3 py-2 text-[15px] md:text-sm text-text-secondary"
         >
           Projects could not be loaded. Browse and Clone are still available.
           <button type="button" onClick={retry} className="ml-2 text-brand-400 hover:underline cursor-pointer">
@@ -124,7 +125,7 @@ export function ProjectStep({
                 setManualTab(tab.id);
                 tabFocusRequested.current = true;
               }}
-              className={`px-3 py-2 text-sm whitespace-nowrap cursor-pointer transition-colors border-b-2 -mb-px ${
+              className={`min-h-11 md:min-h-0 px-3 py-2 text-[15px] md:text-sm whitespace-nowrap cursor-pointer transition-colors border-b-2 -mb-px ${
                 activeTab === tab.id
                   ? "border-brand-600 text-text-primary"
                   : "border-transparent text-text-dim hover:text-text-secondary"
@@ -139,7 +140,7 @@ export function ProjectStep({
       {loading && (
         <div className="animate-pulse space-y-2">
           {[...Array(3)].map((_, i) => (
-            <div key={i} className="h-[60px] bg-surface-900 border border-surface-700/40 rounded-md" />
+            <div key={i} className="h-[60px] bg-surface-900 border border-surface-700/40 rounded-xl" />
           ))}
         </div>
       )}
@@ -171,14 +172,16 @@ export function ProjectStep({
             selectRef={importRef}
           />
         ) : (
-          <p className="text-sm text-text-muted">Resolve the server profile or select a profile to import a session.</p>
+          <p className="text-[15px] md:text-sm text-text-muted">
+            Resolve the server profile or select a profile to import a session.
+          </p>
         ))}
 
       {!loading && activeTab === "clone" && <CloneRepoForm onCloned={selectPath} inputRef={cloneRef} />}
 
       {!loading && activeTab === "scratch" && (
         <div className="space-y-3">
-          <p className="text-sm text-text-muted">
+          <p className="text-[15px] md:text-sm text-text-muted">
             Run the agent in a fresh scratch directory under your AoE app data folder. The folder is removed when you
             delete the session.
           </p>
@@ -188,7 +191,7 @@ export function ProjectStep({
               onChange("scratch", true);
               onPicked?.();
             }}
-            className="px-3 py-2 text-sm rounded-md border border-brand-600 text-text-primary hover:bg-surface-850 cursor-pointer"
+            className={BUTTON_SECONDARY}
           >
             {data.scratch ? "Keep scratch folder" : "Use a scratch folder"}
           </button>

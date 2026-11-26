@@ -1,10 +1,10 @@
 import type { KeyboardEvent } from "react";
 
-/** Arrow, Home and End keys move focus among a menu's items, wrapping at either end. */
+/** Arrow, Home and End keys move focus among a menu's enabled items, wrapping at either end. */
 export function moveMenuFocus(e: KeyboardEvent<HTMLElement>) {
   const items = [
     ...e.currentTarget.querySelectorAll<HTMLElement>(
-      '[role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"]',
+      '[role="menuitem"]:not(:disabled), [role="menuitemcheckbox"]:not(:disabled), [role="menuitemradio"]:not(:disabled)',
     ),
   ];
   const at = items.indexOf(document.activeElement as HTMLElement);

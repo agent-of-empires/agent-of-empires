@@ -249,21 +249,21 @@ export function DiffFileViewer({
   if (loading && !contents) {
     return (
       <Centered className="bg-surface-900 text-text-dim">
-        <span className="text-sm">Loading diff...</span>
+        <span>Loading diff...</span>
       </Centered>
     );
   }
   if (error) {
     return (
       <Centered className="bg-surface-900 text-status-error">
-        <span className="text-sm">{error}</span>
+        <span>{error}</span>
       </Centered>
     );
   }
   if (!contents) {
     return (
       <Centered className="bg-surface-900 text-text-dim">
-        <span className="text-sm">Select a file to view changes</span>
+        <span>Select a file to view changes</span>
       </Centered>
     );
   }
@@ -277,7 +277,7 @@ export function DiffFileViewer({
   } else if (contents.is_binary) {
     body = (
       <Centered>
-        <span className="text-sm">{isFullFile ? "Binary file" : "Binary file changed"}</span>
+        <span>{isFullFile ? "Binary file" : "Binary file changed"}</span>
       </Centered>
     );
   } else if (contents.truncated) {
@@ -287,7 +287,7 @@ export function DiffFileViewer({
   } else if (oldContent === newContent && staleComments.length === 0) {
     body = (
       <Centered>
-        <span className="text-sm">No changes in this file</span>
+        <span>No changes in this file</span>
       </Centered>
     );
   } else {

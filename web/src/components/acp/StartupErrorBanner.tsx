@@ -5,13 +5,12 @@ import { fetchAgentInstallInfo, type AgentInstallInfo } from "../../lib/api";
 import { writeClipboard } from "../../lib/clipboard";
 import type { AcpWorkerState } from "../../lib/types";
 import { splitInstallHint, startupErrorCause, useAdapterInstall } from "./adapterRecovery";
-import { CommandBlock, RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
+import { BUTTON_SECONDARY_SM } from "../../lib/surfaces";
+import { CommandBlock, InlineCode, RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
 import { ApiKeyAlternative } from "./SignInPopover";
 import { signInSteps } from "./signInSteps";
 
-function Code({ children }: { children: React.ReactNode }) {
-  return <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">{children}</code>;
-}
+const Code = InlineCode;
 
 const RETRY = (
   <>
@@ -409,7 +408,7 @@ function AgentLogDisclosure({ sessionId }: { sessionId: string }) {
             onClick={() => void fetchLog()}
             disabled={log.kind === "loading"}
             data-testid="acp-agent-log-refresh"
-            className="rounded-md border border-surface-700 bg-surface-800 px-2 py-0.5 text-[10px] font-medium text-text-primary hover:bg-surface-700 disabled:cursor-not-allowed disabled:opacity-60"
+            className={BUTTON_SECONDARY_SM}
           >
             {log.kind === "loading" ? "Loading…" : "Refresh"}
           </button>
@@ -432,7 +431,7 @@ function AgentLogDisclosure({ sessionId }: { sessionId: string }) {
           {log.kind === "ok" && log.exists && log.tail.length > 0 && (
             <>
               {log.truncated && (
-                <div className="mb-1 text-[10px] text-text-subtle">Log is large; showing the tail.</div>
+                <div className="mb-1 text-[11px] text-text-subtle">Log is large; showing the tail.</div>
               )}
               <pre
                 data-testid="acp-agent-log-pre"

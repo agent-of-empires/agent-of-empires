@@ -1,5 +1,6 @@
 import { useId, useState, type ReactNode } from "react";
 import type { SettingsIntroId } from "../../lib/settingsIntros";
+import { CARD } from "../../lib/surfaces";
 
 // Copy explains what a tab is for and never states a setting's current value.
 const INTROS: Record<SettingsIntroId, { summary: ReactNode; details: string }> = {
@@ -31,10 +32,7 @@ export function SettingsIntro({ id, onFold }: { id: SettingsIntroId; onFold: () 
   const detailsId = useId();
   const { summary, details } = INTROS[id];
   return (
-    <section
-      aria-label="About this tab"
-      className="rounded-lg border border-surface-700 bg-surface-850 px-4 py-3 text-sm leading-relaxed text-text-primary"
-    >
+    <section aria-label="About this tab" className={`${CARD} py-3 text-sm leading-relaxed text-text-primary`}>
       <p>{summary}</p>
       <p
         id={detailsId}
@@ -49,14 +47,14 @@ export function SettingsIntro({ id, onFold }: { id: SettingsIntroId; onFold: () 
           aria-expanded={open}
           aria-controls={detailsId}
           onClick={() => setOpen((o) => !o)}
-          className="min-h-8 cursor-pointer font-medium text-text-primary underline-offset-4 hover:underline"
+          className="min-h-8 max-md:min-h-11 cursor-pointer font-medium text-text-primary underline-offset-4 hover:underline"
         >
           Details <span aria-hidden="true">{open ? "⌄" : "›"}</span>
         </button>
         <button
           type="button"
           onClick={onFold}
-          className="min-h-8 cursor-pointer font-medium text-text-primary underline-offset-4 hover:underline"
+          className="min-h-8 max-md:min-h-11 cursor-pointer font-medium text-text-primary underline-offset-4 hover:underline"
         >
           Got it
         </button>

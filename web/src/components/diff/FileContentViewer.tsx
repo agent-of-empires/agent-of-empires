@@ -11,6 +11,7 @@ import { lazyView } from "../../lib/lazyView";
 const FullFileViewer = lazyView(() => import("./FullFileViewer").then((m) => m.FullFileViewer), null);
 const MarkdownFileView = lazyView(() => import("./MarkdownFileView").then((m) => m.MarkdownFileView), null);
 import { BackButton, Centered, MarkdownToggle, TooLarge } from "./viewerChrome";
+import { BUTTON_SECONDARY_SM } from "../../lib/surfaces";
 
 interface Props {
   sessionId: string;
@@ -79,7 +80,7 @@ function SessionFileViewer({ sessionId, filePath, onBack, structured }: Props) {
       className="flex-1 flex flex-col bg-surface-900 overflow-hidden focus:outline-none"
     >
       {!activeEditing && (
-        <div className="px-3 py-2 border-b border-surface-700/20 flex items-center gap-2 shrink-0">
+        <div className="px-3 py-2 border-b border-surface-700/50 flex items-center gap-2 shrink-0">
           {onBack && <BackButton label="Files" onClick={onBack} />}
           <span className="font-mono text-[12px] text-text-primary truncate flex-1">{filePath}</span>
           {isMarkdown && !data?.is_binary && <MarkdownToggle />}
@@ -88,7 +89,7 @@ function SessionFileViewer({ sessionId, filePath, onBack, structured }: Props) {
               type="button"
               disabled={!data.version || !!data.edit_disabled_reason}
               title={data.edit_disabled_reason ?? undefined}
-              className="flex items-center gap-1 min-h-8 px-2 py-1 text-xs rounded-md border border-surface-700/50 text-text-secondary disabled:opacity-40 cursor-pointer"
+              className={BUTTON_SECONDARY_SM}
               onClick={() => {
                 setEditing(getFileDraft(fileDraftKey(sessionId, filePath))?.original ?? data);
                 setSaved(false);
@@ -102,10 +103,10 @@ function SessionFileViewer({ sessionId, filePath, onBack, structured }: Props) {
       )}
 
       {!activeEditing && settings.fileEditing && data?.edit_disabled_reason && (
-        <div className="px-3 py-2 text-xs text-text-dim">{data.edit_disabled_reason}</div>
+        <div className="px-3 py-2 text-[12px] text-text-dim">{data.edit_disabled_reason}</div>
       )}
       {saved && (
-        <div role="status" className="px-3 py-2 text-xs text-text-secondary flex gap-2 items-center flex-wrap">
+        <div role="status" className="px-3 py-2 text-[12px] text-text-secondary flex gap-2 items-center flex-wrap">
           <span>File saved.</span>
           {structured ? (
             <button
@@ -144,11 +145,11 @@ function SessionFileViewer({ sessionId, filePath, onBack, structured }: Props) {
         />
       ) : loading ? (
         <Centered>
-          <span className="text-sm">Loading file...</span>
+          <span>Loading file...</span>
         </Centered>
       ) : error ? (
         <Centered className="text-status-error">
-          <span className="text-sm">{error}</span>
+          <span>{error}</span>
         </Centered>
       ) : data?.is_binary ? (
         <BinaryFileView sessionId={sessionId} filePath={filePath} />

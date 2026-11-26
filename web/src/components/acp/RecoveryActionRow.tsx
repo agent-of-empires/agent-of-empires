@@ -1,6 +1,8 @@
-import { useState } from "react";
+import { useState, type ComponentProps, type ReactNode } from "react";
 
 import { writeClipboard } from "../../lib/clipboard";
+import { BUTTON_DANGER, BUTTON_SECONDARY, CARD } from "../../lib/surfaces";
+import { BUTTON_SECONDARY_SM } from "../../lib/surfaces";
 
 export interface RecoveryAction {
   label: string;
@@ -12,14 +14,27 @@ export interface RecoveryAction {
   describedBy?: string;
 }
 
-const BUTTON =
-  "min-h-8 rounded-md px-3 py-1.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60";
-
 /** Label and fill are a theme-projected readable pair; hover adds a ring instead of
  *  changing either, so the pair holds in every state. */
-const PRIMARY = `${BUTTON} bg-status-error text-text-on-status-error hover:ring-2 hover:ring-status-error/50`;
+const PRIMARY = BUTTON_DANGER.replace(
+  "text-white hover:opacity-90",
+  "text-text-on-status-error hover:ring-2 hover:ring-status-error/50",
+);
 
-export const SECONDARY_BUTTON = `${BUTTON} border border-surface-700 bg-surface-800 text-text-primary hover:bg-surface-700`;
+const SCREEN_CARD = `${CARD.replace("border-surface-700/50", "border-status-error/60").replace("px-4", "p-4 sm:p-6")} w-full max-w-xl text-text-primary`;
+
+/** Fills the agent pane with one red-edged card, for a Session that can't start. */
+export function RecoveryScreen({ children, ...props }: ComponentProps<"div">) {
+  return (
+    <div {...props} className="flex h-full flex-1 items-center justify-center bg-surface-900 px-4 py-12">
+      <div className={SCREEN_CARD}>{children}</div>
+    </div>
+  );
+}
+
+export function InlineCode({ children }: { children: ReactNode }) {
+  return <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">{children}</code>;
+}
 
 /** The recovery buttons both startup error surfaces show, primary first, and the
  *  install's failure and npm output under them. */
@@ -44,7 +59,7 @@ export function RecoveryActionRow({
             disabled={action.disabled}
             title={action.title}
             aria-describedby={action.describedBy}
-            className={action === primary ? `${PRIMARY} w-full sm:w-auto` : SECONDARY_BUTTON}
+            className={action === primary ? `${PRIMARY} w-full sm:w-auto` : BUTTON_SECONDARY}
           >
             {action.label}
           </button>
@@ -87,7 +102,7 @@ export function CommandBlock({
         <button
           type="button"
           onClick={() => void writeClipboard(command).then(setCopied)}
-          className="shrink-0 rounded-md border border-surface-700 bg-surface-800 px-2 py-0.5 text-[11px] font-medium text-text-primary transition-colors hover:bg-surface-700"
+          className={`${BUTTON_SECONDARY_SM} shrink-0`}
         >
           {copied ? "Copied" : "Copy"}
         </button>

@@ -1,12 +1,39 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject, useId } from "react";
-import { X } from "lucide-react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent,
+  type MouseEvent,
+  type ReactNode,
+  type RefObject,
+} from "react";
+import { Check, X } from "lucide-react";
 import { createPortal } from "react-dom";
 import { useFocusTrap } from "../hooks/useFocusTrap";
+import {
+  BACKDROP,
+  MENU,
+  MENU_HEADING,
+  MENU_HEADING_TEXT,
+  MENU_ITEM,
+  MENU_ITEM_DANGER,
+  MENU_PHONE,
+  MENU_SEPARATOR,
+  SHEET,
+  SHEET_HANDLE,
+} from "../lib/surfaces";
+import { moveMenuFocus } from "./menuFocus";
 
 // Below Tailwind's `md`, where `sheetOnMobile` docks the menu as a sheet.
 const MOBILE_QUERY = "(max-width: 767.98px)";
 // How far the sheet's header must be dragged down to dismiss it.
 const SWIPE_CLOSE_PX = 72;
+/** A phone's floating menu is frosted; a menu docked as a sheet takes SHEET instead. */
+/** MENU_HEADING's type, for a heading row that sets its own padding. */
 
 export function ContextMenu({
   menu,
@@ -14,6 +41,7 @@ export function ContextMenu({
   testId,
   minWidth = "min-w-[190px]",
   sheetOnMobile = false,
+  role,
   label,
   heading,
   onClose,
@@ -22,13 +50,16 @@ export function ContextMenu({
 }: {
   menu: { x: number; y: number };
   menuRef: RefObject<HTMLDivElement | null>;
-  testId: string;
+  testId?: string;
   minWidth?: string;
   /** Below `md`, dock to the bottom edge over a backdrop instead of floating at the pointer. */
   sheetOnMobile?: boolean;
+  /** For a menu whose items carry `menuitem` roles; a phone sheet is a dialog regardless. */
+  role?: "menu";
   /** Accessible name of the sheet dialog. */
   label?: string;
-  /** Sticky title row; on the phone sheet it carries the grab handle and a close button. */
+  /** Sticky title row, set as a menu heading when it is plain text; on the phone sheet it carries the grab
+   *  handle and a close button. */
   heading?: ReactNode;
   /** Escape, the close button, and a swipe down on the sheet header close it. */
   onClose?: () => void;
@@ -69,36 +100,37 @@ export function ContextMenu({
 
   // `!` overrides the pointer position and height cap set inline.
   const sheet = sheetOnMobile
-    ? " max-md:!left-0 max-md:!top-auto max-md:bottom-0 max-md:w-full max-md:!max-h-[85dvh] max-md:rounded-b-none max-md:border-x-0 max-md:border-b-0 max-md:pb-[max(0.5rem,env(safe-area-inset-bottom))]"
+    ? " max-md:!left-0 max-md:!top-auto max-md:bottom-0 max-md:w-full max-md:!max-h-[85dvh] max-md:pb-[max(0.5rem,env(safe-area-inset-bottom))]"
     : "";
+  const surface = modal ? `${SHEET} py-1` : `${MENU} ${MENU_PHONE}`;
   return createPortal(
     <>
       {/* Taps on the backdrop fall through to the hook's outside-click close. */}
-      {sheetOnMobile && <div className="md:hidden fixed inset-0 z-50 bg-black/50" aria-hidden="true" />}
+      {sheetOnMobile && <div className={`md:hidden fixed inset-0 z-50 ${BACKDROP}`} aria-hidden="true" />}
       <div
         ref={menuRef}
         data-testid={testId}
-        role={modal ? "dialog" : undefined}
+        role={modal ? "dialog" : role}
         aria-modal={modal || undefined}
         aria-label={modal ? label : undefined}
+        // The browser's own menu never opens over this one.
+        onContextMenu={(e) => e.preventDefault()}
         onKeyDown={(e) => {
           if (e.key === "Escape" && onClose) {
             e.preventDefault();
             onClose();
           }
         }}
-        className={`fixed z-50 bg-surface-800 border border-surface-700 rounded-lg shadow-lg py-1 ${minWidth} overflow-y-auto${sheet}`}
+        className={`fixed z-50 ${surface} ${minWidth} overflow-y-auto overscroll-contain${sheet}`}
         style={{ left: menu.x, top: menu.y, maxHeight: "calc(100dvh - 16px)" }}
       >
         {(heading != null || sheetOnMobile) && (
           <div {...swipe} className="sticky top-0 z-10 bg-surface-800 max-md:-mt-1 max-md:touch-none">
-            {sheetOnMobile && (
-              <div className="md:hidden flex justify-center pt-2 pb-1" aria-hidden="true">
-                <span className="h-1 w-9 rounded-full bg-surface-600" />
-              </div>
-            )}
+            {sheetOnMobile && <div className={`md:hidden mb-1 ${SHEET_HANDLE}`} aria-hidden="true" />}
             <div className="flex items-center gap-2 px-3 pt-1.5 pb-1 max-md:pt-0">
-              <div className="min-w-0 flex-1">{heading}</div>
+              <div className="min-w-0 flex-1">
+                {typeof heading === "string" ? <span className={MENU_HEADING_TEXT}>{heading}</span> : heading}
+              </div>
               {sheetOnMobile && onClose && (
                 <button
                   type="button"
@@ -153,64 +185,93 @@ function useSwipeToClose(menuRef: RefObject<HTMLDivElement | null>, onClose: (()
   };
 }
 
+/** One row of a menu. `role` and `checked` make it a menu item, or one of a set of choices with a check on
+ *  the current one; icons take the menu's size whatever their own. */
 export function MenuItem({
   onClick,
   testId,
   icon,
   indent = false,
-  flex = icon != null,
-  className = "text-text-secondary hover:bg-surface-700/50",
+  danger = false,
+  role,
+  checked,
+  disabled,
+  tabIndex,
   ariaExpanded,
   ariaControls,
   detail,
+  trailing,
+  className = "",
   children,
 }: {
-  onClick: () => void;
+  onClick: (e: MouseEvent<HTMLButtonElement>) => void;
   testId?: string;
-  /** A second line under the label; screen readers get it as the item's description. */
-  detail?: ReactNode;
+  icon?: ReactNode;
+  indent?: boolean;
+  /** For an item that removes or stops something. */
+  danger?: boolean;
+  role?: "menuitem" | "menuitemradio" | "menuitemcheckbox";
+  checked?: boolean;
+  disabled?: boolean;
+  tabIndex?: number;
   /** For an item that discloses a group, e.g. "More". */
   ariaExpanded?: boolean;
   ariaControls?: string;
-  icon?: ReactNode;
-  indent?: boolean;
-  flex?: boolean;
+  /** A second line under the label; screen readers get it as the item's description. */
+  detail?: ReactNode;
+  /** Quiet text at the row's end, such as a state. */
+  trailing?: ReactNode;
+  /** Layout only, such as a sticky footer row; the look comes from MENU_ITEM. */
   className?: string;
   children: ReactNode;
 }) {
   const detailId = useId();
+  const base = danger ? MENU_ITEM_DANGER : MENU_ITEM;
   return (
     <button
       type="button"
       onClick={onClick}
       data-testid={testId}
+      role={role}
+      aria-checked={checked}
+      disabled={disabled}
+      tabIndex={tabIndex}
       aria-expanded={ariaExpanded}
       aria-controls={ariaControls}
       aria-describedby={detail ? detailId : undefined}
-      className={`w-full text-left ${indent ? "pl-6 pr-3" : "px-3"} py-2 md:py-2 max-md:py-3 text-sm ${className} cursor-pointer transition-colors${flex ? " flex items-center gap-2" : ""}`}
+      className={`${indent ? base.replace("px-3", "pl-6 pr-3") : base} ${className}`.trimEnd()}
     >
-      {icon}
-      {detail ? (
-        <span className="flex min-w-0 flex-col">
-          <span>{children}</span>
-          {/* Out of the name, so it reads once, as the description. */}
-          <span id={detailId} aria-hidden="true" className="text-xs text-text-subtle">
+      {icon != null && (
+        <span className="flex shrink-0 [&>*]:size-4 max-md:[&>*]:size-[18px]" aria-hidden="true">
+          {icon}
+        </span>
+      )}
+      <span className="min-w-0 flex-1">
+        <span className="block truncate">{children}</span>
+        {/* Out of the name, so it reads once, as the description. */}
+        {detail && (
+          <span id={detailId} aria-hidden="true" className="block truncate text-[12px] text-text-dim">
             {detail}
           </span>
-        </span>
-      ) : (
-        children
-      )}
+        )}
+      </span>
+      {trailing != null && <span className="shrink-0 font-mono text-[11px] text-text-dim">{trailing}</span>}
+      {checked && <Check className="size-4 shrink-0 text-text-primary" strokeWidth={2} aria-hidden />}
     </button>
   );
 }
 
 export function MenuSeparator() {
-  return <div role="separator" className="border-t border-surface-700/20 my-1" />;
+  return <div role="separator" className={MENU_SEPARATOR} />;
 }
 
-export function MenuHeading({ children }: { children: ReactNode }) {
-  return <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">{children}</div>;
+/** `decorative` for a heading a labelled group already names. */
+export function MenuHeading({ decorative = false, children }: { decorative?: boolean; children: ReactNode }) {
+  return (
+    <div className={MENU_HEADING} aria-hidden={decorative || undefined}>
+      {children}
+    </div>
+  );
 }
 
 /** A labelled row of inline choices, replacing a heading plus one item per option. */
@@ -218,10 +279,75 @@ export function MenuChoiceRow({ label, hint, children }: { label: string; hint?:
   return (
     <div className="px-3 py-1.5">
       <div className="flex items-center gap-2">
-        <span className="w-12 shrink-0 text-xs text-text-dim">{label}</span>
+        <span className="w-12 shrink-0 text-[12px] text-text-dim">{label}</span>
         <div className="flex flex-1 flex-wrap items-center">{children}</div>
       </div>
       {hint && <p className="mt-1 pl-14 text-[11px] text-text-dim">{hint}</p>}
     </div>
   );
 }
+
+/** A dropdown's list, placed by `className` against its trigger. Arrow, Home and End move among the items,
+ *  and `initialFocus` picks the one focused as it opens. */
+export function DropdownMenu({
+  menuRef,
+  id,
+  label,
+  labelledBy,
+  testId,
+  className,
+  style,
+  initialFocus,
+  phoneGlass = true,
+  onKeyDown = moveMenuFocus,
+  children,
+}: {
+  menuRef?: RefObject<HTMLDivElement | null>;
+  id?: string;
+  label?: string;
+  labelledBy?: string;
+  testId?: string;
+  /** Position, width and height cap. */
+  className: string;
+  style?: CSSProperties;
+  /** `checked` falls back to the first item when none is checked. */
+  initialFocus?: "first" | "last" | "checked";
+  /** Frosted on a phone, as DESIGN.md has a phone's menus; off for one inside a sheet or panel. */
+  phoneGlass?: boolean;
+  onKeyDown?: (e: KeyboardEvent<HTMLDivElement>) => void;
+  children: ReactNode;
+}) {
+  const [focusAt] = useState(initialFocus);
+  const attach = useCallback(
+    (el: HTMLDivElement | null) => {
+      if (menuRef) menuRef.current = el;
+      if (!el || !focusAt || el.contains(document.activeElement)) return;
+      const items = [...el.querySelectorAll<HTMLElement>(MENU_ITEMS)];
+      const pick =
+        focusAt === "last"
+          ? items[items.length - 1]
+          : ((focusAt === "checked" ? items.find((i) => i.getAttribute("aria-checked") === "true") : undefined) ??
+            items[0]);
+      pick?.focus({ preventScroll: true });
+    },
+    [menuRef, focusAt],
+  );
+  return (
+    <div
+      ref={attach}
+      id={id}
+      role="menu"
+      aria-label={label}
+      aria-labelledby={labelledBy}
+      data-testid={testId}
+      data-owns-escape="open"
+      onKeyDown={onKeyDown}
+      style={style}
+      className={`${MENU} ${phoneGlass ? MENU_PHONE : ""} overflow-y-auto overscroll-contain animate-fade-in ${className}`}
+    >
+      {children}
+    </div>
+  );
+}
+
+const MENU_ITEMS = '[role^="menuitem"]:not(:disabled)';

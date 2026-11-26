@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { fetchAgents, fetchThemes } from "../../lib/api";
 import { dispatchThemePickerChanged } from "../../hooks/useResolvedTheme";
 import type { AgentInfo, SettingsFieldDescriptor } from "../../lib/types";
+import { CAPTION_INLINE } from "../../lib/surfaces";
+import { PanelMessage } from "../panelParts";
 import { SelectField, SliderField, TextField } from "./FormFields";
 import type { RowLabel } from "./rowLabel";
 
@@ -208,7 +210,7 @@ export function LoggingTargetsWidget({ value, save, row }: CustomWidgetProps) {
     <div role="group" aria-labelledby={row.labelId} className="space-y-4">
       {Object.entries(grouped).map(([group, items]) => (
         <div key={group} className="space-y-2">
-          <h5 className="text-[12px] font-semibold uppercase tracking-[0.06em] text-text-dim">{group}</h5>
+          <h5 className={CAPTION_INLINE}>{group}</h5>
           <div className="grid gap-3 sm:grid-cols-2">
             {items.map((t) => (
               <SelectField
@@ -243,7 +245,7 @@ export function SmartRenameModelWidget({ value, save, row }: CustomWidgetProps) 
   return (
     <div role="group" aria-labelledby={row.labelId} className="space-y-4">
       {tunable.length === 0 ? (
-        <p className="text-xs text-text-dim">No one-shot-capable agents installed.</p>
+        <PanelMessage>No one-shot-capable agents installed.</PanelMessage>
       ) : (
         <div className="grid gap-3 sm:grid-cols-2">
           {tunable.map((a) => (

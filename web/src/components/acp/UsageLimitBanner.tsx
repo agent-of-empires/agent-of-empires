@@ -14,6 +14,7 @@ import {
 } from "../../lib/switchAccountTrigger";
 import { reportError } from "../../lib/toastBus";
 import { formatDurationSecondsShort } from "../sidebar/format";
+import { BUTTON_PRIMARY_SM, BUTTON_SECONDARY_SM } from "../../lib/surfaces";
 import { SwitchAccountModal } from "./SwitchAccountModal";
 import { SwitchAgentModal } from "./SwitchAgentModal";
 
@@ -26,8 +27,9 @@ function rateLimitWording(status: string): string {
     .trim();
 }
 
-const BUTTON =
-  "min-h-8 shrink-0 rounded-md px-3 py-1.5 text-xs font-medium disabled:cursor-not-allowed disabled:opacity-60";
+const SECONDARY = `${BUTTON_SECONDARY_SM} shrink-0`;
+// The theme-projected readable pair on brand; hover rings rather than changing the fill.
+const PRIMARY = `${BUTTON_PRIMARY_SM.replace("text-surface-950", "text-text-on-brand").replace("hover:bg-brand-500", "hover:ring-2 hover:ring-brand-600/50")} shrink-0`;
 
 /** Shown above the composer while the Agent's usage limit pauses the Session. */
 export function UsageLimitBanner({
@@ -141,17 +143,13 @@ export function UsageLimitBanner({
               type="button"
               data-testid="usage-limit-switch-account"
               onClick={onSwitchAccount}
-              className={`${BUTTON} border border-surface-700 bg-surface-800 text-text-primary hover:bg-surface-700`}
+              className={SECONDARY}
             >
               Switch account
             </button>
           )}
           {onSwitchAgent && !failoverTo && (
-            <button
-              type="button"
-              onClick={onSwitchAgent}
-              className={`${BUTTON} border border-surface-700 bg-surface-800 text-text-primary hover:bg-surface-700`}
-            >
+            <button type="button" onClick={onSwitchAgent} className={SECONDARY}>
               Switch Agent
             </button>
           )}
@@ -161,11 +159,7 @@ export function UsageLimitBanner({
               data-testid="usage-limit-resume"
               onClick={onResume}
               disabled={busy}
-              className={
-                resumeNow
-                  ? `${BUTTON} bg-brand-600 text-text-on-brand hover:ring-2 hover:ring-brand-600/50`
-                  : `${BUTTON} border border-surface-700 bg-surface-800 text-text-primary hover:bg-surface-700`
-              }
+              className={resumeNow ? PRIMARY : SECONDARY}
             >
               {resumeState === "retrying"
                 ? "Resuming…"

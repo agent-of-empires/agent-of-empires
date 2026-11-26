@@ -8,6 +8,8 @@ import { DiffScopePicker } from "./DiffScopePicker";
 import { useDiffScopeContext } from "../../lib/diffScope";
 import { FileContextMenu, type PathMenuState } from "./FileContextMenu";
 import { Chevron, FlatList, LineCounts, TreeView } from "./DiffFileRows";
+import { Centered } from "./viewerChrome";
+import { CAPTION_INLINE } from "../../lib/surfaces";
 
 interface Props {
   files: RichDiffFile[];
@@ -138,11 +140,7 @@ export function DiffFileList({
 
   let body;
   if (loading && files.length === 0) {
-    body = (
-      <div className="flex items-center justify-center h-full text-text-dim">
-        <span className="text-xs">Loading files...</span>
-      </div>
-    );
+    body = <Centered className="h-full text-text-dim">Loading files...</Centered>;
   } else if (isMultiRepo) {
     body = perRepoBases.map((repo) => (
       <RepoGroup
@@ -162,9 +160,9 @@ export function DiffFileList({
   } else if (files.length === 0) {
     // Naming the base makes a clean tree read as checked, not broken.
     body = (
-      <div className="flex items-center justify-center h-full text-text-dim text-xs">
+      <Centered className="h-full text-text-dim">
         No changes vs <span className="font-mono ml-1">{singleBaseBranch}</span>
-      </div>
+      </Centered>
     );
   } else if (viewMode === "tree") {
     body = (
@@ -182,22 +180,22 @@ export function DiffFileList({
 
   if (outsideRepository) {
     return (
-      <div className="flex flex-col items-center justify-center h-full bg-surface-900 px-4 text-center text-sm">
+      <Centered className="h-full flex-col bg-surface-900 text-text-dim">
         <p className="font-medium text-text-secondary">No diff</p>
-        <p className="mt-1 text-text-muted">
+        <p className="mt-1">
           The working directory (<span className="font-mono break-all">{perRepoBases[0]?.repo_path}</span>) isn't a git
           repository, so there's nothing to compare.
         </p>
-      </div>
+      </Centered>
     );
   }
 
   return (
     <div className="flex flex-col h-full bg-surface-900 overflow-hidden" onContextMenu={handleContextMenu}>
       <FileContextMenu menu={pathMenu} onClose={closePathMenu} />
-      <div className="px-3 py-2 border-b border-surface-700/20 shrink-0">
+      <div className="px-3 py-2 border-b border-surface-700/50 shrink-0">
         <div className="flex items-center gap-2 flex-wrap">
-          <span className="font-mono text-[11px] uppercase tracking-wider text-text-dim">Changes</span>
+          <span className={CAPTION_INLINE}>Changes</span>
           <DiffScopePicker />
           {scope !== "branch" ? null : isMultiRepo ? (
             <span className={CHIP}>{perRepoBases.length} repos</span>
@@ -227,7 +225,7 @@ export function DiffFileList({
                   update({ diffViewMode: viewMode === "flat" ? "tree" : "flat" });
                   setFocusedIndex(-1);
                 }}
-                className="ml-auto shrink-0 p-1 rounded text-text-dim hover:text-text-muted hover:bg-surface-800/50 transition-colors cursor-pointer"
+                className="ml-auto shrink-0 p-1 max-md:p-3 rounded-md text-text-dim hover:text-text-secondary hover:bg-surface-700/50 transition-colors cursor-pointer"
                 title={viewMode === "flat" ? "Switch to tree view" : "Switch to flat list"}
               >
                 <svg className="w-3.5 h-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
@@ -243,7 +241,7 @@ export function DiffFileList({
             </>
           )}
         </div>
-        {warning && <p className="text-[11px] text-status-waiting mt-1">{warning}</p>}
+        {warning && <p className="text-[12px] text-status-warning mt-1">{warning}</p>}
       </div>
 
       <div ref={listRef} className="flex-1 overflow-y-auto" tabIndex={0} onKeyDown={handleKeyDown}>
@@ -324,7 +322,7 @@ function RepoGroup({
         <LineCounts additions={sum(files, "additions")} deletions={sum(files, "deletions")} />
       </div>
       {!collapsed && files.length === 0 && (
-        <div className="px-3 py-2 text-[11px] text-text-dim italic">No changes in this repo.</div>
+        <div className="px-3 py-2 text-[12px] text-text-dim">No changes in this repo.</div>
       )}
       {!collapsed &&
         files.length > 0 &&

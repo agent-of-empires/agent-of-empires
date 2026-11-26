@@ -1,9 +1,9 @@
 import { useState } from "react";
+import { BUTTON_GHOST, BUTTON_PRIMARY, INPUT } from "../../lib/surfaces";
 import type { AttachProjectResult } from "../../lib/api";
 import { ProjectSearchList } from "../session-wizard/steps/ProjectSearchList";
 import { useProjectPicker } from "../session-wizard/steps/projectPicker";
 import { SidebarModal } from "./SidebarModal";
-import { MODAL_CANCEL, MODAL_INPUT, MODAL_PRIMARY } from "./styles";
 import { isImeComposing } from "../../lib/ime";
 
 function workerSummary(res: AttachProjectResult): string {
@@ -123,7 +123,7 @@ export function AddProjectModal({
             }}
             placeholder="or enter a project name or /path/to/repo"
             data-testid="add-project-modal-input"
-            className={MODAL_INPUT}
+            className={`${INPUT} font-mono`}
           />
           <label className="flex items-center gap-2 text-sm text-text-secondary cursor-pointer">
             <input
@@ -151,19 +151,19 @@ export function AddProjectModal({
 
       <div className="px-4 py-3 border-t border-surface-700/40 flex justify-end gap-2">
         {result ? (
-          <button onClick={onDone} data-testid="add-project-modal-done" className={MODAL_PRIMARY}>
+          <button onClick={onDone} data-testid="add-project-modal-done" className={BUTTON_PRIMARY}>
             Done
           </button>
         ) : (
           <>
-            <button onClick={onCancel} className={MODAL_CANCEL}>
+            <button onClick={onCancel} className={BUTTON_GHOST}>
               Cancel
             </button>
             <button
               onClick={() => void submit()}
               disabled={busy}
               data-testid="add-project-modal-submit"
-              className={`${MODAL_PRIMARY} disabled:opacity-50`}
+              className={BUTTON_PRIMARY}
             >
               {busy ? "Attaching…" : "Attach"}
             </button>

@@ -48,7 +48,6 @@ function Row({ mark, meaning, testId }: { mark: ReactNode; meaning: StatusMeanin
   );
 }
 
-/** The sidebar footer's "?": what the status glyphs and marks mean. A popover, or a sheet on a phone. */
 /**
  * What the sidebar's glyphs and marks mean, opened from the app's ⋯ menu: a popover at `anchor` on desktop,
  * a sheet on a phone.
@@ -113,7 +112,7 @@ export function SidebarLegend({
           minWidth="w-[340px] max-w-[calc(100vw-16px)] max-md:max-w-none"
           sheetOnMobile
           label="What the sidebar symbols mean"
-          heading={<span className="text-xs font-medium uppercase tracking-wide text-text-subtle">Symbols</span>}
+          heading="Symbols"
           onClose={close}
           returnFocusTo={returnFocusTo}
         >
@@ -138,7 +137,7 @@ export function SidebarLegend({
                 />
               ))}
             </ul>
-            <ul className="mt-1 border-t border-surface-700/60 pt-1">
+            <ul className="mt-1 border-t border-surface-700/50 pt-1">
               <Row mark={<span className="text-status-unread">●</span>} meaning={MARK_MEANING.unread} />
               <Row mark={<Pin className="inline h-3 w-3 -rotate-45 text-brand-400" />} meaning={MARK_MEANING.pinned} />
               <Row mark={<span className="text-favorite">✦</span>} meaning={MARK_MEANING.favorite} />

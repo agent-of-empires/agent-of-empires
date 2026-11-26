@@ -3,6 +3,7 @@ import { SquareTerminal } from "lucide-react";
 import type { PairedShell, PairedShellGroup } from "../lib/pairedShells";
 import type { RightPanelView } from "../lib/rightPanelView";
 import { sessionRowChromeClass } from "../lib/sessionRowChrome";
+import { BACKDROP, SHEET, SHEET_HANDLE } from "../lib/surfaces";
 import type { PaneDisplay } from "./Dock";
 import { PaneIcon } from "./PaneIcon";
 
@@ -102,14 +103,14 @@ export function MobileRightPanelPicker({
   return (
     <div className="md:hidden">
       <div
-        className={`fixed inset-0 z-40 bg-black/50 transition-[opacity,visibility] ${SHEET_MOTION} ${
+        className={`fixed inset-0 z-40 ${BACKDROP} transition-[opacity,visibility] ${SHEET_MOTION} ${
           open ? "opacity-100" : "opacity-0 invisible"
         }`}
         onClick={onClose}
         data-testid="mobile-right-panel-picker-backdrop"
       />
       <div
-        className={`fixed inset-x-0 bottom-0 z-50 max-h-[75dvh] rounded-t-[28px] bg-surface-800 chrome-drawer border-t border-surface-600/40 shadow-[0_-12px_40px_-12px_rgb(0_0_0/0.6)] flex flex-col px-[env(safe-area-inset-left)] pb-[env(safe-area-inset-bottom)] transition-[translate,visibility] ${SHEET_MOTION} ${
+        className={`fixed inset-x-0 bottom-0 z-50 max-h-[75dvh] ${SHEET} flex flex-col px-[env(safe-area-inset-left)] pb-[env(safe-area-inset-bottom)] transition-[translate,visibility] ${SHEET_MOTION} ${
           open ? "translate-y-0" : "translate-y-full invisible"
         }`}
         role="dialog"
@@ -117,7 +118,7 @@ export function MobileRightPanelPicker({
         aria-label="More"
         data-testid="mobile-right-panel-picker"
       >
-        <div className="mx-auto mt-2 h-1 w-9 shrink-0 rounded-full bg-surface-600" aria-hidden />
+        <div className={SHEET_HANDLE} aria-hidden />
         <div className="px-4 pt-2 pb-2 flex items-baseline gap-2">
           <div className="text-[15px] font-medium text-text-primary">More</div>
           <div className="min-w-0 truncate text-[12px] text-text-dim">{sessionTitle}</div>

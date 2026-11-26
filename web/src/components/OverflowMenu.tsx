@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { type TourAnchorId } from "../lib/tourSteps";
-import { Check, type LucideIcon } from "lucide-react";
+import { type LucideIcon } from "lucide-react";
+import { DropdownMenu, MenuItem, MenuSeparator } from "./ContextMenu";
 import { StrokeIcon } from "./icons";
 
 export interface OverflowItem {
@@ -66,38 +67,30 @@ export function OverflowMenu({ items, triggerDataTour, phoneFloating = false }: 
       </button>
 
       {open && (
-        <div
-          role="menu"
-          className={`absolute right-0 top-full mt-1 min-w-[160px] bg-surface-800 border border-surface-700/50 rounded-md shadow-xl py-1 z-50 animate-fade-in ${
-            phoneFloating
-              ? "max-md:mt-2 max-md:min-w-[240px] max-md:max-h-[calc(100dvh-7rem)] max-md:overflow-y-auto max-md:overscroll-contain max-md:rounded-2xl max-md:glass-menu max-md:py-1.5"
-              : ""
+        <DropdownMenu
+          phoneGlass={phoneFloating}
+          className={`absolute right-0 top-full mt-1 min-w-[180px] z-50 ${
+            phoneFloating ? "max-md:mt-2 max-md:min-w-[240px] max-md:max-h-[calc(100dvh-7rem)]" : ""
           }`}
         >
           {items.map(({ label, onClick, detail, icon: Icon, separated, checked }) => (
-            <div key={label}>
-              {separated && <div className="my-1 mx-3 border-t border-surface-600/40" role="separator" />}
-              <button
+            <Fragment key={label}>
+              {separated && <MenuSeparator />}
+              <MenuItem
                 role={checked === undefined ? "menuitem" : "menuitemradio"}
-                aria-checked={checked}
+                checked={checked}
+                icon={Icon && <Icon strokeWidth={1.6} />}
+                detail={detail}
                 onClick={() => {
                   setOpen(false);
                   onClick();
                 }}
-                className={`w-full flex items-center gap-3 text-left px-3 py-1.5 text-sm text-text-secondary hover:bg-surface-700/60 hover:text-text-primary cursor-pointer ${
-                  phoneFloating ? "max-md:px-4 max-md:py-2.5 max-md:text-[15px] max-md:text-text-primary" : ""
-                }`}
               >
-                {Icon && <Icon className="size-[18px] shrink-0 text-text-secondary" strokeWidth={1.6} aria-hidden />}
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate">{label}</span>
-                  {detail && <span className="block truncate text-[12px] text-text-dim">{detail}</span>}
-                </span>
-                {checked && <Check className="size-4 shrink-0 text-text-primary" strokeWidth={2} aria-hidden />}
-              </button>
-            </div>
+                {label}
+              </MenuItem>
+            </Fragment>
           ))}
-        </div>
+        </DropdownMenu>
       )}
     </div>
   );

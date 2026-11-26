@@ -1,10 +1,10 @@
 import { useRef, useState } from "react";
-import { Check, ChevronDown, PanelRight, SquareTerminal } from "lucide-react";
+import { ChevronDown, PanelRight, SquareTerminal } from "lucide-react";
 
 import type { PaneDisplay } from "./Dock";
 import { PaneIcon } from "./PaneIcon";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
-import { moveMenuFocus } from "./menuFocus";
+import { DropdownMenu, MenuItem } from "./ContextMenu";
 import { useOutsideDismiss } from "./useOutsideDismiss";
 import { formatShortcut, IS_MAC, SHORTCUTS_BY_ID, type ShortcutId } from "../lib/shortcuts";
 
@@ -90,47 +90,33 @@ export function PanelControl({
         <ChevronDown className="size-3" aria-hidden />
       </button>
       {menuOpen && (
-        <div
-          ref={(el) => {
-            menuRef.current = el;
-            // Focus the first entry as the menu opens.
-            if (el && !el.contains(document.activeElement))
-              el.querySelector<HTMLElement>("[role=menuitemcheckbox]")?.focus();
-          }}
-          role="menu"
-          aria-label="Panes"
-          data-testid="pane-menu"
-          data-owns-escape="open"
-          onKeyDown={moveMenuFocus}
-          className="absolute right-0 top-full mt-1 z-50 w-52 max-h-[calc(100vh-4rem)] overflow-y-auto py-1 bg-surface-800 border border-surface-700/50 rounded-md shadow-xl animate-fade-in"
+        <DropdownMenu
+          menuRef={menuRef}
+          initialFocus="first"
+          label="Panes"
+          testId="pane-menu"
+          className="absolute right-0 top-full mt-1 z-50 w-56 max-h-[calc(100vh-4rem)]"
         >
           {paneIds.map((id) => {
             const desc = descriptorFor(id);
             const checked = openIds.includes(id);
             return (
-              <button
+              <MenuItem
                 key={id}
-                type="button"
                 role="menuitemcheckbox"
-                aria-checked={checked}
-                data-testid={`pane-toggle-${id}`}
+                checked={checked}
+                testId={`pane-toggle-${id}`}
+                icon={<PaneIcon icon={desc.icon} iconAssetUrl={desc.iconAssetUrl} className="text-text-dim" />}
                 onClick={() => {
                   setMenuOpen(false);
                   onTogglePane(id);
                 }}
-                className="w-full flex items-center gap-2 h-8 px-3 text-left text-[12px] text-text-secondary cursor-pointer hover:bg-surface-700/60 hover:text-text-primary focus:outline-none focus-visible:bg-surface-700/60"
               >
-                <PaneIcon
-                  icon={desc.icon}
-                  iconAssetUrl={desc.iconAssetUrl}
-                  className="size-3.5 shrink-0 text-text-dim"
-                />
-                <span className="truncate">{desc.title}</span>
-                {checked && <Check className="size-3.5 ml-auto shrink-0" aria-hidden />}
-              </button>
+                {desc.title}
+              </MenuItem>
             );
           })}
-        </div>
+        </DropdownMenu>
       )}
     </div>
   );

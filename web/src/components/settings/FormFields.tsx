@@ -1,5 +1,5 @@
 import { useId, useState, type ReactNode } from "react";
-import { CARD, INPUT } from "../../lib/surfaces";
+import { CARD, FIELD_DESCRIPTION, FIELD_LABEL, INPUT } from "../../lib/surfaces";
 
 import { rowInputProps, type RowLabel } from "./rowLabel";
 import { isImeComposing } from "../../lib/ime";
@@ -25,10 +25,8 @@ function FieldShell({
   if (row) return <>{children}</>;
   return (
     <div>
-      {label !== undefined && (
-        <label className={labelClassName ?? "block text-[15px] md:text-sm text-text-primary mb-0.5"}>{label}</label>
-      )}
-      {description && <div className="text-[13px] leading-normal text-text-secondary mb-2">{description}</div>}
+      {label !== undefined && <label className={labelClassName ?? FIELD_LABEL}>{label}</label>}
+      {description && <div className={FIELD_DESCRIPTION}>{description}</div>}
       {children}
     </div>
   );

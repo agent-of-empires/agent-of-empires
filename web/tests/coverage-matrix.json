@@ -213,7 +213,11 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/settings-panels.spec.ts"],
-      "components": ["web/src/components/McpServers.tsx", "web/src/components/McpServerForm.tsx"]
+      "components": [
+        "web/src/components/McpServers.tsx",
+        "web/src/components/McpServerForm.tsx",
+        "web/src/components/panelParts.tsx"
+      ]
     },
     {
       "id": "settings.mcp-servers.handlers",
@@ -3824,7 +3828,8 @@
         "web/src/hooks/useAcpSession.ts",
         "web/src/components/acp/AcpRuntime.tsx",
         "web/src/components/acp/ElicitationAnswerCard.tsx",
-        "web/src/components/acp/StructuredView.tsx"
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/UserReplyCard.tsx"
       ]
     },
     {
@@ -4737,7 +4742,7 @@
         "web/src/hooks/acpSession/stateCache.ts",
         "web/src/lib/acpTypes.ts"
       ],
-      "notes": "Retry, and Install and retry once its install succeeds, replace the banner with the startup line (Starting <Agent>\u2026, with its elapsed count and Restart after 30s), also for a Session that ran before, and never show both; the Agent starting ends the line and shows the transcript. A startup error that ends the Retry with the same cause, after spawn failed: or restart spawn failed: and any reason code, brings the banner back as <Agent> still couldn't start with Same error as before., then the cause's own fix and actions. A refused Retry request fails the same way without its HTTP status. A reload, or a later error with no Retry, reads as a first failure again."
+      "notes": "Retry, and Install and retry once its install succeeds, replace the banner with the startup line (Starting <Agent>…, with its elapsed count and Restart after 30s), also for a Session that ran before, and never show both; the Agent starting ends the line and shows the transcript. A startup error that ends the Retry with the same cause, after spawn failed: or restart spawn failed: and any reason code, brings the banner back as <Agent> still couldn't start with Same error as before., then the cause's own fix and actions. A refused Retry request fails the same way without its HTTP status. A reload, or a later error with no Retry, reads as a first failure again."
     },
     {
       "id": "acp.startup-error-banner-retry-changed-cause",
@@ -4759,7 +4764,7 @@
         "web/src/hooks/acpSession/stateCache.ts",
         "web/src/lib/acpTypes.ts"
       ],
-      "notes": "Retry, and Install and retry once its install succeeds, replace the banner with the startup line (Starting <Agent>\u2026, with its elapsed count and Restart after 30s), also for a Session that ran before, and never show both; the Agent starting ends the line and shows the transcript. A startup error, or a refused Retry request, with a different cause brings the banner back as <Agent> still couldn't start with It failed differently this time: and the new cause's first line, then the new cause's fix and actions. Details hold the full error with Copy."
+      "notes": "Retry, and Install and retry once its install succeeds, replace the banner with the startup line (Starting <Agent>…, with its elapsed count and Restart after 30s), also for a Session that ran before, and never show both; the Agent starting ends the line and shows the transcript. A startup error, or a refused Retry request, with a different cause brings the banner back as <Agent> still couldn't start with It failed differently this time: and the new cause's first line, then the new cause's fix and actions. Details hold the full error with Copy."
     },
     {
       "id": "acp.empty-state-not-running",

@@ -1,9 +1,10 @@
-import { useRef, useState, type ReactNode } from "react";
-import { Check, SlidersHorizontal } from "lucide-react";
+import { useRef, useState } from "react";
+import { SlidersHorizontal } from "lucide-react";
 
 import type { SidebarAxis } from "../../lib/sidebarAxis";
 import type { SidebarSortMode } from "../../lib/sidebarSort";
 import type { PluginSortSpec } from "../../lib/pluginUi";
+import { DropdownMenu, MenuHeading, MenuItem, MenuSeparator } from "../ContextMenu";
 import { moveMenuFocus } from "../menuFocus";
 import { Tooltip } from "../Tooltip";
 import { useOutsideDismiss } from "../useOutsideDismiss";
@@ -25,17 +26,6 @@ const SORTS: readonly { mode: SidebarSortMode; label: string; hint?: string }[] 
   { mode: "attention", label: "Attention" },
 ];
 
-const item =
-  "w-full flex items-center gap-2 h-8 px-3 text-left text-[13px] text-text-secondary cursor-pointer hover:bg-surface-700/60 hover:text-text-primary focus:outline-none focus-visible:bg-surface-700/60";
-
-function Heading({ children }: { children: ReactNode }) {
-  return (
-    <div className="px-3 pt-2 pb-1 text-[11px] font-medium text-text-dim" aria-hidden>
-      {children}
-    </div>
-  );
-}
-
 function Option({
   role,
   checked,
@@ -53,22 +43,17 @@ function Option({
   onSelect: (keyboard: boolean) => void;
 }) {
   return (
-    <button
-      type="button"
+    <MenuItem
       role={role}
-      aria-checked={checked}
+      checked={checked}
       tabIndex={-1}
-      data-testid={testId}
+      testId={testId}
       // A keyboard click carries no pointer detail.
       onClick={(e) => onSelect(e.detail === 0)}
-      className={item}
     >
-      <span className="flex-1 truncate">
-        {label}
-        {hint && <span className="text-text-dim"> · {hint}</span>}
-      </span>
-      {checked && <Check className="size-3.5 shrink-0 text-brand-400" aria-hidden />}
-    </button>
+      {label}
+      {hint && <span className="text-text-dim"> · {hint}</span>}
+    </MenuItem>
   );
 }
 
@@ -143,16 +128,11 @@ export function SidebarViewMenu({
         </button>
       </Tooltip>
       {open && (
-        <div
-          ref={(el) => {
-            menuRef.current = el;
-            if (el && !el.contains(document.activeElement))
-              el.querySelector<HTMLElement>('[aria-checked="true"]')?.focus();
-          }}
-          role="menu"
-          aria-label="View options"
-          data-testid="sidebar-view-menu"
-          data-owns-escape="open"
+        <DropdownMenu
+          menuRef={menuRef}
+          initialFocus="checked"
+          label="View options"
+          testId="sidebar-view-menu"
           onKeyDown={(e) => {
             // Tab leaves the menu rather than walking its options.
             if (e.key === "Tab") {
@@ -163,9 +143,9 @@ export function SidebarViewMenu({
             }
             moveMenuFocus(e);
           }}
-          className="absolute right-0 top-full mt-1 z-50 w-60 max-h-[calc(100vh-8rem)] overflow-y-auto py-1 bg-surface-800 border border-surface-700/50 rounded-md shadow-xl animate-fade-in"
+          className="absolute right-0 top-full mt-1 z-50 w-60 max-h-[calc(100vh-8rem)]"
         >
-          <Heading>Group by</Heading>
+          <MenuHeading decorative>Group by</MenuHeading>
           <div role="group" aria-label="Group by">
             {AXES.map((a) => (
               <Option
@@ -178,8 +158,8 @@ export function SidebarViewMenu({
               />
             ))}
           </div>
-          <div className="my-1 border-t border-surface-700/50" role="separator" />
-          <Heading>Sort by</Heading>
+          <MenuSeparator />
+          <MenuHeading decorative>Sort by</MenuHeading>
           <div role="group" aria-label="Sort by">
             {SORTS.map((s) => (
               <Option
@@ -208,7 +188,7 @@ export function SidebarViewMenu({
               );
             })}
           </div>
-          <div className="my-1 border-t border-surface-700/50" role="separator" />
+          <MenuSeparator />
           <Option
             role="menuitemcheckbox"
             checked={filterOpen}
@@ -225,7 +205,7 @@ export function SidebarViewMenu({
               onSelect={(k) => choose(k, onToggleFacets)}
             />
           )}
-        </div>
+        </DropdownMenu>
       )}
     </div>
   );

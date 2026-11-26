@@ -83,9 +83,12 @@ content. It is denser and quieter than the marketing site.
 
 - Use self-hosted Geist Sans for headings and body copy, and Geist Mono for
   session names, paths, status glyphs, shortcuts, and data.
-- Rows are 28 to 32px; buttons are 32 to 40px.
-- Use 6px radii for controls and 8px for panels and dialogs. Do not add larger
-  radii.
+- Rows are 28 to 32px and buttons 32 to 40px on desktop; on a phone, tap
+  targets are at least 44px and inputs use 16px text.
+- Draw surfaces from `web/src/lib/surfaces.ts` (cards, captions, inputs,
+  menus, sheets, dialogs, buttons) rather than restyling them per component.
+  Radii follow it: 8px controls, 12px cards and menus, 16px dialogs and a
+  phone's cards, 28px a phone's sheets.
 - Use semantic theme tokens such as `bg-surface-900`,
   `text-status-running`, and `border-surface-700`.
 - All body text must meet WCAG AA contrast against its surface.

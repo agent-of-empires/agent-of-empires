@@ -9,6 +9,8 @@ import {
   terminalFontChoices,
   terminalFontStack,
 } from "../../lib/terminalFonts";
+import { INPUT } from "../../lib/surfaces";
+import { FIELD_DESCRIPTION, FIELD_LABEL } from "../../lib/surfaces";
 
 interface TerminalFontPickerProps {
   value: string;
@@ -24,15 +26,19 @@ export function TerminalFontPicker({ value, onChange }: TerminalFontPickerProps)
 
   return (
     <div>
-      <label htmlFor="terminal-font-family" className="block text-[13px] text-text-secondary mb-2">
+      <label htmlFor="terminal-font-family" className={FIELD_LABEL}>
         Font family
       </label>
+      <p className={FIELD_DESCRIPTION}>
+        Font for web terminal sessions. Bundled fonts work everywhere; installed fonts are listed when this device has
+        them, and the choice follows you to other devices. Pick a Nerd Font to render powerline and icon glyphs.
+      </p>
       <select
         id="terminal-font-family"
         value={value}
         onChange={(e) => onChange(e.target.value)}
         style={fontStyle(missing ? DEFAULT_TERMINAL_FONT : value)}
-        className="w-full bg-surface-800 border border-surface-700 rounded-md px-2 py-1 text-sm text-text-primary"
+        className={INPUT}
       >
         <optgroup label="Bundled">
           <option value={DEFAULT_TERMINAL_FONT} style={fontStyle(DEFAULT_TERMINAL_FONT)}>
@@ -60,14 +66,10 @@ export function TerminalFontPicker({ value, onChange }: TerminalFontPickerProps)
         )}
       </select>
       {missing && (
-        <p className="text-[11px] text-status-warning mt-1" data-testid="terminal-font-missing">
+        <p className="text-[13px] text-status-warning mt-1" data-testid="terminal-font-missing">
           {missing} isn't installed on this device, so terminals here use {DEFAULT_TERMINAL_FONT_NAME}.
         </p>
       )}
-      <p className="text-[11px] text-text-muted mt-1">
-        Font for web terminal sessions. Bundled fonts work everywhere; installed fonts are listed when this device has
-        them, and the choice follows you to other devices. Pick a Nerd Font to render powerline and icon glyphs.
-      </p>
     </div>
   );
 }

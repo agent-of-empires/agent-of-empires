@@ -1,4 +1,11 @@
+import { BUTTON_DANGER_GHOST_SM, BUTTON_PRIMARY_SM } from "../../../lib/surfaces";
 import { Tooltip } from "../../Tooltip";
+
+// aria-disabled rather than disabled, so the BUTTON set's disabled: styles never apply.
+const SEND_BLOCKED = BUTTON_PRIMARY_SM.replace("cursor-pointer", "cursor-not-allowed opacity-40").replace(
+  " hover:bg-brand-500",
+  "",
+);
 
 interface Props {
   count: number;
@@ -13,8 +20,8 @@ interface Props {
 export function CommentsBanner({ count, sendEnabled, sendDisabledReason, onSend, onDiscardAll }: Props) {
   if (count === 0) return null;
   return (
-    <div className="flex items-center gap-2 px-3 py-1.5 bg-brand-600/10 border-b border-brand-600/30 text-[11px] font-mono">
-      <span className="text-brand-500 font-semibold">
+    <div className="flex items-center gap-2 px-3 py-1.5 border-b border-surface-700/50 bg-surface-850 text-[12px]">
+      <span className="font-medium text-text-primary">
         {count} comment{count === 1 ? "" : "s"}
       </span>
       <span className="text-text-dim hidden sm:inline">Cmd/Ctrl+Shift+S to send</span>
@@ -26,7 +33,7 @@ export function CommentsBanner({ count, sendEnabled, sendDisabledReason, onSend,
               onDiscardAll();
             }
           }}
-          className="px-2 py-0.5 rounded text-text-dim hover:text-status-error hover:bg-surface-800 cursor-pointer transition-colors"
+          className={BUTTON_DANGER_GHOST_SM}
         >
           Discard all
         </button>
@@ -44,11 +51,7 @@ export function CommentsBanner({ count, sendEnabled, sendDisabledReason, onSend,
               if (sendEnabled) onSend();
             }}
             aria-disabled={!sendEnabled}
-            className={`px-2 py-0.5 rounded-md transition-colors ${
-              sendEnabled
-                ? "bg-brand-600 text-white hover:bg-brand-500 cursor-pointer"
-                : "bg-surface-700 text-text-dim cursor-not-allowed"
-            }`}
+            className={sendEnabled ? BUTTON_PRIMARY_SM : SEND_BLOCKED}
           >
             Send
           </button>

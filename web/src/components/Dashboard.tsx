@@ -6,6 +6,7 @@ import { AOE_BRAND_MARK_COLORS, AOE_BRAND_MARK_TEXT_SHADOW } from "../lib/brandM
 import { TOUR_ANCHORS, type TourAnchorId } from "../lib/tourSteps";
 import { PluginCards, PluginHomePanes } from "./plugin/PluginSlots";
 import { StrokeIcon } from "./icons";
+import { CARD } from "../lib/surfaces";
 
 interface Props {
   sessions: SessionResponse[];
@@ -132,7 +133,7 @@ export function Dashboard({
       {/* Action panes */}
       {readOnly ? (
         <div className="max-w-sm w-full">
-          <p className="text-xs text-text-dim text-center mb-3">This dashboard is in read-only mode.</p>
+          <p className="text-[13px] text-text-dim text-center mb-3">This dashboard is in read-only mode.</p>
           <ActionPane
             title="Docs"
             subtitle="Guides and reference"
@@ -221,29 +222,31 @@ function ActionPane({
     ),
   };
 
-  const classes = `flex flex-col items-start gap-2 px-4 rounded-lg bg-surface-900 border border-surface-700/40 transition-colors cursor-pointer hover:border-brand-600/40 hover:bg-surface-850 active:bg-surface-800 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 ${
+  const classes = `${CARD} flex flex-col items-start gap-2 transition-colors cursor-pointer hover:border-brand-600/40 hover:bg-surface-800 active:bg-surface-700/60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 ${
     featured ? "md:col-span-2 md:row-span-2 py-6" : "py-4"
   }`;
+
+  const content = (
+    <>
+      {iconSvg[icon]}
+      <div>
+        <p className={`font-medium text-text-primary ${featured ? "text-base" : "text-sm"}`}>{title}</p>
+        <p className="text-[13px] text-text-secondary mt-0.5">{subtitle}</p>
+      </div>
+    </>
+  );
 
   if (href) {
     return (
       <a href={href} target="_blank" rel="noopener noreferrer" data-tour={dataTour} className={classes}>
-        {iconSvg[icon]}
-        <div>
-          <p className={`font-medium text-text-primary ${featured ? "text-base" : "text-sm"}`}>{title}</p>
-          <p className="text-xs text-text-muted mt-0.5">{subtitle}</p>
-        </div>
+        {content}
       </a>
     );
   }
 
   return (
     <button onClick={onClick} data-tour={dataTour} className={`text-left ${classes}`}>
-      {iconSvg[icon]}
-      <div>
-        <p className={`font-medium text-text-primary ${featured ? "text-base" : "text-sm"}`}>{title}</p>
-        <p className="text-xs text-text-muted mt-0.5">{subtitle}</p>
-      </div>
+      {content}
     </button>
   );
 }

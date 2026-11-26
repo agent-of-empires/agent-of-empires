@@ -2,6 +2,10 @@ import { useEffect, type ReactNode } from "react";
 import { useServerDown, OFFLINE_TITLE } from "../../lib/connectionState";
 import { hasFinePointer } from "../../lib/platform";
 import { launchEligible } from "./createRequest";
+import { BUTTON_GHOST, BUTTON_PRIMARY } from "../../lib/surfaces";
+import { Spinner } from "../Dialog";
+
+const ERROR_BANNER = "mb-3 rounded-lg bg-status-error/10 p-3 text-[15px] md:text-sm text-status-error";
 
 interface LaunchData {
   path: string;
@@ -60,27 +64,14 @@ export function LaunchFooter({
     <div>
       {failure}
       {/* Shown with a failure, the error says why its actions are disabled. */}
-      {error && <div className="text-sm text-status-error bg-status-error/10 rounded-lg p-3 mb-4">{error}</div>}
-      {offline && (
-        <div className="text-sm text-status-error bg-status-error/10 rounded-lg p-3 mb-4">{OFFLINE_TITLE}</div>
-      )}
-      <button
-        onClick={onSubmit}
-        disabled={!canSubmit}
-        className={`w-full py-3 rounded-lg font-semibold text-sm transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 ${
-          !canSubmit
-            ? "bg-brand-600/50 text-surface-900/50 cursor-not-allowed"
-            : "bg-brand-600 hover:bg-brand-700 active:bg-brand-800 text-surface-900 cursor-pointer"
-        }`}
-      >
+      {error && <div className={ERROR_BANNER}>{error}</div>}
+      {offline && <div className={ERROR_BANNER}>{OFFLINE_TITLE}</div>}
+      <button type="button" onClick={onSubmit} disabled={!canSubmit} className={`${BUTTON_PRIMARY} w-full`}>
         {isSubmitting ? (
-          <span className="flex items-center justify-center gap-2">
-            <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-            </svg>
+          <>
+            <Spinner />
             Creating session...
-          </span>
+          </>
         ) : (
           <span>
             Launch session {hasFinePointer() && <span className="opacity-60">({isMac ? "⌘" : "Ctrl"}+Enter)</span>}
@@ -88,11 +79,7 @@ export function LaunchFooter({
         )}
       </button>
       {isSubmitting && onBackground && (
-        <button
-          type="button"
-          onClick={onBackground}
-          className="w-full mt-2 py-2 text-sm text-text-secondary hover:text-text-primary rounded-lg hover:bg-surface-700/50 cursor-pointer transition-colors"
-        >
+        <button type="button" onClick={onBackground} className={`${BUTTON_GHOST} w-full mt-2`}>
           Continue in background
         </button>
       )}

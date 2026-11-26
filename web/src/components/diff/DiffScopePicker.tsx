@@ -1,5 +1,5 @@
 import { DIFF_SCOPES, NO_LAST_TURN, useDiffScopeContext } from "../../lib/diffScope";
-import { ACTIVE, GROUP, IDLE } from "./viewerChrome";
+import { ACTIVE, GROUP, IDLE, SEGMENT } from "./viewerChrome";
 
 /** Branch, Uncommitted or Last turn; hidden where the scope can't change. */
 export function DiffScopePicker() {
@@ -24,11 +24,11 @@ export function DiffScopePicker() {
             title={title}
             data-testid={`diff-scope-${s.scope}`}
             onClick={() => onChange(s.scope)}
-            className={`px-1.5 py-px text-[10px] font-mono transition-colors ${
+            className={
               unavailable
-                ? "text-text-dim/50 cursor-not-allowed"
-                : `cursor-pointer ${scope === s.scope ? ACTIVE : IDLE}`
-            }`}
+                ? `${SEGMENT.replace("cursor-pointer", "cursor-not-allowed")} text-text-dim/50`
+                : `${SEGMENT} ${scope === s.scope ? ACTIVE : IDLE}`
+            }
           >
             {s.label}
           </button>

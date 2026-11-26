@@ -1,9 +1,9 @@
-import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
+import { useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import { ChevronDown, Plus, SquareTerminal } from "lucide-react";
 
 import { shellLabel, type PairedShell, type PairedShellGroup } from "../lib/pairedShells";
-import { moveMenuFocus } from "./menuFocus";
+import { DropdownMenu, MenuItem, MenuSeparator } from "./ContextMenu";
 import { useOutsideDismiss } from "./useOutsideDismiss";
 
 export interface TerminalSwitcherProps {
@@ -23,72 +23,59 @@ export function TerminalSwitcherMenu({
   onDone,
   maxHeight,
 }: TerminalSwitcherProps & { onDone: () => void; maxHeight?: number }) {
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    ref.current?.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
-  }, []);
-  const item =
-    "w-full flex items-center gap-2 h-8 px-3 text-left text-[12px] text-text-secondary cursor-pointer hover:bg-surface-700/60 hover:text-text-primary focus:outline-none focus-visible:bg-surface-700/60";
   return (
-    <div
-      ref={ref}
-      role="menu"
-      aria-label="Paired terminals"
-      data-testid="terminal-switcher-menu"
-      data-owns-escape="open"
-      onKeyDown={moveMenuFocus}
+    <DropdownMenu
+      initialFocus="first"
+      label="Paired terminals"
+      testId="terminal-switcher-menu"
       style={maxHeight === undefined ? undefined : { maxHeight }}
-      className="w-72 max-h-[60vh] overflow-y-auto bg-surface-800 border border-surface-700/50 rounded-md shadow-xl py-1"
+      className="w-72 max-h-[60vh]"
     >
-      {groups.length === 0 && <div className="px-3 py-1.5 text-[12px] text-text-dim">No paired terminals are open</div>}
+      {groups.length === 0 && <div className="px-3 py-1.5 text-[13px] text-text-dim">No paired terminals are open</div>}
       {groups.map(({ session, shells }) => (
         <div key={session.id} role="group" aria-label={session.title} className="pb-1">
-          <div className="px-3 pt-1.5 pb-0.5 truncate font-mono text-[11px] text-text-dim" title={session.project_path}>
+          <div className="px-3 pt-2 pb-1 truncate font-mono text-[11px] text-text-dim" title={session.project_path}>
             {session.title}
           </div>
           {shells.map((shell) => (
-            <button
+            <MenuItem
               key={`${shell.index}:${shell.mode}`}
-              type="button"
               role="menuitem"
-              data-testid={`terminal-switcher-item-${shell.sessionId}-${shell.index}-${shell.mode}`}
+              testId={`terminal-switcher-item-${shell.sessionId}-${shell.index}-${shell.mode}`}
+              icon={<SquareTerminal className="text-text-dim" />}
+              trailing={
+                (session.is_sandboxed || shell.open) &&
+                [session.is_sandboxed && (shell.mode === "container" ? "Container" : "Host"), shell.open && "open"]
+                  .filter(Boolean)
+                  .join(" · ")
+              }
               onClick={() => {
                 onDone();
                 onPick(shell);
               }}
-              className={item}
             >
-              <SquareTerminal className="size-3.5 shrink-0 text-text-dim" aria-hidden />
-              <span className="truncate">{shellLabel(shell.index)}</span>
-              {session.is_sandboxed && (
-                <span className="font-mono text-[11px] text-text-dim">
-                  {shell.mode === "container" ? "Container" : "Host"}
-                </span>
-              )}
-              {shell.open && <span className="ml-auto font-mono text-[11px] text-text-dim">open</span>}
-            </button>
+              {shellLabel(shell.index)}
+            </MenuItem>
           ))}
         </div>
       ))}
       {onNew && newTerminalFor !== undefined && (
         <>
-          <div className="my-1 border-t border-surface-700/50" role="separator" />
-          <button
-            type="button"
+          <MenuSeparator />
+          <MenuItem
             role="menuitem"
-            data-testid="terminal-switcher-new"
+            testId="terminal-switcher-new"
+            icon={<Plus className="text-text-dim" />}
             onClick={() => {
               onDone();
               onNew();
             }}
-            className={item}
           >
-            <Plus className="size-3.5 shrink-0 text-text-dim" aria-hidden />
-            <span className="truncate">New terminal for {newTerminalFor}</span>
-          </button>
+            New terminal for {newTerminalFor}
+          </MenuItem>
         </>
       )}
-    </div>
+    </DropdownMenu>
   );
 }
 
@@ -141,7 +128,7 @@ export function TerminalSwitcherButton(props: TerminalSwitcherProps) {
       {open &&
         placement &&
         createPortal(
-          <div ref={menuRef} style={placement.position} className="z-50 animate-fade-in">
+          <div ref={menuRef} style={placement.position} className="z-50">
             <TerminalSwitcherMenu {...props} maxHeight={placement.maxHeight} onDone={() => setOpen(false)} />
           </div>,
           document.body,
@@ -160,7 +147,7 @@ export function TerminalSwitcherOverlay({ onClose, ...props }: TerminalSwitcherP
   });
   return (
     <div className="fixed inset-x-0 top-[15vh] z-50 flex justify-center px-4 pointer-events-none">
-      <div ref={ref} className="pointer-events-auto animate-fade-in">
+      <div ref={ref} className="pointer-events-auto">
         <TerminalSwitcherMenu {...props} onDone={onClose} />
       </div>
     </div>
