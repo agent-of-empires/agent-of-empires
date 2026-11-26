@@ -901,6 +901,20 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
       expect(bar(), "A's hidden pull, still running, came back").toBeNull();
       unmount();
     }
+
+    // A click on A forgets only A's earlier pull: B's, which this page saw run, still shows its outcome.
+    {
+      const { unmount } = await mount(otherRunning());
+      fetchSandboxImageStatus.mockResolvedValue(status());
+      await pollAfter(2000);
+      expect(banner()?.textContent).toBe("Sandbox image update available");
+      pullSandboxImage.mockResolvedValueOnce({ ok: true, image: IMAGE });
+      fetchSandboxImageStatus.mockResolvedValue(otherCurrent({ state: "done" }));
+      updateNow();
+      await pollAfter(0);
+      expect(banner()?.textContent, "the click on A forgot B's pull this page saw run").toBe(UPDATED);
+      unmount();
+    }
   });
 
   it("drops a Cancel once the banner shows another image, so its reply and refusal stay off it", async () => {

@@ -245,8 +245,9 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
     attemptImage.current = image;
     setAttemptFor(image);
     setPulledDigest(offeredDigest.current);
-    seenRunningRef.current = null;
-    setSeenRunning(null);
+    // A pull of another image this page saw running keeps its outcome.
+    if (seenRunningRef.current === image) seenRunningRef.current = null;
+    setSeenRunning((seen) => (seen === image ? null : seen));
     setAcceptedImage(null);
     setNoticeDismissed(false);
     setHiddenImage((h) => (h === image ? null : h));
