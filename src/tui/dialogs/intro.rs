@@ -131,13 +131,11 @@ pub struct IntroDialog {
 }
 
 impl IntroDialog {
-    pub fn new(original_theme: impl Into<String>) -> Self {
+    /// `detection` comes from the TUI's detection worker: reading the host here
+    /// would run the bundled adapter's node probe on the event loop.
+    pub fn new(original_theme: impl Into<String>, detection: &quickstart::Detection) -> Self {
         let config = crate::session::config::Config::load_or_warn();
-        Self::with_detection(
-            original_theme,
-            &config.acp,
-            &quickstart::Detection::detect_env(),
-        )
+        Self::with_detection(original_theme, &config.acp, detection)
     }
 
     /// The wizard for an explicit configuration and detection, so tests never

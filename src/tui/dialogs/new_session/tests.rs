@@ -1562,6 +1562,34 @@ fn structured_default_reseeds_only_until_the_user_decides() {
     }
 }
 
+/// The bundled adapter is only an ACP agent, so its tool cannot run as a
+/// terminal command. Submitting it with Structured off would launch `aoe-agent`
+/// as a terminal tool, so the view cannot be turned off.
+#[test]
+fn the_bundled_agent_cannot_leave_the_structured_view() {
+    let bundle = crate::acp::quickstart::BUNDLED_AGENT;
+    let mut dialog = NewSessionDialog::new_with_tools(vec![bundle], TEST_PATH.to_string());
+    dialog.set_structured_capable(true);
+    dialog.apply_structured_default();
+    assert!(
+        dialog.structured_value(),
+        "the bundled agent starts structured"
+    );
+
+    dialog.set_structured(false);
+    assert!(
+        dialog.structured_value(),
+        "aoe-agent has no terminal command, so the view cannot be turned off"
+    );
+
+    // A native tool keeps the toggle.
+    let mut native = single_tool_dialog();
+    native.set_structured_capable(true);
+    native.apply_structured_default();
+    native.set_structured(false);
+    assert!(!native.structured_value());
+}
+
 /// Init a repo with one commit so it has a branch to list.
 fn branch_picker_repo_in(parent: &std::path::Path) -> std::path::PathBuf {
     let dir = parent.join("repo");

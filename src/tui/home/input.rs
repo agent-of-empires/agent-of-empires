@@ -89,14 +89,11 @@ impl HomeView {
             .with_tool(crate::acp::quickstart::BUNDLED_AGENT)
     }
 
-    /// Hold the wizard's Structured agent as the new-session dialog's default
-    /// tool. No terminal tool maps to the bundled agent, so without it the first
-    /// session would open on whatever tool the config defaults to.
-    fn remember_first_session_agent(&mut self, outcome: &IntroOutcome) {
-        self.first_session_agent = outcome
-            .acp_default_agent
-            .clone()
-            .filter(|agent| agent == crate::acp::quickstart::BUNDLED_AGENT);
+    /// Hold the wizard's agent as the new-session dialog's default tool, native
+    /// or bundled. The dialog's tool list decides whether it can be honoured, so
+    /// seeding it here cannot offer something the dialog lacks.
+    pub(super) fn remember_first_session_agent(&mut self, outcome: &IntroOutcome) {
+        self.first_session_agent = outcome.acp_default_agent.clone();
     }
 }
 

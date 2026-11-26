@@ -5,7 +5,7 @@ use super::*;
 impl HomeView {
     pub fn show_intro(&mut self, current_theme: &str) {
         tracing::info!(target: "tui.dialog", dialog = "intro", "opening");
-        self.intro_dialog = Some(IntroDialog::new(current_theme));
+        self.intro_dialog = Some(IntroDialog::new(current_theme, &self.detection));
     }
 
     pub fn show_no_agents(&mut self) {
@@ -22,6 +22,12 @@ impl HomeView {
     /// Record what the detection worker found about the bundled adapter.
     pub fn set_bundled_ready(&mut self, ready: bool) {
         self.bundled_ready = ready;
+    }
+
+    /// Record the worker's detection, so the wizard does not probe on the UI
+    /// thread when it opens.
+    pub fn set_detection(&mut self, detection: crate::acp::quickstart::Detection) {
+        self.detection = detection;
     }
 
     pub fn show_changelog(&mut self, from_version: Option<String>) {

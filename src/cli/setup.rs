@@ -72,7 +72,10 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     let install_allowed = bundled_target(args.agent.as_deref())
         && (args.install_adapter
             || config.acp.allow_agent_install
-            || (!args.quick && adapter_missing && prompt_install(quickstart::BUNDLED_AGENT)));
+            || (!args.quick
+                && adapter_missing
+                && install_would_apply(&detection, &config.acp)
+                && prompt_install(quickstart::BUNDLED_AGENT)));
 
     let mut plan = quickstart::plan(&detection, &config.acp, install_allowed);
     if let Some(requested) = &args.agent {
@@ -252,6 +255,12 @@ fn bundled_target(requested: Option<&str>) -> bool {
     requested.is_none_or(|agent| agent == quickstart::BUNDLED_AGENT)
 }
 
+/// Whether installing would change the plan. A default the user already chose
+/// wins over the bundled agent, so an answer to the prompt would be discarded.
+fn install_would_apply(detection: &Detection, config: &crate::session::config::AcpConfig) -> bool {
+    quickstart::plan(detection, config, true).bundled
+}
+
 /// Ask before an install. A non-tty caller (CI, a piped run) never installs
 /// silently, so the answer defaults to no.
 fn prompt_install(binary: &str) -> bool {
@@ -328,6 +337,23 @@ mod tests {
         assert!(bundled_target(None));
         assert!(bundled_target(Some(quickstart::BUNDLED_AGENT)));
         assert!(!bundled_target(Some("claude-code")));
+
+        // A saved native default wins in the planner, so the answer would be
+        // discarded there too.
+        let detection = Detection {
+            present_agents: vec!["claude".to_string()],
+            bundled_installed: false,
+            gateway_credential: Some(GatewayCredential::Otari),
+        };
+        let native = crate::session::config::AcpConfig {
+            default_agent: "claude".to_string(),
+            ..Default::default()
+        };
+        assert!(!install_would_apply(&detection, &native));
+        assert!(install_would_apply(
+            &detection,
+            &crate::session::config::AcpConfig::default()
+        ));
         assert_eq!(
             undo_instruction("acp.structured_view", &Undo::Value("auto".into())),
             "    undo: set acp.structured_view = \"auto\" in that file"

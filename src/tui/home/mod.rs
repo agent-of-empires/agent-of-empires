@@ -482,6 +482,9 @@ pub struct HomeView {
     /// The bundled adapter could start a turn here, as the detection worker last
     /// found it. Cached because the check spawns a node process.
     pub(super) bundled_ready: bool,
+    /// What the detection worker found, for the first-run wizard. Cached for the
+    /// same reason as `bundled_ready`.
+    pub(super) detection: crate::acp::quickstart::Detection,
 
     pub(super) plugin_ui: crate::tui::plugin_ui_poller::PluginUiState,
     pub(super) show_diagnostics: bool,

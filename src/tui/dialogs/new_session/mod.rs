@@ -811,7 +811,7 @@ impl NewSessionDialog {
     /// The Yolo choice resets only when the view moves the session onto or off an
     /// always-Yolo agent.
     fn set_structured(&mut self, enabled: bool) {
-        if self.structured_fork() && !enabled {
+        if !enabled && (self.structured_fork() || self.structured_is_forced()) {
             return;
         }
         let was_locked = self.selected_tool_always_yolo();
@@ -918,7 +918,16 @@ impl NewSessionDialog {
     fn apply_structured_default(&mut self) {
         self.structured_enabled = self.structured_capable
             && (self.structured_fork()
+                || self.structured_is_forced()
                 || self.structured_choice.unwrap_or(self.structured_default));
+    }
+
+    /// The bundled adapter is only an ACP agent. Its tool has no terminal
+    /// command behind it, so the session cannot leave the Structured view.
+    fn structured_is_forced(&self) -> bool {
+        self.available_tools
+            .get(self.tool_index)
+            .is_some_and(|tool| tool == crate::acp::quickstart::BUNDLED_AGENT)
     }
 
     /// The test constructors skip config resolution, so capability is opted

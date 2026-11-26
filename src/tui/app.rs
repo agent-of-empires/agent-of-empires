@@ -147,7 +147,7 @@ pub struct App {
 #[derive(Debug)]
 struct DetectedTools {
     tools: AvailableTools,
-    bundled: bool,
+    detection: crate::acp::quickstart::Detection,
 }
 
 struct ToolDetection {
@@ -423,10 +423,13 @@ impl App {
             .spawn(move || {
                 let tools = AvailableTools::detect_cancellable(&worker_cancel, force);
                 // The node probe behind this spawns a process and can time out, so it
-                // runs here once and the dialog reads the cached answer.
+                // runs here once and the wizard and dialog read the cached answer.
                 let app_dir = crate::session::get_app_dir().ok();
-                let bundled = crate::acp::quickstart::bundled_ready(app_dir.as_deref());
-                let _ = tx.send(DetectedTools { tools, bundled });
+                let detection =
+                    crate::acp::quickstart::Detection::detect(app_dir.as_deref(), &|name| {
+                        std::env::var(name).ok()
+                    });
+                let _ = tx.send(DetectedTools { tools, detection });
             }) {
             Ok(thread) => {
                 self.tool_detection = Some(ToolDetection {
@@ -443,7 +446,7 @@ impl App {
     fn poll_tool_detection(&mut self) -> bool {
         if let Some(rx) = self.available_tools_rx.as_mut() {
             match rx.try_recv() {
-                Ok(DetectedTools { tools, bundled }) => {
+                Ok(DetectedTools { tools, detection }) => {
                     if self.home.no_agents_dialog.is_some() {
                         if tools.any_available() {
                             self.home.no_agents_dialog = None;
@@ -452,7 +455,8 @@ impl App {
                         }
                     }
                     self.home.set_available_tools(tools);
-                    self.home.set_bundled_ready(bundled);
+                    self.home.set_bundled_ready(detection.bundled_installed);
+                    self.home.set_detection(detection);
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
                 Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
@@ -5089,7 +5093,7 @@ mod tests {
             }
             tx.send(DetectedTools {
                 tools: AvailableTools::with_tools(&["claude"]),
-                bundled: false,
+                detection: Default::default(),
             })
             .unwrap();
             assert!(app.poll_tool_detection());
@@ -5193,7 +5197,7 @@ mod tests {
             if deliver_result {
                 tx.send(DetectedTools {
                     tools: AvailableTools::with_tools(&[]),
-                    bundled: false,
+                    detection: Default::default(),
                 })
                 .unwrap();
             } else {
@@ -5395,7 +5399,7 @@ mod tests {
             app.available_tools_rx = Some(rx);
             tx.send(DetectedTools {
                 tools: AvailableTools::with_tools(tools),
-                bundled: false,
+                detection: Default::default(),
             })
             .unwrap();
             assert!(app.poll_tool_detection());
@@ -5448,7 +5452,7 @@ mod tests {
 
             tx.send(DetectedTools {
                 tools: AvailableTools::with_tools(tools),
-                bundled: false,
+                detection: Default::default(),
             })
             .unwrap();
             assert!(app.poll_tool_detection());
