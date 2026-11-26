@@ -112,9 +112,8 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
   const cancelImage = useRef<string | null>(null);
   // Moves on whenever a status names another image, so a Cancel sent before that can never apply its reply.
   const cancelToken = useRef(0);
-  // The digest the latest status offered, and the one the current attempt pulled, so a finished
-  // pull can tell a newer image published since from the one it just pulled.
-  const offeredDigest = useRef<string | null>(null);
+  // The digest the current attempt's banner offered, so a finished pull can tell a newer image published since
+  // from the one it just pulled.
   const [pulledDigest, setPulledDigest] = useState<string | null>(null);
   // The image a status since the click showed running, and the one whose pull the Daemon accepted for
   // this attempt (it claims the pull before it answers): from then on, that image's outcome is this page's.
@@ -169,7 +168,6 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
           setCancelling(false);
           setCancelRefused(null);
         }
-        offeredDigest.current = answer.state === "available" ? answer.remote_digest : null;
         setStatus(predatesPull ? { ...answer, pull: { state: "running" } } : answer);
         const running = answer.pull.state === "running";
         if (running && !polledRunning.current) setNoticeDismissed(false);
@@ -243,11 +241,12 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
     };
   }, []);
 
-  const update = useCallback((image: string) => {
+  // `image` and `digest` are the banner's that was clicked, not refs a poll may have moved since.
+  const update = useCallback((image: string, digest: string | null) => {
     const mine = ++attempt.current;
     attemptImage.current = image;
     setAttemptFor(image);
-    setPulledDigest(offeredDigest.current);
+    setPulledDigest(digest);
     // A pull of another image this page saw running keeps its outcome.
     if (seenRunningRef.current === image) seenRunningRef.current = null;
     setSeenRunning((seen) => (seen === image ? null : seen));
@@ -260,7 +259,7 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
     expectingPull.current = true;
     confirmedImage.current = null;
     replyPendingSince.current = Date.now();
-    setStatus((s) => s && { ...s, pull: { state: "running" } });
+    setStatus((s) => s && (s.image === image ? { ...s, pull: { state: "running" } } : s));
     void pullSandboxImage().then((reply) => {
       if (mine !== attempt.current) return;
       replyPendingSince.current = null;
@@ -342,6 +341,7 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
       };
     }
     if (!status || !status.checks_enabled || !status.sandbox_in_use) return { view: null, running: null };
+    const offered = status.state === "available" ? status.remote_digest : null;
 
     // The refusal has its own dismissal: it says nothing about an outcome's notice, which stays as the user left it.
     if (refusal !== null) {
@@ -350,7 +350,7 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
           kind: "failed",
           message: REFUSED,
           error: refusal,
-          onRetry: () => update(status.image),
+          onRetry: () => update(status.image, offered),
           onDismiss: () => setRefusal(null),
         },
         running: null,
@@ -381,7 +381,7 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
     // live attempt's image; otherwise every reload would repeat an old result.
     if ((tied(status.image) || status.image === attemptFor) && !noticeDismissed) {
       const onDismiss = () => setNoticeDismissed(true);
-      const again = status.pull_blocked ? undefined : () => update(status.image);
+      const again = status.pull_blocked ? undefined : () => update(status.image, offered);
       // An image published since this pull is news again; the one it pulled isn't.
       const newer = status.state === "available" && status.remote_digest !== pulledDigest;
       // An outcome nothing tied to this page may be an older pull's: the offer shows rather than it while one
@@ -415,7 +415,7 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
       return { view: { kind: "gated", image: status.image, command: status.pull_command, onDismiss }, running: null };
     }
     return {
-      view: { kind: "available", image: status.image, onUpdate: () => update(status.image), onDismiss },
+      view: { kind: "available", image: status.image, onUpdate: () => update(status.image, offered), onDismiss },
       running: null,
     };
   })();
