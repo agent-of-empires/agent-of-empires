@@ -191,6 +191,8 @@ pub async fn get_suggestions(State(state): State<Arc<AppState>>) -> impl IntoRes
             suggestions::attach_started(&mut snapshot, &started);
             suggestions::attach_refreshing(&mut snapshot, &refreshing);
             snapshot["profile"] = json!(reported_profile);
+            snapshot["setup_offered"] = json!(crate::plugin::featured::FeaturedIndex::load()
+                .is_ok_and(|index| index.offers_suggestions()));
             Json(snapshot).into_response()
         }
         Ok(Err(error)) => internal(error),

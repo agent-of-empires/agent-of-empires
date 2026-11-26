@@ -416,10 +416,7 @@ fn spawn_worker() -> Worker<Req, Res> {
 /// The empty pane's setup advice for the providers' `enabled` flags.
 /// `offered` says whether the dashboard shows Set up suggestions, which it
 /// does only while a featured plugin offers them.
-fn setup_lines(
-    enabled: &[bool],
-    offered: impl FnOnce() -> bool,
-) -> Option<&'static [&'static str]> {
+fn setup_lines(enabled: &[bool], offered: bool) -> Option<&'static [&'static str]> {
     if enabled.contains(&true) {
         None
     } else if !enabled.is_empty() {
@@ -427,7 +424,7 @@ fn setup_lines(
             "Your suggestion sources are off. Turn one on in the web",
             "dashboard under Settings › Suggestions.",
         ])
-    } else if offered() {
+    } else if offered {
         Some(&[
             "No suggestion source is installed. To set one up, use",
             "Set up suggestions on the web dashboard's homepage, or run:",
@@ -1395,13 +1392,10 @@ impl SuggestionsView {
             .providers_enabled()
             .filter(|_| self.order.is_empty())
             .and_then(|enabled| {
-                setup_lines(&enabled, || {
-                    static OFFERED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-                        crate::plugin::featured::FeaturedIndex::load()
-                            .is_ok_and(|index| index.offers_suggestions())
-                    });
-                    *OFFERED
-                })
+                setup_lines(
+                    &enabled,
+                    store.snapshot.as_ref().is_some_and(|s| s.setup_offered),
+                )
             });
         if let Some(setup) = setup {
             for line in setup {
@@ -1879,12 +1873,19 @@ impl SuggestionsFeed {
         !self.provider_failures().is_empty()
     }
 
-    /// The prompt Enter sends, as the daemon resolved it, or the plugin's draft.
+    /// The prompt Enter sends, as the daemon resolved it, or the plugin's draft
+    /// when the daemon resolved none. A resolution without a prompt is one the
+    /// daemon refused as too long, so the refusal shows instead of a draft Start would not send.
     fn effective_prompt(&self, item: &Item) -> String {
-        item.start
-            .as_ref()
-            .and_then(|s| s.prompt.clone())
-            .unwrap_or_else(|| item.draft.prompt.clone())
+        match item.start.as_ref() {
+            None => item.draft.prompt.clone(),
+            Some(start) => start.prompt.clone().unwrap_or_else(|| {
+                format!(
+                    "Not sent: the expanded prompt exceeds {} bytes.",
+                    crate::session::MAX_INITIAL_PROMPT_BYTES
+                )
+            }),
+        }
     }
 
     /// "Starts with Claude Code · Structured · worktree", from what Start will create.
@@ -2383,6 +2384,7 @@ mod tests {
         store.snapshot = Some(Snapshot {
             daemon: None,
             pre_trust: None,
+            setup_offered: false,
             profile: None,
             providers: vec![Provider {
                 id: "p".into(),
@@ -2503,6 +2505,7 @@ mod tests {
         let snapshot = Snapshot {
             daemon: None,
             pre_trust: None,
+            setup_offered: false,
             profile: None,
             providers: vec![Provider {
                 id: "p".into(),
@@ -2559,6 +2562,7 @@ mod tests {
         rig.store.snapshot = Some(Snapshot {
             daemon: None,
             pre_trust: None,
+            setup_offered: false,
             profile: None,
             providers: vec![],
             items: vec![
@@ -2803,6 +2807,7 @@ mod tests {
         rig.store.snapshot = Some(Snapshot {
             daemon: None,
             pre_trust: None,
+            setup_offered: false,
             profile: None,
             providers: vec![],
             items: vec![item("a", None, dismissed)],
@@ -2858,6 +2863,7 @@ mod tests {
         let snapshot = |a: bool, b: bool| Snapshot {
             daemon: None,
             pre_trust: None,
+            setup_offered: false,
             profile: None,
             providers: vec![],
             items: vec![item("a", None, a), item("b", None, b)],
@@ -3055,7 +3061,10 @@ mod tests {
         let item = |id: &str| rig.store.item(&("p".into(), id.into())).unwrap();
         assert_eq!(rig.store.effective_prompt(item("a")), "review PR 42");
         assert!(rig.store.preset_line(item("a")).unwrap().ends_with("yolo"));
-        assert_eq!(rig.store.effective_prompt(item("b")), "do the thing");
+        assert!(rig
+            .store
+            .effective_prompt(item("b"))
+            .starts_with("Not sent: the expanded prompt exceeds"));
         assert!(!rig.store.preset_line(item("b")).unwrap().contains("yolo"));
     }
 
@@ -3580,6 +3589,7 @@ mod tests {
         let published = |profile: &str| Snapshot {
             daemon: None,
             pre_trust: None,
+            setup_offered: false,
             profile: Some(profile.into()),
             providers: vec![],
             items: vec![item("a", None, false)],
@@ -3644,6 +3654,7 @@ mod tests {
                 Res::Snapshot(Ok(Snapshot {
                     daemon: Some("http://b".into()),
                     pre_trust: None,
+                    setup_offered: false,
                     profile: Some("B".into()),
                     providers: Vec::new(),
                     items: vec![item("a", None, false)],
@@ -3835,11 +3846,11 @@ mod tests {
         assert!(!text.contains("Nothing to suggest"), "{text}");
 
         for offered in [true, false] {
-            let lines = setup_lines(&[], || offered).unwrap().join("\n");
+            let lines = setup_lines(&[], offered).unwrap().join("\n");
             assert_eq!(lines.contains("Set up suggestions"), offered, "{lines}");
             assert!(lines.contains("Settings › Suggestions"), "{lines}");
         }
-        assert!(setup_lines(&[false, true], || true).is_none());
+        assert!(setup_lines(&[false, true], true).is_none());
     }
 
     #[test]

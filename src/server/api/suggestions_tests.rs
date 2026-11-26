@@ -226,6 +226,10 @@ async fn snapshot_and_refresh() {
     assert_eq!(body["items"][0]["dismissed"], false);
     assert_eq!(body["prefs"]["refresh_minutes"], 15);
     assert!(
+        body["setup_offered"].is_boolean(),
+        "the TUI takes the featured index from the daemon"
+    );
+    assert!(
         body["profile"].is_string(),
         "clients check it against their own"
     );

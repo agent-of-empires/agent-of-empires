@@ -31,6 +31,9 @@ pub struct Snapshot {
     pub(crate) items: Vec<Item>,
     #[serde(default)]
     pub(crate) prefs: Prefs,
+    /// A featured plugin offers suggestions, as the daemon's index says.
+    #[serde(default)]
+    pub(crate) setup_offered: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
