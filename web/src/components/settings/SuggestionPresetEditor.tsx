@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { fetchAgents, putSuggestionPreset, resetSuggestionPreset } from "../../lib/api";
 import type {
   AgentInfo,
@@ -57,6 +57,14 @@ export function SuggestionPresetEditor({ provider, source, entry, item, disabled
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Back stays usable during a save, so a late one must not close whatever is open by then.
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     let live = true;
@@ -89,7 +97,7 @@ export function SuggestionPresetEditor({ provider, source, entry, item, disabled
       return;
     }
     await onSaved();
-    onBack();
+    if (mounted.current) onBack();
   };
   const reset = async () => {
     setBusy(true);
@@ -101,7 +109,7 @@ export function SuggestionPresetEditor({ provider, source, entry, item, disabled
       return;
     }
     await onSaved();
-    onBack();
+    if (mounted.current) onBack();
   };
   const preview = item
     ? draft.prompt === null

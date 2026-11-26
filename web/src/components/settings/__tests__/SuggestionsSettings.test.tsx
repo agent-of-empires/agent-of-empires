@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { SuggestionsSettings } from "../SuggestionsSettings";
 import type { PresetFocus } from "../SuggestionPresetEditor";
 import { useSuggestionsSnapshot } from "../useSuggestionsSnapshot";
@@ -347,6 +347,20 @@ describe("SuggestionsSettings", () => {
     await screen.findByText(/Edit \u00b7 CI failures/);
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(api.putSuggestionPreset).toHaveBeenCalledWith("gh", "ci-failed", PRESETS[1]!.preset));
+  });
+
+  it("a save that lands after leaving its editor does not close the next one", async () => {
+    open();
+    let land: (v: typeof ok) => void = () => {};
+    api.putSuggestionPreset.mockReturnValueOnce(new Promise((resolve) => (land = resolve)));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit Review requests" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Save" }));
+    fireEvent.click(screen.getByRole("button", { name: /\u2190 Review requests/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit CI failures" }));
+    await screen.findByText(/Edit \u00b7 CI failures/);
+    await act(async () => land(ok));
+    await waitFor(() => expect(api.fetchSuggestions.mock.calls.length).toBeGreaterThan(1));
+    expect(screen.getByText(/Edit \u00b7 CI failures/)).toBeTruthy();
   });
 
   describe("Linked repos", () => {
