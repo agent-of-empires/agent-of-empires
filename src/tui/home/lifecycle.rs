@@ -298,6 +298,7 @@ impl HomeView {
             creating_hook_progress: HashMap::new(),
             creating_stub_id: None,
             pending_archive_cursor: None,
+            pending_snooze_flash: None,
             preview_cache: PreviewCache::default(),
             preview_timings: PreviewTimings::default(),
             terminal_preview_cache: PreviewCache::default(),

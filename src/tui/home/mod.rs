@@ -151,6 +151,15 @@ pub(super) struct PendingArchiveCursor {
     pub(super) successor: Option<String>,
 }
 
+/// Status flash owed to the snapshot that reflects a snooze toggle: the view
+/// submits the change, and the message waits for the canonical stamp so it
+/// never announces a change the daemon has not applied.
+pub(super) struct PendingSnoozeFlash {
+    pub(super) id: String,
+    pub(super) snoozed: bool,
+    pub(super) message: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("Native metadata for profile '{profile}', session '{id}' is not yet available")]
 pub(super) struct CanonicalMetadataLag {
@@ -518,6 +527,9 @@ pub struct HomeView {
 
     /// Cursor placement owed to the applied snapshot after an archive toggle.
     pub(super) pending_archive_cursor: Option<PendingArchiveCursor>,
+
+    /// Status flash owed to the applied snapshot after a snooze toggle.
+    pub(super) pending_snooze_flash: Option<PendingSnoozeFlash>,
 
     pub(super) preview_cache: PreviewCache,
     pub(super) terminal_preview_cache: PreviewCache,
