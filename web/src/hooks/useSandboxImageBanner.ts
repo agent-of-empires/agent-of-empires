@@ -389,10 +389,8 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
       // An image published since this pull is news again; the one it pulled isn't.
       const newer = status.state === "available" && status.remote_digest !== pulledDigest;
       // An outcome nothing tied to this page may be an older pull's: the offer shows rather than it while one
-      // is up, and it never shows for another image than the one the page follows, clicked or watched.
-      const followed = attemptFor ?? seenRunning;
-      const otherImage = followed !== null && status.image !== followed;
-      const unconfirmed = !tied(status.image) && (status.state === "available" || otherImage);
+      // is up.
+      const unconfirmed = !tied(status.image) && status.state === "available";
       if (pull.state === "done" && !newer && !unconfirmed) return { view: { kind: "done", onDismiss }, running: null };
       if (pull.state === "cancelled" && !unconfirmed) {
         return { view: { kind: "cancelled", onUpdate: again, onDismiss }, running: null };
