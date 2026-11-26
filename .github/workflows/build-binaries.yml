@@ -14,11 +14,6 @@ on:
         required: false
         default: ''
         type: string
-      macos-runner:
-        description: 'runs-on label for the darwin legs'
-        required: false
-        default: 'macos-latest'
-        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -50,10 +45,10 @@ jobs:
       matrix:
         include:
           - target: x86_64-apple-darwin
-            os: ${{ inputs.macos-runner }}
+            os: macos-latest
             name: aoe-darwin-amd64
           - target: aarch64-apple-darwin
-            os: ${{ inputs.macos-runner }}
+            os: macos-latest
             name: aoe-darwin-arm64
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest

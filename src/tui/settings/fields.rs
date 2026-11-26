@@ -15,7 +15,7 @@ use crate::session::config::settings_schema::{
     clear_path, merge_json, FieldDescriptor, ValidationKind, WidgetKind,
 };
 use crate::session::{validate_snooze_duration, Config, ProfileConfig};
-use crate::sound::{validate_sound_exists, volume_from_option, volume_options, volume_to_index};
+use crate::sound::{volume_from_option, volume_options, volume_to_index};
 use crate::tui::styles::available_themes;
 
 use super::SettingsScope;
@@ -320,15 +320,6 @@ impl SettingField {
                     Ok(_) => Err("Must be a JSON object (agent -> value)".to_string()),
                     Err(e) => Err(format!("Invalid JSON: {e}")),
                 }
-            }
-            // Sound files must exist on disk if named.
-            (FieldKind::Schema { section, .. }, FieldValue::OptionalText(Some(name)))
-                if section == "sound" =>
-            {
-                if !name.is_empty() {
-                    validate_sound_exists(name)?;
-                }
-                Ok(())
             }
             // Everything else: enforce the schema's server-authoritative rule.
             (FieldKind::Schema { validation, .. }, value) => {

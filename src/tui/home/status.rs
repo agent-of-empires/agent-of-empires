@@ -87,10 +87,11 @@ impl HomeView {
             if let Err(error) = update_app_state(|state| state.used_system_health = true) {
                 tracing::warn!(target: "tui.home", "failed to persist System Health discovery: {error}");
             } else if let Ok(config) = load_config().map(|config| config.unwrap_or_default()) {
-                self.tips_unseen = tips_unseen_count(&config);
+                self.tips_unseen = self.tips_unseen_count(&config);
             }
         }
         self.system_health_open = true;
+        self.suggestions_focused = false;
         self.system_health_scroll = 0;
         self.diff_view = None;
         self.live_send = None;
@@ -120,7 +121,7 @@ impl HomeView {
         let Ok(config) = load_config().map(|config| config.unwrap_or_default()) else {
             return;
         };
-        self.tips_unseen = tips_unseen_count(&config);
+        self.tips_unseen = self.tips_unseen_count(&config);
         if config.session.show_tips
             && !config.app_state.used_system_health
             && !config
@@ -379,6 +380,19 @@ impl HomeView {
             return false;
         }
         for error in &errors {
+            if self
+                .start_after_trash
+                .as_ref()
+                .is_some_and(|retry| retry.session_id == error.id)
+            {
+                self.start_after_trash = None;
+                if let Some(view) = &mut self.suggestions_view {
+                    view.set_error(format!(
+                        "Couldn't move the blocked Session to Trash, so nothing started: {}",
+                        error.message
+                    ));
+                }
+            }
             if self
                 .pending_archive_cursor
                 .as_ref()
@@ -654,18 +668,7 @@ impl HomeView {
                 GroupTree::new_with_groups(&rows, &profile.groups),
             );
         }
-        // No displayed row, approval, selection, or sound changes before every read and parse succeeds.
-        for (id, instance) in &next {
-            if let Some(previous) = self.instances.get(id) {
-                if previous.status != instance.status {
-                    crate::sound::play_for_transition(
-                        previous.status,
-                        instance.status,
-                        &self.sound_config,
-                    );
-                }
-            }
-        }
+        // No displayed row, approval or selection changes before every read and parse succeeds.
         self.instances = next;
         self.group_trees = trees;
         self.storages.extend(opened_storages);
@@ -841,12 +844,14 @@ impl HomeView {
                                 metadata_changed = true;
                                 for row in &snapshot.contents.sessions {
                                     self.apply_daemon_status_update(row);
+                                    self.announce_prompt_failure(row);
                                     if !row.unread
                                         && self.manual_unread_hold.as_deref() == Some(&row.id)
                                     {
                                         self.manual_unread_hold = None;
                                     }
                                 }
+                                self.prompt_failures_seeded = true;
                                 let ids: std::collections::HashSet<_> =
                                     self.instances.keys().map(String::as_str).collect();
                                 self.structured_pending_approvals
@@ -922,7 +927,8 @@ impl HomeView {
                 self.clear_unread_on_view(&id);
             }
         }
-        let outcomes_changed = self.apply_runtime_outcomes(promote_dialogs);
+        let outcomes_changed = self.apply_runtime_outcomes(promote_dialogs)
+            | (promote_dialogs && self.promote_prompt_failure());
         let pending_after =
             self.session_feed.any_pending() || self.pending_namespace_intent.is_some();
         updated
@@ -947,9 +953,6 @@ impl HomeView {
         let mut changed = instance.status != status
             || instance.last_error.as_deref() != row.last_error.as_deref()
             || instance.pane_dead_observed != row.pane_dead_observed;
-        if instance.status != status {
-            crate::sound::play_for_transition(instance.status, status, &self.sound_config);
-        }
         instance.status = status;
         match row.last_error.as_deref() {
             Some(error) => instance.last_error.set(error),
@@ -1158,19 +1161,32 @@ impl HomeView {
         let mut purge_notes: Vec<(String, String)> = Vec::new();
         for (id, outcome) in row_outcomes {
             match outcome {
-                SessionCommandOutcome::Trashed(receipt) => match receipt.outcome.relocation {
-                    crate::daemon::TrashRelocationOutcome::Failed { reason } => {
-                        self.record_runtime_message(format!("{id}: Session is in Trash, but its worktree relocation is incomplete: {reason}"));
+                SessionCommandOutcome::Trashed(receipt) => {
+                    if self
+                        .start_after_trash
+                        .as_ref()
+                        .is_some_and(|retry| retry.session_id == id)
+                    {
+                        if let Some(retry) = self.start_after_trash.take() {
+                            if retry.epoch == receipt.cursor.epoch {
+                                self.suggestions_feed.start_from(retry.key, retry.origin);
+                            }
+                        }
                     }
-                    crate::daemon::TrashRelocationOutcome::TeardownFailed { reason } => {
-                        self.record_runtime_message(format!("{id}: Session is in Trash, but its tmux sessions could not be stopped: {reason}"));
+                    match receipt.outcome.relocation {
+                        crate::daemon::TrashRelocationOutcome::Failed { reason } => {
+                            self.record_runtime_message(format!("{id}: Session is in Trash, but its worktree relocation is incomplete: {reason}"));
+                        }
+                        crate::daemon::TrashRelocationOutcome::TeardownFailed { reason } => {
+                            self.record_runtime_message(format!("{id}: Session is in Trash, but its tmux sessions could not be stopped: {reason}"));
+                        }
+                        crate::daemon::TrashRelocationOutcome::Relocated {
+                            warning: Some(warning),
+                        } => self.record_runtime_message(format!("{id}: {warning}")),
+                        crate::daemon::TrashRelocationOutcome::Relocated { warning: None }
+                        | crate::daemon::TrashRelocationOutcome::Skipped => {}
                     }
-                    crate::daemon::TrashRelocationOutcome::Relocated {
-                        warning: Some(warning),
-                    } => self.record_runtime_message(format!("{id}: {warning}")),
-                    crate::daemon::TrashRelocationOutcome::Relocated { warning: None }
-                    | crate::daemon::TrashRelocationOutcome::Skipped => {}
-                },
+                }
                 SessionCommandOutcome::Purged(receipt) => {
                     self.record_purge_outcome(&id, receipt.outcome, &mut purge_notes)
                 }

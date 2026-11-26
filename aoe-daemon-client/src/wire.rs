@@ -140,6 +140,15 @@ pub struct CliCreationOptions {
     pub worktree_path_id: Option<String>,
 }
 
+/// Published suggestion that started a session. The server sets the profile.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SuggestionOrigin {
+    pub provider_id: String,
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct CreateSessionBody {
     pub title: Option<String>,
@@ -190,6 +199,9 @@ pub struct CreateSessionBody {
     /// Typed into the agent as its first turn, only once it is ready.
     #[serde(default)]
     pub initial_prompt: Option<String>,
+    /// Suggestion this session starts from; omitted by "Start another".
+    #[serde(default)]
+    pub suggestion: Option<SuggestionOrigin>,
     pub profile: Option<String>,
     /// Structured view requires an ACP-capable agent.
     #[serde(default)]

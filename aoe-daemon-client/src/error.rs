@@ -19,6 +19,8 @@ pub enum ApiErrorCode {
     LifecycleLocked,
     TrashIncomplete,
     LifecycleSuperseded,
+    /// The caller selected its target under a profile the Daemon does not serve.
+    ProfileMismatch,
     PendingTargetGone,
     TlsRequired,
     RuntimeEpochMismatch,
@@ -66,6 +68,7 @@ impl ApiErrorCode {
             Self::LifecycleLocked => "lifecycle_locked",
             Self::TrashIncomplete => "trash_incomplete",
             Self::LifecycleSuperseded => "lifecycle_superseded",
+            Self::ProfileMismatch => "profile_mismatch",
             Self::PendingTargetGone => "pending_target_gone",
             Self::StartFailed => "start_failed",
             Self::SandboxMigrationDeferred => "sandbox_migration_deferred",
@@ -108,6 +111,7 @@ impl ApiErrorCode {
             Self::LifecycleLocked
             | Self::TrashIncomplete
             | Self::LifecycleSuperseded
+            | Self::ProfileMismatch
             | Self::RuntimeEpochMismatch
             | Self::ResumeFailed
             | Self::ManagedResumeRefused(_)
@@ -183,6 +187,7 @@ impl ApiErrorCode {
             b"lifecycle_locked" => Self::LifecycleLocked,
             b"trash_incomplete" => Self::TrashIncomplete,
             b"lifecycle_superseded" => Self::LifecycleSuperseded,
+            b"profile_mismatch" => Self::ProfileMismatch,
             b"pending_target_gone" if resolving_pending_target => Self::PendingTargetGone,
             b"tls_required" => Self::TlsRequired,
             b"runtime_epoch_mismatch" => Self::RuntimeEpochMismatch,
@@ -464,6 +469,12 @@ mod tests {
                 Some(ApiErrorCode::NoRevive),
             ),
             (StatusCode::FORBIDDEN, "no_revive", false, None),
+            (
+                StatusCode::CONFLICT,
+                "profile_mismatch",
+                false,
+                Some(ApiErrorCode::ProfileMismatch),
+            ),
             (
                 StatusCode::CONFLICT,
                 "lifecycle_superseded",

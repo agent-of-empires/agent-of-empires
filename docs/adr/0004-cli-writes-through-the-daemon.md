@@ -13,7 +13,7 @@ Today almost every mutating CLI command writes `sessions.json`, tmux, worktrees 
 - **Session state goes only through the Daemon:** `add`, `remove`, `send`, every `session` subcommand, `group`, `worktree cleanup`, and `acp stop|kill|restart`. Commands without an endpoint get one; `session empty-trash` gets a bulk purge endpoint rather than a Client-side loop, which would reopen #2541. A migrated command has no local path.
 - **Config the Daemon reads goes only through the Daemon:** `profile`, `project`, `skill`, `plugin` (its local fallback in `plugin enable|disable` is removed), `telemetry` and `cityhall apply`. The Daemon is the single writer of what it consumes, so no config watcher is needed and remote Clients work.
 - **Stays local, never auto-starts:**
-  - Client assets: `theme export`, `sounds install`.
+  - Client assets: `theme export`.
   - Files on the Daemon host: `init`, `hooks approve`. They only make sense when the Client runs on that host.
   - Daemon and install management: `killall`, `update`, `uninstall`, `migrate`, `sandbox reclaim`, `acp recover`, `serve`. `acp recover` is the operator escape hatch for when the Daemon cannot prove worker ownership, so it must not depend on that Daemon. `migrate` refuses while a Daemon runs.
   - `log-level` only changes a running Daemon, so it errors instead of starting one.

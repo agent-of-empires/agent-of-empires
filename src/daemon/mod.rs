@@ -154,3 +154,6 @@ fn matches_local_identity(client: &DaemonClient, info: &RuntimeInfo) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod suggestions_tests;

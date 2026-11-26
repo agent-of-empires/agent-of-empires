@@ -18,7 +18,8 @@ pub struct TerminalInfo {
 
 pub use aoe_daemon_client::{
     AuxiliaryObservation, AuxiliaryTarget, LegacyToolAdoption, LegacyToolIdentity,
-    LegacyToolObservation, PaneObservation, PanePresence, TmuxServerIdentity, View,
+    LegacyToolObservation, PaneObservation, PanePresence, SuggestionOrigin, TmuxServerIdentity,
+    View,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
