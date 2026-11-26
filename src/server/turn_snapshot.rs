@@ -171,9 +171,13 @@ pub fn spawn_recorder(state: Arc<AppState>) {
                 };
                 let (state, baselines, permits) =
                     (task_state.clone(), baselines.clone(), permits.clone());
-                tokio::spawn(async move {
+                task_state.runtime.work.spawn("server.turn_snapshot.capture", async move {
                     loop {
-                        let trees = match permits.acquire().await {
+                        let permit = tokio::select! {
+                            permit = permits.acquire() => permit,
+                            _ = state.shutdown.cancelled() => return,
+                        };
+                        let trees = match permit {
                             Ok(_permit) => capture(&state, &id).await,
                             Err(_) => Trees::new(),
                         };

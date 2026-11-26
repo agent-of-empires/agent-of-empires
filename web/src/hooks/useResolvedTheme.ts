@@ -43,7 +43,10 @@ export function useResolvedTheme(): ResolvedTheme | null {
     const onStorage = (event: Event) => {
       const { key, newValue } = event as StorageEvent;
       const next = key === THEME_STORAGE_KEY ? parseTheme(newValue) : null;
-      if (next) setResolvedTheme(next, false);
+      if (!next) return;
+      // Newer than any fetch in flight, which would otherwise repaint and re-cache the old theme.
+      lastAppliedSeq = ++nextSeq;
+      setResolvedTheme(next, false);
     };
     // A pick on another device or in the TUI shows up when this window comes back.
     const onVisible = () => {

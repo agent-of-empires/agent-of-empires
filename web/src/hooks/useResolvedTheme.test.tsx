@@ -142,6 +142,22 @@ describe("a theme picked in another window", () => {
     expect(document.documentElement.style.getPropertyValue("--color-surface-900")).toBe("#700000");
   });
 
+  it("outranks this window's fetch still in flight", async () => {
+    let resolveMount!: (t: ResolvedTheme) => void;
+    fetchCurrentThemeMock.mockReturnValueOnce(new Promise<ResolvedTheme>((r) => (resolveMount = r)));
+    renderHook(() => useResolvedTheme());
+    const picked = makeTheme("dracula");
+    act(() => {
+      window.dispatchEvent(new StorageEvent("storage", { key: THEME_STORAGE_KEY, newValue: JSON.stringify(picked) }));
+    });
+    await act(async () => {
+      resolveMount(makeTheme("empire"));
+      await Promise.resolve();
+    });
+    expect(getResolvedTheme()?.name).toBe("dracula");
+    expect(localStorage.getItem(THEME_STORAGE_KEY)).not.toContain("empire");
+  });
+
   it("ignores other storage keys and corrupt payloads", () => {
     fetchCurrentThemeMock.mockImplementation(never);
     renderHook(() => useResolvedTheme());

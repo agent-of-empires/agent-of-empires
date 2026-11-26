@@ -140,9 +140,13 @@ fn snapshot_worktree_within(
             continue;
         }
         files += 1;
-        if let Ok(path) = entry.path() {
-            bytes += std::fs::symlink_metadata(workdir.join(path)).map_or(0, |m| m.len());
-        }
+        // Bytes, not `path()`, so a non-UTF-8 name still counts toward the bound.
+        #[cfg(unix)]
+        let path =
+            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(entry.path_bytes());
+        #[cfg(not(unix))]
+        let path = String::from_utf8_lossy(entry.path_bytes()).into_owned();
+        bytes += std::fs::symlink_metadata(workdir.join(path)).map_or(0, |m| m.len());
         if files > max_files || bytes > max_bytes {
             return Err(GitError::SnapshotTooLarge { files, bytes });
         }
@@ -998,6 +1002,22 @@ mod tests {
         }
         snapshot_worktree_within(dir.path(), 1, 4096).unwrap();
         assert!(repo.find_blob(blob).is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_non_utf8_name_counts_toward_the_snapshot_limit() {
+        use std::os::unix::ffi::OsStrExt;
+        let (dir, _repo) = setup_test_repo();
+        let name = std::ffi::OsStr::from_bytes(b"big\xff.bin");
+        if fs::write(dir.path().join(name), vec![7u8; 4096]).is_err() {
+            eprintln!("skipping: the filesystem refuses non-UTF-8 names");
+            return;
+        }
+        assert!(matches!(
+            snapshot_worktree_within(dir.path(), usize::MAX, 4095),
+            Err(GitError::SnapshotTooLarge { .. })
+        ));
     }
 
     /// Only tracked blobs are served: an untracked secret (#1810) and `.git`

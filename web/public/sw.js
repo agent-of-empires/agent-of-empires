@@ -48,23 +48,29 @@ async function navigate(request) {
     const response = await fetch(request);
     if (response.ok && (response.headers.get("content-type") || "").includes("text/html")) {
       const copy = response.clone();
-      caches.open(SHELL_CACHE).then((cache) => cache.put(SHELL_KEY, copy));
+      caches
+        .open(SHELL_CACHE)
+        .then((cache) => cache.put(SHELL_KEY, copy))
+        .catch(() => {});
     }
     return response;
   } catch {
-    const shell = await caches.match(SHELL_KEY, { cacheName: SHELL_CACHE });
+    const shell = await caches.match(SHELL_KEY, { cacheName: SHELL_CACHE }).catch(() => undefined);
     return shell || new Response(OFFLINE_PAGE, { headers: { "content-type": "text/html; charset=utf-8" } });
   }
 }
 
+// Caching is best effort: a quota error or unusable Cache Storage must not fail an asset the network served.
 async function asset(request) {
-  const cache = await caches.open(ASSET_CACHE);
-  const hit = await cache.match(request);
+  const cache = await caches.open(ASSET_CACHE).catch(() => null);
+  const hit = cache && (await cache.match(request).catch(() => undefined));
   if (hit) return hit;
   const response = await fetch(request);
-  if (response.ok) {
-    await cache.put(request, response.clone());
-    void trimAssets(cache);
+  if (cache && response.ok) {
+    cache
+      .put(request, response.clone())
+      .then(() => trimAssets(cache))
+      .catch(() => {});
   }
   return response;
 }
