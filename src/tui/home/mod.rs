@@ -567,7 +567,9 @@ pub struct HomeView {
     pub(super) footer_buttons: Vec<(crossterm::event::KeyEvent, Rect)>,
     pub(super) footer_hover: Option<crossterm::event::KeyEvent>,
     pub(super) mouse_pos: Option<(u16, u16)>,
-    pub(super) last_click: Option<(std::time::Instant, u16, u16)>,
+    /// The last list click and the session it hit, so a double-click needs the same session
+    /// under the pointer, not just the same screen row.
+    pub(super) last_click: Option<(std::time::Instant, u16, u16, Option<String>)>,
 
     pub(super) last_preview_click: Option<(std::time::Instant, u16, u16)>,
 

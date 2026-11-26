@@ -6627,15 +6627,20 @@ impl HomeView {
         // A click in the list gives it the keys back from the suggestions pane.
         self.suggestions_focused = false;
 
-        let is_double_click = matches!(
-            self.last_click,
-            Some((prev_time, _, prev_row))
-                if prev_row == row
-                    && now.duration_since(prev_time) <= DOUBLE_CLICK_THRESHOLD
-        );
-        self.last_click = Some((now, col, row));
-
         let item = self.flat_items[abs_idx].clone();
+        let target = match &item {
+            Item::Session { id, .. } => Some(id.clone()),
+            Item::Group { .. } | Item::Suggested { .. } => None,
+        };
+        let is_double_click = matches!(
+            &self.last_click,
+            Some((prev_time, _, prev_row, prev_target))
+                if *prev_row == row
+                    && *prev_target == target
+                    && now.duration_since(*prev_time) <= DOUBLE_CLICK_THRESHOLD
+        );
+        self.last_click = Some((now, col, row, target));
+
         if is_double_click {
             // The first click already selected the row and toggled a group, so the second
             // only activates a session; re-toggling would undo the first and flicker.
