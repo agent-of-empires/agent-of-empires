@@ -576,13 +576,6 @@ async function handleRequest(msg) {
         }
         fakeDebug(`session/load released sessionId=${sessionId} pid=${process.pid}`);
       }
-      if (method === "session/load" && script.holdLoad === true) {
-        fakeDebug(`session/load held sessionId=${sessionId} pid=${process.pid}`);
-        while (!existsSync(`${process.env.FAKE_ACP_SCRIPT}.load-release`)) {
-          await new Promise((resolve) => setTimeout(resolve, 20));
-        }
-        fakeDebug(`session/load released sessionId=${sessionId} pid=${process.pid}`);
-      }
       sendResult(id, result);
       if (method === "session/load" && loadReplay && !replayBeforeResponse) {
         setImmediate(replayLoadHistory);

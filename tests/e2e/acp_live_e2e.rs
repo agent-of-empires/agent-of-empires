@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use futures_util::StreamExt as _;
 use serial_test::parallel;
 
 use crate::harness::{
@@ -227,11 +228,11 @@ fn daemon_breadcrumbs_reach_per_session_log() {
     assert!(body.contains("acp.protocol"), "daemon target:\n{body}");
 }
 
-/// The daemon fails the first fresh-spawn handshake while the runner stays
-/// registered; the reconciler must readopt it so prompts are accepted (#1890).
+/// A failed first handshake must not authorize prompt delivery or a fresh retry
+/// while the original establishment remains unresolved.
 #[test]
 #[parallel]
-fn acp_recovers_orphaned_runner_after_failed_first_handshake() {
+fn acp_refuses_input_after_unresolved_first_handshake() {
     require_tmux!();
     require_node!();
     let mut h = TuiTestHarness::new_acp(
@@ -239,22 +240,49 @@ fn acp_recovers_orphaned_runner_after_failed_first_handshake() {
         r#"{ "turns": [ { "updates": [], "stopReason": "end_turn" } ] }"#,
     );
     h.set_env("AOE_ACP_TEST_FAIL_FIRST_HANDSHAKES", "1");
-    let (_, session_id) = h.start_structured_session("orphan-recovery");
+    let (port, session_id) = h.start_structured_session("orphan-recovery");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{port}/api/sessions/{session_id}/acp/prompt");
+    let prompt = "please proceed";
 
-    // 404 or 503 `worker_not_ready` are the expected transients; anything
-    // else fails fast rather than timing out.
-    wait_until(Duration::from_secs(45), Duration::from_millis(250), || {
-        let out = h.run_cli(&["acp", "prompt", &session_id, "please proceed"]);
-        if out.status.success() {
-            return Ok(());
-        }
-        let stderr = String::from_utf8_lossy(&out.stderr);
+    let log = app_dir_in(h.home_path()).join("fake-acp.log");
+    let blocked = wait_until(Duration::from_secs(15), Duration::from_millis(100), || {
+        let (status, body) = runtime.block_on(async {
+            let response = client
+                .post(&url)
+                .json(&serde_json::json!({ "text": prompt }))
+                .send()
+                .await
+                .unwrap();
+            (response.status(), response.text().await.unwrap())
+        });
         assert!(
-            stderr.contains("not found on the daemon") || stderr.contains("worker_not_ready"),
-            "acp prompt failed with an unexpected error before recovery.\nstderr: {stderr}"
+            !status.is_success(),
+            "unresolved establishment accepted input"
         );
-        Err(format!("worker never recovered.\nstderr: {stderr}"))
+        if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            && body.contains("Conversation establishment is unresolved")
+        {
+            Ok(body)
+        } else {
+            Err(format!(
+                "establishment refusal not yet visible: {status}: {body}"
+            ))
+        }
     });
+    assert!(blocked.contains("Retry same or Start fresh explicitly"));
+    match std::fs::read_to_string(log) {
+        Ok(contents) => {
+            assert!(!contents.contains("session/prompt prompt="), "{contents}");
+            assert!(
+                contents.matches("fake-acp starting pid=").count() <= 1,
+                "{contents}"
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("read adapter log: {error}"),
+    }
 }
 
 fn env_value(capture: &str, key: &str) -> Option<String> {
@@ -337,34 +365,7 @@ fn asserted_claude_store_harness(name: &str) -> (TuiTestHarness, PathBuf, PathBu
         String::from_utf8_lossy(&add.stderr)
     );
 
-    let sid = "11111111-1111-4111-8111-111111111111";
-    let encoded: String = project
-        .to_string_lossy()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let transcripts = selected.join("projects").join(encoded);
-    std::fs::create_dir_all(&transcripts).unwrap();
-    std::fs::write(transcripts.join(format!("{sid}.jsonl")), "{}\n").unwrap();
-    let pin = h.run_cli(&[
-        "session",
-        "set-session-id",
-        "handoff",
-        sid,
-        "--store",
-        selected.to_str().unwrap(),
-    ]);
-    assert!(
-        pin.status.success(),
-        "{}",
-        String::from_utf8_lossy(&pin.stderr)
-    );
+    pin_claude_session(&h, &project, "handoff", &selected);
     // Stores are recorded canonically; macOS `/tmp` resolves to `/private/tmp`.
     let selected = selected.canonicalize().unwrap();
 
@@ -381,6 +382,37 @@ fn asserted_claude_store_harness(name: &str) -> (TuiTestHarness, PathBuf, PathBu
         .unwrap()
         .to_owned();
     (h, selected, capture_dir, id)
+}
+
+const SELECTED_CLAUDE_SID: &str = "11111111-1111-4111-8111-111111111111";
+
+fn pin_claude_session(h: &TuiTestHarness, project: &Path, title: &str, store: &Path) {
+    let encoded: String = project
+        .to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let transcripts = store.join("projects").join(encoded);
+    std::fs::create_dir_all(&transcripts).unwrap();
+    std::fs::write(
+        transcripts.join(format!("{SELECTED_CLAUDE_SID}.jsonl")),
+        "{}\n",
+    )
+    .unwrap();
+    h.run_cli_ok(&[
+        "session",
+        "set-session-id",
+        title,
+        SELECTED_CLAUDE_SID,
+        "--store",
+        store.to_str().unwrap(),
+    ]);
 }
 
 fn start_daemon(h: &TuiTestHarness) -> u16 {
@@ -461,8 +493,7 @@ fn assert_selected_claude_store_survives_stop_and_respawn(hold_load: bool) {
         );
     });
     assert_eq!(wait_for_session_loads(&log, 1), 1);
-    let selected_sid = "11111111-1111-4111-8111-111111111111";
-    let held_marker = format!("session/load held sessionId={selected_sid} pid=");
+    let held_marker = format!("session/load held sessionId={SELECTED_CLAUDE_SID} pid=");
     if hold_load {
         wait_until(Duration::from_secs(75), Duration::from_millis(50), || {
             let contents = std::fs::read_to_string(&log).unwrap_or_default();
@@ -472,6 +503,21 @@ fn assert_selected_claude_store_survives_stop_and_respawn(hold_load: bool) {
                 .ok_or_else(|| {
                     format!("original native Load did not enter its response gate: {contents}")
                 })
+        });
+    } else {
+        wait_until(Duration::from_secs(75), Duration::from_millis(50), || {
+            let rows = h.read_sessions();
+            let state = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == id)
+                .map(|row| &row["acp_establishment"]["state"]);
+            if state.and_then(serde_json::Value::as_str) == Some("applied") {
+                Ok(())
+            } else {
+                Err(format!("original native Load was not applied: {state:?}"))
+            }
         });
     }
     let enabled_row = h
@@ -486,10 +532,20 @@ fn assert_selected_claude_store_survives_stop_and_respawn(hold_load: bool) {
         .as_u64()
         .expect("the enable transaction persists its native generation");
     let enabled_resume_binding = enabled_row["resume_binding"].clone();
+    if hold_load {
+        let establishment = &enabled_row["acp_establishment"];
+        assert_eq!(establishment["state"], "pending");
+        assert_eq!(
+            establishment["attempt"]["target"],
+            serde_json::json!({
+                "operation": "load", "session_id": SELECTED_CLAUDE_SID, "import": false,
+            }),
+            "an asserted resume is a selected native Load, not a transcript import",
+        );
+    }
     let enabled: agent_of_empires::session::Instance = serde_json::from_value(enabled_row).unwrap();
     if hold_load {
-        assert_eq!(enabled.acp_session_id.as_deref(), Some(selected_sid));
-        assert_eq!(enabled.import_pending, Some(true));
+        assert_eq!(enabled.acp_session_id.as_deref(), Some(SELECTED_CLAUDE_SID));
         assert_eq!(
             enabled.agent_session_binding.as_ref().unwrap().provenance,
             agent_of_empires::session::ConversationProvenance::Asserted,
@@ -546,8 +602,6 @@ fn assert_selected_claude_store_survives_stop_and_respawn(hold_load: bool) {
             })
             .await
             .expect("Stop commits while the original native Load response is held");
-            // Opening the response gate does not promise a result from an already-retired actor.
-            std::fs::write(h.home_path().join("agent.json.load-release"), "").unwrap();
         }
         let response = match completed_stop {
             Some(response) => response,
@@ -567,7 +621,7 @@ fn assert_selected_claude_store_survives_stop_and_respawn(hold_load: bool) {
             serde_json::from_value(stopped_row).unwrap();
         assert_eq!(stopped.status, agent_of_empires::session::Status::Stopped);
         assert!(stopped.is_idle_dormant());
-        assert_eq!(stopped.acp_session_id.as_deref(), Some(selected_sid));
+        assert_eq!(stopped.acp_session_id.as_deref(), Some(SELECTED_CLAUDE_SID));
         if hold_load {
             assert_eq!(stopped.agent_session_binding, enabled.agent_session_binding);
             assert_eq!(stopped_resume_binding, enabled_resume_binding);
@@ -577,12 +631,57 @@ fn assert_selected_claude_store_survives_stop_and_respawn(hold_load: bool) {
             !agent_of_empires::acp::runner_lifecycle::SystemProcessControl::default()
                 .is_alive(original_identity)
         );
-        let response = client
+        if hold_load {
+            // Let only the replacement answer Load; the original must retire without a result.
+            std::fs::write(h.home_path().join("agent.json.load-release"), "").unwrap();
+        }
+        let spawn = client
             .post(format!("{base}/acp/spawn"))
-            .json(&serde_json::json!({}))
-            .send()
+            .json(&serde_json::json!({}));
+        let response = if hold_load {
+            let refused = spawn.send().await.unwrap();
+            assert_eq!(refused.status(), reqwest::StatusCode::CONFLICT);
+            assert!(
+                refused
+                    .text()
+                    .await
+                    .unwrap()
+                    .contains("Conversation establishment is unresolved"),
+                "a stopped Load without a result must require explicit recovery",
+            );
+
+            // Use the same comparison token as the web client; never recover by editing storage.
+            let revision = tokio::time::timeout(Duration::from_secs(15), async {
+                let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+                    "ws://127.0.0.1:{port}/sessions/{id}/acp/ws?frames=0"
+                ))
+                .await
+                .unwrap();
+                loop {
+                    let message = ws.next().await.expect("ACP stream closed").unwrap();
+                    if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                        let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        let revision = &payload["state"]["establishment_revision"];
+                        if let Some(bytes) = revision.as_array() {
+                            assert_eq!(bytes.len(), 32);
+                            break revision.clone();
+                        }
+                    }
+                }
+            })
             .await
-            .unwrap();
+            .expect("the stopped session exposes a recovery revision");
+            client
+                .post(format!("{base}/acp/restart"))
+                .json(
+                    &serde_json::json!({ "recovery": { "revision": revision, "action": "same" } }),
+                )
+                .send()
+                .await
+                .unwrap()
+        } else {
+            spawn.send().await.unwrap()
+        };
         assert!(
             response.status().is_success(),
             "{}",
@@ -779,7 +878,7 @@ fn before_session_mints_environment_for_structured_worker() {
     }
 }
 
-/// Seeded config with the structured view offered, over a daemon.
+/// Seeded config with the structured view offered.
 fn structured_tui_harness(name: &str) -> TuiTestHarness {
     let script = r#"{
   "turns": [
@@ -806,7 +905,6 @@ fn structured_tui_harness(name: &str) -> TuiTestHarness {
     )
     .expect("write config");
     init_git_repo(&h.project_path());
-    h.start_daemon();
     h
 }
 
@@ -819,6 +917,7 @@ fn wizard_created_structured_session_opens_structured_view() {
     require_node!();
     let mut h = structured_tui_harness("structured_wizard");
     h.append_config("[session]\ndefault_tool = \"claude\"");
+    h.start_daemon();
     let project = h.project_path();
 
     h.spawn_tui();
@@ -856,6 +955,9 @@ fn keyboard_confirmed_view_switch_fires_immediately() {
     let mut h = structured_tui_harness("structured_switch");
     let project = h.project_path();
     h.add_session(&[project.to_str().unwrap(), "-t", "switchme", "-c", "claude"]);
+    let project = project.canonicalize().unwrap();
+    pin_claude_session(&h, &project, "switchme", &h.home_path().join(".claude"));
+    h.start_daemon();
 
     h.spawn_tui();
     h.wait_for("switchme");
