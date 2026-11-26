@@ -225,6 +225,8 @@ html {
   /* Live right-panel width, published by ContentSplit for the symmetric
      treatment on the right. Default mirrors ContentSplit's DEFAULT_DIFF_WIDTH. */
   --aoe-right-panel-width: 380px;
+  /* The phone session drawer's width; the Session it pushes aside moves by as much. */
+  --aoe-drawer-w: min(85vw, 400px);
 }
 
 body {

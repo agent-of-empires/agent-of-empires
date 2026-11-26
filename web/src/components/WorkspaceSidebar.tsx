@@ -23,6 +23,8 @@ import { useSidebarTriage } from "../hooks/useSidebarTriage";
 import { sessionWorkspaces } from "../lib/sessionWorkspace";
 import { ProjectsSection } from "./ProjectsSection";
 import { FoldChevron, PlusIcon, StrokeIcon } from "./icons";
+import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
+import { Search, SquarePen } from "lucide-react";
 import { usePersistedFlag } from "./usePersistedFlag";
 import { NAV_ITEM, ROWS, onSidebarArrowKey } from "./sidebar/keyboardNav";
 import { newDragClickGuard, useSuppressClickAfterDrag, type DragClickGuard } from "./sidebar/dnd";
@@ -45,6 +47,9 @@ import { TrashMenu } from "./sidebar/TrashMenu";
 import { useFacetFilter } from "./sidebar/useFacetFilter";
 import { useSidebarSelection } from "./sidebar/useSidebarSelection";
 import { useSidebarWidth } from "./sidebar/useSidebarWidth";
+
+/** The phone drawer moves on the iOS sheet curve; reduced motion skips it. */
+const DRAWER_MOTION = "max-md:duration-[400ms] max-md:ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none";
 
 /** Rows of the "Snoozed & archived" section. Outside `rowsId`'s "sidebar-rows-" namespace, so no Group,
  *  whatever its name, can share it. */
@@ -85,6 +90,10 @@ interface Props {
   asPage?: boolean;
   /** Shown above the list on the phone page, such as the setup banner. */
   pageTop?: ReactNode;
+  /** Phone with a Session open: the list is a drawer from the left, opened and closed through `open`. */
+  drawer?: boolean;
+  /** The app's ⋯ items, which a phone's list carries in its title row. */
+  menuItems?: OverflowItem[];
   onCreateSession: (repoPath: string) => void;
   onPinProject?: (repoPath: string) => void;
   onUnpinProject?: (group: SidebarGroup) => void;
@@ -309,13 +318,20 @@ export function WorkspaceSidebar(props: Props) {
     if (!filterOpen) requestAnimationFrame(() => filterRef.current?.focus());
   };
 
-  // A phone shows the sidebar as its own page, the app's home, as Claude's app lists sessions; a Session opens
-  // over it with a back button, so there is no phone drawer.
-  const phoneClass = props.asPage ? "max-md:flex-1 max-md:!w-full" : "max-md:hidden";
+  // A phone lists sessions as Muse does: the whole screen with no Session open, else a drawer from the left that
+  // pushes the Session aside. Both run the full height on a solid colour, which iOS 26 extends under its bars.
+  const phoneClass = props.asPage
+    ? "max-md:flex-1 max-md:!w-full max-md:bg-surface-950"
+    : props.drawer
+      ? `max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-40 max-md:!w-[var(--aoe-drawer-w)] max-md:pt-[env(safe-area-inset-top)] max-md:bg-surface-950 max-md:transition-[translate,visibility] ${DRAWER_MOTION} ${
+          open ? "max-md:translate-x-0" : "max-md:-translate-x-full max-md:invisible"
+        }`
+      : "max-md:hidden";
   return (
     <SidebarCompactContext.Provider value={compact}>
       <div
-        {...tourAnchor(TOUR_ANCHORS.sidebar)}
+        // A phone's list fills the screen, leaving the tour no room beside it, so its title takes the anchor.
+        {...(props.asPage || props.drawer ? {} : tourAnchor(TOUR_ANCHORS.sidebar))}
         role="navigation"
         aria-label="Sessions sidebar"
         tabIndex={-1}
@@ -343,7 +359,12 @@ export function WorkspaceSidebar(props: Props) {
           onToggleFacets={() => setFacetOpen((o) => !o)}
           filterOpen={filterOpen}
           onToggleFilter={toggleFilter}
-          onSearch={props.onOpenPalette}
+          headingAnchored={!!(props.asPage || props.drawer)}
+          phoneMenu={
+            props.menuItems && (
+              <OverflowMenu items={props.menuItems} phoneFloating triggerDataTour={TOUR_ANCHORS.topbarMore} />
+            )
+          }
         />
 
         {filterOpen && !compact && (
@@ -412,8 +433,8 @@ export function WorkspaceSidebar(props: Props) {
                 // A header for the arrow keys like a Group's, so Left on one of its rows comes back here.
                 aria-controls={SUNK_ROWS}
                 {...{ [NAV_ITEM]: "" }}
-                className={`w-full flex items-center gap-2 py-1.5 rounded-md text-[12px] font-medium text-text-dim hover:text-text-secondary hover:bg-surface-800/60 cursor-pointer transition-colors border-t border-surface-800/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 ${
-                  compact ? "px-2" : "px-3 tracking-widest"
+                className={`w-full flex items-center gap-2 py-1.5 rounded-md text-[12px] font-medium text-text-dim hover:text-text-secondary hover:bg-surface-800/60 cursor-pointer transition-colors border-t border-surface-800/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 max-md:mt-4 max-md:border-t-0 max-md:text-[12px] max-md:uppercase max-md:tracking-[0.06em] max-md:font-semibold ${
+                  compact ? "px-2" : "px-3 md:tracking-widest"
                 }`}
               >
                 <FoldChevron
@@ -468,7 +489,7 @@ export function WorkspaceSidebar(props: Props) {
 
         {/* The rail is a fixed 88px, so its controls stack to fit a scaled root font. */}
         <div
-          className={`p-2 max-md:px-4 max-md:pb-[max(0.75rem,env(safe-area-inset-bottom))] max-md:sticky max-md:bottom-0 max-md:bg-surface-900 flex items-center ${
+          className={`p-2 max-md:px-4 max-md:pb-[max(0.75rem,env(safe-area-inset-bottom))] max-md:sticky max-md:bottom-0 max-md:bg-surface-950 max-md:gap-2 flex items-center ${
             compact ? "flex-col gap-2" : "gap-1"
           }`}
         >
@@ -492,7 +513,8 @@ export function WorkspaceSidebar(props: Props) {
           <button
             onClick={props.onSettings}
             {...tourAnchor(TOUR_ANCHORS.sidebarSettings)}
-            className="w-8 h-8 shrink-0 flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer rounded-md transition-colors"
+            // A phone's row reads as Muse's: settings, search, then a new session.
+            className="w-8 h-8 shrink-0 flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer rounded-md transition-colors max-md:order-first max-md:w-11 max-md:h-11 max-md:rounded-full max-md:float-control"
             title="Settings"
             aria-label="Settings"
           >
@@ -501,22 +523,45 @@ export function WorkspaceSidebar(props: Props) {
               <circle cx="12" cy="12" r="3" />
             </StrokeIcon>
           </button>
-          {/* The phone's New session is a floating pill, as Claude's app has it; wide screens keep the nav row. */}
+          {/* Wide screens keep Search and New session in the nav rows above the list. */}
+          {!compact && props.onOpenPalette && (
+            <button
+              type="button"
+              onClick={props.onOpenPalette}
+              {...tourAnchor(TOUR_ANCHORS.topbar)}
+              data-testid="sidebar-search-pill"
+              className="md:hidden flex-1 min-w-0 h-11 px-4 flex items-center gap-2 rounded-full float-control text-[15px] text-text-dim cursor-pointer active:scale-[0.98] transition-transform"
+            >
+              <Search className="size-[18px] shrink-0" strokeWidth={1.75} aria-hidden />
+              Search
+            </button>
+          )}
           {!compact && (
             <button
               type="button"
               onClick={() => props.onNew()}
               disabled={offline}
+              aria-label="New session"
+              title="New session"
               {...tourAnchor(TOUR_ANCHORS.dashboardNewSession)}
               data-testid="sidebar-new-session-pill"
-              className="md:hidden ml-auto inline-flex items-center gap-2 h-12 px-5 rounded-full bg-text-primary text-surface-950 text-[15px] font-semibold shadow-[0_1px_2px_rgb(0_0_0/0.3),0_12px_28px_-8px_rgb(0_0_0/0.7)] cursor-pointer active:scale-[0.97] transition-transform disabled:opacity-40"
+              className="md:hidden w-11 h-11 shrink-0 flex items-center justify-center rounded-full bg-text-primary text-surface-950 shadow-[0_1px_2px_rgb(0_0_0/0.3),0_10px_24px_-8px_rgb(0_0_0/0.7)] cursor-pointer active:scale-95 transition-transform disabled:opacity-40"
             >
-              <PlusIcon size={16} />
-              New session
+              <SquarePen className="size-[19px]" strokeWidth={1.9} aria-hidden />
             </button>
           )}
         </div>
       </div>
+      {props.drawer && open && (
+        // The pushed Session's edge: a tap closes the drawer, as in Muse.
+        <button
+          type="button"
+          aria-label="Close sessions"
+          data-testid="sidebar-drawer-scrim"
+          onClick={() => props.onOpenChange(false)}
+          className="md:hidden fixed inset-y-0 right-0 left-[var(--aoe-drawer-w)] z-40 cursor-pointer"
+        />
+      )}
       {/* Hidden with the panel so no dead drag bar lingers when the sidebar is closed. On a touch screen the
          pseudo-element widens the hit area outward, clear of the rows, and touch-action lets it drag instead of scroll. */}
       <div

@@ -67,7 +67,7 @@ test.describe("Mobile session view tabs (#1452)", () => {
     await openLiveTerminal(page, { mobile: true, settings: null });
     const viewport = page.viewportSize()!;
     await expectPhoneView(page, "Agent");
-    await page.getByRole("button", { name: "More options" }).click();
+    await page.locator("header").getByRole("button", { name: "More options" }).click();
     // More panes shows only with something to hold, such as another Session's shell.
     await expect(page.getByRole("menuitemradio")).toHaveText(["Agent", "Terminal", "Diff", "Files"]);
     await expect(page.getByRole("menuitemradio", { name: "Agent" })).toHaveAttribute("aria-checked", "true");
@@ -75,28 +75,36 @@ test.describe("Mobile session view tabs (#1452)", () => {
     // The header holds no panels toggle: the ⋯ replaces it.
     await expect(page.getByRole("button", { name: "Toggle panels" })).toHaveCount(0);
 
-    // A swipe left raises nothing; a swipe right goes back to the session list.
+    // A swipe left raises nothing; a swipe right opens the session drawer, and a swipe left closes it.
     const y = viewport.height / 2;
+    const drawer = page.getByTestId("sidebar-new-session-pill");
     await swipe(page, viewport.width / 2 + 80, viewport.width / 2 - 80, y);
     await expect(picker(page)).toBeHidden();
-    await expect(page.getByTestId("topbar-back")).toBeVisible();
+    await expect(drawer).not.toBeInViewport();
     await swipe(page, viewport.width / 2 - 80, viewport.width / 2 + 80, y);
-    await expect(page.getByTestId("sidebar-new-session-pill")).toBeInViewport();
-    await expect(page.getByTestId("topbar-back")).toHaveCount(0);
+    await expect(drawer).toBeInViewport();
+    await expect(page.getByTestId("sidebar-drawer-scrim")).toBeVisible();
+    await swipe(page, viewport.width / 2 + 80, viewport.width / 2 - 80, y);
+    await expect(drawer).not.toBeInViewport();
+    // A tap on the pushed Session's edge closes it too.
+    await page.getByTestId("topbar-menu").click();
+    await expect(drawer).toBeInViewport();
+    await page.getByTestId("sidebar-drawer-scrim").click();
+    await expect(drawer).not.toBeInViewport();
   });
 
-  test("a swipe right goes back even with the sidebar set to the right, or left open on a wider screen", async ({
-    page,
-  }) => {
-    await page.setViewportSize({ width: 1024, height: 844 });
+  test("the drawer opens from the left with a swipe right even with the sidebar set to the right", async ({ page }) => {
     await openLiveTerminal(page, { mobile: true, settings: { sidebarSide: "right" } });
-    await page.setViewportSize({ width: 390, height: 844 });
-    await expect(page.getByTestId("topbar-back")).toBeVisible();
+    await expect(page.getByTestId("topbar-menu")).toBeVisible();
     await swipe(page, 195 - 80, 195 + 80, 422);
-    await expect(page.getByTestId("sidebar-new-session-pill")).toBeInViewport();
+    const pill = page.getByTestId("sidebar-new-session-pill");
+    await expect(pill).toBeInViewport();
+    await expect
+      .poll(async () => (await page.getByRole("navigation", { name: "Sessions sidebar" }).boundingBox())?.x)
+      .toBe(0);
   });
 
-  test("adjusting selected chat text neither raises More nor goes back", async ({ page }) => {
+  test("adjusting selected chat text neither raises More nor opens the drawer", async ({ page }) => {
     await openLiveTerminal(page, { mobile: true, settings: null });
     const content = liveContent(page).first();
     await expect(content).toContainText("$ ready");
@@ -116,15 +124,15 @@ test.describe("Mobile session view tabs (#1452)", () => {
     ]) {
       await swipe(page, from, to, height / 2);
       await expect(picker(page)).toBeHidden();
-      await expect(page.getByTestId("topbar-back")).toBeVisible();
+      await expect(page.getByTestId("sidebar-new-session-pill")).not.toBeInViewport();
       expect(await page.evaluate(() => document.getSelection()?.toString())).toBe(selected);
     }
     await page.evaluate(() => document.getSelection()?.removeAllRanges());
     await swipe(page, width / 2 - 80, width / 2 + 80, height / 2);
-    await expect(page.getByTestId("topbar-back")).toHaveCount(0);
+    await expect(page.getByTestId("sidebar-new-session-pill")).toBeInViewport();
   });
 
-  test("Terminal promotes the paired terminal, survives the keyboard, and back returns to the agent", async ({
+  test("Terminal promotes the paired terminal, survives the keyboard, and stays mounted behind the agent", async ({
     page,
   }) => {
     await openLiveTerminal(page, { mobile: true, settings: { mobileFontSize: 10 } });
@@ -141,8 +149,8 @@ test.describe("Mobile session view tabs (#1452)", () => {
       })
       .toBeGreaterThan(150);
 
-    // Back returns to the agent first: the paired shell stays mounted, keeping its PTY and scrollback.
-    await page.getByTestId("topbar-back").click();
+    // Back to the agent: the paired shell stays mounted, keeping its PTY and scrollback.
+    await pickPhoneView(page, "Agent");
     await expectPhoneView(page, "Agent");
     await expect(paired).toHaveCount(1);
     await expect(liveTerminal(page)).toBeVisible();
@@ -200,7 +208,7 @@ test.describe("Mobile agent pane", () => {
   test("no touch toolbar without a session; the agent pane renders the live view, not xterm", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
+    await expect(page.getByRole("navigation", { name: "Sessions sidebar" })).toBeVisible();
     await expect(page.getByRole("button", { name: /Arrow/ })).toHaveCount(0);
 
     await openLiveSession(page, handle, { mobile: true, settings: null });

@@ -37,12 +37,12 @@ export async function dragSidebarHandle(page: Page, ...xs: number[]) {
   await page.mouse.up();
 }
 
-/** Show the phone's session list, its home screen: from an open Session, back returns to it. */
+/** Show the phone's session list: the home screen, or with a Session open the drawer ☰ opens. */
 export async function openMobileSidebar(page: Page) {
-  const back = page.getByTestId("topbar-back");
+  const menu = page.getByTestId("topbar-menu");
   const row = page.getByTestId("sidebar-session-row").first();
-  await expect(back.or(row).first()).toBeVisible({ timeout: 10_000 });
-  if (await back.isVisible()) await back.click();
+  await expect(menu.or(row).first()).toBeVisible({ timeout: 10_000 });
+  if (await menu.isVisible()) await menu.click();
   await page.waitForFunction(
     () => {
       const r = document.querySelector('[data-testid="sidebar-session-row"]')?.getBoundingClientRect();

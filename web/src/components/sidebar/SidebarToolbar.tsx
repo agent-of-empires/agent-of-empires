@@ -1,4 +1,5 @@
-import { Search } from "lucide-react";
+import type { ReactNode } from "react";
+import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
 import type { SidebarAxis } from "../../lib/sidebarAxis";
 import { SidebarViewMenu } from "./SidebarViewMenu";
 import type { SidebarSortMode } from "../../lib/sidebarSort";
@@ -30,7 +31,8 @@ export function SidebarToolbar({
   onToggleFacets,
   filterOpen,
   onToggleFilter,
-  onSearch,
+  headingAnchored = false,
+  phoneMenu,
 }: {
   compact: boolean;
   axis: SidebarAxis;
@@ -46,34 +48,28 @@ export function SidebarToolbar({
   onToggleFacets: () => void;
   filterOpen: boolean;
   onToggleFilter: () => void;
-  /** Opens the command palette from the phone title row's Search button. */
-  onSearch?: () => void;
+  /** The title carries the tour's sidebar step, for a list that fills the screen. */
+  headingAnchored?: boolean;
+  /** The app's ⋯, which a phone's title row carries. */
+  phoneMenu?: ReactNode;
 }) {
   const axisHeading = AXIS_HEADING[axis];
   return (
-    <div className={`${compact ? "px-1" : "pl-4 pr-2"} pt-4 pb-1 max-md:pb-2 flex items-center`}>
+    <div
+      className={`${compact ? "px-1" : "pl-4 pr-2"} pt-4 pb-1 max-md:pt-3 max-md:pb-2 max-md:pr-3 max-md:sticky max-md:top-0 max-md:z-10 max-md:bg-surface-950 flex items-center`}
+    >
       {compact ? (
         <span className="flex-1" />
       ) : (
         <>
           {/* A phone titles the drawer large, as Claude's app does; wide screens keep a quiet label. */}
           <span
+            {...(headingAnchored ? tourAnchor(TOUR_ANCHORS.sidebar) : {})}
             data-testid="sidebar-axis-heading"
             className="text-[12px] font-medium text-text-dim max-md:text-[22px] max-md:font-semibold max-md:text-text-primary flex-1"
           >
             {axisHeading}
           </span>
-          {onSearch && (
-            <button
-              type="button"
-              onClick={onSearch}
-              aria-label="Search"
-              data-testid="sidebar-search-round"
-              className="md:hidden w-10 h-10 mr-2 flex items-center justify-center rounded-full float-control text-text-secondary cursor-pointer active:scale-95 transition-transform"
-            >
-              <Search className="size-[18px]" strokeWidth={1.75} aria-hidden />
-            </button>
-          )}
           <SidebarViewMenu
             axis={axis}
             onAxisChange={onAxisChange}
@@ -89,6 +85,7 @@ export function SidebarToolbar({
             facetOpen={facetOpen}
             onToggleFacets={onToggleFacets}
           />
+          {phoneMenu && <div className="md:hidden ml-2">{phoneMenu}</div>}
         </>
       )}
     </div>

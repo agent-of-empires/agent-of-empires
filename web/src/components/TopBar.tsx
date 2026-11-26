@@ -1,9 +1,10 @@
 import { useMemo } from "react";
-import { ChevronLeft, Folder, LayoutGrid, type LucideIcon } from "lucide-react";
+import { Folder, LayoutGrid, Menu, type LucideIcon } from "lucide-react";
 import type { RightPanelView } from "../lib/rightPanelView";
 import type { SessionResponse, Workspace } from "../lib/types";
 import { PaletteTriggerPill } from "./PaletteTriggerPill";
 import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
+import { appMenuItems } from "../lib/appMenu";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { PluginHeaderStartSegments, PluginStatusBarSegments } from "./plugin/PluginSlots";
 import { PluginPageButtons } from "./plugin/PluginPageButtons";
@@ -103,16 +104,10 @@ export function TopBar({
   sidebarColumnVisible,
   rightColumnVisible,
 }: Props) {
-  const overflowItems = useMemo<OverflowItem[]>(() => {
-    const items: OverflowItem[] = [
-      { label: "Help", onClick: onOpenHelp },
-      { label: "Show tutorial", onClick: onStartTutorial },
-      { label: "Tips", onClick: onOpenTips },
-      { label: "About", onClick: onOpenAbout },
-    ];
-    if (loginRequired) items.push({ label: "Sign out", onClick: onLogout });
-    return items;
-  }, [onOpenHelp, onStartTutorial, onOpenTips, onOpenAbout, onLogout, loginRequired]);
+  const overflowItems = useMemo<OverflowItem[]>(
+    () => appMenuItems({ onOpenHelp, onStartTutorial, onOpenTips, onOpenAbout, onLogout, loginRequired }),
+    [onOpenHelp, onStartTutorial, onOpenTips, onOpenAbout, onLogout, loginRequired],
+  );
   // A phone's menu: the Session's views, then its actions, then the app's items.
   const menuItems = useMemo<OverflowItem[]>(() => {
     const views: OverflowItem[] = (phoneViews?.choices ?? []).map(({ id, label, icon }) => ({
@@ -135,8 +130,6 @@ export function TopBar({
       group.map((item, i) => (g > 0 && i === 0 ? { ...item, separated: true } : item)),
     );
   }, [phoneViews, sessionItems, overflowItems]);
-  const phoneView =
-    phoneViews?.label !== undefined ? { label: phoneViews.label, onBack: () => phoneViews.onPick("agent") } : undefined;
   const phoneSession = !!activeSession && !onExitFocusMode;
 
   // The left zone only borrows the sidebar's width while that column is visible, so the compact rail only crowds
@@ -160,21 +153,15 @@ export function TopBar({
         }`}
       >
         {phoneSession && (
-          // A Session opens over the list on a phone; back returns to it, carrying the list's attention counts.
+          // A phone opens the session list as a drawer from here, as Muse and Claude's app do, carrying its counts.
           <button
-            onClick={phoneView ? phoneView.onBack : onGoDashboard}
-            aria-label={
-              phoneView
-                ? "Back to agent"
-                : waitingCount > 0
-                  ? `Back to sessions, ${waitingCount} waiting for your input`
-                  : "Back to sessions"
-            }
-            data-testid="topbar-back"
+            onClick={onToggleSidebar}
+            aria-label={waitingCount > 0 ? `Show sessions, ${waitingCount} waiting for your input` : "Show sessions"}
+            data-testid="topbar-menu"
             className="md:hidden relative w-10 h-10 flex items-center justify-center shrink-0 rounded-full float-control text-text-secondary cursor-pointer active:scale-95 transition-transform"
           >
-            <ChevronLeft className="size-5" strokeWidth={1.75} aria-hidden />
-            {!phoneView && waitingCount + unreadCount > 0 && (
+            <Menu className="size-5" strokeWidth={1.75} aria-hidden />
+            {waitingCount + unreadCount > 0 && (
               <span
                 aria-hidden="true"
                 className="absolute -top-0.5 -right-0.5 min-w-[1.1rem] rounded-full px-1 text-[10px] font-semibold leading-[1.1rem] tabular-nums text-center shadow"
@@ -312,8 +299,8 @@ export function TopBar({
                 {activeSession.title}
               </span>
               <span className="max-w-full truncate text-[11px] text-text-dim">
-                {phoneView
-                  ? `${phoneView.label} · ${projectName(activeSession.project_path)}`
+                {phoneViews?.label
+                  ? `${phoneViews.label} · ${projectName(activeSession.project_path)}`
                   : projectName(activeSession.project_path)}
               </span>
             </div>

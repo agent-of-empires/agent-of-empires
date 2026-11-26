@@ -175,7 +175,6 @@ import { SnoozeModal } from "./components/sidebar/SnoozeModal";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
 import { StopSessionDialog } from "./components/StopSessionDialog";
 import { SwitchViewDialog } from "./components/SwitchViewDialog";
-import { TopBar } from "./components/TopBar";
 import { AppShellSkeleton, MainPaneSkeleton } from "./components/AppShellSkeleton";
 import { TrashReadFailed } from "./components/TrashReadFailed";
 import { ContentSplit } from "./components/ContentSplit";
@@ -225,7 +224,8 @@ import { FilesPane } from "./components/FilesPane";
 import { FileContentViewer } from "./components/diff/FileContentViewer";
 import { MainViewTabs } from "./components/MainViewTabs";
 import type { OverflowItem } from "./components/OverflowMenu";
-import type { PhoneViewChoice } from "./components/TopBar";
+import { TopBar, type PhoneViewChoice } from "./components/TopBar";
+import { appMenuItems } from "./lib/appMenu";
 import { MAIN_VIEW_IDS } from "./lib/mainViewIds";
 import { DiffScopeContext, loadDiffScope, saveDiffScope, type DiffScope, type DiffScopeState } from "./lib/diffScope";
 import { PairedShellPane, ShellModeToggle } from "./components/PairedTerminal";
@@ -436,6 +436,10 @@ const SESSION_STATE_FEATURE: Partial<Record<SessionStateAction, FeatureUse>> = {
 };
 
 /** Composes the authenticated dashboard and synchronizes its user-scoped UI state. */
+/** The phone drawer pushes the Session aside on the iOS sheet curve; reduced motion skips it. */
+const PUSH_MOTION =
+  "max-md:transition-[translate,border-radius] max-md:duration-[400ms] max-md:ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none";
+
 function AppContent({
   loginRequired,
   onLogout,
@@ -1966,18 +1970,17 @@ function AppContent({
   const handleDrawerSwipe = useCallback(
     (action: DrawerSwipeAction) => {
       // Phones have no sidebar drawer: the opening swipe goes back from a Session to the list.
-      if (action === "open-sidebar") {
-        if (focusMode || !activeSession) return;
-        if (rightPanelView !== "agent") handlePickView("agent");
-        else handleGoDashboard();
+      // With no Session open the list is the whole screen, so there is no drawer to move.
+      if (action === "open-sidebar" || action === "close-sidebar") {
+        if (!focusMode && activeSession) setSidebarOpen(action === "open-sidebar");
       } else if (action === "close-panels") setPickerOpen(false);
     },
-    [focusMode, activeSession, rightPanelView, handlePickView, handleGoDashboard],
+    [focusMode, activeSession],
   );
   useDrawerSwipe(
     {
-      // A phone has no sidebar drawer: a swipe right always goes back, whichever side the desktop sidebar takes.
-      sidebarOpen: singlePane ? false : sidebarOpen,
+      // A phone's session drawer is always on the left, as Muse and Claude's app have it.
+      sidebarOpen,
       sidebarSide: singlePane ? "left" : webSettings.sidebarSide,
       panelsOpen: pickerOpen,
       // More panes opens from the header's ⋯; a sideways swipe raising a bottom sheet is no gesture people expect.
@@ -2130,21 +2133,17 @@ function AppContent({
   }, [attentionJump, activeSessionId, handleSelectSession]);
 
   const handleFocusSidebar = useCallback(() => {
-    // A phone's list is a screen of its own: go back to it, landing on the Session just left.
-    const leaving = singlePane ? activeSessionId : null;
-    if (leaving) navigate("/");
-    else setSidebarOpen(true);
-    const focusRow = () => {
-      const sidebar = document.querySelector<HTMLElement>('[role="navigation"][aria-label="Sessions sidebar"]');
-      const activeRow = sidebar?.querySelector<HTMLElement>(
-        leaving ? `[href="/session/${CSS.escape(leaving)}"]` : "[data-active-session-row]",
-      );
-      const target = activeRow && activeRow.getClientRects().length > 0 ? activeRow : sidebar;
-      target?.focus();
-    };
-    // Going back re-renders the list first; wait a frame more for it.
-    requestAnimationFrame(() => (leaving ? requestAnimationFrame(focusRow) : focusRow()));
-  }, [singlePane, activeSessionId, navigate]);
+    setSidebarOpen(true);
+    // Two frames: a phone's drawer is hidden, and so unfocusable, until the opening render commits.
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        const sidebar = document.querySelector<HTMLElement>('[role="navigation"][aria-label="Sessions sidebar"]');
+        const activeRow = sidebar?.querySelector<HTMLElement>("[data-active-session-row]");
+        const target = activeRow && activeRow.getClientRects().length > 0 ? activeRow : sidebar;
+        target?.focus();
+      }),
+    );
+  }, []);
 
   useKeyboardShortcuts(
     useCallback(
@@ -2927,6 +2926,18 @@ function AppContent({
     seenKnown: tourSeenKnown,
     onSeen: handleTourSeen,
   });
+  const appMenu = useMemo(
+    () =>
+      appMenuItems({
+        onOpenHelp: handleOpenHelp,
+        onStartTutorial: tour.startTour,
+        onOpenTips: tips.open,
+        onOpenAbout: handleOpenAbout,
+        onLogout,
+        loginRequired,
+      }),
+    [handleOpenHelp, tour.startTour, tips.open, handleOpenAbout, onLogout, loginRequired],
+  );
 
   // Auto-pop the tip-of-the-day once per load, after onboarding settles, like
   // GIMP/DBeaver. Gated like the tour: only on a settled dashboard, only when a
@@ -3017,6 +3028,9 @@ function AppContent({
   // dashboard / settings / diff panes the bar is the only navigation there is.
   // A phone is a two-screen stack, as Claude's app is: the session list is home, and a Session opens over it.
   const phoneHome = singlePane && !activeSession && !fullPageView && !focusMode;
+  // With a Session open, a phone's session list is a drawer that pushes the Session aside as a card.
+  const phoneDrawer = singlePane && !!activeSession && !fullPageView && !focusMode;
+  const drawerPushed = phoneDrawer && sidebarOpen;
   const headerCollapsible =
     singlePane &&
     !fullPageView &&
@@ -3042,52 +3056,63 @@ function AppContent({
             flips, e.g. opening settings on a phone. An expanded region is a
             `1fr` grid row around a fixed-height bar, so the wrapper is inert
             for every view that cannot collapse. */}
-            <CollapsibleRegion id="conversation-header" collapsed={headerCollapsible && headerCollapsed}>
-              <TopBar
-                activeWorkspace={activeWorkspace}
-                activeSession={activeSession ?? null}
-                onToggleSidebar={handleToggleSidebar}
-                onOpenPalette={() => setShowPalette(true)}
-                terminal={
-                  caps.canUseTerminal ? { open: terminalOpen, onToggle: () => togglePaneAny("terminal") } : undefined
-                }
-                sessionItems={phoneSessionItems}
-                phoneViews={phoneViews && { ...phoneViews, onPick: handlePickView, onMore: () => setPickerOpen(true) }}
-                panels={
-                  dockPaneIds.length > 0
-                    ? {
-                        ...paneMenu,
-                        open: !rightDockCollapsed,
-                        onToggle: toggleRightDock,
-                        badge: caps.canUseDiff ? diffFiles.length : 0,
-                      }
-                    : undefined
-                }
-                onOpenHelp={handleOpenHelp}
-                onOpenAbout={handleOpenAbout}
-                onStartTutorial={tour.startTour}
-                unreadCount={unreadCount}
-                waitingCount={waitingCount}
-                attentionBadgeColors={attentionBadgeColors}
-                onLogout={onLogout}
-                loginRequired={loginRequired}
-                isOffline={!!error}
-                isDevBuild={isDebugBuild(serverAbout)}
-                onOpenTips={tips.open}
-                onGoDashboard={handleGoDashboard}
-                onExitFocusMode={focusMode ? exitFocusMode : undefined}
-                sidebarColumnVisible={!focusMode && !fullPageView && sidebarOpen}
-                rightColumnVisible={
-                  isMdUp &&
-                  !rightDockSheet &&
-                  !rightMaximized &&
-                  !fullPageView &&
-                  !!activeWorkspace &&
-                  !!activeSession &&
-                  !rightDockCollapsed
-                }
-              />
-            </CollapsibleRegion>
+            <div
+              // The phone's list is the whole screen with no Session open, and carries the app's menu itself.
+              className={`${PUSH_MOTION} ${phoneHome ? "max-md:hidden" : ""} ${
+                drawerPushed
+                  ? "max-md:translate-x-[var(--aoe-drawer-w)] max-md:rounded-tl-[28px] max-md:overflow-hidden"
+                  : ""
+              }`}
+            >
+              <CollapsibleRegion id="conversation-header" collapsed={headerCollapsible && headerCollapsed}>
+                <TopBar
+                  activeWorkspace={activeWorkspace}
+                  activeSession={activeSession ?? null}
+                  onToggleSidebar={handleToggleSidebar}
+                  onOpenPalette={() => setShowPalette(true)}
+                  terminal={
+                    caps.canUseTerminal ? { open: terminalOpen, onToggle: () => togglePaneAny("terminal") } : undefined
+                  }
+                  sessionItems={phoneSessionItems}
+                  phoneViews={
+                    phoneViews && { ...phoneViews, onPick: handlePickView, onMore: () => setPickerOpen(true) }
+                  }
+                  panels={
+                    dockPaneIds.length > 0
+                      ? {
+                          ...paneMenu,
+                          open: !rightDockCollapsed,
+                          onToggle: toggleRightDock,
+                          badge: caps.canUseDiff ? diffFiles.length : 0,
+                        }
+                      : undefined
+                  }
+                  onOpenHelp={handleOpenHelp}
+                  onOpenAbout={handleOpenAbout}
+                  onStartTutorial={tour.startTour}
+                  unreadCount={unreadCount}
+                  waitingCount={waitingCount}
+                  attentionBadgeColors={attentionBadgeColors}
+                  onLogout={onLogout}
+                  loginRequired={loginRequired}
+                  isOffline={!!error}
+                  isDevBuild={isDebugBuild(serverAbout)}
+                  onOpenTips={tips.open}
+                  onGoDashboard={handleGoDashboard}
+                  onExitFocusMode={focusMode ? exitFocusMode : undefined}
+                  sidebarColumnVisible={!focusMode && !fullPageView && sidebarOpen}
+                  rightColumnVisible={
+                    isMdUp &&
+                    !rightDockSheet &&
+                    !rightMaximized &&
+                    !fullPageView &&
+                    !!activeWorkspace &&
+                    !!activeSession &&
+                    !rightDockCollapsed
+                  }
+                />
+              </CollapsibleRegion>
+            </div>
 
             <BannerStack
               onRetryServerSettings={serverAbout ? undefined : () => void recoverServerAbout()}
@@ -3117,6 +3142,8 @@ function AppContent({
               {!fullPageView && !focusMode && (
                 <WorkspaceSidebar
                   asPage={phoneHome}
+                  drawer={phoneDrawer}
+                  menuItems={appMenu}
                   pageTop={setupBanner}
                   observedById={observedById}
                   runtimeEpoch={runtimeEpoch}
@@ -3173,7 +3200,13 @@ function AppContent({
               )}
 
               {/* The phone home is the session list, so the dashboard behind it stays out of the way. */}
-              <div className={`flex-1 flex flex-col min-h-0 min-w-0 ${phoneHome ? "max-md:hidden" : ""}`}>
+              <div
+                className={`flex-1 flex flex-col min-h-0 min-w-0 ${PUSH_MOTION} ${phoneHome ? "max-md:hidden" : ""} ${
+                  drawerPushed
+                    ? "max-md:translate-x-[var(--aoe-drawer-w)] max-md:rounded-bl-[28px] max-md:overflow-hidden"
+                    : ""
+                }`}
+              >
                 {renderContent()}
               </div>
             </div>

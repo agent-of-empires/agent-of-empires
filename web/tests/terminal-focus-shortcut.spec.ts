@@ -235,11 +235,9 @@ test.describe("Cmd/Ctrl+` mobile", () => {
     await page.keyboard.press("Control+a");
     await expect.poll(() => terminal.liveInput.some((input) => input.equals(Buffer.from([0x01])))).toBe(true);
 
-    // A phone goes back to the session list, on the row of the Session it left.
     await page.keyboard.press("Control+q");
-    await expect(page).toHaveURL(/\/$/);
     const sidebar = page.getByRole("navigation", { name: "Sessions sidebar" });
-    await expect(sidebar.getByTestId("sidebar-session-row").first()).toBeFocused();
+    await expect(sidebar.locator("[data-active-session-row]")).toBeFocused();
     await observeFor(page, 250, async () => {
       expect(terminal.liveInput.some((input) => input.includes(0x11))).toBe(false);
     });

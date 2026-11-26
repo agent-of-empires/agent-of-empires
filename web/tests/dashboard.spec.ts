@@ -150,7 +150,7 @@ test.describe("Phone session stack", () => {
     await page.setViewportSize({ width: 375, height: 812 });
   });
 
-  test("the session list is home; a Session opens over it and back returns", async ({ page }) => {
+  test("the session list is home; a Session pushes it into a drawer that ☰ brings back", async ({ page }) => {
     await page.goto("/");
     await expect(page.getByTestId("sidebar-new-session-pill")).toBeInViewport();
     await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).toBeHidden();
@@ -162,13 +162,15 @@ test.describe("Phone session stack", () => {
     await expect(pill).toContainText("Alpha");
     await expect(pill).toContainText("shop");
     await expect(page.getByTestId("sidebar-new-session-pill")).toBeHidden();
-    // Beta waits elsewhere, so back carries the count.
-    const back = page.getByTestId("topbar-back");
-    await expect(back).toHaveAccessibleName("Back to sessions, 1 waiting for your input");
+    // Beta waits elsewhere, so ☰ carries the count.
+    const menu = page.getByTestId("topbar-menu");
+    await expect(menu).toHaveAccessibleName("Show sessions, 1 waiting for your input");
 
-    await back.click();
+    await menu.click();
     await expect(page.getByTestId("sidebar-new-session-pill")).toBeInViewport();
-    await expect(back).toHaveCount(0);
+    await page.getByTestId("sidebar-session-row").filter({ hasText: "Beta" }).click();
+    await expect(page).toHaveURL(/\/session\/beta$/);
+    await expect(page.getByTestId("sidebar-new-session-pill")).not.toBeInViewport();
   });
 
   test("the header's ⋯ holds the open Session's views, then its actions", async ({ page }) => {

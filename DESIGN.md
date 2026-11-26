@@ -98,11 +98,14 @@ content. It is denser and quieter than the marketing site.
 - Fixed palette colors are allowed only when hue carries meaning, such as
   status, severity, syntax, user content, third-party visualizations, and the
   brand mark.
-- Mobile prioritizes monitoring and conversation controls, after Claude's iOS
-  app: the session list is home and a Session opens over it. Controls float
-  (`float-control`: round, raised, soft shadow) over a page with no header
-  rule; menus are frosted (`glass-menu`); a Session's views switch from the header's ⋯ so the agent keeps the screen;
-  sheets replace persistent side panels.
+- Mobile prioritizes monitoring and conversation controls, after Muse and
+  Claude's iOS app: the session list is home, and with a Session open it is a
+  darker drawer that pushes the Session aside as a rounded card. Controls
+  float (`float-control`: round, raised, soft shadow) over a page with no
+  header rule; menus are frosted (`glass-menu`); a Session's views switch from
+  the header's ⋯ so the agent keeps the screen; sheets replace persistent side
+  panels. Bars at the top and bottom edges are fixed or sticky and opaque, so
+  iOS 26 tints its bars from them instead of blurring.
 - Sessions stay on the left. The right dock is the Session's review panel
   (Diff, Files, Background, plugins), with the terminal tabs stacked below
   them in the same dock, as in Conductor.

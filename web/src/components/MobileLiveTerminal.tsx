@@ -125,9 +125,12 @@ function pushFlickSample(samples: FlickSample[], sample: FlickSample) {
   while (samples.length > 1 && sample.t - samples[0]!.t > FLICK_VELOCITY_WINDOW_MS) samples.shift();
 }
 
+/** After the key event: iOS can ignore a blur made while it still handles the Enter that caused it. */
 function dismissSoftKeyboard() {
-  const el = document.activeElement;
-  if (el instanceof HTMLElement) el.blur();
+  setTimeout(() => {
+    const el = document.activeElement;
+    if (el instanceof HTMLElement) el.blur();
+  }, 0);
 }
 
 export function MobileLiveTerminal({

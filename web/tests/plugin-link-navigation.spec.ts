@@ -88,7 +88,7 @@ test.describe("Plugin UI link navigation (#4089)", () => {
     await mockApis(page, UI_ENTRIES);
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto("/");
-    // Selecting a Session leaves the phone's session list for the Session; a bare route change would not.
+    // Selecting a Session closes the phone's session drawer; a bare route change would leave it open.
     await openMobileSidebar(page);
 
     await page.getByRole("link", { name: "acme: session link", exact: true }).click();
@@ -98,7 +98,7 @@ test.describe("Plugin UI link navigation (#4089)", () => {
       .poll(() =>
         page.evaluate(() => {
           const r = document.querySelector('[data-testid="sidebar-session-row"]')?.getBoundingClientRect();
-          return r ? r.width === 0 : true;
+          return r ? r.right <= 0 : true;
         }),
       )
       .toBe(true);

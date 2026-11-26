@@ -3,7 +3,6 @@
 import { test, expect } from "./helpers/mockedTest";
 import type { Page } from "@playwright/test";
 import { openLiveTerminal } from "./helpers/liveTerminal";
-import { openMobileSidebar } from "./helpers/sidebar";
 import { iPhone13 } from "./helpers/viewports";
 
 /** The fixed or sticky container hit at `y`, with what iOS samples from it. */
@@ -26,7 +25,7 @@ test.describe("edges an iOS 26 installed app can tint", () => {
   test("the session list and an open session paint opaque edges", async ({ page }) => {
     await openLiveTerminal(page, { mobile: true });
     for (const screen of ["session", "list"] as const) {
-      if (screen === "list") await openMobileSidebar(page);
+      if (screen === "list") await page.goto("/");
       for (const edge of ["top", "bottom"] as const) {
         const box = await edgeContainer(page, edge);
         expect(box, `${screen} ${edge}`).not.toBeNull();

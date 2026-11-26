@@ -65,10 +65,10 @@ test.describe("Command palette", () => {
     await expect(page.getByPlaceholder("Search actions, sessions, settings…")).toBeVisible();
   });
 
-  test("mobile: the session list's search button opens the palette", async ({ page }) => {
+  test("mobile: the session list's search pill opens the palette", async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 812 });
     await page.goto("/");
-    await page.getByTestId("sidebar-search-round").click();
+    await page.getByTestId("sidebar-search-pill").click();
     await expect(page.getByPlaceholder("Search actions, sessions, settings…")).toBeVisible();
   });
 

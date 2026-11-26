@@ -192,7 +192,8 @@ test.describe("resize handle and compact rail (#2288)", () => {
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto("/");
     await openMobileSidebar(page);
-    const panel = page.locator('[data-tour="sidebar"]');
+    // A CSS locator: the panel stays mounted, hidden, once the wider screen leaves it closed.
+    const panel = page.locator('[role="navigation"][aria-label="Sessions sidebar"]');
     await expect(panel).not.toHaveAttribute("data-compact", "true");
     await expect(page.locator(COUNT).first()).toBeVisible();
     expect((await panel.boundingBox())!.width).toBe(390);
