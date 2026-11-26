@@ -1,20 +1,10 @@
 //! OMP store layout resolution from launcher env, dotenv files and profiles.
 
-use super::*;
+use std::collections::HashSet;
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 
-/// Resolve OMP's host store and the native routing context used by the launch.
-pub(crate) fn resolve_omp_store_layout(
-    environment: &[String],
-    launch_cwd: &str,
-    options: &OmpCliCaptureOptions,
-) -> Result<OmpStoreLayout> {
-    resolve_omp_store_layout_with_environment(
-        host_launcher_environment(environment),
-        launch_cwd,
-        options,
-    )
-    .map(|context| context.layout)
-}
+use super::*;
 
 pub(crate) fn resolve_omp_store_layout_with_environment(
     launcher_env: HashMap<String, String>,
@@ -790,6 +780,14 @@ done"#;
 mod tests {
     use super::*;
     use crate::session::test_support::EnvGuard;
+    fn resolve_omp_store_layout(
+        entries: &[String],
+        cwd: &str,
+        options: &OmpCliCaptureOptions,
+    ) -> Result<OmpStoreLayout> {
+        resolve_omp_store_layout_with_environment(host_launcher_environment(entries), cwd, options)
+            .map(|context| context.layout)
+    }
     fn resolve_with_entries(
         entries: &[String],
         cwd: &str,

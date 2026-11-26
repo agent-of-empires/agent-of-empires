@@ -381,12 +381,7 @@ impl Instance {
                     .map_or(prime_options.is_some(), |active| {
                         matches!(active.capture, Some(CaptureContext::Prime { .. }))
                     }),
-                crate::agents::SessionCaptureBackend::Omp => {
-                    self.active_execution.as_ref().map_or_else(
-                        || self.omp_capture_options().is_some(),
-                        |active| matches!(active.capture, Some(CaptureContext::Omp(_))),
-                    )
-                }
+                crate::agents::SessionCaptureBackend::Omp => false,
                 crate::agents::SessionCaptureBackend::Pi => self.pi_sidecar_source().is_some(),
                 crate::agents::SessionCaptureBackend::Claude
                 | crate::agents::SessionCaptureBackend::ExtensionSidecar
@@ -474,22 +469,6 @@ impl Instance {
                 self.id);
             return Ok(PollerStart::NotApplicable);
         };
-        let omp_metadata = if backend == crate::agents::SessionCaptureBackend::Omp {
-            if let Some(active) = &self.active_execution {
-                match &active.capture {
-                    Some(CaptureContext::Omp(metadata)) => Some(metadata.clone()),
-                    _ => None,
-                }
-            } else {
-                let Some(options) = self.omp_capture_options() else {
-                    return Ok(PollerStart::NotApplicable);
-                };
-                self.omp_capture_metadata(&tmux_session_name, &options, None)
-            }
-        } else {
-            None
-        };
-
         let mut poller = SessionPoller::new(
             tmux_session_name,
             self.tool.clone(),
@@ -502,43 +481,6 @@ impl Instance {
                 .is_some_and(ConversationBinding::is_known)
         });
         let extra_excludes = self.retroactive_capture_excludes.clone();
-
-        if backend == crate::agents::SessionCaptureBackend::Omp {
-            let Some(metadata) = omp_metadata.as_ref() else {
-                return Ok(PollerStart::NotApplicable);
-            };
-            let container_name = match &self.active_execution {
-                Some(active) => active
-                    .container
-                    .as_ref()
-                    .map(|container| container.id.clone()),
-                None => self
-                    .sandbox_info
-                    .as_ref()
-                    .filter(|sandbox| sandbox.enabled)
-                    .map(|sandbox| sandbox.container_name.clone()),
-            };
-            let poll_fn: crate::session::poller::SessionIdPollFn =
-                if let Some(container_name) = container_name {
-                    Box::new(omp_poll_fn_sandboxed(
-                        container_name,
-                        self.id.clone(),
-                        Some(metadata.launch_marker.clone()),
-                        extra_excludes,
-                        self.active_execution.clone(),
-                    ))
-                } else {
-                    Box::new(omp_poll_fn(
-                        self.id.clone(),
-                        extra_excludes,
-                        self.active_execution.clone(),
-                    ))
-                };
-            let on_change = log_observed_session_id(&self.id);
-            let initial = initial_known.map(|sid| metadata.session_observation(sid));
-            let spawn = poller.start_observations(instance_id, poll_fn, on_change, initial);
-            return Ok(self.install_poller(poller, spawn));
-        }
 
         if backend == crate::agents::SessionCaptureBackend::Pi {
             let Some(source) = self.pi_sidecar_source() else {

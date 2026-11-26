@@ -56,7 +56,6 @@ struct Update {
     expected_prior: ConversationState,
     profile: String,
     observation: SessionIdObservation,
-    confirms_omp_pin: bool,
 }
 
 struct Rollback {
@@ -192,23 +191,19 @@ fn drain_and_persist_session_ids_inner(
             filtered_ids.insert(inst.id.clone());
             continue;
         };
-        let confirms_omp_pin = observation.confirms_omp_pin(&inst.resume_intent);
         if observation.execution != inst.active_execution {
             acknowledge_poller_observation(inst, &observation);
-            if !(inst.tool == "omp"
-                && matches!(&inst.resume_intent, ResumeIntent::Use(pinned) if pinned == &sid)
-                && !confirms_omp_pin)
-            {
-                filtered_ids.insert(inst.id.clone());
-            }
+            filtered_ids.insert(inst.id.clone());
             continue;
         }
-        // Unguarded and legacy filesystem scans from a stopped session can
-        // belong to a peer sharing the cwd. A generation-typed OMP result is
-        // bound to the exact old pane and must remain eligible for the
-        // restart's post-join final flush.
+        // A filesystem scan from a stopped session can belong to a peer sharing
+        // the cwd. A sidecar read names this pane, and a restart's final flush
+        // must stay eligible.
         if matches!(inst.status, Status::Stopped)
-            && !matches!(&observation.guard, SessionIdGuard::OmpGeneration(_))
+            && !matches!(
+                &observation.guard,
+                crate::session::poller::SessionIdGuard::InstanceSidecar { .. }
+            )
             && inst.agent_session_id.as_deref() != Some(sid.as_str())
         {
             tracing::debug!(
@@ -238,62 +233,40 @@ fn drain_and_persist_session_ids_inner(
                 continue;
             }
         }
-        if inst.tool == "omp"
-            && matches!(&inst.resume_intent, ResumeIntent::Use(pinned) if pinned == &sid)
-            && !confirms_omp_pin
-        {
+        // Never adopt an id another instance already owns: that is the
+        // same-cwd cross-assignment drift itself (#2708 symptom 1).
+        if sid_owners.get(sid.as_str()).is_some_and(|owners| {
+            owners.iter().any(|(owner, key)| {
+                *owner != inst.id.as_str()
+                    && match (*key, observation.conversation_key()) {
+                        (Some(peer), Some(captured)) => peer == captured,
+                        _ => true,
+                    }
+            })
+        }) {
+            tracing::warn!(
+                target: "session.sync",
+                instance = %inst.id,
+                sid = %sid,
+                "Ignoring poller-reported sid already owned by another instance",
+            );
+            acknowledge_poller_observation(inst, &observation);
+            filtered_ids.insert(inst.id.clone());
+            continue;
+        }
+        if inst.is_capture_excluded(&sid, observation.source()) {
             tracing::debug!(
                 target: "session.sync",
                 instance = %inst.id,
                 sid = %sid,
-                "Ignoring OMP observation without current typed generation",
+                "Ignoring poller-reported sid: in retroactive_capture_excludes",
             );
             acknowledge_poller_observation(inst, &observation);
-            // A non-generation OMP pin rejection is terminal but not a state transition.
+            filtered_ids.insert(inst.id.clone());
             continue;
         }
-        // A guarded pin confirmation does not claim a new sid. Its disk CAS
-        // verifies that this row already owns it, so stale in-memory ownership
-        // and capture exclusions must not mask the launch confirmation.
-        if !confirms_omp_pin {
-            // Never adopt an id another instance already owns: that is the
-            // same-cwd cross-assignment drift itself (#2708 symptom 1).
-            if sid_owners.get(sid.as_str()).is_some_and(|owners| {
-                owners.iter().any(|(owner, key)| {
-                    *owner != inst.id.as_str()
-                        && match (*key, observation.conversation_key()) {
-                            (Some(peer), Some(captured)) => peer == captured,
-                            _ => true,
-                        }
-                })
-            }) {
-                tracing::warn!(
-                    target: "session.sync",
-                    instance = %inst.id,
-                    sid = %sid,
-                    "Ignoring poller-reported sid already owned by another instance",
-                );
-                acknowledge_poller_observation(inst, &observation);
-                filtered_ids.insert(inst.id.clone());
-                continue;
-            }
-            if inst.is_capture_excluded(&sid, observation.source()) {
-                tracing::debug!(
-                    target: "session.sync",
-                    instance = %inst.id,
-                    sid = %sid,
-                    "Ignoring poller-reported sid: in retroactive_capture_excludes",
-                );
-                acknowledge_poller_observation(inst, &observation);
-                filtered_ids.insert(inst.id.clone());
-                continue;
-            }
-        }
         let same_binding = observation_matches_conversation(inst, &observation, &sid);
-        if inst.agent_session_id.as_deref() == Some(sid.as_str())
-            && same_binding
-            && !confirms_omp_pin
-        {
+        if inst.agent_session_id.as_deref() == Some(sid.as_str()) && same_binding {
             // The pane published the id this row already holds, so there is no sid to write.
             already_current.push((inst.id.clone(), observation));
             continue;
@@ -304,7 +277,6 @@ fn drain_and_persist_session_ids_inner(
             expected_prior: inst.conversation_state(),
             profile: inst.source_profile.clone(),
             observation,
-            confirms_omp_pin,
         });
     }
 
@@ -319,9 +291,6 @@ fn drain_and_persist_session_ids_inner(
         let mut qualified: HashMap<&str, usize> = HashMap::new();
         let mut unqualified: HashMap<&str, usize> = HashMap::new();
         for update in &updates {
-            if update.confirms_omp_pin {
-                continue;
-            }
             match update.observation.conversation_key() {
                 Some(key) => {
                     *per_conversation
@@ -337,9 +306,6 @@ fn drain_and_persist_session_ids_inner(
         updates
             .iter()
             .filter(|update| {
-                if update.confirms_omp_pin {
-                    return false;
-                }
                 let sid = update.sid.as_str();
                 match update.observation.conversation_key() {
                     // Only another claim on the very same conversation competes with this one.
@@ -400,41 +366,33 @@ fn drain_and_persist_session_ids_inner(
     let mut capture_generations: Vec<(String, u64)> = Vec::with_capacity(updates.len());
     for update in &updates {
         let persisted = stores.with_store(&update.profile, |storage| {
-            let ownership =
-                if matches!(stores, CaptureStorage::Scoped(_)) || update.confirms_omp_pin {
-                    None
-                } else {
-                    let lock = storage
-                        .storage()
-                        .acquire_instance_lifecycle_lock(&update.id)?;
-                    let generation = storage.update(|instances, _| {
-                        let instance = instances
-                            .iter_mut()
-                            .find(|instance| instance.id == update.id)
-                            .ok_or(crate::session::LifecycleReservationError::Superseded)?;
-                        instance
-                            .try_acquire_lifecycle_reservation(
-                                crate::session::LifecycleOperation::Capture,
-                                Instance::LIFECYCLE_RESERVATION_TTL,
-                                crate::time::Timestamp::now(),
-                            )
-                            .map_err(anyhow::Error::from)
-                    })?;
-                    Some((lock, generation))
-                };
-            let result = if update.confirms_omp_pin {
-                let SessionIdGuard::OmpGeneration(generation) = &update.observation.guard else {
-                    unreachable!("OMP pin confirmations require a generation guard");
-                };
-                Instance::persist_omp_pin_confirmation(storage, &update.id, &update.sid, generation)
+            let ownership = if matches!(stores, CaptureStorage::Scoped(_)) {
+                None
             } else {
-                persist_conversation_observation_to_store(
-                    storage,
-                    &update.id,
-                    &update.observation,
-                    &update.expected_prior,
-                )
+                let lock = storage
+                    .storage()
+                    .acquire_instance_lifecycle_lock(&update.id)?;
+                let generation = storage.update(|instances, _| {
+                    let instance = instances
+                        .iter_mut()
+                        .find(|instance| instance.id == update.id)
+                        .ok_or(crate::session::LifecycleReservationError::Superseded)?;
+                    instance
+                        .try_acquire_lifecycle_reservation(
+                            crate::session::LifecycleOperation::Capture,
+                            Instance::LIFECYCLE_RESERVATION_TTL,
+                            crate::time::Timestamp::now(),
+                        )
+                        .map_err(anyhow::Error::from)
+                })?;
+                Some((lock, generation))
             };
+            let result = persist_conversation_observation_to_store(
+                storage,
+                &update.id,
+                &update.observation,
+                &update.expected_prior,
+            );
             if let Some((_lock, generation)) = ownership {
                 storage.update(|instances, _| {
                     let instance = instances
@@ -524,10 +482,6 @@ fn drain_and_persist_session_ids_inner(
         if let Some(inst) = instances.iter_mut().find(|i| i.id == update.id) {
             inst.apply_conversation_observation(&update.observation);
             inst.resume_probe_failed_sid = failed_sid.take();
-            if update.confirms_omp_pin {
-                inst.resume_intent = ResumeIntent::Default;
-                inst.resume_binding = None;
-            }
             // The conversation CAS already stored a path that names the same file.
             let path_committed_with_sid = matches!(
                 &update.observation.guard,
@@ -544,9 +498,7 @@ fn drain_and_persist_session_ids_inner(
     }
     for rb in &to_rollback {
         if let Some(inst) = instances.iter_mut().find(|i| i.id == rb.id) {
-            let update = updates
-                .iter()
-                .find(|update| update.id == rb.id && !update.confirms_omp_pin);
+            let update = updates.iter().find(|update| update.id == rb.id);
             let stale_same_sid = update.is_some_and(|update| {
                 rb.conversation.session_id.as_deref() == Some(update.sid.as_str())
                     && update.observation.execution != rb.conversation.active
@@ -815,8 +767,6 @@ fn persist_conversation_observation_to_store(
     observation: &SessionIdObservation,
     expected: &ConversationState,
 ) -> anyhow::Result<CaptureCommit> {
-    use crate::session::poller::SessionIdGuard;
-
     let session_id = observation.sid.as_str();
     if validated_session_id(session_id.to_string()).is_none() {
         return Ok(CaptureCommit::unapplied(SidWrite::Failed));
@@ -837,17 +787,6 @@ fn persist_conversation_observation_to_store(
             || matches!(instance.resume_intent, ResumeIntent::Fork { .. })
         {
             return Ok(CaptureCommit::unapplied(SidWrite::Skipped));
-        }
-        match &observation.guard {
-            SessionIdGuard::OmpGeneration(generation)
-                if instance.omp_capture_generation.as_ref() != Some(generation) =>
-            {
-                return Ok(CaptureCommit::unapplied(SidWrite::Skipped))
-            }
-            SessionIdGuard::OmpLegacy if instance.omp_capture_generation.is_some() => {
-                return Ok(CaptureCommit::unapplied(SidWrite::Skipped))
-            }
-            _ => {}
         }
         if let ResumeIntent::Use(pinned) = &instance.resume_intent {
             if pinned != session_id {
@@ -881,28 +820,16 @@ fn persist_conversation_observation_to_store(
                     )
                 }))
         });
-        // Read before the conflict verdict: a pin confirmation is not a fresh
-        // claim, so it keeps the retryable outcome instead of becoming one.
-        let confirms_pin = observation.confirms_omp_pin(&instance.resume_intent);
         if conflict {
             // A peer durably owns this sid, so the publication is a conflict to
-            // retry rather than a divergence to abandon. A pin confirmation is
-            // exempt: the row armed the pin and must be able to re-prove it.
-            return Ok(CaptureCommit::unapplied(if confirms_pin {
-                SidWrite::Skipped
-            } else {
-                SidWrite::OwnershipConflict
-            }));
+            // retry rather than a divergence to abandon.
+            return Ok(CaptureCommit::unapplied(SidWrite::OwnershipConflict));
         }
         let new_conversation = instance.agent_session_id.as_deref() != Some(session_id);
         let instance = &mut instances[index];
         instance.apply_conversation_observation(observation);
         if new_conversation {
             instance.resume_probe_failed_sid = None;
-        }
-        if confirms_pin {
-            instance.resume_intent = ResumeIntent::Default;
-            instance.resume_binding = None;
         }
         Ok(CaptureCommit {
             outcome: SidWrite::Applied,
@@ -1050,471 +977,6 @@ mod tests {
         poller.inject_test_update(&inst.id, sid);
         inst.capture_poller
             .set_handle(Some(Arc::new(Mutex::new(poller))));
-    }
-
-    fn attach_poller_with_omp_update(inst: &mut Instance, sid: &str, generation: &str) {
-        let poller = SessionPoller::new(
-            format!("test-tmux-{}", inst.id),
-            inst.tool.clone(),
-            inst.active_execution.clone(),
-        );
-        let mut observation = crate::session::poller::SessionIdObservation::omp(
-            sid.to_owned(),
-            generation.to_owned(),
-        );
-        observation.execution = inst.active_execution.clone();
-        if let Some(binding) = inst
-            .active_execution
-            .as_ref()
-            .map(|active| active.binding.clone())
-        {
-            observation.scope_to(binding);
-        }
-        poller.inject_test_observation(&inst.id, observation);
-        inst.capture_poller
-            .set_handle(Some(Arc::new(Mutex::new(poller))));
-    }
-
-    fn attach_poller_with_legacy_omp_update(inst: &mut Instance, sid: &str) {
-        let poller = SessionPoller::new(
-            format!("test-tmux-{}", inst.id),
-            inst.tool.clone(),
-            inst.active_execution.clone(),
-        );
-        poller.inject_test_omp_legacy_update(&inst.id, sid);
-        inst.capture_poller
-            .set_handle(Some(Arc::new(Mutex::new(poller))));
-    }
-
-    fn pinned_omp_instance(profile: &str, sid: &str, generation: &str) -> Instance {
-        let mut inst = Instance::new("omp-pin-title", "/tmp/x");
-        inst.source_profile = profile.to_string();
-        inst.tool = "omp".to_string();
-        inst.agent_session_id = Some(sid.to_string());
-        inst.resume_intent = ResumeIntent::Use(sid.to_string());
-        inst.omp_capture_generation = Some(generation.to_string());
-        let execution = crate::session::ExecutionBinding {
-            agent: "omp".into(),
-            stores: vec!["/native-omp-store".into()],
-            configuration: Vec::new(),
-            cwd: "/tmp/x".into(),
-            cwd_filesystem: "host".into(),
-            filesystem: "host".into(),
-            exported_default_store: None,
-        };
-        let binding = crate::session::ConversationBinding {
-            session_id: sid.into(),
-            execution: Some(execution.clone()),
-            provenance: crate::session::ConversationProvenance::Observed,
-            transcript_path: None,
-        };
-        inst.agent_session_binding = Some(binding.clone());
-        inst.resume_binding = Some(crate::session::ConversationBinding {
-            provenance: crate::session::ConversationProvenance::Asserted,
-            ..binding
-        });
-        inst.active_execution = Some(crate::session::instance::ActiveExecution {
-            launch_id: uuid::Uuid::new_v4().to_string(),
-            binding: execution,
-            capture: None,
-            container: None,
-        });
-        inst
-    }
-
-    #[test]
-    #[serial]
-    fn exact_omp_generation_confirmation_consumes_pin_idempotently() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-        let profile = "sync-omp-pin-exact";
-        let sid = "019342ab-1234-7def-8901-abcdef012340";
-        let generation = "launch-exact";
-        let mut inst = pinned_omp_instance(profile, sid, generation);
-        seed_instance_on_disk(profile, &inst);
-        attach_poller_with_omp_update(&mut inst, sid, generation);
-
-        let file_watch = FileWatchService::noop();
-        let mut instances = vec![inst];
-        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
-
-        assert_eq!(outcome.applied, vec![instances[0].id.clone()]);
-        assert_eq!(instances[0].resume_intent, ResumeIntent::Default);
-        let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
-        assert_eq!(disk[0].resume_intent, ResumeIntent::Default);
-        let acknowledged = drain_and_persist_session_ids(&mut instances, &file_watch);
-        assert!(!acknowledged.touched());
-
-        attach_poller_with_omp_update(&mut instances[0], sid, generation);
-        let repeated = drain_and_persist_session_ids(&mut instances, &file_watch);
-        assert!(!repeated.touched());
-        let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
-        assert_eq!(disk[0].resume_intent, ResumeIntent::Default);
-    }
-
-    #[test]
-    #[serial]
-    fn stale_omp_generation_does_not_consume_pin() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-        let profile = "sync-omp-pin-stale";
-        let sid = "019342ab-1234-7def-8901-abcdef012341";
-        let mut inst = pinned_omp_instance(profile, sid, "launch-current");
-        seed_instance_on_disk(profile, &inst);
-        attach_poller_with_omp_update(&mut inst, sid, "launch-stale");
-
-        let file_watch = FileWatchService::noop();
-        let mut instances = vec![inst];
-        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
-
-        assert_eq!(outcome.rolled_back, vec![instances[0].id.clone()]);
-        assert_eq!(
-            instances[0].resume_intent,
-            ResumeIntent::Use(sid.to_string())
-        );
-        let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
-        assert_eq!(disk[0].resume_intent, ResumeIntent::Use(sid.to_string()));
-    }
-
-    #[test]
-    #[serial]
-    fn legacy_omp_observation_does_not_consume_pin() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-        let profile = "sync-omp-pin-legacy";
-        let sid = "019342ab-1234-7def-8901-abcdef012342";
-        let mut inst = pinned_omp_instance(profile, sid, "launch-current");
-        seed_instance_on_disk(profile, &inst);
-        attach_poller_with_legacy_omp_update(&mut inst, sid);
-
-        let mut instances = vec![inst];
-        let outcome = drain_and_persist_session_ids(&mut instances, &FileWatchService::noop());
-
-        assert!(!outcome.touched());
-        assert_eq!(
-            instances[0].resume_intent,
-            ResumeIntent::Use(sid.to_string())
-        );
-        assert_eq!(
-            Storage::new_unwatched(profile).unwrap().load().unwrap()[0].resume_intent,
-            ResumeIntent::Use(sid.to_string())
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn unguarded_observation_does_not_consume_omp_pin() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-        let profile = "sync-omp-pin-unguarded";
-        let sid = "019342ab-1234-7def-8901-abcdef012349";
-        let mut inst = pinned_omp_instance(profile, sid, "launch-current");
-        seed_instance_on_disk(profile, &inst);
-        attach_poller_with_update(&mut inst, sid);
-
-        let mut instances = vec![inst];
-        let outcome = drain_and_persist_session_ids(&mut instances, &FileWatchService::noop());
-
-        assert!(!outcome.touched());
-        assert_eq!(
-            instances[0].resume_intent,
-            ResumeIntent::Use(sid.to_string())
-        );
-        assert_eq!(
-            Storage::new_unwatched(profile).unwrap().load().unwrap()[0].resume_intent,
-            ResumeIntent::Use(sid.to_string())
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn contradictory_omp_observation_does_not_consume_pin() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-        let profile = "sync-omp-pin-mismatch";
-        let sid = "019342ab-1234-7def-8901-abcdef012343";
-        let other_sid = "019342ab-1234-7def-8901-abcdef012344";
-        let generation = "launch-current";
-        let mut inst = pinned_omp_instance(profile, sid, generation);
-        seed_instance_on_disk(profile, &inst);
-        attach_poller_with_omp_update(&mut inst, other_sid, generation);
-
-        let mut instances = vec![inst];
-        let outcome = drain_and_persist_session_ids(&mut instances, &FileWatchService::noop());
-
-        assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
-        assert_eq!(
-            instances[0].resume_intent,
-            ResumeIntent::Use(sid.to_string())
-        );
-        assert_eq!(
-            Storage::new_unwatched(profile).unwrap().load().unwrap()[0].resume_intent,
-            ResumeIntent::Use(sid.to_string())
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn omp_pin_requires_binding_and_current_typed_generation() {
-        let sid = "019342ab-1234-7def-8901-abcdef012340";
-        for case in ["unbound", "stale", "legacy"] {
-            let temp = tempdir().unwrap();
-            let _guard = storage_home_guard(&temp);
-            let profile = "sync-omp-pin-negative";
-            let mut inst = pinned_omp_instance(profile, sid, "launch-current");
-            if case == "unbound" {
-                inst.agent_session_binding = None;
-                inst.resume_binding = None;
-                inst.active_execution = None;
-            }
-            let expected = inst.conversation_state();
-            seed_instance_on_disk(profile, &inst);
-            match case {
-                "legacy" => attach_poller_with_legacy_omp_update(&mut inst, sid),
-                "stale" => attach_poller_with_omp_update(&mut inst, sid, "launch-stale"),
-                _ => attach_poller_with_omp_update(&mut inst, sid, "launch-current"),
-            }
-            let mut instances = vec![inst];
-            let outcome = drain_and_persist_session_ids(&mut instances, &FileWatchService::noop());
-            assert!(outcome.applied.is_empty(), "{case}");
-            assert_eq!(instances[0].conversation_state(), expected, "{case}");
-            assert_eq!(
-                Storage::new_unwatched(profile).unwrap().load().unwrap()[0].conversation_state(),
-                expected,
-                "{case}"
-            );
-            assert_eq!(
-                instances[0].resume_intent,
-                ResumeIntent::Use(sid.into()),
-                "{case}"
-            );
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn omp_pin_confirmation_cas_loss_retries_sticky_observation() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-        let profile = "sync-omp-pin-retry";
-        let sid = "019342ab-1234-7def-8901-abcdef012345";
-        let generation = "launch-observed";
-        let mut inst = pinned_omp_instance(profile, sid, generation);
-        let original = inst.conversation_state();
-        seed_instance_on_disk(profile, &inst);
-        let storage = Storage::new_unwatched(profile).unwrap();
-        let peer_pin = "019342ab-1234-7def-8901-abcdef012348";
-        storage
-            .update(|instances, _groups| {
-                instances[0].omp_capture_generation = Some("peer-launch".to_string());
-                instances[0].resume_intent = ResumeIntent::Use(peer_pin.to_string());
-                instances[0].resume_binding.as_mut().unwrap().session_id = peer_pin.into();
-                Ok(())
-            })
-            .unwrap();
-        attach_poller_with_omp_update(&mut inst, sid, generation);
-
-        let file_watch = FileWatchService::noop();
-        let mut instances = vec![inst];
-        let lost = drain_and_persist_session_ids(&mut instances, &file_watch);
-        assert_eq!(lost.rolled_back, vec![instances[0].id.clone()]);
-        assert_eq!(
-            instances[0].resume_intent,
-            ResumeIntent::Use(peer_pin.to_string())
-        );
-
-        storage
-            .update(|disk, _groups| {
-                disk[0].omp_capture_generation = Some(generation.to_string());
-                disk[0].resume_intent = ResumeIntent::Use(sid.to_string());
-                disk[0].resume_binding = original.resume_binding.clone();
-                Ok(())
-            })
-            .unwrap();
-        instances[0].adopt_conversation_state(original);
-        instances[0].omp_capture_generation = Some(generation.into());
-        let retried = drain_and_persist_session_ids(&mut instances, &file_watch);
-        assert_eq!(retried.applied, vec![instances[0].id.clone()]);
-        assert_eq!(instances[0].resume_intent, ResumeIntent::Default);
-        let disk = storage.load().unwrap();
-        assert_eq!(disk[0].resume_intent, ResumeIntent::Default);
-    }
-
-    #[test]
-    #[serial]
-    fn stale_omp_generation_cannot_persist_after_restart() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-        let profile = "sync-omp-generation";
-        let stale_generation = "launch-a";
-        let current_generation = "launch-b";
-        let stale_sid = "019342ab-1234-7def-8901-abcdef012345";
-
-        let mut inst = Instance::new("omp-generation-title", "/tmp/x");
-        inst.source_profile = profile.to_string();
-        inst.tool = "omp".to_string();
-        inst.omp_capture_generation = Some(stale_generation.to_string());
-        seed_instance_on_disk(profile, &inst);
-        Storage::new_unwatched(profile)
-            .unwrap()
-            .update(|instances, _groups| {
-                instances[0].omp_capture_generation = Some(current_generation.to_string());
-                Ok(())
-            })
-            .unwrap();
-        attach_poller_with_omp_update(&mut inst, stale_sid, stale_generation);
-
-        let file_watch = FileWatchService::noop();
-        let mut instances = vec![inst];
-        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
-
-        assert!(outcome.applied.is_empty());
-        assert_eq!(outcome.rolled_back, vec![instances[0].id.clone()]);
-        assert_eq!(instances[0].agent_session_id, None);
-        assert_eq!(
-            instances[0].omp_capture_generation.as_deref(),
-            Some(current_generation)
-        );
-        let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
-        assert_eq!(disk[0].agent_session_id, None);
-        let legacy_sid = "019342ab-1234-7def-8901-abcdef012346";
-        attach_poller_with_legacy_omp_update(&mut instances[0], legacy_sid);
-        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
-        assert_eq!(outcome.rolled_back, vec![instances[0].id.clone()]);
-        assert_eq!(instances[0].agent_session_id, None);
-        let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
-        assert_eq!(disk[0].agent_session_id, None);
-    }
-
-    #[test]
-    #[serial]
-    fn disk_generation_accepts_typed_observation_when_memory_is_stale() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-        let profile = "sync-omp-disk-authority";
-        let current_generation = "launch-current";
-        let sid = "019342ab-1234-7def-8901-abcdef012347";
-
-        let mut inst = Instance::new("omp-disk-authority-title", "/tmp/x");
-        inst.source_profile = profile.to_string();
-        inst.tool = "omp".to_string();
-        inst.omp_capture_generation = Some("launch-stale-memory".to_string());
-        seed_instance_on_disk(profile, &inst);
-        Storage::new_unwatched(profile)
-            .unwrap()
-            .update(|instances, _groups| {
-                instances[0].omp_capture_generation = Some(current_generation.to_string());
-                Ok(())
-            })
-            .unwrap();
-        attach_poller_with_omp_update(&mut inst, sid, current_generation);
-
-        let file_watch = FileWatchService::noop();
-        let mut instances = vec![inst];
-        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
-
-        assert_eq!(outcome.applied, vec![instances[0].id.clone()]);
-        assert_eq!(instances[0].agent_session_id.as_deref(), Some(sid));
-        let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
-        assert_eq!(disk[0].agent_session_id.as_deref(), Some(sid));
-    }
-
-    #[test]
-    #[serial]
-    fn drain_preserves_failed_marker_when_same_sid_is_qualified() {
-        let sid = "019342ab-1234-7def-8901-abcdef012345";
-        let other_sid = "019342aa-2222-7eee-8fff-aaaabbbbcccc";
-        for (case, qualified, prior_binding, captured_sid) in [
-            ("qualified-replay", true, "observed", sid),
-            ("binding-enrichment", true, "missing", sid),
-            ("asserted-qualification", true, "asserted", sid),
-            ("source-less-replay", false, "observed", sid),
-            ("different-sid", true, "observed", other_sid),
-        ] {
-            let temp = tempdir().unwrap();
-            let _guard = storage_home_guard(&temp);
-            let profile = "sync-failed-marker";
-            let generation = "failed-generation";
-            let mut inst = pinned_omp_instance(profile, sid, generation);
-            inst.resume_intent = ResumeIntent::Default;
-            inst.resume_binding = None;
-            match prior_binding {
-                "missing" => inst.agent_session_binding = None,
-                "asserted" => {
-                    inst.agent_session_binding.as_mut().unwrap().provenance =
-                        crate::session::ConversationProvenance::Asserted;
-                }
-                _ => {}
-            }
-            inst.resume_probe_failed_sid = Some(sid.into());
-            seed_instance_on_disk(profile, &inst);
-            if qualified {
-                attach_poller_with_omp_update(&mut inst, captured_sid, generation);
-            } else {
-                attach_poller_with_update(&mut inst, captured_sid);
-            }
-            let mut instances = vec![inst];
-
-            let outcome = drain_and_persist_session_ids(&mut instances, &FileWatchService::noop());
-
-            assert!(outcome.filtered.is_empty(), "{case}");
-            assert!(outcome.rolled_back.is_empty(), "{case}");
-            let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
-            for row in [&instances[0], &disk[0]] {
-                assert_eq!(
-                    row.agent_session_id.as_deref(),
-                    Some(captured_sid),
-                    "{case}"
-                );
-                if qualified {
-                    let binding = row.agent_session_binding.as_ref().unwrap();
-                    assert_eq!(binding.session_id, captured_sid, "{case}");
-                    assert_eq!(
-                        binding.provenance,
-                        crate::session::ConversationProvenance::Observed,
-                        "{case}"
-                    );
-                }
-                assert_eq!(
-                    row.resume_probe_failed_sid.as_deref(),
-                    (captured_sid == sid).then_some(sid),
-                    "{case}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn omp_pin_confirmation_restores_durable_failed_marker_with_empty_memory_sid() {
-        let sid = "019342ab-1234-7def-8901-abcdef012345";
-        for memory_marker in [None, Some("stale-memory-marker")] {
-            let temp = tempdir().unwrap();
-            let _guard = storage_home_guard(&temp);
-            let profile = "sync-omp-pin-failed-marker";
-            let generation = "failed-generation";
-            let mut inst = pinned_omp_instance(profile, sid, generation);
-            inst.resume_probe_failed_sid = Some(sid.into());
-            seed_instance_on_disk(profile, &inst);
-            inst.agent_session_id = None;
-            inst.agent_session_binding = None;
-            inst.resume_probe_failed_sid = memory_marker.map(str::to_owned);
-            attach_poller_with_omp_update(&mut inst, sid, generation);
-            let mut instances = vec![inst];
-
-            let outcome = drain_and_persist_session_ids(&mut instances, &FileWatchService::noop());
-
-            assert_eq!(outcome.applied, vec![instances[0].id.clone()]);
-            let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
-            for row in [&instances[0], &disk[0]] {
-                assert_eq!(row.agent_session_id.as_deref(), Some(sid));
-                assert_eq!(row.resume_intent, ResumeIntent::Default);
-                assert_eq!(row.resume_probe_failed_sid.as_deref(), Some(sid));
-            }
-            assert!(
-                !drain_and_persist_session_ids(&mut instances, &FileWatchService::noop()).touched()
-            );
-        }
     }
 
     #[test]

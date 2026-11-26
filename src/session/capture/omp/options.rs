@@ -256,6 +256,9 @@ pub(super) fn expansion_cannot_produce_flag(word: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use super::super::layout::normalize_profile;
     use super::*;
 
     #[test]
