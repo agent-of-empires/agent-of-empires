@@ -136,14 +136,20 @@ pub(crate) fn host_hook_agent(
         })
 }
 
-/// The active plugin declaration that runs `tool` as `command` when no built-in
-/// or bundled agent covers it. Its hooks and trust are installed like theirs.
+/// The active plugin declaration that runs `tool` as `command`. It outranks the
+/// built-in a command's first word names, as at launch (`Instance::resolved_agent`),
+/// so what is disclosed is what is installed.
 pub(crate) fn host_hook_declared_agent(
     tool_name: &str,
     command: &str,
     session: &crate::session::config::SessionConfig,
 ) -> Option<crate::plugin::agent_integration::DeclaredAgent> {
-    if host_hook_agent(tool_name, command, session).is_some() {
+    if crate::agents::get_agent(tool_name).is_some()
+        || session
+            .agent_command_override
+            .get(tool_name)
+            .is_some_and(|command| !command.trim().is_empty())
+    {
         return None;
     }
     crate::plugin::agent_integration::declared_agent(
@@ -1428,6 +1434,47 @@ mod tests {
             "hooks landed outside the store the launch routes to"
         );
         assert!(inst.identity_publisher_launched);
+    }
+
+    /// A declaration whose command is a built-in binary is disclosed as the
+    /// declaration, which is what launch installs.
+    #[test]
+    #[serial_test::serial]
+    fn disclosure_prefers_the_declaration_over_the_built_in_its_command_names() {
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
+        let _app = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let _env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        crate::session::test_support::install_agent_plugin(
+            "acme.declared-claude-command",
+            "id = \"acme.declared-claude-command\"\nname = \"Declared\"\nversion = \"1.0.0\"\n\
+             api_version = 26\n[[agent_integrations]]\ntool = \"example-helper\"\n\
+             command = \"claude\"\n[agent_integrations.hooks]\n\
+             settings_rel_path = \".example/settings.json\"\nformat = \"json_settings\"\n\
+             [[agent_integrations.hooks.events]]\nevent = \"Stop\"\nstatus = \"idle\"\n",
+        );
+        let config = crate::session::config::profile_config::resolve_config_or_warn("");
+        assert_eq!(
+            host_hook_agent("example-helper", "claude", &config.session).map(|a| a.name),
+            Some("claude"),
+            "the command alone names the built-in"
+        );
+        let declared = host_hook_declared_agent("example-helper", "claude", &config.session)
+            .expect("the declaration is selected first");
+        let paths = declared
+            .with_definition(|agent| {
+                host_hook_disclosure("example-helper", agent, &config).settings_paths
+            })
+            .unwrap();
+        assert_eq!(
+            paths,
+            vec![tmp
+                .path()
+                .join(".example/settings.json")
+                .to_string_lossy()
+                .into_owned()]
+        );
     }
 
     /// A plugin-declared agent gets its hooks and trust through the same launch

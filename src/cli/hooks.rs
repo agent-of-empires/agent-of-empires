@@ -90,16 +90,14 @@ fn print_disclosure(profile: &str) {
                 crate::agents::hook_install_required(agent, status_hooks)
                     .then(|| host_hook_disclosure(tool_name, agent, &config))
             };
-            let disclosure = match host_hook_agent(tool_name, &command, &config.session) {
-                Some(agent) => describe(agent),
+            let disclosure = match host_hook_declared_agent(tool_name, &command, &config.session) {
+                Some(declared) => declared.with_definition(describe).flatten(),
                 None => {
-                    let Some(declared) =
-                        host_hook_declared_agent(tool_name, &command, &config.session)
-                    else {
+                    let Some(agent) = host_hook_agent(tool_name, &command, &config.session) else {
                         unresolved.push(tool_name);
                         return None;
                     };
-                    declared.with_definition(describe).flatten()
+                    describe(agent)
                 }
             }?;
             (!disclosure.settings_paths.is_empty()).then_some((tool_name, disclosure))

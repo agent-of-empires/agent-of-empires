@@ -2186,19 +2186,18 @@ impl HomeView {
                         && !acknowledged)
                         .then(|| HooksInstallDialog::new(&tool_name, hook_agent, &resolved_config))
                 };
-                let dialog = match crate::session::host_hook_agent(
+                let dialog = match crate::session::host_hook_declared_agent(
                     &tool_name,
                     &command,
                     &resolved_config.session,
                 ) {
-                    Some(hook_agent) => dialog_for(hook_agent),
-                    None => crate::session::host_hook_declared_agent(
+                    Some(declared) => declared.with_definition(dialog_for).flatten(),
+                    None => crate::session::host_hook_agent(
                         &tool_name,
                         &command,
                         &resolved_config.session,
                     )
-                    .and_then(|declared| declared.with_definition(dialog_for))
-                    .flatten(),
+                    .and_then(dialog_for),
                 };
                 if let Some(dialog) = dialog {
                     self.hooks_install_dialog = Some(dialog);

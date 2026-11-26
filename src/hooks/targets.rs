@@ -59,6 +59,16 @@ pub(crate) fn iter_hook_targets() -> Vec<HookTarget> {
                     let Some(root) = config.session.agent_config_dir_for(tool, &home) else {
                         continue;
                     };
+                    // A declaration outranks the built-in its command names, as at launch.
+                    let command = config.session.launch_command_for(tool);
+                    if let Some(declared) =
+                        crate::session::host_hook_declared_agent(tool, &command, &config.session)
+                    {
+                        declared.with_definition(|agent| {
+                            push_relocated_target(&mut targets, agent, root, &config)
+                        });
+                        continue;
+                    }
                     match crate::session::resolved_agent_for(&profile, tool, detect_as) {
                         Some(agent) => {
                             if agent.hook_config.is_some() {
@@ -85,18 +95,7 @@ pub(crate) fn iter_hook_targets() -> Vec<HookTarget> {
                                 }
                             }
                         }
-                        None => {
-                            let command = config.session.launch_command_for(tool);
-                            if let Some(declared) = crate::session::host_hook_declared_agent(
-                                tool,
-                                &command,
-                                &config.session,
-                            ) {
-                                declared.with_definition(|agent| {
-                                    push_relocated_target(&mut targets, agent, root, &config)
-                                });
-                            }
-                        }
+                        None => {}
                     }
                 }
                 let instances = match crate::session::Storage::new_unwatched(&profile)
