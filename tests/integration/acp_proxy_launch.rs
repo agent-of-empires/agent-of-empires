@@ -309,3 +309,115 @@ mod attach {
         }
     }
 }
+
+/// Killing a proxied session's proxy mid-turn loses its integration rather
+/// than failing it as a startup error.
+#[cfg(debug_assertions)]
+#[tokio::test]
+#[serial]
+async fn killing_the_proxy_mid_turn_loses_the_integration() {
+    use agent_of_empires::acp::acp_client::{
+        AcpClient, ProxyFailurePolicy, ProxySpec, SpawnConfig,
+    };
+    use agent_of_empires::acp::agent_compat::ProxyCompat;
+    use agent_of_empires::acp::agent_registry::AgentSpec;
+    use agent_of_empires::acp::state::{AcpSessionId, Event, IntegrationLostReason};
+
+    if let Err(reason) = shim_ready() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let temp = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+    let record_dir = temp.path().join("record");
+    std::fs::create_dir_all(&record_dir).unwrap();
+    let node = shim_node().expect("shim prerequisite");
+    let proxy = shim_path().with_file_name("fake-proxy.mjs");
+    let cwd = temp.path().to_path_buf();
+    let config = SpawnConfig {
+        launch_lease: None,
+        provider_routing: Vec::new(),
+        wrapper_substitution: None,
+        agent_key: "claude".into(),
+        tool: "claude".into(),
+        spec: AgentSpec {
+            command: node.to_string_lossy().into_owned(),
+            args: vec![
+                proxy.to_string_lossy().into_owned(),
+                "--".into(),
+                node.to_string_lossy().into_owned(),
+                shim_path().to_string_lossy().into_owned(),
+            ],
+            description: "fake proxy over the test shim".into(),
+            env_allowlist: None,
+        },
+        config_path: cwd.clone(),
+        cwd,
+        additional_dirs: vec![],
+        provider_env: vec![],
+        host_environment: vec![
+            (
+                "FAKE_PROXY_RECORD_DIR".into(),
+                record_dir.to_string_lossy().into_owned(),
+            ),
+            // Holds the prompt open until a release file that never appears.
+            (
+                "SHIM_PROMPT_COMPLETION_RELEASE_FILE".into(),
+                temp.path().join("never").to_string_lossy().into_owned(),
+            ),
+        ],
+        default_effort: None,
+        default_effort_explicit: false,
+        default_model_config: Default::default(),
+        default_mode: None,
+        default_model: None,
+        socket_path: None,
+        stored_acp_session_id: None,
+        fork_from: None,
+        seed_history_replay: false,
+        prior_conversation: false,
+        generation: 0,
+        artifact_dir: None,
+        proxy: Some(ProxySpec {
+            plugin_id: "fake-proxy".into(),
+            command: String::new(),
+            args: Vec::new(),
+            failure_policy: ProxyFailurePolicy::Refuse,
+            display_name: "Fake".into(),
+            compat: ProxyCompat::default(),
+        }),
+        degraded: None,
+        sandbox_info: None,
+        workspace_info: None,
+        source_profile: None,
+        mcp_servers: Vec::new(),
+        claude_store_pin: None,
+        base_host_environment: vec![],
+    };
+    let mut client = AcpClient::spawn(config, AcpSessionId("proxy-mid-turn".into()))
+        .await
+        .expect("spawn fake proxy");
+    client.send_prompt("hello", &[]).await.expect("send_prompt");
+
+    let lost = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut killed = false;
+        while let Some(event) = client.next_event().await {
+            match event {
+                // The turn is open: the shim has streamed and now parks the prompt.
+                Event::AgentMessageChunk { ref text, .. } if text == "done" && !killed => {
+                    let pid = std::fs::read_to_string(record_dir.join("pid")).unwrap();
+                    signal("-KILL", pid.trim());
+                    killed = true;
+                }
+                Event::IntegrationLost { reason } => return Some(reason),
+                Event::AgentStartupError { message, .. } => {
+                    panic!("a proxy exit is not a startup error: {message}")
+                }
+                _ => {}
+            }
+        }
+        None
+    })
+    .await
+    .expect("the proxy's death is reported");
+    assert_eq!(lost, Some(IntegrationLostReason::ProxyExited));
+}
