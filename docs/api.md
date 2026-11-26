@@ -942,6 +942,12 @@ PUT accepts `{ "path", "version", "content" }` for an existing project UTF-8 tex
 
 Read-only and CityHall modes return 403. Escaping paths, binary files, and unverified or separate Sandbox volumes cannot be edited. The browser's opt-in setting and workflow are described in [Editing project files](guides/web/dashboard.md#editing-project-files).
 
+## GET /api/sessions/{id}/diff/files and /diff/file
+
+Both take `?scope=` for what the working tree is compared against: `branch` (the default) is the merge-base with the session's diff base branch, `uncommitted` is HEAD, and `last_turn` is the working tree recorded when the agent's latest turn started. `/diff/file` also takes `?path=` and, for a workspace session, `?repo=`.
+
+The `/diff/files` response carries `last_turn_at`, when that recording was taken, and omits it while the latest turn has none; a client offers the Last turn scope only when it is set. A `last_turn` request for a session with no recording returns `409` with `AoE-Error-Code: no_turn_snapshot`. A workspace repo the recording missed is named in the response's `warning` instead of listing files. How the recording is taken, and what it writes to the repo's object store, is in the [dashboard guide](guides/web/dashboard.md).
+
 ## POST /api/sessions/{id}/send
 
 Type a message into the agent and press Enter, the same way the TUI's
