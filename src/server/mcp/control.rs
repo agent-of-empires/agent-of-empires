@@ -758,20 +758,26 @@ fn pane_readiness(instance: &Instance) -> (PaneReadiness, Option<String>) {
     let pane = session
         .live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())
         .ok();
-    let input_line = pane
-        .as_deref()
-        .map_or(crate::tmux::InputLine::Unknown, |pane| {
-            instance.input_line_in(&session, pane)
-        });
+    readiness_in(instance, &session, pane)
+}
+
+/// [`pane_readiness`] of the pane its lookup found. Without one nothing is captured: the
+/// session's default target may be another pane than the one a send would type into.
+fn readiness_in(
+    instance: &Instance,
+    session: &crate::tmux::Session,
+    pane: Option<String>,
+) -> (PaneReadiness, Option<String>) {
+    let Some(pane) = pane else {
+        return (PaneReadiness::Unreadable, None);
+    };
     let readiness = readiness_of(
-        instance.detect_pane_now(&instance.source_profile, &session, None, pane.as_deref()),
-        input_line,
+        instance.detect_pane_now(&instance.source_profile, session, None, Some(&pane)),
+        instance.input_line_in(session, &pane),
     );
     #[cfg(test)]
-    if let Some(pane) = &pane {
-        crate::tmux::test_helpers::after_input_check(pane);
-    }
-    (readiness, pane)
+    crate::tmux::test_helpers::after_input_check(&pane);
+    (readiness, Some(pane))
 }
 
 /// MCP `send` refuses a pane whose status rules detect a dialog, one holding a draft, or one it
@@ -1054,6 +1060,51 @@ pub(super) fn not_found(id: &str) -> CallToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pane the lookup didn't find is unreadable, even when the session's default target
+    /// shows the agent at its prompt.
+    #[test]
+    #[serial_test::serial]
+    fn readiness_without_a_looked_up_pane_is_unreadable() {
+        use crate::tmux::test_helpers::{only_pane_id, TmuxTestSession, INPUT_BOX_SCRIPT};
+        if !crate::tmux::test_helpers::tmux_available() {
+            return;
+        }
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let mut instance = Instance::new("mcp-readiness", "/tmp/aoe-mcp-readiness");
+        instance.source_profile = "default".into();
+        let session = instance.tmux_session().unwrap();
+        let mut args: Vec<String> = ["new-session", "-d", "-s", session.name(), "sh", "-c"]
+            .map(str::to_string)
+            .to_vec();
+        args.push(INPUT_BOX_SCRIPT.to_string());
+        crate::tmux::utils::append_pane_base_index_args(&mut args, session.name());
+        assert!(crate::tmux::tmux_command()
+            .args(&args)
+            .status()
+            .unwrap()
+            .success());
+        let _cleanup = TmuxTestSession::from_name(session.name());
+        let pane = only_pane_id(session.name());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !session
+            .try_capture_pane_in(&pane, 0)
+            .is_ok_and(|screen| screen.contains("for shortcuts"))
+        {
+            assert!(std::time::Instant::now() < deadline, "the box shows");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        // (case, the lookup's pane, readiness; the send gets the looked-up pane back)
+        for (case, looked_up, want) in [
+            ("looked-up", Some(pane.clone()), PaneReadiness::AtPrompt),
+            ("lookup-failed", None, PaneReadiness::Unreadable),
+        ] {
+            let (readiness, checked) = readiness_in(&instance, &session, looked_up.clone());
+            assert_eq!(readiness, want, "{case}");
+            assert_eq!(checked, looked_up, "{case}");
+        }
+    }
 
     #[test]
     fn only_a_prompt_box_rule_reads_as_at_the_prompt() {
