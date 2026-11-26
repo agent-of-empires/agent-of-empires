@@ -1953,7 +1953,7 @@ export function applyReducedState(
       reduced.subagents ?? [],
       snapshotSeq === undefined || snapshotSeq >= state.lastSeq,
     ),
-    subagentsSeq: seq === undefined ? state.subagentsSeq : Math.max(state.subagentsSeq ?? 0, seq),
+    subagentsSeq: authoritative ? Math.max(state.subagentsSeq ?? 0, snapshotSeq) : state.subagentsSeq,
     locallyResolved,
   };
   if (
