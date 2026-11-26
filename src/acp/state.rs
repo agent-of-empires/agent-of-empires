@@ -874,10 +874,7 @@ impl CurrentNativeAvailability {
         &mut self,
         row: &crate::session::Instance,
         storage: &crate::session::Storage,
-    ) -> Result<
-        Option<Arc<crate::acp::establishment::EstablishmentAttempt>>,
-        crate::acp::establishment::EstablishmentRefusal,
-    > {
+    ) -> anyhow::Result<Option<Arc<crate::acp::establishment::EstablishmentAttempt>>> {
         use crate::acp::establishment::{
             AcpEstablishment, CreationStage, EstablishmentAttempt, EstablishmentOrigin,
             EstablishmentRefusal,
@@ -950,13 +947,9 @@ impl CurrentNativeAvailability {
             _ => false,
         };
         if !matches
-            || !self
-                .refresh(&row.id, matches)
-                .map_err(|_| EstablishmentRefusal::Unconfirmed)?
+            || !self.refresh(&row.id, matches)?
             || self.unavailable.is_some()
-            || !self
-                .qualify_owner(&row.id)
-                .map_err(|_| EstablishmentRefusal::Unconfirmed)?
+            || !self.qualify_owner(&row.id)?
         {
             return Ok(None);
         }
@@ -964,6 +957,8 @@ impl CurrentNativeAvailability {
     }
 }
 
+#[derive(thiserror::Error)]
+#[error("native observation is contended")]
 pub(crate) struct NativeObservationWait {
     pub context: NativeEventContext,
     lock: NativeObservationLock,
@@ -1002,6 +997,13 @@ impl NativeObservationWait {
         })
         .await
         .unwrap_or(false)
+    }
+
+    pub(crate) async fn settle_before(self, deadline: tokio::time::Instant) -> bool {
+        tokio::time::Instant::now() < deadline
+            && tokio::time::timeout_at(deadline, self.settle())
+                .await
+                .unwrap_or(false)
     }
 }
 

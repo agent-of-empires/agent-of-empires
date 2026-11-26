@@ -1013,6 +1013,8 @@ impl SessionService {
         refuse_if_ignored: bool,
         allow_explicit_stop: bool,
     ) -> PromptTouch {
+        use crate::acp::establishment::EstablishmentRefusal;
+        use crate::acp::state::NativeObservationWait;
         let Ok(state) = self.native_state() else {
             return PromptTouch::WorkerNotReady;
         };
@@ -1036,6 +1038,8 @@ impl SessionService {
                 row.is_idle_dormant(),
             )
         };
+        let observation_deadline =
+            tokio::time::Instant::now() + crate::acp::supervisor::WORKER_READY_TIMEOUT;
         // Refusal order comes from the canonical row, even when no resume is needed.
         let (
             native,
@@ -1160,9 +1164,10 @@ impl SessionService {
                 initial_prompt,
             )
         };
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<PromptTouch> {
-            // Runtime-owned wake retains exclusion if its HTTP/plugin caller disappears.
-            let _exclusion = (namespace, guard);
+        // Runtime-owned wake retains exclusion if its HTTP/plugin caller disappears.
+        let _exclusion = (namespace, guard);
+        let mut resume_reservation = resume_reservation;
+        let mut commit = move || -> anyhow::Result<PromptTouch> {
             let _identity = crate::session::acquire_session_identity_lock()?;
             let _title = crate::session::acquire_session_title_lock(&worker_id)?;
             use crate::session::SessionStore;
@@ -1212,9 +1217,21 @@ impl SessionService {
                 }
                 let unavailable = if let Some(current) = current_native.as_mut() {
                     let selected = current.scope.choice.as_ref().is_some_and(|choice| choice.matches(row));
-                    if current.scope.context != crate::acp::state::NativeEventContext::capture(row, native.storage())?
-                        || !current.refresh(&worker_id, selected).unwrap_or(false)
-                    {
+                    let same_context = current.scope.context
+                        == crate::acp::state::NativeEventContext::capture(row, native.storage())?;
+                    let active = if same_context {
+                        match current.refresh(&worker_id, selected) {
+                            Ok(active) => active,
+                            Err(wait) if initial_prompt.is_some() => return Err(wait.into()),
+                            Err(_) => false,
+                        }
+                    } else {
+                        false
+                    };
+                    if !active {
+                        if initial_prompt.is_some() {
+                            anyhow::bail!(EstablishmentRefusal::Superseded);
+                        }
                         refused = Some(PromptTouch::WorkerNotReady);
                         anyhow::bail!(crate::session::LifecycleReservationError::Superseded);
                     }
@@ -1238,25 +1255,48 @@ impl SessionService {
                         tracing::info!(target: "acp.supervisor", session = %worker_id,
                             "waking idle-dormant structured view session on prompt; spawning a fresh worker");
                     }
-                    Ok(PromptTouch::Touched { idle_dormant, resume_reservation })
+                    Ok(PromptTouch::Touched {
+                        idle_dormant,
+                        resume_reservation: resume_reservation.take(),
+                    })
                 }
                 Err(error) => match refused {
                     Some(outcome) => Ok(outcome),
                     None => Err(error),
                 },
             }
-        }).await;
-        match result {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(error)) => {
-                tracing::warn!(target: "server.session_service", session = %id, %error,
-                    "canonical prompt touch and wake failed");
-                PromptTouch::WorkerNotReady
-            }
-            Err(error) => {
-                tracing::warn!(target: "server.session_service", session = %id, %error,
-                    "canonical prompt touch worker failed");
-                PromptTouch::WorkerNotReady
+        };
+        loop {
+            let result = tokio::task::spawn_blocking(move || {
+                let outcome = commit();
+                (commit, outcome)
+            })
+            .await;
+            match result {
+                Ok((_, Ok(outcome))) => return outcome,
+                Ok((retry, Err(error))) => match error.downcast::<NativeObservationWait>() {
+                    Ok(wait) => {
+                        // No row update committed. All storage locks are free, so the
+                        // next probe can recheck the same actor and creation attempt.
+                        if !wait.settle_before(observation_deadline).await {
+                            return PromptTouch::Establishment(EstablishmentRefusal::Unconfirmed);
+                        }
+                        commit = retry;
+                    }
+                    Err(error) => {
+                        if let Some(refusal) = error.downcast_ref::<EstablishmentRefusal>() {
+                            return PromptTouch::Establishment(*refusal);
+                        }
+                        tracing::warn!(target: "server.session_service", session = %id, %error,
+                            "canonical prompt touch and wake failed");
+                        return PromptTouch::WorkerNotReady;
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(target: "server.session_service", session = %id, %error,
+                        "canonical prompt touch worker failed");
+                    return PromptTouch::WorkerNotReady;
+                }
             }
         }
     }

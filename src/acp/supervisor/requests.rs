@@ -176,7 +176,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         attachments: &[crate::acp::event_store::AttachmentBlob],
     ) -> Result<Option<crate::acp::acp_client::PreparedInitialPrompt>, SupervisorError> {
         use crate::acp::establishment::EstablishmentRefusal;
-        let mut current = self
+        use crate::acp::state::NativeObservationWait;
+        let unconfirmed = || AcpError::Establishment(EstablishmentRefusal::Unconfirmed);
+        let original = self
             .current_native_availability(session_id)
             .await
             .ok_or_else(|| SupervisorError::UnknownSession(session_id.to_owned()))?;
@@ -210,18 +212,12 @@ impl<S: BroadcastSink> Supervisor<S> {
                         Ok(None)
                     },
                     true,
-                )
-                .map_err(|error| {
-                    error
-                        .downcast_ref::<EstablishmentRefusal>()
-                        .map_or(SupervisorError::NativeStoreUnavailable, |refusal| {
-                            SupervisorError::Acp(AcpError::Establishment(*refusal))
-                        })
-                })?;
-            let Some((_guard, expected)) = observed else {
-                return Err(SupervisorError::Acp(AcpError::Establishment(
-                    EstablishmentRefusal::Unconfirmed,
-                )));
+                        return Err(AcpError::Establishment(
+                            refusal.unwrap_or(EstablishmentRefusal::Unconfirmed),
+                        )
+                        .into());
+                    }
+                },
             };
             expected
         };
