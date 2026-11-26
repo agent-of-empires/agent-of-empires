@@ -182,13 +182,13 @@ mod tests {
             "prefs": { "homepage": true, "sidebar": false },
         });
         let adoption = adoption(&snapshot);
-        assert_eq!(adoption.features["suggestions_on"], true);
-        assert_eq!(adoption.features["suggestions_homepage"], true);
-        assert_eq!(adoption.features["suggestions_sidebar"], false);
+        assert!(adoption.features["suggestions_on"]);
+        assert!(adoption.features["suggestions_homepage"]);
+        assert!(!adoption.features["suggestions_sidebar"]);
         assert_eq!(adoption.prefs["suggestions_sources"], "2-3");
         assert_eq!(adoption.prefs["suggestions_open"], "1-5");
         let none = super::adoption(&json!({ "providers": [], "items": [] }));
-        assert_eq!(none.features["suggestions_on"], false);
+        assert!(!none.features["suggestions_on"]);
         assert_eq!(none.prefs["suggestions_open"], "0");
     }
 
