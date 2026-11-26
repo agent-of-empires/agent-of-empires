@@ -825,8 +825,7 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
                 ReorderBody::Group { .. } => None,
             };
             let mut outcome = ReorderOutcome::Stale;
-            let mut replaced_order = None;
-            let mut before = None;
+            let mut placement = None;
             let committed = (&store as &dyn SessionStore).update(|rows, groups| {
                 let freeze = match &body {
                     ReorderBody::Session { freeze, .. } | ReorderBody::Group { freeze, .. } => {
@@ -844,49 +843,42 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
                 }) {
                     return Ok(());
                 }
-                before = Some(membership(rows, groups, &body));
                 outcome = apply_canonical_reorder(rows, groups, &body, worker_state.cityhall_mode)?;
                 // CityHall may regroup a row but not rewrite the shared order, which it
-                // denies through `PUT /api/workspace-ordering`. The order is written before
-                // the move commits, and put back when the commit fails, so a retry finds
-                // the row and its rank where they were.
+                // denies through `PUT /api/workspace-ordering`.
                 if worker_state.cityhall_mode || !matches!(outcome, ReorderOutcome::Moved { .. }) {
                     return Ok(());
                 }
                 let frozen = freeze.map(|freeze| freeze.order.clone());
-                replaced_order = match &body {
+                placement = match &body {
                     ReorderBody::Session {
                         destination: None, ..
                     }
-                    | ReorderBody::Group { .. } => match frozen {
-                        Some(order) => Some(commit_workspace_order(&worker_state, |_| order)?),
-                        None => None,
-                    },
+                    | ReorderBody::Group { .. } => frozen.map(OrderPlacement::Frozen),
                     ReorderBody::Session {
                         id,
                         source_group,
                         destination,
                         direction,
                         ..
-                    } => place_carried_workspace(
-                        &worker_state,
+                    } => carried_placement(
                         rows,
                         id,
                         destination.as_deref().unwrap_or(source_group),
                         *direction,
                         frozen,
-                    )?,
+                    ),
                 };
                 Ok(())
             });
-            if let (Err(error), Some(previous), Some(before)) = (&committed, replaced_order, before)
-            {
-                let disk = || store.storage().load_complete_with_groups();
-                if commit_left_unapplied(error, disk, &body, &before) {
-                    commit_workspace_order(&worker_state, |_| previous)?;
-                }
-            }
             committed?;
+            // The shared order follows the committed membership, so an interrupted or failed
+            // order write leaves the move made with its row's rank unplaced, never a rank
+            // placed for a move that did not land.
+            if let Some(placement) = placement {
+                let _publication = worker_state.publication.blocking_write();
+                placement.commit(&worker_state)?;
+            }
             Ok(outcome)
         })
         .await
@@ -912,59 +904,34 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
     }
 }
 
-/// Whether a failed reorder commit left the disk as the move found it. A failure after
-/// sessions.json was replaced may still have applied it, so only a disk that reads and
-/// shows the `before` membership proves it did not.
-fn commit_left_unapplied(
-    error: &anyhow::Error,
-    disk: impl FnOnce() -> Result<(Vec<Instance>, Vec<crate::session::Group>)>,
-    body: &crate::daemon::ReorderBody,
-    before: &(Option<String>, Vec<String>),
-) -> bool {
-    !error.is::<crate::session::SessionCommitApplied>()
-        && disk().is_ok_and(|(rows, groups)| membership(&rows, &groups, body) == *before)
+/// The shared order write a moved reorder makes once its membership commits.
+enum OrderPlacement {
+    /// The order a move under Name or Newest first showed.
+    Frozen(Vec<String>),
+    /// The carried workspace at the edge of the destination it entered, in the stored order
+    /// or `frozen`.
+    Carry {
+        moved: String,
+        peers: Vec<String>,
+        direction: crate::daemon::MoveDirection,
+        frozen: Option<Vec<String>>,
+    },
 }
 
-/// What a reorder changes in a profile's sessions: the moved row's group and the group
-/// order.
-fn membership(
-    rows: &[Instance],
-    groups: &[crate::session::Group],
-    body: &crate::daemon::ReorderBody,
-) -> (Option<String>, Vec<String>) {
-    let moved = match body {
-        crate::daemon::ReorderBody::Session { id, .. } => rows
-            .iter()
-            .find(|row| &row.id == id)
-            .map(|row| row.group_path.clone()),
-        crate::daemon::ReorderBody::Group { .. } => None,
-    };
-    (
-        moved,
-        groups.iter().map(|group| group.path.clone()).collect(),
-    )
-}
-
-/// Put a carried session's workspace at the edge of `destination` it entered from, so the
-/// shared Custom order ranks it there. Sessions sharing the workspace move with it. A
-/// `frozen` order replaces the stored one. Runs inside the carry's session commit, which
-/// holds the publication guard; `rows` are the carried profile's rows with the move
-/// applied. Returns the stored order it replaced.
-fn place_carried_workspace(
-    state: &AppState,
+/// Where a carried session's workspace goes, so the shared Custom order ranks it at the edge
+/// of `destination` it entered from. Sessions sharing the workspace move with it. `rows` are
+/// the carried profile's rows with the move applied.
+fn carried_placement(
     rows: &[Instance],
     id: &str,
     destination: &str,
     direction: crate::daemon::MoveDirection,
     frozen: Option<Vec<String>>,
-) -> Result<Option<Vec<String>>> {
-    let Some(moved) = rows
+) -> Option<OrderPlacement> {
+    let moved = rows
         .iter()
         .find(|row| row.id == id)
-        .map(|row| row.workspace_id())
-    else {
-        return Ok(None);
-    };
+        .map(|row| row.workspace_id())?;
     let peers: Vec<String> = rows
         .iter()
         .filter(|row| row.group_path == destination && !row.is_archived() && !row.is_trashed())
@@ -972,39 +939,57 @@ fn place_carried_workspace(
         .filter(|workspace| *workspace != moved)
         .collect();
     if peers.is_empty() && frozen.is_none() {
-        return Ok(None);
+        return None;
     }
-    let created: Vec<_> = state
-        .instances
-        .blocking_read()
-        .iter()
-        .map(|row| (row.workspace_id(), Some(row.created_at)))
-        .collect();
-    let live = created
-        .iter()
-        .map(|(workspace, _)| workspace.clone())
-        .collect();
-    commit_workspace_order(state, |stored| {
-        let order =
-            frozen.unwrap_or_else(|| super::sessions::merge_workspace_ordering(created, stored));
-        let order =
-            place_at_entering_edge(order.clone(), &moved, &peers, direction).unwrap_or(order);
-        // Within what a Client's rewrite of the full order keeps, so that one drops nothing.
-        super::sessions::writable_live_order(live, order)
+    Some(OrderPlacement::Carry {
+        moved,
+        peers,
+        direction,
+        frozen,
     })
-    .map(Some)
 }
 
-/// Replace the stored row order with `next(stored)` and return the order it replaced. A
-/// failed write degrades the runtime, since the stored order is then unknown.
+impl OrderPlacement {
+    /// Write the placement. The caller holds the publication guard.
+    fn commit(self, state: &AppState) -> Result<()> {
+        let (moved, peers, direction, frozen) = match self {
+            OrderPlacement::Frozen(order) => return commit_workspace_order(state, |_| order),
+            OrderPlacement::Carry {
+                moved,
+                peers,
+                direction,
+                frozen,
+            } => (moved, peers, direction, frozen),
+        };
+        let created: Vec<_> = state
+            .instances
+            .blocking_read()
+            .iter()
+            .map(|row| (row.workspace_id(), Some(row.created_at)))
+            .collect();
+        let live = created
+            .iter()
+            .map(|(workspace, _)| workspace.clone())
+            .collect();
+        commit_workspace_order(state, |stored| {
+            let order = frozen
+                .unwrap_or_else(|| super::sessions::merge_workspace_ordering(created, stored));
+            let order =
+                place_at_entering_edge(order.clone(), &moved, &peers, direction).unwrap_or(order);
+            // Within what a Client's rewrite of the full order keeps, so that one drops nothing.
+            super::sessions::writable_live_order(live, order)
+        })
+    }
+}
+
+/// Replace the stored row order with `next(stored)`. A failed write degrades the runtime,
+/// since the stored order is then unknown.
 fn commit_workspace_order(
     state: &AppState,
     next: impl FnOnce(&[String]) -> Vec<String>,
-) -> Result<Vec<String>> {
-    let mut previous = Vec::new();
+) -> Result<()> {
     let committed = crate::session::update_workspace_ordering(|ordering| {
-        let replacement = next(&ordering.order);
-        previous = std::mem::replace(&mut ordering.order, replacement);
+        ordering.order = next(&ordering.order);
         Ok(())
     });
     let (_, ordering) = match committed {
@@ -1022,7 +1007,7 @@ fn commit_workspace_order(
     state
         .mutation_epoch
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    Ok(previous)
+    Ok(())
 }
 
 /// `order` with `moved` at the edge of the `peers` workspaces a carry enters from: before
@@ -1159,40 +1144,6 @@ fn apply_canonical_reorder(
 mod tests {
     use super::place_at_entering_edge;
     use crate::daemon::MoveDirection::{Down, Up};
-
-    #[test]
-    fn a_failed_carry_restores_its_order_only_when_the_disk_shows_it_unapplied() {
-        let mut row = crate::session::Instance::new("one", "/tmp/one");
-        row.group_path = "aaa".into();
-        let body = crate::daemon::ReorderBody::Session {
-            id: row.id.clone(),
-            profile: "default".into(),
-            source_group: "aaa".into(),
-            destination: Some("bbb".into()),
-            direction: Down,
-            headers: None,
-            freeze: None,
-        };
-        let groups = vec![crate::session::Group::new("aaa", "aaa")];
-        let before = super::membership(std::slice::from_ref(&row), &groups, &body);
-        let mut moved = row.clone();
-        moved.group_path = "bbb".into();
-        let failed = || anyhow::anyhow!("sync failed");
-        let applied = || failed().context(crate::session::SessionCommitApplied);
-        for (name, error, disk, restores) in [
-            ("disk unchanged", failed(), Ok(vec![row.clone()]), true),
-            ("disk moved", failed(), Ok(vec![moved.clone()]), false),
-            ("disk unreadable", failed(), Err(failed()), false),
-            ("commit applied", applied(), Ok(vec![row.clone()]), false),
-        ] {
-            let disk = || disk.map(|rows| (rows, groups.clone()));
-            assert_eq!(
-                super::commit_left_unapplied(&error, disk, &body, &before),
-                restores,
-                "{name}"
-            );
-        }
-    }
 
     #[test]
     fn carried_workspace_lands_at_the_entering_edge() {

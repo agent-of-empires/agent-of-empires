@@ -14,16 +14,20 @@ pub(in crate::tui) struct OrderUndo {
     order: Vec<String>,
     repositories: Vec<String>,
     sort: SortOrder,
+    /// A freeze's profile and its stored group order before the freeze replaced it.
+    groups: Option<(String, Vec<String>)>,
 }
 
 /// What Undo in the command palette does next.
 #[derive(Debug)]
 pub(super) enum UndoPoint {
-    /// Write back `restore` while the Daemon of `epoch` holds the orders the switch left.
+    /// Write back `restore` while the Daemon of `epoch` holds the orders the switch left,
+    /// `groups` being the stored group order of `restore`'s freeze.
     Order {
         restore: OrderUndo,
         order: Vec<String>,
         repositories: Vec<String>,
+        groups: Vec<String>,
         epoch: String,
     },
     /// The order is back but the sort write failed, so only the sort is retried.
@@ -288,6 +292,7 @@ impl HomeView {
                 restore,
                 order,
                 repositories,
+                groups,
                 epoch,
             }) => {
                 let base = self.ordering_base();
@@ -299,23 +304,94 @@ impl HomeView {
                     self.flash_status("The Daemon restarted, nothing to undo");
                     return Ok(());
                 }
-                if base.order != order || base.repositories != repositories {
+                if base.order != order
+                    || base.repositories != repositories
+                    || restore
+                        .groups
+                        .as_ref()
+                        .is_some_and(|(profile, _)| self.stored_groups(profile) != groups)
+                {
                     self.flash_status("The order changed elsewhere, nothing to undo");
                     return Ok(());
                 }
                 let change = OrderChange::Undo(restore.clone());
                 let written = (restore.order.clone(), restore.repositories.clone());
+                let frozen = restore.groups.clone();
                 // Kept until the write commits, so a refused one can be retried.
                 self.order_undo = Some(UndoPoint::Order {
                     restore,
                     order,
                     repositories,
+                    groups: groups.clone(),
                     epoch,
                 });
+                if let Some((profile, before)) = frozen {
+                    if let Some(anchor) = self.group_order_anchor(&profile) {
+                        let order = written.0;
+                        return self
+                            .undo_frozen_groups(anchor, profile, before, order, groups, change);
+                    }
+                }
                 return self.write_order(Some(written.0), Some(written.1), Some(change));
             }
         }
         Ok(())
+    }
+
+    /// Write back a freeze's row and group orders in one move, refused as stale once either
+    /// changed since the switch. The move needs a row of the profile to anchor it.
+    fn undo_frozen_groups(
+        &mut self,
+        (id, source_group): (String, String),
+        profile: String,
+        before: Vec<String>,
+        order: Vec<String>,
+        after: Vec<String>,
+        change: OrderChange,
+    ) -> anyhow::Result<()> {
+        let freeze = crate::daemon::FrozenOrder {
+            order,
+            base: self.ordering_base(),
+            groups: after,
+        };
+        self.submit_namespace_intent(
+            crate::daemon::NamespaceMutation::Reorder(crate::daemon::ReorderBody::Session {
+                id,
+                profile,
+                source_group,
+                destination: None,
+                direction: crate::daemon::MoveDirection::Down,
+                headers: Some(before),
+                freeze: Some(freeze),
+            }),
+            NamespaceIntent::ReorderGroup {
+                switch: Some(change),
+            },
+        )
+    }
+
+    /// A listed row of `profile` and its group, which a move restoring its group order names.
+    fn group_order_anchor(&self, profile: &str) -> Option<(String, String)> {
+        self.instances
+            .values()
+            .filter(|row| row.source_profile == profile && !row.is_archived() && !row.is_trashed())
+            .map(|row| (row.id.clone(), row.group_path.clone()))
+            .min()
+    }
+
+    /// `profile`'s stored group paths, in stored order, as the Daemon last published them.
+    fn stored_groups(&self, profile: &str) -> Vec<String> {
+        self.session_feed
+            .applied_snapshot()
+            .and_then(|snapshot| {
+                snapshot
+                    .contents
+                    .profiles
+                    .iter()
+                    .find(|p| p.name == profile)
+                    .map(|p| p.groups.iter().map(|group| group.path.clone()).collect())
+            })
+            .unwrap_or_default()
     }
 
     /// Pick `sort` again for Undo, retried from the palette when the write fails. Returns
@@ -433,16 +509,17 @@ impl HomeView {
         profile: &str,
     ) -> (crate::daemon::FrozenOrder, OrderChange) {
         let snapshot = self.session_feed.applied_snapshot();
-        let contents = snapshot.as_ref().map(|snapshot| &snapshot.contents);
-        let sessions = contents.map_or(&[][..], |c| c.sessions.as_slice());
+        let sessions = snapshot
+            .as_ref()
+            .map_or(&[][..], |snapshot| snapshot.contents.sessions.as_slice());
         let order = crate::server::api::sessions::writable_workspace_order(sessions, order);
-        let groups = contents
-            .and_then(|c| c.profiles.iter().find(|p| p.name == profile))
-            .map(|p| p.groups.iter().map(|group| group.path.clone()).collect())
-            .unwrap_or_default();
+        let groups = self.stored_groups(profile);
         let base = self.ordering_base();
         let change = OrderChange::SwitchToCustom {
-            undo: self.order_undo_point(),
+            undo: OrderUndo {
+                groups: Some((profile.to_owned(), groups.clone())),
+                ..self.order_undo_point()
+            },
             expected: (order.clone(), base.repositories.clone()),
         };
         (
@@ -476,6 +553,7 @@ impl HomeView {
             order: base.order,
             repositories: base.repositories,
             sort: self.sort_order,
+            groups: None,
         }
     }
 
@@ -504,10 +582,16 @@ impl HomeView {
                 if self.sort_order != SortOrder::Custom {
                     self.apply_sort_order(SortOrder::Custom);
                 }
+                let groups = undo
+                    .groups
+                    .as_ref()
+                    .map(|(profile, _)| self.stored_groups(profile))
+                    .unwrap_or_default();
                 self.order_undo = kept.then_some(UndoPoint::Order {
                     restore: undo,
                     order: expected.0,
                     repositories: expected.1,
+                    groups,
                     epoch: receipt.epoch.clone(),
                 });
                 self.flash_status(if kept {
@@ -938,6 +1022,7 @@ mod tests {
                 order: Vec::new(),
                 repositories: Vec::new(),
                 sort: SortOrder::Name,
+                groups: None,
             },
             expected: (Vec::new(), expected),
         };
@@ -1019,6 +1104,7 @@ mod tests {
                 order: Vec::new(),
                 repositories: Vec::new(),
                 sort,
+                groups: None,
             })
         };
         view.sort_order = SortOrder::Newest;
@@ -1193,11 +1279,11 @@ mod tests {
         }
     }
 
-    /// A carry whose order placement fails, or that names no other group, leaves the row in
-    /// its source group, so the move can be made again.
+    /// A move that names no other group is refused. A carry whose order placement fails
+    /// keeps its committed move and reports the failure, leaving the stored order untouched.
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_carry_whose_placement_fails_does_not_move_the_row() {
+    async fn a_carry_whose_placement_fails_keeps_its_move_and_reports_it() {
         let _home = crate::session::test_support::isolate_app_dir();
         let storage = crate::session::Storage::new_unwatched("reorder").unwrap();
         let rows: Vec<Instance> = [("one", "aaa"), ("two", "bbb")]
@@ -1241,7 +1327,8 @@ mod tests {
         assert!(!status.is_success(), "{status}: {value}");
         let (stored, _) = storage.load_with_groups().unwrap();
         let row = stored.iter().find(|row| row.id == id).unwrap();
-        assert_eq!(row.group_path, "aaa");
+        assert_eq!(row.group_path, "bbb");
+        assert!(ordering.is_dir(), "the stored order is untouched");
     }
 
     /// A carry writes only live workspaces, so a Client rewriting the full order next keeps
@@ -1790,6 +1877,54 @@ mod tests {
             } else {
                 assert_eq!(groups, ["bbb", "aaa", "ccc"]);
                 assert_eq!(titles, ["bee", "zed", "one"]);
+            }
+
+            // Undo puts back the row order and the group order the freeze replaced, in one
+            // move guarded by both.
+            let stored_groups = || -> Vec<String> {
+                let (_, groups) = storage.load_with_groups().unwrap();
+                groups.into_iter().map(|group| group.path).collect()
+            };
+            let frozen_groups = stored_groups();
+            let (anchor, anchor_group) = view
+                .instances()
+                .map(|row| (row.id.clone(), row.group_path.clone()))
+                .min()
+                .unwrap();
+            let undo = serde_json::json!({"target":"session","id":anchor,"profile":"reorder",
+                "source_group":anchor_group,"direction":"down","headers":["ccc","aaa","bbb"],
+                "freeze":{"order":[],"base":{"order":expected,"repositories":[]},
+                    "groups":frozen_groups}});
+            let mut respond = view.session_feed.namespace_driver_for_test();
+            view.undo_order_change().unwrap();
+            let (status, headers, value) =
+                request_with_headers(&state, "POST", "/api/reorder", undo.clone()).await;
+            assert!(status.is_success(), "{status}: {value}");
+            assert_eq!(value["status"], "moved", "{case}");
+            let receipt = crate::daemon::MutationReceipt {
+                cursor: receipt_cursor(&headers),
+                outcome: crate::daemon::NamespaceOutcome::Reordered(
+                    serde_json::from_value(value).unwrap(),
+                ),
+            };
+            match respond(Ok(receipt)) {
+                Some(crate::daemon::NamespaceMutation::Reorder(sent)) => {
+                    assert_eq!(serde_json::to_value(sent).unwrap(), undo, "{case}");
+                }
+                _ => panic!("expected the Undo"),
+            }
+            assert_eq!(stored_groups(), ["ccc", "aaa", "bbb"], "{case}");
+            assert!(crate::session::load_workspace_ordering()
+                .unwrap()
+                .order
+                .is_empty());
+            let mut capture = view.session_feed.view_write_driver_for_test();
+            apply_published(&mut view, &state).await;
+            match capture().map(|captured| captured.write) {
+                Some(ViewWrite::SidebarView(patch)) => {
+                    assert_eq!(patch.sort, Some(SortOrder::Name), "{case}");
+                }
+                other => panic!("expected the sort back, got {other:?}"),
             }
         }
     }
