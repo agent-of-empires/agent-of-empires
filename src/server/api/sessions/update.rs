@@ -190,13 +190,9 @@ where
     match persisted {
         Ok((Ok(result), _)) => Ok(result),
         Ok((Err(_), Some(response))) => Err(response),
-        Ok((Err(error), None)) if error.is::<crate::session::SessionCommitApplied>() => Err(
-            super::super::api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "outcome_unconfirmed",
-                "The change committed, but runtime publication is unconfirmed. Check canonical state before retrying.",
-            ),
-        ),
+        Ok((Err(error), None)) if error.is::<crate::session::SessionCommitApplied>() => {
+            Err(outcome_unconfirmed_response())
+        }
         Ok((Err(error), None)) if error.is::<crate::session::NativeStoreUnavailable>() => {
             Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
         }
@@ -215,6 +211,13 @@ where
             Err(persist_failed_response())
         }
     }
+}
+
+pub(super) fn outcome_unconfirmed_response() -> axum::response::Response {
+    super::super::api_error_with_code_header(
+        crate::daemon::ApiErrorCode::OutcomeUnconfirmed,
+        "The change committed, but runtime publication is unconfirmed. Check canonical state before retrying.",
+    )
 }
 
 pub(super) async fn adopt_profile_update<R>(

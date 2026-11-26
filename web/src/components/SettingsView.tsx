@@ -1,6 +1,7 @@
 /* eslint-disable react-refresh/only-export-components */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
+import { SandboxLoginStatusRow } from "./SandboxLoginDialog";
 import { ConnectedDevices } from "./ConnectedDevices";
 import { PasskeySettings } from "./PasskeySettings";
 import { McpServers } from "./McpServers";
@@ -470,6 +471,7 @@ export function SettingsView({
     reloadSettings();
   }, [reloadSettings]);
 
+  const [credentialSaves, setCredentialSaves] = useState(0);
   const sendSave = useCallback(
     (section: string, field: string, value: unknown): Promise<boolean> => {
       if (!selectedProfile) return Promise.resolve(false);
@@ -478,7 +480,13 @@ export function SettingsView({
       // toggles are profile overrides with their own narrow endpoint.
       const send = () =>
         cityhall ? updateProfileSettings(selectedProfile, patch) : updateSettings(patch, selectedProfile);
-      return saveField(selectedProfile, section, field, value, send);
+      // The login row re-reads once the credential mode is on the server: when the save commits, or when a fetch confirms an uncertain one.
+      const credential = section === "sandbox" && field === "shared_credential";
+      const reread = () => setCredentialSaves((n) => n + 1);
+      return saveField(selectedProfile, section, field, value, send, 0, credential ? reread : undefined).then((ok) => {
+        if (ok && credential) reread();
+        return ok;
+      });
     },
     [selectedProfile, cityhall],
   );
@@ -636,14 +644,21 @@ export function SettingsView({
 
       case "sandbox":
         return (
-          <SchemaSection
-            section="sandbox"
-            schema={schema}
-            focusRequest={focusRequest}
-            values={sandbox}
-            onSaveField={sendSave}
-            advancedSubtitle="Resource limits, custom instructions, environment, volumes, and ports."
-          />
+          <>
+            <SandboxLoginStatusRow
+              profile={selectedProfile || undefined}
+              reloadKey={credentialSaves}
+              readOnly={readOnly || cityhall}
+            />
+            <SchemaSection
+              section="sandbox"
+              schema={schema}
+              focusRequest={focusRequest}
+              values={sandbox}
+              onSaveField={sendSave}
+              advancedSubtitle="Resource limits, custom instructions, environment, volumes, and ports."
+            />
+          </>
         );
 
       case "worktree":

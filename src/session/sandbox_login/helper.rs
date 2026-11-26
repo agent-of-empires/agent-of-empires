@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -37,6 +38,11 @@ pub(crate) struct HelperTimeouts {
     pub url: Duration,
     pub after_code: Duration,
     pub total: Duration,
+    /// How long removing the container may take.
+    pub cleanup: Duration,
+    /// How long a cancel waits for the supervisor to finish: the kill, the drain of both
+    /// readers and the removal.
+    pub retire: Duration,
 }
 
 impl Default for HelperTimeouts {
@@ -45,8 +51,25 @@ impl Default for HelperTimeouts {
             url: Duration::from_secs(90),
             after_code: Duration::from_secs(120),
             total: Duration::from_secs(600),
+            cleanup: CLEANUP_WAIT,
+            // The supervisor's worst case, with a margin so it never loses by a hair.
+            retire: Duration::from_secs(
+                KILL_WAIT.as_secs() + 2 * DRAIN_WAIT.as_secs() + CLEANUP_WAIT.as_secs() + 2,
+            ),
         }
     }
+}
+
+/// How far a helper got in going away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Retired {
+    /// The client ended and its container was removed.
+    Removed,
+    /// The client ended and released the login lock, but the container may remain; the next
+    /// start sweeps it.
+    Left,
+    /// Still ending: it keeps the login lock, so whoever holds it must keep owning it.
+    Pending,
 }
 
 /// Host files the helper mounts, and where it sees them.
@@ -280,16 +303,63 @@ pub(crate) struct LoginHelper {
     /// `Some` once the client ended, its output was drained, cleanup ran and the login
     /// lock was released.
     exit: watch::Receiver<Option<HelperExit>>,
+    /// Set before `exit`: the container was removed, or there was none to remove.
+    removed: Arc<AtomicBool>,
     stdin: tokio::sync::Mutex<Option<ChildStdin>>,
     kill: mpsc::Sender<()>,
     submit: tokio::sync::Mutex<()>,
+    /// The dialogs sharing this login, one lease each; the login ends with the last.
+    leases: std::sync::Mutex<Leases>,
+    /// Whether the code exchange succeeded, set when it ends.
+    outcome: OnceLock<bool>,
+    /// A code exchange is in progress. Readers of the outcome wait on this, not on `submit`:
+    /// a reader holding the lock would make a last-lease release lose its `try_lock` and
+    /// leave the login running with no one to end it.
+    exchanging: watch::Sender<bool>,
     #[cfg(test)]
     pid: Option<u32>,
+}
+
+/// The exchange lock, and the flag readers wait on, cleared when it ends.
+struct Exchange<'a> {
+    _one: tokio::sync::MutexGuard<'a, ()>,
+    exchanging: &'a watch::Sender<bool>,
+}
+
+impl Drop for Exchange<'_> {
+    fn drop(&mut self) {
+        self.exchanging.send_replace(false);
+    }
+}
+
+#[derive(Default)]
+struct Leases {
+    held: std::collections::HashSet<String>,
+    /// A code exchange began or a cancel took the login down: no one joins it any more.
+    sealed: bool,
 }
 
 fn random_id() -> String {
     use rand::RngExt;
     format!("{:016x}", rand::rng().random::<u64>())
+}
+
+/// What spawns a helper: runs the closure it is given once, or refuses with an error.
+pub(crate) type Admit<'a> = &'a (dyn Fn(
+    &mut dyn FnMut() -> Result<Arc<LoginHelper>, LoginError>,
+) -> Result<Arc<LoginHelper>, LoginError>
+         + Send
+         + Sync);
+
+/// What `LoginHelper::spawn` needs.
+struct Parts {
+    id: String,
+    login: &'static AgentLogin,
+    lock: LoginLock,
+    argv: Vec<String>,
+    shared: PathBuf,
+    cleanup: Option<Vec<String>>,
+    timeouts: HelperTimeouts,
 }
 
 impl LoginHelper {
@@ -302,6 +372,22 @@ impl LoginHelper {
         tool: &str,
         command: Option<&str>,
         force: bool,
+    ) -> Result<Arc<Self>, LoginError> {
+        let never = tokio_util::sync::CancellationToken::new();
+        Self::start_admitted(profile, tool, command, force, &never, &|spawn| spawn()).await
+    }
+
+    /// As [`start`](Self::start), spawning through `admit`: it may refuse, and what it does
+    /// around the spawn happens before the wait for the sign-in URL, so a caller can own the
+    /// helper from its first moment. `cancel` ends the preparation, the image pull included,
+    /// and releases the login lock.
+    pub(crate) async fn start_admitted(
+        profile: &str,
+        tool: &str,
+        command: Option<&str>,
+        force: bool,
+        cancel: &tokio_util::sync::CancellationToken,
+        admit: Admit<'_>,
     ) -> Result<Arc<Self>, LoginError> {
         let config = crate::session::config::profile_config::resolve_config_or_warn(profile);
         if config.sandbox.shared_credential != SharedCredentialMode::SeparateLogin {
@@ -345,32 +431,41 @@ impl LoginHelper {
         let kind = runtime.kind;
         // Before the sweep or any image work: a path that cannot be mounted must not hide behind a pull error.
         check_mount_paths(&mounts)?;
-        sweep_root(kind, binary, &shared).await;
+        if cancel.is_cancelled() {
+            return Err(LoginError::Cancelled);
+        }
+        // Under the lock, and each runtime call can take a cleanup wait: a cancel drops the
+        // sweep, which kills its command, instead of holding the lock until it ends.
+        tokio::select! {
+            () = cancel.cancelled() => return Err(LoginError::Cancelled),
+            () = sweep_root(kind, binary, &shared) => {}
+        }
         // The automatic image may fall back to its minor tag: the helper runs what was ensured.
-        let image = tokio::task::spawn_blocking(move || {
+        let pull_cancel = cancel.clone();
+        let pulled = tokio::task::spawn_blocking(move || {
             runtime
-                .ensure_image(
-                    &image,
-                    automatic,
-                    &tokio_util::sync::CancellationToken::new(),
-                )
+                .ensure_image(&image, automatic, &pull_cancel)
                 .map_err(|e| anyhow::anyhow!("pulling the sandbox image: {e}"))
         })
         .await
-        .context("the sandbox image task failed")??;
+        .context("the sandbox image task failed")?;
+        if cancel.is_cancelled() {
+            return Err(LoginError::Cancelled);
+        }
+        let image = pulled?;
         let argv = helper_argv(kind, binary, &image, &name, &mounts, login, relabel)?;
         write_home_seed(&mounts.home_seed, login.home_seed.content)?;
         let cleanup = Some(rm_argv(kind, binary, &[name]));
-        Self::start_inner(
+        let parts = Parts {
             id,
             login,
             lock,
             argv,
             shared,
             cleanup,
-            HelperTimeouts::default(),
-        )
-        .await
+            timeouts: HelperTimeouts::default(),
+        };
+        Self::start_inner(parts, admit).await
     }
 
     #[cfg(test)]
@@ -381,19 +476,52 @@ impl LoginHelper {
         cleanup: Option<Vec<String>>,
         timeouts: HelperTimeouts,
     ) -> Result<Arc<Self>, LoginError> {
-        let lock = LoginLock::try_acquire(&shared)?;
-        Self::start_inner(random_id(), login, lock, argv, shared, cleanup, timeouts).await
+        Self::start_with_admission(login, argv, shared, cleanup, timeouts, &|spawn| spawn()).await
     }
 
-    async fn start_inner(
-        id: String,
+    #[cfg(test)]
+    pub(crate) async fn start_with_admission(
         login: &'static AgentLogin,
-        lock: LoginLock,
         argv: Vec<String>,
         shared: PathBuf,
         cleanup: Option<Vec<String>>,
         timeouts: HelperTimeouts,
+        admit: Admit<'_>,
     ) -> Result<Arc<Self>, LoginError> {
+        let lock = LoginLock::try_acquire(&shared)?;
+        let parts = Parts {
+            id: random_id(),
+            login,
+            lock,
+            argv,
+            shared,
+            cleanup,
+            timeouts,
+        };
+        Self::start_inner(parts, admit).await
+    }
+
+    async fn start_inner(parts: Parts, admit: Admit<'_>) -> Result<Arc<Self>, LoginError> {
+        let timeouts = parts.timeouts;
+        let deadline = tokio::time::Instant::now() + timeouts.url;
+        let mut parts = Some(parts);
+        let helper = admit(&mut || Self::spawn(parts.take().context("spawned twice")?))?;
+        helper.await_url(deadline).await?;
+        Ok(helper)
+    }
+
+    /// Spawns the client and its supervisor. Synchronous, so the caller of `admit` can hold a
+    /// lock from its check to the helper's registration.
+    fn spawn(parts: Parts) -> Result<Arc<Self>, LoginError> {
+        let Parts {
+            id,
+            login,
+            lock,
+            argv,
+            shared,
+            cleanup,
+            timeouts,
+        } = parts;
         let (program, args) = argv.split_first().context("empty helper command")?;
         let spawned = tokio::time::Instant::now();
         let mut child = tokio::process::Command::new(program)
@@ -427,6 +555,7 @@ impl LoginHelper {
         drop(rev_tx);
         let (exit_tx, exit) = watch::channel(None);
         let (kill, kill_rx) = mpsc::channel(1);
+        let removed = Arc::new(AtomicBool::new(false));
         tokio::spawn(supervise(Supervised {
             name,
             child,
@@ -434,6 +563,8 @@ impl LoginHelper {
             kill_rx,
             total: spawned + timeouts.total,
             cleanup,
+            cleanup_wait: timeouts.cleanup,
+            removed: Arc::clone(&removed),
             lock,
             exit_tx,
         }));
@@ -447,13 +578,16 @@ impl LoginHelper {
             stdout,
             output_rev,
             exit,
+            removed,
             stdin: tokio::sync::Mutex::new(stdin),
             kill,
             submit: tokio::sync::Mutex::new(()),
+            leases: std::sync::Mutex::default(),
+            outcome: OnceLock::new(),
+            exchanging: watch::channel(false).0,
             #[cfg(test)]
             pid,
         });
-        helper.await_url(spawned + timeouts.url).await?;
         Ok(helper)
     }
 
@@ -494,6 +628,16 @@ impl LoginHelper {
         format!("{HELPER_NAME_PREFIX}{}", self.id)
     }
 
+    /// Names this login to a client (16 hex, not derived from any secret).
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The shared credential file this helper logs into.
+    pub(crate) fn shared(&self) -> &Path {
+        &self.shared
+    }
+
     pub(crate) fn url(&self) -> &str {
         self.url.get().map_or("", String::as_str)
     }
@@ -501,7 +645,41 @@ impl LoginHelper {
     /// One code per helper: `Ok(())` means logged in; any `Err` ends this helper
     /// (a wrong code is `Failed { message }`; trying again needs a new `start`).
     pub(crate) async fn submit_code(&self, code: LoginCode) -> Result<(), LoginError> {
-        let _one = self.submit.lock().await;
+        let _one = self.begin_exchange().await;
+        let result = self.exchange(code).await;
+        // Set under the lock, so a retry that finds the login gone also finds its outcome.
+        if !matches!(result, Err(LoginError::Gone)) {
+            let _ = self.outcome.set(result.is_ok());
+        }
+        result
+    }
+
+    /// Takes the exchange lock and seals the login as one step, under the leases mutex: a
+    /// joiner or a last-lease release that sees the seal also finds the lock held, never a
+    /// sealed login whose exchange has not started and can still be cancelled.
+    async fn begin_exchange(&self) -> Exchange<'_> {
+        {
+            let mut leases = self.leases();
+            if let Ok(one) = self.submit.try_lock() {
+                leases.sealed = true;
+                return self.exchange_guard(one);
+            }
+        }
+        // Held by an exchange or a cancel, which sealed already.
+        let one = self.submit.lock().await;
+        self.leases().sealed = true;
+        self.exchange_guard(one)
+    }
+
+    fn exchange_guard<'a>(&'a self, one: tokio::sync::MutexGuard<'a, ()>) -> Exchange<'a> {
+        self.exchanging.send_replace(true);
+        Exchange {
+            _one: one,
+            exchanging: &self.exchanging,
+        }
+    }
+
+    async fn exchange(&self, code: LoginCode) -> Result<(), LoginError> {
         let Some(mut stdin) = self.stdin.lock().await.take() else {
             return Err(LoginError::Gone);
         };
@@ -572,23 +750,105 @@ impl LoginHelper {
         }
     }
 
-    pub(crate) async fn cancel(&self) {
-        self.kill_and_cleanup().await;
+    pub(crate) async fn cancel(&self) -> Retired {
+        self.kill_and_cleanup().await
+    }
+
+    /// Joins this login: the lease to release when the dialog goes, the `chosen` one when the
+    /// dialog names it, so a start it repeats is the same lease. `None` once a code was
+    /// submitted or a cancel took it down.
+    pub(crate) fn join(&self, chosen: Option<&str>) -> Option<String> {
+        let mut leases = self.leases();
+        if leases.sealed {
+            return None;
+        }
+        let lease = chosen.map_or_else(random_id, str::to_string);
+        leases.held.insert(lease.clone());
+        Some(lease)
+    }
+
+    /// Whether `lease` is one this login still holds.
+    pub(crate) fn holds(&self, lease: &str) -> bool {
+        self.leases().held.contains(lease)
+    }
+
+    /// Releases `lease`, or every lease when `None`, and cancels once none is left, unless
+    /// a code exchange is in progress, which may be about to write the credential. `None`
+    /// when it did not cancel. A code arriving meanwhile waits for the cancel and finds the
+    /// login gone.
+    pub(crate) async fn release(&self, lease: Option<&str>) -> Option<Retired> {
+        let one = {
+            let mut leases = self.leases();
+            match lease {
+                Some(lease) => {
+                    leases.held.remove(lease);
+                }
+                None => leases.held.clear(),
+            }
+            if !leases.held.is_empty() {
+                return None;
+            }
+            let Ok(one) = self.submit.try_lock() else {
+                return None;
+            };
+            leases.sealed = true;
+            one
+        };
+        let retired = self.kill_and_cleanup().await;
+        drop(one);
+        Some(retired)
+    }
+
+    /// Whether the code exchange succeeded, once it ended.
+    pub(crate) fn outcome(&self) -> Option<bool> {
+        self.outcome.get().copied()
+    }
+
+    /// Waits for a code exchange in progress, then gives its outcome.
+    pub(crate) async fn settled_outcome(&self) -> Option<bool> {
+        let mut running = self.exchanging.subscribe();
+        let _ = running.wait_for(|running| !*running).await;
+        self.outcome()
+    }
+
+    fn leases(&self) -> std::sync::MutexGuard<'_, Leases> {
+        self.leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A code exchange is in progress.
+    #[cfg(test)]
+    pub(crate) fn is_submitting(&self) -> bool {
+        self.submit.try_lock().is_err()
     }
 
     pub(crate) fn is_finished(&self) -> bool {
         self.exit.borrow().is_some()
     }
 
-    async fn kill_and_cleanup(&self) {
+    /// Whether the container was removed by name. False until then, and when removal failed.
+    pub(crate) fn removed(&self) -> bool {
+        self.removed.load(Ordering::SeqCst)
+    }
+
+    async fn kill_and_cleanup(&self) -> Retired {
         let _ = self.kill.try_send(());
         drop(self.stdin.lock().await.take());
         let mut exit = self.exit.clone();
-        let _ = tokio::time::timeout(
-            KILL_WAIT + DRAIN_WAIT + CLEANUP_WAIT,
-            exit.wait_for(Option::is_some),
-        )
-        .await;
+        let waited =
+            tokio::time::timeout(self.timeouts.retire, exit.wait_for(Option::is_some)).await;
+        match waited {
+            Err(_) => Retired::Pending,
+            Ok(exited) => {
+                let exited = exited.is_ok();
+                if exited && self.removed.load(Ordering::SeqCst) {
+                    Retired::Removed
+                } else {
+                    Retired::Left
+                }
+            }
+        }
     }
 
     /// Resolves once the helper ended on its own (timeout, kill, client exit), with why.
@@ -647,6 +907,8 @@ struct Supervised {
     kill_rx: mpsc::Receiver<()>,
     total: tokio::time::Instant,
     cleanup: Option<Vec<String>>,
+    cleanup_wait: Duration,
+    removed: Arc<AtomicBool>,
     lock: LoginLock,
     exit_tx: watch::Sender<Option<HelperExit>>,
 }
@@ -687,9 +949,15 @@ async fn supervise(mut s: Supervised) {
         }
     }
     // `--rm` normally removes the container; killing the client alone may leave it running.
-    if let Some(argv) = &s.cleanup {
-        run_cleanup(argv).await;
+    let removed = match &s.cleanup {
+        Some(argv) => run_cleanup(argv, s.cleanup_wait).await,
+        None => true,
+    };
+    if !removed {
+        tracing::warn!(target: LOG_TARGET, helper = %s.name, "Sandbox login helper container was not removed");
     }
+    s.removed.store(removed, Ordering::SeqCst);
+    // Released even when the removal failed: the next start sweeps by label.
     drop(s.lock);
     let _ = s.exit_tx.send(Some(exited));
 }
@@ -699,9 +967,10 @@ async fn kill(child: &mut Child) {
     let _ = tokio::time::timeout(KILL_WAIT, child.wait()).await;
 }
 
-async fn run_cleanup(argv: &[String]) {
+/// Whether the command ran and succeeded within `wait`.
+async fn run_cleanup(argv: &[String], wait: Duration) -> bool {
     let Some((program, args)) = argv.split_first() else {
-        return;
+        return true;
     };
     let status = tokio::process::Command::new(program)
         .args(args)
@@ -711,7 +980,7 @@ async fn run_cleanup(argv: &[String]) {
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .status();
-    let _ = tokio::time::timeout(CLEANUP_WAIT, status).await;
+    matches!(tokio::time::timeout(wait, status).await, Ok(Ok(status)) if status.success())
 }
 
 /// `rm -f` without podman's 10 s stop grace (`-t 0`); Docker's `rm -f` kills at once
@@ -765,7 +1034,9 @@ async fn sweep_root(kind: RuntimeKind, binary: &str, shared: &Path) {
         return;
     }
     tracing::info!(target: LOG_TARGET, count = ids.len(), "Removing stale sandbox login helpers");
-    run_cleanup(&rm_argv(kind, binary, &ids)).await;
+    if !run_cleanup(&rm_argv(kind, binary, &ids), CLEANUP_WAIT).await {
+        tracing::warn!(target: LOG_TARGET, "Removing stale sandbox login helpers failed");
+    }
 }
 
 /// The helper-private seed file, rewritten before each run.
@@ -814,115 +1085,10 @@ mod tests {
     use super::super::claude::LOGIN;
     use super::*;
     use crate::session::config::container_config::login_target;
+    use crate::session::sandbox_login::test_fake::{bounded, Fake, DEADLINE, MEASURED_URL};
     use tempfile::TempDir;
 
-    // Measured shape, `state`/`code_challenge` replaced by SAMPLE values.
-    const MEASURED_URL: &str = "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference+user%3Asessions%3Aclaude_code+user%3Amcp_servers+user%3Afile_upload+user%3Aplugins&code_challenge=SAMPLEchallenge&code_challenge_method=S256&state=SAMPLEstate";
-    const DEADLINE: Duration = Duration::from_secs(10);
     const WRONG_LINE: &str = "Login failed: Request failed with status code 400";
-
-    /// Imitates the measured plain output: the URL line over two writes, the prompt
-    /// without a newline, one `read`. `HANG_ON_EOF=1` ignores EOF like the real client.
-    const FAKE_HELPER: &str = r#"#!/bin/sh
-printf 'Opening browser to sign in\342\200\246\n'
-half=${#URL}; half=$((half / 2))
-printf "If the browser didn't open, visit: %s" "$(printf %s "$URL" | cut -c1-$half)"
-printf '%s\n' "$(printf %s "$URL" | cut -c$((half + 1))-)"
-printf 'Paste code here if prompted > '
-if ! IFS= read -r code; then
-  [ -n "$HANG_ON_EOF" ] && exec sleep 3600
-  exit 3
-fi
-case "$code" in
-  good-code#good-state)
-    printf '{"claudeAiOauth":{"accessToken":"fake-access","refreshToken":"fake-refresh","expiresAt":%s}}' "$(( $(date +%s) * 1000 + 3600000 ))" > "$CRED"
-    printf 'Login successful.\n'; exit 0 ;;
-  lie*) printf 'Login successful.\n'; exit 0 ;;
-  late*)
-    printf '{"claudeAiOauth":{"accessToken":"fake-access","refreshToken":"fake-refresh","expiresAt":%s}}' "$(( $(date +%s) * 1000 + 3600000 ))" > "$CRED"
-    exec sleep 3600 ;;
-  hang*) exec sleep 3600 ;;
-  invalid*) printf 'Invalid code. Please make sure the full code was copied.\n'; exec sleep 3600 ;;
-  echo*) printf '%s\n%s\n' "$code" "$URL"; printf 'Login failed: Request failed with status code 400\n' >&2; exit 1 ;;
-  *) printf 'Login failed: Request failed with status code 400\n'; exit 1 ;;
-esac
-"#;
-
-    struct Fake {
-        tmp: TempDir,
-        shared: PathBuf,
-    }
-
-    impl Fake {
-        fn new() -> Self {
-            let tmp = TempDir::new().unwrap();
-            let shared = tmp.path().join("sandbox-v2").join(".credentials.json");
-            Self::at(tmp, shared)
-        }
-
-        /// A fake helper filling `shared`, the file a real start would mount.
-        fn at(tmp: TempDir, shared: PathBuf) -> Self {
-            use std::os::unix::fs::PermissionsExt;
-            let script = tmp.path().join("fake.sh");
-            std::fs::write(&script, FAKE_HELPER).unwrap();
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-            std::fs::create_dir_all(shared.parent().unwrap()).unwrap();
-            std::fs::write(&shared, "{}").unwrap();
-            Self { tmp, shared }
-        }
-
-        fn argv(&self, hang_on_eof: bool) -> Vec<String> {
-            let mut argv = vec![
-                "/usr/bin/env".to_string(),
-                format!("URL={MEASURED_URL}"),
-                format!("CRED={}", self.shared.display()),
-            ];
-            if hang_on_eof {
-                argv.push("HANG_ON_EOF=1".to_string());
-            }
-            argv.push("/bin/sh".to_string());
-            argv.push(self.tmp.path().join("fake.sh").display().to_string());
-            argv
-        }
-
-        fn cleaned(&self) -> PathBuf {
-            self.tmp.path().join("cleaned")
-        }
-
-        fn cleanup(&self) -> Option<Vec<String>> {
-            Some(vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                format!("touch '{}'", self.cleaned().display()),
-            ])
-        }
-
-        async fn start(&self, hang_on_eof: bool) -> Result<Arc<LoginHelper>, LoginError> {
-            self.start_timed(hang_on_eof, HelperTimeouts::default())
-                .await
-        }
-
-        async fn start_timed(
-            &self,
-            hang_on_eof: bool,
-            timeouts: HelperTimeouts,
-        ) -> Result<Arc<LoginHelper>, LoginError> {
-            bounded(LoginHelper::start_with(
-                &LOGIN,
-                self.argv(hang_on_eof),
-                self.shared.clone(),
-                self.cleanup(),
-                timeouts,
-            ))
-            .await
-        }
-    }
-
-    async fn bounded<T>(future: impl std::future::Future<Output = T>) -> T {
-        tokio::time::timeout(DEADLINE, future)
-            .await
-            .expect("deadline exceeded")
-    }
 
     fn code(raw: &str) -> LoginCode {
         LoginCode::parse(raw.to_string()).unwrap()
@@ -1300,6 +1466,7 @@ esac
                     url: Duration::from_secs(5),
                     after_code: Duration::from_secs(5),
                     total: Duration::from_secs(1),
+                    ..HelperTimeouts::default()
                 },
             )
             .await
@@ -1519,6 +1686,121 @@ esac
         ));
     }
 
+    async fn start_cleaning_with(
+        fake: &Fake,
+        cleanup: &str,
+        timeouts: HelperTimeouts,
+    ) -> Arc<LoginHelper> {
+        bounded(LoginHelper::start_with(
+            &LOGIN,
+            fake.argv(true),
+            fake.shared.clone(),
+            Some(vec!["sh".into(), "-c".into(), cleanup.into()]),
+            timeouts,
+        ))
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(sandbox_login_helper)]
+    async fn sandbox_login_helper_a_cancel_says_how_far_the_removal_got() {
+        let quick = HelperTimeouts {
+            cleanup: Duration::from_millis(300),
+            ..HelperTimeouts::default()
+        };
+        // (cleanup command, what the cancel reports)
+        for (cleanup, expected) in [
+            ("true", Retired::Removed),
+            // The client ended and the lock is free, but the container may remain.
+            ("exit 1", Retired::Left),
+            ("sleep 5", Retired::Left),
+        ] {
+            let fake = Fake::new();
+            let helper = start_cleaning_with(&fake, cleanup, quick).await;
+            assert_eq!(bounded(helper.cancel()).await, expected, "{cleanup}");
+            assert!(helper.is_finished(), "{cleanup}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(sandbox_login_helper)]
+    async fn sandbox_login_helper_a_cancel_that_runs_out_of_wait_keeps_its_ownership() {
+        let fake = Fake::new();
+        let helper = start_cleaning_with(
+            &fake,
+            "sleep 2",
+            HelperTimeouts {
+                cleanup: Duration::from_secs(5),
+                retire: Duration::from_millis(300),
+                ..HelperTimeouts::default()
+            },
+        )
+        .await;
+        assert_eq!(bounded(helper.cancel()).await, Retired::Pending);
+        assert!(!helper.is_finished(), "still removing");
+        assert!(
+            matches!(fake.start(true).await, Err(LoginError::Busy)),
+            "the login lock is still held"
+        );
+        // A later cancel finds it done.
+        bounded(helper.ended()).await;
+        assert_eq!(bounded(helper.cancel()).await, Retired::Removed);
+    }
+
+    /// A code and a last-lease release meeting: whichever comes first wins whole.
+    #[tokio::test]
+    #[serial_test::serial(sandbox_login_helper)]
+    async fn sandbox_login_helper_release_and_submit_never_split_an_exchange() {
+        // Release first: the login is gone, a late code finds that and no one joins it.
+        let fake = Fake::new();
+        let helper = fake.start(true).await.unwrap();
+        assert_eq!(bounded(helper.release(None)).await, Some(Retired::Removed));
+        assert!(matches!(
+            bounded(helper.submit_code(code("good-code#good-state"))).await,
+            Err(LoginError::Gone)
+        ));
+        assert!(helper.join(None).is_none());
+
+        // Submit first: the release leaves the exchange alone, and so does a later join.
+        let fake = Fake::new();
+        let helper = fake.start(true).await.unwrap();
+        let lease = helper.join(None).unwrap();
+        let submitting = {
+            let helper = Arc::clone(&helper);
+            tokio::spawn(async move { helper.submit_code(code("good-code#good-state")).await })
+        };
+        let result = bounded(async {
+            while !helper.is_submitting() {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(helper.release(Some(&lease)).await, None);
+            assert!(helper.join(None).is_none());
+            submitting.await.unwrap()
+        })
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(helper.outcome(), Some(true));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(sandbox_login_helper)]
+    async fn sandbox_login_helper_a_code_queued_behind_the_lock_survives_a_release() {
+        let fake = Fake::new();
+        let helper = fake.start(true).await.unwrap();
+        // The lock is taken, as a cancel in progress holds it.
+        let holder = helper.submit.lock().await;
+        let submitting = {
+            let helper = Arc::clone(&helper);
+            tokio::spawn(async move { helper.submit_code(code("good-code#good-state")).await })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(helper.release(None).await, None, "the lock is taken");
+        drop(holder);
+        let result = bounded(submitting).await.unwrap();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
     #[tokio::test]
     #[serial_test::serial(sandbox_login_helper)]
     async fn sandbox_login_helper_ended_by_client_exit_redacts_the_link() {
@@ -1720,6 +2002,112 @@ esac
             LoginHelper::start(&profile, "claude", None, false).await,
             Err(LoginError::AlreadyLoggedIn)
         ));
+    }
+
+    /// The login lock is taken before the image pull: a cancel in the pull ends it at once
+    /// and lets the next start take the lock, instead of waiting out the pull.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_helper_a_cancel_during_the_image_pull_releases_the_lock() {
+        let home = crate::session::test_support::isolate_app_dir();
+        let (_runtime, calls) =
+            crate::session::test_support::hanging_pull_container_runtime(home.path());
+        let profile = crate::session::config::effective_profile("");
+        crate::session::config::update_config(|c| {
+            c.sandbox.shared_credential = SharedCredentialMode::SeparateLogin;
+            c.sandbox.container_runtime = crate::session::config::ContainerRuntimeName::Docker;
+        })
+        .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let start = tokio::spawn({
+            let (profile, cancel) = (profile.clone(), cancel.clone());
+            async move {
+                LoginHelper::start_admitted(&profile, "claude", None, true, &cancel, &|spawn| {
+                    spawn()
+                })
+                .await
+                .map(|_| ())
+            }
+        });
+        // The pull is under way, with the lock held.
+        tokio::time::timeout(DEADLINE, async {
+            while !std::fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .contains("pull")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the image pull started");
+        let shared = login_target(&profile, "claude").unwrap().credential;
+        assert!(matches!(
+            LoginLock::try_acquire(&shared),
+            Err(LoginError::Busy)
+        ));
+
+        cancel.cancel();
+
+        let ended = tokio::time::timeout(DEADLINE, start)
+            .await
+            .expect("the cancel ends the start well before the pull would")
+            .unwrap();
+        assert!(matches!(ended, Err(LoginError::Cancelled)), "{ended:?}");
+        LoginLock::try_acquire(&shared).expect("the lock is free for the next start");
+    }
+
+    /// The pre-start sweep of stale helpers runs under the login lock and can wait out a
+    /// runtime call: a cancel while the listing is blocked ends the start and frees the lock.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_helper_a_cancel_during_the_stale_sweep_releases_the_lock() {
+        let home = crate::session::test_support::isolate_app_dir();
+        let (_runtime, calls) =
+            crate::session::test_support::hanging_listing_container_runtime(home.path());
+        let profile = crate::session::config::effective_profile("");
+        crate::session::config::update_config(|c| {
+            c.sandbox.shared_credential = SharedCredentialMode::SeparateLogin;
+            c.sandbox.container_runtime = crate::session::config::ContainerRuntimeName::Docker;
+        })
+        .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let start = tokio::spawn({
+            let (profile, cancel) = (profile.clone(), cancel.clone());
+            async move {
+                LoginHelper::start_admitted(&profile, "claude", None, true, &cancel, &|spawn| {
+                    spawn()
+                })
+                .await
+                .map(|_| ())
+            }
+        });
+        // The listing is under way, with the lock held.
+        tokio::time::timeout(DEADLINE, async {
+            while !std::fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .contains("ps")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the stale sweep started its listing");
+        let shared = login_target(&profile, "claude").unwrap().credential;
+        assert!(matches!(
+            LoginLock::try_acquire(&shared),
+            Err(LoginError::Busy)
+        ));
+
+        cancel.cancel();
+
+        let ended = tokio::time::timeout(DEADLINE, start)
+            .await
+            .expect("the cancel ends the start well before the listing would")
+            .unwrap();
+        assert!(matches!(ended, Err(LoginError::Cancelled)), "{ended:?}");
+        LoginLock::try_acquire(&shared).expect("the lock is free for the next start");
     }
 
     /// Apple Container cannot run the helper: the login refuses with the setting's message
