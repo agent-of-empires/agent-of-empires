@@ -373,6 +373,8 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
             warn!(target: "acp.runner", session = %session_id, %error, "failed to delete worker record");
         }
     }
+    // Last, so a grandchild that outlived its parent (a proxy's adapter) dies too.
+    crate::process::worker::kill_own_process_group_if_leader(our_pid);
     Ok(())
 }
 
