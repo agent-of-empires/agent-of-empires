@@ -915,6 +915,45 @@ mod tests {
         ),
     ];
 
+    // Audited writes that take a body but can't refuse read-only before it.
+    const BODY_LAYER_EXEMPTIONS: &[(&str, &str, &str, &str)] = &[(
+        "POST",
+        "/api/sessions/{id}/ensure",
+        "api::ensure_session",
+        "Read-only Ensure answers the existing agent target, so it isn't refused.",
+    )];
+
+    /// Whether a handler argument extracts the request body.
+    fn body_extractor(ty: &syn::Type) -> bool {
+        let syn::Type::Path(path) = ty else {
+            return false;
+        };
+        let Some(segment) = path.path.segments.last() else {
+            return false;
+        };
+        if [
+            "Json",
+            "Bytes",
+            "String",
+            "Body",
+            "Multipart",
+            "Request",
+            "Form",
+        ]
+        .iter()
+        .any(|name| segment.ident == name)
+        {
+            return true;
+        }
+        if segment.ident != "Option" && segment.ident != "Result" {
+            return false;
+        }
+        let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+            return false;
+        };
+        matches!(arguments.args.first(), Some(syn::GenericArgument::Type(ty)) if body_extractor(ty))
+    }
+
     fn audited_handler(identity: &str, audited: &[&str]) -> bool {
         audited.iter().any(|name| {
             if name.contains("::") {
@@ -1860,6 +1899,45 @@ mod tests {
                         "{file}: `{name}` can reject deferred JSON before its read-only guard"
                     ));
                 }
+                // A handler guard runs only once the body is read, so a body-taking write
+                // refuses read-only through the route layer or an `ElevatedMutationGuard`.
+                let takes_body = syn::parse_str::<syn::Signature>(signature)
+                    .expect("audited function signature")
+                    .inputs
+                    .iter()
+                    .any(|argument| {
+                        matches!(argument, syn::FnArg::Typed(argument) if body_extractor(&argument.ty))
+                    });
+                if takes_body && parts_guard.is_none() {
+                    for route in routes
+                        .iter()
+                        .filter(|route| audited_handler(route.handler, &[*name]))
+                    {
+                        let exempt =
+                            BODY_LAYER_EXEMPTIONS
+                                .iter()
+                                .any(|(method, path, handler, _)| {
+                                    (route.method, route.path, route.handler)
+                                        == (*method, *path, *handler)
+                                });
+                        if !route.read_only_layer && !exempt {
+                            failures.push(format!(
+                                "{file}: {} {} reads `{name}`'s body before refusing read-only",
+                                route.method, route.path
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        for (method, path, handler, _) in BODY_LAYER_EXEMPTIONS {
+            if !routes.iter().any(|route| {
+                (route.method, route.path, route.handler) == (*method, *path, *handler)
+                    && !route.read_only_layer
+            }) {
+                failures.push(format!(
+                    "stale body-layer exemption: {method} {path} {handler}"
+                ));
             }
         }
         assert!(
@@ -1867,6 +1945,250 @@ mod tests {
             "{classification_failures:#?}\n{}",
             failures.join("\n")
         );
+    }
+
+    /// A read-only Daemon refuses every body-taking write before reading its body. The other
+    /// methods on those routes keep their own answers, and a route's own body limit still holds.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn read_only_writes_refuse_before_reading_the_body() {
+        use axum::body::{Body, Bytes};
+        use axum::http::{Method, Request};
+        use axum::response::IntoResponse as _;
+        use tower::ServiceExt;
+
+        const WRITES: &[(&str, &str)] = &[
+            ("POST", "/api/sessions"),
+            ("PUT", "/api/workspace-ordering"),
+            ("POST", "/api/mcp/servers/work/resolve"),
+            ("POST", "/api/mcp/servers/work/keep"),
+            ("POST", "/api/mcp/servers/work/drop"),
+            ("PATCH", "/api/sessions/missing/group"),
+            ("PUT", "/api/sessions/missing/file"),
+            ("POST", "/api/sessions/missing/send"),
+            ("POST", "/api/sessions/missing/paste-image"),
+            ("PATCH", "/api/sessions/missing/notifications"),
+            ("PATCH", "/api/sessions/missing/diff-base"),
+            ("PATCH", "/api/sessions/missing/worktree-name"),
+            ("POST", "/api/sessions/missing/projects"),
+            ("PATCH", "/api/sessions/missing/pin"),
+            ("PATCH", "/api/sessions/missing/archive"),
+            ("PATCH", "/api/sessions/missing/snooze"),
+            ("PATCH", "/api/sessions/missing/unread"),
+            ("POST", "/api/sessions/missing/start"),
+            ("POST", "/api/sessions/missing/terminal"),
+            ("POST", "/api/sessions/missing/container-terminal"),
+            ("POST", "/api/profiles"),
+            ("PATCH", "/api/profiles/work/settings"),
+            ("PATCH", "/api/profiles/work/rename"),
+            ("PATCH", "/api/default-profile"),
+            ("POST", "/api/git/clone"),
+            ("POST", "/api/projects"),
+            ("PATCH", "/api/projects/work"),
+            ("PATCH", "/api/settings"),
+            ("POST", "/api/tips/show"),
+            ("POST", "/api/app-state/tip-seen"),
+            ("POST", "/api/suggestions/refresh"),
+            ("POST", "/api/suggestions/checks/run"),
+            ("POST", "/api/suggestions/fix"),
+            ("POST", "/api/suggestions/dismiss"),
+            ("POST", "/api/suggestions/undismiss"),
+            ("PATCH", "/api/suggestions/sources"),
+            ("PATCH", "/api/suggestions/prefs"),
+            ("PUT", "/api/suggestions/presets"),
+            ("POST", "/api/suggestions/start"),
+            ("PUT", "/api/suggestions/mappings"),
+            ("POST", "/api/plugins/missing/action"),
+            ("PATCH", "/api/setup"),
+            ("POST", "/api/app-state/dismiss-update"),
+            ("PATCH", "/api/app-state/web-ui-state"),
+            ("PATCH", "/api/theme"),
+            ("POST", "/api/push/subscribe"),
+            ("POST", "/api/push/unsubscribe"),
+            ("POST", "/api/push/test"),
+            ("PATCH", "/api/log-level"),
+            ("POST", "/api/telemetry/consent"),
+            ("POST", "/api/telemetry/seen"),
+            ("POST", "/api/telemetry/feature-use"),
+            ("POST", "/api/telemetry/structured-interaction"),
+            ("POST", "/api/sessions/missing/acp/spawn"),
+            ("POST", "/api/sessions/missing/acp/restart"),
+            ("POST", "/api/sessions/missing/acp/switch-provider"),
+            ("POST", "/api/sessions/missing/acp/prompt"),
+            ("POST", "/api/sessions/missing/acp/prompt/diff-comments"),
+            ("POST", "/api/sessions/missing/acp/mode"),
+            ("POST", "/api/sessions/missing/acp/config-option"),
+            ("POST", "/api/sessions/missing/acp/disable"),
+            ("POST", "/api/sessions/missing/queue"),
+            ("PATCH", "/api/sessions/missing/queue/p1"),
+            ("POST", "/api/sessions/missing/acp/approvals/n1"),
+            ("POST", "/api/sessions/missing/acp/elicitations/n1"),
+        ];
+        // Body-less writes sharing those routes, which already refuse in the handler.
+        const BODYLESS: &[(&str, &str)] = &[
+            ("DELETE", "/api/sessions/missing/terminal"),
+            ("DELETE", "/api/projects/work"),
+            ("DELETE", "/api/suggestions/presets"),
+            ("DELETE", "/api/suggestions/mappings"),
+            ("DELETE", "/api/sessions/missing/queue"),
+            ("DELETE", "/api/sessions/missing/queue/p1"),
+        ];
+        const READS: &[&str] = &[
+            "/api/sessions",
+            "/api/sessions/missing/file",
+            "/api/profiles",
+            "/api/profiles/work/settings",
+            "/api/projects",
+            "/api/settings",
+            "/api/suggestions/presets",
+            "/api/suggestions/mappings",
+            "/api/setup",
+            "/api/app-state/web-ui-state",
+            "/api/log-level",
+            "/api/sessions/missing/queue",
+        ];
+
+        async fn send(
+            app: &axum::Router,
+            method: &str,
+            path: &str,
+            body: Body,
+        ) -> Option<(StatusCode, Option<String>, Bytes)> {
+            let mut request = Request::builder()
+                .method(Method::from_bytes(method.as_bytes()).unwrap())
+                .uri(path)
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .body(body)
+                .unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                crate::server::peer::ConnectionPeer::UnixOwner {
+                    uid: nix::unistd::geteuid().as_raw(),
+                },
+            ));
+            // Bounds a write that waits for its body; a refusal answers at once.
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let response = app.clone().oneshot(request).await.unwrap();
+                split(response).await
+            })
+            .await
+            .ok()
+        }
+        async fn split(response: Response) -> (StatusCode, Option<String>, Bytes) {
+            let status = response.status();
+            let code = response
+                .headers()
+                .get(crate::daemon::ERROR_CODE_HEADER)
+                .map(|code| code.to_str().unwrap().to_string());
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, code, body)
+        }
+        let never_ends =
+            || Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::io::Error>>());
+
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        let build = |read_only: bool| {
+            let state = crate::server::test_support::build_test_app_state_with_policy_configured(
+                Vec::new(),
+                vec!["localhost".into()],
+                Vec::new(),
+                None,
+                |state| state.read_only = read_only,
+            );
+            (
+                state.clone(),
+                crate::server::test_support::build_router_for_test(state),
+            )
+        };
+        let (read_only_state, read_only) = build(true);
+        let (_, writable) = build(false);
+        let refusal = split(read_only_response()).await;
+
+        let mut unrefused = Vec::new();
+        for (method, path) in WRITES {
+            if send(&read_only, method, path, never_ends()).await.as_ref() != Some(&refusal) {
+                unrefused.push(format!("{method} {path}"));
+            }
+        }
+        assert!(
+            unrefused.is_empty(),
+            "read-only writes that read their body first: {unrefused:?}"
+        );
+        for (method, path) in BODYLESS {
+            let answer = send(&read_only, method, path, Body::empty()).await;
+            assert_eq!(answer.as_ref(), Some(&refusal), "{method} {path}");
+        }
+        for path in READS {
+            let (status, code, _) = send(&read_only, "GET", path, Body::empty())
+                .await
+                .unwrap_or_else(|| panic!("GET {path} didn't answer"));
+            assert_ne!(code.as_deref(), Some("read_only"), "GET {path}: {status}");
+        }
+        // Read-only Ensure answers the existing agent target, and prepare mutates nothing.
+        for (path, body) in [
+            ("/api/sessions/missing/ensure", "{}"),
+            (
+                "/api/suggestions/prepare",
+                r#"{"provider_id":"p","id":"i"}"#,
+            ),
+        ] {
+            let (status, code, _) = send(&read_only, "POST", path, Body::from(body))
+                .await
+                .unwrap_or_else(|| panic!("POST {path} didn't answer"));
+            assert_ne!(
+                code.as_deref(),
+                Some("read_only"),
+                "POST {path}: refused on a read-only Daemon ({status})"
+            );
+        }
+
+        // The layer's refusal is the one the handler gave, byte for byte. Before the layer a
+        // malformed body already got it, since the handler checked read-only before unwrapping
+        // the body; a writable Daemon parses it.
+        let prefs = "/api/suggestions/prefs";
+        let handler_refusal = split(
+            patch_suggestion_prefs(
+                axum::extract::State(read_only_state),
+                Ok(axum::Json(Default::default())),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        for body in ["{}", "{"] {
+            assert_eq!(
+                send(&read_only, "PATCH", prefs, Body::from(body)).await,
+                Some(handler_refusal.clone()),
+                "PATCH {prefs} with {body}: not the handler's refusal"
+            );
+        }
+        let (status, code, _) = send(&writable, "PATCH", prefs, Body::from("{"))
+            .await
+            .unwrap();
+        assert!(
+            status.is_client_error() && code.as_deref() != Some("read_only"),
+            "PATCH {prefs}: a writable Daemon didn't parse the body ({status})"
+        );
+
+        // Off read-only the layer passes the request on, and the route's own limit answers.
+        for (method, path, limit) in [
+            ("PUT", "/api/sessions/missing/file", 32 << 20),
+            ("POST", "/api/sessions/missing/paste-image", 8 << 20),
+            ("POST", "/api/sessions/missing/acp/prompt", 28 << 20),
+        ] {
+            let oversize = Body::from(vec![b' '; limit + 1]);
+            let (status, _, _) = send(&writable, method, path, oversize)
+                .await
+                .unwrap_or_else(|| panic!("{method} {path} didn't answer"));
+            assert_eq!(
+                status,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "{method} {path}: its own body limit"
+            );
+        }
     }
 
     #[tokio::test]
