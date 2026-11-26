@@ -149,6 +149,9 @@ pub struct App {
     pull_image: String,
     /// The update the watched pull installs, recorded when it starts.
     pull_digest: Option<String>,
+    /// The update offered when another client's pull, waiting behind an outcome, was first seen
+    /// running: it installs that one.
+    behind_digest: Option<String>,
     /// The watched pull is one this TUI started, so only the offer at its start names its
     /// digest: a later one may be of a tag that moved since.
     pull_started_here: bool,
@@ -423,6 +426,7 @@ impl App {
             pull_image: String::new(),
             pull_started_here: false,
             pull_digest: None,
+            behind_digest: None,
             cancel_after_start: false,
             pull: PullWatch::default(),
             pull_rx: None,
@@ -1936,6 +1940,7 @@ impl App {
                 let installed = self
                     .pull_digest
                     .take()
+                    .or_else(|| self.behind_digest.take())
                     .or_else(|| {
                         (!self.pull_started_here)
                             .then(|| self.offered_digest(&self.pull_image))
@@ -1962,6 +1967,11 @@ impl App {
             }
         };
         let offered = offer.is_some_and(|offer| self.offer_image_update(offer));
+        if !self.pull.behind_running() {
+            self.behind_digest = None;
+        } else if self.behind_digest.is_none() {
+            self.behind_digest = self.offered_digest(&self.pull_image);
+        }
         if self.pull.running() {
             // A pull seen running elsewhere installs the update on offer now, and is of the
             // image this poll reported on.
@@ -5757,6 +5767,59 @@ mod tests {
             app.image_update, None,
             "the pull that took over recorded the first pull's digest"
         );
+
+        // Another client's pull finishes while waiting behind this TUI's failure. It installs what
+        // was on offer when it was seen running; a newer one published while it ran stays.
+        let newer = ImageUpdate {
+            image: a.image.clone(),
+            remote_digest: "sha256:newer".into(),
+        };
+        for (case, later, offered) in [
+            ("its install", &moved, None),
+            ("a newer one", &newer, Some(&newer)),
+        ] {
+            let (mut app, _terminal) = key_app();
+            let sent = hold_pull_requests(&mut app);
+            app.image_update = Some(a.clone());
+            app.start_pull(a.image.clone());
+            answer_sent(&mut app, &sent, 0, running());
+            answer_pull(
+                &mut app,
+                PullRequest::Poll,
+                PullReport::State(PullState::Failed {
+                    reason: crate::containers::image_pull::PullFailureReason::Network,
+                    message: String::new(),
+                    error: String::new(),
+                }),
+            );
+            let offering = |report, update: &ImageUpdate| PullAnswer {
+                report,
+                offer: Some(ImageOffer::Update(update.clone())),
+                image: Some(a.image.clone()),
+                flight: None,
+            };
+            answer_pull(&mut app, PullRequest::Poll, offering(running(), &moved));
+            answer_pull(&mut app, PullRequest::Poll, offering(running(), later));
+            // The Daemon keeps reporting the last result, so a second poll answers Done again.
+            for _ in 0..2 {
+                answer_pull(&mut app, PullRequest::Poll, offering(done(), later));
+            }
+            assert!(
+                app.pull.dismiss(&app.pull.drawn().unwrap()),
+                "{case}: the failure"
+            );
+            assert_eq!(app.pull.line(), Some(&PullLine::Done), "{case}");
+            assert!(
+                app.pull.dismiss(&app.pull.drawn().unwrap()),
+                "{case}: its Done"
+            );
+            assert_eq!(
+                app.pulled_image.as_ref().map(|u| u.remote_digest.as_str()),
+                Some(moved.remote_digest.as_str()),
+                "{case}: the pull that finished behind the failure recorded the wrong install"
+            );
+            assert_eq!(app.image_update.as_ref(), offered, "{case}: the offer");
+        }
     }
 
     /// A key acknowledges Done only once a frame drew it: behind a status, it waits.

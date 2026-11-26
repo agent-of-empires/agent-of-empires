@@ -474,12 +474,22 @@ impl PullWatch {
         )
     }
 
+    /// Another client's pull waits behind the outcome shown, still running.
+    pub(crate) fn behind_running(&self) -> bool {
+        matches!(self.behind, Some(PullLine::Running(_)))
+    }
+
     /// While an outcome is shown, a poll reports another client's pull, which waits behind it.
-    /// None when the report isn't about such a pull, so it applies as usual.
+    /// None when the report isn't about such a pull, so it applies as usual; `Updated` when
+    /// that pull finished, so its install is recorded though its Done shows later.
     fn track_behind(&mut self, report: &PullReport) -> Option<Applied> {
         match report {
             PullReport::State(PullState::Running(snapshot)) => {
                 self.behind = Some(PullLine::Running(*snapshot));
+            }
+            PullReport::State(PullState::Done) if self.behind_running() => {
+                self.behind = Some(PullLine::Done);
+                return Some(Applied::Updated);
             }
             PullReport::State(state) if self.behind.is_some() => {
                 self.behind = match state {
@@ -792,9 +802,14 @@ mod tests {
             watch.start();
             watch.apply(PullRequest::Poll, outcome);
             for report in after {
+                let finished = report == PullReport::State(PullState::Done);
                 assert_eq!(
                     watch.apply(PullRequest::Poll, report),
-                    Applied::Unchanged,
+                    if finished {
+                        Applied::Updated
+                    } else {
+                        Applied::Unchanged
+                    },
                     "{case}"
                 );
             }
