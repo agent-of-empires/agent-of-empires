@@ -2774,7 +2774,7 @@
       "specs": ["tests/sidebar-sort-mode.spec.ts"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
-        "web/src/components/SidebarSortPicker.tsx",
+        "web/src/components/sidebar/SidebarViewMenu.tsx",
         "web/src/components/Tooltip.tsx",
         "web/src/components/sidebar/SidebarToolbar.tsx"
       ]
@@ -2783,9 +2783,9 @@
       "id": "sidebar.popup-escape-keeps-selection",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/__tests__/SidebarSortPicker.test.tsx"],
+      "specs": ["src/components/__tests__/SidebarViewMenu.test.tsx"],
       "components": [
-        "web/src/components/SidebarSortPicker.tsx",
+        "web/src/components/sidebar/SidebarViewMenu.tsx",
         "web/src/components/useOutsideDismiss.ts",
         "web/src/components/sidebar/useSidebarSelection.ts"
       ]
@@ -2795,7 +2795,7 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/sidebar-sort-mode.spec.ts"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/SidebarSortPicker.tsx"]
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/SidebarViewMenu.tsx"]
     },
     {
       "id": "sidebar.plugin-sort-filter",
@@ -2804,7 +2804,7 @@
       "specs": ["tests/plugin-sort-filter.spec.ts"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
-        "web/src/components/SidebarSortPicker.tsx",
+        "web/src/components/sidebar/SidebarViewMenu.tsx",
         "web/src/components/plugin/PluginSlots.tsx"
       ]
     },
@@ -2954,7 +2954,7 @@
       "risk": "high",
       "specs": ["tests/sidebar-grouping.spec.ts"],
       "components": [
-        "web/src/components/SidebarAxisPicker.tsx",
+        "web/src/components/sidebar/SidebarViewMenu.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/hooks/useStatusGroups.ts",
         "web/src/lib/sidebarGroups.ts"

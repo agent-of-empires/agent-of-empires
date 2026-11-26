@@ -57,7 +57,8 @@ test.describe("sidebar legend on desktop", () => {
     await toggle.click();
     await expect(legend).toBeVisible();
     await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
-    await page.getByRole("button", { name: "Filter sessions" }).click();
+    await page.getByTestId("sidebar-view-toggle").click();
+    await page.getByTestId("sidebar-filter-toggle").click();
     await expect(legend).toBeHidden();
     await expect(page.getByTestId("sidebar-filter-input")).toBeFocused();
 

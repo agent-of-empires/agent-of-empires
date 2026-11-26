@@ -105,7 +105,7 @@ test.describe("desktop rows", () => {
         ordering: order.map((title) => workspaceId(sessions.find((s) => s.title === title)!)),
       });
       // #1418: drag needs manual sort, which must stay the default.
-      await expect(page.locator("[data-testid='sidebar-sort-toggle']")).toHaveAttribute("data-sort-mode", "manual");
+      await expect(page.locator("[data-testid='sidebar-view-toggle']")).toHaveAttribute("data-sort-mode", "manual");
       await expect.poll(() => readVisibleSessionTitles(page), { timeout: 8_000 }).toEqual(order);
     }
   });

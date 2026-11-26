@@ -40,6 +40,7 @@ import { FlatGroupList, NestedGroupList, OrgGroupList, type ListContext } from "
 import { SessionRow } from "./sidebar/SessionRow";
 import { FacetPanel, SidebarToolbar } from "./sidebar/SidebarToolbar";
 import { SidebarNav } from "./sidebar/SidebarNav";
+import { SidebarLegend } from "./sidebar/SidebarLegend";
 import { TrashMenu } from "./sidebar/TrashMenu";
 import { useFacetFilter } from "./sidebar/useFacetFilter";
 import { useSidebarSelection } from "./sidebar/useSidebarSelection";
@@ -486,6 +487,8 @@ export function WorkspaceSidebar(props: Props) {
               onEmptyTrash={(workspaces) => props.onEmptyTrash?.(workspaces)}
             />
           )}
+          {/* Secondary help lives with Settings, as in Claude Code desktop, keeping the list header to one control. */}
+          <SidebarLegend />
           <button
             onClick={props.onSettings}
             {...tourAnchor(TOUR_ANCHORS.sidebarSettings)}

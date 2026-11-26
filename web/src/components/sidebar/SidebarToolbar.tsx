@@ -1,13 +1,7 @@
-import { ListFilter } from "lucide-react";
 import type { SidebarAxis } from "../../lib/sidebarAxis";
+import { SidebarViewMenu } from "./SidebarViewMenu";
 import type { SidebarSortMode } from "../../lib/sidebarSort";
 import { toneTextClass, type PluginFacetSpec, type PluginSortSpec } from "../../lib/pluginUi";
-import { SidebarAxisPicker } from "../SidebarAxisPicker";
-import { SidebarSortPicker } from "../SidebarSortPicker";
-import { Tooltip } from "../Tooltip";
-import { TOOLBAR_BUTTON, TOOLBAR_TINT } from "./styles";
-import { StrokeIcon } from "../icons";
-import { SidebarLegend } from "./SidebarLegend";
 
 type PluginSortRef = { pluginId: string; entryId: string };
 
@@ -63,45 +57,23 @@ export function SidebarToolbar({
           <span data-testid="sidebar-axis-heading" className="text-[12px] font-medium text-text-dim flex-1">
             {axisHeading}
           </span>
-          <SidebarAxisPicker axis={axis} onAxisChange={onAxisChange} />
-          <SidebarSortPicker
+          <SidebarViewMenu
+            axis={axis}
+            onAxisChange={onAxisChange}
             sortMode={sortMode}
             onSortModeChange={onSortModeChange}
             pluginSorts={pluginSorts}
             pluginSortRef={pluginSortRef}
             onPluginSortChange={onPluginSortChange}
+            filterOpen={filterOpen}
+            onToggleFilter={onToggleFilter}
+            hasFacets={hasFacets}
+            facetsActive={facetsActive}
+            facetOpen={facetOpen}
+            onToggleFacets={onToggleFacets}
           />
-          {hasFacets && (
-            <Tooltip text="Plugin facets">
-              <button
-                onClick={onToggleFacets}
-                aria-haspopup="true"
-                aria-expanded={facetOpen}
-                aria-label="Plugin facet filters"
-                data-testid="sidebar-facet-toggle"
-                className={`relative ${TOOLBAR_BUTTON} ${TOOLBAR_TINT(facetsActive || facetOpen)}`}
-              >
-                <ListFilter className="h-3.5 w-3.5" />
-                {facetsActive && (
-                  <span className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-brand-500" aria-hidden />
-                )}
-              </button>
-            </Tooltip>
-          )}
-          <Tooltip text="Filter">
-            <button
-              onClick={onToggleFilter}
-              className={`${TOOLBAR_BUTTON} ${TOOLBAR_TINT(filterOpen, "text-text-secondary")}`}
-              aria-label="Filter sessions"
-            >
-              <StrokeIcon size={14} strokeWidth="2">
-                <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
-              </StrokeIcon>
-            </button>
-          </Tooltip>
         </>
       )}
-      <SidebarLegend />
       <button
         onClick={onClose}
         aria-label="Close sidebar"

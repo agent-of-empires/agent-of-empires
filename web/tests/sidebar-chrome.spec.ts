@@ -98,7 +98,8 @@ test.describe("resize handle and compact rail (#2288)", () => {
     await expect(page.locator(COUNT).first()).toBeVisible();
 
     // Entering compact hides an open filter and stops its query narrowing the list.
-    await page.getByRole("button", { name: "Filter sessions" }).click();
+    await page.getByTestId("sidebar-view-toggle").click();
+    await page.getByTestId("sidebar-filter-toggle").click();
     const filterInput = page.getByTestId("sidebar-filter-input");
     // "beta" matches a title only; "alpha" would also match the project name.
     await filterInput.fill("beta");
@@ -106,7 +107,7 @@ test.describe("resize handle and compact rail (#2288)", () => {
     await expect(page.locator('[data-tour="sidebar"]').getByText("beta-session")).toBeVisible();
     await dragSidebarHandle(page, 100);
     await expect(filterInput).toHaveCount(0);
-    await expect(page.getByRole("button", { name: "Filter sessions" })).toHaveCount(0);
+    await expect(page.getByTestId("sidebar-view-toggle")).toHaveCount(0);
     await expect(page.locator('[data-tour="sidebar"]').getByText("alpha-session")).toBeVisible();
     await dragSidebarHandle(page, 260);
     await expect(filterInput).toHaveValue("beta");

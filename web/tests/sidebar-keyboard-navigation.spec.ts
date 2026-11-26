@@ -61,7 +61,7 @@ const twoByTwo: MockSessionInput[] = [
 ];
 
 async function showAxis(page: Page, axis: string) {
-  const toggle = page.getByTestId("sidebar-axis-toggle");
+  const toggle = page.getByTestId("sidebar-view-toggle");
   await toggle.click();
   await page.getByTestId(`sidebar-axis-option-${axis}`).click();
   await expect(toggle).toHaveAttribute("data-axis", axis);

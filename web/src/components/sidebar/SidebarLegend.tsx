@@ -7,6 +7,7 @@ import { useContextMenu } from "../useContextMenu";
 import { MARK_MEANING } from "../../lib/sidebarMarks";
 import { STATUS_DOT_CLASS } from "../../lib/session";
 import { TOOLBAR_BUTTON, TOOLBAR_TINT } from "./styles";
+import { TOUR_ANCHORS, tourSelector } from "../../lib/tourSteps";
 
 const REDUCED_MOTION = "(prefers-reduced-motion: reduce)";
 const INTERACTIVE = 'a[href], button, input, select, textarea, [contenteditable], [tabindex]:not([tabindex="-1"])';
@@ -49,7 +50,7 @@ function Row({ mark, meaning, testId }: { mark: ReactNode; meaning: StatusMeanin
   );
 }
 
-/** The sidebar header's "?": what the status glyphs and marks mean. A popover, or a sheet on a phone. */
+/** The sidebar footer's "?": what the status glyphs and marks mean. A popover, or a sheet on a phone. */
 export function SidebarLegend() {
   const buttonRef = useRef<HTMLButtonElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
@@ -85,8 +86,11 @@ export function SidebarLegend() {
   const toggle = () => {
     if (menu) return close();
     const rect = buttonRef.current?.getBoundingClientRect();
-    // Beside the button, past the sidebar: clamped up to fit the window, it still never covers its own trigger.
-    openMenu({ x: (rect?.right ?? 0) + 8, y: rect?.top ?? 0 });
+    // Past the sidebar's edge, level with "?": clamped up to fit the window, it covers neither its trigger nor
+    // the sidebar's other controls.
+    const edge =
+      buttonRef.current?.closest(tourSelector(TOUR_ANCHORS.sidebar))?.getBoundingClientRect().right ?? rect?.right ?? 0;
+    openMenu({ x: edge + 8, y: rect?.top ?? 0 });
     // The popover isn't modal, so it takes focus itself; Escape then reaches it. The phone sheet is
     // modal and has already focused its close button, where its Tab trap starts; leave that be.
     requestAnimationFrame(() => {

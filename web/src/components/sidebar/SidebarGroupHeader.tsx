@@ -207,7 +207,8 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
             <button
               onClick={onNewSession}
               disabled={offline}
-              className={`w-8 h-8 flex items-center justify-center shrink-0 rounded-md transition-colors text-text-muted hover:text-text-secondary hover:bg-surface-700/50 cursor-pointer ${DISABLED_ICON_BUTTON}`}
+              // Shown on hover or focus, as Claude Code desktop and Conductor show row actions; always on touch.
+              className={`w-8 h-8 flex items-center justify-center shrink-0 rounded-md transition-[color,opacity] text-text-muted hover:text-text-secondary hover:bg-surface-700/50 cursor-pointer opacity-0 group-hover:opacity-100 focus-visible:opacity-100 pointer-coarse:opacity-100 ${DISABLED_ICON_BUTTON}`}
               aria-label={`New session in ${group.displayName}`}
             >
               <PlusIcon size={14} strokeWidth="2.5" round={false} />
