@@ -84,6 +84,7 @@ export const HOST_STATE_VARS = new Set([
   "AOE_OMP_CAPTURE_META",
   "AOE_OMP_CAPTURE_READY",
   "AOE_OMP_LAUNCH_ID",
+  "AOE_PROXY_LAUNCH_CONFIG", // names a host proxy launch config the runner would hand its agent
   "TMUX",
   "TMUX_PANE",
   "DBUS_SESSION_BUS_ADDRESS",
