@@ -36,7 +36,7 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<CommandContribution>,
 
-    /// Named groups that nest their commands under one CLI verb (API v26).
+    /// Named groups that nest their commands under one CLI verb (API v27).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command_groups: Vec<CommandGroupContribution>,
 
@@ -91,7 +91,7 @@ pub struct CommandContribution {
     pub description: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<ClientAction>,
-    /// Group id this command nests under as `aoe <group> <id>` (API v26).
+    /// Group id this command nests under as `aoe <group> <id>` (API v27).
     /// Ungrouped commands keep their flat top-level name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
@@ -1248,8 +1248,8 @@ impl PluginManifest {
             );
             if let Some(group) = &c.group {
                 check(
-                    self.api_version >= 26,
-                    format!("commands[{i}].group requires api_version >= 26"),
+                    self.api_version >= 27,
+                    format!("commands[{i}].group requires api_version >= 27"),
                 );
                 check(
                     c.id != "help",
@@ -1583,10 +1583,10 @@ impl PluginManifest {
                 "composer-status UI slots require api_version >= 25".into(),
             );
         }
-        if self.api_version < 26 {
+        if self.api_version < 27 {
             check(
                 self.command_groups.is_empty(),
-                "command_groups require api_version >= 26".into(),
+                "command_groups require api_version >= 27".into(),
             );
         }
         if self.api_version < 9 {
@@ -2359,14 +2359,14 @@ mod tests {
     }
 
     #[test]
-    fn command_groups_parse_from_api_26_and_leave_flat_commands_unchanged() {
+    fn command_groups_parse_from_api_27_and_leave_flat_commands_unchanged() {
         let m = PluginManifest::from_toml_str(&grouped_commands_toml(
-            26,
+            27,
             "[[command_groups]]\nid = \"linear\"\nabout = \"Linear issue commands\"\n\n",
             "[[commands]]\nid = \"refresh\"\ntitle = \"Refresh Linear issues\"\ngroup = \"linear\"\n\n\
              [[commands]]\nid = \"linear_sync\"\n",
         ))
-        .expect("v26 grouped manifest parses");
+        .expect("v27 grouped manifest parses");
         assert_eq!(m.command_groups[0].id, "linear");
         assert_eq!(m.command_groups[0].about, "Linear issue commands");
         assert_eq!(m.commands[0].group.as_deref(), Some("linear"));
@@ -2379,7 +2379,7 @@ mod tests {
 
         // A manifest written before command groups still parses flat, and one
         // that does not use them does not grow the section on re-serialization.
-        for version in [2, 12, 25, 26] {
+        for version in [2, 12, 26, 27] {
             let flat = PluginManifest::from_toml_str(&grouped_commands_toml(
                 version,
                 "",
@@ -2394,39 +2394,39 @@ mod tests {
     }
 
     #[test]
-    fn command_groups_require_api_26_and_a_declared_id() {
+    fn command_groups_require_api_27_and_a_declared_id() {
         let group = "[[command_groups]]\nid = \"linear\"\n\n";
         let nested = "[[commands]]\nid = \"refresh\"\ngroup = \"linear\"\n";
         rejects(&[
             (
-                "a group before api_version 26",
-                grouped_commands_toml(25, group, ""),
-                "command_groups require api_version >= 26",
+                "a group before api_version 27",
+                grouped_commands_toml(26, group, ""),
+                "command_groups require api_version >= 27",
             ),
             (
-                "a nested command before api_version 26",
-                grouped_commands_toml(25, group, nested),
-                "commands[0].group requires api_version >= 26",
+                "a nested command before api_version 27",
+                grouped_commands_toml(26, group, nested),
+                "commands[0].group requires api_version >= 27",
             ),
             (
                 "a group id that is not a bare verb",
-                grouped_commands_toml(26, "[[command_groups]]\nid = \"Linear Issue\"\n\n", ""),
+                grouped_commands_toml(27, "[[command_groups]]\nid = \"Linear Issue\"\n\n", ""),
                 "bare lowercase CLI verb",
             ),
             (
                 "a repeated group id",
-                grouped_commands_toml(26, &format!("{group}{group}"), ""),
+                grouped_commands_toml(27, &format!("{group}{group}"), ""),
                 "must not repeat id",
             ),
             (
                 "a group named like clap's help subcommand",
-                grouped_commands_toml(26, "[[command_groups]]\nid = \"help\"\n\n", ""),
+                grouped_commands_toml(27, "[[command_groups]]\nid = \"help\"\n\n", ""),
                 "is clap's own subcommand",
             ),
             (
                 "a command naming an undeclared group",
                 grouped_commands_toml(
-                    26,
+                    27,
                     group,
                     "[[commands]]\nid = \"refresh\"\ngroup = \"github\"\n",
                 ),
@@ -2435,7 +2435,7 @@ mod tests {
             (
                 "a grouped command id that is not a bare leaf",
                 grouped_commands_toml(
-                    26,
+                    27,
                     group,
                     "[[commands]]\nid = \"linear.refresh\"\ngroup = \"linear\"\n",
                 ),
@@ -2444,7 +2444,7 @@ mod tests {
             (
                 "a grouped command named like clap's help subcommand",
                 grouped_commands_toml(
-                    26,
+                    27,
                     group,
                     "[[commands]]\nid = \"help\"\ngroup = \"linear\"\n",
                 ),
@@ -2453,7 +2453,7 @@ mod tests {
             (
                 "two groups publishing the same command id",
                 grouped_commands_toml(
-                    26,
+                    27,
                     &format!("{group}[[command_groups]]\nid = \"github\"\n\n"),
                     "[[commands]]\nid = \"refresh\"\ngroup = \"linear\"\n\n\
                      [[commands]]\nid = \"refresh\"\ngroup = \"github\"\n",
