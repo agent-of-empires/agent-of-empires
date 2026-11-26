@@ -186,39 +186,43 @@ pub fn uninstall_hooks(settings_path: &Path) -> Result<bool> {
     if !settings_path.exists() {
         return Ok(false);
     }
-    with_config_lock(settings_path, "json.lock", || {
-        let content = std::fs::read_to_string(settings_path)?;
-        let mut settings: Value = serde_json::from_str(&content).unwrap_or_else(|e| {
+    with_config_lock(
+        &SymlinkPolicy::Follow.lock_path(settings_path)?,
+        "json.lock",
+        || {
+            let content = std::fs::read_to_string(settings_path)?;
+            let mut settings: Value = serde_json::from_str(&content).unwrap_or_else(|e| {
             tracing::warn!(target: "hooks.uninstall", "Failed to parse {}: {}", settings_path.display(), e);
             serde_json::json!({})
         });
-        let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) else {
-            return Ok(false);
-        };
+            let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) else {
+                return Ok(false);
+            };
 
-        let mut modified = false;
-        for groups in hooks.values_mut().filter_map(Value::as_array_mut) {
-            let before = groups.len();
-            remove_aoe_entries(groups);
-            modified |= groups.len() != before;
-        }
-        if !modified {
-            return Ok(false);
-        }
-        remove_empty_events(hooks);
-        if hooks.is_empty() {
-            if let Some(obj) = settings.as_object_mut() {
-                obj.remove("hooks");
+            let mut modified = false;
+            for groups in hooks.values_mut().filter_map(Value::as_array_mut) {
+                let before = groups.len();
+                remove_aoe_entries(groups);
+                modified |= groups.len() != before;
             }
-        }
+            if !modified {
+                return Ok(false);
+            }
+            remove_empty_events(hooks);
+            if hooks.is_empty() {
+                if let Some(obj) = settings.as_object_mut() {
+                    obj.remove("hooks");
+                }
+            }
 
-        crate::session::atomic_write(
-            settings_path,
-            serde_json::to_string_pretty(&settings)?.as_bytes(),
-        )?;
-        log_removed(settings_path);
-        Ok(true)
-    })
+            crate::session::atomic_write(
+                settings_path,
+                serde_json::to_string_pretty(&settings)?.as_bytes(),
+            )?;
+            log_removed(settings_path);
+            Ok(true)
+        },
+    )
 }
 
 /// Drops AoE entries from flat `hooks.<event>[].command` arrays; returns whether any were removed.
@@ -591,6 +595,25 @@ mod tests {
 
         assert!(read_json(&target)["hooks"].is_object());
         assert!(target.with_extension("json.lock").exists());
+        assert!(!link.with_extension("json.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_locks_the_same_file_as_install() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("dotfiles/settings.json");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "{}").unwrap();
+        let link = tmp.path().join("settings.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        install_hooks(&link, agent_events("claude", &[]), HookInstallTarget::Host).unwrap();
+        let lock = target.with_extension("json.lock");
+        std::fs::remove_file(&lock).unwrap();
+
+        assert!(uninstall_hooks(&link).unwrap());
+
+        assert!(lock.exists(), "uninstall locks what install locks");
         assert!(!link.with_extension("json.lock").exists());
     }
 }
