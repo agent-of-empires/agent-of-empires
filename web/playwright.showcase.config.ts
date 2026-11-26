@@ -45,7 +45,7 @@ export default defineConfig({
   webServer: {
     command: "npx vite preview --port 4173",
     port: 4173,
-    reuseExistingServer: true,
+    reuseExistingServer: !process.env.CI,
   },
 
   reporter: [["html", { open: "never", outputFolder: "playwright-showcase-report" }], ["list"]],
