@@ -1131,11 +1131,12 @@ function isSteeredContinuation(state: AcpState): boolean {
   return state.serverTurnActive && !!state.promptCapabilities?.steering;
 }
 
+const PROXY_DEGRADED_NOTICE_ID = "notice-proxy-degraded";
+
 function applyNewTurnResets(next: AcpState): void {
   next.startupRecoveries += 1;
   next.startupError = null;
   next.startupCause = null;
-  next.integrationLost = null;
   if (!next.restartInFlight) next.retriedError = null;
   next.lastError = null;
   // The cancel phase is server-owned; only the escalation deadline is ours.
@@ -1161,9 +1162,9 @@ function applyNewTurnResets(next: AcpState): void {
   next.monitorWorkSeen = false;
   next.monitorDescription = null;
   next.contextPrimerAvailable = null;
-  // Advisories describe the turn they arrived in; the transcript keeps history.
-  next.sessionNotices = [];
-  next.dismissedNoticeIds = [];
+  // Advisories describe the turn they arrived in, except the degraded-proxy banner; the transcript keeps history.
+  next.sessionNotices = next.sessionNotices.filter((n) => n.id === PROXY_DEGRADED_NOTICE_ID);
+  next.dismissedNoticeIds = next.dismissedNoticeIds.filter((id) => id === PROXY_DEGRADED_NOTICE_ID);
 }
 
 /** Pure reducer. Drops frames whose seq is not above `state.lastSeq` so replays are idempotent. */

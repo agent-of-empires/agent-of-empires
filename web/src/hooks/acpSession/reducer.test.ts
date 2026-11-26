@@ -622,10 +622,26 @@ describe("integration lost", () => {
   it.each<[string, Action[], boolean]>([
     ["the event sets it without a startup error", [lost(1)], true],
     ["the Agent starting clears it", [lost(1), frame(2, { AcpSessionAssigned: { acp_session_id: "a" } })], false],
-    ["a new turn clears it", [lost(1), frame(2, { UserPromptSent: { text: "hi", prompt_id: "p" } })], false],
+    [
+      "a new turn keeps it, as the daemon does",
+      [lost(1), frame(2, { UserPromptSent: { text: "hi", prompt_id: "p" } })],
+      true,
+    ],
   ])("%s", (_label, actions, set) => {
     const state = run(empty(), ...actions);
     expect(state.integrationLost).toEqual(set ? { kind: "proxy_exited" } : null);
     expect(state.startupError).toBeNull();
+  });
+
+  it("a new turn retires advisories except the degraded-proxy banner", () => {
+    const notice = (seq: number, title: string, key?: string) =>
+      frame(seq, { SessionNotice: { severity: "warning", title, description: null, key } });
+    const state = run(
+      empty(),
+      notice(1, "Fake features unavailable", "proxy-degraded"),
+      notice(2, "stale"),
+      frame(3, { UserPromptSent: { text: "hi", prompt_id: "p" } }),
+    );
+    expect(state.sessionNotices.map((n) => n.title)).toEqual(["Fake features unavailable"]);
   });
 });
