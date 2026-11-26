@@ -82,7 +82,8 @@ export function layerCount({ done, known }: SandboxPullProgress): string | null 
 export function useSandboxImageBanner(): SandboxImageBannerState {
   const [status, setStatus] = useState<SandboxImageStatus | null>(null);
   const [dismissedDigest, setDismissedDigest] = useState<string | null>(null);
-  const [noticeDismissed, setNoticeDismissed] = useState(false);
+  // The image whose outcome notice was dismissed; that image's next pull, click or Cancel brings notices back.
+  const [dismissedNotice, setDismissedNotice] = useState<string | null>(null);
   // × on a running pull hides its banner until that image's pull ends; its outcome shows again.
   const [hiddenImage, setHiddenImage] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState(false);
@@ -121,8 +122,8 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
   // `seenRunning` for the reply, which can't read state.
   const seenRunningRef = useRef<string | null>(null);
   const [acceptedImage, setAcceptedImage] = useState<string | null>(null);
-  // Whether the last status showed a pull running, so a pull starting elsewhere re-arms the outcome notice.
-  const polledRunning = useRef(false);
+  // The image the last status showed running, so a pull of an image starting re-arms that image's notice.
+  const polledRunning = useRef<string | null>(null);
   // The Daemon refuses checks and pulls while it can't read its configuration.
   const [configUnreadable, setConfigUnreadable] = useState(false);
   const [configNoticeDismissed, setConfigNoticeDismissed] = useState(false);
@@ -170,8 +171,10 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
         }
         setStatus(predatesPull ? { ...answer, pull: { state: "running" } } : answer);
         const running = answer.pull.state === "running";
-        if (running && !polledRunning.current) setNoticeDismissed(false);
-        polledRunning.current = running;
+        if (running && polledRunning.current !== answer.image) {
+          setDismissedNotice((d) => (d === answer.image ? null : d));
+        }
+        polledRunning.current = running ? answer.image : null;
         if (running) {
           seenRunningRef.current = answer.image;
           setSeenRunning(answer.image);
@@ -251,7 +254,7 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
     if (seenRunningRef.current === image) seenRunningRef.current = null;
     setSeenRunning((seen) => (seen === image ? null : seen));
     setAcceptedImage(null);
-    setNoticeDismissed(false);
+    setDismissedNotice((d) => (d === image ? null : d));
     setHiddenImage((h) => (h === image ? null : h));
     setRefusal(null);
     setCancelling(false);
@@ -316,7 +319,7 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
         // This page cancelled it, so the outcome is this page's to show.
         seenRunningRef.current = image;
         setSeenRunning(image);
-        setNoticeDismissed(false);
+        setDismissedNotice((d) => (d === image ? null : d));
         setHiddenImage((h) => (h === image ? null : h));
         setStatus((s) => s && { ...s, pull });
       }
@@ -379,8 +382,9 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
     }
     // The Daemon keeps its last pull result, so an outcome shows only for a pull tied to this page or for the
     // live attempt's image; otherwise every reload would repeat an old result.
-    if ((tied(status.image) || status.image === attemptFor) && !noticeDismissed) {
-      const onDismiss = () => setNoticeDismissed(true);
+    if ((tied(status.image) || status.image === attemptFor) && dismissedNotice !== status.image) {
+      const image = status.image;
+      const onDismiss = () => setDismissedNotice(image);
       const again = status.pull_blocked ? undefined : () => update(status.image, offered);
       // An image published since this pull is news again; the one it pulled isn't.
       const newer = status.state === "available" && status.remote_digest !== pulledDigest;

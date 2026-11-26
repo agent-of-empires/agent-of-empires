@@ -929,6 +929,42 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
       expect(banner()?.textContent, "a create's pull of C dropped A's refusal").toBe(FAILED);
       unmount();
     }
+
+    // Dismissing B's outcome holds for B: a click on A re-arms only A's notices.
+    {
+      const { unmount } = await mount(otherRunning());
+      fetchSandboxImageStatus.mockResolvedValue(otherCurrent({ state: "done" }));
+      await pollAfter(2000);
+      expect(banner()?.textContent).toBe(UPDATED);
+      dismiss();
+      expect(banner()).toBeNull();
+      fetchSandboxImageStatus.mockResolvedValue(status());
+      await pollAfter(30_000);
+      expect(banner()?.textContent).toBe("Sandbox image update available");
+      pullSandboxImage.mockImplementationOnce(() => new Promise(() => {}));
+      updateNow();
+      fetchSandboxImageStatus.mockResolvedValue(otherCurrent({ state: "done" }));
+      await pollAfter(2000);
+      expect(banner(), "a click on A brought back B's dismissed outcome").toBeNull();
+      unmount();
+    }
+
+    // B's pull starting right after A's is still B's pull starting: it brings back B's dismissed outcome.
+    {
+      const { unmount } = await mount(otherRunning());
+      fetchSandboxImageStatus.mockResolvedValue(otherCurrent({ state: "done" }));
+      await pollAfter(2000);
+      expect(banner()?.textContent).toBe(UPDATED);
+      dismiss();
+      fetchSandboxImageStatus.mockResolvedValue(running());
+      await pollAfter(30_000);
+      fetchSandboxImageStatus.mockResolvedValue(otherRunning());
+      await pollAfter(2000);
+      fetchSandboxImageStatus.mockResolvedValue(otherCurrent({ state: "done" }));
+      await pollAfter(2000);
+      expect(banner()?.textContent, "B's pull starting after A's kept B's outcome dismissed").toBe(UPDATED);
+      unmount();
+    }
   });
 
   it("drops a Cancel once the banner shows another image, so its reply and refusal stay off it", async () => {
