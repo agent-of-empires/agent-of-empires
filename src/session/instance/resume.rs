@@ -2797,7 +2797,6 @@ mod tests {
                 );
                 assert!(stored.lifecycle_reservation.is_none());
                 assert_eq!(instance.capture_started_at, before.capture_started_at);
-                assert_eq!(instance.started_at, before.started_at);
                 assert_eq!(released.get(), 0);
                 let transcript = root
                     .path()
@@ -3349,7 +3348,6 @@ mod tests {
         let finalized_in_observer = finalized.clone();
         let retained_capture =
             std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        let retained_start = crate::time::Timestamp::from_unix_secs(1_700_000_000).unwrap();
         let _observer = FinalizeObserver::install(inst.id.clone(), move |instance, phase| {
             match phase {
                 FinalizePhase::Before => {
@@ -3376,7 +3374,6 @@ mod tests {
                                 .launch_id
                                 .push_str("-retained");
                             row.capture_started_at = Some(retained_capture);
-                            row.started_at = Some(retained_start);
                             row.launch_executable = Some("/bin/sh".into());
                             Ok(())
                         })
@@ -3402,7 +3399,6 @@ mod tests {
         let row = rows.iter().find(|row| row.id == inst.id).unwrap();
         assert_eq!(row.agent_session_id.as_deref(), Some(PEER_SID));
         assert_eq!(row.capture_started_at, Some(retained_capture));
-        assert_eq!(row.started_at, Some(retained_start));
         assert_eq!(
             row.launch_executable.as_deref(),
             Some(std::path::Path::new("/bin/sh"))
@@ -4788,7 +4784,7 @@ exec sleep 60
         assert_eq!(row.agent_session_id, conversation.session_id);
         assert_eq!(row.agent_session_binding, conversation.binding);
         assert!(row.lifecycle_reservation.is_none());
-        assert!(row.launch_resolved_executable.is_some());
+        assert!(row.launch_executable.is_some());
         assert_eq!(
             crate::tmux::utils::probe_pane(&name),
             crate::tmux::utils::PaneProbe::Alive

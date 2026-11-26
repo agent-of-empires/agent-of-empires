@@ -4,6 +4,8 @@ import { useRespawnSession } from "../../hooks/useRespawnSession";
 import { fetchAgentInstallInfo, type AgentInstallInfo } from "../../lib/api";
 import { writeClipboard } from "../../lib/clipboard";
 import type { AcpWorkerState } from "../../lib/types";
+import type { StartupCause } from "../../lib/acpTypes";
+import { SandboxLoginDialog } from "../SandboxLoginDialog";
 import { splitInstallHint, startupErrorCause, useAdapterInstall } from "./adapterRecovery";
 import { CommandBlock, RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
 import { ApiKeyAlternative } from "./SignInPopover";
@@ -154,6 +156,7 @@ const ADAPTER_NOT_FOUND = /binary `[^`]+` not found/;
 
 export function StartupErrorBanner({
   sessionId,
+  tool,
   message,
   acpWorkerState,
   canRecover,
@@ -162,9 +165,12 @@ export function StartupErrorBanner({
   restartEpoch = 0,
   onRetryStarted,
   onRetryFailed,
+  cause,
   onSwitchToTerminal,
 }: {
   sessionId: string;
+  /** The session's `tool`: the login runs for the shared credential file it waits on. */
+  tool?: string | null;
   message: string;
   acpWorkerState: AcpWorkerState;
   /** Parent policy and current Native uncertainty gate actions, not Details or logs. */
@@ -178,9 +184,17 @@ export function StartupErrorBanner({
   onRetryStarted?: (epoch: number, message: string) => void;
   /** The Retry's request failed: its full detail, which becomes the next startup error. */
   onRetryFailed?: (epoch: number, detail: string) => void;
+  /** Why the Daemon says the start failed. A login-required cause names the `command` and `profile` (a session outside the daemon's profile) the login runs for; the message already shows the whole recovery line. */
+  cause?: StartupCause | null;
   /** Opens the switch-view confirmation; omitted where the Session can't switch. */
   onSwitchToTerminal?: () => void;
 }) {
+  const [loginOpen, setLoginOpen] = useState(false);
+  const login = cause?.kind === "sandbox_login_required" ? cause : null;
+  const loginRequired = login !== null;
+  // The refusal says what to change; the adapter and credentials remediation does not apply.
+  const loginUnsupported = cause?.kind === "sandbox_login_unsupported";
+  const loginCase = loginRequired || loginUnsupported;
   const [info, setInfo] = useState<AgentInstallInfo | null>(null);
   const [infoRequest, setInfoRequest] = useState(0);
   const [detailsOpen, setDetailsOpen] = useState(false);
@@ -208,13 +222,15 @@ export function StartupErrorBanner({
   }, [sessionId, infoRequest]);
 
   const name = info?.display_name ?? AGENT_IN_MESSAGE.exec(message)?.[1] ?? "The agent";
-  const specific = specificRemediation(
-    message,
-    info?.agent ?? AGENT_IN_MESSAGE.exec(message)?.[1],
-    name,
-    info ? info.sandboxed === true : undefined,
-  );
-  const canInstall = !specific && info?.install_allowed === true && info.npm_installable;
+  const specific = loginCase
+    ? null
+    : specificRemediation(
+        message,
+        info?.agent ?? AGENT_IN_MESSAGE.exec(message)?.[1],
+        name,
+        info ? info.sandboxed === true : undefined,
+      );
+  const canInstall = !loginCase && !specific && info?.install_allowed === true && info.npm_installable;
   const busy = retryState === "retrying" || install.state === "installing";
 
   const retry = async () => {
@@ -239,6 +255,12 @@ export function StartupErrorBanner({
     testId: "startup-error-banner-install",
     disabled: busy || !canRecover,
   };
+  const loginAction: RecoveryAction = {
+    label: "Log in",
+    onClick: () => setLoginOpen(true),
+    testId: "startup-error-banner-login",
+    disabled: busy,
+  };
   const switchAction: RecoveryAction[] = onSwitchToTerminal
     ? [
         {
@@ -250,13 +272,13 @@ export function StartupErrorBanner({
       ]
     : [];
 
-  const cause = startupErrorCause(message);
+  const errorLine = startupErrorCause(message);
   const changed =
     retriedError === null
       ? null
-      : cause === startupErrorCause(retriedError)
+      : errorLine === startupErrorCause(retriedError)
         ? "Same error as before."
-        : `It failed differently this time: ${cause.split("\n")[0]}`;
+        : `It failed differently this time: ${errorLine.split("\n")[0]}`;
   const copy = async () => {
     if (await writeClipboard(message)) setCopied(message);
   };
@@ -269,11 +291,15 @@ export function StartupErrorBanner({
     >
       <div role="alert">
         <h2 className="text-sm font-semibold">
-          {STOP_FENCE.test(message)
-            ? `${name} was stopped`
-            : retriedError === null
-              ? `${name} couldn't start in Structured view`
-              : `${name} still couldn't start`}
+          {loginRequired
+            ? "Sandbox login required"
+            : loginUnsupported
+              ? "Sandbox login not supported"
+              : STOP_FENCE.test(message)
+                ? `${name} was stopped`
+                : retriedError === null
+                  ? `${name} couldn't start in Structured view`
+                  : `${name} still couldn't start`}
         </h2>
         {changed && (
           <div data-testid="startup-error-banner-changed" className="mt-1 text-xs wrap-anywhere text-text-primary">
@@ -281,7 +307,10 @@ export function StartupErrorBanner({
           </div>
         )}
         <div className="mt-1 text-xs text-text-subtle">
-          {specific ??
+          {loginCase ? (
+            <pre className="whitespace-pre-wrap font-sans">{message}</pre>
+          ) : (
+            (specific ??
             (ADAPTER_NOT_FOUND.test(message) ? (
               <>{name}'s ACP adapter isn't installed where the Daemon runs.</>
             ) : (
@@ -289,19 +318,28 @@ export function StartupErrorBanner({
                 The ACP adapter, the program that connects AoE to {name}, didn't start. It's usually missing or out of
                 date.
               </>
-            ))}
+            )))
+          )}
         </div>
       </div>
-      {!specific && !canInstall && <InstallSteps info={info} />}
+      {!loginCase && !specific && !canInstall && <InstallSteps info={info} />}
       <RecoveryActionRow
-        primary={canInstall ? installAction : retryAction}
-        secondary={[...(canInstall ? [retryAction] : []), ...switchAction]}
+        primary={loginRequired ? loginAction : canInstall ? installAction : retryAction}
+        secondary={[...(canInstall || loginRequired ? [retryAction] : []), ...switchAction]}
         install={install}
       />
       {sentStopped && (
         <div data-testid="startup-error-banner-sent-stopped" className="mt-2 text-xs text-text-subtle">
           The message you sent was stopped. Send it again once {name} is ready.
         </div>
+      )}
+      {loginOpen && (
+        <SandboxLoginDialog
+          tool={tool ?? undefined}
+          command={login?.command}
+          profile={login?.profile}
+          onClose={() => setLoginOpen(false)}
+        />
       )}
       <div className="mt-3 border-t border-status-error/30 pt-2">
         <button

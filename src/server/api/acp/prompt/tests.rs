@@ -3167,6 +3167,97 @@ async fn no_revive_prompt_to_a_stop_fenced_session_stays_fenced() {
         .is_empty());
 }
 
+/// A sandbox login refusal keeps the prompt and gives the dashboard the profile to log in.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn sandbox_login_queue_keeps_http_prompt() {
+    let app_dir = crate::session::test_support::isolate_app_dir();
+    let _auth = crate::session::test_support::unset_claude_auth_routes();
+    let (_runtime, calls) = crate::session::test_support::failing_container_runtime(app_dir.path());
+    let id = "sess-login-http".to_string();
+    let mut row = structured_instance(&id, true);
+    row.mark_idle_dormant();
+    row.pending_initial_turn = Some(crate::session::PendingInitialTurn {
+        text: "run the nightly task".to_string(),
+        attachments: Vec::new(),
+        synthesized: false,
+        error: None,
+        error_code: None,
+        id: String::new(),
+        origin: crate::daemon::PromptOrigin::Unknown,
+    });
+    crate::session::test_support::sandbox_needing_login(app_dir.path(), &mut row);
+    let state = crate::server::test_support::build_native_test_app_state(vec![row]).await;
+    let mut request = prompt_req("caption").unwrap().0;
+    request.prompt_id = Some("p-login".into());
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.clone()),
+        dashboard_headers(),
+        Ok(Json(request)),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let message = crate::session::test_support::login_required("claude").to_string();
+    let profile = crate::session::config::effective_profile("");
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "error": "sandbox_login_required",
+            "message": message,
+            "tool": "claude",
+            "profile": profile,
+            "queued_id": "p-login",
+        })
+    );
+
+    let events = state.acp_event_store.replay_from(&id, 0).unwrap();
+    let guidance: Vec<_> = events
+        .iter()
+        .filter_map(|stored| match stored.event.as_ref() {
+            Event::AgentStartupError { message, cause, .. } => Some((message, cause)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        guidance,
+        vec![(
+            &message,
+            &Some(crate::acp::state::StartupCause::SandboxLoginRequired {
+                command: None,
+                profile: Some(profile),
+            })
+        )]
+    );
+    let queue = state.session_service.queued_prompts_snapshot(&id).await;
+    assert_eq!(queue.len(), 1);
+    assert_eq!(
+        (queue[0].id.as_str(), queue[0].text.as_str()),
+        ("p-login", "caption")
+    );
+    assert_eq!(
+        state.session_service.sandbox_login.held_origin(&id),
+        Some(crate::server::sandbox_login::LaunchOrigin::Interactive)
+    );
+    assert_eq!(
+        state.instances.read().await[0]
+            .pending_initial_turn
+            .as_ref()
+            .map(|turn| turn.text.as_str()),
+        Some("run the nightly task")
+    );
+    assert!(!events
+        .iter()
+        .any(|stored| matches!(stored.event.as_ref(), Event::UserPromptSent { .. })));
+    assert_eq!(std::fs::read_to_string(&calls).unwrap_or_default(), "");
+}
+
 /// A stop that lands while the `before_start` hook runs is newer than the one the prompt
 /// observed: the failed start refuses the prompt (409) instead of queueing it.
 #[cfg(unix)]

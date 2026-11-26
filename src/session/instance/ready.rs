@@ -743,7 +743,7 @@ mod tests {
         row.source_profile = storage.profile().into();
         row.lifecycle_generation = 7;
         row.status = Status::Error;
-        row.started_at = Some(crate::time::Timestamp::now());
+        row.capture_started_at = Some(std::time::SystemTime::now());
         storage.update(|rows, _| {
             rows.push(row.clone());
             Ok(())
@@ -751,11 +751,11 @@ mod tests {
         let stale = row.native_input_fence(true)?;
         let execution = row.active_execution.clone();
         let sid = row.agent_session_id.clone();
-        let started_at = row.started_at;
+        let capture_started_at = row.capture_started_at;
         row.advance_auxiliary_generation_in(&storage)?;
         assert_eq!(row.active_execution, execution);
         assert_eq!(row.agent_session_id, sid);
-        assert_eq!(row.started_at, started_at);
+        assert_eq!(row.capture_started_at, capture_started_at);
         let error = stale
             .lock()
             .err()
