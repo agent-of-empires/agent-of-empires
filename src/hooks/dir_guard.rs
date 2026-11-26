@@ -463,9 +463,37 @@ pub(crate) fn switch_instance_dir(instance_id: &str, to: HookBase) -> Result<Pat
         pause();
     }
     remove_child(to.other(), instance_id)?;
+    set_aside(to.other(), instance_id);
     let lexical = to.path()?.join(instance_id);
     std::fs::canonicalize(&lexical)
         .with_context(|| format!("canonicalize hook dir {}", lexical.display()))
+}
+
+/// Moves a dir cleanup couldn't empty to `.stale-<id>` in its base, so the lookup no longer
+/// finds it beside the one a switch made. It replaces an earlier one, which is first emptied
+/// as cleanup empties. Whatever still can't be removed stays where it is, with a warning, as
+/// cleanup leaves it: a stale dir never blocks a switch.
+fn set_aside(kind: HookBase, instance_id: &str) {
+    let stale = format!(".stale-{instance_id}");
+    let moved = with_base(kind, |base| {
+        match fstatat(base, instance_id, AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Err(Errno::ENOENT) => return Ok(false),
+            Err(e) => return Err(e).with_context(|| format!("fstatat {instance_id}")),
+            Ok(_) => {}
+        }
+        remove_entry(kind, base, &stale)?;
+        renameat(base, instance_id, base, stale.as_str())
+            .with_context(|| format!("renameat {instance_id} -> {stale}"))?;
+        Ok(true)
+    });
+    match moved {
+        Ok(false) => {}
+        Ok(true) => tracing::warn!(target: "hooks.guard",
+            "set aside {}, which cleanup couldn't empty, as {stale}",
+            kind.label(instance_id).display()),
+        Err(e) => tracing::warn!(target: "hooks.guard",
+            "left {} in place: {e:#}", kind.label(instance_id).display()),
+    }
 }
 
 /// Read-only variant: never creates the dir. Returns `Ok(None)` on `ENOENT` /
@@ -768,8 +796,15 @@ pub(crate) fn remove_instance_dir(instance_id: &str) -> Result<()> {
     crate::session::validate_instance_id(instance_id)?;
     let sandbox_base = sandbox_hook_base_path().is_ok_and(|base| base.exists());
     let _lock = sandbox_base.then(|| lock_instance(instance_id)).flatten();
+    let stale = format!(".stale-{instance_id}");
+    let _ = with_base(HookBase::Host, |base| {
+        remove_entry(HookBase::Host, base, &stale)
+    });
     let host = remove_child(HookBase::Host, instance_id);
     if sandbox_base {
+        let _ = with_base(HookBase::Sandbox, |base| {
+            remove_entry(HookBase::Sandbox, base, &stale)
+        });
         remove_child(HookBase::Sandbox, instance_id)?;
         let _ = with_base(HookBase::Sandbox, |base| {
             Ok(unlinkat(
@@ -783,46 +818,49 @@ pub(crate) fn remove_instance_dir(instance_id: &str) -> Result<()> {
 }
 
 fn remove_child(kind: HookBase, instance_id: &str) -> Result<()> {
-    with_base(kind, |base| {
-        let dir_fd = match openat(
-            base,
-            instance_id,
-            OFlag::O_DIRECTORY
-                | OFlag::O_NOFOLLOW
-                | OFlag::O_CLOEXEC
-                | OFlag::O_RDONLY
-                | OFlag::O_NONBLOCK,
-            Mode::empty(),
-        ) {
-            Ok(fd) => fd,
-            Err(Errno::ENOENT) | Err(Errno::ELOOP) => {
-                // Gone, or a hostile symlink: unlink whatever is at the path
-                // so a future open succeeds. Without `RemoveDir` that removes
-                // the symlink itself, never its target.
-                let _ = unlinkat(base, instance_id, UnlinkatFlags::NoRemoveDir);
-                return Ok(());
-            }
-            Err(e) => return Err(e).with_context(|| format!("openat cleanup {instance_id}")),
-        };
-        let label = kind.label(instance_id);
-        if let Err(e) = verify_dir_metadata(&dir_fd, &label) {
-            // Wrong owner or mode: neither walk nor unlink, leave it to the user.
-            tracing::warn!(target: "hooks.guard", "skip cleanup {}: {e:#}", label.display());
+    with_base(kind, |base| remove_entry(kind, base, instance_id))
+}
+
+/// [`remove_child`] of any entry `name` in `kind`'s base.
+fn remove_entry(kind: HookBase, base: BorrowedFd<'_>, name: &str) -> Result<()> {
+    let dir_fd = match openat(
+        base,
+        name,
+        OFlag::O_DIRECTORY
+            | OFlag::O_NOFOLLOW
+            | OFlag::O_CLOEXEC
+            | OFlag::O_RDONLY
+            | OFlag::O_NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::ENOENT) | Err(Errno::ELOOP) => {
+            // Gone, or a hostile symlink: unlink whatever is at the path
+            // so a future open succeeds. Without `RemoveDir` that removes
+            // the symlink itself, never its target.
+            let _ = unlinkat(base, name, UnlinkatFlags::NoRemoveDir);
             return Ok(());
         }
-        walk_and_unlink_entries(&dir_fd)?;
-        // Final unlink of the per-instance subdir itself.
-        if let Err(e) = unlinkat(base, instance_id, UnlinkatFlags::RemoveDir) {
-            if e == Errno::ENOTEMPTY {
-                tracing::warn!(target: "hooks.guard",
-                    "skipped non-empty cleanup of {}: hostile or stale subdir present",
-                    label.display());
-                return Ok(());
-            }
-            return Err(e).with_context(|| format!("unlinkat RemoveDir {instance_id}"));
+        Err(e) => return Err(e).with_context(|| format!("openat cleanup {name}")),
+    };
+    let label = kind.label(name);
+    if let Err(e) = verify_dir_metadata(&dir_fd, &label) {
+        // Wrong owner or mode: neither walk nor unlink, leave it to the user.
+        tracing::warn!(target: "hooks.guard", "skip cleanup {}: {e:#}", label.display());
+        return Ok(());
+    }
+    walk_and_unlink_entries(&dir_fd)?;
+    // Final unlink of the per-instance subdir itself.
+    if let Err(e) = unlinkat(base, name, UnlinkatFlags::RemoveDir) {
+        if e == Errno::ENOTEMPTY {
+            tracing::warn!(target: "hooks.guard",
+                "skipped non-empty cleanup of {}: hostile or stale subdir present",
+                label.display());
+            return Ok(());
         }
-        Ok(())
-    })
+        return Err(e).with_context(|| format!("unlinkat RemoveDir {name}"));
+    }
+    Ok(())
 }
 
 fn walk_and_unlink_entries(dir_fd: &OwnedFd) -> Result<()> {
@@ -854,7 +892,8 @@ fn walk_and_unlink_entries(dir_fd: &OwnedFd) -> Result<()> {
             }
         };
         // Classify without opening: a FIFO with no writer would block an open, and the dir is a
-        // sandbox's writable bind. Only symlinks and regular files are removed.
+        // sandbox's writable bind. Symlinks, FIFOs and sockets are unlinked by name, never
+        // opened; a regular file is checked again first; anything else is left.
         let kind = match fstatat(dir_fd, name_str, AtFlags::AT_SYMLINK_NOFOLLOW) {
             Ok(st) => st.st_mode & libc::S_IFMT,
             Err(Errno::ENOENT) => continue,
@@ -863,9 +902,9 @@ fn walk_and_unlink_entries(dir_fd: &OwnedFd) -> Result<()> {
                 continue;
             }
         };
-        if kind == libc::S_IFLNK {
+        if matches!(kind, libc::S_IFLNK | libc::S_IFIFO | libc::S_IFSOCK) {
             if let Err(e) = unlinkat(dir_fd, name_str, UnlinkatFlags::NoRemoveDir) {
-                tracing::warn!(target: "hooks.guard", "unlinkat symlink {name_str}: {e}");
+                tracing::warn!(target: "hooks.guard", "unlinkat {name_str}: {e}");
             }
             continue;
         }
@@ -1335,9 +1374,67 @@ mod tests {
         remove_instance_dir(id).unwrap();
     }
 
-    /// A sandbox can leave a FIFO in its writable hook dir. Cleanup never opens it, so a switch
-    /// away completes; the dir it leaves behind reads the FIFO as absent and takes a new write
-    /// when the row is sandboxed again.
+    /// A dir a switch can't empty is set aside, at one name per row, so the lookup reads the
+    /// new one; deleting the row removes it; and one that can't be removed never blocks a switch.
+    #[test]
+    #[serial(hook_base)]
+    fn a_switch_sets_aside_a_host_dir_it_cannot_empty() {
+        let (_g, _base, _tmp) = BaseGuard::ready();
+        let stale = |id: &str| HookBase::Host.label(&format!(".stale-{id}"));
+        let stuck = |id: &str| {
+            create_child(HookBase::Host, id).unwrap();
+            std::fs::create_dir(HookBase::Host.label(id).join("sub")).unwrap();
+        };
+        // subdir: set aside, and the lookup reads the sandbox dir.
+        stuck("subdir");
+        switch_instance_dir("subdir", HookBase::Sandbox).unwrap();
+        assert!(!kind_exists(HookBase::Host, "subdir"), "subdir");
+        assert!(stale("subdir").join("sub").is_dir(), "subdir");
+        // second-switch: an earlier set-aside that empties is replaced, never stacked. A file
+        // keeps it non-empty, so a rename alone couldn't replace it.
+        std::fs::remove_dir(stale("subdir").join("sub")).unwrap();
+        std::fs::write(stale("subdir").join("status"), "idle").unwrap();
+        stuck("subdir");
+        switch_instance_dir("subdir", HookBase::Sandbox).unwrap();
+        assert!(stale("subdir").join("sub").is_dir(), "second-switch");
+        let siblings = std::fs::read_dir(hook_base_path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("subdir")
+            })
+            .count();
+        assert_eq!(siblings, 1, "second-switch: one set-aside dir per row");
+        // deleted: removing the row removes its set-aside dir once it can be emptied.
+        std::fs::remove_dir(stale("subdir").join("sub")).unwrap();
+        remove_instance_dir("subdir").unwrap();
+        assert!(!stale("subdir").exists(), "deleted");
+        // stale-blocked: an earlier set-aside that can't be emptied leaves this one in place.
+        stuck("blocked");
+        switch_instance_dir("blocked", HookBase::Sandbox).unwrap();
+        stuck("blocked");
+        switch_instance_dir("blocked", HookBase::Sandbox).unwrap();
+        assert!(
+            kind_exists(HookBase::Host, "blocked"),
+            "stale-blocked: left in place"
+        );
+        assert!(
+            stale("blocked").join("sub").is_dir(),
+            "stale-blocked: unchanged"
+        );
+        switch_instance_dir("blocked", HookBase::Sandbox).unwrap();
+        for id in ["subdir", "blocked"] {
+            let _ = std::fs::remove_dir(stale(id).join("sub"));
+            let _ = std::fs::remove_dir(HookBase::Host.label(id).join("sub"));
+            remove_instance_dir(id).unwrap();
+        }
+    }
+
+    /// A sandbox can leave a FIFO in its writable hook dir. Cleanup unlinks it without opening
+    /// it, so a switch away completes and removes the dir, leaving nothing set aside.
     #[test]
     #[serial(hook_base)]
     fn a_switch_skips_a_fifo_in_the_old_dir() {
@@ -1346,23 +1443,17 @@ mod tests {
         create_child(HookBase::Sandbox, id).unwrap();
         let fifo = HookBase::Sandbox.label(id).join("status");
         nix::unistd::mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
-        let inode = std::os::unix::fs::MetadataExt::ino(
-            &std::fs::metadata(HookBase::Sandbox.label(id)).unwrap(),
-        );
         let (done, finished) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             BaseGuard::set_thread_base(base);
             switch_instance_dir(id, HookBase::Host).unwrap();
-            let after_host = read_status(id);
-            switch_instance_dir(id, HookBase::Sandbox).unwrap();
-            let reused = std::os::unix::fs::MetadataExt::ino(
-                &std::fs::metadata(HookBase::Sandbox.label(id)).unwrap(),
-            );
-            let polluted = read_status(id);
-            write_status(HookBase::Sandbox, id, "idle");
-            let _ = done.send((after_host, reused, polluted, read_status(id)));
+            let _ = done.send((
+                read_status(id),
+                kind_exists(HookBase::Sandbox, id),
+                HookBase::Sandbox.label(&format!(".stale-{id}")).exists(),
+            ));
         });
-        let Ok((after_host, reused, polluted, written)) =
+        let Ok((after_host, sandbox_left, set_aside)) =
             finished.recv_timeout(std::time::Duration::from_secs(10))
         else {
             // A writer releases an open blocked on the FIFO, so the thread can end.
@@ -1371,13 +1462,8 @@ mod tests {
         };
         worker.join().unwrap();
         assert_eq!(after_host, None, "the host dir is read");
-        assert_eq!(reused, inode, "the sandbox dir left by the skip is reused");
-        assert_eq!(polluted, None, "a FIFO reads as absent");
-        assert_eq!(
-            written.as_deref(),
-            Some("idle"),
-            "a write replaces the FIFO"
-        );
+        assert!(!sandbox_left, "the FIFO's dir is removed");
+        assert!(!set_aside, "nothing is set aside");
         remove_instance_dir(id).unwrap();
     }
 
