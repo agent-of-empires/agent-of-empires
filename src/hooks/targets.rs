@@ -211,15 +211,25 @@ pub(crate) fn is_other_builtin_hook_path(
     .any(|target| target.agent_name != agent_name && resolved(&target.path) == resolved(path))
 }
 
-/// Where a write to `path` lands: the file itself, else its resolved parent plus
-/// the name, so an alias of a directory is seen before the file exists.
+/// Where a write to `path` lands: a symlink chain is followed even when it dangles,
+/// then a missing file resolves through its parent, so an alias of a directory or of
+/// a file not created yet is seen before the installer creates it.
 fn resolved(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path)
+    let mut current = path.to_path_buf();
+    for _ in 0..16 {
+        let is_link = std::fs::symlink_metadata(&current)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink());
+        let Some(link) = is_link.then(|| std::fs::read_link(&current).ok()).flatten() else {
+            break;
+        };
+        current = current.parent().map_or(link.clone(), |dir| dir.join(&link));
+    }
+    std::fs::canonicalize(&current)
         .or_else(|error| {
-            let parent = std::fs::canonicalize(path.parent().ok_or(error)?)?;
-            Ok::<_, std::io::Error>(parent.join(path.file_name().unwrap_or_default()))
+            let parent = std::fs::canonicalize(current.parent().ok_or(error)?)?;
+            Ok::<_, std::io::Error>(parent.join(current.file_name().unwrap_or_default()))
         })
-        .unwrap_or_else(|_| path.to_path_buf())
+        .unwrap_or(current)
 }
 
 fn builtin_hook_targets_in(
@@ -610,5 +620,45 @@ mod tests {
         assert!(!owned(".mine/settings.json", "example"));
         assert!(!owned(".claude/settings.json", "claude"));
         assert!(!owned(".example/settings.json", "claude"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn builtin_hook_ownership_follows_dangling_symlinks() {
+        let _env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR", "CODEX_HOME"]);
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(home.join(".mine")).unwrap();
+        std::fs::create_dir_all(home.join(".rel")).unwrap();
+        std::fs::create_dir_all(home.join("dotfiles")).unwrap();
+        // Claude's settings file does not exist yet, so every link here dangles.
+        std::os::unix::fs::symlink(
+            home.join(".claude/settings.json"),
+            home.join(".mine/settings.json"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("../.claude/settings.json", home.join(".rel/settings.json"))
+            .unwrap();
+        std::os::unix::fs::symlink(
+            home.join(".mine/settings.json"),
+            home.join("dotfiles/chain.json"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            home.join("dotfiles/missing.json"),
+            home.join(".mine/own.json"),
+        )
+        .unwrap();
+        let owned = |path: &str| is_other_builtin_hook_path(&home.join(path), "example", home, &[]);
+
+        assert!(owned(".mine/settings.json"));
+        assert!(owned(".rel/settings.json"));
+        assert!(owned("dotfiles/chain.json"), "a chain of links is followed");
+        assert!(
+            !owned(".mine/own.json"),
+            "a link to the plugin's own file stays allowed"
+        );
     }
 }
