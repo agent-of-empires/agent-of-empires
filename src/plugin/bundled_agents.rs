@@ -21,6 +21,7 @@ static DEFINITION: LazyLock<AgentDef<'static>> = LazyLock::new(|| {
         .expect("bundled OMP fallback must declare a command");
     definition.detect_status = crate::tmux::status_detection::detect_omp_status;
     definition.fork_strategy = crate::agents::ForkStrategy::ValueFlag("--fork");
+    definition.fork_host_only = true;
     definition
 });
 

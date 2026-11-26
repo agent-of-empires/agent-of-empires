@@ -917,6 +917,11 @@ impl Instance {
                 .resolve(generation)
                 .expect("the unknown generation bailed above");
             anyhow::ensure!(
+                !(self.is_sandboxed() && agent.fork_host_only),
+                "{} forks only on the host, so a sandboxed session cannot fork it",
+                agent.name
+            );
+            anyhow::ensure!(
                 agent.can_fork_in(self.is_sandboxed()),
                 "{} mints the forked conversation id, and AoE can capture that id only in a sandbox",
                 agent.name

@@ -32,6 +32,8 @@ pub enum ForkDenied {
     /// The agent mints the fork's child id, and AoE cannot capture it where the
     /// parent runs (or cannot tell where that is).
     ChildNotCapturable { agent: String },
+    /// The agent forks only on the host, and the parent runs in a sandbox.
+    SandboxedParent { agent: String },
     /// The parent names no single conversation to fork: no row carries the id,
     /// or the rows that do name different conversations.
     NoParentSession,
@@ -68,6 +70,9 @@ impl ForkDenied {
             ),
             Self::ChildNotCapturable { agent } => format!(
                 "Nothing to fork: session '{title}' runs agent '{agent}', which mints the forked conversation id, and that id can only be captured for sandboxed sessions."
+            ),
+            Self::SandboxedParent { agent } => format!(
+                "Nothing to fork: session '{title}' runs agent '{agent}' in a sandbox, and AoE forks this agent only on the host."
             ),
             Self::NoParentSession => format!(
                 "Nothing to fork: session '{title}' has no single captured conversation to fork from: it has captured none, or more than one session records this conversation id."
@@ -379,6 +384,11 @@ pub fn terminal_fork_seed(
     };
     if !terminal_agent_can_fork(agent) {
         return Err(ForkDenied::AgentCannotFork {
+            agent: agent.to_owned(),
+        });
+    }
+    if sandboxed && native_definition(agent).is_some_and(|def| def.fork_host_only) {
+        return Err(ForkDenied::SandboxedParent {
             agent: agent.to_owned(),
         });
     }
@@ -723,13 +733,40 @@ mod tests {
         ));
     }
 
+    /// An OMP fork reads the parent's transcript on the host, so a sandboxed
+    /// OMP parent is refused even when its store is mounted from the host and
+    /// its binding records `host`.
+    #[test]
+    fn a_sandboxed_omp_parent_is_refused_before_dispatch() {
+        let mut parent = bound(ConversationProvenance::Observed);
+        parent.execution.as_mut().unwrap().agent = "omp".into();
+        assert_eq!(parent.execution.as_ref().unwrap().filesystem, "host");
+        let seed = |sandboxed| {
+            terminal_fork_seed(
+                Some(ForkParentRef::Bound(&parent)),
+                "child-uuid".into(),
+                sandboxed,
+            )
+        };
+
+        assert_eq!(
+            seed(true).map(|_| ()),
+            Err(ForkDenied::SandboxedParent {
+                agent: "omp".into()
+            })
+        );
+        assert!(!terminal_agent_can_fork_in("omp", true));
+        assert!(matches!(seed(false), Ok(ForkSeed::Terminal { .. })));
+    }
+
     /// Every refusal state names the remedy that comes back to it, and no
     /// other state's remedy: a preallocated id has no conversation to qualify,
     /// so it is told to send a message, and the rest are told to re-assert one.
     #[test]
     fn user_message_names_the_remedy_of_its_own_state_only() {
-        let (agent_cannot_fork, no_parent, send_a_message, re_assert, unlaunched) = (
+        let (agent_cannot_fork, host_only, no_parent, send_a_message, re_assert, unlaunched) = (
             "no native fork capability",
+            "only on the host",
             "captured none",
             "Send it at least one message first",
             "set-session-id",
@@ -741,6 +778,12 @@ mod tests {
                     agent: "gemini".into(),
                 },
                 vec![agent_cannot_fork],
+            ),
+            (
+                ForkDenied::SandboxedParent {
+                    agent: "omp".into(),
+                },
+                vec![host_only],
             ),
             (ForkDenied::NoParentSession, vec![no_parent]),
             (
@@ -761,6 +804,7 @@ mod tests {
         ];
         let remedies = [
             agent_cannot_fork,
+            host_only,
             no_parent,
             send_a_message,
             re_assert,

@@ -4035,7 +4035,8 @@ impl HomeView {
                 Err(denied) => {
                     let dialog_title = match denied {
                         crate::session::ForkDenied::AgentCannotFork { .. }
-                        | crate::session::ForkDenied::ChildNotCapturable { .. } => {
+                        | crate::session::ForkDenied::ChildNotCapturable { .. }
+                        | crate::session::ForkDenied::SandboxedParent { .. } => {
                             "Fork not supported"
                         }
                         crate::session::ForkDenied::NoParentSession
