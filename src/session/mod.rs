@@ -97,7 +97,7 @@ pub(crate) use instance::{
 };
 pub(crate) use instance::{
     host_hook_agent, host_hook_declared_agent, host_hook_disclosure,
-    host_hook_disclosure_config_with_repo, host_hook_post_install_notes,
+    host_hook_disclosure_config_with_repo, host_hook_post_install_notes, HostHookDisclosure,
 };
 pub(crate) use instance::{reports_tmux_session_gone, resolved_agent_for, UNBOUND_STORE_HINT};
 pub use instance::{

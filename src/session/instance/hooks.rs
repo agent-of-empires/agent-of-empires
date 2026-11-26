@@ -97,6 +97,9 @@ pub(crate) fn sidecar_host_config_path_for(
 /// both describe the same install from the same resolution.
 pub(crate) struct HostHookDisclosure {
     pub settings_paths: Vec<String>,
+    /// Plugin-declared trust files a launch may write when
+    /// `session.pre_trust_agent_folders` is on.
+    pub trust_paths: Vec<String>,
     pub hook_commands: Vec<(String, String)>,
     pub needs_codex_trust_note: bool,
     /// Files the installer writes beside `settings_paths`, as
@@ -237,6 +240,7 @@ pub(crate) fn host_hook_disclosure(
 ) -> HostHookDisclosure {
     let mut disclosure = HostHookDisclosure {
         settings_paths: Vec::new(),
+        trust_paths: Vec::new(),
         hook_commands: Vec::new(),
         needs_codex_trust_note: false,
         status_hooks_enabled: false,
@@ -246,6 +250,21 @@ pub(crate) fn host_hook_disclosure(
     let host_env = config.environment.as_slice();
     let home = host_home(host_env).unwrap_or_else(|| std::path::PathBuf::from("~"));
     let session_config = &config.session;
+
+    if let Some(trust) = agent.trust {
+        disclosure.trust_paths.push(
+            crate::hooks::declared_trust_path(
+                trust,
+                &home,
+                host_env,
+                session_config
+                    .agent_config_dir_for(tool_name, &home)
+                    .as_deref(),
+            )
+            .to_string_lossy()
+            .into_owned(),
+        );
+    }
 
     // No session is in scope here, so there is no routed store to apply: the
     // dialog and `aoe hooks approve` name what a launch on the profile's own
