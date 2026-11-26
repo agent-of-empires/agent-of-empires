@@ -215,7 +215,10 @@ export function SuggestionPresetEditor({ provider, source, entry, item, disabled
             </button>
           )}
         </p>
-        <p className="mt-1 break-words font-mono text-xs text-text-muted">
+        <p
+          data-testid="preset-preview"
+          className="mt-1 whitespace-pre-wrap break-words font-mono text-xs text-text-muted"
+        >
           {item ? `For ${shortRef(item.source_ref)}: ` : "Preview: "}
           {preview}
         </p>

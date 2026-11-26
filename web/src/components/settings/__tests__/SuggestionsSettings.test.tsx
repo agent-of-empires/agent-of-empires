@@ -254,6 +254,26 @@ describe("SuggestionsSettings", () => {
     await screen.findByRole("button", { name: "Edit Review requests" });
   });
 
+  it("the preview keeps the prompt's line breaks and spacing, and a save sends them unchanged", async () => {
+    open();
+    fireEvent.click(await screen.findByRole("button", { name: "Edit Review requests" }));
+    await screen.findByText(/Edit \u00b7 Review requests/);
+    const multi = "Review {repo}\n\n1. Find it.   Then run:\n2. Done";
+    fireEvent.change(screen.getByLabelText("GitHub review-requested prompt"), { target: { value: multi } });
+    const preview = screen.getByTestId("preset-preview");
+    // The text holds the breaks; white-space: pre-wrap is what keeps a browser from folding them.
+    expect(preview.textContent).toContain("\n\n1. Find it.   Then run:\n2. Done");
+    expect(preview.className).toContain("whitespace-pre-wrap");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(api.putSuggestionPreset).toHaveBeenCalledWith(
+        "gh",
+        "review-requested",
+        expect.objectContaining({ prompt: multi }),
+      ),
+    );
+  });
+
   it("a preset with no prompt uses the plugin's, and typing one replaces it", async () => {
     open({ presets: [{ ...PRESETS[0]!, preset: { ...PRESET, prompt: null } }, PRESETS[1]!] });
     fireEvent.click(await screen.findByRole("button", { name: "Edit Review requests" }));
