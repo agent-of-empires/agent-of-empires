@@ -3150,7 +3150,7 @@ function AppContent({
             // A phone's home is the session list, whose darker colour then runs up under the clock too.
             className={`h-(--app-height) flex flex-col ${phoneHome ? "bg-surface-950" : "bg-surface-900"} md:bg-surface-950 md:chrome-canvas text-text-primary overflow-hidden safe-area-inset`}
             // What a phone's floating header covers, for the views that keep their banners and first lines clear of it.
-            style={phoneDrawer ? ({ "--phone-overlay-top": "64px" } as CSSProperties) : undefined}
+            style={phoneDrawer ? ({ "--phone-overlay-top": "76px" } as CSSProperties) : undefined}
           >
             {phoneDrawer && (
               // Under the clock, which an installed app draws beneath: the page colour, never content. Fixed and opaque,
@@ -3162,7 +3162,10 @@ function AppContent({
                 }`}
               />
             )}
-            {!phoneDrawer && <div className={phoneHome ? "max-md:hidden" : undefined}>{topBar}</div>}
+            {!phoneDrawer && (
+              // The phone's list carries the app's menu itself, and Settings heads its own page.
+              <div className={phoneHome || showSettings ? "max-md:hidden" : undefined}>{topBar}</div>
+            )}
             <BannerStack
               onRetryServerSettings={serverAbout ? undefined : () => void recoverServerAbout()}
               tourActive={tour.isTourActive}

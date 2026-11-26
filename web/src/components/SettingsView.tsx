@@ -829,7 +829,8 @@ export function SettingsView({
   const showProfilePicker = !cityhall && profileScopedTabs.has(activeTab);
 
   return (
-    <div className="flex-1 flex flex-col overflow-hidden bg-surface-900">
+    // On a wide screen the nav sits on the canvas and the section in a card, as a Session's views do.
+    <div className="flex-1 flex flex-col overflow-hidden bg-surface-900 md:bg-transparent">
       <SettingsHeader
         onClose={onClose}
         saving={saving}
@@ -838,32 +839,34 @@ export function SettingsView({
         schemaLoading={schemaLoading}
         onSearchJump={handleSearchJump}
         onBackToList={showList ? undefined : onShowList}
+        sectionLabel={currentTabLabel}
       />
 
       {/* Mobile: a grouped section list; picking one pushes its page. */}
       {showList && (
         <nav
           data-testid="settings-section-list"
-          className="md:hidden flex-1 overflow-y-auto px-4 py-3"
+          className="md:hidden flex-1 overflow-y-auto px-4 pt-1 pb-3"
           style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
         >
           {groupSidebar(sidebar).map((group) => (
-            <div key={group.label ?? "top"} className="mb-4">
+            <div key={group.label ?? "top"} className="mb-5">
               {group.label && (
-                <div className="px-1 pb-1.5 text-[10px] font-mono uppercase tracking-widest text-text-dim">
+                <div className="px-4 pb-2 text-[12px] font-semibold uppercase tracking-[0.06em] text-text-dim">
                   {group.label}
                 </div>
               )}
-              <div className="bg-surface-850 border border-surface-700/60 rounded-lg overflow-hidden">
+              {/* One raised card per group, rows split by inset hairlines, as iOS groups a settings list. */}
+              <div className="bg-surface-800 border border-surface-700/50 rounded-2xl shadow-md overflow-hidden">
                 {group.tabs.map((item) => (
                   <button
                     key={item.id}
                     onClick={() => onSelectTab(item.id)}
-                    className="w-full flex items-center gap-2 min-h-[44px] px-3 text-sm text-left text-text-primary border-b border-surface-700/40 last:border-b-0 hover:bg-surface-800 cursor-pointer"
+                    className="w-full flex items-center gap-3 min-h-12 px-4 text-[16px] text-left text-text-primary cursor-pointer active:bg-surface-700/60 [&:not(:last-child)]:shadow-[inset_0_-1px_0_color-mix(in_srgb,var(--color-surface-600)_45%,transparent)]"
                   >
                     {item.icon}
                     <span className="flex-1">{item.label}</span>
-                    <svg className="w-3 h-3 text-text-dim" viewBox="0 0 12 12" aria-hidden="true">
+                    <svg className="w-3.5 h-3.5 text-text-dim" viewBox="0 0 12 12" aria-hidden="true">
                       <path
                         d="M4.5 2l4.5 4-4.5 4"
                         stroke="currentColor"
@@ -883,12 +886,13 @@ export function SettingsView({
 
       <div className={`flex-1 min-h-0 ${showList ? "hidden md:flex" : "flex"}`}>
         {/* Side tabs (desktop only) */}
-        <nav className="hidden md:flex flex-col w-44 shrink-0 border-r border-surface-700 bg-surface-850 py-2 overflow-y-auto">
+        {/* Styled as the session sidebar is: quiet captions, and the open section a filled pill. */}
+        <nav className="hidden md:flex flex-col w-48 shrink-0 px-2 py-2 overflow-y-auto">
           {sidebar.map((item, i) =>
             item.kind === "divider" ? (
               <div
                 key={item.label}
-                className={`px-4 pt-3 pb-1 text-[10px] font-mono uppercase tracking-widest text-text-dim ${i > 0 ? "mt-2 border-t border-surface-700/40" : ""}`}
+                className={`px-3 pb-1 text-[11px] font-semibold uppercase tracking-[0.06em] text-text-dim ${i > 0 ? "pt-4" : "pt-1"}`}
               >
                 {item.label}
               </div>
@@ -896,10 +900,11 @@ export function SettingsView({
               <button
                 key={item.id}
                 onClick={() => onSelectTab(item.id)}
-                className={`flex items-center gap-2 px-4 py-2 text-sm text-left cursor-pointer transition-colors ${
+                aria-current={activeTab === item.id ? "page" : undefined}
+                className={`flex items-center gap-2 px-3 py-1.5 rounded-md text-[13px] text-left cursor-pointer transition-colors ${
                   activeTab === item.id
-                    ? "text-brand-500 bg-surface-800 border-r-2 border-brand-500"
-                    : "text-text-secondary hover:text-text-primary hover:bg-surface-800/50"
+                    ? "bg-surface-700/70 text-text-primary"
+                    : "text-text-secondary hover:text-text-primary hover:bg-surface-800/60"
                 }`}
               >
                 {item.icon}
@@ -911,14 +916,18 @@ export function SettingsView({
 
         {/* Content area. Owns its bottom home-indicator clearance now that the
             App root no longer reserves it (see index.css .safe-area-inset). */}
-        <div className="flex-1 overflow-y-auto" style={{ paddingBottom: "env(safe-area-inset-bottom)" }}>
+        <div
+          className="flex-1 overflow-y-auto md:mr-2 md:mb-2 md:rounded-xl md:border md:border-surface-700/45 md:bg-surface-900 md:shadow-md"
+          style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+        >
           {/* Skills renders its own two-pane layout and needs the full window
               width; every other tab keeps a generous but capped width so
               label-to-control gaps don't stretch across an ultrawide monitor. */}
           <div className={activeTab === "skills" ? "p-4 md:p-6 space-y-5" : "p-4 md:p-6 max-w-5xl mx-auto space-y-5"}>
             <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
               <div className="flex items-center gap-3">
-                <h2 className="text-lg font-semibold text-text-bright">{currentTabLabel}</h2>
+                {/* A phone's header carries the section's name. */}
+                <h2 className="max-md:hidden text-lg font-semibold text-text-primary">{currentTabLabel}</h2>
                 {introId && introFolded && <SettingsIntroReopen onReopen={() => reopenIntro(introId)} />}
               </div>
               {showProfilePicker && (

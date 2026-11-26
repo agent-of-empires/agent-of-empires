@@ -130,8 +130,11 @@ export function TopBar({
       {...tourAnchor(TOUR_ANCHORS.topbar)}
       // On a phone the bar dissolves: over a Session its controls float on the content scrolling beneath, as in
       // Muse; elsewhere it stays a sticky, solid box so iOS 26 tints the status bar from it rather than blurring.
-      className={`h-12 max-md:h-14 md:bg-transparent flex items-stretch shrink-0 ${
-        phoneSession ? "max-md:bg-transparent" : "bg-surface-900 max-md:sticky max-md:top-0 max-md:z-30"
+      className={`h-12 md:bg-transparent flex items-stretch shrink-0 ${
+        // Over a Session it sits lower, clear of the faint band iOS still shades just under the status bar.
+        phoneSession
+          ? "max-md:h-[68px] max-md:pt-3 max-md:bg-transparent"
+          : "max-md:h-14 bg-surface-900 max-md:sticky max-md:top-0 max-md:z-30"
       }`}
     >
       {/* Left zone: widens to the sidebar column when it's visible, so the header lines up with the sidebar on the

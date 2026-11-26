@@ -25,7 +25,7 @@ test.describe("URL routing", () => {
   test("settings deep links, tab URLs, refresh, and back/forward", async ({ page }) => {
     await page.goto("/");
     await page.goto("/settings");
-    await expect(page.getByText("Settings", { exact: true }).first()).toBeVisible();
+    await expect(page.getByText("Settings", { exact: true }).filter({ visible: true }).first()).toBeVisible();
     await expect(page).toHaveURL("/settings");
 
     await page.goto("/settings/theme");

@@ -351,7 +351,8 @@ test.describe("Mobile settings", () => {
 
     await list.getByRole("button", { name: /Notifications/ }).click();
     await expect(page).toHaveURL(/\/settings\/notifications$/);
-    await expect(page.getByRole("heading", { name: "Notifications", level: 2 })).toBeVisible();
+    // A phone titles the section in its header, beside the round back button.
+    await expect(page.getByRole("heading", { name: "Notifications", level: 1 })).toBeVisible();
     await expect(list).toHaveCount(0);
     await page.getByRole("button", { name: /All settings/ }).click();
     await expect(page).toHaveURL(/\/settings$/);
