@@ -2956,7 +2956,11 @@ fn declared_container_dir(
             .cloned(),
         None => {
             let dir = Path::new(CONTAINER_HOME).join(rel).display().to_string();
-            Some(dir.trim_end_matches('/').to_string())
+            let dir = dir.trim_end_matches('/').to_string();
+            // An empty `rel` is the home directory itself, which only a file mount uses.
+            (rel.as_os_str().is_empty()
+                || aoe_plugin_api::agent_integration::container_dir_ok(&dir))
+            .then_some(dir)
         }
     }
 }
@@ -7811,6 +7815,17 @@ sandbox = "SANDBOX"
             declared_container_dir(&entry, None, Path::new(".example")).as_deref(),
             Some("/root/.example")
         );
+        assert_eq!(
+            declared_container_dir(&entry, None, Path::new("")).as_deref(),
+            Some("/root"),
+            "a trust file under the home directory stays allowed"
+        );
+        for rel in [".example:invalid", ".a,b", ".a/../b"] {
+            assert!(
+                declared_container_dir(&entry, None, Path::new(rel)).is_none(),
+                "{rel}"
+            );
+        }
         let bound = [VolumeMount {
             host_path: "/h".into(),
             container_path: "/opt/example/sub".into(),

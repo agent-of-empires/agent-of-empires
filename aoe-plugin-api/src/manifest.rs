@@ -836,7 +836,9 @@ fn cli_verb_ok(name: &str) -> bool {
 fn declaration_rel_path_ok(path: &str) -> bool {
     use std::path::{Component, Path};
     (1..=crate::agent_integration::AGENT_HOOK_PATH_MAX).contains(&path.len())
-        && path.chars().all(|c| !c.is_control())
+        && path
+            .chars()
+            .all(|c| !c.is_control() && !matches!(c, ':' | ',' | '\\'))
         && path.split('/').all(|part| !part.is_empty() && part != ".")
         && Path::new(path)
             .components()

@@ -975,6 +975,9 @@ fn hooks_declarations_are_validated() {
         (with(".example/settings.json", ".example/./settings.json"), "settings_rel_path"),
         (with(".example/settings.json", ""), "settings_rel_path"),
         (with(".example/settings.json", ".zshrc"), "settings_rel_path"),
+        (with(".example/settings.json", ".example:invalid/settings.json"), "settings_rel_path"),
+        (with(".example/settings.json", ".ex,ample/settings.json"), "settings_rel_path"),
+        (with(".example/settings.json", ".ex\\\\ample/settings.json"), "settings_rel_path"),
         (with(".example/settings.json", ".example/.zshrc"), "settings_rel_path"),
         (with(".example/settings.json", "settings.json"), "settings_rel_path"),
         (with("EXAMPLE_CONFIG_DIR", "1BAD"), "config_dir_env_var"),
@@ -1129,6 +1132,8 @@ fn declaration_bounds_each_reject() {
             "trust.value must be 1..=256",
         ),
         (trust_with(".example.json", ".example"), "trust.file"),
+        (trust_with(".example.json", "a:b.json"), "trust.file"),
+        (trust_with(".example.json", "a,b.json"), "trust.file"),
         (trust_with(".example.json", ".example.yaml"), "trust.file"),
         (
             trust_with(
