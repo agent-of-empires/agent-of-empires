@@ -3,7 +3,7 @@
 use tracing::info;
 
 use super::{
-    publish_next_persisted, publish_with_next_seq, BroadcastSink, PromptDisposition,
+    publish_next_persisted, publish_with_next_seq, BroadcastSink, Persisted, PromptDisposition,
     PublishedPrompt, SeqMap, Supervisor, WorkerKind,
 };
 use crate::acp::approvals::ApprovalDecision;
@@ -34,7 +34,15 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Publish an `AgentStartupError` for a session whose worker never came online.
     pub fn publish_startup_error(&self, session_id: &str, message: String) {
-        self.publish_next(session_id, &Event::startup_error(message));
+        self.queue_startup_error(session_id, message).wait();
+    }
+
+    /// Allocate a startup error's seq and queue it; the receipt waits for the store.
+    pub(crate) fn queue_startup_error(&self, session_id: &str, message: String) -> Persisted {
+        let event = Event::startup_error(message);
+        publish_with_next_seq(&self.next_seqs, session_id, |seq| {
+            self.sink.queue_persisted(session_id, seq, &event)
+        })
     }
 
     /// Publish `Stopped { reason }` only if `expected_seq` is still the

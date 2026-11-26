@@ -1127,9 +1127,12 @@ async fn revert_retry_starting(
                 attempt,
                 "Retry from a resumed stop failed; publishing its startup error"
             );
-            // Under `instances`, as `begin` reads its watermark, so a later attempt's watermark
-            // is at or above this seq and the error cannot end that attempt's Starting.
-            state.acp_supervisor.publish_startup_error(id, message);
+            // The seq is allocated under `instances`, as `begin` reads its watermark, so a later
+            // attempt's watermark is at or above it and the error cannot end that attempt's
+            // Starting. The store is waited on after.
+            let persisted = state.acp_supervisor.queue_startup_error(id, message);
+            drop(instances);
+            persisted.wait();
             return;
         }
         let restored = commit_status_intent(inst, StatusPolicy::Authoritative, origin.prior());
@@ -3051,6 +3054,61 @@ mod tests {
             got,
             [(1, Status::Starting), (0, Status::Idle), (0, Status::Idle)]
         );
+    }
+
+    /// A failed Retry from a resumed stop waits for its startup error's store outside
+    /// `instances`, so a slow write does not hold up every reader of the rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn a_resumed_stops_startup_error_is_stored_outside_the_rows_lock() {
+        use crate::acp::supervisor::SupervisorError;
+        use std::time::{Duration, Instant};
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Idle;
+        let id = inst.id.clone();
+        let state = test_support::build_test_app_state(vec![inst]);
+        let (entered_tx, entered) = std::sync::mpsc::sync_channel::<()>(1);
+        let (release, held) = std::sync::mpsc::sync_channel::<()>(1);
+        state.acp_supervisor.test_run_on_writer(move || {
+            entered_tx.send(()).expect("test waits");
+            let _ = held.recv_timeout(Duration::from_secs(30));
+        });
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the writer is held");
+        let guard = RetryStartingGuard::begin(&state, &id, RetryOrigin::ResumedStop, NO_LAUNCH)
+            .await
+            .expect("a resumed stop starts");
+        let before = state.acp_supervisor.latest_seq(&id);
+        guard.fail(
+            "codex",
+            &SupervisorError::Acp(crate::acp::acp_client::AcpError::Spawn("boom".into())),
+        );
+        // Allocated under `instances`, so what follows is the rollback's wait for the store.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.acp_supervisor.latest_seq(&id) == before {
+            assert!(
+                Instant::now() < deadline,
+                "the rollback queues its startup error"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        drop(
+            tokio::time::timeout(Duration::from_secs(5), state.instances.read())
+                .await
+                .expect("the rows stay readable while the store is held"),
+        );
+        release.send(()).expect("the writer is held");
+        drained(&state).await;
+        let published = state
+            .acp_event_store
+            .replay_from(&id, 0)
+            .into_iter()
+            .filter(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
+            .count();
+        assert_eq!(published, 1);
     }
 
     /// A Retry that takes over a failed resumed stop's `Starting` keeps that origin, though its
