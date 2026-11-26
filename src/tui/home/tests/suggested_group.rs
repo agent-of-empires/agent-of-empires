@@ -714,6 +714,7 @@ fn hooks_that_need_trust_show_a_review_and_approving_starts_with_its_fingerprint
         env.view.confirm_dialog.as_ref().unwrap().action(),
         "approve_suggestion_hooks"
     );
+    render_geometry(&mut env.view);
     env.view.handle_key(key(KeyCode::Char('y')), None);
     assert_eq!(
         next_request(&requests),
@@ -1519,6 +1520,7 @@ fn pre_trust_is_refused_when_the_list_changes_under_its_confirmation() {
     let _commands = env.view.session_feed.request_driver_for_test();
     env.view.handle_key(key(KeyCode::Char('t')), None);
     assert!(env.view.confirm_dialog.is_some());
+    render_geometry(&mut env.view);
     let mut other = snapshot(1, &[]);
     other["profile"] = "other".into();
     env.view.suggestions_feed.set_snapshot_for_test(other);
