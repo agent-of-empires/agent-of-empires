@@ -295,10 +295,18 @@ test("switch to terminal is refused when the command's session flag conflicts wi
   spawnServe,
 }) => {
   const title = "acp-selector-conflict";
+  const sid = "11111111-2222-4333-8444-555555555555";
   const serve = await spawnServe({
     acp: true,
     seedFn: (seed) => {
-      seedSessionViaAoeAdd({ title, tool: "claude" })(seed);
+      seedSessionViaAoeAdd({
+        title,
+        tool: "claude",
+        prepare: (path) => {
+          const cwd = realpathSync(path);
+          seedTranscript(seed.home, cwd.replace(/[^a-zA-Z0-9-]/g, "-"), sid, cwd, "retained conversation");
+        },
+      })(seed);
       const profilesDir = join(appDirFor(seed.home, seed.env.XDG_CONFIG_HOME!, resolveAoeBinary()), "profiles");
       let seeded = false;
       for (const profile of readdirSync(profilesDir)) {
@@ -308,7 +316,7 @@ test("switch to terminal is refused when the command's session flag conflicts wi
         const row = rows.find((r) => r.title === title);
         if (!row) continue;
         row.command = "claude --resume old-id";
-        row.agent_session_id = "sid-held";
+        row.agent_session_id = sid;
         writeFileSync(path, JSON.stringify(rows));
         seeded = true;
       }
@@ -335,7 +343,7 @@ test("switch to terminal is refused when the command's session flag conflicts wi
   await expect(page.getByText(/remove the session flag from its command or arguments to switch/)).toBeVisible();
 
   const session = (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId);
-  expect(session?.view).toBe("structured");
+  expect(session).toMatchObject({ view: "structured", acp_session_id: sid });
   const fakeLog = join(serve.home, "fake-acp.log");
   expect(existsSync(fakeLog) ? readFileSync(fakeLog, "utf8") : "").not.toContain('"--resume","old-id"');
 });

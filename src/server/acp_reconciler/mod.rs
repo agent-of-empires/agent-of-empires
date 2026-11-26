@@ -2363,7 +2363,8 @@ mod tests {
                 ("compact", "follow up", false),
                 ("clear", "/clear", false),
             ] {
-                let agent = if name == "agent" { "codex" } else { "claude" };
+                // Gemini leaves transcript tailing to AoE; Codex advertises ACP subagents.
+                let agent = if name == "agent" { "gemini" } else { "claude" };
                 let mut live = test_support::managed_control_session(
                     scope, name, agent, None,
                 ).await;

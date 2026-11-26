@@ -2151,9 +2151,7 @@ async fn resume_structured_stop_inner(
             );
             let registry = worker_registry::try_registry_lock(&probe_id)?
                 .ok_or(worker_registry::RegistryBusy)?;
-            let observed_stop = registry
-                .stop()
-                .map_err(|error| error.context(worker_registry::StopSuperseded))?;
+            let observed_stop = registry.stop()?;
             let stopped_record = registry.record()?;
             let context = crate::acp::state::NativeEventContext::capture(&row, native.storage())?;
             drop(registry);
