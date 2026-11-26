@@ -95,22 +95,58 @@ pub enum DiffBase<'a> {
 fn base_tree<'r>(repo: &'r git2::Repository, base: DiffBase<'_>) -> Result<git2::Tree<'r>> {
     match base {
         DiffBase::Branch(branch) => get_merge_base_tree(repo, branch),
-        DiffBase::Head => match repo.head().and_then(|head| head.peel_to_tree()) {
-            Ok(tree) => Ok(tree),
+        DiffBase::Head => match repo.head() {
+            Ok(head) => Ok(head.peel_to_tree()?),
             // An unborn branch has nothing committed: everything is uncommitted.
-            Err(_) => Ok(repo.find_tree(repo.treebuilder(None)?.write()?)?),
+            Err(e) if e.code() == git2::ErrorCode::UnbornBranch => {
+                Ok(repo.find_tree(repo.treebuilder(None)?.write()?)?)
+            }
+            Err(e) => Err(e.into()),
         },
         DiffBase::Tree(oid) => Ok(repo.find_tree(oid)?),
     }
 }
 
+/// The most new or changed content [`snapshot_worktree`] writes: a turn's baseline that would
+/// copy more, such as build output nobody ignored, is refused rather than taken in part.
+pub const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+pub const SNAPSHOT_MAX_FILES: usize = 20_000;
+
 /// The working tree as a tree object, untracked files included and ignored ones not.
 ///
 /// Like `git stash create`, it stages into a copy of the index that is never saved, so the user's
 /// index, refs and stash are untouched; only the tree and its new blobs are written to the object
-/// store, unreferenced until garbage collection.
+/// store, unreferenced until garbage collection. Fails with [`GitError::SnapshotTooLarge`] past
+/// [`SNAPSHOT_MAX_FILES`] or [`SNAPSHOT_MAX_BYTES`] of new or changed files, before writing any.
 pub fn snapshot_worktree(repo_path: &Path) -> Result<git2::Oid> {
+    snapshot_worktree_within(repo_path, SNAPSHOT_MAX_FILES, SNAPSHOT_MAX_BYTES)
+}
+
+fn snapshot_worktree_within(
+    repo_path: &Path,
+    max_files: usize,
+    max_bytes: u64,
+) -> Result<git2::Oid> {
     let repo = super::open_repo_at(repo_path)?;
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false);
+    let changed = git2::Status::WT_NEW | git2::Status::WT_MODIFIED | git2::Status::WT_TYPECHANGE;
+    let workdir = repo.workdir().ok_or(GitError::NotAGitRepo)?.to_path_buf();
+    let (mut files, mut bytes) = (0usize, 0u64);
+    for entry in repo.statuses(Some(&mut opts))?.iter() {
+        if !entry.status().intersects(changed) {
+            continue;
+        }
+        files += 1;
+        if let Ok(path) = entry.path() {
+            bytes += std::fs::symlink_metadata(workdir.join(path)).map_or(0, |m| m.len());
+        }
+        if files > max_files || bytes > max_bytes {
+            return Err(GitError::SnapshotTooLarge { files, bytes });
+        }
+    }
     let mut index = repo.index()?;
     index.add_all(["*"], git2::IndexAddOption::DEFAULT, None)?;
     index.update_all(["*"], None)?;
@@ -934,6 +970,34 @@ mod tests {
         let files = compute_changed_files_against(dir.path(), DiffBase::Head).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, Path::new("first.txt"));
+
+        // A HEAD that names a commit the store lacks is an error, not an empty repository.
+        let (dir, _repo) = setup_test_repo();
+        fs::write(
+            dir.path().join(".git/HEAD"),
+            format!("{}\n", "1".repeat(40)),
+        )
+        .unwrap();
+        assert!(compute_changed_files_against(dir.path(), DiffBase::Head).is_err());
+    }
+
+    #[test]
+    fn a_snapshot_past_its_limit_is_refused_before_writing_anything() {
+        let (dir, repo) = setup_test_repo();
+        fs::write(dir.path().join("big.bin"), vec![7u8; 4096]).unwrap();
+        let blob = git2::Oid::hash_object(git2::ObjectType::Blob, &[7u8; 4096]).unwrap();
+        for (max_files, max_bytes) in [(0, u64::MAX), (usize::MAX, 4095)] {
+            assert!(matches!(
+                snapshot_worktree_within(dir.path(), max_files, max_bytes),
+                Err(GitError::SnapshotTooLarge { .. })
+            ));
+            assert!(
+                repo.find_blob(blob).is_err(),
+                "{max_files} files, {max_bytes} bytes"
+            );
+        }
+        snapshot_worktree_within(dir.path(), 1, 4096).unwrap();
+        assert!(repo.find_blob(blob).is_ok());
     }
 
     /// Only tracked blobs are served: an untracked secret (#1810) and `.git`
