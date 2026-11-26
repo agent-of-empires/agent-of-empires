@@ -80,8 +80,6 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe tmux`↴](#aoe-tmux)
 * [`aoe tmux status`↴](#aoe-tmux-status)
 * [`aoe sounds`↴](#aoe-sounds)
-* [`aoe sounds install`↴](#aoe-sounds-install)
-* [`aoe sounds list`↴](#aoe-sounds-list)
 * [`aoe sounds test`↴](#aoe-sounds-test)
 * [`aoe theme`↴](#aoe-theme)
 * [`aoe theme list`↴](#aoe-theme-list)
@@ -175,7 +173,7 @@ Run without arguments to launch the TUI dashboard.
 * `sandbox` — Clean up sandbox agent stores and log in sandboxed agents
 * `worktree` — Manage git worktrees for parallel development
 * `tmux` — tmux integration utilities
-* `sounds` — Manage sound effects for agent state transitions
+* `sounds` — Test the built-in sound effects
 * `theme` — Manage color themes (list, export, customize)
 * `settings` — Inspect resolved settings and their provenance
 * `cityhall` — Export and apply the CityHall config bundle (settings + projects)
@@ -1341,43 +1339,37 @@ Add this to your ~/.tmux.conf: set -g status-right "#(aoe tmux status)"
 
 ## `aoe sounds`
 
-Manage sound effects for agent state transitions
+Test the built-in sound effects
 
 **Usage:** `aoe sounds <COMMAND>`
 
 ###### **Subcommands:**
 
-* `install` — Install bundled sound effects
-* `list` — List currently installed sounds
-* `test` — Test a sound by playing it
-
-
-
-## `aoe sounds install`
-
-Install bundled sound effects
-
-**Usage:** `aoe sounds install`
-
-
-
-## `aoe sounds list`
-
-List currently installed sounds
-
-**Usage:** `aoe sounds list`
+* `test` — Play a built-in sound on this machine to check that audio works
 
 
 
 ## `aoe sounds test`
 
-Test a sound by playing it
+Play a built-in sound on this machine to check that audio works
 
-**Usage:** `aoe sounds test <NAME>`
+**Usage:** `aoe sounds test [EVENT]`
 
 ###### **Arguments:**
 
-* `<NAME>` — Sound file name (without extension)
+* `<EVENT>` — The sound to play
+
+  Default value: `idle`
+
+  Possible values:
+  - `start`
+  - `running`
+  - `waiting`
+  - `idle`
+  - `error`
+  - `approval`:
+    A Structured view Session asks for permission or a question; browser only
+
 
 
 

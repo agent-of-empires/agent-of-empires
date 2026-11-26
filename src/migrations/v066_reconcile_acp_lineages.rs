@@ -1,4 +1,4 @@
-//! Reconcile the published ACP54–57 and main54–55 data histories.
+//! Reconcile the published ACP and main data histories with conflicting schema markers.
 
 use anyhow::Result;
 
@@ -17,7 +17,9 @@ pub fn run() -> Result<()> {
     reconcile_autonomous_metadata()?;
     super::v059_owner_only_event_logs::run()?;
     super::v063_retire_color_labels::run()?;
-    tracing::info!(target: "migrations.v064", "Reconciled ACP and main data histories");
+    // The ACP branch's marker 64 did not run main's sound cleanup.
+    super::v064_builtin_sounds::run()?;
+    tracing::info!(target: "migrations.v066", "Reconciled ACP and main data histories");
     Ok(())
 }
 
@@ -243,6 +245,18 @@ mod tests {
         }
         if matches!(history, History::Frontier58) {
             seed_frontier_58(conn);
+            // ACP's marker 58 did not run main's account-window cache migration.
+            conn.execute_batch(
+                "CREATE TABLE acp_account_limits (
+                     account_key TEXT PRIMARY KEY,
+                     limited_until_ms INTEGER NOT NULL DEFAULT 0,
+                     window_kind TEXT NOT NULL DEFAULT '',
+                     unusable_until_ms INTEGER NOT NULL DEFAULT 0,
+                     updated_at_ms INTEGER NOT NULL
+                 );
+                 INSERT INTO acp_account_limits VALUES ('/a', 9, 'usage', 0, 1);",
+            )
+            .unwrap();
         }
         let version = match history {
             History::Legacy53 => 53,
@@ -345,7 +359,7 @@ mod tests {
         let app = crate::session::get_app_dir().unwrap();
         fs::create_dir_all(&app).unwrap();
         run_migrations().unwrap();
-        assert_eq!(get_current_version(), 64);
+        assert_eq!(get_current_version(), 66);
         assert!(!app.join("acp_events.db").exists());
     }
 
@@ -373,7 +387,7 @@ mod tests {
             prepare_history(history, &conn);
             let old_identity = identity(&conn);
             run_migrations().unwrap();
-            assert_eq!(get_current_version(), 64, "{history:?}");
+            assert_eq!(get_current_version(), 66, "{history:?}");
             assert_preserved(&app, &conn);
             let reconciled_identity = identity(&conn).unwrap();
             if let Some(old) = old_identity {
@@ -399,6 +413,13 @@ mod tests {
             if matches!(history, History::Frontier58) {
                 assert_eq!(conn.query_row("SELECT version,through_seq,context_json FROM acp_transcript_frontier WHERE session_id=?1", [SID], |row| Ok((row.get::<_, i64>(0)?,row.get::<_, i64>(1)?,row.get::<_, String>(2)?))).unwrap(), (1,3,r#"{"last_message_id":null,"last_thought_id":null}"#.to_owned()));
                 assert_eq!(conn.query_row("SELECT phase,phase_scope,state_json FROM acp_transcript_tools WHERE session_id=?1 AND tool_call_id='old-open'", [SID], |row| Ok((row.get::<_, i64>(0)?,row.get::<_, i64>(1)?,row.get::<_, String>(2)?))).unwrap(), (1,0,r#"{"Open":{"first_seq":null,"text":""}}"#.to_owned()));
+                assert!(!conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='acp_account_limits')",
+                        [],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap());
             }
             let path = app.join("acp_events.db");
             let backups = crate::session::migration_backups(&path).unwrap();
@@ -442,7 +463,7 @@ mod tests {
         let conn = seed_legacy_database(&app);
         prepare_history(History::Main57, &conn);
         let old_identity = identity(&conn).unwrap();
-        set_version(63).unwrap();
+        set_version(65).unwrap();
         let marker_before_reconciliation = fs::read(app.join(VERSION_FILE)).unwrap();
         let other = app.join("profiles/other/config.toml");
         let valid_config = fs::read(&other).unwrap();
@@ -473,7 +494,7 @@ mod tests {
         let backups = crate::session::migration_backups(&path).unwrap().len();
         fs::write(&other, valid_config).unwrap();
         run_migrations().unwrap();
-        assert_eq!(get_current_version(), 64);
+        assert_eq!(get_current_version(), 66);
         assert_preserved(&app, &conn);
         assert_eq!(identity(&conn).unwrap(), old_identity);
         assert_eq!(
@@ -506,12 +527,98 @@ mod tests {
             set_version(63).unwrap();
 
             run_migrations().unwrap();
-            assert_eq!(get_current_version(), 64);
+            assert_eq!(get_current_version(), 66);
             assert_preserved(&app, &conn);
             let cleaned = fs::read_to_string(&config).unwrap();
             assert!(!cleaned.contains("show_session_colors"));
             run_migrations().unwrap();
             assert_eq!(fs::read_to_string(&config).unwrap(), cleaned);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn versions_64_and_65_reconcile_sound_config_and_account_estimates() {
+        for (marker, acp_lineage) in [(64, true), (64, false), (65, false)] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let app = crate::session::get_app_dir().unwrap();
+            seed_profiles(&app);
+            let conn = seed_legacy_database(&app);
+            prepare_history(History::Main57, &conn);
+            if acp_lineage {
+                super::run().unwrap();
+            }
+            let configs = [
+                app.join("config.toml"),
+                app.join("profiles/work/config.toml"),
+            ];
+            for path in &configs {
+                let mut contents = fs::read_to_string(path).unwrap();
+                contents.push_str("\n[sound]\nenabled = true\non_idle = 'idle.wav'\n");
+                fs::write(path, contents).unwrap();
+            }
+            if !acp_lineage {
+                v064_builtin_sounds::run().unwrap();
+            }
+            conn.execute_batch(
+                "CREATE TABLE acp_account_limits (
+                     account_key TEXT NOT NULL, window_kind TEXT NOT NULL,
+                     limited_until_ms INTEGER NOT NULL DEFAULT 0,
+                     unusable_until_ms INTEGER NOT NULL DEFAULT 0,
+                     updated_at_ms INTEGER NOT NULL, estimated INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY(account_key, window_kind)
+                 );
+                 INSERT INTO acp_account_limits VALUES ('/a','weekly',900,0,2,1);
+                 INSERT INTO acp_account_limits VALUES ('/a','five_hour',500,0,1,0);",
+            )
+            .unwrap();
+            if marker == 65 {
+                v065_account_limit_estimate_rows::run().unwrap();
+            }
+            set_version(marker).unwrap();
+            let old_identity = identity(&conn).unwrap();
+            let account_limits = || {
+                conn.prepare(
+                    "SELECT window_kind, limited_until_ms, updated_at_ms, estimated
+                     FROM acp_account_limits ORDER BY window_kind",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<(String, i64, i64, bool)>>>()
+                .unwrap()
+            };
+
+            run_migrations().unwrap();
+            assert_eq!(get_current_version(), 66);
+            assert_preserved(&app, &conn);
+            assert_eq!(identity(&conn).unwrap(), old_identity);
+            let retained_limits = vec![
+                ("five_hour".to_owned(), 500, 1, false),
+                ("weekly#estimate".to_owned(), 900, 2, true),
+            ];
+            assert_eq!(account_limits(), retained_limits);
+            let cleaned = configs.map(|path| {
+                let contents = fs::read_to_string(&path).unwrap();
+                let config = contents.parse::<toml::Table>().unwrap();
+                assert_eq!(config["sound"]["enabled"].as_bool(), Some(true));
+                assert!(config["sound"].get("on_idle").is_none());
+                (path, contents)
+            });
+
+            run_migrations().unwrap();
+            assert_eq!(get_current_version(), 66);
+            assert_eq!(account_limits(), retained_limits);
+            for (path, contents) in cleaned {
+                assert_eq!(fs::read_to_string(path).unwrap(), contents);
+            }
         }
     }
 
@@ -536,7 +643,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            set_version(63).unwrap();
+            set_version(65).unwrap();
             let marker = fs::read(app.join(VERSION_FILE)).unwrap();
             assert!(run_migrations().is_err());
             assert_eq!(fs::read(app.join(VERSION_FILE)).unwrap(), marker);
@@ -569,7 +676,7 @@ mod tests {
         prepare_history(History::Main57, &conn);
         let malformed = br#"[{"id":"5959595959595959","acp_establishment":{"version":999}}]"#;
         fs::write(app.join("sessions.json"), malformed).unwrap();
-        set_version(63).unwrap();
+        set_version(65).unwrap();
         let marker = fs::read(app.join(VERSION_FILE)).unwrap();
         assert!(run_migrations().is_err());
         assert_eq!(fs::read(app.join(VERSION_FILE)).unwrap(), marker);

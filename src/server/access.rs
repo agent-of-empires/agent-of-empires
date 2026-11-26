@@ -381,6 +381,8 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     // Session creation (server-derived) + lifecycle / metadata on the structured
     // sessions this mode owns; each handler re-checks the target is structured.
     ("POST", "/api/sessions"),
+    // Resolves a prefill and mutates nothing; `/api/suggestions/start` stays denied.
+    ("POST", "/api/suggestions/prepare"),
     ("POST", "/api/sessions/{id}/creation/cancel"),
     ("DELETE", "/api/sessions/{id}"),
     ("DELETE", "/api/workspaces"),
@@ -520,8 +522,8 @@ pub(super) async fn cityhall_gate(
 ///   redirect, so both hosts must be allowed. `data:` covers inline icons.
 ///   `raw.githubusercontent.com` serves plugin screenshots resolved by the
 ///   plugin detail endpoint (#2484).
-/// - `media-src 'self' blob:`: browser sounds are fetched with auth and
-///   played from a blob URL, since `<audio src>` bypasses the fetch interceptor.
+/// - `media-src 'self'`: browser sounds play through Web Audio from fetched
+///   bytes, so no media element loads a blob URL.
 /// - `font-src 'self'`: the dashboard's fonts are bundled under /fonts/.
 /// - `connect-src 'self' ws: wss:`: REST + PTY WebSocket to same origin.
 /// - `frame-ancestors 'none'`: CSP-native equivalent of X-Frame-Options.
@@ -531,7 +533,7 @@ pub(super) const CSP: &str = "default-src 'self'; \
     script-src 'self' 'wasm-unsafe-eval'; \
     style-src 'self' 'unsafe-inline'; \
     img-src 'self' data: blob: https://github.com https://avatars.githubusercontent.com https://raw.githubusercontent.com; \
-    media-src 'self' blob:; \
+    media-src 'self'; \
     font-src 'self'; \
     connect-src 'self' ws: wss:; \
     frame-ancestors 'none'; \
@@ -563,6 +565,59 @@ mod tests {
     use super::*;
     use crate::server::test_helpers::vecs;
     use crate::server::test_support;
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cityhall_suggestions_allow_prepare_but_reject_mutations_before_json() {
+        use axum::http::{Method, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let state = test_support::build_test_app_state_with_policy_configured(
+            Vec::new(),
+            vec!["localhost".into()],
+            Vec::new(),
+            None,
+            |state| state.cityhall_mode = true,
+        );
+        let app = test_support::build_router_for_test(state);
+        for (method, route, expected) in [
+            (Method::POST, "prepare", StatusCode::BAD_REQUEST),
+            (Method::POST, "start", StatusCode::FORBIDDEN),
+            (Method::POST, "refresh", StatusCode::FORBIDDEN),
+            (Method::POST, "checks/run", StatusCode::FORBIDDEN),
+            (Method::POST, "fix", StatusCode::FORBIDDEN),
+            (Method::POST, "dismiss", StatusCode::FORBIDDEN),
+            (Method::POST, "undismiss", StatusCode::FORBIDDEN),
+            (Method::PATCH, "sources", StatusCode::FORBIDDEN),
+            (Method::PATCH, "prefs", StatusCode::FORBIDDEN),
+            (Method::PUT, "presets", StatusCode::FORBIDDEN),
+            (Method::DELETE, "presets", StatusCode::FORBIDDEN),
+            (Method::PUT, "mappings", StatusCode::FORBIDDEN),
+            (Method::DELETE, "mappings", StatusCode::FORBIDDEN),
+        ] {
+            let mut request = Request::builder()
+                .method(method.clone())
+                .uri(format!("/api/suggestions/{route}"))
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{"))
+                .unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                crate::server::peer::ConnectionPeer::UnixOwner {
+                    uid: nix::unistd::geteuid().as_raw(),
+                },
+            ));
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected, "{method} {route}");
+            if expected == StatusCode::FORBIDDEN {
+                assert_eq!(
+                    response.headers()[crate::daemon::ERROR_CODE_HEADER],
+                    "cityhall_mode"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn cityhall_reorder_preserves_native_rows_and_allows_structured_ordering() {
@@ -1405,7 +1460,7 @@ mod tests {
             "default-src 'self'",
             "script-src 'self' 'wasm-unsafe-eval'",
             "img-src 'self' data: blob: https://github.com https://avatars.githubusercontent.com https://raw.githubusercontent.com",
-            "media-src 'self' blob:",
+            "media-src 'self';",
             "connect-src 'self' ws: wss:",
             "frame-ancestors 'none'",
         ] {

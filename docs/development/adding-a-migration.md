@@ -17,17 +17,19 @@ Migrations must be idempotent, use `tracing::info!`, gate platform-specific ones
 
 Do not reuse a published migration number for a different transformation. When integrating divergent schema histories, preserve the published meaning and add idempotent reconciliation steps newer than both histories. Test upgrades from each history and a second run over the migrated state.
 
-ACP reconciliation (v064) preserves ACP54–57 establishment, event scope,
+ACP reconciliation (v066) preserves ACP54–57 establishment, event scope,
 prompt publication and budget knowledge. A main55 marker does not prove ACP55
-event scope. The migration registry keeps main63 for retired color labels.
-v064 reconciles both histories, including repeating color-label cleanup for
-installations that reached 63 through the ACP lineage. It advances the marker
-only after all steps succeed; a retry can safely repeat completed steps.
+event scope. The registry preserves main63 for retired color labels, main64 for
+retired sound file overrides, and main65 for separate account-limit estimate rows.
+The estimate migration first reconciles the cache shape if an ACP marker skipped
+main58. v066 repeats color and sound cleanup because ACP markers 63 and 64 do
+not prove those steps ran. The runner stamps each migration only after it succeeds;
+a retry can safely repeat completed steps.
 
 Qualification reconciliation also validates recorded private child source and
 ancestry metadata. It does not synthesize that proof from reported parent/child
-IDs, rewrite historical content into current authority, or treat schema version 64 as
-proof that a legacy child may join a current resource.
+IDs, rewrite historical content into current authority, or treat a current schema
+marker as proof that a legacy child may join a current resource.
 
 Adding an optional field whose missing and null forms mean the same thing does not require rewriting existing rows.
 

@@ -695,6 +695,83 @@ describe("BackgroundAgentsPanel", () => {
       subagentsMock.mockReturnValue([]);
     });
 
+    it("keeps a resumed child running past its first launch result and labels that output", () => {
+      const at = "2026-01-01T00:00:00Z";
+      const rows: ActivityRow[] = [
+        {
+          id: "r1",
+          kind: "tool_start",
+          text: "",
+          at,
+          tool: { id: "msg-1", name: "Explore repo", kind: "think", args_preview: "{}", started_at: at },
+        },
+        { id: "r2", kind: "tool_complete", toolCallId: "msg-1", text: "first report", at: "2026-01-01T00:01:00Z" },
+      ];
+      agentsMock.mockReturnValue([]);
+      subagentsMock.mockReturnValue([
+        record({ parent_tool_call_id: "msg-1", title: "Explore repo", background: true }),
+      ]);
+      activityMock.mockReturnValue(rows);
+      const { container, getByRole, getByTitle } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      expect(container.textContent).toContain("Running · 1");
+      expect(container.textContent).not.toContain("Recent");
+      expect(getByTitle("Stop this sub-agent")).toBeTruthy();
+      fireEvent.click(getByRole("button", { name: /Explore repo/ }));
+      expect(container.textContent).toContain("Output from an earlier run");
+      expect(container.textContent).toContain("first report");
+      subagentsMock.mockReturnValue([]);
+      activityMock.mockReturnValue([]);
+    });
+
+    it("does not claim an idle resumed child wrote no report, with or without a first report", () => {
+      for (const firstReport of ["first report", ""]) {
+        const at = "2026-01-01T00:00:00Z";
+        const rows: ActivityRow[] = [
+          {
+            id: "r1",
+            kind: "tool_start",
+            text: "",
+            at,
+            tool: { id: "msg-1", name: "Explore repo", kind: "think", args_preview: "{}", started_at: at },
+          },
+          { id: "r2", kind: "tool_complete", toolCallId: "msg-1", text: firstReport, at: "2026-01-01T00:01:00Z" },
+          {
+            id: "r3",
+            kind: "tool_start",
+            text: "",
+            at,
+            tool: {
+              id: "c1",
+              name: "Read",
+              kind: "read",
+              args_preview: "{}",
+              started_at: "2026-01-01T00:02:00Z",
+              parent_tool_call_id: "msg-1",
+            },
+          },
+        ];
+        agentsMock.mockReturnValue([]);
+        subagentsMock.mockReturnValue([
+          record({
+            parent_tool_call_id: "msg-1",
+            title: "Explore repo",
+            background: true,
+            state: "idle",
+            stop_reason: "end_turn",
+          }),
+        ]);
+        activityMock.mockReturnValue(rows);
+        const { container, getByRole, unmount } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+        fireEvent.click(getByRole("button", { name: /Explore repo/ }));
+        expect(container.textContent).toContain("Final report not captured.");
+        expect(container.textContent).not.toContain("Finished without writing a report");
+        expect(container.textContent?.includes("Output from an earlier run")).toBe(firstReport !== "");
+        unmount();
+        subagentsMock.mockReturnValue([]);
+        activityMock.mockReturnValue([]);
+      }
+    });
+
     it("opens the detail Stop confirmation on the header's wrapping row, not in its action group", () => {
       agentsMock.mockReturnValue([agent()]);
       subagentsMock.mockReturnValue([record()]);

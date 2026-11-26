@@ -23,10 +23,18 @@ import type {
   CreationTrustFingerprint,
   ImportableSession,
   SettingsFieldDescriptor,
+  SuggestionMapping,
+  SuggestionProject,
+  SuggestionPrefs,
+  SuggestionPrepared,
+  SuggestionPreset,
+  SuggestionPresetEntry,
+  SuggestionsSnapshot,
 } from "./types";
 import type { AcpAttachment, ConfigOptionDescriptor, PromptAttachmentInput } from "./acpTypes";
 import { clearDeviceBindingSecret, getOrCreateDeviceBindingSecret } from "./deviceBinding";
 import { INLINE_ELEVATION_HEADER } from "./fetchInterceptor";
+import { notifySuggestionsChanged } from "./suggestionEvents";
 
 type Payload = Record<string, unknown>;
 
@@ -748,6 +756,8 @@ export interface PluginDiscoveryResult {
   description: string | null;
   stars: number;
   badge: "installed" | "featured" | "unvetted";
+  /** The featured index marks the manifest as declaring `[suggestions]`. */
+  suggestions: boolean;
   install_command: string;
   /** The repo owner's GitHub avatar; a source-identity affordance, NOT the
    *  plugin's own icon (unknown until a manifest fetch, which discovery
@@ -1536,20 +1546,12 @@ export function fetchCurrentTheme(): Promise<ResolvedTheme | null> {
   return fetchJson<ResolvedTheme>("/api/theme/current");
 }
 
-export async function fetchSounds(): Promise<string[]> {
-  return (await fetchJson<string[]>("/api/sounds")) ?? [];
-}
-
-/** Fetch a sound file as a Blob so the acp's browser-side approval
- *  player can hand a blob URL to `new Audio(...)`. The fetch path runs
- *  through `fetchInterceptor.ts`, which injects `Authorization: Bearer`
- *  on every request; an `<audio src="...">` element does not, so a
- *  blob round-trip is necessary in PWA mode. See #1038. */
-export async function fetchSoundBlob(name: string): Promise<Blob | null> {
+/** A built-in sound's bytes, fetched (not loaded by a media element) so the auth interceptor covers it. */
+export async function fetchSound(event: string): Promise<ArrayBuffer | null> {
   try {
-    const res = await fetch(`/api/sounds/file/${encodeURIComponent(name)}`);
+    const res = await fetch(`/api/sounds/${encodeURIComponent(event)}`);
     if (!res.ok) return null;
-    return await res.blob();
+    return await res.arrayBuffer();
   } catch {
     return null;
   }
@@ -2508,7 +2510,12 @@ export async function createSession(body: CreateSessionRequest): Promise<{
         trustChanged: true,
       };
     }
-    if (res.ok) return { ok: true, session: await res.json() };
+    if (res.ok) {
+      const session = await res.json();
+      // The linked item now shows as started in every mounted suggestions view.
+      if (body.suggestion) notifySuggestionsChanged();
+      return { ok: true, session };
+    }
     const text = await res.text();
     let data: { error?: unknown; message?: string; [k: string]: unknown } | null = null;
     try {
@@ -2761,9 +2768,8 @@ export async function logout(): Promise<void> {
     } catch {
       // ignore
     }
-    // Drop the in-memory approval-sound caches so a future user on the
-    // same tab does not see the previous user's settings snapshot or
-    // hear their cached blob.
+    // Drop the cached sound settings so a future user on the same tab
+    // does not inherit the previous user's.
     try {
       const { clearSoundCache } = await import("./soundPlayer");
       clearSoundCache();
@@ -3639,3 +3645,186 @@ export function updateSetup(patch: SetupPatch): Promise<{ ok: boolean; message?:
 export function fetchSetupRuntimes(): Promise<RuntimeStatus[] | null> {
   return fetchJson<RuntimeStatus[]>("/api/setup/runtimes");
 }
+// --- Suggested sessions ---
+
+export type SuggestionResult<T = undefined> = { ok: true; data: T } | { ok: false; error: string; stale: boolean };
+
+export function fetchSuggestions(): Promise<SuggestionsSnapshot | null> {
+  return fetchJson<SuggestionsSnapshot>("/api/suggestions");
+}
+
+async function suggestionRequest<T>(url: string, method: string, body?: unknown): Promise<SuggestionResult<T>> {
+  let res: Response;
+  let text: string;
+  try {
+    res = await fetch(url, jsonInit(method, body));
+    text = await res.text();
+  } catch (error) {
+    return {
+      ok: false,
+      error: `Network error: ${error instanceof Error ? error.message : "connection failed"}`,
+      stale: false,
+    };
+  }
+  if (!res.ok) return { ok: false, error: parseApiErrorText(text, res.status), stale: res.status === 409 };
+  if (!text) return { ok: true, data: undefined as T };
+  // The request reached a server and a change may have applied, so this is not a network error.
+  try {
+    return { ok: true, data: JSON.parse(text) as T };
+  } catch {
+    return { ok: false, error: "Unexpected response from the server. Reload to see the current state.", stale: false };
+  }
+}
+
+/** A change other mounted suggestion views must reload for, such as the sidebar section. */
+async function suggestionMutation(url: string, method: string, body?: unknown): Promise<SuggestionResult<unknown>> {
+  const result = await suggestionRequest(url, method, body);
+  if (result.ok) notifySuggestionsChanged();
+  return result;
+}
+
+export const refreshSuggestions = () => suggestionRequest("/api/suggestions/refresh", "POST");
+
+export const runSuggestionFix = (providerId: string) =>
+  suggestionRequest("/api/suggestions/fix", "POST", { provider_id: providerId });
+
+/** Asks every provider to re-run its setup checks; results arrive on the next snapshot. */
+export const runSuggestionChecks = () => suggestionRequest("/api/suggestions/checks/run", "POST");
+
+export const dismissSuggestion = (providerId: string, id: string, dismissed: boolean) =>
+  suggestionMutation(`/api/suggestions/${dismissed ? "dismiss" : "undismiss"}`, "POST", {
+    provider_id: providerId,
+    id,
+  });
+
+export const updateSuggestionSource = (providerId: string, criterion: string, enabled: boolean) =>
+  suggestionMutation("/api/suggestions/sources", "PATCH", { provider_id: providerId, criterion, enabled });
+
+/** Resolves the wizard prefill. Creates nothing. */
+export const prepareSuggestion = (providerId: string, id: string) =>
+  suggestionRequest<SuggestionPrepared>("/api/suggestions/prepare", "POST", { provider_id: providerId, id });
+
+export type SuggestionPrefsPatch = Partial<Omit<SuggestionPrefs, "provider_order">> & {
+  provider_order?: string[];
+  provider_enabled?: Record<string, boolean>;
+};
+
+export const updateSuggestionPrefs = (patch: SuggestionPrefsPatch) =>
+  suggestionMutation("/api/suggestions/prefs", "PATCH", patch);
+
+export async function fetchSuggestionPresets(): Promise<SuggestionPresetEntry[] | null> {
+  const body = await fetchJson<{ presets: SuggestionPresetEntry[] }>("/api/suggestions/presets");
+  return body?.presets ?? null;
+}
+
+export const putSuggestionPreset = (providerId: string, criterion: string, preset: SuggestionPreset) =>
+  suggestionMutation("/api/suggestions/presets", "PUT", { provider_id: providerId, criterion, preset });
+
+/** Drops the edits, so the kind follows the Profile's defaults and the provider's prompt again. */
+export const resetSuggestionPreset = (providerId: string, criterion: string) =>
+  suggestionMutation(
+    `/api/suggestions/presets?${new URLSearchParams({ provider_id: providerId, criterion })}`,
+    "DELETE",
+  );
+
+/** The repo's hooks, as `POST /start` returns them with a 409 `hooks_need_trust`. */
+export interface StartHooksReview {
+  commands: { on_create?: string[]; on_launch?: string[]; on_destroy?: string[] };
+  needs_mcp_trust?: boolean;
+  /** Redacted one-line summaries of the repo's MCP servers. */
+  mcp_summaries?: string[];
+  review_fingerprint: string;
+}
+
+export interface StartOptions {
+  /** Links the item's repo to this registered Project, then starts. */
+  project?: { path: string };
+  approve_hooks?: boolean;
+  review_fingerprint?: string;
+}
+
+export type StartResult =
+  | { kind: "started"; sessionId: string; title: string }
+  | { kind: "already_started"; sessionId: string }
+  | { kind: "hooks_need_trust"; review: StartHooksReview }
+  /** The approved review no longer matches the repo: ask again, without approval. */
+  | { kind: "trust_changed" }
+  /** The server said no: `reason` is what went wrong, `hint` what to do. */
+  | { kind: "failed"; reason: string; hint?: string; retryable: boolean }
+  | { kind: "stale" }
+  /** The repo has no linked Project: pick one with "Start in…". */
+  | { kind: "no_project" }
+  | { kind: "error"; error: string };
+
+/** Starts a Session from a suggestion with its kind's preset; the server answers 201 once it exists. */
+export async function startSuggestion(
+  providerId: string,
+  id: string,
+  options: StartOptions = {},
+): Promise<StartResult> {
+  let res: Response;
+  let text: string;
+  try {
+    res = await fetch("/api/suggestions/start", jsonInit("POST", { provider_id: providerId, id, ...options }));
+    text = await res.text();
+  } catch (error) {
+    return { kind: "error", error: `Network error: ${error instanceof Error ? error.message : "connection failed"}` };
+  }
+  let body: Record<string, unknown> = {};
+  try {
+    body = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+  } catch {
+    // Handled below by status.
+  }
+  const str = (v: unknown) => (typeof v === "string" ? v : undefined);
+  if (res.ok) {
+    const sessionId = str(body.session_id);
+    if (!sessionId)
+      return { kind: "error", error: "Unexpected response from the server. Reload to see the current state." };
+    notifySuggestionsChanged();
+    return { kind: "started", sessionId, title: str(body.title) ?? "" };
+  }
+  const code = str(body.error);
+  if (res.status === 409 && code === "already_started") {
+    notifySuggestionsChanged();
+    return { kind: "already_started", sessionId: str(body.session_id) ?? "" };
+  }
+  if (res.status === 409 && code === "hooks_need_trust") {
+    return { kind: code, review: body as unknown as StartHooksReview };
+  }
+  if (res.status === 409 && code === "trust_changed") return { kind: "trust_changed" };
+  if (res.status === 409 && code === "stale_suggestion") return { kind: "stale" };
+  if (res.status === 422 && code === "start_failed") {
+    return {
+      kind: "failed",
+      reason: str(body.reason) ?? str(body.message) ?? "The Session could not be started.",
+      hint: str(body.hint),
+      retryable: body.retryable !== false,
+    };
+  }
+  if (res.status === 400 && code === "no_project") return { kind: "no_project" };
+  return { kind: "error", error: parseApiErrorText(text, res.status) };
+}
+
+export async function fetchSuggestionMappings(): Promise<SuggestionMapping[] | null> {
+  const body = await fetchJson<{ mappings: SuggestionMapping[] }>("/api/suggestions/mappings");
+  return body?.mappings ?? null;
+}
+
+export const putSuggestionMapping = (providerId: string, mappingKey: string, projects: string[]) =>
+  suggestionRequest("/api/suggestions/mappings", "PUT", {
+    provider_id: providerId,
+    mapping_key: mappingKey,
+    projects,
+  });
+
+export async function fetchSuggestionProjects(): Promise<SuggestionProject[] | null> {
+  const body = await fetchJson<{ projects: SuggestionProject[] }>("/api/suggestions/projects");
+  return body?.projects ?? null;
+}
+
+export const deleteSuggestionMapping = (providerId: string, mappingKey: string) =>
+  suggestionRequest(
+    `/api/suggestions/mappings?${new URLSearchParams({ provider_id: providerId, mapping_key: mappingKey })}`,
+    "DELETE",
+  );

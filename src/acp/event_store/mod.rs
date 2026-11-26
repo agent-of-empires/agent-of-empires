@@ -43,7 +43,7 @@ pub use attachments::AttachmentBlob;
 pub use control::ControlKnowledge;
 pub(crate) use establishment::EstablishmentSeal;
 pub use establishment::ReplayCommit;
-pub use rate_limit::RateLimitPark;
+pub use rate_limit::{RateLimitPark, ResetProvenance};
 pub use replay::ReplayPage;
 pub use search::ContentHit;
 pub use turns::{TerminalRepairProbe, UnresolvedBackgroundAgentLaunch};
@@ -568,14 +568,75 @@ impl EventStore {
         event: &Event,
         metadata: &EventMetadata,
     ) -> Result<RecordDisposition> {
+        let json = Self::encode_event(event)
+            .with_context(|| format!("serialise event for {session_id}@{seq}"))?;
+        self.record_json(
+            session_id,
+            seq,
+            event,
+            metadata,
+            crate::time::Timestamp::now().as_millis(),
+            json,
+        )
+    }
+
+    /// Append a `RateLimit` whose reset was copied from an earlier event, stamped with when that
+    /// reset was originally reported and the window it was reported for. Only an inherited reset
+    /// carries the stamp; any other `RateLimit` is observed when it is recorded.
+    pub(crate) fn record_inherited_rate_limit(
+        &self,
+        session_id: &str,
+        seq: u64,
+        event: &Event,
+        metadata: &EventMetadata,
+        observed_at_ms: i64,
+        source_window: &str,
+    ) -> Result<RecordDisposition> {
+        let json = inherited_json(session_id, seq, event, observed_at_ms, source_window)?;
+        self.record_json(
+            session_id,
+            seq,
+            event,
+            metadata,
+            crate::time::Timestamp::now().as_millis(),
+            json,
+        )
+    }
+
+    /// Record qualified projection test data at an explicit observation time.
+    #[cfg(test)]
+    pub(crate) fn record_quota_calendar_at(
+        &self,
+        session_id: &str,
+        seq: u64,
+        event: &Event,
+        metadata: &EventMetadata,
+        created_at_ms: i64,
+        inherited: Option<(i64, &str)>,
+    ) -> Result<RecordDisposition> {
+        let json = match inherited {
+            Some((observed_at_ms, source_window)) => {
+                inherited_json(session_id, seq, event, observed_at_ms, source_window)?
+            }
+            None => Self::encode_event(event)?,
+        };
+        self.record_json(session_id, seq, event, metadata, created_at_ms, json)
+    }
+
+    fn record_json(
+        &self,
+        session_id: &str,
+        seq: u64,
+        event: &Event,
+        metadata: &EventMetadata,
+        now_ms: i64,
+        json: String,
+    ) -> Result<RecordDisposition> {
         metadata.validate_for_event(event)?;
         anyhow::ensure!(
             metadata.clear_after_seq.is_none_or(|cut| cut < seq),
             "conversation display cut must precede its clear"
         );
-        let json = Self::encode_event(event)
-            .with_context(|| format!("serialise event for {session_id}@{seq}"))?;
-        let now_ms = crate::time::Timestamp::now().as_millis();
         let recorded = self.append_controlled(session_id, seq, event, metadata, now_ms, |tx| {
             if let Some(recorded) =
                 Self::record_autonomous_result(tx, session_id, seq, &json, now_ms, metadata)?
@@ -619,6 +680,17 @@ impl EventStore {
         created_at_ms: i64,
     ) -> Result<()> {
         let json = Self::encode_event(event)?;
+        self.record_json_at(session_id, seq, &json, created_at_ms)
+    }
+
+    #[cfg(test)]
+    fn record_json_at(
+        &self,
+        session_id: &str,
+        seq: u64,
+        json: &str,
+        created_at_ms: i64,
+    ) -> Result<()> {
         self.control_cache
             .with_control(session_id, |cursor| -> Result<()> {
                 events::insert_event(
@@ -626,7 +698,7 @@ impl EventStore {
                     &self.schema,
                     session_id,
                     seq,
-                    &json,
+                    json,
                     created_at_ms,
                 )?;
                 *cursor = None;
@@ -867,6 +939,31 @@ fn prune_completed_background_work(
             }
         }
     }
+}
+
+/// A `RateLimit`'s JSON stamped as inheriting its reset, see `record_inherited_rate_limit`.
+fn inherited_json(
+    session_id: &str,
+    seq: u64,
+    event: &Event,
+    observed_at_ms: i64,
+    source_window: &str,
+) -> Result<String> {
+    let mut value = serde_json::to_value(event)
+        .with_context(|| format!("serialise event for {session_id}@{seq}"))?;
+    let object = value
+        .get_mut("RateLimit")
+        .and_then(serde_json::Value::as_object_mut)
+        .context("inherited reset on an event that is not a RateLimit")?;
+    object.insert(
+        rate_limit::INHERITED_OBSERVATION_KEY.into(),
+        observed_at_ms.into(),
+    );
+    object.insert(
+        rate_limit::INHERITED_WINDOW_KEY.into(),
+        source_window.into(),
+    );
+    Ok(value.to_string())
 }
 
 fn decode(json: &str) -> Option<Event> {

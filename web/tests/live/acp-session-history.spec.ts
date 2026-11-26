@@ -297,10 +297,19 @@ test("switch to terminal is refused when the command's session flag conflicts wi
   spawnServe,
 }) => {
   const title = "acp-selector-conflict";
+  const sid = "11111111-2222-4333-8444-555555555555";
   const serve = await spawnServe({
     acp: true,
     seedFn: (seed) => {
-      seedSessionViaAoeAdd({ title, tool: "claude", structuredView: true })(seed);
+      seedSessionViaAoeAdd({
+        title,
+        tool: "claude",
+        structuredView: true,
+        prepare: (path) => {
+          const cwd = realpathSync(path);
+          seedTranscript(seed.home, cwd.replace(/[^a-zA-Z0-9-]/g, "-"), sid, cwd, "retained conversation");
+        },
+      })(seed);
       const stop = spawnSync(resolveAoeBinary(), ["serve", "--stop"], { env: seed.env, encoding: "utf8" });
       expect(stop.status, stop.stderr).toBe(0);
       const profilesDir = join(appDirFor(seed.home, seed.env.XDG_CONFIG_HOME!, resolveAoeBinary()), "profiles");
@@ -308,14 +317,12 @@ test("switch to terminal is refused when the command's session flag conflicts wi
       for (const profile of readdirSync(profilesDir)) {
         const path = join(profilesDir, profile, "sessions.json");
         if (!existsSync(path)) continue;
-        const original = readFileSync(path, "utf8");
-        const titleField = /"title"\s*:\s*"acp-selector-conflict"/;
-        if (!titleField.test(original)) continue;
-        const command = /"command"\s*:\s*"(?:\\.|[^"\\])*"/;
-        const modified = command.test(original)
-          ? original.replace(command, '"command": "claude --resume old-id"')
-          : original.replace(titleField, '$&, "command": "claude --resume old-id"');
-        writeFileSync(path, modified);
+        const rows = JSON.parse(readFileSync(path, "utf8")) as { title: string; [field: string]: unknown }[];
+        const row = rows.find((r) => r.title === title);
+        if (!row) continue;
+        row.command = "claude --resume old-id";
+        row.agent_session_id = sid;
+        writeFileSync(path, JSON.stringify(rows));
         seeded = true;
       }
       expect(seeded, "the conflicting row must be persisted before boot").toBe(true);
@@ -341,7 +348,7 @@ test("switch to terminal is refused when the command's session flag conflicts wi
   await expect(page.getByText(/remove the session flag from its command or arguments to switch/)).toBeVisible();
 
   const session = (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId);
-  expect(session?.view).toBe("structured");
+  expect(session).toMatchObject({ view: "structured", acp_session_id: sid });
   const fakeLog = join(serve.home, "fake-acp.log");
   expect(existsSync(fakeLog) ? readFileSync(fakeLog, "utf8") : "").not.toContain('"--resume","old-id"');
 });

@@ -28,6 +28,7 @@ import { safeGetItem, safeRemoveItem, safeSetItem } from "../lib/safeStorage";
 import { isSessionActive } from "../lib/session";
 import { publishLivePane } from "../lib/liveControl";
 import { LiveControlStrip } from "./LiveControlStrip";
+import { PromptBlockedNote } from "./PromptBlockedNote";
 
 interface Props {
   readOnly: boolean;
@@ -643,11 +644,24 @@ export function LiveTerminalView({
         paneDeadLabel={surface === "agent" ? "Terminal stream closed" : undefined}
       />
 
-      {ensureWarning && (
-        <div className="absolute left-0 right-0 top-12 z-20 flex justify-center px-3 pointer-events-none">
-          <span className="text-xs text-status-warning bg-surface-900/90 border border-surface-700/60 rounded-full px-4 py-2 max-w-md break-words text-center">
-            {ensureWarning}
-          </span>
+      {(ensureWarning || session.initial_prompt_error) && (
+        <div className="absolute left-0 right-0 top-12 z-20 flex flex-col items-center gap-2 px-3 pointer-events-none">
+          {ensureWarning && (
+            <span className="text-xs text-status-warning bg-surface-900/90 border border-surface-700/60 rounded-full px-4 py-2 max-w-md break-words text-center">
+              {ensureWarning}
+            </span>
+          )}
+          {session.initial_prompt_error && (
+            <div className="pointer-events-auto bg-surface-900/90 border border-surface-700/60 rounded-2xl px-4 py-2 max-w-md text-center">
+              <PromptBlockedNote
+                inSession
+                label="Initial prompt not sent"
+                code={session.initial_prompt_error_code}
+                message={session.initial_prompt_error}
+                disabled={readOnly}
+              />
+            </div>
+          )}
         </div>
       )}
 

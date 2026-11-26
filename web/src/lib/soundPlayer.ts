@@ -1,4 +1,4 @@
-import { fetchSettings, fetchSounds, fetchSoundBlob } from "./api";
+import { fetchSettings, fetchSound } from "./api";
 import { onSettingsChanged } from "./settingsEvents";
 
 export type SoundEvent = "approval" | "waiting" | "idle" | "error";
@@ -12,10 +12,6 @@ interface SoundSettings {
   browser_waiting_enabled?: boolean;
   browser_idle_enabled?: boolean;
   browser_error_enabled?: boolean;
-  on_approval?: string | null;
-  on_waiting?: string | null;
-  on_idle?: string | null;
-  on_error?: string | null;
 }
 
 const SETTINGS_KEYS = [
@@ -27,19 +23,13 @@ const SETTINGS_KEYS = [
   "browser_waiting_enabled",
   "browser_idle_enabled",
   "browser_error_enabled",
-  "on_approval",
-  "on_waiting",
-  "on_idle",
-  "on_error",
 ] as const;
 
 let cachedSettings: SoundSettings | null = null;
 let cachedSettingsAt = 0;
 const SETTINGS_TTL_MS = 30_000;
 
-const soundUrls = new Map<string, string>();
-const pendingSoundUrls = new Map<string, Promise<string | null>>();
-let availableSounds: string[] | null = null;
+const buffers = new Map<SoundEvent, Promise<AudioBuffer | null>>();
 
 // Bumped on every clear, so a read started before a save cannot re-cache the old value.
 let cacheGeneration = 0;
@@ -48,13 +38,10 @@ export function clearSoundCache(): void {
   cacheGeneration++;
   cachedSettings = null;
   cachedSettingsAt = 0;
-  availableSounds = null;
-  for (const url of soundUrls.values()) URL.revokeObjectURL(url);
-  soundUrls.clear();
-  pendingSoundUrls.clear();
+  buffers.clear();
 }
 
-// A saved sound choice applies to the next sound, not after the cache expires.
+// A saved setting applies to the next sound, not after the cache expires.
 onSettingsChanged(clearSoundCache);
 
 async function loadSettings(): Promise<SoundSettings | null> {
@@ -78,43 +65,70 @@ async function loadSettings(): Promise<SoundSettings | null> {
   return sound;
 }
 
-// An empty list may be a failed request, so only a non-empty one is kept; the next sound asks again.
-async function discoverSounds(generation: number): Promise<string[]> {
-  if (availableSounds) return availableSounds;
-  const sounds = await fetchSounds();
-  if (generation !== cacheGeneration) return [];
-  if (sounds.length > 0) availableSounds = sounds;
-  return sounds;
+// One context for the page: browsers start it suspended until a user gesture, and once resumed it stays unlocked,
+// where each new <audio> element would need its own gesture on iOS. Every gesture resumes it, since the system can
+// suspend it again later, as iOS does when the page goes to the background.
+let context: AudioContext | null = null;
+const UNLOCK_EVENTS = ["pointerdown", "keydown", "touchend"] as const;
+
+function audioContext(): AudioContext | null {
+  if (!context && globalThis.AudioContext) context = new globalThis.AudioContext();
+  return context;
 }
 
-async function resolveSoundName(sound: SoundSettings, event: SoundEvent, generation: number): Promise<string | null> {
-  const override = sound[`on_${event}` as const]?.trim();
-  if (override) return override;
-  // Approvals only chime when a sound is chosen. Status sounds pick at random, like the host does.
-  if (event === "approval") return null;
-  const sounds = await discoverSounds(generation);
-  return sounds[Math.floor(Math.random() * sounds.length)] ?? null;
+function unlock(): void {
+  const ctx = audioContext();
+  if (!ctx || ctx.state === "running") return;
+  void ctx.resume().catch(() => {});
 }
 
-function ensureSoundUrl(name: string): Promise<string | null> {
-  const cached = soundUrls.get(name);
-  if (cached) return Promise.resolve(cached);
-  const pending = pendingSoundUrls.get(name);
-  if (pending) return pending;
-  const generation = cacheGeneration;
+if (typeof window !== "undefined") {
+  for (const type of UNLOCK_EVENTS) window.addEventListener(type, unlock, { capture: true, passive: true });
+}
+
+// A resume outside a gesture settles at once when the page was unlocked earlier, and never when it was not.
+const RESUME_WAIT_MS = 200;
+
+async function running(ctx: AudioContext): Promise<boolean> {
+  if (ctx.state === "running") return true;
+  await Promise.race([ctx.resume().catch(() => {}), new Promise((r) => setTimeout(r, RESUME_WAIT_MS))]);
+  // `resume` changes the state, which narrowing from the check above does not see.
+  return (ctx.state as AudioContextState) === "running";
+}
+
+function loadBuffer(ctx: AudioContext, event: SoundEvent): Promise<AudioBuffer | null> {
+  const cached = buffers.get(event);
+  if (cached) return cached;
   const load = (async () => {
-    // `<audio src>` bypasses the fetch auth interceptor, so load the bytes via fetch.
-    const blob = await fetchSoundBlob(name);
-    if (!blob || generation !== cacheGeneration) return null;
-    const url = URL.createObjectURL(blob);
-    soundUrls.set(name, url);
-    return url;
+    const bytes = await fetchSound(event);
+    if (!bytes) return null;
+    try {
+      return await ctx.decodeAudioData(bytes);
+    } catch {
+      return null;
+    }
   })();
-  pendingSoundUrls.set(name, load);
-  void load.finally(() => {
-    if (pendingSoundUrls.get(name) === load) pendingSoundUrls.delete(name);
+  buffers.set(event, load);
+  // A failed load is retried by the next sound.
+  void load.then((buffer) => {
+    if (!buffer && buffers.get(event) === load) buffers.delete(event);
   });
   return load;
+}
+
+const blockedListeners = new Set<() => void>();
+let blockedReported = false;
+
+/** Calls `listener` the first time this page cannot play a sound until the user interacts with it. */
+export function onSoundBlocked(listener: () => void): () => void {
+  blockedListeners.add(listener);
+  return () => void blockedListeners.delete(listener);
+}
+
+function reportBlocked(): void {
+  if (blockedReported) return;
+  blockedReported = true;
+  for (const listener of blockedListeners) listener();
 }
 
 export interface SoundContext {
@@ -144,22 +158,25 @@ export async function playSoundFor(event: SoundEvent, context: SoundContext = {}
   if (generation !== cacheGeneration) return false;
   if (!sound || !sound.enabled || sound.browser_enabled === false) return false;
   if (sound[`browser_${event}_enabled` as const] === false || !inScope(sound, context)) return false;
-  const name = await resolveSoundName(sound, event, generation);
-  if (!name || generation !== cacheGeneration) return false;
-  const url = await ensureSoundUrl(name);
+  const ctx = audioContext();
+  if (!ctx) return false;
+  const buffer = await loadBuffer(ctx, event);
   // The tab may have come back to the foreground while the sound loaded.
-  if (!url || generation !== cacheGeneration || !inScope(sound, context)) return false;
-  const audio = new Audio(url);
-  const volume = typeof sound.browser_volume === "number" ? sound.browser_volume : 1.0;
-  // The host scale tops out at 1.5; HTMLAudioElement at 1.0.
-  audio.volume = Math.max(0, Math.min(1, volume));
-  try {
-    await audio.play();
-    return true;
-  } catch {
-    // Autoplay blocked; the push and toast still notify.
+  if (!buffer || generation !== cacheGeneration || !inScope(sound, context)) return false;
+  const unlocked = await running(ctx);
+  if (generation !== cacheGeneration || !inScope(sound, context)) return false;
+  if (!unlocked) {
+    reportBlocked();
     return false;
   }
+  const gain = ctx.createGain();
+  gain.gain.value = typeof sound.browser_volume === "number" ? Math.max(0, sound.browser_volume) : 1.0;
+  gain.connect(ctx.destination);
+  const source = ctx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(gain);
+  source.start();
+  return true;
 }
 
 // The status sound for a Waiting session would repeat the approval chime that just played.

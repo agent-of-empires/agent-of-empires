@@ -20,18 +20,27 @@ fn migrate_database(path: &Path) -> Result<()> {
     }
     let conn = rusqlite::Connection::open(path)
         .with_context(|| format!("open event store {}", path.display()))?;
+    reconcile_table(&conn)?;
+    Ok(())
+}
+
+/// Drop an outdated cache and report whether a current table remains.
+pub(super) fn reconcile_table(conn: &rusqlite::Connection) -> Result<bool> {
     let mut statement = conn.prepare("SELECT name, pk FROM pragma_table_info(?1)")?;
     let columns: Vec<(String, i64)> = statement
         .query_map([TABLE], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     drop(statement);
-    if columns.is_empty() || has_current_shape(&columns) {
-        return Ok(());
+    if columns.is_empty() {
+        return Ok(false);
+    }
+    if has_current_shape(&columns) {
+        return Ok(true);
     }
     conn.execute_batch(&format!("DROP TABLE {TABLE};"))
         .with_context(|| format!("drop outdated {TABLE}"))?;
     info!(target: "migrations.v058", "Dropped the outdated account limits table; it is recreated on open");
-    Ok(())
+    Ok(false)
 }
 
 fn has_current_shape(columns: &[(String, i64)]) -> bool {
