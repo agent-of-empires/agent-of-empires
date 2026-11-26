@@ -1113,6 +1113,17 @@ impl Instance {
                     ));
             let mut handoff_prior = None;
             let (execution, unpinned) = self.resolve_launch_routing()?;
+            if let Some((execution, container)) = execution
+                .as_ref()
+                .and_then(|execution| Some((execution, execution.inputs.container.as_ref()?)))
+            {
+                crate::migrations::requalify_shared_runtime_bindings(
+                    self,
+                    stores,
+                    &execution.binding,
+                    container,
+                )?;
+            }
             if let Some(execution) = execution.as_ref() {
                 handoff_prior = self.hand_off_prime_fork_parent(execution)?;
                 if validate_target {
@@ -3876,6 +3887,343 @@ sandbox = "unsupported"
                 "{runtime} {written}"
             );
         }
+    }
+
+    /// v067: an execution recorded before Colima's home share became a host path is
+    /// requalified at the next launch only when it is this launch's runtime and context.
+    #[test]
+    #[serial_test::serial]
+    fn a_launch_requalifies_an_execution_recorded_before_its_runtime_shared_home() {
+        use crate::session::ConversationProvenance::{Asserted, Preallocated};
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let profile = "sandbox-legacy-colima";
+        super::super::test_helpers::declare_execution_aliases(
+            profile,
+            &[("claude", "claude")],
+            temp.path(),
+        );
+        let mut inst = Instance::new("claude-legacy", project.to_str().unwrap());
+        inst.tool = "claude".into();
+        inst.command = "claude".into();
+        inst.source_profile = profile.into();
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "fixture".into(),
+            container_name: "claude-legacy".into(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: Some("/workspace/project".into()),
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+        });
+        let config = inst.build_container_config_for_test().unwrap();
+        let _transport = super::super::test_helpers::install_container_transport(
+            temp.path(),
+            "claude-legacy",
+            &config.volumes,
+        );
+        std::fs::copy(
+            temp.path().join("native-bin/prime-agent"),
+            temp.path().join("native-bin/claude"),
+        )
+        .unwrap();
+        let _colima = super::super::test_helpers::route_through_colima(temp.path());
+        let yaml = temp.path().join("colima/_lima/colima/colima.yaml");
+        let sid = "33333333-3333-4333-8333-333333333333";
+        // Before the upgrade the share wasn't recorded, as a custom mount list gives today.
+        std::fs::write(&yaml, "mounts:\n  - location: /elsewhere\n").unwrap();
+        let legacy = inst.resolve_native_execution(None).unwrap().binding;
+        std::fs::write(&yaml, "mounts: []\n").unwrap();
+        let now = inst.resolve_native_execution(None).unwrap().binding;
+        assert!(legacy.filesystem.starts_with("runtime:") && now.filesystem == "host");
+        let other_endpoint = ExecutionBinding {
+            filesystem: "runtime:Docker:unix:///elsewhere/docker.sock".into(),
+            cwd_filesystem: "runtime:Docker:unix:///elsewhere/docker.sock".into(),
+            ..legacy.clone()
+        };
+        let moved_cwd = ExecutionBinding {
+            cwd: temp.path().join("moved"),
+            ..legacy.clone()
+        };
+        let transcript = now.stores[0]
+            .join("projects")
+            .join(crate::session::capture::encode_claude_project_path(
+                "/workspace/project",
+            ))
+            .join(format!("{sid}.jsonl"));
+        let storage = crate::session::Storage::open_unwatched(profile).unwrap();
+        let path = storage.sessions_path().to_path_buf();
+        let backups = || crate::session::migration_backups(&path).unwrap();
+        let seed = |inst: &Instance| {
+            for (_, backup) in backups() {
+                std::fs::remove_file(backup).unwrap();
+            }
+            storage
+                .update(|rows, _| {
+                    rows.retain(|row| row.id != inst.id);
+                    rows.push(inst.clone());
+                    Ok(())
+                })
+                .unwrap();
+            std::fs::read(&path).unwrap()
+        };
+        // The row as sessions.json holds it: its conversation's and active execution's domains.
+        let id = inst.id.clone();
+        let on_disk = || {
+            let rows: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let row = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == id.as_str())
+                .unwrap()
+                .clone();
+            let domain = |pointer: &str| {
+                row.pointer(pointer)
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            };
+            (
+                domain("/agent_session_binding/execution/filesystem"),
+                domain("/active_execution/binding/filesystem"),
+            )
+        };
+        let host = |execution: Option<&ExecutionBinding>| {
+            execution.map(|execution| execution.filesystem.clone())
+        };
+        let legacy_active = || super::super::execution::ActiveExecution {
+            launch_id: "legacy-launch".into(),
+            binding: legacy.clone(),
+            capture: None,
+            container: None,
+            container_cwd: None,
+        };
+        #[derive(PartialEq)]
+        enum Want {
+            Requalified,
+            Refused,
+            Untouched,
+        }
+        for (case, provenance, recorded, active, want, flag) in [
+            (
+                "legacy-asserted",
+                Asserted,
+                &legacy,
+                false,
+                Want::Requalified,
+                "--resume",
+            ),
+            (
+                "active-legacy-requalified",
+                Asserted,
+                &legacy,
+                true,
+                Want::Requalified,
+                "--resume",
+            ),
+            (
+                "set-session-id-after",
+                Asserted,
+                &legacy,
+                true,
+                Want::Requalified,
+                "--resume",
+            ),
+            (
+                "second-run",
+                Asserted,
+                &now,
+                false,
+                Want::Untouched,
+                "--resume",
+            ),
+            (
+                "other-endpoint",
+                Asserted,
+                &other_endpoint,
+                false,
+                Want::Refused,
+                "",
+            ),
+            ("moved-cwd", Asserted, &moved_cwd, false, Want::Refused, ""),
+            (
+                "refused-beside-active",
+                Asserted,
+                &moved_cwd,
+                true,
+                Want::Refused,
+                "",
+            ),
+            (
+                "legacy-reserved",
+                Preallocated,
+                &legacy,
+                false,
+                Want::Untouched,
+                "--session-id",
+            ),
+            (
+                "legacy-reserved-written",
+                Preallocated,
+                &legacy,
+                false,
+                Want::Untouched,
+                "--resume",
+            ),
+        ] {
+            let _ = std::fs::remove_file(&transcript);
+            if case != "legacy-reserved" {
+                std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+                std::fs::write(&transcript, "").unwrap();
+            }
+            inst.resume_intent = ResumeIntent::Default;
+            inst.resume_binding = None;
+            inst.set_agent_conversation(
+                Some(sid.into()),
+                Some(crate::session::ConversationBinding {
+                    session_id: sid.into(),
+                    execution: Some(recorded.clone()),
+                    provenance,
+                    transcript_path: None,
+                }),
+                None,
+            );
+            inst.active_execution = active.then(legacy_active);
+            let before = seed(&inst);
+            let got = inst.prepare_launch_command_in(
+                CaptureStorage::Scoped(&storage),
+                inst.conversation_state(),
+            );
+            if want == Want::Refused {
+                let error = format!("{:#}", got.err().expect(case));
+                assert!(
+                    error.contains("differs from this launch"),
+                    "{case}: {error}"
+                );
+            } else {
+                let command = got.expect(case).command.unwrap_or_default();
+                assert!(command.contains(flag), "{case}: {command}");
+            }
+            if want != Want::Requalified {
+                assert_eq!(std::fs::read(&path).unwrap(), before, "{case}");
+                assert!(backups().is_empty(), "{case}");
+                continue;
+            }
+            assert_eq!(backups().len(), 1, "{case}");
+            let (conversation, active_domain) = on_disk();
+            assert_eq!(conversation.as_deref(), Some("host"), "{case}");
+            if active {
+                assert_eq!(active_domain.as_deref(), Some("host"), "{case}");
+            }
+            if case == "set-session-id-after" {
+                let mut rebound = storage
+                    .load()
+                    .unwrap()
+                    .into_iter()
+                    .find(|row| row.id == inst.id)
+                    .unwrap();
+                let binding = rebound.asserted_resume_binding(sid, None).expect(case);
+                assert_eq!(
+                    host(binding.execution.as_ref()).as_deref(),
+                    Some("host"),
+                    "{case}"
+                );
+                rebound.resume_intent = ResumeIntent::Use(sid.into());
+                rebound.resume_binding = Some(binding);
+                let command = rebound
+                    .prepare_launch_command_in(
+                        CaptureStorage::Scoped(&storage),
+                        rebound.conversation_state(),
+                    )
+                    .expect(case)
+                    .command
+                    .unwrap_or_default();
+                assert!(command.contains("--resume"), "{case}: {command}");
+            }
+        }
+
+        // `aoe migrate` requalifies a stored row with no launch, then finds nothing left.
+        inst.resume_intent = ResumeIntent::Default;
+        inst.set_agent_conversation(
+            Some(sid.into()),
+            Some(crate::session::ConversationBinding {
+                session_id: sid.into(),
+                execution: Some(legacy.clone()),
+                provenance: Asserted,
+                transcript_path: None,
+            }),
+            None,
+        );
+        inst.active_execution = Some(legacy_active());
+        seed(&inst);
+        // Another profile's undecodable component waits for its repair, untouched.
+        let broken = crate::session::get_profile_dir("broken")
+            .unwrap()
+            .join("sessions.json");
+        std::fs::write(&broken, b"{").unwrap();
+        crate::migrations::reconcile_shared_runtime_bindings(true).expect("reconcile-pending");
+        assert_eq!(std::fs::read(&broken).unwrap(), b"{", "reconcile-pending");
+        assert!(
+            crate::session::migration_backups(&broken)
+                .unwrap()
+                .is_empty(),
+            "reconcile-pending"
+        );
+        assert_eq!(
+            on_disk(),
+            (Some("host".into()), Some("host".into())),
+            "reconcile-pending"
+        );
+        assert_eq!(backups().len(), 1, "reconcile-pending");
+        let migrated = std::fs::read(&path).unwrap();
+        crate::migrations::reconcile_shared_runtime_bindings(true).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            migrated,
+            "reconcile-pending second run"
+        );
+        assert_eq!(backups().len(), 1, "reconcile-pending second run");
+
+        // A row a build before v060 wrote doesn't load until `aoe migrate`'s recovery repairs
+        // it, so the same run must requalify it after that recovery.
+        std::fs::remove_file(&broken).unwrap();
+        let mut row = serde_json::to_value(&inst).unwrap();
+        let mut handoff =
+            serde_json::to_value(crate::session::test_support::launch_owed_handoff(&inst)).unwrap();
+        handoff.as_object_mut().unwrap().remove("outcome");
+        row["terminal_handoff"] = handoff;
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!([row])).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            storage.load_instances_complete().is_err(),
+            "repaired-in-same-run"
+        );
+        let app = crate::session::get_app_dir().unwrap();
+        std::fs::write(
+            app.join(".schema_version"),
+            crate::migrations::current_schema_version().to_string(),
+        )
+        .unwrap();
+        crate::session::purge_owners::initialize(&app).unwrap();
+        crate::migrations::run_migrations_announced(None).expect("repaired-in-same-run");
+        assert_eq!(
+            on_disk(),
+            (Some("host".into()), Some("host".into())),
+            "repaired-in-same-run"
+        );
+        assert!(
+            storage.load_instances_complete().is_ok(),
+            "repaired-in-same-run"
+        );
     }
 
     #[test]

@@ -1999,6 +1999,17 @@ impl Instance {
             .context(ManagedResumeCause::UnsupportedManagedArguments)
     }
 
+    /// This context's execution and container, for a migration that compares recorded ones.
+    pub(crate) fn current_native_execution(
+        &self,
+    ) -> Result<(
+        ExecutionBinding,
+        Option<crate::containers::ContainerExecutionSnapshot>,
+    )> {
+        let execution = self.resolve_native_execution(None)?;
+        Ok((execution.binding, execution.inputs.container))
+    }
+
     pub(super) fn resolve_native_execution(
         &self,
         target: Option<(&str, Option<&ConversationBinding>, bool)>,
