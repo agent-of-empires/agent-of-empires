@@ -68,6 +68,17 @@ pub struct Provider {
     pub(crate) refreshing: bool,
     #[serde(default)]
     pub(crate) checks: Vec<Check>,
+    #[serde(default)]
+    pub(crate) sources: Vec<Source>,
+}
+
+/// One kind of suggestion a provider declares.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Source {
+    pub(crate) criterion: String,
+    /// Set (to the cap) when open items of this kind start on their own.
+    #[serde(default)]
+    pub(crate) auto_start: Option<serde_json::Value>,
 }
 
 /// A provider's setup check; `fix` is the plugin's own untrusted advice.
@@ -131,6 +142,12 @@ pub struct Item {
     /// The source closed or changed; the item cannot start.
     #[serde(default)]
     pub(crate) stale: bool,
+    /// Which declared kind produced the item.
+    #[serde(default)]
+    pub(crate) criterion: String,
+    /// Why auto start left the item alone, or that its start failed.
+    #[serde(default)]
+    pub(crate) auto_note: Option<String>,
 }
 
 /// The live Session an item was started as.
@@ -302,6 +319,22 @@ impl DaemonClient {
         let url = self.suggestions_url("suggestions/prefs")?;
         let response = self
             .send_suggestion_request(self.http.patch(url).json(patch))
+            .await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::suggestion_refusal(response).await)
+        }
+    }
+
+    /// `PUT /api/suggestions/auto-start`: turns auto start on or off for one kind.
+    pub async fn set_suggestion_auto_start(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<(), DaemonClientError> {
+        let url = self.suggestions_url("suggestions/auto-start")?;
+        let response = self
+            .send_suggestion_request(self.http.put(url).json(body))
             .await?;
         if response.status().is_success() {
             Ok(())

@@ -47,6 +47,22 @@ If the repo defines [hooks](repo-config.md) you have not approved, Start pauses 
 
 If the repo has no Project yet, **Start in… ▾** replaces Start. Picking a Project links the repo to it, then starts, so later suggestions from that repo start in one click. It is off on read-only dashboards and in CityHall mode, which cannot save the link.
 
+### Start several at once
+
+Tick the checkbox on each row (or **Select all shown**), then **Start N** in the bar that appears. Items start one after another with their own presets. A failure stays on its row and the rest continue; a toast counts what started, what waits for a hooks review and what failed. Review dialogs open one at a time as usual.
+
+### Auto start
+
+Off by default. In **Settings › Suggestions**, a kind's preset has an **Auto start** switch. Turning it on asks first: auto start launches an agent on text written by others (issue and PR content) with no human check, and says so again when the preset has Yolo on (no approval prompts). Pick a per-refresh cap from 1 to 10 (default 3).
+
+After each provider publish, AoE starts up to the cap of that kind's items that:
+
+- are not stale or dismissed and have no Session linked yet,
+- have exactly one linked Project and need no hooks or MCP review,
+- were never auto started before (each item is tried once, even if the start fails).
+
+Nothing runs when you turn the switch on, only after the next publish, and only when the daemon accepts changes (not on a read-only dashboard). Items left alone show a "Not auto started: <reason>" note while the switch is on. A failed start keeps "Auto start failed: <reason>. Start it by hand." on the row and is not retried.
+
 ### After starting
 
 The row stops offering Start. It shows "⠋ Running · started 3 min ago" (or "Idle", the session's other status, or "Archived") and an **Open** button. The **⋯** menu has **Start another Session…**, **Open in <provider> ↗** and **Dismiss**. Trashing the session removes the link; archiving keeps it. Only one Session can claim a suggestion: a second Start on it opens the first.
@@ -115,6 +131,8 @@ Strict mode moves the letters by Home's rule: a bare letter takes Shift, and a S
 | Enter | Enter | Start with the preset. On a started item it opens the session |
 | `e` | `E` | Start with changes: opens the New session dialog prefilled from the kind's preset and the final prompt |
 | `N` | `Ctrl+N` | Another session for the item that does not take its link, so a started item can have more than one |
+| Space | Space | Mark or unmark the item. Enter then starts every marked item one after another; a failure does not stop the rest, and one needing a hooks review stays on its row |
+| `a` | `A` | Turn auto start on or off for the item's kind. Turning it on asks first |
 | `z` | `Z` | Dismiss or restore |
 | `d` | `D` | Show or hide dismissed items |
 | `t` | `T` | Turn on pre-trust, on a Session blocked on folder trust |

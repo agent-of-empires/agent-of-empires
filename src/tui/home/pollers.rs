@@ -159,6 +159,22 @@ impl HomeView {
         };
         // Enter opens a started item only in the pane.
         let opens = if shown { " · Enter opens it" } else { "" };
+        if let Some(step) = self.suggestions_feed.batch_answer(&key, &answer) {
+            if let StartAnswer::Started { session_id, .. }
+            | StartAnswer::AlreadyStarted(Some(session_id)) = &answer
+            {
+                self.suggestions_feed.link_started(&key, session_id);
+                self.rebuild_flat_items_keeping_cursor();
+                self.update_selected();
+            }
+            if let Some(note) = step.failure {
+                self.suggestions_feed.failed = Some((key, note));
+            }
+            if let Some(summary) = step.summary {
+                say(self, summary, false);
+            }
+            return;
+        }
         match answer {
             StartAnswer::Started { session_id, title } => {
                 self.suggestions_feed.link_started(&key, &session_id);
