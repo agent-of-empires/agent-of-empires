@@ -111,6 +111,9 @@ pub enum ActionId {
     /// Scroll the preview back or forward a page.
     PreviewScrollUp,
     PreviewScrollDown,
+    /// Log the sandboxes in (palette only; no chord). Listed only while
+    /// `sandbox.shared_credential = "separate_login"`.
+    SandboxLogin,
 }
 
 impl ActionId {
@@ -1320,6 +1323,25 @@ pub static BINDINGS: &[Binding] = &[
             group: PaletteGroup::Actions,
         }),
     },
+    Binding {
+        id: ActionId::SandboxLogin,
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: None,
+        palette: Some(PaletteMeta {
+            title: "Log the sandboxes in",
+            keywords: &[
+                "claude",
+                "sandbox",
+                "login",
+                "log in",
+                "credential",
+                "sign in",
+            ],
+            group: PaletteGroup::Actions,
+        }),
+    },
     // The mnemonic keys (a/A, n/N, r/R, t/T) are taken and the home keyspace is saturated
     // (see Fork), so "Auto-name now" lands on the free v/V pair. Gated to a
     // still-default-named session by the daemon handler.
@@ -1412,6 +1434,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::DismissUpdateBanner => "dismiss-update-banner",
         ActionId::PreviewScrollUp => "preview-scroll-up",
         ActionId::PreviewScrollDown => "preview-scroll-down",
+        ActionId::SandboxLogin => "sandbox-login",
     }
 }
 
@@ -1681,6 +1704,21 @@ mod tests {
             assert!(binding.help.is_none());
             assert!(binding.palette.is_some());
         }
+    }
+
+    #[test]
+    fn sandbox_login_is_palette_only() {
+        let binding = BINDINGS
+            .iter()
+            .find(|b| b.id == ActionId::SandboxLogin)
+            .unwrap();
+        assert!(binding.non_strict.is_empty() && binding.strict.is_empty());
+        assert!(binding.help.is_none());
+        assert_eq!(
+            binding.palette.as_ref().map(|p| p.title),
+            Some("Log the sandboxes in")
+        );
+        assert_eq!(palette_id(ActionId::SandboxLogin), "sandbox-login");
     }
 
     #[test]

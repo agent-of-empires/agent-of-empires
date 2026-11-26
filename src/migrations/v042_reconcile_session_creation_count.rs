@@ -37,7 +37,7 @@ mod tests {
                 profile.join("sessions.json"),
                 format!(r#"[{retained},{{"id":"trashed","trashed_at":"2026-01-01"}}]"#),
             )?;
-            // Values this build no longer decodes must survive until v065 rewrites them. Before
+            // Values this build no longer decodes must survive until v067 rewrites them. Before
             // v021 the state was the `[app_state]` table of config.toml.
             let state = format!(
                 "sort_order = \"a_z\"\ngroup_by = \"manual\"\nsessions_created_seeded = {seeded}\nsessions_created = {count}\ntips_seen = [\"retained-tip\"]\n"

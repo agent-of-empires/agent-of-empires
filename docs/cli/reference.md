@@ -193,7 +193,7 @@ Run without arguments to launch the TUI dashboard.
 ###### **Options:**
 
 * `-p`, `--profile <PROFILE>` — Profile to use (separate workspace with its own sessions). Commands that consume or create profile state require an existing profile: an unknown name is refused, not created (make one with `aoe profile create`). Profile-independent commands such as `list --all` and `serve --stop` ignore it. `AGENT_OF_EMPIRES_PROFILE` names one too, and an explicit `-p` wins over it
-* `--daemon-url <DAEMON_URL>` — Select a daemon endpoint for read-only CLI commands or the TUI.
+* `--daemon-url <DAEMON_URL>` — Select a Daemon endpoint for commands that use the Daemon API, or for the TUI.
 
    Explicit endpoints and `AOE_DAEMON_URL` never fall back to local storage or start a local daemon. Authenticate with `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`. An unauthenticated daemon needs neither. See the HTTP API reference for transport and authentication rules.
 * `--no-autostart` — Fail instead of starting a local daemon when none is running

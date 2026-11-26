@@ -78,6 +78,7 @@ vi.mock("../../lib/api", () => ({
   fetchSuggestions: vi.fn(() => Promise.resolve(null)),
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
   fetchPlugins: vi.fn(() => Promise.resolve(null)),
+  getSandboxLoginStatus: vi.fn(() => Promise.resolve(null)),
   fetchSettings: vi.fn(() => Promise.resolve({ acp: {}, sandbox: {}, worktree: {} })),
   getSettingsSchema: vi.fn(() => Promise.resolve(MOCK_SCHEMA)),
   updateSettings: vi.fn(() => Promise.resolve("committed" as const)),

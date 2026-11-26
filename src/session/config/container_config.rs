@@ -2028,6 +2028,30 @@ pub(crate) fn effective_launch_command(profile: &str, tool: &str, session_comman
         .launch_command_for(tool)
 }
 
+/// The refusal of a launch of `tool` under `profile` that waits on `target`, and so the
+/// recovery that releases it: it runs under the launch's profile (`-p`, unless that is the
+/// default one the CLI uses anyway), and names the launch's own command (`--command`) only
+/// when `--tool` alone reaches another file than `target` and the command is what leads to
+/// it. `session_command` is the launch's own command for the tool, if it has one.
+pub(crate) fn login_required_for(
+    profile: &str,
+    tool: &str,
+    session_command: Option<&str>,
+    target: &LoginTarget,
+) -> crate::session::SandboxLoginRequired {
+    let reaches = |command: Option<&str>| {
+        login_target_with_command(profile, tool, command)
+            .is_some_and(|t| t.credential == target.credential)
+    };
+    let command = session_command.filter(|_| !reaches(None) && reaches(session_command));
+    crate::session::SandboxLoginRequired {
+        tool: tool.to_string(),
+        credential: target.credential.clone(),
+        profile: Some(profile.to_string()),
+        command: command.map(str::to_string),
+    }
+}
+
 /// The tool a login without `--tool` is for: the profile's default tool when it has a sandbox
 /// login, else the only agent that declares one. `None` when neither picks one.
 pub(crate) fn default_login_tool(profile: &str) -> Option<String> {

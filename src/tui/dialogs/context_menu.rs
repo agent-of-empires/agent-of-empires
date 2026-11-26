@@ -26,8 +26,6 @@ pub enum ContextMenuAction {
     NewFromSelection,
     /// Fork the session into an independent one resuming its conversation.
     Fork,
-    /// Relaunch the session on the agent binary installed since it started.
-    RestartForUpdate,
     /// Flip the persisted view between structured (ACP) and tmux terminal.
     /// Confirmed first, since the swap destroys in-flight history.
     SwitchView,
@@ -155,15 +153,6 @@ impl ContextMenuDialog {
             items.push((ContextMenuAction::SwitchView, label));
         }
         Self::new(anchor, items)
-    }
-
-    /// Adds the update restart row, for a session whose agent binary was replaced after launch.
-    pub fn with_restart_for_update(mut self) -> Self {
-        self.items.push((
-            ContextMenuAction::RestartForUpdate,
-            "Restart to apply update",
-        ));
-        self
     }
 
     pub fn for_trashed_session(anchor: (u16, u16), unfinished: bool) -> Self {
@@ -520,16 +509,6 @@ mod tests {
 
     fn labels(menu: &ContextMenuDialog) -> Vec<&'static str> {
         menu.items_for_test().iter().map(|(_, l)| *l).collect()
-    }
-
-    #[test]
-    fn update_restart_row_is_added_last_and_only_on_request() {
-        assert!(!labels(&session()).contains(&"Restart to apply update"));
-        let menu = session().with_restart_for_update();
-        assert_eq!(
-            menu.items_for_test().last().copied(),
-            Some((A::RestartForUpdate, "Restart to apply update"))
-        );
     }
 
     #[test]

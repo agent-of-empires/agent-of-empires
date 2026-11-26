@@ -946,7 +946,7 @@ pub struct AppStateConfig {
     #[serde(default)]
     pub has_acknowledged_volume_ignores_globs: bool,
 
-    /// Lenient so a removed order still loads before migration v065 rewrites it.
+    /// Lenient so a removed order still loads before migration v067 rewrites it.
     #[serde(
         default,
         deserialize_with = "unknown_as_none",
@@ -954,7 +954,7 @@ pub struct AppStateConfig {
     )]
     pub sort_order: Option<SortOrder>,
 
-    /// Lenient so a removed grouping still loads before migration v065 rewrites it.
+    /// Lenient so a removed grouping still loads before migration v067 rewrites it.
     #[serde(
         default,
         deserialize_with = "unknown_as_none",
@@ -5856,7 +5856,7 @@ mod tests {
         assert!(Config::load().unwrap().app_state.has_seen_welcome);
     }
 
-    /// Removed sorts and groupings read as unpicked, so Config loads before v065 rewrites them.
+    /// Removed sorts and groupings read as unpicked, so Config loads before v067 rewrites them.
     #[test]
     fn removed_sort_and_grouping_values_load_as_unpicked() {
         for (sort, group) in [
