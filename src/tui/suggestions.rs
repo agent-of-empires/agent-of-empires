@@ -60,6 +60,8 @@ pub(super) struct Start {
     pub source_text: Option<String>,
     /// `None` when no single registered project matched; the dialog asks for one.
     pub path: Option<String>,
+    /// The repo's other mapped Projects, the dialog's extra repos.
+    pub extra_paths: Vec<String>,
     pub title: String,
     pub initial_prompt: String,
     pub tool: String,
@@ -491,6 +493,11 @@ fn start_for(snapshot: Option<&Snapshot>, key: &ItemKey, prepared: Prepared) -> 
             .filter(|i| !i.preview.trim().is_empty())
             .map(|i| plain(&i.preview)),
         path: prepared.project.map(|p| p.path),
+        extra_paths: prepared
+            .extra_projects
+            .into_iter()
+            .map(|p| p.path)
+            .collect(),
         title: plain_line(&prepared.title),
         initial_prompt: plain(&prepared.initial_prompt),
         tool: prepared.tool,
@@ -2005,6 +2012,9 @@ impl SuggestionsFeed {
                         project: Some(PreparedProject {
                             path: "/tmp".into(),
                         }),
+                        extra_projects: vec![PreparedProject {
+                            path: "/tmp/extra".into(),
+                        }],
                         view: Some("terminal".into()),
                         worktree: true,
                         sandbox: false,
@@ -2470,6 +2480,7 @@ mod tests {
             initial_prompt: "final prompt".into(),
             tool: "claude".into(),
             project: project.map(|path| PreparedProject { path: path.into() }),
+            extra_projects: Vec::new(),
             view: None,
             worktree: false,
             sandbox: false,

@@ -279,6 +279,7 @@ impl HomeView {
             start.preset.sandbox,
             start.preset.yolo,
         );
+        dialog.set_extra_repos(start.extra_paths);
         dialog.set_title(start.title);
         dialog.set_suggestion(
             start.initial_prompt,

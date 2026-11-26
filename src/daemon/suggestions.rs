@@ -164,6 +164,9 @@ pub struct Prepared {
     pub(crate) initial_prompt: String,
     pub(crate) tool: String,
     pub(crate) project: Option<PreparedProject>,
+    /// The rest of the repo's mapped Projects, for a worktree Session.
+    #[serde(default)]
+    pub(crate) extra_projects: Vec<PreparedProject>,
     #[serde(default)]
     pub(crate) view: Option<String>,
     #[serde(default)]
