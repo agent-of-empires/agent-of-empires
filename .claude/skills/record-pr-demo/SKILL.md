@@ -51,7 +51,7 @@ aoe add -t shell-urls -g web-shop --tool shell -l .
 aoe add -t claude-agent -g web-shop --tool claude -l --structured-view --prompt '<one tiny prompt>' .
 ```
 
-Use `--tool shell` for anything scripted; use one real agent session where the PR touches agent views, and keep its prompt tiny (it may ignore `--model`). Done when every session the clips need shows in `aoe list` and its tmux pane holds the state you will film.
+Use `--tool shell` for anything scripted; use one real agent session where the PR touches agent views, and keep its prompt tiny (it may ignore `--model`). Done when every session the clips need shows in `aoe list`. Terminal sessions must have a tmux pane holding the state you will film. Structured sessions (`--structured-view`) have no agent pane, so check their `aoe list` status (Idle or Active) or the transcript.
 
 ## 4. Record
 
