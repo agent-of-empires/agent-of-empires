@@ -181,8 +181,10 @@ pub struct AddArgs {
     /// First turn sent to the agent once it is ready. A structured session gets
     /// it when `aoe serve` starts the worker. A terminal session keeps it until
     /// the agent starts (`--launch`, or later from the dashboard or TUI) and
-    /// types it only into an agent with a ready marker; otherwise nothing is
-    /// typed and the session row carries `initial_prompt_error`.
+    /// types it only into an agent with a ready marker, so a shell, a
+    /// `--cmd-override` command and an agent without one are refused here, with
+    /// nothing created. A terminal session whose agent times out or shows a
+    /// dialog carries `initial_prompt_error`.
     #[arg(long, conflicts_with = "prompt_file")]
     prompt: Option<String>,
 
@@ -254,6 +256,36 @@ fn resolve_initial_prompt(args: &AddArgs) -> Result<Option<String>> {
     Ok(Some(text))
 }
 
+/// The refusal for a terminal first turn the daemon could never type: it needs a
+/// known agent's input box, so a shell, a `--cmd-override` command and an agent
+/// with no ready marker are turned away here instead of failing at launch.
+const PROMPT_UNDELIVERABLE: &str =
+    "--prompt needs an agent whose input box AoE can see, so this terminal session would never \
+     type it: a shell, a --cmd-override command, and an agent with no ready marker are refused \
+     here rather than after launch.\n\
+     Pass --structured-view (or --agent) to send the prompt as the session's first turn.";
+
+/// Whether a terminal session for these arguments has an agent the delivery step
+/// could type into. Mirrors `wait_for_terminal_agent`, which refuses a shell, a
+/// command override and any agent without a ready marker.
+fn terminal_prompt_is_deliverable(args: &AddArgs) -> bool {
+    let Some(tool) = args
+        .tool
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    else {
+        // No --tool: the row runs a shell.
+        return false;
+    };
+    let agent = crate::agents::get_agent(tool);
+    let overrides_agent = args
+        .cmd_override
+        .as_deref()
+        .is_some_and(|command| agent.is_none_or(|a| command != a.binary));
+    !overrides_agent && !crate::agents::ready_markers(tool).is_empty()
+}
+
 fn prompt_too_large() -> String {
     format!(
         "The initial prompt is larger than {} KiB",
@@ -274,6 +306,12 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         .is_some_and(|tool| tool.trim().is_empty())
     {
         bail!("--tool requires a non-empty agent name");
+    }
+    if initial_prompt.is_some()
+        && !(args.structured_view || args.agent.is_some())
+        && !terminal_prompt_is_deliverable(&args)
+    {
+        bail!(PROMPT_UNDELIVERABLE);
     }
     if args.scratch && args.path.is_some() {
         bail!("Cannot specify a project path with --scratch");
@@ -1080,6 +1118,87 @@ mod tests {
                 Ok(text) => assert_eq!(got.unwrap().as_deref(), text, "{argv:?}"),
                 Err(msg) => assert!(got.unwrap_err().to_string().contains(msg), "{argv:?}"),
             }
+        }
+    }
+
+    /// A terminal first turn needs a known agent's input box, so the cases the
+    /// delivery step could never type are refused before anything is created.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_prompt_a_terminal_session_cannot_deliver_is_refused_up_front() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().to_str().unwrap();
+        for argv in [
+            // No --tool: a plain shell row.
+            vec!["aoe", "add", path, "--prompt", "go"],
+            // A shell named as the tool.
+            vec!["aoe", "add", path, "--tool", "bash", "--prompt", "go"],
+            // An agent with no ready marker.
+            vec!["aoe", "add", path, "--tool", "gemini", "--prompt", "go"],
+            // A command override under an agent that does have one.
+            vec![
+                "aoe",
+                "add",
+                path,
+                "--tool",
+                "claude",
+                "--cmd-override",
+                "my-agent",
+                "--prompt",
+                "go",
+            ],
+        ] {
+            let err = super::run("default", parse_add(&argv).unwrap())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--prompt needs an agent"), "{argv:?}: {err}");
+        }
+        let (rows, _) = crate::session::Storage::new_unwatched("default")
+            .unwrap()
+            .load_with_groups()
+            .unwrap();
+        assert!(rows.is_empty(), "a refused prompt stored a row");
+    }
+
+    /// The refusal is only for what cannot be delivered: a marker-carrying agent
+    /// with its own binary, and the structured view, both pass.
+    #[test]
+    fn only_the_undeliverable_terminal_cases_are_refused() {
+        let path = tempfile::tempdir().unwrap();
+        let path = path.path().to_str().unwrap();
+        for (argv, deliverable) in [
+            (
+                vec!["aoe", "add", path, "--tool", "claude", "--prompt", "go"],
+                true,
+            ),
+            (
+                vec!["aoe", "add", path, "--prompt", "go", "--structured-view"],
+                true,
+            ),
+            (
+                vec![
+                    "aoe",
+                    "add",
+                    path,
+                    "--prompt",
+                    "go",
+                    "--agent",
+                    "claude-code",
+                ],
+                true,
+            ),
+            (
+                vec!["aoe", "add", path, "--tool", "gemini", "--prompt", "go"],
+                false,
+            ),
+            (vec!["aoe", "add", path, "--prompt", "go"], false),
+        ] {
+            let args = parse_add(&argv).unwrap();
+            let structured = args.structured_view || args.agent.is_some();
+            let accepted = structured || super::terminal_prompt_is_deliverable(&args);
+            assert_eq!(accepted, deliverable, "{argv:?}");
         }
     }
 

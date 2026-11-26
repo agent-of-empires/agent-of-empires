@@ -5661,6 +5661,36 @@ mod tests {
         }
     }
 
+    /// A turn a stopped row keeps is spent once that row is launched, without
+    /// another create: the row's status, not the prompt, gates the drain.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_stopped_rows_turn_is_taken_once_the_row_is_launched() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = terminal_turn_instance("sess-launched", "term-launched", "first");
+        inst.status = crate::session::Status::Stopped;
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+        assert!(
+            service
+                .undelivered_terminal_turn("sess-launched")
+                .await
+                .is_none(),
+            "a row nobody launched spent its turn"
+        );
+
+        service.instances.write().await[0].status = crate::session::Status::Starting;
+
+        assert!(
+            service
+                .undelivered_terminal_turn("sess-launched")
+                .await
+                .is_some(),
+            "a launched row kept its turn instead of spending it"
+        );
+    }
+
     /// A Claude session is typed into once its input box shows the mode line,
     /// not while it is still starting.
     #[tokio::test]
