@@ -138,6 +138,7 @@ test.describe("Phone session stack", () => {
   const phoneSessions = [
     sessionResponse({ id: "alpha", title: "Alpha", project_path: "/repo/shop", branch: "feat/cart" }),
     sessionResponse({ id: "beta", title: "Beta", project_path: "/repo/api", status: "Waiting" }),
+    sessionResponse({ id: "gamma", title: "docs", project_path: "/repo/docs", status: "Idle" }),
   ];
 
   test.beforeEach(async ({ page }) => {
@@ -171,6 +172,23 @@ test.describe("Phone session stack", () => {
     await page.getByTestId("sidebar-session-row").filter({ hasText: "Beta" }).click();
     await expect(page).toHaveURL(/\/session\/beta$/);
     await expect(page.getByTestId("sidebar-new-session-pill")).toBeHidden();
+  });
+
+  test("tapping the title pill opens the Session's menu; its folder drops out where it repeats the title", async ({
+    page,
+  }) => {
+    await page.goto("/session/beta");
+    const pill = page.getByTestId("session-title-pill");
+    await expect(pill).toContainText("api");
+    await pill.click();
+    const menu = page.getByTestId("sidebar-context-menu");
+    await expect(menu).toBeVisible();
+    await expect(menu.getByTestId("sidebar-context-menu-rename")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(menu).toBeHidden();
+
+    await page.goto("/session/gamma");
+    await expect(page.getByTestId("session-title-status")).toHaveText("Idle");
   });
 
   test("the header's ⋯ holds the open Session's views, then its actions", async ({ page }) => {

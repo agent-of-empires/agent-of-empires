@@ -26,7 +26,8 @@ async function openDashboard(page: Page, baseUrl: string) {
   // iOS Safari exposes push only to Home Screen apps; Chromium's iPhone emulation still has it.
   await page.addInitScript(() => delete (window as { PushManager?: unknown }).PushManager);
   await page.goto(baseUrl);
-  await expect(page.getByRole("button", { name: "Go to dashboard" })).toBeVisible();
+  // A phone's home is the session list.
+  await expect(page.getByRole("navigation", { name: "Sessions sidebar" })).toBeVisible();
 }
 
 const tourSeen = (page: Page) =>
@@ -62,7 +63,8 @@ test("× hides the banner across a reload, and Settings › Notifications keeps 
   await banner.getByRole("button", { name: HIDE }).click();
   await expect(banner).toHaveCount(0);
   await page.reload();
-  await expect(page.getByRole("button", { name: "Go to dashboard" })).toBeVisible();
+  // A phone's home is the session list.
+  await expect(page.getByRole("navigation", { name: "Sessions sidebar" })).toBeVisible();
   await expect(page.getByRole("region", { name: BANNER })).toHaveCount(0);
 
   await page.goto(`${serve.baseUrl}/settings/notifications`);

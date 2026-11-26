@@ -111,7 +111,7 @@ import { PluginPaneBody } from "./components/plugin/PluginPane";
 import { PluginPageView } from "./components/plugin/PluginPageView";
 import { SuggestionsView } from "./components/SuggestionsView";
 import { DashboardSuggestions } from "./components/DashboardSuggestions";
-import { PluginSessionMenu } from "./components/plugin/PluginSessionMenu";
+import { PluginSessionMenu, type SessionMenuRequest } from "./components/plugin/PluginSessionMenu";
 import {
   deleteWorkspaceSessions,
   restoreSessions,
@@ -2346,6 +2346,26 @@ function AppContent({
     };
   }, [singlePane, activeSession, caps.canUseTerminal, dockPaneIds, shellGroups.length, rightPanelView, paneDescriptor]);
   // The open Session's actions, a phone's only way to them; desktop keeps the sidebar row's menu.
+  // The open Session's full menu, the one a long press on its row opens, from a phone's title pill. Kept mounted after
+  // it closes so a picker it opened, such as Rename, can finish.
+  const [titleMenu, setTitleMenu] = useState<SessionMenuRequest | null>(null);
+  const renderSessionMenu = (request: SessionMenuRequest) => (
+    <PluginSessionMenu
+      request={request}
+      workspaces={workspaces}
+      readOnly={caps.readOnly}
+      observedById={observedById}
+      runtimeEpoch={runtimeEpoch}
+      handlers={{
+        onSessionMutation: applySessionMutation,
+        onDelete: handleDeleteSession,
+        onStop: handleStopSession,
+        onStart: handleStartSession,
+        onSwitchView: handleSwitchView,
+        onCreateSession: handleCreateSession,
+      }}
+    />
+  );
   const phoneSessionItems = useMemo<OverflowItem[] | undefined>(() => {
     if (!singlePane || !activeSession) return undefined;
     const s = activeSession;
@@ -2728,23 +2748,7 @@ function AppContent({
             if (openedSessionUnread) return { title: "", view: <TrashReadFailed onRetry={loadTrash} /> };
             return activeSession ? { title: activeSession.title, view: renderSessionLayout() } : null;
           }}
-          renderSessionMenu={(request) => (
-            <PluginSessionMenu
-              request={request}
-              workspaces={workspaces}
-              readOnly={caps.readOnly}
-              observedById={observedById}
-              runtimeEpoch={runtimeEpoch}
-              handlers={{
-                onSessionMutation: applySessionMutation,
-                onDelete: handleDeleteSession,
-                onStop: handleStopSession,
-                onStart: handleStartSession,
-                onSwitchView: handleSwitchView,
-                onCreateSession: handleCreateSession,
-              }}
-            />
-          )}
+          renderSessionMenu={renderSessionMenu}
         />
       );
     }
@@ -3213,6 +3217,20 @@ function AppContent({
       onOpenPalette={() => setShowPalette(true)}
       terminal={caps.canUseTerminal ? { open: terminalOpen, onToggle: () => togglePaneAny("terminal") } : undefined}
       sessionItems={phoneSessionItems}
+      onOpenSessionMenu={
+        singlePane && activeSession
+          ? (x, y) =>
+              setTitleMenu({
+                key: Date.now(),
+                sessionId: activeSession.id,
+                x,
+                y,
+                items: [],
+                source: "",
+                onClose: () => {},
+              })
+          : undefined
+      }
       appMenu={appMenu}
       phoneViews={phoneViews && { ...phoneViews, onPick: handlePickView, onMore: () => setPickerOpen(true) }}
       panels={
@@ -3411,6 +3429,7 @@ function AppContent({
               </div>
             </div>
 
+            {titleMenu && renderSessionMenu(titleMenu)}
             {legend && <SidebarLegend anchor={legend.anchor} onClose={closeLegend} opener={legend.opener} />}
 
             {showSessionWizard && (

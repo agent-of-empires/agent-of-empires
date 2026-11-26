@@ -31,6 +31,8 @@ interface Props {
   terminal?: { open: boolean; onToggle: () => void };
   /** The open Session's actions for the overflow menu (a phone's only way to them); omitted on desktop. */
   sessionItems?: OverflowItem[];
+  /** Opens the Session's actions, as a long press on its row does; a phone's title pill calls it when tapped. */
+  onOpenSessionMenu?: (x: number, y: number) => void;
   /** A phone's views of the open Session, chosen from the ⋯; away from the agent, the pill names the view and
    *  back returns to the agent. */
   phoneViews?: {
@@ -81,6 +83,7 @@ export function TopBar({
   terminal,
   panels,
   sessionItems,
+  onOpenSessionMenu,
   phoneViews,
   appMenu,
   unreadCount,
@@ -92,6 +95,8 @@ export function TopBar({
   sidebarColumnVisible,
   rightColumnVisible,
 }: Props) {
+  // Its folder, left out where it repeats the title, as a worktree named after its Session does.
+  const project = activeSession ? projectName(activeSession.project_path) : "";
   // A phone's menu: the Session's views, then its actions, then the app's items.
   const menuItems = useMemo<OverflowItem[]>(() => {
     const views: OverflowItem[] = (phoneViews?.choices ?? []).map(({ id, label, icon }) => ({
@@ -270,20 +275,32 @@ export function TopBar({
               title={activeSession.project_path}
             >
               <Folder className="size-3.5 shrink-0 text-text-dim" strokeWidth={1.5} aria-hidden />
-              <span className="text-text-secondary truncate shrink">{projectName(activeSession.project_path)}</span>
-              <span className="text-text-dim" aria-hidden>
-                /
-              </span>
+              {project !== activeSession.title && (
+                <>
+                  <span className="text-text-secondary truncate shrink">{project}</span>
+                  <span className="text-text-dim" aria-hidden>
+                    /
+                  </span>
+                </>
+              )}
               <span className="text-text-primary font-medium truncate">{activeSession.title}</span>
             </div>
           )}
           {activeSession && (
             // A phone heads the Session with a floating pill, its title over its project, as Claude's app does;
             // it gives the slower-updates notice the room when that shows.
-            <div
+            <button
+              type="button"
               data-testid="session-title-pill"
               title={activeSession.project_path}
-              className="md:hidden min-w-0 max-w-full h-10 px-4 flex flex-col items-center justify-center rounded-full float-control leading-tight group-has-[[data-live-slow-notice]]/center:hidden"
+              aria-label={`${activeSession.title} actions`}
+              aria-haspopup="menu"
+              disabled={!onOpenSessionMenu}
+              onClick={(e) => {
+                const r = e.currentTarget.getBoundingClientRect();
+                onOpenSessionMenu?.(r.left + r.width / 2, r.bottom);
+              }}
+              className="md:hidden min-w-0 max-w-full h-10 px-4 flex flex-col items-center justify-center rounded-full float-control leading-tight cursor-pointer active:scale-[0.97] transition-transform disabled:cursor-default group-has-[[data-live-slow-notice]]/center:hidden focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
             >
               <span className="max-w-full truncate text-[13px] font-semibold text-text-primary">
                 {activeSession.title}
@@ -303,10 +320,12 @@ export function TopBar({
                   />
                 )}
                 <span className="truncate">
-                  {`${phoneViews?.label ?? activeSession.status} · ${projectName(activeSession.project_path)}`}
+                  {project === activeSession.title
+                    ? (phoneViews?.label ?? activeSession.status)
+                    : `${phoneViews?.label ?? activeSession.status} · ${project}`}
                 </span>
               </span>
-            </div>
+            </button>
           )}
           {/* Search lives in the sidebar on desktop with a Session open, and on the phone's session list. */}
           <div className={activeSession ? "hidden" : "hidden md:contents"}>

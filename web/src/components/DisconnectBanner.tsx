@@ -23,7 +23,15 @@ export function DisconnectBanner({ state }: { state: ConnectionBannerState }) {
       className="bg-status-error/10 border-b border-status-error/30 px-4 py-2 flex items-center justify-center gap-2 text-[13px] text-status-error animate-fade-in"
     >
       <span className="w-1.5 h-1.5 rounded-full bg-status-error animate-pulse shrink-0" />
-      Daemon unreachable. Reconnecting…
+      <span>{navigator.onLine === false ? "Offline. Reconnecting…" : "Daemon unreachable. Reconnecting…"}</span>
+      {/* The list polls every few seconds on its own; this is for whoever would rather not wait. */}
+      <button
+        type="button"
+        onClick={() => window.location.reload()}
+        className="ml-1 min-h-8 px-2 -my-1 rounded-md font-medium underline underline-offset-2 cursor-pointer hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
+      >
+        Try again
+      </button>
     </div>
   );
 }

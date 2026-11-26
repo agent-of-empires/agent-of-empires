@@ -10,7 +10,7 @@ export async function pickPhoneView(page: Page, label: "Agent" | "Terminal" | "D
 /** The phone shows `label`'s view: the agent, or another view the title pill names. */
 export async function expectPhoneView(page: Page, label: string) {
   const status = page.getByTestId("session-title-status");
-  // The agent's pill says what the Session is doing; another view names itself.
-  if (label === "Agent") await expect(status).not.toHaveText(/^(Terminal|Diff|Files|Background) ·/);
-  else await expect(status).toHaveText(new RegExp(`^${label} ·`));
+  // The agent's pill says what the Session is doing; another view names itself, then the folder unless it repeats the title.
+  if (label === "Agent") await expect(status).not.toHaveText(/^(Terminal|Diff|Files|Background)( ·|$)/);
+  else await expect(status).toHaveText(new RegExp(`^${label}( ·|$)`));
 }
