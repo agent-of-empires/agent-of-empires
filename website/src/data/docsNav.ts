@@ -74,6 +74,7 @@ export const docsNav: NavSection[] = [
       { title: "Development", href: "/docs/development/" },
       { title: "Adding a New Agent", href: "/docs/development/adding-agents/" },
       { title: "Adding a Setting", href: "/docs/development/adding-settings/" },
+      { title: "Showcase video pipeline", href: "/docs/development/showcase-video/" },
       { title: "Releases", href: "/docs/development/releases/" },
       { title: "Writing Plugins", href: "/docs/development/writing-plugins/" },
     ],
