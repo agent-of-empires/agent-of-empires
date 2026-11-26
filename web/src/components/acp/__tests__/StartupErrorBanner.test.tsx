@@ -600,3 +600,138 @@ describe("AgentLogDisclosure", () => {
     expect(queryByTestId("acp-agent-log-pre")).toBeNull();
   });
 });
+
+describe("StartupErrorBanner sandbox login", () => {
+  const LOGIN_MESSAGE = "sandbox login required for claude: run `aoe sandbox login --tool claude`";
+  const LOGIN_BODY = { login_id: "login-1", url: "https://login.example.test/authorize?code=true" };
+  /** Answers the login endpoints, and 404s the rest the banner asks on mount. */
+  const isStart = (url: string, init?: RequestInit) =>
+    url.split("?")[0] === "/api/sandbox/login" && init?.method === "POST";
+  function stubLogin() {
+    const spy = vi.fn(async (url: string, init?: RequestInit) =>
+      isStart(url, init)
+        ? new Response(JSON.stringify(LOGIN_BODY), { status: 200 })
+        : new Response("not found", { status: 404 }),
+    );
+    vi.stubGlobal("fetch", spy);
+    return spy;
+  }
+  const loginCall = (spy: ReturnType<typeof stubLogin>) =>
+    spy.mock.calls.find(([url, init]) => isStart(String(url), init));
+
+  it("offers Log in only for the login-required cause", () => {
+    stubApi({});
+    const withCause = render(
+      <StartupErrorBanner
+        sessionId="s-1"
+        acpWorkerState="absent"
+        message={LOGIN_MESSAGE}
+        cause={{ kind: "sandbox_login_required" }}
+      />,
+    );
+    expect(withCause.queryByRole("button", { name: "Log in" })).not.toBeNull();
+    withCause.unmount();
+
+    const otherCause = render(
+      <StartupErrorBanner
+        sessionId="s-1"
+        acpWorkerState="absent"
+        message={LOGIN_MESSAGE}
+        cause={{ kind: "container_missing" }}
+      />,
+    );
+    expect(otherCause.queryByRole("button", { name: "Log in" })).toBeNull();
+    otherCause.unmount();
+
+    const noCause = renderBanner({ message: LOGIN_MESSAGE });
+    expect(noCause.queryByRole("button", { name: "Log in" })).toBeNull();
+  });
+
+  it("opens the login dialog for the tool of the session that is waiting", async () => {
+    const spy = stubLogin();
+    const { getByRole, findByRole } = render(
+      <StartupErrorBanner
+        sessionId="s-1"
+        acpWorkerState="absent"
+        tool="claude-personal"
+        message={LOGIN_MESSAGE}
+        cause={{ kind: "sandbox_login_required" }}
+      />,
+    );
+    fireEvent.click(getByRole("button", { name: "Log in" }));
+    await findByRole("dialog");
+    await waitFor(() => expect(loginCall(spy)).toBeDefined());
+    expect(loginCall(spy)?.[1]).toEqual(
+      expect.objectContaining({
+        method: "POST",
+        body: expect.stringMatching(/^\{"force":false,"tool":"claude-personal","lease":"[0-9a-f]{32}"\}$/),
+      }),
+    );
+  });
+
+  it("shows the server's message and logs in the command and profile it named", async () => {
+    const message =
+      "sandbox login required for personal: run `aoe sandbox login -p work --tool personal --command claude`";
+    const spy = stubLogin();
+    const { container, getByRole, findByRole } = render(
+      <StartupErrorBanner
+        sessionId="s-1"
+        acpWorkerState="absent"
+        tool="personal"
+        message={message}
+        cause={{ kind: "sandbox_login_required", command: "claude", profile: "work" }}
+      />,
+    );
+    // The recovery command is the server's text, not one built here.
+    expect(container.textContent).toContain(message);
+    fireEvent.click(getByRole("button", { name: "Log in" }));
+    await findByRole("dialog");
+    await waitFor(() => expect(loginCall(spy)).toBeDefined());
+    expect(loginCall(spy)?.[1]).toEqual(
+      expect.objectContaining({
+        method: "POST",
+        body: expect.stringMatching(
+          /^\{"force":false,"tool":"personal","command":"claude","profile":"work","lease":"[0-9a-f]{32}"\}$/,
+        ),
+      }),
+    );
+  });
+
+  it("says the login is required, with the daemon's guidance and no adapter remediation", () => {
+    stubApi({});
+    const { container, getByRole } = render(
+      <StartupErrorBanner
+        sessionId="s-1"
+        acpWorkerState="absent"
+        message={LOGIN_MESSAGE}
+        cause={{ kind: "sandbox_login_required" }}
+      />,
+    );
+    expect(container.textContent).toContain("Sandbox login required");
+    expect(container.textContent).toContain(LOGIN_MESSAGE);
+    expect(container.textContent).not.toContain("couldn't start");
+    expect(container.textContent).not.toContain("claude /login");
+    expect(getByRole("button", { name: "Retry" })).toBeTruthy();
+    expect(getByRole("button", { name: "Log in" })).toBeTruthy();
+  });
+
+  it("offers no Log in for a runtime that cannot run the login, and shows its refusal as is", () => {
+    stubApi({});
+    const refusal =
+      "sandbox.shared_credential is separate_login, which is not supported with Apple Container; use host_seed or Docker/Podman";
+    const { container, queryByRole } = render(
+      <StartupErrorBanner
+        sessionId="s-1"
+        acpWorkerState="absent"
+        message={refusal}
+        cause={{ kind: "sandbox_login_unsupported" }}
+      />,
+    );
+    expect(queryByRole("button", { name: "Log in" })).toBeNull();
+    expect(container.textContent).toContain("Sandbox login not supported");
+    expect(container.textContent).toContain(refusal);
+    // The refusal is the guidance: the adapter and credentials remediation does not apply.
+    expect(container.textContent).not.toContain("claude /login");
+    expect(container.textContent).not.toContain("aoe acp doctor");
+  });
+});

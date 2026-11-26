@@ -2393,23 +2393,34 @@ async fn sandbox_login_queue_keeps_http_prompt() {
             "error": "sandbox_login_required",
             "message": message,
             "tool": "claude",
+            "profile": crate::session::config::effective_profile(""),
             "queued_id": "p-login",
         })
     );
     // The queue cannot advance, so the log carries the recovery guidance once: it names the
     // agent and the command to run.
-    let guidance = || -> Vec<String> {
+    let guidance = || -> Vec<(String, Option<crate::acp::state::StartupCause>)> {
         state
             .acp_event_store
             .replay_from(&id, 0)
             .into_iter()
             .filter_map(|(_, e)| match e {
-                Event::AgentStartupError { message, .. } => Some(message),
+                Event::AgentStartupError { message, cause } => Some((message, cause)),
                 _ => None,
             })
             .collect()
     };
-    assert_eq!(guidance(), vec![message.clone()]);
+    // The cause lets the dashboard offer its Log in button beside the guidance.
+    assert_eq!(
+        guidance(),
+        vec![(
+            message.clone(),
+            Some(crate::acp::state::StartupCause::SandboxLoginRequired {
+                command: None,
+                profile: Some(crate::session::config::effective_profile("")),
+            })
+        )]
+    );
     assert!(
         message.contains("aoe sandbox login --tool claude"),
         "{message}"
