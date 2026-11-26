@@ -623,10 +623,17 @@ async fn start_outcome(
         ),
         _ => "Try again, or use Start with changes to see the full error.".to_string(),
     };
-    let reason = body["message"]
+    let mut reason = body["message"]
         .as_str()
         .map(String::from)
         .unwrap_or_else(|| format!("The Session could not be created ({status})"));
+    if code == "sandbox_unavailable" {
+        // The hint repeats the create reason's own "Start {runtime}, then try again."
+        let runtime = crate::containers::get_container_runtime().display_name();
+        if let Some(cause) = reason.strip_suffix(&format!(" Start {runtime}, then try again.")) {
+            reason = cause.to_string();
+        }
+    }
     start_failed(reason, &hint)
 }
 
@@ -1244,5 +1251,31 @@ mod tests {
             let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert!(body["hint"].as_str().unwrap().contains(needle), "{body}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_docker_down_start_gives_the_instruction_once() {
+        let runtime = crate::containers::get_container_runtime().display_name();
+        let create_reason = format!(
+            "{runtime} isn't running, so the Sandbox can't start. Start {runtime}, then try again."
+        );
+        let refused = api_error(
+            StatusCode::from_u16(422).unwrap(),
+            "sandbox_unavailable",
+            &create_reason,
+        );
+        let response = start_outcome(refused, "default".into(), "/repo".into()).await;
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["reason"],
+            format!("{runtime} isn't running, so the Sandbox can't start.")
+        );
+        assert_eq!(
+            body["hint"],
+            format!("Start {runtime} and try again, or use Start with changes to run without the sandbox.")
+        );
     }
 }
