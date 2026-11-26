@@ -4290,8 +4290,9 @@ fn a_sidebar_pick_is_not_sent_once_mutations_are_revoked() {
     let daemon = SidebarView {
         group_by: GroupByMode::Group,
         sort: SortOrder::Name,
+        ..Default::default()
     };
-    Arc::make_mut(&mut snapshot).contents.sidebar_view = daemon;
+    Arc::make_mut(&mut snapshot).contents.sidebar_view = daemon.clone();
     env.view
         .session_feed
         .publish_for_test(SessionFeedResult::Snapshot(snapshot));
