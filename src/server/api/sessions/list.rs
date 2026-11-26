@@ -694,7 +694,18 @@ pub async fn update_workspace_ordering(
         )
             .into_response();
     }
+    match tokio::spawn(commit_workspace_ordering(state, body.order)).await {
+        Ok(response) => response,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
 
+/// Owns an admitted ordering write through reconciliation, so a dropped request cannot
+/// release its guards before the canonical metadata catches up with the disk.
+async fn commit_workspace_ordering(
+    state: Arc<AppState>,
+    order: Vec<String>,
+) -> axum::response::Response {
     let namespace = state.profile_namespace.read().await;
     let publication = state.publication.write().await;
     if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
@@ -702,7 +713,7 @@ pub async fn update_workspace_ordering(
     }
     let result = tokio::task::spawn_blocking(move || {
         crate::session::update_workspace_ordering(move |ordering| {
-            ordering.order = body.order;
+            ordering.order = order;
             Ok(())
         })
     })
@@ -757,8 +768,18 @@ pub async fn update_sidebar_view(
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
+    match tokio::spawn(commit_sidebar_view(state, patch)).await {
+        Ok(response) => response,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
 
-    // Same lock order as the ordering handler: namespace, then this write's lane.
+/// Owns an admitted sidebar view write through reconciliation, like the ordering commit.
+async fn commit_sidebar_view(
+    state: Arc<AppState>,
+    patch: crate::daemon::SidebarViewPatch,
+) -> axum::response::Response {
+    // Same lock order as the ordering commit: namespace, then this write's lane.
     let namespace = state.profile_namespace.read().await;
     let lane = state.sidebar_view_lane.lock().await;
     if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
@@ -934,7 +955,7 @@ mod sidebar_view_tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_stalled_storage_lock_leaves_publication_free() {
+    async fn a_stalled_write_frees_publication_and_outlives_its_dropped_request() {
         use std::time::Duration;
         let _home = crate::session::test_support::isolate_app_dir();
         let state = crate::server::test_support::build_test_app_state(Vec::new());
@@ -968,11 +989,15 @@ mod sidebar_view_tests {
                 .expect("a stalled sidebar write must not hold publication"),
         );
         assert!(!write.is_finished());
+        write.abort();
+        assert!(write.await.is_err_and(|error| error.is_cancelled()));
 
         release_tx.send(()).unwrap();
         holder.join().unwrap();
-        let response = write.await.unwrap().into_response();
-        assert_eq!(response.status(), StatusCode::OK);
+        // The admitted commit keeps its lane until the canonical view matches the disk.
+        let _lane = tokio::time::timeout(Duration::from_secs(10), state.sidebar_view_lane.lock())
+            .await
+            .expect("the detached commit never finished");
         assert_eq!(
             state.canonical_metadata.read().await.sidebar_view.sort,
             SortOrder::Name
