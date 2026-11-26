@@ -2367,11 +2367,10 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
         let result = crate::hooks::declared_sandbox_dir(instance_id).and_then(|stage| {
             let file = stage.join("home").join(&trust.file);
             if !applies {
-                // A record staged by an earlier Yolo launch must not outlive it.
-                return match std::fs::remove_file(&file) {
-                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-                    _ => Ok(()),
-                };
+                // A record staged by an earlier launch must not outlive it. A running
+                // container keeps its file mount on the old inode, so the file is
+                // blanked in place rather than unlinked.
+                return blank_staged_file(&file);
             }
             std::fs::create_dir_all(file.parent().expect("staged under home"))?;
             crate::hooks::write_declared_trust(
@@ -2984,6 +2983,7 @@ fn stage_declared_sandbox(
     instance_id: &str,
     profile_config: &super::Config,
     bound: &[VolumeMount],
+    yolo: bool,
 ) -> Result<DeclaredSandboxMounts> {
     let entry = declared.contribution();
     let stage = crate::hooks::declared_sandbox_dir(instance_id)?;
@@ -3057,7 +3057,7 @@ fn stage_declared_sandbox(
     }
     if let Some(trust) = &entry.trust {
         let file = stage.join("home").join(&trust.file);
-        if file.is_file() {
+        if file.is_file() && crate::hooks::declared_trust_applies_in_sandbox(trust, yolo) {
             // Validation refuses a shared file; a file mount over the staged hooks
             // file would hide it, so it is skipped here too.
             let target =
@@ -3080,6 +3080,22 @@ fn stage_declared_sandbox(
         }
     }
     Ok(mounts)
+}
+
+/// Truncates a staged file to `{}` through the same inode, never following a link.
+fn blank_staged_file(file: &Path) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(file)
+    {
+        Ok(mut staged) => Ok(staged.write_all(b"{}")?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("blanking {}", file.display())),
+    }
 }
 
 fn validate_managed_container_environment(
@@ -3620,7 +3636,13 @@ pub(crate) fn build_container_config(
         yolo.enabled,
     );
     if let Some(declared) = &plugin_agent {
-        match stage_declared_sandbox(declared, instance_id, profile_config, &volumes) {
+        match stage_declared_sandbox(
+            declared,
+            instance_id,
+            profile_config,
+            &volumes,
+            yolo.enabled,
+        ) {
             Ok(staged) => {
                 volumes.extend(staged.volumes);
                 identity_output_path = identity_output_path.or(staged.identity_output);
@@ -7697,7 +7719,16 @@ sandbox = "SANDBOX"
             &DECLARED_SANDBOX_PLUGIN.replace("SANDBOX", "yolo_only"),
         );
         assert!(mount_of(&launch("declared-flip", true), "/root/.example.json").is_some());
+        let staged = crate::hooks::declared_sandbox_dir("declared-flip")
+            .unwrap()
+            .join("home/.example.json");
+        let inode = |path: &Path| std::os::unix::fs::MetadataExt::ino(&fs::metadata(path).unwrap());
+        let mounted_inode = inode(&staged);
         assert!(mount_of(&launch("declared-flip", false), "/root/.example.json").is_none());
+        // A running container keeps its mount on the old inode, so the record is
+        // blanked in place, not unlinked.
+        assert_eq!(inode(&staged), mounted_inode);
+        assert_eq!(fs::read_to_string(&staged).unwrap(), "{}");
 
         // A link planted in the staged directory is replaced, never followed.
         crate::session::test_support::install_agent_plugin(
