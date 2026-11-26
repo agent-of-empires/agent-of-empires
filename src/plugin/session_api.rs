@@ -29,7 +29,7 @@ use crate::plugin::automation_policy::{
 };
 use crate::plugin::host_api::{DispatchError, PluginRpcContext};
 use crate::plugin::protocol::codes;
-use crate::server::api::sessions::{send_terminal_message, SendKeysError};
+use crate::server::api::sessions::{send_terminal_message, SendKeysError, SendPane};
 use crate::server::session_service::{
     CreateIdempotencyProbe, IdempotencyConflict, PromptTouch, SendTurnError, SendTurnRequest,
     SessionCaller, SessionService,
@@ -960,7 +960,7 @@ async fn deliver_message(
         req.message.clone(),
         true,
         true,
-        None,
+        SendPane::LIVE,
     )
     .await
     .map_err(|error| map_terminal_error(error.error))?;

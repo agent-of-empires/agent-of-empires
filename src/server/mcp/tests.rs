@@ -1361,12 +1361,14 @@ async fn terminal_sessions_send_and_read_through_their_pane() {
 }
 
 /// MCP `send` types into the pane its dialog check read, or refuses, even when the live target
-/// moves to another pane after the check, or the checked pane leaves the session.
+/// moves to another pane after the check, or the checked pane leaves the session. A draft typed
+/// after the check refuses at once rather than being waited out.
 #[tokio::test]
 #[serial_test::serial]
 async fn an_mcp_send_types_into_the_pane_it_checked() {
     use crate::tmux::test_helpers::{
-        on_input_checked, only_pane_id, split_pane, wait_for_pane_command, TmuxTestSession,
+        on_draft_seen, on_input_checked, only_pane_id, split_pane, wait_for_pane_command,
+        TmuxTestSession, INPUT_BOX_SCRIPT,
     };
     if !crate::tmux::test_helpers::tmux_available() {
         return;
@@ -1394,12 +1396,14 @@ async fn an_mcp_send_types_into_the_pane_it_checked() {
         Unpin,
         Kill,
         Move,
+        Draft,
     }
     // (case, what happens to the checked pane after the check, besides the pin being dropped)
     for (case, then) in [
         ("unpinned", Then::Unpin),
         ("killed", Then::Kill),
         ("moved", Then::Move),
+        ("drafted-after-check", Then::Draft),
     ] {
         let mut live = Instance::new("mcp-checked", "/tmp/aoe-mcp-checked");
         live.source_profile = "default".into();
@@ -1412,8 +1416,31 @@ async fn an_mcp_send_types_into_the_pane_it_checked() {
         start_cat(other.name());
         let first = only_pane_id(session.name());
         wait_for_pane_command(&first, "cat");
-        let checked = split_pane(session.name(), "exec cat");
+        let checked = split_pane(
+            session.name(),
+            if then == Then::Draft {
+                INPUT_BOX_SCRIPT
+            } else {
+                "exec cat"
+            },
+        );
         wait_for_pane_command(&checked, "cat");
+        if then == Then::Draft {
+            // The draft's clear, at the send's first read of it, would let a wait type.
+            let target = checked.clone();
+            on_draft_seen(&checked, move || {
+                assert!(crate::tmux::tmux_command()
+                    .args(["send-keys", "-t", &target, "C-u"])
+                    .status()
+                    .unwrap()
+                    .success());
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while shows(&target, "half typed") {
+                    assert!(std::time::Instant::now() < deadline, "the draft clears");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            });
+        }
         let dir = tempfile::tempdir().unwrap();
         let pin =
             crate::tmux::vt::register_live_target_for_test(session.name(), dir.path(), &checked);
@@ -1423,6 +1450,7 @@ async fn an_mcp_send_types_into_the_pane_it_checked() {
             let action = match then {
                 Then::Kill => vec!["kill-pane", "-t", &target],
                 Then::Move => vec!["join-pane", "-d", "-s", &target, "-t", &to],
+                Then::Draft => vec!["send-keys", "-t", &target, "-l", "half typed"],
                 Then::Unpin => return,
             };
             assert!(crate::tmux::tmux_command()
@@ -1430,6 +1458,11 @@ async fn an_mcp_send_types_into_the_pane_it_checked() {
                 .status()
                 .unwrap()
                 .success());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while then == Then::Draft && !shows(&target, "❯ half typed") {
+                assert!(std::time::Instant::now() < deadline, "the draft shows");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
         });
 
         let arguments = json!({"session_id": live_id, "message": "typed-by-mcp"});
@@ -1446,7 +1479,15 @@ async fn an_mcp_send_types_into_the_pane_it_checked() {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         } else {
-            assert!(error_code(&result).is_some(), "{case}: {result}");
+            if then == Then::Draft {
+                assert_eq!(
+                    error_code(&result),
+                    Some("input_line_busy"),
+                    "{case}: {result}"
+                );
+            } else {
+                assert!(error_code(&result).is_some(), "{case}: {result}");
+            }
             assert!(
                 !shows(&checked, "typed-by-mcp"),
                 "{case}: typed after the check"

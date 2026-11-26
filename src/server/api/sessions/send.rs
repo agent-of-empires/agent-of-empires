@@ -42,16 +42,29 @@ pub(crate) struct TerminalSendError {
     committed_cursor: Option<Box<(axum::http::HeaderValue, axum::http::HeaderValue)>>,
 }
 
+/// Which pane a terminal send types into, and how long it waits there for a draft to clear.
+pub(crate) struct SendPane {
+    /// A pane the caller already checked (MCP's dialog check), addressed instead of the live one.
+    pub checked: Option<String>,
+    pub draft_wait: std::time::Duration,
+}
+
+impl SendPane {
+    /// The session's live pane, with [`INPUT_LINE_WAIT`] for a draft.
+    pub(crate) const LIVE: SendPane = SendPane {
+        checked: None,
+        draft_wait: INPUT_LINE_WAIT,
+    };
+}
+
 /// Revive through the native lifecycle command, then send under immutable pane ownership.
-/// `checked_pane` is a pane the caller already checked (MCP's dialog check): the send then
-/// addresses only that pane instead of resolving the live one.
 pub(crate) async fn send_terminal_message(
     service: &SessionService,
     id: &str,
     message: String,
     revive: bool,
     refuse_if_ignored: bool,
-    checked_pane: Option<String>,
+    target: SendPane,
 ) -> Result<bool, TerminalSendError> {
     let mut committed_cursor = None;
     send_terminal_message_inner(
@@ -60,7 +73,7 @@ pub(crate) async fn send_terminal_message(
         message,
         revive,
         refuse_if_ignored,
-        checked_pane,
+        target,
         &mut committed_cursor,
     )
     .await
@@ -76,7 +89,7 @@ async fn send_terminal_message_inner(
     message: String,
     revive: bool,
     refuse_if_ignored: bool,
-    checked_pane: Option<String>,
+    target: SendPane,
     committed_cursor: &mut Option<(axum::http::HeaderValue, axum::http::HeaderValue)>,
 ) -> Result<bool, SendKeysError> {
     let state = service.native_state().map_err(SendKeysError::Tmux)?;
@@ -229,7 +242,7 @@ async fn send_terminal_message_inner(
             );
             let session = instance.tmux_session()?;
             // Readiness, the draft check and the keys all address this one pane.
-            let pane = match checked_pane {
+            let pane = match target.checked {
                 Some(pane) => pane,
                 None => session
                     .live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())
@@ -244,7 +257,7 @@ async fn send_terminal_message_inner(
                 .map_err(|_| TerminalNotRunning)?;
             // Typed after a person's unsent text, the message would merge with it on Enter.
             anyhow::ensure!(
-                instance.wait_for_input_line(&session, &pane, INPUT_LINE_WAIT),
+                instance.wait_for_input_line(&session, &pane, target.draft_wait),
                 InputLineBusy
             );
             session.send_keys_to_pane(&pane, &message, instance.send_keys_enter_delay())?;
@@ -420,7 +433,7 @@ pub async fn send_message(
         req.message,
         revive,
         false,
-        None,
+        SendPane::LIVE,
     )
     .await
     {

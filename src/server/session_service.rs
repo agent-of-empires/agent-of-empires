@@ -5645,7 +5645,7 @@ mod tests {
                 "hello".to_string(),
                 false,
                 false,
-                None,
+                crate::server::api::sessions::SendPane::LIVE,
             )
             .await
             .map(|_| ())
@@ -5799,7 +5799,7 @@ mod tests {
                 "hello".to_string(),
                 false,
                 false,
-                None,
+                crate::server::api::sessions::SendPane::LIVE,
             )
             .await
         };
@@ -6409,7 +6409,7 @@ mod tests {
             "user-message-B".to_string(),
             false,
             false,
-            None,
+            crate::server::api::sessions::SendPane::LIVE,
         )
         .await;
         assert!(sent.is_ok());
@@ -6460,7 +6460,7 @@ mod tests {
                     "user-message-B".to_string(),
                     false,
                     false,
-                    None,
+                    crate::server::api::sessions::SendPane::LIVE,
                 ),
             )
             .await
@@ -6500,7 +6500,7 @@ mod tests {
                     "user-message-B".to_string(),
                     false,
                     false,
-                    None,
+                    crate::server::api::sessions::SendPane::LIVE,
                 )
                 .await
             })

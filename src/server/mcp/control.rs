@@ -14,7 +14,7 @@ use crate::acp::dispatch::PromptDispatch;
 use crate::daemon::{CreateSessionBody, SessionResponse};
 use crate::server::api::sessions::{
     capture_terminal_output, create_session_with, send_terminal_message, CaptureError,
-    SendKeysError,
+    SendKeysError, SendPane,
 };
 use crate::server::api::{submit_prompt, PromptSubmission, PromptSubmitError, PromptSubmitted};
 use crate::server::session_service::{SendTurnError, SessionCaller};
@@ -309,7 +309,10 @@ impl McpServer {
                     text.clone(),
                     false,
                     true,
-                    checked_pane,
+                    SendPane {
+                        checked: checked_pane,
+                        draft_wait: std::time::Duration::ZERO,
+                    },
                 )
                 .await
                 {
@@ -520,7 +523,10 @@ impl McpServer {
             message.clone(),
             false,
             true,
-            checked_pane,
+            SendPane {
+                checked: checked_pane,
+                draft_wait: std::time::Duration::ZERO,
+            },
         )
         .await
         {
