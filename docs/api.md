@@ -717,7 +717,8 @@ remain sanitized rather than exposing their internal causes.
 `initial_prompt` is sent to the agent as its first turn, never before the
 agent is ready. Structured sessions deliver it once the worker is live and
 retry until it lands. A terminal session running an agent with a ready marker
-waits up to 60 seconds for that marker, then types it. A shell, a
+waits up to 60 seconds for that marker, then types it. A terminal session that has not been launched (`aoe add` without
+`--launch`, status `stopped`) keeps its prompt until the agent starts. A shell, a
 command-override session or an agent without a ready marker is refused
 immediately and surfaces `initial_prompt_error`. On timeout nothing is typed;
 a send error can leave partial input in the pane. Either way the session row

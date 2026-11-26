@@ -123,7 +123,7 @@ If the repo has hooks nobody has approved, Enter shows them, with a one-line sum
 
 **New-session dialog.** The dialog has no Prompt row. For a suggestion, the first turn is one line above the footer: "Prompt from GitHub, not checked by AoE", or "Prompt: none" once you erase it. A blank session shows no prompt line until you add one. `Ctrl+O` opens it in a small editor, which also shows the item's source text; `Esc` closes it and keeps your edits. `Ctrl+P` still opens the focused row's picker. The prompt is sent once the agent is ready (typed into a terminal session, or sent as the first turn of a [structured-view](../structured-view.md) one).
 
-From the command line, `aoe add --structured-view --prompt <text>` (or `--prompt-file <path>`) sets the same first turn. It needs `--structured-view` or `--agent`; without either, `aoe add` refuses it.
+From the command line, `aoe add --prompt <text>` (or `--prompt-file <path>`) sets the same first turn. A terminal session (the default) keeps it until its agent starts, with `--launch` or later from the dashboard or TUI.
 
 ## Read-only dashboards and CityHall
 
