@@ -38,7 +38,7 @@ capabilities = ["runtime.worker"]
 | `screenshots` | array | no | Up to 8. Requires `api_version >= 5`. See [Screenshots](#screenshots). |
 | `suggestions` | table | no | Suggested-session sources the worker publishes. Requires `api_version >= 23` and `runtime.worker`. See [Suggested sessions](#suggested-sessions). |
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
-| `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; the launch, detection, and reply-fallback extensions require API 21, and the session-id capture extension requires API 22, each with a host implementing them. Provider-native status and replies require `session.integration`. |
+| `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; the launch, detection, and reply-fallback extensions require API 21, the session-id capture extension requires API 22, and the `hooks` and `trust` tables require API 26, each with a host implementing them. Provider-native status and replies require `session.integration`. |
 
 ## Agent integrations
 
@@ -134,6 +134,42 @@ A report is not tied to a launch. The host mints no launch token and the call ca
 - `reply_fallback` contains nonempty `allow` and `deny` arrays, and an optional nonempty `allow_always` array, of literal or named keys. Named keys are `Enter`, `Tab`, `Escape`, `Space`, `Backspace`, `Up`, `Down`, `Left`, `Right`, `Home`, `End`, `PageUp`, `PageDown`, and `F1` through `F12`. Fallback is allowed only with `replies = false` and does not automatically approve a prompt.
 
 For reply-enabled integrations, the provider report's `reply_keys` must contain at most eight distinct function-key names from `F1` through `F12`; the host rejects a report with more than eight keys or any duplicate. AoE sends those keys only after the user submits a response. A status-only report may omit `reply_keys` or send an empty array. Prompts are ignored unless the integration enables replies and the report supplies wake keys. Missing or invalid reports for reply-enabled integrations never fall back to terminal approval keystrokes.
+
+### Hooks and folder trust (API 26)
+
+`[agent_integrations.hooks]` and `[agent_integrations.trust]` let a declared agent get the status hooks and pre-trusted folders a built-in agent has. Both require `api_version >= 26` and a nonblank `command`; a manifest below 26 that declares either is rejected. The host runs its own installer and writer, so the plugin supplies data, never code. Installing the plugin shows the resolved files in the approval prompt, and `aoe hooks status` lists them.
+
+```toml
+[agent_integrations.hooks]
+settings_rel_path = ".example/settings.json"
+config_dir_env_var = "EXAMPLE_CONFIG_DIR"
+format = "json_settings"
+
+[[agent_integrations.hooks.events]]
+event = "PreToolUse"
+status = "running"
+waiting_tools = ["AskUserQuestion"]
+
+[[agent_integrations.hooks.events]]
+event = "Notification"
+matcher = "permission_prompt"
+status = "waiting"
+
+[agent_integrations.trust]
+file = ".example.json"
+location = "config_dir_or_home"
+config_dir_env_var = "EXAMPLE_CONFIG_DIR"
+pointer = "/projects/{path}/hasTrustDialogAccepted"
+value = true
+sandbox = "yolo_only"
+```
+
+- `hooks.settings_rel_path` is relative to the home directory. When `config_dir_env_var` is set, the file's name is placed in that directory instead. Paths hold only plain components: no absolute paths, `.` or `..`, and at most 256 bytes.
+- `hooks.format` is `json_settings`, the `hooks.<event>[].hooks[].command` layout. `events` holds 1 to 32 entries; each `event` is one of `SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`, `StopFailure`, `Notification`, `ElicitationResult`, `PermissionRequest`, `BeforeTool`, `BeforeAgent`, `AfterAgent`. An event may repeat only with different `matcher` values. `status` is `running`, `waiting`, `idle` or `error`; `identity_field` is `session_id` or `conversation_id_or_session_id`; `waiting_tools` lists tools that block on the user.
+- `trust.file` is one file name. `location = "config_dir_or_home"` resolves to the session's `agent_config_dir`, else the `config_dir_env_var` directory, else the home directory. `pointer` is absolute, has exactly one `{path}` segment, and at most 8 segments. `{path}` receives the project path as a single object key, with no escaping. The value is written at the last segment. `value` is a boolean or a string.
+- The trust writer is strict. It creates missing objects but fails, without writing, when the file is not valid JSON or a segment on the pointer exists and is not an object. The host chooses whether to follow symlinks; a plugin cannot.
+- `trust.sandbox` is `always` or `yolo_only`; `yolo_only` writes the record only for a sandbox launched in Yolo mode. A sandbox write never follows a symlink.
+- Uninstalling AoE removes the hooks from the declared settings file while the plugin is active. Trust entries stay, as built-in ones do.
 
 ### Report and reply files
 
