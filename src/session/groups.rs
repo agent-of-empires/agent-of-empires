@@ -591,7 +591,6 @@ fn has_placed_favorite(path: &str, instances: &[Instance]) -> bool {
     group_members(path, instances).any(holds_favorite_place)
 }
 
-/// Flatten instances from multiple profiles into a single flat list.
 /// Every profile's rows from `instances`, with headers ranked by `ranked`'s members, so a
 /// filter that hides rows leaves the headers in place.
 pub fn flatten_tree_all_profiles(

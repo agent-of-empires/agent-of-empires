@@ -38,6 +38,23 @@ pub(super) fn split_project_view_path(path: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Header path to profile to the number of its sessions that need you.
+#[derive(Default)]
+pub(super) struct NeedsYouCounts(HashMap<String, HashMap<String, usize>>);
+
+impl NeedsYouCounts {
+    /// Under Groups a profile's header counts only its own profile's sessions.
+    pub(super) fn under(&self, path: &str, profile: Option<&str>, group_by: GroupByMode) -> usize {
+        let Some(by_profile) = self.0.get(path) else {
+            return 0;
+        };
+        match (group_by, profile) {
+            (GroupByMode::Group, Some(profile)) => by_profile.get(profile).copied().unwrap_or(0),
+            _ => by_profile.values().sum(),
+        }
+    }
+}
+
 impl HomeView {
     pub fn instances(&self) -> impl ExactSizeIterator<Item = &Instance> + '_ {
         self.instances.values()
@@ -194,24 +211,31 @@ impl HomeView {
         });
     }
 
-    /// Sessions under the header at `path` that need you. Under Repository a header
-    /// holds the rows at or beneath its `repo/group` path; under Groups, its own
-    /// profile's rows at or beneath its group path.
-    pub(super) fn needs_you_under(&self, path: &str, profile: Option<&str>) -> usize {
-        let prefix = format!("{path}/");
-        let within = |p: &str| p == path || p.starts_with(&prefix);
+    /// Sessions that need you under each header path, by profile, in one pass. Under
+    /// Repository a header holds the rows at or beneath its `repo/group` path; under Groups,
+    /// the rows at or beneath its group path.
+    pub(super) fn needs_you_counts(&self) -> NeedsYouCounts {
         let active = self.active_profile.as_deref();
-        self.instances
-            .values()
-            .filter(|inst| inst.needs_you())
-            .filter(|inst| active.is_none_or(|p| inst.source_profile == p))
-            .filter(|inst| match self.group_by {
-                GroupByMode::Project => within(&project_view_path(inst)),
-                GroupByMode::Group => {
-                    within(&inst.group_path) && profile.is_none_or(|p| inst.source_profile == p)
-                }
-            })
-            .count()
+        let mut counts = NeedsYouCounts::default();
+        for inst in self.instances.values() {
+            if !inst.needs_you() || active.is_some_and(|p| inst.source_profile != p) {
+                continue;
+            }
+            let path = match self.group_by {
+                GroupByMode::Project => project_view_path(inst),
+                GroupByMode::Group => inst.group_path.clone(),
+            };
+            let ends = path.match_indices('/').map(|(at, _)| at);
+            for end in ends.chain([path.len()]) {
+                *counts
+                    .0
+                    .entry(path[..end].to_owned())
+                    .or_default()
+                    .entry(inst.source_profile.clone())
+                    .or_default() += 1;
+            }
+        }
+        counts
     }
 
     pub(super) fn toggle_hide_stopped_in_groups(&mut self) {

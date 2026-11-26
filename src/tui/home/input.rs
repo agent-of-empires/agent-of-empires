@@ -56,9 +56,6 @@ pub(super) fn web_plugin_disabled() -> bool {
         .is_some_and(|p| !p.enabled)
 }
 
-/// Persist the first-run intro picks: theme name to `config.theme.name` and attach mode to
-/// `default_attach_mode`; the telemetry answer goes to the Daemon, which owns consent.
-/// Failures are logged and swallowed so a config write hiccup cannot block startup.
 /// Whether two list rows name the same session, group or Suggested row.
 fn same_row(a: &Item, b: &Item) -> bool {
     match (a, b) {
@@ -80,6 +77,9 @@ fn same_row(a: &Item, b: &Item) -> bool {
     }
 }
 
+/// Persist the first-run intro picks: theme name to `config.theme.name` and attach mode to
+/// `default_attach_mode`; the telemetry answer goes to the Daemon, which owns consent.
+/// Failures are logged and swallowed so a config write hiccup cannot block startup.
 fn apply_intro_outcome(outcome: &IntroOutcome) {
     if let Some(opt_in) = outcome.telemetry_opt_in {
         crate::tui::telemetry::set_consent(opt_in);

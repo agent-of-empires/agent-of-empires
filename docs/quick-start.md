@@ -66,7 +66,7 @@ A **project** is a saved directory path you register once so you can start sessi
 
 A **group** is unrelated: it is a label you assign to existing sessions to sort them in the sidebar, set from the rename dialog or with `aoe group move`. Projects are where sessions start; groups are how they are bucketed once they exist. See [the grouping axes](guides/web/dashboard.md#sidebar-grouping-repo-organization-group-both-or-status).
 
-Rows keep their place when a session needs you. A session needs you when it is Waiting, in Error, flagged urgent, or finished and unread, and each header shows `●N` for those under it. `w` jumps to the next one, or to a session that just finished. **Show only sessions that need you** in the `Ctrl+K` palette hides the rest without reordering the list; the selected session stays listed until you move off it.
+Rows keep their place when a session needs you. A session needs you when it is Waiting, in Error, flagged urgent, or finished and unread, and each header shows `●N` for those under it. `w` jumps to the next one, or to a session that just finished. **Show only sessions that need you** in the `Ctrl+K` palette hides the rest without reordering the list; a session that stops needing you while selected stays listed until you move off it.
 
 ## Worktrees
 

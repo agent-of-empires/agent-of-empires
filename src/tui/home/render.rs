@@ -1678,6 +1678,7 @@ impl HomeView {
 
         let hover_idx = self.hovered_index();
         let favorite_gutter = self.favorite_gutter();
+        let needs_you = self.needs_you_counts();
 
         // --- Workspace list (every row before the shelf) ---
         let list_visible_height = if self.search_bar_visible() {
@@ -1714,13 +1715,14 @@ impl HomeView {
             let is_hovered = !is_selected && Some(abs_idx) == hover_idx;
             let is_match =
                 !self.search_matches.is_empty() && self.search_matches.contains(&abs_idx);
-            let mut line = self.render_item_line(
+            let mut line = self.render_list_line(
                 item,
                 is_selected,
                 is_match,
                 theme,
                 inner.width,
                 favorite_gutter,
+                &needs_you,
             );
             // Selection wins over hover, so the already-selected row under the
             // mouse keeps the brighter selected background.
@@ -1795,13 +1797,14 @@ impl HomeView {
                 let is_hovered = !is_selected && Some(abs_idx) == hover_idx;
                 let is_match =
                     !self.search_matches.is_empty() && self.search_matches.contains(&abs_idx);
-                let mut line = self.render_item_line(
+                let mut line = self.render_list_line(
                     item,
                     is_selected,
                     is_match,
                     theme,
                     inner.width,
                     favorite_gutter,
+                    &needs_you,
                 );
                 if is_selected || is_hovered {
                     let pad = (inner.width as usize).saturating_sub(line.width());
@@ -1930,6 +1933,7 @@ impl HomeView {
                 .any(crate::session::is_live_favorite)
     }
 
+    #[cfg(test)]
     pub(super) fn render_item_line(
         &self,
         item: &Item,
@@ -1938,6 +1942,30 @@ impl HomeView {
         theme: &Theme,
         list_width: u16,
         favorite_gutter: bool,
+    ) -> Line<'static> {
+        let needs_you = self.needs_you_counts();
+        self.render_list_line(
+            item,
+            is_selected,
+            is_match,
+            theme,
+            list_width,
+            favorite_gutter,
+            &needs_you,
+        )
+    }
+
+    /// One list row, with `attention` counted once for the frame.
+    #[allow(clippy::too_many_arguments)]
+    fn render_list_line(
+        &self,
+        item: &Item,
+        is_selected: bool,
+        is_match: bool,
+        theme: &Theme,
+        list_width: u16,
+        favorite_gutter: bool,
+        attention: &super::rows::NeedsYouCounts,
     ) -> Line<'static> {
         let indent = get_indent(item.depth());
 
@@ -1997,7 +2025,7 @@ impl HomeView {
                 {
                     0
                 } else {
-                    self.needs_you_under(path, profile.as_deref())
+                    attention.under(path, profile.as_deref(), self.group_by)
                 };
                 let session_count = if needs_you > 0 {
                     format!("{session_count}) \u{25cf}{needs_you}")
