@@ -3702,6 +3702,10 @@ export const dismissSuggestion = (providerId: string, id: string, dismissed: boo
 export const updateSuggestionSource = (providerId: string, criterion: string, enabled: boolean) =>
   suggestionMutation("/api/suggestions/sources", "PATCH", { provider_id: providerId, criterion, enabled });
 
+/** Turns auto start on for a kind (at most `cap` items per refresh) or off. */
+export const putSuggestionAutoStart = (providerId: string, criterion: string, enabled: boolean, cap?: number) =>
+  suggestionMutation("/api/suggestions/auto-start", "PUT", { provider_id: providerId, criterion, enabled, cap });
+
 /** Resolves the wizard prefill. Creates nothing. */
 export const prepareSuggestion = (providerId: string, id: string) =>
   suggestionRequest<SuggestionPrepared>("/api/suggestions/prepare", "POST", { provider_id: providerId, id });

@@ -623,6 +623,8 @@ export interface SuggestionSource {
   enabled: boolean;
   /** Placeholder names every item of this criterion carries. */
   variables: string[];
+  /** Set when open items of this kind start on their own, at most `cap` per refresh. */
+  auto_start?: { cap: number } | null;
 }
 
 /** How a kind starts a Session. `prompt` is a template with `{variables}` filled from each item; null uses the plugin's own prompt. */
@@ -738,6 +740,8 @@ export interface SuggestionItem {
   stale?: boolean;
   /** The registered Project the item resolves to; the provider's `project` is only a hint. */
   resolved_project?: { name: string; path: string } | null;
+  /** Why auto start left this item alone, or that its start failed. */
+  auto_note?: string;
 }
 
 export interface SuggestionsSnapshot {

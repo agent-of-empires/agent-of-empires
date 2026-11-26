@@ -153,6 +153,51 @@ describe("SuggestionsView", () => {
     expect(prepareSuggestion).not.toHaveBeenCalled();
   });
 
+  it("selected rows start one after another, a failure does not stop the rest, and the toast sums up", async () => {
+    startSuggestion
+      .mockResolvedValueOnce({ kind: "started", sessionId: "s1", title: "Fix lifecycle" })
+      .mockResolvedValueOnce({ kind: "failed", reason: "No sandbox", retryable: true })
+      .mockResolvedValueOnce({ kind: "started", sessionId: "s3", title: "Third" });
+    const [info, infoAction] = [vi.fn(), vi.fn()];
+    toastBus.handler = { push: vi.fn(), error: vi.fn(), info, openLink: vi.fn(), action: vi.fn(), infoAction };
+    await open(
+      snapshot({
+        items: [
+          item,
+          { ...item, id: "issue-2", title: "Second" },
+          { ...item, id: "issue-3", title: "Third" },
+          { ...item, id: "issue-4", title: "Dismissed", dismissed: true },
+        ],
+      }),
+    );
+    await screen.findByRole("checkbox", { name: "Select Third" });
+    expect(screen.queryByRole("button", { name: "Start 1" })).toBeNull();
+    for (const title of ["Fix lifecycle", "Second", "Third"])
+      fireEvent.click(screen.getByRole("checkbox", { name: `Select ${title}` }));
+    fireEvent.click(screen.getByRole("button", { name: "Start 3" }));
+    await waitFor(() => expect(info).toHaveBeenCalledWith("Started 2, 1 could not start (see the rows)."));
+    expect(startSuggestion.mock.calls.map((c) => c[1])).toEqual(["issue-1", "issue-2", "issue-3"]);
+    expect(screen.getByText(/No sandbox/)).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Selected suggestions" })).toBeNull();
+  });
+
+  it("offers no checkboxes when read-only or for a row that cannot start", async () => {
+    await open(snapshot({ items: [item, { ...item, id: "issue-2", title: "Second", stale: true }] }), {
+      readOnly: true,
+    });
+    await screen.findByText("Fix lifecycle");
+    expect(screen.queryAllByRole("checkbox")).toHaveLength(0);
+    cleanup();
+    await open(snapshot({ items: [item, { ...item, id: "issue-2", title: "Second", stale: true }] }));
+    await screen.findByText("Fix lifecycle");
+    expect(screen.getAllByRole("checkbox")).toHaveLength(1);
+  });
+
+  it("an auto start note shows under the row it explains", async () => {
+    await open(snapshot({ items: [{ ...item, auto_note: "Not auto started: its repo is not linked to a project" }] }));
+    expect(await screen.findByText("Not auto started: its repo is not linked to a project")).toBeTruthy();
+  });
+
   it("a started row turns into Open at once, before the reload answers", async () => {
     startSuggestion.mockResolvedValue({ kind: "started", sessionId: "s1", title: "Fix lifecycle" });
     await open(snapshot());

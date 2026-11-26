@@ -13,6 +13,7 @@ import { expandTemplate } from "../../lib/suggestionTemplate";
 import { TemplateEditor } from "./TemplateEditor";
 import { SuggestionSwitch } from "./suggestionsShared";
 import { BUTTON_INLINE } from "../../lib/surfaces";
+import { SuggestionAutoStart } from "./SuggestionAutoStart";
 
 /** The Back button mounts once the draft is there, so focus follows the open. */
 const focusOnMount = (el: HTMLElement | null) => el?.focus();
@@ -223,6 +224,13 @@ export function SuggestionPresetEditor({ provider, source, entry, item, disabled
           {preview}
         </p>
       </div>
+      <SuggestionAutoStart
+        provider={provider}
+        source={source}
+        yolo={stored?.yolo ?? draft.yolo}
+        disabled={disabled}
+        onChanged={onSaved}
+      />
       <div className="flex items-center gap-2">
         <button type="button" className={GHOST} disabled={off || !entry?.customized} onClick={() => void reset()}>
           Reset to {provider.name}&apos;s settings

@@ -16,6 +16,7 @@ const api = vi.hoisted(() => ({
   updateSuggestionPrefs: vi.fn(),
   updateSuggestionSource: vi.fn(),
   putSuggestionPreset: vi.fn(),
+  putSuggestionAutoStart: vi.fn(),
   resetSuggestionPreset: vi.fn(),
   fetchSuggestionMappings: vi.fn(),
   putSuggestionMapping: vi.fn(),
@@ -272,6 +273,44 @@ describe("SuggestionsSettings", () => {
         expect.objectContaining({ prompt: multi }),
       ),
     );
+  });
+
+  it("auto start is off until confirmed, says who wrote the text, and mentions yolo only when the preset has it", async () => {
+    api.putSuggestionAutoStart.mockResolvedValue(ok);
+    for (const yolo of [false, true]) {
+      cleanup();
+      api.putSuggestionAutoStart.mockClear();
+      open({ presets: [{ ...PRESETS[0]!, preset: { ...PRESET, yolo } }, PRESETS[1]!] });
+      fireEvent.click(await screen.findByRole("button", { name: "Edit Review requests" }));
+      const toggle = await screen.findByRole("switch", { name: "Auto start" });
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+      fireEvent.click(toggle);
+      // Nothing is saved before the warning is accepted.
+      const dialog = screen.getByRole("alertdialog", { name: "Turn on auto start" });
+      expect(api.putSuggestionAutoStart).not.toHaveBeenCalled();
+      expect(dialog.textContent).toContain("launches an agent on text written by others (issue and PR content)");
+      expect(dialog.textContent).toContain("no human check");
+      expect(/YOLO mode/.test(dialog.textContent ?? "")).toBe(yolo);
+      fireEvent.change(within(dialog).getByLabelText("Auto start limit per refresh"), { target: { value: "5" } });
+      fireEvent.click(within(dialog).getByRole("button", { name: "Turn on auto start" }));
+      await waitFor(() => expect(api.putSuggestionAutoStart).toHaveBeenCalledWith("gh", "review-requested", true, 5));
+    }
+  });
+
+  it("a kind with auto start on shows its limit and turns off at once", async () => {
+    api.putSuggestionAutoStart.mockResolvedValue(ok);
+    const snap = snapshot();
+    snap.providers[0]!.sources[0]!.auto_start = { cap: 3 };
+    api.fetchSuggestions.mockResolvedValue(snap);
+    api.fetchSuggestionPresets.mockResolvedValue(PRESETS);
+    api.fetchAgents.mockResolvedValue([]);
+    render(<Harness readOnly={false} onOpenSuggestions={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Edit Review requests" }));
+    const toggle = await screen.findByRole("switch", { name: "Auto start" });
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    expect((screen.getByLabelText("Auto start limit per refresh") as HTMLSelectElement).value).toBe("3");
+    fireEvent.click(toggle);
+    await waitFor(() => expect(api.putSuggestionAutoStart).toHaveBeenCalledWith("gh", "review-requested", false, 3));
   });
 
   it("a preset with no prompt uses the plugin's, and typing one replaces it", async () => {

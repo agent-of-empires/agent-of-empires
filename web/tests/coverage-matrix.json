@@ -1159,7 +1159,7 @@
         "web/src/components/session-wizard/HooksTrustDialog.tsx",
         "web/src/components/SuggestionMappingWizard.tsx"
       ],
-      "notes": "A second Start with changes does not swap an open New session dialog's suggestion link. Start in… and the pre-trust note keep focus where the user moved it while a result was pending. A stalled mapping save times out, says it may have saved, and the wizard reloads what stuck."
+      "notes": "A second Start with changes does not swap an open New session dialog's suggestion link. Start in… and the pre-trust note keep focus where the user moved it while a result was pending. A stalled mapping save times out, says it may have saved, and the wizard reloads what stuck. Selected rows start one after another and a failure does not stop the rest (SuggestionsView.test.tsx)."
     },
     {
       "id": "sidebar.suggested",
@@ -1217,13 +1217,14 @@
         "web/src/components/settings/SuggestionsSettings.tsx",
         "web/src/components/settings/PluginSettingsSections.tsx",
         "web/src/components/settings/SuggestionPresetEditor.tsx",
+        "web/src/components/settings/SuggestionAutoStart.tsx",
         "web/src/components/settings/SuggestionLinkedRepos.tsx",
         "web/src/components/settings/TemplateEditor.tsx",
         "web/src/components/settings/suggestionsShared.tsx",
         "web/src/components/settings/useSuggestionsSnapshot.ts",
         "web/src/lib/suggestionTemplate.ts"
       ],
-      "notes": "Each kind opens its own preset editor, and a save that lands after leaving it does not close the next. Opening the editor or Linked repos moves focus into it, and going back returns focus to the Edit button that opened it."
+      "notes": "Each kind opens its own preset editor, and a save that lands after leaving it does not close the next. Auto start is off until the warning about running an agent on other people's text is accepted. Opening the editor or Linked repos moves focus into it, and going back returns focus to the Edit button that opened it."
     },
     {
       "id": "settings.advanced-fold",

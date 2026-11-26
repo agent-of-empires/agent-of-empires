@@ -56,6 +56,8 @@ interface RowProps {
   failure?: { reason: string; hint?: string };
   /** Under the reason line, e.g. why a started Session's prompt was not typed. */
   note?: ReactNode;
+  /** A checkbox ahead of the row, for starting several suggestions at once. */
+  select?: { checked: boolean; onChange: (checked: boolean) => void; label: string };
   actions: ReactNode;
 }
 
@@ -89,6 +91,7 @@ export function SuggestionRow({
   stale,
   failure,
   note,
+  select,
   actions,
 }: RowProps) {
   return (
@@ -98,6 +101,15 @@ export function SuggestionRow({
         failure ? "flex-wrap bg-status-error/[0.07] md:flex-nowrap" : ""
       }`}
     >
+      {select && (
+        <input
+          type="checkbox"
+          aria-label={select.label}
+          checked={select.checked}
+          onChange={(e) => select.onChange(e.target.checked)}
+          className="h-4 w-4 flex-none cursor-pointer accent-brand-500"
+        />
+      )}
       <div className={`min-w-0 flex-1 ${failure ? "max-md:basis-full" : ""}`}>
         {sourceRef && <SourceRef value={sourceRef} />}
         <div className={inlineRef !== undefined ? "md:flex md:items-baseline md:gap-3" : ""}>

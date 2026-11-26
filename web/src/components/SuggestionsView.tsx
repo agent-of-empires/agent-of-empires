@@ -101,6 +101,8 @@ export function SuggestionsView({
   const [keyChips, setKeyChips] = useState<KeyChip[]>([]);
   const [kinds, setKinds] = useState<string[]>([]);
   const [collapsed, setCollapsed] = useState<string[]>([]);
+  const [selected, setSelected] = useState<string[]>([]);
+  const [batching, setBatching] = useState(false);
 
   // A source chip belongs to the list it was picked in, so it does not outlive a tab change.
   const changeFilter = (next: Filter) => {
@@ -139,6 +141,19 @@ export function SuggestionsView({
   const allOff = !!snapshot && snapshot.providers.length > 0 && providers.length === 0;
   const anyRefreshing = refreshing || providers.some((p) => p.refreshing);
   const groups = groupByRepo(visible);
+  // What Start would act on: not dismissed, closed or already started.
+  const startable = (i: SuggestionItem) => !i.dismissed && !i.stale && !i.started_session;
+  const canSelect = !readOnly && !offline;
+  const chosen = visible.filter((i) => startable(i) && selected.includes(suggestionKey(i)));
+  const allChosen = visible.filter(startable).length > 0 && visible.filter(startable).every((i) => chosen.includes(i));
+  const toggleSelected = (key: string, on: boolean) =>
+    setSelected((c) => (on ? (c.includes(key) ? c : [...c, key]) : c.filter((k) => k !== key)));
+  const startChosen = async () => {
+    setBatching(true);
+    setSelected([]);
+    await ctrl.startMany(chosen);
+    setBatching(false);
+  };
   const kindOptions = providers.flatMap((p) =>
     p.sources
       .map((src) => ({ id: kindId({ provider_id: p.id, criterion: src.criterion }), label: src.label }))
@@ -350,6 +365,20 @@ export function SuggestionsView({
                 </button>
               )}
             </div>
+            {canSelect && visible.filter(startable).length > 1 && (
+              <label className="flex items-center gap-2 text-xs text-text-secondary">
+                <input
+                  type="checkbox"
+                  aria-label="Select all shown"
+                  checked={allChosen}
+                  onChange={(e) =>
+                    setSelected(e.target.checked ? visible.filter(startable).map((i) => suggestionKey(i)) : [])
+                  }
+                  className="h-4 w-4 cursor-pointer accent-brand-500"
+                />
+                Select all shown
+              </label>
+            )}
             {(providers.length > 1 || dismissedCount > 0 || showDismissed) && (
               <div className="flex gap-2 overflow-x-auto" role="group" aria-label="Filter suggestions">
                 {providers.length > 1 && (
@@ -432,12 +461,26 @@ export function SuggestionsView({
                             session={liveSession(item.started_session, sessions)}
                             stale={item.stale}
                             failure={failures[key]}
+                            select={
+                              canSelect && startable(item)
+                                ? {
+                                    checked: selected.includes(key),
+                                    onChange: (on) => toggleSelected(key, on),
+                                    label: `Select ${item.title}`,
+                                  }
+                                : undefined
+                            }
                             note={
-                              <StartedPromptNote
-                                session={liveSession(item.started_session, sessions)}
-                                onTryAgain={() => ctrl.retryBlocked(item)}
-                                disabled={disabled}
-                              />
+                              <>
+                                <StartedPromptNote
+                                  session={liveSession(item.started_session, sessions)}
+                                  onTryAgain={() => ctrl.retryBlocked(item)}
+                                  disabled={disabled}
+                                />
+                                {item.auto_note && !item.started_session && (
+                                  <p className="mt-0.5 break-words text-xs text-text-dim">{item.auto_note}</p>
+                                )}
+                              </>
                             }
                             actions={
                               <SuggestionItemActions
@@ -499,6 +542,30 @@ export function SuggestionsView({
                   ))}
               <SuggestionStatusNotes readOnly={readOnly} offline={offline} cityhall={cityhall} />
             </ul>
+            {chosen.length > 0 && (
+              <div
+                role="region"
+                aria-label="Selected suggestions"
+                className="sticky bottom-3 mt-4 flex items-center gap-2 rounded-lg border border-surface-700 bg-surface-800 px-3 py-2 shadow-lg"
+              >
+                <span className="flex-1 text-sm text-text-primary">{chosen.length} selected</span>
+                <button
+                  type="button"
+                  onClick={() => setSelected([])}
+                  className="inline-flex h-8 items-center rounded-md px-3 text-xs text-text-secondary hover:bg-surface-700/50"
+                >
+                  Clear
+                </button>
+                <button
+                  type="button"
+                  disabled={batching || disabled}
+                  onClick={() => void startChosen()}
+                  className="inline-flex h-8 items-center rounded-md bg-brand-600 px-3 text-xs font-medium text-white hover:bg-brand-500 disabled:opacity-50"
+                >
+                  {batching ? "Starting…" : `Start ${chosen.length}`}
+                </button>
+              </div>
+            )}
             {undo && (
               <UndoBar
                 // A new dismissal gets a fresh bar, not the last one's Stop state.
