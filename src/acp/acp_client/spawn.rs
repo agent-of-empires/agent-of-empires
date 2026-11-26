@@ -21,7 +21,7 @@ pub enum ProxyFailurePolicy {
 }
 
 /// A plugin-supplied process that sits between the runner and the adapter.
-/// The runner launches `command args... -- <adapter argv>`; `SpawnConfig::spec`
+/// The runner launches `command args... <adapter argv>`; `SpawnConfig::spec`
 /// stays the adapter.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProxySpec {
