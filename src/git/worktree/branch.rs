@@ -326,6 +326,14 @@ impl GitWorktree {
         Ok(None)
     }
 
+    /// The checkout holding `branch` when it still exists on disk. A stale
+    /// entry whose checkout is gone is `None`; `delete_branch` reaps those.
+    pub(crate) fn live_checkout_for_branch(&self, branch: &str) -> Result<Option<PathBuf>> {
+        Ok(self
+            .worktree_path_for_branch(branch)?
+            .filter(|path| matches!(path.try_exists(), Ok(true))))
+    }
+
     /// Unlock and prune the one entry git ties to the branch being deleted.
     /// Git allows one worktree per branch, so this never reaches another live
     /// session's worktree (the over-reap #2414's lock prevents).
@@ -714,5 +722,38 @@ mod tests {
         assert!(!checkout_confirmed_absent(Err(Error::from(
             ErrorKind::PermissionDenied
         ))));
+    }
+
+    #[test]
+    fn live_checkout_for_branch_ignores_vanished_and_absent() {
+        let (dir, _repo) = init_repo();
+        let main = dir.path();
+        let git = GitWorktree::new(main.to_path_buf()).unwrap();
+
+        let live = main.join("wt-live");
+        run_git(
+            main,
+            &["worktree", "add", "-b", "live", live.to_str().unwrap()],
+        );
+        let gone = main.join("wt-gone");
+        run_git(
+            main,
+            &["worktree", "add", "-b", "gone", gone.to_str().unwrap()],
+        );
+        git.lock_worktree(&gone).unwrap();
+        std::fs::remove_dir_all(&gone).unwrap();
+
+        for (branch, held) in [("live", true), ("gone", false), ("absent", false)] {
+            let found = git.live_checkout_for_branch(branch).unwrap();
+            assert_eq!(found.is_some(), held, "{branch}");
+        }
+        assert_eq!(
+            git.live_checkout_for_branch("live")
+                .unwrap()
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            live.canonicalize().unwrap()
+        );
     }
 }
