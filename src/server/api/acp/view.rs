@@ -6,6 +6,7 @@ use crate::acp::protocol::{
     ContainerState, TerminalCheckResponse, TerminalContext, TerminalConversation,
     TerminalSwitchReason, TerminalSwitchRequest,
 };
+use crate::acp::state::StartupCause;
 use crate::server::api::{find_instance, instance_exists};
 use crate::session::{Held, Instance, ResumeIntent, SessionStore, Status, Unserved, View};
 
@@ -418,11 +419,23 @@ fn spawn_enabled_worker(
         {
             None => return,
             Some(Ok(request)) => request,
-            Some(Err(message)) => {
+            Some(Err(EnableFailure::LoginRequired(blocked))) => {
+                publish_login_required_if_current(
+                    &state,
+                    &session_id,
+                    &expected.source_profile,
+                    expected.lifecycle_generation,
+                    &blocked,
+                )
+                .await;
+                return;
+            }
+            Some(Err(EnableFailure::Other { message, cause })) => {
                 tracing::warn!(target: "acp.switch", session = %session_id, %message,
                     "deferred structured launch failed");
-                publish_startup_error_if_current(&state, &session_id, &expected.source_profile,
-                    expected.lifecycle_generation, message).await;
+                publish_startup_error_with_cause_if_current(&state, &session_id,
+                    &expected.source_profile, expected.lifecycle_generation, message, cause)
+                    .await;
                 return;
             }
         };
@@ -439,6 +452,17 @@ fn spawn_enabled_worker(
     });
 }
 
+/// Why an enable could not build its spawn request: the launch waits for the sandbox login,
+/// or another failure with its diagnosed cause, if any.
+#[derive(Debug)]
+enum EnableFailure {
+    LoginRequired(crate::session::SandboxLoginRequired),
+    Other {
+        message: String,
+        cause: Option<StartupCause>,
+    },
+}
+
 /// Built from the live row under the transition lock, since a provider switch
 /// may commit while the enable waits. `None` once the session left the
 /// structured view.
@@ -449,7 +473,7 @@ async fn deferred_enable_request(
     selected_conversation: Option<(String, crate::session::ExecutionBinding)>,
     import_terminal: bool,
     exclusion: crate::acp::sandbox::LaunchExclusion,
-) -> Option<Result<(SpawnRequest, crate::acp::supervisor::ResumeReservation), String>> {
+) -> Option<Result<(SpawnRequest, crate::acp::supervisor::ResumeReservation), EnableFailure>> {
     let session_id = expected.id.as_str();
     let instance = find_instance(state, session_id).await.filter(|row| {
         row.is_structured()
@@ -466,7 +490,12 @@ async fn deferred_enable_request(
     );
     let (native, exclusion) = match launch_store_for(state, &instance, exclusion).await {
         Ok(store) => store,
-        Err(_) => return Some(Err("session source unavailable".to_owned())),
+        Err(_) => {
+            return Some(Err(EnableFailure::Other {
+                message: "session source unavailable".to_owned(),
+                cause: None,
+            }))
+        }
     };
     let exclusion = match crate::acp::sandbox::admit_sandbox_launch(
         native.clone(),
@@ -485,9 +514,12 @@ async fn deferred_enable_request(
                     crate::server::sandbox_login::LaunchOrigin::Interactive,
                     login,
                 );
-                return Some(Err(login.to_string()));
+                return Some(Err(EnableFailure::LoginRequired(login.clone())));
             }
-            return Some(Err(format!("container start failed: {error}")));
+            return Some(Err(EnableFailure::Other {
+                message: format!("container start failed: {error}"),
+                cause: crate::session::SandboxLoginUnsupported::cause_of(&error),
+            }));
         }
     };
     let mut reservation = match state
@@ -504,7 +536,12 @@ async fn deferred_enable_request(
         .await
     {
         Ok(reservation) => reservation,
-        Err(error) => return Some(Err(error.to_string())),
+        Err(error) => {
+            return Some(Err(EnableFailure::Other {
+                message: error.to_string(),
+                cause: None,
+            }))
+        }
     };
     let mut admission = crate::acp::supervisor::LaunchAdmission {
         establishment: reservation.establishment.clone(),
@@ -518,7 +555,12 @@ async fn deferred_enable_request(
         .await
     {
         Ok(row) => row,
-        Err(error) => return Some(Err(error.to_string())),
+        Err(error) => {
+            return Some(Err(EnableFailure::Other {
+                message: error.to_string(),
+                cause: None,
+            }));
+        }
     };
     let (sandbox_info, exclusion) =
         match crate::acp::sandbox::ensure_container_for_session_with_request_env(
@@ -533,7 +575,10 @@ async fn deferred_enable_request(
             Ok(info) => info,
             Err(e) => {
                 tracing::warn!(target: "acp.switch", session = %session_id, "container ensure failed: {e}");
-                return Some(Err(format!("container start failed: {e}")));
+                return Some(Err(EnableFailure::Other {
+                    message: format!("container start failed: {e}"),
+                    cause: crate::session::SandboxLoginUnsupported::cause_of(&e),
+                }));
             }
         };
     drop(exclusion);
@@ -2287,6 +2332,21 @@ pub(crate) async fn publish_startup_error_if_current(
     generation: u64,
     message: String,
 ) -> bool {
+    publish_startup_error_with_cause_if_current(
+        state, session_id, profile, generation, message, None,
+    )
+    .await
+}
+
+/// As [`publish_startup_error_if_current`], naming the cause for clients that act on it.
+pub(crate) async fn publish_startup_error_with_cause_if_current(
+    state: &Arc<AppState>,
+    session_id: &str,
+    profile: &str,
+    generation: u64,
+    message: String,
+    cause: Option<StartupCause>,
+) -> bool {
     let _namespace = state.profile_namespace.read().await;
     let _instance = state.instance_lock(session_id).await.lock_owned().await;
     if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
@@ -2302,9 +2362,29 @@ pub(crate) async fn publish_startup_error_if_current(
     if current {
         state
             .acp_supervisor
-            .publish_startup_error(session_id, message);
+            .publish_startup_error_with_cause(session_id, message, cause);
     }
     current
+}
+
+/// The startup error of a launch held for the sandbox login, published only while that
+/// launch is still the session's current one.
+pub(crate) async fn publish_login_required_if_current(
+    state: &Arc<AppState>,
+    session_id: &str,
+    profile: &str,
+    generation: u64,
+    blocked: &crate::session::SandboxLoginRequired,
+) -> bool {
+    publish_startup_error_with_cause_if_current(
+        state,
+        session_id,
+        profile,
+        generation,
+        blocked.to_string(),
+        Some(blocked.startup_cause()),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -4801,6 +4881,52 @@ mod tests {
         }
     }
 
+    /// The login-required error of a launch that a newer launch or a stop has superseded is
+    /// dropped, as every other startup error of the launch is.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_login_required_error_of_a_superseded_launch_is_not_published() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = Instance::new("claude", "/tmp/aoe-login-required-stale");
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = "default".into();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let blocked = crate::session::test_support::login_required("claude");
+        let events = || {
+            state
+                .acp_event_store
+                .replay_from(&inst.id, 0)
+                .unwrap()
+                .len()
+        };
+
+        assert!(
+            !publish_login_required_if_current(
+                &state,
+                &inst.id,
+                &inst.source_profile,
+                inst.lifecycle_generation + 1,
+                &blocked,
+            )
+            .await
+        );
+        assert_eq!(events(), 0);
+
+        assert!(
+            publish_login_required_if_current(
+                &state,
+                &inst.id,
+                &inst.source_profile,
+                inst.lifecycle_generation,
+                &blocked,
+            )
+            .await
+        );
+        assert_eq!(events(), 1);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial]
@@ -4840,7 +4966,7 @@ mod tests {
                 .await
                 .unwrap();
 
-        let message = match deferred_enable_request(
+        let blocked = match deferred_enable_request(
             &state,
             &inst,
             "claude".to_string(),
@@ -4850,15 +4976,19 @@ mod tests {
         )
         .await
         {
-            Some(Err(message)) => message,
+            Some(Err(EnableFailure::LoginRequired(blocked))) => blocked,
             other => panic!(
-                "expected a startup error, got {:?}",
+                "expected the login to be required, got {:?}",
                 other.map(|r| r.is_ok())
             ),
         };
         assert_eq!(
-            message,
+            blocked.to_string(),
             crate::session::test_support::login_required("claude").to_string()
+        );
+        assert_eq!(
+            (blocked.command, blocked.profile),
+            (None, Some(crate::session::config::effective_profile("")))
         );
         assert_eq!(
             login.held_origin(&id),
@@ -4869,6 +4999,57 @@ mod tests {
             notices.try_recv().is_err(),
             "no push for an interactive hold"
         );
+    }
+
+    /// Apple Container cannot run the login: a view switch is refused with the setting's
+    /// message and its own code, and nothing is held for a login that cannot happen.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_unsupported_enable_publishes_the_refusal_with_its_code() {
+        let app_dir = crate::session::test_support::isolate_app_dir();
+        let (_runtime, _calls) =
+            crate::session::test_support::failing_container_runtime(app_dir.path());
+        let mut inst = Instance::new("claude", "/tmp/aoe-login-unsupported-enable");
+        inst.view = crate::session::View::Structured;
+        crate::session::test_support::sandbox_needing_login(app_dir.path(), &mut inst);
+        crate::session::config::update_config(|c| {
+            c.sandbox.container_runtime =
+                crate::session::config::ContainerRuntimeName::AppleContainer;
+        })
+        .unwrap();
+        inst.source_profile = "default".into();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let exclusion =
+            crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &inst.id, true)
+                .await
+                .unwrap();
+
+        let (message, cause) = match deferred_enable_request(
+            &state,
+            &inst,
+            "claude".to_string(),
+            None,
+            false,
+            exclusion,
+        )
+        .await
+        {
+            Some(Err(EnableFailure::Other { message, cause })) => (message, cause),
+            other => panic!(
+                "expected a startup error, got {:?}",
+                other.map(|r| r.is_ok())
+            ),
+        };
+        assert!(
+            message.contains(&crate::session::SandboxLoginUnsupported.to_string()),
+            "{message}"
+        );
+        assert_eq!(cause, Some(StartupCause::SandboxLoginUnsupported));
+        assert!(!state.session_service.sandbox_login.is_held(&id));
     }
 
     /// An enable queued behind the transition lock must spawn on a provider

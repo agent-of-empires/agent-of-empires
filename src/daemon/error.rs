@@ -38,6 +38,9 @@ pub enum ApiErrorCode {
     CreationNotPending,
     CreateHookFailed,
     CreateOutcomeUnknown,
+    FavoriteSelectionRefused,
+    FavoriteNamespaceBusy,
+    OutcomeUnconfirmed,
     /// The project path is not a directory on the Daemon host.
     WorkingDirMissing,
     /// A worktree checkout named a branch that exists neither locally nor on a remote.
@@ -87,6 +90,9 @@ impl ApiErrorCode {
             Self::CreationNotPending => "creation_not_pending",
             Self::CreateHookFailed => "create_hook_failed",
             Self::CreateOutcomeUnknown => "create_outcome_unknown",
+            Self::FavoriteSelectionRefused => "favorite_selection_refused",
+            Self::FavoriteNamespaceBusy => "favorite_namespace_busy",
+            Self::OutcomeUnconfirmed => "outcome_unconfirmed",
             Self::WorkingDirMissing => "working_dir_missing",
             Self::BranchNotFound => "branch_not_found",
             Self::AgentHooksNotApproved => "agent_hooks_not_approved",
@@ -116,6 +122,7 @@ impl ApiErrorCode {
             | Self::LifecycleSuperseded
             | Self::ProfileMismatch
             | Self::RuntimeEpochMismatch
+            | Self::FavoriteNamespaceBusy
             | Self::ResumeFailed
             | Self::LaunchIndeterminate
             | Self::ManagedResumeRefused(_)
@@ -145,6 +152,8 @@ impl ApiErrorCode {
             Self::SmartRenameFailed | Self::PluginPreviewFailed => StatusCode::BAD_GATEWAY,
             Self::SmartRenameTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::StartFailed | Self::SandboxMigrationFailed => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::FavoriteSelectionRefused => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::OutcomeUnconfirmed => StatusCode::SERVICE_UNAVAILABLE,
             Self::TerminalSwitchRefused(
                 TerminalSwitchReason::HandoffPending | TerminalSwitchReason::ContextUnconfirmed,
             ) => StatusCode::SERVICE_UNAVAILABLE,
@@ -196,6 +205,9 @@ impl ApiErrorCode {
             b"tls_required" => Self::TlsRequired,
             b"runtime_epoch_mismatch" => Self::RuntimeEpochMismatch,
             b"create_outcome_unknown" => Self::CreateOutcomeUnknown,
+            b"favorite_selection_refused" => Self::FavoriteSelectionRefused,
+            b"favorite_namespace_busy" => Self::FavoriteNamespaceBusy,
+            b"outcome_unconfirmed" => Self::OutcomeUnconfirmed,
             b"agent_hooks_not_approved" => Self::AgentHooksNotApproved,
             b"resume_failed" => Self::ResumeFailed,
             b"launch_indeterminate" => Self::LaunchIndeterminate,

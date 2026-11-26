@@ -213,10 +213,6 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(api::recreate_container).layer(read_only.clone()),
         )
         .route(
-            "/api/sessions/{id}/restart-for-update",
-            post(api::restart_for_update).layer(read_only.clone()),
-        )
-        .route(
             "/api/sessions/{id}/terminal",
             post(api::ensure_terminal).delete(api::kill_terminal),
         )
@@ -421,6 +417,30 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/sandbox/volume-ignores-preview",
             get(api::preview_volume_ignores_globs),
+        )
+        .route(
+            "/api/sandbox/login",
+            get(api::get_sandbox_login)
+                .post(api::start_sandbox_login)
+                .delete(api::leave_sandbox_login)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    api::SANDBOX_LOGIN_CODE_BODY_LIMIT,
+                ))
+                .layer(read_only.clone()),
+        )
+        .route(
+            "/api/sandbox/login/{login_id}",
+            get(api::get_sandbox_login_outcome)
+                .delete(api::cancel_sandbox_login)
+                .layer(read_only.clone()),
+        )
+        .route(
+            "/api/sandbox/login/{login_id}/code",
+            post(api::submit_sandbox_login_code)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    api::SANDBOX_LOGIN_CODE_BODY_LIMIT,
+                ))
+                .layer(read_only.clone()),
         )
         .route("/api/themes", get(api::list_themes))
         .route("/api/themes/{name}", get(api::get_resolved_theme))
