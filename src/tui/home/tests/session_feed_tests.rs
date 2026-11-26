@@ -4188,3 +4188,63 @@ fn a_sidebar_pick_is_not_sent_once_mutations_are_revoked() {
     assert!(!env.view.session_feed.sidebar_view_pending());
     assert_eq!(env.view.group_by, GroupByMode::Group);
 }
+
+/// A pick queued behind a write in flight stays bound to the lease it was admitted under, so
+/// a revoke and regrant before the write settles drops it instead of sending it.
+#[test]
+#[serial]
+fn a_queued_sidebar_pick_is_dropped_when_the_grant_changes() {
+    use crate::session::config::{GroupByMode, SortOrder};
+    let mut env = create_test_env_empty();
+    let mut reply = env.view.session_feed.sidebar_view_driver_for_test();
+    env.view.apply_group_by(GroupByMode::Group);
+    env.view.apply_sort_order(SortOrder::Name);
+    env.view
+        .session_feed
+        .set_mutation_permission_for_test(false);
+    env.view.session_feed.set_mutation_permission_for_test(true);
+    assert!(reply(Err("disk full".into())).is_some());
+    env.view.apply_session_feed();
+    assert!(!env.view.session_feed.sidebar_view_pending());
+    assert!(
+        reply(Err("unused".into())).is_none(),
+        "the stale pick is not sent"
+    );
+    let status = env.view.status_flash.as_ref().map(|f| f.text.as_str());
+    assert!(
+        status.is_some_and(|text| text.contains("connection changed")),
+        "{status:?}"
+    );
+}
+
+/// A write that closes before any snapshot is applied forgets the baseline, so the Daemon's
+/// next value is adopted even when it repeats the one seen before the pick.
+#[test]
+#[serial]
+fn a_sidebar_write_closed_before_a_snapshot_adopts_the_next_one() {
+    use crate::session::config::{GroupByMode, SidebarView, SortOrder};
+    let mut env = create_test_env_empty();
+    let before = SidebarView {
+        group_by: GroupByMode::Project,
+        sort: SortOrder::Custom,
+    };
+    env.view.observed_sidebar_view = Some(before);
+    let reply = env.view.session_feed.sidebar_view_driver_for_test();
+    env.view.apply_group_by(GroupByMode::Group);
+    env.view.session_feed.forget_applied_for_test();
+    drop(reply);
+    env.view.apply_session_feed();
+    assert!(!env.view.session_feed.sidebar_view_pending());
+    assert_eq!(env.view.observed_sidebar_view, None);
+
+    let id = structured_row(&mut env, Status::Idle);
+    let SessionFeedResult::Snapshot(mut snapshot) = daemon_snapshot(&env.view, &id, "Idle") else {
+        unreachable!()
+    };
+    Arc::make_mut(&mut snapshot).contents.sidebar_view = before;
+    env.view
+        .session_feed
+        .publish_for_test(SessionFeedResult::Snapshot(snapshot));
+    env.view.apply_session_feed();
+    assert_eq!(env.view.group_by, GroupByMode::Project);
+}

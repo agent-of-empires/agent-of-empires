@@ -268,6 +268,13 @@ enum CommandRequest {
     SidebarView(crate::daemon::SidebarViewPatch),
 }
 
+/// A pick queued behind the write in flight, bound to the lease it was admitted under.
+struct QueuedSidebarView {
+    patch: crate::daemon::SidebarViewPatch,
+    grant: Arc<AtomicU64>,
+    lease: u64,
+}
+
 enum PendingSidebarView {
     Sent(tokio::sync::oneshot::Receiver<Result<CommandReply, CommandFailure>>),
     Committed(RuntimeCursor),
@@ -795,7 +802,7 @@ pub struct SessionFeed {
     pending_sidebar_view: Option<PendingSidebarView>,
     /// Picks made while a sidebar view write is in flight, sent once it settles so its
     /// outcome is still reported.
-    queued_sidebar_view: Option<crate::daemon::SidebarViewPatch>,
+    queued_sidebar_view: Option<QueuedSidebarView>,
     namespace_quarantined: bool,
     row_outcomes: Vec<(String, SessionCommandOutcome)>,
     bulk_queue: VecDeque<(String, SessionRequest)>,
@@ -1167,18 +1174,38 @@ impl SessionFeed {
         &mut self,
         patch: crate::daemon::SidebarViewPatch,
     ) -> anyhow::Result<()> {
-        if self.pending_sidebar_view.is_some() {
-            let queued = self.queued_sidebar_view.get_or_insert_default();
-            queued.group_by = patch.group_by.or(queued.group_by);
-            queued.sort = patch.sort.or(queued.sort);
-            return Ok(());
+        anyhow::ensure!(self.commands.is_some(), "the Daemon is not connected");
+        let lease = self.grant.load(Ordering::SeqCst);
+        anyhow::ensure!(lease & 1 == 1, "the Daemon is read-only or unhealthy");
+        if self.pending_sidebar_view.is_none() {
+            return self.send_sidebar_view(patch, lease);
         }
+        // A pick admitted under an earlier lease is stale; this one replaces it.
+        let queued = self
+            .queued_sidebar_view
+            .take()
+            .filter(|queued| Arc::ptr_eq(&queued.grant, &self.grant) && queued.lease == lease)
+            .map_or_else(Default::default, |queued| queued.patch);
+        self.queued_sidebar_view = Some(QueuedSidebarView {
+            patch: crate::daemon::SidebarViewPatch {
+                group_by: patch.group_by.or(queued.group_by),
+                sort: patch.sort.or(queued.sort),
+            },
+            grant: self.grant.clone(),
+            lease,
+        });
+        Ok(())
+    }
+
+    fn send_sidebar_view(
+        &mut self,
+        patch: crate::daemon::SidebarViewPatch,
+        lease: u64,
+    ) -> anyhow::Result<()> {
         let commands = self
             .commands
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("the Daemon is not connected"))?;
-        let lease = self.grant.load(Ordering::SeqCst);
-        anyhow::ensure!(lease & 1 == 1, "the Daemon is read-only or unhealthy");
         let (result, receiver) = tokio::sync::oneshot::channel();
         commands
             .try_send(SessionCommand {
@@ -1204,7 +1231,16 @@ impl SessionFeed {
         let Some(queued) = self.queued_sidebar_view.take() else {
             return Some(result);
         };
-        match (result, self.submit_sidebar_view(queued)) {
+        let sent = if Arc::ptr_eq(&queued.grant, &self.grant)
+            && self.grant.load(Ordering::SeqCst) == queued.lease
+        {
+            self.send_sidebar_view(queued.patch, queued.lease)
+        } else {
+            Err(anyhow::anyhow!(
+                "the Daemon connection changed before the pick was sent"
+            ))
+        };
+        match (result, sent) {
             (result, Ok(())) => Some(result),
             (Ok(()), Err(error)) => Some(Err(error.to_string())),
             (Err(failure), Err(error)) => Some(Err(format!("{failure}; {error}"))),
@@ -2478,6 +2514,13 @@ impl SessionFeed {
         self.applied
             .as_ref()
             .map_or(2, |snapshot| snapshot.cursor.revision + 1)
+    }
+
+    /// What a reconnect leaves behind: no applied snapshot until the new connection's first.
+    #[cfg(test)]
+    pub(crate) fn forget_applied_for_test(&mut self) {
+        (self.sender, self.receiver) = tokio::sync::watch::channel(None);
+        self.applied = None;
     }
 
     #[cfg(test)]

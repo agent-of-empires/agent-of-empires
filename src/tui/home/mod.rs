@@ -298,8 +298,9 @@ pub struct HomeView {
     /// The runtime publishes a merged view of it (unknown workspaces
     /// appended), so this is what detects a peer's reorder.
     observed_workspace_ordering: Vec<String>,
-    /// The Daemon's grouping and sort as of the last applied snapshot.
-    observed_sidebar_view: Option<crate::session::config::SidebarView>,
+    /// The Daemon's grouping and sort as of the last applied snapshot. Cleared on reconnect,
+    /// so the new connection's first value is adopted.
+    pub(in crate::tui) observed_sidebar_view: Option<crate::session::config::SidebarView>,
     session_feed_reload_retry_at: Option<std::time::Instant>,
     session_feed_failed_cursor: Option<crate::daemon::RuntimeCursor>,
     canonical_metadata_lag: Option<CanonicalMetadataLagState>,
