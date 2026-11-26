@@ -24,7 +24,7 @@
 //!   3. the fork's one-shot `fork_pending` marker is cleared after the child id
 //!      lands.
 //!
-//! The API also reports that resuming the parent remains indeterminate:
+//! The API also reports that resuming the stopped parent is indeterminate:
 //! negotiating `loadSession` does not prove that a later worker can load that
 //! specific conversation.
 //!
@@ -186,46 +186,9 @@ fn structured_fork_mints_distinct_child_id_and_preserves_parent() {
         String::from_utf8_lossy(&add.stdout),
         String::from_utf8_lossy(&add.stderr),
     );
-    let _parent_session_id = parse_session_id(&String::from_utf8_lossy(&add.stdout));
+    let parent_session_id = parse_session_id(&String::from_utf8_lossy(&add.stdout));
     let parent_acp_id = wait_for_acp_id(&h, "ForkParent", Duration::from_secs(45));
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let parent_context_resume = rt.block_on(async {
-        let client = reqwest::Client::new();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let response = client
-                .get(format!("http://127.0.0.1:{port}/api/sessions"))
-                .send()
-                .await
-                .expect("GET /api/sessions")
-                .error_for_status()
-                .expect("successful sessions response")
-                .json::<serde_json::Value>()
-                .await
-                .expect("decode sessions response");
-            let parent = response["sessions"]
-                .as_array()
-                .and_then(|rows| rows.iter().find(|row| row["title"] == "ForkParent"))
-                .expect("ForkParent API row");
-            // Disk persistence does not fence the runtime snapshot publisher.
-            if parent["acp_session_id"].as_str() == Some(parent_acp_id.as_str()) {
-                break parent["context_resume"].clone();
-            }
-            assert!(
-                Instant::now() < deadline,
-                "API never published the captured parent identity: {parent}"
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    });
-    assert_eq!(
-        parent_context_resume,
-        serde_json::json!({
-            "state": "indeterminate",
-            "reason": "agent_handshake_required",
-        }),
-        "loadSession support alone must not promise that the parent conversation can resume"
-    );
 
     // Fork: request a STRUCTURED fork through the REST create endpoint. The CLI
     // `--fork-from` only builds a terminal seed; the structured path is the
@@ -313,6 +276,64 @@ fn structured_fork_mints_distinct_child_id_and_preserves_parent() {
         child["fork_pending"].is_null(),
         "fork_pending must be cleared after the forked id is assigned, got: {:?}",
         child["fork_pending"]
+    );
+
+    // A live, qualified worker can legitimately make context resume available.
+    // Stop the parent after the fork checks and wait for the API to see its
+    // retirement, so this assertion tests capability without a live channel.
+    let parent = rt.block_on(async {
+        let client = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{port}");
+        let stop = client
+            .delete(format!("{base}/api/sessions/{parent_session_id}/acp"))
+            .send()
+            .await
+            .expect("stop ForkParent");
+        assert_eq!(
+            stop.status(),
+            reqwest::StatusCode::NO_CONTENT,
+            "stop ForkParent: {}",
+            stop.text().await.expect("read stop response")
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let response = client
+                .get(format!("{base}/api/sessions"))
+                .send()
+                .await
+                .expect("GET /api/sessions")
+                .error_for_status()
+                .expect("successful sessions response")
+                .json::<serde_json::Value>()
+                .await
+                .expect("decode sessions response");
+            let parent = response["sessions"]
+                .as_array()
+                .and_then(|rows| rows.iter().find(|row| row["id"] == parent_session_id))
+                .expect("ForkParent API row");
+            if parent["status"] == "Stopped" && parent["acp_worker_state"] == "absent" {
+                break parent.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "API never published the stopped parent without a worker: {parent}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    });
+    assert_eq!(
+        parent["acp_session_id"].as_str(),
+        Some(parent_acp_id.as_str()),
+        "the stopped parent must still have the captured ACP identity"
+    );
+    assert_eq!(
+        parent["context_resume"],
+        serde_json::json!({
+            "state": "indeterminate",
+            "reason": "agent_handshake_required",
+        }),
+        "loadSession support alone must not promise that the parent conversation can resume"
     );
 }
 
