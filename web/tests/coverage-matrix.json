@@ -4809,6 +4809,33 @@
       "notes": "An empty transcript under a startup error says <Agent> isn't running. and, during a Retry, <Agent> isn't running yet., with no starter prompts either way; the hint and starter prompts come back once the Agent starts. Archived and trashed Sessions show neither."
     },
     {
+      "id": "settings.sandbox-login",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/SandboxLoginDialog.test.tsx",
+        "src/components/__tests__/SettingsView.sandboxLogin.test.tsx",
+        "src/components/acp/__tests__/StartupErrorBanner.test.tsx",
+        "src/components/acp/__tests__/SessionBanners.test.tsx",
+        "src/hooks/useAcpSession.test.ts",
+        "src/lib/acpTypes.test.ts"
+      ],
+      "components": [
+        "web/src/components/SandboxLoginDialog.tsx",
+        "web/src/components/acp/StartupErrorBanner.tsx",
+        "web/src/components/SettingsView.tsx"
+      ],
+      "notes": "Dialog request payloads and error codes run against MSW handlers shaped like the server contract in docs/api.md; the banner shows Log in only for the login-required startup code, and a prompt kept for the login (409 with queued_id) raises that banner. The `command` and `profile` a login-required startup event or 409 names reach the login the banner starts in its start request, so a session of another profile logs in that profile's file. Dialogs for one credential share a login: each leaves it with its own lease, and a lost answer to a code is settled by the outcome the server holds for that login id. The Settings row hides the button on a read-only server, drops another profile's status while the new one loads, and re-reads after an uncertain credential save is confirmed; the dialog yields Tab and Escape to the passphrase prompt and keeps the login after a too-large code."
+    },
+    {
+      "id": "settings.sandbox-login.browser",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/sandbox-login-dialog.spec.ts"],
+      "components": ["web/src/components/SandboxLoginDialog.tsx", "web/src/components/ElevationPrompt.tsx"],
+      "notes": "Initial focus, Tab order, focus and the typed value after a rejected code, Escape cancelling the login, and the real passphrase prompt a code raises sitting above the dialog and taking pointer clicks."
+    },
+    {
       "id": "acp.startup-error-banner-live",
       "kind": "live-playwright",
       "risk": "high",

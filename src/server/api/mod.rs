@@ -18,6 +18,7 @@ pub mod plugins;
 mod projects;
 mod queue;
 mod sandbox_image;
+mod sandbox_login;
 pub(crate) mod sessions;
 mod setup;
 mod skills;
@@ -37,7 +38,8 @@ pub use acp::{
     spawn_acp, switch_acp_agent, switch_acp_provider,
 };
 pub(crate) use acp::{
-    publish_startup_error_if_current, recover_pending_terminal_handoffs, HandoffRecovery,
+    publish_startup_error_if_current, publish_startup_error_with_cause_if_current,
+    recover_pending_terminal_handoffs, HandoffRecovery,
 };
 
 pub use queue::{queue_clear, queue_edit, queue_enqueue, queue_list, queue_remove};
@@ -67,6 +69,11 @@ pub(crate) use sandbox_image::{
 };
 pub use sandbox_image::{
     sandbox_image_cancel, sandbox_image_dismiss, sandbox_image_pull, sandbox_image_status,
+};
+pub(crate) use sandbox_login::CODE_BODY_LIMIT as SANDBOX_LOGIN_CODE_BODY_LIMIT;
+pub use sandbox_login::{
+    cancel_sandbox_login, get_sandbox_login, get_sandbox_login_outcome, leave_sandbox_login,
+    start_sandbox_login, submit_sandbox_login_code,
 };
 pub use sessions::{
     abandon_purge, attach_session_project, cancel_creation, create_session,
@@ -645,6 +652,16 @@ mod tests {
             ],
         ),
         ("setup.rs", include_str!("setup.rs"), &["patch_setup"]),
+        (
+            "sandbox_login.rs",
+            include_str!("sandbox_login.rs"),
+            &[
+                "cancel_sandbox_login",
+                "leave_sandbox_login",
+                "start_sandbox_login",
+                "submit_sandbox_login_code",
+            ],
+        ),
         (
             "system.rs",
             include_str!("system.rs"),
