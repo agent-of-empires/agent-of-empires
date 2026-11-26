@@ -727,6 +727,7 @@ mod tests {
                 binding,
                 capture: None,
                 container: None,
+                container_cwd: None,
             });
             if conflict == "after" {
                 storage
@@ -830,6 +831,7 @@ mod tests {
                 binding: source.clone(),
                 capture: None,
                 container: None,
+                container_cwd: None,
             });
             let mut observed = observation(captured_sid);
             observed.execution = inst.active_execution.clone();
@@ -939,6 +941,7 @@ mod tests {
             binding: source.clone(),
             capture: None,
             container: None,
+            container_cwd: None,
         });
         let (_temp, _home, storage) = seeded(profile, &[&owner, &claimant]);
         let mut observed =
@@ -987,6 +990,7 @@ mod tests {
                 binding: source.clone(),
                 capture: None,
                 container: None,
+                container_cwd: None,
             });
             let mut parked = make_inst(profile, "parked");
             let mut other = source.clone();
@@ -1115,6 +1119,7 @@ mod tests {
                     root: root.clone(),
                 }),
                 container: None,
+                container_cwd: None,
             });
             let (_temp, _home, storage) = seeded(&profile, &[&owner, &claimant]);
             crate::hooks::write_session_id_via_guard(&claimant.id, sid, Some(launch)).unwrap();
@@ -1182,6 +1187,7 @@ mod tests {
                 root: root.clone(),
             }),
             container: None,
+            container_cwd: None,
         });
         let (_temp, _home, storage) = seeded(profile, &[&claimant]);
         crate::hooks::write_session_id_via_guard(&claimant.id, sid, Some(launch)).unwrap();
@@ -1453,6 +1459,7 @@ mod tests {
             binding: binding(Some(true)),
             capture: None,
             container: None,
+            container_cwd: None,
         };
         let mut inst = make_inst(profile, "pinned");
         inst.agent_session_id = Some(VALID_SID.into());

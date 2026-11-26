@@ -3438,6 +3438,7 @@ mod tests {
                 },
                 capture: None,
                 container: None,
+                container_cwd: None,
             })
         };
         let mut mergers: Vec<fn(Instance, Instance) -> Instance> = vec![|prior, mut fresh| {

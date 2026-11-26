@@ -812,6 +812,7 @@ mod tests {
                 },
                 capture: None,
                 container: None,
+                container_cwd: None,
             })
         };
         let mut live = Instance::new("swapped", "/tmp/swapped");

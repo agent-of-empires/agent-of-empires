@@ -1877,6 +1877,7 @@ work-opencode = "opencode"
                         },
                         capture: Some(CaptureContext::Hooks(sidecar)),
                         container: None,
+                        container_cwd: None,
                     });
                 } else if !published {
                     std::fs::remove_file(directory.join("session_id")).unwrap();

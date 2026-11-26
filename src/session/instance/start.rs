@@ -960,6 +960,7 @@ impl Instance {
                     .capture
                     .or_else(|| omp_capture_metadata.cloned().map(CaptureContext::Omp)),
                 container: execution.inputs.container,
+                container_cwd: container_cwd.clone(),
             });
 
             if prepared.fork_mints_child {

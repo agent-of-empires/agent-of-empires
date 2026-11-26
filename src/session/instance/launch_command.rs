@@ -3713,6 +3713,7 @@ sandbox = "unsupported"
                 binding: execution.binding.clone(),
                 capture: execution.capture.clone(),
                 container: execution.inputs.container.clone(),
+                container_cwd: None,
             };
             let mounted = config
                 .volumes

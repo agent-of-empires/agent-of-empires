@@ -930,6 +930,7 @@ mod tests {
             binding,
             capture: Some(CaptureContext::Hooks(directory.join(leaf.as_ref()))),
             container: None,
+            container_cwd: None,
         });
         let storage = crate::session::Storage::new_unwatched(&inst.source_profile).unwrap();
         storage

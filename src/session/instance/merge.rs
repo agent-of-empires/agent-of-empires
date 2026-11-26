@@ -1090,6 +1090,7 @@ mod tests {
             },
             capture: None,
             container: None,
+            container_cwd: None,
         };
         let launch_2_poller = running_poller(&before.id, "claude", Some(launch_2.clone()));
         let mut relaunched = restarted.clone();
@@ -1150,6 +1151,7 @@ mod tests {
             },
             capture: None,
             container: None,
+            container_cwd: None,
         });
         let mut live = before.clone();
         live.agent_session_id = Some("peer-sid".to_string());
@@ -1766,6 +1768,7 @@ mod tests {
             },
             capture: None,
             container: None,
+            container_cwd: None,
         };
         let mut poller = SessionPoller::new(
             format!("test-tmux-{}", inst.id),
@@ -1840,6 +1843,7 @@ mod tests {
             },
             capture: None,
             container: None,
+            container_cwd: None,
         };
         let mut before = Instance::new("swapped-tool", "/tmp/swapped-tool");
         before.tool = "claude".to_string();

@@ -276,6 +276,7 @@ mod tests {
             },
             capture: None,
             container: None,
+            container_cwd: None,
         }
     }
 

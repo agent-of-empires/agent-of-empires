@@ -306,10 +306,12 @@ impl ReservedClaudeConfirmation {
         })?;
         Some(Self {
             binding: binding.clone(),
-            container_cwd: active
-                .container
-                .is_some()
-                .then(|| instance.container_workdir()),
+            container_cwd: active.container.is_some().then(|| {
+                active
+                    .container_cwd
+                    .clone()
+                    .unwrap_or_else(|| instance.container_workdir())
+            }),
             active: active.clone(),
             superseded: std::cell::Cell::new(false),
             confirmed: std::cell::OnceCell::new(),
@@ -392,6 +394,10 @@ pub(crate) struct ActiveExecution {
     pub(crate) binding: ExecutionBinding,
     pub(crate) capture: Option<CaptureContext>,
     pub(crate) container: Option<crate::containers::ContainerExecutionSnapshot>,
+    /// The canonical cwd a sandboxed launch ran in, inside its container. Rows recorded
+    /// before it was kept have none and fall back to the configured workdir.
+    #[serde(default)]
+    pub(crate) container_cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4931,6 +4937,69 @@ sandbox = "unsupported"
             None,
             "latched after a /clear"
         );
+    }
+
+    /// A sandboxed reserved id is confirmed under the canonical cwd its launch ran in, not the
+    /// configured workdir, which can be an alias of it. A row recorded without one keeps the
+    /// configured workdir.
+    #[test]
+    fn reserved_claude_confirmation_reads_the_launch_container_cwd() {
+        let root = tempfile::tempdir().unwrap();
+        let reserved = "019342ab-1234-7def-8901-abcdef012346";
+        let mut inst = super::super::test_helpers::reserved_claude_instance(root.path(), reserved);
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "fixture".into(),
+            container_name: "fixture".into(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: Some("/workspace/link".into()),
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+        });
+        let store = &inst.active_execution.as_ref().unwrap().binding.stores[0];
+        let project =
+            store
+                .join("projects")
+                .join(crate::session::capture::encode_claude_project_path(
+                    "/workspace/project",
+                ));
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(format!("{reserved}.jsonl")), "{}\n").unwrap();
+        // (case, cwd the launch recorded, confirms the reserved id)
+        for (case, recorded, confirms) in [
+            ("canonical-recorded", Some("/workspace/project"), true),
+            ("recorded-before-upgrade", None, false),
+        ] {
+            let active = inst.active_execution.as_mut().unwrap();
+            active.container = Some(crate::containers::ContainerExecutionSnapshot {
+                runtime: crate::containers::RuntimeExecutionSnapshot {
+                    kind: crate::session::ContainerRuntimeName::Docker,
+                    program: root.path().join("docker"),
+                    cwd: root.path().to_path_buf(),
+                    endpoint: String::new(),
+                    local_mounts: true,
+                    routing: Vec::new(),
+                    global_arguments: Vec::new(),
+                    shared_root: None,
+                },
+                name: "fixture".into(),
+                id: "fixture-id".into(),
+                mounts: Vec::new(),
+                shadow_mounts: Vec::new(),
+            });
+            active.container_cwd = recorded.map(str::to_owned);
+            let confirmation = ReservedClaudeConfirmation::for_instance(&inst).unwrap();
+            assert_eq!(
+                confirmation
+                    .observe(None, || None)
+                    .map(|observation| observation.sid),
+                confirms.then(|| reserved.to_owned()),
+                "{case}"
+            );
+        }
     }
 
     fn hermes_fixture() -> (tempfile::TempDir, NativeLaunchInputs, rusqlite::Connection) {
