@@ -139,8 +139,8 @@ Without that build, run without `SHOW_TITLES=1`.
 | `PRESET` | `slow` | libx264 preset. `veryslow` = best compression at same quality, `medium`/`fast` cheaper. |
 | `GRID` | unset | `COLSxROWS` enables grid mode (e.g. `2x2`, `3x3`, `4x2`). Must total >= 2 cells. |
 | `SHOW_TITLES` | `0` | `1` overlays the spec name on each cell/segment. Requires drawtext. |
-| `TARGET_W` | `1440` | Output canvas width. Matches Playwright viewport. |
-| `TARGET_H` | `900` | Output canvas height. Matches Playwright viewport. |
+| `TARGET_W` | `1440` | Output canvas width. Matches Playwright viewport. Applies to grid and titled concat only; untitled concat keeps native size. |
+| `TARGET_H` | `900` | Output canvas height. Matches Playwright viewport. Applies to grid and titled concat only; untitled concat keeps native size. |
 | `FONT` | auto-detect | Path to a TTF/TTC. Tries common macOS and Linux fonts if unset. |
 | `LEAD_CACHE` | `$TMPDIR/showcase-lead-cache.tsv` | Cache of the per-clip blank lead-in probe. |
 
