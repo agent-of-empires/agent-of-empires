@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use super::codex::{codex_group_aoe_flags, CODEX_HOOK_EVENT_NAMES};
 use super::command::{is_aoe_hook_command, json_command_is_aoe};
+use super::config_io::resolved;
 use super::{agent_settings_path_in, codex_hooks_json_path_in};
 use crate::agents::{HookFormat, SidecarFormat};
 
@@ -209,27 +210,6 @@ pub(crate) fn is_other_builtin_hook_path(
     )
     .iter()
     .any(|target| target.agent_name != agent_name && resolved(&target.path) == resolved(path))
-}
-
-/// Where a write to `path` lands: a symlink chain is followed even when it dangles,
-/// then a missing file resolves through its parent, so an alias of a directory or of
-/// a file not created yet is seen before the installer creates it.
-fn resolved(path: &Path) -> PathBuf {
-    let mut current = path.to_path_buf();
-    for _ in 0..16 {
-        let is_link = std::fs::symlink_metadata(&current)
-            .is_ok_and(|metadata| metadata.file_type().is_symlink());
-        let Some(link) = is_link.then(|| std::fs::read_link(&current).ok()).flatten() else {
-            break;
-        };
-        current = current.parent().map_or(link.clone(), |dir| dir.join(&link));
-    }
-    std::fs::canonicalize(&current)
-        .or_else(|error| {
-            let parent = std::fs::canonicalize(current.parent().ok_or(error)?)?;
-            Ok::<_, std::io::Error>(parent.join(current.file_name().unwrap_or_default()))
-        })
-        .unwrap_or(current)
 }
 
 fn builtin_hook_targets_in(

@@ -9,7 +9,9 @@ use aoe_plugin_api::agent_integration::{
 use serde_json::Value;
 
 use super::codex::{read_codex_config, with_codex_config_lock, write_codex_config};
-use super::config_io::{object_at, parse_json_or_empty, with_config_lock_policy, SymlinkPolicy};
+use super::config_io::{
+    object_at, parse_json_or_empty, resolved, with_config_lock_policy, SymlinkPolicy,
+};
 use super::resolve_config_dir_override;
 
 /// Merge-edits a JSON config under its lock, writing only when `edit` changed it.
@@ -242,10 +244,7 @@ pub fn is_other_builtin_trust_file(
         ),
         ("gemini", home.join(".gemini"), "trustedFolders.json"),
     ];
-    let same = |a: &Path, b: &Path| {
-        a == b
-            || matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
-    };
+    let same = |a: &Path, b: &Path| resolved(a) == resolved(b);
     builtin
         .iter()
         .filter(|(name, ..)| *name != agent_name)
@@ -678,6 +677,7 @@ mod tests {
         assert!(declared_trust_applies_in_sandbox(&trust, false));
     }
 
+    #[cfg(unix)]
     #[test]
     #[serial_test::serial(shell_env)]
     fn declared_trust_never_targets_another_builtin_agents_file() {
@@ -689,6 +689,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
         let env = [format!("CLAUDE_CONFIG_DIR={}", home.join("cfg").display())];
+        std::fs::create_dir_all(home.join(".gemini")).unwrap();
+        std::os::unix::fs::symlink(home.join(".gemini"), home.join("alias")).unwrap();
         for (path, env, agent, refused) in [
             (home.join(".claude.json"), &[][..], "example", true),
             (home.join("cfg/.claude.json"), &env[..], "example", true),
@@ -702,6 +704,14 @@ mod tests {
             (home.join(".codex/config.toml"), &[][..], "example", true),
             (home.join(".claude.json"), &[][..], "claude", false),
             (home.join(".example.json"), &[][..], "example", false),
+            // An alias of a built-in's directory, before its file exists.
+            (
+                home.join("alias/trustedFolders.json"),
+                &[][..],
+                "example",
+                true,
+            ),
+            (home.join("alias/other.json"), &[][..], "example", false),
         ] {
             assert_eq!(
                 is_other_builtin_trust_file(&path, agent, home, env),
