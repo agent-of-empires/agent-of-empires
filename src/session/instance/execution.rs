@@ -4966,13 +4966,23 @@ sandbox = "unsupported"
                 .join(crate::session::capture::encode_claude_project_path(
                     "/workspace/project",
                 ));
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join(format!("{reserved}.jsonl")), "{}\n").unwrap();
-        // (case, cwd the launch recorded, confirms the reserved id)
-        for (case, recorded, confirms) in [
-            ("canonical-recorded", Some("/workspace/project"), true),
-            ("recorded-before-upgrade", None, false),
+        // (case, cwd the launch recorded, the transcript appears only after the poller's first
+        // read, confirms the reserved id)
+        for (case, recorded, late, confirms) in [
+            (
+                "canonical-recorded",
+                Some("/workspace/project"),
+                false,
+                true,
+            ),
+            ("late-transcript", Some("/workspace/project"), true, true),
+            ("recorded-before-upgrade", None, false, false),
         ] {
+            let _ = std::fs::remove_dir_all(&project);
+            if !late {
+                std::fs::create_dir_all(&project).unwrap();
+                std::fs::write(project.join(format!("{reserved}.jsonl")), "{}\n").unwrap();
+            }
             let active = inst.active_execution.as_mut().unwrap();
             active.container = Some(crate::containers::ContainerExecutionSnapshot {
                 runtime: crate::containers::RuntimeExecutionSnapshot {
@@ -4992,6 +5002,16 @@ sandbox = "unsupported"
             });
             active.container_cwd = recorded.map(str::to_owned);
             let confirmation = ReservedClaudeConfirmation::for_instance(&inst).unwrap();
+            if late {
+                // No identity hook: the poller's read before the agent wrote its transcript.
+                assert_eq!(
+                    confirmation.observe(None, || None).map(|o| o.sid),
+                    None,
+                    "{case}: nothing to confirm yet"
+                );
+                std::fs::create_dir_all(&project).unwrap();
+                std::fs::write(project.join(format!("{reserved}.jsonl")), "{}\n").unwrap();
+            }
             assert_eq!(
                 confirmation
                     .observe(None, || None)
