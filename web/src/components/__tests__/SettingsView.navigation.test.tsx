@@ -26,6 +26,7 @@ vi.mock("../../lib/api", () => ({
   fetchSuggestionPresets: vi.fn(() => Promise.resolve(null)),
   fetchSuggestionMappings: vi.fn(() => Promise.resolve(null)),
   fetchProfiles: vi.fn(() => Promise.resolve([{ name: "main", is_default: true }])),
+  getSandboxLoginStatus: vi.fn(() => Promise.resolve(null)),
   fetchSettings: vi.fn(() => Promise.resolve({ sandbox: {}, updates: {} })),
   getSettingsSchema: vi.fn(() => Promise.resolve(SCHEMA)),
   updateProfileSettings: vi.fn(() => Promise.resolve("committed" as const)),

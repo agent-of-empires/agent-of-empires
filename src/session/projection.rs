@@ -235,7 +235,6 @@ pub(crate) fn recovery_selection(
                 &row.resume_probe_failed_sid,
                 &row.omp_capture_generation,
                 row.capture_started_at,
-                row.started_at,
                 row.force_fresh_next_launch,
                 &row.sandbox_info,
                 &row.terminal_handoff,

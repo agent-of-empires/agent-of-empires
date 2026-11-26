@@ -286,7 +286,6 @@ impl HomeView {
             new_tool,
             new_extra_args,
             new_command_override,
-            false,
             None,
         )
     }
@@ -317,38 +316,15 @@ impl HomeView {
             "{}",
             current.guidance
         );
-        self.restart_selected_session_with_wake(None, None, None, None, false, Some(recovery))
+        self.restart_selected_session_with_wake(None, None, None, None, Some(recovery))
     }
 
-    /// Use the daemon's current update-restart admission.
-    pub(super) fn update_restart_offered(&self, id: &str) -> bool {
-        self.session_feed.can_submit(id)
-            && self
-                .session_feed
-                .applied_session(id)
-                .is_some_and(|row| row.update_restart)
-    }
-
-    /// Restart with the daemon's update admission and no wake-up message.
-    pub(super) fn restart_selected_for_update(&mut self) -> anyhow::Result<()> {
-        let Some(id) = self.selected_session.as_deref() else {
-            return Ok(());
-        };
-        if !self.update_restart_offered(id) {
-            return Ok(());
-        }
-        self.restart_selected_session_with_wake(None, None, None, None, true, None)
-    }
-
-    /// `for_update` sends no wake-up message and has the daemon refuse a session that is no longer
-    /// idle.
     fn restart_selected_session_with_wake(
         &mut self,
         new_profile: Option<&str>,
         new_tool: Option<&str>,
         new_extra_args: Option<&str>,
         new_command_override: Option<&str>,
-        for_update: bool,
         recovery: Option<crate::session::SessionRecoveryRequest>,
     ) -> anyhow::Result<()> {
         let id = match &self.selected_session {
@@ -402,8 +378,7 @@ impl HomeView {
                 extra_args: new_extra_args.map(str::to_owned),
                 command_override: new_command_override.map(str::to_owned),
                 unsnooze: wake_snooze,
-                wake_message: (for_update || recovery.is_some()).then(String::new),
-                only_if_idle: for_update,
+                wake_message: recovery.is_some().then(String::new),
                 recovery,
                 ..Default::default()
             },
@@ -731,7 +706,7 @@ impl HomeView {
         };
         self.session_feed.submit(
             id,
-            crate::daemon::SessionMutation::Favorite(crate::daemon::UpdateFavoriteBody {
+            crate::daemon::SessionMutation::Favorite(crate::daemon::UpdateFavoriteBody::Unscoped {
                 favorited: !is_fav,
             }),
         )?;
@@ -1217,7 +1192,6 @@ mod tests {
                     "skip_on_launch",
                     "bound_hooks",
                     "discard_sandbox_container",
-                    "only_if_idle",
                 ] {
                     assert_eq!(request[field], false, "{field} must not override recovery");
                 }

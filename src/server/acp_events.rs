@@ -1353,6 +1353,10 @@ pub(crate) async fn commit_background_bindings(state: &Arc<AppState>) {
                 None,
             )?;
             let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&id)?;
+            // An active restart owns this checkpoint until it releases its claim.
+            if owner.acp_supervisor.restart_request_is_active(&id) {
+                return Ok(());
+            }
             if captured
                 .lease
                 .as_ref()

@@ -26,9 +26,12 @@ const isStructured = async (baseUrl: string, sessionId: string) =>
   (await listSessions(baseUrl)).find((s) => s.id === sessionId)?.view === "structured";
 
 async function seedNativeTranscript(serve: ServeHandle, sessionId: string) {
-  const session = (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId);
-  expect(typeof session?.acp_session_id).toBe("string");
-  expect(session?.acp_session_id).not.toBe("");
+  let session: Record<string, unknown> | undefined;
+  await expect(async () => {
+    session = (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId);
+    expect(typeof session?.acp_session_id).toBe("string");
+    expect(session?.acp_session_id).not.toBe("");
+  }).toPass({ timeout: 15_000, intervals: [100, 200, 400] });
   expect(typeof session?.project_path).toBe("string");
   const cwd = realpathSync(session!.project_path as string);
   const dir = join(serve.home, ".claude", "projects", cwd.replace(/[^a-zA-Z0-9-]/g, "-"));
@@ -41,7 +44,8 @@ async function seedNativeTranscript(serve: ServeHandle, sessionId: string) {
 test("view switch round-trips between tmux and structured view", async ({ spawnServe }) => {
   const { serve, sessionId } = await startAcpSession(spawnServe, { title: "acp-view" });
   const nativeSessionId = await seedNativeTranscript(serve, sessionId);
-  expect((await postAcp(serve.baseUrl, sessionId, "/disable")).ok).toBeTruthy();
+  const disable = await postAcp(serve.baseUrl, sessionId, "/disable");
+  expect(disable.ok, await disable.text()).toBeTruthy();
   expect(await isStructured(serve.baseUrl, sessionId)).toBeFalsy();
 
   const spawnBeforeEnable = await postAcp(serve.baseUrl, sessionId, "/spawn", {});
@@ -54,7 +58,7 @@ test("view switch round-trips between tmux and structured view", async ({ spawnS
     ["/disable", false],
   ] as const) {
     const res = await postAcp(serve.baseUrl, sessionId, path);
-    expect(res.ok).toBeTruthy();
+    expect(res.ok, res.ok ? undefined : await res.text()).toBeTruthy();
     const body = (await res.json()) as { session_id: string; view?: string };
     if (structured) expect(body.session_id).toBe(sessionId);
     expect(body.view === "structured").toBe(structured);
@@ -63,11 +67,15 @@ test("view switch round-trips between tmux and structured view", async ({ spawnS
       .toBe(structured);
 
     const again = await postAcp(serve.baseUrl, sessionId, path);
-    expect(again.ok).toBeTruthy();
+    expect(again.ok, again.ok ? undefined : await again.text()).toBeTruthy();
     expect(((await again.json()) as { view?: string }).view === "structured").toBe(structured);
     if (structured) {
       await waitForAcpReady(serve.baseUrl, sessionId, 30_000, serve.home);
-      expect((await listSessions(serve.baseUrl)).find((s) => s.id === sessionId)?.acp_session_id).toBe(nativeSessionId);
+      await expect
+        .poll(async () => (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId)?.acp_session_id, {
+          timeout: 10_000,
+        })
+        .toBe(nativeSessionId);
     }
   }
 });

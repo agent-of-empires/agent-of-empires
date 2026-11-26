@@ -179,17 +179,6 @@ pub(crate) async fn project_sessions_with_recovery(
                     })
                     .collect();
             }
-            session.update_restart =
-                crate::session::update_restart::offer_pending(
-                    inst,
-                    session
-                        .context_resume
-                        .as_ref()
-                        .is_some_and(|resume| update_restart_resumable(inst, resume)),
-                    session.context_resume.as_ref().is_some_and(|resume| {
-                        matches!(resume, ContextResumeAvailability::Available)
-                    }) && session.pending_approvals.is_empty(),
-                );
             session
         })
         .collect();
@@ -990,7 +979,6 @@ mod workspace_ordering_tests {
             pending_approvals: Vec::new(),
             acp_worker_state: crate::daemon::AcpWorkerState::Absent,
             acp_worker_start: None,
-            update_restart: false,
             context_resume: Some(ContextResumeAvailability::Unavailable {
                 reason: ContextResumeUnavailableReason::NoTarget,
             }),
@@ -1629,7 +1617,8 @@ mod shared_recovery_tests {
                 let mut live = managed_control_session(
                     scope,
                     "shared-recovery-current-background",
-                    "codex",
+                    // Use the transcript tailer, not the SDK's built-in subagent handling.
+                    "gemini",
                     None,
                 )
                 .await;

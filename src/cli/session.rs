@@ -415,12 +415,8 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::SetBase(args) => set_base(profile, args).await,
         SessionCommands::Snooze(args) => snooze_session(profile, args).await,
         SessionCommands::Unsnooze(args) => unsnooze_session(profile, args).await,
-        SessionCommands::Favorite(args) => {
-            mark_session(profile, args, "Favorited", Instance::favorite).await
-        }
-        SessionCommands::Unfavorite(args) => {
-            mark_session(profile, args, "Unfavorited", Instance::unfavorite).await
-        }
+        SessionCommands::Favorite(args) => set_favorite(profile, args, true).await,
+        SessionCommands::Unfavorite(args) => set_favorite(profile, args, false).await,
         SessionCommands::Archive(args) => archive_session(profile, args).await,
         SessionCommands::Unarchive(args) => {
             mark_session(profile, args, "Unarchived", Instance::unarchive).await
@@ -432,6 +428,78 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         }
         SessionCommands::EmptyTrash => empty_trash(profile).await,
     }
+}
+
+async fn set_favorite(profile: &str, args: SessionIdArgs, favorited: bool) -> Result<()> {
+    use crate::acp::client::{
+        daemon_manager::require_local_read_daemon, discovery::discover_env, HttpClient,
+    };
+    use crate::daemon::{
+        DaemonClientError, RuntimeHealth, UpdateFavoriteBody, RUNTIME_PROTOCOL_VERSION,
+    };
+
+    anyhow::ensure!(
+        !matches!(
+            std::env::var("AOE_DAEMON_URL"),
+            Err(std::env::VarError::NotUnicode(_))
+        ),
+        "AOE_DAEMON_URL must be valid UTF-8"
+    );
+    let endpoint = match discover_env() {
+        Some(endpoint) => endpoint,
+        None => require_local_read_daemon().await?,
+    };
+    let (client, info, baseline) = HttpClient::new(endpoint)?
+        .runtime_mutation_client()
+        .await
+        .map_err(|error| anyhow::anyhow!("{}", super::terminal_text(&error.to_string())))?;
+    anyhow::ensure!(
+        info.protocol_version == RUNTIME_PROTOCOL_VERSION && info.health == RuntimeHealth::Healthy,
+        "Daemon runtime is not ready"
+    );
+    let selector = args.identifier;
+    let body = UpdateFavoriteBody::Scoped {
+        profile: profile.into(),
+        selector,
+        select_favorited: favorited,
+    };
+    let result = client.set_favorite_by_selector(&body, &baseline).await;
+    let outcome = match (result, body) {
+        (Ok(outcome), _) => outcome,
+        (
+            Err(DaemonClientError::FavoriteSelection(error)),
+            UpdateFavoriteBody::Scoped { selector, .. },
+        ) => {
+            return Err(error.for_cli(&selector));
+        }
+        (
+            Err(
+                error @ (DaemonClientError::Transport
+                | DaemonClientError::Timeout
+                | DaemonClientError::UnixTransport
+                | DaemonClientError::InvalidMutationReceipt
+                | DaemonClientError::AuthenticatedDecode
+                | DaemonClientError::Status {
+                    status: reqwest::StatusCode::GATEWAY_TIMEOUT,
+                    ..
+                }
+                | DaemonClientError::ResponseTooLarge { .. }),
+            ),
+            _,
+        ) => {
+            return Err(anyhow::Error::new(error).context(
+                "Favorite outcome may be unknown; check the session before running the command again",
+            ));
+        }
+        (Err(error), _) => bail!("{}", super::terminal_text(&error.to_string())),
+    };
+    let verb = if favorited {
+        "Favorited"
+    } else {
+        "Unfavorited"
+    };
+    println!("{verb}: {}", super::terminal_text(&outcome.title));
+    Ok(())
 }
 
 /// Flips one boolean marker on a session and reports it with `verb`.

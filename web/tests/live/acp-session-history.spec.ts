@@ -1,17 +1,15 @@
 // Conversation identity: driven resets, importing Claude sessions, and keeping context across view switches.
 
-import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test, expect, bootDashboard, type ServeHandle } from "../helpers/liveTest";
-import { appDirFor, listSessions, resolveAoeBinary, seedSessionViaAoeAdd } from "../helpers/aoeServe";
+import { appDirFor, listSessions, resolveAoeBinary } from "../helpers/aoeServe";
 import {
-  spawnAcpAgentAndWait,
   postAcp,
   postPrompt,
   replayFrames,
   startAcpSession,
-  sessionIdByTitle,
+  waitForAcpReady,
   waitForReplayContains,
 } from "../helpers/acp";
 
@@ -237,8 +235,15 @@ test("view switch preserves the claude conversation in both directions", async (
   expect(createRes.ok, `create failed: ${createRes.status}`).toBe(true);
   const sessionId: string = (await createRes.json()).id;
   await expectReplay(sessionId);
+  await waitForAcpReady(serve.baseUrl, sessionId, 30_000, serve.home);
+  await expect
+    .poll(async () => (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId)?.acp_session_id, {
+      timeout: 10_000,
+    })
+    .toBe(sid);
 
-  expect((await postAcp(serve.baseUrl, sessionId, "/disable")).ok).toBe(true);
+  const disable = await postAcp(serve.baseUrl, sessionId, "/disable");
+  expect(disable.ok, await disable.text()).toBe(true);
   await expect
     .poll(async () => (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId)?.view === "structured", {
       timeout: 10_000,
@@ -247,7 +252,9 @@ test("view switch preserves the claude conversation in both directions", async (
     .toBe(false);
 
   // The carried agent_session_id drives a seeded session/load.
-  expect((await postAcp(serve.baseUrl, sessionId, "/enable")).ok).toBe(true);
+  const enable = await postAcp(serve.baseUrl, sessionId, "/enable");
+  expect(enable.ok, await enable.text()).toBe(true);
+  await waitForAcpReady(serve.baseUrl, sessionId, 30_000, serve.home);
   await expectReplay(sessionId);
   await expect
     .poll(async () => (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId), {
@@ -300,36 +307,27 @@ test("switch to terminal is refused when the command's session flag conflicts wi
   const sid = "11111111-2222-4333-8444-555555555555";
   const serve = await spawnServe({
     acp: true,
-    seedFn: (seed) => {
-      seedSessionViaAoeAdd({
-        title,
-        tool: "claude",
-        structuredView: true,
-        prepare: (path) => {
-          const cwd = realpathSync(path);
-          seedTranscript(seed.home, cwd.replace(/[^a-zA-Z0-9-]/g, "-"), sid, cwd, "retained conversation");
-        },
-      })(seed);
-      const stop = spawnSync(resolveAoeBinary(), ["serve", "--stop"], { env: seed.env, encoding: "utf8" });
-      expect(stop.status, stop.stderr).toBe(0);
-      const profilesDir = join(appDirFor(seed.home, seed.env.XDG_CONFIG_HOME!, resolveAoeBinary()), "profiles");
-      let seeded = false;
-      for (const profile of readdirSync(profilesDir)) {
-        const path = join(profilesDir, profile, "sessions.json");
-        if (!existsSync(path)) continue;
-        const rows = JSON.parse(readFileSync(path, "utf8")) as { title: string; [field: string]: unknown }[];
-        const row = rows.find((r) => r.title === title);
-        if (!row) continue;
-        row.command = "claude --resume old-id";
-        row.agent_session_id = sid;
-        writeFileSync(path, JSON.stringify(rows));
-        seeded = true;
-      }
-      expect(seeded, "the conflicting row must be persisted before boot").toBe(true);
+    seedFn: ({ home }) => {
+      const path = join(home, "project");
+      mkdirSync(path, { recursive: true });
+      const cwd = realpathSync(path);
+      seedTranscript(home, cwd.replace(/[^a-zA-Z0-9-]/g, "-"), sid, cwd, "retained conversation");
     },
   });
-  const sessionId = await sessionIdByTitle(serve.baseUrl, title);
-  await spawnAcpAgentAndWait(serve.baseUrl, sessionId, 30_000, serve.home);
+  const create = await importSession(serve, {
+    path: realpathSync(join(serve.home, "project")),
+    title,
+    import_acp_session_id: sid,
+    extra_args: "--resume old-id",
+  });
+  expect(create.ok, create.ok ? undefined : await create.text()).toBe(true);
+  const sessionId: string = (await create.json()).id;
+  await waitForAcpReady(serve.baseUrl, sessionId, 30_000, serve.home);
+  await expect
+    .poll(async () => (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId)?.acp_session_id, {
+      timeout: 10_000,
+    })
+    .toBe(sid);
   const check = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/terminal-check`);
   expect(await check.json()).toMatchObject({ context: "blocked", reason: "command_selector_conflict" });
 

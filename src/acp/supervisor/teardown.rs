@@ -884,6 +884,10 @@ impl<S: BroadcastSink> Supervisor<S> {
             .collect()
     }
 
+    pub(crate) fn restart_request_is_active(&self, session_id: &str) -> bool {
+        lock_recover(&self.restart_requests).contains_key(session_id)
+    }
+
     pub(crate) fn capture_handoff_retirement(
         &self,
         session_id: &str,
@@ -6045,6 +6049,7 @@ mod tests {
             "route_marker",
             "legacy_store",
             "journal_owner",
+            "restart_owner",
         ] {
             let (_home, tmp) = isolate_home();
             let mut row =
@@ -6181,37 +6186,55 @@ mod tests {
                             Duration::from_secs(5),
                         ))
                         .unwrap();
-                    if case == "journal_owner" {
+                    if matches!(case, "journal_owner" | "restart_owner") {
+                        let runtime = tokio::runtime::Handle::current();
+                        let restart = (case == "restart_owner").then(|| {
+                            runtime
+                                .block_on(
+                                    state.acp_supervisor.try_begin_restart_with_reason(&row.id),
+                                )
+                                .expect("restart owns the checkpoint")
+                        });
                         let mut journal_target = retirement.target.clone();
-                        journal_target.claim_journal_ack();
-                        tokio::runtime::Handle::current().block_on(
-                            crate::server::acp_events::commit_background_bindings(&state),
-                        );
+                        if restart.is_none() {
+                            journal_target.claim_journal_ack();
+                        }
+                        runtime.block_on(crate::server::acp_events::commit_background_bindings(
+                            &state,
+                        ));
                         assert_eq!(
                             native.load().unwrap()[0].acp_establishment,
                             row.acp_establishment,
-                            "maintenance must not substitute for the journal's own checkpoint"
+                            "maintenance must not acknowledge a controller's checkpoint"
                         );
                         assert_eq!(
                             state.acp_supervisor.current_lease(&row.id).as_ref(),
                             Some(&lease)
                         );
-                        crate::server::acp_events::commit_retired_binding(
-                            &native,
-                            &row.id,
-                            &retirement,
-                        )
-                        .unwrap();
+                        if let Some(restart) = restart {
+                            drop(restart);
+                            runtime.block_on(
+                                crate::server::acp_events::commit_background_bindings(&state),
+                            );
+                        } else {
+                            crate::server::acp_events::commit_retired_binding(
+                                &native,
+                                &row.id,
+                                &retirement,
+                            )
+                            .unwrap();
+                            state
+                                .acp_supervisor
+                                .acknowledge_retirement(&journal_target)
+                                .unwrap();
+                        }
                         assert_eq!(
                             native.load().unwrap()[0].acp_establishment,
                             Some(AcpEstablishment::Applied {
                                 attempt_id: attempt.id,
                             })
                         );
-                        state
-                            .acp_supervisor
-                            .acknowledge_retirement(&journal_target)
-                            .unwrap();
+                        assert!(state.acp_supervisor.current_lease(&row.id).is_none());
                         return;
                     }
                     if case != "legacy_store" {

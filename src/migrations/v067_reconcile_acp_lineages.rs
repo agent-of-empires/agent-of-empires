@@ -11,15 +11,15 @@ pub fn run() -> Result<()> {
     super::v057_acp_budget_knowledge::run()?;
     super::v054_retained_history_identity::run()?;
     super::v055_global_max_concurrent_workers::run()?;
-    super::v056_launch_resolved_executable::run()?;
-    super::v057_worker_launch_executable::run()?;
     super::v058_account_limits_window_shape::run()?;
     reconcile_autonomous_metadata()?;
     super::v059_owner_only_event_logs::run()?;
     super::v063_retire_color_labels::run()?;
     // The ACP branch's marker 64 did not run main's sound cleanup.
     super::v064_builtin_sounds::run()?;
-    tracing::info!(target: "migrations.v066", "Reconciled ACP and main data histories");
+    // A marker of 66 only proves the retirement ran on main, not on ACP.
+    super::v066_retire_agent_update_fields::run()?;
+    tracing::info!(target: "migrations.v067", "Reconciled ACP and main data histories");
     Ok(())
 }
 
@@ -217,12 +217,6 @@ mod tests {
         if matches!(history, History::Main55 | History::Main56 | History::Main57) {
             v055_global_max_concurrent_workers::run().unwrap();
         }
-        if matches!(history, History::Main56 | History::Main57) {
-            v056_launch_resolved_executable::run().unwrap();
-        }
-        if matches!(history, History::Main57) {
-            v057_worker_launch_executable::run().unwrap();
-        }
         if matches!(
             history,
             History::Acp55 | History::Acp56 | History::Acp57 | History::Frontier58
@@ -359,7 +353,7 @@ mod tests {
         let app = crate::session::get_app_dir().unwrap();
         fs::create_dir_all(&app).unwrap();
         run_migrations().unwrap();
-        assert_eq!(get_current_version(), 66);
+        assert_eq!(get_current_version(), CURRENT_VERSION);
         assert!(!app.join("acp_events.db").exists());
     }
 
@@ -387,7 +381,7 @@ mod tests {
             prepare_history(history, &conn);
             let old_identity = identity(&conn);
             run_migrations().unwrap();
-            assert_eq!(get_current_version(), 66, "{history:?}");
+            assert_eq!(get_current_version(), CURRENT_VERSION, "{history:?}");
             assert_preserved(&app, &conn);
             let reconciled_identity = identity(&conn).unwrap();
             if let Some(old) = old_identity {
@@ -454,7 +448,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn a_late_config_failure_preserves_the_old_marker_and_reenters_completed_schema_steps() {
+    fn a_late_config_failure_stays_at_main_66_and_retries_acp_reconciliation() {
         let home = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(home.path());
         let app = crate::session::get_app_dir().unwrap();
@@ -464,15 +458,12 @@ mod tests {
         prepare_history(History::Main57, &conn);
         let old_identity = identity(&conn).unwrap();
         set_version(65).unwrap();
-        let marker_before_reconciliation = fs::read(app.join(VERSION_FILE)).unwrap();
         let other = app.join("profiles/other/config.toml");
         let valid_config = fs::read(&other).unwrap();
         fs::write(&other, "[acp\n").unwrap();
         assert!(run_migrations().is_err());
-        assert_eq!(
-            fs::read(app.join(VERSION_FILE)).unwrap(),
-            marker_before_reconciliation
-        );
+        assert_eq!(get_current_version(), 66);
+        assert!(has_pending_migrations());
         assert_eq!(identity(&conn).unwrap(), old_identity);
         assert_eq!(
             conn.query_row(
@@ -494,7 +485,7 @@ mod tests {
         let backups = crate::session::migration_backups(&path).unwrap().len();
         fs::write(&other, valid_config).unwrap();
         run_migrations().unwrap();
-        assert_eq!(get_current_version(), 66);
+        assert_eq!(get_current_version(), CURRENT_VERSION);
         assert_preserved(&app, &conn);
         assert_eq!(identity(&conn).unwrap(), old_identity);
         assert_eq!(
@@ -527,7 +518,7 @@ mod tests {
             set_version(63).unwrap();
 
             run_migrations().unwrap();
-            assert_eq!(get_current_version(), 66);
+            assert_eq!(get_current_version(), CURRENT_VERSION);
             assert_preserved(&app, &conn);
             let cleaned = fs::read_to_string(&config).unwrap();
             assert!(!cleaned.contains("show_session_colors"));
@@ -538,8 +529,14 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn versions_64_and_65_reconcile_sound_config_and_account_estimates() {
-        for (marker, acp_lineage) in [(64, true), (64, false), (65, false)] {
+    fn versions_64_through_66_reconcile_both_histories() {
+        for (marker, acp_lineage) in [
+            (64, true),
+            (64, false),
+            (65, false),
+            (66, false),
+            (66, true),
+        ] {
             let _home = crate::session::test_support::isolate_app_dir();
             let app = crate::session::get_app_dir().unwrap();
             seed_profiles(&app);
@@ -572,8 +569,20 @@ mod tests {
                  INSERT INTO acp_account_limits VALUES ('/a','five_hour',500,0,1,0);",
             )
             .unwrap();
-            if marker == 65 {
+            if marker >= 65 {
                 v065_account_limit_estimate_rows::run().unwrap();
+            }
+            let sessions = app.join("profiles/work/sessions.json");
+            let kept = serde_json::json!([{"id": SID, "launch_executable": "/bin/claude"}]);
+            let mut legacy = kept.clone();
+            legacy[0]["started_at"] = serde_json::json!("2026-01-01T00:00:00Z");
+            legacy[0]["launch_resolved_executable"] = serde_json::json!("/opt/claude/2.1");
+            fs::write(&sessions, serde_json::to_vec(&legacy).unwrap()).unwrap();
+            if marker == 66 {
+                if !acp_lineage {
+                    v066_retire_agent_update_fields::run().unwrap();
+                }
+                assert_eq!(super::autonomous_pending().unwrap(), !acp_lineage);
             }
             set_version(marker).unwrap();
             let old_identity = identity(&conn).unwrap();
@@ -597,7 +606,13 @@ mod tests {
             };
 
             run_migrations().unwrap();
-            assert_eq!(get_current_version(), 66);
+            assert_eq!(get_current_version(), CURRENT_VERSION);
+            assert_schema_current().unwrap();
+            let retired = fs::read(&sessions).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&retired).unwrap(),
+                kept
+            );
             assert_preserved(&app, &conn);
             assert_eq!(identity(&conn).unwrap(), old_identity);
             let retained_limits = vec![
@@ -614,7 +629,8 @@ mod tests {
             });
 
             run_migrations().unwrap();
-            assert_eq!(get_current_version(), 66);
+            assert_eq!(get_current_version(), CURRENT_VERSION);
+            assert_eq!(fs::read(&sessions).unwrap(), retired);
             assert_eq!(account_limits(), retained_limits);
             for (path, contents) in cleaned {
                 assert_eq!(fs::read_to_string(path).unwrap(), contents);
@@ -643,7 +659,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            set_version(65).unwrap();
+            set_version(66).unwrap();
             let marker = fs::read(app.join(VERSION_FILE)).unwrap();
             assert!(run_migrations().is_err());
             assert_eq!(fs::read(app.join(VERSION_FILE)).unwrap(), marker);
@@ -676,7 +692,7 @@ mod tests {
         prepare_history(History::Main57, &conn);
         let malformed = br#"[{"id":"5959595959595959","acp_establishment":{"version":999}}]"#;
         fs::write(app.join("sessions.json"), malformed).unwrap();
-        set_version(65).unwrap();
+        set_version(66).unwrap();
         let marker = fs::read(app.join(VERSION_FILE)).unwrap();
         assert!(run_migrations().is_err());
         assert_eq!(fs::read(app.join(VERSION_FILE)).unwrap(), marker);

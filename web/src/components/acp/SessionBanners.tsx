@@ -22,6 +22,7 @@ import { pickWorkerStoppedVariant, showWorkerStoppingBanner } from "./workerStop
 /** Worker lifecycle and triage banners stacked above the transcript. */
 export function SessionBanners({
   sessionId,
+  tool,
   state,
   acpWorkerState,
   trashedAt,
@@ -44,6 +45,8 @@ export function SessionBanners({
   newSession,
 }: {
   sessionId: string;
+  /** The session's `tool`, for the sandbox login a startup error offers. */
+  tool?: string | null;
   state: AcpState;
   /** Set while a new Session starts: the Agent, as copy names it. */
   startingAgent: string | null;
@@ -116,6 +119,7 @@ export function SessionBanners({
       {startupError && !startupDiagnosticOnly && !recovery && state.startupCause?.kind !== "container_missing" && (
         <StartupErrorBanner
           sessionId={sessionId}
+          tool={tool}
           message={startupError}
           acpWorkerState={acpWorkerState}
           canRecover={canRestart && state.connectionUnavailable === null}
@@ -124,6 +128,7 @@ export function SessionBanners({
           restartEpoch={state.restartEpoch}
           onRetryStarted={(epoch, message) => onStartupRestarted?.(epoch, false, message)}
           onRetryFailed={(epoch, message) => onRestartFailed?.(epoch, message, false)}
+          cause={state.startupCause}
           onSwitchToTerminal={onSwitchToTerminal}
         />
       )}

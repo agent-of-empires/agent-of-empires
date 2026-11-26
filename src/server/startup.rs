@@ -1465,13 +1465,17 @@ pub(crate) async fn start_server(
         }
         notify_stopping().await;
         let plugin_host = shutdown_state.plugin_host.clone();
+        let sandbox_login = shutdown_state.session_service.sandbox_login.clone();
         run_shutdown_sequence(
             &shutdown_state.shutdown,
             SHUTDOWN_GRACE,
             async move {
-                if let Some(host) = plugin_host {
-                    host.shutdown().await;
-                }
+                let reap_plugins = async {
+                    if let Some(host) = plugin_host {
+                        host.shutdown().await;
+                    }
+                };
+                tokio::join!(reap_plugins, sandbox_login.shutdown());
             },
             || std::process::exit(0),
         )

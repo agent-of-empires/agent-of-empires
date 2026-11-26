@@ -39,7 +39,8 @@ pub use prompt::{
 pub(crate) use prompt::{submit_prompt, PromptSubmission, PromptSubmitError, PromptSubmitted};
 pub use view::{acp_disable, acp_enable, acp_terminal_check};
 pub(crate) use view::{
-    publish_startup_error_if_current, recover_pending_terminal_handoffs, HandoffRecovery,
+    publish_startup_error_if_current, publish_startup_error_with_cause_if_current,
+    recover_pending_terminal_handoffs, HandoffRecovery,
 };
 pub(crate) use worker::restart_session_recovery;
 pub use worker::{
@@ -340,7 +341,7 @@ mod tests {
 
         with_managed(|scope| {
             Box::pin(async move {
-                let session = support::managed_control_session(
+                let mut session = support::managed_control_session(
                     scope,
                     "late-selector-failure",
                     "claude",
@@ -354,19 +355,37 @@ mod tests {
                     .set_config_option(&id, "model", "new-model", false, None)
                     .await
                     .unwrap();
-                tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                    while !session
-                        .native
-                        .requests()
-                        .iter()
-                        .any(|method| method == "session/set_config_option")
-                    {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .expect("the original Native receives the selector before replacement");
-                let delayed_cleanup = state.acp_supervisor.capture_retirement(&id).unwrap();
+                let delayed_cleanup =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        loop {
+                            let event = session
+                                .client
+                                .next_event()
+                                .await
+                                .expect("original selector response");
+                            if matches!(event, Event::ConfigOptionsUpdated { options }
+                            if options.iter().any(|option|
+                                option.id == "model" && option.current_value == "new-model"))
+                            {
+                                break;
+                            }
+                        }
+                        // Selector publication can reach the observer before releasing registry custody.
+                        loop {
+                            match state.acp_supervisor.capture_retirement(&id) {
+                                Ok(target) => break target,
+                                Err(SupervisorError::RegistryBusy) => {
+                                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                                }
+                                Err(error) => panic!("capturing original retirement: {error}"),
+                            }
+                        }
+                    })
+                    .await
+                    .expect(
+                        "the original Native confirms the selector and releases registry custody",
+                    );
+                assert_eq!(delayed_cleanup.lease.as_ref(), Some(&original_lease));
                 let sid = session.sid.clone();
                 let expected_sid = sid.clone();
                 let row = find_instance(&state, &id).await.unwrap();

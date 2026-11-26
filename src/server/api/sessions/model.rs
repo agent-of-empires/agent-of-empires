@@ -152,7 +152,6 @@ pub(super) fn session_response_from_instance_with_plan(
         context_resume: None,
         acp_worker_state,
         acp_worker_start: None,
-        update_restart: false,
         pending_approvals: Vec::new(),
         rate_limit: None,
         rate_limit_known: None,
@@ -306,21 +305,6 @@ pub(super) fn truncate_title(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
-}
-
-/// A raw stored ID or cached capability is not a context-preservation receipt.
-pub(super) fn update_restart_resumable(
-    inst: &Instance,
-    resume: &ContextResumeAvailability,
-) -> bool {
-    matches!(resume, ContextResumeAvailability::Available)
-        && if inst.is_structured() {
-            inst.require_resolved_acp_selection().is_ok()
-                && inst.acp_load_session_capable == Some(true)
-                && inst.selected_acp_target().is_ok()
-        } else {
-            inst.clone().qualify_recovery_same().is_ok()
-        }
 }
 
 pub(super) fn context_resume_for(inst: &Instance) -> ContextResumeAvailability {

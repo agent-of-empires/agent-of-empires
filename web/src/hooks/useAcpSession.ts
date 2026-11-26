@@ -7,6 +7,7 @@ import {
   nativeInputAvailable,
   canDecideRequest,
   canSubmitPromptIntent,
+  SANDBOX_LOGIN_REQUIRED_CODE,
   type AcpAttachment,
   type AcpState,
   type ApprovalDecision,
@@ -14,6 +15,7 @@ import {
   type PromptAttachmentInput,
   type QueuedPrompt,
   type RejectedPrompt,
+  type StartupCause,
 } from "../lib/acpTypes";
 import {
   cancelSubagent,
@@ -95,16 +97,42 @@ async function safeText(res: Response, limit = 200): Promise<string> {
 const HOOK_FAILED_QUEUED_MESSAGE =
   "The session's before_start hook failed; your message is queued and will be sent when it works.";
 
+type KeptPrompt = {
+  queuedId: string;
+  message: string;
+  cause: StartupCause | null;
+};
+
 /** The queue id of a prompt the daemon kept until the session can launch (sandbox login or `before_start` hook), with what to tell the user. */
-function keptPrompt(status: number, body: string): { queuedId: string; message: string } | undefined {
+function keptPrompt(status: number, body: string): KeptPrompt | undefined {
   try {
-    const parsed = JSON.parse(body) as { error?: unknown; queued_id?: unknown; message?: unknown };
+    const parsed = JSON.parse(body) as {
+      error?: unknown;
+      queued_id?: unknown;
+      message?: unknown;
+      command?: unknown;
+      profile?: unknown;
+    };
     if (typeof parsed.queued_id !== "string") return undefined;
-    if (status === 409 && parsed.error === "sandbox_login_required") {
-      return { queuedId: parsed.queued_id, message: typeof parsed.message === "string" ? parsed.message : "" };
+    if (status === 409 && parsed.error === SANDBOX_LOGIN_REQUIRED_CODE) {
+      return {
+        queuedId: parsed.queued_id,
+        message: typeof parsed.message === "string" ? parsed.message : "",
+        cause: {
+          kind: "sandbox_login_required",
+          // Present only when the recovery needs `--command`; the login the banner starts takes it.
+          ...(typeof parsed.command === "string" && { command: parsed.command }),
+          // Present only for a session of another profile than the daemon's; the login runs in that profile's file.
+          ...(typeof parsed.profile === "string" && { profile: parsed.profile }),
+        },
+      };
     }
     if (status === 502 && parsed.error === "before_start_hook_failed") {
-      return { queuedId: parsed.queued_id, message: HOOK_FAILED_QUEUED_MESSAGE };
+      return {
+        queuedId: parsed.queued_id,
+        message: HOOK_FAILED_QUEUED_MESSAGE,
+        cause: null,
+      };
     }
   } catch {
     // Not JSON: a plain-text error.
@@ -404,6 +432,7 @@ export function useAcpSession(
       dispatch({ kind: "user_prompt", id: promptId, text, attachments: previews.length > 0 ? previews : undefined });
       if (!requireNativeInput(undefined, admission)) {
         dispatch({ kind: "prompt_send_rejected", id: promptId });
+        dispatch({ kind: "prompt_answered", promptId });
         return { kind: "non_retryable_failure" };
       }
       lastActivityRef.current = Date.now();
@@ -437,7 +466,14 @@ export function useAcpSession(
           if (kept) {
             dispatch({ kind: "rollback_optimistic_prompt", id: promptId });
             // The queue cannot advance until the login: say what to run.
-            if (kept.message) dispatch({ kind: "blocked_launch", message: kept.message });
+            if (kept.message) {
+              dispatch({
+                kind: "blocked_launch",
+                message: kept.message,
+                cause: kept.cause,
+                promptId,
+              });
+            }
             return { kind: "queued", queuedId: kept.queuedId };
           }
           const rejected = res.status >= 400 && res.status < 500;
@@ -472,6 +508,8 @@ export function useAcpSession(
         dispatch({ kind: "settle_inflight_prompt", id: promptId });
         dispatch({ kind: "error", message: `Network error sending prompt: ${describeError(e)}` });
         return { kind: "retryable_failure" };
+      } finally {
+        dispatch({ kind: "prompt_answered", promptId });
       }
     },
     [sessionId, lastActivityRef, requireNativeInput],

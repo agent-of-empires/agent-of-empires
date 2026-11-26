@@ -302,6 +302,7 @@ function AcpChrome({
 
       <SessionBanners
         sessionId={sessionId}
+        tool={view.tool}
         state={state}
         acpWorkerState={acpWorkerState}
         trashedAt={view.trashedAt}
