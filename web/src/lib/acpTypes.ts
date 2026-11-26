@@ -614,6 +614,8 @@ export interface AcpState {
   optimisticRows: ActivityRow[];
   /** Frames with `seq` at or below this are dropped, so replays are idempotent. */
   lastSeq: number;
+  /** Highest seq a `reduced_state` snapshot covered; replayed frames at or below it are already in its `runs`. */
+  subagentsSeq?: number;
   /** `session/new` or `session/load` answered, so the Agent's session exists. */
   sessionAssigned: boolean;
   /** This dashboard restarted a start still in progress; its own stop doesn't read as a stopped Worker. Not persisted. */
@@ -752,6 +754,10 @@ export interface SubagentRecord {
   model?: string | null;
   /** Launched in the background: its card stays open until it goes idle. */
   background?: boolean;
+  /** Client-only: when the child last went idle, from the event's `at`; kept across metadata-only updates, absent on a cold load. */
+  idle_since?: string;
+  /** Number of runs: 1 is the first, each later idle -> active transition adds one. Daemon-published. */
+  runs?: number;
 }
 
 export interface BackgroundAgentTool {
@@ -1541,8 +1547,17 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       );
     }
     const i = next.subagents.findIndex((s) => s.session_id === subagent.session_id);
-    next.subagents =
-      i >= 0 ? next.subagents.map((s, idx) => (idx === i ? subagent : s)) : [...next.subagents, subagent];
+    const prev = next.subagents[i];
+    const resumed =
+      prev?.state === "idle" &&
+      (subagent.state === "running" || subagent.state === "requires_action") &&
+      frame.seq > (state.subagentsSeq ?? 0);
+    const stamped: SubagentRecord = {
+      ...subagent,
+      idle_since: subagent.state === "idle" ? (prev?.state === "idle" ? prev.idle_since : at) : undefined,
+      runs: prev ? (prev.runs ?? 1) + (resumed ? 1 : 0) : subagent.runs || 1,
+    };
+    next.subagents = i >= 0 ? next.subagents.map((s, idx) => (idx === i ? stamped : s)) : [...next.subagents, stamped];
     return next;
   }
   if ("BackgroundTaskStarted" in event) {
@@ -1630,7 +1645,14 @@ function mergeSubagents(
   const fromSnapshot = new Map(snapshot.map((r) => [r.session_id, r]));
   const heldIds = new Set(held.map((r) => r.session_id));
   return [
-    ...held.map((r) => (snapshotIsNewer ? (fromSnapshot.get(r.session_id) ?? r) : r)),
+    ...held.map((r) => {
+      const fresh = snapshotIsNewer ? fromSnapshot.get(r.session_id) : undefined;
+      if (!fresh) return r;
+      // The idle stamp comes from an event time the snapshot lacks, so it holds only while the state agrees.
+      // Runs only grow, so a seen resume survives a snapshot that predates it.
+      const idle_since = fresh.state === r.state ? r.idle_since : undefined;
+      return { ...fresh, idle_since, runs: Math.max(r.runs ?? 0, fresh.runs ?? 0) || undefined };
+    }),
     ...snapshot.filter((r) => !heldIds.has(r.session_id)),
   ];
 }
@@ -1682,6 +1704,7 @@ export function applyReducedState(
     backgroundShells: restoreBackgroundShells(state.backgroundShells, reduced.background_shells ?? []),
     workflowRuns: restoreWorkflowRuns(state.workflowRuns, reduced.workflow_runs ?? []),
     subagents: mergeSubagents(state.subagents, reduced.subagents ?? [], seq === undefined || seq >= state.lastSeq),
+    subagentsSeq: seq === undefined ? state.subagentsSeq : Math.max(state.subagentsSeq ?? 0, seq),
     locallyResolved,
   };
 }
