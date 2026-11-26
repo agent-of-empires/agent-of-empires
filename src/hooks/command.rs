@@ -892,16 +892,21 @@ mod tests {
         }
         let tmp = TempDir::new().unwrap();
         let agent = tmp.path().join("aoe-fake-agent");
+        let fallback = tmp.path().join("aoe-fake-fallback");
+        let wrapper = tmp.path().join("aoe-fake-wrapper");
         std::os::unix::fs::symlink("/bin/sh", &agent).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", &fallback).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", &wrapper).unwrap();
         let hook = hook_command_session_id_sandbox(
             tmp.path().to_str().unwrap(),
             HookIdentityField::SessionId,
             None,
         );
         let payload = r#"{"session_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}"#;
-        for (id, agent_bin, agent_program, script, writes) in [
+        for (id, outer, agent_bin, agent_program, script, writes) in [
             (
                 "pane_agent",
+                &agent,
                 "aoe-fake-agent",
                 None,
                 r#"eval "$HOOK"; true"#,
@@ -909,6 +914,7 @@ mod tests {
             ),
             (
                 "nested_agent",
+                &agent,
                 "aoe-fake-agent",
                 None,
                 r#""$AGENT" -c 'eval "$HOOK"; true'; true"#,
@@ -916,21 +922,56 @@ mod tests {
             ),
             (
                 "pane_fallback_program",
-                "agent",
-                Some("aoe-fake-agent"),
+                &fallback,
+                "aoe-fake-agent",
+                Some("aoe-fake-fallback"),
                 r#"eval "$HOOK"; true"#,
                 true,
             ),
             (
                 "nested_fallback_program",
-                "agent",
-                Some("aoe-fake-agent"),
+                &fallback,
+                "aoe-fake-agent",
+                Some("aoe-fake-fallback"),
+                r#""$FALLBACK" -c 'eval "$HOOK"; true'; true"#,
+                false,
+            ),
+            (
+                "mixed_primary_then_fallback",
+                &agent,
+                "aoe-fake-agent",
+                Some("aoe-fake-fallback"),
+                r#""$FALLBACK" -c 'eval "$HOOK"; true'; true"#,
+                false,
+            ),
+            (
+                "mixed_fallback_then_primary",
+                &fallback,
+                "aoe-fake-agent",
+                Some("aoe-fake-fallback"),
                 r#""$AGENT" -c 'eval "$HOOK"; true'; true"#,
                 false,
             ),
+            (
+                "native_wrapper_with_foreground_agent",
+                &wrapper,
+                "aoe-fake-agent",
+                None,
+                r#""$AGENT" -c 'eval "$HOOK"; true'; true"#,
+                true,
+            ),
+            (
+                "native_wrapper_with_nested_agent",
+                &wrapper,
+                "aoe-fake-agent",
+                None,
+                r#""$AGENT" -c '"$AGENT" -c "eval \"\$HOOK\"; true"; true'; true"#,
+                false,
+            ),
         ] {
-            run_hook(&agent, script, id, payload, |c| {
+            run_hook(outer, script, id, payload, |c| {
                 c.env("AGENT", &agent)
+                    .env("FALLBACK", &fallback)
                     .env("HOOK", &hook)
                     .env("AOE_AGENT_BIN", agent_bin)
                     .env_remove("AOE_AGENT_PROGRAM");

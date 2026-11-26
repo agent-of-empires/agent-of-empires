@@ -72,6 +72,28 @@ fn publisher_is_pane_agent(publisher: Option<&str>, pane_agent: Option<&str>) ->
     }
 }
 
+fn agent_names_for_walk<'a>(agent_bin: &'a str, program: Option<&'a str>) -> Vec<&'a str> {
+    let mut names = vec![agent_bin];
+    for agent in crate::agents::AGENTS
+        .iter()
+        .chain(crate::plugin::bundled_agents::definitions())
+    {
+        if agent.binary == agent_bin {
+            for fallback in agent.fallback_binaries {
+                if !fallback.is_empty() && !names.contains(fallback) {
+                    names.push(fallback);
+                }
+            }
+        }
+    }
+    if let Some(program) = program.filter(|program| !program.is_empty()) {
+        if !names.contains(&program) {
+            names.push(program);
+        }
+    }
+    names
+}
+
 fn fired_by_pane_agent() -> bool {
     let agent_pid = std::env::var("AOE_AGENT_PID")
         .ok()
@@ -86,9 +108,7 @@ fn fired_by_pane_agent() -> bool {
     let program = std::env::var("AOE_AGENT_PROGRAM")
         .ok()
         .filter(|program| !program.is_empty() && *program != agent_bin);
-    let names: Vec<&str> = std::iter::once(agent_bin.as_str())
-        .chain(program.as_deref())
-        .collect();
+    let names = agent_names_for_walk(&agent_bin, program.as_deref());
     walk_reaches_single_agent(
         std::os::unix::process::parent_id(),
         agent_pid,
@@ -520,6 +540,95 @@ mod tests {
                     (7, 1, "/opt/bin/company-codex"),
                 ],
                 true,
+            ),
+        ];
+        for (name, names, agent_pid, chain, owned) in cases {
+            let table: std::collections::HashMap<u32, (u32, String)> = chain
+                .iter()
+                .map(|(pid, ppid, argv0)| (*pid, (*ppid, argv0.to_string())))
+                .collect();
+            let lookup = |pid| table.get(&pid).cloned();
+            assert_eq!(
+                walk_reaches_single_agent(10, agent_pid, names, lookup),
+                owned,
+                "{name}"
+            );
+        }
+    }
+
+    /// Cursor declares both `agent` and `cursor-agent`; a mixed-name parent and
+    /// child (`agent` -> `cursor-agent` or `cursor-agent` -> `agent`) must both
+    /// be counted as nested agents regardless of which binary launched the pane.
+    #[test]
+    fn cursor_walk_recognizes_both_declared_binary_names_in_mixed_parent_child() {
+        type Chain = &'static [(u32, u32, &'static str)];
+        let primary_only_env = agent_names_for_walk("agent", None);
+        let fallback_env = agent_names_for_walk("agent", Some("cursor-agent"));
+        assert_eq!(primary_only_env, ["agent", "cursor-agent"]);
+        assert_eq!(fallback_env, ["agent", "cursor-agent"]);
+
+        let cases: [(&str, &[&str], u32, Chain, bool); 6] = [
+            (
+                "direct agent publishes",
+                &primary_only_env,
+                9,
+                &[(10, 9, "sh"), (9, 1, "/usr/local/bin/agent")],
+                true,
+            ),
+            (
+                "direct cursor-agent publishes",
+                &fallback_env,
+                9,
+                &[(10, 9, "sh"), (9, 1, "/usr/local/bin/cursor-agent")],
+                true,
+            ),
+            (
+                "nested cursor-agent under agent is rejected",
+                &primary_only_env,
+                7,
+                &[
+                    (10, 9, "sh"),
+                    (9, 8, "cursor-agent"),
+                    (8, 7, "bash"),
+                    (7, 1, "/usr/local/bin/agent"),
+                ],
+                false,
+            ),
+            (
+                "nested agent under cursor-agent is rejected",
+                &fallback_env,
+                7,
+                &[
+                    (10, 9, "sh"),
+                    (9, 8, "agent"),
+                    (8, 7, "bash"),
+                    (7, 1, "/usr/local/bin/cursor-agent"),
+                ],
+                false,
+            ),
+            (
+                "nested cursor-agent under cursor-agent is rejected",
+                &fallback_env,
+                7,
+                &[
+                    (10, 9, "sh"),
+                    (9, 8, "cursor-agent"),
+                    (8, 7, "bash"),
+                    (7, 1, "/usr/local/bin/cursor-agent"),
+                ],
+                false,
+            ),
+            (
+                "nested agent under agent is rejected",
+                &primary_only_env,
+                7,
+                &[
+                    (10, 9, "sh"),
+                    (9, 8, "agent"),
+                    (8, 7, "bash"),
+                    (7, 1, "/usr/local/bin/agent"),
+                ],
+                false,
             ),
         ];
         for (name, names, agent_pid, chain, owned) in cases {

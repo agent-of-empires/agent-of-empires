@@ -3547,6 +3547,75 @@ pub(crate) fn is_agent_available(agent: &crate::agents::AgentDef<'_>) -> bool {
     probe_agents_available(&[agent]).contains(agent.name)
 }
 
+/// Resolve the host executable name for an agent with fallback binaries,
+/// probing through the login shell if the cache is cold, and capturing the
+/// owned binary name before releasing `AGENT_PROBE_LOCK` so a concurrent
+/// `Recheck` cannot clear discovery between selection and use.
+pub(crate) fn probe_agent_discovered_binary(agent: &crate::agents::AgentDef<'_>) -> Option<String> {
+    if agent.fallback_binaries.is_empty() {
+        return None;
+    }
+    if which::which(agent.binary).is_ok() {
+        return Some(agent.binary.to_string());
+    }
+    if let Some(found) = agent
+        .fallback_binaries
+        .iter()
+        .copied()
+        .find(|bin| which::which(bin).is_ok())
+    {
+        return Some(found.to_string());
+    }
+    if let (Ok(avail), Ok(binaries)) = (AGENT_AVAILABILITY.read(), DISCOVERED_AGENT_BINARIES.read())
+    {
+        if let Some((ok, at)) = avail.as_ref().and_then(|map| map.get(agent.name)) {
+            if at.elapsed() < AGENT_AVAILABILITY_TTL {
+                if !*ok {
+                    return None;
+                }
+                if let Some(bin) = binaries.as_ref().and_then(|map| map.get(agent.name)) {
+                    return Some(bin.clone());
+                }
+            }
+        }
+    }
+    let _probe_guard = AGENT_PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (already_found, uncached) = partition_cached_agents(&[agent]);
+    if uncached.is_empty() {
+        return if already_found.contains(agent.name) {
+            discovered_agent_binary(agent.name)
+        } else {
+            None
+        };
+    }
+    let (ok, discovered) = match agent_available_direct(agent, None) {
+        Some(true) => {
+            let bin = agent
+                .candidate_binaries()
+                .find(|candidate| which::which(candidate).is_ok())
+                .map(str::to_owned);
+            (true, bin)
+        }
+        Some(false) => (false, None),
+        None => {
+            let shell_found = login_shell_probe(&[agent], None);
+            (
+                shell_found.contains(agent.name),
+                discovered_agent_binary(agent.name),
+            )
+        }
+    };
+    if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
+        let map = cache.get_or_insert_with(HashMap::new);
+        map.insert(agent.name.to_string(), (ok, std::time::Instant::now()));
+    }
+    if ok {
+        discovered
+    } else {
+        None
+    }
+}
+
 /// A nonblocking UI snapshot: cached answers, with local PATH lookups for misses.
 pub(crate) fn agent_availability_snapshot(
     agents: &[&crate::agents::AgentDef<'_>],

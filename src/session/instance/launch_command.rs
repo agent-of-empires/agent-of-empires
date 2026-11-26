@@ -4,6 +4,11 @@ use super::execution::{UnattestedCodexPolicy, UnpinnedCodexLaunch};
 use super::*;
 use crate::session::capture::CodexRolloutScanLimit;
 
+#[cfg(test)]
+thread_local! {
+    static INVALIDATE_AFTER_HOST_BINARY_SELECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub(super) struct LaunchCommandParts {
     command: Option<String>,
     is_existing: bool,
@@ -981,6 +986,10 @@ impl Instance {
     /// the subcommand is not applied to it. Used when assembling the launch
     /// command so subcommand-scoped flags (yolo, resume) parse correctly.
     pub(super) fn get_launch_command(&self) -> String {
+        self.launch_command_with_host_binary(None)
+    }
+
+    fn launch_command_with_host_binary(&self, host_binary: Option<&str>) -> String {
         if self.command.is_empty() {
             if let Some(declared) = self.declared_agent() {
                 if let Some(command) = &declared.contribution().command {
@@ -996,6 +1005,11 @@ impl Instance {
                 .map(|a| {
                     if sandboxed {
                         a.primary_launch_base_command()
+                    } else if let Some(bin) = host_binary {
+                        match a.launch_subcommand {
+                            Some(sub) => format!("{} {}", bin, sub),
+                            None => bin.to_string(),
+                        }
                     } else {
                         a.launch_base_command()
                     }
@@ -1728,22 +1742,43 @@ impl Instance {
             fallback_profile = self.effective_profile();
             &fallback_profile
         };
-        // A cold daemon has not yet run a login-shell probe for fallback binaries;
-        // probe before resolving the launch binary so unmanaged host launches
-        // (e.g., `cursor-agent` only on login-shell PATH) pick the right executable.
-        if self.command.is_empty() && execution.is_none() {
-            if let Some(agent) = agent.filter(|a| !a.fallback_binaries.is_empty()) {
-                let _ = crate::tmux::is_agent_available(agent);
-            }
+        // Resolve the host fallback binary once so a concurrent availability
+        // refresh cannot clear login-shell discovery between hook identity
+        // construction and launch command assembly.
+        let selected_host_binary = if self.command.is_empty() && execution.is_none() {
+            agent
+                .filter(|a| !a.fallback_binaries.is_empty())
+                .and_then(crate::tmux::probe_agent_discovered_binary)
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if INVALIDATE_AFTER_HOST_BINARY_SELECT.with(|flag| flag.replace(false)) {
+            crate::tmux::invalidate_agent_availability();
         }
-        let program = parse_launch_command(&self.get_tool_command()).and_then(|parsed| {
-            parsed.words.first().and_then(|word| {
-                Path::new(word)
-                    .file_name()
+        let supplied = if self.command.is_empty() {
+            self.launch_command_with_host_binary(selected_host_binary.as_deref())
+        } else {
+            self.command.clone()
+        };
+        let program = execution
+            .map(|execution| execution.program.as_path())
+            .or_else(|| unpinned.map(|unpinned| unpinned.program.as_path()))
+            .and_then(|path| {
+                path.file_name()
                     .and_then(|name| name.to_str())
                     .map(str::to_owned)
             })
-        });
+            .or_else(|| {
+                parse_launch_command(&supplied).and_then(|parsed| {
+                    parsed.words.first().and_then(|word| {
+                        Path::new(word)
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .map(str::to_owned)
+                    })
+                })
+            });
         let mut env_prefix = self.with_hook_agent(|this, agent| {
             host_launch_env_prefix(profile, &this.id, agent, program.as_deref())
         });
@@ -1761,7 +1796,6 @@ impl Instance {
                     // A blank stored command can still select an approved
                     // declaration whose command carries an assignment and fixed
                     // arguments; the binary alone would drop them.
-                    let supplied = self.get_launch_command();
                     let guarded = appended_flag_invocation(&supplied, &self.extra_args);
                     let mut cmd = self.freeze_native_invocation(
                         supplied.clone(),
@@ -1869,7 +1903,6 @@ impl Instance {
                 }),
             }
         } else {
-            let supplied = self.command.clone();
             let guarded = appended_flag_invocation(&supplied, &self.extra_args);
             let mut cmd = self.freeze_native_invocation(
                 supplied.clone(),
@@ -5235,6 +5268,147 @@ sandbox = "unsupported"
         assert!(
             !command.contains("exec env agent\n") && !command.ends_with(" agent"),
             "launch must not fall back to bare `agent`: {command}"
+        );
+    }
+
+    /// When the daemon PATH and the session's prepared PATH select different
+    /// Cursor binaries (`agent` vs `cursor-agent`), host hook identity metadata
+    /// (`AOE_AGENT_PROGRAM`) must follow the pinned launch executable.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn host_cursor_hook_identity_aligns_with_selected_pane_path_binary() {
+        if crate::tmux::tests::run_probe_test_in_subprocess() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let daemon_bin = temp.path().join("daemon-bin");
+        let pane_bin = temp.path().join("pane-bin");
+        std::fs::create_dir_all(&daemon_bin).unwrap();
+        std::fs::create_dir_all(&pane_bin).unwrap();
+        let install = |dir: &std::path::Path, name: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+
+        // Case 1: Daemon PATH has `agent`, pane PATH has only `cursor-agent`.
+        let daemon_agent = install(&daemon_bin, "agent");
+        let pane_cursor_agent = install(&pane_bin, "cursor-agent");
+        let _env = EnvGuard::set(&[("PATH", format!("{}:/usr/bin:/bin", daemon_bin.display()))]);
+        write_profile_environment(
+            "cursor-pane-fallback",
+            &format!("PATH={}:/usr/bin:/bin", pane_bin.display()),
+        );
+        let mut inst = tool_instance("cursor", project.to_str().unwrap());
+        inst.source_profile = "cursor-pane-fallback".into();
+        let prepared = inst
+            .prepare_launch_command(inst.conversation_state())
+            .expect("pane PATH cursor-agent launch should succeed");
+        assert_eq!(
+            prepared.execution.as_ref().map(|e| e.program.as_path()),
+            Some(pane_cursor_agent.as_path())
+        );
+        let command = prepared.command.expect("host command");
+        assert!(
+            command.contains(&format!(
+                "AOE_AGENT_PROGRAM={}",
+                shell_escape("cursor-agent")
+            )),
+            "hook identity must name the pinned cursor-agent binary: {command}"
+        );
+
+        // Case 2: Daemon PATH has only `cursor-agent`, pane PATH has `agent`.
+        std::fs::remove_file(&daemon_agent).unwrap();
+        std::fs::remove_file(&pane_cursor_agent).unwrap();
+        let _daemon_cursor_agent = install(&daemon_bin, "cursor-agent");
+        let pane_agent = install(&pane_bin, "agent");
+        let mut inst = tool_instance("cursor", project.to_str().unwrap());
+        inst.source_profile = "cursor-pane-fallback".into();
+        let prepared = inst
+            .prepare_launch_command(inst.conversation_state())
+            .expect("pane PATH primary agent launch should succeed");
+        assert_eq!(
+            prepared.execution.as_ref().map(|e| e.program.as_path()),
+            Some(pane_agent.as_path())
+        );
+        let command = prepared.command.expect("host command");
+        assert!(
+            !command.contains("AOE_AGENT_PROGRAM="),
+            "hook identity must omit AOE_AGENT_PROGRAM when pinned binary is primary agent: {command}"
+        );
+    }
+
+    /// Clearing availability discovery between fallback selection and command /
+    /// hook construction (e.g. a concurrent Recheck) must not cause a
+    /// login-shell-only `cursor-agent` launch to fall back to missing `agent`.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn cursor_fallback_selection_survives_concurrent_refresh_during_launch_prep() {
+        if crate::tmux::tests::run_probe_test_in_subprocess() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let login_bin = temp.path().join("login-bin");
+        std::fs::create_dir_all(&login_bin).unwrap();
+        let cursor_agent = login_bin.join("cursor-agent");
+        std::fs::write(&cursor_agent, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&cursor_agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let shell_bin = temp.path().join("shell-bin");
+        std::fs::create_dir_all(&shell_bin).unwrap();
+        let login_shell = shell_bin.join("login-shell");
+        std::fs::write(
+            &login_shell,
+            format!(
+                "#!/bin/sh\nexport PATH={}:$PATH\nexec /bin/sh -c \"$2\"\n",
+                shell_escape(login_bin.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&login_shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _env = EnvGuard::set(&[
+            ("PATH", "/usr/bin:/bin"),
+            ("SHELL", login_shell.to_str().unwrap()),
+        ]);
+        let memo = crate::tmux::AgentAvailabilityGuard::capture();
+        memo.clear();
+
+        INVALIDATE_AFTER_HOST_BINARY_SELECT.with(|flag| flag.set(true));
+        let mut inst = tool_instance("cursor", project.to_str().unwrap());
+        let prepared = inst
+            .prepare_launch_command(inst.conversation_state())
+            .expect("launch should keep selected cursor-agent across refresh");
+        assert!(
+            crate::tmux::discovered_agent_binary("cursor").is_none(),
+            "precondition: refresh cleared discovery between selection and use"
+        );
+        let command = prepared.command.expect("host launch command");
+        assert!(
+            command.contains(&format!(
+                "AOE_AGENT_PROGRAM={}",
+                shell_escape("cursor-agent")
+            )),
+            "hook identity must keep selected cursor-agent: {command}"
+        );
+        assert!(
+            command.contains("cursor-agent\n") || command.contains("cursor-agent '"),
+            "launch command must keep selected cursor-agent: {command}"
         );
     }
 }

@@ -1525,25 +1525,23 @@ impl Instance {
                 .push((crate::hooks::SESSION_SOURCE_ENV.into(), source.to_owned()));
         }
         // The container has no launch pid, so the session-id hook identifies a
-        // nested agent by this binary name (and any fallback/renamed program)
-        // instead.
+        // nested agent by this binary name (and any declared fallback binary)
+        // instead. Declared wrappers (e.g. `company-claude`) are intentionally
+        // excluded so a native wrapper that spawns the foreground agent as a
+        // child is not counted as a second agent.
         if let Some(agent) = agent {
             environment
                 .env
                 .push(("AOE_AGENT_BIN".into(), agent.binary.to_owned()));
-            if let Some(program) =
-                super::launch_command::parse_launch_command(&self.get_tool_command())
-                    .and_then(|parsed| {
-                        parsed.words.first().and_then(|word| {
-                            std::path::Path::new(word)
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .map(str::to_owned)
-                        })
-                    })
-                    .filter(|name| !name.is_empty() && name != agent.binary)
+            if let Some(fallback) = agent
+                .fallback_binaries
+                .iter()
+                .copied()
+                .find(|name| !name.is_empty() && *name != agent.binary)
             {
-                environment.env.push(("AOE_AGENT_PROGRAM".into(), program));
+                environment
+                    .env
+                    .push(("AOE_AGENT_PROGRAM".into(), fallback.to_owned()));
             }
         }
         if let Some((key, value)) = agent.and_then(|agent| {
@@ -2100,11 +2098,20 @@ impl Instance {
         if let Some(docker_env) = inputs.docker_env.as_mut() {
             docker_env.env.retain(|(key, _)| key != "AOE_AGENT_PROGRAM");
             inputs.environment.remove("AOE_AGENT_PROGRAM");
-            if let Some(name) = program
+            let fallback = program
                 .file_name()
                 .and_then(|name| name.to_str())
-                .filter(|name| !name.is_empty() && *name != agent.binary)
-            {
+                .filter(|name| {
+                    !name.is_empty() && *name != agent.binary && agent.matches_binary(name)
+                })
+                .or_else(|| {
+                    agent
+                        .fallback_binaries
+                        .iter()
+                        .copied()
+                        .find(|name| !name.is_empty() && *name != agent.binary)
+                });
+            if let Some(name) = fallback {
                 docker_env
                     .env
                     .push(("AOE_AGENT_PROGRAM".into(), name.to_owned()));
@@ -5457,5 +5464,59 @@ sandbox = "unsupported"
             ManagedResumeCause::PiTranscriptBindingRequired
         );
         assert!(!error.is::<super::super::ManagedResumeRefused>());
+    }
+
+    /// Sandboxed sessions must not expose declared wrappers in
+    /// `AOE_AGENT_PROGRAM` (a native wrapper spawning the foreground agent as a
+    /// child would otherwise be counted as a second nested agent), while agents
+    /// with declared fallback binaries (Cursor -> `cursor-agent`) still expose
+    /// the fallback binary name.
+    #[test]
+    fn sandbox_launch_environment_separates_declared_wrappers_from_fallback_binaries() {
+        let config = crate::session::config::Config::default();
+        let env_val = |env: &crate::session::environment::DockerExecEnv, key: &str| {
+            env.env
+                .iter()
+                .rev()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        };
+
+        let mut wrapped_claude = Instance::new("wrapped-claude", "/tmp/project");
+        wrapped_claude.tool = "company-claude".into();
+        wrapped_claude.command = "company-claude".into();
+        wrapped_claude.sandbox_info = Some(super::super::test_helpers::test_sandbox(
+            "wrapped-claude",
+            Some("/workspace"),
+        ));
+        let claude = crate::agents::get_agent("claude").unwrap();
+        let claude_env = wrapped_claude
+            .sandbox_launch_environment(Some(claude), None, "default", None, &config)
+            .unwrap();
+        assert_eq!(
+            env_val(&claude_env, "AOE_AGENT_BIN").as_deref(),
+            Some("claude")
+        );
+        assert_eq!(env_val(&claude_env, "AOE_AGENT_PROGRAM"), None);
+
+        let mut wrapped_cursor = Instance::new("wrapped-cursor", "/tmp/project");
+        wrapped_cursor.tool = "company-cursor".into();
+        wrapped_cursor.command = "company-cursor".into();
+        wrapped_cursor.sandbox_info = Some(super::super::test_helpers::test_sandbox(
+            "wrapped-cursor",
+            Some("/workspace"),
+        ));
+        let cursor = crate::agents::get_agent("cursor").unwrap();
+        let cursor_env = wrapped_cursor
+            .sandbox_launch_environment(Some(cursor), None, "default", None, &config)
+            .unwrap();
+        assert_eq!(
+            env_val(&cursor_env, "AOE_AGENT_BIN").as_deref(),
+            Some("agent")
+        );
+        assert_eq!(
+            env_val(&cursor_env, "AOE_AGENT_PROGRAM").as_deref(),
+            Some("cursor-agent")
+        );
     }
 }
