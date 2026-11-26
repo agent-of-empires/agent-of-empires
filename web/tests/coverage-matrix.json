@@ -4654,7 +4654,11 @@
       "id": "acp.agent-profile",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/lib/agentProfile.test.ts", "src/lib/memoryClassify.test.ts"],
+      "specs": [
+        "src/lib/agentProfile.test.ts",
+        "src/lib/agentProfileContext.test.tsx",
+        "src/lib/memoryClassify.test.ts"
+      ],
       "components": [
         "web/src/lib/agentProfile.ts",
         "web/src/lib/agentProfileContext.tsx",
