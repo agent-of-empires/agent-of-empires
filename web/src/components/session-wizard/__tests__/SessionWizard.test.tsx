@@ -2477,6 +2477,20 @@ describe("SessionWizard initial prompt", () => {
 });
 
 describe("SessionWizard suggestion link", () => {
+  it("keeps the prefill it opened with when a later one arrives", async () => {
+    const props = { servedProfile: "default", onClose: vi.fn(), onCreated: vi.fn() };
+    const { rerender } = render(<SessionWizard {...props} prefill={{ path: "/tmp/proj", tool: "claude" }} />);
+    rerender(
+      <SessionWizard
+        {...props}
+        prefill={{ path: "/tmp/other", tool: "claude", suggestion: { provider_id: "github", id: "issue-1" } }}
+      />,
+    );
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload().suggestion).toBeUndefined();
+  });
+
   it("sends the suggestion reference, and nothing when the prefill has none", async () => {
     renderWizard({ path: "/tmp/proj", tool: "claude", suggestion: { provider_id: "github", id: "issue-1" } });
     await launch();

@@ -305,12 +305,14 @@ export function SessionWizard({
   onCreatedInBackground,
   onReopenFailure,
   restore,
-  prefill,
+  prefill: openedWith,
   servedProfile,
   onRetryServedProfile,
   nameOnly = false,
   onEditPreset,
 }: Props) {
+  // The form is seeded once, so a later prefill (a slow Start with changes) must not swap its provenance.
+  const [prefill] = useState(openedWith);
   const [state, dispatch] = useReducer(reducer, {
     data: restore?.data ?? initialWizardData(prefill, nameOnly),
     isSubmitting: false,
