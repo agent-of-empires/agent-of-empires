@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useReportFeatureOnce } from "../hooks/useReportFeatureOnce";
 import { ChevronDown, ChevronRight, RefreshCw, Search, Settings, X } from "lucide-react";
 import { agoLabel } from "../lib/suggestionTime";
@@ -163,13 +163,17 @@ export function SuggestionsView({
   const chip = (selected: boolean) =>
     `${CHIP} ${selected ? "border-brand-500 bg-brand-500/10 text-text-primary" : "border-surface-700 text-text-secondary hover:bg-surface-800"}`;
 
+  const headingRef = useRef<HTMLHeadingElement>(null);
   const noProviderNote =
     !readOnly && onOpenMarketplace ? (
       <SuggestionsSetupHint
         ignoreDismissed
         noProvider
         onOpenMarketplace={onOpenMarketplace}
-        onFinished={() => void load()}
+        onFinished={() => {
+          headingRef.current?.focus();
+          void load();
+        }}
         fallback="No plugin provides suggestions."
       />
     ) : (
@@ -181,7 +185,9 @@ export function SuggestionsView({
       <div className="mx-auto max-w-4xl p-4 md:p-8">
         <header className="flex items-center justify-between gap-4">
           <div className="min-w-0">
-            <h1 className="text-lg font-semibold">Suggested sessions</h1>
+            <h1 ref={headingRef} tabIndex={-1} className="text-lg font-semibold outline-none">
+              Suggested sessions
+            </h1>
             {snapshot && snapshot.providers.length > 0 && (
               <ul aria-label="Provider status" className="mt-1 flex flex-wrap gap-x-3 font-mono text-xs text-text-dim">
                 <li>

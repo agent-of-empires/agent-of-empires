@@ -30,7 +30,11 @@ interface Props {
   onOpenSession: (sessionId: string) => void;
   /** Live sessions, so a started row follows its Session's state. */
   sessions?: SessionResponse[];
+  /** The setup sheet just finished and removed the control that had focus; the heading takes it. */
+  focusHeading?: boolean;
 }
+
+const focusOnMount = (el: HTMLElement | null) => el?.focus();
 
 export function DashboardSuggestions({
   readOnly = false,
@@ -41,6 +45,7 @@ export function DashboardSuggestions({
   onViewAll,
   onOpenSession,
   sessions,
+  focusHeading = false,
 }: Props) {
   const wide = useIsWideViewport();
   const ctrl = useSuggestions(onPrepare, onOpenSession);
@@ -89,7 +94,9 @@ export function DashboardSuggestions({
       <div className="mb-2 flex items-center justify-between px-1">
         <h2
           id="suggested-sessions-heading"
-          className="text-[11px] font-mono uppercase tracking-[0.16em] text-text-muted"
+          tabIndex={-1}
+          ref={focusHeading ? focusOnMount : undefined}
+          className="text-[11px] font-mono uppercase tracking-[0.16em] text-text-muted outline-none"
         >
           Suggested sessions
         </h2>
