@@ -25,7 +25,8 @@ use super::state::{
 use crate::acp::approvals::{tool_target, ToolTarget, CMD_KEYS, PATH_KEYS};
 use crate::acp::session_paths::{relative_display_path, SessionPathRoots};
 use crate::acp::state::{
-    AuthStatusKind, SessionUsage, SubagentRecord, SubagentState, ToolOutputBlock,
+    AuthStatusKind, IntegrationLostReason, SessionUsage, SubagentRecord, SubagentState,
+    ToolOutputBlock,
 };
 use crate::acp::transcript::{TranscriptRow, TranscriptRowKind};
 use crate::tui::components::hover::paint_hover_bg;
@@ -432,10 +433,27 @@ fn queued_strip_height(state: &StructuredViewState) -> u16 {
 const CLOSE_LABEL: &str = " × ";
 const CLOSE_LABEL_WIDTH: u16 = 3;
 
-/// One line per undismissed advisory. Capped daemon-side, so this never
-/// starves the transcript.
+/// What went wrong, per reason; the Daemon holds the session's queue meanwhile.
+fn integration_lost_text(reason: &IntegrationLostReason) -> String {
+    let what = match reason {
+        IntegrationLostReason::ContractViolation { detail } => {
+            format!("The integration broke the protocol: {detail}.")
+        }
+        IntegrationLostReason::HoldOverflow => {
+            "The integration held back too many messages.".to_string()
+        }
+        IntegrationLostReason::LeaseOverflow => {
+            "The integration left too many requests open.".to_string()
+        }
+        IntegrationLostReason::ProxyExited => "The integration process exited.".to_string(),
+    };
+    format!(" {what} Messages you send stay queued.")
+}
+
+/// One line for a lost integration, then one per undismissed advisory.
+/// Advisories are capped daemon-side, so this never starves the transcript.
 fn notices_strip_height(state: &StructuredViewState) -> u16 {
-    state.visible_notices().count() as u16
+    state.visible_notices().count() as u16 + u16::from(state.transcript.integration_lost.is_some())
 }
 
 /// Agent-pushed advisories, toned by severity, each dismissable with `x` or a
@@ -447,7 +465,25 @@ fn render_notices(
     state: &StructuredViewState,
 ) -> Vec<(Rect, Intent)> {
     let mut buttons = Vec::new();
+    let mut first_notice_row = 0;
+    if let Some(reason) = &state.transcript.integration_lost {
+        let line = Line::from(vec![
+            Span::styled(
+                " Agent integration lost ",
+                Style::default()
+                    .fg(theme.error)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                integration_lost_text(reason),
+                Style::default().fg(theme.hint),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), Rect { height: 1, ..area });
+        first_notice_row = 1;
+    }
     for (row, notice) in state.visible_notices().enumerate() {
+        let row = row + first_notice_row;
         let Some(y) = area
             .y
             .checked_add(row as u16)
@@ -2975,6 +3011,58 @@ mod tests {
         state.transcript.session_notices.clear();
         state.prune_dismissed_notices();
         assert!(state.dismissed_notices.is_empty());
+    }
+
+    #[test]
+    fn integration_lost_renders_a_line_per_reason_above_the_notices() {
+        let mut state = test_state();
+        state.transcript.session_notices = vec![SessionNotice {
+            id: "notice-1".into(),
+            severity: "info".into(),
+            title: "Fast mode turned off".into(),
+            description: None,
+        }];
+        let strip = |state: &StructuredViewState| -> Vec<String> {
+            render_rows(state, 100, 24, true)
+                .into_iter()
+                .filter(|row| row.contains("integration") || row.contains('×'))
+                .collect()
+        };
+
+        for (reason, expected) in [
+            (
+                IntegrationLostReason::ProxyExited,
+                "The integration process exited.",
+            ),
+            (
+                IntegrationLostReason::ContractViolation {
+                    detail: "bad seq".into(),
+                },
+                "The integration broke the protocol: bad seq.",
+            ),
+            (
+                IntegrationLostReason::HoldOverflow,
+                "The integration held back too many messages.",
+            ),
+            (
+                IntegrationLostReason::LeaseOverflow,
+                "The integration left too many requests open.",
+            ),
+        ] {
+            state.transcript.integration_lost = Some(reason);
+            let rows = strip(&state);
+            assert_eq!(rows.len(), 2, "{rows:?}");
+            assert!(rows[0].contains("Agent integration lost"), "{rows:?}");
+            assert!(rows[0].contains(expected), "{rows:?}");
+            assert!(
+                rows[0].contains("Messages you send stay queued."),
+                "{rows:?}"
+            );
+            assert!(rows[1].contains("Fast mode turned off"), "{rows:?}");
+        }
+
+        state.transcript.integration_lost = None;
+        assert_eq!(strip(&state).len(), 1);
     }
 
     #[test]
