@@ -2173,12 +2173,26 @@ mod tests {
             "PATCH {prefs}: a writable Daemon didn't parse the body ({status})"
         );
 
-        // Off read-only the layer passes the request on, and the route's own limit answers.
+        // Off read-only the layer passes the request on, and the route's own limit answers: a
+        // body past the global 1 MiB but within it gets through, and one past it doesn't.
         for (method, path, limit) in [
             ("PUT", "/api/sessions/missing/file", 32 << 20),
             ("POST", "/api/sessions/missing/paste-image", 8 << 20),
             ("POST", "/api/sessions/missing/acp/prompt", 28 << 20),
         ] {
+            let (status, _, _) = send(
+                &writable,
+                method,
+                path,
+                Body::from(vec![b' '; (1 << 20) + 1]),
+            )
+            .await
+            .unwrap_or_else(|| panic!("{method} {path} didn't answer"));
+            assert_ne!(
+                status,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "{method} {path}: the global limit applied over its own"
+            );
             let oversize = Body::from(vec![b' '; limit + 1]);
             let (status, _, _) = send(&writable, method, path, oversize)
                 .await

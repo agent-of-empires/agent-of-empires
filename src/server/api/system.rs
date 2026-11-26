@@ -743,6 +743,8 @@ pub async fn update_settings(
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
+    // Before the served name is read, so a rename it waits for can't leave it saving to the old name.
+    let namespace = state.profile_namespace.clone().read_owned().await;
     let target = match SettingsLayer::resolve(&query, &state.served_profile()) {
         Ok(layer) => layer,
         Err(message) => return bad_request(message),
@@ -754,7 +756,7 @@ pub async fn update_settings(
     // profile-overridable field sets the inherited value on purpose. A save
     // addressed at a profile splits, and each leaf lands where a plain read of
     // the same layer would find it.
-    let (machine, profile_patch) = match target {
+    let patch = match target {
         SettingsLayer::Profile(_) => split_patch_by_layer(&runtime_schema(), &body),
         SettingsLayer::Machine => (body, serde_json::json!({})),
     };
@@ -764,9 +766,9 @@ pub async fn update_settings(
     };
     save_settings_patch(
         state.clone(),
+        namespace,
         profile,
-        machine,
-        profile_patch,
+        patch,
         session,
         loopback,
         WriteStamp::from_headers(&headers),
@@ -786,13 +788,13 @@ fn take_telemetry_consent(machine: &mut serde_json::Value) -> Option<bool> {
     Some(enabled.as_bool().unwrap_or(false))
 }
 
-/// Write the two halves of a split settings patch and answer with the
-/// effective config of the layer written.
+/// Write the two halves of a split settings patch, `(machine, profile)`, and
+/// answer with the effective config of the layer written.
 async fn save_settings_patch(
     state: Arc<AppState>,
+    namespace: tokio::sync::OwnedRwLockReadGuard<()>,
     profile: Option<String>,
-    mut machine: serde_json::Value,
-    mut profile_patch: serde_json::Value,
+    (mut machine, mut profile_patch): (serde_json::Value, serde_json::Value),
     session: Option<Extension<AuthenticatedBrowserSession>>,
     loopback: Option<Extension<Principal>>,
     stamp: Option<WriteStamp>,
@@ -831,7 +833,7 @@ async fn save_settings_patch(
         }
     }
 
-    let mut write = SettingsWrite::acquire(&state).await;
+    let mut write = SettingsWrite::holding(namespace).await;
     let stale = drop_stale_leaves(&write.applied, stamp.as_ref(), "", &mut machine)
         | drop_stale_leaves(
             &write.applied,
@@ -987,7 +989,12 @@ async fn save_settings_patch(
             }
         }
     }
-    drop(write);
+    // The namespace stays held through the read-back, so the answer is the profile just saved.
+    let SettingsWrite {
+        _namespace,
+        applied,
+    } = write;
+    drop(applied);
     tracing::info!(
         target: "http.api.system",
         ?profile,
@@ -1002,7 +1009,12 @@ async fn save_settings_patch(
     let effective = match (&profile, machine_config) {
         (Some(name), _) => {
             let name = name.clone();
-            tokio::task::spawn_blocking(move || crate::session::resolve_config(&name)).await
+            tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                settings_write_pause(&SETTINGS_READ_BACK, &name);
+                crate::session::resolve_config(&name)
+            })
+            .await
         }
         (None, Some(config)) => Ok(Ok(config)),
         (None, None) => tokio::task::spawn_blocking(crate::session::Config::load).await,
@@ -1091,8 +1103,12 @@ struct SettingsWrite {
 impl SettingsWrite {
     /// The namespace comes first, as for every holder of both.
     async fn acquire(state: &AppState) -> Self {
+        Self::holding(state.profile_namespace.clone().read_owned().await).await
+    }
+
+    async fn holding(namespace: tokio::sync::OwnedRwLockReadGuard<()>) -> Self {
         Self {
-            _namespace: state.profile_namespace.clone().read_owned().await,
+            _namespace: namespace,
             applied: write_gate().await,
         }
     }
@@ -2591,6 +2607,11 @@ static AGENT_DEFAULT_MODEL_READ: std::sync::Mutex<Option<ProfileCommitPause>> =
 /// Pauses a settings save of `profile` after its profile check, before its write.
 #[cfg(test)]
 static PROFILE_PATCH_CHECKED: std::sync::Mutex<Option<ProfileCommitPause>> =
+    std::sync::Mutex::new(None);
+
+/// Pauses a settings save of `profile` before it reads back the layer it answers with.
+#[cfg(test)]
+static SETTINGS_READ_BACK: std::sync::Mutex<Option<ProfileCommitPause>> =
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
@@ -5277,6 +5298,149 @@ command = "zzzeta"
                 "{name}: the save's stamp wasn't recorded"
             );
         }
+        Ok(())
+    }
+
+    /// A profile-layer settings save keeps the namespace through its read-back, so a rename
+    /// waits for the answer and the answer is the profile it saved, not machine-wide values.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn a_profile_settings_save_answers_from_the_profile_it_saved() -> anyhow::Result<()> {
+        use serde_json::json;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir()?;
+        crate::session::purge_owners::initialize(&root)?;
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        crate::session::create_profile("work")?;
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let (entered, read_back) = tokio::sync::oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        *SETTINGS_READ_BACK.lock().unwrap() = Some(ProfileCommitPause {
+            profile: "work".into(),
+            entered,
+            resume: paused,
+        });
+        let patch = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let query = SettingsQuery {
+                    profile: Some("work".into()),
+                    layer: Some("profile".into()),
+                };
+                let body = Ok(Json(json!({"session": {"default_tool": "codex"}})));
+                let loopback = Some(axum::Extension(Principal::LocalPeer { uid: 0 }));
+                update_settings(
+                    State(state),
+                    axum::extract::Query(query),
+                    HeaderMap::new(),
+                    None,
+                    loopback,
+                    body,
+                )
+                .await
+                .into_response()
+            }
+        });
+        read_back.await?;
+        assert!(
+            state.profile_namespace.try_write().is_err(),
+            "the save released the namespace before its read-back"
+        );
+        let rename = crate::daemon::ProfileMutation::Rename {
+            name: "work".into(),
+            body: crate::daemon::RenameProfileBody {
+                new_name: "renamed".into(),
+            },
+        };
+        let commit = tokio::spawn(commit_profile(state.clone(), rename));
+        // With the namespace held, a failed read means the rename is queued for it.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while state.profile_namespace.try_read().is_ok() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the rename never queued"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !commit.is_finished(),
+            "the rename didn't wait for the answer"
+        );
+        resume.send(())?;
+        let answer = patch.await?;
+        assert_eq!(answer.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(answer.into_body(), usize::MAX).await?;
+        let config: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(
+            config["session"]["default_tool"], "codex",
+            "the save answered with another layer's values"
+        );
+        assert_eq!(commit.await?.status(), StatusCode::OK);
+        assert_eq!(
+            crate::session::load_profile_config("renamed")?.overrides["session"]["default_tool"],
+            "codex"
+        );
+        Ok(())
+    }
+
+    /// An unqualified settings save that arrives while a rename of the served profile holds the
+    /// namespace waits before reading the served name, so it saves to the renamed profile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn an_unqualified_save_during_a_rename_saves_to_the_renamed_profile() -> anyhow::Result<()>
+    {
+        use serde_json::json;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir()?;
+        crate::session::purge_owners::initialize(&root)?;
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        crate::session::create_profile("work")?;
+        let served = state.served_profile().to_string();
+        state.rename_served_profile(&served, "work");
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let (entered, committed) = tokio::sync::oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        *PROFILE_COMMIT_PAUSE.lock().unwrap() = Some(ProfileCommitPause {
+            profile: "work".into(),
+            entered,
+            resume: paused,
+        });
+        let rename = tokio::spawn(commit_profile(
+            state.clone(),
+            crate::daemon::ProfileMutation::Rename {
+                name: "work".into(),
+                body: crate::daemon::RenameProfileBody {
+                    new_name: "renamed".into(),
+                },
+            },
+        ));
+        // Paused under the namespace, with the directory moved and the served name not yet.
+        committed.await?;
+        assert_eq!(&*state.served_profile(), "work");
+        let save = update_settings(
+            State(state.clone()),
+            axum::extract::Query(SettingsQuery {
+                profile: None,
+                layer: None,
+            }),
+            HeaderMap::new(),
+            None,
+            Some(axum::Extension(Principal::LocalPeer { uid: 0 })),
+            Ok(Json(json!({"session": {"default_tool": "codex"}}))),
+        );
+        tokio::pin!(save);
+        assert!(futures_util::poll!(&mut save).is_pending());
+        resume.send(())?;
+        assert_eq!(rename.await?.status(), StatusCode::OK);
+        assert_eq!(
+            save.await.status(),
+            StatusCode::OK,
+            "the save addressed the profile's old name"
+        );
+        assert_eq!(
+            crate::session::load_profile_config("renamed")?.overrides["session"]["default_tool"],
+            "codex"
+        );
         Ok(())
     }
 
