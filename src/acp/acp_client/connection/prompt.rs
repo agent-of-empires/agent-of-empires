@@ -24,8 +24,8 @@ use crate::acp::acp_client::errors::{acp_internal_error, prompt_runtime_error, A
 use crate::acp::acp_client::lifecycle::{LifecycleSignal, OffProtocolWorkKind};
 use crate::acp::acp_client::opencode::recover_opencode_prompt_error;
 use crate::acp::acp_client::rate_limit::{
-    captured_rate_limit_reset, classify_rate_limit_error, classify_rate_limit_from_message,
-    clear_captured_rejections, take_rate_limit_from_captured_rejection,
+    captured_rate_limit_reset, classify_rate_limit_error, clear_captured_rejections,
+    take_rate_limit_from_captured_rejection,
 };
 use crate::acp::acp_client::reset::ResetSessionOutcome;
 use crate::acp::acp_client::session_identity::{ordered_native_request, OrderedRequestResult};
@@ -762,6 +762,7 @@ impl Session {
             Err(error) => error,
         };
 
+        let now = crate::time::Timestamp::now();
         let captured = if native {
             original_capture
         } else if turn.result_current {
@@ -769,10 +770,7 @@ impl Session {
                 self.shared
                     .terminal_claim
                     .with_current_epoch(turn.terminal_epoch, || {
-                        captured_rate_limit_reset(
-                            &self.shared.rate_limit_rejections,
-                            crate::time::Timestamp::now(),
-                        )
+                        captured_rate_limit_reset(&self.shared.rate_limit_rejections, now)
                     })
                     .flatten()
             })
@@ -783,11 +781,7 @@ impl Session {
         };
 
         if let Some(info) = correlated
-            .then(|| {
-                classify_rate_limit_error(&error, captured.as_ref()).or_else(|| {
-                    classify_rate_limit_from_message(&error.to_string(), captured.as_ref())
-                })
-            })
+            .then(|| classify_rate_limit_error(&error, captured.as_ref(), now))
             .flatten()
         {
             turn.flags.rate_limit = Some(info);

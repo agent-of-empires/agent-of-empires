@@ -2253,7 +2253,9 @@ fn adopted_prompt_completion(
     match prompt_outcome_to_response(outcome) {
         Ok(_) => (None, reason.into()),
         Err(error) => {
-            if let Some(info) = classify_rate_limit_error(&error, None) {
+            if let Some(info) =
+                classify_rate_limit_error(&error, None, crate::time::Timestamp::now())
+            {
                 (
                     control_protocol::AdoptedPromptDiagnostic::new(Event::RateLimit { info }),
                     "rate_limited".into(),

@@ -1385,6 +1385,7 @@ pub(crate) async fn start_server(
             });
     }
     callback::spawn_consumer(state.clone()).await;
+    super::sound_cues::spawn_host_player(state.clone());
 
     // Report this process's own session commits exactly; the disk consumer covers the rest.
     // Held for the server's lifetime, and only worth running when a plugin host consumes it.

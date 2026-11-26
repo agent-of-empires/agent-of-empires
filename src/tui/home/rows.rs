@@ -134,19 +134,18 @@ impl HomeView {
     }
 
     /// Index of the first `flat_items` row that belongs to the pinned bottom
-    /// shelf (the synthetic Archived / Trash sections), or `None` when neither
-    /// section is present. The shelf is always a contiguous suffix: both
-    /// sections are appended last (Archived then Trash) by `build_flat_items`,
-    /// and nothing non-shelf follows them, so the first row whose path sits
-    /// within either section marks where the workspace list ends and the shelf
-    /// begins. The renderer splits the sidebar here and hit-testing maps clicks
-    /// in the shelf region back to this suffix.
+    /// shelf (the Suggested row and the synthetic Archived / Trash sections), or
+    /// `None` when none is present. The shelf is always a contiguous suffix:
+    /// `build_flat_items` appends them last, in that order, so the first such row
+    /// marks where the workspace list ends. The renderer splits the sidebar here
+    /// and hit-testing maps clicks in the shelf region back to this suffix.
     pub(in crate::tui) fn shelf_start(&self) -> Option<usize> {
         self.flat_items.iter().position(|it| match it {
             Item::Group { path, .. } => {
                 crate::session::is_within_archived_section(path)
                     || crate::session::is_within_trash_section(path)
             }
+            Item::Suggested { .. } => true,
             Item::Session { .. } => false,
         })
     }
@@ -168,7 +167,7 @@ impl HomeView {
                         session_count,
                         ..
                     } => Some(((path, profile), session_count)),
-                    Item::Session { .. } => None,
+                    Item::Session { .. } | Item::Suggested { .. } => None,
                 })
                 .collect()
         } else {
@@ -226,7 +225,7 @@ impl HomeView {
             .position(|item| matches!(item, Item::Session { id: sid, .. } if sid == id))?;
         let (path, profile) = unfiltered[..at].iter().rev().find_map(|item| match item {
             Item::Group { path, profile, .. } => Some((path, profile)),
-            Item::Session { .. } => None,
+            Item::Session { .. } | Item::Suggested { .. } => None,
         })?;
         self.flat_items.iter().position(|item| {
             matches!(item, Item::Group { path: p, profile: pr, .. } if p == path && pr == profile)
@@ -283,6 +282,7 @@ impl HomeView {
         } else {
             flatten_tree_all_profiles(&pool, &self.group_trees, self.sort_order)
         };
+        self.append_suggested(&mut items);
         append_archived_section(&mut items, &pool, self.archived_section_collapsed);
         append_trash_section(&mut items, &pool, self.trashed_section_collapsed);
         items
@@ -327,6 +327,7 @@ impl HomeView {
             tree.set_collapsed(path, true);
         }
         let mut items = flatten_tree(&tree, grouped, self.sort_order);
+        self.append_suggested(&mut items);
         append_archived_section_by_project(
             &mut items,
             grouped,
@@ -453,6 +454,7 @@ impl HomeView {
             items.extend(flatten_tree(&tree, &members, self.sort_order));
         }
 
+        self.append_suggested(&mut items);
         append_archived_section(&mut items, &archived, self.archived_section_collapsed);
         append_trash_section(&mut items, &pool, self.trashed_section_collapsed);
         items

@@ -1040,6 +1040,8 @@ mod tests {
             .expect("acknowledge fixture hooks");
         let project = tempfile::tempdir().unwrap();
         let spec = crate::server::session_spawn::StructuredSessionSpec {
+            session_id: None,
+            suggestion: None,
             title: Some("owned-constructor-registry-deferral".into()),
             title_typed: false,
             size: None,

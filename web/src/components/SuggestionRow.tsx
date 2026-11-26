@@ -1,0 +1,470 @@
+import { useState, type ReactNode } from "react";
+import { MoreHorizontal, X } from "lucide-react";
+import { failureText, lockTitle, STALE_REASON } from "../lib/suggestionPlan";
+import { updateSuggestionPrefs, type SuggestionResult } from "../lib/api";
+import type { StartedSession, SuggestionProvider } from "../lib/types";
+import { agoLabel } from "../lib/suggestionTime";
+import { MENU_ITEM, MenuPopover, StartInMenu, StartMenu, type StartMenuProps } from "./SuggestionStartMenu";
+
+/** Buttons look 32px; on a phone an invisible 44px area around them takes the tap. */
+export const TAP =
+  "relative after:absolute after:left-1/2 after:top-1/2 after:h-11 after:w-11 after:-translate-x-1/2 after:-translate-y-1/2 after:content-[''] md:after:hidden";
+
+export const SUGGESTION_NOTE_CLASS = "border-t border-surface-700/40 px-3 py-2 text-xs text-text-dim first:border-t-0";
+
+/** The reason line of a started item: Session state first, then how long ago it began. */
+function StartedReason({ session }: { session: StartedSession }) {
+  const status = session.archived ? null : session.status;
+  return (
+    <>
+      {status === "Running" ? (
+        <span className="text-status-running">
+          <span aria-hidden="true" className="font-mono">
+            ⠋
+          </span>{" "}
+          Running
+        </span>
+      ) : status === "Idle" ? (
+        <span>
+          <span aria-hidden="true" className="font-mono">
+            ⠒
+          </span>{" "}
+          Idle
+        </span>
+      ) : (
+        <span>{status ?? "Archived"}</span>
+      )}
+      {" · "}started {agoLabel(Date.parse(session.created_at))}
+    </>
+  );
+}
+
+interface RowProps {
+  title: string;
+  /** Shown above the title when non-empty. */
+  sourceRef?: string;
+  /** One line on wide screens, with this short reference (`#12`) ahead of the reason. */
+  inlineRef?: string;
+  reason: string;
+  project?: string | null;
+  /** Replaces the reason with the started Session's state. */
+  session?: StartedSession;
+  /** Dims the row: the source closed or changed. */
+  stale?: boolean;
+  /** A start that failed: the reason, then what to do. The row stays startable. */
+  failure?: { reason: string; hint?: string };
+  /** Under the reason line, e.g. why a started Session's prompt was not typed. */
+  note?: ReactNode;
+  actions: ReactNode;
+}
+
+/**
+ * A `scope/name#n` reference that, when cut, loses the scope first and never the
+ * trailing `#n`.
+ */
+function SourceRef({ value }: { value: string }) {
+  const hash = value.lastIndexOf("#");
+  const head = hash > 0 ? value.slice(0, hash) : value;
+  const tail = hash > 0 ? value.slice(hash) : "";
+  const slash = head.indexOf("/");
+  const scope = slash > 0 ? head.slice(0, slash + 1) : "";
+  const name = slash > 0 ? head.slice(slash + 1) : head;
+  return (
+    <p className="flex font-mono text-[11px] text-text-dim" title={value} data-testid="suggestion-source-ref">
+      {scope && <span className="min-w-0 shrink-[100] truncate">{scope}</span>}
+      <span className="min-w-0 truncate">{name}</span>
+      {tail && <span className="shrink-0">{tail}</span>}
+    </p>
+  );
+}
+
+export function SuggestionRow({
+  title,
+  sourceRef,
+  inlineRef,
+  reason,
+  project,
+  session,
+  stale,
+  failure,
+  note,
+  actions,
+}: RowProps) {
+  return (
+    <li
+      className={`flex items-center gap-3 border-t border-surface-700/40 px-3 py-2.5 first:rounded-t-lg first:border-t-0 last:rounded-b-lg ${
+        // On a phone the failure's two buttons go under the text, which keeps the full width.
+        failure ? "flex-wrap bg-status-error/[0.07] md:flex-nowrap" : ""
+      }`}
+    >
+      <div className={`min-w-0 flex-1 ${failure ? "max-md:basis-full" : ""}`}>
+        {sourceRef && <SourceRef value={sourceRef} />}
+        <div className={inlineRef !== undefined ? "md:flex md:items-baseline md:gap-3" : ""}>
+          <p className={`truncate text-sm text-text-primary ${stale ? "opacity-[0.55]" : ""} md:min-w-0 md:flex-1`}>
+            {title}
+          </p>
+          <p
+            className={`mt-0.5 truncate text-xs md:mt-0 md:flex-none md:max-w-[45%] ${stale ? "text-text-dim" : "text-text-muted"}`}
+          >
+            {inlineRef && (
+              <>
+                <span className="font-mono text-text-secondary">{inlineRef}</span>
+                {" · "}
+              </>
+            )}
+            {session ? <StartedReason session={session} /> : stale ? STALE_REASON : reason}
+            {project && (
+              <>
+                {" · "}
+                <span className="font-mono font-medium text-text-secondary">{project}</span>
+              </>
+            )}
+          </p>
+        </div>
+        {failure && <p className="mt-0.5 break-words text-xs text-status-error">{failureText(failure)}</p>}
+        {note}
+      </div>
+      <div className={`flex flex-none gap-1 ${failure ? "w-full justify-end md:w-auto" : ""}`}>{actions}</div>
+    </li>
+  );
+}
+
+interface ActionsProps {
+  dismissed?: boolean;
+  readOnly: boolean;
+  /** The read-only state comes from CityHall mode. */
+  cityhall?: boolean;
+  offline: boolean;
+  busy: boolean;
+  onStart: () => void;
+  onToggleDismiss: () => void;
+  /** A started item: Open replaces Start, and the others move into a menu. */
+  started?: { onOpen: () => void; onStartAnother: () => void; providerName: string; sourceUrl: string };
+  /** The source closed or changed: Start is removed. */
+  stale?: boolean;
+  /** The last start failed: Start becomes Try again, beside Start with changes. */
+  failed?: boolean;
+  /** False when trying again would fail the same way: only Start with changes is offered. */
+  retryable?: boolean;
+  /** This row's start is running. */
+  starting?: boolean;
+  /** The ▾ menu; absent on a dismissed row. */
+  menu?: Omit<StartMenuProps, "disabled">;
+  /** The repo has no Project yet: "Start in…" replaces Start, and picking a Project links the repo. */
+  startIn?: { onPick: (path: string) => void; disabled?: boolean; title?: string };
+}
+
+function MoreMenu({
+  started,
+  stale,
+  disabled,
+  readOnly,
+  cityhall,
+  offline,
+  onDismiss,
+}: {
+  started: NonNullable<ActionsProps["started"]>;
+  stale: boolean;
+  disabled: boolean;
+  readOnly: boolean;
+  cityhall?: boolean;
+  offline: boolean;
+  onDismiss: () => void;
+}) {
+  const unavailable = lockTitle(readOnly, offline, cityhall);
+  return (
+    <MenuPopover
+      label="More"
+      trigger={({ open, toggle }) => (
+        <button
+          type="button"
+          aria-label="More"
+          title="More"
+          aria-haspopup="menu"
+          aria-expanded={open}
+          onClick={toggle}
+          className={`${TAP} inline-flex h-8 w-8 items-center justify-center rounded-md text-text-secondary hover:bg-surface-700/50`}
+        >
+          <MoreHorizontal className="h-4 w-4" />
+        </button>
+      )}
+    >
+      {(close) => (
+        <>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={disabled || stale}
+            title={stale ? STALE_REASON : unavailable}
+            className={MENU_ITEM}
+            onClick={() => {
+              close();
+              started.onStartAnother();
+            }}
+          >
+            Start another Session…
+          </button>
+          {/^https?:\/\//i.test(started.sourceUrl) && (
+            <a
+              role="menuitem"
+              href={started.sourceUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className={MENU_ITEM}
+              onClick={() => close()}
+            >
+              Open in {started.providerName} ↗
+            </a>
+          )}
+          {!readOnly && (
+            <>
+              <hr className="my-1 border-surface-700/60" />
+              <button
+                type="button"
+                role="menuitem"
+                disabled={disabled}
+                className={MENU_ITEM}
+                onClick={() => {
+                  close();
+                  onDismiss();
+                }}
+              >
+                Dismiss
+              </button>
+            </>
+          )}
+        </>
+      )}
+    </MenuPopover>
+  );
+}
+
+/** Start plus the dismiss (or, for a dismissed item, restore) button. */
+export function SuggestionActions({
+  dismissed = false,
+  readOnly,
+  cityhall,
+  offline,
+  busy,
+  onStart,
+  onToggleDismiss,
+  started,
+  stale = false,
+  failed = false,
+  retryable = true,
+  starting = false,
+  menu,
+  startIn,
+}: ActionsProps) {
+  const disabled = busy || readOnly || offline;
+  const label = dismissed ? "Restore" : "Dismiss";
+  if (started && !dismissed) {
+    return (
+      <>
+        <button
+          type="button"
+          onClick={started.onOpen}
+          className={`${TAP} inline-flex h-8 items-center rounded-md bg-brand-600 px-3 text-xs font-medium text-text-on-brand hover:bg-brand-500`}
+        >
+          Open
+        </button>
+        <MoreMenu
+          started={started}
+          stale={stale}
+          disabled={disabled}
+          readOnly={readOnly}
+          cityhall={cityhall}
+          offline={offline}
+          onDismiss={onToggleDismiss}
+        />
+      </>
+    );
+  }
+  const unavailable = lockTitle(readOnly, offline, cityhall);
+  const showStart = !dismissed && !stale;
+  return (
+    <>
+      {showStart && startIn && !failed && !starting && (
+        <StartInMenu
+          disabled={disabled || startIn.disabled === true}
+          title={startIn.title ?? unavailable}
+          onPick={startIn.onPick}
+        />
+      )}
+      {showStart && !(startIn && !failed && !starting) && !(failed && !retryable) && (
+        <button
+          type="button"
+          onClick={onStart}
+          disabled={disabled || starting}
+          title={unavailable}
+          className={`${TAP} inline-flex h-8 items-center rounded-md border border-surface-700 bg-surface-800 px-3 text-xs font-medium text-text-primary hover:bg-surface-700/50 disabled:opacity-50`}
+        >
+          {starting ? "Starting…" : failed ? "Try again" : "Start"}
+        </button>
+      )}
+      {showStart && menu && failed && (
+        <button
+          type="button"
+          onClick={menu.onStartWithChanges}
+          disabled={disabled}
+          title={unavailable}
+          className={`${TAP} inline-flex h-8 items-center rounded-md border border-surface-700 bg-surface-800 px-3 text-xs font-medium text-text-primary hover:bg-surface-700/50 disabled:opacity-50`}
+        >
+          Start with changes
+        </button>
+      )}
+      {showStart && menu && !failed && !starting && !startIn && (
+        <StartMenu {...menu} disabled={disabled} locked={readOnly ? unavailable : undefined} />
+      )}
+      {!readOnly && (
+        <button
+          type="button"
+          aria-label={label}
+          title={label}
+          onClick={onToggleDismiss}
+          disabled={disabled}
+          className={`${TAP} inline-flex h-8 items-center justify-center rounded-md text-text-secondary hover:bg-surface-700/50 disabled:opacity-50 ${
+            dismissed ? "border border-surface-700 bg-surface-800 px-3 text-xs font-medium text-text-primary" : "w-8"
+          }`}
+        >
+          {dismissed ? "Restore" : <X className="h-4 w-4" />}
+        </button>
+      )}
+    </>
+  );
+}
+
+/** Every installed provider is off. Read-only says it can't turn them on; its Settings are read-only too. */
+export function SuggestionsOffNote({
+  providers,
+  readOnly,
+  disabled,
+  act,
+}: {
+  providers: SuggestionProvider[];
+  readOnly: boolean;
+  disabled: boolean;
+  /** The `act` of {@link useSuggestions}, so the snapshot reloads once they are on. */
+  act: (key: string, run: () => Promise<SuggestionResult<unknown>>) => Promise<boolean>;
+}) {
+  const one = providers.length === 1;
+  const turnOn = () =>
+    act("turn-on", () =>
+      updateSuggestionPrefs({ provider_enabled: Object.fromEntries(providers.map((p) => [p.id, true])) }),
+    );
+  return (
+    <li className={SUGGESTION_NOTE_CLASS} data-testid="suggestions-off">
+      Suggestions are off: {providers.map((p) => p.name).join(", ")} {one ? "is" : "are"} installed but turned off.{" "}
+      {readOnly ? (
+        `Read-only: this dashboard can't turn ${one ? "it" : "them"} on.`
+      ) : (
+        <button
+          type="button"
+          onClick={() => void turnOn()}
+          disabled={disabled}
+          className="cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
+        >
+          {one ? "Turn it on" : "Turn them on"}
+        </button>
+      )}
+    </li>
+  );
+}
+
+export function SuggestionStatusNotes({
+  readOnly,
+  offline,
+  cityhall = false,
+  homepage = false,
+}: {
+  readOnly: boolean;
+  offline: boolean;
+  cityhall?: boolean;
+  /** Home already says when the whole dashboard is read-only. */
+  homepage?: boolean;
+}) {
+  return (
+    <>
+      {readOnly && cityhall && (
+        <li className={SUGGESTION_NOTE_CLASS}>Suggestions are view-only in CityHall mode. New session still works.</li>
+      )}
+      {readOnly && !cityhall && !homepage && (
+        <li className={SUGGESTION_NOTE_CLASS}>Read-only: suggestions can&apos;t be started or changed.</li>
+      )}
+      {offline && (
+        <li className={SUGGESTION_NOTE_CLASS}>
+          Disconnected. Suggestions show from the last fetch; reconnect to start one.
+        </li>
+      )}
+    </>
+  );
+}
+
+/** Shown for 10 s after a dismiss; `onStop` turns the item's kind off. */
+export function UndoBar({
+  title,
+  disabled,
+  onUndo,
+  onStop,
+  onResume,
+  stopLabel,
+}: {
+  title: string;
+  disabled: boolean;
+  onUndo: () => void;
+  /** Resolves true once the kind is off. */
+  onStop?: () => Promise<boolean>;
+  /** Undoes Stop; resolves true once the kind is back on. */
+  onResume?: () => Promise<boolean>;
+  stopLabel?: string;
+}) {
+  const [stopped, setStopped] = useState(false);
+  return (
+    <div className="mt-2 flex w-max max-w-full flex-wrap items-baseline gap-x-1 rounded-md bg-surface-800 px-3 py-1.5 text-[13px] text-text-secondary">
+      {stopped ? (
+        <>
+          <span>Stopped suggesting {stopLabel}.</span>
+          {onResume && (
+            <>
+              <button
+                type="button"
+                onClick={() => void onResume().then((ok) => setStopped(!ok))}
+                disabled={disabled}
+                className="flex-none cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
+              >
+                Undo
+              </button>
+              <span aria-hidden="true">·</span>
+            </>
+          )}
+          <span>Turn it back on in Settings › Suggestions.</span>
+        </>
+      ) : (
+        <>
+          <span className="max-w-full truncate">Dismissed &ldquo;{title}&rdquo;.</span>
+          <button
+            type="button"
+            onClick={onUndo}
+            disabled={disabled}
+            className="flex-none cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
+          >
+            Undo
+          </button>
+          {onStop && stopLabel && (
+            <>
+              <span aria-hidden="true">·</span>
+              <button
+                type="button"
+                onClick={() => void onStop().then(setStopped)}
+                disabled={disabled}
+                className="flex-none cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
+              >
+                Stop suggesting {stopLabel}
+              </button>
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}

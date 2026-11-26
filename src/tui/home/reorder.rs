@@ -129,6 +129,7 @@ impl HomeView {
                     }
                     _ => continue,
                 },
+                Item::Suggested { .. } => continue,
             };
             if crate::session::is_within_archived_section(path)
                 || crate::session::is_within_trash_section(path)

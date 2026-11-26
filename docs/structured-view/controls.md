@@ -61,7 +61,7 @@ The rich form is web-first. The TUI answers the common case natively: when every
 When an approval lands and you are away from the dashboard, two channels fire:
 
 - **Web push**, tagged `acp-approval-<session>`, deep-linking back to the session. Unlike status pushes, approval pushes are not suppressed when the dashboard or TUI is active; focused clients get an in-app toast. See [Push notifications](../push-notifications.md).
-- **Browser sound**: the dashboard plays `[sound] on_approval` whenever pending approvals go from zero to non-zero. It plays client-side because `aoe serve` often runs on a remote box.
+- **Browser sound**: the dashboard plays the built-in approval chime whenever pending approvals go from zero to non-zero (`[sound] browser_approval_enabled`). It plays client-side because `aoe serve` often runs on a remote box. See [Sound effects](../sounds.md).
 
 ## Model and reasoning effort
 

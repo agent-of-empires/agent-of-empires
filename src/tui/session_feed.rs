@@ -773,6 +773,13 @@ struct PendingCreation {
     receipt: Option<Box<MutationReceipt<crate::daemon::SessionResponse>>>,
 }
 
+/// Why the daemon refuses mutations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MutationBlock {
+    ReadOnly,
+    Offline,
+}
+
 fn set_grant(grant: &AtomicU64, allowed: bool) {
     // Renamed to try_update in the standard library; the MSRV this builds against
     // does not have it yet. Upstream carries the same allowance.
@@ -1310,6 +1317,27 @@ impl SessionFeed {
             preparation: None,
             latest: Some(self.receiver.clone()),
         }
+    }
+
+    /// Why mutations are unavailable; `None` when they are available.
+    pub(crate) fn mutation_block(&self) -> Option<MutationBlock> {
+        if self.mutations_available() {
+            return None;
+        }
+        // The writer keeps its channel open after the read side drops, so the
+        // latest runtime result decides whether the daemon is still there.
+        let connected = matches!(
+            self.receiver.borrow().as_ref(),
+            Some(SessionFeedResult::Snapshot(_))
+        ) && self
+            .commands
+            .as_ref()
+            .is_some_and(|commands| !commands.is_closed());
+        Some(if connected {
+            MutationBlock::ReadOnly
+        } else {
+            MutationBlock::Offline
+        })
     }
 
     pub(crate) fn mutations_available(&self) -> bool {

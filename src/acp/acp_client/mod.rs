@@ -56,6 +56,7 @@ pub use delete::DeleteSessionOutcome;
 pub use errors::{is_authentication_failure, AcpError, IncompatibleAgentError};
 pub(crate) use list::probe_option_catalog;
 pub use list::{list_native_sessions, ListSessionsError};
+pub(crate) use rate_limit::{refine_from_status, Observation, FIVE_HOUR_WINDOW_SECS};
 pub use reset::ResetSessionOutcome;
 pub use resolve_command::{
     is_bare_command, on_agent_path, resolve_agent_command, ResolvedAgentCommand, Unresolved,
@@ -1323,12 +1324,8 @@ impl AcpClient {
             Arc::clone(raw)
         };
         let error = errors::acp_error_from_value(Arc::unwrap_or_clone(raw));
-        let limit = rate_limit::classify_rate_limit_error(&error, None).or_else(|| {
-            rate_limit::classify_rate_limit_from_message(&error.message, None).map(|mut info| {
-                info.status = errors::public_error_message(&error);
-                info
-            })
-        });
+        let limit =
+            rate_limit::classify_rate_limit_error(&error, None, crate::time::Timestamp::now());
         if let Some(info) = limit {
             return Some(AcpError::RateLimited(Box::new(info)));
         }
