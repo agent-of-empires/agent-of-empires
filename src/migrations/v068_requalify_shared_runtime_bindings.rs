@@ -1,4 +1,4 @@
-//! Migration v067: a Colima VM's home share now makes the paths under it host paths, so an
+//! Migration v068: a Colima VM's home share now makes the paths under it host paths, so an
 //! execution recorded before that, under `runtime:<kind>:<endpoint>`, no longer matches the
 //! launch it describes. The proof needs the launch's runtime snapshot, so startup only stamps;
 //! each launch requalifies its own row, and `aoe migrate` resolves and requalifies every row.
@@ -10,7 +10,7 @@ use std::path::Path;
 use tracing::info;
 
 pub fn run() -> Result<()> {
-    info!(target: "migrations.v067", "Rows recorded under a shared runtime are requalified at their next launch or by aoe migrate");
+    info!(target: "migrations.v068", "Rows recorded under a shared runtime are requalified at their next launch or by aoe migrate");
     Ok(())
 }
 
@@ -135,7 +135,7 @@ pub(crate) fn requalify_launch(
         })?;
     }
     requalify_row(inst, now, container);
-    info!(target: "migrations.v067", id = inst.id, stored, "Requalified executions recorded under a shared runtime");
+    info!(target: "migrations.v068", id = inst.id, stored, "Requalified executions recorded under a shared runtime");
     Ok(())
 }
 
@@ -151,7 +151,7 @@ pub(crate) fn reconcile_pending(explicit_migrate: bool) -> Result<()> {
         let rows = match storage.load_instances_complete() {
             Ok(rows) => rows,
             Err(error) => {
-                info!(target: "migrations.v067", profile, error = %format!("{error:#}"), "Left a profile pending; its sessions do not load");
+                info!(target: "migrations.v068", profile, error = %format!("{error:#}"), "Left a profile pending; its sessions do not load");
                 continue;
             }
         };
@@ -166,7 +166,7 @@ pub(crate) fn reconcile_pending(explicit_migrate: bool) -> Result<()> {
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    info!(target: "migrations.v067", profile, id = row.id, error = %format!("{error:#}"), "Left a row pending; its launch context does not resolve");
+                    info!(target: "migrations.v068", profile, id = row.id, error = %format!("{error:#}"), "Left a row pending; its launch context does not resolve");
                 }
             }
         }
@@ -185,7 +185,7 @@ pub(crate) fn reconcile_pending(explicit_migrate: bool) -> Result<()> {
                 .filter(|requalified| *requalified)
                 .count())
         })?;
-        info!(target: "migrations.v067", profile, requalified, "Requalified executions recorded under a shared runtime");
+        info!(target: "migrations.v068", profile, requalified, "Requalified executions recorded under a shared runtime");
     }
     Ok(())
 }

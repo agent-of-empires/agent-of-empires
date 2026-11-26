@@ -3889,7 +3889,7 @@ sandbox = "unsupported"
         }
     }
 
-    /// v067: an execution recorded before Colima's home share became a host path is
+    /// v068: an execution recorded before Colima's home share became a host path is
     /// requalified at the next launch only when it is this launch's runtime and context.
     #[test]
     #[serial_test::serial]

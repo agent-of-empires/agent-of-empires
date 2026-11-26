@@ -75,10 +75,11 @@ mod v063_retire_color_labels;
 mod v064_builtin_sounds;
 mod v065_account_limit_estimate_rows;
 mod v066_retire_agent_update_fields;
-mod v067_requalify_shared_runtime_bindings;
+mod v067_retire_restart_wake;
+mod v068_requalify_shared_runtime_bindings;
 #[cfg(test)]
-pub(crate) use v067_requalify_shared_runtime_bindings::reconcile_pending as reconcile_shared_runtime_bindings;
-pub(crate) use v067_requalify_shared_runtime_bindings::requalify_launch as requalify_shared_runtime_bindings;
+pub(crate) use v068_requalify_shared_runtime_bindings::reconcile_pending as reconcile_shared_runtime_bindings;
+pub(crate) use v068_requalify_shared_runtime_bindings::requalify_launch as requalify_shared_runtime_bindings;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -119,7 +120,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 67;
+const CURRENT_VERSION: u32 = 68;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -348,10 +349,11 @@ const MIGRATIONS: &[Migration] = &[
         "retire_agent_update_fields",
         v066_retire_agent_update_fields::run,
     ),
+    (67, "retire_restart_wake", v067_retire_restart_wake::run),
     (
-        67,
+        68,
         "requalify_shared_runtime_bindings",
-        v067_requalify_shared_runtime_bindings::run,
+        v068_requalify_shared_runtime_bindings::run,
     ),
 ];
 
@@ -553,7 +555,7 @@ fn run_migrations_inner(
     if announce {
         run_explicit_recovery(transaction, serve)?;
     }
-    v067_requalify_shared_runtime_bindings::reconcile_pending(announce)?;
+    v068_requalify_shared_runtime_bindings::reconcile_pending(announce)?;
     Ok(())
 }
 
