@@ -1030,6 +1030,8 @@ impl<S: BroadcastSink> Supervisor<S> {
                 Some(tokio::time::Instant::now() + std::time::Duration::from_secs(3)),
                 Some(reservation.lease().clone()),
                 claude_home,
+                // No production source launches a proxy yet.
+                None,
             ),
         )
         .await;

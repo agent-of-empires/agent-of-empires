@@ -3464,6 +3464,7 @@ mod tests {
             Some(tokio::time::Instant::now() + Duration::from_secs(5)),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3750,6 +3751,7 @@ mod tests {
             "test-agent".into(),
             None,
             Some(tokio::time::Instant::now() + Duration::from_secs(5)),
+            None,
             None,
             None,
         )
@@ -4050,6 +4052,7 @@ mod tests {
             "test-agent".into(),
             None,
             Some(tokio::time::Instant::now() + Duration::from_secs(5)),
+            None,
             None,
             None,
         )

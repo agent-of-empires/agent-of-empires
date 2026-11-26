@@ -145,6 +145,7 @@ struct ReattachSpec {
     agent_key: String,
     source_profile: Option<String>,
     claude_home: Option<PathBuf>,
+    proxy: Option<ProxySpec>,
     state: Arc<SessionState>,
 }
 
@@ -629,6 +630,7 @@ impl AcpClient {
                 agent_key: config.agent_key.clone(),
                 source_profile: launch.source_profile.clone(),
                 claude_home: launch.claude_home.clone(),
+                proxy: launch.proxy.clone(),
                 state: launch.state.clone(),
             };
             let mut client = Self::connect_via_socket(socket_path, launch, None).await?;
@@ -756,6 +758,7 @@ impl AcpClient {
         deadline: Option<tokio::time::Instant>,
         launch_lease: Option<crate::acp::runner_lifecycle::Lease>,
         claude_home: Option<PathBuf>,
+        proxy: Option<ProxySpec>,
     ) -> Result<Self, AcpError> {
         let spec = ReattachSpec {
             socket_path,
@@ -765,6 +768,7 @@ impl AcpClient {
             agent_key,
             source_profile,
             claude_home,
+            proxy,
             state: Arc::default(),
         };
         let mode = ConnectMode::Resume {
@@ -796,7 +800,7 @@ impl AcpClient {
             sandbox: spec.sandbox.clone(),
             profile: agent_profiles::resolve(&spec.agent_key),
             install_binary,
-            proxy: None,
+            proxy: spec.proxy.clone(),
             source_profile: spec.source_profile.clone(),
             // Resume sends no session/new or load, so defaults and MCP servers
             // were applied on first connect.
