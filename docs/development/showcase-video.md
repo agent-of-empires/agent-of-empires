@@ -142,7 +142,7 @@ Without that build, run without `SHOW_TITLES=1`.
 | `TARGET_W` | `1440` | Output canvas width. Matches Playwright viewport. Applies to grid and titled concat only; untitled concat keeps native size. |
 | `TARGET_H` | `900` | Output canvas height. Matches Playwright viewport. Applies to grid and titled concat only; untitled concat keeps native size. |
 | `FONT` | auto-detect | Path to a TTF/TTC. Tries common macOS and Linux fonts if unset. |
-| `LEAD_CACHE` | `$TMPDIR/showcase-lead-cache.tsv` | Cache of the per-clip blank lead-in probe. |
+| `LEAD_CACHE` | `test-results/.lead-cache.tsv` | Cache of the per-clip blank lead-in probe. |
 
 The script auto-rounds cell width/height to even numbers (libx264 requirement).
 

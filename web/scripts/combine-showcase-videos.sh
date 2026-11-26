@@ -128,7 +128,7 @@ fi
 # Playwright recordings start with a blank white page before first paint.
 # Probe the first non-white time (YAVG<200 at 10 fps) per clip; cached by
 # path+mtime so reruns are fast. Grid mode trims it off (see trims[]).
-LEAD_CACHE="${LEAD_CACHE:-${TMPDIR:-/tmp}/showcase-lead-cache.tsv}"
+LEAD_CACHE="${LEAD_CACHE:-${RESULTS}/.lead-cache.tsv}"
 touch "${LEAD_CACHE}"
 file_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
 probe_lead() {
