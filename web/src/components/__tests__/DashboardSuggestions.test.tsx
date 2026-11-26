@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { reportFeatureUse } from "../../lib/featureUse";
 import { DashboardSuggestions } from "../DashboardSuggestions";
 import { setServerDown } from "../../lib/connectionState";
 import type { SuggestionItem, SuggestionsSnapshot } from "../../lib/types";
@@ -73,6 +74,14 @@ const renderIt = (props: Partial<Parameters<typeof DashboardSuggestions>[0]> = {
   render(<DashboardSuggestions onPrepare={vi.fn()} onViewAll={vi.fn()} onOpenSession={vi.fn()} {...props} />);
 
 describe("DashboardSuggestions", () => {
+  it("counts one home use when it lists items", async () => {
+    fetchSuggestions.mockResolvedValue(snap([mk(1)]));
+    renderIt();
+    await screen.findByText("Item 1");
+    await waitFor(() => expect(reportFeatureUse).toHaveBeenCalledWith("suggest_from_home"));
+    expect(reportFeatureUse).toHaveBeenCalledTimes(1);
+  });
+
   it("says when every installed provider is off, and turns them on in one click", async () => {
     const off: SuggestionsSnapshot = {
       ...snap([]),

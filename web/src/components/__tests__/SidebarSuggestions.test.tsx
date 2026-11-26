@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { reportFeatureUse } from "../../lib/featureUse";
 import { SidebarSuggestions } from "../sidebar/SidebarSuggestions";
 import { refreshSuggestions, updateSuggestionPrefs } from "../../lib/api";
 import type { SuggestionItem, SuggestionsSnapshot } from "../../lib/types";
@@ -63,6 +64,20 @@ const renderIt = (props: Partial<Parameters<typeof SidebarSuggestions>[0]> = {})
 };
 
 describe("SidebarSuggestions", () => {
+  it("counts one sidebar use when it lists items, none while the pref is off", async () => {
+    fetchSuggestions.mockResolvedValue(snap(ITEMS, false));
+    renderIt();
+    await waitFor(() => expect(fetchSuggestions).toHaveBeenCalledTimes(1));
+    await act(async () => {});
+    expect(reportFeatureUse).not.toHaveBeenCalled();
+    cleanup();
+    fetchSuggestions.mockResolvedValue(snap(ITEMS, true));
+    renderIt();
+    await screen.findByTestId("sidebar-suggested-toggle");
+    await waitFor(() => expect(reportFeatureUse).toHaveBeenCalledWith("suggest_from_sidebar"));
+    expect(reportFeatureUse).toHaveBeenCalledTimes(1);
+  });
+
   it("appears once the sidebar pref is turned on elsewhere, without a remount", async () => {
     fetchSuggestions.mockResolvedValue(snap(ITEMS, false));
     renderIt();

@@ -301,7 +301,15 @@ async fn set_dismissed(
     })
     .await;
     match result {
-        Ok(Ok(true)) => Json(json!({ "ok": true })).into_response(),
+        Ok(Ok(true)) => {
+            use crate::telemetry::feature_use::{record, FeatureUse};
+            record(if dismissed {
+                FeatureUse::SuggestDismiss
+            } else {
+                FeatureUse::SuggestRestore
+            });
+            Json(json!({ "ok": true })).into_response()
+        }
         Ok(Ok(false)) => stale_item(),
         Ok(Err(error)) => internal(error),
         Err(error) => internal(error),
@@ -382,7 +390,13 @@ pub async fn update_suggestion_source(
         .await
     };
     match stored {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => {
+            if !body.enabled {
+                crate::telemetry::feature_use::record(
+                    crate::telemetry::feature_use::FeatureUse::SuggestStopKind,
+                );
+            }
+        }
         Ok(Err(error)) => return internal(error),
         Err(error) => return internal(error),
     }
@@ -588,6 +602,16 @@ async fn start_outcome(
     if status == StatusCode::CONFLICT && matches!(code, "already_started" | "stale_suggestion") {
         return (status, Json(body)).into_response();
     }
+    {
+        use crate::telemetry::feature_use::{record, FeatureUse};
+        record(match code {
+            "creation_trust_changed" | "hooks_need_trust" | "agent_hooks_not_approved" => {
+                FeatureUse::SuggestFailHooks
+            }
+            "sandbox_unavailable" => FeatureUse::SuggestFailSandbox,
+            _ => FeatureUse::SuggestFailOther,
+        });
+    }
     if code == "creation_trust_changed" {
         return api_error(
             StatusCode::CONFLICT,
@@ -685,6 +709,7 @@ pub async fn start_suggestion(
     let Some(provider) = find_provider(&body.provider_id) else {
         return unknown_provider();
     };
+    let start_in = body.project.is_some();
     let StartBody {
         provider_id,
         id,
@@ -791,7 +816,13 @@ pub async fn start_suggestion(
         },
     )
     .await;
-    start_outcome(response, profile, path).await
+    let outcome = start_outcome(response, profile, path).await;
+    if start_in && outcome.status() == StatusCode::CREATED {
+        crate::telemetry::feature_use::record(
+            crate::telemetry::feature_use::FeatureUse::SuggestStartIn,
+        );
+    }
+    outcome
 }
 
 pub async fn prepare_suggestion(
@@ -987,7 +1018,12 @@ pub async fn put_suggestion_preset(
     })
     .await;
     match result {
-        Ok(Ok(Ok(body))) => Json(body).into_response(),
+        Ok(Ok(Ok(body))) => {
+            crate::telemetry::feature_use::record(
+                crate::telemetry::feature_use::FeatureUse::SuggestPresetEdit,
+            );
+            Json(body).into_response()
+        }
         Ok(Ok(Err(response))) => response,
         Ok(Err(error)) => internal(error),
         Err(error) => internal(error),
@@ -1020,7 +1056,12 @@ pub async fn delete_suggestion_preset(
     })
     .await;
     match result {
-        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Ok(())) => {
+            crate::telemetry::feature_use::record(
+                crate::telemetry::feature_use::FeatureUse::SuggestPresetReset,
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(Err(error)) => internal(error),
         Err(error) => internal(error),
     }
@@ -1110,7 +1151,12 @@ pub async fn put_suggestion_mapping(
     })
     .await;
     match result {
-        Ok(Ok(Ok(stored))) => Json(stored).into_response(),
+        Ok(Ok(Ok(stored))) => {
+            crate::telemetry::feature_use::record(
+                crate::telemetry::feature_use::FeatureUse::SuggestMappingAdd,
+            );
+            Json(stored).into_response()
+        }
         Ok(Ok(Err(message))) => api_error(StatusCode::BAD_REQUEST, "validation_failed", message),
         Ok(Err(error)) => internal(error),
         Err(error) => internal(error),

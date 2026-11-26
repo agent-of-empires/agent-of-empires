@@ -894,6 +894,11 @@ impl SuggestionsView {
         store.failed = None;
         self.preparing = Some(key.clone());
         self.prepare_another = another;
+        if another {
+            crate::tui::telemetry::report_feature_use(
+                crate::telemetry::feature_use::FeatureUse::SuggestStartAnother,
+            );
+        }
         store.prepare(key);
     }
 

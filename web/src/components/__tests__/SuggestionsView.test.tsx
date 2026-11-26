@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { reportFeatureUse } from "../../lib/featureUse";
 import { SuggestionsView } from "../SuggestionsView";
 import { setServerDown } from "../../lib/connectionState";
 import { toastBus } from "../../lib/toastBus";
@@ -593,6 +594,8 @@ describe("SuggestionsView", () => {
       fireEvent.click(screen.getByRole("menuitem", { name: "Start another Session…" }));
       await waitFor(() => expect(onPrepare).toHaveBeenCalled());
       expect(onPrepare.mock.calls[0]![0].suggestion).toBeUndefined();
+      expect(reportFeatureUse).toHaveBeenCalledWith("suggest_start_another");
+      expect(reportFeatureUse).toHaveBeenCalledWith("suggest_from_page");
     });
 
     it("an archived Session says so and read-only keeps Open but offers no Dismiss", async () => {

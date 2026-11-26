@@ -7,6 +7,8 @@ import {
   type PluginDiscoveryResult,
 } from "../lib/api";
 import { sourceLabel } from "../lib/featuredSuggestionSources";
+import { reportFeatureUse } from "../lib/featureUse";
+import { useReportFeatureOnce } from "../hooks/useReportFeatureOnce";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import type { SuggestionSetupCheck, SuggestionsSnapshot } from "../lib/types";
 import { PluginInstallConsentModal } from "./settings/PluginInstallConsentModal";
@@ -48,8 +50,17 @@ export function SuggestionsSetupSheet({ sources, onClose, onFinished, onOpenMark
   const installing = queue.length > 0;
   const toDone = useCallback(() => setStep("done"), []);
 
+  useReportFeatureOnce("suggest_setup_opened", true);
+  const finished = useCallback(() => {
+    reportFeatureUse("suggest_setup_finished");
+    onFinished();
+  }, [onFinished]);
+  const finishLater = () => {
+    reportFeatureUse("suggest_setup_later");
+    onFinished();
+  };
   // Once a plugin is installed, closing finishes the sheet so the hint does not offer the same install again.
-  const close = step === "pick" ? onClose : onFinished;
+  const close = step === "pick" ? onClose : finished;
 
   useEffect(() => {
     if (step === "done") return;
@@ -125,14 +136,14 @@ export function SuggestionsSetupSheet({ sources, onClose, onFinished, onOpenMark
             onOpenMarketplace={onOpenMarketplace}
           />
         )}
-        {step === "checks" && <ChecksStep ids={installedIds} onDone={toDone} onFinishLater={onFinished} />}
+        {step === "checks" && <ChecksStep ids={installedIds} onDone={toDone} onFinishLater={finishLater} />}
         {step === "done" && (
           <>
             <p className="px-4 py-4 text-sm text-text-secondary">
               You'll see up to 3 on your homepage. Choose a suggestion and start it to keep the work going.
             </p>
             <Footer note="Turn them off any time in Settings › Suggestions.">
-              <button type="button" className={PRIMARY} onClick={onFinished} data-testid="suggestions-setup-show">
+              <button type="button" className={PRIMARY} onClick={finished} data-testid="suggestions-setup-show">
                 Show suggestions
               </button>
             </Footer>

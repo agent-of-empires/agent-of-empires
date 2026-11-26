@@ -1,4 +1,5 @@
 import type { SessionResponse } from "../lib/types";
+import { useReportFeatureOnce } from "../hooks/useReportFeatureOnce";
 import { liveSession } from "../lib/suggestionPlan";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { StartedPromptNote } from "./PromptBlockedNote";
@@ -47,6 +48,10 @@ export function DashboardSuggestions({
   const agentName = useAgentNames();
   const presetOf = useSuggestionPresets();
   const { undo, dismiss, stop } = useDismissUndo(act);
+  useReportFeatureOnce(
+    "suggest_from_home",
+    Boolean(snapshot?.prefs.homepage && snapshot.items.some((item) => !item.dismissed)),
+  );
 
   // Offline, the disconnect banner already explains a missing snapshot.
   if (!snapshot && loadFailed && !offline)

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useReportFeatureOnce } from "../hooks/useReportFeatureOnce";
 import { ChevronDown, ChevronRight, RefreshCw, Search, Settings, X } from "lucide-react";
 import { agoLabel } from "../lib/suggestionTime";
 import { chipId, filterSuggestions, keyChipGroups, type KeyChip } from "../lib/suggestionFilter";
@@ -92,6 +93,7 @@ export function SuggestionsView({
   const agentName = useAgentNames();
   const presetOf = useSuggestionPresets();
   const { undo, dismiss, stop } = useDismissUndo(act);
+  useReportFeatureOnce("suggest_from_page", snapshot !== null);
   const [filter, setFilter] = useState<Filter>(initialDismissed ? "dismissed" : "all");
   const [query, setQuery] = useState("");
   const [keyChips, setKeyChips] = useState<KeyChip[]>([]);

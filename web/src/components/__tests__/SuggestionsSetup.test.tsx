@@ -5,6 +5,7 @@ import { SuggestionsSetupHint } from "../SuggestionsSetupHint";
 import { SuggestionsSetupSheet } from "../SuggestionsSetupSheet";
 import { tabStops } from "../../hooks/useFocusTrap";
 import { safeGetItem } from "../../lib/safeStorage";
+import { reportFeatureUse } from "../../lib/featureUse";
 import { clearFeaturedSuggestionSources } from "../../lib/featuredSuggestionSources";
 import type { SuggestionProvider, SuggestionsSnapshot } from "../../lib/types";
 
@@ -114,8 +115,14 @@ describe("first-run hint", () => {
     renderHint();
     const hint = await screen.findByTestId("suggestions-hint");
     expect(hint.textContent).toContain("based on your GitHub issues and PRs?");
+    expect(vi.mocked(reportFeatureUse).mock.calls).toEqual([["suggest_tip_shown"]]);
     fireEvent.click(screen.getByTestId("suggestions-hint-open"));
     expect(screen.getByTestId("suggestions-setup-sheet")).toBeTruthy();
+    expect(vi.mocked(reportFeatureUse).mock.calls).toEqual([
+      ["suggest_tip_shown"],
+      ["suggest_tip_clicked"],
+      ["suggest_setup_opened"],
+    ]);
     expect(screen.getByText("Install 1 plugin")).toBeTruthy();
     expect(screen.getByTestId(`suggestions-setup-option-${github.slug}`).textContent).toContain("GitHub");
   });
@@ -149,6 +156,7 @@ describe("first-run hint", () => {
     fireEvent.click(await screen.findByTestId("suggestions-hint-dismiss"));
     expect(screen.queryByTestId("suggestions-hint")).toBeNull();
     expect(safeGetItem("aoe-suggestions-hint-dismissed")).toBe("1");
+    expect(reportFeatureUse).toHaveBeenCalledWith("suggest_tip_dismissed");
   });
 
   it("waits for hydration before reading the dismissal, so another Device's dismissal wins", async () => {
@@ -351,6 +359,8 @@ describe("setup sheet", () => {
     await waitFor(() => expect(api.runSuggestionChecks).toHaveBeenCalled());
     await waitFor(() => expect(api.fetchSuggestions.mock.calls.length).toBeGreaterThan(calls));
     fireEvent.click(screen.getByTestId("suggestions-setup-later"));
+    expect(reportFeatureUse).toHaveBeenCalledWith("suggest_setup_later");
+    expect(reportFeatureUse).not.toHaveBeenCalledWith("suggest_setup_finished");
     expect(onFinished).toHaveBeenCalled();
   });
 
@@ -403,6 +413,8 @@ describe("setup sheet", () => {
     fireEvent.click(await screen.findByText("close-job"));
 
     fireEvent.click(await screen.findByTestId("suggestions-setup-show"));
+    expect(reportFeatureUse).toHaveBeenCalledWith("suggest_setup_finished");
+    expect(reportFeatureUse).not.toHaveBeenCalledWith("suggest_setup_later");
     expect(onFinished).toHaveBeenCalled();
   });
 

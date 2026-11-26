@@ -75,6 +75,11 @@ impl HomeView {
         self.system_health_open = false;
         // A Trash transcript reader would otherwise take the keys first.
         self.retained_focus = None;
+        if !self.suggestions_focused {
+            crate::tui::telemetry::report_feature_use(
+                crate::telemetry::feature_use::FeatureUse::SuggestFromTui,
+            );
+        }
         self.suggestions_focused = true;
     }
 

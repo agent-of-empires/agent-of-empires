@@ -1671,6 +1671,11 @@ impl SessionService {
         let code = error
             .downcast_ref::<TerminalPromptBlocker>()
             .map(|blocker| blocker.code());
+        if code == Some("agent_folder_not_trusted") && waited.suggestion.is_some() {
+            crate::telemetry::feature_use::record(
+                crate::telemetry::feature_use::FeatureUse::SuggestFailTrust,
+            );
+        }
         self.fail_pending_initial_turn(waited, text, error.to_string(), code)
             .await;
     }
