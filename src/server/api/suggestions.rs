@@ -318,6 +318,81 @@ async fn set_dismissed(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PushBody {
+    expected_profile: Option<String>,
+    id: Option<String>,
+    title: String,
+    #[serde(default)]
+    reason: String,
+    prompt: String,
+    project: Option<String>,
+    /// Shown as the item's source reference; defaults to "Agent".
+    pushed_by: Option<String>,
+}
+
+/// Adds or replaces one built-in agent suggestion; the HTTP route and the
+/// `suggest_session` MCP tool both call it.
+pub(crate) async fn push_agent_suggestion(
+    state: &Arc<AppState>,
+    input: suggestions::AgentPush,
+) -> Result<String, (StatusCode, &'static str, String)> {
+    let Some(host) = state.plugin_host.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "Plugin host is unavailable".into(),
+        ));
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        host.with_suggestions_db(|conn, profile| suggestions::push_agent(conn, profile, input))
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => Ok(value["id"].as_str().unwrap_or_default().to_string()),
+        Ok(Err(error)) if error.code == crate::plugin::protocol::codes::INVALID_PARAMS => {
+            Err((StatusCode::BAD_REQUEST, "validation_failed", error.message))
+        }
+        Ok(Err(error)) => Err((StatusCode::INTERNAL_SERVER_ERROR, "internal", error.message)),
+        Err(error) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            error.to_string(),
+        )),
+    }
+}
+
+pub async fn push_suggestion(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<PushBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    if let Some(host) = &state.plugin_host {
+        if let Some(refused) = wrong_profile(host, body.expected_profile.as_deref()) {
+            return refused;
+        }
+    }
+    let input = suggestions::AgentPush {
+        id: body.id,
+        title: body.title,
+        reason: body.reason,
+        prompt: body.prompt,
+        project: body.project,
+        pushed_by: body.pushed_by.unwrap_or_else(|| "Agent".into()),
+    };
+    match push_agent_suggestion(&state, input).await {
+        Ok(id) => Json(json!({ "ok": true, "id": id })).into_response(),
+        Err((status, code, message)) => api_error(status, code, message),
+    }
+}
+
 pub async fn dismiss_suggestion(
     State(state): State<Arc<AppState>>,
     body: Result<Json<ItemRef>, axum::extract::rejection::JsonRejection>,

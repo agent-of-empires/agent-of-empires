@@ -11,6 +11,8 @@ import { useAgentNames } from "../hooks/useAgentNames";
 import { useSuggestionPresets } from "../hooks/useSuggestionPresets";
 import { SuggestionItemActions } from "./SuggestionItemActions";
 import { SuggestionHooksReview } from "./SuggestionHooksReview";
+import { SuggestionsAgentGuide } from "./SuggestionsAgentGuide";
+import { isPluginProvider } from "../lib/suggestionProviders";
 import { SuggestionsSetupHint } from "./SuggestionsSetupHint";
 import { StartedPromptNote } from "./PromptBlockedNote";
 import {
@@ -164,21 +166,25 @@ export function SuggestionsView({
     `${CHIP} ${selected ? "border-brand-500 bg-brand-500/10 text-text-primary" : "border-surface-700 text-text-secondary hover:bg-surface-800"}`;
 
   const headingRef = useRef<HTMLHeadingElement>(null);
-  const noProviderNote =
-    !readOnly && onOpenMarketplace ? (
-      <SuggestionsSetupHint
-        ignoreDismissed
-        noProvider
-        onOpenMarketplace={onOpenMarketplace}
-        onFinished={() => {
-          headingRef.current?.focus();
-          void load();
-        }}
-        fallback="No plugin provides suggestions."
-      />
-    ) : (
-      "No plugin provides suggestions."
-    );
+  const noProviderNote = (
+    <>
+      <SuggestionsAgentGuide />
+      {!readOnly && onOpenMarketplace ? (
+        <SuggestionsSetupHint
+          ignoreDismissed
+          noProvider
+          onOpenMarketplace={onOpenMarketplace}
+          onFinished={() => {
+            headingRef.current?.focus();
+            void load();
+          }}
+          fallback="No plugin provides suggestions."
+        />
+      ) : (
+        "No plugin provides suggestions."
+      )}
+    </>
+  );
 
   return (
     <main className="flex-1 min-h-0 overflow-y-auto bg-surface-900 text-text-primary">
@@ -471,7 +477,7 @@ export function SuggestionsView({
                     ? "No suggestions match the filters."
                     : showDismissed
                       ? "No dismissed suggestions."
-                      : snapshot.providers.length === 0
+                      : !snapshot.providers.some(isPluginProvider)
                         ? noProviderNote
                         : "Nothing to suggest right now."}
                 </li>

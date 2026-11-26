@@ -2,6 +2,8 @@ import type { SessionResponse } from "../lib/types";
 import { useReportFeatureOnce } from "../hooks/useReportFeatureOnce";
 import { liveSession } from "../lib/suggestionPlan";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
+import { isPluginProvider } from "../lib/suggestionProviders";
+import { SuggestionsAgentGuide } from "./SuggestionsAgentGuide";
 import { StartedPromptNote } from "./PromptBlockedNote";
 import { useAgentNames } from "../hooks/useAgentNames";
 import { useSuggestionPresets } from "../hooks/useSuggestionPresets";
@@ -168,7 +170,12 @@ export function DashboardSuggestions({
             act={act}
           />
         )}
-        {rows.length === 0 && pending.length === 0 && on.length > 0 && (
+        {rows.length === 0 && !snapshot.providers.some(isPluginProvider) && (
+          <li className={SUGGESTION_NOTE_CLASS}>
+            <SuggestionsAgentGuide />
+          </li>
+        )}
+        {rows.length === 0 && pending.length === 0 && on.some(isPluginProvider) && (
           <li className={SUGGESTION_NOTE_CLASS}>
             {errored.length === 0 && "Nothing to suggest right now. "}
             {!readOnly && !offline && (

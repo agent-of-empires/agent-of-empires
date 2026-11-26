@@ -47,16 +47,19 @@ pub(crate) struct Provider {
 
 pub(crate) fn providers() -> Vec<Provider> {
     let registry = crate::plugin::registry();
-    registry
-        .active()
-        .filter(|p| p.manifest.runtime.is_some())
-        .filter_map(|p| {
-            Some(Provider {
-                id: p.id().to_string(),
-                name: p.manifest.name.clone(),
-                spec: p.manifest.suggestions.clone()?,
-            })
-        })
+    std::iter::once(agent::provider())
+        .chain(
+            registry
+                .active()
+                .filter(|p| p.manifest.runtime.is_some())
+                .filter_map(|p| {
+                    Some(Provider {
+                        id: p.id().to_string(),
+                        name: p.manifest.name.clone(),
+                        spec: p.manifest.suggestions.clone()?,
+                    })
+                }),
+        )
         .collect()
 }
 
@@ -197,6 +200,7 @@ fn effective_enabled(
     })
 }
 
+mod agent;
 mod ingest;
 mod links;
 mod prefs;
@@ -204,6 +208,7 @@ mod prepare;
 mod preset;
 mod store;
 
+pub(crate) use agent::{push as push_agent, Push as AgentPush, PROVIDER_ID as AGENT_PROVIDER_ID};
 pub(crate) use ingest::*;
 pub(crate) use links::*;
 pub(crate) use prefs::*;

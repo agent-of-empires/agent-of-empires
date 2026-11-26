@@ -233,7 +233,9 @@ pub(crate) fn snapshot(
     let mut per_provider: Vec<Vec<Value>> = Vec::new();
     for &index in &order {
         let provider = &providers[index];
-        let enabled = stored.get(&provider.id).is_some_and(|p| p.0);
+        let enabled = stored
+            .get(&provider.id)
+            .map_or(default_enabled(&provider.id), |p| p.0);
         let status: Option<(Option<String>, i64)> = conn
             .query_row(
                 "SELECT error, updated_at FROM suggestion_providers WHERE profile = ?1 AND provider_id = ?2",
@@ -247,6 +249,7 @@ pub(crate) fn snapshot(
             "name": provider.name,
             "enabled": enabled,
             "status": match &status {
+                None if provider.id == AGENT_PROVIDER_ID => "ok",
                 None => "pending",
                 Some((None, _)) => "ok",
                 Some((Some(_), _)) => "error",

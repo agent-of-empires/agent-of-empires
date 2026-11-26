@@ -14,6 +14,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe log-level`↴](#aoe-log-level)
 * [`aoe remove`↴](#aoe-remove)
 * [`aoe send`↴](#aoe-send)
+* [`aoe suggest`↴](#aoe-suggest)
 * [`aoe status`↴](#aoe-status)
 * [`aoe killall`↴](#aoe-killall)
 * [`aoe session`↴](#aoe-session)
@@ -163,6 +164,7 @@ Run without arguments to launch the TUI dashboard.
 * `log-level` — Get or set the running daemon's log filter at runtime. Pass a bare level (debug/info/...) for the safe expansion, or `--filter <expr>` for raw EnvFilter syntax. `--get` prints the current filter. Changes are ephemeral and lost on daemon restart
 * `remove` — Remove a session
 * `send` — Send a message to a running agent session
+* `suggest` — Suggest a session: it shows under Suggested sessions until started or dismissed
 * `status` — Show session status summary
 * `killall` — Force-stop everything aoe is running: the serve daemon, all agent workers, and all aoe tmux sessions. Destructive and unprompted
 * `session` — Manage session lifecycle (start, stop, attach, etc.)
@@ -391,6 +393,27 @@ Send a message to a running agent session
 ###### **Options:**
 
 * `--no-revive` — Fail loud on dead/stopped sessions instead of auto-respawning. Default behavior is to revive the session so a `send` after a crash or stop just works; pass this for scripts that want the previous bail-out
+
+
+
+## `aoe suggest`
+
+Suggest a session: it shows under Suggested sessions until started or dismissed
+
+**Usage:** `aoe suggest [OPTIONS] --prompt <PROMPT> <TITLE>`
+
+###### **Arguments:**
+
+* `<TITLE>` — Short title of the suggested session
+
+###### **Options:**
+
+* `--prompt <PROMPT>` — The first prompt the suggested session starts with
+* `--reason <REASON>` — Why this is worth doing now
+
+  Default value: ``
+* `--project <PROJECT>` — Registered Project name or path the session belongs in
+* `--id <ID>` — A stable key; suggesting the same one again replaces that suggestion
 
 
 

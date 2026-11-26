@@ -407,4 +407,26 @@ describe("DashboardSuggestions", () => {
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
   });
+
+  it("with only the built-in agent provider, explains how to get suggestions and offers a prompt", async () => {
+    fetchSuggestions.mockResolvedValue({
+      ...snap([]),
+      providers: [{ id: "builtin.agent", name: "Agent", status: "ok", enabled: true, sources: [] }],
+    });
+    renderIt();
+    expect((await screen.findByTestId("suggestions-agent-guide")).textContent).toContain("Ask any session to suggest");
+    expect(screen.queryByText(/Nothing to suggest|Refresh/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show a prompt to paste" }));
+    expect(screen.getByText(/call the suggest_session tool/)).toBeTruthy();
+  });
+
+  it("lists items an agent pushed without the guide", async () => {
+    fetchSuggestions.mockResolvedValue({
+      ...snap([mk(1, { provider_id: "builtin.agent", source_url: "" })]),
+      providers: [{ id: "builtin.agent", name: "Agent", status: "ok", enabled: true, sources: [] }],
+    });
+    renderIt();
+    await screen.findByText("Item 1");
+    expect(screen.queryByTestId("suggestions-agent-guide")).toBeNull();
+  });
 });

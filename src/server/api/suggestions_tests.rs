@@ -241,6 +241,41 @@ async fn snapshot_and_refresh() {
     }
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn an_agent_can_push_a_suggestion_without_a_plugin() {
+    let f = fixture();
+    let (status, _, body) = f
+        .call(
+            Method::POST,
+            "/api/suggestions/push",
+            json!({ "title": "Fix flaky test", "prompt": "Fix it", "reason": "Fails on CI" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = body["id"].as_str().unwrap().to_string();
+
+    let (_, _, snapshot) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
+    let item = snapshot["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == id)
+        .expect("pushed item is listed");
+    assert_eq!(item["provider_id"], "builtin.agent");
+    assert_eq!(item["draft"]["prompt"], "Fix it");
+
+    let (status, code, _) = f
+        .call(
+            Method::POST,
+            "/api/suggestions/push",
+            json!({ "title": " ", "prompt": "x" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(code, "validation_failed");
+}
+
 /// `started_session` follows the link table joined to live Sessions, not a scan
 /// of Sessions that carry an origin; CityHall keeps terminal Sessions hidden.
 #[tokio::test]

@@ -21,12 +21,13 @@ fn kinds() -> std::sync::MutexGuard<'static, BTreeMap<String, u32>> {
 /// `provider/kind` for a builtin or featured plugin, else `other`: a community plugin's ids
 /// and kinds are its own text and never leave the machine.
 fn kind_key(provider_id: &str, criterion: &str) -> String {
-    let known = crate::plugin::registry().get(provider_id).is_some_and(|p| {
-        matches!(
-            p.validation,
-            ValidationState::Builtin | ValidationState::Featured
-        )
-    });
+    let known = provider_id == crate::plugin::suggestions::AGENT_PROVIDER_ID
+        || crate::plugin::registry().get(provider_id).is_some_and(|p| {
+            matches!(
+                p.validation,
+                ValidationState::Builtin | ValidationState::Featured
+            )
+        });
     if known {
         format!("{provider_id}/{criterion}")
     } else {

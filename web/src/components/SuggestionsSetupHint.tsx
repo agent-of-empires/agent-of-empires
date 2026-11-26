@@ -11,6 +11,7 @@ import {
 } from "../lib/featuredSuggestionSources";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import { isWebUiStateHydrated, onWebUiStateHydrated } from "../lib/webUiHydration";
+import { isPluginProvider } from "../lib/suggestionProviders";
 import { SuggestionsSetupSheet } from "./SuggestionsSetupSheet";
 import { BUTTON_INLINE } from "../lib/surfaces";
 
@@ -58,7 +59,7 @@ export function SuggestionsSetupHint({
       if (noProviderProp === false) return;
       if (noProviderProp === undefined) {
         const snapshot = await fetchSuggestions();
-        if (!alive || !snapshot || snapshot.providers.length > 0 || !snapshot.prefs.homepage) return;
+        if (!alive || !snapshot || snapshot.providers.some(isPluginProvider) || !snapshot.prefs.homepage) return;
       }
       setNoProvider(true);
       const next = await loadFeaturedSuggestionSources();

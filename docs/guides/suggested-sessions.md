@@ -6,6 +6,12 @@ Each item has a title, a reason, the plugin that proposed it, and a draft prompt
 
 Suggestions show up in the web dashboard (homepage section, `/suggestions`, and optionally the sidebar) and in the TUI. They are stored per [profile](configuration.md#profiles).
 
+## Without a plugin
+
+Any session can suggest work. Tell an agent, for example: "Look at this project and suggest up to three sessions worth starting next." It calls the `suggest_session` tool of AoE's MCP server, or you run `aoe suggest "<title>" --prompt "<prompt>" --reason "<why>"` (`--project` names a registered Project; `--id` makes a repeat replace the earlier suggestion). The suggestion appears under the **Agent** provider, which is on from the start, and stays across reloads and daemon restarts until you start or dismiss it. There is nothing to refresh: **Refresh** asks plugins only. The homepage section and the TUI's list (`S`) show a prompt to paste into a session until something is suggested.
+
+Plugins add to this list; they do not replace it.
+
 ## Setting up
 
 With no provider installed, the web homepage and the empty `/suggestions` view offer **Set up suggestions** when a featured plugin exists. The sheet installs the sources you tick, runs each plugin's setup checks (✓, `!`, ✕, with the plugin's fix text and **Check again**), and ends with "Suggestions are on". **Finish later** closes it; the plugin stays installed. **More sources in the Marketplace ›** opens Settings › Plugins › Marketplace filtered to plugins that work with suggestions. With no provider, the TUI's list (`S`) says to run `aoe plugin install gh:agent-of-empires/plugin-github` and turn the provider on in the dashboard, and names **Set up suggestions** when the dashboard offers it. With every provider off, it says to turn one on in Settings › Suggestions.

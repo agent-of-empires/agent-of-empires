@@ -413,7 +413,7 @@ fn spawn_worker() -> Worker<Req, Res> {
     })
 }
 
-/// The empty pane's setup advice for the providers' `enabled` flags.
+/// The empty pane's setup advice for the plugin providers' `enabled` flags.
 /// `offered` says whether the dashboard shows Set up suggestions, which it
 /// does only while a featured plugin offers them.
 fn setup_lines(enabled: &[bool], offered: bool) -> Option<&'static [&'static str]> {
@@ -426,8 +426,13 @@ fn setup_lines(enabled: &[bool], offered: bool) -> Option<&'static [&'static str
         ])
     } else if offered {
         Some(&[
-            "No suggestion source is installed. To set one up, use",
-            "Set up suggestions on the web dashboard's homepage, or run:",
+            "Nothing suggested yet. In any session, ask the agent:",
+            "",
+            "  Suggest the next sessions worth starting here. Use the",
+            "  suggest_session tool, or run: aoe suggest \"<title>\" --prompt \"<prompt>\"",
+            "",
+            "Suggestions stay until you start or dismiss them. For GitHub issues and",
+            "PRs too, use Set up suggestions on the web dashboard's homepage, or run:",
             "",
             "  aoe plugin install gh:agent-of-empires/plugin-github",
             "",
@@ -435,7 +440,13 @@ fn setup_lines(enabled: &[bool], offered: bool) -> Option<&'static [&'static str
         ])
     } else {
         Some(&[
-            "No suggestion source is installed. To set one up, run:",
+            "Nothing suggested yet. In any session, ask the agent:",
+            "",
+            "  Suggest the next sessions worth starting here. Use the",
+            "  suggest_session tool, or run: aoe suggest \"<title>\" --prompt \"<prompt>\"",
+            "",
+            "Suggestions stay until you start or dismiss them. For GitHub issues and",
+            "PRs too, run:",
             "",
             "  aoe plugin install gh:agent-of-empires/plugin-github",
             "",
@@ -1944,12 +1955,16 @@ impl SuggestionsFeed {
         }
     }
 
-    /// Each provider's `enabled` flag as the daemon reports it; None until a
-    /// snapshot loads.
+    /// Each plugin provider's `enabled` flag as the daemon reports it, without
+    /// the built-in agent provider; None until a snapshot loads.
     pub(super) fn providers_enabled(&self) -> Option<Vec<bool>> {
-        self.snapshot
-            .as_ref()
-            .map(|s| s.providers.iter().map(|p| p.enabled).collect())
+        self.snapshot.as_ref().map(|s| {
+            s.providers
+                .iter()
+                .filter(|p| p.id != crate::plugin::suggestions::AGENT_PROVIDER_ID)
+                .map(|p| p.enabled)
+                .collect()
+        })
     }
 
     /// True while a request is in flight: its answer is not yet processed.
