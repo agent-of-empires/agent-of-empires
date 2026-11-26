@@ -87,18 +87,52 @@ pub fn install_hooks(
     events: impl AsRef<[ResolvedHookEvent]>,
     target: HookInstallTarget,
 ) -> Result<()> {
+    install_hooks_with(settings_path, events, target, false)
+}
+
+/// As [`install_hooks`], for a plugin-declared file: content that is not a JSON
+/// object is an error and the file is left as it was, where a built-in agent's
+/// torn file reads as empty.
+pub fn install_declared_hooks(
+    settings_path: &Path,
+    events: impl AsRef<[ResolvedHookEvent]>,
+    target: HookInstallTarget,
+) -> Result<()> {
+    install_hooks_with(settings_path, events, target, true)
+}
+
+fn install_hooks_with(
+    settings_path: &Path,
+    events: impl AsRef<[ResolvedHookEvent]>,
+    target: HookInstallTarget,
+    strict: bool,
+) -> Result<()> {
     if events.as_ref().is_empty() && !settings_path.exists() {
         return Ok(());
     }
     let policy = SymlinkPolicy::for_target(target);
     with_config_lock_policy(settings_path, "json.lock", policy, || {
         let content = policy.read(settings_path)?;
-        let mut settings = parse_json_or_empty(content, settings_path);
+        let mut settings = if strict {
+            match content {
+                None => serde_json::json!({}),
+                Some(content) => serde_json::from_str(&content)
+                    .with_context(|| format!("{} is not valid JSON", settings_path.display()))?,
+            }
+        } else {
+            parse_json_or_empty(content, settings_path)
+        };
         let before = settings.clone();
 
         let root = settings
             .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("Settings file root is not a JSON object"))?;
+        if strict && root.get("hooks").is_some_and(|hooks| !hooks.is_object()) {
+            anyhow::bail!(
+                "hooks key in {} is not a JSON object",
+                settings_path.display()
+            );
+        }
         if !root.get("hooks").is_some_and(Value::is_object) {
             root.insert("hooks".to_string(), serde_json::json!({}));
         }
@@ -508,5 +542,30 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn declared_install_fails_closed_where_the_built_in_one_resets() {
+        let tmp = TempDir::new().unwrap();
+        let events = agent_events("claude", &[]);
+        for (content, label) in [
+            ("{not json", "malformed"),
+            ("export PATH=/bin\n", "shell script"),
+            ("[]", "array root"),
+            (r#"{"hooks":[]}"#, "hooks not an object"),
+        ] {
+            let path = tmp.path().join(format!("{}.json", label.replace(' ', "-")));
+            std::fs::write(&path, content).unwrap();
+            assert!(
+                install_declared_hooks(&path, &events, HookInstallTarget::Host).is_err(),
+                "{label}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), content, "{label}");
+        }
+        // The built-in installer keeps treating a torn file as empty.
+        let torn = tmp.path().join("torn.json");
+        std::fs::write(&torn, "{not json").unwrap();
+        install_hooks(&torn, &events, HookInstallTarget::Host).unwrap();
+        assert!(read_json(&torn)["hooks"].is_object());
     }
 }

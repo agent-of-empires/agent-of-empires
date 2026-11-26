@@ -780,7 +780,24 @@ impl Instance {
                     }
                 }
             }
-            crate::agents::HookFormat::JsonSettings => self.install_json_host_hooks(&path, events),
+            crate::agents::HookFormat::JsonSettings => {
+                // An install replaces every AoE entry in the file, so a plugin
+                // must not share a built-in agent's file and strip its hooks.
+                if hook_cfg.strict
+                    && crate::hooks::is_other_builtin_hook_path(
+                        &path,
+                        agent.name,
+                        home,
+                        host_environment,
+                    )
+                {
+                    tracing::warn!(target: "session.store",
+                        "Not installing {} hooks into {}: it is another agent's settings file",
+                        agent.name, path.display());
+                    return false;
+                }
+                self.install_json_host_hooks(hook_cfg, &path, events)
+            }
         }
     }
 
@@ -925,10 +942,12 @@ impl Instance {
     /// file than the one the guard approved.
     fn install_json_host_hooks(
         &self,
+        hook_cfg: &crate::agents::AgentHookConfig<'_>,
         settings_path: &Path,
         events: &[crate::agents::ResolvedHookEvent],
     ) -> bool {
-        match crate::hooks::install_hooks(
+        match crate::hooks::install_json_hooks(
+            hook_cfg,
             settings_path,
             events,
             crate::hooks::HookInstallTarget::Host,
@@ -1403,6 +1422,87 @@ mod tests {
             "hooks landed outside the store the launch routes to"
         );
         assert!(inst.identity_publisher_launched);
+    }
+
+    /// A plugin-declared agent gets its hooks and trust through the same launch
+    /// wiring as a built-in one, and its writers fail closed.
+    #[test]
+    #[serial_test::serial]
+    fn a_plugin_declared_agent_gets_hooks_and_trust_through_the_launch() {
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
+        let _app = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let _env = EnvGuard::unset(&["EXAMPLE_CONFIG_DIR"]);
+        let manifest = |settings: &str| {
+            format!(
+                "id = \"acme.declared-launch\"\nname = \"Declared launch\"\nversion = \"1.0.0\"\n\
+                 api_version = 26\n[[agent_integrations]]\ntool = \"example-helper\"\n\
+                 command = \"example-helper\"\n[agent_integrations.hooks]\n\
+                 settings_rel_path = \"{settings}\"\nformat = \"json_settings\"\n\
+                 [[agent_integrations.hooks.events]]\nevent = \"Stop\"\nstatus = \"idle\"\n\
+                 [agent_integrations.trust]\nfile = \".example.json\"\n\
+                 location = \"config_dir_or_home\"\npointer = \"/projects/{{path}}/trusted\"\n\
+                 value = true\nsandbox = \"always\"\n"
+            )
+        };
+        crate::session::test_support::install_agent_plugin(
+            "acme.declared-launch",
+            &manifest(".example/settings.json"),
+        );
+        acknowledge_hooks();
+        crate::session::config::update_config(|config| {
+            config.session.pre_trust_agent_folders = true;
+        })
+        .unwrap();
+        let mut inst = tool_instance("example-helper", tmp.path().to_str().unwrap());
+        let launch = |inst: &mut Instance| {
+            inst.with_hook_agent(|this, agent| {
+                assert_eq!(agent.map(|agent| agent.name), Some("example-helper"));
+                this.ensure_disclosed_host_hook_path(agent).unwrap();
+                this.install_agent_status_hooks(agent);
+                this.ensure_host_folder_trust(agent);
+            })
+        };
+
+        launch(&mut inst);
+        let settings = tmp.path().join(".example/settings.json");
+        let installed = std::fs::read_to_string(&settings).unwrap();
+        assert!(installed.contains("aoe-hooks"), "{installed}");
+        let trusted: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join(".example.json")).unwrap(),
+        )
+        .unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        assert_eq!(
+            trusted["projects"][project.to_str().unwrap()]["trusted"],
+            true
+        );
+
+        // The installed file is a hook target, and uninstall removes the hooks but
+        // keeps the trust record.
+        let target = crate::hooks::iter_hook_targets_in(tmp.path(), &[])
+            .into_iter()
+            .find(|target| target.agent_name == "example-helper")
+            .expect("declared agent is a hook target");
+        assert_eq!(target.path, settings);
+        assert!(crate::hooks::has_aoe_marker(&target));
+        assert!(crate::hooks::uninstall_hooks(&settings).unwrap());
+        assert!(!crate::hooks::has_aoe_marker(&target));
+        assert!(tmp.path().join(".example.json").exists());
+
+        // A settings file that is not JSON is never replaced.
+        std::fs::write(&settings, "{not json").unwrap();
+        launch(&mut inst);
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), "{not json");
+
+        // Another agent's settings file is never taken over.
+        crate::session::test_support::install_agent_plugin(
+            "acme.declared-launch",
+            &manifest(".claude/settings.json"),
+        );
+        launch(&mut inst);
+        assert!(!tmp.path().join(".claude/settings.json").exists());
     }
 
     #[test]

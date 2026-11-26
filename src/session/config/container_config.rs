@@ -2318,7 +2318,6 @@ fn apply_folder_trust_config(
     container_workspace_path: &str,
     is_yolo_mode: bool,
     staged: bool,
-    declared: Option<&aoe_plugin_api::agent_integration::AgentTrustDeclaration>,
 ) -> Result<()> {
     match (mount.tool_name, mount.host_rel) {
         ("codex", ".codex") if is_yolo_mode => crate::hooks::trust_codex_project(
@@ -2345,18 +2344,7 @@ fn apply_folder_trust_config(
             // Bind-mounted into the container, which can plant a link here.
             crate::hooks::SymlinkPolicy::Never,
         ),
-        _ => match declared {
-            Some(trust) if crate::hooks::declared_trust_applies_in_sandbox(trust, is_yolo_mode) => {
-                crate::hooks::write_declared_trust(
-                    &sandbox_dir.join(&trust.file),
-                    trust,
-                    container_workspace_path,
-                    // Bind-mounted into the container, which can plant a link here.
-                    crate::hooks::SymlinkPolicy::Never,
-                )
-            }
-            _ => Ok(()),
-        },
+        _ => Ok(()),
     }
 }
 
@@ -2371,6 +2359,35 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
     let Some(home) = dirs::home_dir() else {
         return;
     };
+
+    if let Some(trust) = declared_sandbox_agent(tool, command, session_config)
+        .and_then(|declared| declared.contribution().trust.clone())
+    {
+        let applies = crate::hooks::declared_trust_applies_in_sandbox(&trust, is_yolo_mode);
+        let result = crate::hooks::declared_sandbox_dir(instance_id).and_then(|stage| {
+            let file = stage.join("home").join(&trust.file);
+            if !applies {
+                // A record staged by an earlier Yolo launch must not outlive it.
+                return match std::fs::remove_file(&file) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+                    _ => Ok(()),
+                };
+            }
+            std::fs::create_dir_all(file.parent().expect("staged under home"))?;
+            crate::hooks::write_declared_trust(
+                &file,
+                &trust,
+                container_workspace_path,
+                // Bind-mounted into the container, which can plant a link here.
+                crate::hooks::SymlinkPolicy::Never,
+            )
+        });
+        if let Err(e) = result {
+            tracing::warn!(target: "session.profile",
+                "Failed to apply sandbox folder trust for {tool}: {e:#}");
+        }
+        return;
+    }
 
     let active_agent = resolve_active_agent(tool, command, session_config);
     let config_tool = active_agent.map_or(tool, |agent| agent.name);
@@ -2405,7 +2422,6 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
                     container_workspace_path,
                     is_yolo_mode,
                     agent_config_dir.is_none(),
-                    active_agent.and_then(|agent| agent.trust),
                 )
             })
         {
@@ -2863,6 +2879,181 @@ pub(crate) fn stranded_named_ignore_volumes(
 }
 
 /// Reject managed agent paths that would bypass the sandbox's private mounts.
+/// Binds the session's host hook directory into the container, so sandbox hooks
+/// can report. `None` when the directory is unavailable and pane detection takes over.
+fn mount_hook_status_dir(
+    instance_id: &str,
+    volumes: &mut Vec<VolumeMount>,
+) -> Result<Option<(PathBuf, String)>> {
+    crate::session::validate_instance_id(instance_id).map_err(|e| {
+        anyhow::anyhow!("refusing to mount hook directory: AOE_INSTANCE_ID failed validation: {e}")
+    })?;
+    match crate::hooks::ensure_instance_dir_path(instance_id) {
+        Ok(hook_dir) => {
+            let container_hook_path = format!(
+                "{}/{instance_id}",
+                crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
+            );
+            volumes.push(VolumeMount {
+                host_path: hook_dir.to_string_lossy().to_string(),
+                container_path: container_hook_path.clone(),
+                read_only: false,
+            });
+            Ok(Some((hook_dir, container_hook_path)))
+        }
+        Err(e) => {
+            tracing::warn!(target: "session.profile",
+                "Hook directory unavailable, skipping bind-mount; \
+                 agent boots without status hooks (pane detection takes over): {e:#}");
+            Ok(None)
+        }
+    }
+}
+
+/// The active plugin declaration that runs `tool` in a sandbox when no built-in or
+/// bundled agent covers it.
+fn declared_sandbox_agent(
+    tool: &str,
+    command: Option<&str>,
+    session_config: &super::SessionConfig,
+) -> Option<crate::plugin::agent_integration::DeclaredAgent> {
+    if crate::agents::get_agent(tool).is_some()
+        || session_config
+            .agent_command_override
+            .get(tool)
+            .is_some_and(|command| !command.trim().is_empty())
+    {
+        return None;
+    }
+    crate::plugin::agent_integration::declared_agent(
+        crate::plugin::registry(),
+        tool,
+        session_config
+            .custom_agents
+            .iter()
+            .filter(|(_, command)| !command.trim().is_empty())
+            .map(|(name, _)| name.as_str()),
+    )
+    .filter(|agent| {
+        command.is_none_or(|command| agent.contribution().command.as_deref() == Some(command))
+    })
+}
+
+/// The config directory a declared sandbox mounts: the directory its declared
+/// environment variable names in the container, else `rel` under the container home.
+fn declared_container_dir(
+    entry: &aoe_plugin_api::agent_integration::AgentIntegrationContribution,
+    env_var: Option<&str>,
+    rel: &Path,
+) -> String {
+    env_var
+        .and_then(|var| entry.launch.as_ref()?.container_env.get(var))
+        .filter(|dir| dir.starts_with('/'))
+        .map(|dir| dir.trim_end_matches('/'))
+        .map_or_else(
+            || {
+                let dir = Path::new(CONTAINER_HOME).join(rel).display().to_string();
+                dir.trim_end_matches('/').to_string()
+            },
+            str::to_string,
+        )
+}
+
+/// What a plugin-declared sandbox mounts, staged per session outside the host
+/// config because the agent has no `AGENT_CONFIG_MOUNTS` entry: its hooks file in
+/// one directory and its trust file in another.
+struct DeclaredSandboxMounts {
+    volumes: Vec<VolumeMount>,
+    identity_publisher: Option<(PathBuf, String)>,
+    identity_output: Option<(PathBuf, String)>,
+}
+
+fn stage_declared_sandbox(
+    declared: &crate::plugin::agent_integration::DeclaredAgent,
+    instance_id: &str,
+    profile_config: &super::Config,
+) -> Result<DeclaredSandboxMounts> {
+    let entry = declared.contribution();
+    let stage = crate::hooks::declared_sandbox_dir(instance_id)?;
+    let mut mounts = DeclaredSandboxMounts {
+        volumes: Vec::new(),
+        identity_publisher: None,
+        identity_output: None,
+    };
+    // A failure here must not cost the trust mount below.
+    if let Some(hooks) = &entry.hooks {
+        let staged = (|| -> Result<()> {
+            let status_hooks_enabled = profile_config.session.agent_status_hooks;
+            let events = declared
+                .with_definition(|agent| {
+                    crate::agents::resolved_hook_events(agent, profile_config).map(|mut events| {
+                        if !status_hooks_enabled {
+                            events.retain(|event| event.identity_field.is_some());
+                            for event in &mut events {
+                                event.status = None;
+                            }
+                        }
+                        events
+                    })
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let settings = Path::new(&hooks.settings_rel_path);
+            let (Some(rel_dir), Some(leaf)) = (settings.parent(), settings.file_name()) else {
+                anyhow::bail!(
+                    "declared settings path {} has no directory",
+                    settings.display()
+                );
+            };
+            let config_dir = stage.join("config");
+            std::fs::create_dir_all(&config_dir)?;
+            let settings_file = config_dir.join(leaf);
+            crate::hooks::install_declared_hooks(
+                &settings_file,
+                &events,
+                crate::hooks::HookInstallTarget::Sandbox,
+            )?;
+            if settings_file.is_file() {
+                let container_dir =
+                    declared_container_dir(entry, hooks.config_dir_env_var.as_deref(), rel_dir);
+                if !events.is_empty() {
+                    mounts.identity_output =
+                        mount_hook_status_dir(instance_id, &mut mounts.volumes)?;
+                    if events.iter().any(|event| event.identity_field.is_some()) {
+                        mounts.identity_publisher = Some((
+                            settings_file.clone(),
+                            format!("{container_dir}/{}", leaf.to_string_lossy()),
+                        ));
+                    }
+                }
+                mounts.volumes.push(VolumeMount {
+                    host_path: config_dir.to_string_lossy().to_string(),
+                    container_path: container_dir,
+                    read_only: false,
+                });
+            }
+            Ok(())
+        })();
+        if let Err(e) = staged {
+            tracing::warn!(target: "session.profile",
+                "Failed to stage sandbox hooks for {}: {e:#}", entry.tool);
+        }
+    }
+    if let Some(trust) = &entry.trust {
+        let file = stage.join("home").join(&trust.file);
+        if file.is_file() {
+            let container_dir =
+                declared_container_dir(entry, trust.config_dir_env_var.as_deref(), Path::new(""));
+            mounts.volumes.push(VolumeMount {
+                host_path: file.to_string_lossy().to_string(),
+                container_path: format!("{container_dir}/{}", trust.file),
+                read_only: false,
+            });
+        }
+    }
+    Ok(mounts)
+}
+
 fn validate_managed_container_environment(
     environment: &[EnvEntry],
     active_agent: Option<&crate::agents::AgentDef<'_>>,
@@ -2922,29 +3113,11 @@ pub(crate) fn build_container_config(
     let project_path = Path::new(project_path_str);
     let profile_config = &launch_config.profile;
     let profile_session_config = &profile_config.session;
-    let plugin_agent = if crate::agents::get_agent(agent_selection.tool).is_none()
-        && !profile_session_config
-            .agent_command_override
-            .get(agent_selection.tool)
-            .is_some_and(|command| !command.trim().is_empty())
-    {
-        crate::plugin::agent_integration::declared_agent(
-            crate::plugin::registry(),
-            agent_selection.tool,
-            profile_session_config
-                .custom_agents
-                .iter()
-                .filter(|(_, command)| !command.trim().is_empty())
-                .map(|(name, _)| name.as_str()),
-        )
-        .filter(|agent| {
-            agent_selection
-                .command
-                .is_none_or(|command| agent.contribution().command.as_deref() == Some(command))
-        })
-    } else {
-        None
-    };
+    let plugin_agent = declared_sandbox_agent(
+        agent_selection.tool,
+        agent_selection.command,
+        profile_session_config,
+    );
     let active_agent = if plugin_agent.is_none() {
         resolve_active_agent(
             agent_selection.tool,
@@ -3225,31 +3398,7 @@ pub(crate) fn build_container_config(
             // generic hook_config path below cannot emit; they install through
             // their SidecarHooks installer at the sandbox config subpath.
             if status_hooks_enabled || identity_hooks_required {
-                crate::session::validate_instance_id(instance_id).map_err(|e| {
-                    anyhow::anyhow!(
-                        "refusing to mount hook directory: AOE_INSTANCE_ID failed validation: {e}"
-                    )
-                })?;
-                match crate::hooks::ensure_instance_dir_path(instance_id) {
-                    Ok(hook_dir) => {
-                        let container_hook_path = format!(
-                            "{}/{instance_id}",
-                            crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
-                        );
-                        identity_output_path =
-                            Some((hook_dir.clone(), container_hook_path.clone()));
-                        volumes.push(VolumeMount {
-                            host_path: hook_dir.to_string_lossy().to_string(),
-                            container_path: container_hook_path,
-                            read_only: false,
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!(target: "session.profile",
-                            "Hook directory unavailable, skipping bind-mount; \
-                             agent boots without status hooks (pane detection takes over): {e:#}");
-                    }
-                }
+                identity_output_path = mount_hook_status_dir(instance_id, &mut volumes)?;
             }
 
             if let Some(sidecar) = &agent.sidecar_hooks {
@@ -3442,6 +3591,20 @@ pub(crate) fn build_container_config(
         &workspace_path,
         yolo.enabled,
     );
+    if let Some(declared) = &plugin_agent {
+        match stage_declared_sandbox(declared, instance_id, profile_config) {
+            Ok(staged) => {
+                volumes.extend(staged.volumes);
+                identity_output_path = identity_output_path.or(staged.identity_output);
+                if let Some(path) = staged.identity_publisher {
+                    identity_publisher_installed = true;
+                    identity_publisher_path = Some(path);
+                }
+            }
+            Err(e) => tracing::warn!(target: "session.profile",
+                "Failed to stage sandbox config for {}: {e:#}", agent_selection.tool),
+        }
+    }
 
     // Add extra_volumes from config (host:container format)
     // Also collect container paths to filter conflicting volume_ignores later
@@ -7389,46 +7552,154 @@ codex-work = "{}"
         crate::hooks::cleanup_hook_status_dir(instance_id);
     }
 
-    // A declared record is written through `SymlinkPolicy::Never`, and `yolo_only`
-    // follows the host launch state.
+    const DECLARED_SANDBOX_PLUGIN: &str = r#"
+id = "acme.declared-sandbox"
+name = "Declared sandbox"
+version = "1.0.0"
+api_version = 26
+
+[[agent_integrations]]
+tool = "example-helper"
+command = "example-helper"
+
+[agent_integrations.launch.container_env]
+EXAMPLE_CONFIG_DIR = "/opt/example"
+
+[agent_integrations.hooks]
+settings_rel_path = ".example/settings.json"
+config_dir_env_var = "EXAMPLE_CONFIG_DIR"
+format = "json_settings"
+
+[[agent_integrations.hooks.events]]
+event = "Stop"
+status = "idle"
+
+[agent_integrations.trust]
+file = ".example.json"
+location = "config_dir_or_home"
+pointer = "/projects/{path}/trusted"
+value = true
+sandbox = "SANDBOX"
+"#;
+
+    // A plugin-declared agent has no config mount; its sandbox hooks and trust
+    // are staged per session and bound only when the launch state allows them.
     #[cfg(unix)]
     #[test]
-    fn test_apply_folder_trust_config_declared_record_in_sandbox() {
-        use aoe_plugin_api::agent_integration::{
-            AgentTrustDeclaration, AgentTrustLocation, AgentTrustSandbox, AgentTrustValue,
+    #[serial_test::serial]
+    fn declared_agent_sandbox_stages_hooks_and_trust_through_the_launch() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let sandbox_info = crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
         };
-        let mount = AGENT_CONFIG_MOUNTS
-            .iter()
-            .find(|m| m.tool_name == "pi")
-            .unwrap();
-        let trust = |sandbox| AgentTrustDeclaration {
-            file: ".example.json".into(),
-            location: AgentTrustLocation::ConfigDirOrHome,
-            config_dir_env_var: None,
-            pointer: "/projects/{path}/trusted".into(),
-            value: AgentTrustValue::Bool(true),
-            sandbox,
+        let launch = |instance: &str, yolo: bool| {
+            build_container_config(
+                project_dir.path().to_str().unwrap(),
+                &sandbox_info,
+                ContainerAgentSelection::new("example-helper", Some("example-helper")),
+                SandboxYolo { enabled: yolo },
+                instance,
+                None,
+                "",
+            )
+            .unwrap()
         };
-        let apply = |dir: &Path, yolo, trust| {
-            apply_folder_trust_config(mount, dir, "/workspace/wt", yolo, true, Some(trust)).unwrap()
+        let mount_of = |config: &ContainerConfig, container: &str| {
+            config
+                .volumes
+                .iter()
+                .find(|volume| volume.container_path == container)
+                .map(|volume| PathBuf::from(&volume.host_path))
         };
 
-        let dir = TempDir::new().unwrap();
-        let yolo_only = trust(AgentTrustSandbox::YoloOnly);
-        apply(dir.path(), false, &yolo_only);
-        assert!(!dir.path().join(".example.json").exists());
-        apply(dir.path(), true, &yolo_only);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(dir.path().join(".example.json")).unwrap())
-                .unwrap();
-        assert_eq!(parsed["projects"]["/workspace/wt"]["trusted"], true);
+        for (sandbox, yolo, trusted) in [
+            ("always", false, true),
+            ("always", true, true),
+            ("yolo_only", false, false),
+            ("yolo_only", true, true),
+        ] {
+            crate::session::test_support::install_agent_plugin(
+                "acme.declared-sandbox",
+                &DECLARED_SANDBOX_PLUGIN.replace("SANDBOX", sandbox),
+            );
+            let instance = format!("declared-{sandbox}-{yolo}");
+            let config = launch(&instance, yolo);
 
-        let planted = TempDir::new().unwrap();
-        let outside = planted.path().join("host-secret");
+            let hooks = mount_of(&config, "/opt/example").expect("hooks directory is bound");
+            let settings = fs::read_to_string(hooks.join("settings.json")).unwrap();
+            assert!(settings.contains("\"Stop\""), "{settings}");
+            assert!(
+                mount_of(
+                    &config,
+                    &format!("{}/{instance}", crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER)
+                )
+                .is_some(),
+                "status directory is bound for the hooks"
+            );
+
+            let trust = mount_of(&config, "/root/.example.json");
+            assert_eq!(trust.is_some(), trusted, "{sandbox} yolo={yolo}");
+            if let Some(trust) = trust {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&fs::read_to_string(trust).unwrap()).unwrap();
+                assert_eq!(
+                    parsed["projects"][config.working_dir.as_str()]["trusted"],
+                    true
+                );
+            }
+        }
+
+        // A later launch without Yolo drops a record an earlier Yolo launch staged.
+        crate::session::test_support::install_agent_plugin(
+            "acme.declared-sandbox",
+            &DECLARED_SANDBOX_PLUGIN.replace("SANDBOX", "yolo_only"),
+        );
+        assert!(mount_of(&launch("declared-flip", true), "/root/.example.json").is_some());
+        assert!(mount_of(&launch("declared-flip", false), "/root/.example.json").is_none());
+
+        // A link planted in the staged directory is replaced, never followed.
+        crate::session::test_support::install_agent_plugin(
+            "acme.declared-sandbox",
+            &DECLARED_SANDBOX_PLUGIN.replace("SANDBOX", "always"),
+        );
+        let outside = temp_home.path().join("host-secret");
         fs::write(&outside, "{}").unwrap();
-        std::os::unix::fs::symlink(&outside, planted.path().join(".example.json")).unwrap();
-        apply(planted.path(), false, &trust(AgentTrustSandbox::Always));
+        let stage = crate::hooks::declared_sandbox_dir("declared-link").unwrap();
+        fs::create_dir_all(stage.join("home")).unwrap();
+        std::os::unix::fs::symlink(&outside, stage.join("home/.example.json")).unwrap();
+        let config = launch("declared-link", false);
         assert_eq!(fs::read_to_string(&outside).unwrap(), "{}");
+        let staged = mount_of(&config, "/root/.example.json").unwrap();
+        assert!(!fs::symlink_metadata(staged)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        // A staged settings file that is not JSON is left alone and not bound.
+        let stage = crate::hooks::declared_sandbox_dir("declared-torn").unwrap();
+        fs::create_dir_all(stage.join("config")).unwrap();
+        fs::write(stage.join("config/settings.json"), "{not json").unwrap();
+        let config = launch("declared-torn", false);
+        assert_eq!(
+            fs::read_to_string(stage.join("config/settings.json")).unwrap(),
+            "{not json"
+        );
+        assert!(mount_of(&config, "/opt/example").is_none());
+        assert!(mount_of(&config, "/root/.example.json").is_some());
     }
 
     // The wholesale folder-trust disable is only safe against a config AoE
@@ -7443,8 +7714,7 @@ codex-work = "{}"
 
         for staged in [true, false] {
             let dir = TempDir::new().unwrap();
-            apply_folder_trust_config(mount, dir.path(), "/workspace/wt", true, staged, None)
-                .unwrap();
+            apply_folder_trust_config(mount, dir.path(), "/workspace/wt", true, staged).unwrap();
 
             let settings = dir.path().join("settings.json");
             let trusted = dir.path().join("trustedFolders.json");

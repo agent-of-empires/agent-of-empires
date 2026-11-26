@@ -56,48 +56,46 @@ pub(crate) fn iter_hook_targets() -> Vec<HookTarget> {
                         .get(tool)
                         .map(String::as_str)
                         .unwrap_or("");
-                    let Some(agent) = crate::session::resolved_agent_for(&profile, tool, detect_as)
-                    else {
-                        continue;
-                    };
                     let Some(root) = config.session.agent_config_dir_for(tool, &home) else {
                         continue;
                     };
-                    if let Some(hook_cfg) = agent.hook_config.as_ref() {
-                        if let Some(file) = Path::new(hook_cfg.settings_rel_path).file_name() {
-                            let path = root.join(file);
-                            if !targets.iter().any(|target| {
-                                matches!(target.kind, HookTargetKind::JsonSettings)
-                                    && target.path == path
-                            }) {
-                                let events = crate::agents::resolved_hook_events(agent, &config)
-                                    .unwrap_or_default();
-                                targets.push(HookTarget {
-                                    agent_name: agent.name.to_string(),
-                                    kind: HookTargetKind::JsonSettings,
-                                    path,
-                                    events,
-                                });
+                    match crate::session::resolved_agent_for(&profile, tool, detect_as) {
+                        Some(agent) => {
+                            if agent.hook_config.is_some() {
+                                push_relocated_target(&mut targets, agent, root, &config);
+                            } else if let Some(sidecar) = agent.sidecar_hooks.as_ref() {
+                                let relative: PathBuf = Path::new(sidecar.host_config_subpath)
+                                    .components()
+                                    .skip(1)
+                                    .collect();
+                                let path = root.join(relative);
+                                if !targets.iter().any(|target| {
+                                    matches!(target.kind, HookTargetKind::Sidecar(_))
+                                        && target.path == path
+                                }) {
+                                    let events =
+                                        crate::agents::resolved_sidecar_hook_events(agent, &config)
+                                            .unwrap_or_default();
+                                    targets.push(HookTarget {
+                                        agent_name: agent.name.to_string(),
+                                        kind: HookTargetKind::Sidecar(sidecar),
+                                        path,
+                                        events,
+                                    });
+                                }
                             }
                         }
-                    } else if let Some(sidecar) = agent.sidecar_hooks.as_ref() {
-                        let relative: PathBuf = Path::new(sidecar.host_config_subpath)
-                            .components()
-                            .skip(1)
-                            .collect();
-                        let path = root.join(relative);
-                        if !targets.iter().any(|target| {
-                            matches!(target.kind, HookTargetKind::Sidecar(_)) && target.path == path
-                        }) {
-                            let events =
-                                crate::agents::resolved_sidecar_hook_events(agent, &config)
-                                    .unwrap_or_default();
-                            targets.push(HookTarget {
-                                agent_name: agent.name.to_string(),
-                                kind: HookTargetKind::Sidecar(sidecar),
-                                path,
-                                events,
-                            });
+                        None => {
+                            let command = config.session.launch_command_for(tool);
+                            if let Some(declared) = crate::session::host_hook_declared_agent(
+                                tool,
+                                &command,
+                                &config.session,
+                            ) {
+                                declared.with_definition(|agent| {
+                                    push_relocated_target(&mut targets, agent, root, &config)
+                                });
+                            }
                         }
                     }
                 }
@@ -172,19 +170,7 @@ pub(crate) fn iter_hook_targets() -> Vec<HookTarget> {
 
 pub(crate) fn iter_hook_targets_in(home: &Path, env_lists: &[Vec<String>]) -> Vec<HookTarget> {
     let defaults = crate::session::config::Config::default();
-    let mut out = Vec::new();
-    for agent in crate::agents::AGENTS {
-        push_hook_config_targets(&mut out, agent, home, env_lists, &defaults);
-        if let Some(sidecar) = agent.sidecar_hooks.as_ref() {
-            out.push(HookTarget {
-                agent_name: agent.name.to_string(),
-                kind: HookTargetKind::Sidecar(sidecar),
-                path: home.join(sidecar.host_config_subpath),
-                events: crate::agents::resolved_sidecar_hook_events(agent, &defaults)
-                    .unwrap_or_default(),
-            });
-        }
-    }
+    let mut out = builtin_hook_targets_in(home, env_lists, &defaults);
     // Declarations of plugins that are active now; hooks written by one that
     // has since been removed stay until the plugin is back.
     let registry = crate::plugin::registry();
@@ -201,6 +187,73 @@ pub(crate) fn iter_hook_targets_in(home: &Path, env_lists: &[Vec<String>]) -> Ve
         });
     }
     out
+}
+
+/// Whether `path` is a built-in agent other than `agent_name`'s own settings file,
+/// which no plugin declaration may take over.
+pub(crate) fn is_other_builtin_hook_path(
+    path: &Path,
+    agent_name: &str,
+    home: &Path,
+    host_env: &[String],
+) -> bool {
+    builtin_hook_targets_in(
+        home,
+        &[host_env.to_vec()],
+        &crate::session::config::Config::default(),
+    )
+    .iter()
+    .any(|target| target.agent_name != agent_name && target.path == path)
+}
+
+fn builtin_hook_targets_in(
+    home: &Path,
+    env_lists: &[Vec<String>],
+    defaults: &crate::session::config::Config,
+) -> Vec<HookTarget> {
+    let mut out = Vec::new();
+    for agent in crate::agents::AGENTS {
+        push_hook_config_targets(&mut out, agent, home, env_lists, defaults);
+        if let Some(sidecar) = agent.sidecar_hooks.as_ref() {
+            out.push(HookTarget {
+                agent_name: agent.name.to_string(),
+                kind: HookTargetKind::Sidecar(sidecar),
+                path: home.join(sidecar.host_config_subpath),
+                events: crate::agents::resolved_sidecar_hook_events(agent, defaults)
+                    .unwrap_or_default(),
+            });
+        }
+    }
+    out
+}
+
+/// A settings file relocated by `session.agent_config_dir`.
+fn push_relocated_target(
+    targets: &mut Vec<HookTarget>,
+    agent: &crate::agents::AgentDef,
+    root: PathBuf,
+    config: &crate::session::config::Config,
+) {
+    let Some(hook_cfg) = agent.hook_config.as_ref() else {
+        return;
+    };
+    let Some(file) = Path::new(hook_cfg.settings_rel_path).file_name() else {
+        return;
+    };
+    let path = root.join(file);
+    if targets
+        .iter()
+        .any(|target| matches!(target.kind, HookTargetKind::JsonSettings) && target.path == path)
+    {
+        return;
+    }
+    let events = crate::agents::resolved_hook_events(agent, config).unwrap_or_default();
+    targets.push(HookTarget {
+        agent_name: agent.name.to_string(),
+        kind: HookTargetKind::JsonSettings,
+        path,
+        events,
+    });
 }
 
 fn push_hook_config_targets(
@@ -228,6 +281,15 @@ fn push_hook_config_targets(
         }
     }
     for path in paths {
+        if out.iter().any(|target| {
+            target.path == path
+                && matches!(
+                    target.kind,
+                    HookTargetKind::JsonSettings | HookTargetKind::CodexJson
+                )
+        }) {
+            continue;
+        }
         out.push(HookTarget {
             agent_name: agent.name.to_string(),
             kind,
@@ -449,7 +511,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial(shell_env)]
-    fn plugin_declared_hooks_are_listed_consented_and_uninstalled() {
+    fn plugin_declared_hooks_are_listed_and_consented() {
         let app = TempDir::new().unwrap();
         let _reload = crate::plugin::ReloadRegistryOnDrop;
         let _app = crate::session::test_support::isolate_app_dir_at(app.path());
@@ -485,14 +547,20 @@ mod tests {
         assert!(lines.contains("/projects/{path}/trusted = true into ~/.example.json"));
         assert!(lines.contains("kept on uninstall"));
 
-        super::super::install_hooks(
-            &target.path,
-            &target.events,
-            crate::hooks::HookInstallTarget::Host,
+        // A profile's relocated config directory is found too.
+        let relocated = home.path().join("relocated");
+        let profile_dir = crate::session::get_profile_dir("declared-profile").unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            format!(
+                "[session.agent_config_dir]\nexample-helper = \"{}\"\n",
+                relocated.display()
+            ),
         )
         .unwrap();
-        assert!(has_aoe_marker(&target));
-        assert!(super::super::uninstall_hooks(&target.path).unwrap());
-        assert!(!has_aoe_marker(&target));
+        assert!(iter_hook_targets()
+            .into_iter()
+            .any(|target| target.agent_name == "example-helper"
+                && target.path == relocated.join("settings.json")));
     }
 }

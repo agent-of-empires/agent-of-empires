@@ -159,6 +159,7 @@ impl<'a> DefinitionData<'a> {
                 settings_rel_path: &hooks.settings_rel_path,
                 config_dir_env_var: hooks.config_dir_env_var.as_deref(),
                 events: &self.hook_events,
+                strict: true,
                 format: match hooks.format {
                     AgentHookFormat::JsonSettings => HookFormat::JsonSettings,
                 },

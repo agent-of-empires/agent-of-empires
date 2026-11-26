@@ -202,6 +202,16 @@ pub fn declared_trust_path(
         .join(&trust.file)
 }
 
+/// The per-session directory a plugin-declared agent's sandbox config is staged in:
+/// `config/` holds its hooks file and `home/` its trust file.
+pub fn declared_sandbox_dir(instance_id: &str) -> Result<PathBuf> {
+    crate::session::validate_instance_id(instance_id)
+        .map_err(|e| anyhow::anyhow!("unsafe AOE_INSTANCE_ID {instance_id:?}: {e}"))?;
+    Ok(crate::session::get_app_dir()?
+        .join("sandbox-declared")
+        .join(instance_id))
+}
+
 /// Whether a sandbox launch gets the declared record.
 pub fn declared_trust_applies_in_sandbox(trust: &AgentTrustDeclaration, yolo: bool) -> bool {
     match trust.sandbox {

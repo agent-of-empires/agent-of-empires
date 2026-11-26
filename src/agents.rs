@@ -348,6 +348,9 @@ pub struct AgentHookConfig<'a> {
     pub config_dir_env_var: Option<&'a str>,
     pub events: &'a [HookEvent<'a>],
     pub format: HookFormat,
+    /// Plugin-declared: the installer refuses a settings file that is not a JSON object
+    /// instead of replacing it.
+    pub strict: bool,
 }
 
 /// An agent has at most one of `hook_config` or `sidecar_hooks`.
@@ -624,6 +627,7 @@ const fn json_hooks(
         config_dir_env_var: None,
         events,
         format,
+        strict: false,
     })
 }
 
@@ -674,6 +678,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             config_dir_env_var: Some("CLAUDE_CONFIG_DIR"),
             events: CLAUDE_HOOK_EVENTS,
             format: HookFormat::JsonSettings,
+            strict: false,
         }),
         session_support: session_support(
             ResumeStrategy::FlagPair {
