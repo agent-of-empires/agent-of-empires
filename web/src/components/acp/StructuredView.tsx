@@ -35,6 +35,7 @@ import type { RecreateContainerBlock } from "../sidebar/sessionActionTargets";
 import { ConfigOptionSwitchFailedNotice } from "./SessionConfigControls";
 import { StartupErrorScreen } from "./StartupErrorScreen";
 import { SystemNotices } from "./SystemNotices";
+import { TRANSCRIPT_COLUMN } from "./transcriptColumn";
 import { AssistantMessage, UserMessage } from "./ThreadMessages";
 import { UsageLimitSection } from "./UsageLimitBanner";
 import { ToolExpansionProvider } from "./ToolExpansion";
@@ -318,7 +319,7 @@ function AcpChrome({
             tabIndex={0}
             className="flex-1 overflow-x-hidden overflow-y-auto [overflow-anchor:none]"
           >
-            <div ref={messagesContentRef} className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl px-4 py-6">
+            <div ref={messagesContentRef} className={`${TRANSCRIPT_COLUMN} px-4 py-6`}>
               {!readOnly && (
                 <ThreadPrimitive.Empty>
                   <EmptyState onPick={ctx.sendPrompt} notRunning={notRunning} />

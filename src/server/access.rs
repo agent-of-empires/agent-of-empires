@@ -381,6 +381,8 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     // Session creation (server-derived) + lifecycle / metadata on the structured
     // sessions this mode owns; each handler re-checks the target is structured.
     ("POST", "/api/sessions"),
+    // Resolves a prefill and mutates nothing; `/api/suggestions/start` stays denied.
+    ("POST", "/api/suggestions/prepare"),
     ("POST", "/api/sessions/{id}/creation/cancel"),
     ("DELETE", "/api/sessions/{id}"),
     ("DELETE", "/api/workspaces"),
@@ -523,6 +525,19 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("POST", "/api/plugins/{id}/update/apply"),
     ("POST", "/api/plugins/{id}/update/dismiss"),
     ("POST", "/api/plugins/commands/{fqid}/invoke"),
+    // Plugin suggestions.
+    ("POST", "/api/suggestions/refresh"),
+    ("POST", "/api/suggestions/checks/run"),
+    ("POST", "/api/suggestions/fix"),
+    ("POST", "/api/suggestions/dismiss"),
+    ("POST", "/api/suggestions/undismiss"),
+    ("PATCH", "/api/suggestions/sources"),
+    ("PATCH", "/api/suggestions/prefs"),
+    ("PUT", "/api/suggestions/presets"),
+    ("DELETE", "/api/suggestions/presets"),
+    ("PUT", "/api/suggestions/mappings"),
+    ("DELETE", "/api/suggestions/mappings"),
+    ("POST", "/api/suggestions/start"),
     // ACP agent / worker lifecycle + config.
     ("DELETE", "/api/sessions/{id}/acp"),
     ("POST", "/api/sessions/{id}/acp/config-option"),
