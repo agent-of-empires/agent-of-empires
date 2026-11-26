@@ -4671,6 +4671,7 @@ impl HomeView {
                         payload: PaletteAction::JumpToGroup {
                             path: path.clone(),
                             profile: profile.clone(),
+                            group_by: self.group_by,
                         },
                     });
                 }
@@ -4741,7 +4742,14 @@ impl HomeView {
                 self.jump_to_session_id(&id);
                 None
             }
-            PaletteAction::JumpToGroup { path, profile } => {
+            PaletteAction::JumpToGroup {
+                path,
+                profile,
+                group_by,
+            } => {
+                if group_by != self.group_by {
+                    return None;
+                }
                 if let Some(idx) = self.flat_items.iter().position(|item| {
                     matches!(item, Item::Group { path: p, profile: pr, .. } if *p == path && *pr == profile)
                 }) {
@@ -5181,6 +5189,9 @@ impl HomeView {
         if self.search_active && !self.search_query.value().is_empty() {
             self.refresh_flat_items();
             self.update_search();
+            if self.search_matches.is_empty() {
+                self.reseat_cursor_after_rebuild();
+            }
         } else {
             self.rebuild_flat_items();
             self.reseat_cursor_after_rebuild();

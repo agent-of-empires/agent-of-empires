@@ -3037,6 +3037,59 @@ fn test_a_peer_sidebar_view_keeps_palette_and_live_send_on_their_session() {
     assert!(env.view.live_send.is_none(), "live-send ended");
 }
 
+/// A peer regroup under an open palette or a search with no match keeps rows, cursor and
+/// selection consistent: a header pick from the other grouping selects nothing, even when
+/// a header of the new grouping has the same path.
+#[test]
+#[serial]
+fn test_a_peer_regroup_keeps_palette_header_picks_and_search_selection_consistent() {
+    use crate::session::config::{GroupByMode, SortOrder};
+
+    let instances = [
+        instance_in("Alpha", "/tmp/work", ""),
+        instance_in("Beta", "/tmp/zeta", "work"),
+    ];
+    let mut env = seeded_env(test_home(), &instances, false);
+    env.view
+        .show_sidebar_view(GroupByMode::Project, SortOrder::Name);
+    let has_header = |view: &HomeView, path: &str| {
+        view.flat_items
+            .iter()
+            .any(|i| matches!(i, Item::Group { path: p, .. } if p == path))
+    };
+    assert!(has_header(&env.view, "work"), "a Repository header `work`");
+    let beta = env
+        .view
+        .instances()
+        .find(|i| i.title == "Beta")
+        .map(|i| i.id.clone())
+        .unwrap();
+    env.view.jump_to_session_id(&beta);
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        None,
+    );
+    for ch in "Jump to group: work".chars() {
+        env.view.handle_key(key(KeyCode::Char(ch)), None);
+    }
+    env.view
+        .show_sidebar_view(GroupByMode::Group, SortOrder::Name);
+    assert!(has_header(&env.view, "work"), "a manual Group `work`");
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert_eq!(env.view.selected_session.as_deref(), Some(beta.as_str()));
+    assert_eq!(env.view.selected_group, None);
+
+    env.view.search_active = true;
+    env.view.search_query = Input::new("no such row".to_string());
+    let before = env.view.session_row(&beta);
+    env.view
+        .show_sidebar_view(GroupByMode::Project, SortOrder::Name);
+    assert!(env.view.search_matches.is_empty());
+    assert_ne!(env.view.session_row(&beta), before, "the rows moved");
+    assert_eq!(env.view.session_row(&beta), Some(env.view.cursor));
+    assert_eq!(env.view.selected_session.as_deref(), Some(beta.as_str()));
+}
+
 /// Project and Org headers are derived from repo paths, and their rows carry a rewritten
 /// `group_path` for display. A move there would persist a manual membership the list is not
 /// showing, so it is refused and the stored groups stay put.

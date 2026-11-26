@@ -146,7 +146,7 @@ pub struct AppState {
     pub(crate) publication: Arc<RwLock<()>>,
     pub(crate) reload_lane: tokio::sync::Mutex<()>,
     /// Orders sidebar view commits without holding `publication` across the storage write.
-    pub(crate) sidebar_view_lane: tokio::sync::Mutex<()>,
+    pub(crate) sidebar_view_lane: Arc<tokio::sync::Mutex<()>>,
     pub(crate) canonical_metadata: RwLock<super::reload::CanonicalMetadata>,
     pub(crate) canonical_health: RwLock<crate::daemon::RuntimeHealth>,
     pub(crate) canonical_diagnostics: std::sync::RwLock<Vec<crate::daemon::OwnerLoadDiagnostic>>,

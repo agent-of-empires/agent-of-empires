@@ -61,10 +61,12 @@ pub enum PaletteAction {
     /// Select this session's row. Rows can move while the palette is open, so entries name
     /// their target rather than its index.
     JumpToSession(String),
-    /// Select this group header's row.
+    /// Select this group header's row. Header paths of different groupings can collide, so
+    /// a pick made under another grouping selects nothing.
     JumpToGroup {
         path: String,
         profile: Option<String>,
+        group_by: crate::session::config::GroupByMode,
     },
     ToolSession(String),
     /// Open this http(s) link in the browser.
