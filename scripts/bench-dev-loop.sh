@@ -75,7 +75,7 @@ echo "target dir growth from the first cargo test --no-run after cargo build: $(
 if [[ $RUN == *" 1 "* ]]; then
 echo "== 1. build/test alternation"
 hyperfine --runs 5 --export-markdown "$OUT/1-build-test.md" --export-json "$OUT/1-build-test.json" \
-  --prepare "$DISK && touch src/lib.rs && cargo build -q" 'cargo test --no-run -q'
+  --prepare "\"$DISK\" && touch src/lib.rs && cargo build -q" 'cargo test --no-run -q'
 echo "cargo test --no-run mean CPU seconds: $(jq -r '.results[0] | "user \(.summary.time_user.mean // .user) system \(.summary.time_system.mean // .system)"' "$OUT/1-build-test.json")" |
   tee -a "$OUT/summary.txt"
 touch src/lib.rs && cargo build -q
@@ -95,8 +95,8 @@ if [[ $RUN == *" 2 "* ]]; then
 echo "== 2. commit"
 cargo build --tests -q
 hyperfine --runs 5 --export-markdown "$OUT/2-commit.md" \
-  -n commit --prepare "$DISK && git commit --allow-empty -qm bench" 'cargo build --tests -q' \
-  -n control --prepare "$DISK" 'cargo build --tests -q'
+  -n commit --prepare "\"$DISK\" && git commit --allow-empty -qm bench" 'cargo build --tests -q' \
+  -n control --prepare "\"$DISK\"" 'cargo build --tests -q'
 git commit --allow-empty -qm bench
 echo "agent_of_empires rustc runs in cargo build --tests after a commit: $(cargo build --tests -v 2>&1 | count_lib_rustc)" |
   tee -a "$OUT/summary.txt"
@@ -107,9 +107,9 @@ echo "== 3. xtask dev rebuild"
 "$DISK"
 cargo build --features web -q
 hyperfine --runs 5 --export-markdown "$OUT/3-xtask-dev.md" \
-  -n 'web, Rust edit' --prepare "$DISK && touch src/lib.rs" 'cargo build --features web -q' \
-  -n 'web, Rust edit after a frontend edit' --prepare "$DISK && touch web/src/main.tsx src/lib.rs" 'cargo build --features web -q' \
-  -n 'no web, Rust edit' --prepare "$DISK && touch src/lib.rs" 'cargo build -q'
+  -n 'web, Rust edit' --prepare "\"$DISK\" && touch src/lib.rs" 'cargo build --features web -q' \
+  -n 'web, Rust edit after a frontend edit' --prepare "\"$DISK\" && touch web/src/main.tsx src/lib.rs" 'cargo build --features web -q' \
+  -n 'no web, Rust edit' --prepare "\"$DISK\" && touch src/lib.rs" 'cargo build -q'
 fi
 
 for f in "$OUT"/*; do echo "--- $(basename "$f")"; cat "$f"; done
