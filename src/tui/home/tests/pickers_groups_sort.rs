@@ -2885,36 +2885,71 @@ async fn test_ctrl_arrows_under_name_start_custom_from_the_screen_order() {
         Some("Switched to Custom (Undo in Ctrl+K)")
     );
 
-    // A refused Undo leaves the sort alone and stays on offer.
-    let mut capture = env.view.session_feed.view_write_driver_for_test();
+    // Undo puts back the row and group orders the freeze replaced in one move. A refused
+    // one leaves the sort alone and stays on offer.
+    let mut respond = env.view.session_feed.namespace_driver_for_test();
     env.view.undo_order_change().unwrap();
-    let refused = capture().expect("the restoring order write");
-    assert!(matches!(refused.write, ViewWrite::Ordering(_)));
-    refused.finish(Err("refused".into()));
+    let undo = match respond(Err("refused".into())) {
+        Some(crate::daemon::NamespaceMutation::Reorder(undo)) => undo,
+        _ => panic!("expected the restoring move"),
+    };
+    match &undo {
+        crate::daemon::ReorderBody::Session {
+            destination: None,
+            headers: Some(groups),
+            freeze: Some(freeze),
+            ..
+        } => {
+            // Rows no move placed stay unplaced.
+            assert_eq!(freeze.order, before.contents.placed_workspaces);
+            assert_eq!(
+                &body["freeze"]["groups"],
+                &serde_json::to_value(groups).unwrap()
+            );
+        }
+        other => panic!("expected the restoring move, got {other:?}"),
+    }
+    let mut capture = env.view.session_feed.view_write_driver_for_test();
     env.view.apply_session_feed();
     assert!(capture().is_none(), "no sort write follows a refused Undo");
     assert_eq!(env.view.sort_order, SortOrder::Custom);
 
     // Undo restores the order and the Name sort from before the move.
-    let writes = settle_view_writes(&state, &mut env.view, |view| {
-        view.undo_order_change().unwrap();
-    })
-    .await;
-    match writes.as_slice() {
-        [ViewWrite::Ordering(patch), ViewWrite::SidebarView(view)] => {
-            // Rows no move placed stay unplaced.
-            assert_eq!(
-                patch.order.as_ref(),
-                Some(&before.contents.placed_workspaces)
-            );
-            assert_eq!(
-                patch.repositories.as_ref(),
-                Some(&before.contents.repository_order)
-            );
+    let undo = serde_json::to_value(undo).unwrap();
+    let (status, reply_headers, value) =
+        request_with_headers(&state, "POST", "/api/reorder", undo.clone()).await;
+    assert!(status.is_success(), "{status}: {value}");
+    let receipt = crate::daemon::MutationReceipt {
+        cursor: receipt_cursor(&reply_headers),
+        outcome: crate::daemon::NamespaceOutcome::Reordered(serde_json::from_value(value).unwrap()),
+    };
+    let mut respond = env.view.session_feed.namespace_driver_for_test();
+    env.view.undo_order_change().unwrap();
+    let sent = respond(Ok(receipt)).expect("the restoring move");
+    let crate::daemon::NamespaceMutation::Reorder(sent) = sent else {
+        panic!("expected the restoring move");
+    };
+    assert_eq!(serde_json::to_value(sent).unwrap(), undo);
+    let mut capture = env.view.session_feed.view_write_driver_for_test();
+    apply_published(&mut env.view, &state).await;
+    let restore = capture().expect("the restored sort");
+    let patch = match &restore.write {
+        ViewWrite::SidebarView(view) => {
             assert_eq!(view.sort, Some(SortOrder::Name));
+            serde_json::to_value(view).unwrap()
         }
-        other => panic!("expected an order and a sort write, got {other:?}"),
-    }
+        other => panic!("expected the sort write, got {other:?}"),
+    };
+    let (status, reply_headers, value) =
+        request_with_headers(&state, "PATCH", "/api/sidebar-view", patch).await;
+    assert!(status.is_success(), "{status}: {value}");
+    restore.finish(Ok(receipt_cursor(&reply_headers)));
+    apply_published(&mut env.view, &state).await;
+    env.view.apply_session_feed();
+    assert_eq!(
+        crate::session::load_workspace_ordering().unwrap().order,
+        before.contents.placed_workspaces
+    );
     assert_eq!(env.view.sort_order, SortOrder::Name);
     assert_eq!(work_group_titles(&env.view), ["Apple", "Mango", "Zebra"]);
 }
