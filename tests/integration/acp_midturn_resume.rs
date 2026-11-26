@@ -354,6 +354,14 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
     .await;
     assert!(closed.is_ok(), "resumed client detached cleanly");
 
+    let record = agent_of_empires::process::worker_registry::record_path(session).unwrap();
+    let registry = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(record.with_extension("lock"))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&registry).unwrap();
+
     let reopened = AcpClient::attach(
         socket_path,
         std::env::temp_dir(),
@@ -368,9 +376,17 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
         None,
         None,
         None,
-    )
-    .await
-    .expect("runner accepts a new daemon after clean shutdown");
+    );
+    tokio::pin!(reopened);
+    tokio::select! {
+        biased;
+        _ = &mut reopened => panic!("attach finished while the registry was locked"),
+        _ = std::future::ready(()) => {}
+    }
+    drop(registry);
+    let reopened = reopened
+        .await
+        .expect("runner accepts a new daemon after clean shutdown");
     reopened.shutdown().await.expect("shutdown reopened client");
     reason
 }

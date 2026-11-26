@@ -929,7 +929,24 @@ impl<S: BroadcastSink> Drain<S> {
             if worker_registry::stop_requested(session_id) {
                 return None;
             }
-            let record = match worker_registry::load_strict(session_id) {
+            let resume_by = tokio::time::Instant::now() + CONTROL_REATTACH_DEADLINE;
+            // The runner may hold this lock to record the detach we just saw.
+            let observed = match worker_registry::registry_lock_until(session_id, resume_by).await {
+                Ok(registry) => registry.record(),
+                Err(error) => {
+                    warn!(
+                        target: "acp.supervisor",
+                        session = %session_id,
+                        %error,
+                        "could not read runner registry for control channel recovery"
+                    );
+                    return None;
+                }
+            };
+            if worker_registry::stop_requested(session_id) {
+                return None;
+            }
+            let record = match observed {
                 Ok(Some(record))
                     if identity.owns_record(&record)
                         && worker_registry::is_record_live(&record) =>
@@ -951,7 +968,6 @@ impl<S: BroadcastSink> Drain<S> {
             if attempt == 1 && !self.admit_reattach(lease).await {
                 return None;
             }
-            let resume_by = tokio::time::Instant::now() + CONTROL_REATTACH_DEADLINE;
             let attempt_result = tokio::time::timeout_at(
                 resume_by,
                 lost.reattach(
@@ -5026,6 +5042,22 @@ mod tests {
         let first = Arc::clone(&sup.workers.lock().await[id].client);
         // Launches register their client for retirement, as here.
         lease.retirement().record_client(&first, false);
+        if case == ControlLossCase::LiveRunner {
+            let registry = worker_registry::try_registry_lock(id).unwrap().unwrap();
+            let driver = recovery_test_drain(&sup, id);
+            let loss = ControlLoss {
+                io_error: None,
+                turn_in_flight: true,
+            };
+            tokio::select! {
+                biased;
+                _ = driver.reattach_same_runner(&lease, &first, loss, 0) => {
+                    panic!("registry contention must not end live-runner recovery");
+                }
+                _ = std::future::ready(()) => {}
+            }
+            drop(registry);
+        }
         let drain = sup.start_drain_task(id.into(), lease, inbound, None);
         first.send_prompt("run the tests", &[]).await.unwrap();
         started_rx.await.unwrap();

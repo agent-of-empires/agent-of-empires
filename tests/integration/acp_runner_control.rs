@@ -2293,7 +2293,13 @@ async fn assert_original_turn_completed(
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|_| {
+        panic!(
+            "original turn did not complete: {:?}; runner stderr: {}",
+            store.replay_from(id, 0),
+            std::fs::read_to_string(held.scratch.0.join("runner.stderr")).unwrap_or_default()
+        )
+    });
     let events = store.replay_from(id, 0);
     assert!(events.iter().any(|(_, event)| matches!(event,
         Event::AcpSessionAssigned { acp_session_id, connection_ready: true, .. } if acp_session_id == "owned-native-session")));

@@ -1001,14 +1001,33 @@ impl AcpClient {
         {
             Some(identity) => identity,
             None => {
-                let record =
-                    crate::process::worker_registry::control_admission(&session_id.0)
-                        .map_err(|refusal| AcpError::RetainedRuntimeUnavailable(Box::new(refusal)))?
-                        .ok_or_else(|| {
+                use crate::process::worker_registry::{
+                    registry_lock_until, ControlAdmissionRefusal, RegistryBusy,
+                };
+
+                // The previous attachment can still be publishing its detach.
+                let admission_by = deadline.unwrap_or_else(|| {
+                    tokio::time::Instant::now() + runner::runner_socket_deadline()
+                });
+                let registry = registry_lock_until(&session_id.0, admission_by)
+                    .await
+                    .map_err(|error| {
+                        if error.is::<RegistryBusy>() {
+                            AcpError::RegistryBusy
+                        } else {
                             AcpError::RetainedRuntimeUnavailable(Box::new(
-                        crate::process::worker_registry::ControlAdmissionRefusal::unconfirmed(None),
-                    ))
-                        })?;
+                                ControlAdmissionRefusal::unconfirmed(None),
+                            ))
+                        }
+                    })?;
+                let record = registry
+                    .control_admission()
+                    .map_err(|refusal| AcpError::RetainedRuntimeUnavailable(Box::new(refusal)))?
+                    .ok_or_else(|| {
+                        AcpError::RetainedRuntimeUnavailable(Box::new(
+                            ControlAdmissionRefusal::unconfirmed(None),
+                        ))
+                    })?;
                 crate::acp::runner_lifecycle::RunnerIdentity::from_record(&record)
             }
         };
