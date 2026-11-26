@@ -106,7 +106,7 @@ export function ContentSplit({ left, right, collapsed, onToggleCollapse, sheet =
       <div
         className={`${inlineMaximized && !collapsed ? "hidden" : "flex"} flex-1 flex-col min-w-0 min-h-0 md:mb-2 md:ml-1 ${
           dockBeside ? "md:mr-1" : "md:mr-2"
-        } md:rounded-xl md:border md:border-surface-700/45 md:bg-surface-900 md:overflow-hidden`}
+        } md:rounded-xl md:border md:border-surface-700/45 md:bg-surface-900 md:shadow-md md:overflow-hidden`}
         inert={sheetOpen}
       >
         {left}

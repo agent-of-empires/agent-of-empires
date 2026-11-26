@@ -40,7 +40,7 @@ export function TerminalConnectionBanners({
   if (connected) return null;
   if (paneDead) {
     return (
-      <div className="bg-status-error/10 border-b border-status-error/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
+      <div className="max-md:mt-[var(--phone-overlay-top,0px)] bg-status-error/10 border-b border-status-error/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
         <span className="text-xs text-status-error">Agent exited</span>
         {onRestart && (
           <button onClick={onRestart} className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline">
@@ -54,14 +54,14 @@ export function TerminalConnectionBanners({
     // The app's Daemon unreachable banner already says it for every pane.
     if (!slow || daemon === "down") return null;
     return (
-      <div className="bg-status-waiting/15 border-b border-status-waiting/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
+      <div className="max-md:mt-[var(--phone-overlay-top,0px)] bg-status-waiting/15 border-b border-status-waiting/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
         <span className="text-xs text-status-waiting">Reconnecting…</span>
       </div>
     );
   }
   if (retryCount >= maxRetries) {
     return (
-      <div className="bg-status-error/10 border-b border-status-error/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
+      <div className="max-md:mt-[var(--phone-overlay-top,0px)] bg-status-error/10 border-b border-status-error/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
         <span className="text-xs text-status-error">Connection lost</span>
         <button onClick={onRetry} className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline">
           Retry

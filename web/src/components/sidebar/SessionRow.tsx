@@ -180,7 +180,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         }}
         {...longPress.handlers}
         data-selected={isSelected || undefined}
-        className={`block w-full text-left py-1.5 max-md:py-2.5 rounded-md cursor-pointer select-none [-webkit-touch-callout:none] transition-colors duration-75 ${
+        className={`block w-full max-md:w-auto max-md:mx-2 text-left py-1.5 max-md:py-2.5 rounded-md max-md:rounded-2xl cursor-pointer select-none [-webkit-touch-callout:none] transition-colors duration-75 ${
           compact ? (indented ? "pl-3 pr-1" : "px-2") : indented ? "pl-5 pr-2" : "px-2.5"
         } ${sessionRowChromeClass(isActive, isSelected)} ${isDeleting ? "opacity-50 pointer-events-none" : ""} focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500`}
       >

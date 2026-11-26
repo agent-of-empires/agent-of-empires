@@ -1,4 +1,5 @@
 import {
+  type CSSProperties,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -249,7 +250,6 @@ import {
 } from "./lib/panes";
 import { MobileRightPanelPicker } from "./components/MobileRightPanelPicker";
 import { MobileMainPane } from "./components/MobileMainPane";
-import { ChromeCollapseHandle, CollapsibleRegion } from "./components/CollapsibleChrome";
 import { ProjectFormModal } from "./components/ProjectFormModal";
 import { ScratchOverridesModal } from "./components/ScratchOverridesModal";
 import { HelpOverlay } from "./components/HelpOverlay";
@@ -438,7 +438,7 @@ const SESSION_STATE_FEATURE: Partial<Record<SessionStateAction, FeatureUse>> = {
 /** Composes the authenticated dashboard and synchronizes its user-scoped UI state. */
 /** The phone drawer pushes the Session aside on the iOS sheet curve; reduced motion skips it. */
 const PUSH_MOTION =
-  "max-md:transition-[translate,border-radius] max-md:duration-[400ms] max-md:ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none";
+  "max-md:transition-[translate,border-radius,box-shadow] max-md:duration-[400ms] max-md:ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none";
 
 function AppContent({
   loginRequired,
@@ -959,7 +959,6 @@ function AppContent({
   // survives switching sessions; the collapse only *applies* on the mobile
   // conversation view, so leaving it on and navigating to settings or the
   // dashboard shows the bar again.
-  const [headerCollapsed, setHeaderCollapsed] = useState(false);
   // The paired shell mounts lazily on first activation, then stays mounted
   // (kept alive but hidden) so its PTY, scrollback, and focus survive view
   // switches. Mounting it eagerly would spawn a shell for every mobile
@@ -3031,12 +3030,6 @@ function AppContent({
   // With a Session open, a phone's session list is a drawer that pushes the Session aside as a card.
   const phoneDrawer = singlePane && !!activeSession && !fullPageView && !focusMode;
   const drawerPushed = phoneDrawer && sidebarOpen;
-  const headerCollapsible =
-    singlePane &&
-    !fullPageView &&
-    !!activeWorkspace &&
-    activeSession?.view === "structured" &&
-    rightPanelView === "agent";
 
   return (
     <AcpPrefsProvider value={acpPrefs}>
@@ -3049,93 +3042,90 @@ function AppContent({
           readOnly={caps.readOnly}
           available={!error}
         >
-          <div className="h-(--app-height) flex flex-col bg-surface-900 md:bg-surface-950 md:chrome-canvas text-text-primary overflow-hidden safe-area-inset">
-            {/* Wrapped unconditionally, not behind the `headerCollapsible`
-            ternary: swapping the element type at this position would remount
-            `TopBar` (and reset its overflow menu) every time the boundary
-            flips, e.g. opening settings on a phone. An expanded region is a
-            `1fr` grid row around a fixed-height bar, so the wrapper is inert
-            for every view that cannot collapse. */}
+          <div
+            className="h-(--app-height) flex flex-col bg-surface-900 md:bg-surface-950 md:chrome-canvas text-text-primary overflow-hidden safe-area-inset"
+            // What a phone's floating header covers, for the views that keep their banners and first lines clear of it.
+            style={phoneDrawer ? ({ "--phone-overlay-top": "64px" } as CSSProperties) : undefined}
+          >
             <div
-              // The phone's list is the whole screen with no Session open, and carries the app's menu itself.
+              // The phone's list is the whole screen with no Session open, and carries the app's menu itself. With a
+              // Session open the header floats over it, as Muse's does: only its controls take taps.
               className={`${PUSH_MOTION} ${phoneHome ? "max-md:hidden" : ""} ${
+                phoneDrawer
+                  ? "max-md:fixed max-md:inset-x-0 max-md:top-0 max-md:z-30 max-md:pointer-events-none max-md:[&_button]:pointer-events-auto max-md:[&_[role=menu]]:pointer-events-auto max-md:[&_[data-testid=session-title-pill]]:pointer-events-auto"
+                  : ""
+              } ${
                 drawerPushed
-                  ? "max-md:translate-x-[var(--aoe-drawer-w)] max-md:rounded-tl-[28px] max-md:overflow-hidden"
+                  ? "max-md:translate-x-[var(--aoe-drawer-w)] max-md:rounded-tl-[44px] max-md:overflow-hidden"
                   : ""
               }`}
             >
-              <CollapsibleRegion id="conversation-header" collapsed={headerCollapsible && headerCollapsed}>
-                <TopBar
-                  activeWorkspace={activeWorkspace}
-                  activeSession={activeSession ?? null}
-                  onToggleSidebar={handleToggleSidebar}
-                  onOpenPalette={() => setShowPalette(true)}
-                  terminal={
-                    caps.canUseTerminal ? { open: terminalOpen, onToggle: () => togglePaneAny("terminal") } : undefined
-                  }
-                  sessionItems={phoneSessionItems}
-                  phoneViews={
-                    phoneViews && { ...phoneViews, onPick: handlePickView, onMore: () => setPickerOpen(true) }
-                  }
-                  panels={
-                    dockPaneIds.length > 0
-                      ? {
-                          ...paneMenu,
-                          open: !rightDockCollapsed,
-                          onToggle: toggleRightDock,
-                          badge: caps.canUseDiff ? diffFiles.length : 0,
-                        }
-                      : undefined
-                  }
-                  onOpenHelp={handleOpenHelp}
-                  onOpenAbout={handleOpenAbout}
-                  onStartTutorial={tour.startTour}
-                  unreadCount={unreadCount}
-                  waitingCount={waitingCount}
-                  attentionBadgeColors={attentionBadgeColors}
-                  onLogout={onLogout}
-                  loginRequired={loginRequired}
-                  isOffline={!!error}
-                  isDevBuild={isDebugBuild(serverAbout)}
-                  onOpenTips={tips.open}
-                  onGoDashboard={handleGoDashboard}
-                  onExitFocusMode={focusMode ? exitFocusMode : undefined}
-                  sidebarColumnVisible={!focusMode && !fullPageView && sidebarOpen}
-                  rightColumnVisible={
-                    isMdUp &&
-                    !rightDockSheet &&
-                    !rightMaximized &&
-                    !fullPageView &&
-                    !!activeWorkspace &&
-                    !!activeSession &&
-                    !rightDockCollapsed
-                  }
-                />
-              </CollapsibleRegion>
+              {phoneDrawer && (
+                <>
+                  {/* iOS 26 blurs the top edge unless a fixed, opaque, full-width box sits there; this strip is it. */}
+                  <div className="md:hidden fixed inset-x-0 top-0 h-3 bg-surface-900 pointer-events-auto" />
+                  {/* Keeps the floating controls legible over the text scrolling beneath them. */}
+                  <div
+                    aria-hidden
+                    className="md:hidden absolute inset-x-0 top-0 h-16 -z-10 bg-gradient-to-b from-surface-900/90 to-transparent"
+                  />
+                </>
+              )}
+              <TopBar
+                activeWorkspace={activeWorkspace}
+                activeSession={activeSession ?? null}
+                onToggleSidebar={handleToggleSidebar}
+                onOpenPalette={() => setShowPalette(true)}
+                terminal={
+                  caps.canUseTerminal ? { open: terminalOpen, onToggle: () => togglePaneAny("terminal") } : undefined
+                }
+                sessionItems={phoneSessionItems}
+                phoneViews={phoneViews && { ...phoneViews, onPick: handlePickView, onMore: () => setPickerOpen(true) }}
+                panels={
+                  dockPaneIds.length > 0
+                    ? {
+                        ...paneMenu,
+                        open: !rightDockCollapsed,
+                        onToggle: toggleRightDock,
+                        badge: caps.canUseDiff ? diffFiles.length : 0,
+                      }
+                    : undefined
+                }
+                onOpenHelp={handleOpenHelp}
+                onOpenAbout={handleOpenAbout}
+                onStartTutorial={tour.startTour}
+                unreadCount={unreadCount}
+                waitingCount={waitingCount}
+                attentionBadgeColors={attentionBadgeColors}
+                onLogout={onLogout}
+                loginRequired={loginRequired}
+                isOffline={!!error}
+                isDevBuild={isDebugBuild(serverAbout)}
+                onOpenTips={tips.open}
+                onGoDashboard={handleGoDashboard}
+                onExitFocusMode={focusMode ? exitFocusMode : undefined}
+                sidebarColumnVisible={!focusMode && !fullPageView && sidebarOpen}
+                rightColumnVisible={
+                  isMdUp &&
+                  !rightDockSheet &&
+                  !rightMaximized &&
+                  !fullPageView &&
+                  !!activeWorkspace &&
+                  !!activeSession &&
+                  !rightDockCollapsed
+                }
+              />
             </div>
 
-            <BannerStack
-              onRetryServerSettings={serverAbout ? undefined : () => void recoverServerAbout()}
-              tourActive={tour.isTourActive}
-            />
+            {/* Below a phone's floating header, so its controls never cover a banner's own. */}
+            <div className="max-md:mt-[var(--phone-overlay-top,0px)] max-md:empty:mt-0 shrink-0">
+              <BannerStack
+                onRetryServerSettings={serverAbout ? undefined : () => void recoverServerAbout()}
+                tourActive={tour.isTourActive}
+              />
+            </div>
             {focusMode && focusSession.title !== null && !focusSession.gone && (
               <FocusModeNote title={focusSession.title} />
-            )}
-
-            {/* Below the banners, not directly under the bar: the handle is
-            absolutely positioned at the top-right, and hanging it off the bar
-            puts it on top of the update banner's dismiss button (same corner),
-            which then cannot be tapped at all. */}
-            {headerCollapsible && (
-              <ChromeCollapseHandle
-                edge="top"
-                collapsed={headerCollapsed}
-                onToggle={() => setHeaderCollapsed((v) => !v)}
-                collapseLabel="Collapse conversation header"
-                expandLabel="Expand conversation header"
-                controlsId="conversation-header"
-                testId="header-collapse-toggle"
-              />
             )}
 
             <div className="flex flex-1 min-h-0">
@@ -3203,7 +3193,7 @@ function AppContent({
               <div
                 className={`flex-1 flex flex-col min-h-0 min-w-0 ${PUSH_MOTION} ${phoneHome ? "max-md:hidden" : ""} ${
                   drawerPushed
-                    ? "max-md:translate-x-[var(--aoe-drawer-w)] max-md:rounded-bl-[28px] max-md:overflow-hidden"
+                    ? "max-md:translate-x-[var(--aoe-drawer-w)] max-md:rounded-l-[44px] max-md:overflow-hidden max-md:ring-1 max-md:ring-white/8 max-md:shadow-[-18px_0_44px_-6px_rgb(0_0_0/0.75)]"
                     : ""
                 }`}
               >

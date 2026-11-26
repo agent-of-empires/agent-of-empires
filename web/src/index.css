@@ -75,6 +75,19 @@
    matches the resolved palette for zinc. Keep these values in
    sync with that TOML file. */
 @theme {
+  /* Elevation: layered shadows with a hairline edge and a faint top highlight, so cards, menus and dialogs sit
+     above the canvas the way a native app's do. Every shadow-* utility in the app reads these. */
+  --shadow-md: 0 0 0 1px rgb(255 255 255 / 0.03), 0 1px 2px rgb(0 0 0 / 0.3), 0 10px 28px -14px rgb(0 0 0 / 0.55);
+  --shadow-lg:
+    inset 0 1px 0 rgb(255 255 255 / 0.05), 0 0 0 1px rgb(0 0 0 / 0.25), 0 2px 4px -1px rgb(0 0 0 / 0.35),
+    0 10px 22px -6px rgb(0 0 0 / 0.5);
+  --shadow-xl:
+    inset 0 1px 0 rgb(255 255 255 / 0.05), 0 0 0 1px rgb(0 0 0 / 0.3), 0 4px 8px -2px rgb(0 0 0 / 0.4),
+    0 18px 36px -10px rgb(0 0 0 / 0.6);
+  --shadow-2xl:
+    inset 0 1px 0 rgb(255 255 255 / 0.05), 0 0 0 1px rgb(0 0 0 / 0.3), 0 8px 16px -4px rgb(0 0 0 / 0.45),
+    0 32px 64px -16px rgb(0 0 0 / 0.7);
+
   /* Brand, derived from zinc.accent */
   --color-brand-100: #fdecce;
   --color-brand-200: #fcddaa;
@@ -796,12 +809,16 @@ select:focus-visible,
 /* Floating controls on phones, after Claude's iOS app: a raised surface with a hairline edge, a faint top
    highlight and a soft two-layer shadow, so they read as sitting above the content. */
 @utility float-control {
-  background-color: color-mix(in srgb, var(--color-surface-800) 92%, transparent);
-  border: 1px solid color-mix(in srgb, var(--color-surface-600) 35%, transparent);
+  /* Frosted glass, as Muse's controls are: what scrolls beneath shows through, blurred. */
+  background-color: color-mix(in srgb, var(--color-surface-800) 62%, transparent);
+  -webkit-backdrop-filter: blur(18px) saturate(1.6);
+  backdrop-filter: blur(18px) saturate(1.6);
+  border: 1px solid color-mix(in srgb, var(--color-text-primary) 9%, transparent);
   box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--color-text-primary) 6%, transparent),
-    0 1px 2px rgb(0 0 0 / 0.35),
-    0 8px 20px -8px rgb(0 0 0 / 0.55);
+    inset 0 1px 0 color-mix(in srgb, var(--color-text-primary) 10%, transparent),
+    inset 0 -1px 0 rgb(0 0 0 / 0.25),
+    0 2px 4px rgb(0 0 0 / 0.3),
+    0 10px 24px -6px rgb(0 0 0 / 0.55);
 }
 /* A frosted popover for menus: translucent surface, blur behind, a deep soft shadow. */
 @utility glass-menu {

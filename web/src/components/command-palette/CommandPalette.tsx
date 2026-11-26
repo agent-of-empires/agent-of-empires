@@ -68,7 +68,8 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
     return () => {
       clearTimeout(t);
       const prev = previousFocusRef.current;
-      if (prev?.isConnected) prev.focus();
+      // A focus primer only carried the tap's gesture so iOS would raise the keyboard; refocusing it reopens it.
+      if (prev?.isConnected && !prev.hasAttribute("data-focus-primer")) prev.focus();
     };
   }, [open]);
 

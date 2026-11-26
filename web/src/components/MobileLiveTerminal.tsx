@@ -723,8 +723,8 @@ export function MobileLiveTerminal({
     uploadPastedImage,
     captureWriteAdmission,
     onTabEscape,
-    // Sending a line puts the soft keyboard away so the reply has the screen; a full-screen app keeps it.
-    onSubmit: coarse && !altScreen ? dismissSoftKeyboard : undefined,
+    // Sending a line puts the soft keyboard away so the reply has the screen, as in a chat app.
+    onSubmit: coarse ? dismissSoftKeyboard : undefined,
   });
 
   const cursorRow = connected && !reading ? live.row : -1;

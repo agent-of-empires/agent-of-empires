@@ -145,7 +145,8 @@ export function MobileMainPane({
 }: Props) {
   const activePluginPane = isPluginPaneId(view) ? (pluginPanes.find((p) => p.id === view) ?? null) : null;
   return (
-    <div className="flex-1 flex flex-col min-h-0">
+    // Only the agent scrolls under the floating header; other views start below it.
+    <div className={`flex-1 flex flex-col min-h-0 ${view === "agent" ? "" : "pt-[var(--phone-overlay-top,0px)]"}`}>
       {view === "paired" && (
         // Which shell shows, since it can be another Session's, and its Host/Container control.
         <div

@@ -39,7 +39,7 @@ export function DockGroups({
       {groups.map((g) => (
         <Fragment key={g.group}>
           {/* Each group is a card on the canvas (see DESIGN.md). */}
-          <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden rounded-xl border border-surface-700/45 bg-surface-900">
+          <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden rounded-xl border border-surface-700/45 bg-surface-900 shadow-md">
             <Dock
               location={location}
               groupIndex={g.group}

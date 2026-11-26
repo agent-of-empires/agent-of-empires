@@ -320,6 +320,12 @@ export function WorkspaceSidebar(props: Props) {
 
   // A phone lists sessions as Muse does: the whole screen with no Session open, else a drawer from the left that
   // pushes the Session aside. Both run the full height on a solid colour, which iOS 26 extends under its bars.
+  const searchPrimerRef = useRef<HTMLInputElement>(null);
+  const openSearch = () => {
+    searchPrimerRef.current?.focus();
+    props.onOpenPalette?.();
+  };
+
   const phoneClass = props.asPage
     ? "max-md:flex-1 max-md:!w-full max-md:bg-surface-950"
     : props.drawer
@@ -525,9 +531,20 @@ export function WorkspaceSidebar(props: Props) {
           </button>
           {/* Wide screens keep Search and New session in the nav rows above the list. */}
           {!compact && props.onOpenPalette && (
+            // iOS raises the keyboard only for a focus inside the tap, and the palette's input mounts after it: this
+            // takes the focus first, and the palette's input then takes it over with the keyboard already up.
+            <input
+              ref={searchPrimerRef}
+              data-focus-primer
+              aria-hidden="true"
+              tabIndex={-1}
+              className="md:hidden fixed top-0 left-0 w-px h-px opacity-0 pointer-events-none text-[16px]"
+            />
+          )}
+          {!compact && props.onOpenPalette && (
             <button
               type="button"
-              onClick={props.onOpenPalette}
+              onClick={openSearch}
               {...tourAnchor(TOUR_ANCHORS.topbar)}
               data-testid="sidebar-search-pill"
               className="md:hidden flex-1 min-w-0 h-11 px-4 flex items-center gap-2 rounded-full float-control text-[15px] text-text-dim cursor-pointer active:scale-[0.98] transition-transform"

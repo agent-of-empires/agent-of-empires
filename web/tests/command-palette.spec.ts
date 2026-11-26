@@ -69,7 +69,13 @@ test.describe("Command palette", () => {
     await page.setViewportSize({ width: 375, height: 812 });
     await page.goto("/");
     await page.getByTestId("sidebar-search-pill").click();
-    await expect(page.getByPlaceholder("Search actions, sessions, settings…")).toBeVisible();
+    const search = page.getByPlaceholder("Search actions, sessions, settings…");
+    // Focused, so a phone's keyboard comes up with it.
+    await expect(search).toBeFocused();
+    // Closing leaves nothing focused, so the keyboard goes away rather than coming back for a hidden input.
+    await page.keyboard.press("Escape");
+    await expect(search).toHaveCount(0);
+    expect(await page.evaluate(() => document.activeElement?.hasAttribute("data-focus-primer") ?? false)).toBe(false);
   });
 
   test("cheat code fires a toast and clears the input", async ({ page }) => {
