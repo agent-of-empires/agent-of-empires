@@ -1273,6 +1273,24 @@ fn same_basename_repos_pin_independently() {
     assert_eq!(paths, vec!["/work/api".to_string()]);
 }
 
+/// "New Session" on a Group nested under a Repository header prefills a checkout from that
+/// Group, not any checkout sharing the repository's basename.
+#[test]
+#[serial]
+fn nested_repository_group_new_session_uses_its_own_checkout() {
+    let mut frontend = instance_in("fe", "/a/repo", "frontend");
+    frontend.created_at = crate::time::Timestamp::now() - crate::time::Duration::days(1);
+    let backend = instance_in("be", "/b/repo", "backend");
+    let env = seeded_env(test_home(), &[frontend, backend], false);
+    for (header, want) in [("repo/frontend", "/a/repo"), ("repo/backend", "/b/repo")] {
+        assert_eq!(
+            env.view.group_repo_path(header).as_deref(),
+            Some(want),
+            "{header}"
+        );
+    }
+}
+
 /// "New Session" on an empty pinned project (no member sessions) must prefill
 /// the registered repo path, so the pin->launch loop works: the path can only
 /// come from the registry fallback in `group_repo_path`.
@@ -1686,7 +1704,7 @@ fn favorite_gutter_follows_pin_predicate() {
         (SortOrder::Name, false, true, false, false),
         (SortOrder::Name, true, true, false, true),
         (SortOrder::Custom, true, false, false, false),
-        // A snoozed favorite is not pinned, so it is not marked.
+        // A snoozed favorite keeps its place but not its mark.
         (SortOrder::Custom, true, true, true, false),
     ] {
         env.view.mutate_instance(&fav, |inst| {

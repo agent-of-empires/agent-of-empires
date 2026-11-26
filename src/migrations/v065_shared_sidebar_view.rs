@@ -43,7 +43,7 @@ fn migrate(state: &mut toml::Table) -> bool {
     let tui_group = state.get("group_by").and_then(toml::Value::as_str);
     let group = web_axis
         .as_deref()
-        .map(web_group)
+        .and_then(web_group)
         .or_else(|| tui_group.map(tui_group_by))
         .or_else(|| {
             let seen_tui = state
@@ -55,6 +55,7 @@ fn migrate(state: &mut toml::Table) -> bool {
     let tui_sort = state.get("sort_order").and_then(toml::Value::as_str);
     // The web offered Manual, Last activity and Attention; none of them orders by name.
     let sort = web_sort
+        .filter(|mode| matches!(mode.as_str(), "manual" | "lastActivity" | "attention"))
         .map(|_| "custom")
         .or_else(|| tui_sort.map(tui_sort_order));
 
@@ -76,10 +77,12 @@ fn migrate(state: &mut toml::Table) -> bool {
     changed
 }
 
-fn web_group(axis: &str) -> &'static str {
+/// An axis the web never wrote is not a pick, so it leaves the TUI's grouping in place.
+fn web_group(axis: &str) -> Option<&'static str> {
     match axis {
-        "group" => "group",
-        _ => "project",
+        "group" => Some("group"),
+        "repo" | "repo+group" | "org" | "status" => Some("project"),
+        _ => None,
     }
 }
 
@@ -146,6 +149,12 @@ mod tests {
                 "group_by = \"manual\"\n[web_ui_state]\n\"aoe-sidebar-axis\" = \"repo+group\"\n",
                 some("project"),
                 None,
+            ),
+            // A value the web never wrote is not a pick.
+            (
+                "group_by = \"manual\"\nsort_order = \"a_z\"\n[web_ui_state]\n\"aoe-sidebar-axis\" = \"future\"\n\"aoe-sidebar-sort-mode\" = \"future\"\n",
+                some("group"),
+                some("name"),
             ),
         ];
         for (input, group, sort) in cases {

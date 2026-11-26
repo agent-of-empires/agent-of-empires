@@ -4092,18 +4092,20 @@ impl HomeView {
         if crate::session::is_synthetic_project_header(group_path) {
             return None;
         }
+        let nested = format!("{group_path}/");
+        let profile = self.selected_group_profile.as_deref();
+        // Newest member first, so the pick does not depend on `HashMap` order.
         self.instances
             .values()
-            .find(|inst| match self.group_by {
-                GroupByMode::Project => {
-                    super::project_group_key(inst)
-                        == super::rows::split_project_view_path(group_path).0
-                }
-                GroupByMode::Group => {
-                    inst.group_path == group_path
-                        || inst.group_path.starts_with(&format!("{group_path}/"))
-                }
+            .filter(|inst| profile.is_none_or(|p| inst.source_profile == p))
+            .filter(|inst| {
+                let path = match self.group_by {
+                    GroupByMode::Project => super::rows::project_view_path(inst),
+                    GroupByMode::Group => inst.group_path.clone(),
+                };
+                path == group_path || path.starts_with(&nested)
             })
+            .max_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)))
             .map(|inst| inst.repo_path().to_string())
             .or_else(|| {
                 // An empty pinned project has no members to borrow from, so fall back to

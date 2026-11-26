@@ -472,7 +472,7 @@ fn sort_sessions_inner(sessions: &mut [&Instance], sort_order: SortOrder, favori
         SortOrder::Name => sessions.sort_by_key(|i| i.title.to_lowercase()),
     }
     if favorites_first {
-        sessions.sort_by_key(|i| !is_live_favorite(i));
+        sessions.sort_by_key(|i| !holds_favorite_place(i));
     }
 }
 
@@ -516,7 +516,7 @@ fn sort_groups_inner<T, N, P>(
         SortOrder::Name => items.sort_by_key(|g| name(g).to_lowercase()),
     }
     if favorites_first {
-        items.sort_by_key(|g| !has_live_favorite(path(g), instances));
+        items.sort_by_key(|g| !has_placed_favorite(path(g), instances));
     }
 }
 
@@ -548,10 +548,16 @@ pub(crate) fn is_live_favorite(inst: &Instance) -> bool {
         && inst.is_favorited()
 }
 
-/// True when the group at `path` (including nested sub-groups) has at least one live favorited
-/// member.
-fn has_live_favorite(path: &str, instances: &[Instance]) -> bool {
-    group_members(path, instances).any(is_live_favorite)
+/// True for a favorite that keeps its pinned place. Unlike [`is_live_favorite`], a snoozed
+/// favorite holds its place, so snoozing and waking never move rows.
+fn holds_favorite_place(inst: &Instance) -> bool {
+    !inst.is_archived() && !inst.is_trashed() && !inst.is_ignored() && inst.is_favorited()
+}
+
+/// True when the group at `path` (including nested sub-groups) has a member that
+/// [`holds_favorite_place`].
+fn has_placed_favorite(path: &str, instances: &[Instance]) -> bool {
+    group_members(path, instances).any(holds_favorite_place)
 }
 
 /// Flatten instances from multiple profiles into a single flat list.
@@ -604,7 +610,7 @@ pub fn flatten_tree_all_profiles(
         SortOrder::Name => all_roots.sort_by_key(|(_, g, _)| g.name.to_lowercase()),
     }
     if sort_order != SortOrder::Custom && crate::session::favorites_first() {
-        all_roots.sort_by_key(|(_, g, insts)| !has_live_favorite(&g.path, insts));
+        all_roots.sort_by_key(|(_, g, insts)| !has_placed_favorite(&g.path, insts));
     }
 
     for (profile_name, root, profile_instances) in &all_roots {
@@ -735,7 +741,7 @@ fn append_section(
     if members.is_empty() {
         return;
     }
-    members.sort_by_key(|i| Reverse(stamp(i)));
+    members.sort_by(|a, b| stamp(b).cmp(&stamp(a)).then_with(|| a.id.cmp(&b.id)));
     items.push(Item::Group {
         path: path.to_string(),
         name: name.to_string(),
@@ -821,7 +827,11 @@ pub fn append_archived_section_by_project(
     sort_archived_project_buckets(&mut buckets);
 
     for (project_name, mut sessions) in buckets {
-        sessions.sort_by_key(|i| Reverse(i.archived_at));
+        sessions.sort_by(|a, b| {
+            b.archived_at
+                .cmp(&a.archived_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         let sub_path = archived_project_sub_path(&project_name);
         let sub_collapsed = project_collapsed.get(&sub_path).copied().unwrap_or(false);
         items.push(Item::Group {
@@ -845,16 +855,16 @@ pub fn append_archived_section_by_project(
     }
 }
 
-/// Archived project sub-folders, most recently archived first under every sort.
+/// Archived project sub-folders, most recently archived first under every sort. Ties fall
+/// back to the name, since the buckets arrive in `HashMap` order.
 fn sort_archived_project_buckets(buckets: &mut [(String, Vec<&Instance>)]) {
-    buckets.sort_by_key(|(_, sessions)| {
-        Reverse(
-            sessions
-                .iter()
-                .filter_map(|i| i.archived_at)
-                .max()
-                .unwrap_or(Timestamp::MIN),
-        )
+    buckets.sort_by_cached_key(|(name, sessions)| {
+        let newest = sessions
+            .iter()
+            .filter_map(|i| i.archived_at)
+            .max()
+            .unwrap_or(Timestamp::MIN);
+        (Reverse(newest), name.clone())
     });
 }
 
@@ -901,6 +911,34 @@ mod tests {
 
     fn titles<'a>(sessions: &[&'a Instance]) -> Vec<&'a str> {
         sessions.iter().map(|i| i.title.as_str()).collect()
+    }
+
+    #[test]
+    fn archived_buckets_and_rows_with_one_stamp_keep_a_fixed_order() {
+        let stamp = Timestamp::now();
+        let archived = |title: &str, repo: &str| {
+            let mut i = inst(title, repo);
+            i.archived_at = Some(stamp);
+            i
+        };
+        let mut instances = vec![
+            archived("c1", "gamma"),
+            archived("a1", "alpha"),
+            archived("b1", "beta"),
+            archived("b2", "beta"),
+        ];
+        let mut want = None;
+        for _ in 0..2 {
+            let mut items = Vec::new();
+            append_archived_section_by_project(&mut items, &instances, false, &HashMap::new());
+            assert_eq!(group_names(&items)[1..], ["alpha", "beta", "gamma"]);
+            let rows = session_titles(&items, &instances)
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            assert_eq!(*want.get_or_insert_with(|| rows.clone()), rows);
+            instances.reverse();
+        }
     }
 
     /// Under `SortOrder::Custom` a session's stored `sort_index` is the order, and sessions never
@@ -1144,20 +1182,23 @@ mod tests {
         let mut fav = inst("fav", "work");
         fav.favorite();
         assert!(is_live_favorite(&fav));
-        assert!(has_live_favorite("work", std::slice::from_ref(&fav)));
+        assert!(has_placed_favorite("work", std::slice::from_ref(&fav)));
         let mut nested = inst("nested", "work/frontend");
         nested.favorite();
-        assert!(has_live_favorite("work", std::slice::from_ref(&nested)));
-        assert!(!has_live_favorite(
+        assert!(has_placed_favorite("work", std::slice::from_ref(&nested)));
+        assert!(!has_placed_favorite(
             "personal",
             std::slice::from_ref(&nested)
         ));
-        assert!(!has_live_favorite("work", &[inst("plain", "work")]));
+        assert!(!has_placed_favorite("work", &[inst("plain", "work")]));
 
         fav.snooze(60);
         assert!(fav.is_favorited(), "snooze must not clear the star");
-        assert!(!is_live_favorite(&fav));
-        assert!(!has_live_favorite("work", std::slice::from_ref(&fav)));
+        assert!(!is_live_favorite(&fav), "a snoozed favorite drops its star");
+        assert!(
+            holds_favorite_place(&fav) && has_placed_favorite("work", std::slice::from_ref(&fav)),
+            "a snoozed favorite keeps its place"
+        );
 
         let mut archived = inst("archived", "");
         archived.favorited_at = Some(now);
@@ -1165,15 +1206,15 @@ mod tests {
         let mut trashed = inst("trashed", "");
         trashed.favorited_at = Some(now);
         trashed.trashed_at = Some(now);
-        assert!(!is_live_favorite(&archived) && !is_live_favorite(&trashed));
+        assert!(!holds_favorite_place(&archived) && !holds_favorite_place(&trashed));
 
         let mut ignored = inst("ignored", "work");
         ignored.favorite();
         ignored.ignore();
         assert!(ignored.is_favorited(), "ignore must not clear the star");
-        assert!(!is_live_favorite(&ignored));
+        assert!(!is_live_favorite(&ignored) && !holds_favorite_place(&ignored));
         assert!(
-            !has_live_favorite("work", std::slice::from_ref(&ignored)),
+            !has_placed_favorite("work", std::slice::from_ref(&ignored)),
             "an ignored favorite must not pin its group"
         );
     }
@@ -1211,7 +1252,10 @@ mod tests {
         let pair = [snoozed, aged("new_plain", 0, false)];
         let mut refs: Vec<&Instance> = pair.iter().collect();
         sort_sessions_inner(&mut refs, SortOrder::Name, true);
-        assert_eq!(refs[0].title, "new_plain", "snooze outranks the star");
+        assert_eq!(
+            refs[0].title, "snoozed_fav",
+            "a snoozed favorite keeps its place"
+        );
     }
 
     #[test]
