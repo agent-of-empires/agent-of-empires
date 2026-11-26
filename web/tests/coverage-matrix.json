@@ -2452,7 +2452,7 @@
       "risk": "low",
       "specs": ["src/components/sidebar/filterGroups.test.ts"],
       "components": ["web/src/components/sidebar/filterGroups.ts"],
-      "notes": "The Snoozed & archived footer lists Workspaces newest archived_at (or snoozed_until) first across every group, whatever the sidebar sort; ties keep group order."
+      "notes": "The Snoozed & archived footer lists Workspaces newest archived_at (or snoozed_until) first across every group, whatever the sidebar sort (ignoring trashed sessions); ties keep group order."
     },
     {
       "id": "sidebar.group-reorder",
