@@ -1913,8 +1913,19 @@ impl App {
             }
         };
         let applied = self.pull.apply(request, report);
-        // A new id is another pull: a cancel prompt for the one shown ends, and repaints.
+        // A new id is another pull: a cancel prompt for the one shown ends, and repaints. That pull
+        // installs what was on offer when it was seen, not what the one before it started with.
+        let took_over = self.pull.running()
+            && flight.is_some()
+            && self
+                .pull
+                .cancel_flight()
+                .is_some_and(|shown| Some(shown) != flight);
         let replaced = self.pull.note_flight(flight);
+        if took_over {
+            self.pull_digest = None;
+            self.pull_started_here = false;
+        }
         // A Start the Daemon didn't answer may never have reached it, so a running pull it then
         // polls may be another client's, which a cancel would stop.
         let start_unanswered = request == PullRequest::Start && applied == Applied::Recheck;
@@ -5702,6 +5713,49 @@ mod tests {
         assert_eq!(
             app.image_update, None,
             "the failed pull's digest left the newer install on offer"
+        );
+
+        // This TUI's own pull learning its first flight id isn't a takeover: the offer at its
+        // start still names what it installs.
+        let (mut app, _terminal) = key_app();
+        let sent = hold_pull_requests(&mut app);
+        app.image_update = Some(a.clone());
+        app.start_pull(a.image.clone());
+        answer_sent(
+            &mut app,
+            &sent,
+            0,
+            PullAnswer {
+                report: running(),
+                offer: Some(ImageOffer::Update(moved.clone())),
+                image: Some(a.image.clone()),
+                flight: Some(7),
+            },
+        );
+        answer_pull(&mut app, PullRequest::Poll, done());
+        assert_eq!(
+            app.image_update,
+            Some(moved.clone()),
+            "our pull's first flight id was read as a takeover"
+        );
+
+        // Another flight takes over the line this TUI's pull of A was running on.
+        let (mut app, _terminal) = key_app();
+        let sent = hold_pull_requests(&mut app);
+        app.image_update = Some(a.clone());
+        app.start_pull(a.image.clone());
+        let at = |flight, offer: Option<&ImageUpdate>| PullAnswer {
+            report: running(),
+            offer: offer.cloned().map(ImageOffer::Update),
+            image: Some(a.image.clone()),
+            flight: Some(flight),
+        };
+        answer_sent(&mut app, &sent, 0, at(7, None));
+        answer_pull(&mut app, PullRequest::Poll, at(9, Some(&moved)));
+        answer_pull(&mut app, PullRequest::Poll, done());
+        assert_eq!(
+            app.image_update, None,
+            "the pull that took over recorded the first pull's digest"
         );
     }
 
