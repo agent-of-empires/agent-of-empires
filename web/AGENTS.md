@@ -15,8 +15,7 @@ npm run typecheck:tests
 ```
 
 `cargo xtask dev` runs the debug server (without `--features web`) on 8081 and
-Vite on 5173. A build
-without `--features web` needs no JavaScript tooling. Use `npm run format` to fix oxfmt output;
+Vite on 5173. A build without `--features web` needs no JavaScript tooling. Use `npm run format` to fix oxfmt output;
 Prettier is not used.
 
 The lint command checks Rust environment reads against the live fixture's
