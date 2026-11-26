@@ -954,7 +954,7 @@ fn a_repository_keeps_its_place_when_its_newest_session_drops_out() {
             .iter()
             .filter_map(|item| match item {
                 Item::Group { path, .. } => Some(path.clone()),
-                Item::Session { .. } => None,
+                Item::Session { .. } | Item::Suggested { .. } => None,
             })
             .collect()
     };
