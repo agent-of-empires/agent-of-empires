@@ -472,12 +472,16 @@ fn classify_live_panes(succeeded: bool, stdout: &[u8], stderr: &[u8]) -> bool {
 }
 
 pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
-    let first = first_pane_id(session_name)?;
+    pane_current_command_at(&first_pane_id(session_name)?)
+}
+
+/// [`pane_current_command`] of the pane `target` names.
+pub(crate) fn pane_current_command_at(target: &str) -> Option<String> {
     crate::tmux::tmux_query_command()
         .args([
             "display-message",
             "-t",
-            &first,
+            target,
             "-p",
             "#{pane_current_command}",
         ])
@@ -496,9 +500,13 @@ pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
 /// matched by `^`-anchored rules, so trimming here would let the same pane
 /// read one way through the poller and another through `aoe session capture`.
 pub(crate) fn pane_title(session_name: &str) -> Option<String> {
-    let target = format!("={session_name}:^");
+    pane_title_at(&format!("={session_name}:^"))
+}
+
+/// [`pane_title`] of the pane `target` names.
+pub(crate) fn pane_title_at(target: &str) -> Option<String> {
     crate::tmux::tmux_query_command()
-        .args(["display-message", "-t", &target, "-p", "#{pane_title}"])
+        .args(["display-message", "-t", target, "-p", "#{pane_title}"])
         .output()
         .ok()
         .filter(|output| output.status.success())
@@ -515,15 +523,16 @@ fn strip_display_delimiter(raw: &str) -> &str {
 }
 
 pub(crate) fn pane_start_command_is_protected(session_name: &str) -> bool {
-    let Some(first) = first_pane_id(session_name) else {
-        return false;
-    };
-    let target = first;
+    first_pane_id(session_name).is_some_and(|first| pane_start_command_is_protected_at(&first))
+}
+
+/// [`pane_start_command_is_protected`] of the pane `target` names.
+pub(crate) fn pane_start_command_is_protected_at(target: &str) -> bool {
     crate::tmux::tmux_query_command()
         .args([
             "display-message",
             "-t",
-            &target,
+            target,
             "-p",
             "#{pane_start_command}",
         ])
