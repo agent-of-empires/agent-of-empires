@@ -172,6 +172,7 @@ impl From<NewSessionData> for crate::session::builder::InstanceParams {
             no_submodules: false,
             tie_workdir_to_name: false,
             worktree_path_id: None,
+            session_id: None,
         }
     }
 }
