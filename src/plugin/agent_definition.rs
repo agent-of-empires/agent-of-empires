@@ -236,7 +236,9 @@ status = "running"
         let manifest = aoe_plugin_api::PluginManifest::from_toml_str(&format!(
             "id = \"acme.claude-shaped\"\nname = \"Claude shaped\"\nversion = \"1.0.0\"\n\
              api_version = 26\n[[agent_integrations]]\ntool = \"example-helper\"\n\
-             command = \"claude\"\n{CLAUDE_SHAPED_HOOKS}"
+             command = \"claude\"\n\
+             [agent_integrations.launch.container_env]\nCLAUDE_CONFIG_DIR = \"/root/.claude\"\n\
+             {CLAUDE_SHAPED_HOOKS}"
         ))
         .unwrap();
         let entry = &manifest.agent_integrations[0];

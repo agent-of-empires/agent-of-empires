@@ -220,6 +220,40 @@ pub fn declared_trust_applies_in_sandbox(trust: &AgentTrustDeclaration, yolo: bo
     }
 }
 
+/// Whether `path` is the trust file of a built-in agent other than `agent_name`, so a
+/// plugin cannot pre-trust folders for another agent.
+pub fn is_other_builtin_trust_file(
+    path: &Path,
+    agent_name: &str,
+    home: &Path,
+    host_env: &[String],
+) -> bool {
+    let from_env = |var: &str| resolve_config_dir_override(var, host_env).map(PathBuf::from);
+    let builtin = [
+        (
+            "claude",
+            from_env("CLAUDE_CONFIG_DIR").unwrap_or_else(|| home.to_path_buf()),
+            ".claude.json",
+        ),
+        (
+            "codex",
+            from_env("CODEX_HOME").unwrap_or_else(|| home.join(".codex")),
+            "config.toml",
+        ),
+        ("gemini", home.join(".gemini"), "trustedFolders.json"),
+    ];
+    let same = |a: &Path, b: &Path| {
+        a == b
+            || matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
+    };
+    builtin
+        .iter()
+        .filter(|(name, ..)| *name != agent_name)
+        .any(|(_, dir, file)| same(path, &dir.join(file)))
+        || (agent_name != "gemini"
+            && from_env("GEMINI_CLI_TRUSTED_FOLDERS_PATH").is_some_and(|file| same(path, &file)))
+}
+
 /// Writes a plugin-declared trust leaf, with the project path as one object key.
 ///
 /// Strict where the built-in writers are lenient: a malformed file or a non-object
@@ -642,5 +676,39 @@ mod tests {
         assert!(declared_trust_applies_in_sandbox(&trust, true));
         trust.sandbox = AgentTrustSandbox::Always;
         assert!(declared_trust_applies_in_sandbox(&trust, false));
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn declared_trust_never_targets_another_builtin_agents_file() {
+        let _guard = EnvGuard::unset(&[
+            "CLAUDE_CONFIG_DIR",
+            "CODEX_HOME",
+            "GEMINI_CLI_TRUSTED_FOLDERS_PATH",
+        ]);
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let env = [format!("CLAUDE_CONFIG_DIR={}", home.join("cfg").display())];
+        for (path, env, agent, refused) in [
+            (home.join(".claude.json"), &[][..], "example", true),
+            (home.join("cfg/.claude.json"), &env[..], "example", true),
+            (home.join(".claude.json"), &env[..], "example", false),
+            (
+                home.join(".gemini/trustedFolders.json"),
+                &[][..],
+                "example",
+                true,
+            ),
+            (home.join(".codex/config.toml"), &[][..], "example", true),
+            (home.join(".claude.json"), &[][..], "claude", false),
+            (home.join(".example.json"), &[][..], "example", false),
+        ] {
+            assert_eq!(
+                is_other_builtin_trust_file(&path, agent, home, env),
+                refused,
+                "{} {agent}",
+                path.display()
+            );
+        }
     }
 }

@@ -2940,23 +2940,34 @@ fn declared_sandbox_agent(
 }
 
 /// The config directory a declared sandbox mounts: the directory its declared
-/// environment variable names in the container, else `rel` under the container home.
+/// environment variable names in the container, else `rel` under the container
+/// home. `None` when the declared directory is unsafe.
 fn declared_container_dir(
     entry: &aoe_plugin_api::agent_integration::AgentIntegrationContribution,
     env_var: Option<&str>,
     rel: &Path,
-) -> String {
-    env_var
-        .and_then(|var| entry.launch.as_ref()?.container_env.get(var))
-        .filter(|dir| dir.starts_with('/'))
-        .map(|dir| dir.trim_end_matches('/'))
-        .map_or_else(
-            || {
-                let dir = Path::new(CONTAINER_HOME).join(rel).display().to_string();
-                dir.trim_end_matches('/').to_string()
-            },
-            str::to_string,
-        )
+) -> Option<String> {
+    match env_var {
+        Some(var) => entry
+            .launch
+            .as_ref()?
+            .container_env
+            .get(var)
+            .filter(|dir| aoe_plugin_api::agent_integration::container_dir_ok(dir))
+            .cloned(),
+        None => {
+            let dir = Path::new(CONTAINER_HOME).join(rel).display().to_string();
+            Some(dir.trim_end_matches('/').to_string())
+        }
+    }
+}
+
+/// Whether binding at `target` would shadow, or be shadowed by, a bound mount.
+fn overlaps_bound_mount(target: &str, bound: &[VolumeMount]) -> bool {
+    bound.iter().any(|volume| {
+        let (target, other) = (Path::new(target), Path::new(&volume.container_path));
+        target.starts_with(other) || other.starts_with(target)
+    })
 }
 
 /// What a plugin-declared sandbox mounts, staged per session outside the host
@@ -2972,6 +2983,7 @@ fn stage_declared_sandbox(
     declared: &crate::plugin::agent_integration::DeclaredAgent,
     instance_id: &str,
     profile_config: &super::Config,
+    bound: &[VolumeMount],
 ) -> Result<DeclaredSandboxMounts> {
     let entry = declared.contribution();
     let stage = crate::hooks::declared_sandbox_dir(instance_id)?;
@@ -3015,7 +3027,11 @@ fn stage_declared_sandbox(
             )?;
             if settings_file.is_file() {
                 let container_dir =
-                    declared_container_dir(entry, hooks.config_dir_env_var.as_deref(), rel_dir);
+                    declared_container_dir(entry, hooks.config_dir_env_var.as_deref(), rel_dir)
+                        .filter(|dir| !overlaps_bound_mount(dir, bound))
+                        .with_context(|| {
+                            "the declared container directory is unsafe or overlaps a mount"
+                        })?;
                 if !events.is_empty() {
                     mounts.identity_output =
                         mount_hook_status_dir(instance_id, &mut mounts.volumes)?;
@@ -3042,13 +3058,20 @@ fn stage_declared_sandbox(
     if let Some(trust) = &entry.trust {
         let file = stage.join("home").join(&trust.file);
         if file.is_file() {
-            let container_dir =
-                declared_container_dir(entry, trust.config_dir_env_var.as_deref(), Path::new(""));
-            mounts.volumes.push(VolumeMount {
-                host_path: file.to_string_lossy().to_string(),
-                container_path: format!("{container_dir}/{}", trust.file),
-                read_only: false,
-            });
+            let target =
+                declared_container_dir(entry, trust.config_dir_env_var.as_deref(), Path::new(""))
+                    .map(|dir| format!("{dir}/{}", trust.file))
+                    .filter(|target| !overlaps_bound_mount(target, bound));
+            match target {
+                Some(container_path) => mounts.volumes.push(VolumeMount {
+                    host_path: file.to_string_lossy().to_string(),
+                    container_path,
+                    read_only: false,
+                }),
+                None => tracing::warn!(target: "session.profile",
+                    "Not mounting the declared trust file for {}: its container directory is unsafe or overlaps a mount",
+                    entry.tool),
+            }
         }
     }
     Ok(mounts)
@@ -3592,7 +3615,7 @@ pub(crate) fn build_container_config(
         yolo.enabled,
     );
     if let Some(declared) = &plugin_agent {
-        match stage_declared_sandbox(declared, instance_id, profile_config) {
+        match stage_declared_sandbox(declared, instance_id, profile_config, &volumes) {
             Ok(staged) => {
                 volumes.extend(staged.volumes);
                 identity_output_path = identity_output_path.or(staged.identity_output);
@@ -7700,6 +7723,60 @@ sandbox = "SANDBOX"
         );
         assert!(mount_of(&config, "/opt/example").is_none());
         assert!(mount_of(&config, "/root/.example.json").is_some());
+
+        // Stale staged content that cleanup could not remove never blocks the next launch.
+        let stage = crate::hooks::declared_sandbox_dir("declared-stale").unwrap();
+        let locked = stage.join("config/locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("stale"), "x").unwrap();
+        let mode = |mode| {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&locked, fs::Permissions::from_mode(mode))
+        };
+        mode(0o500).unwrap();
+        crate::hooks::cleanup_hook_status_dir("declared-stale");
+        let config = launch("declared-stale", false);
+        mode(0o700).ok();
+        assert!(mount_of(&config, "/opt/example").is_some());
+        assert!(mount_of(&config, "/root/.example.json").is_some());
+    }
+
+    #[test]
+    fn declared_container_dirs_are_checked_again_at_use() {
+        let mut entry = aoe_plugin_api::agent_integration::AgentIntegrationContribution::default();
+        for (dir, ok) in [
+            ("/opt/example", true),
+            ("/", false),
+            ("/root", false),
+            ("/workspace/project", false),
+            ("/opt/../etc", false),
+            ("/opt/a:b", false),
+            ("relative", false),
+        ] {
+            let launch = entry.launch.get_or_insert_with(Default::default);
+            launch.container_env.clear();
+            launch
+                .container_env
+                .insert("EXAMPLE_CONFIG_DIR".into(), dir.into());
+            assert_eq!(
+                declared_container_dir(&entry, Some("EXAMPLE_CONFIG_DIR"), Path::new("x"))
+                    .is_some(),
+                ok,
+                "{dir}"
+            );
+        }
+        assert_eq!(
+            declared_container_dir(&entry, None, Path::new(".example")).as_deref(),
+            Some("/root/.example")
+        );
+        let bound = [VolumeMount {
+            host_path: "/h".into(),
+            container_path: "/opt/example/sub".into(),
+            read_only: false,
+        }];
+        assert!(overlaps_bound_mount("/opt/example", &bound));
+        assert!(overlaps_bound_mount("/opt/example/sub/x", &bound));
+        assert!(!overlaps_bound_mount("/opt/other", &bound));
     }
 
     // The wholesale folder-trust disable is only safe against a config AoE

@@ -844,6 +844,12 @@ impl Instance {
                 &environment,
                 config_dir.as_deref(),
             );
+            if crate::hooks::is_other_builtin_trust_file(&path, agent.name, &home, &environment) {
+                tracing::warn!(target: "session.store",
+                    "Not pre-trusting {} for {}: {} is another agent's trust file",
+                    project_path, agent.name, path.display());
+                return;
+            }
             if let Err(e) = crate::hooks::write_declared_trust(
                 &path,
                 trust,
@@ -1434,21 +1440,21 @@ mod tests {
         let _home_guard = crate::session::test_support::isolate_home(tmp.path());
         let _app = crate::session::test_support::isolate_app_dir_at(tmp.path());
         let _env = EnvGuard::unset(&["EXAMPLE_CONFIG_DIR"]);
-        let manifest = |settings: &str| {
+        let manifest = |settings: &str, trust_file: &str| {
             format!(
                 "id = \"acme.declared-launch\"\nname = \"Declared launch\"\nversion = \"1.0.0\"\n\
                  api_version = 26\n[[agent_integrations]]\ntool = \"example-helper\"\n\
                  command = \"example-helper\"\n[agent_integrations.hooks]\n\
                  settings_rel_path = \"{settings}\"\nformat = \"json_settings\"\n\
                  [[agent_integrations.hooks.events]]\nevent = \"Stop\"\nstatus = \"idle\"\n\
-                 [agent_integrations.trust]\nfile = \".example.json\"\n\
+                 [agent_integrations.trust]\nfile = \"{trust_file}\"\n\
                  location = \"config_dir_or_home\"\npointer = \"/projects/{{path}}/trusted\"\n\
                  value = true\nsandbox = \"always\"\n"
             )
         };
         crate::session::test_support::install_agent_plugin(
             "acme.declared-launch",
-            &manifest(".example/settings.json"),
+            &manifest(".example/settings.json", ".example.json"),
         );
         acknowledge_hooks();
         crate::session::config::update_config(|config| {
@@ -1481,7 +1487,7 @@ mod tests {
 
         // The installed file is a hook target, and uninstall removes the hooks but
         // keeps the trust record.
-        let target = crate::hooks::iter_hook_targets_in(tmp.path(), &[])
+        let target = crate::hooks::iter_all_hook_targets_in(tmp.path(), &[])
             .into_iter()
             .find(|target| target.agent_name == "example-helper")
             .expect("declared agent is a hook target");
@@ -1499,10 +1505,14 @@ mod tests {
         // Another agent's settings file is never taken over.
         crate::session::test_support::install_agent_plugin(
             "acme.declared-launch",
-            &manifest(".claude/settings.json"),
+            &manifest(".claude/settings.json", ".claude.json"),
         );
         launch(&mut inst);
         assert!(!tmp.path().join(".claude/settings.json").exists());
+        assert!(
+            !tmp.path().join(".claude.json").exists(),
+            "another agent's trust file is never written"
+        );
     }
 
     #[test]

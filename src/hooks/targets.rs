@@ -37,7 +37,7 @@ pub(crate) fn iter_hook_targets() -> Vec<HookTarget> {
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
     };
-    let mut targets = iter_hook_targets_in(&home, &collect_env_lists_from_session());
+    let mut targets = iter_all_hook_targets_in(&home, &collect_env_lists_from_session());
     match crate::session::list_profiles() {
         Ok(profiles) => {
             for profile in profiles {
@@ -168,7 +168,14 @@ pub(crate) fn iter_hook_targets() -> Vec<HookTarget> {
     targets
 }
 
+/// Built-in agents only. The versioned hook-rewrite migrations run once with the
+/// lenient writer, so they must never see a plugin's files.
 pub(crate) fn iter_hook_targets_in(home: &Path, env_lists: &[Vec<String>]) -> Vec<HookTarget> {
+    builtin_hook_targets_in(home, env_lists, &crate::session::config::Config::default())
+}
+
+/// Built-in and plugin-declared targets, for status, consent and uninstall.
+pub(crate) fn iter_all_hook_targets_in(home: &Path, env_lists: &[Vec<String>]) -> Vec<HookTarget> {
     let defaults = crate::session::config::Config::default();
     let mut out = builtin_hook_targets_in(home, env_lists, &defaults);
     // Declarations of plugins that are active now; hooks written by one that
@@ -520,6 +527,7 @@ mod tests {
             "id = \"acme.declared-hooks\"\nname = \"Declared hooks\"\nversion = \"1.0.0\"\n\
             api_version = 26\n[[agent_integrations]]\ntool = \"example-helper\"\n\
             command = \"example-helper\"\n\
+            [agent_integrations.launch.container_env]\nEXAMPLE_CONFIG_DIR = \"/opt/example\"\n\
             [agent_integrations.hooks]\nsettings_rel_path = \".example/settings.json\"\n\
             config_dir_env_var = \"EXAMPLE_CONFIG_DIR\"\nformat = \"json_settings\"\n\
             [[agent_integrations.hooks.events]]\nevent = \"Stop\"\nstatus = \"idle\"\n\
@@ -529,7 +537,7 @@ mod tests {
         crate::session::test_support::install_agent_plugin("acme.declared-hooks", manifest);
 
         let home = TempDir::new().unwrap();
-        let target = iter_hook_targets_in(home.path(), &[])
+        let target = iter_all_hook_targets_in(home.path(), &[])
             .into_iter()
             .find(|target| target.agent_name == "example-helper")
             .expect("declared agent is a hook target");
@@ -546,6 +554,11 @@ mod tests {
         assert!(lines.contains("~/.example/settings.json or $EXAMPLE_CONFIG_DIR/settings.json"));
         assert!(lines.contains("/projects/{path}/trusted = true into ~/.example.json"));
         assert!(lines.contains("kept on uninstall"));
+
+        // Migrations see built-in agents only.
+        assert!(iter_hook_targets_in(home.path(), &[])
+            .iter()
+            .all(|target| target.agent_name != "example-helper"));
 
         // A profile's relocated config directory is found too.
         let relocated = home.path().join("relocated");

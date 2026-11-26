@@ -57,14 +57,16 @@ pub use status_file::{
     read_hook_session_path, read_hook_status, read_hook_status_age, read_hook_urgent,
     session_id_sidecar_exists,
 };
+#[cfg(test)]
+pub(crate) use targets::iter_all_hook_targets_in;
 pub(crate) use targets::{
     has_aoe_marker, is_other_builtin_hook_path, iter_hook_targets, iter_hook_targets_in,
     HookTarget, HookTargetKind,
 };
 pub use trust::{
     declared_sandbox_dir, declared_trust_applies_in_sandbox, declared_trust_path,
-    disable_gemini_folder_trust, trust_claude_project, trust_codex_project, trust_gemini_project,
-    trust_host_project, write_declared_trust,
+    disable_gemini_folder_trust, is_other_builtin_trust_file, trust_claude_project,
+    trust_codex_project, trust_gemini_project, trust_host_project, write_declared_trust,
 };
 
 /// Where the agent's settings live, which decides the base directory baked into
