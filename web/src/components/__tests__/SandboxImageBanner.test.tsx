@@ -809,6 +809,27 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
     }
   });
 
+  it("scopes every pull's state to its own image", async () => {
+    const OTHER = "ghcr.io/example/other:1";
+    const dismiss = () => fireEvent.click(screen.getByRole("button", { name: "Dismiss sandbox image notice" }));
+    const updateNow = () => fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+    const otherRunning = () => ({ ...running(), image: OTHER });
+
+    // Dismissing A's refusal dismisses only it, so a pull of B starting later doesn't bring it back.
+    {
+      const { unmount } = await mount(status());
+      pullSandboxImage.mockResolvedValueOnce({ ok: false, message: "pulls are off" });
+      updateNow();
+      await pollAfter(0);
+      expect(banner()?.textContent).toBe(FAILED);
+      dismiss();
+      fetchSandboxImageStatus.mockResolvedValue(otherRunning());
+      await pollAfter(30_000);
+      expect(banner()?.textContent, "B starting brought back A's dismissed refusal").toBe(DOWNLOADING);
+      unmount();
+    }
+  });
+
   it("drops a Cancel once the banner shows another image, so its reply and refusal stay off it", async () => {
     const OTHER = "ghcr.io/example/other:1";
     const cancelButton = () => screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement;

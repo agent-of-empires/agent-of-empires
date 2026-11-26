@@ -281,8 +281,6 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
           (s) => s && (s.image === image && s.pull.state === "running" ? { ...s, pull: { state: "idle" } } : s),
         );
         setRefusal(reply.message ?? "Couldn't reach the Daemon.");
-        // The user may have dismissed an older outcome shown meanwhile; this refusal is new.
-        setNoticeDismissed(false);
       }
       pollNow.current();
     });
@@ -339,14 +337,15 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
     }
     if (!status || !status.checks_enabled || !status.sandbox_in_use) return { view: null, running: null };
 
-    if (refusal !== null && !noticeDismissed) {
+    // The refusal has its own dismissal: it says nothing about an outcome's notice, which stays as the user left it.
+    if (refusal !== null) {
       return {
         view: {
           kind: "failed",
           message: REFUSED,
           error: refusal,
           onRetry: () => update(status.image),
-          onDismiss: () => setNoticeDismissed(true),
+          onDismiss: () => setRefusal(null),
         },
         running: null,
       };
