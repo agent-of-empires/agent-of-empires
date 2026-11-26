@@ -104,7 +104,7 @@ export function TopBar({
   return (
     <header
       {...tourAnchor(TOUR_ANCHORS.topbar)}
-      className="h-12 bg-surface-850 md:bg-transparent flex items-stretch shrink-0"
+      className="h-12 bg-surface-850 chrome-header md:bg-transparent md:bg-none flex items-stretch shrink-0"
     >
       {/* Left zone: widens to the sidebar column when it's visible, so the header lines up with the sidebar on the
          canvas. */}

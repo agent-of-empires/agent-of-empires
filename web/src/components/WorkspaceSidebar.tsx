@@ -336,7 +336,7 @@ export function WorkspaceSidebar(props: Props) {
         style={{ width: effectiveWidth, ...(dragging ? { transform: `translateX(${swipe.offset}px)` } : {}) }}
         {...swipe.handlers}
         data-compact={compact ? "true" : undefined}
-        className={`fixed top-[calc(3rem+env(safe-area-inset-top))] bottom-0 z-40 max-md:max-w-full md:static md:z-auto bg-surface-800 md:bg-transparent border-surface-700/60 flex flex-col md:h-full shrink-0 max-md:touch-pan-y max-md:shadow-2xl ${DRAWER_MOTION} ${
+        className={`fixed top-[calc(3rem+env(safe-area-inset-top))] bottom-0 z-40 max-md:max-w-full md:static md:z-auto bg-surface-800 chrome-drawer md:bg-transparent md:bg-none border-surface-700/60 flex flex-col md:h-full shrink-0 max-md:touch-pan-y max-md:shadow-2xl ${DRAWER_MOTION} ${
           dragging ? "transition-none" : "transition-transform"
         } md:transition-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 ${
           rightSide ? "right-0 border-l md:border-l-0" : "left-0 border-r md:border-r-0"

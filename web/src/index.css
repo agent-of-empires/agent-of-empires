@@ -770,3 +770,27 @@ select:focus-visible,
     0 0 / 2ch 1lh repeat-y;
   pointer-events: none;
 }
+
+/* Barely-there washes for the chrome around the cards, mixed from theme surfaces so every theme gets them:
+   lighter at the top, where the header sits, settling into the canvas. */
+@utility chrome-canvas {
+  background-image: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--color-surface-900) 55%, var(--color-surface-950)) 0%,
+    var(--color-surface-950) 55%
+  );
+}
+@utility chrome-header {
+  background-image: linear-gradient(
+    to bottom,
+    var(--color-surface-850),
+    color-mix(in srgb, var(--color-surface-850) 45%, var(--color-surface-900))
+  );
+}
+@utility chrome-drawer {
+  background-image: linear-gradient(
+    to bottom,
+    var(--color-surface-800),
+    color-mix(in srgb, var(--color-surface-800) 55%, var(--color-surface-850))
+  );
+}

@@ -2952,7 +2952,7 @@ function AppContent({
           readOnly={caps.readOnly}
           available={!error}
         >
-          <div className="h-(--app-height) flex flex-col bg-surface-900 md:bg-surface-950 text-text-primary overflow-hidden safe-area-inset">
+          <div className="h-(--app-height) flex flex-col bg-surface-900 md:bg-surface-950 md:chrome-canvas text-text-primary overflow-hidden safe-area-inset">
             {/* Wrapped unconditionally, not behind the `headerCollapsible`
             ternary: swapping the element type at this position would remount
             `TopBar` (and reset its overflow menu) every time the boundary
