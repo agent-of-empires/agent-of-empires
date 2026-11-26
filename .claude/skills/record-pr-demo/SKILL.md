@@ -51,7 +51,7 @@ aoe add -t shell-urls -g web-shop --tool shell -l .
 aoe add -t claude-agent -g web-shop --tool claude -l --structured-view --prompt '<one tiny prompt>' .
 ```
 
-Use `--tool shell` for anything scripted; use one real agent session where the PR touches agent views, and keep its prompt tiny (it may ignore `--model`). Done when every session the clips need shows in `aoe list`. Terminal sessions must have a tmux pane holding the state you will film. Structured sessions (`--structured-view`) have no agent pane, so check their `aoe list` status (Idle or Active) or the transcript.
+Before adding a `--structured-view` session, run `aoe acp doctor` (`--fix` installs the Claude adapter); without it the session falls back to a terminal view. Use `--tool shell` for anything scripted; use one real agent session where the PR touches agent views, and keep its prompt tiny (it may ignore `--model`). Done when every session the clips need shows in `aoe list`. Terminal sessions must have a tmux pane holding the state you will film. Structured sessions (`--structured-view`) have no agent pane, so check their `aoe list` status (Idle or Active) or the transcript.
 
 ## 4. Record
 
@@ -73,7 +73,7 @@ nohup ttyd --port 7683 --interface 127.0.0.1 --cwd "$DEMO/projects/<scene>" -c d
 echo $! > "$DEMO/ttyd.pid"
 ```
 
-In the clip script: `const h = await launch("<clip>")` (the name also goes to `finish(h, "<clip>")` at the end), `await h.context.setHTTPCredentials({ username: "demo", password: process.env.TTYD_PW })`, `h.page.goto("http://127.0.0.1:7683")`, click `.xterm`, then `h.page.keyboard.press`. Set `AOE_DEMO_TOKEN=-` (no dashboard token). Assert on `document.body.innerText` before each key. Traps are in [`TECHNIQUES.md`](TECHNIQUES.md#tui-clips-ttyd). For scripted e2e tests, `RECORD_E2E=1` records asciinema casts that `agg` converts; both must be on `PATH` (`tests/e2e/harness.rs`).
+In the clip script: `const h = await launch("<clip>")` (the name also goes to `finish(h, "<clip>")` at the end), `await h.context.setHTTPCredentials({ username: "demo", password: process.env.TTYD_PW })`, `h.page.goto("http://127.0.0.1:7683")`, click `.xterm`, then `h.page.keyboard.press`. Set `AOE_DEMO_TOKEN=-` only if the script never calls `prep()` (no dashboard token); `prep()` opens the dashboard, so a script that uses it needs the real token. Assert on `document.body.innerText` before each key. Traps are in [`TECHNIQUES.md`](TECHNIQUES.md#tui-clips-ttyd). For scripted e2e tests, `RECORD_E2E=1` records asciinema casts that `agg` converts; both must be on `PATH` (`tests/e2e/harness.rs`).
 
 Done when the contact sheet shows each key's effect at the moment its caption claims.
 
