@@ -2812,7 +2812,9 @@ async fn test_ctrl_arrows_under_name_start_custom_from_the_screen_order() {
         "source_group": "work", "direction": "down", "headers": headers,
         "freeze": {"order": expected, "base": {
             "order": before.contents.placed_workspaces,
-            "repositories": before.contents.repository_order}}});
+            "repositories": before.contents.repository_order},
+            "groups": before.contents.profiles.iter().find(|p| p.name == profile).unwrap()
+                .groups.iter().map(|g| g.path.clone()).collect::<Vec<_>>()}});
 
     // A refused move leaves the sort alone.
     let mut respond = env.view.session_feed.namespace_driver_for_test();
@@ -2981,12 +2983,16 @@ fn test_alt_arrows_jump_between_just_finished_sessions() {
 #[tokio::test]
 #[serial]
 async fn test_ctrl_arrows_carry_a_session_into_the_next_group() {
-    use crate::session::config::SortOrder;
+    use crate::session::config::{GroupByMode, SortOrder};
 
     let mut env = create_test_env_with_mixed_sessions();
     let profiles = crate::session::list_profiles().unwrap();
     let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
     apply_published(&mut env.view, &state).await;
+    // The snapshot carries the Daemon's grouping; the carry is a Groups move.
+    env.view.group_by = GroupByMode::Group;
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.update_selected();
     env.view.apply_sort_order(SortOrder::Custom);
 
     let work_ids: Vec<String> = env
@@ -3017,6 +3023,7 @@ async fn test_ctrl_arrows_carry_a_session_into_the_next_group() {
     env.view.update_selected();
 
     // Above "work" sits the ungrouped bucket, so moving up leaves the group.
+    assert_eq!(env.view.group_by, GroupByMode::Group);
     settle_reorder(&state, &mut env.view, -1).await.unwrap();
     assert_eq!(
         env.view.get_instance(&top).map(|i| i.group_path.clone()),
@@ -3591,6 +3598,87 @@ async fn test_cross_group_move_lands_in_an_empty_neighbour() {
 }
 
 /// Session id of the row titled `title`.
+/// Under Custom a repository's own groups follow their rows' order, so a switch from Name,
+/// which commits the rows as shown, keeps the groups where they were.
+#[test]
+#[serial]
+fn test_repository_groups_follow_their_rows_under_custom() {
+    use crate::session::config::{GroupByMode, SortOrder};
+
+    let instances = [
+        instance_in("a1", "/r/repo", "alpha"),
+        instance_in("b1", "/r/repo", "beta"),
+    ];
+    let mut env = seeded_env(test_home(), &instances, false);
+    let (a, b) = (
+        custom_order_id_of(&env.view, "a1"),
+        custom_order_id_of(&env.view, "b1"),
+    );
+    env.view
+        .mutate_instance(&a, |inst| inst.sort_index = Some(0));
+    env.view.mutate_instance(&b, |inst| {
+        inst.sort_index = Some(1);
+        inst.created_at = crate::time::Timestamp::now() + crate::time::Duration::hours(1);
+    });
+    env.view.group_by = GroupByMode::Project;
+    env.view.sort_order = SortOrder::Custom;
+    env.view.flat_items = env.view.build_flat_items();
+    let nested: Vec<&str> = env
+        .view
+        .flat_items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Group { name, depth: 1, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(nested, ["alpha", "beta"]);
+}
+
+/// A move waits for the Daemon's first snapshot, which carries the order it replaces, and
+/// never reorders an archived row, which keeps its archive order.
+#[test]
+#[serial]
+fn test_moves_wait_for_a_snapshot_and_leave_archived_rows() {
+    use crate::session::config::SortOrder;
+
+    let instances = [
+        instance_in("a1", "/tmp/a1", "work"),
+        instance_in("b1", "/tmp/b1", "work"),
+    ];
+    let mut env = seeded_env(test_home(), &instances, true);
+    env.view.sort_order = SortOrder::Custom;
+    env.view.rebuild_flat_items();
+    let (a, b) = (
+        custom_order_id_of(&env.view, "a1"),
+        custom_order_id_of(&env.view, "b1"),
+    );
+    let delta = if env.view.session_row(&a) < env.view.session_row(&b) {
+        1
+    } else {
+        -1
+    };
+    env.view.select_session_by_id(&a);
+    let mut capture = env.view.session_feed.view_write_driver_for_test();
+    env.view.mutate_instance(&a, |inst| {
+        inst.archived_at = Some(crate::time::Timestamp::now());
+    });
+    env.view.move_row_at_cursor(delta).unwrap();
+    assert!(capture().is_none());
+    assert_eq!(
+        flash_text(&env.view),
+        Some("Archived and trashed rows keep their own order")
+    );
+    env.view.mutate_instance(&a, |inst| inst.archived_at = None);
+    env.view.session_feed.forget_applied_for_test();
+    env.view.move_row_at_cursor(delta).unwrap();
+    assert!(capture().is_none());
+    assert_eq!(
+        flash_text(&env.view),
+        Some("The list is still loading from the Daemon")
+    );
+}
+
 fn custom_order_id_of(view: &HomeView, title: &str) -> String {
     view.flat_items
         .iter()
@@ -3713,25 +3801,24 @@ async fn test_failed_native_reorder_keeps_source_rows_and_explains_uncertainty()
         .position(|item| matches!(item, Item::Session { id, .. } if id == &a))
         .unwrap();
     env.view.update_selected();
-    let responder = env.view.session_feed.namespace_driver_for_test();
+    let mut capture = env.view.session_feed.namespace_capture_for_test();
     env.view.move_row_at_cursor(1).unwrap();
+    let Some((crate::daemon::NamespaceMutation::Reorder(sent), reply)) = capture() else {
+        panic!("expected the carry");
+    };
+    let sent = serde_json::to_value(sent).unwrap();
+    assert_eq!(
+        (&sent["source_group"], &sent["destination"]),
+        (&serde_json::json!("aaa"), &serde_json::json!("bbb"))
+    );
     let storage = Storage::open_unwatched("test").unwrap();
     let rows_before = std::fs::read(storage.sessions_path()).unwrap();
     std::fs::write(storage.sessions_path().with_file_name("groups.json"), b"{").unwrap();
-    let (status, _, _) = request_with_headers(
-        &state,
-        "POST",
-        "/api/reorder",
-        serde_json::json!({
-            "target": "session", "id": a, "profile": "test", "source_group": "aaa",
-            "destination": "bbb", "direction": "down",
-        }),
-    )
-    .await;
+    let (status, _, _) = request_with_headers(&state, "POST", "/api/reorder", sent).await;
     assert!(status.is_server_error());
     assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), rows_before);
     // A missing response is unknown, never a fabricated definitive rejection.
-    drop(responder);
+    reply.lose();
     env.view.apply_session_feed();
     assert_eq!(env.view.get_instance(&a).unwrap().group_path, "aaa");
     assert_eq!(env.view.selected_session.as_deref(), Some(a.as_str()));

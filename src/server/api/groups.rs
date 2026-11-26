@@ -726,8 +726,19 @@ pub async fn reorder(
         crate::daemon::ReorderBody::Session {
             source_group,
             destination,
+            headers,
             ..
         } => {
+            // A Client older than the shared order sent in-group moves this way.
+            if destination.is_none() && headers.is_none() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "message": "A move within a group rewrites the shared order through PUT /api/workspace-ordering"
+                    })),
+                )
+                    .into_response();
+            }
             for path in std::iter::once(source_group).chain(destination) {
                 if !path.is_empty()
                     && (crate::session::is_synthetic_project_header(path)
@@ -806,6 +817,10 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
                     let metadata = worker_state.canonical_metadata.blocking_read();
                     freeze.base.order != metadata.workspace_ordering
                         || freeze.base.repositories != metadata.repository_order
+                        || !freeze
+                            .groups
+                            .iter()
+                            .eq(groups.iter().map(|group| &group.path))
                 }) {
                     return Ok(());
                 }
@@ -1026,19 +1041,17 @@ fn apply_canonical_reorder(
             };
             check_row(&rows[anchor], cityhall)?;
             // In place, the move commits only the header and row orders it carries.
-            if destination.is_none() && headers.is_none()
-                || destination.as_ref().is_some_and(|destination| {
-                    destination == source_group
-                        || !(destination.is_empty()
-                            || groups.iter().any(|group| &group.path == destination)
-                            || rows.iter().any(|row| {
-                                &row.source_profile == profile
-                                    && belongs(&row.group_path, destination)
-                                    && !row.is_archived()
-                                    && !row.is_trashed()
-                            }))
-                })
-            {
+            if destination.as_ref().is_some_and(|destination| {
+                destination == source_group
+                    || !(destination.is_empty()
+                        || groups.iter().any(|group| &group.path == destination)
+                        || rows.iter().any(|row| {
+                            &row.source_profile == profile
+                                && belongs(&row.group_path, destination)
+                                && !row.is_archived()
+                                && !row.is_trashed()
+                        }))
+            }) {
                 return Ok(ReorderOutcome::Stale);
             }
             if let Some(headers) = headers {

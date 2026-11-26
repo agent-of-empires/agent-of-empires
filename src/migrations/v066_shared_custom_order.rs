@@ -14,8 +14,13 @@
 //! ran an earlier v065 without `legacy_sort_order` falls back to the sort v065 left.
 //! A `sessions.json` that cannot be read is left untouched and the run completes without
 //! it; the sort and the skipped files are kept in `PENDING_FILE`, and a later run, `aoe
-//! migrate` or a retried upgrade, adds only those profiles' order to the shared one. A run
-//! that skips a profile records that before it writes, so an interrupted one still owes it.
+//! migrate` or a retried upgrade, adds only those profiles' order to the shared one, and
+//! only to a list the upgrade seeded: a dashboard order it kept stays as it was. The
+//! repaired rows go ahead of the entries already there, which the user may have moved
+//! since, rather than where the removed sort would have ranked them. A run that skips a
+//! profile records that before it writes, so an interrupted one still owes it. A
+//! `workspace-ordering.json` that cannot be read or parsed is left untouched with every
+//! legacy input, and recovery reruns the whole upgrade once it reads.
 
 use super::sessions_file;
 use super::v065_shared_sidebar_view::{web_effective_sort, LEGACY_SORT_KEY, WEB_SORT_KEY};
@@ -33,6 +38,8 @@ const WEB_REPO_ORDER_KEY: &str = "aoe-repo-group-order-v1";
 /// seeds, each after [`UNFINISHED`].
 const PENDING_FILE: &str = ".v066_custom_order_pending";
 const UNFINISHED: &str = "+";
+/// Marks a list the upgrade seeded, which recovery may still add to.
+const SEEDED: &str = "=";
 
 pub fn run() -> Result<()> {
     run_in(&crate::session::get_app_dir()?, Pass::Upgrade)
@@ -75,12 +82,17 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
             .collect();
         (!names.is_empty()).then_some(names)
     });
+    let seeded_lists: Vec<&str> = lines
+        .iter()
+        .flatten()
+        .filter_map(|line| line.strip_prefix(SEEDED))
+        .collect();
     // Profiles an earlier run migrated are done; only the skipped ones still seed.
     let owed = lines.filter(|_| seeding.is_none());
     if pass == Pass::Recovery && pending.is_none() {
         return Ok(());
     }
-    let mut placed: Vec<(u64, Option<Timestamp>, String)> = Vec::new();
+    let mut placed: std::collections::BTreeMap<(String, String), Vec<Placed>> = Default::default();
     let mut live: Vec<LiveRow> = Vec::new();
     let mut to_strip: Vec<(std::path::PathBuf, String)> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
@@ -117,7 +129,12 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
             };
             let workspace = workspace_id(row);
             if let Some(index) = row.get("sort_index").and_then(Value::as_u64) {
-                placed.push((index, time("created_at"), workspace.clone()));
+                let group = (relative.clone(), text(row.get("group_path")).to_owned());
+                placed.entry(group).or_default().push((
+                    index,
+                    Reverse(time("created_at")),
+                    workspace.clone(),
+                ));
             }
             live.push(LiveRow {
                 workspace,
@@ -130,10 +147,7 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
             to_strip.push((path, content));
         }
     }
-    // Each group numbered its own rows from 0, so interleaving by index keeps every
-    // group's order; newer rows break ties as they did on screen.
-    placed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
-    let tui_order = dedup(placed.into_iter().map(|(_, _, id)| id));
+    let tui_order = merge_group_orders(placed.into_values().collect());
 
     let state = read_state(app_dir)?;
     let web_repositories = web_repository_order(state.as_ref());
@@ -152,10 +166,26 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
     };
 
     let ordering_path = app_dir.join("workspace-ordering.json");
-    let mut ordering: crate::session::WorkspaceOrdering = read_if_present(&ordering_path)?
-        .map(|content| serde_json::from_str(&content))
-        .transpose()?
-        .unwrap_or_default();
+    let read = read_if_present(&ordering_path).and_then(|content| {
+        content
+            .map(|content| serde_json::from_str(&content))
+            .transpose()
+            .map_err(anyhow::Error::from)
+    });
+    let mut ordering: crate::session::WorkspaceOrdering = match read {
+        Ok(ordering) => ordering.unwrap_or_default(),
+        Err(error) => {
+            warn!(target: "migrations.v066", path = %ordering_path.display(), %error, "Preserved an unreadable shared order; repair it and run aoe migrate");
+            if pass == Pass::Upgrade {
+                let sort = legacy_sort.as_deref().unwrap_or_default();
+                crate::session::atomic_write(
+                    &pending_path,
+                    format!("{sort}\n{UNFINISHED}order\n{UNFINISHED}repositories\n").as_bytes(),
+                )?;
+            }
+            return Ok(());
+        }
+    };
     let mut changed = false;
     let mut seeds: Vec<&str> = Vec::new();
     let legacy = legacy_sort
@@ -193,7 +223,11 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
             (_, None, Some(_)) => continue,
             // Earlier entries keep their place, which the user may have moved since. A
             // retried upgrade adds the profiles an earlier run skipped the same way.
-            _ => add_missing(current, &seeded),
+            _ if seeded_lists.contains(&name) => {
+                seeds.push(name);
+                add_missing(current, &seeded)
+            }
+            _ => continue,
         };
         if !next.is_empty() && next != *current {
             *current = next;
@@ -229,10 +263,16 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
     // `state.toml` drops keys this binary does not know on its next save, so the pending
     // sort lives in its own file.
     match &legacy_sort {
-        Some(sort) if !skipped.is_empty() => crate::session::atomic_write(
-            &pending_path,
-            format!("{sort}\n{}\n", skipped.join("\n")).as_bytes(),
-        )?,
+        Some(sort) if !skipped.is_empty() => {
+            let lists: String = seeds
+                .iter()
+                .map(|name| format!("{SEEDED}{name}\n"))
+                .collect();
+            crate::session::atomic_write(
+                &pending_path,
+                format!("{sort}\n{}\n{lists}", skipped.join("\n")).as_bytes(),
+            )?
+        }
         _ if pending_file.is_some() => fs::remove_file(&pending_path)?,
         _ => {}
     }
@@ -252,11 +292,61 @@ fn sort_left_by_v065(state: Option<&toml::Table>) -> Option<String> {
         .get("web_ui_state")
         .and_then(|web| web.get(WEB_SORT_KEY))
         .and_then(toml::Value::as_str);
-    match web {
+    match web.filter(|web| super::v065_shared_sidebar_view::is_web_sort(web)) {
         Some(web) => Some(web_effective_sort(web).to_owned()),
         None => (state.get("sort_order").and_then(toml::Value::as_str) == Some("custom"))
             .then(|| "custom".to_owned()),
     }
+}
+
+/// A row's `sort_index`, its creation time, newer first, and its workspace.
+type Placed = (u64, Reverse<Option<Timestamp>>, String);
+
+/// One order keeping each group's own: every group numbered its rows from 0, so a
+/// workspace follows the ones above it in each of its groups. Where groups disagree, or
+/// leave the order open, the lower index and then the newer row goes first, as on screen.
+fn merge_group_orders(groups: Vec<Vec<Placed>>) -> Vec<String> {
+    let mut rank: std::collections::HashMap<String, (u64, Reverse<Option<Timestamp>>)> =
+        Default::default();
+    let mut above: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for mut group in groups {
+        group.sort();
+        let mut seen: Vec<String> = Vec::new();
+        for (index, created, workspace) in group {
+            let key = (index, created);
+            rank.entry(workspace.clone())
+                .and_modify(|best| *best = (*best).min(key))
+                .or_insert(key);
+            // A workspace's first row in the group places it.
+            if seen.contains(&workspace) {
+                continue;
+            }
+            if let Some(previous) = seen.last() {
+                above
+                    .entry(workspace.clone())
+                    .or_default()
+                    .push(previous.clone());
+            }
+            seen.push(workspace);
+        }
+    }
+    let mut left: Vec<(u64, Reverse<Option<Timestamp>>, String)> = rank
+        .into_iter()
+        .map(|(workspace, (index, created))| (index, created, workspace))
+        .collect();
+    left.sort();
+    let mut order: Vec<String> = Vec::new();
+    while !left.is_empty() {
+        let free = left.iter().position(|(_, _, workspace)| {
+            above
+                .get(workspace)
+                .is_none_or(|list| list.iter().all(|a| order.contains(a)))
+        });
+        // A cycle means the groups disagree; the best-ranked row breaks it.
+        let (_, _, workspace) = left.remove(free.unwrap_or(0));
+        order.push(workspace);
+    }
+    order
 }
 
 /// `current` with each `seeded` entry it lacks placed after the entry it follows in
@@ -464,27 +554,23 @@ mod tests {
     /// A run that cannot commit the shared order leaves every legacy source as it was.
     #[test]
     fn a_failed_run_keeps_the_legacy_order() {
-        for (file, broken) in [
-            ("workspace-ordering.json", "{not json"),
-            ("state.toml", "not = [toml"),
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            seed(
-                dir.path(),
-                serde_json::json!([{"id": "a", "project_path": "/r/one", "sort_index": 0}]),
-            );
-            fs::write(dir.path().join(file), broken).unwrap();
-            assert!(run_in(dir.path(), Pass::Upgrade).is_err(), "{file}");
-            let rows = fs::read_to_string(dir.path().join("profiles/main/sessions.json")).unwrap();
-            assert!(rows.contains("sort_index"), "{file}");
-            assert_eq!(fs::read_to_string(dir.path().join(file)).unwrap(), broken);
-        }
+        let (file, broken) = ("state.toml", "not = [toml");
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            serde_json::json!([{"id": "a", "project_path": "/r/one", "sort_index": 0}]),
+        );
+        fs::write(dir.path().join(file), broken).unwrap();
+        assert!(run_in(dir.path(), Pass::Upgrade).is_err());
+        let rows = fs::read_to_string(dir.path().join("profiles/main/sessions.json")).unwrap();
+        assert!(rows.contains("sort_index"));
+        assert_eq!(fs::read_to_string(dir.path().join(file)).unwrap(), broken);
     }
 
     /// A session list that cannot be read is skipped and left for its recovery, while the
     /// other profiles migrate; once repaired, recovery adds its order. An unreadable
-    /// `workspace-ordering.json` fails the run untouched, since writing over it could lose
-    /// an order.
+    /// `workspace-ordering.json` is left untouched with every legacy input, since writing
+    /// over it could lose an order, and recovery runs the whole upgrade once it reads.
     #[test]
     fn an_unreadable_input_is_left_untouched() {
         for broken in [
@@ -492,6 +578,7 @@ mod tests {
             "profiles/other/sessions.json:not json",
             "profiles/other/sessions.json:{}",
             "workspace-ordering.json",
+            "workspace-ordering.json:{not json",
         ] {
             let dir = tempfile::tempdir().unwrap();
             seed(
@@ -518,10 +605,29 @@ mod tests {
             };
             let rows =
                 || fs::read_to_string(dir.path().join("profiles/main/sessions.json")).unwrap();
+            let pending = dir.path().join(PENDING_FILE);
             if file == "workspace-ordering.json" {
-                assert!(run_in(dir.path(), Pass::Upgrade).is_err(), "{broken}");
+                run_in(dir.path(), Pass::Upgrade).unwrap();
                 assert!(rows().contains("sort_index"), "{broken}");
                 assert!(read_back(), "{broken}");
+                assert_eq!(
+                    fs::read_to_string(&pending).unwrap(),
+                    "custom\n+order\n+repositories\n"
+                );
+                run_in(dir.path(), Pass::Recovery).unwrap();
+                assert!(read_back() && pending.exists(), "{broken}");
+                if path.is_dir() {
+                    fs::remove_dir(&path).unwrap();
+                } else {
+                    fs::remove_file(&path).unwrap();
+                }
+                run_in(dir.path(), Pass::Recovery).unwrap();
+                assert_eq!(ordering(dir.path()).order, ["/r/one::__session__::a"]);
+                assert!(!rows().contains("sort_index"), "{broken}");
+                assert!(!pending.exists(), "{broken}");
+                assert!(!fs::read_to_string(dir.path().join("state.toml"))
+                    .unwrap()
+                    .contains(LEGACY_SORT_KEY));
                 continue;
             }
             run_in(dir.path(), Pass::Upgrade).unwrap();
@@ -532,10 +638,9 @@ mod tests {
                 "{broken}"
             );
             assert!(read_back(), "{broken}");
-            let pending = dir.path().join(PENDING_FILE);
             assert_eq!(
                 fs::read_to_string(&pending).unwrap(),
-                "custom\nprofiles/other/sessions.json\n",
+                "custom\nprofiles/other/sessions.json\n=order\n=repositories\n",
                 "{broken}"
             );
             assert!(!fs::read_to_string(dir.path().join("state.toml"))
@@ -590,7 +695,7 @@ mod tests {
             run_in(dir.path(), Pass::Upgrade).unwrap();
             assert_eq!(
                 fs::read_to_string(&pending).unwrap(),
-                "oldest\nprofiles/other/sessions.json\n"
+                "oldest\nprofiles/other/sessions.json\n=order\n=repositories\n"
             );
         }
     }
@@ -720,6 +825,10 @@ mod tests {
                 "sort_order = \"custom\"\n[web_ui_state]\n\"aoe-sidebar-sort-mode\" = \"lastActivity\"\n",
                 vec![b, a],
             ),
+            (
+                "sort_order = \"custom\"\n[web_ui_state]\n\"aoe-sidebar-sort-mode\" = \"future\"\n",
+                vec![a],
+            ),
         ] {
             let dir = tempfile::tempdir().unwrap();
             seed(
@@ -743,6 +852,8 @@ mod tests {
         }
     }
 
+    /// The dashboard's order wins, and a profile repaired after the upgrade adds nothing
+    /// to it.
     #[test]
     fn an_existing_dashboard_order_wins() {
         let dir = tempfile::tempdir().unwrap();
@@ -750,6 +861,8 @@ mod tests {
             dir.path(),
             serde_json::json!([{"id": "a", "project_path": "/r/one", "sort_index": 0}]),
         );
+        let other = dir.path().join("profiles/other/sessions.json");
+        fs::create_dir_all(&other).unwrap();
         fs::write(
             dir.path().join("workspace-ordering.json"),
             r#"{"order": ["/r/web::main"]}"#,
@@ -762,6 +875,52 @@ mod tests {
         .unwrap();
         run_in(dir.path(), Pass::Upgrade).unwrap();
         assert_eq!(ordering(dir.path()).order, ["/r/web::main"]);
+        fs::remove_dir(&other).unwrap();
+        fs::write(
+            &other,
+            serde_json::json!([{"id": "b", "project_path": "/r/two", "sort_index": 0}]).to_string(),
+        )
+        .unwrap();
+        run_in(dir.path(), Pass::Recovery).unwrap();
+        assert_eq!(ordering(dir.path()).order, ["/r/web::main"]);
+        assert!(!fs::read_to_string(&other).unwrap().contains("sort_index"));
+        assert!(!dir.path().join(PENDING_FILE).exists());
+    }
+
+    /// Groups that agree keep their own order, even where their indices overlap; groups that
+    /// disagree fall back to the lower index, then the newer row.
+    #[test]
+    fn merging_keeps_each_groups_order() {
+        let at = |index: u64, created: &str, workspace: &str| -> Placed {
+            (
+                index,
+                Reverse(Timestamp::parse_rfc3339(created).ok()),
+                workspace.to_owned(),
+            )
+        };
+        let (old, new) = ("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
+        for (groups, expected) in [
+            (
+                vec![
+                    vec![at(0, new, "w")],
+                    vec![at(0, old, "x"), at(1, old, "w")],
+                ],
+                &["x", "w"][..],
+            ),
+            (
+                vec![
+                    vec![at(0, old, "a"), at(1, old, "b")],
+                    vec![at(0, new, "b"), at(1, new, "a")],
+                ],
+                &["b", "a"],
+            ),
+            (
+                vec![vec![at(0, old, "a"), at(1, old, "b"), at(2, old, "a")]],
+                &["a", "b"],
+            ),
+        ] {
+            assert_eq!(merge_group_orders(groups.clone()), expected, "{groups:?}");
+        }
     }
 
     /// With no TUI or dashboard order, the removed sort v065 kept seeds one that shows the

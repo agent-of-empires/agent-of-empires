@@ -345,8 +345,14 @@ impl HomeView {
         }
         headers.sort_by_key(|(rank, _)| (rank.is_some(), *rank));
         let headers: Vec<Group> = headers.into_iter().map(|(_, group)| group).collect();
+        // Under Custom a repository's own groups follow their rows' order, which a move
+        // from Name or Newest first keeps as shown.
+        let mut nested = seeded.clone();
+        if self.sort_order == SortOrder::Custom {
+            nested.sort_by_key(|i| i.custom_order_key());
+        }
         let mut tree =
-            GroupTree::new_with_group_paths(seeded.iter().map(|i| i.group_path.as_str()), &headers);
+            GroupTree::new_with_group_paths(nested.iter().map(|i| i.group_path.as_str()), &headers);
         let scratch = populated_labels
             .contains(crate::session::SCRATCH_GROUP_PATH)
             .then(|| {

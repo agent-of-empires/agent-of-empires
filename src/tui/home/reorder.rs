@@ -67,6 +67,13 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
+        if self
+            .get_instance(&id)
+            .is_some_and(|inst| inst.is_archived() || inst.is_trashed())
+        {
+            self.flash_status("Archived and trashed rows keep their own order");
+            return Ok(());
+        }
         let (Some(at), Some(workspace)) = (
             self.session_row(&id),
             self.get_instance(&id).map(Instance::workspace_id),
@@ -85,8 +92,13 @@ impl HomeView {
     }
 
     /// Flash and return true while an order write or a carry or group move is unapplied,
-    /// since a move built before it shows would undo it.
+    /// since a move built before it shows would undo it, or before any snapshot applies,
+    /// since a move carries the stored order it replaces.
     fn refuse_while_a_move_saves(&mut self) -> bool {
+        if self.session_feed.applied_snapshot().is_none() {
+            self.flash_status("The list is still loading from the Daemon");
+            return true;
+        }
         let pending = self.session_feed.ordering_pending()
             || matches!(
                 self.pending_namespace_intent,
@@ -218,7 +230,7 @@ impl HomeView {
         let profile = row.source_profile.clone();
         let source_group = row.group_path.clone();
         let headers = self.displayed_headers(&profile);
-        let (freeze, switch) = self.frozen_order(order);
+        let (freeze, switch) = self.frozen_order(order, &profile);
         self.submit_namespace_intent(
             crate::daemon::NamespaceMutation::Reorder(crate::daemon::ReorderBody::Session {
                 id: id.to_owned(),
@@ -269,7 +281,9 @@ impl HomeView {
             Some(UndoPoint::Sort(_)) if self.sort_order != SortOrder::Custom => {
                 self.flash_status("The sort changed elsewhere, nothing to undo");
             }
-            Some(UndoPoint::Sort(sort)) => self.restore_sort(sort),
+            Some(UndoPoint::Sort(sort)) => {
+                self.restore_sort(sort);
+            }
             Some(UndoPoint::Order {
                 restore,
                 order,
@@ -304,18 +318,32 @@ impl HomeView {
         Ok(())
     }
 
-    /// Pick `sort` again for Undo, retried from the palette when the write fails.
-    fn restore_sort(&mut self, sort: SortOrder) {
+    /// Pick `sort` again for Undo, retried from the palette when the write fails. Returns
+    /// whether the write was sent or queued.
+    fn restore_sort(&mut self, sort: SortOrder) -> bool {
         let behind = self.session_feed.sidebar_view_pending();
-        self.apply_sort_order(sort);
-        if self.session_feed.sidebar_view_pending() {
-            self.sort_restore = Some(SortRestore { sort, behind });
+        self.show_sidebar_view(self.group_by, sort);
+        let patch = crate::daemon::SidebarViewPatch {
+            sort: Some(sort),
+            ..Default::default()
+        };
+        if let Err(error) = self.save_sidebar_view(patch) {
+            self.order_undo = Some(UndoPoint::Sort(sort));
+            self.flash_status(format!(
+                "Order restored, sort not saved: {error} (Undo in Ctrl+K retries it)"
+            ));
+            return false;
         }
+        self.sort_restore = Some(SortRestore { sort, behind });
+        true
     }
 
     /// Act on a settled sidebar view write. A failed one carrying Undo's sort leaves the
     /// sort to retry.
-    pub(super) fn sidebar_view_settled(&mut self, result: &Result<(), String>) {
+    pub(super) fn sidebar_view_settled(
+        &mut self,
+        result: &Result<crate::tui::session_feed::ViewWriteSettled, String>,
+    ) {
         // A write the sort waited behind sends the sort as it settles.
         let sent_since = self.session_feed.sidebar_view_pending();
         let ours = match &mut self.sort_restore {
@@ -340,7 +368,20 @@ impl HomeView {
             (Err(error), None) => {
                 self.flash_status(format!("Grouping and sort not saved: {error}"));
             }
-            (Ok(()), _) => {}
+            // A replacement Daemon's frame came first; one still on another sort leaves the
+            // sort to retry.
+            (Ok(crate::tui::session_feed::ViewWriteSettled::Superseded), Some(sort))
+                if self
+                    .session_feed
+                    .applied_snapshot()
+                    .is_some_and(|snapshot| snapshot.contents.sidebar_view.sort != sort) =>
+            {
+                self.order_undo = Some(UndoPoint::Sort(sort));
+                self.flash_status(
+                    "Order restored, sort unconfirmed after a Daemon restart (Undo in Ctrl+K retries it)",
+                );
+            }
+            (Ok(_), _) => {}
         }
     }
 
@@ -374,7 +415,7 @@ impl HomeView {
             .submit_workspace_ordering(crate::daemon::WorkspaceOrderingPatch {
                 order,
                 repositories,
-                base: snapshot.is_some().then_some(base),
+                base: Some(base),
             })?;
         if !matches!(change, Some(OrderChange::Undo(_))) {
             self.order_undo = None;
@@ -384,20 +425,34 @@ impl HomeView {
     }
 
     /// The order a move under Name or Newest first commits with the move, and the switch to
-    /// Custom that follows it.
-    fn frozen_order(&self, order: Vec<String>) -> (crate::daemon::FrozenOrder, OrderChange) {
-        let sessions = self
-            .session_feed
-            .applied_snapshot()
-            .map(|snapshot| snapshot.contents.sessions.clone())
+    /// Custom that follows it. `profile`'s stored group order goes with it, since the move
+    /// replaces that too.
+    fn frozen_order(
+        &self,
+        order: Vec<String>,
+        profile: &str,
+    ) -> (crate::daemon::FrozenOrder, OrderChange) {
+        let snapshot = self.session_feed.applied_snapshot();
+        let contents = snapshot.as_ref().map(|snapshot| &snapshot.contents);
+        let sessions = contents.map_or(&[][..], |c| c.sessions.as_slice());
+        let order = crate::server::api::sessions::writable_workspace_order(sessions, order);
+        let groups = contents
+            .and_then(|c| c.profiles.iter().find(|p| p.name == profile))
+            .map(|p| p.groups.iter().map(|group| group.path.clone()).collect())
             .unwrap_or_default();
-        let order = crate::server::api::sessions::writable_workspace_order(&sessions, order);
         let base = self.ordering_base();
         let change = OrderChange::SwitchToCustom {
             undo: self.order_undo_point(),
             expected: (order.clone(), base.repositories.clone()),
         };
-        (crate::daemon::FrozenOrder { order, base }, change)
+        (
+            crate::daemon::FrozenOrder {
+                order,
+                base,
+                groups,
+            },
+            change,
+        )
     }
 
     /// The stored row and header orders as the Daemon last published them.
@@ -464,10 +519,12 @@ impl HomeView {
             OrderChange::Undo(undo) => {
                 self.order_undo = None;
                 // A sort picked since the switch wins.
-                if self.sort_order == SortOrder::Custom && undo.sort != SortOrder::Custom {
-                    self.restore_sort(undo.sort);
+                if self.sort_order != SortOrder::Custom
+                    || undo.sort == SortOrder::Custom
+                    || self.restore_sort(undo.sort)
+                {
+                    self.flash_status("Order change undone");
                 }
-                self.flash_status("Order change undone");
             }
         }
     }
@@ -527,30 +584,37 @@ impl HomeView {
                 .iter()
                 .position(|r| r.trim_end_matches('/') == repo)
         };
+        // An empty header is a pinned project's, chosen as the renderer chooses it.
         self.instances
             .values()
-            .filter(|inst| !inst.scratch && project_group_key(inst) == label)
+            .filter(|inst| {
+                !inst.scratch
+                    && !inst.is_archived()
+                    && !inst.is_trashed()
+                    && project_group_key(inst) == label
+            })
             .map(|inst| {
                 let repo = inst.repo_path().trim_end_matches('/').to_string();
-                let live = !inst.is_archived() && !inst.is_trashed();
                 let rank = rank(&repo);
                 (
-                    (
-                        !live,
-                        rank.is_some(),
-                        rank,
-                        std::cmp::Reverse(inst.created_at),
-                    ),
+                    (rank.is_some(), rank, std::cmp::Reverse(inst.created_at)),
                     repo,
                 )
             })
             .min()
             .map(|(_, repo)| repo)
             .or_else(|| {
-                self.registered_projects
-                    .iter()
-                    .find(|p| crate::session::projects::repo_label(&p.path) == label)
-                    .map(|p| p.path.trim_end_matches('/').to_string())
+                crate::session::projects::unpopulated_projects(
+                    &std::collections::HashSet::new(),
+                    &self.registered_projects,
+                )
+                .into_iter()
+                .filter(|p| p.label == label)
+                .min_by_key(|p| {
+                    let rank = rank(p.path.trim_end_matches('/'));
+                    (rank.is_some(), rank)
+                })
+                .map(|p| p.path.trim_end_matches('/').to_string())
             })
     }
 
@@ -571,6 +635,15 @@ impl HomeView {
         };
         let other = order[to].clone();
         order.swap(at, to);
+        // Under Custom only the two headers gain a place; unplaced ones stay newest first.
+        if self.sort_order == SortOrder::Custom {
+            let placed: Vec<&str> = self
+                .repository_order
+                .iter()
+                .map(|r| r.trim_end_matches('/'))
+                .collect();
+            order.retain(|r| placed.contains(&r.as_str()) || *r == repo || *r == other);
+        }
         let rows = (self.sort_order != SortOrder::Custom).then(|| self.displayed_workspace_order());
         let order = crate::server::api::sessions::writable_repository_order(keep_unshown(
             order,
@@ -630,7 +703,7 @@ impl HomeView {
                 direction,
             )
             .unwrap_or(order);
-            self.frozen_order(order)
+            self.frozen_order(order, &profile)
         });
         let (freeze, switch) = frozen.unzip();
         self.submit_namespace_intent(
@@ -735,7 +808,7 @@ impl HomeView {
         let freeze = self.sort_order != SortOrder::Custom;
         let siblings = freeze.then(|| self.displayed_sibling_groups(&group));
         let (freeze, switch) = freeze
-            .then(|| self.frozen_order(self.displayed_workspace_order()))
+            .then(|| self.frozen_order(self.displayed_workspace_order(), &group.profile))
             .unzip();
         self.submit_namespace_intent(
             crate::daemon::NamespaceMutation::Reorder(crate::daemon::ReorderBody::Group {
@@ -989,6 +1062,29 @@ mod tests {
             Some("Order restored, sort not saved: refused (Undo in Ctrl+K retries it)")
         );
 
+        // A sort the queue cannot take stays on offer, as does one a replacement Daemon's
+        // frame overtakes while it still shows Custom.
+        view.sort_order = SortOrder::Custom;
+        view.session_feed.set_mutation_permission_for_test(false);
+        view.order_change_committed(undo(SortOrder::Name), &at);
+        assert!(matches!(
+            view.order_undo,
+            Some(UndoPoint::Sort(SortOrder::Name))
+        ));
+        assert!(flash(&view).is_some_and(|text| text.starts_with("Order restored, sort not saved")));
+        view.session_feed.set_mutation_permission_for_test(true);
+        view.undo_order_change().unwrap();
+        capture().expect("the sort").finish(Ok(RuntimeCursor {
+            epoch: "new".into(),
+            revision: 50,
+        }));
+        publish(&mut view, "newer", 1, &[]);
+        assert!(matches!(
+            view.order_undo,
+            Some(UndoPoint::Sort(SortOrder::Name))
+        ));
+        assert_eq!(view.sort_order, SortOrder::Custom);
+
         // A sort picked since the move started wins.
         view.sort_order = SortOrder::Newest;
         view.order_change_committed(switch(repositories.clone()), &restarted);
@@ -999,6 +1095,102 @@ mod tests {
             flash(&view).as_deref(),
             Some("Order saved, the sort picked since stays")
         );
+    }
+
+    /// An empty header resolves to the pinned project the renderer shows, not to an archived
+    /// session that shares its label.
+    #[test]
+    #[serial_test::serial]
+    fn an_empty_header_names_the_pinned_project_it_shows() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut view = HomeView::new_for_test(
+            None,
+            crate::tmux::AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        let mut archived = Instance::new("old", "/team-a/app");
+        archived.archived_at = Some(crate::time::Timestamp::now());
+        view.instances.insert(archived.id.clone(), archived);
+        let mut pinned = crate::session::Project::new(
+            "app",
+            "/team-b/app",
+            crate::session::ProjectScope::Global,
+        );
+        pinned.pinned = true;
+        view.registered_projects = vec![pinned];
+        assert_eq!(
+            view.repository_path_for_header("app").as_deref(),
+            Some("/team-b/app")
+        );
+    }
+
+    /// A Custom header move places only the two headers it swaps; an unplaced one above them
+    /// stays unplaced.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_custom_header_move_leaves_unplaced_headers_unplaced() {
+        use crate::tui::session_feed::ViewWrite;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("reorder").unwrap();
+        let now = crate::time::Timestamp::now();
+        let rows: Vec<Instance> = [("a", 2), ("b", 1), ("c", 0)]
+            .into_iter()
+            .map(|(name, age)| {
+                let mut row = Instance::new(name, &format!("/r/{name}"));
+                row.created_at = now - crate::time::Duration::hours(age);
+                row
+            })
+            .collect();
+        storage
+            .update(|stored, _| {
+                *stored = rows.clone();
+                Ok(())
+            })
+            .unwrap();
+        crate::session::update_workspace_ordering(|ordering| {
+            ordering.repositories = vec!["/r/a".into(), "/r/b".into()];
+            Ok(())
+        })
+        .unwrap();
+        let state = native_state(&["reorder"]).await;
+        let mut view = HomeView::new_for_test(
+            Some("reorder".into()),
+            crate::tmux::AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        apply_published(&mut view, &state).await;
+        view.sort_order = SortOrder::Custom;
+        view.group_by = GroupByMode::Project;
+        view.flat_items = view.build_flat_items();
+        let headers: Vec<&str> = view
+            .flat_items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Group { path, depth: 0, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(headers, ["c", "a", "b"]);
+        view.cursor = view
+            .flat_items
+            .iter()
+            .position(|item| matches!(item, Item::Group { path, .. } if path == "a"))
+            .unwrap();
+        view.update_selected();
+        let mut capture = view.session_feed.view_write_driver_for_test();
+        view.move_row_at_cursor(1).unwrap();
+        match capture().map(|captured| captured.write) {
+            Some(ViewWrite::Ordering(patch)) => {
+                assert_eq!(patch.order, None);
+                assert_eq!(
+                    patch.repositories,
+                    Some(vec!["/r/b".to_string(), "/r/a".to_string()])
+                );
+            }
+            other => panic!("expected an order write, got {other:?}"),
+        }
     }
 
     /// A carry whose order placement fails, or that names no other group, leaves the row in
@@ -1028,12 +1220,11 @@ mod tests {
             .unwrap();
         let state = native_state(&["reorder"]).await;
         // A body with no destination, as an older Client sends for a move within its group,
-        // leaves the row where it is.
+        // is refused rather than settled as a move.
         let body = serde_json::json!({"target":"session","id":id,"profile":"reorder",
             "source_group":"aaa","direction":"down"});
         let (status, _, value) = request_with_headers(&state, "POST", "/api/reorder", body).await;
-        assert!(status.is_success(), "{status}: {value}");
-        assert_eq!(value["status"], "stale");
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{value}");
         let ordering = crate::session::get_app_dir()
             .unwrap()
             .join("workspace-ordering.json");
@@ -1469,14 +1660,21 @@ mod tests {
             body["freeze"] = serde_json::json!({
                 "order": expected,
                 "base": {"order": [], "repositories": []},
+                "groups": ["ccc", "aaa", "bbb"],
             });
-            // A move built from an order a peer has since replaced is refused untouched.
-            let mut stale = body.clone();
-            stale["freeze"]["base"]["order"] = serde_json::json!([zed]);
-            let (status, _, value) =
-                request_with_headers(&state, "POST", "/api/reorder", stale).await;
-            assert!(status.is_success(), "{status}: {value}");
-            assert_eq!(value["status"], "stale", "{case}");
+            // A move built from a row or group order a peer has since replaced is refused
+            // untouched.
+            for (field, peer) in [
+                ("/base/order", serde_json::json!([zed])),
+                ("/groups", serde_json::json!(["aaa", "ccc", "bbb"])),
+            ] {
+                let mut stale = body.clone();
+                *stale["freeze"].pointer_mut(field).unwrap() = peer;
+                let (status, _, value) =
+                    request_with_headers(&state, "POST", "/api/reorder", stale).await;
+                assert!(status.is_success(), "{status}: {value}");
+                assert_eq!(value["status"], "stale", "{case} {field}");
+            }
             assert!(crate::session::load_workspace_ordering()
                 .unwrap()
                 .order

@@ -41,7 +41,7 @@ fn migrate(state: &mut toml::Table) -> bool {
     let web_sort = web
         .and_then(|t| t.get(WEB_SORT_KEY))
         .and_then(toml::Value::as_str)
-        .filter(|mode| matches!(*mode, "manual" | "lastActivity" | "attention"))
+        .filter(|mode| is_web_sort(mode))
         .map(str::to_owned);
 
     let tui_group = state.get("group_by").and_then(toml::Value::as_str);
@@ -115,6 +115,11 @@ fn tui_effective_sort(sort: &str) -> &'static str {
         "a_z" | "az" | "z_a" | "za" | "name" => "name",
         _ => "newest",
     }
+}
+
+/// Whether `mode` is a sort the dashboard offered.
+pub(super) fn is_web_sort(mode: &str) -> bool {
+    matches!(mode, "manual" | "lastActivity" | "attention")
 }
 
 /// The sort a web pick showed, for v066. Manual's drag order is already in the shared store.

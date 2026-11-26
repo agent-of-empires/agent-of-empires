@@ -334,13 +334,16 @@ pub struct WorkspaceOrderingPatch {
 }
 
 /// The row order a move under Name or Newest first shows, which it commits as the shared
-/// Custom order with the move. The move is refused as stale once `base` no longer matches
-/// the stored orders.
+/// Custom order with the move. The move is refused as stale once `base` or `groups` no
+/// longer matches what is stored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FrozenOrder {
     pub order: Vec<String>,
     pub base: WorkspaceOrderingBase,
+    /// The profile's stored group paths, in stored order, which `headers` or `siblings`
+    /// replace.
+    pub groups: Vec<String>,
 }
 
 /// The stored row and Repository header orders, as published in a runtime snapshot.
@@ -443,7 +446,7 @@ pub enum ReorderBody {
         profile: String,
         source_group: String,
         /// Omitted, the row stays and the move commits only `headers`, which it then
-        /// requires, and `freeze`.
+        /// requires (a body with neither is refused with 400), and `freeze`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         destination: Option<String>,
         direction: MoveDirection,

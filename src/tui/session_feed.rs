@@ -348,6 +348,15 @@ pub(crate) enum ViewWrite {
     SidebarView(crate::daemon::SidebarViewPatch),
 }
 #[cfg(test)]
+pub(crate) struct HeldReply(tokio::sync::oneshot::Sender<Result<CommandReply, CommandFailure>>);
+#[cfg(test)]
+impl HeldReply {
+    /// Ends the request as if its reply were lost.
+    pub fn lose(self) {
+        drop(self.0);
+    }
+}
+#[cfg(test)]
 pub(crate) struct CapturedViewWrite {
     pub write: ViewWrite,
     reply: tokio::sync::oneshot::Sender<Result<CommandReply, CommandFailure>>,
@@ -1305,12 +1314,11 @@ impl SessionFeed {
     /// The outcome of the oldest sidebar view write once its snapshot, or one from a
     /// replacement Daemon, is applied, or its failure. `None` while it is in flight or when
     /// none was sent. A settled write sends the queued picks, if any.
-    pub(crate) fn drain_sidebar_view_result(&mut self) -> Option<Result<(), String>> {
+    pub(crate) fn drain_sidebar_view_result(&mut self) -> Option<Result<ViewWriteSettled, String>> {
         let mut slot = self.pending_sidebar_view.take();
         let result = self.poll_write(&mut slot);
         self.pending_sidebar_view = slot;
-        // The view converges on whichever Daemon's value is applied.
-        let result = result?.map(|_| ()).map_err(|failure| failure.to_string());
+        let result = result?.map_err(|failure| failure.to_string());
         let Some(queued) = self.queued_sidebar_view.take() else {
             return Some(result);
         };
@@ -1326,7 +1334,7 @@ impl SessionFeed {
         };
         match (result, sent) {
             (result, Ok(())) => Some(result),
-            (Ok(()), Err(error)) => Some(Err(error.to_string())),
+            (Ok(_), Err(error)) => Some(Err(error.to_string())),
             (Err(failure), Err(error)) => Some(Err(format!("{failure}; {error}"))),
         }
     }
@@ -2596,6 +2604,24 @@ impl SessionFeed {
                 )
                 .is_ok());
             Some(request)
+        }
+    }
+
+    /// Takes each namespace request without replying; dropping its reply loses the outcome.
+    #[cfg(test)]
+    pub(crate) fn namespace_capture_for_test(
+        &mut self,
+    ) -> impl FnMut() -> Option<(crate::daemon::NamespaceMutation, HeldReply)> {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<SessionCommand>(COMMAND_CAPACITY);
+        self.commands = Some(sender);
+        set_grant(&self.grant, true);
+        set_grant(&self.native_grant, true);
+        move || {
+            let command = receiver.try_recv().ok()?;
+            let CommandRequest::Namespace(request) = command.request else {
+                panic!("expected a namespace command");
+            };
+            Some((request, HeldReply(command.result)))
         }
     }
 
