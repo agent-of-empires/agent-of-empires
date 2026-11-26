@@ -93,7 +93,7 @@ fn codex_home_in(home: &Path, host_env: &[String]) -> PathBuf {
 /// `<home>/<settings_rel_path>`.
 pub(crate) fn agent_settings_path_in(
     home: &Path,
-    hook_cfg: &crate::agents::AgentHookConfig,
+    hook_cfg: &crate::agents::AgentHookConfig<'_>,
     host_env: &[String],
 ) -> PathBuf {
     let override_dir = hook_cfg

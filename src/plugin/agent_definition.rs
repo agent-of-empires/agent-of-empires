@@ -1,14 +1,16 @@
 //! Borrowed host metadata projected from the validated declaration format.
 
 use aoe_plugin_api::agent_integration::{
-    AgentCaptureBackend, AgentCaptureContext, AgentIntegrationContribution, AgentKeyDeclaration,
+    AgentCaptureBackend, AgentCaptureContext, AgentHookEventDeclaration, AgentHookFormat,
+    AgentHookIdentityField, AgentHookStatus, AgentIntegrationContribution, AgentKeyDeclaration,
     AgentResumeDeclaration, AgentYoloDeclaration,
 };
 
 use crate::agents::{
-    AgentDef, AgentLifecycle, DetectionMethod, ForkStrategy, KeyToken, PermissionResponse,
-    ResumeStrategy, SessionCaptureBackend, SessionCaptureContext, SessionCaptureSpec,
-    SessionSupport, YoloMode,
+    AgentDef, AgentHookConfig, AgentLifecycle, DetectionMethod, ForkStrategy, HookEvent,
+    HookFormat, HookIdentityField, HookStatus, KeyToken, PermissionResponse, ResumeStrategy,
+    SessionCaptureBackend, SessionCaptureContext, SessionCaptureSpec, SessionSupport, ToolNames,
+    YoloMode,
 };
 
 /// Reference arrays owned separately from the declaration, without leaking a registry snapshot.
@@ -18,6 +20,27 @@ pub(super) struct DefinitionData<'a> {
     allow: Vec<KeyToken<'a>>,
     always: Option<Vec<KeyToken<'a>>>,
     deny: Vec<KeyToken<'a>>,
+    hook_events: Vec<HookEvent<'a>>,
+}
+
+fn hook_event(event: &AgentHookEventDeclaration) -> HookEvent<'_> {
+    HookEvent {
+        name: &event.event,
+        matcher: event.matcher.as_deref(),
+        status: event.status.map(|status| match status {
+            AgentHookStatus::Running => HookStatus::Running,
+            AgentHookStatus::Waiting => HookStatus::Waiting,
+            AgentHookStatus::Idle => HookStatus::Idle,
+            AgentHookStatus::Error => HookStatus::Error,
+        }),
+        identity_field: event.identity_field.map(|field| match field {
+            AgentHookIdentityField::SessionId => HookIdentityField::SessionId,
+            AgentHookIdentityField::ConversationIdOrSessionId => {
+                HookIdentityField::ConversationIdOrSessionId
+            }
+        }),
+        waiting_tools: ToolNames::Declared(&event.waiting_tools),
+    }
 }
 
 impl<'a> DefinitionData<'a> {
@@ -58,6 +81,11 @@ impl<'a> DefinitionData<'a> {
                 .reply_fallback
                 .as_ref()
                 .map_or_else(Vec::new, |reply| reply.deny.iter().map(key).collect()),
+            hook_events: entry
+                .hooks
+                .iter()
+                .flat_map(|hooks| hooks.events.iter().map(hook_event))
+                .collect(),
         }
     }
 
@@ -127,7 +155,15 @@ impl<'a> DefinitionData<'a> {
                 crate::tmux::status_detection::detect_hook_only_status
             },
             container_env: &self.environment,
-            hook_config: None,
+            hook_config: entry.hooks.as_ref().map(|hooks| AgentHookConfig {
+                settings_rel_path: &hooks.settings_rel_path,
+                config_dir_env_var: hooks.config_dir_env_var.as_deref(),
+                events: &self.hook_events,
+                format: match hooks.format {
+                    AgentHookFormat::JsonSettings => HookFormat::JsonSettings,
+                },
+            }),
+            trust: entry.trust.as_ref(),
             sidecar_hooks: None,
             session_support: support,
             fork_strategy: ForkStrategy::Unsupported,

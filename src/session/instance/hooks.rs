@@ -44,7 +44,7 @@ pub(super) fn host_launch_env_prefix(
 
 pub(crate) fn generic_host_config_path_for(
     tool_name: &str,
-    hook_cfg: &crate::agents::AgentHookConfig,
+    hook_cfg: &crate::agents::AgentHookConfig<'_>,
     home: &Path,
     session_cfg: &crate::session::config::SessionConfig,
     host_environment: &[String],
@@ -194,7 +194,7 @@ fn host_hook_config_path(
 /// whole `~/.claude`-style directory, so the file keeps only its own name.
 fn routed_settings_path(
     routed_root: Option<&std::path::Path>,
-    hook_cfg: &crate::agents::AgentHookConfig,
+    hook_cfg: &crate::agents::AgentHookConfig<'_>,
 ) -> Option<std::path::PathBuf> {
     Some(routed_root?.join(Path::new(hook_cfg.settings_rel_path).file_name()?))
 }
@@ -272,7 +272,7 @@ pub(crate) fn host_hook_disclosure(
                 effects.push(format!(
                     "runs aoe __extract-session-id --field {}{}",
                     crate::hooks::identity_field_name(field),
-                    crate::hooks::identity_publisher_arg(event.publisher),
+                    crate::hooks::identity_publisher_arg(event.publisher.as_deref()),
                 ));
             }
             if let Some(status) = event.status {

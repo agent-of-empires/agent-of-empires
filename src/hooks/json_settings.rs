@@ -20,9 +20,9 @@ use super::HookInstallTarget;
 fn event_commands(event: &ResolvedHookEvent, target: HookInstallTarget) -> Vec<String> {
     let identity = event
         .identity_field
-        .map(|field| hook_command_session_id(target, field, event.publisher));
+        .map(|field| hook_command_session_id(target, field, event.publisher.as_deref()));
     let status = event.status.map(|status| {
-        let bound = event.publisher == Some("claude");
+        let bound = event.publisher.as_deref() == Some("claude");
         status_command_for_event(status, &event.waiting_tools, target, bound)
     });
     identity.into_iter().chain(status).collect()
@@ -485,7 +485,7 @@ mod tests {
             status: Some(HookStatus::Running),
             identity_field: Some(HookIdentityField::ConversationIdOrSessionId),
             waiting_tools: Vec::new(),
-            publisher: Some("agent"),
+            publisher: Some("agent".into()),
         }];
 
         install_cursor_hooks_with_events(&path, HookInstallTarget::Host, &events).unwrap();
