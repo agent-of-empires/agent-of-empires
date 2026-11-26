@@ -605,15 +605,27 @@ describe("a diagnosed startup cause", () => {
       [gone(1), frame(2, { AgentSwitched: { from: "claude", to: "codex", reason: "manual" } })],
       [null, null, null, false],
     ],
-    [
-      "a lost integration is untyped",
-      [gone(1), frame(2, { IntegrationLost: { reason: { kind: "hold_overflow" } } })],
-      [null, "Agent integration lost: hold overflow", null, false],
-    ],
   ])("%s", (_label, actions, expected) => {
     const state = run(empty(), ...actions);
     expect([state.startupCause?.kind ?? null, state.startupError, state.retriedError, state.restartInFlight]).toEqual(
       expected,
     );
+  });
+});
+
+describe("integration lost", () => {
+  const frame = (seq: number, event: AcpFrame["event"]): Action => ({
+    kind: "frame",
+    frame: { session_id: "s", seq, event },
+  });
+  const lost = (seq: number) => frame(seq, { IntegrationLost: { reason: { kind: "proxy_exited" } } });
+  it.each<[string, Action[], boolean]>([
+    ["the event sets it without a startup error", [lost(1)], true],
+    ["the Agent starting clears it", [lost(1), frame(2, { AcpSessionAssigned: { acp_session_id: "a" } })], false],
+    ["a new turn clears it", [lost(1), frame(2, { UserPromptSent: { text: "hi", prompt_id: "p" } })], false],
+  ])("%s", (_label, actions, set) => {
+    const state = run(empty(), ...actions);
+    expect(state.integrationLost).toEqual(set ? { kind: "proxy_exited" } : null);
+    expect(state.startupError).toBeNull();
   });
 });

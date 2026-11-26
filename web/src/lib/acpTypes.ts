@@ -652,6 +652,8 @@ export interface AcpState {
   startupError: string | null;
   /** Why `startupError` happened, when the Daemon said; set and cleared with it. */
   startupCause: StartupCause | null;
+  /** Why the Agent's plugin integration was lost; cleared when the Agent's session is assigned again. */
+  integrationLost: IntegrationLostReason | null;
   /** Counts the events that cleared the startup error; a late blocked launch from before one is stale. */
   startupRecoveries: number;
   /** `startupRecoveries` as each in-flight prompt was sent, for the refused-launch guard. */
@@ -1080,6 +1082,7 @@ export function emptyAcpState(): AcpState {
     lagged: false,
     startupError: null,
     startupCause: null,
+    integrationLost: null,
     startupRecoveries: 0,
     promptRecoveries: {},
     incompatibleAgent: null,
@@ -1132,6 +1135,7 @@ function applyNewTurnResets(next: AcpState): void {
   next.startupRecoveries += 1;
   next.startupError = null;
   next.startupCause = null;
+  next.integrationLost = null;
   if (!next.restartInFlight) next.retriedError = null;
   next.lastError = null;
   // The cancel phase is server-owned; only the escalation deadline is ours.
@@ -1339,11 +1343,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("IntegrationLost" in event) {
-    const { reason } = event.IntegrationLost;
-    next.startupError = `Agent integration lost: ${
-      reason.kind === "contract_violation" ? reason.detail : reason.kind.replace("_", " ")
-    }`;
-    next.startupCause = null;
+    next.integrationLost = event.IntegrationLost.reason;
     next.agentUnresponsive = false;
     closeTurn(next);
     return next;
@@ -1412,6 +1412,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     endRestart(next);
     next.startupError = null;
     next.startupCause = null;
+    next.integrationLost = null;
     next.startupRecoveries += 1;
     next.lastError = null;
     next.incompatibleAgent = null;
@@ -1468,6 +1469,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.usageBaseline = null;
     next.startupError = null;
     next.startupCause = null;
+    next.integrationLost = null;
     next.retriedError = null;
     next.lastAgentSwitch = { from, to, reason, at: now };
     // The switch emits Stopped { user_stopped } first; keep its banner hidden through the handshake.
