@@ -1230,15 +1230,28 @@ impl PluginManifest {
             .capabilities
             .iter()
             .any(|c| c.as_str() == "browser_open");
+        let mut command_ids = std::collections::HashSet::new();
         for (i, c) in self.commands.iter().enumerate() {
             check(
                 !c.id.is_empty(),
                 format!("commands[{i}].id must not be empty"),
             );
+            // The command id alone names the command for the palette, keybinds
+            // and dispatch, so two groups cannot both publish `refresh`.
+            check(
+                command_ids.insert(c.id.as_str()),
+                format!("commands must not repeat id {:?}", c.id),
+            );
             if let Some(group) = &c.group {
                 check(
                     self.api_version >= 26,
                     format!("commands[{i}].group requires api_version >= 26"),
+                );
+                check(
+                    c.id != "help",
+                    format!(
+                        "commands[{i}].id \"help\" is the group's own help subcommand and cannot be a grouped command id"
+                    ),
                 );
                 check(
                     cli_verb_ok(&c.id),
@@ -2377,6 +2390,25 @@ mod tests {
                     "[[commands]]\nid = \"linear.refresh\"\ngroup = \"linear\"\n",
                 ),
                 "bare lowercase CLI verb when it names a group",
+            ),
+            (
+                "a grouped command named like clap's help subcommand",
+                grouped_commands_toml(
+                    26,
+                    group,
+                    "[[commands]]\nid = \"help\"\ngroup = \"linear\"\n",
+                ),
+                "cannot be a grouped command id",
+            ),
+            (
+                "two groups publishing the same command id",
+                grouped_commands_toml(
+                    26,
+                    &format!("{group}[[command_groups]]\nid = \"github\"\n\n"),
+                    "[[commands]]\nid = \"refresh\"\ngroup = \"linear\"\n\n\
+                     [[commands]]\nid = \"refresh\"\ngroup = \"github\"\n",
+                ),
+                "commands must not repeat id",
             ),
         ]);
     }

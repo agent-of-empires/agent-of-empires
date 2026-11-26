@@ -235,9 +235,10 @@ That grafts `aoe linear refresh`. A `[[commands]]` entry with no `group` keeps
 its flat top-level name, so groups are additive and one level deep.
 
 `id` on a group, and on a command that names one, is a single bare lowercase
-verb (letters, digits, `-`, `_`). Nesting changes only the CLI path: the command
-id, the `plugin.<id>.<command-id>` worker method, `action` targets, and
-`[[keybinds]]` stay as they are.
+verb (letters, digits, `-`, `_`), and `help` is reserved for the group's own
+help subcommand. Nesting changes only the CLI path: the command id, the
+`plugin.<id>.<command-id>` name the host sends in `plugin.command.invoke`
+params, `action` targets, and `[[keybinds]]` stay as they are.
 
 Core keeps the top level. A group whose id matches a core subcommand is not
 grafted, and neither are its commands; a group id goes to the first active

@@ -111,9 +111,12 @@ fn group_about(about: &str, plugin_id: &str) -> String {
 /// the first plugin to claim a flat name. A group that is not grafted drops its
 /// commands rather than flattening them.
 fn graft_onto(mut cmd: Command, commands: Vec<PluginCommand>) -> Command {
+    // Aliases count as taken: `aoe rm refresh` parses as core `remove`.
     let mut taken: HashSet<String> = cmd
         .get_subcommands()
-        .map(|s| s.get_name().to_string())
+        .flat_map(|s| {
+            std::iter::once(s.get_name().to_string()).chain(s.get_all_aliases().map(str::to_string))
+        })
         .collect();
 
     let mut groups: Vec<(String, String, String)> = Vec::new();
@@ -150,7 +153,11 @@ fn graft_onto(mut cmd: Command, commands: Vec<PluginCommand>) -> Command {
     }
 
     for (group_id, about, plugin_id) in groups {
-        let mut group_cmd = Command::new(&group_id).about(group_about(&about, &plugin_id));
+        let mut group_cmd = Command::new(&group_id)
+            .about(group_about(&about, &plugin_id))
+            // A bare group verb must not fall through to a flat lookup.
+            .subcommand_required(true)
+            .arg_required_else_help(true);
         for child in children.remove(&group_id).unwrap_or_default() {
             group_cmd = group_cmd.subcommand(child);
         }
@@ -279,10 +286,14 @@ mod tests {
         let commands = vec![
             grouped("acme.kit", "add", "refresh"),
             pc("acme.other", "add"),
+            // `rm` is a core alias, so core still wins the token.
+            grouped("acme.kit", "rm", "refresh"),
+            pc("acme.other", "rm"),
         ];
         let cmd = graft_onto(Cli::command(), commands);
         let names: Vec<&str> = cmd.get_subcommands().map(|s| s.get_name()).collect();
         assert_eq!(names.iter().filter(|n| **n == "add").count(), 1);
+        assert!(!names.contains(&"rm"));
         // The rejected group does not flatten its commands to the top level.
         assert!(!names.contains(&"refresh"));
         let add = cmd
@@ -290,6 +301,23 @@ mod tests {
             .find(|s| s.get_name() == "add")
             .expect("core add");
         assert_eq!(add.get_subcommands().count(), 0);
+    }
+
+    #[test]
+    fn bare_group_verb_does_not_resolve_as_a_flat_command() {
+        // A group verb needs its leaf, so `aoe linear` shows the group's help
+        // instead of resolving to another plugin's flat `linear` command.
+        let commands = vec![
+            grouped("linear", "linear", "refresh"),
+            pc("acme.other", "linear"),
+        ];
+        let err = graft_onto(Cli::command(), commands)
+            .try_get_matches_from(["aoe", "linear"])
+            .expect_err("a bare group verb is not a command");
+        assert!(matches!(
+            err.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        ));
     }
 
     #[test]
