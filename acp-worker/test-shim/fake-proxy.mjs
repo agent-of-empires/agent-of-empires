@@ -8,9 +8,11 @@
  * FAKE_PROXY_MODE: "bad-hello" (wrong plugin_id), "no-hello" (no hello), "die"
  * (exit 1 before spawning the adapter), "orphan-on-term" (SIGTERM exits without
  * stopping the adapter); default is a valid hello.
+ * FAKE_PROXY_EMIT_FILE: each time that file appears, its lines are written to
+ * the client as the proxy's own frames and the file is removed.
  */
 import { spawn } from "node:child_process";
-import { fstatSync, writeFileSync } from "node:fs";
+import { fstatSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 
@@ -78,6 +80,19 @@ lines.on("line", (line) => {
   }
   process.stdout.write(out + "\n");
 });
+const emitFile = process.env.FAKE_PROXY_EMIT_FILE;
+if (emitFile) {
+  setInterval(() => {
+    let text;
+    try {
+      text = readFileSync(emitFile, "utf8");
+      rmSync(emitFile);
+    } catch {
+      return;
+    }
+    process.stdout.write(text);
+  }, 20);
+}
 child.on("exit", (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
 for (const sig of ["SIGTERM", "SIGINT"]) {
   process.on(sig, () =>

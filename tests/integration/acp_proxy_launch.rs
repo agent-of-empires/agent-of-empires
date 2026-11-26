@@ -218,6 +218,7 @@ mod attach {
     use agent_of_empires::acp::state::{AcpSessionId, Event, StartupErrorDetail};
 
     use crate::common::{shim_node, shim_path, shim_ready, spawn_runner, RunnerGuard};
+    use std::time::Duration;
 
     fn proxy_spec() -> ProxySpec {
         ProxySpec {
@@ -230,24 +231,29 @@ mod attach {
         }
     }
 
-    async fn attach(session_id: &str, mode: &str) -> (Result<AcpClient, AcpError>, RunnerGuard) {
+    fn proxy_argv() -> [String; 5] {
         let node = shim_node().expect("shim prerequisite").to_str().unwrap();
         let proxy = shim_path().with_file_name("fake-proxy.mjs");
-        let argv = [
+        [
             node,
             proxy.to_str().unwrap(),
             "--",
             node,
             shim_path().to_str().unwrap(),
         ]
-        .map(String::from);
-        let env = [("FAKE_PROXY_MODE", mode.to_string())];
-        let (socket, runner) = spawn_runner(session_id, &env, &argv).await;
-        let result = AcpClient::attach(
+        .map(String::from)
+    }
+
+    async fn connect(
+        socket: std::path::PathBuf,
+        session_id: &str,
+        acp_session_id: &str,
+    ) -> Result<AcpClient, AcpError> {
+        AcpClient::attach(
             socket,
             std::env::temp_dir(),
             vec![],
-            "unused".into(),
+            acp_session_id.into(),
             false,
             AcpSessionId(session_id.into()),
             None,
@@ -259,8 +265,13 @@ mod attach {
             Some(proxy_spec()),
             false,
         )
-        .await;
-        (result, runner)
+        .await
+    }
+
+    async fn attach(session_id: &str, mode: &str) -> (Result<AcpClient, AcpError>, RunnerGuard) {
+        let env = [("FAKE_PROXY_MODE", mode.to_string())];
+        let (socket, runner) = spawn_runner(session_id, &env, &proxy_argv()).await;
+        (connect(socket, session_id, "unused").await, runner)
     }
 
     #[tokio::test]
@@ -283,6 +294,108 @@ mod attach {
         .await
         .expect("timed out");
         assert!(assigned, "a proxied session must reach AcpSessionAssigned");
+    }
+
+    /// Writes the proxy's own frames: `(text, after_adapter_sequence)`, where
+    /// `None` is an adapter frame.
+    fn emit(file: &std::path::Path, acp_session_id: &str, frames: &[(&str, Option<u64>)]) {
+        let lines: String = frames
+            .iter()
+            .map(|(text, after)| {
+                let mut update = serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": text},
+                });
+                if let Some(after) = after {
+                    update["_meta"] = serde_json::json!({
+                        "aoe": {"v": 1, "key": text, "after_adapter_sequence": after}
+                    });
+                }
+                let frame = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {"sessionId": acp_session_id, "update": update},
+                });
+                format!("{frame}\n")
+            })
+            .collect();
+        let staged = file.with_extension("staged");
+        std::fs::write(&staged, lines).unwrap();
+        std::fs::rename(staged, file).unwrap();
+    }
+
+    async fn next_chunk(client: &mut AcpClient) -> String {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Event::AgentMessageChunk { text, .. } =
+                    client.next_event().await.expect("event stream open")
+                {
+                    return text;
+                }
+            }
+        })
+        .await
+        .expect("the expected frame never arrived")
+    }
+
+    async fn assigned_id(client: &mut AcpClient) -> String {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Event::AcpSessionAssigned { acp_session_id } =
+                    client.next_event().await.expect("event stream open")
+                {
+                    return acp_session_id;
+                }
+            }
+        })
+        .await
+        .expect("session never assigned")
+    }
+
+    /// The proxy numbers adapter frames for the life of the adapter, but a
+    /// daemon counts per connection. After a reattach a frame anchored before
+    /// it must still be released at the right adapter frame, and a replayed
+    /// backlog must not be counted twice.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_reattach_keeps_counting_the_adapters_frames() {
+        if let Err(reason) = shim_ready() {
+            eprintln!("skipping: {reason}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("emit");
+        let env = [("FAKE_PROXY_EMIT_FILE", file.display().to_string())];
+        let id = "proxy-reattach-count";
+        let (socket, _runner) = spawn_runner(id, &env, &proxy_argv()).await;
+
+        let mut client = connect(socket.clone(), id, "unused").await.expect("attach");
+        let acp = assigned_id(&mut client).await;
+        emit(&file, &acp, &[("a1", None), ("a2", None)]);
+        assert_eq!(next_chunk(&mut client).await, "a1");
+        assert_eq!(next_chunk(&mut client).await, "a2");
+        client.shutdown().await.unwrap();
+
+        // Quiet adapter: an anchor behind the count is delivered at once.
+        let mut client = connect(socket.clone(), id, &acp).await.expect("reattach");
+        assigned_id(&mut client).await;
+        emit(&file, &acp, &[("t2", Some(2))]);
+        assert_eq!(next_chunk(&mut client).await, "t2");
+
+        // An anchor ahead of the count waits for exactly the next adapter frame.
+        emit(&file, &acp, &[("t3", Some(3)), ("a3", None)]);
+        assert_eq!(next_chunk(&mut client).await, "a3");
+        assert_eq!(next_chunk(&mut client).await, "t3");
+        client.shutdown().await.unwrap();
+
+        // Frames sent while detached are replayed and counted once.
+        emit(&file, &acp, &[("a4", None), ("t5", Some(5))]);
+        let mut client = connect(socket, id, &acp).await.expect("second reattach");
+        assigned_id(&mut client).await;
+        assert_eq!(next_chunk(&mut client).await, "a4");
+        emit(&file, &acp, &[("a5", None)]);
+        assert_eq!(next_chunk(&mut client).await, "a5");
+        assert_eq!(next_chunk(&mut client).await, "t5");
     }
 
     #[tokio::test]
