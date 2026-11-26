@@ -49,7 +49,8 @@ function Option({
   testId: string;
   label: string;
   hint?: string;
-  onSelect: () => void;
+  /** `keyboard` when Enter or Space picked it, not a pointer. */
+  onSelect: (keyboard: boolean) => void;
 }) {
   return (
     <button
@@ -58,7 +59,8 @@ function Option({
       aria-checked={checked}
       tabIndex={-1}
       data-testid={testId}
-      onClick={onSelect}
+      // A keyboard click carries no pointer detail.
+      onClick={(e) => onSelect(e.detail === 0)}
       className={item}
     >
       <span className="flex-1 truncate">
@@ -113,10 +115,11 @@ export function SidebarViewMenu({
     ? pluginSorts.find((s) => s.pluginId === pluginSortRef.pluginId && s.entryId === pluginSortRef.entryId)
     : undefined;
   const customized = axis !== "repo" || sortMode !== "manual" || !!activePlugin || filterOpen || facetsActive;
-  // The trigger keeps the focus after a choice; a choice that opens the filter then moves it there.
-  const choose = (fn: () => void) => {
+  // A keyboard choice hands focus back to the trigger, where a pointer's would only raise its tooltip; a
+  // choice that opens the filter then moves it there.
+  const choose = (keyboard: boolean, fn: () => void) => {
     setOpen(false);
-    triggerRef.current?.focus();
+    if (keyboard) triggerRef.current?.focus();
     fn();
   };
   return (
@@ -170,7 +173,7 @@ export function SidebarViewMenu({
                 checked={a.axis === axis}
                 testId={`sidebar-axis-option-${a.axis}`}
                 label={a.label}
-                onSelect={() => choose(() => a.axis !== axis && onAxisChange(a.axis))}
+                onSelect={(k) => choose(k, () => a.axis !== axis && onAxisChange(a.axis))}
               />
             ))}
           </div>
@@ -185,7 +188,7 @@ export function SidebarViewMenu({
                 testId={`sidebar-sort-option-${s.mode}`}
                 label={s.label}
                 hint={s.hint}
-                onSelect={() => choose(() => (activePlugin || s.mode !== sortMode) && onSortModeChange(s.mode))}
+                onSelect={(k) => choose(k, () => (activePlugin || s.mode !== sortMode) && onSortModeChange(s.mode))}
               />
             ))}
             {pluginSorts.map((spec) => {
@@ -197,8 +200,8 @@ export function SidebarViewMenu({
                   checked={checked}
                   testId={`sidebar-sort-option-plugin-${spec.entryId}`}
                   label={spec.label}
-                  onSelect={() =>
-                    choose(() => !checked && onPluginSortChange({ pluginId: spec.pluginId, entryId: spec.entryId }))
+                  onSelect={(k) =>
+                    choose(k, () => !checked && onPluginSortChange({ pluginId: spec.pluginId, entryId: spec.entryId }))
                   }
                 />
               );
@@ -210,7 +213,7 @@ export function SidebarViewMenu({
             checked={filterOpen}
             testId="sidebar-filter-toggle"
             label="Filter sessions"
-            onSelect={() => choose(onToggleFilter)}
+            onSelect={(k) => choose(k, onToggleFilter)}
           />
           {hasFacets && (
             <Option
@@ -218,7 +221,7 @@ export function SidebarViewMenu({
               checked={facetOpen}
               testId="sidebar-facet-toggle"
               label={facetsActive ? "Plugin facets · active" : "Plugin facets"}
-              onSelect={() => choose(onToggleFacets)}
+              onSelect={(k) => choose(k, onToggleFacets)}
             />
           )}
         </div>
