@@ -1221,6 +1221,10 @@ impl PluginManifest {
                 ),
             );
             check(
+                g.id != "help",
+                format!("command_groups[{i}].id \"help\" is clap's own subcommand"),
+            );
+            check(
                 group_ids.insert(g.id.as_str()),
                 format!("command_groups must not repeat id {:?}", g.id),
             );
@@ -2372,6 +2376,11 @@ mod tests {
                 "a repeated group id",
                 grouped_commands_toml(26, &format!("{group}{group}"), ""),
                 "must not repeat id",
+            ),
+            (
+                "a group named like clap's help subcommand",
+                grouped_commands_toml(26, "[[command_groups]]\nid = \"help\"\n\n", ""),
+                "is clap's own subcommand",
             ),
             (
                 "a command naming an undeclared group",

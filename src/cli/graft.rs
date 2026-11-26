@@ -111,12 +111,14 @@ fn group_about(about: &str, plugin_id: &str) -> String {
 /// the first plugin to claim a flat name. A group that is not grafted drops its
 /// commands rather than flattening them.
 fn graft_onto(mut cmd: Command, commands: Vec<PluginCommand>) -> Command {
-    // Aliases count as taken: `aoe rm refresh` parses as core `remove`.
+    // Aliases count as taken (`aoe rm refresh` parses as core `remove`), and so
+    // does clap's generated `help`, which no subcommand list contains.
     let mut taken: HashSet<String> = cmd
         .get_subcommands()
         .flat_map(|s| {
             std::iter::once(s.get_name().to_string()).chain(s.get_all_aliases().map(str::to_string))
         })
+        .chain(std::iter::once("help".to_string()))
         .collect();
 
     let mut groups: Vec<(String, String, String)> = Vec::new();
@@ -301,6 +303,21 @@ mod tests {
             .find(|s| s.get_name() == "add")
             .expect("core add");
         assert_eq!(add.get_subcommands().count(), 0);
+    }
+
+    #[test]
+    fn graft_onto_never_claims_clap_builtin_help() {
+        let commands = vec![
+            grouped("acme.kit", "help", "status"),
+            pc("acme.other", "help"),
+        ];
+        let cmd = graft_onto(Cli::command(), commands);
+        assert!(cmd.get_subcommands().all(|s| s.get_name() != "help"));
+        // `aoe help` still reaches clap's own help rather than a plugin group.
+        let err = cmd
+            .try_get_matches_from(["aoe", "help"])
+            .expect_err("help prints help");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
     }
 
     #[test]
