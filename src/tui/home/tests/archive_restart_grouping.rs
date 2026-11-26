@@ -1567,7 +1567,7 @@ fn group_by_toggle_preserves_selected_session() {
             .expect("cursor must point into flat_items");
         match cursor_item {
             Item::Session { id, .. } => assert_eq!(id, &target_id),
-            Item::Group { .. } => panic!("cursor landed on a group header, not the session"),
+            _ => panic!("cursor landed on a non-session row"),
         }
     }
     // Custom to Name under Project grouping.
@@ -1869,6 +1869,7 @@ fn project_mode_nests_groups_under_their_repository() {
             Item::Session { id, depth } => {
                 (env.view.get_instance(id).unwrap().title.clone(), *depth)
             }
+            other => panic!("unexpected row {other:?}"),
         })
         .collect();
     let at = |label: &str| {
@@ -2180,7 +2181,7 @@ fn archived_section_nests_by_project_in_project_mode() {
             .iter()
             .filter(|it| match it {
                 Item::Group { path, .. } => is_within_archived_section(path),
-                Item::Session { .. } => false,
+                _ => false,
             })
             .collect();
         assert_eq!(

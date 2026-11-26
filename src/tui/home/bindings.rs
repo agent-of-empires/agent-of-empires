@@ -50,6 +50,8 @@ pub enum ActionId {
     Diff,
     Serve,
     Settings,
+    /// Select the Suggested row and focus its pane. `S` is provisional pending #4597.
+    Suggestions,
     Profiles,
     Projects,
     Restart,
@@ -785,7 +787,7 @@ pub static BINDINGS: &[Binding] = &[
         context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Actions,
-            desc: "New from selection",
+            desc: "New from selection (new session from a suggestion)",
         }),
         palette: Some(PaletteMeta {
             title: "New session from selection",
@@ -1013,6 +1015,21 @@ pub static BINDINGS: &[Binding] = &[
             group: PaletteGroup::Settings,
         }),
     },
+    Binding {
+        id: ActionId::Suggestions,
+        non_strict: &[k('S')],
+        strict: &[ctrl('s')],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Other,
+            desc: "Suggested sessions",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Suggested sessions",
+            keywords: &["suggestions", "suggest", "issues", "review"],
+            group: PaletteGroup::Actions,
+        }),
+    },
     // Pin toggle shares `p` (Shift+P in strict) with Projects but fires only on a project
     // header, so it must precede the Projects binding. The `?` overlay lists both rows
     // unconditionally, so each desc names its context (#3133).
@@ -1110,7 +1127,7 @@ pub static BINDINGS: &[Binding] = &[
         context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Attention,
-            desc: "Archive (toggle, any sort)",
+            desc: "Archive (toggle) or dismiss suggestion",
         }),
         palette: Some(PaletteMeta {
             title: "Toggle archive",
@@ -1354,6 +1371,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::Diff => "diff",
         ActionId::Serve => "serve",
         ActionId::Settings => "settings",
+        ActionId::Suggestions => "suggestions",
         ActionId::Profiles => "profiles",
         ActionId::Projects => "projects",
         ActionId::Restart => "restart",
@@ -1543,6 +1561,7 @@ mod tests {
             (key('u'), ActionId::Update),
             (key('U'), ActionId::ToggleUnread),
             (key('y'), ActionId::ToggleHideStopped),
+            (key('S'), ActionId::Suggestions),
             (ctrl_key('o'), ActionId::SortPicker),
         ];
         let strict = [
@@ -1561,6 +1580,7 @@ mod tests {
             (ctrl_key('p'), ActionId::Profiles),
             (ctrl_key('g'), ActionId::GroupBy),
             (ctrl_key('u'), ActionId::Update),
+            (ctrl_key('s'), ActionId::Suggestions),
             (ctrl_key('o'), ActionId::SortPicker),
         ];
         for (strict_mode, cases) in [(false, &non_strict[..]), (true, &strict[..])] {

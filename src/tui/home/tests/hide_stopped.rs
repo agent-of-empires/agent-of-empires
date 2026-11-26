@@ -42,7 +42,7 @@ fn session_titles(view: &HomeView) -> Vec<String> {
         .iter()
         .filter_map(|item| match item {
             Item::Session { id, .. } => view.get_instance(id).map(|i| i.title.clone()),
-            Item::Group { .. } => None,
+            _ => None,
         })
         .collect()
 }
@@ -125,6 +125,99 @@ fn project_grouping_hides_by_its_own_groups() {
     assert_eq!(session_titles(&env.view), vec!["util-live".to_string()]);
     assert!(header_text(&env.view, "util").contains("util (1/3)"));
     assert!(header_text(&env.view, "loose").contains("loose (0/1)"));
+}
+
+/// `session.hide_snoozed_with_stopped` folds snoozed sessions into the rows `y` hides; a session
+/// in no manual group stays visible either way.
+#[test]
+#[serial]
+fn the_setting_hides_snoozed_sessions_with_stopped_ones() {
+    let mut snoozed = with_status(
+        instance_in("util-snoozed", "/tmp/util", "util"),
+        Status::Waiting,
+    );
+    snoozed.snooze(30);
+    let mut loose = with_status(
+        Instance::new("loose-snoozed", "/tmp/loose"),
+        Status::Waiting,
+    );
+    loose.snooze(30);
+    let mut env = seeded_env(
+        test_home(),
+        &[
+            with_status(instance_in("util-live", "/tmp/util", "util"), Status::Idle),
+            with_status(
+                instance_in("util-stopped", "/tmp/util", "util"),
+                Status::Stopped,
+            ),
+            snoozed,
+            loose,
+        ],
+        true,
+    );
+
+    press_y(&mut env);
+    let shown = session_titles(&env.view);
+    assert!(shown.contains(&"util-snoozed".to_string()), "{shown:?}");
+    assert!(!shown.contains(&"util-stopped".to_string()), "{shown:?}");
+    assert!(header_text(&env.view, "util").contains("util (2/3)"));
+
+    env.view.hide_snoozed_with_stopped = true;
+    env.view.rebuild_flat_items();
+    let shown = session_titles(&env.view);
+    assert!(!shown.contains(&"util-snoozed".to_string()), "{shown:?}");
+    assert!(
+        shown.contains(&"loose-snoozed".to_string()),
+        "a session in no group is never hidden: {shown:?}"
+    );
+    assert!(header_text(&env.view, "util").contains("util (1/3)"));
+}
+
+/// Editing `session.hide_snoozed_with_stopped` while `y` is on re-filters the list on the next
+/// config refresh, in both directions.
+#[test]
+#[serial]
+fn a_config_refresh_applies_the_setting_while_stopped_sessions_are_hidden() {
+    let mut snoozed = with_status(
+        instance_in("util-snoozed", "/tmp/util", "util"),
+        Status::Waiting,
+    );
+    snoozed.snooze(30);
+    let mut env = seeded_env(
+        test_home(),
+        &[
+            with_status(instance_in("util-live", "/tmp/util", "util"), Status::Idle),
+            with_status(
+                instance_in("util-stopped", "/tmp/util", "util"),
+                Status::Stopped,
+            ),
+            snoozed,
+        ],
+        true,
+    );
+
+    press_y(&mut env);
+    assert!(
+        session_titles(&env.view).contains(&"util-snoozed".to_string()),
+        "the setting is still off"
+    );
+
+    fn set(view: &mut HomeView, on: bool) {
+        crate::session::update_config(|config| {
+            config.session.hide_snoozed_with_stopped = on;
+        })
+        .unwrap();
+        view.refresh_from_config(ConfigRefreshOrigin::Interactive);
+    }
+
+    set(&mut env.view, true);
+    assert!(env.view.hide_snoozed_with_stopped);
+    assert_eq!(session_titles(&env.view), vec!["util-live".to_string()]);
+    assert!(header_text(&env.view, "util").contains("util (1/3)"));
+
+    set(&mut env.view, false);
+    assert!(session_titles(&env.view).contains(&"util-snoozed".to_string()));
+    assert!(header_text(&env.view, "util").contains("util (2/3)"));
 }
 
 /// Archived sessions keep their own section, so hiding stopped never drops one.
@@ -526,7 +619,7 @@ fn live_send_ends_when_a_grouping_change_hides_its_session() {
 fn cursor_row_session(view: &HomeView) -> Option<String> {
     match view.flat_items.get(view.cursor)? {
         Item::Session { id, .. } => Some(id.clone()),
-        Item::Group { .. } => None,
+        _ => None,
     }
 }
 

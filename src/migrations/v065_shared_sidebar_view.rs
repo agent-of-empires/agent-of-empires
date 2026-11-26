@@ -1,4 +1,4 @@
-//! Migration v064: one grouping and sort for every Client (#5896).
+//! Migration v065: one grouping and sort for every Client (#5896).
 //!
 //! `state.toml` held the TUI's `group_by` and `sort_order`, and its `web_ui_state` table
 //! held the dashboard's own `aoe-sidebar-axis` and `aoe-sidebar-sort-mode`. Both pairs fold
@@ -25,7 +25,7 @@ fn run_in(app_dir: &Path) -> Result<()> {
         return Ok(());
     }
     crate::session::backup_before_migration(&path)?;
-    super::config_file::rewrite_strict(&path, "v064", migrate)
+    super::config_file::rewrite_strict(&path, "v065", migrate)
 }
 
 fn migrate(state: &mut toml::Table) -> bool {
@@ -71,7 +71,7 @@ fn migrate(state: &mut toml::Table) -> bool {
 
     let changed = *state != before;
     if changed {
-        info!(target: "migrations.v064", ?group, ?sort, "folded the sidebar grouping and sort into one shared value");
+        info!(target: "migrations.v065", ?group, ?sort, "folded the sidebar grouping and sort into one shared value");
     }
     changed
 }

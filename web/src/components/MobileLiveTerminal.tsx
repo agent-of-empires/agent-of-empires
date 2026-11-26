@@ -292,8 +292,10 @@ export function MobileLiveTerminal({
   // blanks for bottom alignment does not bounce with a spinner on the last row.
   const [renderRowCount, setRenderRowCount] = useState(0);
   const shrinkTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const rowTargetRef = useRef(0);
   useEffect(() => {
     const target = Math.max(0, lastNonBlankRow + 1);
+    rowTargetRef.current = target;
     setRenderRowCount((current) => {
       if (target >= current) {
         if (shrinkTimerRef.current) clearTimeout(shrinkTimerRef.current);
@@ -302,7 +304,8 @@ export function MobileLiveTerminal({
       }
       shrinkTimerRef.current ??= setTimeout(() => {
         shrinkTimerRef.current = null;
-        setRenderRowCount(Math.max(0, lastNonBlankRow + 1));
+        // Rows may have arrived since this was scheduled; trim to the rows there now.
+        setRenderRowCount(rowTargetRef.current);
       }, SHRINK_DELAY_MS);
       return current;
     });

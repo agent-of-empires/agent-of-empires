@@ -823,20 +823,26 @@ impl HomeView {
         Ok(())
     }
     /// Preserve the shelf's collapsed state; teardown and relocation remain daemon-owned.
-    pub(super) fn trash_session_by_id(&mut self, id: &str) {
+    /// True when the runtime queued the Trash request.
+    pub(super) fn trash_session_by_id(&mut self, id: &str) -> bool {
         let Some(epoch) = self.session_feed.applied_epoch().map(str::to_owned) else {
             self.flash_status("Runtime unavailable; reopen Trash controls");
-            return;
+            return false;
         };
-        self.trash_session_by_id_at_epoch(id, epoch);
+        self.trash_session_by_id_at_epoch(id, epoch)
     }
 
-    pub(super) fn trash_session_by_id_at_epoch(&mut self, id: &str, expected_epoch: String) {
+    /// True when the runtime queued the Trash request.
+    pub(super) fn trash_session_by_id_at_epoch(
+        &mut self,
+        id: &str,
+        expected_epoch: String,
+    ) -> bool {
         let Some(instance) = self
             .get_instance(id)
             .filter(|instance| !instance.is_trashed())
         else {
-            return;
+            return false;
         };
         let generation = instance.lifecycle_generation;
         let profile = instance.source_profile.clone();
@@ -855,7 +861,9 @@ impl HomeView {
                 "Could Not Trash Session",
                 &error.to_string(),
             ));
+            return false;
         }
+        true
     }
 
     pub(super) fn retry_selected_trash(&mut self) {

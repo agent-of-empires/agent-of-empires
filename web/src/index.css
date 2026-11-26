@@ -193,6 +193,10 @@
   --font-sans: "Geist Sans", system-ui, -apple-system, sans-serif;
   --font-mono: "Geist Mono", ui-monospace, "SFMono-Regular", monospace;
 
+  /* Wide-screen steps above the default 2xl (96rem) */
+  --breakpoint-3xl: 120rem;
+  --breakpoint-4xl: 150rem;
+
   /* Layout widths */
   --width-sidebar: 280px;
   --width-sidebar-sm: 220px;

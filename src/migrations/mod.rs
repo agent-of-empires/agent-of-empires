@@ -72,7 +72,8 @@ mod v060_terminal_handoff_outcome;
 mod v061_unpin_default_sandbox_image;
 mod v062_plugin_staging_evidence;
 mod v063_retire_color_labels;
-mod v064_shared_sidebar_view;
+mod v064_builtin_sounds;
+mod v065_shared_sidebar_view;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -113,7 +114,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 64;
+const CURRENT_VERSION: u32 = 65;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -331,7 +332,8 @@ const MIGRATIONS: &[Migration] = &[
         v062_plugin_staging_evidence::run,
     ),
     (63, "retire_color_labels", v063_retire_color_labels::run),
-    (64, "shared_sidebar_view", v064_shared_sidebar_view::run),
+    (64, "builtin_sounds", v064_builtin_sounds::run),
+    (65, "shared_sidebar_view", v065_shared_sidebar_view::run),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install

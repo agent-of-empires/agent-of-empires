@@ -946,7 +946,7 @@ pub struct AppStateConfig {
     #[serde(default)]
     pub has_acknowledged_volume_ignores_globs: bool,
 
-    /// Lenient so a removed order still loads before migration v064 rewrites it.
+    /// Lenient so a removed order still loads before migration v065 rewrites it.
     #[serde(
         default,
         deserialize_with = "unknown_as_none",
@@ -954,7 +954,7 @@ pub struct AppStateConfig {
     )]
     pub sort_order: Option<SortOrder>,
 
-    /// Lenient so a removed grouping still loads before migration v064 rewrites it.
+    /// Lenient so a removed grouping still loads before migration v065 rewrites it.
     #[serde(
         default,
         deserialize_with = "unknown_as_none",
@@ -1777,6 +1777,18 @@ pub struct SessionConfig {
     )]
     pub show_structured_badge: bool,
 
+    /// Count snoozed Sessions among the stopped rows the TUI's `y` filter hides.
+    /// Off by default: snoozing defers a Session without stopping it, so it stays
+    /// visible while stopped ones are hidden.
+    #[serde(default)]
+    #[setting(
+        label = "Hide snoozed Sessions too",
+        widget = "toggle",
+        tui_only,
+        summary = "While stopped Sessions are hidden with y, drop snoozed ones out of groups as well."
+    )]
+    pub hide_snoozed_with_stopped: bool,
+
     /// Comma-separated chord specs that exit live-send mode. Tmux-style: C-q,
     /// M-x, F12. The first chord in the list that matches an event ends live
     /// mode. Default `C-q` works in every terminal we ship to; add entries for
@@ -2333,6 +2345,7 @@ impl Default for SessionConfig {
             row_tag: RowTagMode::default(),
             show_activity_age: true,
             show_structured_badge: true,
+            hide_snoozed_with_stopped: false,
             live_send_exit_chord: default_live_send_exit_chord(),
             live_send_leader: default_live_send_leader(),
             default_attach_mode: AttachMode::default(),
@@ -5843,7 +5856,7 @@ mod tests {
         assert!(Config::load().unwrap().app_state.has_seen_welcome);
     }
 
-    /// Removed sorts and groupings read as unpicked, so Config loads before v064 rewrites them.
+    /// Removed sorts and groupings read as unpicked, so Config loads before v065 rewrites them.
     #[test]
     fn removed_sort_and_grouping_values_load_as_unpicked() {
         for (sort, group) in [
