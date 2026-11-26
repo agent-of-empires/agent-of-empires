@@ -614,6 +614,8 @@ export interface AcpState {
   optimisticRows: ActivityRow[];
   /** Frames with `seq` at or below this are dropped, so replays are idempotent. */
   lastSeq: number;
+  /** Highest seq a `reduced_state` snapshot covered; replayed frames at or below it are already in its `runs`. */
+  subagentsSeq?: number;
   /** `session/new` or `session/load` answered, so the Agent's session exists. */
   sessionAssigned: boolean;
   /** This dashboard restarted a start still in progress; its own stop doesn't read as a stopped Worker. Not persisted. */
@@ -1546,7 +1548,10 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     }
     const i = next.subagents.findIndex((s) => s.session_id === subagent.session_id);
     const prev = next.subagents[i];
-    const resumed = prev?.state === "idle" && (subagent.state === "running" || subagent.state === "requires_action");
+    const resumed =
+      prev?.state === "idle" &&
+      (subagent.state === "running" || subagent.state === "requires_action") &&
+      frame.seq > (state.subagentsSeq ?? 0);
     const stamped: SubagentRecord = {
       ...subagent,
       idle_since: subagent.state === "idle" ? (prev?.state === "idle" ? prev.idle_since : at) : undefined,
@@ -1699,6 +1704,7 @@ export function applyReducedState(
     backgroundShells: restoreBackgroundShells(state.backgroundShells, reduced.background_shells ?? []),
     workflowRuns: restoreWorkflowRuns(state.workflowRuns, reduced.workflow_runs ?? []),
     subagents: mergeSubagents(state.subagents, reduced.subagents ?? [], seq === undefined || seq >= state.lastSeq),
+    subagentsSeq: seq === undefined ? state.subagentsSeq : Math.max(state.subagentsSeq ?? 0, seq),
     locallyResolved,
   };
 }

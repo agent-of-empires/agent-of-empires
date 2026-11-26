@@ -452,6 +452,22 @@ describe("applyEvent / subagent roster", () => {
     expect(card).toMatchObject({ status: "done", report: "", earlierReport: "first report" });
   });
 
+  it("does not count a first run again when replay frames the snapshot already covers arrive after it", () => {
+    const idle = { stop_reason: "end_turn", background: true };
+    const t = (m: number) => `2026-01-01T00:0${m}:00Z`;
+    const settled = run(update("running", t(1), { background: true }), update("idle", t(2), idle)).subagents[0]!;
+    const { idle_since: _i, ...bare } = settled as Record<string, unknown>;
+    const snapshot = reducedState({ subagents: [{ ...bare, runs: 1 }] as never });
+    // Snapshot at seq 2 lands first; the replay of seq 1 and 2 follows.
+    let state = applyReducedState(emptyAcpState(), snapshot, [], 2);
+    state = ev(state, 1, update("running", t(1), { background: true }));
+    state = ev(state, 2, update("idle", t(2), idle));
+    expect(state.subagents[0]!.runs).toBe(1);
+    // A real resume after the snapshot still counts.
+    state = ev(state, 3, update("running", t(4), { background: true }));
+    expect(state.subagents[0]!.runs).toBe(2);
+  });
+
   it("reads a resume from the snapshot's run count on a cold load, with no event times", () => {
     const launch: ToolCall = { id: "task-1", name: "Explore", kind: "think", args_preview: "{}", started_at: "t0" };
     const first: ActivityRow = {
