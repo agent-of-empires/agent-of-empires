@@ -384,7 +384,7 @@ else
     FILTER_FILE="$(mktemp -t showcase-filter.XXXXXX)"
     printf '%s' "${filter}" >"${FILTER_FILE}"
 
-    ffmpeg -y "${inputs[@]}" \
+    ffmpeg -y -filter_threads 1 -filter_complex_threads 1 "${inputs[@]}" \
       -/filter_complex "${FILTER_FILE}" \
       -map "[out]" \
       -an \
