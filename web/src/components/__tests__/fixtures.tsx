@@ -208,7 +208,7 @@ export function openRowMenu(ws: Workspace, options: RowOptions & { expandMore?: 
 
 type SidebarProps = React.ComponentProps<typeof WorkspaceSidebar>;
 
-/** Every WorkspaceSidebar prop with a no-op default, grouped by My groups over `workspaces`. */
+/** Every WorkspaceSidebar prop with a no-op default, grouped by Groups over `workspaces`. */
 export function sidebarProps(workspaces: Workspace[], over: Partial<SidebarProps> = {}): SidebarProps {
   const noop = () => {};
   return {
@@ -219,7 +219,6 @@ export function sidebarProps(workspaces: Workspace[], over: Partial<SidebarProps
     sort: "custom",
     onGroupByChange: noop,
     onSortChange: noop,
-    onResetCustomOrder: noop,
     groups: buildSessionGroups(workspaces, {
       idleDecayWindowMs: 60_000,
       compareWorkspace: compareWorkspacesByCustomOrder(workspaces.map((w) => w.id)),

@@ -1,6 +1,6 @@
 import type { ProjectInfo, RepoGroup, SessionResponse, Workspace, WorkspaceStatus } from "./types";
 import { isSessionActive } from "./session";
-import { compareNames, workspaceIsSunk } from "./sidebarSort";
+import { compareNames, descending, headerNewestMs, workspaceIsSunk } from "./sidebarSort";
 import { MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID } from "../hooks/useRepoGroups";
 
 // Bucket for sessions with no `group_path`; also a localStorage collapse key.
@@ -11,7 +11,7 @@ export interface SidebarGroupCapabilities {
   create: "repo" | "generic";
 }
 
-// Under My groups `sessions` is a per-group slice, so use `workspace.id` for actions and `key` only for render/DnD identity.
+// Under Groups `sessions` is a per-group slice, so use `workspace.id` for actions and `key` only for render/DnD identity.
 export interface SidebarWorkspaceView {
   key: string;
   workspace: Workspace;
@@ -78,6 +78,33 @@ function groupDisplayName(path: string): string {
   return path.split("/").join(" / ");
 }
 
+/** How Group headers are ordered: by a path comparator, or "newest" for the Newest first sort. */
+export type PathOrder = "newest" | ((a: string, b: string) => number);
+
+/** Orders Group paths as the TUI's tree under Newest first: a Group before its descendants, siblings by the newest
+ *  session under them in `workspaces`, then by name. */
+export function newestPathComparator(workspaces: readonly Workspace[]): (a: string, b: string) => number {
+  const members = new Map<string, SessionResponse[]>();
+  for (const s of workspaces.flatMap((ws) => ws.sessions)) {
+    const parts = normalizeGroupPath(s.group_path).split("/");
+    for (let i = 1; i <= parts.length; i++) {
+      const prefix = parts.slice(0, i).join("/");
+      members.set(prefix, [...(members.get(prefix) ?? []), s]);
+    }
+  }
+  const newest = new Map([...members].map(([path, sessions]) => [path, headerNewestMs(sessions)] as const));
+  return (a, b) => {
+    const left = a.split("/");
+    const right = b.split("/");
+    for (let i = 0; i < Math.min(left.length, right.length); i++) {
+      if (left[i] === right[i]) continue;
+      const at = (parts: string[]) => newest.get(parts.slice(0, i + 1).join("/")) ?? Number.NEGATIVE_INFINITY;
+      return descending(at(left), at(right)) || compareNames(left[i]!, right[i]!) || (left[i]! < right[i]! ? -1 : 1);
+    }
+    return left.length - right.length;
+  };
+}
+
 // Split workspaces by per-session `group_path`; a workspace spanning groups appears once per group.
 export function buildSessionGroups(
   workspaces: Workspace[],
@@ -89,10 +116,11 @@ export function buildSessionGroups(
     /** Every session in Ungrouped, whatever its Group. */
     ungrouped?: boolean;
     /** Orders Group paths; name order when absent. */
-    comparePaths?: (a: string, b: string) => number;
+    comparePaths?: PathOrder;
   },
 ): SidebarGroup[] {
   const { compareWorkspace } = opts;
+  const comparePaths = opts.comparePaths === "newest" ? newestPathComparator(workspaces) : opts.comparePaths;
   const byGroup = new Map<string, SidebarWorkspaceView[]>();
   const order: string[] = [];
 
@@ -151,9 +179,7 @@ export function buildSessionGroups(
     // Ungrouped rows lead, as the TUI's tree puts them first.
     if (a.id === UNGROUPED_GROUP_ID) return -1;
     if (b.id === UNGROUPED_GROUP_ID) return 1;
-    return opts.comparePaths
-      ? opts.comparePaths(a.groupPath!, b.groupPath!)
-      : compareNames(a.displayName, b.displayName);
+    return comparePaths ? comparePaths(a.groupPath!, b.groupPath!) : compareNames(a.displayName, b.displayName);
   });
 
   return groups;
@@ -191,7 +217,7 @@ export function buildNestedSidebarGroups(
     idleDecayWindowMs: number;
     compareWorkspace: (a: Workspace, b: Workspace) => number;
     isSubgroupCollapsed: (repoId: string, groupPath: string) => boolean;
-    comparePaths?: (a: string, b: string) => number;
+    comparePaths?: PathOrder;
   },
 ): NestedSidebarGroup[] {
   return repoGroups.map((repoGroup) => {

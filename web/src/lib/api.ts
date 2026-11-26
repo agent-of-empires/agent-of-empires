@@ -197,7 +197,7 @@ export type SessionSettingOutcome =
 /** The one grouping and sort every Client shows, owned by the Daemon. */
 export interface SidebarView {
   group_by: "project" | "group";
-  sort: "custom" | "name";
+  sort: "custom" | "newest" | "name";
 }
 
 export interface SessionsEnvelope {

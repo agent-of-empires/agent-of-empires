@@ -85,7 +85,7 @@ function compareSunk(a: Workspace, b: Workspace): number {
   return ab - bb || (ak === bk ? 0 : ak < bk ? -1 : 1);
 }
 
-// Deduped by workspace: My groups slices one workspace into a Group per session group, so the
+// Deduped by workspace: Groups slices one workspace into a Group per session group, so the
 // footer lists it once with every archived session from those slices. First slice wins for
 // the row identity. Rows follow `compareSunk` across groups, whatever the sidebar sort.
 export const sunkViews = (groups: SidebarGroup[]) => {

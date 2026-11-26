@@ -5,6 +5,8 @@ import { useCollapsedKeys } from "./useCollapsedKeys";
 import { compareSortValues } from "../lib/pluginUi";
 import {
   compareNames,
+  descending,
+  headerNewestMs,
   type PluginSortContext,
   repoGroupLastActivityMs,
   repoGroupPluginSortValue,
@@ -124,6 +126,10 @@ export function useRepoGroups(
         return cmp || (ak !== bk ? (bk > ak ? 1 : -1) : a.repoPath.localeCompare(b.repoPath));
       }
       if (sort === "name") return compareNames(a.displayName, b.displayName) || a.repoPath.localeCompare(b.repoPath);
+      if (sort === "newest") {
+        const newest = (g: RepoGroup) => headerNewestMs(g.workspaces.flatMap((ws) => ws.sessions));
+        return descending(newest(a), newest(b)) || a.repoPath.localeCompare(b.repoPath);
+      }
       const ar = headerRank.get(a.id);
       const br = headerRank.get(b.id);
       if (ar === undefined || br === undefined) return ar === br ? newestFirst(a, b) : ar === undefined ? -1 : 1;

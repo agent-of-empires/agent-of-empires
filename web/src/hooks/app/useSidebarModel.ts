@@ -17,8 +17,9 @@ import { buildSortValueMap, pluginSortSpecs } from "../../lib/pluginUi";
 import { usePluginUiEntries } from "../../lib/pluginUiContext";
 import { reportInfo, toastBus } from "../../lib/toastBus";
 import { keepUnshown, moveId, orderStartingWith } from "../../lib/sidebarReorder";
-import { compareNames, workspaceComparator, type PluginSortContext } from "../../lib/sidebarSort";
+import { workspaceComparator, type PluginSortContext } from "../../lib/sidebarSort";
 import { GROUP_BY_FEATURE, SORT_FEATURE, type SidebarGroupBy, type SidebarSort } from "../../lib/sidebarView";
+import type { PathOrder } from "../../lib/sidebarGroups";
 import type { ProjectInfo, Workspace } from "../../lib/types";
 import type { SharedRead } from "../useSessions";
 import { useAttentionJump } from "../useAttentionJump";
@@ -173,9 +174,10 @@ export function useSidebarModel({
     pluginSort,
     drawsRepoHeaders: groupBy === "project",
   });
-  // Under Custom, Group headers follow the Daemon's Group order; under Name they stay A to Z.
-  const comparePaths = useMemo(
-    () => (sort === "custom" ? groupPathComparator(mergeGroupOrder(groupOrder)) : undefined),
+  // Under Custom, Group headers follow the Daemon's Group order, under Newest first their newest session, and under
+  // Name they stay A to Z.
+  const comparePaths = useMemo<PathOrder | undefined>(
+    () => (sort === "custom" ? groupPathComparator(mergeGroupOrder(groupOrder)) : sort === "newest" ? sort : undefined),
     [sort, groupOrder],
   );
   const session = useSessionGroups(workspaces, compareWorkspace, comparePaths);
@@ -196,8 +198,8 @@ export function useSidebarModel({
     return true;
   }, [orderingSaving]);
 
-  // One level of Undo for the order changes that rewrite more than the dragged item, offered once the write
-  // lands. The next local change drops it, and so does a read showing another Client changed what it wrote.
+  // One level of Undo for a drag that switched the sort to Custom, offered once the write lands. The next local
+  // change drops it, and so does a read showing another Client changed what it wrote.
   const undoOffer = useRef<UndoOffer>({ seq: 0 });
   const dropUndo = useCallback(() => {
     const offer = undoOffer.current;
@@ -281,8 +283,8 @@ export function useSidebarModel({
     setPluginSortRef(ref);
   }, []);
 
-  // Under Name a drag switches to Custom starting from the order on screen, so nothing else moves.
-  const frozen = sort === "name" && !pluginSort;
+  // Under Name or Newest first a drag switches to Custom starting from the order on screen, so nothing else moves.
+  const frozen = sort !== "custom" && !pluginSort;
   const onScreenOrder = useCallback(
     (): WorkspaceOrderingPatch => ({
       order: orderStartingWith(
@@ -298,21 +300,21 @@ export function useSidebarModel({
     }),
     [displayGroups, workspaceOrdering, groupBy, repo.groups, repositoryOrder],
   );
-  /** Each profile's Group moves that keep the headers in the name order Name shows them in, and how many profiles
-   *  the headers show. */
-  const onScreenGroupMoves = useCallback(() => {
+  /** Each profile's Group paths in the order on screen, a parent before its first descendant. */
+  const onScreenGroupPaths = useCallback(() => {
     const shown = new Map<string, string[]>();
     for (const g of displayGroups) {
       if (!g.groupPath) continue;
+      const parts = g.groupPath.split("/");
+      const lineage = parts.map((_, i) => parts.slice(0, i + 1).join("/"));
       for (const s of g.workspaces.flatMap((v) => v.workspace.sessions)) {
-        shown.set(s.profile, [...(shown.get(s.profile) ?? []), g.groupPath]);
+        const paths = shown.get(s.profile) ?? [];
+        paths.push(...lineage.filter((p) => !paths.includes(p)));
+        shown.set(s.profile, paths);
       }
     }
-    const moves = [...shown].flatMap(([profile, paths]) =>
-      arrangeGroups(groupOrder[profile] ?? [], paths, compareNames).map((m) => ({ profile, ...m })),
-    );
-    return { moves, profiles: shown.size };
-  }, [displayGroups, groupOrder]);
+    return shown;
+  }, [displayGroups]);
   /** Whether the Group headers keep their place on screen once each profile's Group order is `after`. */
   const keepsHeaderOrder = useCallback(
     (after: GroupOrder) => {
@@ -325,22 +327,34 @@ export function useSidebarModel({
     },
     [groupBy, nested.groups, session.groups],
   );
+  /** Commits `patch`; under Name or Newest first also the Group order on screen and the switch to Custom, with
+   *  `header`, a Group header drag, on top of them. */
   const commit = useCallback(
-    (patch: WorkspaceOrderingPatch) => {
+    (patch: WorkspaceOrderingPatch, header?: { profile: string; path: string; over: string; after: boolean }) => {
       if (!frozen) {
         dropUndo();
         void changeOrdering(patch);
         return;
       }
-      const { moves, profiles: shownProfiles } = onScreenGroupMoves();
-      const profiles = [...new Set(moves.map((m) => m.profile))];
-      const groupsAfter = Object.fromEntries(
-        profiles.map((p) => [p, moves.findLast((m) => m.profile === p)!.move.order]),
+      const shown = onScreenGroupPaths();
+      const moves = [...shown].flatMap(([profile, paths]) =>
+        arrangeGroups(groupOrder[profile] ?? [], paths, groupPathComparator(paths)).map((m) => ({ profile, ...m })),
       );
-      // Custom lists each profile's Groups after the previous profile's, which may not keep a merged name order.
-      if (shownProfiles > 1 && !keepsHeaderOrder({ ...groupOrder, ...groupsAfter })) {
-        reportInfo("Pick Custom first: Groups of several profiles can't keep this order");
+      const groupsAfter: GroupOrder = Object.fromEntries(
+        [...new Set(moves.map((m) => m.profile))].map((p) => [p, moves.findLast((m) => m.profile === p)!.move.order]),
+      );
+      // Custom lists each profile's Groups after the previous profile's, and in one order under every Repository,
+      // which may not keep the headers where they are.
+      if (!keepsHeaderOrder({ ...groupOrder, ...groupsAfter })) {
+        reportInfo("Pick Custom first: the Groups can't keep this order");
         return;
+      }
+      if (header) {
+        const arranged = groupsAfter[header.profile] ?? groupOrder[header.profile] ?? [];
+        const move = groupMove(arranged, shown.get(header.profile) ?? [], header.path, header.over, header.after);
+        if (!move) return;
+        moves.push({ profile: header.profile, path: header.path, move });
+        groupsAfter[header.profile] = move.order;
       }
       dropUndo();
       const offer = undoOffer.current;
@@ -350,16 +364,16 @@ export function useSidebarModel({
       const previous: Shared = {
         ...(patch.order && { order: workspaceOrdering }),
         ...(patch.repositories && { repositories: repositoryOrder }),
-        sort: "name",
+        sort,
       };
       if (moves.length > 0) {
         wrote.groups = groupsAfter;
-        previous.groups = Object.fromEntries(profiles.map((p) => [p, groupOrder[p] ?? []]));
+        previous.groups = Object.fromEntries(Object.keys(groupsAfter).map((p) => [p, groupOrder[p] ?? []]));
       }
       const writes = [write, ...moves.map((m) => moveGroup(m.profile, m.path, m.move, write))];
       switching.current = true;
       const switched = changeSidebarView({ sort: "custom" }, settleAll(writes));
-      offerUndo("Sorted by Custom now", switched, wrote, previous);
+      offerUndo("Switched to Custom", switched, wrote, previous);
       // The orders and the sort land together: when the switch fails after a write landed, the orders go back.
       void Promise.all([switched, ...writes])
         .then(([receipt, ...receipts]) => {
@@ -379,8 +393,9 @@ export function useSidebarModel({
       frozen,
       dropUndo,
       changeOrdering,
-      onScreenGroupMoves,
+      onScreenGroupPaths,
       keepsHeaderOrder,
+      sort,
       workspaceOrdering,
       repositoryOrder,
       groupOrder,
@@ -391,27 +406,12 @@ export function useSidebarModel({
     ],
   );
 
-  const resetCustomOrder = useCallback(() => {
-    if (refuseWhileSaving()) return;
-    dropUndo();
-    const cleared = { order: [], repositories: [] };
-    offerUndo(
-      "Custom order reset",
-      changeOrdering(cleared),
-      { ...cleared },
-      {
-        order: workspaceOrdering,
-        repositories: repositoryOrder,
-      },
-    );
-  }, [refuseWhileSaving, dropUndo, changeOrdering, offerUndo, workspaceOrdering, repositoryOrder]);
-
   /** Moves a row next to `overId`, after it when the drag went down. */
   const moveWorkspace = useCallback(
     (activeId: string, overId: string, after: boolean) => {
       if (refuseWhileSaving()) return;
       reportFeatureUse("row_reorder");
-      // A reset lists nothing until the next poll, and moving next to an unlisted row needs it listed.
+      // Moving next to a row the order does not list yet needs it listed.
       const listed = workspaceOrdering.includes(activeId) && workspaceOrdering.includes(overId);
       const base = frozen ? onScreenOrder() : { order: listed ? workspaceOrdering : onScreenOrder().order };
       commit({ ...base, order: moveId(base.order ?? [], activeId, overId, after) });
@@ -435,7 +435,7 @@ export function useSidebarModel({
   /** Moves a Group header next to its sibling `overPath`, after it when the drag went down. */
   const moveGroupHeader = useCallback(
     (activePath: string, overPath: string, after: boolean) => {
-      if (sort !== "custom") {
+      if (pluginSort) {
         reportInfo("Pick Custom to arrange groups");
         return;
       }
@@ -461,6 +461,10 @@ export function useSidebarModel({
         reportInfo("Groups move only within one profile");
         return;
       }
+      if (frozen) {
+        commit(onScreenOrder(), { profile, path: activePath, over: overPath, after });
+        return;
+      }
       const move = groupMove(order, shown, activePath, overPath, after);
       if (!move) return;
       dropUndo();
@@ -468,7 +472,7 @@ export function useSidebarModel({
         if (!receipt) reportInfo("Couldn't move the group there");
       });
     },
-    [sort, refuseWhileSaving, displayGroups, groupOrder, dropUndo, moveGroup],
+    [pluginSort, refuseWhileSaving, displayGroups, groupOrder, frozen, commit, onScreenOrder, dropUndo, moveGroup],
   );
 
   return {
@@ -478,7 +482,6 @@ export function useSidebarModel({
     selectGroupBy,
     selectSort,
     selectPluginSort,
-    resetCustomOrder,
     repoGroups: repo.groups,
     savedProjects: repo.savedProjects,
     toggleRepoCollapsed: repo.toggleRepoCollapsed,

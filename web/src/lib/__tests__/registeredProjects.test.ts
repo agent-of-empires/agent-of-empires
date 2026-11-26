@@ -151,7 +151,7 @@ describe("unpinnedSavedProjects (#2212)", () => {
     expect(summary(unpinnedSavedProjects(groups, projects))).toEqual(expected);
   });
 
-  // #5065: My groups draws no repository headers, so a Project with live Sessions, or a pinned one, has nowhere
+  // #5065: Groups draws no repository headers, so a Project with live Sessions, or a pinned one, has nowhere
   // else to appear; it lists every registered Project, each once.
   it.each<[SidebarGroupBy, string[]]>([
     ["project", ["/work/saved"]],

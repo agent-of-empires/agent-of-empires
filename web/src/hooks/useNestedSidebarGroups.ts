@@ -1,6 +1,6 @@
 import { useCallback, useMemo } from "react";
 import type { RepoGroup, Workspace } from "../lib/types";
-import { buildNestedSidebarGroups, type NestedSidebarGroup } from "../lib/sidebarGroups";
+import { buildNestedSidebarGroups, type NestedSidebarGroup, type PathOrder } from "../lib/sidebarGroups";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { useCollapsedKeys } from "./useCollapsedKeys";
 
@@ -11,7 +11,7 @@ const subgroupKey = (repoId: string, groupPath: string) =>
 export function useNestedSidebarGroups(
   repoGroups: RepoGroup[],
   compareWorkspace: (a: Workspace, b: Workspace) => number,
-  comparePaths?: (a: string, b: string) => number,
+  comparePaths?: PathOrder,
 ): {
   groups: NestedSidebarGroup[];
   toggleSubgroupCollapsed: (repoId: string, groupPath: string) => void;

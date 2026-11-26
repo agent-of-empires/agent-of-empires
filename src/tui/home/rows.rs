@@ -488,7 +488,7 @@ impl HomeView {
         }
         headers.sort_by_key(|(rank, _)| (rank.is_some(), *rank));
         let mut headers: Vec<Group> = headers.into_iter().map(|(_, group)| group).collect();
-        // Under Custom, nested Groups follow the Group order, as under My groups.
+        // Under Custom, nested Groups follow the Group order, as under Groups.
         if self.sort_order == SortOrder::Custom {
             let mut nested: Vec<(usize, String)> = Vec::new();
             for inst in &seeded {

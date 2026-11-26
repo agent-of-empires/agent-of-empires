@@ -44,6 +44,28 @@ export function workspacesNewestMs(workspaces: readonly Workspace[]): number {
   return best;
 }
 
+/** Newest creation among sessions neither archived nor trashed, which orders headers under Newest first as the
+ *  TUI does; a header with none sorts last. */
+export function headerNewestMs(sessions: Iterable<SessionResponse>): number {
+  let best = Number.NEGATIVE_INFINITY;
+  for (const s of sessions) {
+    if (s.archived_at == null && s.trashed_at == null) best = Math.max(best, epochOr(s.created_at));
+  }
+  return best;
+}
+
+/** Larger first; two missing values tie. */
+export const descending = (a: number, b: number) => (a === b ? 0 : a > b ? -1 : 1);
+
+/** Tier, then newest session first, then id. */
+export function compareWorkspacesByNewest(a: Workspace, b: Workspace): number {
+  return (
+    workspaceTriageTier(a) - workspaceTriageTier(b) ||
+    descending(workspacesNewestMs([a]), workspacesNewestMs([b])) ||
+    a.id.localeCompare(b.id)
+  );
+}
+
 export const compareNames = (a: string, b: string) => a.toLowerCase().localeCompare(b.toLowerCase());
 
 /** Tier, then A to Z by title ignoring case, then id. */
@@ -300,5 +322,6 @@ export function workspaceComparator(
   pluginSort?: PluginSortContext,
 ): (a: Workspace, b: Workspace) => number {
   if (pluginSort) return compareWorkspacesByPluginSort(pluginSort);
-  return sort === "name" ? compareWorkspacesByName : compareWorkspacesByCustomOrder(customOrder);
+  if (sort === "name") return compareWorkspacesByName;
+  return sort === "newest" ? compareWorkspacesByNewest : compareWorkspacesByCustomOrder(customOrder);
 }

@@ -1,13 +1,13 @@
 import { useMemo } from "react";
 import type { Workspace } from "../lib/types";
-import { buildSessionGroups, type SidebarGroup } from "../lib/sidebarGroups";
+import { buildSessionGroups, type PathOrder, type SidebarGroup } from "../lib/sidebarGroups";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { useCollapsedKeys } from "./useCollapsedKeys";
 
 export function useSessionGroups(
   workspaces: Workspace[],
   compareWorkspace: (a: Workspace, b: Workspace) => number,
-  comparePaths?: (a: string, b: string) => number,
+  comparePaths?: PathOrder,
 ): {
   groups: SidebarGroup[];
   toggleGroupCollapsed: (groupId: string) => void;

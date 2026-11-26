@@ -48,14 +48,15 @@ afterEach(() => {
 describe("the sidebar view button", () => {
   it.each<[Partial<Props>, string]>([
     [{ groupBy: "project", sort: "custom" }, "Repository · Custom"],
-    [{ groupBy: "group", sort: "name" }, "My groups · Name"],
+    [{ groupBy: "group", sort: "name" }, "Groups · Name"],
+    [{ groupBy: "project", sort: "newest" }, "Repository · Newest first"],
   ])("reads the grouping and sort %j", (over, label) => {
     renderSidebar([ws("a")], over);
     expect(toggle().getAttribute("aria-label")).toBe(`Sidebar view: ${label}`);
     expect(toggle().textContent?.replace("·", " · ").replace(/\s+/g, " ")).toBe(label);
   });
 
-  it("offers both groupings and both sorts as radios and reports a pick", () => {
+  it("offers both groupings and the three sorts as radios and reports a pick", () => {
     const onGroupByChange = vi.fn();
     const onSortChange = vi.fn();
     renderSidebar([ws("a")], { groupBy: "project", sort: "custom", onGroupByChange, onSortChange });
@@ -63,28 +64,22 @@ describe("the sidebar view button", () => {
     const group = within(within(menu).getByRole("group", { name: "Group by" })).getAllByRole("menuitemradio");
     expect(group.map((r) => [r.textContent, r.getAttribute("aria-checked")])).toEqual([
       ["Repository", "true"],
-      ["My groups", "false"],
+      ["Groups", "false"],
     ]);
     const sort = within(within(menu).getByRole("group", { name: "Sort" })).getAllByRole("menuitemradio");
     expect(sort.map((r) => [r.textContent, r.getAttribute("aria-checked")])).toEqual([
       ["Customdrag to reorder", "true"],
+      ["Newest first", "false"],
       ["Name", "false"],
     ]);
     // Focus starts on the checked grouping, for the arrow keys.
     expect(document.activeElement).toBe(group[0]);
 
     fireEvent.click(sort[1]!);
-    expect(onSortChange).toHaveBeenCalledWith("name");
+    expect(onSortChange).toHaveBeenCalledWith("newest");
     expect(screen.queryByRole("menu")).toBeNull();
-    fireEvent.click(within(openMenu()).getByText("My groups"));
+    fireEvent.click(within(openMenu()).getByText("Groups"));
     expect(onGroupByChange).toHaveBeenCalledWith("group");
-  });
-
-  it("resets the Custom order from the sort section", () => {
-    const onResetCustomOrder = vi.fn();
-    renderSidebar([ws("a")], { onResetCustomOrder });
-    fireEvent.click(within(openMenu()).getByRole("menuitem", { name: "Reset to newest first" }));
-    expect(onResetCustomOrder).toHaveBeenCalledTimes(1);
   });
 
   it.each<[string, Partial<Props>]>([
@@ -95,8 +90,6 @@ describe("the sidebar view button", () => {
     const menu = openMenu();
     for (const item of within(menu).getAllByRole("menuitemradio"))
       expect((item as HTMLButtonElement).disabled).toBe(true);
-    const reset = within(menu).getByRole("menuitem", { name: "Reset to newest first" }) as HTMLButtonElement;
-    expect(reset.disabled).toBe(true);
   });
 });
 

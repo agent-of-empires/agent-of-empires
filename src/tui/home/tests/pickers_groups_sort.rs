@@ -1195,7 +1195,7 @@ fn repository_mode_header_refusals_name_what_was_selected() {
     for (path, title) in [
         ("alpha", "Cannot Modify Repository Headers"),
         (archived.as_str(), "Cannot Modify Repository Headers"),
-        ("alpha/work", "Manage Groups Under My Groups"),
+        ("alpha/work", "Switch to Groups to Manage"),
     ] {
         for open in [
             HomeView::open_rename_for_selected,
@@ -3401,7 +3401,7 @@ fn test_row_moves_never_regroup_under_repository_grouping() {
 }
 
 /// Under Repository + Custom, nested Group headers follow the Group order and move through it
-/// like My groups headers; under Name they stay A to Z.
+/// among the shown siblings, past a Group with no shown session; under Name they stay A to Z.
 #[test]
 #[serial]
 fn repository_mode_orders_and_moves_nested_groups_by_the_group_order() {
@@ -3419,8 +3419,8 @@ fn repository_mode_orders_and_moves_nested_groups_by_the_group_order() {
     );
     let view = &mut env.view;
     view.group_by = GroupByMode::Project;
-    let order =
-        ["zeta", "beta", "beta/child"].map(|p| Group::new(p.rsplit('/').next().unwrap(), p));
+    let order = ["zeta", "hidden", "beta", "beta/child"]
+        .map(|p| Group::new(p.rsplit('/').next().unwrap(), p));
     view.group_trees.insert(
         "test".into(),
         GroupTree::new_with_group_paths(std::iter::empty(), &order),
@@ -3466,10 +3466,10 @@ fn repository_mode_orders_and_moves_nested_groups_by_the_group_order() {
     assert!(
         matches!(
             respond(Err("refused".into())),
-            Some(NamespaceMutation::Reorder(ReorderBody::Group { group, direction: MoveDirection::Up, siblings: None, freeze: None }))
-                if group.profile == "test" && group.path == "beta"
+            Some(NamespaceMutation::Reorder(ReorderBody::Group { group, direction: MoveDirection::Up, siblings: Some(siblings), freeze: None }))
+                if group.profile == "test" && group.path == "beta" && siblings == ["zeta", "beta", "mid"]
         ),
-        "a nested header moves its profile's Group"
+        "a nested header moves its profile's Group among the shown siblings"
     );
     view.pending_namespace_intent = None;
 
@@ -3495,7 +3495,7 @@ fn repository_mode_orders_and_moves_nested_groups_by_the_group_order() {
     }
 }
 
-/// Under My groups and Name a nested Group header moves, starting from the headers on screen.
+/// Under Groups and Name a nested Group header moves, starting from the headers on screen.
 #[test]
 #[serial]
 fn my_groups_moves_a_nested_header_under_name() {

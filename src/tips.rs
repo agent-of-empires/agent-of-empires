@@ -194,7 +194,7 @@ static CATALOG: &[Tip] = &[
         id: "group-sessions",
         title: "Organize sessions into groups",
         body: "The view menu above the list groups by Repository, with your Groups nested \
-               inside, or by My groups. Right-click a session and choose More, then Move to \
+               inside, or by Groups. Right-click a session and choose More, then Move to \
                another group, to file it under any name you like.",
         trigger: TipTrigger::Rotation,
         surfaces: &[TipSurface::Web],

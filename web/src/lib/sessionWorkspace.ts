@@ -7,7 +7,7 @@ export function sessionWorkspace(group: Workspace, session: SessionResponse): Wo
 
 /**
  * Per-session workspaces of every slice, once per id, for reconciling their optimistic overrides.
- * Pass every slice: My groups splits one workspace across groups under a single id, and a later
+ * Pass every slice: Groups splits one workspace across groups under a single id, and a later
  * slice's children would otherwise have nothing to reconcile against. Single-session slices count too,
  * so an override written while a session had a sibling keeps reconciling after the sibling is gone.
  */

@@ -146,12 +146,12 @@ describe("ToastProvider", () => {
     renderProvider();
     let dismiss: (() => void) | undefined;
     act(() => {
-      dismiss = toastBus.handler?.infoAction("Custom order reset", "Undo", () => false);
+      dismiss = toastBus.handler?.infoAction("Switched to Custom", "Undo", () => false);
     });
     fireEvent.click(screen.getByRole("button", { name: "Undo" }));
-    expect(screen.queryByText("Custom order reset")).toBeTruthy();
+    expect(screen.queryByText("Switched to Custom")).toBeTruthy();
     act(() => dismiss?.());
-    expect(screen.queryByText("Custom order reset")).toBeNull();
+    expect(screen.queryByText("Switched to Custom")).toBeNull();
   });
 
   it("removes a toast after its 6s lifetime elapses", () => {

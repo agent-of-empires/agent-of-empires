@@ -3,6 +3,7 @@
 // Mirrors the registry in `src/telemetry/feature_use.rs`; off-list names get a 400.
 export type FeatureUse =
   | "sort_custom"
+  | "sort_newest"
   | "sort_az"
   | "sort_plugin"
   | "group_by_project"

@@ -359,7 +359,7 @@ test.describe("group headers", () => {
 });
 
 // Group headers follow each profile's `groups.json` order under Custom; one request arranges the siblings.
-test.describe("My groups headers", () => {
+test.describe("Groups headers", () => {
   const grouped: MockSessionInput[] = ["alpha", "beta", "gamma"].map((group) => ({
     id: `s-${group}`,
     title: `${group}-session`,
@@ -457,7 +457,7 @@ test.describe("My groups headers", () => {
       ]);
   });
 
-  test("Ungrouped leads the Groups under My groups, as selection ranges count it", async ({ page }) => {
+  test("Ungrouped leads the Groups under Groups, as selection ranges count it", async ({ page }) => {
     await openDesktop(
       page,
       [{ id: "s-u", title: "loose-session", project_path: "/tmp/repo", branch: "feat/u" }, ...grouped],
@@ -469,17 +469,19 @@ test.describe("My groups headers", () => {
     await expect.poll(() => names(page), { timeout: 8_000 }).toEqual(["Ungrouped", "alpha", "beta", "gamma"]);
   });
 
-  test("under Name a header drag points to Custom and moves nothing", async ({ page }) => {
-    const handle = await openDesktop(page, grouped, {
-      groupOrder: { default: ["gamma", "beta", "alpha"] },
-      view: { group_by: "group", sort: "name" },
-    });
-    await expect.poll(() => names(page), { timeout: 8_000 }).toEqual(["alpha", "beta", "gamma"]);
+  test("under Newest first a header drag switches to Custom from the headers on screen, then moves it", async ({
+    page,
+  }) => {
+    const handle = await openDesktop(page, grouped, { groupOrder, view: { group_by: "group", sort: "newest" } });
+    // Each Group's session is newer than the one before it.
+    await expect.poll(() => names(page), { timeout: 8_000 }).toEqual(["gamma", "beta", "alpha"]);
     await dragHeader(page, 2, 0);
-    await expect(page.getByText("Pick Custom to arrange groups")).toBeVisible();
-    await expect.poll(() => names(page)).toEqual(["alpha", "beta", "gamma"]);
-    expect(handle.reorders).toEqual([]);
-    expect(handle.viewPatches).toEqual([]);
+    await expect.poll(() => handle.viewPatches, { timeout: 4_000 }).toEqual([{ sort: "custom" }]);
+    await expect.poll(() => names(page)).toEqual(["alpha", "gamma", "beta"]);
+    await expect(page.getByText("Switched to Custom")).toBeVisible();
+    expect(handle.reorders.at(-1)).toMatchObject({ group: { path: "alpha" }, direction: "up" });
+    await page.reload();
+    await expect.poll(() => names(page), { timeout: 8_000 }).toEqual(["alpha", "gamma", "beta"]);
   });
 
   test("a CityHall client moves a Group header onto its sibling in one request", async ({ page }) => {

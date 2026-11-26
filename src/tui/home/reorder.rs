@@ -732,7 +732,7 @@ impl HomeView {
     fn move_header_row(&mut self, path: &str, delta: isize) -> anyhow::Result<()> {
         let nested = super::rows::split_project_view_path(path).1.is_some();
         if self.group_by == GroupByMode::Group || nested {
-            // Under Repository a nested header moves only under Custom; My groups switches from Name.
+            // Under Repository a nested header moves only under Custom; Groups switches from Name.
             if nested && self.group_by != GroupByMode::Group && self.sort_order != SortOrder::Custom
             {
                 self.flash_status("Pick the Custom sort (o) to arrange groups by hand");
@@ -931,7 +931,12 @@ impl HomeView {
             group
         };
         let freeze = self.sort_order != SortOrder::Custom;
-        let siblings = freeze.then(|| self.displayed_sibling_groups(&group));
+        // A stored Group with no shown session has no nested header, so only shown ones count.
+        let siblings = if self.group_by == GroupByMode::Group {
+            freeze.then(|| self.displayed_sibling_groups(&group))
+        } else {
+            Some(self.displayed_nested_siblings(header_path, &group))
+        };
         let (freeze, switch) = freeze
             .then(|| self.frozen_order(self.displayed_workspace_order(), &group.profile))
             .unzip();
@@ -992,6 +997,33 @@ impl HomeView {
             }
         };
         Some(location)
+    }
+
+    /// The stored paths of the nested headers in `header_path`'s repository that share `group`'s
+    /// parent, in the order the list shows them.
+    fn displayed_nested_siblings(
+        &self,
+        header_path: &str,
+        group: &crate::daemon::GroupLocation,
+    ) -> Vec<String> {
+        let parent = |path: &str| path.rsplit_once('/').map(|(head, _)| head.to_owned());
+        let repo = super::rows::split_project_view_path(header_path).0;
+        let mut siblings: Vec<String> = Vec::new();
+        for item in &self.flat_items {
+            let Item::Group { path, .. } = item else {
+                continue;
+            };
+            let (label, Some(path)) = super::rows::split_project_view_path(path) else {
+                continue;
+            };
+            if label == repo
+                && parent(path) == parent(&group.path)
+                && !siblings.iter().any(|s| s == path)
+            {
+                siblings.push(path.to_owned());
+            }
+        }
+        siblings
     }
 
     /// The headers sharing `group`'s parent and profile, in the order the list shows them.

@@ -12,7 +12,7 @@ type Props = React.ComponentProps<typeof WorkspaceSidebar>;
 const noop = () => {};
 const PAST = "2026-01-01T00:00:00Z";
 
-/** One worktree whose sessions My groups splits across two groups under the same workspace id. */
+/** One worktree whose sessions Groups splits across two groups under the same workspace id. */
 const split = (secondPinned: string | null): Workspace =>
   makeWorkspace(
     "w",
@@ -66,7 +66,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("expanded rows when My groups splits one workspace across groups", () => {
+describe("expanded rows when Groups splits one workspace across groups", () => {
   it("reconciles a pin on a later slice's child, so a later canonical unpin is not masked", async () => {
     const { rerender } = render(sidebar(split(null)));
     // Only the beta slice ([s2, s3]) is expandable; alpha holds s1 alone.

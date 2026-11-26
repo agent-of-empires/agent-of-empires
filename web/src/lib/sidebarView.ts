@@ -7,14 +7,18 @@ export type SidebarSort = SidebarView["sort"];
 /** What a Daemon that predates the shared view shows. */
 export const DEFAULT_SIDEBAR_VIEW: SidebarView = { group_by: "project", sort: "custom" };
 
-export const GROUP_BY_LABEL: Record<SidebarGroupBy, string> = { project: "Repository", group: "My groups" };
-export const SORT_LABEL: Record<SidebarSort, string> = { custom: "Custom", name: "Name" };
+export const GROUP_BY_LABEL: Record<SidebarGroupBy, string> = { project: "Repository", group: "Groups" };
+export const SORT_LABEL: Record<SidebarSort, string> = { custom: "Custom", newest: "Newest first", name: "Name" };
 
 export const GROUP_BY_FEATURE: Record<SidebarGroupBy, FeatureUse> = {
   project: "group_by_project",
   group: "group_by_manual",
 };
-export const SORT_FEATURE: Record<SidebarSort, FeatureUse> = { custom: "sort_custom", name: "sort_az" };
+export const SORT_FEATURE: Record<SidebarSort, FeatureUse> = {
+  custom: "sort_custom",
+  newest: "sort_newest",
+  name: "sort_az",
+};
 
 /**
  * Local writes of one Daemon value that a poll must not undo. A poll is held off while any write is in

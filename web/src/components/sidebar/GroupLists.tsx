@@ -174,7 +174,7 @@ function SortableRows({ ctx, group, drag }: { ctx: ListContext; group: SidebarGr
   );
 }
 
-/** My groups: one header per Group, in the shared sort; headers reorder among their siblings, rows within their
+/** Groups: one header per Group, in the shared sort; headers reorder among their siblings, rows within their
  *  Group. */
 export function FlatGroupList({
   ctx,

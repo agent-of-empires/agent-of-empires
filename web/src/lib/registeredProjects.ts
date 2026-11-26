@@ -68,7 +68,7 @@ export function mergeRegisteredProjects(
 /**
  * The registered Projects the sidebar's Projects section lists, one per path. Where the grouping draws repository
  * headers, a Project with a live group or a pin already has one, so only unpinned Projects without one are
- * listed. Otherwise (My groups) every registered Project is, since it has nowhere else to appear (#5065).
+ * listed. Otherwise (Groups) every registered Project is, since it has nowhere else to appear (#5065).
  */
 export function unpinnedSavedProjects(
   repoGroups: RepoGroup[],

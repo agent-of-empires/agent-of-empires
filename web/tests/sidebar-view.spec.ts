@@ -63,16 +63,9 @@ test.describe("shared sidebar view (#5896)", () => {
     await expect(page.locator(TOGGLE)).toHaveText(/Repository.*Custom/);
     await expect.poll(() => readVisibleSessionTitles(page), { timeout: 8_000 }).toEqual(["zulu", "alpha", "mike"]);
     handle.view = { group_by: "group", sort: "name" };
-    await expect(page.locator(TOGGLE)).toHaveText(/My groups.*Name/, { timeout: 8_000 });
+    await expect(page.locator(TOGGLE)).toHaveText(/Groups.*Name/, { timeout: 8_000 });
     await expect.poll(() => readVisibleSessionTitles(page)).toEqual(["alpha", "mike", "zulu"]);
     expect(handle.viewPatches).toEqual([]);
-  });
-
-  test("Reset to newest first clears both shared lists", async ({ page }) => {
-    const handle = await open(page);
-    await page.locator(TOGGLE).click();
-    await page.getByRole("menuitem", { name: "Reset to newest first" }).click();
-    await expect.poll(() => handle.puts).toEqual([{ order: [], repositories: [] }]);
   });
 
   // #1836: the list keeps its single separator under the toolbar.
