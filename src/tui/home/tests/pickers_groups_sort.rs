@@ -3453,7 +3453,7 @@ fn repository_mode_orders_and_moves_nested_groups_by_the_group_order() {
             .into_iter()
             .filter_map(|item| match item {
                 Item::Group { path, .. } => Some(path),
-                Item::Session { .. } => None,
+                Item::Session { .. } | Item::Suggested { .. } => None,
             })
             .collect();
         assert_eq!(headers, expected, "{sort:?}");
