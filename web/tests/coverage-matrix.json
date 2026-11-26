@@ -2407,18 +2407,6 @@
       ]
     },
     {
-      "id": "sidebar.restart-for-update",
-      "kind": "vitest",
-      "risk": "medium",
-      "specs": ["src/components/__tests__/SessionRowSiblingTargets.test.tsx", "src/lib/restartForUpdate.test.ts"],
-      "components": [
-        "web/src/components/sidebar/sessionActionTargets.ts",
-        "web/src/components/sidebar/SessionRowMenu.tsx",
-        "web/src/components/sidebar/SessionActions.tsx",
-        "web/src/lib/restartForUpdate.ts"
-      ]
-    },
-    {
       "id": "sidebar.recreate-container",
       "kind": "vitest",
       "risk": "high",
@@ -6009,7 +5997,7 @@
         "web/src/components/ContextMenu.tsx",
         "web/src/components/plugin/PluginSessionMenu.tsx"
       ],
-      "notes": "The Session menu groups its items into tiers (quick row, Rename, Run, Start another, More, Settings, plugin items, Move to Trash…) with a separator only between tiers that show something, in the popover and the mobile sheet. Restart to update and Recreate container carry a second line as their description. The Notify hint shows only for Off and All. The heading adds the Session's status and view, or a count for a row with several. Read-only leaves only Notify."
+      "notes": "The Session menu groups its items into tiers (quick row, Rename, Run, Start another, More, Settings, plugin items, Move to Trash…) with a separator only between tiers that show something, in the popover and the mobile sheet. Recreate container carries a second line as its description. The Notify hint shows only for Off and All. The heading adds the Session's status and view, or a count for a row with several. Read-only leaves only Notify."
     },
     {
       "id": "sidebar.context-menu-clamp",
