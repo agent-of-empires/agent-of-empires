@@ -1,7 +1,7 @@
 //! Pure fork-eligibility logic for terminal sessions, plus the one-shot fork seed a new session
 //! carries.
 
-use crate::agents::{get_agent, ForkStrategy};
+use crate::agents::{get_agent, native_definition, ForkStrategy};
 use crate::session::ConversationProvenance;
 
 /// The kind of one-shot fork a freshly-created session should perform on its first launch.
@@ -260,7 +260,7 @@ pub fn structured_fork_capable_in(
 /// binary sits on one side or the other and refusing on the strength of the arm
 /// that does not apply would hide a capability the user has.
 pub fn terminal_agent_can_fork(agent: &str) -> bool {
-    get_agent(agent).is_some_and(|def| match def.fork_strategy {
+    native_definition(agent).is_some_and(|def| match def.fork_strategy {
         ForkStrategy::EitherGeneration { legacy, current } => {
             !matches!(legacy, ForkStrategy::Unsupported)
                 || !matches!(current, ForkStrategy::Unsupported)
@@ -274,7 +274,8 @@ pub fn terminal_agent_can_fork(agent: &str) -> bool {
 /// `sandboxed` is the parent row's runtime context, not its store's filesystem:
 /// a sandbox whose store is mounted from the host records `host` there.
 pub fn terminal_agent_can_fork_in(agent: &str, sandboxed: bool) -> bool {
-    terminal_agent_can_fork(agent) && get_agent(agent).is_some_and(|def| def.can_fork_in(sandboxed))
+    terminal_agent_can_fork(agent)
+        && native_definition(agent).is_some_and(|def| def.can_fork_in(sandboxed))
 }
 
 /// Hold a fork child to the parent's identity when the parent is an
@@ -696,6 +697,30 @@ mod tests {
             !terminal_agent_can_fork_in("gemini", true),
             "no fork at all"
         );
+    }
+
+    /// An approved OMP declaration hides the bundled listing, but the launch
+    /// still runs the native agent, so an OMP parent stays forkable.
+    #[test]
+    #[serial_test::serial]
+    fn an_omp_parent_forks_while_a_declaration_holds_the_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(dir.path());
+        crate::session::test_support::install_omp_takeover("omp-next");
+        assert!(get_agent("omp").is_none());
+
+        let mut parent = bound(ConversationProvenance::Observed);
+        parent.execution.as_mut().unwrap().agent = "omp".into();
+        assert!(matches!(
+            terminal_fork_seed(
+                Some(ForkParentRef::Bound(&parent)),
+                "child-uuid".into(),
+                false
+            ),
+            Ok(ForkSeed::Terminal { .. })
+        ));
     }
 
     /// Every refusal state names the remedy that comes back to it, and no
