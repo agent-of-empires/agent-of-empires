@@ -23,6 +23,10 @@
 //!   2. the parent's `acp_session_id` is UNCHANGED;
 //!   3. the fork's one-shot `fork_pending` marker is cleared after the child id
 //!      lands.
+
+//! The API also reports that resuming the parent remains indeterminate:
+//! negotiating `loadSession` does not prove that a later worker can load that
+//! specific conversation.
 //!
 //! A refused `session/fork` is the other half: the spawn fails, the child keeps
 //! its `fork_pending` seed (so a later start forks again instead of opening an
@@ -216,8 +220,11 @@ fn structured_fork_mints_distinct_child_id_and_preserves_parent() {
     });
     assert_eq!(
         parent_context_resume,
-        serde_json::json!({ "state": "available" }),
-        "the negotiated loadSession capability must reach GET /api/sessions"
+        serde_json::json!({
+            "state": "indeterminate",
+            "reason": "agent_handshake_required",
+        }),
+        "loadSession support alone must not promise that the parent conversation can resume"
     );
 
     // Fork: request a STRUCTURED fork through the REST create endpoint. The CLI

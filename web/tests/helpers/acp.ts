@@ -183,7 +183,9 @@ export async function spawnAcpAgent(baseUrl: string, sessionId: string, agent?: 
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ agent }),
   });
-  if (![200, 202, 409].includes(res.status)) throw new Error(`structured view spawn failed: ${res.status}`);
+  if (![200, 202, 409].includes(res.status)) {
+    throw new Error(`structured view spawn failed: status=${res.status} body=${await res.text()}`);
+  }
 }
 
 export async function postPrompt(baseUrl: string, sessionId: string, text: string): Promise<Response> {
