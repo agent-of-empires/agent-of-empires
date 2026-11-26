@@ -61,6 +61,8 @@ pub enum PaletteAction {
     /// Move the cursor to a position in `flat_items`.
     JumpToCursor(usize),
     ToolSession(String),
+    /// Open this http(s) link in the browser.
+    OpenLink(String),
     /// The query matched an Age of Empires cheat code; toast its message.
     Cheat(String),
 }
@@ -152,6 +154,11 @@ impl CommandPaletteDialog {
         };
         dialog.recompute_matches();
         dialog
+    }
+
+    #[cfg(test)]
+    pub fn entry_ids(&self) -> Vec<&'static str> {
+        self.entries.iter().map(|e| e.id).collect()
     }
 
     pub fn handle_click(&mut self, col: u16, row: u16) -> DialogResult<PaletteAction> {
