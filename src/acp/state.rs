@@ -325,11 +325,22 @@ pub struct ConfigOptionSwitchFailure {
 }
 
 /// A startup failure aoe has diagnosed; clients branch on it instead of the message.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StartupCause {
     /// The sandboxed Session's container no longer exists, so a respawn can't reach it.
     ContainerMissing,
+    /// The launch waits for the sandbox login. `command` and `profile` are what its
+    /// `aoe sandbox login` needs, as the 409 body carries them: the session's profile and, only
+    /// when it matters, its command.
+    SandboxLoginRequired {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<String>,
+    },
+    /// The container runtime cannot run the sandbox login; the setting or the runtime has to change.
+    SandboxLoginUnsupported,
 }
 
 impl Event {
@@ -2198,6 +2209,40 @@ mod tests {
                 },
                 serde_json::json!({ "AgentStartupError": {
                     "message": "x", "cause": { "kind": "container_missing" }
+                } }),
+            ),
+            (
+                Event::AgentStartupError {
+                    message: "x".into(),
+                    cause: Some(StartupCause::SandboxLoginRequired {
+                        command: Some("my claude".into()),
+                        profile: Some("work".into()),
+                    }),
+                },
+                serde_json::json!({ "AgentStartupError": {
+                    "message": "x",
+                    "cause": { "kind": "sandbox_login_required", "command": "my claude", "profile": "work" }
+                } }),
+            ),
+            (
+                Event::AgentStartupError {
+                    message: "x".into(),
+                    cause: Some(StartupCause::SandboxLoginRequired {
+                        command: None,
+                        profile: None,
+                    }),
+                },
+                serde_json::json!({ "AgentStartupError": {
+                    "message": "x", "cause": { "kind": "sandbox_login_required" }
+                } }),
+            ),
+            (
+                Event::AgentStartupError {
+                    message: "x".into(),
+                    cause: Some(StartupCause::SandboxLoginUnsupported),
+                },
+                serde_json::json!({ "AgentStartupError": {
+                    "message": "x", "cause": { "kind": "sandbox_login_unsupported" }
                 } }),
             ),
         ] {
