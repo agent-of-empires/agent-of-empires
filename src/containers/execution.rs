@@ -646,12 +646,21 @@ impl ContainerExecutionSnapshot {
 }
 
 /// `path` with its deepest existing ancestor canonicalized, so a path not created yet still
-/// resolves the links above it.
+/// resolves the links above it. Only missing components are skipped: one that exists but won't
+/// resolve, such as a dangling link, gives `None`, since the VM follows it.
 fn canonical_prefix(path: &std::path::Path) -> Option<std::path::PathBuf> {
-    path.ancestors().find_map(|ancestor| {
-        let canonical = std::fs::canonicalize(ancestor).ok()?;
-        Some(canonical.join(path.strip_prefix(ancestor).ok()?))
-    })
+    for ancestor in path.ancestors() {
+        match std::fs::canonicalize(ancestor) {
+            Ok(canonical) => return Some(canonical.join(path.strip_prefix(ancestor).ok()?)),
+            Err(_)
+                if matches!(
+                    std::fs::symlink_metadata(ancestor),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                ) => {}
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 /// The home directory a Colima VM shares at the same path, when `socket` is a profile's
@@ -892,11 +901,24 @@ mod tests {
         std::fs::create_dir_all(home.join("store")).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, home.join("link")).unwrap();
+        std::os::unix::fs::symlink(outside.join("missing"), home.join("dangling")).unwrap();
         // (case, bind source, shared root, is a host path)
         for (case, source, shared, host) in [
             ("under-home", home.join("store"), Some(home.clone()), true),
             ("outside-home", outside.clone(), Some(home.clone()), false),
             ("symlink-out", home.join("link"), Some(home.clone()), false),
+            (
+                "dangling-link-out",
+                home.join("dangling"),
+                Some(home.clone()),
+                false,
+            ),
+            (
+                "missing-under-home",
+                home.join("store/new"),
+                Some(home.clone()),
+                true,
+            ),
             ("no-share", home.join("store"), None, false),
         ] {
             let mut snapshot = snapshot(false);
