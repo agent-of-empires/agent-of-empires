@@ -293,12 +293,16 @@ describe("SuggestionsSettings", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
     await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Edit CI failures" })));
 
+    const advanced = screen.getByText("Advanced").closest("details")!;
+    fireEvent.click(screen.getByText("Advanced"));
+    await waitFor(() => expect(advanced.open).toBe(true));
     const linked = document.querySelector<HTMLElement>('[data-focus-key="linked"]')!;
     fireEvent.click(linked);
     const linkedBack = await screen.findByRole("button", { name: /\u2190 Suggestions/ });
     await waitFor(() => expect(document.activeElement).toBe(linkedBack));
     fireEvent.click(linkedBack);
     await waitFor(() => expect(document.activeElement).toBe(document.querySelector('[data-focus-key="linked"]')));
+    expect(screen.getByText("Advanced").closest("details")!.open).toBe(true);
   });
 
   it("keeps the editor open and shows the error when saving fails", async () => {
