@@ -774,13 +774,21 @@ pub(crate) fn ensure_instance_dir_path(instance_id: &str) -> Result<PathBuf> {
         .with_context(|| format!("canonicalize hook dir {}", lexical.display()))
 }
 
-/// The hook dir a host launch prepares its paths in: the host one, switched to now so the
-/// launch's own switch removes nothing they point into. When the switch can't run, the
-/// launch's can't either, so the existing dir stays and is used.
+/// The hook dir a host launch prepares its paths in: the host one, switched to now. A later
+/// switch to the host base, the launch's own included, never removes it. When this switch
+/// can't run, only an existing host dir is used: a lock that can't be taken now may be free
+/// for the launch's switch, which would remove a sandbox dir under the paths prepared in it.
 pub(crate) fn host_launch_instance_dir_path(instance_id: &str) -> Result<PathBuf> {
     switch_instance_dir(instance_id, HookBase::Host).or_else(|error| {
+        let (kind, _fd) = resolve_or_create(instance_id)?;
+        anyhow::ensure!(
+            kind == HookBase::Host,
+            "host hook dir switch failed, and only the sandbox dir exists: {error:#}"
+        );
         tracing::warn!(target: "hooks.guard", "host hook dir switch failed: {error:#}");
-        ensure_instance_dir_path(instance_id)
+        let lexical = kind.path()?.join(instance_id);
+        std::fs::canonicalize(&lexical)
+            .with_context(|| format!("canonicalize hook dir {}", lexical.display()))
     })
 }
 
@@ -1348,6 +1356,56 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o700);
         remove_instance_dir(id).unwrap();
+    }
+
+    /// A host launch never prepares its paths in a dir a later switch to the host base removes,
+    /// even when its own switch can't take the lock and the launch's can.
+    #[test]
+    #[serial(hook_base)]
+    fn a_host_launch_prepares_in_a_dir_its_switch_keeps() {
+        let (_g, _base, _tmp) = BaseGuard::ready();
+        with_base(HookBase::Sandbox, |_| Ok(())).unwrap();
+        // (case, dirs present, lock free while preparing, prepares)
+        for (case, dirs, lock_free, prepares) in [
+            ("prepare-switch-ok", &[HookBase::Sandbox][..], true, true),
+            (
+                "prepare-switch-fails",
+                &[HookBase::Sandbox][..],
+                false,
+                false,
+            ),
+            (
+                "prepare-switch-fails-host-present",
+                &[HookBase::Host, HookBase::Sandbox][..],
+                false,
+                true,
+            ),
+        ] {
+            let id = case;
+            for kind in dirs {
+                write_status(*kind, id, "idle");
+            }
+            let lock = sandbox_hook_base_path()
+                .unwrap()
+                .join(format!(".{id}.lock"));
+            if !lock_free {
+                std::fs::create_dir(&lock).unwrap();
+            }
+            let prepared = host_launch_instance_dir_path(id);
+            if !lock_free {
+                std::fs::remove_dir(&lock).unwrap();
+            }
+            assert_eq!(prepared.is_ok(), prepares, "{case}: {prepared:?}");
+            // The launch's own switch, once the lock is free.
+            switch_instance_dir(id, HookBase::Host).unwrap();
+            if let Ok(dir) = prepared {
+                assert!(
+                    dir.is_dir(),
+                    "{case}: the prepared dir outlives the launch's switch"
+                );
+            }
+            remove_instance_dir(id).unwrap();
+        }
     }
 
     /// A switch that can't take its lock changes nothing: it would otherwise remove a dir a
