@@ -66,6 +66,23 @@ describe("sunkViews", () => {
     // archived_at wins over later activity; ties keep group order.
     expect(sunkViews(groups).map((v) => v.workspace.id)).toEqual(["mixed", "snoozed", "old", "stale"]);
   });
+
+  it("ignores trashed sessions when computing footer sink order", () => {
+    const row = (groupId: string, id: string, sessions: SessionStub[]) => ({
+      key: `${groupId}::${id}`,
+      workspace: workspace(id, sessions),
+    });
+    const groups = [
+      group("a", [
+        row("a", "old-with-trashed", [
+          { id: "s1", archived_at: "2026-01-01T00:00:00Z" },
+          { id: "s2", trashed_at: "2026-05-01T00:00:00Z", last_accessed_at: "2026-05-01T00:00:00Z" },
+        ]),
+        row("a", "newer-archived", [{ id: "s3", archived_at: "2026-03-01T00:00:00Z" }]),
+      ]),
+    ];
+    expect(sunkViews(groups).map((v) => v.workspace.id)).toEqual(["newer-archived", "old-with-trashed"]);
+  });
 });
 
 const live = (id: string): SidebarWorkspaceView => ({
