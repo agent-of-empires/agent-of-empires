@@ -764,6 +764,42 @@ fn a_right_click_that_drops_the_kept_row_opens_on_the_row_clicked() {
     assert!(env.view.context_menu.is_some());
 }
 
+/// Right-clicking a Repository header whose only row is the kept one drops that header, so
+/// no menu opens on the row that takes its place.
+#[test]
+#[serial]
+fn a_right_click_on_a_header_that_drops_opens_no_menu() {
+    let mut env = env_with_stopped(false);
+    env.view.apply_group_by(GroupByMode::Project);
+    let kept = select_session(&mut env, "util-stopped-a");
+    let other = select_session(&mut env, "ops-stopped-b");
+    publish_statuses(
+        &mut env.view,
+        &[(&kept, Status::Waiting), (&other, Status::Waiting)],
+    );
+    env.view.toggle_needs_you_only();
+    select_session(&mut env, "util-stopped-a");
+    publish_statuses(&mut env.view, &[(&kept, Status::Running)]);
+    let clicked = env
+        .view
+        .flat_items
+        .windows(2)
+        .position(|pair| {
+            matches!(&pair[0], Item::Group { .. })
+                && matches!(&pair[1], Item::Session { id, .. } if *id == kept)
+        })
+        .expect("the kept row's header");
+    env.view.list_inner_area = ratatui::layout::Rect::new(1, 1, 28, 20);
+    env.view.list_area = ratatui::layout::Rect::new(0, 0, 30, 22);
+
+    assert!(env
+        .view
+        .handle_right_click(5, env.view.list_inner_area.y + clicked as u16));
+
+    assert_eq!(session_titles(&env.view), ["ops-stopped-b"]);
+    assert!(env.view.context_menu.is_none());
+}
+
 /// Under Newest first, a header keeps its place when the needs-you filter hides the member
 /// that ranks it, in both groupings.
 #[test]

@@ -59,6 +59,27 @@ pub(super) fn web_plugin_disabled() -> bool {
 /// Persist the first-run intro picks: theme name to `config.theme.name` and attach mode to
 /// `default_attach_mode`; the telemetry answer goes to the Daemon, which owns consent.
 /// Failures are logged and swallowed so a config write hiccup cannot block startup.
+/// Whether two list rows name the same session, group or Suggested row.
+fn same_row(a: &Item, b: &Item) -> bool {
+    match (a, b) {
+        (Item::Session { id: a, .. }, Item::Session { id: b, .. }) => a == b,
+        (
+            Item::Group {
+                path: a,
+                profile: a_profile,
+                ..
+            },
+            Item::Group {
+                path: b,
+                profile: b_profile,
+                ..
+            },
+        ) => a == b && a_profile == b_profile,
+        (Item::Suggested { .. }, Item::Suggested { .. }) => true,
+        _ => false,
+    }
+}
+
 fn apply_intro_outcome(outcome: &IntroOutcome) {
     if let Some(opt_in) = outcome.telemetry_opt_in {
         crate::tui::telemetry::set_consent(opt_in);
@@ -5758,15 +5779,21 @@ impl HomeView {
         let anchor = (col.saturating_add(1), row.saturating_add(1));
         if let Some(clicked) = self.resolve_row_to_index(col, row) {
             if self.cursor != clicked {
+                let target = self.flat_items[clicked].clone();
                 self.cursor = clicked;
                 self.update_selected();
+                // Selecting can drop the row the cursor left and shift the clicked one, or
+                // drop the clicked header itself; then no menu opens.
+                match self
+                    .flat_items
+                    .iter()
+                    .position(|item| same_row(item, &target))
+                {
+                    Some(at) if at == self.cursor => {}
+                    _ => return true,
+                }
             }
-            // Selecting can drop the row the cursor left, so the clicked row is where the
-            // rebuild put the cursor.
             let idx = self.cursor;
-            if idx >= self.flat_items.len() {
-                return true;
-            }
             // Every menu entry would be refused on the creating stub, so say why
             // instead of opening a menu that can only fail.
             if self.is_creating_stub_selected() {
