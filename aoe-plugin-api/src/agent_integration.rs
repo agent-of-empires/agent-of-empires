@@ -173,6 +173,31 @@ pub fn container_dir_ok(dir: &str) -> bool {
             .any(|reserved| dir == *reserved || dir.starts_with(&format!("{reserved}/")))
 }
 
+impl AgentIntegrationContribution {
+    /// The directory a declared config-dir variable names in the container, else `default`.
+    fn container_config_dir(&self, var: Option<&str>, default: String) -> String {
+        var.and_then(|var| self.launch.as_ref()?.container_env.get(var))
+            .map_or(default, |dir| dir.trim_end_matches('/').to_string())
+    }
+
+    /// Where a sandbox sees the declared hooks file, else `None`.
+    pub fn container_hooks_file(&self) -> Option<String> {
+        let hooks = self.hooks.as_ref()?;
+        let (dir, leaf) = hooks.settings_rel_path.rsplit_once('/')?;
+        let dir =
+            self.container_config_dir(hooks.config_dir_env_var.as_deref(), format!("/root/{dir}"));
+        Some(format!("{dir}/{leaf}"))
+    }
+
+    /// Where a sandbox sees the declared trust file, else `None`.
+    pub fn container_trust_file(&self) -> Option<String> {
+        let trust = self.trust.as_ref()?;
+        let dir =
+            self.container_config_dir(trust.config_dir_env_var.as_deref(), "/root".to_string());
+        Some(format!("{dir}/{}", trust.file))
+    }
+}
+
 /// The pointer's segments, or `None` unless it is a valid trust pointer.
 pub fn parse_trust_pointer(pointer: &str) -> Option<Vec<&str>> {
     let rest = pointer.strip_prefix('/')?;

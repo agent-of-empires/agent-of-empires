@@ -3058,10 +3058,15 @@ fn stage_declared_sandbox(
     if let Some(trust) = &entry.trust {
         let file = stage.join("home").join(&trust.file);
         if file.is_file() {
+            // Validation refuses a shared file; a file mount over the staged hooks
+            // file would hide it, so it is skipped here too.
             let target =
                 declared_container_dir(entry, trust.config_dir_env_var.as_deref(), Path::new(""))
                     .map(|dir| format!("{dir}/{}", trust.file))
-                    .filter(|target| !overlaps_bound_mount(target, bound));
+                    .filter(|target| {
+                        !overlaps_bound_mount(target, bound)
+                            && entry.container_hooks_file().as_ref() != Some(target)
+                    });
             match target {
                 Some(container_path) => mounts.volumes.push(VolumeMount {
                     host_path: file.to_string_lossy().to_string(),

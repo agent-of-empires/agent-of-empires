@@ -1037,6 +1037,15 @@ fn validate_agent_declaration(
     if let Some(trust) = &integration.trust {
         validate_agent_trust(i, trust, integration, check);
     }
+    if integration.hooks.is_some() && integration.trust.is_some() {
+        check(
+            integration.container_hooks_file() != integration.container_trust_file(),
+            format!(
+                "agent_integrations[{i}].hooks.settings_rel_path and trust.file must not name the \
+                 same file in the sandbox"
+            ),
+        );
+    }
     if let Some(launch) = &integration.launch {
         for (j, alias) in launch.aliases.iter().enumerate() {
             check(!alias.is_empty() && alias.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_') && alias != &integration.tool && !launch.aliases[..j].contains(alias), format!("agent_integrations[{i}].launch.aliases[{j}] must be a unique lowercase agent id"));

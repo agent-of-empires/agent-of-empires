@@ -1088,6 +1088,13 @@ fn declaration_bounds_each_reject() {
     );
     let cases: Vec<(String, &str)> = vec![
         (
+            agent(&format!(
+                "{HOOKS}{}",
+                TRUST.replace(".example.json", "settings.json")
+            )),
+            "must not name the same file",
+        ),
+        (
             hooks_with(".example/settings.json", &long_path),
             "settings_rel_path",
         ),
@@ -1141,6 +1148,15 @@ fn declaration_bounds_each_reject() {
             Ok(_) => panic!("{want}: should be rejected\n{body}"),
         }
     }
+
+    // Another file in the shared directory is fine.
+    parse(
+        26,
+        &agent(&format!(
+            "{HOOKS}{}",
+            TRUST.replace(".example.json", "other.json")
+        )),
+    );
 
     // Config-directory variables: credential-shaped, reserved and undeclared names.
     for var in [
