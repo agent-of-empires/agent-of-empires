@@ -30,7 +30,8 @@ fi
 # Temp files, removed on exit.
 FILTER_FILE=""
 LIST=""
-trap 'rm -f "${FILTER_FILE}" "${LIST}"' EXIT
+PARTIAL=""
+trap 'rm -f "${FILTER_FILE}" "${LIST}" "${PARTIAL}"' EXIT
 
 MAX_SECONDS="${MAX_SECONDS:-120}"
 CRF="${CRF:-14}"
@@ -47,6 +48,8 @@ FONT="${FONT:-}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS="${ROOT}/test-results"
 OUT="${1:-${RESULTS}/showcase-combined.mp4}"
+# Encode to a sibling file so a failed run never clobbers a good ${OUT}.
+PARTIAL="${OUT}.partial.mp4"
 
 if [[ ! -d "${RESULTS}" ]]; then
   echo "no test-results/ directory at ${RESULTS}" >&2
@@ -299,7 +302,7 @@ if [[ -n "${GRID}" ]]; then
     -an \
     -c:v libx264 -preset "${PRESET}" -crf "${CRF}" \
     -movflags +faststart \
-    "${OUT}"
+    "${PARTIAL}"
 
 else
   # ---- concat mode ------------------------------------------------------
@@ -337,7 +340,7 @@ else
       -an \
       -c:v libx264 -preset "${PRESET}" -crf "${CRF}" \
       -movflags +faststart \
-      "${OUT}"
+      "${PARTIAL}"
   else
     # Cheap path: concat demuxer + setpts filter. One re-encode, no
     # per-input scaling so input resolution must match across files
@@ -353,8 +356,9 @@ else
       -an \
       -c:v libx264 -preset "${PRESET}" -crf "${CRF}" \
       -movflags +faststart \
-      "${OUT}"
+      "${PARTIAL}"
   fi
 fi
 
+mv -f "${PARTIAL}" "${OUT}"
 echo "done -> ${OUT}"
