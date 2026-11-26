@@ -2626,7 +2626,8 @@ fn test_all_profiles_view_loads_from_multiple_profiles() {
 }
 
 /// Under Custom, Ctrl+Down swaps the session's workspace with the next row's in the shared
-/// order, and the list follows the snapshot that write publishes.
+/// order, placing only its header's rows, and the list follows the snapshot that write
+/// publishes.
 #[tokio::test]
 #[serial]
 async fn test_ctrl_arrows_move_a_session_under_custom_sort() {
@@ -2671,14 +2672,18 @@ async fn test_ctrl_arrows_move_a_session_under_custom_sort() {
         workspace(&env.view, &original[0]),
         workspace(&env.view, &original[1]),
     );
-    let mut expected = env
+    let in_work: Vec<String> = original.iter().map(|t| workspace(&env.view, t)).collect();
+    let mut expected: Vec<String> = env
         .view
         .session_feed
         .applied_snapshot()
         .unwrap()
         .contents
         .workspace_ordering
-        .clone();
+        .iter()
+        .filter(|w| in_work.contains(w))
+        .cloned()
+        .collect();
     let (i, j) = (
         expected.iter().position(|w| *w == first).unwrap(),
         expected.iter().position(|w| *w == second).unwrap(),
@@ -2728,8 +2733,9 @@ async fn test_ctrl_arrows_move_a_session_under_custom_sort() {
     assert_eq!(work_group_titles(&env.view), original);
 }
 
-/// Under the Name sort, Ctrl+Down starts the Custom order from the rows on screen: it sends
-/// that order with the two rows swapped and switches the shared sort to Custom.
+/// Under the Name sort, Ctrl+Down starts the Custom order from the rows on screen: it commits
+/// that order with the two rows swapped and the Groups headers on screen, then switches the
+/// shared sort to Custom.
 #[tokio::test]
 #[serial]
 async fn test_ctrl_arrows_under_name_start_custom_from_the_screen_order() {
@@ -2784,40 +2790,92 @@ async fn test_ctrl_arrows_under_name_start_custom_from_the_screen_order() {
         .unwrap();
     env.view.update_selected();
 
-    // A refused order leaves the sort alone.
-    let mut capture = env.view.session_feed.view_write_driver_for_test();
+    let before = env.view.session_feed.applied_snapshot().unwrap();
+    let profile = env.view.get_instance(&id).unwrap().source_profile.clone();
+    let headers: Vec<String> = env
+        .view
+        .flat_items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Group {
+                path, profile: p, ..
+            } if p.as_deref().is_none_or(|p| p == profile)
+                && !crate::session::is_within_archived_section(path)
+                && !crate::session::is_within_trash_section(path) =>
+            {
+                Some(path.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    let body = serde_json::json!({"target": "session", "id": id, "profile": profile,
+        "source_group": "work", "direction": "down", "headers": headers,
+        "freeze": {"order": expected, "base": {
+            "order": before.contents.placed_workspaces,
+            "repositories": before.contents.repository_order}}});
+
+    // A refused move leaves the sort alone.
+    let mut respond = env.view.session_feed.namespace_driver_for_test();
     env.view
         .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
-    let refused = capture().expect("the order write");
-    assert!(matches!(refused.write, ViewWrite::Ordering(_)));
-    refused.finish(Err("refused".into()));
+    let sent = respond(Err("refused".into())).expect("the move");
+    let crate::daemon::NamespaceMutation::Reorder(sent) = sent else {
+        panic!("expected the move");
+    };
+    assert_eq!(serde_json::to_value(sent).unwrap(), body);
+    let mut capture = env.view.session_feed.view_write_driver_for_test();
     env.view.apply_session_feed();
-    assert!(capture().is_none(), "no sort write follows a refused order");
+    assert!(capture().is_none(), "no sort write follows a refused move");
     assert_eq!(env.view.sort_order, SortOrder::Name);
+    env.view.info_dialog = None;
 
     // Undo waits for the move, whose commit alone switches the sort.
-    let before = env.view.session_feed.applied_snapshot().unwrap();
-    let writes = settle_view_writes(&state, &mut env.view, |view| {
-        view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
-        view.undo_order_change().unwrap();
-        assert_eq!(
-            view.status_flash.as_ref().map(|flash| flash.text.as_str()),
-            Some("The last move is still saving")
-        );
-    })
-    .await;
-    match writes.as_slice() {
-        [ViewWrite::Ordering(patch), ViewWrite::SidebarView(view)] => {
-            assert_eq!(patch.order.as_ref(), Some(&expected));
-            assert_eq!(
-                patch.repositories, None,
-                "no Repository header is on screen under Groups"
-            );
+    let mut respond = env.view.session_feed.namespace_driver_for_test();
+    env.view
+        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL), None);
+    env.view.undo_order_change().unwrap();
+    assert_eq!(flash_text(&env.view), Some("The last move is still saving"));
+    let (status, reply_headers, value) =
+        request_with_headers(&state, "POST", "/api/reorder", body.clone()).await;
+    assert!(status.is_success(), "{status}: {value}");
+    let receipt = crate::daemon::MutationReceipt {
+        cursor: receipt_cursor(&reply_headers),
+        outcome: crate::daemon::NamespaceOutcome::Reordered(serde_json::from_value(value).unwrap()),
+    };
+    let sent = respond(Ok(receipt)).expect("the move");
+    let crate::daemon::NamespaceMutation::Reorder(sent) = sent else {
+        panic!("expected the move");
+    };
+    assert_eq!(serde_json::to_value(sent).unwrap(), body);
+    let mut capture = env.view.session_feed.view_write_driver_for_test();
+    apply_published(&mut env.view, &state).await;
+    let switch = capture().expect("the switch to Custom");
+    match &switch.write {
+        ViewWrite::SidebarView(view) => {
             assert_eq!(view.sort, Some(SortOrder::Custom));
             assert_eq!(view.group_by, None);
         }
-        other => panic!("expected an order and a sort write, got {other:?}"),
+        other => panic!("expected the sort write, got {other:?}"),
     }
+    let (status, reply_headers, value) = request_with_headers(
+        &state,
+        "PATCH",
+        "/api/sidebar-view",
+        serde_json::to_value(match &switch.write {
+            ViewWrite::SidebarView(view) => view,
+            _ => unreachable!(),
+        })
+        .unwrap(),
+    )
+    .await;
+    assert!(status.is_success(), "{status}: {value}");
+    switch.finish(Ok(receipt_cursor(&reply_headers)));
+    apply_published(&mut env.view, &state).await;
+    env.view.apply_session_feed();
+    assert_eq!(
+        crate::session::load_workspace_ordering().unwrap().order,
+        expected
+    );
     assert_eq!(env.view.sort_order, SortOrder::Custom);
     assert_eq!(work_group_titles(&env.view), ["Mango", "Apple", "Zebra"]);
     assert_eq!(

@@ -1188,17 +1188,8 @@ impl HomeView {
             _ => {}
         }
         if let Some(result) = self.session_feed.drain_sidebar_view_result() {
-            match result {
-                Err(error) => {
-                    if !self.sort_restore_failed(&error) {
-                        self.flash_status(format!("Grouping and sort not saved: {error}"));
-                    }
-                    changed = true;
-                }
-                // A queued pick still on its way may carry the sort Undo restores.
-                Ok(()) if !self.session_feed.sidebar_view_pending() => self.sort_restore = None,
-                Ok(()) => {}
-            }
+            changed |= result.is_err();
+            self.sidebar_view_settled(&result);
             // Snapshots applied while the write was pending were not shown or recorded, so
             // converge on the Daemon's value, which may carry another Client's change.
             changed |= self.converge_sidebar_view();

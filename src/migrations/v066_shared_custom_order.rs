@@ -14,7 +14,8 @@
 //! ran an earlier v065 without `legacy_sort_order` falls back to the sort v065 left.
 //! A `sessions.json` that cannot be read is left untouched and the run completes without
 //! it; the sort and the skipped files are kept in `PENDING_FILE`, and a later run, `aoe
-//! migrate` or a retried upgrade, adds only those profiles' order to the shared one.
+//! migrate` or a retried upgrade, adds only those profiles' order to the shared one. A run
+//! that skips a profile records that before it writes, so an interrupted one still owes it.
 
 use super::sessions_file;
 use super::v065_shared_sidebar_view::{web_effective_sort, LEGACY_SORT_KEY, WEB_SORT_KEY};
@@ -28,8 +29,10 @@ use tracing::{info, warn};
 
 const WEB_REPO_ORDER_KEY: &str = "aoe-repo-group-order-v1";
 /// The legacy sort on its first line, then the `sessions.json` paths, relative to the app
-/// directory, that still owe their order.
+/// directory, that still owe their order, or, while an upgrade is unfinished, the orders it
+/// seeds, each after [`UNFINISHED`].
 const PENDING_FILE: &str = ".v066_custom_order_pending";
+const UNFINISHED: &str = "+";
 
 pub fn run() -> Result<()> {
     run_in(&crate::session::get_app_dir()?, Pass::Upgrade)
@@ -63,8 +66,17 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
         .as_mut()
         .and_then(Iterator::next)
         .map(|sort| sort.trim().to_owned());
+    let lines: Option<Vec<&str>> = pending_lines.map(|lines| lines.map(str::trim).collect());
+    // An unfinished upgrade reruns over every profile, into the orders it was seeding.
+    let seeding: Option<Vec<&str>> = lines.as_ref().and_then(|lines| {
+        let names: Vec<&str> = lines
+            .iter()
+            .filter_map(|line| line.strip_prefix(UNFINISHED))
+            .collect();
+        (!names.is_empty()).then_some(names)
+    });
     // Profiles an earlier run migrated are done; only the skipped ones still seed.
-    let owed: Option<Vec<&str>> = pending_lines.map(|lines| lines.map(str::trim).collect());
+    let owed = lines.filter(|_| seeding.is_none());
     if pass == Pass::Recovery && pending.is_none() {
         return Ok(());
     }
@@ -145,6 +157,7 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
         .transpose()?
         .unwrap_or_default();
     let mut changed = false;
+    let mut seeds: Vec<&str> = Vec::new();
     let legacy = legacy_sort
         .as_deref()
         .and_then(|sort| legacy_rank(live, sort))
@@ -159,13 +172,25 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
     } else {
         web_repositories
     };
-    for (current, seeded) in [
-        (&mut ordering.order, seeded),
-        (&mut ordering.repositories, seeded_repositories),
+    for (name, current, seeded) in [
+        ("order", &mut ordering.order, seeded),
+        (
+            "repositories",
+            &mut ordering.repositories,
+            seeded_repositories,
+        ),
     ] {
-        let next = match (pass, &owed) {
-            (Pass::Upgrade, None) if current.is_empty() => seeded,
-            (Pass::Upgrade, None) => continue,
+        let next = match (pass, &owed, &seeding) {
+            (Pass::Upgrade, None, None) if current.is_empty() => {
+                seeds.push(name);
+                seeded
+            }
+            (Pass::Upgrade, None, None) => continue,
+            (_, None, Some(seeding)) if seeding.contains(&name) => {
+                seeds.push(name);
+                add_missing(current, &seeded)
+            }
+            (_, None, Some(_)) => continue,
             // Earlier entries keep their place, which the user may have moved since. A
             // retried upgrade adds the profiles an earlier run skipped the same way.
             _ => add_missing(current, &seeded),
@@ -174,6 +199,16 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
             *current = next;
             changed = true;
         }
+    }
+    if let Some(sort) = legacy_sort
+        .as_ref()
+        .filter(|_| changed && owed.is_none() && !skipped.is_empty())
+    {
+        let seeds: String = seeds
+            .iter()
+            .map(|name| format!("{UNFINISHED}{name}\n"))
+            .collect();
+        crate::session::atomic_write(&pending_path, format!("{sort}\n{seeds}").as_bytes())?;
     }
     if changed {
         crate::session::atomic_write(
@@ -198,7 +233,7 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
             &pending_path,
             format!("{sort}\n{}\n", skipped.join("\n")).as_bytes(),
         )?,
-        _ if owed.is_some() => fs::remove_file(&pending_path)?,
+        _ if pending_file.is_some() => fs::remove_file(&pending_path)?,
         _ => {}
     }
     if in_state.is_some() {
@@ -557,6 +592,71 @@ mod tests {
                 fs::read_to_string(&pending).unwrap(),
                 "oldest\nprofiles/other/sessions.json\n"
             );
+        }
+    }
+
+    /// An upgrade that skipped a profile and stopped after any of its writes still seeds
+    /// that profile once it reads, and finishes the profiles it had not stripped.
+    #[test]
+    fn an_interrupted_upgrade_still_owes_the_skipped_profile() {
+        let (a, b) = ("/r/a::__session__::a", "/r/b::__session__::b");
+        let indexed = serde_json::json!([{"id": "a", "project_path": "/r/a", "sort_index": 0}]);
+        let stripped = serde_json::json!([{"id": "a", "project_path": "/r/a"}]);
+        // Each stop: whether the shared order, the stripped rows and the final record landed.
+        for (written, strip, recorded) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (true, true, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let other = dir.path().join("profiles/other/sessions.json");
+            fs::create_dir_all(&other).unwrap();
+            seed(dir.path(), indexed.clone());
+            fs::write(
+                dir.path().join("state.toml"),
+                format!("{LEGACY_SORT_KEY} = \"custom\"\n"),
+            )
+            .unwrap();
+            run_in(dir.path(), Pass::Upgrade).unwrap();
+            let pending = dir.path().join(PENDING_FILE);
+            if !recorded {
+                fs::write(&pending, "custom\n+order\n").unwrap();
+            }
+            if !written {
+                fs::remove_file(dir.path().join("workspace-ordering.json")).unwrap();
+            }
+            seed(
+                dir.path(),
+                if strip {
+                    stripped.clone()
+                } else {
+                    indexed.clone()
+                },
+            );
+            fs::write(
+                dir.path().join("state.toml"),
+                format!("{LEGACY_SORT_KEY} = \"custom\"\n"),
+            )
+            .unwrap();
+            fs::remove_dir(&other).unwrap();
+            fs::write(
+                &other,
+                serde_json::json!([{"id": "b", "project_path": "/r/b", "sort_index": 1}])
+                    .to_string(),
+            )
+            .unwrap();
+
+            run_in(dir.path(), Pass::Upgrade).unwrap();
+
+            let mut order = ordering(dir.path()).order;
+            order.sort();
+            assert_eq!(order, [a, b], "{written} {strip} {recorded}");
+            for profile in ["main", "other"] {
+                let rows = dir.path().join(format!("profiles/{profile}/sessions.json"));
+                assert!(!fs::read_to_string(rows).unwrap().contains("sort_index"));
+            }
+            assert!(!pending.exists(), "{written} {strip} {recorded}");
         }
     }
 

@@ -436,12 +436,14 @@ pub enum MoveDirection {
 pub enum ReorderBody {
     /// Carry a session into a neighbouring group, at the edge it enters from: moving
     /// `Down` it lands before the group's first row, `Up` after its last. A move within one
-    /// group rewrites the shared order instead (`PUT /api/workspace-ordering`).
+    /// group rewrites the shared order instead (`PUT /api/workspace-ordering`), or, to keep
+    /// the headers on screen, omits `destination`.
     Session {
         id: String,
         profile: String,
         source_group: String,
-        /// Omitted, the source group, which leaves the row where it is.
+        /// Omitted, the row stays and the move commits only `headers`, which it then
+        /// requires, and `freeze`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         destination: Option<String>,
         direction: MoveDirection,

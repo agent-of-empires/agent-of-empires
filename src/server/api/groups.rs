@@ -820,6 +820,13 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
                 let frozen = freeze.map(|freeze| freeze.order.clone());
                 replaced_order = match &body {
                     ReorderBody::Session {
+                        destination: None, ..
+                    }
+                    | ReorderBody::Group { .. } => match frozen {
+                        Some(order) => Some(commit_workspace_order(&worker_state, |_| order)?),
+                        None => None,
+                    },
+                    ReorderBody::Session {
                         id,
                         source_group,
                         destination,
@@ -833,10 +840,6 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
                         *direction,
                         frozen,
                     )?,
-                    ReorderBody::Group { .. } => match frozen {
-                        Some(order) => Some(commit_workspace_order(&worker_state, |_| order)?),
-                        None => None,
-                    },
                 };
                 Ok(())
             });
@@ -1012,7 +1015,6 @@ fn apply_canonical_reorder(
             headers,
             ..
         } => {
-            let destination = destination.as_ref().unwrap_or(source_group);
             let Some(anchor) = rows.iter().position(|row| {
                 &row.id == id
                     && &row.source_profile == profile
@@ -1023,15 +1025,19 @@ fn apply_canonical_reorder(
                 return Ok(ReorderOutcome::Stale);
             };
             check_row(&rows[anchor], cityhall)?;
-            if destination == source_group
-                || !(destination.is_empty()
-                    || groups.iter().any(|group| &group.path == destination)
-                    || rows.iter().any(|row| {
-                        &row.source_profile == profile
-                            && belongs(&row.group_path, destination)
-                            && !row.is_archived()
-                            && !row.is_trashed()
-                    }))
+            // In place, the move commits only the header and row orders it carries.
+            if destination.is_none() && headers.is_none()
+                || destination.as_ref().is_some_and(|destination| {
+                    destination == source_group
+                        || !(destination.is_empty()
+                            || groups.iter().any(|group| &group.path == destination)
+                            || rows.iter().any(|row| {
+                                &row.source_profile == profile
+                                    && belongs(&row.group_path, destination)
+                                    && !row.is_archived()
+                                    && !row.is_trashed()
+                            }))
+                })
             {
                 return Ok(ReorderOutcome::Stale);
             }
@@ -1046,6 +1052,9 @@ fn apply_canonical_reorder(
                 }
                 *groups = tree.get_all_groups();
             }
+            let Some(destination) = destination else {
+                return Ok(ReorderOutcome::Moved { destination: None });
+            };
             rows[anchor].group_path = destination.clone();
             // Reveal only explicit persisted ancestors; implicit paths are synthesized
             // from the newly committed row by the normal GroupTree projection.

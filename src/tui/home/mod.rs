@@ -308,7 +308,7 @@ pub struct HomeView {
     /// What "Undo switch to Custom" writes back.
     order_undo: Option<reorder::UndoPoint>,
     /// The sort an Undo is writing back, kept until that write settles.
-    sort_restore: Option<crate::session::config::SortOrder>,
+    sort_restore: Option<reorder::SortRestore>,
     session_feed_reload_retry_at: Option<std::time::Instant>,
     session_feed_failed_cursor: Option<crate::daemon::RuntimeCursor>,
     canonical_metadata_lag: Option<CanonicalMetadataLagState>,
