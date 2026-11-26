@@ -2147,13 +2147,11 @@ mod tests {
                     .await;
                     let state = live.state.clone();
                     let id = live.id().to_owned();
-                    let setup_submission = tokio::time::timeout(
-                        Duration::from_secs(10),
-                        state.session_service.prompt_submission(&id),
-                    )
-                    .await
-                    .expect("actual creation releases prompt admission before lock contention");
-                    drop(setup_submission);
+                    // Launch finalization publishes after releasing prompt admission.
+                    // Join that work so only observation can hold the guards under test.
+                    tokio::time::timeout(Duration::from_secs(10), state.runtime.work.drain())
+                        .await
+                        .expect("launch publication completes before lock contention");
                     let row = state
                         .instances
                         .read()
