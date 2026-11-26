@@ -686,9 +686,9 @@ fn colima_shared_root(
     colima_default_mounts(&config).then(|| home.to_path_buf())
 }
 
-/// Whether a `colima.yaml` keeps the default mounts: a mapping whose `mounts` is absent, null or
-/// empty. Any list replaces the home share, and a file that doesn't parse as such a mapping
-/// proves nothing, so it counts as custom.
+/// Whether a `colima.yaml` keeps the default mounts: a mapping whose `mounts` is an empty list.
+/// Colima shares the home directory only then; an absent or null `mounts` means no mounts, and
+/// any entry replaces the share. A file that doesn't parse as such a mapping proves nothing.
 fn colima_default_mounts(config: &str) -> bool {
     use serde_json::Value;
     let Ok(Value::Object(config)) =
@@ -696,11 +696,7 @@ fn colima_default_mounts(config: &str) -> bool {
     else {
         return false;
     };
-    match config.get("mounts") {
-        None | Some(Value::Null) => true,
-        Some(Value::Array(mounts)) => mounts.is_empty(),
-        Some(_) => false,
-    }
+    matches!(config.get("mounts"), Some(Value::Array(mounts)) if mounts.is_empty())
 }
 
 #[cfg(test)]
@@ -757,8 +753,8 @@ mod tests {
         assert_eq!(path, std::path::PathBuf::from("/unmapped/file.txt"));
     }
 
-    /// Colima's profile socket is trusted only with the default mounts, which share `$HOME` at
-    /// the same path; any other socket or config proves nothing.
+    /// Colima's profile socket is trusted only with the default mounts, an explicit empty list,
+    /// which share `$HOME` at the same path; any other socket or config proves nothing.
     #[test]
     fn colima_shared_root_trusts_only_the_default_home_share() {
         let temp = tempfile::tempdir().unwrap();
@@ -783,10 +779,10 @@ mod tests {
                 shared.clone(),
             ),
             (
-                "default-no-mounts-key",
+                "no-mounts-key",
                 profile(&colima, "nokey", Some("cpu: 2\nvmType: vz\n")),
                 None,
-                shared.clone(),
+                None,
             ),
             (
                 "custom-mounts-list",
@@ -839,10 +835,16 @@ mod tests {
                 None,
             ),
             (
+                "explicit-null-mounts",
+                profile(&colima, "nulled", Some("mounts: null\n")),
+                None,
+                None,
+            ),
+            (
                 "null-mounts",
                 profile(&colima, "null", Some("cpu: 2\nmounts:\n")),
                 None,
-                shared.clone(),
+                None,
             ),
             (
                 "malformed",
