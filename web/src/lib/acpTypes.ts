@@ -1752,13 +1752,6 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     // projection may restore native controls or physical-worker chrome.
     return next;
   }
-  if ("RateLimitAutoResumed" in event) {
-    // Only the cap park ends here. The armed park outlives an auto-resume attempt: the daemon's
-    // `rate_limit_park` does not treat this event as superseding it, so a failed respawn leaves
-    // the session parked and a prompt still has to wake it.
-    next.rateLimitRetriesExhausted = false;
-    return next;
-  }
   if ("SessionContextReset" in event) {
     next.hostPromptIntent = null;
     next.establishmentRevision = null;
