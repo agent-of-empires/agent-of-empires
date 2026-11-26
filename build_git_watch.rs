@@ -1,5 +1,11 @@
 // Shared by build.rs and tests/integration/build_version_rerun.rs; dependency-free.
 
+/// Watching git would recompile the crate on every commit, so only release-based
+/// profiles (`release`, `dev-release`) stamp; others fall back in `build_info`.
+pub fn stamps_git(profile: &str) -> bool {
+    profile == "release"
+}
+
 /// Skip index churn from `git status` and missing inputs that keep Cargo stale.
 pub fn git_watch_paths(dir: &std::path::Path) -> Vec<String> {
     ["HEAD", "logs/HEAD"]

@@ -58,6 +58,7 @@ fn serve_unavailable_error(cli: &Cli) -> Option<clap::Error> {
 }
 
 fn main() -> Result<()> {
+    agent_of_empires::build_info::build_version();
     let mut args = std::env::args();
     let _ = args.next();
     let helper = args.next();

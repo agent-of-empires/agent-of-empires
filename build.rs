@@ -24,6 +24,9 @@ fn warn_on_deprecated_serve_feature() {
 /// wins: env override, `GITHUB_SHA`, local git sha plus a coarse dirty flag, then
 /// `CARGO_PKG_VERSION`.
 fn emit_build_version() {
+    if !stamps_git(&std::env::var("PROFILE").unwrap_or_default()) {
+        return;
+    }
     let repo_dir = std::path::Path::new(".");
 
     for path in git_watch_paths(repo_dir) {
