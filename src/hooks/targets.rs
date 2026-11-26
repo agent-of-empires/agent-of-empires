@@ -209,7 +209,18 @@ pub(crate) fn is_other_builtin_hook_path(
         &crate::session::config::Config::default(),
     )
     .iter()
-    .any(|target| target.agent_name != agent_name && target.path == path)
+    .any(|target| target.agent_name != agent_name && resolved(&target.path) == resolved(path))
+}
+
+/// Where a write to `path` lands: the file itself, else its resolved parent plus
+/// the name, so an alias of a directory is seen before the file exists.
+fn resolved(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path)
+        .or_else(|error| {
+            let parent = std::fs::canonicalize(path.parent().ok_or(error)?)?;
+            Ok::<_, std::io::Error>(parent.join(path.file_name().unwrap_or_default()))
+        })
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn builtin_hook_targets_in(
@@ -574,5 +585,31 @@ mod tests {
             .into_iter()
             .any(|target| target.agent_name == "example-helper"
                 && target.path == relocated.join("settings.json")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn builtin_hook_ownership_follows_symlinks() {
+        let _env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR", "CODEX_HOME"]);
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::os::unix::fs::symlink(home.join(".claude"), home.join(".example")).unwrap();
+        let dotfiles = home.join("dotfiles");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        std::os::unix::fs::symlink(&dotfiles, home.join(".mine")).unwrap();
+        let owned = |path: &str, agent: &str| {
+            is_other_builtin_hook_path(&home.join(path), agent, home, &[])
+        };
+
+        // An alias of another agent's directory is that agent's file, existing or not.
+        assert!(owned(".example/settings.json", "example"));
+        std::fs::write(home.join(".claude/settings.json"), "{}").unwrap();
+        assert!(owned(".example/settings.json", "example"));
+        // A symlinked dotfile that lands elsewhere stays the plugin's own, as does the built-in itself.
+        assert!(!owned(".mine/settings.json", "example"));
+        assert!(!owned(".claude/settings.json", "claude"));
+        assert!(!owned(".example/settings.json", "claude"));
     }
 }
