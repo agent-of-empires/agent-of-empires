@@ -31,7 +31,7 @@ use serde_json::Value;
 use std::cmp::Reverse;
 use std::fs;
 use std::path::Path;
-use tracing::info;
+use tracing::{info, warn};
 
 const WEB_REPO_ORDER_KEY: &str = "aoe-repo-group-order-v1";
 /// The legacy sort on its first line, then the `sessions.json` paths, relative to the app
