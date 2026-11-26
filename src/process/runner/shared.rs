@@ -646,7 +646,7 @@ impl RunnerShared {
         let announces_session = matches!(&body, ControlBody::SessionReady { .. });
         let adapter_frame = matches!(&body, ControlBody::Notify { method, params }
             if method == "session/update"
-                && params.get("update").is_some_and(|u| !aoe_meta::is_anchored(u)));
+                && aoe_meta::session_update_of(params).is_some_and(|u| !aoe_meta::is_anchored(u)));
         let wire: Arc<[u8]> = match control_protocol::encode_frame(&body) {
             Ok(frame) => frame.into(),
             Err(error) => {
@@ -1601,6 +1601,29 @@ mod tests {
         };
         // a1 and a2 went to the first daemon; a3 is replayed; t1 and t2 take no number.
         assert_eq!(adapter_frames, 2);
+    }
+
+    /// The daemon decodes positional `[sessionId, update]` params too, so the
+    /// runner must number them the same way.
+    #[tokio::test]
+    async fn positional_session_updates_count_as_adapter_frames() {
+        let (shared, stdin, _child) = shared_with_stdin().await;
+        let positional = |meta: serde_json::Value| {
+            serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":[
+                "s",{"sessionUpdate":"agent_message_chunk","_meta":meta,"content":{"type":"text","text":"x"}}]})
+            .to_string()
+        };
+        shared.begin_attachment().await;
+        for (line, expected) in [
+            (positional(serde_json::json!({})), 1),
+            (
+                positional(serde_json::json!({"aoe":{"v":1,"key":"k","after_adapter_sequence":1}})),
+                1,
+            ),
+        ] {
+            shared.deliver_line(line.as_bytes(), &stdin).await;
+            assert_eq!(shared.control.lock().await.adapter_frames, expected);
+        }
     }
 
     /// The replay barrier follows the updates an agent sent before its session reply,
