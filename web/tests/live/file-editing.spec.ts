@@ -331,18 +331,17 @@ test("a Structured view save offers a note that appends to the draft without sub
   spawnServe,
 }, testInfo) => {
   let target = "";
-  const serve = await spawnServe({
-    acp: true,
-    seedFn: seedSessionViaAoeAdd({
-      title: "file-structured",
-      structuredView: true,
-      git: false,
-      files: { "notes.txt": "original" },
-      prepare: (dir) => {
-        target = join(dir, "notes.txt");
-      },
-    }),
-  });
+  const serve = await spawnServe({ acp: true });
+  // Create the Structured session under the live daemon, not the fixture's temporary core daemon.
+  seedSessionViaAoeAdd({
+    title: "file-structured",
+    structuredView: true,
+    git: false,
+    files: { "notes.txt": "original" },
+    prepare: (dir) => {
+      target = join(dir, "notes.txt");
+    },
+  })(serve);
   const [session] = await listSessions(serve.baseUrl);
   await spawnAcpAgentAndWait(serve.baseUrl, session!.id, 30_000, serve.home);
   await enableEditing(page, serve);
