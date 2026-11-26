@@ -301,9 +301,7 @@ impl Instance {
             stored.last_accessed_at = self.last_accessed_at;
             stored.sandbox_info = self.sandbox_info.clone();
             stored.capture_started_at = self.capture_started_at;
-            stored.started_at = self.started_at;
             stored.launch_executable = self.launch_executable.clone();
-            stored.launch_resolved_executable = self.launch_resolved_executable.clone();
             stored.active_execution = self.active_execution.clone();
             if restart && stored.agent_session_id == self.agent_session_id {
                 stored.resume_probe_failed_sid = self.resume_probe_failed_sid.clone();
@@ -342,10 +340,7 @@ impl Instance {
                     row.unproven_native_birth_generation = None;
                 }
                 row.capture_started_at = self.capture_started_at;
-                row.started_at = self.started_at;
                 row.launch_executable.clone_from(&self.launch_executable);
-                row.launch_resolved_executable
-                    .clone_from(&self.launch_resolved_executable);
                 if let (Some(prior), Some(current), Some(stored)) = (
                     sandbox_prior,
                     self.sandbox_info.as_ref(),
@@ -1548,7 +1543,7 @@ mod tests {
             let mut instance =
                 Instance::new("indeterminate-workdir", root.path().to_str().unwrap());
             instance.source_profile = "indeterminate-workdir".into();
-            instance.launch_resolved_executable = Some("/recorded-agent".into());
+            instance.launch_executable = Some("/recorded-agent".into());
             let mut sandbox = crate::session::instance::test_helpers::test_sandbox(
                 "original-container",
                 Some("/recorded"),
@@ -1580,7 +1575,7 @@ mod tests {
                 pane: None,
                 expected: instance.conversation_state(),
             };
-            instance.launch_resolved_executable = Some("/actual-agent".into());
+            instance.launch_executable = Some("/actual-agent".into());
             let current = instance.sandbox_info.as_mut().unwrap();
             current.container_workdir = Some("/actual".into());
             current.container_id = Some(
@@ -1616,7 +1611,7 @@ mod tests {
             let row = storage.load().unwrap().remove(0);
             if matches!(change, "adopted" | "peer_conversation") {
                 assert_eq!(
-                    row.launch_resolved_executable.as_deref(),
+                    row.launch_executable.as_deref(),
                     Some(std::path::Path::new(if change == "peer_conversation" {
                         "/recorded-agent"
                     } else {
@@ -1746,13 +1741,7 @@ mod tests {
                 );
                 instance.source_profile = "indeterminate-create-release".into();
                 let executable = root.path().join("current-agent");
-                std::fs::write(&executable, b"current").unwrap();
-                instance.launch_executable = Some(executable.clone());
-                instance.launch_resolved_executable = Some(root.path().join("prior-agent"));
-                instance.started_at = Some(
-                    Timestamp::from(std::fs::metadata(&executable).unwrap().modified().unwrap())
-                        + crate::time::Duration::seconds(1),
-                );
+                instance.launch_executable = Some(root.path().join("prior-agent"));
                 let storage =
                     crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
                 storage
@@ -1773,7 +1762,7 @@ mod tests {
                     pane: None,
                     expected: instance.conversation_state(),
                 };
-                instance.launch_resolved_executable = Some(executable.canonicalize().unwrap());
+                instance.launch_executable = Some(executable.clone());
                 storage
                     .update(|rows, _| {
                         rows[0].status = status;
@@ -1787,13 +1776,13 @@ mod tests {
                     instance.release_indeterminate_launch(&storage, generation, &probe, None);
                 let stored = storage.load().unwrap().remove(0);
                 assert_eq!(
-                    stored.launch_resolved_executable,
+                    stored.launch_executable,
                     Some(if superseded {
                         root.path().join("prior-agent")
                     } else {
-                        executable.canonicalize().unwrap()
+                        executable
                     }),
-                    "only the owned generation may publish its resolved executable"
+                    "only the owned generation may publish its launch executable"
                 );
                 if superseded {
                     assert!(result.unwrap_err().is::<LifecycleReservationError>());
@@ -1813,13 +1802,6 @@ mod tests {
                     assert_eq!(instance.status, stored.status);
                     assert_eq!(stored.lifecycle_generation, generation);
                     assert!(stored.lifecycle_reservation.is_none());
-                }
-                if status == Status::Idle {
-                    assert_eq!(
-                        crate::session::update_restart::binary_updated(&stored),
-                        superseded,
-                        "only the owned launch may replace the recorded executable target"
-                    );
                 }
             }
         }
@@ -2070,8 +2052,6 @@ mod tests {
         let capture_floor = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_234_567);
         committed.status = Status::Running;
         committed.capture_started_at = Some(capture_floor);
-        let launched_at = Timestamp::from_unix_secs(1_234_567).unwrap();
-        committed.started_at = Some(launched_at);
         committed.launch_executable = Some("/opt/agent/bin/claude".into());
         committed
             .commit_lifecycle_launch(&storage, reserved_generation, false, None)
@@ -2086,7 +2066,6 @@ mod tests {
         assert_eq!(disk.lifecycle_generation, committed.lifecycle_generation);
         assert_eq!(disk.status, Status::Running);
         assert_eq!(disk.capture_started_at, Some(capture_floor));
-        assert_eq!(disk.started_at, Some(launched_at));
         assert_eq!(
             disk.launch_executable.as_deref(),
             Some(std::path::Path::new("/opt/agent/bin/claude"))

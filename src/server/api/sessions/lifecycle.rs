@@ -62,6 +62,7 @@ pub async fn update_session_pin(
 pub async fn update_session_favorite(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
     body: Result<Json<UpdateFavoriteBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
@@ -71,37 +72,57 @@ pub async fn update_session_favorite(
         Ok(body) => body,
         Err(rejection) => return rejection.into_response(),
     };
+    let favorited = match body {
+        UpdateFavoriteBody::Scoped {
+            profile,
+            selector,
+            select_favorited,
+        } => {
+            use crate::daemon::{ApiErrorCode, FAVORITE_BY_SELECTOR, RUNTIME_EPOCH_HEADER};
+            if id != FAVORITE_BY_SELECTOR {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            if !headers.contains_key(RUNTIME_EPOCH_HEADER) {
+                return crate::server::api::api_error_with_code_header(
+                    ApiErrorCode::RuntimeEpochMismatch,
+                    "An epoch is required for selector-based favorite updates.",
+                );
+            }
+            return update_favorite_by_selector(&state, profile, selector, select_favorited).await;
+        }
+        UpdateFavoriteBody::Unscoped { favorited } => favorited,
+    };
 
     let namespace = state.profile_namespace.read().await;
     let lock = state.instance_lock(&id).await;
     let guard = lock.lock().await;
-    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
-        return response;
-    }
+    let cityhall_mode = state.cityhall_mode;
     let profile = {
         let instances = state.instances.read().await;
-        let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
+        let target = instances.iter().find(|instance| instance.id == id);
+        if cityhall_mode && !target.is_some_and(Instance::is_structured) {
+            return crate::server::api::cityhall_response();
+        }
+        let Some(instance) = target else {
             return crate::server::api::session_not_found();
         };
         instance.source_profile.clone()
     };
-    let favorited = body.favorited;
     let persist_id = id.clone();
-    let committed = commit_profile_update(
+    let committed = commit_profile_update_with_refusal(
         &state,
         profile,
         "favorite update",
         move |instances| {
-            if let Some(instance) = instances
+            let instance = instances
                 .iter_mut()
                 .find(|instance| instance.id == persist_id)
-            {
-                if body.favorited {
-                    instance.favorite();
-                } else {
-                    instance.unfavorite();
-                }
+                .ok_or_else(crate::server::api::session_not_found)?;
+            if cityhall_mode && !instance.is_structured() {
+                return Err(crate::server::api::cityhall_response());
             }
+            apply_favorite(instance, favorited);
+            Ok(())
         },
         None,
     )
@@ -113,6 +134,119 @@ pub async fn update_session_favorite(
     drop(guard);
     drop(namespace);
     crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
+}
+
+fn apply_favorite(row: &mut Instance, favorited: bool) {
+    if favorited {
+        row.favorite();
+    } else {
+        row.unfavorite();
+    }
+}
+
+async fn update_favorite_by_selector(
+    state: &Arc<AppState>,
+    mut profile: String,
+    selector: String,
+    favorited: bool,
+) -> axum::response::Response {
+    use crate::daemon::{ApiErrorCode, FavoriteOutcome, SessionLookupError};
+    // A purge can hold a namespace lease past the client's request deadline.
+    let admission = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        state.profile_namespace.write(),
+    );
+    let Ok(namespace) = admission.await else {
+        return crate::server::api::api_error_with_code_header(
+            ApiErrorCode::FavoriteNamespaceBusy,
+            "Profile namespace is busy; no favorite change was made.",
+        );
+    };
+    {
+        let metadata = state.canonical_metadata.read().await;
+        if profile.is_empty() {
+            profile.clone_from(&metadata.default_profile);
+        }
+        if !metadata.profiles.iter().any(|entry| entry.name == profile) {
+            return favorite_selection_refused(crate::daemon::SessionLookupError::ProfileNotFound(
+                profile,
+            ));
+        }
+    }
+    let cityhall_mode = state.cityhall_mode;
+    let committed = commit_profile_update_with_refusal(
+        state,
+        profile,
+        "favorite update",
+        move |rows| {
+            if cityhall_mode
+                && rows
+                    .iter()
+                    .any(|row| row.id == selector && !row.is_structured())
+            {
+                return Err(favorite_selection_refused(SessionLookupError::NotFound));
+            }
+            let (index, _) = crate::cli::lookup_session(
+                &selector,
+                rows.iter()
+                    .enumerate()
+                    .filter(|(_, row)| !cityhall_mode || row.is_structured()),
+            )
+            .map_err(favorite_selection_refused)?;
+            let row = &mut rows[index];
+            apply_favorite(row, favorited);
+            Ok(FavoriteOutcome {
+                title: row.title.clone(),
+            })
+        },
+        None,
+    )
+    .await;
+    let outcome = match committed {
+        Ok(outcome) => outcome,
+        Err(response) => return response,
+    };
+    drop(namespace);
+    match state.runtime.publish(state).await {
+        Ok(snapshot) => {
+            crate::server::runtime::mutation_response(&snapshot.value.cursor, Json(outcome))
+        }
+        Err(error) => {
+            tracing::debug!(target: "server.runtime", %error, "favorite publication failed");
+            outcome_unconfirmed_response()
+        }
+    }
+}
+
+fn favorite_selection_refused(
+    mut error: crate::daemon::SessionLookupError,
+) -> axum::response::Response {
+    if let crate::daemon::SessionLookupError::Ambiguous { candidates, .. } = &mut error {
+        candidates.sort_unstable();
+        // Budget for worst-case JSON escaping within the client's error response limit.
+        let mut remaining = 1000usize;
+        let keep = candidates
+            .iter()
+            .take(12)
+            .take_while(|(id, title)| {
+                let bytes = id.len() + title.len();
+                if bytes > remaining {
+                    return false;
+                }
+                remaining -= bytes;
+                true
+            })
+            .count();
+        candidates.truncate(keep);
+    }
+    if let crate::daemon::SessionLookupError::ProfileNotFound(name) = &mut error {
+        if name.len() > 1000 {
+            name.truncate(name.floor_char_boundary(1000));
+            name.push('…');
+        }
+    }
+    let code = crate::daemon::ApiErrorCode::FavoriteSelectionRefused;
+    (code.status(), code.header(), Json(error)).into_response()
 }
 
 /// 409 for ignore refusing a sunk row. The codes stay the ones clients already
@@ -2231,88 +2365,6 @@ pub async fn recreate_container(
     .await
 }
 
-/// Restart a session whose agent binary was replaced after launch (#4214). Eligibility is
-/// re-checked here because the list that offered it may be several seconds old.
-pub async fn restart_for_update(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> axum::response::Response {
-    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
-        return resp;
-    }
-    let instance = {
-        let instances = state.instances.read().await;
-        let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return crate::server::api::session_not_found();
-        };
-        inst.clone()
-    };
-    let structured_ready = state
-        .acp_supervisor
-        .worker_states_snapshot()
-        .await
-        .get(&id)
-        .is_some_and(|(worker, _)| *worker == crate::daemon::AcpWorkerState::Running)
-        && state
-            .acp_event_store
-            .pending_approval_requests(&id)
-            .is_empty();
-    let resume_available = update_restart_resumable(&instance, &context_resume_for(&instance));
-    if !crate::session::update_restart::offer_pending(&instance, resume_available, structured_ready)
-    {
-        return api_error(
-            StatusCode::CONFLICT,
-            "not_eligible",
-            "Session is busy or its agent is not out of date".to_string(),
-        );
-    }
-    apply_update_restart(&state, id, instance).await
-}
-
-/// Restart an eligible session onto the updated agent.
-pub(super) async fn apply_update_restart(
-    state: &Arc<AppState>,
-    id: String,
-    instance: Instance,
-) -> axum::response::Response {
-    if instance.is_structured() {
-        // The reconciler terminates the worker once its turn drains and respawns it against the
-        // stored conversation.
-        state.acp_supervisor.mark_build_respawn_pending(&id);
-        let response = session_response_from_instance(
-            &instance,
-            crate::claude_settings::read_tui_fullscreen(),
-        );
-        return (StatusCode::ACCEPTED, Json(response)).into_response();
-    }
-    // The offer promises the conversation survives, and a restart that honors
-    // `auto_resume_on_restart` would start a new one when it is off.
-    let auto_resume = crate::session::resolve_config(&instance.effective_profile())
-        .map(|config| config.session.auto_resume_on_restart)
-        .unwrap_or(true);
-    if !auto_resume {
-        return api_error(
-            StatusCode::CONFLICT,
-            "auto_resume_disabled",
-            "auto_resume_on_restart is off, so a restart would start a new conversation"
-                .to_string(),
-        );
-    }
-    let body = crate::daemon::RestartSessionBody {
-        wake_message: Some(String::new()),
-        only_if_idle: true,
-        ..Default::default()
-    };
-    prepare_agent_session(
-        state.clone(),
-        id,
-        Ok(None),
-        AgentPreparation::Restart,
-        Some(Arc::new(body)),
-    )
-    .await
-}
-
 /// `GET /api/sessions/{id}/account-targets`: the configured tool names this session can swap to
 /// without losing its conversation. Names only; `agent_config_dir` paths never leave the host.
 pub async fn session_account_targets(
@@ -2539,7 +2591,6 @@ async fn admit_restart_sandbox_login(
     // A restart a cheaper check refuses never runs the hook: those checks answer first.
     if row.ensure_startable().is_err()
         || matches!(row.status, Status::Creating | Status::Deleting)
-        || (body.only_if_idle && row.status != Status::Idle)
         || (state.cityhall_mode && !row.is_structured())
         || *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy
     {
@@ -3109,7 +3160,6 @@ fn restart_reason(
     match (origin, body) {
         (RestartOrigin::StartupRecovery, _) => "startup_recovery",
         (_, Some(body)) if body.discard_sandbox_container => "recreate_container",
-        (_, Some(body)) if body.only_if_idle => "agent_update",
         _ => "user",
     }
 }
@@ -3488,15 +3538,6 @@ async fn prepare_agent_session_inner(
     }
     if state.cityhall_mode && !instance.is_structured() {
         return crate::server::api::cityhall_response();
-    }
-    // The eligibility check that asked for this ran before these locks, and a prompt can land
-    // while it waited, so the idle promise is enforced on the row this request reloaded.
-    if restart.as_ref().is_some_and(|body| body.only_if_idle) && instance.status != Status::Idle {
-        return api_error(
-            StatusCode::CONFLICT,
-            "not_eligible",
-            "Session is busy or its agent is not out of date".to_string(),
-        );
     }
     // #4116: a shelved row refuses every start path with its own code, decided on
     // the row this request reloaded. It answers before the lifecycle reservation,

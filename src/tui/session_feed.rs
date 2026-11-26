@@ -196,6 +196,8 @@ impl CommandFailure {
                     && *status != reqwest::StatusCode::REQUEST_TIMEOUT
                     && *code != Some(crate::daemon::ApiErrorCode::CreateOutcomeUnknown)
             }
+            DaemonClientError::FavoriteSelection(_) => true,
+            DaemonClientError::RuntimeCursorUnsupported => !submitted,
             DaemonClientError::InvalidBaseUrl { .. }
             | DaemonClientError::InvalidPathSegment
             | DaemonClientError::InvalidBearerToken
