@@ -189,10 +189,20 @@ pub(super) fn acp_internal_error(message: String) -> agent_client_protocol::Erro
 /// `message` is primary; only a direct string `data.details` supplements it.
 /// The allowlist is a diagnostic convention, not arbitrary-secret detection.
 pub(super) fn public_error_message(error: &agent_client_protocol::Error) -> String {
+    let details = error
+        .data
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .and_then(|data| data.get("details"))
+        .and_then(serde_json::Value::as_str);
+    public_error_text(&error.message, details)
+}
+
+pub(super) fn public_error_text(message: &str, details: Option<&str>) -> String {
     const CAP: usize = 2048;
     const LABEL: &str = "\nDetails: ";
     const ELLIPSIS: &str = "...";
-    let primary = super::spawn::scrub_stderr_secrets(&error.message);
+    let primary = super::spawn::scrub_stderr_secrets(message);
     if primary.len() > CAP {
         return super::delete::truncate_for_log(&primary, CAP - ELLIPSIS.len());
     }
@@ -200,14 +210,7 @@ pub(super) fn public_error_message(error: &agent_client_protocol::Error) -> Stri
     if remaining <= LABEL.len() + ELLIPSIS.len() {
         return primary.into_owned();
     }
-    let Some(details) = error
-        .data
-        .as_ref()
-        .and_then(serde_json::Value::as_object)
-        .and_then(|data| data.get("details"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|details| !details.trim().is_empty())
-    else {
+    let Some(details) = details.filter(|details| !details.trim().is_empty()) else {
         return primary.into_owned();
     };
     let details = super::spawn::scrub_stderr_secrets(details);

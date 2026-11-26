@@ -1102,6 +1102,90 @@
       ]
     },
     {
+      "id": "suggestions.review-and-start",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/suggestions-review.spec.ts",
+        "tests/dashboard-suggestions.spec.ts",
+        "tests/suggestions-filter-mapping.spec.ts",
+        "src/components/__tests__/SuggestionsView.test.tsx",
+        "src/components/__tests__/DashboardSuggestions.test.tsx",
+        "src/components/__tests__/SuggestionMappingWizard.test.tsx"
+      ],
+      "components": [
+        "web/src/components/SuggestionsView.tsx",
+        "web/src/components/SuggestionRow.tsx",
+        "web/src/components/SuggestionHooksReview.tsx",
+        "web/src/components/PromptBlockedNote.tsx",
+        "web/src/components/SuggestionItemActions.tsx",
+        "web/src/components/SuggestionStartMenu.tsx",
+        "web/src/components/SuggestionFilterMenu.tsx",
+        "web/src/components/DashboardSuggestions.tsx",
+        "web/src/hooks/useSuggestions.ts",
+        "web/src/components/session-wizard/HooksTrustDialog.tsx",
+        "web/src/components/SuggestionMappingWizard.tsx"
+      ]
+    },
+    {
+      "id": "sidebar.suggested",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/SidebarSuggestions.test.tsx"],
+      "components": ["web/src/components/sidebar/SidebarSuggestions.tsx", "web/src/components/WorkspaceSidebar.tsx"],
+      "notes": "The Suggested Group shows only while prefs.sidebar is on, and appears without a remount when the pref changes in Settings."
+    },
+    {
+      "id": "suggestions.cityhall-read-only",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/DashboardSetupHint.test.tsx",
+        "src/components/__tests__/SuggestionsView.test.tsx"
+      ],
+      "components": ["web/src/lib/clientCapabilities.ts", "web/src/components/Dashboard.tsx", "web/src/App.tsx"],
+      "notes": "CityHall refuses suggestion mutations, so canManageSuggestions renders the Suggestions page, Home section and sidebar Group read-only."
+    },
+    {
+      "id": "suggestions.first-run-setup",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/suggestions-first-run.spec.ts",
+        "src/components/__tests__/SuggestionsSetup.test.tsx",
+        "src/components/__tests__/DashboardSetupHint.test.tsx"
+      ],
+      "components": ["web/src/components/SuggestionsSetupHint.tsx", "web/src/components/SuggestionsSetupSheet.tsx"]
+    },
+    {
+      "id": "suggestions.live-persistence",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/suggestions.spec.ts"],
+      "components": [
+        "web/src/components/settings/SuggestionsSettings.tsx",
+        "web/src/components/settings/SuggestionPresetEditor.tsx",
+        "web/src/components/SuggestionsView.tsx"
+      ],
+      "notes": "A real worker publishes; preferences, presets, mappings and dismissals round-trip through the server, and read-only refuses every write."
+    },
+    {
+      "id": "settings.suggestions",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/settings-suggestions.spec.ts", "src/components/settings/__tests__/SuggestionsSettings.test.tsx"],
+      "components": [
+        "web/src/components/settings/SuggestionsSettings.tsx",
+        "web/src/components/settings/PluginSettingsSections.tsx",
+        "web/src/components/settings/SuggestionPresetEditor.tsx",
+        "web/src/components/settings/SuggestionLinkedRepos.tsx",
+        "web/src/components/settings/TemplateEditor.tsx",
+        "web/src/components/settings/suggestionsShared.tsx",
+        "web/src/components/settings/useSuggestionsSnapshot.ts",
+        "web/src/lib/suggestionTemplate.ts"
+      ]
+    },
+    {
       "id": "settings.advanced-fold",
       "kind": "vitest",
       "risk": "medium",
@@ -1273,9 +1357,16 @@
         "src/lib/statusSounds.test.ts",
         "src/hooks/useStatusSounds.test.ts",
         "src/hooks/useSessionStatusStream.test.ts",
-        "src/hooks/useSessions.test.ts"
+        "src/hooks/useSessions.test.ts",
+        "src/lib/soundPlayer.test.ts"
       ],
-      "components": ["web/src/lib/statusSounds.ts", "web/src/hooks/useStatusSounds.ts", "web/src/lib/soundPlayer.ts"]
+      "components": [
+        "web/src/lib/statusSounds.ts",
+        "web/src/hooks/useStatusSounds.ts",
+        "web/src/lib/soundPlayer.ts",
+        "web/src/App.tsx"
+      ],
+      "notes": "Sounds are built in and fetched per event from `/api/sounds/{event}`. They play through one Web Audio context that each click or key press resumes; a sound that comes while it is suspended stays silent and fires `onSoundBlocked` once. The tests fake the context, so they cover this logic, not a real browser's autoplay policy or App's toast. The Daemon plays the host sounds itself (`server::sound_cues`)."
     },
     {
       "id": "notifications.linked-toasts",
@@ -3141,6 +3232,22 @@
         "web/src/components/diff/comments/DiffCommentsUserCard.tsx"
       ],
       "notes": "Tool input and output, tool errors, edit diffs, todo lists, the plan, answers, review prompts, sub-agent prompt and result, and install commands each copy their own content. Prompt, diff and error copies are pinned in a mocked browser; the rest are unit tests."
+    },
+    {
+      "id": "acp.resumed-subagent-status",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/acp/subagents/model.test.ts",
+        "src/lib/acpTypes.reducer.test.ts",
+        "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx"
+      ],
+      "components": [
+        "web/src/components/acp/subagents/model.ts",
+        "web/src/lib/acpTypes.ts",
+        "web/src/components/acp/subagents/SubagentDetail.tsx"
+      ],
+      "notes": "A resumed background sub-agent shows running or waiting with Stop, and a second finish shows its stop reason with the first report under earlier output. Foreground and never-resumed cards are unchanged."
     },
     {
       "id": "acp.tool-group-chunking",
@@ -6084,6 +6191,7 @@
       ],
       "components": [
         "web/src/components/Dashboard.tsx",
+        "web/src/components/DashboardSuggestions.tsx",
         "web/src/components/tour/TourRunner.tsx",
         "web/src/components/tour/tourRunnerStyles.ts",
         "web/src/lib/brandMark.ts",
@@ -6225,6 +6333,7 @@
         "web/src/components/settings/PluginIdentityIcon.tsx",
         "web/src/components/settings/PluginCard.tsx",
         "web/src/components/settings/PluginMarketplace.tsx",
+        "web/src/components/settings/pluginFlows.ts",
         "web/src/components/settings/PluginModal.tsx"
       ]
     },
