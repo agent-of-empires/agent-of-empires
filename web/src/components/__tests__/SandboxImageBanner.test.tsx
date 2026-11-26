@@ -915,6 +915,20 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
       expect(banner()?.textContent, "the click on A forgot B's pull this page saw run").toBe(UPDATED);
       unmount();
     }
+
+    // A create's pull of another image doesn't supersede the update of A, so A's refusal still shows.
+    {
+      const { unmount } = await mount(status());
+      const reply = hold<{ ok: boolean; image?: string; message?: string }>();
+      pullSandboxImage.mockImplementationOnce(() => reply.promise);
+      updateNow();
+      await pollAfter(0);
+      act(() => notifySandboxImagePulled("ghcr.io/example/created:1"));
+      await pollAfter(0);
+      await act(async () => reply.resolve({ ok: false, message: "pulls are off" }));
+      expect(banner()?.textContent, "a create's pull of C dropped A's refusal").toBe(FAILED);
+      unmount();
+    }
   });
 
   it("drops a Cancel once the banner shows another image, so its reply and refusal stay off it", async () => {

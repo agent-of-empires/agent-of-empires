@@ -1729,8 +1729,9 @@ describe("SessionWizard Pull latest image first", () => {
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalledOnce());
     expect(payload(0).pull_latest_image).toBe(checked || undefined);
-    // Only a create that pulled tells the update banner to ask again.
+    // Only a create that pulled tells the update banner to ask again, naming the image its row showed.
     await waitFor(() => expect(pulled).toHaveBeenCalledTimes(checked ? 1 : 0));
+    if (checked) expect((pulled.mock.calls[0][0] as CustomEvent).detail, "the pulled image").toBe(IMAGE);
   });
 
   describe("while the image downloads", () => {

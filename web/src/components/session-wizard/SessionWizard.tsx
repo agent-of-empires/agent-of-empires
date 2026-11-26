@@ -756,7 +756,8 @@ export function SessionWizard({
         safeSetItem(LAST_USED_INSTRUCTION_KEY, body.custom_instruction ?? "");
         if (body.path.startsWith("/")) safeSetItem(LAST_USED_PROJECT_KEY, body.path);
         for (const w of result.session?.warnings ?? []) toastBus.handler?.error(w);
-        if (body.pull_latest_image) notifySandboxImagePulled();
+        // An empty image is the Daemon's default, which only the banner's status resolves.
+        if (body.pull_latest_image) notifySandboxImagePulled(body.sandbox_image || undefined);
         if (background) onCreatedInBackground?.(result.session);
         else onCreated(result.session);
       } else if (background) {

@@ -213,15 +213,18 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
     const offServerDown = onServerDownChange((down) => {
       if (!down) pollNow.current();
     });
-    // The create's pull supersedes any "Update now", refused or still awaiting its reply.
-    const offPulled = onSandboxImagePulled(() => {
-      attempt.current++;
-      replyPendingSince.current = null;
+    // The create's pull supersedes an "Update now" of its image, refused or still awaiting its reply; one
+    // whose image the dialog didn't know may be any.
+    const offPulled = onSandboxImagePulled((image) => {
       createPullSince.current = null;
-      setRefusal(null);
-      // A Cancel still out now answers an older attempt, which can't reset its button.
-      setCancelling(false);
-      setCancelRefused(null);
+      if (image === undefined || image === attemptImage.current) {
+        attempt.current++;
+        replyPendingSince.current = null;
+        setRefusal(null);
+        // A Cancel still out now answers an older attempt, which can't reset its button.
+        setCancelling(false);
+        setCancelRefused(null);
+      }
       pollNow.current();
     });
     const offStarted = onSandboxImagePullStarted(() => {
