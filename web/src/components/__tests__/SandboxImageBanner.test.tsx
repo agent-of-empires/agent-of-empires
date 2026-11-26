@@ -5,7 +5,12 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import type { SandboxImagePull, SandboxImageStatus } from "../../lib/api";
-import { useSandboxImageBanner } from "../../hooks/useSandboxImageBanner";
+import {
+  type Attempt,
+  type BannerInputs,
+  deriveBanner,
+  useSandboxImageBanner,
+} from "../../hooks/useSandboxImageBanner";
 import { notifySandboxImagePullStarted, notifySandboxImagePulled } from "../../lib/sandboxImageEvents";
 import { CANCEL_NOT_READY, SandboxImageBanner } from "../SandboxImageBanner";
 
@@ -274,7 +279,7 @@ describe("SandboxImageBanner", () => {
       reply({ ok: false });
       await vi.advanceTimersByTimeAsync(0);
     });
-    expect(banner()?.textContent).toBe(UPDATED);
+    expect(banner()?.textContent, "a late failed reply undid the pull a status confirmed").toBe(UPDATED);
   });
 
   it("keeps showing the pull it asked for when an older status lands before the reply", async () => {
@@ -757,7 +762,8 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
     ];
     const otherCurrent = (pull: SandboxImagePull) => status({ image: OTHER, state: "current", pull } as never);
 
-    // B running before A's refusal: B's pull shows, but only A's own pull confirms A, so the refusal stands.
+    // B running before A's refusal: B's pull shows, and only A's own pull confirms A, so the refusal stands. It
+    // waits behind B's running pull, and shows once B's pull ends (Seluj78, #5940 :279).
     for (const next of ["dismiss", "poll"]) {
       const { unmount } = await mount(status());
       let reply!: (r: { ok: boolean; message?: string }) => void;
@@ -769,14 +775,23 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
       let fresh!: (s: SandboxImageStatus) => void;
       fetchSandboxImageStatus.mockImplementationOnce(() => new Promise((resolve) => (fresh = resolve)));
       await act(async () => reply({ ok: false, message: "pulls are off" }));
-      expect(banner()?.textContent, `${next}: A's refusal was dropped`).toBe(FAILED);
+      expect(banner()?.textContent, `${next}: A's refusal stopped B's pull showing`).toBe(DOWNLOADING);
+      if (next === "dismiss") {
+        await act(async () => fresh(otherCurrent({ state: "done" })));
+      } else {
+        await act(async () => fresh({ ...running(), image: OTHER }));
+        expect(banner()?.textContent, `${next}: B's next poll`).toBe(DOWNLOADING);
+        fetchSandboxImageStatus.mockResolvedValue(otherCurrent({ state: "done" }));
+        await pollAfter(2000);
+      }
+      expect(
+        banner()?.textContent,
+        next === "dismiss" ? `${next}: A's refusal was dropped` : "B's next poll cleared A's refusal",
+      ).toBe(FAILED);
       expect(screen.getByText("pulls are off")).toBeTruthy();
       if (next === "dismiss") {
         dismiss();
-        expect(banner()?.textContent, "A's refusal stopped B's pull showing").toBe(DOWNLOADING);
-      } else {
-        await act(async () => fresh({ ...running(), image: OTHER }));
-        expect(banner()?.textContent, "B's next poll cleared A's refusal").toBe(FAILED);
+        expect(banner()?.textContent, `${next}: B's outcome after A's refusal`).toBe(UPDATED);
       }
       unmount();
     }
@@ -831,6 +846,9 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
       fetchSandboxImageStatus.mockResolvedValue(otherRunning());
       await pollAfter(30_000);
       expect(banner()?.textContent, "B starting brought back A's dismissed refusal").toBe(DOWNLOADING);
+      fetchSandboxImageStatus.mockResolvedValue(otherCurrent({ state: "done" }));
+      await pollAfter(2000);
+      expect(banner()?.textContent, "B ending brought back A's dismissed refusal").toBe(UPDATED);
       unmount();
     }
 
@@ -866,6 +884,24 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
       expect(banner()?.textContent).toBe(FAILED);
       dismiss();
       expect(banner()?.textContent, "A's refusal hid B's outcome").toBe(UPDATED);
+      unmount();
+    }
+
+    // A is refused while B still runs: B's pull keeps the banner, and A's refusal shows once it ends.
+    {
+      const { unmount } = await mount(status());
+      const reply = hold<{ ok: boolean; image?: string; message?: string }>();
+      pullSandboxImage.mockImplementationOnce(() => reply.promise);
+      updateNow();
+      fetchSandboxImageStatus.mockResolvedValue(otherRunning());
+      await pollAfter(2000);
+      await act(async () => reply.resolve({ ok: false, message: "pulls are off" }));
+      expect(banner()?.textContent, "A's refusal hid B's running pull").toBe(DOWNLOADING);
+      fetchSandboxImageStatus.mockResolvedValue(otherCurrent({ state: "done" }));
+      await pollAfter(2000);
+      expect(banner()?.textContent, "A's refusal didn't wait for B's pull").toBe(FAILED);
+      dismiss();
+      expect(banner()?.textContent, "A's waiting refusal hid B's outcome").toBe(UPDATED);
       unmount();
     }
 
@@ -1052,6 +1088,18 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
     expect(banner()?.textContent, "the old reply ended the new pull").toBe(DOWNLOADING);
     fireEvent.click(cancelButton());
     expect(cancelSandboxImagePull).toHaveBeenCalledTimes(2);
+
+    // A refusal of a Cancel the create's pull retired, landing before any poll, says nothing about this pull.
+    cleanup();
+    let refuse!: (r: { ok: boolean; message?: string }) => void;
+    cancelSandboxImagePull.mockReturnValueOnce(new Promise((r) => (refuse = r)));
+    await mount(running());
+    fireEvent.click(cancelButton());
+    fetchSandboxImageStatus.mockImplementation(() => new Promise(() => {}));
+    act(() => notifySandboxImagePulled());
+    await act(async () => refuse({ ok: false, message: "cancels are off here" }));
+    expect(banner()?.textContent, "a Cancel retired by a create's pull still answered").toBe(DOWNLOADING);
+    expect(cancelButton().disabled).toBe(false);
   });
 
   it("ignores a Cancel reply that arrives after a newer update started", async () => {
@@ -1254,5 +1302,94 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
     fetchSandboxImageStatus.mockResolvedValue(running());
     await pollAfter(2000);
     expect(banner()?.textContent).toBe(DOWNLOADING);
+  });
+});
+
+describe("deriveBanner", () => {
+  const OTHER = "ghcr.io/example/other:1";
+  const attempt = (over: Partial<Attempt> = {}): Attempt => ({
+    id: 1,
+    image: IMAGE,
+    digest: "sha256:new",
+    since: 0,
+    replyOut: false,
+    confirmed: null,
+    accepted: false,
+    refused: false,
+    refusal: null,
+    ...over,
+  });
+  const input = (over: Partial<BannerInputs> = {}): BannerInputs => ({
+    status: status(),
+    attempt: null,
+    cancel: null,
+    seenRunning: null,
+    hiddenImage: null,
+    dismissedNotice: null,
+    dismissedDigest: null,
+    configUnreadable: false,
+    configNoticeDismissed: false,
+    ...over,
+  });
+  const runningPull = { state: "running" } as SandboxImagePull;
+  const current = (image: string, pull: SandboxImagePull) => status({ image, state: "current", pull } as never);
+  const refusedA = attempt({ refused: true, refusal: "pulls are off" });
+
+  it("shows the first state that applies, in order", () => {
+    const rows: [string, BannerInputs, string | null, boolean][] = [
+      ["an unreadable config", input({ configUnreadable: true, attempt: refusedA }), "config_unreadable", false],
+      ["a dismissed config notice", input({ configUnreadable: true, configNoticeDismissed: true }), null, false],
+      ["no status yet", input({ status: null }), null, false],
+      ["checks off", input({ status: status({ checks_enabled: false }) }), null, false],
+      ["a running pull", input({ status: status({ pull: runningPull }) }), "updating", true],
+      ["a hidden running pull", input({ status: status({ pull: runningPull }), hiddenImage: IMAGE }), null, true],
+      [
+        "a refusal doesn't outrank a running pull",
+        input({ status: { ...status({ pull: runningPull }), image: OTHER }, attempt: refusedA }),
+        "updating",
+        true,
+      ],
+      ["a refusal", input({ attempt: refusedA }), "failed", false],
+      ["a dismissed refusal", input({ attempt: { ...refusedA, refusal: null } }), "available", false],
+      ["a pull this page saw", input({ status: current(IMAGE, { state: "done" }), seenRunning: IMAGE }), "done", false],
+      [
+        "the accepted attempt's pull",
+        input({ status: current(IMAGE, { state: "done" }), attempt: attempt({ accepted: true }) }),
+        "done",
+        false,
+      ],
+      [
+        "a refused attempt owns no outcome",
+        input({ status: current(IMAGE, { state: "done" }), attempt: { ...refusedA, refusal: null } }),
+        null,
+        false,
+      ],
+      [
+        "another image seen owns no outcome",
+        input({ status: current(IMAGE, { state: "failed", message: "x", error: "y" } as never), seenRunning: OTHER }),
+        null,
+        false,
+      ],
+      [
+        "a dismissed outcome",
+        input({ status: current(IMAGE, { state: "done" }), seenRunning: IMAGE, dismissedNotice: IMAGE }),
+        null,
+        false,
+      ],
+      [
+        "an image published since the pull",
+        input({ status: status({ remote_digest: "sha256:newer", pull: { state: "done" } }), seenRunning: IMAGE }),
+        "available",
+        false,
+      ],
+      ["an offer", input(), "available", false],
+      ["an offer the Daemon can't pull", input({ status: status({ pull_blocked: "disabled" }) }), "gated", false],
+      ["a dismissed offer", input({ dismissedDigest: "sha256:new" }), null, false],
+    ];
+    for (const [name, given, kind, running] of rows) {
+      const shown = deriveBanner(given);
+      expect(shown.view?.kind ?? null, name).toBe(kind);
+      expect(shown.running !== null, `${name}: running`).toBe(running);
+    }
   });
 });
