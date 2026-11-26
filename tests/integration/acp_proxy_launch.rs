@@ -4,6 +4,7 @@
 //! (`acp-worker/test-shim/fake-proxy.mjs`) wrapping the Node shim.
 
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -110,4 +111,91 @@ fn proxy_receives_argv_and_owner_only_launch_config_removed_at_session_end() {
         !launch_config.exists(),
         "config must be removed at session end"
     );
+}
+
+fn pid_alive(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Runs a runner (its own group leader, as the daemon spawns it) over the fake
+/// proxy and a `sleep` adapter (unlike the shim, it ignores stdin EOF), ends it
+/// with `end`, and asserts neither the proxy nor the adapter outlives it.
+fn assert_no_orphans(session_id: &str, proxy_mode: &str, end: impl FnOnce(&str, &str)) {
+    let temp = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let _home = set_temp_home(temp.path());
+    let record_dir = temp.path().join("record");
+    std::fs::create_dir_all(&record_dir).unwrap();
+
+    let node = shim_node().expect("shim prerequisite");
+    let proxy = shim_path().with_file_name("fake-proxy.mjs");
+    let socket = worker_registry::socket_path_for(session_id).unwrap();
+    let mut runner = Command::new(env!("CARGO_BIN_EXE_aoe"))
+        .args(["__acp-runner", "--socket"])
+        .arg(&socket)
+        .args(["--session-id", session_id, "--agent-name", "shim", "--cwd"])
+        .arg(temp.path())
+        .args(["--", node.to_str().unwrap(), proxy.to_str().unwrap()])
+        .args(["--", "sleep", "600"])
+        .env("FAKE_PROXY_RECORD_DIR", &record_dir)
+        .env("FAKE_PROXY_MODE", proxy_mode)
+        .process_group(0)
+        .spawn()
+        .expect("spawn acp runner");
+
+    wait_for(&record_dir.join("adapter_pid"), "adapter pid record");
+    let read = |name: &str| std::fs::read_to_string(record_dir.join(name)).unwrap();
+    let (proxy_pid, adapter_pid) = (read("pid"), read("adapter_pid"));
+    assert!(pid_alive(&proxy_pid) && pid_alive(&adapter_pid));
+
+    end(&runner.id().to_string(), proxy_pid.trim());
+
+    wait_until("runner did not exit", || {
+        runner.try_wait().unwrap().is_some()
+    });
+    wait_until("proxy outlived the runner", || !pid_alive(&proxy_pid));
+    wait_until("adapter outlived the runner", || !pid_alive(&adapter_pid));
+}
+
+fn signal(sig: &str, pid: &str) {
+    assert!(Command::new("kill")
+        .args([sig, pid])
+        .status()
+        .unwrap()
+        .success());
+}
+
+#[test]
+#[serial]
+fn runner_shutdown_leaves_no_orphan_proxy_or_adapter() {
+    if let Err(reason) = shim_ready() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    assert_no_orphans("proxy-orphan-term", "orphan-on-term", |runner, _| {
+        signal("-TERM", runner)
+    });
+}
+
+#[test]
+#[serial]
+fn proxy_exit_leaves_no_orphan_adapter() {
+    if let Err(reason) = shim_ready() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    assert_no_orphans("proxy-orphan-exit", "ok", |_, proxy| signal("-KILL", proxy));
 }

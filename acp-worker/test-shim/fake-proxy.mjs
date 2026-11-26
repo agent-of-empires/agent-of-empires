@@ -3,10 +3,11 @@
  * Fake plugin proxy for tests: `fake-proxy [flags] -- <adapter argv...>`.
  * Spawns the adapter with piped stdio, forwards both directions, and adds
  * `_meta.aoe.proxy` to the initialize result. Inherited fds and env pass through.
- * FAKE_PROXY_RECORD_DIR: writes argv.json (own argv), pid, and env.json
- * (AOE_PROXY_LAUNCH_CONFIG as received) there.
+ * FAKE_PROXY_RECORD_DIR: writes argv.json (own argv), pid, adapter_pid, and
+ * env.json (AOE_PROXY_LAUNCH_CONFIG as received) there.
  * FAKE_PROXY_MODE: "bad-hello" (wrong plugin_id), "no-hello" (no hello), "die"
- * (exit 1 before spawning the adapter); default is a valid hello.
+ * (exit 1 before spawning the adapter), "orphan-on-term" (SIGTERM exits without
+ * stopping the adapter); default is a valid hello.
  */
 import { spawn } from "node:child_process";
 import { fstatSync, writeFileSync } from "node:fs";
@@ -49,6 +50,8 @@ const child = spawn(command, args, {
   stdio: ["pipe", "pipe", "inherit", ...extraFds],
 });
 
+if (dir) writeFileSync(join(dir, "adapter_pid"), String(child.pid));
+
 const hello = {
   plugin_id: mode === "bad-hello" ? "wrong-plugin" : "fake-proxy",
   protocol_version: 1,
@@ -76,4 +79,8 @@ lines.on("line", (line) => {
   process.stdout.write(out + "\n");
 });
 child.on("exit", (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
-for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => child.kill(sig));
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, () =>
+    mode === "orphan-on-term" ? process.exit(0) : child.kill(sig),
+  );
+}
