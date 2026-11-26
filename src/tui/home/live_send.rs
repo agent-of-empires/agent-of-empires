@@ -98,24 +98,10 @@ fn e2e_report_vt_arm(
 }
 
 #[cfg(all(unix, feature = "e2e-tests"))]
-fn e2e_report_vt_arm_consumed() {
-    let Some(gate) = e2e_vt_arm_gate() else {
-        return;
-    };
-    let attempt = E2E_VT_ARM_COUNTER.load(std::sync::atomic::Ordering::Relaxed);
-    if attempt > 0 {
-        let _ = e2e_publish_vt_arm(&gate, &format!("attempt-{attempt}-consumed"), b"consumed");
-    }
-}
-
-#[cfg(all(unix, feature = "e2e-tests"))]
-fn e2e_report_vt_arm_orphaned() {
-    let Some(gate) = e2e_vt_arm_gate() else {
-        return;
-    };
-    let attempt = E2E_VT_ARM_COUNTER.load(std::sync::atomic::Ordering::Relaxed);
-    if attempt > 0 {
-        let _ = e2e_publish_vt_arm(&gate, &format!("attempt-{attempt}-orphaned"), b"orphaned");
+fn e2e_vt_arm_settled() {
+    if let Some(gate) = e2e_vt_arm_gate() {
+        let attempt = E2E_VT_ARM_COUNTER.load(std::sync::atomic::Ordering::Relaxed);
+        let _ = e2e_publish_vt_arm(&gate, &format!("attempt-{attempt}-settled"), b"");
     }
 }
 
@@ -876,16 +862,15 @@ impl<T: Send + Sync + 'static> PendingArm<T> {
         arm: impl FnOnce(&str) -> Option<std::sync::Arc<T>> + Send + 'static,
     ) -> Self {
         let (sender, result) = std::sync::mpsc::channel();
+        #[cfg(feature = "e2e-tests")]
         let native_arm = authority.is_some();
         std::thread::spawn(move || {
             // A send to a stopped worker fails and drops the channel here.
-            let delivered = sender.send(arm(&name)).is_ok();
+            let _undelivered = sender.send(arm(&name)).is_err();
             #[cfg(feature = "e2e-tests")]
-            if native_arm && !delivered {
-                e2e_report_vt_arm_orphaned();
+            if native_arm && _undelivered {
+                e2e_vt_arm_settled();
             }
-            #[cfg(not(feature = "e2e-tests"))]
-            let _ = (native_arm, delivered);
             signal_capture_wake(&nudge);
         });
         Self {
@@ -1497,6 +1482,9 @@ impl LiveCaptureWorker {
                     #[cfg(feature = "e2e-tests")]
                     {
                         e2e_vt_arm_consumed = was_pending && pending_vt_arm.is_none();
+                        if e2e_vt_arm_consumed && !vt_authorized {
+                            e2e_vt_arm_settled();
+                        }
                     }
                     if let Some((v, authority)) = armed {
                         // Event-driven echo: the channel pokes the nudge condvar on every grid
@@ -1519,10 +1507,6 @@ impl LiveCaptureWorker {
                 // `[tmux] vt_live`, re-read every cycle. Toggling off tears down an armed
                 // channel, and resetting the arm latch lets a later re-enable arm afresh for
                 // the same target instead of waiting for a retarget.
-                #[cfg(all(unix, feature = "e2e-tests"))]
-                if e2e_vt_arm_consumed && !vt_authorized && pending_vt_arm.is_none() {
-                    e2e_report_vt_arm_consumed();
-                }
                 #[cfg(unix)]
                 let vt_enabled = !scripted_capture && vt_enabled_cell.load(Ordering::Relaxed);
                 #[cfg(unix)]

@@ -126,7 +126,8 @@ fn stale_pending_vt_arm_is_fenced_after_disconnect() {
     );
     assert_eq!(tmux_field(&h, &target, "#{pane_pipe}").unwrap(), "0");
     wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
-        (gate.join("attempt-1-consumed").exists() || gate.join("attempt-1-orphaned").exists())
+        gate.join("attempt-1-settled")
+            .exists()
             .then_some(())
             .ok_or("revoked pending arm did not settle".into())
     });
