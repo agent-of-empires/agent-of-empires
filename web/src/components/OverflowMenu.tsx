@@ -69,7 +69,7 @@ export function OverflowMenu({ items, triggerDataTour, phoneFloating = false }: 
         <div
           role="menu"
           className={`absolute right-0 top-full mt-1 min-w-[160px] bg-surface-800 border border-surface-700/50 rounded-md shadow-xl py-1 z-50 animate-fade-in ${
-            phoneFloating ? "max-md:mt-2 max-md:min-w-[240px] max-md:rounded-2xl max-md:glass-menu max-md:py-1.5" : ""
+            phoneFloating ? "max-md:mt-2 max-md:min-w-[240px] max-md:max-h-[calc(100dvh-7rem)] max-md:overflow-y-auto max-md:overscroll-contain max-md:rounded-2xl max-md:glass-menu max-md:py-1.5" : ""
           }`}
         >
           {items.map(({ label, onClick, detail, icon: Icon, separated, checked }) => (
