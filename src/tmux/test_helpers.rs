@@ -199,6 +199,23 @@ pub(crate) fn after_input_check(pane: &str) {
     }
 }
 
+static SCREEN_CAPTURED_HOOKS: HookRegistry = std::sync::Mutex::new(Vec::new());
+
+/// Runs `hook` once, after an automatic-input check has captured `pane` and before it reads
+/// the capture.
+pub(crate) fn on_screen_captured(pane: &str, hook: impl FnOnce() + Send + 'static) {
+    SCREEN_CAPTURED_HOOKS
+        .lock()
+        .unwrap()
+        .push((pane.to_string(), Box::new(hook)));
+}
+
+pub(crate) fn after_screen_captured(pane: &str) {
+    for hook in take_hooks(&SCREEN_CAPTURED_HOOKS, pane) {
+        hook();
+    }
+}
+
 static TEXT_TYPED_HOOKS: HookRegistry = std::sync::Mutex::new(Vec::new());
 
 /// Runs `hook` once, after a checked-pane send has typed its text into `pane` and before its

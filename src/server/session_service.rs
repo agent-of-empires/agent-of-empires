@@ -3178,11 +3178,13 @@ fn pane_accepts_automatic_input(
     pane: &str,
 ) -> anyhow::Result<bool> {
     let capture = tmux.try_capture_pane_in(pane, 0)?;
+    #[cfg(test)]
+    crate::tmux::test_helpers::after_screen_captured(pane);
     let screen = crate::tmux::utils::strip_ansi(&capture);
     if let Some(blocker) = TerminalPromptBlocker::detect(&instance.tool, &screen) {
         return Err(blocker.into());
     }
-    if instance.input_line_in(tmux, pane) == crate::tmux::InputLine::Draft {
+    if instance.input_line_of(&capture) == crate::tmux::InputLine::Draft {
         return Err(TerminalPromptBlocker::InputLineBusy.into());
     }
     let screen = screen.to_lowercase();
@@ -5498,6 +5500,37 @@ mod tests {
             assert_eq!(turn.error_code.as_deref(), Some(code), "{case}");
             assert!(turn.error.is_some_and(|e| e.contains(hint)), "{case}");
         }
+    }
+
+    /// The draft check reads the capture the dialog check took: a pane that can't be captured
+    /// again doesn't turn the draft it showed into a ready screen.
+    #[test]
+    #[serial_test::serial]
+    fn the_automatic_input_check_reads_its_draft_from_its_one_capture() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = terminal_turn_instance("sess-one-capture", "term-one-capture", "unused");
+        inst.tool = "claude".into();
+        let pane = start_terminal_pane(&inst, INPUT_BOX_SCRIPT, false);
+        let pane_id = type_draft(&pane, "half typed");
+        let target = pane_id.clone();
+        crate::tmux::test_helpers::on_screen_captured(&pane_id, move || {
+            let status = crate::tmux::tmux_command()
+                .args(["kill-pane", "-t", &target])
+                .status()
+                .unwrap();
+            assert!(status.success(), "kill-pane");
+        });
+
+        let tmux = crate::tmux::Session::from_name(pane.name());
+        let error = pane_accepts_automatic_input(&inst, &tmux, &pane_id)
+            .expect_err("the captured draft refuses");
+        assert_eq!(
+            error.downcast_ref::<TerminalPromptBlocker>(),
+            Some(&TerminalPromptBlocker::InputLineBusy)
+        );
     }
 
     /// The screen is read again under the final guards: a ready marker that has

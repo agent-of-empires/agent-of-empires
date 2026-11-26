@@ -645,20 +645,33 @@ impl Instance {
     /// What the agent's input box in `pane` holds, read through its detection manifest. A pane
     /// that cannot be captured, or an agent with no `[input_line]` table, is `Unknown`.
     pub(crate) fn input_line_in(&self, session: &tmux::Session, pane: &str) -> tmux::InputLine {
-        let alias = tmux::status_rules::effective_detect_as(
-            &self.source_profile,
-            &self.tool,
-            &self.detect_as,
-        );
-        let tool: &str = if alias.is_empty() { &self.tool } else { &alias };
-        if !tmux::detect::has_input_line(tool) {
+        let tool = self.input_line_tool();
+        if !tmux::detect::has_input_line(&tool) {
             return tmux::InputLine::Unknown;
         }
         session
             .try_capture_pane_in(pane, 0)
             .map_or(tmux::InputLine::Unknown, |capture| {
-                tmux::detect::input_line(tool, &capture)
+                tmux::detect::input_line(&tool, &capture)
             })
+    }
+
+    /// What the input box in `capture`, a coloured capture of the agent's pane, holds.
+    pub(crate) fn input_line_of(&self, capture: &str) -> tmux::InputLine {
+        tmux::detect::input_line(&self.input_line_tool(), capture)
+    }
+
+    fn input_line_tool(&self) -> std::borrow::Cow<'_, str> {
+        let alias = tmux::status_rules::effective_detect_as(
+            &self.source_profile,
+            &self.tool,
+            &self.detect_as,
+        );
+        if alias.is_empty() {
+            std::borrow::Cow::Borrowed(&self.tool)
+        } else {
+            alias
+        }
     }
 
     /// Polls [`Self::input_line_in`] until the box reads empty. A first read that is `Unknown`
