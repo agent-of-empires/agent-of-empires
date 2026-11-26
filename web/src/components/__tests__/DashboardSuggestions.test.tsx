@@ -1,33 +1,20 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  act,
-  cleanup,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { reportFeatureUse } from "../../lib/featureUse";
 import { DashboardSuggestions } from "../DashboardSuggestions";
 import { setServerDown } from "../../lib/connectionState";
 import type { SuggestionItem, SuggestionsSnapshot } from "../../lib/types";
 
-const {
-  fetchSuggestions,
-  prepareSuggestion,
-  refreshSuggestions,
-  dismissSuggestion,
-  startSuggestion,
-  wide,
-} = vi.hoisted(() => ({
-  startSuggestion: vi.fn(),
-  fetchSuggestions: vi.fn(),
-  prepareSuggestion: vi.fn(),
-  refreshSuggestions: vi.fn(),
-  dismissSuggestion: vi.fn(),
-  wide: { value: true },
-}));
+const { fetchSuggestions, prepareSuggestion, refreshSuggestions, dismissSuggestion, startSuggestion, wide } =
+  vi.hoisted(() => ({
+    startSuggestion: vi.fn(),
+    fetchSuggestions: vi.fn(),
+    prepareSuggestion: vi.fn(),
+    refreshSuggestions: vi.fn(),
+    dismissSuggestion: vi.fn(),
+    wide: { value: true },
+  }));
 
 const { updateSuggestionSource, updateSuggestionPrefs } = vi.hoisted(() => ({
   updateSuggestionSource: vi.fn(),
@@ -70,14 +57,9 @@ const PREFS: SuggestionsSnapshot["prefs"] = {
   show_source_ref: true,
   provider_order: [],
 };
-const snap = (
-  items: SuggestionItem[],
-  status: "ok" | "pending" = "ok",
-): SuggestionsSnapshot => ({
+const snap = (items: SuggestionItem[], status: "ok" | "pending" = "ok"): SuggestionsSnapshot => ({
   items,
-  providers: [
-    { id: "github", name: "GitHub", status, enabled: true, sources: [] },
-  ],
+  providers: [{ id: "github", name: "GitHub", status, enabled: true, sources: [] }],
   prefs: PREFS,
 });
 const ok = { ok: true, data: undefined };
@@ -90,26 +72,15 @@ afterEach(() => {
   wide.value = true;
 });
 
-const renderIt = (
-  props: Partial<Parameters<typeof DashboardSuggestions>[0]> = {},
-) =>
-  render(
-    <DashboardSuggestions
-      onPrepare={vi.fn()}
-      onViewAll={vi.fn()}
-      onOpenSession={vi.fn()}
-      {...props}
-    />,
-  );
+const renderIt = (props: Partial<Parameters<typeof DashboardSuggestions>[0]> = {}) =>
+  render(<DashboardSuggestions onPrepare={vi.fn()} onViewAll={vi.fn()} onOpenSession={vi.fn()} {...props} />);
 
 describe("DashboardSuggestions", () => {
   it("counts one home use when it lists items", async () => {
     fetchSuggestions.mockResolvedValue(snap([mk(1)]));
     renderIt();
     await screen.findByText("Item 1");
-    await waitFor(() =>
-      expect(reportFeatureUse).toHaveBeenCalledWith("suggest_from_home"),
-    );
+    await waitFor(() => expect(reportFeatureUse).toHaveBeenCalledWith("suggest_from_home"));
     expect(reportFeatureUse).toHaveBeenCalledTimes(1);
   });
 
@@ -126,17 +97,13 @@ describe("DashboardSuggestions", () => {
         },
       ],
     };
-    fetchSuggestions
-      .mockResolvedValueOnce(off)
-      .mockResolvedValue(snap([mk(1)]));
+    fetchSuggestions.mockResolvedValueOnce(off).mockResolvedValue(snap([mk(1)]));
     updateSuggestionPrefs.mockResolvedValue(ok);
     renderIt();
     expect((await screen.findByTestId("suggestions-off")).textContent).toBe(
       "Suggestions are off: GitHub is installed but turned off. Turn it on",
     );
-    expect(
-      screen.queryByText(/Getting your first suggestions|Nothing to suggest/),
-    ).toBeNull();
+    expect(screen.queryByText(/Getting your first suggestions|Nothing to suggest/)).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Turn it on" }));
     await waitFor(() =>
       expect(updateSuggestionPrefs).toHaveBeenCalledWith({
@@ -189,35 +156,23 @@ describe("DashboardSuggestions", () => {
       ],
     });
     renderIt();
-    expect(
-      await screen.findByText(/GitHub · couldn't refresh, gh is not signed in/),
-    ).toBeTruthy();
+    expect(await screen.findByText(/GitHub · couldn't refresh, gh is not signed in/)).toBeTruthy();
     expect(screen.queryByText(/Nothing to suggest right now/)).toBeNull();
   });
 
   it("caps rows (3 wide, 2 narrow) and counts all non-dismissed items in View all", async () => {
-    fetchSuggestions.mockResolvedValue(
-      snap(
-        [1, 2, 3, 4, 5].map((n) => mk(n)).concat(mk(6, { dismissed: true })),
-      ),
-    );
+    fetchSuggestions.mockResolvedValue(snap([1, 2, 3, 4, 5].map((n) => mk(n)).concat(mk(6, { dismissed: true }))));
     const onViewAll = vi.fn();
     const { unmount } = renderIt({ onViewAll });
-    expect(
-      await screen.findAllByRole("button", { name: "Start" }),
-    ).toHaveLength(3);
+    expect(await screen.findAllByRole("button", { name: "Start" })).toHaveLength(3);
     fireEvent.click(screen.getByRole("link", { name: "View all (5)" }));
     expect(onViewAll).toHaveBeenCalled();
-    expect(
-      screen.getByRole("link", { name: "View all (5)" }).getAttribute("href"),
-    ).toBe("/suggestions");
+    expect(screen.getByRole("link", { name: "View all (5)" }).getAttribute("href")).toBe("/suggestions");
     unmount();
 
     wide.value = false;
     renderIt();
-    expect(
-      await screen.findAllByRole("button", { name: "Start" }),
-    ).toHaveLength(2);
+    expect(await screen.findAllByRole("button", { name: "Start" })).toHaveLength(2);
   });
 
   it("renders nothing without a provider", async () => {
@@ -254,12 +209,8 @@ describe("DashboardSuggestions", () => {
         prefs: { ...PREFS, show_source_ref: shown },
       });
       const { unmount } = renderIt();
-      expect((await screen.findByText(/Assigned to you/)).textContent).toBe(
-        "Assigned to you · aoe",
-      );
-      expect(
-        screen.queryByTestId("suggestion-source-ref")?.textContent ?? null,
-      ).toBe(expected);
+      expect((await screen.findByText(/Assigned to you/)).textContent).toBe("Assigned to you · aoe");
+      expect(screen.queryByTestId("suggestion-source-ref")?.textContent ?? null).toBe(expected);
       unmount();
     }
   });
@@ -274,9 +225,7 @@ describe("DashboardSuggestions", () => {
     const onPrepare = vi.fn();
     renderIt({ onPrepare });
     fireEvent.click(await screen.findByRole("button", { name: "Start" }));
-    await waitFor(() =>
-      expect(startSuggestion).toHaveBeenCalledWith("github", "i1", {}),
-    );
+    await waitFor(() => expect(startSuggestion).toHaveBeenCalledWith("github", "i1", {}));
     expect(onPrepare).not.toHaveBeenCalled();
 
     prepareSuggestion.mockResolvedValue({
@@ -293,9 +242,7 @@ describe("DashboardSuggestions", () => {
       },
     });
     fireEvent.click(screen.getByRole("button", { name: "Start options" }));
-    fireEvent.click(
-      screen.getByRole("menuitem", { name: /^Start with changes/ }),
-    );
+    fireEvent.click(screen.getByRole("menuitem", { name: /^Start with changes/ }));
     await waitFor(() => expect(onPrepare).toHaveBeenCalled());
     expect(prepareSuggestion).toHaveBeenCalledWith("github", "i1");
     expect(onPrepare.mock.calls[0][0]).toMatchObject({
@@ -306,9 +253,7 @@ describe("DashboardSuggestions", () => {
   });
 
   it("Dismiss shows an undo bar that restores the item, and the bar expires after 10s", async () => {
-    fetchSuggestions
-      .mockResolvedValueOnce(snap([mk(1)]))
-      .mockResolvedValue(snap([mk(1, { dismissed: true })]));
+    fetchSuggestions.mockResolvedValueOnce(snap([mk(1)])).mockResolvedValue(snap([mk(1, { dismissed: true })]));
     dismissSuggestion.mockResolvedValue(ok);
     renderIt();
     fireEvent.click(await screen.findByRole("button", { name: "Dismiss" }));
@@ -316,9 +261,7 @@ describe("DashboardSuggestions", () => {
     expect(dismissSuggestion).toHaveBeenCalledWith("github", "i1", true);
 
     fireEvent.click(screen.getByRole("button", { name: "Undo" }));
-    await waitFor(() =>
-      expect(dismissSuggestion).toHaveBeenCalledWith("github", "i1", false),
-    );
+    await waitFor(() => expect(dismissSuggestion).toHaveBeenCalledWith("github", "i1", false));
     await waitFor(() => expect(screen.queryByText(/Dismissed/)).toBeNull());
   });
 
@@ -344,9 +287,7 @@ describe("DashboardSuggestions", () => {
         },
       ],
     });
-    fetchSuggestions
-      .mockResolvedValueOnce(withKind([mk(1)]))
-      .mockResolvedValue(withKind([mk(1, { dismissed: true })]));
+    fetchSuggestions.mockResolvedValueOnce(withKind([mk(1)])).mockResolvedValue(withKind([mk(1, { dismissed: true })]));
     dismissSuggestion.mockResolvedValue(ok);
     updateSuggestionSource.mockResolvedValue(ok);
     renderIt();
@@ -358,28 +299,12 @@ describe("DashboardSuggestions", () => {
         name: "Stop suggesting assigned issues",
       }),
     );
-    await waitFor(() =>
-      expect(updateSuggestionSource).toHaveBeenCalledWith(
-        "github",
-        "assigned",
-        false,
-      ),
-    );
-    expect(
-      (
-        await screen.findByText(/^Stopped suggesting assigned issues\./)
-      ).closest("div")!.textContent,
-    ).toBe(
+    await waitFor(() => expect(updateSuggestionSource).toHaveBeenCalledWith("github", "assigned", false));
+    expect((await screen.findByText(/^Stopped suggesting assigned issues\./)).closest("div")!.textContent).toBe(
       "Stopped suggesting assigned issues.Undo·Turn it back on in Settings › Suggestions.",
     );
     fireEvent.click(screen.getByRole("button", { name: "Undo" }));
-    await waitFor(() =>
-      expect(updateSuggestionSource).toHaveBeenLastCalledWith(
-        "github",
-        "assigned",
-        true,
-      ),
-    );
+    await waitFor(() => expect(updateSuggestionSource).toHaveBeenLastCalledWith("github", "assigned", true));
     expect(
       await screen.findByRole("button", {
         name: "Stop suggesting assigned issues",
@@ -414,9 +339,7 @@ describe("DashboardSuggestions", () => {
     dismissSuggestion.mockResolvedValue(ok);
     updateSuggestionSource.mockResolvedValue({ ok: false, error: "nope" });
     renderIt();
-    fireEvent.click(
-      (await screen.findAllByRole("button", { name: "Dismiss" }))[0]!,
-    );
+    fireEvent.click((await screen.findAllByRole("button", { name: "Dismiss" }))[0]!);
     fireEvent.click(
       await screen.findByRole("button", {
         name: "Stop suggesting assigned issues",
@@ -428,26 +351,20 @@ describe("DashboardSuggestions", () => {
     expect(screen.getByRole("button", { name: "Undo" })).toBeTruthy();
 
     updateSuggestionSource.mockResolvedValue(ok);
-    fireEvent.click(
-      screen.getByRole("button", { name: "Stop suggesting assigned issues" }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "Stop suggesting assigned issues" }));
     await screen.findByText(/^Stopped suggesting/);
     fireEvent.click(screen.getAllByRole("button", { name: "Dismiss" })[1]!);
     expect(await screen.findByRole("button", { name: "Undo" })).toBeTruthy();
   });
 
   it("expires the undo bar after 10s", async () => {
-    fetchSuggestions
-      .mockResolvedValueOnce(snap([mk(1)]))
-      .mockResolvedValue(snap([mk(1, { dismissed: true })]));
+    fetchSuggestions.mockResolvedValueOnce(snap([mk(1)])).mockResolvedValue(snap([mk(1, { dismissed: true })]));
     dismissSuggestion.mockResolvedValue(ok);
     const spy = vi.spyOn(globalThis, "setTimeout");
     renderIt();
     fireEvent.click(await screen.findByRole("button", { name: "Dismiss" }));
     await screen.findByText(/Dismissed/);
-    const expire = spy.mock.calls.find(
-      ([, ms]) => ms === 10_000,
-    )?.[0] as () => void;
+    const expire = spy.mock.calls.find(([, ms]) => ms === 10_000)?.[0] as () => void;
     act(() => expire());
     expect(screen.queryByText(/Dismissed/)).toBeNull();
   });
@@ -455,9 +372,7 @@ describe("DashboardSuggestions", () => {
   it("shows the first-results note while a provider is pending and a refresh note when empty", async () => {
     fetchSuggestions.mockResolvedValue(snap([], "pending"));
     const { unmount } = renderIt();
-    expect(
-      await screen.findByText(/Getting your first suggestions from GitHub/),
-    ).toBeTruthy();
+    expect(await screen.findByText(/Getting your first suggestions from GitHub/)).toBeTruthy();
     unmount();
 
     fetchSuggestions.mockResolvedValue(snap([]));
@@ -472,9 +387,7 @@ describe("DashboardSuggestions", () => {
     renderIt({ readOnly: true });
     const start = await screen.findByRole("button", { name: "Start" });
     expect((start as HTMLButtonElement).disabled).toBe(true);
-    expect(start.getAttribute("title")).toBe(
-      "Read-only: can't create Sessions",
-    );
+    expect(start.getAttribute("title")).toBe("Read-only: can't create Sessions");
     expect(screen.queryByRole("button", { name: "Dismiss" })).toBeNull();
     expect(
       (
@@ -492,23 +405,13 @@ describe("DashboardSuggestions", () => {
     renderIt({ readOnly: true, cityhall: true });
     const start = await screen.findByRole("button", { name: "Start" });
     expect(start.getAttribute("title")).toBe("Off in CityHall mode");
-    expect(
-      screen
-        .getByRole("button", { name: "Start options" })
-        .getAttribute("title"),
-    ).toBe("Off in CityHall mode");
-    expect(
-      screen.getByText(
-        "Suggestions are view-only in CityHall mode. New session still works.",
-      ),
-    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Start options" }).getAttribute("title")).toBe("Off in CityHall mode");
+    expect(screen.getByText("Suggestions are view-only in CityHall mode. New session still works.")).toBeTruthy();
   });
 
   it("stays hidden when the first fetch fails, and retries on reconnect", async () => {
     setServerDown(true);
-    fetchSuggestions
-      .mockResolvedValueOnce(null)
-      .mockResolvedValue(snap([mk(1)]));
+    fetchSuggestions.mockResolvedValueOnce(null).mockResolvedValue(snap([mk(1)]));
     const { container } = renderIt();
     await waitFor(() => expect(fetchSuggestions).toHaveBeenCalledTimes(1));
     await act(async () => {});
@@ -519,9 +422,7 @@ describe("DashboardSuggestions", () => {
   });
 
   it("a failed first load shows one inline error with Try again", async () => {
-    fetchSuggestions
-      .mockResolvedValueOnce(null)
-      .mockResolvedValue(snap([mk(1)]));
+    fetchSuggestions.mockResolvedValueOnce(null).mockResolvedValue(snap([mk(1)]));
     renderIt();
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("Could not load suggestions.");
@@ -535,10 +436,7 @@ describe("DashboardSuggestions", () => {
     await screen.findByRole("button", { name: "Start" });
     act(() => setServerDown(true));
     expect(screen.getByText(/Disconnected\./)).toBeTruthy();
-    expect(
-      (screen.getByRole("button", { name: "Start" }) as HTMLButtonElement)
-        .disabled,
-    ).toBe(true);
+    expect((screen.getByRole("button", { name: "Start" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("a reload that fails with rows showing keeps Try again", async () => {
@@ -548,12 +446,8 @@ describe("DashboardSuggestions", () => {
       .mockResolvedValue(snap([mk(2)]));
     dismissSuggestion.mockResolvedValue(ok);
     renderIt();
-    fireEvent.click(
-      (await screen.findAllByRole("button", { name: "Dismiss" }))[0]!,
-    );
-    expect((await screen.findByRole("alert")).textContent).toBe(
-      "Could not load suggestions. Try again",
-    );
+    fireEvent.click((await screen.findAllByRole("button", { name: "Dismiss" }))[0]!);
+    expect((await screen.findByRole("alert")).textContent).toBe("Could not load suggestions. Try again");
     fireEvent.click(screen.getByRole("button", { name: "Try again" }));
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
     expect(screen.getAllByRole("button", { name: "Start" })).toHaveLength(1);
@@ -579,20 +473,14 @@ describe("DashboardSuggestions", () => {
     });
     renderIt();
     fireEvent.click(await screen.findByRole("button", { name: "Refresh" }));
-    expect((await screen.findByRole("alert")).textContent).toBe(
-      "Refresh failed. Try again",
-    );
+    expect((await screen.findByRole("alert")).textContent).toBe("Refresh failed. Try again");
     fireEvent.click(screen.getByRole("button", { name: "Try again" }));
     await waitFor(() => expect(refreshSuggestions).toHaveBeenCalledTimes(2));
   });
 
   it("keeps the undo bar when the restore fails", async () => {
-    fetchSuggestions
-      .mockResolvedValueOnce(snap([mk(1)]))
-      .mockResolvedValue(snap([mk(1, { dismissed: true })]));
-    dismissSuggestion
-      .mockResolvedValueOnce(ok)
-      .mockResolvedValueOnce({ ok: false, error: "boom", stale: false });
+    fetchSuggestions.mockResolvedValueOnce(snap([mk(1)])).mockResolvedValue(snap([mk(1, { dismissed: true })]));
+    dismissSuggestion.mockResolvedValueOnce(ok).mockResolvedValueOnce({ ok: false, error: "boom", stale: false });
     renderIt();
     fireEvent.click(await screen.findByRole("button", { name: "Dismiss" }));
     fireEvent.click(await screen.findByRole("button", { name: "Undo" }));
@@ -611,9 +499,7 @@ describe("DashboardSuggestions", () => {
       .mockResolvedValueOnce(ok);
     renderIt();
     fireEvent.click(await screen.findByRole("button", { name: "Refresh" }));
-    expect((await screen.findByRole("alert")).textContent).toBe(
-      "refresh failed Try again",
-    );
+    expect((await screen.findByRole("alert")).textContent).toBe("refresh failed Try again");
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
   });
@@ -632,13 +518,9 @@ describe("DashboardSuggestions", () => {
       ],
     });
     renderIt();
-    expect(
-      (await screen.findByTestId("suggestions-agent-guide")).textContent,
-    ).toContain("Ask any session to suggest");
+    expect((await screen.findByTestId("suggestions-agent-guide")).textContent).toContain("Ask any session to suggest");
     expect(screen.queryByText(/Nothing to suggest|Refresh/)).toBeNull();
-    fireEvent.click(
-      screen.getByRole("button", { name: "Show a prompt to paste" }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "Show a prompt to paste" }));
     expect(screen.getByText(/call the suggest_session tool/)).toBeTruthy();
   });
 
