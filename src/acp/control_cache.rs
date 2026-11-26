@@ -499,17 +499,16 @@ impl ControlStateCache {
                         .choice
                         .as_ref()
                         .is_some_and(|choice| choice.matches(row));
-                    let expected =
-                        if current.is_some() && row.require_resolved_acp_selection().is_err() {
-                            Some(
-                                crate::acp::establishment::EstablishmentExpected::capture(
-                                    row, storage,
-                                )?
-                                .revision()?,
-                            )
-                        } else {
-                            None
-                        };
+                    let expected = if row.require_resolved_acp_selection().is_err() {
+                        Some(
+                            crate::acp::establishment::EstablishmentExpected::capture(
+                                row, storage,
+                            )?
+                            .revision()?,
+                        )
+                    } else {
+                        None
+                    };
                     Ok((selected, expected))
                 },
                 true,
@@ -591,14 +590,7 @@ impl ControlStateCache {
                 NativeSubjectEvent::StartupDiagnostic => Some((seq, NativeControlFailure::Startup)),
                 _ => None,
             });
-        Ok((
-            projection,
-            if current.is_some() {
-                establishment_revision
-            } else {
-                None
-            },
-        ))
+        Ok((projection, establishment_revision))
     }
 
     /// Whether the session has a hydrated fold, with no locking beyond the
