@@ -50,6 +50,20 @@ type Entry = Option<(Stamp, bool)>;
 static CACHE: LazyLock<Mutex<HashMap<JsonProbe, Entry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Results of probes within one request, so a list of rows evaluates each probe once.
+#[derive(Default)]
+pub struct Memo(std::cell::RefCell<HashMap<JsonProbe, bool>>);
+
+impl Memo {
+    pub fn matches(&self, probe: &JsonProbe) -> bool {
+        *self
+            .0
+            .borrow_mut()
+            .entry(*probe)
+            .or_insert_with(|| matches(probe))
+    }
+}
+
 /// Evaluate `probe`. A missing or invalid path, missing file, parse error or
 /// other value returns false. Re-reads the file only when it changed.
 pub fn matches(probe: &JsonProbe) -> bool {

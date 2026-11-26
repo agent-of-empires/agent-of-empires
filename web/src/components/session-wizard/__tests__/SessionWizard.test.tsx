@@ -288,6 +288,16 @@ describe("SessionWizard structured view payload", () => {
   });
 });
 
+describe("SessionWizard last tool memory", () => {
+  it("falls back to claude when the stored tool is not an available agent", async () => {
+    localStorage.setItem("aoe-acp-last-tool", "ghost");
+    renderWizard({ path: "/tmp/proj" });
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload().tool).toBe("claude");
+  });
+});
+
 describe("SessionWizard last instruction memory", () => {
   it("prefills the stored instruction into the create payload", async () => {
     localStorage.setItem(INSTRUCTION_KEY, "always be terse");

@@ -81,6 +81,7 @@ const LAST_USED_INSTRUCTION_KEY = "aoe-new-session-last-instruction";
 // Path of the last launched session, seeded into a plain open. Absolute paths only.
 const LAST_USED_PROJECT_KEY = "aoe-new-session-last-project";
 
+// Validated against the loaded agents list, since another install may have written it.
 function loadLastUsedTool(): string {
   return safeGetItem(LAST_USED_TOOL_KEY) || "claude";
 }
@@ -330,6 +331,8 @@ export function SessionWizard({
   // A Retry found the Container runtime still down after a sandbox_unavailable failure.
   const [runtimeDown, setRuntimeDown] = useState(false);
   const [rechecking, setRechecking] = useState(false);
+  // The remembered tool, until the first agents list confirms it exists.
+  const storedToolRef = useRef(prefill?.tool || restore ? null : safeGetItem(LAST_USED_TOOL_KEY));
   const viewGroupRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
@@ -477,6 +480,10 @@ export function SessionWizard({
         if (Array.isArray(list)) {
           // The app-wide names describe the served profile; the project doesn't change them.
           if (agentsProfile === servedProfile) setAgentNames(list);
+          const stored = storedToolRef.current;
+          storedToolRef.current = null;
+          if (stored && dataRef.current.tool === stored && !list.some((a) => a.name === stored))
+            dispatch({ type: "SET_FIELD", field: "tool", value: "claude" });
           return dispatch({ type: "SET_AGENTS", agents: list, agentsFor: agentsKey, agentsProject: fetchProjectKey });
         }
         const missing = list === "profile_not_found";

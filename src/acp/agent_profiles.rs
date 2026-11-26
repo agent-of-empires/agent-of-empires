@@ -154,11 +154,11 @@ impl AgentProfile {
         None
     }
 
-    /// Evaluate the fullscreen probe, false without one.
-    pub fn probe_fullscreen(&self) -> bool {
+    /// Evaluate the fullscreen probe through `memo`, false without one.
+    pub fn probe_fullscreen(&self, memo: &crate::json_probe::Memo) -> bool {
         self.fullscreen_probe
             .as_ref()
-            .is_some_and(crate::json_probe::matches)
+            .is_some_and(|probe| memo.matches(probe))
     }
 
     /// True iff the agent surfaces session-start memory recall through

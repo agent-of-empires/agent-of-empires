@@ -10,6 +10,7 @@ use crate::time::Timestamp;
 pub(crate) fn session_response_from_instance(inst: &Instance) -> SessionResponse {
     let mut response = session_response_from_instance_with_plan(
         inst,
+        &crate::json_probe::Memo::default(),
         None,
         crate::daemon::AcpWorkerState::Absent,
         None,
@@ -23,6 +24,7 @@ pub(crate) fn session_response_from_instance(inst: &Instance) -> SessionResponse
 /// Convert backend session facts with the request's plan and runtime snapshots.
 pub(super) fn session_response_from_instance_with_plan(
     inst: &Instance,
+    probes: &crate::json_probe::Memo,
     plan_summary: Option<PlanSummary>,
     acp_worker_state: crate::daemon::AcpWorkerState,
     next_wakeup_at: Option<String>,
@@ -43,7 +45,10 @@ pub(super) fn session_response_from_instance_with_plan(
             .filter(|s| !s.is_empty())
             .unwrap_or(inst.tool.as_str()),
     );
-    let fullscreen = agent_profile.probe_fullscreen();
+    let agent_profile_wire = crate::acp::agent_profiles::AgentProfileWire::new(
+        agent_profile,
+        agent_profile.probe_fullscreen(probes),
+    );
     let timestamp = |value: Option<Timestamp>| value.map(|t| t.to_rfc3339());
     let status = if inst
         .lifecycle_reservation
@@ -194,8 +199,8 @@ pub(super) fn session_response_from_instance_with_plan(
                 .filter(|s| !s.is_empty())
                 .unwrap_or(inst.tool.as_str()),
         ),
-        claude_fullscreen: fullscreen && inst.tool == "claude",
-        agent_profile: crate::acp::agent_profiles::AgentProfileWire::new(agent_profile, fullscreen),
+        claude_fullscreen: inst.tool == "claude" && agent_profile_wire.fullscreen,
+        agent_profile: agent_profile_wire,
         // A session converted by `attach_project` (#3103) has a real
         // `workspace_info`, so both repos list here with no special case.
         workspace_repos: row

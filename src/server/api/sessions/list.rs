@@ -39,6 +39,7 @@ pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
 
 pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionResponse> {
     let instances = state.instances.read().await;
+    let probes = crate::json_probe::Memo::default();
     let worker_states = state.acp_supervisor.worker_states_snapshot().await;
     // Every positional overlay shares this filtered view.
     let scoped_instances: Vec<&Instance> = instances
@@ -84,6 +85,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                 .unwrap_or((crate::daemon::AcpWorkerState::Absent, None));
             let mut session = session_response_from_instance_with_plan(
                 inst,
+                &probes,
                 plan_summary,
                 acp_worker_state,
                 next_wakeup_at,
@@ -185,8 +187,9 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
             };
             resp.agent_profile = crate::acp::agent_profiles::AgentProfileWire::new(
                 profile,
-                profile.probe_fullscreen(),
+                profile.probe_fullscreen(&probes),
             );
+            resp.claude_fullscreen = inst.tool == "claude" && resp.agent_profile.fullscreen;
         }
         // Only a terminal session that could switch needs the setting resolved.
         if resp.acp_capable && !inst.is_structured() {

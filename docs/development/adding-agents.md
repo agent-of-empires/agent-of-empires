@@ -11,7 +11,7 @@
 | `src/session/instance/hooks.rs` | Hook wiring plus the `AOE_INSTANCE_ID` env prefix |
 | `src/session/config/container_config.rs` | Config mount for the sandbox |
 | `src/acp/agent_registry.rs` | ACP adapter entry, if the agent ships an ACP server |
-| `src/acp/agent_profiles.rs`, `web/src/lib/agentProfiles.ts` | Structured view profile |
+| `src/acp/agent_profiles.rs` | Structured view profile, sent to the dashboard on each session |
 | `src/acp/install_hints.rs` | Install hint for `aoe acp doctor` and handshake failures |
 | `docker/Dockerfile` | Install the agent in the sandbox image |
 | `docs/structured-view.md`, `docs/index.md`, `README.md` | Supported-agent lists |
