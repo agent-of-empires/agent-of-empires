@@ -2699,7 +2699,6 @@ mod tests {
                 let _release = crate::process::systemd::release_probe::install(move |_| {
                     releases.set(releases.get() + 1)
                 });
-                let wake_dispatches = crate::session::restart::wake_dispatches_for_test();
                 let result = if fault == "lookup_timeout" {
                     match instance.ensure_pane_ready_with_size(None) {
                         Ok(EnsureReadyOutcome::Indeterminate { cause }) => {
@@ -2713,7 +2712,6 @@ mod tests {
                             session_id: instance.id.clone(),
                             instance,
                             size: None,
-                            wake_message: "must-not-be-dispatched".into(),
                             skip_on_launch: true,
                             bound_hooks: false,
                             discard_sandbox_container: false,
@@ -2725,10 +2723,6 @@ mod tests {
                 } else {
                     instance.start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
                 };
-                assert_eq!(
-                    crate::session::restart::wake_dispatches_for_test(),
-                    wake_dispatches
-                );
                 let (before, pane, pid, native_pid, native_birth) = snapshot
                     .borrow_mut()
                     .take()
@@ -2917,7 +2911,6 @@ mod tests {
                             "private launch diagnostics:\n{}",
                             logs.contents()
                         );
-                        assert!(!crate::session::restart::launched_agent(&Ok(outcome)));
                     }
                 }
                 instance.capture_poller.clear();
@@ -4850,7 +4843,6 @@ exec sleep 60
             }
         });
         let _settings = ProbeSettings::install(Some(0), None);
-        let wakes = crate::session::restart::wake_dispatches_for_test();
         let warnings = crate::session::attach_project::resume_after_conversion(
             &storage,
             &instance.id,
@@ -4876,7 +4868,6 @@ exec sleep 60
             crate::tmux::utils::PaneProbe::Alive
         );
         assert_eq!(std::fs::read(&births).unwrap(), b"x");
-        assert_eq!(crate::session::restart::wake_dispatches_for_test(), wakes);
     }
 
     fn observed_dead_resume_fixture(

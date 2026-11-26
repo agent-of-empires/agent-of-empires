@@ -79,7 +79,8 @@ mod v063_retire_color_labels;
 mod v064_builtin_sounds;
 mod v065_account_limit_estimate_rows;
 mod v066_retire_agent_update_fields;
-mod v067_reconcile_acp_lineages;
+mod v067_retire_restart_wake;
+mod v068_reconcile_acp_lineages;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -120,7 +121,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 67;
+const CURRENT_VERSION: u32 = 68;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -349,10 +350,11 @@ const MIGRATIONS: &[Migration] = &[
         "retire_agent_update_fields",
         v066_retire_agent_update_fields::run,
     ),
+    (67, "retire_restart_wake", v067_retire_restart_wake::run),
     (
-        67,
+        68,
         "reconcile_acp_lineages",
-        v067_reconcile_acp_lineages::run,
+        v068_reconcile_acp_lineages::run,
     ),
 ];
 
@@ -369,7 +371,7 @@ pub fn has_pending_migrations() -> bool {
     let current = get_current_version();
     current < CURRENT_VERSION
         || (current == CURRENT_VERSION
-            && v067_reconcile_acp_lineages::autonomous_pending().unwrap_or(true))
+            && v068_reconcile_acp_lineages::autonomous_pending().unwrap_or(true))
 }
 
 /// Check compatibility before changing or stopping a managed daemon.
@@ -387,7 +389,7 @@ pub(crate) fn ensure_schema_supported() -> Result<u32> {
 pub fn assert_schema_current() -> Result<()> {
     let current = ensure_schema_supported()?;
     anyhow::ensure!(
-        current == CURRENT_VERSION && !v067_reconcile_acp_lineages::autonomous_pending()?,
+        current == CURRENT_VERSION && !v068_reconcile_acp_lineages::autonomous_pending()?,
         "data schema version {current} is behind this build ({CURRENT_VERSION}); \
          the parent `aoe serve` must migrate before launching the daemon child"
     );
@@ -488,7 +490,7 @@ fn run_migrations_inner(
     let needs_exclusion = |current| -> Result<bool> {
         Ok(announce
             || current < CURRENT_VERSION
-            || v067_reconcile_acp_lineages::autonomous_pending()?)
+            || v068_reconcile_acp_lineages::autonomous_pending()?)
     };
     let requires_exclusion = needs_exclusion(current)?;
     // Older daemons know serve.lock but not the lifecycle transaction. Hold
@@ -531,7 +533,7 @@ fn run_migrations_inner(
     }
     debug!("Current schema version: {}", current);
     if current == CURRENT_VERSION {
-        v067_reconcile_acp_lineages::reconcile_autonomous_metadata()?;
+        v068_reconcile_acp_lineages::reconcile_autonomous_metadata()?;
         v027_isolate_sandbox_stores::reconcile_pending(announce)?;
         v033_isolate_sandbox_content::reconcile_pending(announce)?;
     } else {

@@ -378,7 +378,6 @@ impl HomeView {
                 extra_args: new_extra_args.map(str::to_owned),
                 command_override: new_command_override.map(str::to_owned),
                 unsnooze: wake_snooze,
-                wake_message: recovery.is_some().then(String::new),
                 recovery,
                 ..Default::default()
             },
@@ -1155,7 +1154,6 @@ mod tests {
                             action,
                             expected: "qualified-exact-selection".into(),
                         }),
-                        wake_message: Some(String::new()),
                         ..Default::default()
                     },
                     || {
@@ -1180,7 +1178,7 @@ mod tests {
                         "expected": "qualified-exact-selection",
                     })
                 );
-                assert_eq!(request["wake_message"], "");
+                assert!(request.get("wake_message").is_none());
                 for field in ["profile", "tool", "extra_args", "command_override"] {
                     assert!(
                         request[field].is_null(),

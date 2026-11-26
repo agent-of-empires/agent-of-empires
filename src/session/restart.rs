@@ -14,9 +14,6 @@ pub struct RestartRequest {
     /// cascade and hands the post-cascade snapshot back in `RestartResult`.
     pub instance: Instance,
     pub size: Option<(u16, u16)>,
-    /// Keys to send once the pane is live again. Empty disables the wake-up
-    /// (the documented opt-out via `session.restart_wake_message`).
-    pub wake_message: String,
     /// Skip on_launch hooks that already ran in the background creation poller.
     pub skip_on_launch: bool,
     /// Kill a hook that outlives the recovery hook timeout, so a hung hook
@@ -52,7 +49,6 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
         session_id,
         mut instance,
         size,
-        wake_message,
         skip_on_launch,
         bound_hooks,
         discard_sandbox_container,
@@ -60,9 +56,6 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
     } = request;
 
     let before = instance.clone();
-    let wake_source = (!wake_message.is_empty())
-        .then(|| super::Storage::open_reference(&instance.effective_profile()).ok())
-        .flatten();
 
     // Recovery bounds hooks so a hanging command cannot wedge its worker.
     let outcome = {
@@ -81,101 +74,11 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
             .map_err(|e| e.to_string())
     };
 
-    // On a successful restart, send the wake-up keys on a detached thread so the result (and the
-    // row's status update) propagate back immediately rather than waiting out the up-to-3s
-    // pane-readiness probe.
-    let should_wake = launched_agent(&outcome);
-    if should_wake && !wake_message.is_empty() {
-        let profile_identity = wake_source
-            .as_ref()
-            .filter(|source| source.verify_bound_profile().is_ok())
-            .and_then(|source| source.bound_profile_identity().ok());
-        let delay = instance.send_keys_enter_delay();
-        spawn_wake_worker(&instance, wake_message, profile_identity, delay);
-    }
-
     RestartResult {
         session_id,
         before: Box::new(before),
         instance: Box::new(instance),
         outcome,
-    }
-}
-
-/// Whether the restart left the agent running in a live pane.
-pub(crate) fn launched_agent(outcome: &Result<StartOutcome, String>) -> bool {
-    matches!(outcome, Ok(StartOutcome::Fresh | StartOutcome::Resumed))
-}
-
-#[cfg(test)]
-thread_local! {
-    static WAKE_DISPATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn wake_dispatches_for_test() -> u64 {
-    WAKE_DISPATCHES.with(std::cell::Cell::get)
-}
-
-/// Send a restart wake through the captured launch pane, never a later name owner.
-/// Failure is logged without replaying the message or replacing a runtime.
-pub(crate) fn spawn_wake_worker(
-    instance: &Instance,
-    wake_message: String,
-    profile_identity: Option<(u64, u64)>,
-    delay: u64,
-) {
-    #[cfg(test)]
-    WAKE_DISPATCHES.with(|count| count.set(count.get() + 1));
-    let (Some(name), Some(physical)) = (
-        instance.agent_pane.tmux_session.as_ref(),
-        instance.agent_pane.physical.clone(),
-    ) else {
-        tracing::warn!(target: "session.restart", session = %instance.id,
-            "restart wake refused: physical launch receipt unavailable");
-        return;
-    };
-    let captured = (|| -> anyhow::Result<_> {
-        let expected = profile_identity.ok_or(crate::session::NativeInputError::Ownership)?;
-        let fence = crate::session::NativeInputFence::capture_route(
-            &instance.effective_profile(),
-            &instance.id,
-            instance.created_at,
-            instance.lifecycle_generation,
-            true,
-            Some(expected),
-        )?;
-        Ok(crate::tmux::Session::from_observation(name, physical).with_native_input_fence(fence))
-    })();
-    let mut session = match captured {
-        Ok(session) => session,
-        Err(error) => {
-            tracing::warn!(target: "session.restart", session = %instance.id, %error,
-                "restart wake refused before enqueue; no retry performed");
-            return;
-        }
-    };
-    let session_id = instance.id.clone();
-    let tool = instance.tool.clone();
-    let expects_shell = instance.expects_shell();
-    let spawn_result = std::thread::Builder::new()
-        .name(format!("aoe-restart-wake/{session_id}"))
-        .spawn(move || {
-            session.wait_until_ready(
-                std::time::Duration::from_secs(5),
-                crate::agents::ready_markers(&tool),
-            );
-            let delivered = session
-                .admit_agent_input(expects_shell)
-                .and_then(|()| session.send_keys_with_delay(&wake_message, delay));
-            if let Err(error) = delivered {
-                tracing::warn!(target: "session.restart", %error,
-                    "restart wake was not confirmed; no retry performed");
-            }
-        });
-    if let Err(error) = spawn_result {
-        tracing::warn!(target: "session.restart", ?error,
-            "failed to spawn restart wake-up worker");
     }
 }
 
@@ -257,7 +160,6 @@ mod tests {
                 session_id: instance.id.clone(),
                 instance,
                 size: None,
-                wake_message: String::new(),
                 skip_on_launch: false,
                 bound_hooks: true,
                 discard_sandbox_container: true,
@@ -278,17 +180,5 @@ mod tests {
                 "peer_reserved={peer_reserved}: {error}"
             );
         }
-    }
-
-    #[test]
-    fn restart_wake_requires_a_successful_launch() {
-        assert!(!launched_agent(&Ok(StartOutcome::ResumeFailed {
-            sid: "11111111-2222-3333-4444-555555555555".into(),
-        })));
-        assert!(!launched_agent(&Ok(StartOutcome::Indeterminate {
-            cause: crate::session::LaunchIndeterminateCause::CommandTimedOut,
-        })));
-        assert!(launched_agent(&Ok(StartOutcome::Fresh)));
-        assert!(!launched_agent(&Err("launch refused".into())));
     }
 }

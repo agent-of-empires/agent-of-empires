@@ -1257,7 +1257,6 @@ async fn restart_session_recovery(
             action,
             expected: recovery.expected.clone(),
         }),
-        wake_message: Some(String::new()),
         ..Default::default()
     };
     let receipt = client.restart_session(&selected.id, &body, &epoch).await?;
@@ -1476,41 +1475,10 @@ fn pick_targets_for_restart_all(
         .collect()
 }
 
-/// Type the restart wake message under the input lock, so an archive or trash that landed after
-/// the relaunch wins and nothing is typed into the shelved pane.
-fn send_restart_wake(
-    working: &Instance,
-    wake_msg: &str,
-    profile_identity: (u64, u64),
-) -> Result<bool> {
-    let name = working
-        .agent_pane
-        .tmux_session
-        .as_deref()
-        .ok_or(crate::session::NativeInputError::Ownership)?;
-    let physical = working
-        .agent_pane
-        .physical
-        .clone()
-        .ok_or(crate::session::NativeInputError::Ownership)?;
-    let fence = crate::session::NativeInputFence::capture(
-        &working.effective_profile(),
-        &working.id,
-        working.created_at,
-        working.lifecycle_generation,
-        true,
-        Some(profile_identity),
-    )?;
-    let tmux_session = working.agent_input_session(name, physical, true, Some(fence))?;
-    let delay = working.send_keys_enter_delay();
-    tmux_session.send_keys_with_delay(wake_msg, delay)?;
-    Ok(true)
-}
-
 #[cfg(test)]
 struct CliRestartMergeGate {
     session_id: String,
-    reached: std::sync::mpsc::SyncSender<bool>,
+    reached: std::sync::mpsc::SyncSender<()>,
     release: std::sync::mpsc::Receiver<()>,
 }
 
@@ -1519,7 +1487,7 @@ static CLI_RESTART_MERGE_GATE: std::sync::Mutex<Option<CliRestartMergeGate>> =
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
-fn pause_before_cli_restart_merge(session_id: &str, wake_succeeded: bool) {
+fn pause_before_cli_restart_completion(session_id: &str) {
     let gate = {
         let mut slot = CLI_RESTART_MERGE_GATE.lock().unwrap();
         if slot
@@ -1532,7 +1500,7 @@ fn pause_before_cli_restart_merge(session_id: &str, wake_succeeded: bool) {
         }
     };
     if let Some(gate) = gate {
-        if gate.reached.send(wake_succeeded).is_ok() {
+        if gate.reached.send(()).is_ok() {
             gate.release
                 .recv_timeout(std::time::Duration::from_secs(10))
                 .expect("release the CLI restart completion gate");
@@ -1560,21 +1528,6 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let title = working.title.clone();
     let session_id = working.id.clone();
 
-    let wake_msg = crate::session::resolve_config(profile)
-        .map(|c| c.session.restart_wake_message.clone())
-        .unwrap_or_else(|_| "wake up: pick up what you were doing".to_string());
-
-    let mut wake_succeeded = false;
-    if !wake_msg.is_empty() && matches!(outcome, StartOutcome::Fresh | StartOutcome::Resumed) {
-        match storage
-            .bound_profile_identity()
-            .and_then(|identity| send_restart_wake(&working, &wake_msg, identity))
-        {
-            Ok(sent) => wake_succeeded = sent,
-            Err(e) => eprintln!("Warning: failed to send wake-up message: {}", e),
-        }
-    }
-
     let file_watch = crate::file_watch::FileWatchService::noop();
     crate::session::sync::capture_launched_session_id_blocking(
         &mut working,
@@ -1583,41 +1536,16 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         true,
     );
     #[cfg(test)]
-    pause_before_cli_restart_merge(&session_id, wake_succeeded);
+    pause_before_cli_restart_completion(&session_id);
 
     let _completion_lock = storage
         .acquire_instance_lifecycle_lock(&session_id)
         .context("failed to acquire restart completion lock")?;
-    let landed = if wake_succeeded {
-        match storage.update_complete(|instances, _groups| {
-            let stored = instances
-                .iter_mut()
-                .find(|row| row.id == session_id)
-                .ok_or(crate::session::SessionGone)?;
-            anyhow::ensure!(
-                stored.created_at == working.created_at
-                    && stored.lifecycle_generation == working.lifecycle_generation,
-                crate::session::LifecycleReservationError::Superseded
-            );
-            stored.last_accessed_at = Some(crate::time::Timestamp::now());
-            Ok(())
-        }) {
-            Ok(()) => true,
-            Err(error)
-                if error.downcast_ref::<crate::session::LifecycleReservationError>()
-                    == Some(&crate::session::LifecycleReservationError::Superseded) =>
-            {
-                true
-            }
-            Err(error) if error.is::<crate::session::SessionGone>() => false,
-            Err(error) => return Err(error),
-        }
-    } else {
-        storage
-            .load_instances_complete()?
-            .iter()
-            .any(|row| row.id == session_id)
-    };
+    // Launch finalization and the SID capture already saved their owned fields.
+    let landed = storage
+        .load_instances_complete()?
+        .iter()
+        .any(|row| row.id == session_id);
     if !landed {
         bail!(
             "Session {} was removed by another process after restart completed",
@@ -3476,77 +3404,13 @@ mod target_filter_tests {
 /// #4116: CLI start and restart refuse an archived or trashed session.
 #[cfg(test)]
 mod start_blocked_tests {
-    use super::{
-        archive_session, restart_session, send_restart_wake, start_session, ArchiveArgs,
-        SessionIdArgs,
-    };
+    use super::{archive_session, restart_session, start_session, ArchiveArgs, SessionIdArgs};
     use crate::session::{Instance, Storage};
     use serial_test::serial;
 
-    /// The restart wake runs after the relaunch released its locks; a peer archive that landed
-    /// since wins, so nothing is typed into the pane and the row stays archived.
     #[test]
     #[serial]
-    fn restart_wake_is_not_typed_into_a_row_archived_since_the_relaunch() {
-        if crate::tmux::tmux_command().arg("-V").output().is_err() {
-            eprintln!("tmux not available; skipping");
-            return;
-        }
-        let temp = tempfile::tempdir().unwrap();
-        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let profile = "restart-wake-archived";
-        let mut working = Instance::new("restart-wake", "/tmp/x");
-        working.source_profile = profile.to_string();
-        let mut peer = working.clone();
-        peer.archive();
-        Storage::new_unwatched(profile)
-            .unwrap()
-            .update(|rows, _| {
-                *rows = vec![peer];
-                Ok(())
-            })
-            .unwrap();
-        let pane = crate::tmux::Session::generate_name(&working.id, &working.title);
-        let created = crate::tmux::tmux_command()
-            .args(["new-session", "-d", "-s", &pane, "cat"])
-            .status();
-        if !created.map(|s| s.success()).unwrap_or(false) {
-            eprintln!("tmux new-session failed; skipping");
-            return;
-        }
-        crate::tmux::refresh_session_cache();
-        let (physical, probe, _) =
-            crate::tmux::utils::observe_pane(&pane, &crate::tmux::TmuxCommandDeadline::new())
-                .unwrap()
-                .expect("the native fixture pane exists");
-        assert_eq!(probe, crate::tmux::utils::PaneProbe::Alive);
-        working.agent_pane.tmux_session = Some(pane.clone());
-        working.agent_pane.physical = Some(std::sync::Arc::new(physical));
-
-        let binding = Storage::open_reference(profile).unwrap();
-        let result = send_restart_wake(
-            &working,
-            "wake-4116",
-            binding.bound_profile_identity().unwrap(),
-        );
-        let captured = crate::tmux::tmux_command()
-            .args(["capture-pane", "-p", "-t", &pane])
-            .output()
-            .unwrap();
-        let _ = crate::tmux::tmux_command()
-            .args(["kill-session", "-t", &pane])
-            .output();
-
-        let err = result.expect_err("an archived row takes no wake message");
-        assert_eq!(err.to_string(), "session is archived; unarchive it first");
-        assert!(!String::from_utf8_lossy(&captured.stdout).contains("wake-4116"));
-        let stored = Storage::new_unwatched(profile).unwrap().load().unwrap();
-        assert!(stored[0].is_archived());
-    }
-
-    #[test]
-    #[serial]
-    fn restart_completion_preserves_shelving_committed_after_wake_ack() {
+    fn restart_completion_preserves_peer_shelving() {
         use std::sync::mpsc;
         use std::time::Duration;
 
@@ -3586,7 +3450,6 @@ mod start_blocked_tests {
                 config.systemd.enabled = false;
                 config.session.smart_rename = false;
                 config.session.auto_resume_on_restart = false;
-                config.session.restart_wake_message = "CLI_COMPLETED_WAKE".into();
             })
             .unwrap();
             let profile = "cli-restart-completion";
@@ -3631,10 +3494,9 @@ mod start_blocked_tests {
                             },
                         ))
                 });
-                assert!(
-                    reached_rx.recv_timeout(Duration::from_secs(20)).unwrap(),
-                    "the actual native wake must have acknowledged before shelving"
-                );
+                reached_rx
+                    .recv_timeout(Duration::from_secs(20))
+                    .expect("restart must reach completion before shelving");
                 let shelved = {
                     let _lock = storage.acquire_instance_lifecycle_lock(&id).unwrap();
                     storage

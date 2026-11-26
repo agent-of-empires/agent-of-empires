@@ -19,7 +19,9 @@ pub fn run() -> Result<()> {
     super::v064_builtin_sounds::run()?;
     // A marker of 66 only proves the retirement ran on main, not on ACP.
     super::v066_retire_agent_update_fields::run()?;
-    tracing::info!(target: "migrations.v067", "Reconciled ACP and main data histories");
+    // A marker of 67 may be ACP reconciliation rather than main's wake cleanup.
+    super::v067_retire_restart_wake::run()?;
+    tracing::info!(target: "migrations.v068", "Reconciled ACP and main data histories");
     Ok(())
 }
 
@@ -448,7 +450,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn a_late_config_failure_stays_at_main_66_and_retries_acp_reconciliation() {
+    fn a_late_config_failure_stays_at_main_67_and_retries_acp_reconciliation() {
         let home = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(home.path());
         let app = crate::session::get_app_dir().unwrap();
@@ -457,12 +459,13 @@ mod tests {
         let conn = seed_legacy_database(&app);
         prepare_history(History::Main57, &conn);
         let old_identity = identity(&conn).unwrap();
-        set_version(65).unwrap();
+        v067_retire_restart_wake::run().unwrap();
+        set_version(67).unwrap();
         let other = app.join("profiles/other/config.toml");
         let valid_config = fs::read(&other).unwrap();
         fs::write(&other, "[acp\n").unwrap();
         assert!(run_migrations().is_err());
-        assert_eq!(get_current_version(), 66);
+        assert_eq!(get_current_version(), 67);
         assert!(has_pending_migrations());
         assert_eq!(identity(&conn).unwrap(), old_identity);
         assert_eq!(
@@ -529,13 +532,15 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn versions_64_through_66_reconcile_both_histories() {
+    fn versions_64_through_67_reconcile_both_histories() {
         for (marker, acp_lineage) in [
             (64, true),
             (64, false),
             (65, false),
             (66, false),
             (66, true),
+            (67, false),
+            (67, true),
         ] {
             let _home = crate::session::test_support::isolate_app_dir();
             let app = crate::session::get_app_dir().unwrap();
@@ -551,11 +556,18 @@ mod tests {
             ];
             for path in &configs {
                 let mut contents = fs::read_to_string(path).unwrap();
-                contents.push_str("\n[sound]\nenabled = true\non_idle = 'idle.wav'\n");
+                contents.push_str(
+                    "\n[sound]\nenabled = true\non_idle = 'idle.wav'\n\
+                     \n[session]\nrestart_wake_message = 'go'\nstartup_recovery_wake = true\n\
+                     auto_resume_on_restart = false\n",
+                );
                 fs::write(path, contents).unwrap();
             }
             if !acp_lineage {
                 v064_builtin_sounds::run().unwrap();
+            }
+            if marker >= 67 && !acp_lineage {
+                v067_retire_restart_wake::run().unwrap();
             }
             conn.execute_batch(
                 "CREATE TABLE acp_account_limits (
@@ -578,13 +590,14 @@ mod tests {
             legacy[0]["started_at"] = serde_json::json!("2026-01-01T00:00:00Z");
             legacy[0]["launch_resolved_executable"] = serde_json::json!("/opt/claude/2.1");
             fs::write(&sessions, serde_json::to_vec(&legacy).unwrap()).unwrap();
-            if marker == 66 {
+            if marker >= 66 {
                 if !acp_lineage {
                     v066_retire_agent_update_fields::run().unwrap();
                 }
                 assert_eq!(super::autonomous_pending().unwrap(), !acp_lineage);
             }
             set_version(marker).unwrap();
+            assert!(has_pending_migrations());
             let old_identity = identity(&conn).unwrap();
             let account_limits = || {
                 conn.prepare(
@@ -625,6 +638,12 @@ mod tests {
                 let config = contents.parse::<toml::Table>().unwrap();
                 assert_eq!(config["sound"]["enabled"].as_bool(), Some(true));
                 assert!(config["sound"].get("on_idle").is_none());
+                assert_eq!(
+                    config["session"]["auto_resume_on_restart"].as_bool(),
+                    Some(false)
+                );
+                assert!(config["session"].get("restart_wake_message").is_none());
+                assert!(config["session"].get("startup_recovery_wake").is_none());
                 (path, contents)
             });
 
@@ -659,7 +678,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            set_version(66).unwrap();
+            set_version(67).unwrap();
             let marker = fs::read(app.join(VERSION_FILE)).unwrap();
             assert!(run_migrations().is_err());
             assert_eq!(fs::read(app.join(VERSION_FILE)).unwrap(), marker);
@@ -692,7 +711,7 @@ mod tests {
         prepare_history(History::Main57, &conn);
         let malformed = br#"[{"id":"5959595959595959","acp_establishment":{"version":999}}]"#;
         fs::write(app.join("sessions.json"), malformed).unwrap();
-        set_version(66).unwrap();
+        set_version(67).unwrap();
         let marker = fs::read(app.join(VERSION_FILE)).unwrap();
         assert!(run_migrations().is_err());
         assert_eq!(fs::read(app.join(VERSION_FILE)).unwrap(), marker);
