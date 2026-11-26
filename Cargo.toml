@@ -77,6 +77,8 @@ indexmap = "2"
 thiserror = "2.0"
 anyhow = "1.0"
 
+# Resolves the IANA zone a usage-limit message names; the bundled database keeps it host-independent.
+jiff = { version = "1", default-features = false, features = ["std", "tzdb-bundle-always"] }
 
 # UUID generation
 uuid = { version = "1.23", features = ["v4", "serde"] }
