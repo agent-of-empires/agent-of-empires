@@ -75,6 +75,19 @@ describe("nextStatusSoundState", () => {
     ]);
   });
 
+  it.each([
+    ["resumed-stop", ["Stopped", "Idle"], []],
+    ["launch-reached-prompt", ["Starting", "Idle"], []],
+    ["retry-rolled-back", ["Stopped", "Starting", "Idle"], []],
+    ["turn-ended", ["Running", "Idle"], [{ id: "a", event: "idle" }]],
+    ["turn-after-resume", ["Stopped", "Idle", "Running", "Idle"], [{ id: "a", event: "idle" }]],
+  ] as const)("%s: an Idle sounds only after a turn", (_case, statuses, want) => {
+    const snapshots = statuses.map((status, i): [number, ReturnType<typeof at>[]] => [i * 1000, [at("a", status)]]);
+    const last = statuses[statuses.length - 1];
+    const due = run(...snapshots, [statuses.length * 1000 + 3000, [at("a", last)]]);
+    expect(due.flat()).toEqual(want);
+  });
+
   it.each(["Running", "Starting", "Stopped", "Unknown", "Creating", "Deleting"] as const)(
     "never sounds for %s",
     (status) => {
@@ -154,6 +167,17 @@ describe("soundDueFor", () => {
     const result = soundDueFor(prev, session, event);
     expect(result.play).toBe(play);
     if (play) expect(result.state?.get("a")?.sounded).toBe(true);
+  });
+
+  it("is silent for a server cue after a launch reached its prompt", () => {
+    let state: StatusSoundState | null = null;
+    for (const [now, status] of [
+      [0, "Starting"],
+      [1000, "Idle"],
+    ] as const) {
+      state = nextStatusSoundState(state, [at("a", status)], now).state;
+    }
+    expect(soundDueFor(state, at("a", "Idle"), "idle").play).toBe(false);
   });
 
   it("keeps the later poll from sounding the same status again", () => {

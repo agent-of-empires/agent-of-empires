@@ -5,6 +5,10 @@ export type StatusSoundEvent = "waiting" | "idle" | "error";
 // A status must hold this long before it sounds, so a flap is silent. Mirrors the push delays in src/server/push.rs.
 const DWELL_MS: Record<StatusSoundEvent, number> = { waiting: 5000, idle: 2000, error: 2000 };
 
+// An Idle entered from these ended no turn: a resume, a launch reaching its prompt, or a cancelled Retry's
+// rollback. Mirrors `StatusChange::resumes_a_stop` in src/server/push.rs.
+const NO_TURN_BEFORE_IDLE: ReadonlySet<SessionStatus> = new Set(["Stopped", "Starting"]);
+
 const EVENT_FOR_STATUS: Partial<Record<SessionStatus, StatusSoundEvent>> = {
   Waiting: "waiting",
   Idle: "idle",
@@ -57,7 +61,8 @@ export function nextStatusSoundState(
     if (!before) {
       tracked = { status: s.status, since: now, sounded: true };
     } else if (before.status !== s.status) {
-      tracked = { status: s.status, since: now, sounded: false };
+      const noTurn = s.status === "Idle" && NO_TURN_BEFORE_IDLE.has(before.status);
+      tracked = { status: s.status, since: now, sounded: noTurn };
     } else {
       tracked = { ...before };
     }

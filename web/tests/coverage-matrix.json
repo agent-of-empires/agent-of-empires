@@ -1407,7 +1407,7 @@
         "web/src/lib/soundPlayer.ts",
         "web/src/App.tsx"
       ],
-      "notes": "Sounds are built in and fetched per event from `/api/sounds/{event}`. They play through one Web Audio context that each click or key press resumes; a sound that comes while it is suspended stays silent and fires `onSoundBlocked` once. The tests fake the context, so they cover this logic, not a real browser's autoplay policy or App's toast. The Daemon plays the host sounds itself (`server::sound_cues`)."
+      "notes": "Sounds are built in and fetched per event from `/api/sounds/{event}`. They play through one Web Audio context that each click or key press resumes; a sound that comes while it is suspended stays silent and fires `onSoundBlocked` once. The tests fake the context, so they cover this logic, not a real browser's autoplay policy or App's toast. The Daemon plays the host sounds itself (`server::sound_cues`). An Idle entered from Stopped or Starting (a resume, a launch reaching its prompt, or a cancelled Retry's rollback) ended no turn and never sounds, as the server's idle push rule; an Idle after a turn does."
     },
     {
       "id": "notifications.linked-toasts",
