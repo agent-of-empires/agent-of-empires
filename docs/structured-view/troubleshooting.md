@@ -78,7 +78,7 @@ Some adapters finish a turn, stream the final message and end-of-turn usage, but
 - A new session whose agent hasn't started after 30 seconds offers **Restart** on its startup line, which replaces the start in progress. A message you sent while it was starting is stopped; send it again once the agent is ready.
 - A repeatedly-failing worker is parked with a red "session parked" banner: retry from the dashboard or run `aoe acp restart <session>`.
 
-The view auto-reconnects with exponential backoff if the WebSocket drops and resumes the transcript where it left off. The banner counts the attempts and offers a manual **Reconnect** once they are exhausted; returning the tab to the foreground reconnects immediately.
+The view auto-reconnects with exponential backoff if the WebSocket drops and resumes the transcript where it left off. A **Reconnecting…** line shows only once a drop outlasts two seconds, and not while the dashboard's Daemon unreachable banner already says so; once the attempts are exhausted it offers **Reconnect**, and returning the tab to the foreground reconnects immediately.
 
 ### Approval card vanished without resolving
 

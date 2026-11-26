@@ -285,7 +285,6 @@ function AcpChrome({
             replayedWhileDown={ctx.replayedWhileDown}
             reconnecting={ctx.reconnecting}
             retryCount={ctx.retryCount}
-            retryCountdown={ctx.retryCountdown}
             maxRetries={ctx.maxRetries}
             manualReconnect={ctx.manualReconnect}
             newSessionStarting={startingAgent !== null}

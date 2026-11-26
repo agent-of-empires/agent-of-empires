@@ -231,6 +231,7 @@ import { MainViewTabs } from "./components/MainViewTabs";
 import type { OverflowItem } from "./components/OverflowMenu";
 import { TopBar, type PhoneViewChoice } from "./components/TopBar";
 import { appMenuItems } from "./lib/appMenu";
+import { PHONE_BANNER_CARD } from "./lib/surfaces";
 import { TOUR_ANCHORS, findTourAnchor } from "./lib/tourSteps";
 import { SidebarLegend } from "./components/sidebar/SidebarLegend";
 import { MAIN_VIEW_IDS } from "./lib/mainViewIds";
@@ -2728,6 +2729,7 @@ function AppContent({
     if (showSettings) {
       return (
         <SettingsView
+          banner={singlePane ? bannerStack : undefined}
           tab={settingsTab}
           onClose={handleCloseSettings}
           onSelectTab={(t) => {
@@ -3088,7 +3090,14 @@ function AppContent({
   // With a Session open, a phone's session list is a drawer that pushes the Session aside as a card.
   const phoneDrawer = singlePane && !!activeSession && !fullPageView && !focusMode;
   const drawerPushed = phoneDrawer && sidebarOpen;
+  const phonePagesHostBanners = phoneDrawer || phoneHome || (singlePane && showSettings);
 
+  const bannerStack = (
+    <BannerStack
+      onRetryServerSettings={serverAbout ? undefined : () => void recoverServerAbout()}
+      tourActive={tour.isTourActive}
+    />
+  );
   const topBar = (
     <TopBar
       activeWorkspace={activeWorkspace}
@@ -3112,7 +3121,6 @@ function AppContent({
       unreadCount={unreadCount}
       waitingCount={waitingCount}
       attentionBadgeColors={attentionBadgeColors}
-      isOffline={!!error}
       isDevBuild={isDebugBuild(serverAbout)}
       onGoDashboard={handleGoDashboard}
       onExitFocusMode={focusMode ? exitFocusMode : undefined}
@@ -3144,7 +3152,9 @@ function AppContent({
             // A phone's home is the session list, whose darker colour then runs up under the clock too.
             className={`h-(--app-height) flex flex-col ${phoneHome ? "bg-surface-950" : "bg-surface-900"} md:bg-surface-950 md:chrome-canvas text-text-primary overflow-hidden safe-area-inset`}
             // What a phone's floating header covers, for the views that keep their banners and first lines clear of it.
-            style={phoneDrawer ? ({ "--phone-overlay-top": "76px" } as CSSProperties) : undefined}
+            style={
+              phoneDrawer ? ({ "--phone-header-h": "76px", "--phone-overlay-top": "76px" } as CSSProperties) : undefined
+            }
           >
             {phoneDrawer && (
               // Under the clock, which an installed app draws beneath: the page colour, never content. Fixed and opaque,
@@ -3160,10 +3170,8 @@ function AppContent({
               // The phone's list carries the app's menu itself, and Settings heads its own page.
               <div className={phoneHome || showSettings ? "max-md:hidden" : undefined}>{topBar}</div>
             )}
-            <BannerStack
-              onRetryServerSettings={serverAbout ? undefined : () => void recoverServerAbout()}
-              tourActive={tour.isTourActive}
-            />
+            {/* A phone's pages host the banners under their own top controls. */}
+            {!phonePagesHostBanners && bannerStack}
             {focusMode && focusSession.title !== null && !focusSession.gone && (
               <FocusModeNote title={focusSession.title} />
             )}
@@ -3172,6 +3180,7 @@ function AppContent({
               {!fullPageView && !focusMode && (
                 <WorkspaceSidebar
                   asPage={phoneHome}
+                  pageBanner={phoneHome ? bannerStack : undefined}
                   drawer={phoneDrawer}
                   menuItems={appMenu}
                   pageTop={setupBanner}
@@ -3235,7 +3244,9 @@ function AppContent({
                 // With a Session open on a phone this is a card over the session drawer: the drawer pushes it aside
                 // whole, header and all, as clawbolt's and Claude's apps do.
                 className={`flex-1 flex flex-col min-h-0 min-w-0 ${PUSH_MOTION} ${phoneHome ? "max-md:hidden" : ""} ${
-                  phoneDrawer ? "max-md:relative max-md:z-10 max-md:bg-surface-900" : ""
+                  phoneDrawer
+                    ? "max-md:relative max-md:z-10 max-md:bg-surface-900 max-md:has-[>[data-phone-banner]:not(:empty)]:[--phone-overlay-top:0px]"
+                    : ""
                 } ${
                   drawerPushed
                     ? "max-md:translate-x-[var(--aoe-drawer-w)] max-md:rounded-[28px] max-md:overflow-hidden max-md:shadow-xl"
@@ -3246,6 +3257,16 @@ function AppContent({
                   // Floats over the Session, which scrolls beneath it; only its controls take taps.
                   <div className="md:hidden absolute inset-x-0 top-0 z-30 translate-y-[var(--vv-offset-top,0px)] pointer-events-none [&_button]:pointer-events-auto [&_[role=menu]]:pointer-events-auto [&_[data-testid=session-title-pill]]:pointer-events-auto">
                     {topBar}
+                  </div>
+                )}
+                {phoneDrawer && (
+                  // In the card's flow under the floating header, whose menus open over it. While it shows, the
+                  // views below it start right under it instead of clearing the header themselves.
+                  <div
+                    data-phone-banner
+                    className={`md:hidden shrink-0 mx-3 mt-[var(--phone-header-h)] mb-2 ${PHONE_BANNER_CARD}`}
+                  >
+                    {bannerStack}
                   </div>
                 )}
                 {renderContent()}

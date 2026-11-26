@@ -1,7 +1,8 @@
 /* eslint-disable react-refresh/only-export-components */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { PHONE_BANNER_CARD } from "../lib/surfaces";
 import { SETTINGS_CAPTION, SETTINGS_CARD } from "./settings/FormFields";
-import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
+import { useServerDown } from "../lib/connectionState";
 import { ConnectedDevices } from "./ConnectedDevices";
 import { PasskeySettings } from "./PasskeySettings";
 import { McpServers } from "./McpServers";
@@ -169,6 +170,8 @@ function curateCityhallSchema(schema: SettingsFieldDescriptor[]): SettingsFieldD
 }
 
 interface Props {
+  /** The app's banners on a phone, under the page's header. */
+  banner?: ReactNode;
   onClose: () => void;
   tab: string | null;
   onSelectTab: (tab: TabId | string) => void;
@@ -260,6 +263,7 @@ export function resolveSelectedProfile(current: string, profiles: ProfileInfo[])
 const storedIntroFolds = () => new Set(SETTINGS_INTRO_IDS.filter(isSettingsIntroFolded));
 
 export function SettingsView({
+  banner,
   onClose,
   tab,
   onSelectTab: selectTabRoute,
@@ -846,6 +850,7 @@ export function SettingsView({
         onBackToList={showList ? undefined : onShowList}
         sectionLabel={currentTabLabel}
       />
+      {banner && <div className={`md:hidden mx-4 mb-3 ${PHONE_BANNER_CARD}`}>{banner}</div>}
 
       {/* Mobile: a grouped section list; picking one pushes its page. */}
       {showList && (
@@ -947,11 +952,6 @@ export function SettingsView({
             </div>
 
             {introId && !introFolded && <SettingsIntro key={introId} id={introId} onFold={() => foldIntro(introId)} />}
-            {offline && (
-              <div className="text-sm text-status-error bg-status-error/10 rounded-lg p-3">
-                {OFFLINE_TITLE}: toggles will not save while disconnected.
-              </div>
-            )}
             {/* Keying on tab + profileEpoch remounts the content subtree on a
                 tab switch or a user-initiated profile switch, which resets every
                 component-local <CollapsibleSection> "Advanced" fold back to

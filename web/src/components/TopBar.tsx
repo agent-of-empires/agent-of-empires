@@ -51,7 +51,6 @@ interface Props {
   /** Colors for the unread/waiting badges, derived from the app's single resolved-theme read (in `App`); computed
    *  here instead, it would call `useResolvedTheme()` a second time and race that one (see the function's doc). */
   attentionBadgeColors: AttentionBadgeColors;
-  isOffline: boolean;
   /** When true, render a "DEV" badge (in the `status-waiting` amber) in the right-hand status zone so debug builds
    *  (port 8081 / `aoe_dev_` tmux / `~/.agent-of-empires-dev/`) are visually distinct from release builds at a
    *  glance, including in PWA installs where the port is not visible in the window chrome. */
@@ -87,7 +86,6 @@ export function TopBar({
   unreadCount,
   waitingCount,
   attentionBadgeColors,
-  isOffline,
   isDevBuild,
   onGoDashboard,
   onExitFocusMode,
@@ -335,15 +333,6 @@ export function TopBar({
             aria-label="Debug build"
           >
             DEV
-          </span>
-        )}
-        {isOffline && (
-          <span
-            className="font-mono text-[11px] px-1.5 py-0.5 rounded-full bg-status-error/10 text-status-error flex items-center gap-1.5"
-            title="Disconnected from backend"
-          >
-            <span className="w-1.5 h-1.5 rounded-full bg-status-error animate-pulse" />
-            offline
           </span>
         )}
 

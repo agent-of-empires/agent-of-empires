@@ -24,6 +24,7 @@ import { sessionWorkspaces } from "../lib/sessionWorkspace";
 import { ProjectsSection } from "./ProjectsSection";
 import { FoldChevron, PlusIcon, StrokeIcon } from "./icons";
 import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
+import { PHONE_BANNER_CARD } from "../lib/surfaces";
 import { Search, SquarePen } from "lucide-react";
 import { usePersistedFlag } from "./usePersistedFlag";
 import { NAV_ITEM, ROWS, onSidebarArrowKey } from "./sidebar/keyboardNav";
@@ -89,6 +90,8 @@ interface Props {
   asPage?: boolean;
   /** Shown above the list on the phone page, such as the setup banner. */
   pageTop?: ReactNode;
+  /** The app's banners on the phone page, under its title row. */
+  pageBanner?: ReactNode;
   /** Phone with a Session open: the list is a drawer from the left, opened and closed through `open`. */
   drawer?: boolean;
   /** The app's ⋯ items, which a phone's list carries in its title row. */
@@ -372,6 +375,7 @@ export function WorkspaceSidebar(props: Props) {
             )
           }
         />
+        {props.pageBanner && <div className={`mx-3 mb-2 ${PHONE_BANNER_CARD}`}>{props.pageBanner}</div>}
 
         {filterOpen && !compact && (
           <div className="px-3 pb-2">
@@ -475,7 +479,8 @@ export function WorkspaceSidebar(props: Props) {
             </div>
           )}
 
-          {!hasResults && !hasFilter && (
+          {/* Unreachable, the list is unknown rather than empty; the banner above says why. */}
+          {!hasResults && !hasFilter && !offline && (
             <div className="px-4 py-10 text-center" data-testid="sidebar-empty-state">
               <p className="text-sm font-medium text-text-secondary">No sessions yet</p>
               <p className="mt-1 text-[13px] text-text-muted">Create a session to start working in a repo.</p>

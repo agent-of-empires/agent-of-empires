@@ -7,6 +7,8 @@ import { MemoryRouter } from "react-router-dom";
 import { useSessions } from "../../hooks/useSessions";
 import { setServerDown } from "../../lib/connectionState";
 import { TopBar } from "../TopBar";
+import { DisconnectBanner } from "../DisconnectBanner";
+import { useConnectionBanner } from "../../hooks/useConnectionBanner";
 import type { SessionResponse, Workspace } from "../../lib/types";
 import type { AttentionBadgeColors } from "../../lib/attentionBadgeColors";
 
@@ -27,7 +29,6 @@ afterEach(() => {
 
 type TopBarOverrides = {
   isDevBuild?: boolean;
-  isOffline?: boolean;
   activeWorkspace?: Workspace;
   activeSession?: SessionResponse | null;
   onToggleSidebar?: () => void;
@@ -49,7 +50,6 @@ function topBarProps(overrides: TopBarOverrides = {}) {
     unreadCount: overrides.unreadCount ?? 0,
     waitingCount: overrides.waitingCount ?? 0,
     attentionBadgeColors: overrides.attentionBadgeColors ?? DEFAULT_ATTENTION_BADGE_COLORS,
-    isOffline: overrides.isOffline ?? false,
     isDevBuild: overrides.isDevBuild ?? false,
     appMenu: [],
     onGoDashboard: vi.fn(),
@@ -63,15 +63,14 @@ function renderTopBar(overrides: TopBarOverrides = {}) {
 }
 
 describe("TopBar", () => {
-  it("renders the DEV and offline badges independently", () => {
+  it("renders the DEV badge only on a debug build", () => {
     const off = renderTopBar({ isDevBuild: false });
     expect(off.queryByLabelText("Debug build")).toBeNull();
     expect(off.queryByText("DEV")).toBeNull();
     off.unmount();
-    const { getByText, getByLabelText } = renderTopBar({ isDevBuild: true, isOffline: true });
+    const { getByText, getByLabelText } = renderTopBar({ isDevBuild: true });
     expect(getByText("DEV")).toBeTruthy();
     expect(getByLabelText("Debug build")).toBeTruthy();
-    expect(getByText("offline")).toBeTruthy();
   });
 
   it("bounds the header-start group: hidden below md, capped above, and hidden on the compact rail", () => {
@@ -177,7 +176,7 @@ describe("TopBar", () => {
 });
 
 describe("polling connectivity consumer", () => {
-  it("shows offline on an unanswered first poll, then clears it when the replacement succeeds", async () => {
+  it("says the Daemon is unreachable on an unanswered first poll, then clears it when the replacement succeeds", async () => {
     vi.useFakeTimers();
     const signals: AbortSignal[] = [];
     vi.stubGlobal(
@@ -208,24 +207,27 @@ describe("polling connectivity consumer", () => {
             }),
         ),
     );
+    // The app's one statement of it: the Daemon banner, which the header no longer repeats.
     function Header() {
-      const sessions = useSessions();
-      return <TopBar {...topBarProps({ isOffline: sessions.error })} />;
+      useSessions();
+      const connection = useConnectionBanner();
+      return connection === "down" ? <DisconnectBanner state="down" /> : null;
     }
     const view = render(
       <MemoryRouter>
         <Header />
       </MemoryRouter>,
     );
-    expect(view.queryByText("offline")).toBeNull();
+    const down = () => view.queryByText("Daemon unreachable. Reconnecting…");
+    expect(down()).toBeNull();
     await act(async () => {
       await vi.advanceTimersByTimeAsync(15000);
     });
     expect(signals[0]!.aborted).toBe(true);
-    expect(view.getByText("offline")).toBeTruthy();
+    expect(down()).toBeTruthy();
     await act(async () => {
       await vi.advanceTimersByTimeAsync(3000);
     });
-    expect(view.queryByText("offline")).toBeNull();
+    expect(down()).toBeNull();
   });
 });
