@@ -27,6 +27,11 @@ else
   ulimit -n "${hard}" || true
 fi
 
+# Temp files, removed on exit.
+FILTER_FILE=""
+LIST=""
+trap 'rm -f "${FILTER_FILE}" "${LIST}"' EXIT
+
 MAX_SECONDS="${MAX_SECONDS:-120}"
 CRF="${CRF:-14}"
 PRESET="${PRESET:-slow}"
@@ -284,8 +289,12 @@ if [[ -n "${GRID}" ]]; then
   filter+="${stack_inputs}xstack=inputs=${cells}:layout=${layout}[stacked];"
   filter+="[stacked]setpts=PTS/${factor},format=yuv420p[out]"
 
+  # Graph goes in a file: ~680 inputs exceed Linux's 128KB single-argument limit.
+  FILTER_FILE="$(mktemp -t showcase-filter.XXXXXX)"
+  printf '%s' "${filter}" >"${FILTER_FILE}"
+
   ffmpeg -y -filter_threads 1 -filter_complex_threads 1 "${inputs[@]}" \
-    -filter_complex "${filter}" \
+    -/filter_complex "${FILTER_FILE}" \
     -map "[out]" \
     -an \
     -c:v libx264 -preset "${PRESET}" -crf "${CRF}" \
@@ -319,8 +328,11 @@ else
     filter+="${concat_inputs}concat=n=${count}:v=1:a=0[joined];"
     filter+="[joined]setpts=PTS/${factor},format=yuv420p[out]"
 
+    FILTER_FILE="$(mktemp -t showcase-filter.XXXXXX)"
+    printf '%s' "${filter}" >"${FILTER_FILE}"
+
     ffmpeg -y "${inputs[@]}" \
-      -filter_complex "${filter}" \
+      -/filter_complex "${FILTER_FILE}" \
       -map "[out]" \
       -an \
       -c:v libx264 -preset "${PRESET}" -crf "${CRF}" \
@@ -331,7 +343,6 @@ else
     # per-input scaling so input resolution must match across files
     # (the showcase config pins it).
     LIST="$(mktemp -t showcase-concat.XXXXXX)"
-    trap 'rm -f "${LIST}"' EXIT
     for video in "${videos[@]}"; do
       escaped="${video//\'/\'\\\'\'}"
       printf "file '%s'\n" "${escaped}" >>"${LIST}"
