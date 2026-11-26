@@ -216,18 +216,22 @@ impl HomeView {
             }
             return self.refresh_after_stale_move();
         }
-        if freeze && self.group_by == GroupByMode::Group {
-            return self.freeze_in_place(id, order, delta);
+        if freeze {
+            let repositories =
+                repositories.map(crate::server::api::sessions::writable_repository_order);
+            return self.freeze_in_place(id, order, repositories, delta);
         }
         self.submit_custom_order(Some(order), repositories)
     }
 
-    /// Commit `order` with the Groups header order on screen, leaving session `id` in its
-    /// group, so the switch to Custom keeps the headers where they are.
+    /// Commit `order`, and `repositories` under Repository, with the Group header order on
+    /// screen, leaving session `id` in its group, so the switch to Custom keeps every header
+    /// where it is.
     fn freeze_in_place(
         &mut self,
         id: &str,
         order: Vec<String>,
+        repositories: Option<Vec<String>>,
         delta: isize,
     ) -> anyhow::Result<()> {
         let Some(row) = self.instances.get(id) else {
@@ -235,8 +239,12 @@ impl HomeView {
         };
         let profile = row.source_profile.clone();
         let source_group = row.group_path.clone();
-        let headers = self.displayed_headers(&profile);
-        let (freeze, switch) = self.frozen_order(order, &profile);
+        let headers = if self.group_by == GroupByMode::Group {
+            self.displayed_headers(&profile)
+        } else {
+            self.displayed_nested_headers(&profile)
+        };
+        let (freeze, switch) = self.frozen_order(order, &profile, repositories);
         self.submit_namespace_intent(
             crate::daemon::NamespaceMutation::Reorder(crate::daemon::ReorderBody::Session {
                 id: id.to_owned(),
@@ -252,6 +260,24 @@ impl HomeView {
                 switch: Some(switch),
             },
         )
+    }
+
+    /// `profile`'s Groups nested under Repository headers, in the order the list shows them.
+    fn displayed_nested_headers(&self, profile: &str) -> Vec<String> {
+        let tree = self.group_trees.get(profile);
+        let mut headers: Vec<String> = Vec::new();
+        for item in &self.flat_items {
+            let Item::Group { path, .. } = item else {
+                continue;
+            };
+            if let (_, Some(path)) = super::rows::split_project_view_path(path) {
+                if tree.is_some_and(|t| t.group_exists(path)) && !headers.iter().any(|h| h == path)
+                {
+                    headers.push(path.to_owned());
+                }
+            }
+        }
+        headers
     }
 
     /// `profile`'s group headers in the order the list shows them.
@@ -331,9 +357,8 @@ impl HomeView {
                 if let Some((profile, before)) = frozen {
                     match self.group_order_anchor(&profile) {
                         Some(anchor) => {
-                            let order = written.0;
                             return self.undo_frozen_groups(
-                                anchor, profile, before, order, groups, change,
+                                anchor, profile, before, written, groups, change,
                             );
                         }
                         // Only a move puts a Group order back, and it needs a row to name.
@@ -359,7 +384,7 @@ impl HomeView {
         (id, source_group): (String, String),
         profile: String,
         before: Vec<String>,
-        order: Vec<String>,
+        (order, repositories): (Vec<String>, Vec<String>),
         after: Vec<String>,
         change: OrderChange,
     ) -> anyhow::Result<()> {
@@ -367,6 +392,7 @@ impl HomeView {
             order,
             base: self.ordering_base(),
             groups: after,
+            repositories: Some(repositories),
         };
         self.submit_namespace_intent(
             crate::daemon::NamespaceMutation::Reorder(crate::daemon::ReorderBody::Session {
@@ -516,11 +542,12 @@ impl HomeView {
 
     /// The order a move under Name or Newest first commits with the move, and the switch to
     /// Custom that follows it. `profile`'s stored group order goes with it, since the move
-    /// replaces that too.
+    /// replaces that too, and `repositories`, the Repository header order it commits.
     fn frozen_order(
         &self,
         order: Vec<String>,
         profile: &str,
+        repositories: Option<Vec<String>>,
     ) -> (crate::daemon::FrozenOrder, OrderChange) {
         let snapshot = self.session_feed.applied_snapshot();
         let sessions = snapshot
@@ -534,7 +561,12 @@ impl HomeView {
                 groups: Some((profile.to_owned(), groups.clone())),
                 ..self.order_undo_point()
             },
-            expected: (order.clone(), base.repositories.clone()),
+            expected: (
+                order.clone(),
+                repositories
+                    .clone()
+                    .unwrap_or_else(|| base.repositories.clone()),
+            ),
             sort_changes: self.sort_changes,
         };
         (
@@ -542,6 +574,7 @@ impl HomeView {
                 order,
                 base,
                 groups,
+                repositories,
             },
             change,
         )
@@ -821,7 +854,7 @@ impl HomeView {
                 direction,
             )
             .unwrap_or(order);
-            self.frozen_order(order, &profile)
+            self.frozen_order(order, &profile, None)
         });
         let (freeze, switch) = frozen.unzip();
         self.submit_namespace_intent(
@@ -938,7 +971,7 @@ impl HomeView {
             Some(self.displayed_nested_siblings(header_path, &group))
         };
         let (freeze, switch) = freeze
-            .then(|| self.frozen_order(self.displayed_workspace_order(), &group.profile))
+            .then(|| self.frozen_order(self.displayed_workspace_order(), &group.profile, None))
             .unzip();
         self.submit_namespace_intent(
             crate::daemon::NamespaceMutation::Reorder(crate::daemon::ReorderBody::Group {
@@ -1811,7 +1844,6 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_split_workspace_moves_past_its_neighbour() {
-        use crate::tui::session_feed::ViewWrite;
         let _home = crate::session::test_support::isolate_app_dir();
         let storage = crate::session::Storage::new_unwatched("reorder").unwrap();
         let row = |title: &str, branch: &str, age: i64| {
@@ -1856,13 +1888,23 @@ mod tests {
                 view.flat_items = view.build_flat_items();
                 let id = rows.iter().find(|r| r.title == title).unwrap().id.clone();
                 view.select_session_by_id(&id);
-                let mut capture = view.session_feed.view_write_driver_for_test();
+                let mut capture = view.session_feed.namespace_capture_for_test();
                 view.move_row_at_cursor(delta).unwrap();
-                match capture().map(|captured| captured.write) {
-                    Some(ViewWrite::Ordering(patch)) => {
-                        assert_eq!(patch.order, Some(expected.map(String::clone).to_vec()));
+                // Under Repository the freeze carries the nested Group and header orders.
+                match capture().map(|(sent, _)| sent) {
+                    Some(crate::daemon::NamespaceMutation::Reorder(
+                        crate::daemon::ReorderBody::Session {
+                            destination: None,
+                            headers: Some(headers),
+                            freeze: Some(freeze),
+                            ..
+                        },
+                    )) => {
+                        assert_eq!(freeze.order, expected.map(String::clone).to_vec());
+                        assert_eq!(freeze.repositories, Some(vec!["/tmp/repo".to_string()]));
+                        assert_eq!(headers, ["aaa"]);
                     }
-                    other => panic!("{sort:?} {title}: expected an order write, got {other:?}"),
+                    _ => panic!("{sort:?} {title}: expected a frozen move"),
                 }
             }
         }
@@ -2089,7 +2131,7 @@ mod tests {
             let undo = serde_json::json!({"target":"session","id":anchor,"profile":"reorder",
                 "source_group":anchor_group,"direction":"down","headers":["ccc","aaa","bbb"],
                 "freeze":{"order":[],"base":{"order":expected,"repositories":[]},
-                    "groups":frozen_groups}});
+                    "groups":frozen_groups,"repositories":[]}});
             let mut respond = view.session_feed.namespace_driver_for_test();
             view.undo_order_change().unwrap();
             let (status, headers, value) =

@@ -344,6 +344,9 @@ pub struct FrozenOrder {
     /// The profile's stored group paths, in stored order, which `headers` or `siblings`
     /// replace.
     pub groups: Vec<String>,
+    /// The Repository header order shown, committed with `order` when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repositories: Option<Vec<String>>,
 }
 
 /// The stored row and Repository header orders, as published in a runtime snapshot.

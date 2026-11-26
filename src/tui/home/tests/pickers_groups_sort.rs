@@ -3763,43 +3763,6 @@ async fn test_cross_group_move_lands_in_an_empty_neighbour() {
 }
 
 /// Session id of the row titled `title`.
-/// Under Custom a repository's own groups follow their rows' order, so a switch from Name,
-/// which commits the rows as shown, keeps the groups where they were.
-#[test]
-#[serial]
-fn test_repository_groups_follow_their_rows_under_custom() {
-    use crate::session::config::{GroupByMode, SortOrder};
-
-    let instances = [
-        instance_in("a1", "/r/repo", "alpha"),
-        instance_in("b1", "/r/repo", "beta"),
-    ];
-    let mut env = seeded_env(test_home(), &instances, false);
-    let (a, b) = (
-        custom_order_id_of(&env.view, "a1"),
-        custom_order_id_of(&env.view, "b1"),
-    );
-    env.view
-        .mutate_instance(&a, |inst| inst.sort_index = Some(0));
-    env.view.mutate_instance(&b, |inst| {
-        inst.sort_index = Some(1);
-        inst.created_at = crate::time::Timestamp::now() + crate::time::Duration::hours(1);
-    });
-    env.view.group_by = GroupByMode::Project;
-    env.view.sort_order = SortOrder::Custom;
-    env.view.flat_items = env.view.build_flat_items();
-    let nested: Vec<&str> = env
-        .view
-        .flat_items
-        .iter()
-        .filter_map(|item| match item {
-            Item::Group { name, depth: 1, .. } => Some(name.as_str()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(nested, ["alpha", "beta"]);
-}
-
 /// A move waits for the Daemon's first snapshot, which carries the order it replaces, and
 /// never reorders an archived row, which keeps its archive order.
 #[test]
