@@ -660,6 +660,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 seed_history_replay,
                 prior_conversation: req.prior_conversation,
                 artifact_dir: crate::session::artifacts::session_artifact_dir(&req.session_id).ok(),
+                proxy: None,
                 wrapper_substitution,
                 generation,
                 claude_store_pin,

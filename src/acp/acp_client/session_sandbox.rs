@@ -399,6 +399,37 @@ mod tests {
         }
     }
 
+    /// A proxy wraps the whole `docker exec` line, so the container still
+    /// receives the adapter argv with spaces and quotes intact.
+    #[test]
+    fn proxy_wraps_the_docker_exec_argv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = sandbox("aoe-sandbox-abc12345", None);
+        let mut config = sandbox_config(tmp.path(), &info);
+        config.spec.args = vec!["a b".into(), "it's \"x\"".into()];
+        let sandbox_argv = build_sandbox_docker_argv(&config, &info, "/workspace/proj").unwrap();
+        let proxy = crate::acp::acp_client::ProxySpec {
+            plugin_id: "p".into(),
+            command: "/opt/proxy".into(),
+            args: vec!["--x".into()],
+            failure_policy: crate::acp::acp_client::ProxyFailurePolicy::Refuse,
+            display_name: "P".into(),
+        };
+
+        let argv = super::super::runner::agent_argv(
+            Some(&proxy),
+            &sandbox_argv.docker_binary,
+            &sandbox_argv.docker_args,
+        );
+
+        assert_eq!(
+            argv[..3],
+            ["/opt/proxy", "--x", sandbox_argv.docker_binary.as_str()]
+        );
+        assert_eq!(argv[3..], sandbox_argv.docker_args[..]);
+        assert_eq!(argv[argv.len() - 2..], ["a b", "it's \"x\""]);
+    }
+
     /// The agent command is wrapped as `docker exec -i -w <workdir> ... <container>
     /// <argv>`, with a literal env entry delivered only through the env-file.
     #[test]

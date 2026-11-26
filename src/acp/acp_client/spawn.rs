@@ -11,6 +11,25 @@ use tracing::{debug, info, warn};
 use super::errors::AcpError;
 use super::resolve_command::{resolve_agent_command, Unresolved};
 
+/// What to do when a launched proxy fails before a valid hello.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyFailurePolicy {
+    Refuse,
+    NeutralBoot,
+}
+
+/// A plugin-supplied process that sits between the runner and the adapter.
+/// The runner launches `command args... -- <adapter argv>`; `SpawnConfig::spec`
+/// stays the adapter.
+#[derive(Debug, Clone)]
+pub struct ProxySpec {
+    pub plugin_id: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub failure_policy: ProxyFailurePolicy,
+    pub display_name: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SpawnConfig {
     /// Registry key of the resolved ACP backend; selects the `AgentProfile`.
@@ -84,6 +103,8 @@ pub struct SpawnConfig {
     /// Recomputed on every launch, and applied only to the agent process environment, which
     /// other local users cannot read, unlike the command line the entries end up on.
     pub mcp_credentials: crate::acp::mcp_rewrite::McpCredentialEnv,
+    /// Runner launches only; the in-proc stdio spawn never uses a proxy.
+    pub proxy: Option<ProxySpec>,
 }
 
 impl SpawnConfig {

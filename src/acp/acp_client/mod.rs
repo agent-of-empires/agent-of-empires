@@ -57,7 +57,7 @@ pub(crate) use runner::wrap_in_scope;
 pub use session_sandbox::{effective_launch_env, SessionSandbox};
 pub(crate) use session_sandbox::{known_container_workdir, SandboxLayout};
 pub(crate) use spawn::host_environment_denyreason;
-pub use spawn::SpawnConfig;
+pub use spawn::{ProxyFailurePolicy, ProxySpec, SpawnConfig};
 
 use crate::acp::agent_compat::ExpectedAgent;
 use crate::acp::agent_profiles;

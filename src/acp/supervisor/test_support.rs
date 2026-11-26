@@ -478,6 +478,7 @@ pub(super) fn runner_config(socket_path: PathBuf) -> SpawnConfig {
         seed_history_replay: false,
         prior_conversation: false,
         artifact_dir: None,
+        proxy: None,
         sandbox_info: None,
         workspace_info: None,
         source_profile: None,
