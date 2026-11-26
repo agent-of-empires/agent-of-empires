@@ -85,6 +85,17 @@ test.describe("Mobile session view tabs (#1452)", () => {
     await expect(page.getByTestId("topbar-back")).toHaveCount(0);
   });
 
+  test("a swipe right goes back even with the sidebar set to the right, or left open on a wider screen", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1024, height: 844 });
+    await openLiveTerminal(page, { mobile: true, settings: { sidebarSide: "right" } });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(page.getByTestId("topbar-back")).toBeVisible();
+    await swipe(page, 195 - 80, 195 + 80, 422);
+    await expect(page.getByTestId("sidebar-new-session-pill")).toBeInViewport();
+  });
+
   test("adjusting selected chat text neither raises More nor goes back", async ({ page }) => {
     await openLiveTerminal(page, { mobile: true, settings: null });
     const content = liveContent(page).first();

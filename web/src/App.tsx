@@ -1976,10 +1976,11 @@ function AppContent({
   );
   useDrawerSwipe(
     {
-      sidebarOpen,
-      sidebarSide: webSettings.sidebarSide,
+      // A phone has no sidebar drawer: a swipe right always goes back, whichever side the desktop sidebar takes.
+      sidebarOpen: singlePane ? false : sidebarOpen,
+      sidebarSide: singlePane ? "left" : webSettings.sidebarSide,
       panelsOpen: pickerOpen,
-      // More opens from the phone tab bar; a sideways swipe raising a bottom sheet is no gesture people expect.
+      // More panes opens from the header's ⋯; a sideways swipe raising a bottom sheet is no gesture people expect.
       panelsAvailable: false,
     },
     handleDrawerSwipe,
