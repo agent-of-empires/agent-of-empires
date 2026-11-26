@@ -482,6 +482,9 @@ pub(super) async fn connect_runner_control_v3(
                             return;
                         }
                     }
+                    Ok(Some((ControlBody::AdapterFramesShed { count }, _))) => {
+                        reader_ingress.skip_adapter_frames(count);
+                    }
                     Ok(Some((ControlBody::PromptStarted { prompt_req_id }, _))) => {
                         let mut completion =
                             reader_completion.lock().expect("completion mutex poisoned");
@@ -1392,6 +1395,43 @@ mod tests {
             write.write_all(&response).await.unwrap();
         }
         fake.await.unwrap();
+    }
+
+    /// A marker for frames the runner shed from its queue counts them as
+    /// adapter frames the connection never received.
+    #[tokio::test]
+    async fn a_shed_marker_advances_the_ingress_adapter_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (control, listener) = bind(&tmp);
+        let fake = tokio::spawn(async move {
+            let mut peer = accept_hello(
+                &listener,
+                "shed",
+                control_protocol::CONTROL_PROTOCOL_VERSION,
+            )
+            .await;
+            control_protocol::write_frame(&mut peer, &ControlBody::AdapterFramesShed { count: 3 })
+                .await
+                .unwrap();
+            peer
+        });
+        let (client, _crate_side) =
+            connect(&control, "shed", Arc::new(TerminalClaim::new()), false)
+                .await
+                .unwrap();
+        let _peer = fake.await.unwrap();
+        let counted = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let n = client.ingress.take_discarded_adapter_frames();
+                if n > 0 {
+                    return n;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the reader applies the marker");
+        assert_eq!(counted, 3);
     }
 
     #[tokio::test]

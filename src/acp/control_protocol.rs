@@ -64,6 +64,9 @@ pub enum ControlBody {
         /// backlog it still holds is replayed after this frame.
         adapter_frames: u64,
     },
+    /// Adapter frames the runner shed from a full queue. They stay numbered by
+    /// the proxy, so the daemon counts them in the position they held.
+    AdapterFramesShed { count: u64 },
     /// The runner-owned handshake failed (agent incompatible, `session/new`
     /// error, transport failure).
     HandshakeFailed { error: serde_json::Value },
@@ -294,6 +297,7 @@ mod tests {
                 result: serde_json::json!({"sessionId": "sess-1"}),
                 adapter_frames: 0,
             },
+            ControlBody::AdapterFramesShed { count: 3 },
             ControlBody::ResumeSession,
             ControlBody::HandshakeFailed {
                 error: serde_json::json!({"code": -32603, "message": "incompatible"}),

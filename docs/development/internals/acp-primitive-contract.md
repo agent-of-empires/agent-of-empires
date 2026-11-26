@@ -27,7 +27,7 @@ A proxy adds `_meta.aoe.proxy = {plugin_id, protocol_version, primitive_schema_v
 ```
 
 - `key` is an idempotency key. A repeat is dropped, among the last 4096 keys of a native session; a reset starts a fresh key space. A proxy must not replay a key older than that window.
-- `after_adapter_sequence: N` marks a frame the proxy emitted itself, for example from a transcript tailer. It is not an adapter frame and takes no number; core delivers it after adapter frame `N`. Adapter frames are numbered from 1 per adapter process and keep counting across a conversation reset and a runner reattach. At most 1024 frames may wait; a reset drops them.
+- `after_adapter_sequence: N` marks a frame the proxy emitted itself, for example from a transcript tailer. It is not an adapter frame and takes no number; core delivers it after adapter frame `N`. Adapter frames are numbered from 1 per adapter process and keep counting across a conversation reset and a runner reattach, including frames the runner sheds from a full queue. At most 1024 frames may wait; a reset drops them.
 - `lease` is described below.
 - Primitives: `parent_tool_call`, `ephemeral` (drop before the reducer), `memory_recall`, `plan_proposal`, `tool_presentation`, `option_preview`. `parent_tool_call`, `memory_recall` and `plan_proposal` are read on `tool_call` updates only, where they produce the same events as the matching agent-specific path. `tool_presentation` and `option_preview` are validated and carried; no surface renders them yet.
 
