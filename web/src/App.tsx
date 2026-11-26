@@ -540,10 +540,8 @@ function AppContent({
     [cancelCue, applyPushedStatus],
   );
   useSessionStatusStream({ onStatus: onPushedStatus, onSoundDue, onResync: refreshSessions });
-  useEffect(
-    () => onSoundBlocked(() => createToasts(focusMode)?.info("Click anywhere on this page to turn on sounds.")),
-    [focusMode],
-  );
+  // Shown in focus mode too: the focused session's sounds are blocked like any other.
+  useEffect(() => onSoundBlocked(() => toastBus.handler?.info("Click anywhere on this page to turn on sounds.")), []);
   const attentionBadgeColors = useMemo(() => getAttentionBadgeColors(resolvedTheme), [resolvedTheme]);
 
   // Remember the active session and restore it on a PWA relaunch (#2103). A focus window is not the main window.

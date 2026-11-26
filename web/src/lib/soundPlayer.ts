@@ -163,11 +163,12 @@ export async function playSoundFor(event: SoundEvent, context: SoundContext = {}
   const buffer = await loadBuffer(ctx, event);
   // The tab may have come back to the foreground while the sound loaded.
   if (!buffer || generation !== cacheGeneration || !inScope(sound, context)) return false;
-  if (!(await running(ctx))) {
+  const unlocked = await running(ctx);
+  if (generation !== cacheGeneration || !inScope(sound, context)) return false;
+  if (!unlocked) {
     reportBlocked();
     return false;
   }
-  if (generation !== cacheGeneration || !inScope(sound, context)) return false;
   const gain = ctx.createGain();
   gain.gain.value = typeof sound.browser_volume === "number" ? Math.max(0, sound.browser_volume) : 1.0;
   gain.connect(ctx.destination);

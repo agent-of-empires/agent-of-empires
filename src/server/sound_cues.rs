@@ -167,6 +167,14 @@ mod tests {
     use super::*;
     use crate::time::Timestamp;
 
+    /// Fails instead of hanging when the player never plays.
+    async fn next_played<T>(played: &mut tokio::sync::mpsc::UnboundedReceiver<T>) -> T {
+        tokio::time::timeout(Duration::from_secs(60), played.recv())
+            .await
+            .expect("no sound played")
+            .expect("player stopped")
+    }
+
     fn change(id: &str, new: Status) -> StatusChange {
         StatusChange {
             instance_id: id.to_string(),
@@ -245,14 +253,14 @@ mod tests {
 
         let sent = Instant::now();
         state.status_tx.send(change(&id, Status::Running)).unwrap();
-        let (profile, event, at) = played.recv().await.unwrap();
+        let (profile, event, at) = next_played(&mut played).await;
         assert_eq!((profile.as_str(), event), ("work", SoundEvent::Running));
         assert_eq!(at, sent, "running waited for a dwell");
 
         set_status(&state, &id, Status::Idle).await;
         let sent = Instant::now();
         state.status_tx.send(change(&id, Status::Idle)).unwrap();
-        let (_, event, at) = played.recv().await.unwrap();
+        let (_, event, at) = next_played(&mut played).await;
         assert_eq!(event, SoundEvent::Idle);
         assert!(
             at - sent >= Duration::from_millis(2_000),
@@ -287,7 +295,7 @@ mod tests {
             state.status_tx.send(change(id, Status::Idle)).unwrap();
         }
         // One batch plays without yielding, so its sounds are all queued once the first arrives.
-        let mut batch = vec![played.recv().await.unwrap()];
+        let mut batch = vec![next_played(&mut played).await];
         while let Ok(next) = played.try_recv() {
             batch.push(next);
         }

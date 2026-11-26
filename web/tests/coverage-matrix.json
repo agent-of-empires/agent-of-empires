@@ -1248,7 +1248,7 @@
         "web/src/lib/soundPlayer.ts",
         "web/src/App.tsx"
       ],
-      "notes": "Sounds are built in and fetched per event from `/api/sounds/{event}`. They play through one Web Audio context that the page's first click or key press resumes; a sound that comes first stays silent and shows a one-time toast asking for a click. The Daemon plays the host sounds itself (`server::sound_cues`)."
+      "notes": "Sounds are built in and fetched per event from `/api/sounds/{event}`. They play through one Web Audio context that each click or key press resumes; a sound that comes while it is suspended stays silent and fires `onSoundBlocked` once. The tests fake the context, so they cover this logic, not a real browser's autoplay policy or App's toast. The Daemon plays the host sounds itself (`server::sound_cues`)."
     },
     {
       "id": "notifications.linked-toasts",
