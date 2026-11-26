@@ -549,7 +549,17 @@ done
             &script,
             source.replace(
                 r#"    *'"method":"session/prompt"'*)"#,
-                &format!("    *'\"method\":\"session/prompt\"'*)\n{injected}"),
+                &format!(
+                    r#"    *'"method":"session/prompt"'*)
+{injected}
+      callback_replies=0
+      while [ "$callback_replies" -lt {} ]; do
+        IFS= read -r reply || exit 1
+        printf '%s\n' "$reply" >> "$CAPTURE"
+        callback_replies=$((callback_replies+1))
+      done"#,
+                    callbacks.len()
+                ),
             ),
         )
         .unwrap();
@@ -561,9 +571,7 @@ done
         .unwrap();
         client.send_prompt("exercise callbacks", &[]).await.unwrap();
         let events = identity_events_until_stop(&mut client).await;
-        // A second prompt is a wire barrier: the adapter has consumed every callback reply.
-        client.send_prompt("barrier", &[]).await.unwrap();
-        identity_events_until_stop(&mut client).await;
+        // The agent answers the prompt only after consuming every callback reply.
         client.shutdown().await.unwrap();
         assert!(!denied_file.exists());
         assert!(!denied_command.exists());
@@ -643,14 +651,29 @@ done
             let response = "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"sessionId\":\"%s\"}}\\n' \"$id\" \"$sid\" ;;";
             let replacement = format!(
                 r#"      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"%s","configOptions":[{{"id":"effort","name":"Effort","category":"thought_level","type":"select","currentValue":"high","options":[{{"value":"high","name":"High"}}]}},{{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"code","options":[{{"value":"code","name":"Code"}}]}}]}}}}\n' "$id" "$sid"
+      callback_reply=
       printf '{{"jsonrpc":"2.0","id":"callback","method":"fs/write_text_file","params":{{"sessionId":"%s","path":"{}","content":"%s"}}}}\n' "$sid" "$sid" ;;
+    *'"id":"callback"'*)
+      callback_reply=$line ;;
     *'"method":"session/set_config_option"'*)
       printf '{{"jsonrpc":"2.0","id":%s,"result":{{"configOptions":[]}}}}\n' "$id" ;;"#,
                 written.display()
             );
             let source = std::fs::read_to_string(&script)
                 .unwrap()
-                .replace(response, &replacement);
+                .replace(response, &replacement)
+                .replace(
+                    r#"    *'"method":"session/prompt"'*)"#,
+                    r#"    *'"method":"session/prompt"'*)
+      # Config requests have been answered; only the callback reply can follow.
+      if [ -z "$callback_reply" ]; then
+        IFS= read -r callback_reply || exit 1
+      fi
+      case $callback_reply in
+        *'"id":"callback"'*'"result":'*|*'"result":'*'"id":"callback"'*) ;;
+        *) printf 'Expected a successful callback reply, got: %s\n' "$callback_reply" >&2; exit 1 ;;
+      esac"#,
+                );
             std::fs::write(&script, source).unwrap();
             let mut config = reset_fake_spawn_config(&script, temp.path());
             config.default_mode = Some("code".into());
@@ -673,7 +696,7 @@ done
                 ResetSessionOutcome::Reset { .. }
             ));
             identity_events_until_stop(&mut client).await;
-            // The prompt response is a wire barrier after the accepted callback.
+            // The agent gates prompt completion on the write callback's success.
             client.send_prompt("after", &[]).await.unwrap();
             identity_events_until_stop(&mut client).await;
             assert_eq!(
