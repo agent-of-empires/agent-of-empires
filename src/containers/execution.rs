@@ -991,6 +991,7 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, home.join("link")).unwrap();
         std::os::unix::fs::symlink(outside.join("missing"), home.join("dangling")).unwrap();
+        std::os::unix::fs::symlink(home.join("missing"), home.join("dangling-in")).unwrap();
         // (case, bind source, shared root, is a host path)
         for (case, source, shared, host) in [
             ("under-home", home.join("store"), Some(home.clone()), true),
@@ -999,6 +1000,12 @@ mod tests {
             (
                 "dangling-link-out",
                 home.join("dangling"),
+                Some(home.clone()),
+                false,
+            ),
+            (
+                "dangling-link-in",
+                home.join("dangling-in"),
                 Some(home.clone()),
                 false,
             ),
