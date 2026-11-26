@@ -1374,31 +1374,13 @@ mod tests {
     async fn a_purge_fence_during_attach_defers_and_refunds_the_fallback_spawn() {
         let id = "s-purge-at-fallback";
         let (_home, state, project) = test_state(id);
-        let sockets = tempfile::TempDir::with_prefix_in("aoe-attach-", "/tmp").unwrap();
-        let socket = sockets.path().join("runner.sock");
-        let listener =
-            tokio::net::UnixListener::bind(crate::process::worker::control_socket_sibling(&socket))
-                .unwrap();
-        let mut child = tokio::process::Command::new("sleep")
-            .arg("60")
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let record = crate::process::worker_registry::WorkerRecord::new(
-            id.into(),
-            child.id().unwrap(),
-            socket,
-            "test-agent-acp".into(),
-            "test-agent".into(),
-            project.path().to_path_buf(),
-            None,
-            vec![],
-            vec![],
-            Some("native-id".into()),
-            Some("default".into()),
+        let mut runner = crate::acp::supervisor::test_support::HeldAttachRunner::new(
+            id,
+            project.path(),
+            17,
+            Some("default"),
         )
-        .with_generation(17);
-        crate::process::worker_registry::save(&record).unwrap();
+        .await;
 
         let first_tick = tokio::spawn({
             let state = Arc::clone(&state);
@@ -1408,15 +1390,13 @@ mod tests {
                 tick
             }
         });
-        // The runner is still live when attach connects. Fence admission before
-        // allowing attach to fail, so only the fallback can see the purge fence.
-        let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        // Hold the attested runner in initialize. Fence admission before the
+        // runner exits, so only the fallback can see the purge fence.
+        tokio::time::timeout(Duration::from_secs(5), runner.entered())
             .await
-            .expect("reconciliation must try to attach")
-            .unwrap();
+            .expect("reconciliation must try to attach");
         let purge = state.acp_supervisor.fence_spawn_admission(id);
-        child.kill().await.unwrap();
-        drop(stream);
+        runner.exit_peer();
 
         let mut tick = first_tick.await.unwrap();
         assert!(crate::process::worker_registry::load(id).unwrap().is_none());

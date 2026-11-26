@@ -216,6 +216,9 @@ socket connection and runner registration.
 A timeout while observing an attested retained runner releases only the borrowed
 attachment and re-arms the existing reconciler tick. It does not manufacture a
 persistent ownership refusal, terminate native work or authorize replacement.
+If the control channel closes during attach and the recorded runner is proven
+gone, the reconciler settles its runtime before attempting fallback spawn.
+A concurrent purge fences that spawn and refunds the reconciler's attempt.
 
 Stop can preserve a private, qualified binding receipt already journaled by its
 exact original lease/actor/native context before incrementing the stop generation.

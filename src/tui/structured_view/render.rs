@@ -2946,6 +2946,7 @@ fn help_hint(
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::NativeInputFixture;
     use super::*;
     use crate::acp::client::HttpClient;
     use crate::acp::state::{AvailableCommand, Event, SessionNotice};
@@ -3653,11 +3654,12 @@ mod tests {
 
     /// A pending question has to say what it is asking: the option labels alone
     /// leave the lead-in and the chosen answer's detail unsaid.
-    #[test]
-    fn question_picker_shows_the_question_context_and_highlighted_detail() {
+    #[tokio::test]
+    async fn question_picker_shows_the_question_context_and_highlighted_detail() {
         use super::super::state::{ChoicePicker, ChoicePurpose};
 
-        let mut state = test_state();
+        let mut fixture = NativeInputFixture::ready().await;
+        let state = &mut fixture.view;
         state.choice = Some(ChoicePicker {
             title: " Which store? (Enter=pick · Esc=dismiss) ".into(),
             context: Some(
@@ -3671,7 +3673,7 @@ mod tests {
             selected: 0,
             purpose: ChoicePurpose::Mode,
         });
-        let dump = render_dump(&state, 80, 24);
+        let dump = render_dump(state, 80, 24);
         assert!(dump.contains("Picking the store for"), "{dump}");
         assert!(
             dump.contains("Postgres") && dump.contains("SQLite"),
@@ -3699,9 +3701,10 @@ mod tests {
 
     /// The approval shelf has to show the request itself: the tool name and an
     /// elided target in the title are not enough to decide on a command.
-    #[test]
-    fn approval_shelf_shows_the_request_payload() {
-        let mut state = test_state();
+    #[tokio::test]
+    async fn approval_shelf_shows_the_request_payload() {
+        let mut fixture = NativeInputFixture::ready().await;
+        let state = &mut fixture.view;
         state.transcript.pending_approvals = vec![PendingApproval {
             nonce: "n-1".into(),
             title: "Bash".into(),
@@ -3713,7 +3716,7 @@ mod tests {
         }];
         state.selected_approval = Some("n-1".into());
         state.focus = Focus::Approval;
-        let dump = render_dump(&state, 80, 24);
+        let dump = render_dump(state, 80, 24);
         for want in [
             "$ rm -rf build && make",
             "description: clean the tree",
@@ -3731,13 +3734,13 @@ mod tests {
                 .join(" && "),
         })
         .to_string();
-        let dump = render_dump(&state, 40, 24);
+        let dump = render_dump(state, 40, 24);
         assert!(dump.contains("step-0"), "{dump}");
         assert!(dump.contains(" more"), "the rest is counted: {dump}");
 
         // A shelf clamped by a short terminal clips the paragraph, so the count
         // has to come from the height it really has.
-        let dump = render_dump(&state, 40, 12);
+        let dump = render_dump(state, 40, 12);
         assert!(
             dump.contains(" more"),
             "a clipped body still counts what it dropped: {dump}"
@@ -3871,10 +3874,11 @@ mod tests {
 
     /// Moving between options must not resize the popup: it is bottom-anchored,
     /// so a shorter detail would slide the options out from under the pointer.
-    #[test]
-    fn question_picker_option_rows_hold_still_while_the_detail_changes() {
+    #[tokio::test]
+    async fn question_picker_option_rows_hold_still_while_the_detail_changes() {
         use super::super::state::{ChoicePicker, ChoicePurpose};
-        let mut state = test_state();
+        let mut fixture = NativeInputFixture::ready().await;
+        let state = &mut fixture.view;
         state.choice = Some(ChoicePicker {
             title: " Which store? ".into(),
             context: None,
@@ -3889,11 +3893,11 @@ mod tests {
             selected: 0,
             purpose: ChoicePurpose::Mode,
         });
-        let _ = render_dump(&state, 80, 24);
+        let _ = render_dump(state, 80, 24);
         let with_detail = state.mouse_targets.borrow().picker.expect("picker").rows;
 
         state.choice.as_mut().unwrap().selected = 1;
-        let _ = render_dump(&state, 80, 24);
+        let _ = render_dump(state, 80, 24);
         let without_detail = state.mouse_targets.borrow().picker.expect("picker").rows;
         assert_eq!(
             with_detail.y, without_detail.y,
