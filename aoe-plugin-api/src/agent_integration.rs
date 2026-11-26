@@ -144,6 +144,35 @@ pub struct AgentTrustDeclaration {
     pub sandbox: AgentTrustSandbox,
 }
 
+/// A container directory a declared config-dir variable may name: absolute and
+/// normalized, away from the home directory itself and the host-provided mounts.
+pub fn container_dir_ok(dir: &str) -> bool {
+    const RESERVED: [&str; 6] = [
+        "/workspace",
+        "/aoe",
+        "/proc",
+        "/sys",
+        "/dev",
+        "/tmp/aoe-hooks",
+    ];
+    let Some(rest) = dir.strip_prefix('/') else {
+        return false;
+    };
+    dir.len() <= AGENT_HOOK_PATH_MAX
+        && dir != "/root"
+        && !rest.is_empty()
+        && rest.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && !part.contains([':', ',', '\\'])
+                && part.chars().all(|c| !c.is_control())
+        })
+        && !RESERVED
+            .iter()
+            .any(|reserved| dir == *reserved || dir.starts_with(&format!("{reserved}/")))
+}
+
 /// The pointer's segments, or `None` unless it is a valid trust pointer.
 pub fn parse_trust_pointer(pointer: &str) -> Option<Vec<&str>> {
     let rest = pointer.strip_prefix('/')?;

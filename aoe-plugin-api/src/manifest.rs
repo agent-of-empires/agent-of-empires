@@ -843,13 +843,44 @@ fn declaration_rel_path_ok(path: &str) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
-fn declaration_env_var_ok(name: &str) -> bool {
-    let mut bytes = name.bytes();
+/// A config-directory variable: a launch environment name that is not
+/// credential-shaped, since the host reads its value as a directory.
+fn declaration_config_dir_var_ok(name: &str) -> bool {
     name.len() <= 64
-        && bytes
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
-        && bytes.all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        && declaration_env_name_ok(name)
+        && !name.starts_with("XDG_")
+        && !["TOKEN", "SECRET", "KEY", "PASSWORD", "CREDENTIAL", "AUTH"]
+            .iter()
+            .any(|word| name.contains(word))
+}
+
+/// Checks a declared `config_dir_env_var`: well-formed, and declared with a safe
+/// directory in `launch.container_env`, which is where the sandbox mounts it.
+fn validate_config_dir_var(
+    i: usize,
+    table: &str,
+    var: &str,
+    integration: &crate::agent_integration::AgentIntegrationContribution,
+    check: &mut impl FnMut(bool, String),
+) {
+    check(
+        declaration_config_dir_var_ok(var),
+        format!(
+            "agent_integrations[{i}].{table}.config_dir_env_var must be a non-credential \
+             environment variable name"
+        ),
+    );
+    check(
+        integration
+            .launch
+            .as_ref()
+            .and_then(|launch| launch.container_env.get(var))
+            .is_some_and(|dir| crate::agent_integration::container_dir_ok(dir)),
+        format!(
+            "agent_integrations[{i}].{table}.config_dir_env_var must also be a \
+             launch.container_env key whose value is a normalized absolute directory"
+        ),
+    );
 }
 
 fn declaration_text_ok(value: &str) -> bool {
@@ -861,6 +892,7 @@ fn declaration_text_ok(value: &str) -> bool {
 fn validate_agent_hooks(
     i: usize,
     hooks: &crate::agent_integration::AgentHooksDeclaration,
+    integration: &crate::agent_integration::AgentIntegrationContribution,
     check: &mut impl FnMut(bool, String),
 ) {
     use crate::agent_integration::{AGENT_HOOK_EVENTS, AGENT_HOOK_EVENTS_MAX};
@@ -874,10 +906,7 @@ fn validate_agent_hooks(
         ),
     );
     if let Some(var) = &hooks.config_dir_env_var {
-        check(
-            declaration_env_var_ok(var),
-            format!("agent_integrations[{i}].hooks.config_dir_env_var must be an environment variable name"),
-        );
+        validate_config_dir_var(i, "hooks", var, integration, check);
     }
     check(
         (1..=AGENT_HOOK_EVENTS_MAX).contains(&hooks.events.len()),
@@ -918,18 +947,18 @@ fn validate_agent_hooks(
 fn validate_agent_trust(
     i: usize,
     trust: &crate::agent_integration::AgentTrustDeclaration,
+    integration: &crate::agent_integration::AgentIntegrationContribution,
     check: &mut impl FnMut(bool, String),
 ) {
     use crate::agent_integration::{parse_trust_pointer, AgentTrustValue};
     check(
-        declaration_rel_path_ok(&trust.file) && !trust.file.contains('/'),
-        format!("agent_integrations[{i}].trust.file must be a single file name"),
+        declaration_rel_path_ok(&trust.file)
+            && !trust.file.contains('/')
+            && trust.file.ends_with(".json"),
+        format!("agent_integrations[{i}].trust.file must be a single `.json` file name"),
     );
     if let Some(var) = &trust.config_dir_env_var {
-        check(
-            declaration_env_var_ok(var),
-            format!("agent_integrations[{i}].trust.config_dir_env_var must be an environment variable name"),
-        );
+        validate_config_dir_var(i, "trust", var, integration, check);
     }
     check(
         parse_trust_pointer(&trust.pointer).is_some(),
@@ -1003,10 +1032,10 @@ fn validate_agent_declaration(
         format!("agent_integrations[{i}] declarations require a non-blank command"),
     );
     if let Some(hooks) = &integration.hooks {
-        validate_agent_hooks(i, hooks, check);
+        validate_agent_hooks(i, hooks, integration, check);
     }
     if let Some(trust) = &integration.trust {
-        validate_agent_trust(i, trust, check);
+        validate_agent_trust(i, trust, integration, check);
     }
     if let Some(launch) = &integration.launch {
         for (j, alias) in launch.aliases.iter().enumerate() {

@@ -930,12 +930,16 @@ const HOOKS: &str = "[agent_integrations.hooks]\n\
 const TRUST: &str = "[agent_integrations.trust]\n\
     file = \".example.json\"\n\
     location = \"config_dir_or_home\"\n\
+    config_dir_env_var = \"EXAMPLE_CONFIG_DIR\"\n\
     pointer = \"/projects/{path}/trusted\"\n\
     value = true\n\
     sandbox = \"always\"\n";
 
 fn agent(tables: &str) -> String {
-    format!("[[agent_integrations]]\ntool = \"example\"\ncommand = \"example\"\n{tables}")
+    format!(
+        "[[agent_integrations]]\ntool = \"example\"\ncommand = \"example\"\n\
+         [agent_integrations.launch.container_env]\nEXAMPLE_CONFIG_DIR = \"/opt/example\"\n{tables}"
+    )
 }
 
 #[test]
@@ -1058,4 +1062,148 @@ fn trust_declarations_are_validated() {
     parse(26, &with("value = true", "value = \"TRUST_FOLDER\""));
     parse(26, &with("/projects/{path}/trusted", "/{path}"));
     parse(26, &with("sandbox = \"always\"", "sandbox = \"yolo_only\""));
+}
+
+#[test]
+fn declaration_bounds_each_reject() {
+    let hooks_with = |from: &str, to: &str| agent(&HOOKS.replace(from, to));
+    let trust_with = |from: &str, to: &str| agent(&TRUST.replace(from, to));
+    let with_env = |tables: &str, var: &str, dir: &str| {
+        format!(
+            "[[agent_integrations]]\ntool = \"example\"\ncommand = \"example\"\n\
+             [agent_integrations.launch.container_env]\n{var} = \"{dir}\"\n{}",
+            tables.replace("EXAMPLE_CONFIG_DIR", var)
+        )
+    };
+    let event = |n: usize| {
+        format!("[[agent_integrations.hooks.events]]\nevent = \"Stop\"\nstatus = \"idle\"\nmatcher = \"m{n}\"\n")
+    };
+    let long_path = format!("{}/settings.json", "d".repeat(260));
+    let too_many_tools = format!(
+        "waiting_tools = [{}]",
+        (0..33)
+            .map(|n| format!("\"t{n}\""))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let cases: Vec<(String, &str)> = vec![
+        (
+            hooks_with(".example/settings.json", &long_path),
+            "settings_rel_path",
+        ),
+        (
+            agent(&format!(
+                "{}{}",
+                HOOKS
+                    .split("[[agent_integrations.hooks.events]]")
+                    .next()
+                    .unwrap(),
+                (0..33).map(event).collect::<String>()
+            )),
+            "hooks.events must hold",
+        ),
+        (
+            hooks_with("waiting_tools = [\"AskUserQuestion\"]", &too_many_tools),
+            "waiting_tools",
+        ),
+        (
+            hooks_with(
+                "waiting_tools = [\"AskUserQuestion\"]",
+                &format!("waiting_tools = [\"{}\"]", "w".repeat(129)),
+            ),
+            "waiting_tools",
+        ),
+        (
+            hooks_with("permission_prompt", &"m".repeat(257)),
+            "matcher must be 1..=256",
+        ),
+        (
+            trust_with("value = true", &format!("value = \"{}\"", "v".repeat(257))),
+            "trust.value must be 1..=256",
+        ),
+        (trust_with(".example.json", ".example"), "trust.file"),
+        (trust_with(".example.json", ".example.yaml"), "trust.file"),
+        (
+            trust_with(
+                "/projects/{path}/trusted",
+                &format!("/{}/{{path}}", ["s"; 8].join("/")),
+            ),
+            "trust.pointer",
+        ),
+        (
+            trust_with("/projects/{path}/trusted", &format!("/{}", "s".repeat(257))),
+            "trust.pointer",
+        ),
+    ];
+    for (body, want) in cases {
+        match PluginManifest::from_toml_str(&manifest(26, &body)) {
+            Err(error) => assert!(error.to_string().contains(want), "{want}: {error}"),
+            Ok(_) => panic!("{want}: should be rejected\n{body}"),
+        }
+    }
+
+    // Config-directory variables: credential-shaped, reserved and undeclared names.
+    for var in [
+        "HOME",
+        "PATH",
+        "AOE_CONFIG_DIR",
+        "LD_LIBRARY_DIR",
+        "DYLD_FALLBACK_DIR",
+        "XDG_CONFIG_HOME",
+        "GITHUB_TOKEN",
+        "API_KEY_DIR",
+        "DB_PASSWORD",
+        "CLIENT_SECRET_DIR",
+        "1BAD",
+        "BAD-NAME",
+    ] {
+        for tables in [HOOKS, TRUST] {
+            let body = with_env(tables, var, "/opt/example");
+            let error = PluginManifest::from_toml_str(&manifest(26, &body))
+                .map(|_| ())
+                .expect_err(var);
+            assert!(
+                error.to_string().contains("config_dir_env_var"),
+                "{var}: {error}"
+            );
+        }
+    }
+    let undeclared =
+        format!("[[agent_integrations]]\ntool = \"example\"\ncommand = \"example\"\n{HOOKS}");
+    assert!(PluginManifest::from_toml_str(&manifest(26, &undeclared))
+        .unwrap_err()
+        .to_string()
+        .contains("launch.container_env key"));
+
+    // Container directories the sandbox would mount read-write.
+    let too_long = format!("/{}", "d".repeat(300));
+    for dir in [
+        "relative/dir",
+        "/",
+        "/root",
+        "/opt/../etc",
+        "/opt/./x",
+        "/opt//x",
+        "/opt/x/",
+        "/opt/a:b",
+        "/opt/a,b",
+        "/workspace",
+        "/workspace/project",
+        "/aoe/artifacts",
+        "/tmp/aoe-hooks/x",
+        "/proc/self",
+        &too_long,
+    ] {
+        let body = with_env(HOOKS, "EXAMPLE_CONFIG_DIR", dir);
+        let error = PluginManifest::from_toml_str(&manifest(26, &body))
+            .map(|_| ())
+            .expect_err(dir);
+        assert!(
+            error.to_string().contains("container_env"),
+            "{dir}: {error}"
+        );
+    }
+    for dir in ["/opt/example", "/root/.example", "/home/agent/.cfg"] {
+        parse(26, &with_env(HOOKS, "EXAMPLE_CONFIG_DIR", dir));
+    }
 }
