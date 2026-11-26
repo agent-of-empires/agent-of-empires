@@ -82,9 +82,6 @@ export function layerCount({ done, known }: SandboxPullProgress): string | null 
 export function useSandboxImageBanner(): SandboxImageBannerState {
   const [status, setStatus] = useState<SandboxImageStatus | null>(null);
   const [dismissedDigest, setDismissedDigest] = useState<string | null>(null);
-  // The Daemon keeps its last pull result, so an outcome shows only for a pull this page saw
-  // running; otherwise every reload would repeat an old result.
-  const [watchedPull, setWatchedPull] = useState(false);
   const [noticeDismissed, setNoticeDismissed] = useState(false);
   // × on a running pull hides its banner until that pull ends; its outcome shows again.
   const [hidden, setHidden] = useState(false);
@@ -122,6 +119,8 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
   // The image a status since the click showed running, and the one whose pull the Daemon accepted for
   // this attempt (it claims the pull before it answers): from then on, that image's outcome is this page's.
   const [seenRunning, setSeenRunning] = useState<string | null>(null);
+  // `seenRunning` for the reply, which can't read state.
+  const seenRunningRef = useRef<string | null>(null);
   const [acceptedImage, setAcceptedImage] = useState<string | null>(null);
   // Whether the last status showed a pull running, so a pull starting elsewhere re-arms the outcome notice.
   const polledRunning = useRef(false);
@@ -176,8 +175,8 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
         if (running && !polledRunning.current) setNoticeDismissed(false);
         polledRunning.current = running;
         if (running) {
+          seenRunningRef.current = answer.image;
           setSeenRunning(answer.image);
-          setWatchedPull(true);
           if (answer.image === attemptImage.current) {
             confirmedImage.current = answer.image;
             // The Daemon is pulling after all, e.g. the "Update now" reply was lost on the way.
@@ -246,9 +245,9 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
     attemptImage.current = image;
     setAttemptFor(image);
     setPulledDigest(offeredDigest.current);
+    seenRunningRef.current = null;
     setSeenRunning(null);
     setAcceptedImage(null);
-    setWatchedPull(true);
     setNoticeDismissed(false);
     setHidden(false);
     setRefusal(null);
@@ -266,6 +265,8 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
         attemptImage.current = pulled;
         setAttemptFor(pulled);
         setAcceptedImage(pulled);
+        // A poll since the click already showed this image's pull, so it says what that pull is doing.
+        if (seenRunningRef.current === pulled) confirmedImage.current = pulled;
         // Acceptance ties what comes next to this click, not a state already on screen: until a
         // status fetched after it lands, show the pull as running, if it is that image's.
         if (confirmedImage.current !== pulled) {
@@ -276,7 +277,8 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
         // Nothing was pulled, and the Daemon may still hold an older pull's outcome. No status has
         // shown this image's pull since the click, so a "running" for it in `status` is this page's guess.
         expectingPull.current = false;
-        setWatchedPull(false);
+        // The attempt is over; a pull of another image seen meanwhile keeps its own outcome.
+        setAttemptFor(null);
         setStatus(
           (s) => s && (s.image === image && s.pull.state === "running" ? { ...s, pull: { state: "idle" } } : s),
         );
@@ -303,13 +305,13 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
       if (!reply.ok) setCancelRefused(reply.message ?? "Couldn't reach the Daemon.");
       if (reply.pull) {
         const pull = reply.pull;
-        if (pull.state !== "running") {
-          // The pull is over, so a reply to "Update now" still on its way no longer decides what shows.
+        if (pull.state !== "running" && image === attemptImage.current) {
+          // This attempt's pull is over, so its reply still on the way no longer decides what shows.
           attempt.current++;
           replyPendingSince.current = null;
         }
         // This page cancelled it, so the outcome is this page's to show.
-        setWatchedPull(true);
+        seenRunningRef.current = image;
         setSeenRunning(image);
         setNoticeDismissed(false);
         setHidden(false);
@@ -370,7 +372,9 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
         running: { progress, hidden, onShow: show },
       };
     }
-    if (watchedPull && !noticeDismissed) {
+    // The Daemon keeps its last pull result, so an outcome shows only for a pull tied to this page or for the
+    // live attempt's image; otherwise every reload would repeat an old result.
+    if ((tied(status.image) || status.image === attemptFor) && !noticeDismissed) {
       const onDismiss = () => setNoticeDismissed(true);
       const again = status.pull_blocked ? undefined : () => update(status.image);
       // An image published since this pull is news again; the one it pulled isn't.

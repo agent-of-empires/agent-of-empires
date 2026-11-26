@@ -814,6 +814,11 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
     const dismiss = () => fireEvent.click(screen.getByRole("button", { name: "Dismiss sandbox image notice" }));
     const updateNow = () => fireEvent.click(screen.getByRole("button", { name: "Update now" }));
     const otherRunning = () => ({ ...running(), image: OTHER });
+    const otherCurrent = (pull: SandboxImagePull) => status({ image: OTHER, state: "current", pull } as never);
+    const hold = <T,>() => {
+      let resolve!: (value: T) => void;
+      return { promise: new Promise<T>((r) => (resolve = r)), resolve: (value: T) => resolve(value) };
+    };
 
     // Dismissing A's refusal dismisses only it, so a pull of B starting later doesn't bring it back.
     {
@@ -826,6 +831,60 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
       fetchSandboxImageStatus.mockResolvedValue(otherRunning());
       await pollAfter(30_000);
       expect(banner()?.textContent, "B starting brought back A's dismissed refusal").toBe(DOWNLOADING);
+      unmount();
+    }
+
+    // Update now on A with its 202 held while the default moves to B, which polls see running and then done.
+    const bRunsAndFinishes = async () => {
+      const { unmount } = await mount(status());
+      const reply = hold<{ ok: boolean; image?: string; message?: string }>();
+      pullSandboxImage.mockImplementationOnce(() => reply.promise);
+      updateNow();
+      fetchSandboxImageStatus.mockResolvedValue(otherRunning());
+      await pollAfter(2000);
+      expect(banner()?.textContent).toBe(DOWNLOADING);
+      fetchSandboxImageStatus.mockResolvedValue(otherCurrent({ state: "done" }));
+      await pollAfter(2000);
+      expect(banner()?.textContent).toBe(UPDATED);
+      // Hold the poll the reply triggers, so only the reply decides what shows.
+      fetchSandboxImageStatus.mockImplementation(() => new Promise(() => {}));
+      return { unmount, reply };
+    };
+
+    // The 202, naming B, lands after polls saw B's pull end: what they saw stands.
+    {
+      const { unmount, reply } = await bRunsAndFinishes();
+      await act(async () => reply.resolve({ ok: true, image: OTHER }));
+      expect(banner()?.textContent, "the 202 for B overwrote B's observed done").toBe(UPDATED);
+      unmount();
+    }
+
+    // A is refused instead: B's outcome is still shown once the refusal is dismissed.
+    {
+      const { unmount, reply } = await bRunsAndFinishes();
+      await act(async () => reply.resolve({ ok: false, message: "pulls are off" }));
+      expect(banner()?.textContent).toBe(FAILED);
+      dismiss();
+      expect(banner()?.textContent, "A's refusal hid B's outcome").toBe(UPDATED);
+      unmount();
+    }
+
+    // A Cancel that ends B leaves A's 202 outstanding, so A's refusal still shows.
+    {
+      const { unmount } = await mount(status());
+      const reply = hold<{ ok: boolean; image?: string; message?: string }>();
+      pullSandboxImage.mockImplementationOnce(() => reply.promise);
+      updateNow();
+      fetchSandboxImageStatus.mockResolvedValue(otherRunning());
+      await pollAfter(2000);
+      fetchSandboxImageStatus.mockImplementation(() => new Promise(() => {}));
+      cancelSandboxImagePull.mockResolvedValueOnce({ ok: true, pull: { state: "cancelled" } });
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      await pollAfter(0);
+      expect(cancelSandboxImagePull).toHaveBeenCalledWith(OTHER);
+      expect(banner()?.textContent).toBe(CANCELLED);
+      await act(async () => reply.resolve({ ok: false, message: "pulls are off" }));
+      expect(banner()?.textContent, "B's Cancel dropped A's refusal").toBe(FAILED);
       unmount();
     }
   });
