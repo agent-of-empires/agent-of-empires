@@ -1304,7 +1304,7 @@ fn the_suggestions_tip_signal_follows_the_daemon_snapshot() {
 fn an_undelivered_first_prompt_is_announced_once_per_failure() {
     let mut env = create_test_env_with_sessions(1);
     let instance = env.view.instances().next().unwrap().clone();
-    let mut row = crate::server::api::sessions::session_response_from_instance(&instance, false);
+    let mut row = crate::server::api::sessions::session_response_from_instance(&instance);
     row.initial_prompt_error = Some("the agent was not ready".into());
     let announce = |env: &mut TestEnv, row: &crate::daemon::SessionResponse| {
         env.view.announce_prompt_failure(row);
@@ -1452,7 +1452,7 @@ fn blocked_on_folder_trust() -> (TestEnv, String, mpsc::Receiver<String>) {
     use crate::tui::session_feed::SessionFeedResult;
     let mut env = create_test_env_with_sessions(1);
     let instance = env.view.instances().next().unwrap().clone();
-    let mut row = crate::server::api::sessions::session_response_from_instance(&instance, false);
+    let mut row = crate::server::api::sessions::session_response_from_instance(&instance);
     row.initial_prompt_error = Some("Claude Code is asking whether to trust this folder.".into());
     row.initial_prompt_error_code = Some("agent_folder_not_trusted".into());
     let rows = fixture_snapshot(vec![row], "test", "test", 5);

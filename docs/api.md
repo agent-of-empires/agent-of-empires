@@ -477,6 +477,15 @@ an object tagged by `state`, with a `reason` on every state but `available`.
 A daemon older than this field omits it entirely. Treat an absent
 `context_resume` as unreported rather than as `unavailable`.
 
+Each row carries `agent_profile`, the server-side profile of the agent that
+classifies the session's prompts and tool calls (reset and compact aliases,
+capability gates, card aliases, the daemon-evaluated `fullscreen` setting).
+`agent_profile.v` is its shape version; a client must ignore a profile with a
+`v` it does not know. The top-level `clear_aliases` and `compact_aliases` are
+removed (read `agent_profile.clear_aliases` and `agent_profile.compact_aliases`).
+`claude_fullscreen` is deprecated in favor of `agent_profile.fullscreen` and is
+removed in the next minor release.
+
 **Example**
 
 ```bash

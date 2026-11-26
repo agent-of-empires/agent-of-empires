@@ -1167,8 +1167,7 @@ mod tests {
                 let cli =
                     serde_json::to_value(session_json(&inst, &inst.source_profile, false)).unwrap();
                 let wire = SessionRead::from_instance(&inst);
-                let rest =
-                    crate::server::api::sessions::session_response_from_instance(&inst, false);
+                let rest = crate::server::api::sessions::session_response_from_instance(&inst);
 
                 assert_eq!(wire.state.as_str(), cli["state"], "{label}");
                 let cli_time = |key: &str| cli[key].as_str().map(instant);

@@ -1,14 +1,29 @@
-//! Read-only access to Claude Code's user settings.
+//! Daemon-side probe of one string value in a JSON file under the user's home.
 //!
-//! Used to detect when the user has opted into Claude Code's fullscreen
-//! (alt-screen) renderer via `/tui fullscreen`, so the web client can
-//! skip mobile workarounds that target the default main-screen renderer.
+//! Agent profiles declare probes (for example Claude Code's `/tui` setting) so
+//! clients get the evaluated result and never read the file themselves.
 
+use std::collections::HashMap;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::{LazyLock, Mutex, PoisonError};
 
-fn user_settings_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".claude").join("settings.json"))
+/// True when the string at `pointer` (RFC 6901) in the JSON file at `path`
+/// (relative to the home directory) equals `equals`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct JsonProbe {
+    pub path: &'static str,
+    pub pointer: &'static str,
+    pub equals: &'static str,
+}
+
+/// `path` under the home directory, or `None` for an absolute path or one with `..`.
+fn home_path(path: &str) -> Option<PathBuf> {
+    let rel = Path::new(path);
+    if !rel.components().all(|c| matches!(c, Component::Normal(_))) {
+        return None;
+    }
+    Some(dirs::home_dir()?.join(rel))
 }
 
 #[cfg(unix)]
@@ -29,25 +44,25 @@ fn identity(meta: &std::fs::Metadata) -> Identity {
 #[cfg(not(unix))]
 fn identity(_: &std::fs::Metadata) -> Identity {}
 
-/// Last parse, valid while the stamp of the opened file is unchanged.
-static CACHE: std::sync::Mutex<Option<(Stamp, bool)>> = std::sync::Mutex::new(None);
+type Entry = Option<(Stamp, bool)>;
 
-/// True when the user has set Claude Code's `tui` setting to `"fullscreen"`
-/// in `~/.claude/settings.json`. Any other value, missing file, or parse
-/// error returns false. Re-reads the file only when it changed.
-pub fn read_tui_fullscreen() -> bool {
-    let Some(path) = user_settings_path() else {
+/// Last result per probe, valid while the stamp of the opened file is unchanged.
+static CACHE: LazyLock<Mutex<HashMap<JsonProbe, Entry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Evaluate `probe`. A missing or invalid path, missing file, parse error or
+/// other value returns false. Re-reads the file only when it changed.
+pub fn matches(probe: &JsonProbe) -> bool {
+    let Some(path) = home_path(probe.path) else {
         return false;
     };
-    let mut cache = CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    read_tui_fullscreen_at(&path, &mut cache)
+    let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+    probe_at(&path, probe, cache.entry(*probe).or_default())
 }
 
 /// Stamps and reads the same open handle. An unopenable or unreadable file
 /// returns false and drops the entry, so it is retried once access returns.
-fn read_tui_fullscreen_at(path: &Path, cache: &mut Option<(Stamp, bool)>) -> bool {
+fn probe_at(path: &Path, probe: &JsonProbe, cache: &mut Entry) -> bool {
     let Ok(mut file) = std::fs::File::open(path) else {
         *cache = None;
         return false;
@@ -74,7 +89,7 @@ fn read_tui_fullscreen_at(path: &Path, cache: &mut Option<(Stamp, bool)>) -> boo
         return false;
     }
     let value = serde_json::from_str::<serde_json::Value>(&contents)
-        .is_ok_and(|v| v.get("tui").and_then(|v| v.as_str()) == Some("fullscreen"));
+        .is_ok_and(|v| v.pointer(probe.pointer).and_then(|v| v.as_str()) == Some(probe.equals));
     *cache = Some((stamp, value));
     value
 }
@@ -85,6 +100,12 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    const TUI: JsonProbe = JsonProbe {
+        path: ".claude/settings.json",
+        pointer: "/tui",
+        equals: "fullscreen",
+    };
+
     fn write_settings(contents: &str) -> NamedTempFile {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(contents.as_bytes()).unwrap();
@@ -92,9 +113,9 @@ mod tests {
     }
 
     #[test]
-    fn read_tui_fullscreen_only_for_a_fullscreen_string() {
+    fn probe_matches_only_the_expected_string() {
         let path = std::path::Path::new("/nonexistent/aoe-test/settings.json");
-        assert!(!read_tui_fullscreen_at(path, &mut None));
+        assert!(!probe_at(path, &TUI, &mut None));
         for (contents, expected) in [
             (r#"{"tui": "fullscreen"}"#, true),
             (
@@ -107,12 +128,21 @@ mod tests {
             (r#"{"tui": true}"#, false),
         ] {
             let f = write_settings(contents);
-            assert_eq!(
-                read_tui_fullscreen_at(f.path(), &mut None),
-                expected,
-                "{contents}"
-            );
+            assert_eq!(probe_at(f.path(), &TUI, &mut None), expected, "{contents}");
         }
+    }
+
+    #[test]
+    fn probe_paths_must_stay_under_home() {
+        for bad in ["/etc/passwd", "../x.json", ".claude/../../x.json"] {
+            assert!(home_path(bad).is_none(), "{bad}");
+        }
+        let probe = JsonProbe {
+            path: "/etc/passwd",
+            ..TUI
+        };
+        assert!(!matches(&probe));
+        assert!(home_path(TUI.path).is_some());
     }
 
     #[test]
@@ -122,18 +152,18 @@ mod tests {
         let mut cache = None;
 
         std::fs::write(&path, r#"{"tui":"fullscreen"}"#).unwrap();
-        assert!(read_tui_fullscreen_at(&path, &mut cache));
+        assert!(probe_at(&path, &TUI, &mut cache));
 
         // Poison the entry: only a cache hit can return it.
         cache.as_mut().unwrap().1 = false;
         assert!(
-            !read_tui_fullscreen_at(&path, &mut cache),
+            !probe_at(&path, &TUI, &mut cache),
             "an unchanged file must not be re-read"
         );
 
         std::fs::write(&path, r#"{"tui": "fullscreen"}"#).unwrap();
         assert!(
-            read_tui_fullscreen_at(&path, &mut cache),
+            probe_at(&path, &TUI, &mut cache),
             "a changed file must be re-read"
         );
     }
@@ -147,20 +177,20 @@ mod tests {
         let mut cache = None;
 
         std::fs::write(&path, r#"{"tui":"fullscreen"}"#).unwrap();
-        assert!(read_tui_fullscreen_at(&path, &mut cache));
+        assert!(probe_at(&path, &TUI, &mut cache));
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         if std::fs::File::open(&path).is_ok() {
             return; // privileged user ignores the mode bits
         }
         assert!(
-            !read_tui_fullscreen_at(&path, &mut cache),
+            !probe_at(&path, &TUI, &mut cache),
             "a warm entry must not outlive read access"
         );
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(
-            read_tui_fullscreen_at(&path, &mut cache),
+            probe_at(&path, &TUI, &mut cache),
             "a failed read must not be cached"
         );
     }
@@ -173,7 +203,7 @@ mod tests {
         let mut cache = None;
 
         std::fs::write(&path, r#"{"tui":"fullscreen"}"#).unwrap();
-        assert!(read_tui_fullscreen_at(&path, &mut cache));
+        assert!(probe_at(&path, &TUI, &mut cache));
 
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
         let replacement = dir.path().join("replacement.json");
@@ -185,6 +215,6 @@ mod tests {
             .set_modified(mtime)
             .unwrap();
         std::fs::rename(&replacement, &path).unwrap();
-        assert!(!read_tui_fullscreen_at(&path, &mut cache));
+        assert!(!probe_at(&path, &TUI, &mut cache));
     }
 }
