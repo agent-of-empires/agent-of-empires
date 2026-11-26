@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { updateSettings } from "../lib/api";
 import { copyPrompt } from "../lib/suggestionPlan";
 import type { StartedSession } from "../lib/types";
@@ -53,15 +53,18 @@ export function PromptBlockedNote({
       setRetrying(false);
     }
   };
+  const root = useRef<HTMLDivElement>(null);
   const turnOn = async () => {
     setStep("saving");
     const outcome = await updateSettings({ session: { pre_trust_agent_folders: true } });
     setStep(outcome === "committed" ? "on" : "failed");
-    setReturned(true);
+    // Focus the user moved elsewhere while the save was pending stays there.
+    const active = document.activeElement;
+    setReturned(active === document.body || !!root.current?.contains(active));
   };
   const actions = code === FOLDER && !disabled;
   return (
-    <div className="text-xs text-status-warning">
+    <div ref={root} className="text-xs text-status-warning">
       <p role={live} className="break-words">
         {label}: {(code && PLAIN[code]) || message}
       </p>

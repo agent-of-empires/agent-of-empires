@@ -63,6 +63,29 @@ describe("PromptBlockedNote", () => {
     expect(document.activeElement).toBe(reopen());
   });
 
+  it("a failed save leaves focus where the user moved while it was pending", async () => {
+    let settle: (v: string) => void = () => {};
+    updateSettings.mockReturnValue(new Promise((resolve) => (settle = resolve)));
+    render(
+      <div>
+        <PromptBlockedNote
+          label="Prompt not sent"
+          code="agent_folder_not_trusted"
+          message={LONG}
+          onCopyPrompt={() => {}}
+        />
+        <button type="button">elsewhere</button>
+      </div>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Turn on pre-trust" }));
+    fireEvent.click(screen.getByRole("button", { name: "Turn on" }));
+    const elsewhere = screen.getByRole("button", { name: "elsewhere" });
+    elsewhere.focus();
+    settle("rejected");
+    await screen.findByText("Couldn't turn on pre-trust.");
+    expect(document.activeElement).toBe(elsewhere);
+  });
+
   it("an untrusted folder names the direct fix first, with Copy prompt, then pre-trust", () => {
     const onCopyPrompt = vi.fn();
     const { container, rerender } = render(

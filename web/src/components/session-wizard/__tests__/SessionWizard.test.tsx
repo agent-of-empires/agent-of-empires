@@ -2552,10 +2552,14 @@ describe("SessionWizard suggestion source", () => {
       { name: "proj", path: "/tmp/proj", scope: "global", pinned: false, overrides: { sandbox_enabled: false } },
     ] as never);
     renderWizard({ path: "/tmp/proj", tool: "claude", useSandbox: true });
+    await waitFor(() => expect(fetchProjects).toHaveBeenCalled());
     await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
-    await waitFor(() =>
-      expect(screen.getByRole("switch", { name: "Run in a safe container" }).getAttribute("aria-checked")).toBe("true"),
-    );
+    // Both seeds have resolved; let their state updates commit before looking at the switch.
+    await act(async () => {
+      await Promise.all(vi.mocked(fetchProjects).mock.results.map((r) => r.value));
+      await Promise.all(vi.mocked(fetchSettings).mock.results.map((r) => r.value));
+    });
+    expect(screen.getByRole("switch", { name: "Run in a safe container" }).getAttribute("aria-checked")).toBe("true");
   });
 
   it("drops the preset's worktree when the profile changes", async () => {
