@@ -2,7 +2,7 @@ import { chmodSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Dialog, Page } from "@playwright/test";
 import { test, expect, type ServeHandle } from "../helpers/liveTest";
-import { enableStructuredViewAndWait, composer } from "../helpers/acp";
+import { composer, spawnAcpAgentAndWait } from "../helpers/acp";
 import { listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 import { openDeleteDialogFromRow } from "../helpers/trashMocks";
 
@@ -335,6 +335,7 @@ test("a Structured view save offers a note that appends to the draft without sub
     acp: true,
     seedFn: seedSessionViaAoeAdd({
       title: "file-structured",
+      structuredView: true,
       git: false,
       files: { "notes.txt": "original" },
       prepare: (dir) => {
@@ -343,7 +344,7 @@ test("a Structured view save offers a note that appends to the draft without sub
     }),
   });
   const [session] = await listSessions(serve.baseUrl);
-  await enableStructuredViewAndWait(serve.baseUrl, session!.id, 30_000, serve.home);
+  await spawnAcpAgentAndWait(serve.baseUrl, session!.id, 30_000, serve.home);
   await enableEditing(page, serve);
   await openFile(page, serve);
   const draft = composer(page);
