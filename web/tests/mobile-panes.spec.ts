@@ -133,17 +133,6 @@ test.describe("Mobile session view tabs (#1452)", () => {
     await expect(drawer).toBeVisible();
   });
 
-  test("the drawer opens from the left with a swipe right even with the sidebar set to the right", async ({ page }) => {
-    await openLiveTerminal(page, { mobile: true, settings: { sidebarSide: "right" } });
-    await expect(page.getByTestId("topbar-menu")).toBeVisible();
-    await swipe(page, 195 - 80, 195 + 80, 422);
-    const pill = page.getByTestId("sidebar-new-session-pill");
-    await expect(pill).toBeInViewport();
-    await expect
-      .poll(async () => (await page.getByRole("navigation", { name: "Sessions sidebar" }).boundingBox())?.x)
-      .toBe(0);
-  });
-
   test("adjusting selected chat text neither raises More nor opens the drawer", async ({ page }) => {
     await openLiveTerminal(page, { mobile: true, settings: null });
     const content = liveContent(page).first();

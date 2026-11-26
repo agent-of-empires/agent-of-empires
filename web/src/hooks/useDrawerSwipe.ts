@@ -6,18 +6,16 @@ export type DrawerSwipeAction = "open-sidebar" | "close-sidebar" | "open-panels"
 
 export interface DrawerSwipeState {
   sidebarOpen: boolean;
-  sidebarSide: "left" | "right";
   panelsOpen: boolean;
   panelsAvailable: boolean;
 }
 
-/** A drawer opens with a swipe away from its edge and closes with a swipe back
- *  toward it. The panels drawer is always on the right; one drawer at a time. */
+/** A drawer opens with a swipe away from its edge and closes with a swipe back toward it: the session drawer
+ *  is on the left, the panels on the right, and one is open at a time. */
 export function drawerSwipeAction(dir: SwipeDirection, s: DrawerSwipeState): DrawerSwipeAction | null {
   if (s.panelsOpen) return dir === "right" ? "close-panels" : null;
-  if (s.sidebarOpen) return dir === s.sidebarSide ? "close-sidebar" : null;
-  // A right-side sidebar has no open swipe: swipe-left belongs to the panels.
-  if (dir === "right") return s.sidebarSide === "left" ? "open-sidebar" : null;
+  if (s.sidebarOpen) return dir === "left" ? "close-sidebar" : null;
+  if (dir === "right") return "open-sidebar";
   return s.panelsAvailable ? "open-panels" : null;
 }
 

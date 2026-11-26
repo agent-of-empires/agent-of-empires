@@ -2028,9 +2028,7 @@ function AppContent({
   const phoneDrawerTracking = singlePane && !!activeSession && !fullPageView && !focusMode;
   useDrawerSwipe(
     {
-      // A phone's session drawer is always on the left, as Muse and Claude's app have it.
       sidebarOpen,
-      sidebarSide: singlePane ? "left" : webSettings.sidebarSide,
       panelsOpen: pickerOpen,
       // More panes opens from the header's ⋯; a sideways swipe raising a bottom sheet is no gesture people expect.
       panelsAvailable: false,
