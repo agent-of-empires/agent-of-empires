@@ -1,4 +1,4 @@
-//! Migration v067: Favorite folds into Pin, the one mark every Client honors (#5896).
+//! Migration v070: Favorite folds into Pin, the one mark every Client honors (#5896).
 //!
 //! A row's `favorited_at` becomes its `pinned_at` unless it already has a pin or sits in
 //! a state Pin cannot coexist with: archived, ignored, or snoozed. Trash keeps a pin, so a
@@ -22,7 +22,7 @@ use tracing::info;
 const FAVORITED_AT: &str = "favorited_at";
 /// Whether favorites become pins, kept while a skipped `sessions.json` still owes its
 /// conversion.
-const PENDING_FILE: &str = ".v067_favorites_pending";
+const PENDING_FILE: &str = ".v070_favorites_pending";
 
 pub fn run() -> Result<()> {
     run_in(&crate::session::get_app_dir()?, Pass::Upgrade)
@@ -51,7 +51,7 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
     };
     let mut skipped = false;
     for path in sessions_file::session_files(app_dir)? {
-        let content = match sessions_file::read_rows(&path, "v067") {
+        let content = match sessions_file::read_rows(&path, "v070") {
             SessionList::Rows(content, rows)
                 if rows.iter().any(|row| row.get(FAVORITED_AT).is_some()) =>
             {
@@ -77,7 +77,7 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
             }
             true
         })?;
-        info!(target: "migrations.v067", path = %path.display(), healed, pinned, "folded favorites into pins");
+        info!(target: "migrations.v070", path = %path.display(), healed, pinned, "folded favorites into pins");
     }
     if skipped {
         let choice = if lift_favorites { "pin" } else { "drop" };
@@ -122,7 +122,7 @@ fn favorites_first(app_dir: &Path) -> Result<bool> {
     };
     let config: toml::Table = content
         .parse()
-        .with_context(|| format!("Failed to parse {} during v067 migration", path.display()))?;
+        .with_context(|| format!("Failed to parse {} during v070 migration", path.display()))?;
     Ok(config
         .get("session")
         .and_then(|session| session.get("favorites_first"))

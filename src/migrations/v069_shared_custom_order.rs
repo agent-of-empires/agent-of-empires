@@ -117,7 +117,7 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
         {
             continue;
         }
-        let (content, rows) = match sessions_file::read_rows(&path, "v066") {
+        let (content, rows) = match sessions_file::read_rows(&path, "v069") {
             SessionList::Rows(content, rows) => (content, rows),
             SessionList::Missing => continue,
             SessionList::Unreadable => {
