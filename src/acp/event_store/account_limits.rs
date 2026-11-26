@@ -16,7 +16,12 @@ const ACCOUNT_STATE_RETENTION_MS: i64 = 7 * 24 * 3600 * 1000;
 /// The row kind holding a failed login; limit reports use their own quota-window name.
 const LOGIN_ROW: &str = "";
 
-/// Creates the table: one row per account and quota window, plus one login row per account.
+/// Appended to a window's name for the row holding its estimated deadline, so an estimate never
+/// shares a row with the window's reported one.
+const ESTIMATE_SUFFIX: &str = "#estimate";
+
+/// Creates the table: one row per account and quota window, plus one login row per account, and
+/// one more per window holding its estimate.
 pub(super) fn ensure_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     conn.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS {ACCOUNT_LIMITS_TABLE} (
@@ -39,6 +44,8 @@ pub struct WindowLimit {
     pub until_ms: i64,
     /// `until_ms` is a guess (no reset time was reported), not a reported deadline.
     pub estimated: bool,
+    /// When the report behind `until_ms` was observed.
+    pub observed_at_ms: i64,
 }
 
 /// What is known about one account at a point in time.
@@ -50,9 +57,13 @@ pub struct AccountState {
 }
 
 impl AccountState {
-    /// The limit recorded for quota window `kind`.
+    /// The limit recorded for quota window `kind`: its reported deadline and its estimated one
+    /// are separate entries, and this is the one that holds longer.
     pub fn window(&self, kind: &str) -> Option<&WindowLimit> {
-        self.windows.iter().find(|window| window.kind == kind)
+        self.windows
+            .iter()
+            .filter(|window| window.kind == kind)
+            .max_by_key(|window| window.until_ms)
     }
 
     /// Whether a session may be sent to this account at `now_ms`: every window has elapsed and
@@ -66,8 +77,12 @@ impl EventStore {
     /// Record that `account_key`'s quota window `window_kind` is limited until `limited_until_ms`.
     /// Windows are independent: a report never changes another window's deadline. Within one
     /// window a report observed earlier than the stored one never overwrites it, so replaying the
-    /// same park is idempotent, and an `estimated` deadline (the park carried no reset time) never
-    /// replaces a reported one that is still in the future.
+    /// same park is idempotent.
+    ///
+    /// A window's reported deadline and its `estimated` one (the park carried no reset time) are
+    /// separate entries. An estimate never replaces a reported deadline, in force or elapsed: a
+    /// session that parked under it reads it as its baseline however late it is handled. A newer
+    /// report replaces the estimates it supersedes.
     pub fn record_account_limit(
         &self,
         account_key: &str,
@@ -82,32 +97,70 @@ impl EventStore {
             window_kind
         };
         let conn = self.conn();
-        logged(
+        let upsert_sql = format!(
+            "INSERT INTO {ACCOUNT_LIMITS_TABLE}
+                (account_key, window_kind, limited_until_ms, updated_at_ms, estimated)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(account_key, window_kind) DO UPDATE SET
+                limited_until_ms = excluded.limited_until_ms,
+                updated_at_ms = excluded.updated_at_ms,
+                estimated = excluded.estimated
+             WHERE excluded.updated_at_ms >= {ACCOUNT_LIMITS_TABLE}.updated_at_ms"
+        );
+        let upsert = |conn: &rusqlite::Connection, row: &str, estimated: bool| {
             conn.execute(
-                &format!(
-                    "INSERT INTO {ACCOUNT_LIMITS_TABLE}
-                        (account_key, window_kind, limited_until_ms, updated_at_ms, estimated)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(account_key, window_kind) DO UPDATE SET
-                        limited_until_ms = excluded.limited_until_ms,
-                        updated_at_ms = excluded.updated_at_ms,
-                        estimated = excluded.estimated
-                     WHERE excluded.updated_at_ms >= {ACCOUNT_LIMITS_TABLE}.updated_at_ms
-                       AND NOT (excluded.estimated = 1
-                                AND {ACCOUNT_LIMITS_TABLE}.estimated = 0
-                                AND {ACCOUNT_LIMITS_TABLE}.limited_until_ms > excluded.updated_at_ms)"
-                ),
+                &upsert_sql,
                 params![
                     account_key,
-                    window_kind,
+                    row,
                     limited_until_ms,
                     observed_at_ms,
                     estimated
                 ],
-            ),
-            "record_account_limit",
-            account_key,
-        );
+            )
+        };
+        let estimate_row = format!("{window_kind}{ESTIMATE_SUFFIX}");
+        if estimated {
+            let reported_in_force: bool = logged(
+                conn.query_row(
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM {ACCOUNT_LIMITS_TABLE}
+                         WHERE account_key = ?1 AND window_kind = ?2 AND estimated = 0
+                           AND limited_until_ms > ?3)"
+                    ),
+                    params![account_key, window_kind, observed_at_ms],
+                    |row| row.get(0),
+                ),
+                "record_account_limit",
+                account_key,
+            )
+            .unwrap_or(false);
+            if !reported_in_force {
+                logged(
+                    upsert(&conn, &estimate_row, true),
+                    "record_account_limit",
+                    account_key,
+                );
+            }
+        } else {
+            // One transaction: a report that landed beside the estimate it supersedes would
+            // let the longer, stale estimate outlast a shortened deadline.
+            let report = || -> rusqlite::Result<()> {
+                let tx = conn.unchecked_transaction()?;
+                if upsert(&tx, window_kind, false)? > 0 {
+                    tx.execute(
+                        &format!(
+                            "DELETE FROM {ACCOUNT_LIMITS_TABLE}
+                             WHERE account_key = ?1 AND window_kind = ?2 AND estimated = 1
+                               AND updated_at_ms <= ?3"
+                        ),
+                        params![account_key, estimate_row, observed_at_ms],
+                    )?;
+                }
+                tx.commit()
+            };
+            logged(report(), "record_account_limit", account_key);
+        }
         prune(&conn, observed_at_ms);
     }
 
@@ -146,7 +199,7 @@ impl EventStore {
     ) -> rusqlite::Result<Option<AccountState>> {
         let conn = self.conn();
         let mut statement = conn.prepare(&format!(
-            "SELECT window_kind, limited_until_ms, unusable_until_ms, estimated
+            "SELECT window_kind, limited_until_ms, unusable_until_ms, estimated, updated_at_ms
              FROM {ACCOUNT_LIMITS_TABLE} WHERE account_key = ?1"
         ))?;
         let rows = statement.query_map(params![account_key], |row| {
@@ -155,19 +208,24 @@ impl EventStore {
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, bool>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })?;
         let mut state = AccountState::default();
         let mut seen = false;
         for row in rows {
-            let (kind, until_ms, unusable_until_ms, estimated) = row?;
+            let (kind, until_ms, unusable_until_ms, estimated, observed_at_ms) = row?;
             seen = true;
             state.unusable_until_ms = state.unusable_until_ms.max(unusable_until_ms);
             if kind != LOGIN_ROW {
                 state.windows.push(WindowLimit {
-                    kind,
+                    kind: kind
+                        .strip_suffix(ESTIMATE_SUFFIX)
+                        .unwrap_or(&kind)
+                        .to_string(),
                     until_ms,
                     estimated,
+                    observed_at_ms,
                 });
             }
         }
@@ -265,6 +323,116 @@ mod tests {
         store.record_account_limit("/b", 100, "usage", 10, true);
         store.record_account_limit("/b", 50, "usage", 20, true);
         assert_eq!(until(&store, "/b", "usage"), Some(50));
+    }
+
+    /// A park just after a reported deadline expired only has an estimate. It is kept beside the
+    /// report, not over it: a session that parked before the expiry still reads the report as
+    /// its baseline.
+    #[test]
+    fn an_estimate_after_expiry_leaves_the_elapsed_report_in_place() {
+        let (_dir, store) = store();
+        store.record_account_limit("/a", 10 * HOUR, "weekly", 1_000, false);
+        store.record_account_limit("/a", 11 * HOUR, "weekly", 10 * HOUR + 1_000, true);
+
+        let state = store.account_state("/a").unwrap();
+        let entry = |estimated| {
+            state
+                .windows
+                .iter()
+                .find(|w| w.kind == "weekly" && w.estimated == estimated)
+                .map(|w| (w.until_ms, w.observed_at_ms))
+        };
+        assert_eq!(entry(false), Some((10 * HOUR, 1_000)));
+        assert_eq!(entry(true), Some((11 * HOUR, 10 * HOUR + 1_000)));
+        assert!(
+            !state.has_headroom(10 * HOUR + 1),
+            "the estimate holds the account"
+        );
+        assert!(state.has_headroom(11 * HOUR));
+        assert_eq!(until(&store, "/a", "weekly"), Some(11 * HOUR));
+
+        // A newer report replaces what it supersedes, estimate included.
+        store.record_account_limit("/a", 20 * HOUR, "weekly", 12 * HOUR, false);
+        let state = store.account_state("/a").unwrap();
+        assert_eq!(state.windows.len(), 1);
+        assert_eq!(until(&store, "/a", "weekly"), Some(20 * HOUR));
+        // An estimate after that report ran out sits beside it again; a delayed older report
+        // is dropped and takes neither away.
+        store.record_account_limit("/a", 25 * HOUR, "weekly", 21 * HOUR, true);
+        store.record_account_limit("/a", 15 * HOUR, "weekly", 11 * HOUR, false);
+        let state = store.account_state("/a").unwrap();
+        assert_eq!(state.windows.len(), 2);
+        assert_eq!(until(&store, "/a", "weekly"), Some(25 * HOUR));
+    }
+
+    fn insert_estimate(store: &EventStore, key: &str, kind: &str, until: i64, at: i64) {
+        store
+            .conn()
+            .execute(
+                &format!(
+                    "INSERT INTO {ACCOUNT_LIMITS_TABLE}
+                        (account_key, window_kind, limited_until_ms, updated_at_ms, estimated)
+                     VALUES (?1, ?2, ?3, ?4, 1)"
+                ),
+                params![key, kind, until, at],
+            )
+            .unwrap();
+    }
+
+    /// A failed estimate write leaves what was stored: nothing is deleted unless its replacement
+    /// was persisted, or the account would look free.
+    #[test]
+    fn a_failed_estimate_write_keeps_the_stored_evidence() {
+        let (_dir, store) = store();
+        insert_estimate(&store, "/a", "weekly", 5 * HOUR, 100);
+        store
+            .conn()
+            .execute_batch(&format!(
+                "CREATE TRIGGER refuse_estimates BEFORE INSERT ON {ACCOUNT_LIMITS_TABLE}
+                 WHEN NEW.window_kind LIKE '%{ESTIMATE_SUFFIX}'
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;"
+            ))
+            .unwrap();
+
+        store.record_account_limit("/a", 6 * HOUR, "weekly", 200, true);
+
+        let state = store.account_state("/a").unwrap();
+        assert_eq!(until(&store, "/a", "weekly"), Some(5 * HOUR));
+        assert!(!state.has_headroom(4 * HOUR), "the account is still held");
+    }
+
+    /// A report and the estimates it supersedes land together: when removing the estimate
+    /// fails, the report is not stored either, so no state holds a shortened report beside a
+    /// longer stale estimate.
+    #[test]
+    fn a_report_and_the_estimates_it_supersedes_land_together() {
+        let (_dir, store) = store();
+        store.record_account_limit("/a", 5 * HOUR, "weekly", HOUR, false);
+        store.record_account_limit("/a", 20 * HOUR, "weekly", 6 * HOUR, true);
+        store
+            .conn()
+            .execute_batch(&format!(
+                "CREATE TRIGGER refuse_deletes BEFORE DELETE ON {ACCOUNT_LIMITS_TABLE}
+                 BEGIN SELECT RAISE(ABORT, 'interrupted'); END;"
+            ))
+            .unwrap();
+
+        store.record_account_limit("/a", 12 * HOUR, "weekly", 7 * HOUR, false);
+
+        let state = store.account_state("/a").unwrap();
+        let entry = |estimated| {
+            state
+                .windows
+                .iter()
+                .find(|w| w.estimated == estimated)
+                .map(|w| (w.until_ms, w.observed_at_ms))
+        };
+        assert_eq!(
+            entry(false),
+            Some((5 * HOUR, HOUR)),
+            "the report is not half-applied"
+        );
+        assert_eq!(entry(true), Some((20 * HOUR, 6 * HOUR)));
     }
 
     /// Weekly, then usage 4h, usage 5h, and a newer usage 2h: the account is held until the

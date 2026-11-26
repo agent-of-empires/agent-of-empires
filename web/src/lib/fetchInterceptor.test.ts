@@ -295,6 +295,17 @@ describe("installFetchErrorToasts", () => {
     ["an /api 5xx", json(503, {}), "/api/sessions", undefined, false, "Server error 503 from /api/sessions"],
     ["a 5xx while the server is known down", json(500, {}), "/api/sessions", undefined, true, null],
     ["a non-/api 5xx", json(500, {}), "/static", undefined, false, null],
+    // Every view that loads suggestions shows its own error.
+    ["the suggestions snapshot", json(500, {}), "/api/suggestions", undefined, false, null],
+    ["plugin discovery", json(503, {}), "/api/plugins/discover?q=x", undefined, false, null],
+    [
+      "a suggestions mutation",
+      json(500, {}),
+      "/api/suggestions/start",
+      { method: "POST" },
+      false,
+      "Server error 500 from /api/suggestions/start",
+    ],
     [
       "worker_not_ready on /acp/prompt",
       new Response("worker_not_ready", { status: 503 }),
@@ -331,6 +342,7 @@ describe("installFetchErrorToasts", () => {
   it.each<[string, Error, string, boolean, string | null]>([
     ["an /api failure", new TypeError("Failed to fetch"), "/api/sessions", false, networkToast],
     ["a known-down server", new TypeError("Failed to fetch"), "/api/sessions", true, null],
+    ["the suggestions snapshot", new TypeError("Failed to fetch"), "/api/suggestions", false, null],
     ["AbortError", new DOMException("aborted", "AbortError"), "/api/sessions", false, null],
     ["TimeoutError", new DOMException("timed out", "TimeoutError"), "/api/sessions", false, null],
     ["a non-/api path", new TypeError("Failed to fetch"), "/asset.js", false, null],

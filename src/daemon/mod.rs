@@ -22,6 +22,7 @@ pub(crate) mod transport;
 pub(crate) mod websocket;
 pub use websocket::WsError;
 pub mod live;
+pub mod suggestions;
 mod wire;
 
 use std::fmt;
@@ -421,6 +422,27 @@ impl DaemonClient {
             return Err(DaemonClientError::InvalidMutationReceipt);
         }
         Ok(snapshot)
+    }
+
+    /// `GET /api/settings`: the served profile resolved over the machine-wide values.
+    pub async fn settings(&self) -> Result<serde_json::Value, DaemonClientError> {
+        let url = self
+            .sessions_url
+            .join("settings")
+            .map_err(|_| DaemonClientError::Transport)?;
+        self.request_json(self.http.get(url)).await
+    }
+
+    /// `PATCH /api/settings`: the daemon routes each leaf to the layer it is read from.
+    pub async fn patch_settings(&self, patch: &serde_json::Value) -> Result<(), DaemonClientError> {
+        let url = self
+            .sessions_url
+            .join("settings")
+            .map_err(|_| DaemonClientError::Transport)?;
+        let mut response = self
+            .request_response(self.http.patch(url).json(patch))
+            .await?;
+        discard_bounded_body(&mut response).await
     }
 
     /// The daemon's own default profile, which can differ from this client's config.
