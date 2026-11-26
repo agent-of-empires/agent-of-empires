@@ -621,7 +621,7 @@ Suggestions are stored per profile. The routes below list and act on them; only 
 
 | Route | Body | Result |
 |---|---|---|
-| `GET /api/suggestions` | none | `{ profile?, providers: [{ id, name, enabled, status, error?, updated_at?, refreshing, sources: [{ criterion, label, description, variables, enabled, preset, customized }], checks: [{ id, label, status, detail, fix }] }], items, prefs: { homepage, sidebar, refresh_minutes, show_source_ref, provider_order } }` |
+| `GET /api/suggestions` | none | `{ profile?, providers: [{ id, name, enabled, status, error?, updated_at?, refreshing, sources: [{ criterion, label, description, variables, enabled, preset, customized }], checks: [{ id, label, status, detail, fix }] }], items, prefs: { homepage, sidebar, refresh_minutes, show_source_ref, provider_order }, setup_offered }`; `setup_offered` says whether the host may offer suggested-session setup |
 | `POST /api/suggestions/refresh` | none | `{ ok, notified }` |
 | `POST /api/suggestions/checks/run` | none | `{ ok, notified }` |
 | `POST /api/suggestions/push` | `{ title, prompt, reason?, project?, id?, pushed_by? }` | `{ ok, id }`; adds or replaces a built-in `builtin.agent` item. Used by `aoe suggest` and the `suggest_session` MCP tool |
