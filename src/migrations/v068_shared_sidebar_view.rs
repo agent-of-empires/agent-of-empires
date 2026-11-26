@@ -7,7 +7,7 @@
 //! Groups, the TUI's old default; everyone else gets the new Repository default. The
 //! org and status collapse lists go with their groupings. The web keys stay, since the
 //! dashboard still reads them. The sort in effect before the fold is kept in
-//! `legacy_sort_order` so v066 can seed the Custom order that matches it; v066 removes it.
+//! `legacy_sort_order` so v069 can seed the Custom order that matches it; v069 removes it.
 
 use anyhow::Result;
 use std::path::Path;
@@ -104,7 +104,7 @@ fn tui_group_by(mode: &str) -> &'static str {
     }
 }
 
-/// The sort a TUI user saw, for v066. Only `custom` means its `sort_index` was the order
+/// The sort a TUI user saw, for v069. Only `custom` means its `sort_index` was the order
 /// on screen. Attention ranked rows by live status, which no stored order can follow, so
 /// it becomes last activity, the stable order closest to it.
 fn tui_effective_sort(sort: &str) -> &'static str {
@@ -122,7 +122,7 @@ pub(super) fn is_web_sort(mode: &str) -> bool {
     matches!(mode, "manual" | "lastActivity" | "attention")
 }
 
-/// The sort a web pick showed, for v066. Manual's drag order is already in the shared store.
+/// The sort a web pick showed, for v069. Manual's drag order is already in the shared store.
 pub(super) fn web_effective_sort(sort: &str) -> &'static str {
     match sort {
         "lastActivity" | "attention" => "last_activity",
@@ -201,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_the_effective_sort_for_v066() {
+    fn keeps_the_effective_sort_for_v069() {
         let web = |sort: &str| format!("[web_ui_state]\n\"aoe-sidebar-sort-mode\" = \"{sort}\"\n");
         for (input, legacy) in [
             ("sort_order = \"oldest\"\n".to_string(), Some("oldest")),

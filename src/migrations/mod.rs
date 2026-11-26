@@ -75,9 +75,9 @@ mod v063_retire_color_labels;
 mod v064_builtin_sounds;
 mod v065_account_limit_estimate_rows;
 mod v066_retire_agent_update_fields;
-mod v066_shared_custom_order;
 mod v067_retire_restart_wake;
 mod v068_shared_sidebar_view;
+mod v069_shared_custom_order;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -349,7 +349,7 @@ const MIGRATIONS: &[Migration] = &[
     ),
     (67, "retire_restart_wake", v067_retire_restart_wake::run),
     (68, "shared_sidebar_view", v068_shared_sidebar_view::run),
-    (69, "shared_custom_order", v066_shared_custom_order::run),
+    (69, "shared_custom_order", v069_shared_custom_order::run),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install
@@ -583,7 +583,7 @@ fn run_explicit_recovery(
         recovery::reconcile_repaired_components()?;
         // Not in the helper: registered v046 calls it, and an upgrade must reach v060 in order.
         v060_terminal_handoff_outcome::run()?;
-        v066_shared_custom_order::recover()
+        v069_shared_custom_order::recover()
     })?;
     legacy_scope_recovery::run_under_exclusion(transaction, serve)
 }
