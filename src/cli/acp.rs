@@ -543,69 +543,74 @@ fn adapters_to_install(requested: &[String], all: bool) -> Result<Vec<&'static s
         .collect())
 }
 
+/// Resolve the Node an in-tree adapter runs on, downloading the pinned runtime
+/// when none qualifies, then install each named adapter into `app_dir`. Shared
+/// by `doctor --fix` and `aoe setup` so the two cannot drift. Returns whether
+/// every install succeeded.
+pub(crate) async fn install_adapters(app_dir: &std::path::Path, wanted: &[&'static str]) -> bool {
+    let needs_sources = wanted
+        .iter()
+        .any(|binary| crate::acp::adapters::ships_sources(binary));
+    let node = match node::resolve_for("", app_dir, needs_sources) {
+        Ok(node) => {
+            println!("Node available: {} ({})", node.path.display(), node.version);
+            Some(node)
+        }
+        Err(node::NodeError::NoNode(_)) | Err(node::NodeError::TooOld { .. }) => {
+            println!("Downloading Node {} runtime...", node::PINNED_NODE_VERSION);
+            match node::download(app_dir).await {
+                Ok(node) => {
+                    println!("Installed Node {} at {}", node.version, node.path.display());
+                    Some(node)
+                }
+                Err(e) => {
+                    println!("Node download failed: {e}");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            println!("Cannot probe Node: {e}");
+            None
+        }
+    };
+    let Some(node) = node else {
+        return false;
+    };
+    let mut all_installed = true;
+    for binary in wanted {
+        println!("Installing bundled ACP adapter {binary}...");
+        match crate::acp::adapters::install(app_dir, &node, binary) {
+            Ok(()) => println!("{binary} ready."),
+            Err(e) => {
+                println!("{binary} install failed: {e}");
+                all_installed = false;
+            }
+        }
+    }
+    all_installed
+}
+
 async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool) -> Result<()> {
     if fix {
         match crate::session::get_app_dir() {
             Err(e) => println!(
                 "Cannot resolve the app data dir ({e}); skipping the Node and adapter install."
             ),
-            Ok(app_dir) => {
-                let needs_sources =
-                    adapters_to_install(&adapter, all_adapters).is_ok_and(|wanted| {
-                        wanted
-                            .iter()
-                            .any(|b| crate::acp::adapters::ships_sources(b))
-                    });
-                let node = match node::resolve_for("", &app_dir, needs_sources) {
-                    Ok(node) => {
-                        println!("Node available: {} ({})", node.path.display(), node.version);
-                        Some(node)
-                    }
-                    Err(node::NodeError::NoNode(_)) | Err(node::NodeError::TooOld { .. }) => {
-                        println!("Downloading Node {} runtime...", node::PINNED_NODE_VERSION);
-                        match node::download(&app_dir).await {
-                            Ok(node) => {
-                                println!(
-                                    "Installed Node {} at {}",
-                                    node.version,
-                                    node.path.display()
-                                );
-                                Some(node)
-                            }
-                            Err(e) => {
-                                println!("Node download failed: {e}");
-                                None
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        println!("Cannot probe Node: {e}");
-                        None
-                    }
-                };
-                if let Some(node) = node {
-                    match adapters_to_install(&adapter, all_adapters) {
-                        Err(unknown) => println!(
-                            "Unknown adapter(s): {}. Valid values: {}.",
-                            unknown.join(", "),
-                            crate::acp::adapters::BUNDLED_ADAPTERS
-                                .iter()
-                                .map(|a| a.binary)
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
-                        Ok(wanted) => {
-                            for binary in wanted {
-                                println!("Installing bundled ACP adapter {binary}...");
-                                match crate::acp::adapters::install(&app_dir, &node, binary) {
-                                    Ok(()) => println!("{binary} ready."),
-                                    Err(e) => println!("{binary} install failed: {e}"),
-                                }
-                            }
-                        }
-                    }
+            Ok(app_dir) => match adapters_to_install(&adapter, all_adapters) {
+                Err(unknown) => println!(
+                    "Unknown adapter(s): {}. Valid values: {}.",
+                    unknown.join(", "),
+                    crate::acp::adapters::BUNDLED_ADAPTERS
+                        .iter()
+                        .map(|a| a.binary)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Ok(wanted) => {
+                    install_adapters(&app_dir, &wanted).await;
                 }
-            }
+            },
         }
         for gate in crate::acp::agent_compat::version_gates() {
             if skip_gate_check(gate.binary, find_in_path(gate.binary).is_some()) {

@@ -6,6 +6,7 @@ AoE is the client of the [Agent Client Protocol](https://agentclientprotocol.com
 
 ![The structured view rendering an agent's plan, tool-call cards, and a pending approval](assets/structured-view/overview.png)
 
+- **[Quickstart](structured-view/quickstart.md)**: the default path, the bundled `aoe-agent` on Otari, and model ids.
 - **[Interface](structured-view/interface.md)**: surfaces, keybinds, composer, queued prompts, timeline grouping.
 - **[Modes, approvals & model controls](structured-view/controls.md)**: permission modes, approval cards, notifications, model selectors.
 - **[Troubleshooting](structured-view/troubleshooting.md)**: the security model and a field guide to each failure mode.
@@ -26,7 +27,7 @@ aoe ships an ACP registry entry for each tool whose ACP server we've verified. F
 | `omp` | `omp acp` (native) | `curl -fsSL https://omp.sh/install \| sh` | provider environment or OMP login |
 | `kimi` | `kimi acp` (native) | `curl -fsSL https://code.kimi.com/kimi-code/install.sh \| bash` | `kimi login`, or provider env |
 | `prime-agent` | `prime-agent --mode acp` (native 0.10.x) | `curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh \| sh` | `/login` once, or provider env |
-| `aoe-agent` | bundled (Vercel AI SDK 7, runs on the resolved Node) | `aoe acp doctor --fix --adapter aoe-agent` installs it into the data dir; nothing to install globally | provider env vars |
+| `aoe-agent` (default) | bundled (Vercel AI SDK 7, runs on the resolved Node) | `aoe setup`, or `aoe acp doctor --fix --adapter aoe-agent`, installs it into the data dir; nothing to install globally | provider env vars, or Otari via `OTARI_API_KEY` |
 
 
 Gemini CLI is deprecated upstream for individual accounts since 2026-06-18. Enterprise and API-key authentication remain valid; Antigravity CLI is the replacement for consumer accounts.
@@ -45,7 +46,7 @@ Each built-in adapter receives only verified provider variables from the Daemon'
 | `codex` | `CODEX_API_KEY`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `CODEX_HOME` |
 | `opencode` | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, `GOOGLE_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `OPENCODE_API_KEY` |
 | `gemini` | `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_GENAI_USE_VERTEXAI`, `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION` |
-| `aoe-agent` | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `GOOGLE_GENERATIVE_AI_API_KEY` |
+| `aoe-agent` | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `GOOGLE_GENERATIVE_AI_API_KEY`, `OTARI_API_KEY`, `OTARI_BASE_URL` |
 | `prime-agent` | `PRIME_API_KEY`, `PRIME_TEAM_ID`, and its verified provider, Vertex, Bedrock and AWS credential-chain keys. See the [adapter allowlists](https://github.com/agent-of-empires/agent-of-empires/blob/main/src/acp/install_hints.rs). |
 
 `vibe`, `pi`, `omp`, `kimi` and custom adapters have no ambient provider allowlist. Supply host auth through `extra_env`, `environment`, or opt-in `session.inherit_host_environment`. Sandbox auth uses `sandbox.environment`; whole-host inheritance never crosses that boundary. Verified provider keys can cross, but ambient file/directory selectors, including config roots and AWS credential files, cannot: managed config roots are already mounted at canonical container paths. Explicit `provider_env` values are separate from ambient filtering. Drops are logged under `acp` with the key and reason.
@@ -109,6 +110,13 @@ In a sandboxed session a Claude `Workflow` run is not tracked, like a background
 Capabilities depend on channels the adapter advertises; unavailable mode, slash-command or usage controls stay empty rather than stale. Codex currently advertises no Plan-mode channel. With the bundled codex-acp 2.6.0, each Codex subagent gets a Sub agents row with its state, but its tool calls stay unnested in the parent thread; nesting needs codex-acp 2.7.0 or newer. Codex subagent support has not been checked against a live session. OpenCode 1.16.0 or newer improves edit/think classification, read output and permission context; older versions use generic cards and prompts. Report unexpected `tool.kind` and `tool.name` values. See [agent profiles](development/internals/structured-view.md#agent-profiles).
 
 ## Quickstart
+
+One command configures the default: `aoe setup` installs the bundled `aoe-agent` adapter
+with consent, sets `acp.default_agent = "aoe-agent"` and `acp.structured_view = "structured"`
+without overwriting values you set, and prints the Otari account steps when no provider key is
+present. See [Structured View Quickstart](structured-view/quickstart.md) for the flag list,
+the model id forms (`claude-`, `gpt-`, `gemini-`, `anthropic:`, `openai:`, `google:`, and
+`openai-compatible:<vendor>/<model>` for a gateway) and undo instructions.
 
 In the web dashboard, create a session and choose an ACP-capable agent; **Structured** defaults on. In the TUI dialog the default is terminal view; tick Structured there. Set `acp.structured_view` to `terminal` to preselect terminal view, or `off` to hide the option. The CLI defaults to terminal view; opt in with:
 

@@ -701,6 +701,38 @@ fn a_hook_failure_offers_retry_create_without_setup_or_cancel() {
     }
 }
 
+/// The wizard's agent is the new-session dialog's default tool, not an override
+/// for the first Structured session: a tool chosen in the dialog wins.
+#[test]
+#[serial]
+fn the_wizard_agent_seeds_the_dialog_without_outranking_its_tool() {
+    use crate::tui::session_feed::CommandFailure;
+    let bundle = crate::acp::quickstart::BUNDLED_AGENT;
+    for (tool, agent_name) in [("claude", None), (bundle, Some(bundle))] {
+        let CreationTestEnv {
+            mut view,
+            project_dir,
+            _guard,
+            _temp,
+        } = setup_creation_test_env();
+        let mut fail = view.session_feed.creation_failure_driver_for_test();
+        view.session_feed
+            .publish_for_test(creation_snapshot(vec![], "test", 1));
+        view.apply_session_feed();
+        view.first_session_agent = Some(bundle.to_string());
+        let mut data = creation_data(&project_dir, "First", "test");
+        data.tool = tool.to_string();
+        data.structured = true;
+        view.request_creation(data, None, None, false);
+        let body = fail(CommandFailure::Rejected("done".into()));
+        assert_eq!(
+            body.agent_name.as_deref(),
+            agent_name,
+            "the dialog's tool decides which agent {tool} runs"
+        );
+    }
+}
+
 /// A resubmit refused before it is sent reopens the recovery dialog with the same request,
 /// beneath the refusal, so Retry still works once the cause clears.
 #[test]
@@ -965,4 +997,46 @@ fn a_paste_over_the_setup_failed_dialog_goes_nowhere() {
             "{case}: only the settings search shows the paste"
         );
     }
+}
+
+/// The bundled adapter is offered wherever it can run, beside native tools as
+/// well as instead of them, and the gate sees it: a host with only the bundle
+/// gets the dialog, not the setup pointer, seeded with the wizard's agent.
+#[test]
+#[serial]
+fn the_new_session_dialog_offers_a_runnable_bundle_beside_native_tools() {
+    let bundle = crate::acp::quickstart::BUNDLED_AGENT;
+    for (native, expected) in [
+        (&[][..], vec![bundle]),
+        (&["claude"][..], vec!["claude", bundle]),
+    ] {
+        let CreationTestEnv { mut view, .. } = setup_creation_test_env();
+        view.available_tools = AvailableTools::with_tools(native);
+        let tools = view.dialog_tools_with_bundle(true);
+        assert_eq!(
+            tools.available_list(),
+            expected,
+            "a runnable bundle is offered {native:?}"
+        );
+        view.first_session_agent = Some(bundle.to_string());
+        view.open_new_session_dialog_with(tools);
+        assert!(
+            view.no_agents_dialog.is_none(),
+            "the dialog opens with a runnable bundle {native:?}"
+        );
+        let dialog = view.new_dialog.as_ref().expect("the dialog opens");
+        assert_eq!(
+            dialog.selected_tool(),
+            bundle,
+            "the wizard's agent is the default {native:?}"
+        );
+    }
+
+    // Without a runnable bundle nothing changes: native tools alone, and the
+    // setup pointer when there are none.
+    let CreationTestEnv { mut view, .. } = setup_creation_test_env();
+    view.available_tools = AvailableTools::with_tools(&[]);
+    view.open_new_session_dialog_with(view.dialog_tools_with_bundle(false));
+    assert!(view.new_dialog.is_none(), "no tool, no dialog");
+    assert!(view.no_agents_dialog.is_some(), "the setup pointer instead");
 }

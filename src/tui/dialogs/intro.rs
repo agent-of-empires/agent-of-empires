@@ -8,6 +8,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use super::DialogResult;
+use crate::acp::quickstart::{self, Plan};
 use crate::session::AttachMode;
 use crate::tui::components::hover::paint_hover_bg;
 use crate::tui::styles::{available_themes, Theme};
@@ -21,6 +22,13 @@ pub struct IntroOutcome {
     /// The Telemetry page's choice; the caller marks the opt-in prompt
     /// answered only when it is `Some`.
     pub telemetry_opt_in: Option<bool>,
+    /// `acp.default_agent` picked on the Structured view page; the plan it came
+    /// from already folded in detection, so it names an agent that can start.
+    pub acp_default_agent: Option<String>,
+    /// `acp.acp_defaults.<bundled>.model` for that choice: with only the Otari
+    /// key the adapter's own default is an Anthropic id it has no credential
+    /// for, so the first Structured session needs this model.
+    pub acp_default_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +36,7 @@ enum Page {
     Welcome,
     Telemetry,
     FirstSession,
+    StructuredDefault,
     AttachMode,
     ThemePicker,
     Done,
@@ -57,6 +66,7 @@ impl Page {
             Page::Welcome,
             Page::Telemetry,
             Page::FirstSession,
+            Page::StructuredDefault,
             Page::AttachMode,
             Page::ThemePicker,
             Page::Done,
@@ -103,6 +113,16 @@ pub struct IntroDialog {
     /// Hovered option on the Telemetry page.
     hovered_telemetry_idx: Option<usize>,
 
+    /// The default Structured view decision, from the shared planner.
+    plan: Plan,
+    /// The bundled default first, then every agent detected on the machine.
+    agent_options: Vec<String>,
+    agent_cursor: usize,
+    /// A default-agent choice persists only once the page has been seen.
+    structured_visited: bool,
+    structured_option_areas: Vec<Rect>,
+    hovered_structured_idx: Option<usize>,
+
     /// URL rects on the Welcome page, empty elsewhere.
     link_areas: Vec<(&'static str, Rect)>,
     hovered_link: Option<usize>,
@@ -111,12 +131,44 @@ pub struct IntroDialog {
 }
 
 impl IntroDialog {
-    pub fn new(original_theme: impl Into<String>) -> Self {
+    /// `detection` comes from the TUI's detection worker: reading the host here
+    /// would run the bundled adapter's node probe on the event loop.
+    pub fn new(original_theme: impl Into<String>, detection: &quickstart::Detection) -> Self {
+        let config = crate::session::config::Config::load_or_warn();
+        Self::with_detection(original_theme, &config.acp, detection)
+    }
+
+    /// The wizard for an explicit configuration and detection, so tests never
+    /// depend on the host's config or installed agents.
+    fn with_detection(
+        original_theme: impl Into<String>,
+        acp: &crate::session::config::AcpConfig,
+        detection: &quickstart::Detection,
+    ) -> Self {
         let original_theme = original_theme.into();
         let themes = available_themes();
         let theme_cursor = themes
             .iter()
             .position(|t| t == &original_theme)
+            .unwrap_or(0);
+        // The default agent comes from the shared planner, so this wizard and
+        // `aoe setup` cannot disagree. Installing the adapter needs consent the
+        // wizard cannot ask for here, so the page names the command instead.
+        let plan = quickstart::plan(detection, acp, false);
+        let mut agent_options = vec![quickstart::BUNDLED_AGENT.to_string()];
+        agent_options.extend(
+            plan.alternatives
+                .iter()
+                .filter(|name| name.as_str() != quickstart::BUNDLED_AGENT)
+                .cloned(),
+        );
+        // A default the user already set is preselected, never replaced.
+        if !agent_options.contains(&plan.agent) {
+            agent_options.push(plan.agent.clone());
+        }
+        let agent_cursor = agent_options
+            .iter()
+            .position(|name| name == &plan.agent)
             .unwrap_or(0);
         Self {
             original_theme,
@@ -139,6 +191,12 @@ impl IntroDialog {
             telemetry_visited: false,
             telemetry_option_areas: [Rect::default(), Rect::default()],
             hovered_telemetry_idx: None,
+            plan,
+            agent_options,
+            agent_cursor,
+            structured_visited: false,
+            structured_option_areas: Vec::new(),
+            hovered_structured_idx: None,
             link_areas: Vec::new(),
             hovered_link: None,
             pending_link: None,
@@ -179,6 +237,9 @@ impl IntroDialog {
             }
             Page::Telemetry => {
                 self.telemetry_visited = true;
+            }
+            Page::StructuredDefault => {
+                self.structured_visited = true;
             }
             _ => {}
         }
@@ -222,7 +283,33 @@ impl IntroDialog {
             } else {
                 None
             },
+            acp_default_agent: if self.structured_visited {
+                self.agent_options.get(self.agent_cursor).cloned()
+            } else {
+                None
+            },
+            // Keyed off the chosen row, not the plan: the user can pick the
+            // bundled agent on a machine whose configured default was another.
+            acp_default_model: (self.structured_visited
+                && self.chosen_agent_is_bundled()
+                && self.plan.gateway_credential == Some(quickstart::GatewayCredential::Otari))
+            .then(|| quickstart::OTARI_MODEL_EXAMPLE.to_string()),
         }
+    }
+
+    /// The row under the cursor names the bundled agent.
+    fn chosen_agent_is_bundled(&self) -> bool {
+        self.agent_options
+            .get(self.agent_cursor)
+            .is_some_and(|agent| agent == quickstart::BUNDLED_AGENT)
+    }
+
+    fn move_agent_cursor(&mut self, delta: isize) {
+        if self.agent_options.is_empty() {
+            return;
+        }
+        let len = self.agent_options.len() as isize;
+        self.agent_cursor = (self.agent_cursor as isize + delta).rem_euclid(len) as usize;
     }
 
     fn queue_preview_current(&mut self) {
@@ -294,6 +381,20 @@ impl IntroDialog {
             }
         }
 
+        if self.current_page() == Page::StructuredDefault {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.move_agent_cursor(-1);
+                    return DialogResult::Continue;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.move_agent_cursor(1);
+                    return DialogResult::Continue;
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::Esc => self.cancel(),
             KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right | KeyCode::Tab => {
@@ -340,17 +441,26 @@ impl IntroDialog {
         } else {
             None
         };
+        let new_structured = if self.current_page() == Page::StructuredDefault {
+            self.structured_option_areas
+                .iter()
+                .position(|a| a.contains(pos))
+        } else {
+            None
+        };
         let new_link = self.link_areas.iter().position(|(_, a)| a.contains(pos));
         let changed = self.hovered_button != new_button
             || self.hovered_theme_row != new_theme
             || self.hovered_attach_idx != new_attach
             || self.hovered_telemetry_idx != new_telemetry
+            || self.hovered_structured_idx != new_structured
             || self.hovered_link != new_link;
         self.hovered_link = new_link;
         self.hovered_button = new_button;
         self.hovered_theme_row = new_theme;
         self.hovered_attach_idx = new_attach;
         self.hovered_telemetry_idx = new_telemetry;
+        self.hovered_structured_idx = new_structured;
         changed
     }
 
@@ -364,6 +474,7 @@ impl IntroDialog {
         self.hovered_theme_row = None;
         self.hovered_attach_idx = None;
         self.hovered_telemetry_idx = None;
+        self.hovered_structured_idx = None;
     }
 
     /// Route a left-click. Returns `Some(result)` when the click hit a known
@@ -414,6 +525,14 @@ impl IntroDialog {
                 }
             }
         }
+        if self.current_page() == Page::StructuredDefault {
+            for (idx, area) in self.structured_option_areas.iter().enumerate() {
+                if area.contains(pos) {
+                    self.agent_cursor = idx;
+                    return Some(DialogResult::Continue);
+                }
+            }
+        }
         None
     }
 
@@ -442,6 +561,7 @@ impl IntroDialog {
             Page::Welcome => self.render_welcome(frame, chunks[0], theme),
             Page::Telemetry => self.render_telemetry(frame, chunks[0], theme),
             Page::FirstSession => self.render_first_session(frame, chunks[0], theme),
+            Page::StructuredDefault => self.render_structured_default(frame, chunks[0], theme),
             Page::AttachMode => self.render_attach_mode(frame, chunks[0], theme),
             Page::ThemePicker => self.render_theme_picker(frame, chunks[0], theme),
             Page::Done => self.render_done(frame, chunks[0], theme),
@@ -793,6 +913,105 @@ impl IntroDialog {
         frame.render_widget(hint, layout[4]);
     }
 
+    /// What the selected agent needs. Derived from the row under the cursor, so
+    /// moving away from the planner's choice stops describing it.
+    fn structured_guidance(&self) -> Vec<String> {
+        let selected = self.agent_options.get(self.agent_cursor);
+        let selected_bundled = selected.is_some_and(|agent| agent == quickstart::BUNDLED_AGENT);
+        let mut guidance = Vec::new();
+        if selected_bundled && self.plan.needs_gateway_key {
+            guidance.push(format!(
+                "The bundled agent needs an Otari key: {}.",
+                quickstart::OTARI_SIGNUP_URL
+            ));
+        }
+        if selected_bundled && !self.plan.bundled_installed {
+            guidance.push(format!(
+                "Its adapter installs into the aoe data dir: aoe acp doctor --fix --adapter {}",
+                quickstart::BUNDLED_AGENT
+            ));
+        }
+        if selected == Some(&self.plan.agent) {
+            if let Some(reason) = self.plan.fallback {
+                guidance.push(format!("Bundled default unavailable: {reason}."));
+            }
+        }
+        guidance
+    }
+
+    /// The Structured view default: the bundled agent, or an agent already on
+    /// this machine, both decided by the shared planner.
+    fn render_structured_default(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        self.structured_option_areas.clear();
+        let mut lines = vec![
+            Line::from(Span::styled(
+                "Sessions can open in Structured view (plans, tool cards, diffs).",
+                Style::default().fg(theme.title).bold(),
+            )),
+            Line::from(Span::styled(
+                "Which agent should be the default?",
+                Style::default().fg(theme.dimmed),
+            )),
+            Line::from(""),
+        ];
+        let row_count = self.agent_options.len();
+        for (idx, agent) in self.agent_options.iter().enumerate() {
+            let is_selected = idx == self.agent_cursor;
+            let is_hovered = self.hovered_structured_idx == Some(idx);
+            let marker = if is_selected { "  ▶ " } else { "    " };
+            let mut style = if is_selected {
+                Style::default().fg(theme.accent).bold()
+            } else {
+                Style::default().fg(theme.text)
+            };
+            if is_hovered {
+                style = style.bg(theme.selection);
+            }
+            let note = if agent == quickstart::BUNDLED_AGENT {
+                "  (bundled, needs only a provider key)"
+            } else {
+                "  (already installed, reuses its own login)"
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{marker}{agent}{note}"),
+                style,
+            )));
+        }
+        let guidance = self.structured_guidance();
+        if !guidance.is_empty() {
+            lines.push(Line::from(""));
+        }
+        for line in guidance {
+            lines.push(Line::from(Span::styled(
+                line,
+                Style::default().fg(theme.dimmed),
+            )));
+        }
+
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(area);
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[0]);
+
+        // Row rects for the mouse, derived from where the option lines landed.
+        let first_row = layout[0].y + 3;
+        for idx in 0..row_count {
+            let y = first_row + idx as u16;
+            self.structured_option_areas.push(Rect {
+                x: layout[0].x,
+                y,
+                width: layout[0].width,
+                height: 1,
+            });
+        }
+        let hint = Paragraph::new(Span::styled(
+            "↑/↓ to choose  •  Enter to confirm",
+            Style::default().fg(theme.hint).italic(),
+        ));
+        frame.render_widget(hint, layout[1]);
+    }
+
     fn render_theme_picker(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let layout = Layout::default()
             .direction(Direction::Vertical)
@@ -1029,19 +1248,51 @@ mod tests {
     use super::*;
     use crate::tui::dialogs::test_keys::key;
 
-    /// The wizard's page order; `Enter` walks it and a sixth press submits.
+    /// The wizard's page order; `Enter` walks it and a seventh press submits.
     const PAGES: &[Page] = &[
         Page::Welcome,
         Page::Telemetry,
         Page::FirstSession,
+        Page::StructuredDefault,
         Page::AttachMode,
         Page::ThemePicker,
         Page::Done,
     ];
 
+    /// An unconfigured machine whose bundled adapter is ready, so every
+    /// assertion here is independent of the host.
+    fn fresh() -> IntroDialog {
+        IntroDialog::with_detection(
+            "zinc",
+            &crate::session::config::AcpConfig::default(),
+            &quickstart::Detection {
+                present_agents: vec![quickstart::BUNDLED_AGENT.to_string()],
+                bundled_installed: true,
+                gateway_credential: Some(quickstart::GatewayCredential::Otari),
+            },
+        )
+    }
+
+    /// A machine where only `claude` resolves and the bundled adapter is
+    /// missing, so the planner falls back to it.
+    fn fallback_to_claude() -> IntroDialog {
+        IntroDialog::with_detection(
+            "zinc",
+            &crate::session::config::AcpConfig::default(),
+            &quickstart::Detection {
+                present_agents: vec!["claude".to_string()],
+                bundled_installed: false,
+                gateway_credential: None,
+            },
+        )
+    }
+
     /// A dialog parked on `page`, having walked there with Enter.
     fn on_page(page: Page) -> IntroDialog {
-        let mut dialog = IntroDialog::new("zinc");
+        park(fresh(), page)
+    }
+
+    fn park(mut dialog: IntroDialog, page: Page) -> IntroDialog {
         let steps = PAGES.iter().position(|p| *p == page).expect("known page");
         for _ in 0..steps {
             assert!(matches!(
@@ -1051,6 +1302,95 @@ mod tests {
         }
         assert_eq!(dialog.current_page(), page);
         dialog
+    }
+
+    #[test]
+    fn the_structured_page_guides_the_selected_agent() {
+        // Only `claude` resolves, so the planner falls back to it and the page
+        // explains that while its row is selected.
+        let mut dialog = park(fallback_to_claude(), Page::StructuredDefault);
+        assert_eq!(dialog.agent_options, vec!["aoe-agent", "claude"]);
+        assert_eq!(dialog.agent_cursor, 1);
+        let guidance = dialog.structured_guidance();
+        assert!(guidance
+            .iter()
+            .any(|line| line.contains("Bundled default unavailable")));
+        assert!(!guidance.iter().any(|line| line.contains("doctor --fix")));
+
+        // Moving to the missing bundled agent names its install, and the
+        // fallback explanation stops applying.
+        dialog.handle_key(key(KeyCode::Up));
+        assert_eq!(dialog.agent_cursor, 0);
+        let guidance = dialog.structured_guidance();
+        assert!(guidance
+            .iter()
+            .any(|line| line.contains("doctor --fix --adapter aoe-agent")));
+        assert!(guidance.iter().any(|line| line.contains("Otari key")));
+        assert!(!guidance
+            .iter()
+            .any(|line| line.contains("Bundled default unavailable")));
+    }
+
+    #[test]
+    fn a_configured_default_is_preselected_and_kept() {
+        let acp = crate::session::config::AcpConfig {
+            default_agent: "codex".to_string(),
+            ..Default::default()
+        };
+        let mut dialog = park(
+            IntroDialog::with_detection(
+                "zinc",
+                &acp,
+                &quickstart::Detection {
+                    present_agents: vec!["aoe-agent".to_string(), "codex".to_string()],
+                    bundled_installed: true,
+                    gateway_credential: Some(quickstart::GatewayCredential::Otari),
+                },
+            ),
+            Page::StructuredDefault,
+        );
+        assert_eq!(dialog.agent_options, vec!["aoe-agent", "codex"]);
+        assert_eq!(dialog.agent_cursor, 1, "the configured default is selected");
+
+        let _ = dialog.handle_key(key(KeyCode::Enter));
+        assert_eq!(dialog.outcome().acp_default_agent.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn the_bundled_choice_carries_the_otari_model() {
+        let acp = crate::session::config::AcpConfig::default();
+        let bundled_row = |credential| {
+            park(
+                IntroDialog::with_detection(
+                    "zinc",
+                    &acp,
+                    &quickstart::Detection {
+                        present_agents: vec!["aoe-agent".to_string()],
+                        bundled_installed: true,
+                        gateway_credential: credential,
+                    },
+                ),
+                Page::StructuredDefault,
+            )
+        };
+
+        // The adapter's own default model needs an Anthropic credential the
+        // Otari key cannot supply, so the session is given an Otari model.
+        let mut dialog = bundled_row(Some(quickstart::GatewayCredential::Otari));
+        assert_eq!(dialog.agent_cursor, 0);
+        let _ = dialog.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            dialog.outcome().acp_default_model.as_deref(),
+            Some(quickstart::OTARI_MODEL_EXAMPLE)
+        );
+
+        // A detected OpenAI-compatible gateway picks its own models.
+        let mut dialog = bundled_row(Some(quickstart::GatewayCredential::Gateway));
+        let _ = dialog.handle_key(key(KeyCode::Enter));
+        assert_eq!(dialog.outcome().acp_default_model, None);
+
+        // Skipping the wizard writes nothing.
+        assert_eq!(fresh().outcome().acp_default_model, None);
     }
 
     #[test]
@@ -1084,7 +1424,7 @@ mod tests {
 
     #[test]
     fn enter_walks_every_page_and_marks_the_ones_it_visits() {
-        let mut dialog = IntroDialog::new("zinc");
+        let mut dialog = fresh();
         assert_eq!(dialog.page_idx, 0);
         for page in &PAGES[1..] {
             assert!(matches!(
@@ -1094,6 +1434,7 @@ mod tests {
             assert_eq!(dialog.current_page(), *page);
         }
         assert!(dialog.telemetry_visited);
+        assert!(dialog.structured_visited);
         assert!(dialog.attach_mode_visited);
         assert!(dialog.theme_visited);
         assert!(matches!(
@@ -1110,7 +1451,7 @@ mod tests {
 
         // Esc skips out without submitting.
         assert!(matches!(
-            IntroDialog::new("zinc").handle_key(key(KeyCode::Esc)),
+            fresh().handle_key(key(KeyCode::Esc)),
             DialogResult::Cancel
         ));
     }
@@ -1136,26 +1477,33 @@ mod tests {
     #[test]
     fn the_outcome_reports_only_the_choices_the_user_reached() {
         // Skipping on the first page reaches no choice at all.
-        let mut skipped = IntroDialog::new("zinc");
+        let mut skipped = fresh();
         let _ = skipped.handle_key(key(KeyCode::Esc));
         let outcome = skipped.outcome();
         assert!(outcome.final_theme.is_none());
         assert!(outcome.final_attach_mode.is_none());
         assert_eq!(outcome.telemetry_opt_in, None);
+        assert!(outcome.acp_default_agent.is_none());
 
         // Walking through without touching anything: the theme still equals
         // the original, so it is suppressed rather than dispatching a
         // needless SetTheme and screen clear. Visiting the telemetry page and
-        // leaving its default is an explicit decline, and LiveSend is the
-        // wizard's attach default.
-        let mut untouched = IntroDialog::new("zinc");
-        for _ in 0..6 {
+        // leaving its default is an explicit decline, LiveSend is the
+        // wizard's attach default, and the Structured view page leaves the
+        // planner's default agent selected.
+        let mut untouched = fresh();
+        for _ in 0..7 {
             let _ = untouched.handle_key(key(KeyCode::Enter));
         }
         let outcome = untouched.outcome();
         assert!(outcome.final_theme.is_none());
         assert_eq!(outcome.final_attach_mode, Some(AttachMode::LiveSend));
         assert_eq!(outcome.telemetry_opt_in, Some(false));
+        assert_eq!(
+            outcome.acp_default_agent.as_deref(),
+            Some(quickstart::BUNDLED_AGENT),
+            "the bundled agent is what an untouched wizard keeps"
+        );
 
         // Picking a different theme carries it out.
         let mut picked = on_page(Page::ThemePicker);
@@ -1201,7 +1549,7 @@ mod tests {
     fn welcome_links_click_only_while_they_render_unwrapped() {
         use crate::tui::dialogs::test_render::{draw, find};
         let url = WELCOME_LINKS[0].1;
-        let mut dialog = IntroDialog::new("zinc");
+        let mut dialog = fresh();
         let buf = draw(100, 30, |f, theme| dialog.render(f, f.area(), theme));
         find(&buf, "Click a link above");
         let (x, y) = find(&buf, url);
@@ -1213,7 +1561,7 @@ mod tests {
         assert_eq!(dialog.take_pending_link(), Some(url));
 
         // Too narrow: the links wrap, so they are neither targets nor advertised.
-        let mut dialog = IntroDialog::new("zinc");
+        let mut dialog = fresh();
         let buf = draw(50, 40, |f, theme| dialog.render(f, f.area(), theme));
         assert!(dialog.link_areas.is_empty());
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
@@ -1223,14 +1571,14 @@ mod tests {
     #[test]
     fn hover_tracks_the_current_page_s_rows_and_clears_when_it_changes() {
         // Rects the render pass would normally populate.
-        let mut dialog = IntroDialog::new("zinc");
+        let mut dialog = fresh();
         dialog.attach_mode_areas[1] = Rect {
             x: 5,
             y: 5,
             width: 10,
             height: 4,
         };
-        for _ in 0..3 {
+        for _ in 0..4 {
             dialog.handle_key(key(KeyCode::Enter));
         }
         assert_eq!(dialog.current_page(), Page::AttachMode);
@@ -1242,11 +1590,11 @@ mod tests {
 
         // A theme row's rect is ignored off the theme page, so a stale rect
         // cannot paint a highlight over whatever now occupies those cells.
-        let mut dialog = IntroDialog::new("zinc");
+        let mut dialog = fresh();
         dialog.theme_row_areas = vec![row_rect(); dialog.themes.len()];
         assert!(!dialog.handle_hover(5, 0));
         assert_eq!(dialog.hovered_theme_row, None);
-        for _ in 0..4 {
+        for _ in 0..5 {
             dialog.handle_key(key(KeyCode::Enter));
         }
         assert_eq!(dialog.current_page(), Page::ThemePicker);

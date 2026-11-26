@@ -17,16 +17,12 @@
 import * as acp from "@agentclientprotocol/sdk";
 import { Readable, Writable } from "node:stream";
 import { streamText, tool, stepCountIs, type ModelMessage } from "ai";
-import { anthropic } from "@ai-sdk/anthropic";
-import { openai } from "@ai-sdk/openai";
-import { google } from "@ai-sdk/google";
 import { z } from "zod";
 import { appendTurn, createTranscript, loadTranscript } from "./transcript.ts";
 import { toolCallMeta } from "./aoeMeta.ts";
 import { classifyKind } from "./toolKind.ts";
 import { createAgentStream } from "./transport.ts";
-
-const DEFAULT_MODEL = "claude-opus-4-7";
+import { DEFAULT_MODEL, pickModel } from "./model.ts";
 
 interface SessionState {
   pendingPrompt: AbortController | null;
@@ -260,25 +256,6 @@ function serialiseToolOutput(output: unknown): Record<string, unknown> {
     return output as Record<string, unknown>;
   }
   return { value: output };
-}
-
-/**
- * Map an `AOE_AGENT_MODEL` id onto a provider by bare prefix or an explicit
- * `provider:` prefix. Anything else hits the Anthropic fallback, so
- * local-model ids are not a valid configuration until an openai-compatible
- * branch exists.
- */
-function pickModel(modelId: string) {
-  const providers = [
-    { bare: "claude-", tag: "anthropic:", make: anthropic },
-    { bare: "gpt-", tag: "openai:", make: openai },
-    { bare: "gemini-", tag: "google:", make: google },
-  ];
-  for (const { bare, tag, make } of providers) {
-    if (modelId.startsWith(tag)) return make(modelId.slice(tag.length));
-    if (modelId.startsWith(bare)) return make(modelId);
-  }
-  return anthropic(modelId);
 }
 
 function startSession(sessionId: string, messages: ModelMessage[]): void {

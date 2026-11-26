@@ -396,6 +396,7 @@ async fn run(
             let profile = cli.profile.as_deref().unwrap_or_default();
             return exit_zero(cli::add::run(profile, *args).await);
         }
+        Some(Commands::Setup(args)) => return exit_zero(cli::setup::run(args).await),
         Some(Commands::Stop { .. }) => return exit_zero(cli::killall::stop_trap()),
         // Before the startup lock and migrations: see `cli::serve::run_control`.
         Some(Commands::Serve(ref args)) => {

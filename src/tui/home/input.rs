@@ -14,6 +14,7 @@ use super::{
 use crate::session::config::repo_config;
 use crate::session::config::{
     load_config, update_app_state, update_config, GroupByMode, SidebarPosition, SortOrder,
+    StructuredView,
 };
 use crate::session::{list_profiles_for_display, Instance, Item, LifecycleOperation, Status};
 use crate::tui::app::Action;
@@ -56,6 +57,55 @@ pub(super) fn web_plugin_disabled() -> bool {
         .is_some_and(|p| !p.enabled)
 }
 
+impl HomeView {
+    /// Tools the new-session dialog offers. A runnable bundled adapter is
+    /// offered alongside the terminal agents, so a machine with none still gets
+    /// a dialog rather than the no-agents pointer, and the wizard's choice stays
+    /// selectable where native tools exist.
+    fn dialog_tools(&self) -> crate::tmux::AvailableTools {
+        self.dialog_tools_with_bundle(self.bundle_ready())
+    }
+
+    /// Whether the bundled adapter could start a turn here, under the same
+    /// setting the launch honors. The readiness itself comes from the detection
+    /// worker: probing node here would spawn a process on the UI thread every
+    /// time the dialog opens.
+    fn bundle_ready(&self) -> bool {
+        if !self.bundled_ready {
+            return false;
+        }
+        let config = load_config().ok().flatten().unwrap_or_default();
+        config.acp.structured_view != StructuredView::Off
+    }
+
+    pub(super) fn dialog_tools_with_bundle(
+        &self,
+        bundle_ready: bool,
+    ) -> crate::tmux::AvailableTools {
+        if !bundle_ready {
+            return self.available_tools.clone();
+        }
+        self.available_tools
+            .with_tool(crate::acp::quickstart::BUNDLED_AGENT)
+    }
+
+    /// Hold the wizard's agent as the new-session dialog's default tool, native
+    /// or bundled. The dialog's tool list decides whether it can be honoured, so
+    /// seeding it here cannot offer something the dialog lacks.
+    pub(super) fn remember_first_session_agent(&mut self, outcome: &IntroOutcome) {
+        self.first_session_agent = outcome.acp_default_agent.clone();
+    }
+}
+
+/// Open the new-session dialog on the wizard's agent. It is a default, not an
+/// override: the tool the dialog submits is the one the session runs, so a
+/// choice made there wins.
+fn seed_wizard_agent(agent: Option<&str>, dialog: &mut NewSessionDialog) {
+    if let Some(agent) = agent {
+        dialog.set_tool(agent);
+    }
+}
+
 /// Persist the first-run intro picks: theme name to `config.theme.name` and attach mode to
 /// `default_attach_mode`; the telemetry answer goes to the Daemon, which owns consent.
 /// Failures are logged and swallowed so a config write hiccup cannot block startup.
@@ -63,10 +113,40 @@ fn apply_intro_outcome(outcome: &IntroOutcome) {
     if let Some(opt_in) = outcome.telemetry_opt_in {
         crate::tui::telemetry::set_consent(opt_in);
     }
-    if outcome.final_theme.is_none() && outcome.final_attach_mode.is_none() {
+    if outcome.final_theme.is_none()
+        && outcome.final_attach_mode.is_none()
+        && outcome.acp_default_agent.is_none()
+        && outcome.acp_default_model.is_none()
+    {
         return;
     }
     let result = update_config(|config| {
+        if let Some(agent) = &outcome.acp_default_agent {
+            // The page preselects the current default, so this only moves a
+            // choice the user made on it.
+            if config.acp.default_agent.trim() != agent.as_str() {
+                config.acp.default_agent = agent.clone();
+            }
+            if config.acp.structured_view == StructuredView::Auto {
+                config.acp.structured_view = StructuredView::Structured;
+            }
+        }
+        if let Some(model) = &outcome.acp_default_model {
+            // The model the first Structured session needs to reach the
+            // gateway; a model already set for the bundled agent is kept.
+            let entry = config
+                .acp
+                .acp_defaults
+                .entry(crate::acp::quickstart::BUNDLED_AGENT.to_string())
+                .or_default();
+            if entry
+                .model
+                .as_deref()
+                .is_none_or(|current| current.trim().is_empty())
+            {
+                entry.model = Some(model.clone());
+            }
+        }
         if let Some(theme) = &outcome.final_theme {
             config.theme.name = theme.clone();
         }
@@ -1686,6 +1766,7 @@ impl HomeView {
                     DialogResult::Submit(outcome) => {
                         self.intro_dialog = None;
                         apply_intro_outcome(&outcome);
+                        self.remember_first_session_agent(&outcome);
                         // No pending_intro_theme: the live preview already applied
                         // the chosen theme, and re-applying would force a
                         // `clear_terminal` close-flash. Same as the keyboard Submit.
@@ -2510,6 +2591,7 @@ impl HomeView {
                 DialogResult::Submit(outcome) => {
                     self.intro_dialog = None;
                     apply_intro_outcome(&outcome);
+                    self.remember_first_session_agent(&outcome);
                     // No SetTheme dispatch: the live preview already applied the theme
                     // on the picker page, and re-dispatching would re-trigger
                     // `set_theme -> needs_redraw`, forcing the close-flash
@@ -3721,7 +3803,8 @@ impl HomeView {
         // Same gate as `open_new_session_dialog`: with no agent available the dialog has
         // nothing to create, so point at setup instead. Keeps `'N'` and the group menu's
         // New Session in step with `'n'` and the empty-sidebar menu.
-        if !self.available_tools.any_available() {
+        let tools = self.dialog_tools();
+        if !tools.any_available() {
             self.show_no_agents();
             return;
         }
@@ -3769,12 +3852,9 @@ impl HomeView {
                 .unwrap_or_else(|| self.config_profile());
             let profiles =
                 list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
-            let mut dialog = NewSessionDialog::new(
-                self.available_tools.clone(),
-                existing_groups,
-                &current_profile,
-                profiles,
-            );
+            let mut dialog =
+                NewSessionDialog::new(tools, existing_groups, &current_profile, profiles);
+            seed_wizard_agent(self.first_session_agent.as_deref(), &mut dialog);
             let has_prefilled_path = prefill_path.is_some();
             if let Some(path) = prefill_path {
                 dialog.set_path(path);
@@ -5914,6 +5994,12 @@ impl HomeView {
     /// info dialog while a session is being created, the no-agents dialog when no tool is
     /// available, otherwise the full dialog. Shared by `'n'` and the empty-sidebar click.
     pub(super) fn open_new_session_dialog(&mut self) {
+        self.open_new_session_dialog_with(self.dialog_tools());
+    }
+
+    /// The dialog itself, for a toolset already resolved: the gate has to see
+    /// the bundled adapter the dialog can offer, not only the native tools.
+    pub(super) fn open_new_session_dialog_with(&mut self, tools: crate::tmux::AvailableTools) {
         if self.creating_stub_id.is_some() {
             self.info_dialog = Some(InfoDialog::new(
                 "Please Wait",
@@ -5921,7 +6007,7 @@ impl HomeView {
             ));
             return;
         }
-        if !self.available_tools.any_available() {
+        if !tools.any_available() {
             self.show_no_agents();
             return;
         }
@@ -5935,12 +6021,9 @@ impl HomeView {
         let current_profile = self.config_profile();
         let profiles =
             list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
-        self.new_dialog = Some(NewSessionDialog::new(
-            self.available_tools.clone(),
-            existing_groups,
-            &current_profile,
-            profiles,
-        ));
+        let mut dialog = NewSessionDialog::new(tools, existing_groups, &current_profile, profiles);
+        seed_wizard_agent(self.first_session_agent.as_deref(), &mut dialog);
+        self.new_dialog = Some(dialog);
     }
 
     /// Open the tips overlay from `crate::tips`, shared by the palette, the `?` screen

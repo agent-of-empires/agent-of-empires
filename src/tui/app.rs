@@ -67,7 +67,7 @@ pub type TuiBackend = crate::tui::hyperlink::HyperlinkBackend<std::io::Stdout>;
 pub struct App {
     home: HomeView,
     tool_detection: Option<ToolDetection>,
-    available_tools_rx: Option<tokio::sync::oneshot::Receiver<AvailableTools>>,
+    available_tools_rx: Option<tokio::sync::oneshot::Receiver<DetectedTools>>,
     pending_forced_tool_detection: bool,
     startup_dialogs_pending: bool,
     suppress_first_run_dialogs: bool,
@@ -140,6 +140,14 @@ pub struct App {
     /// The running binary keeps its old version until restart, so this stops
     /// periodic re-checks from re-offering a release we already installed.
     last_installed_version_in_session: Option<String>,
+}
+
+/// What the detection worker reports: the terminal tools, and whether the
+/// bundled adapter could start a turn.
+#[derive(Debug)]
+struct DetectedTools {
+    tools: AvailableTools,
+    detection: crate::acp::quickstart::Detection,
 }
 
 struct ToolDetection {
@@ -360,7 +368,13 @@ impl App {
             return false;
         }
         self.startup_dialogs_pending = false;
-        if !self.home.available_tools.any_available() {
+        // The no-agents screen is a dead end for a first run: the wizard can
+        // still deliver the bundled adapter, which needs no terminal agent. Only
+        // fall back to it when the Structured view is off.
+        let structured_off = crate::session::config::Config::load().is_ok_and(|config| {
+            config.acp.structured_view == crate::session::config::StructuredView::Off
+        });
+        if !self.home.available_tools.any_available() && structured_off {
             self.home.show_no_agents();
             return true;
         }
@@ -407,7 +421,15 @@ impl App {
         match std::thread::Builder::new()
             .name("aoe-agent-detection".into())
             .spawn(move || {
-                let _ = tx.send(AvailableTools::detect_cancellable(&worker_cancel, force));
+                let tools = AvailableTools::detect_cancellable(&worker_cancel, force);
+                // The node probe behind this spawns a process and can time out, so it
+                // runs here once and the wizard and dialog read the cached answer.
+                let app_dir = crate::session::get_app_dir().ok();
+                let detection =
+                    crate::acp::quickstart::Detection::detect(app_dir.as_deref(), &|name| {
+                        std::env::var(name).ok()
+                    });
+                let _ = tx.send(DetectedTools { tools, detection });
             }) {
             Ok(thread) => {
                 self.tool_detection = Some(ToolDetection {
@@ -424,7 +446,7 @@ impl App {
     fn poll_tool_detection(&mut self) -> bool {
         if let Some(rx) = self.available_tools_rx.as_mut() {
             match rx.try_recv() {
-                Ok(tools) => {
+                Ok(DetectedTools { tools, detection }) => {
                     if self.home.no_agents_dialog.is_some() {
                         if tools.any_available() {
                             self.home.no_agents_dialog = None;
@@ -433,6 +455,8 @@ impl App {
                         }
                     }
                     self.home.set_available_tools(tools);
+                    self.home.set_bundled_ready(detection.bundled_installed);
+                    self.home.set_detection(detection);
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
                 Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
@@ -5067,7 +5091,11 @@ mod tests {
             if let Ok(state) = saved_state {
                 assert!(state.has_seen_welcome);
             }
-            tx.send(AvailableTools::with_tools(&["claude"])).unwrap();
+            tx.send(DetectedTools {
+                tools: AvailableTools::with_tools(&["claude"]),
+                detection: Default::default(),
+            })
+            .unwrap();
             assert!(app.poll_tool_detection());
 
             assert!(
@@ -5167,7 +5195,11 @@ mod tests {
             );
 
             if deliver_result {
-                tx.send(AvailableTools::with_tools(&[])).unwrap();
+                tx.send(DetectedTools {
+                    tools: AvailableTools::with_tools(&[]),
+                    detection: Default::default(),
+                })
+                .unwrap();
             } else {
                 drop(tx);
             }
@@ -5346,6 +5378,43 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn startup_declares_no_agents_only_when_structured_view_is_off() {
+        for tools in [&[][..], &["claude"][..]] {
+            let temp = tempfile::tempdir().unwrap();
+            let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+            crate::session::get_profile_dir("test").unwrap();
+            crate::session::config::update_config(|config| {
+                config.acp.structured_view = crate::session::config::StructuredView::Off;
+            })
+            .unwrap();
+            let mut app = App::new(
+                "test",
+                AvailableTools::with_tools(&[]),
+                false,
+                false,
+                crate::file_watch::FileWatchService::noop(),
+            )
+            .unwrap();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            app.available_tools_rx = Some(rx);
+            tx.send(DetectedTools {
+                tools: AvailableTools::with_tools(tools),
+                detection: Default::default(),
+            })
+            .unwrap();
+            assert!(app.poll_tool_detection());
+            assert_eq!(
+                app.home.no_agents_dialog.is_some(),
+                tools.is_empty(),
+                "{tools:?}"
+            );
+            // The dead-end screen and the wizard never share the first run.
+            assert_eq!(app.home.intro_dialog.is_none(), tools.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn startup_waits_for_full_detection_before_declaring_no_agents() {
         for (initial_tools, tools, suppress) in [
             (&[][..], &[][..], false),
@@ -5381,7 +5450,11 @@ mod tests {
             assert!(app.home.intro_dialog.is_none());
             assert!(!Config::load_or_warn().app_state.has_seen_welcome);
 
-            tx.send(AvailableTools::with_tools(tools)).unwrap();
+            tx.send(DetectedTools {
+                tools: AvailableTools::with_tools(tools),
+                detection: Default::default(),
+            })
+            .unwrap();
             assert!(app.poll_tool_detection());
             if suppress {
                 assert!(
@@ -5389,18 +5462,17 @@ mod tests {
                     "the startup warning keeps priority"
                 );
                 app.home.info_dialog = None;
-                assert_eq!(app.poll_tool_detection(), tools.is_empty());
+                assert!(
+                    !app.poll_tool_detection(),
+                    "the Structured view onboards instead of declaring no agents"
+                );
             }
             assert_eq!(app.home.available_tools.available_list().len(), tools.len());
-            assert_eq!(app.home.no_agents_dialog.is_some(), tools.is_empty());
-            assert_eq!(
-                app.home.intro_dialog.is_some(),
-                !tools.is_empty() && !suppress
-            );
-            assert_eq!(
-                Config::load_or_warn().app_state.has_seen_welcome,
-                !tools.is_empty() && !suppress
-            );
+            // With the Structured view offered, no terminal agent is not a dead
+            // end: the wizard reaches the bundled adapter.
+            assert!(app.home.no_agents_dialog.is_none());
+            assert_eq!(app.home.intro_dialog.is_some(), !suppress);
+            assert_eq!(Config::load_or_warn().app_state.has_seen_welcome, !suppress);
             assert!(
                 !app.poll_tool_detection(),
                 "completion is applied only once"

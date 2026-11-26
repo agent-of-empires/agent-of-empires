@@ -55,6 +55,9 @@ pub fn env_allowlist_for(binary: &str) -> &'static [&'static str] {
             "OPENAI_API_KEY",
             "OPENAI_BASE_URL",
             "GOOGLE_GENERATIVE_AI_API_KEY",
+            // An OpenAI-compatible gateway (`AOE_AGENT_MODEL=openai-compatible:...`).
+            "OTARI_API_KEY",
+            "OTARI_BASE_URL",
         ],
         // Verified from codex-acp 1.3.0 (dist, `readApiKeyFromEnv`): it takes
         // CODEX_API_KEY first, then OPENAI_API_KEY.

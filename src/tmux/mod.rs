@@ -3605,6 +3605,16 @@ impl AvailableTools {
         !self.available.is_empty()
     }
 
+    /// This set plus `tool`, for a surface that has another way to start a
+    /// session besides a terminal command.
+    pub(crate) fn with_tool(&self, tool: &str) -> Self {
+        let mut available = self.available.clone();
+        if !available.iter().any(|name| name == tool) {
+            available.push(tool.to_string());
+        }
+        Self { available }
+    }
+
     #[cfg(test)]
     pub fn with_tools(tools: &[&str]) -> Self {
         Self {

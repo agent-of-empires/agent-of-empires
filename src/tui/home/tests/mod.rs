@@ -892,6 +892,32 @@ fn setup_creation_test_env() -> CreationTestEnv {
     }
 }
 
+/// A native agent chosen in the wizard reaches the new-session dialog too. Only
+/// the bundled agent used to survive, so a wizard choice of `claude` was dropped
+/// and the dialog opened on whatever the config defaulted to.
+#[test]
+#[serial]
+fn the_wizard_keeps_a_native_agent_for_the_new_session_dialog() {
+    let CreationTestEnv { mut view, .. } = setup_creation_test_env();
+    let outcome = |agent: &str| crate::tui::dialogs::IntroOutcome {
+        final_theme: None,
+        final_attach_mode: None,
+        telemetry_opt_in: None,
+        acp_default_agent: Some(agent.to_string()),
+        acp_default_model: None,
+    };
+
+    view.remember_first_session_agent(&outcome("claude"));
+    assert_eq!(view.first_session_agent.as_deref(), Some("claude"));
+
+    // A wizard skipped before the Structured page seeds nothing.
+    view.remember_first_session_agent(&crate::tui::dialogs::IntroOutcome {
+        acp_default_agent: None,
+        ..outcome("claude")
+    });
+    assert_eq!(view.first_session_agent, None);
+}
+
 /// Base new-session data targeting the shared repo. Callers tweak the
 /// title/group and worktree fields per scenario.
 fn creation_data(project_dir: &std::path::Path, title: &str, group: &str) -> NewSessionData {

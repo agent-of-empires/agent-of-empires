@@ -135,10 +135,18 @@ impl HomeView {
         }
         self.new_dialog = None;
 
+        // The dialog owns the tool, so the ACP agent is the one it submitted.
+        // The wizard's agent only seeded that dialog's initial default.
+        let agent_name = request
+            .data
+            .structured
+            .then(|| request.data.tool.clone())
+            .filter(|tool| tool == crate::acp::quickstart::BUNDLED_AGENT);
         let mut body = wizard_create_body(
             &request.data,
             request.trust_hooks,
             request.trust_review.clone(),
+            agent_name,
         );
         body.idempotency_key = Some(stub_id.clone());
         body.skip_on_create = request.skip_on_create;
@@ -151,6 +159,9 @@ impl HomeView {
             ));
             return Err(Box::new(request));
         }
+        // Consumed: later sessions follow the tool, which is what an explicit
+        // choice on the dialog means.
+        self.first_session_agent = None;
         self.pending_creation = Some(PendingCreation {
             request,
             daemon_id: None,
@@ -692,6 +703,7 @@ fn wizard_create_body(
     data: &NewSessionData,
     trust_hooks: Option<bool>,
     trust_review: Option<crate::daemon::CreationTrustFingerprint>,
+    agent_name: Option<String>,
 ) -> crate::daemon::CreateSessionBody {
     crate::daemon::CreateSessionBody {
         title: Some(data.title.clone()),
@@ -726,7 +738,7 @@ fn wizard_create_body(
         } else {
             crate::session::View::Terminal
         },
-        agent_name: None,
+        agent_name,
         agent_model: None,
         agent_effort: None,
         scratch: data.scratch,

@@ -56,9 +56,9 @@ fn wait_for_config(h: &TuiTestHarness, needles: &[&str]) -> String {
     }
 }
 
-/// The first run walks every page in order; picking Tmux attach and the
-/// `empire` theme persists both choices, and the opt-in reaches the Daemon,
-/// which saves it and mints the install id.
+/// The first run walks every page in order; keeping the default structured
+/// view agent, picking Tmux attach and the `empire` theme persists all three,
+/// and the opt-in reaches the Daemon, which saves it and mints the install id.
 #[test]
 #[parallel]
 fn intro_walkthrough_persists_attach_theme_and_consent_choices() {
@@ -72,42 +72,52 @@ fn intro_walkthrough_persists_attach_theme_and_consent_choices() {
 
     // Title bar uses the literal string from IntroDialog::render.
     h.wait_for("Welcome to Agent of Empires");
-    h.assert_screen_contains("(1/6)");
+    h.assert_screen_contains("(1/7)");
     h.assert_screen_contains("[Skip]");
     h.assert_screen_contains("[Next");
     h.send_keys("Enter");
-    h.wait_for("(2/6)");
+    h.wait_for("(2/7)");
     h.assert_screen_contains("Help improve aoe with anonymous usage telemetry?");
     h.send_keys("Up");
     h.wait_for("▶ Enable anonymous telemetry");
     h.send_keys("Enter");
-    h.wait_for("(3/6)");
+    h.wait_for("(3/7)");
     h.assert_screen_contains("Start your first session");
     h.send_keys("Enter");
-    h.wait_for("(4/6)");
+    h.wait_for("(4/7)");
+    h.assert_screen_contains("Which agent should be the default?");
+    // The bundled agent is always listed; which row starts selected depends on
+    // what is installed, so assert that a selection marker renders at all.
+    h.assert_screen_contains("aoe-agent");
+    h.assert_screen_contains("▶ ");
+    h.send_keys("Enter");
+    h.wait_for("(5/7)");
     h.assert_screen_contains("How do you want to drive your sessions?");
     // LiveSend is pre-selected; flip to Tmux and wait for the `▶` marker so a
     // dropped keystroke cannot advance with the old selection.
     h.send_keys("Down");
     h.wait_for("▶ Tmux mode");
     h.send_keys("Enter");
-    h.wait_for("(5/6)");
+    h.wait_for("(6/7)");
     h.assert_screen_contains("Pick a theme");
     // BUILTIN_THEMES is ordered `default, empire, ...`.
     h.send_keys("Down");
     h.wait_for("▶ empire");
     h.send_keys("Enter");
-    h.wait_for("(6/6)");
+    h.wait_for("(7/7)");
     h.assert_screen_contains("You're all set");
     h.send_keys("Enter");
 
     h.wait_for("No sessions yet");
-    h.wait_for_absent("(6/6)", Duration::from_secs(3));
+    h.wait_for_absent("(7/7)", Duration::from_secs(3));
     wait_for_config(
         &h,
         &[
             "name = \"empire\"",
             "default_attach_mode = \"tmux\"",
+            // The chosen agent is machine-dependent, so assert the write landed
+            // rather than a specific name.
+            "default_agent = ",
             "[telemetry]\nenabled = true",
         ],
     );
@@ -125,7 +135,7 @@ fn intro_esc_skips_without_changing_theme() {
     force_first_run(&h);
     h.spawn_tui();
 
-    h.wait_for("(1/6)");
+    h.wait_for("(1/7)");
     h.send_keys("Escape");
     h.wait_for("No sessions yet");
 

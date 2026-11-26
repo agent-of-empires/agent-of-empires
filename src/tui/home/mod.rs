@@ -370,6 +370,10 @@ pub struct HomeView {
     pub(super) pending_volume_ignores_glob_data: Option<NewSessionData>,
     pub(super) intro_dialog: Option<IntroDialog>,
     pub(super) pending_intro_theme: Option<String>,
+    /// Agent the first-run wizard chose for the first Structured session. No
+    /// terminal tool maps to the bundled agent, so the wizard's choice has to
+    /// reach the session explicitly; the next creation consumes it.
+    pub(super) first_session_agent: Option<String>,
     pub(super) no_agents_dialog: Option<NoAgentsDialog>,
     pub(super) changelog_dialog: Option<ChangelogDialog>,
     pub(super) info_dialog: Option<InfoDialog>,
@@ -475,6 +479,12 @@ pub struct HomeView {
     pub(super) search_match_index: usize,
 
     pub(super) available_tools: AvailableTools,
+    /// The bundled adapter could start a turn here, as the detection worker last
+    /// found it. Cached because the check spawns a node process.
+    pub(super) bundled_ready: bool,
+    /// What the detection worker found, for the first-run wizard. Cached for the
+    /// same reason as `bundled_ready`.
+    pub(super) detection: crate::acp::quickstart::Detection,
 
     pub(super) plugin_ui: crate::tui::plugin_ui_poller::PluginUiState,
     pub(super) show_diagnostics: bool,
