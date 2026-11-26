@@ -493,6 +493,7 @@ mod tests {
                     ControlBody::SessionReady {
                         acp_session_id: "acp".into(),
                         result: serde_json::json!({}),
+                        adapter_frames: 0,
                     },
                 ),
             ],

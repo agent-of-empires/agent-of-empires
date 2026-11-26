@@ -5,6 +5,7 @@ use super::jsonrpc::{
     parse_agent_call_outcome, parse_notification, parse_request_value_id, parse_response,
     parse_response_id,
 };
+use crate::acp::aoe_meta;
 use crate::acp::control_protocol::{self, ControlBody, PromptCompletedMarker, SessionReplayed};
 use crate::process::worker_registry;
 use agent_client_protocol::JsonRpcMessage;
@@ -88,6 +89,8 @@ pub(super) struct QueuedControl {
     pub(super) scope: DeliveryScope,
     pub(super) kind: QueuedKind,
     pub(super) wire: Arc<[u8]>,
+    /// An unanchored `session/update`, which the daemon numbers on receipt.
+    pub(super) adapter_frame: bool,
 }
 
 #[derive(Default)]
@@ -99,6 +102,9 @@ pub(super) struct ControlChannel {
     pub(super) next_entry_id: u64,
     pub(super) in_flight: Option<u64>,
     pub(super) last_prompt_completion: Option<Arc<[u8]>>,
+    /// Every adapter frame the agent sent, including shed ones, so the count
+    /// matches the proxy's numbering.
+    pub(super) adapter_frames: u64,
 }
 
 impl ControlChannel {
@@ -123,7 +129,20 @@ impl ControlChannel {
         true
     }
 
-    pub(super) fn push(&mut self, scope: DeliveryScope, kind: QueuedKind, wire: Arc<[u8]>) {
+    /// Adapter frames the daemon will not receive again: the queue is replayed
+    /// to it, and it numbers those itself.
+    pub(super) fn unreplayed_adapter_frames(&self) -> u64 {
+        let queued = self.queue.iter().filter(|f| f.adapter_frame).count();
+        self.adapter_frames - queued as u64
+    }
+
+    pub(super) fn push(
+        &mut self,
+        scope: DeliveryScope,
+        kind: QueuedKind,
+        wire: Arc<[u8]>,
+        adapter_frame: bool,
+    ) {
         let id = self.next_entry_id;
         self.next_entry_id = self.next_entry_id.wrapping_add(1);
         self.queued_bytes += wire.len();
@@ -132,6 +151,7 @@ impl ControlChannel {
             scope,
             kind,
             wire,
+            adapter_frame,
         });
     }
 
@@ -471,6 +491,7 @@ impl RunnerShared {
             DeliveryScope::Attachment(attachment_id),
             QueuedKind::ServerCall,
             wire,
+            false,
         );
         drop(pending);
         drop(channel);
@@ -620,9 +641,12 @@ impl RunnerShared {
         &self,
         scope: DeliveryScope,
         kind: QueuedKind,
-        body: ControlBody,
+        mut body: ControlBody,
     ) -> bool {
         let announces_session = matches!(&body, ControlBody::SessionReady { .. });
+        let adapter_frame = matches!(&body, ControlBody::Notify { method, params }
+            if method == "session/update"
+                && params.get("update").is_some_and(|u| !aoe_meta::is_anchored(u)));
         let wire: Arc<[u8]> = match control_protocol::encode_frame(&body) {
             Ok(frame) => frame.into(),
             Err(error) => {
@@ -639,8 +663,22 @@ impl RunnerShared {
                         return false;
                     }
                 }
+                if adapter_frame {
+                    channel.adapter_frames += 1;
+                }
                 if channel.make_room(wire.len()) {
-                    channel.push(scope, kind, Arc::clone(&wire));
+                    // Read under the lock, after shedding, so it matches the
+                    // backlog this reply is queued ahead of.
+                    let wire = match &mut body {
+                        ControlBody::SessionReady { adapter_frames, .. } => {
+                            *adapter_frames = channel.unreplayed_adapter_frames();
+                            control_protocol::encode_frame(&body)
+                                .expect("frame encoded above")
+                                .into()
+                        }
+                        _ => Arc::clone(&wire),
+                    };
+                    channel.push(scope, kind, wire, adapter_frame);
                     if announces_session {
                         channel.session_announced = true;
                     }
@@ -1483,14 +1521,13 @@ mod tests {
     fn queue_budget_sheds_notifications_and_preserves_correlations() {
         let wire = |len| Arc::<[u8]>::from(vec![0; len]);
         let mut channel = ControlChannel::default();
-        channel.push(DeliveryScope::Persistent, QueuedKind::AgentReply, wire(16));
-        channel.push(DeliveryScope::Persistent, QueuedKind::Notify, wire(8));
-        channel.push(DeliveryScope::Persistent, QueuedKind::Notify, wire(8));
-        channel.push(
-            DeliveryScope::Persistent,
-            QueuedKind::PromptCompleted,
-            wire(16),
-        );
+        let push = |channel: &mut ControlChannel, kind, len| {
+            channel.push(DeliveryScope::Persistent, kind, wire(len), false)
+        };
+        push(&mut channel, QueuedKind::AgentReply, 16);
+        push(&mut channel, QueuedKind::Notify, 8);
+        push(&mut channel, QueuedKind::Notify, 8);
+        push(&mut channel, QueuedKind::PromptCompleted, 16);
 
         assert!(channel.make_room(control_protocol::MAX_CONTROL_QUEUE_BYTES - 32));
         assert_eq!(channel.queued_bytes, 32);
@@ -1503,6 +1540,67 @@ mod tests {
             !channel.make_room(control_protocol::MAX_CONTROL_QUEUE_BYTES - 31),
             "correlation frames must apply backpressure rather than be evicted"
         );
+    }
+
+    #[test]
+    fn shed_adapter_frames_stay_in_the_unreplayed_count() {
+        let wire = || Arc::<[u8]>::from(vec![0; 8]);
+        let mut channel = ControlChannel {
+            adapter_frames: 5,
+            ..ControlChannel::default()
+        };
+        for _ in 0..2 {
+            channel.push(DeliveryScope::Persistent, QueuedKind::Notify, wire(), true);
+        }
+        assert_eq!(channel.unreplayed_adapter_frames(), 3);
+        assert!(channel.make_room(control_protocol::MAX_CONTROL_QUEUE_BYTES - 8));
+        assert_eq!(channel.unreplayed_adapter_frames(), 4);
+    }
+
+    /// A reattaching daemon numbers the backlog it is replayed itself, so the
+    /// reply reports only what it will not receive again.
+    #[tokio::test]
+    async fn session_ready_reports_adapter_frames_outside_the_backlog() {
+        let (shared, stdin, _child) = shared_with_stdin().await;
+        let update = |id: &str, meta: serde_json::Value| {
+            serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
+                "sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","_meta":meta,"content":{"type":"text","text":id}}}})
+            .to_string()
+        };
+        let adapter = |id: &str| update(id, serde_json::json!({}));
+        let anchored = |id: &str| {
+            update(
+                id,
+                serde_json::json!({"aoe":{"v":1,"key":id,"after_adapter_sequence":1}}),
+            )
+        };
+        let first = shared.begin_attachment().await;
+        shared.control.lock().await.session_announced = true;
+        for line in [adapter("a1"), anchored("t1"), adapter("a2")] {
+            shared.deliver_line(line.as_bytes(), &stdin).await;
+        }
+        while let Some((id, _)) = shared.next_outbound(first).await {
+            shared.commit_outbound(first, id).await;
+        }
+        for line in [adapter("a3"), anchored("t2")] {
+            shared.deliver_line(line.as_bytes(), &stdin).await;
+        }
+
+        let second = shared.begin_attachment().await;
+        let ready = ControlBody::SessionReady {
+            acp_session_id: "s".into(),
+            result: serde_json::json!({}),
+            adapter_frames: 0,
+        };
+        shared.enqueue_handshake(second, ready, false).await;
+        let (_, wire) = shared.next_outbound(second).await.expect("reply first");
+        let ControlBody::SessionReady { adapter_frames, .. } =
+            serde_json::from_slice(&wire[4..]).unwrap()
+        else {
+            panic!("expected SessionReady");
+        };
+        // a1 and a2 went to the first daemon; a3 is replayed; t1 and t2 take no number.
+        assert_eq!(adapter_frames, 2);
     }
 
     /// The replay barrier follows the updates an agent sent before its session reply,
@@ -1520,6 +1618,7 @@ mod tests {
         let ready = ControlBody::SessionReady {
             acp_session_id: "s".into(),
             result: serde_json::json!({}),
+            adapter_frames: 0,
         };
         shared
             .enqueue_handshake(attachment, ready.clone(), true)

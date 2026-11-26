@@ -3478,6 +3478,7 @@ mod tests {
                     ControlBody::ResumeSession => ControlBody::SessionReady {
                         acp_session_id: native.into(),
                         result: serde_json::json!({}),
+                        adapter_frames: 0,
                     },
                     ControlBody::Prompt { .. } => ControlBody::PromptStarted { prompt_req_id: 77 },
                     _ => continue,
@@ -3779,6 +3780,7 @@ mod tests {
                             stream.write_all(&write(ControlBody::SessionReady {
                                 acp_session_id: "native-deadline".into(),
                                 result: serde_json::json!({}),
+                                adapter_frames: 0,
                             })).await.unwrap();
                             if connection == 1 {
                                 for n in 0..100 {
@@ -3974,6 +3976,7 @@ mod tests {
                 let ready = || ControlBody::SessionReady {
                     acp_session_id: native.into(),
                     result: serde_json::json!({}),
+                    adapter_frames: 0,
                 };
                 loop {
                     let (mut stream, _) = listener.accept().await.unwrap();

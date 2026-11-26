@@ -5026,6 +5026,7 @@ time.sleep(60)
                     ControlBody::ResumeSession => ControlBody::SessionReady {
                         acp_session_id: "acp-sid".into(),
                         result: serde_json::json!({}),
+                        adapter_frames: 0,
                     },
                     frame => panic!("unexpected attach handshake frame: {frame:?}"),
                 };

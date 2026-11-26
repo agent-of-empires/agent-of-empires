@@ -206,6 +206,7 @@ impl DaemonControlClient {
             Some(ControlBody::SessionReady {
                 acp_session_id,
                 result,
+                ..
             }) => {
                 self.sessions_established
                     .fetch_add(1, AtomicOrdering::Relaxed);
@@ -468,8 +469,14 @@ pub(super) async fn connect_runner_control_v3(
                         | ControlBody::HandshakeFailed { .. }),
                         _,
                     ))) => {
-                        if let ControlBody::SessionReady { acp_session_id, .. } = &frame {
+                        if let ControlBody::SessionReady {
+                            acp_session_id,
+                            adapter_frames,
+                            ..
+                        } = &frame
+                        {
                             reader_ingress.resolve(None, acp_session_id.clone().into());
+                            reader_ingress.skip_adapter_frames(*adapter_frames);
                         }
                         if hs_tx.send(frame).await.is_err() {
                             return;
@@ -1453,6 +1460,7 @@ mod tests {
                         ControlBody::ResumeSession => ControlBody::SessionReady {
                             acp_session_id: "sid-stored".into(),
                             result: serde_json::json!({}),
+                            adapter_frames: 0,
                         },
                         ControlBody::Prompt { request } => {
                             assert_eq!(request["sessionId"], "sid-stored");
@@ -1624,6 +1632,7 @@ mod tests {
                             &ControlBody::SessionReady {
                                 acp_session_id: "actual".into(),
                                 result: serde_json::json!({}),
+                                adapter_frames: 0,
                             },
                         )
                         .await
@@ -1737,6 +1746,7 @@ mod tests {
                             &ControlBody::SessionReady {
                                 acp_session_id: "actual".into(),
                                 result: serde_json::json!({}),
+                                adapter_frames: 0,
                             },
                         )
                         .await
@@ -1855,6 +1865,7 @@ mod tests {
                             &ControlBody::SessionReady {
                                 acp_session_id: "s".into(),
                                 result: serde_json::json!({}),
+                                adapter_frames: 0,
                             },
                         )
                         .await
@@ -2011,6 +2022,7 @@ mod tests {
                             ControlBody::SessionReady {
                                 acp_session_id: "s".into(),
                                 result: serde_json::json!({}),
+                                adapter_frames: 0,
                             },
                             ControlBody::Notify {
                                 method: "session/update".into(),

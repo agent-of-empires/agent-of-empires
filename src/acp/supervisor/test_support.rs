@@ -825,6 +825,7 @@ impl HeldAttachRunner {
                                 &ControlBody::SessionReady {
                                     acp_session_id: native_id.clone(),
                                     result: serde_json::json!({}),
+                                    adapter_frames: 0,
                                 },
                             )
                             .await

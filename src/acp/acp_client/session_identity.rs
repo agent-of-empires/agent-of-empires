@@ -426,6 +426,12 @@ impl SessionIngress {
         Ok(Some(notification))
     }
 
+    /// Frames the runner numbered before this connection received any: they
+    /// count like frames dropped here, ahead of every frame that follows.
+    pub(super) fn skip_adapter_frames(&self, n: u64) {
+        self.state.lock().unwrap().discarded_adapter_frames += n;
+    }
+
     /// The adapter frames dropped since the last call.
     pub(super) fn take_discarded_adapter_frames(&self) -> u64 {
         std::mem::take(&mut self.state.lock().unwrap().discarded_adapter_frames)
@@ -675,6 +681,14 @@ mod tests {
         assert!(ingress.route(notif("old"), None).unwrap().is_none());
         assert_eq!(ingress.take_discarded_adapter_frames(), 1);
         assert_eq!(ingress.take_discarded_adapter_frames(), 0, "drained");
+    }
+
+    #[test]
+    fn runner_reported_adapter_frames_add_to_dropped_ones() {
+        let ingress = SessionIngress::new(Some(SessionId::from("cur".to_string())));
+        ingress.skip_adapter_frames(2);
+        assert!(ingress.route(notif("other"), None).unwrap().is_none());
+        assert_eq!(ingress.take_discarded_adapter_frames(), 3);
     }
 
     #[test]
