@@ -50,6 +50,19 @@ describe("PromptBlockedNote", () => {
     expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
   });
 
+  it("Cancel and a failed save hand focus back to Turn on pre-trust", async () => {
+    updateSettings.mockResolvedValue("rejected");
+    render(<PromptBlockedNote label="Prompt not sent" code="agent_folder_not_trusted" message={LONG} />);
+    const reopen = () => screen.getByRole("button", { name: "Turn on pre-trust" });
+    fireEvent.click(reopen());
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(document.activeElement).toBe(reopen());
+    fireEvent.click(reopen());
+    fireEvent.click(screen.getByRole("button", { name: "Turn on" }));
+    await screen.findByText("Couldn't turn on pre-trust.");
+    expect(document.activeElement).toBe(reopen());
+  });
+
   it("an untrusted folder names the direct fix first, with Copy prompt, then pre-trust", () => {
     const onCopyPrompt = vi.fn();
     const { container, rerender } = render(

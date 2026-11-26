@@ -42,6 +42,8 @@ export function PromptBlockedNote({
 }) {
   const [step, setStep] = useState<"idle" | "confirm" | "saving" | "on" | "failed">("idle");
   const [retrying, setRetrying] = useState(false);
+  // Back from the confirmation, focus returns to the button that opened it.
+  const [returned, setReturned] = useState(false);
   const tryAgain = async () => {
     if (retrying || !onTryAgain) return;
     setRetrying(true);
@@ -55,6 +57,7 @@ export function PromptBlockedNote({
     setStep("saving");
     const outcome = await updateSettings({ session: { pre_trust_agent_folders: true } });
     setStep(outcome === "committed" ? "on" : "failed");
+    setReturned(true);
   };
   const actions = code === FOLDER && !disabled;
   return (
@@ -81,7 +84,7 @@ export function PromptBlockedNote({
         <p className="text-text-secondary">
           {step === "failed" && <span>Couldn&apos;t turn on pre-trust. </span>}
           Or trust every folder AoE starts Claude Code in:{" "}
-          <button type="button" className={BUTTON_INLINE} onClick={() => setStep("confirm")}>
+          <button type="button" className={BUTTON_INLINE} onClick={() => setStep("confirm")} autoFocus={returned}>
             Turn on pre-trust
           </button>
         </p>
@@ -100,7 +103,15 @@ export function PromptBlockedNote({
           >
             Turn on
           </button>{" "}
-          <button type="button" className={BUTTON_INLINE} disabled={step === "saving"} onClick={() => setStep("idle")}>
+          <button
+            type="button"
+            className={BUTTON_INLINE}
+            disabled={step === "saving"}
+            onClick={() => {
+              setStep("idle");
+              setReturned(true);
+            }}
+          >
             Cancel
           </button>
         </p>
