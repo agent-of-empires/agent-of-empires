@@ -186,12 +186,33 @@ describe("first-run hint", () => {
   });
 
   it("shows a banner when discovery fails and recovers on retry", async () => {
-    api.discoverPlugins.mockResolvedValueOnce({ kind: "error", message: "rate limited" });
+    api.discoverPlugins.mockResolvedValueOnce({
+      kind: "error",
+      message:
+        "GitHub API rate limit exceeded.\nWait for the limit to reset (see the X-RateLimit-Reset header) and retry.",
+    });
     renderHint();
     const banner = await screen.findByTestId("suggestions-hint-error");
-    expect(banner.textContent).toContain("rate limited");
+    expect(banner.textContent).toContain("GitHub is rate limiting requests. Try again in a few minutes.");
+    expect(banner.textContent).not.toContain("X-RateLimit");
     fireEvent.click(screen.getByText("Try again"));
     expect(await screen.findByTestId("suggestions-hint")).toBeTruthy();
+  });
+
+  it("says what a failed lookup means, and keeps the raw reason of an unknown one in the tooltip", async () => {
+    api.discoverPlugins.mockResolvedValueOnce({ kind: "error", message: "Network error." });
+    const first = renderHint();
+    expect((await screen.findByTestId("suggestions-hint-error")).textContent).toContain(
+      "Couldn't reach GitHub. Check your connection and try again.",
+    );
+    first.unmount();
+
+    api.discoverPlugins.mockResolvedValueOnce({ kind: "error", message: "GitHub API returned HTTP 500: boom" });
+    renderHint();
+    const banner = await screen.findByTestId("suggestions-hint-error");
+    expect(banner.textContent).toContain("Couldn't look up suggestion sources.");
+    expect(banner.textContent).not.toContain("boom");
+    expect(banner.querySelector("[title]")?.getAttribute("title")).toBe("GitHub API returned HTTP 500: boom");
   });
 });
 

@@ -1,6 +1,11 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { fetchSuggestions } from "../lib/api";
-import { loadFeaturedSuggestionSources, sourceLabel, type FeaturedSources } from "../lib/featuredSuggestionSources";
+import {
+  discoveryFailureText,
+  loadFeaturedSuggestionSources,
+  sourceLabel,
+  type FeaturedSources,
+} from "../lib/featuredSuggestionSources";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import { isWebUiStateHydrated, onWebUiStateHydrated } from "../lib/webUiHydration";
 import { SuggestionsSetupSheet } from "./SuggestionsSetupSheet";
@@ -86,13 +91,14 @@ export function SuggestionsSetupHint({
   if (hidden) return fallback;
   if (featured.status === "loading") return null;
   if (featured.status === "error") {
+    const failure = discoveryFailureText(featured.message);
     return (
       <p
         className="mt-3.5 flex items-center justify-center gap-2 text-xs text-text-dim"
         role="status"
         data-testid="suggestions-hint-error"
       >
-        Couldn&apos;t look up suggestion sources: {featured.message.replace(/[.!]$/, "")}.
+        <span title={failure.raw}>{failure.text}</span>
         <button type="button" className={BUTTON_INLINE} onClick={() => void retry()}>
           Try again
         </button>
