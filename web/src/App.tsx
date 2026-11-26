@@ -2025,7 +2025,7 @@ function AppContent({
     for (const st of styled) st?.setProperty("transition", "none");
     card.style.translate = `${offset}px 0`;
     card.style.borderRadius = "28px";
-    card.style.boxShadow = "var(--shadow-xl)";
+    card.style.boxShadow = "var(--drawer-card-shadow)";
     drawer?.style.setProperty("visibility", "visible");
     if (scrim) {
       scrim.style.visibility = "visible";
@@ -3256,8 +3256,9 @@ function AppContent({
           available={!error}
         >
           <div
-            // A phone's home is the session list, whose darker colour then runs up under the clock too.
-            className={`h-(--app-height) flex flex-col ${phoneHome ? "bg-surface-950" : "bg-surface-900"} md:bg-surface-950 md:chrome-canvas text-text-primary overflow-hidden safe-area-inset`}
+            // The session drawer's colour on a phone: its home, and behind a Session card the drawer pushes aside, so
+            // nothing lighter shows past the card's rounded edge.
+            className={`h-(--app-height) flex flex-col ${phoneHome || phoneDrawer ? "bg-surface-950" : "bg-surface-900"} md:bg-surface-950 md:chrome-canvas text-text-primary overflow-hidden safe-area-inset`}
             // What a phone's floating header covers, for the views that keep their banners and first lines clear of it.
             style={
               phoneDrawer ? ({ "--phone-header-h": "76px", "--phone-overlay-top": "76px" } as CSSProperties) : undefined
@@ -3372,7 +3373,7 @@ function AppContent({
                     : ""
                 } ${
                   drawerPushed
-                    ? "max-md:translate-x-[var(--aoe-drawer-w)] max-md:rounded-[28px] max-md:overflow-hidden max-md:shadow-xl"
+                    ? "max-md:translate-x-[var(--aoe-drawer-w)] max-md:rounded-[28px] max-md:overflow-hidden max-md:drawer-card-shadow"
                     : ""
                 }`}
               >

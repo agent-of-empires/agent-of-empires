@@ -812,6 +812,16 @@ select:focus-visible,
 
 /* Floating controls on phones, after Claude's iOS app: a raised surface with a hairline edge, a faint top
    highlight and a soft two-layer shadow, so they read as sitting above the content. */
+/* The Session card a phone's drawer pushes aside: a shadow cast left onto the drawer, as Muse's page casts it,
+   and a hairline so its edge reads against a near-black drawer. Shared with the finger-tracked drag. */
+:root {
+  --drawer-card-shadow:
+    -16px 0 40px -8px rgb(0 0 0 / 0.8), -2px 0 6px rgb(0 0 0 / 0.45), 0 0 0 1px rgb(255 255 255 / 0.07);
+}
+@utility drawer-card-shadow {
+  box-shadow: var(--drawer-card-shadow);
+}
+
 @utility float-control {
   /* A solid surface with its own edge and shadow, so it reads over whatever scrolls beneath it. */
   background-color: var(--color-surface-800);
