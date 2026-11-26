@@ -1,7 +1,7 @@
 /* eslint-disable react-refresh/only-export-components */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { PHONE_BANNER_CARD } from "../lib/surfaces";
-import { SETTINGS_CAPTION, SETTINGS_CARD } from "./settings/FormFields";
+import { CARD, CAPTION, PHONE_BANNER_CARD } from "../lib/surfaces";
+
 import { useServerDown } from "../lib/connectionState";
 import { ConnectedDevices } from "./ConnectedDevices";
 import { PasskeySettings } from "./PasskeySettings";
@@ -598,7 +598,7 @@ export function SettingsView({
           <div className="space-y-4">
             {/* Non-schema row: choosing the default profile is a profile-
                 management action, not a config field. */}
-            <div className={`${SETTINGS_CARD} py-3`}>
+            <div className={`${CARD} py-3`}>
               <SelectField
                 label="Default profile"
                 description="Profile used for new sessions"
@@ -721,7 +721,7 @@ export function SettingsView({
               onSaveField={sendSave}
             />
             <div className="space-y-4">
-              <h4 className={SETTINGS_CAPTION}>Daemon</h4>
+              <h4 className={CAPTION}>Daemon</h4>
               <SchemaSection
                 section="serve"
                 schema={schema}
@@ -766,7 +766,7 @@ export function SettingsView({
             <NotificationSettings />
             <div className="space-y-4">
               <div>
-                <h4 className={SETTINGS_CAPTION}>Server defaults</h4>
+                <h4 className={CAPTION}>Server defaults</h4>
                 <p className="px-1 -mt-1 text-[13px] text-text-dim">
                   Which session events send a push notification, for every browser.
                 </p>

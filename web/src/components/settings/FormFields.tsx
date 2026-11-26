@@ -1,19 +1,12 @@
 import { useId, useState, type ReactNode } from "react";
+import { CARD, INPUT } from "../../lib/surfaces";
 
 import { rowInputProps, type RowLabel } from "./rowLabel";
 import { isImeComposing } from "../../lib/ime";
 
-// 16px on a phone, below which iOS zooms the page into a focused field.
-const CONTROL =
-  "w-full bg-surface-900 border border-surface-700/70 rounded-lg px-3 py-2 text-[16px] md:text-sm text-text-primary";
-
-/** A group's caption above its card, as the phone's section list and session list caption theirs. */
-export const SETTINGS_CAPTION = "block px-1 mb-2 text-[12px] font-semibold uppercase tracking-[0.06em] text-text-dim";
-
-/** A settings group's raised card: its rows, or a fold's header and rows, inside. */
-export const SETTINGS_CARD =
-  "rounded-xl max-md:rounded-2xl border border-surface-700/50 bg-surface-850 max-md:bg-surface-800 shadow-md px-4";
-const FOCUS = "focus:border-brand-600 focus:outline-none";
+// INPUT carries focus and placeholder styling itself.
+const CONTROL = INPUT;
+const FOCUS = "";
 
 /** Label above an optional description above the control. A `label` of `undefined` drops the element. */
 function FieldShell({
@@ -78,7 +71,7 @@ export function CollapsibleSection({
 }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
-    <div className={`${SETTINGS_CARD} !px-0 overflow-hidden`}>
+    <div className={`${CARD} !px-0 overflow-hidden`}>
       <button
         type="button"
         aria-expanded={open}

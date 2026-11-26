@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { SETTINGS_CAPTION, SETTINGS_CARD } from "./settings/FormFields";
+import { CARD, CAPTION } from "../lib/surfaces";
+
 import { fetchAbout, type ServerAbout } from "../lib/api";
 
 function Row({ label, value }: { label: string; value: string | React.ReactNode }) {
@@ -36,11 +37,11 @@ export function SecuritySettings() {
 
   return (
     <div>
-      <h3 className={SETTINGS_CAPTION}>Security</h3>
+      <h3 className={CAPTION}>Security</h3>
 
       {loadError && <p className="text-[13px] text-status-error mb-3">Could not load server status.</p>}
 
-      <div className={`${SETTINGS_CARD} py-2`}>
+      <div className={`${CARD} py-2`}>
         <Row
           label="Auth mode"
           value={

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { SETTINGS_CAPTION, SETTINGS_CARD } from "./FormFields";
+import { CARD, CAPTION } from "../../lib/surfaces";
 
 import { useWebSettings } from "../../hooks/useWebSettings";
 import {
@@ -29,8 +29,8 @@ export function StructuredViewDisplaySettings() {
 
   return (
     <div>
-      <h3 className={SETTINGS_CAPTION}>Conversation display</h3>
-      <div className={`${SETTINGS_CARD} py-4 space-y-4`}>
+      <h3 className={CAPTION}>Conversation display</h3>
+      <div className={`${CARD} py-4 space-y-4`}>
         <FontSizeControl
           label="Mobile font size"
           testIdPrefix="structured-mobile-font-size"

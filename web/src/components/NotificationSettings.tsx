@@ -1,5 +1,6 @@
 import { usePushSubscription } from "../hooks/usePushSubscription";
-import { SETTINGS_CAPTION, SETTINGS_CARD } from "./settings/FormFields";
+import { CARD, CAPTION } from "../lib/surfaces";
+
 import { installHint } from "../lib/platform";
 import { deniedGuidance, type PushHealth } from "../lib/pushHealth";
 import { INSTALL_STEPS } from "../lib/tourSteps";
@@ -19,8 +20,8 @@ export function NotificationSettings() {
 
   return (
     <section>
-      <h3 className={SETTINGS_CAPTION}>This device</h3>
-      <div className={`${SETTINGS_CARD} py-4`}>
+      <h3 className={CAPTION}>This device</h3>
+      <div className={`${CARD} py-4`}>
         <StatusRow state={state} />
         <HealthRow health={health} />
 

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { SETTINGS_CAPTION } from "./settings/FormFields";
+import { CAPTION } from "../lib/surfaces";
+
 import { fetchDevices, revokeDevice, signOutAllDevices, type DeviceSession } from "../lib/api";
 
 /** Parse a raw user-agent string into a short "Browser + OS" label. */
@@ -46,7 +47,7 @@ function isInactive(iso: string): boolean {
   return Date.now() - new Date(iso).getTime() > 3_600_000;
 }
 
-const Heading = () => <h3 className={SETTINGS_CAPTION}>Connected devices</h3>;
+const Heading = () => <h3 className={CAPTION}>Connected devices</h3>;
 
 export function ConnectedDevices() {
   const [devices, setDevices] = useState<DeviceSession[] | null>(null);

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
-import { SETTINGS_CAPTION } from "./settings/FormFields";
+import { CAPTION } from "../lib/surfaces";
+
 import { fetchPasskeys, passkeysSupported, registerPasskey, removePasskey, type PasskeyInfo } from "../lib/api";
 
 export function PasskeySettings() {
@@ -44,7 +45,7 @@ export function PasskeySettings() {
 
   return (
     <div className="mt-8">
-      <h3 className={SETTINGS_CAPTION}>Passkeys</h3>
+      <h3 className={CAPTION}>Passkeys</h3>
       {loadFailed && (
         <div className="flex items-center gap-3 mb-3">
           <p className="font-body text-[13px] text-status-error">Could not load passkeys</p>

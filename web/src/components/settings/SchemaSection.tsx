@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { CARD } from "../../lib/surfaces";
 import type { SettingsFieldDescriptor, SettingsValidation } from "../../lib/types";
 import {
   CollapsibleSection,
@@ -8,7 +9,6 @@ import {
   SliderField,
   TextField,
   ToggleField,
-  SETTINGS_CARD,
 } from "./FormFields";
 import type { RowLabel } from "./rowLabel";
 import { CUSTOM_SETTINGS_WIDGETS } from "./customWidgetRegistry";
@@ -270,7 +270,7 @@ export function SchemaSection({
     <div className="space-y-4">
       {primary.length > 0 && (
         // One raised card of rows split by hairlines, as a phone groups its settings; the folds below match it.
-        <div className={SETTINGS_CARD}>
+        <div className={CARD}>
           <div className="divide-y divide-surface-700/40">
             {primary.map((d) => wrap(d, (row) => renderField(d, values, makeSave(d), row)))}
           </div>
