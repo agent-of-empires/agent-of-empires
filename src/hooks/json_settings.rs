@@ -111,65 +111,73 @@ fn install_hooks_with(
         return Ok(());
     }
     let policy = SymlinkPolicy::for_target(target);
-    with_config_lock_policy(settings_path, "json.lock", policy, || {
-        let content = policy.read(settings_path)?;
-        let mut settings = if strict {
-            match content {
-                None => serde_json::json!({}),
-                Some(content) => serde_json::from_str(&content)
-                    .with_context(|| format!("{} is not valid JSON", settings_path.display()))?,
-            }
-        } else {
-            parse_json_or_empty(content, settings_path)
-        };
-        let before = settings.clone();
-
-        let root = settings
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("Settings file root is not a JSON object"))?;
-        if strict && root.get("hooks").is_some_and(|hooks| !hooks.is_object()) {
-            anyhow::bail!(
-                "hooks key in {} is not a JSON object",
-                settings_path.display()
-            );
-        }
-        if !root.get("hooks").is_some_and(Value::is_object) {
-            root.insert("hooks".to_string(), serde_json::json!({}));
-        }
-        let settings_hooks = root
-            .get_mut("hooks")
-            .and_then(Value::as_object_mut)
-            .ok_or_else(|| anyhow::anyhow!("hooks key is not a JSON object"))?;
-
-        for groups in settings_hooks.values_mut().filter_map(Value::as_array_mut) {
-            remove_aoe_entries(groups);
-        }
-        remove_empty_events(settings_hooks);
-        for (event_name, aoe_groups) in build_aoe_hooks(events.as_ref(), target) {
-            match settings_hooks
-                .get_mut(&event_name)
-                .and_then(Value::as_array_mut)
-            {
-                Some(existing) => {
-                    existing.extend(aoe_groups.as_array().into_iter().flatten().cloned())
+    // Locked on the file the write lands in, as the trust writers do, so two
+    // writers reaching one JSON file through different names still exclude each other.
+    with_config_lock_policy(
+        &policy.lock_path(settings_path)?,
+        "json.lock",
+        policy,
+        || {
+            let content = policy.read(settings_path)?;
+            let mut settings = if strict {
+                match content {
+                    None => serde_json::json!({}),
+                    Some(content) => serde_json::from_str(&content).with_context(|| {
+                        format!("{} is not valid JSON", settings_path.display())
+                    })?,
                 }
-                None => {
-                    settings_hooks.insert(event_name, aoe_groups);
+            } else {
+                parse_json_or_empty(content, settings_path)
+            };
+            let before = settings.clone();
+
+            let root = settings
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("Settings file root is not a JSON object"))?;
+            if strict && root.get("hooks").is_some_and(|hooks| !hooks.is_object()) {
+                anyhow::bail!(
+                    "hooks key in {} is not a JSON object",
+                    settings_path.display()
+                );
+            }
+            if !root.get("hooks").is_some_and(Value::is_object) {
+                root.insert("hooks".to_string(), serde_json::json!({}));
+            }
+            let settings_hooks = root
+                .get_mut("hooks")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| anyhow::anyhow!("hooks key is not a JSON object"))?;
+
+            for groups in settings_hooks.values_mut().filter_map(Value::as_array_mut) {
+                remove_aoe_entries(groups);
+            }
+            remove_empty_events(settings_hooks);
+            for (event_name, aoe_groups) in build_aoe_hooks(events.as_ref(), target) {
+                match settings_hooks
+                    .get_mut(&event_name)
+                    .and_then(Value::as_array_mut)
+                {
+                    Some(existing) => {
+                        existing.extend(aoe_groups.as_array().into_iter().flatten().cloned())
+                    }
+                    None => {
+                        settings_hooks.insert(event_name, aoe_groups);
+                    }
                 }
             }
-        }
 
-        if settings == before {
-            log_unchanged(settings_path);
-            return Ok(());
-        }
-        policy.write(
-            settings_path,
-            serde_json::to_string_pretty(&settings)?.as_bytes(),
-        )?;
-        log_installed(settings_path);
-        Ok(())
-    })
+            if settings == before {
+                log_unchanged(settings_path);
+                return Ok(());
+            }
+            policy.write(
+                settings_path,
+                serde_json::to_string_pretty(&settings)?.as_bytes(),
+            )?;
+            log_installed(settings_path);
+            Ok(())
+        },
+    )
 }
 
 /// Remove AoE hooks from `settings.json`, dropping emptied events and an
@@ -567,5 +575,22 @@ mod tests {
         std::fs::write(&torn, "{not json").unwrap();
         install_hooks(&torn, &events, HookInstallTarget::Host).unwrap();
         assert!(read_json(&torn)["hooks"].is_object());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_locks_the_file_a_symlink_resolves_to() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("dotfiles/settings.json");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "{}").unwrap();
+        let link = tmp.path().join("settings.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        install_hooks(&link, agent_events("claude", &[]), HookInstallTarget::Host).unwrap();
+
+        assert!(read_json(&target)["hooks"].is_object());
+        assert!(target.with_extension("json.lock").exists());
+        assert!(!link.with_extension("json.lock").exists());
     }
 }
