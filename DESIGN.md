@@ -100,13 +100,14 @@ content. It is denser and quieter than the marketing site.
   brand mark.
 - Mobile prioritizes monitoring and conversation controls, after Muse and
   Claude's iOS app: the session list is home, and with a Session open it is a
-  darker drawer that pushes the Session aside as a rounded card. Controls
-  float (`float-control`: frosted glass, a top highlight, soft shadow) over the
+  darker drawer under the Session, which slides aside as one rounded, dimmed
+  card, header and all, following the finger. Controls float
+  (`float-control`: a solid surface, hairline edge and soft shadow) over the
   Session, which scrolls beneath them; menus are frosted (`glass-menu`); a Session's views switch from
   the header's ⋯ so the agent keeps the screen; sheets replace persistent side
   panels. Bars at the top and bottom edges are fixed or sticky and opaque (over
-  a Session, a thin strip at the top), so iOS 26 tints its bars from them
-  instead of blurring. Elevation comes from the theme's `shadow-*` tokens:
+  a Session, a strip exactly under the clock), so iOS 26 tints its bars from
+  them instead of blurring. Elevation comes from the theme's `shadow-*` tokens:
   layered shadows with a hairline edge, on cards, menus and dialogs alike.
 - Sessions stay on the left. The right dock is the Session's review panel
   (Diff, Files, Background, plugins), with the terminal tabs stacked below

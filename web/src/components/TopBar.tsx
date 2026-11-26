@@ -1,5 +1,7 @@
 import { useMemo } from "react";
 import { Folder, LayoutGrid, Menu, type LucideIcon } from "lucide-react";
+import { getStatusDotClass } from "../lib/session";
+import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import type { RightPanelView } from "../lib/rightPanelView";
 import type { SessionResponse, Workspace } from "../lib/types";
 import { PaletteTriggerPill } from "./PaletteTriggerPill";
@@ -115,6 +117,7 @@ export function TopBar({
     );
   }, [phoneViews, sessionItems, appMenu]);
   const phoneSession = !!activeSession && !onExitFocusMode;
+  const idleDecayWindowMs = useIdleDecayWindowMs();
 
   // The left zone only borrows the sidebar's width while that column is visible, so the compact rail only crowds
   // the wordmark in that combination.
@@ -284,10 +287,23 @@ export function TopBar({
               <span className="max-w-full truncate text-[13px] font-semibold text-text-primary">
                 {activeSession.title}
               </span>
-              <span className="max-w-full truncate text-[11px] text-text-dim">
-                {phoneViews?.label
-                  ? `${phoneViews.label} · ${projectName(activeSession.project_path)}`
-                  : projectName(activeSession.project_path)}
+              {/* What the Session is doing, live, as clawbolt's header says what its assistant is doing; a view
+                  other than the agent names itself instead. */}
+              <span
+                data-testid="session-title-status"
+                className="max-w-full flex items-center gap-1.5 text-[11px] text-text-dim"
+              >
+                {!phoneViews?.label && (
+                  <span
+                    aria-hidden
+                    className={`h-1.5 w-1.5 shrink-0 rounded-full ${getStatusDotClass(activeSession, idleDecayWindowMs)} ${
+                      activeSession.status === "Running" ? "motion-safe:animate-pulse" : ""
+                    }`}
+                  />
+                )}
+                <span className="truncate">
+                  {`${phoneViews?.label ?? activeSession.status} · ${projectName(activeSession.project_path)}`}
+                </span>
               </span>
             </div>
           )}

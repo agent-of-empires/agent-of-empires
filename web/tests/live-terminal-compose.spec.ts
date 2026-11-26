@@ -137,11 +137,7 @@ test.describe("Live terminal mobile controls", () => {
     await expect.poll(() => handle.liveInput.slice(typedBefore).map((b) => b.toString())).toContain("\x1b[D");
 
     // A swipe this long opens the sidebar from the terminal, but not when it runs over the joystick.
-    const sidebarOpen = () =>
-      page.evaluate(() => {
-        const r = document.querySelector('[data-testid="sidebar-session-row"]')?.getBoundingClientRect();
-        return !!r && r.x >= 0 && r.width > 0;
-      });
+    const sidebarOpen = () => page.getByTestId("sidebar-session-row").first().isVisible();
     const swipeRight = (selector: string) =>
       page.evaluate((selector) => {
         const target = document.querySelector<HTMLElement>(selector)!;

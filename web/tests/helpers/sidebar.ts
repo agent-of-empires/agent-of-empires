@@ -41,16 +41,11 @@ export async function dragSidebarHandle(page: Page, ...xs: number[]) {
 export async function openMobileSidebar(page: Page) {
   const menu = page.getByTestId("topbar-menu");
   const row = page.getByTestId("sidebar-session-row").first();
-  await expect(menu.or(row).first()).toBeVisible({ timeout: 10_000 });
+  await expect.poll(async () => (await menu.isVisible()) || (await row.isVisible()), { timeout: 10_000 }).toBe(true);
   if (await menu.isVisible()) await menu.click();
-  await page.waitForFunction(
-    () => {
-      const r = document.querySelector('[data-testid="sidebar-session-row"]')?.getBoundingClientRect();
-      return !!r && r.x >= 0 && r.width > 0;
-    },
-    null,
-    { timeout: 10_000 },
-  );
+  await expect(row).toBeVisible({ timeout: 10_000 });
+  // The drawer slides out from under the Session card; wait for the card to clear the row.
+  await expect.poll(async () => (await row.boundingBox())?.x ?? -1).toBeGreaterThanOrEqual(0);
 }
 
 /** Session row titles in DOM order, read from the label span so row chips are ignored. */

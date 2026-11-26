@@ -809,10 +809,8 @@ select:focus-visible,
 /* Floating controls on phones, after Claude's iOS app: a raised surface with a hairline edge, a faint top
    highlight and a soft two-layer shadow, so they read as sitting above the content. */
 @utility float-control {
-  /* Frosted glass, as Muse's controls are: what scrolls beneath shows through, blurred. */
-  background-color: color-mix(in srgb, var(--color-surface-800) 62%, transparent);
-  -webkit-backdrop-filter: blur(18px) saturate(1.6);
-  backdrop-filter: blur(18px) saturate(1.6);
+  /* A solid surface with its own edge and shadow, so it reads over whatever scrolls beneath it. */
+  background-color: var(--color-surface-800);
   border: 1px solid color-mix(in srgb, var(--color-text-primary) 9%, transparent);
   box-shadow:
     inset 0 1px 0 color-mix(in srgb, var(--color-text-primary) 10%, transparent),

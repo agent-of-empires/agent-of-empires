@@ -80,17 +80,57 @@ test.describe("Mobile session view tabs (#1452)", () => {
     const drawer = page.getByTestId("sidebar-new-session-pill");
     await swipe(page, viewport.width / 2 + 80, viewport.width / 2 - 80, y);
     await expect(picker(page)).toBeHidden();
-    await expect(drawer).not.toBeInViewport();
+    await expect(drawer).toBeHidden();
     await swipe(page, viewport.width / 2 - 80, viewport.width / 2 + 80, y);
     await expect(drawer).toBeInViewport();
     await expect(page.getByTestId("sidebar-drawer-scrim")).toBeVisible();
     await swipe(page, viewport.width / 2 + 80, viewport.width / 2 - 80, y);
-    await expect(drawer).not.toBeInViewport();
+    await expect(drawer).toBeHidden();
     // A tap on the pushed Session's edge closes it too.
     await page.getByTestId("topbar-menu").click();
     await expect(drawer).toBeInViewport();
     await page.getByTestId("sidebar-drawer-scrim").click();
-    await expect(drawer).not.toBeInViewport();
+    await expect(drawer).toBeHidden();
+  });
+
+  test("the Session card follows a drawer drag, springs back from a short one, and a longer one opens", async ({
+    page,
+  }) => {
+    await openLiveTerminal(page, { mobile: true, settings: null });
+    const y = 400;
+    const touch = (type: "touchstart" | "touchmove" | "touchend", x: number) =>
+      page.evaluate(
+        ({ type, x, y }) => {
+          const t = new Touch({ identifier: 0, target: document.body, clientX: x, clientY: y });
+          document.body.dispatchEvent(
+            new TouchEvent(type, {
+              bubbles: true,
+              touches: type === "touchend" ? [] : [t],
+              changedTouches: [t],
+            }),
+          );
+        },
+        { type, x, y },
+      );
+    // Each move is its own round trip, and the last repeats, so the release is a hold, not a flick.
+    const drag = async (to: number) => {
+      await touch("touchstart", 100);
+      for (const x of [110, 120, (120 + to) / 2, to, to]) await touch("touchmove", x);
+    };
+    const card = page.getByTestId("topbar-menu").locator("xpath=ancestor::div[contains(@class,'max-md:z-10')][1]");
+    const drawer = page.getByTestId("sidebar-new-session-pill");
+
+    await drag(160);
+    // Mid-drag the card sits where the finger is, with the drawer uncovered beneath it.
+    await expect.poll(() => card.evaluate((el) => (el as HTMLElement).style.translate)).toBe("60px");
+    await expect(drawer).toBeVisible();
+    await touch("touchend", 160);
+    await expect(drawer).toBeHidden();
+
+    await drag(260);
+    await touch("touchend", 260);
+    await expect(page.getByTestId("sidebar-drawer-scrim")).toBeVisible();
+    await expect(drawer).toBeVisible();
   });
 
   test("the drawer opens from the left with a swipe right even with the sidebar set to the right", async ({ page }) => {
@@ -124,7 +164,7 @@ test.describe("Mobile session view tabs (#1452)", () => {
     ]) {
       await swipe(page, from, to, height / 2);
       await expect(picker(page)).toBeHidden();
-      await expect(page.getByTestId("sidebar-new-session-pill")).not.toBeInViewport();
+      await expect(page.getByTestId("sidebar-new-session-pill")).toBeHidden();
       expect(await page.evaluate(() => document.getSelection()?.toString())).toBe(selected);
     }
     await page.evaluate(() => document.getSelection()?.removeAllRanges());

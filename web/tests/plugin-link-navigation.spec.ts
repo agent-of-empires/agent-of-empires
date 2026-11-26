@@ -94,14 +94,7 @@ test.describe("Plugin UI link navigation (#4089)", () => {
     await page.getByRole("link", { name: "acme: session link", exact: true }).click();
 
     await expect(page).toHaveURL(/\/session\/sess-b$/);
-    await expect
-      .poll(() =>
-        page.evaluate(() => {
-          const r = document.querySelector('[data-testid="sidebar-session-row"]')?.getBoundingClientRect();
-          return r ? r.right <= 0 : true;
-        }),
-      )
-      .toBe(true);
+    await expect(page.getByTestId("sidebar-session-row").first()).toBeHidden();
   });
 
   test("a modified click on an internal link is not intercepted", async ({ page }) => {

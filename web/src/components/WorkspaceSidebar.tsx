@@ -317,19 +317,20 @@ export function WorkspaceSidebar(props: Props) {
     if (!filterOpen) requestAnimationFrame(() => filterRef.current?.focus());
   };
 
-  // A phone lists sessions as Muse does: the whole screen with no Session open, else a drawer from the left that
-  // pushes the Session aside. Both run the full height on a solid colour, which iOS 26 extends under its bars.
   const searchPrimerRef = useRef<HTMLInputElement>(null);
   const openSearch = () => {
     searchPrimerRef.current?.focus();
     props.onOpenPalette?.();
   };
 
+  // A phone lists sessions as Muse does: the whole screen with no Session open, else a drawer under the Session,
+  // which slides aside to uncover it and hides once it has slid back. Both run the full height on a solid colour,
+  // which iOS 26 extends under its bars.
   const phoneClass = props.asPage
     ? "max-md:flex-1 max-md:!w-full max-md:bg-surface-950"
     : props.drawer
-      ? `max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-40 max-md:!w-[var(--aoe-drawer-w)] max-md:pt-[env(safe-area-inset-top)] max-md:bg-surface-950 max-md:transition-[translate,visibility] ${DRAWER_MOTION} ${
-          open ? "max-md:translate-x-0" : "max-md:-translate-x-full max-md:invisible"
+      ? `max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-0 max-md:!w-[var(--aoe-drawer-w)] max-md:pt-[env(safe-area-inset-top)] max-md:bg-surface-950 max-md:transition-[visibility] ${DRAWER_MOTION} ${
+          open ? "" : "max-md:invisible"
         }`
       : "max-md:hidden";
   return (
@@ -566,16 +567,6 @@ export function WorkspaceSidebar(props: Props) {
           )}
         </div>
       </div>
-      {props.drawer && open && (
-        // The pushed Session's edge: a tap closes the drawer, as in Muse.
-        <button
-          type="button"
-          aria-label="Close sessions"
-          data-testid="sidebar-drawer-scrim"
-          onClick={() => props.onOpenChange(false)}
-          className="md:hidden fixed inset-y-0 right-0 left-[var(--aoe-drawer-w)] z-40 cursor-pointer"
-        />
-      )}
       {/* Hidden with the panel so no dead drag bar lingers when the sidebar is closed. On a touch screen the
          pseudo-element widens the hit area outward, clear of the rows, and touch-action lets it drag instead of scroll. */}
       <div

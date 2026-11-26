@@ -170,7 +170,7 @@ test.describe("Phone session stack", () => {
     await expect(page.getByTestId("sidebar-new-session-pill")).toBeInViewport();
     await page.getByTestId("sidebar-session-row").filter({ hasText: "Beta" }).click();
     await expect(page).toHaveURL(/\/session\/beta$/);
-    await expect(page.getByTestId("sidebar-new-session-pill")).not.toBeInViewport();
+    await expect(page.getByTestId("sidebar-new-session-pill")).toBeHidden();
   });
 
   test("the header's ⋯ holds the open Session's views, then its actions", async ({ page }) => {

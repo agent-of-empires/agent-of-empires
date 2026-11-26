@@ -1978,6 +1978,57 @@ function AppContent({
     },
     [focusMode, activeSession],
   );
+  // The Session card a phone's drawer pushes aside, and the dim over it.
+  const cardRef = useRef<HTMLDivElement>(null);
+  const scrimRef = useRef<HTMLButtonElement>(null);
+  // Follows a drawer swipe with the finger: inline styles, so a frame costs no render. `null` hands back to the
+  // classes, which then animate from wherever the finger let go.
+  const trackDrawerDrag = useCallback((dx: number | null, open: boolean) => {
+    const card = cardRef.current;
+    const scrim = scrimRef.current;
+    const drawer = document.querySelector<HTMLElement>('[role="navigation"][aria-label="Sessions sidebar"]');
+    if (!card) return;
+    const styled = [card.style, scrim?.style, drawer?.style];
+    if (dx === null) {
+      for (const st of styled) st?.removeProperty("transition");
+      card.style.removeProperty("translate");
+      card.style.removeProperty("border-radius");
+      card.style.removeProperty("box-shadow");
+      scrim?.style.removeProperty("opacity");
+      scrim?.style.removeProperty("visibility");
+      drawer?.style.removeProperty("visibility");
+      return;
+    }
+    const width = drawer?.getBoundingClientRect().width || window.innerWidth * 0.85;
+    const offset = Math.min(width, Math.max(0, (open ? width : 0) + dx));
+    for (const st of styled) st?.setProperty("transition", "none");
+    card.style.translate = `${offset}px 0`;
+    card.style.borderRadius = "28px";
+    card.style.boxShadow = "var(--shadow-xl)";
+    drawer?.style.setProperty("visibility", "visible");
+    if (scrim) {
+      scrim.style.visibility = "visible";
+      scrim.style.opacity = String(offset / width);
+    }
+  }, []);
+  // iOS pans the page when the keyboard opens, carrying fixed chrome off the top; the phone header and the strip
+  // under the clock follow the visible viewport instead.
+  useEffect(() => {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const root = document.documentElement;
+    const sync = () => root.style.setProperty("--vv-offset-top", `${Math.max(0, vv.offsetTop)}px`);
+    sync();
+    vv.addEventListener("resize", sync);
+    vv.addEventListener("scroll", sync);
+    return () => {
+      vv.removeEventListener("resize", sync);
+      vv.removeEventListener("scroll", sync);
+      root.style.removeProperty("--vv-offset-top");
+    };
+  }, []);
+
+  const phoneDrawerTracking = singlePane && !!activeSession && !fullPageView && !focusMode;
   useDrawerSwipe(
     {
       // A phone's session drawer is always on the left, as Muse and Claude's app have it.
@@ -1988,6 +2039,8 @@ function AppContent({
       panelsAvailable: false,
     },
     handleDrawerSwipe,
+    // Only a phone's session drawer, which a Session card covers, follows the finger.
+    phoneDrawerTracking ? trackDrawerDrag : undefined,
   );
 
   // Read-only mode hides mutation UI. Guard creation at the handler so every
@@ -3042,6 +3095,46 @@ function AppContent({
   const phoneDrawer = singlePane && !!activeSession && !fullPageView && !focusMode;
   const drawerPushed = phoneDrawer && sidebarOpen;
 
+  const topBar = (
+    <TopBar
+      activeWorkspace={activeWorkspace}
+      activeSession={activeSession ?? null}
+      onToggleSidebar={handleToggleSidebar}
+      onOpenPalette={() => setShowPalette(true)}
+      terminal={caps.canUseTerminal ? { open: terminalOpen, onToggle: () => togglePaneAny("terminal") } : undefined}
+      sessionItems={phoneSessionItems}
+      appMenu={appMenu}
+      phoneViews={phoneViews && { ...phoneViews, onPick: handlePickView, onMore: () => setPickerOpen(true) }}
+      panels={
+        dockPaneIds.length > 0
+          ? {
+              ...paneMenu,
+              open: !rightDockCollapsed,
+              onToggle: toggleRightDock,
+              badge: caps.canUseDiff ? diffFiles.length : 0,
+            }
+          : undefined
+      }
+      unreadCount={unreadCount}
+      waitingCount={waitingCount}
+      attentionBadgeColors={attentionBadgeColors}
+      isOffline={!!error}
+      isDevBuild={isDebugBuild(serverAbout)}
+      onGoDashboard={handleGoDashboard}
+      onExitFocusMode={focusMode ? exitFocusMode : undefined}
+      sidebarColumnVisible={!focusMode && !fullPageView && sidebarOpen}
+      rightColumnVisible={
+        isMdUp &&
+        !rightDockSheet &&
+        !rightMaximized &&
+        !fullPageView &&
+        !!activeWorkspace &&
+        !!activeSession &&
+        !rightDockCollapsed
+      }
+    />
+  );
+
   return (
     <AcpPrefsProvider value={acpPrefs}>
       <DiffScopeContext.Provider value={diffScopeState}>
@@ -3054,82 +3147,26 @@ function AppContent({
           available={!error}
         >
           <div
-            className="h-(--app-height) flex flex-col bg-surface-900 md:bg-surface-950 md:chrome-canvas text-text-primary overflow-hidden safe-area-inset"
+            // A phone's home is the session list, whose darker colour then runs up under the clock too.
+            className={`h-(--app-height) flex flex-col ${phoneHome ? "bg-surface-950" : "bg-surface-900"} md:bg-surface-950 md:chrome-canvas text-text-primary overflow-hidden safe-area-inset`}
             // What a phone's floating header covers, for the views that keep their banners and first lines clear of it.
             style={phoneDrawer ? ({ "--phone-overlay-top": "64px" } as CSSProperties) : undefined}
           >
             {phoneDrawer && (
-              // iOS 26 blurs the top edge unless a fixed, opaque, full-width box sits there. This one fills the status
-              // bar's area, which an installed app draws under, so the clock sits on solid colour, never on content.
-              <div className="md:hidden fixed inset-x-0 top-0 z-30 h-[calc(env(safe-area-inset-top)+12px)] bg-surface-900" />
+              // Under the clock, which an installed app draws beneath: the page colour, never content. Fixed and opaque,
+              // so iOS 26 tints the status bar from it rather than blurring; under sheets and dialogs, and following the
+              // visible viewport while the keyboard pans the page.
+              <div
+                className={`md:hidden fixed inset-x-0 top-[var(--vv-offset-top,0px)] z-30 h-[env(safe-area-inset-top)] transition-colors duration-[400ms] [mask-image:linear-gradient(to_bottom,#000_calc(100%-0.375rem),transparent)] ${
+                  drawerPushed ? "bg-surface-950" : "bg-surface-900"
+                }`}
+              />
             )}
-            <div
-              // The phone's list is the whole screen with no Session open, and carries the app's menu itself. With a
-              // Session open the header floats over it, as Muse's does: only its controls take taps.
-              className={`${PUSH_MOTION} ${phoneHome ? "max-md:hidden" : ""} ${
-                phoneDrawer
-                  ? "max-md:fixed max-md:inset-x-0 max-md:top-[env(safe-area-inset-top)] max-md:z-30 max-md:pointer-events-none max-md:[&_button]:pointer-events-auto max-md:[&_[role=menu]]:pointer-events-auto max-md:[&_[data-testid=session-title-pill]]:pointer-events-auto"
-                  : ""
-              } ${
-                drawerPushed
-                  ? "max-md:translate-x-[var(--aoe-drawer-w)] max-md:rounded-tl-[44px] max-md:overflow-hidden"
-                  : ""
-              }`}
-            >
-              {phoneDrawer && (
-                <div
-                  aria-hidden
-                  className="md:hidden absolute inset-x-0 top-0 h-16 -z-10 bg-gradient-to-b from-surface-900/90 to-transparent"
-                />
-              )}
-              <TopBar
-                activeWorkspace={activeWorkspace}
-                activeSession={activeSession ?? null}
-                onToggleSidebar={handleToggleSidebar}
-                onOpenPalette={() => setShowPalette(true)}
-                terminal={
-                  caps.canUseTerminal ? { open: terminalOpen, onToggle: () => togglePaneAny("terminal") } : undefined
-                }
-                sessionItems={phoneSessionItems}
-                appMenu={appMenu}
-                phoneViews={phoneViews && { ...phoneViews, onPick: handlePickView, onMore: () => setPickerOpen(true) }}
-                panels={
-                  dockPaneIds.length > 0
-                    ? {
-                        ...paneMenu,
-                        open: !rightDockCollapsed,
-                        onToggle: toggleRightDock,
-                        badge: caps.canUseDiff ? diffFiles.length : 0,
-                      }
-                    : undefined
-                }
-                unreadCount={unreadCount}
-                waitingCount={waitingCount}
-                attentionBadgeColors={attentionBadgeColors}
-                isOffline={!!error}
-                isDevBuild={isDebugBuild(serverAbout)}
-                onGoDashboard={handleGoDashboard}
-                onExitFocusMode={focusMode ? exitFocusMode : undefined}
-                sidebarColumnVisible={!focusMode && !fullPageView && sidebarOpen}
-                rightColumnVisible={
-                  isMdUp &&
-                  !rightDockSheet &&
-                  !rightMaximized &&
-                  !fullPageView &&
-                  !!activeWorkspace &&
-                  !!activeSession &&
-                  !rightDockCollapsed
-                }
-              />
-            </div>
-
-            {/* Below a phone's floating header, so its controls never cover a banner's own. */}
-            <div className="max-md:mt-[var(--phone-overlay-top,0px)] max-md:empty:mt-0 shrink-0">
-              <BannerStack
-                onRetryServerSettings={serverAbout ? undefined : () => void recoverServerAbout()}
-                tourActive={tour.isTourActive}
-              />
-            </div>
+            {!phoneDrawer && <div className={phoneHome ? "max-md:hidden" : undefined}>{topBar}</div>}
+            <BannerStack
+              onRetryServerSettings={serverAbout ? undefined : () => void recoverServerAbout()}
+              tourActive={tour.isTourActive}
+            />
             {focusMode && focusSession.title !== null && !focusSession.gone && (
               <FocusModeNote title={focusSession.title} />
             )}
@@ -3197,13 +3234,38 @@ function AppContent({
 
               {/* The phone home is the session list, so the dashboard behind it stays out of the way. */}
               <div
+                ref={cardRef}
+                // With a Session open on a phone this is a card over the session drawer: the drawer pushes it aside
+                // whole, header and all, as clawbolt's and Claude's apps do.
                 className={`flex-1 flex flex-col min-h-0 min-w-0 ${PUSH_MOTION} ${phoneHome ? "max-md:hidden" : ""} ${
+                  phoneDrawer ? "max-md:relative max-md:z-10 max-md:bg-surface-900" : ""
+                } ${
                   drawerPushed
-                    ? "max-md:translate-x-[var(--aoe-drawer-w)] max-md:rounded-l-[44px] max-md:overflow-hidden max-md:ring-1 max-md:ring-white/8 max-md:shadow-[-18px_0_44px_-6px_rgb(0_0_0/0.75)]"
+                    ? "max-md:translate-x-[var(--aoe-drawer-w)] max-md:rounded-[28px] max-md:overflow-hidden max-md:shadow-xl"
                     : ""
                 }`}
               >
+                {phoneDrawer && (
+                  // Floats over the Session, which scrolls beneath it; only its controls take taps.
+                  <div className="md:hidden absolute inset-x-0 top-0 z-30 translate-y-[var(--vv-offset-top,0px)] pointer-events-none [&_button]:pointer-events-auto [&_[role=menu]]:pointer-events-auto [&_[data-testid=session-title-pill]]:pointer-events-auto">
+                    {topBar}
+                  </div>
+                )}
                 {renderContent()}
+                {phoneDrawer && (
+                  // Dims the pushed-aside Session; a tap on it closes the drawer.
+                  <button
+                    ref={scrimRef}
+                    type="button"
+                    tabIndex={-1}
+                    aria-label="Close sessions"
+                    data-testid="sidebar-drawer-scrim"
+                    onClick={() => setSidebarOpen(false)}
+                    className={`md:hidden absolute inset-0 z-40 bg-black/15 cursor-pointer transition-[opacity,visibility] duration-[400ms] motion-reduce:transition-none ${
+                      drawerPushed ? "opacity-100" : "opacity-0 invisible"
+                    }`}
+                  />
+                )}
               </div>
             </div>
 
