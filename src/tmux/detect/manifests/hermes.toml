@@ -68,8 +68,6 @@ visible = true
 contains_any = [
   "(y/n)",
   "[y/n]",
-  "approve",
-  "allow",
   "choice [o/s/a/d]:",
   "[o]nce",
   "dangerous command",
