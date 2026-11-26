@@ -1,9 +1,6 @@
-// Showcase Playwright config: records every mocked AND live spec in one run
-// for demo videos, trading throughput for cinematic footage (full-resolution
-// video, slow per-action delay, single worker so the encoder owns the CPU).
-//
-// Usage, build steps, and the ffmpeg post-processing live in
-// docs/development/showcase-video.md.
+// Records every mocked and live spec for a demo video: full-resolution video,
+// slowMo pacing, one worker so the encoder owns the CPU. Usage and the ffmpeg
+// combine step: scripts/combine-showcase-videos.sh.
 
 import { defineConfig } from "@playwright/test";
 

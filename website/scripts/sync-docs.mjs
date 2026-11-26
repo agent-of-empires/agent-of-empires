@@ -185,13 +185,6 @@ const PAGES = [
       "How to add a configuration setting with the single-source schema that drives the TUI, web dashboard, and server.",
   },
   {
-    source: "docs/development/showcase-video.md",
-    dest: "docs/development/showcase-video.md",
-    title: "Showcase video pipeline",
-    description:
-      "Record every Playwright spec as video and stitch the clips into one demo/highlight mp4: showcase config, the combine script, and its layout/speed/quality knobs.",
-  },
-  {
     source: "docs/development/releases.md",
     dest: "docs/development/releases.md",
     title: "Releases",

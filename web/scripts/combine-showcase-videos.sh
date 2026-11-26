@@ -1,15 +1,42 @@
 #!/usr/bin/env bash
-# Combine every Playwright showcase video.webm under test-results/ into one
-# mp4. Speed-up is computed so the result is always ~MAX_SECONDS regardless
-# of input count. Re-encode is unavoidable (we apply a setpts filter, which
-# stream-copy can't do). Usage and env knobs: docs/development/showcase-video.md.
+# Record every Playwright spec as video, then combine the clips into one mp4.
 #
-# Two layouts, both deterministic (inputs are filesystem-sorted):
-#   - concat (default): videos play back-to-back; factor = max(1, sum / cap).
-#   - grid (GRID=COLSxROWS): videos stream into COLS*ROWS lanes round-robin,
-#     concatenated within each lane and played in parallel. Shorter lanes
-#     tail-pad with their last frame; empty lanes (fewer videos than cells)
-#     are black. factor = max(1, longest-lane / cap).
+# Record (web/playwright.showcase.config.ts: every mocked and live spec, one
+# worker, slowMo 250; about an hour for the full suite):
+#   cargo build --features web
+#   cd web && npm run build
+#   AOE_E2E_BINARY="$(pwd)/../target/debug/aoe" npm run test:showcase
+# The vite preview server starts even for --project=live, so the bundle must
+# be built. Specs that call browser.newContext without recordVideo, or never
+# open a page, record nothing. The next Playwright run wipes test-results/,
+# including the default output; copy anything worth keeping.
+#
+# Combine (run from web/; output defaults to test-results/showcase-combined.mp4):
+#   ./scripts/combine-showcase-videos.sh [out.mp4]
+#   GRID=2x2 SHOW_TITLES=1 MAX_SECONDS=180 ./scripts/combine-showcase-videos.sh
+#   YOUTUBE=1 GRID=2x2 SHOW_TITLES=1 ./scripts/combine-showcase-videos.sh
+#
+# Layouts (inputs are filesystem-sorted):
+#   concat (default): clips play back to back; speed = max(1, total / cap).
+#   grid (GRID=COLSxROWS): clips go round-robin into COLS*ROWS lanes that play
+#     in parallel. Short lanes hold their last frame, empty lanes are black;
+#     speed = max(1, longest lane / cap). Each clip is trimmed to just before
+#     its first non-white frame, since Playwright clips often open on seconds
+#     of blank page; probes are cached in LEAD_CACHE by path and mtime.
+#
+# Environment:
+#   MAX_SECONDS  output length cap (120)
+#   GRID         COLSxROWS, at least 2 cells (unset: concat)
+#   SHOW_TITLES  1 overlays the spec name; needs ffmpeg built with libfreetype
+#   CRF, PRESET  libx264 quality (14) and preset (slow)
+#   TARGET_W/H   canvas for grid and titled concat (1440x900); untitled
+#                concat keeps the recording size
+#   TITLE_FONTSIZE, TITLE_BORDER, TITLE_MARGIN, FONT  title styling
+#   YOUTUBE      1 changes the defaults to a 3840x2160 canvas, CRF 12, larger
+#                titles and BT.709 color tags; explicit vars still win
+#   LEAD_CACHE   lead-in probe cache (test-results/.lead-cache.tsv)
+# GRID and SHOW_TITLES read the filter graph from a file, which needs
+# ffmpeg 7.0 or newer.
 
 set -euo pipefail
 
@@ -53,9 +80,6 @@ CRF="${CRF:-${d_crf}}"
 PRESET="${PRESET:-slow}"
 GRID="${GRID:-}"
 SHOW_TITLES="${SHOW_TITLES:-0}"
-# Playwright videos are captured at 1440x900 (see playwright.showcase.config.ts).
-# Keep the target at native resolution: upscaling adds no detail and just
-# bloats encode time.
 TARGET_W="${TARGET_W:-${d_w}}"
 TARGET_H="${TARGET_H:-${d_h}}"
 TITLE_FONTSIZE="${TITLE_FONTSIZE:-${d_font}}"
@@ -66,9 +90,6 @@ FONT="${FONT:-}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS="${ROOT}/test-results"
 OUT="${1:-${RESULTS}/showcase-combined.mp4}"
-# Encode to a unique sibling file so a failed run never clobbers a good ${OUT}
-# and a planted symlink is never followed.
-PARTIAL="$(mktemp "${OUT}.XXXXXX")"
 
 if [[ ! -d "${RESULTS}" ]]; then
   echo "no test-results/ directory at ${RESULTS}" >&2
@@ -81,6 +102,11 @@ for bin in ffmpeg ffprobe awk; do
     exit 1
   fi
 done
+
+# Encode to a unique sibling file so a failed run never clobbers a good ${OUT}
+# and a planted symlink is never followed. mktemp creates it 0600.
+PARTIAL="$(mktemp "${OUT}.XXXXXX")"
+chmod "$(printf '%o' $(( 0666 & ~$(umask) )))" "${PARTIAL}"
 
 # -/filter_complex (option value from file) needs ffmpeg 7.0+. Git builds
 # (N-...) have no parsable release number, so the check is skipped for them.
@@ -112,18 +138,9 @@ if [[ "${SHOW_TITLES}" == "1" && -z "${FONT}" ]]; then
   fi
 fi
 
-# Escape a string for drawtext: backslash, colon, percent, single quote.
-escape_drawtext() {
-  local s="$1"
-  s="${s//\\/\\\\}"
-  s="${s//:/\\:}"
-  s="${s//\'/\\\\\'}"
-  s="${s//%/\\%}"
-  printf '%s' "${s}"
-}
-
 # Turn "test-results/tests-live-golden-path-create-view-delete.../video.webm"
-# into "golden path: create view delete...". Truncated for overlay sanity.
+# into "golden path create view delete...". Characters outside [A-Za-z0-9 ._]
+# are dropped so the title needs no drawtext or filter-graph escaping.
 derive_title() {
   local video="$1"
   local dir
@@ -131,8 +148,9 @@ derive_title() {
   # Drop common Playwright prefix.
   dir="${dir#tests-}"
   dir="${dir#live-}"
-  # Dashes -> spaces. Cap to 80 chars.
+  # Cap to 80 chars.
   dir="${dir//-/ }"
+  dir="${dir//[^A-Za-z0-9 ._]/}"
   if [[ "${#dir}" -gt 80 ]]; then
     dir="${dir:0:77}..."
   fi
@@ -156,37 +174,39 @@ if [[ "${count}" -eq 0 ]]; then
   exit 1
 fi
 
-# Playwright recordings start with a blank white page before first paint.
-# Probe the first non-white time (YAVG<200 at 10 fps) per clip; cached by
-# path+mtime so reruns are fast. Grid mode trims it off (see trims[]).
-LEAD_CACHE="${LEAD_CACHE:-${RESULTS}/.lead-cache.tsv}"
-touch "${LEAD_CACHE}"
-file_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
-probe_lead() {
-  local f="$1" lead
-  lead="$(ffmpeg -v error -threads 1 -i "${f}" -vf "fps=10,scale=64:-1,signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-" -f null - 2>/dev/null |
-    awk '/pts_time/ { t = substr($0, index($0, "pts_time:") + 9) + 0; next }
-         /YAVG/ { split($0, b, "="); if (b[2] + 0 < 200) { print t; found = 1; exit } }
-         END { if (!found) print 0 }')"
-  printf '%s\t%s\t%s\n' "${f}" "$(file_mtime "${f}")" "${lead:-0}"
-}
-export -f probe_lead file_mtime
-todo="$(mktemp -t showcase-probe.XXXXXX)"
-for v in "${videos[@]}"; do
-  grep -qF "${v}"$'\t'"$(file_mtime "${v}")"$'\t' "${LEAD_CACHE}" || printf '%s\0' "${v}" >>"${todo}"
-done
-if [[ -s "${todo}" ]]; then
-  xargs -0 -n1 -P 6 bash -c 'probe_lead "$1"' _ <"${todo}" >>"${LEAD_CACHE}"
-fi
-rm -f "${todo}"
-# trims[i]: seconds of leading blank to drop. Back off 0.1s from the first
-# non-white sample, never trim when the clip starts non-white (dark theme),
-# and always keep at least 1s of the clip.
 trims=()
-for i in "${!videos[@]}"; do
-  lead="$(awk -F'\t' -v f="${videos[$i]}" -v m="$(file_mtime "${videos[$i]}")" '$1 == f && $2 == m { l = $3 } END { print l + 0 }' "${LEAD_CACHE}")"
-  trims+=("$(awk -v l="${lead}" -v d="${durations[$i]}" 'BEGIN { t = l - 0.1; if (t < 0.1) t = 0; if (t > d - 1) t = d - 1; if (t < 0) t = 0; printf "%.3f", t }')")
-done
+if [[ -n "${GRID}" ]]; then
+  # Playwright recordings start with a blank white page before first paint.
+  # Probe the first non-white time (YAVG<200 at 10 fps) per clip; cached by
+  # path+mtime so reruns are fast. Grid mode trims it off (see trims[]).
+  LEAD_CACHE="${LEAD_CACHE:-${RESULTS}/.lead-cache.tsv}"
+  touch "${LEAD_CACHE}"
+  file_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
+  probe_lead() {
+    local f="$1" lead
+    lead="$(ffmpeg -v error -threads 1 -i "${f}" -vf "fps=10,scale=64:-1,signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-" -f null - 2>/dev/null |
+      awk '/pts_time/ { t = substr($0, index($0, "pts_time:") + 9) + 0; next }
+           /YAVG/ { split($0, b, "="); if (b[2] + 0 < 200) { print t; found = 1; exit } }
+           END { if (!found) print 0 }')"
+    printf '%s\t%s\t%s\n' "${f}" "$(file_mtime "${f}")" "${lead:-0}"
+  }
+  export -f probe_lead file_mtime
+  todo="$(mktemp -t showcase-probe.XXXXXX)"
+  for v in "${videos[@]}"; do
+    grep -qF "${v}"$'\t'"$(file_mtime "${v}")"$'\t' "${LEAD_CACHE}" || printf '%s\0' "${v}" >>"${todo}"
+  done
+  if [[ -s "${todo}" ]]; then
+    xargs -0 -n1 -P 6 bash -c 'probe_lead "$1"' _ <"${todo}" >>"${LEAD_CACHE}"
+  fi
+  rm -f "${todo}"
+  # trims[i]: seconds of leading blank to drop. Back off 0.1s from the first
+  # non-white sample, never trim when the clip starts non-white (dark theme),
+  # and always keep at least 1s of the clip.
+  for i in "${!videos[@]}"; do
+    lead="$(awk -F'\t' -v f="${videos[$i]}" -v m="$(file_mtime "${videos[$i]}")" '$1 == f && $2 == m { l = $3 } END { print l + 0 }' "${LEAD_CACHE}")"
+    trims+=("$(awk -v l="${lead}" -v d="${durations[$i]}" 'BEGIN { t = l - 0.1; if (t < 0.1) t = 0; if (t > d - 1) t = d - 1; if (t < 0) t = 0; printf "%.3f", t }')")
+  done
+fi
 
 # Common drawtext fragment (omit text= so we can plug in per-call).
 drawtext_style() {
@@ -294,8 +314,7 @@ if [[ -n "${GRID}" ]]; then
     for (( i=k; i<count; i+=cells )); do
       chain="[${i}:v]trim=start=${trims[$i]},setpts=PTS-STARTPTS,scale=${cell_w}:${cell_h}:force_original_aspect_ratio=decrease,pad=${cell_w}:${cell_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
       if [[ "${SHOW_TITLES}" == "1" ]]; then
-        title_escaped="$(escape_drawtext "${titles[$i]}")"
-        chain+=",drawtext=$(drawtext_style):text='${title_escaped}'"
+        chain+=",drawtext=$(drawtext_style):text='${titles[$i]}'"
       fi
       chain+="[v_${k}_${member_idx}];"
       filter+="${chain}"
@@ -353,8 +372,7 @@ else
     filter=""
     for i in "${!videos[@]}"; do
       inputs+=("-threads" "1" "-i" "${videos[$i]}")
-      title_escaped="$(escape_drawtext "${titles[$i]}")"
-      filter+="[${i}:v]scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,drawtext=$(drawtext_style):text='${title_escaped}'[s${i}];"
+      filter+="[${i}:v]scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,drawtext=$(drawtext_style):text='${titles[$i]}'[s${i}];"
     done
     concat_inputs=""
     for (( i=0; i<count; i++ )); do

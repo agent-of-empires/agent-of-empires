@@ -42,7 +42,7 @@ its gate directory disappears. Keep request deadlines longer than the bounded
 scenario and assert the expected API error code, not merely any error. Keep an
 emergency hook watchdog beyond the request budget for abrupt test-process exit.
 
-The binary is `target/{profile}/aoe`. Web commands and test selection live in `web/AGENTS.md`. To record every Playwright spec as one demo video, see [showcase-video.md](development/showcase-video.md).
+The binary is `target/{profile}/aoe`. Web commands and test selection live in `web/AGENTS.md`.
 
 Live web fixtures own any Daemon started by `seedFn`, including when seeding
 fails. Teardown stops that Daemon before its runners and removes the isolated
@@ -113,4 +113,4 @@ Maintainer keys can only read and write `maint/`, so CI never consumes artifacts
 
 ## Demo recordings
 
-`web/scripts/record-tui-demo.mjs` produces `docs/assets/demo.gif`, and `web/scripts/record-web-demo.mjs` the desktop and mobile dashboard GIFs. Each documents its dependencies and setup in its file header. To record a PR's change for review, use the `record-pr-demo` agent skill in `.claude/skills/record-pr-demo/`.
+`web/scripts/record-tui-demo.mjs` produces `docs/assets/demo.gif`, `web/scripts/record-web-demo.mjs` the desktop and mobile dashboard GIFs, and `web/scripts/combine-showcase-videos.sh` one video of every Playwright spec. Each documents its dependencies and setup in its file header. To record a PR's change for review, use the `record-pr-demo` agent skill in `.claude/skills/record-pr-demo/`.
