@@ -256,7 +256,7 @@ describe("the shared sidebar view", () => {
     await act(async () => deadline.abort());
     await waitFor(() => expect(settled).toBe(true));
     await pollAt(result, 3);
-    expect(result.current.model.sort).toBe("custom");
+    await waitFor(() => expect(result.current.model.sort).toBe("custom"));
   });
 
   it("ignores a read from before a restart that a write's receipt already reported", async () => {
@@ -491,7 +491,7 @@ describe("write order", () => {
     expect(writes.map((w) => w.body)).toEqual([{ sort: "name" }, { group_by: "group" }, { sort: "custom" }]);
     await pollAt(result, 10);
     expect(daemon.sidebar_view).toEqual({ group_by: "group", sort: "custom" });
-    expect(result.current.model.sort).toBe("custom");
+    await waitFor(() => expect(result.current.model.sort).toBe("custom"));
   });
 
   it("sends each ordering write after the previous one answered", async () => {

@@ -29,17 +29,25 @@ describe("groupMove", () => {
     ["b", "c", true, "down", ["a", "b", "c"], ["a", "b/z", "c", "b/a", "b"]],
     ["b/a", "b/z", false, "up", ["b/z", "b/a"], ["b", "b/a", "a", "b/z", "c"]],
   ] as const)("moves %s next to %s in one request", (active, over, after, direction, siblings, next) => {
-    expect(groupMove(order, [], active, over, after)).toEqual({ direction, siblings, order: next });
+    expect(groupMove(order, order, active, over, after)).toEqual({ direction, siblings, order: next });
+  });
+
+  it("keeps a sibling the sidebar does not show in its slot", () => {
+    expect(groupMove(["a", "hidden", "b"], ["a", "b"], "b", "a", false)).toEqual({
+      direction: "up",
+      siblings: ["a", "b"],
+      order: ["b", "hidden", "a"],
+    });
   });
 
   it("places an unlisted sibling after the listed ones, and refuses other parents and no-ops", () => {
-    expect(groupMove(["a", "b"], ["new"], "new", "a", false)).toEqual({
+    expect(groupMove(["a", "b"], ["a", "b", "new"], "new", "a", false)).toEqual({
       direction: "up",
       siblings: ["a", "new", "b"],
       order: ["new", "a", "b"],
     });
-    expect(groupMove(order, [], "b/a", "a", false)).toBeNull();
-    expect(groupMove(order, [], "a", "b", true)).toBeNull();
+    expect(groupMove(order, order, "b/a", "a", false)).toBeNull();
+    expect(groupMove(order, order, "a", "b", true)).toBeNull();
   });
 });
 

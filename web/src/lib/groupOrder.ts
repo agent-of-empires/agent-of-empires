@@ -52,10 +52,15 @@ function withShown(order: readonly string[], shown: readonly string[]): string[]
   return [...order, ...[...new Set(shown)].filter((p) => !listed.has(p)).sort(compareNames)];
 }
 
-/** `full` with the children of `parent` replaced, slot for slot, by `siblings`. */
-function placeSiblings(full: readonly string[], parent: string, siblings: readonly string[]): string[] {
+/** `full` with the children of `parent` in `within`, or all of them, replaced slot for slot by `siblings`. */
+function placeSiblings(
+  full: readonly string[],
+  parent: string,
+  siblings: readonly string[],
+  within?: ReadonlySet<string>,
+): string[] {
   let next = 0;
-  return full.map((p) => (parentPath(p) === parent ? siblings[next++]! : p));
+  return full.map((p) => (parentPath(p) === parent && (!within || within.has(p)) ? siblings[next++]! : p));
 }
 
 /** The move that leaves `active` at its index in `moved`, coming from the neighbouring slot. */
@@ -69,7 +74,8 @@ function moveInto(moved: readonly string[], active: string, direction: GroupMove
 
 /**
  * The move that puts `active` next to its sibling `over`, after it when the drag went down. `shown` are the paths
- * on screen; one `order` lacks is placed after the listed ones by name, where the sidebar shows it.
+ * on screen; one `order` lacks is placed after the listed ones by name, where the sidebar shows it. Siblings not
+ * shown keep their slots, as the Daemon keeps those a move does not list.
  */
 export function groupMove(
   order: readonly string[],
@@ -81,14 +87,19 @@ export function groupMove(
   const parent = parentPath(active);
   if (active === over || parentPath(over) !== parent) return null;
   const full = withShown(order, shown);
-  const siblings = full.filter((p) => parentPath(p) === parent);
+  const visible = new Set(shown);
+  const siblings = full.filter((p) => parentPath(p) === parent && visible.has(p));
   if (!siblings.includes(active) || !siblings.includes(over)) return null;
   const moved = moveId(siblings, active, over, after);
   const from = siblings.indexOf(active);
   const to = moved.indexOf(active);
   if (from === to) return null;
   const direction = to < from ? "up" : "down";
-  return { direction, siblings: moveInto(moved, active, direction), order: placeSiblings(full, parent, moved) };
+  return {
+    direction,
+    siblings: moveInto(moved, active, direction),
+    order: placeSiblings(full, parent, moved, visible),
+  };
 }
 
 /**
